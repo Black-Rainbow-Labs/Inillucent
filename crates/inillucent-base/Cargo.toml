@@ -1,0 +1,13 @@
+[package]
+name = "inillucent-base"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Checked binary primitives, identifiers, buffers, limits, and the stable error model."
+
+[dependencies]
+
+# The workspace's lint table; see the note beside it in the root manifest.
+[lints]
+workspace = true

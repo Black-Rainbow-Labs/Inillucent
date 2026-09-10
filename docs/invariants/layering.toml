@@ -1,0 +1,873 @@
+# The dependency-direction contract.
+#
+# This file is checked, not documented: `deps.layering-is-acyclic` and its
+# siblings in inillucent-compat read it, walk the workspace manifests, and fail on
+# any edge that is not declared here. An architecture rule that is only written
+# down is a rule that has already been broken somewhere.
+#
+# `kind` decides who may depend on whom. A production crate may depend only on
+# production crates listed in its own `may_depend_on`. A test-only crate may
+# depend inward on anything; nothing may depend outward on a test-only crate,
+# not even as a dev-dependency, unless the production crate names it in
+# `may_test_with` - which only the storage crates do, and only for the
+# simulator, because the TDD's fault campaigns run inside them.
+#
+# The TDD's crate table names `inillucent-value` and `inillucent-vfs` as the two leaves.
+# `inillucent-base` is a refinement: phase 1 needs checked
+# integers, varints, checksums, page arithmetic and the error table before
+# values exist, and `inillucent-vfs` needs the same error table, so they live in a
+# leaf below both rather than being duplicated or forced into a crate whose own
+# contents do not land until phase 2.
+
+schema_version = 1
+
+# The allocator is below everything and depends on nothing, which is the point:
+# it is the one crate that may write `unsafe`, and it can only do so safely
+# because there is nothing underneath it to re-enter.
+[[crate]]
+name = "inillucent-alloc"
+kind = "production"
+layer = 0
+may_depend_on = []
+
+[[crate]]
+name = "inillucent-base"
+kind = "production"
+layer = 0
+may_depend_on = []
+
+[[crate]]
+name = "inillucent-vfs"
+kind = "production"
+layer = 1
+may_depend_on = ["inillucent-base"]
+
+[[crate]]
+name = "inillucent-value"
+kind = "production"
+layer = 1
+may_depend_on = ["inillucent-base"]
+
+# ---------------------------------------------------------------------------
+# The rearchitected engine. These sit beside the crates they
+# replace rather than above them, because for the length of the transition both
+# engines are in the workspace and the old one still has to build and produce a
+# number - the TDD's rule is that nothing is deleted until its replacement is
+# green on the scorecard and the crash campaigns.
+# ---------------------------------------------------------------------------
+
+# `inillucent-pool` is the buffer pool the TDD's Phase 2 delivers: frames, version
+# latches, pointer swizzling, the cooling FIFO, writeback, the free map and blob
+# extents. It sits above `inillucent-vfs`, which is the only thing in the workspace
+# that touches a file, and below `inillucent-tree`, which names pages and children
+# and never an offset.
+#
+# The page header moved down here with it, from `inillucent-tree::page`. A page
+# header is a property of the file format rather than of the B+tree - the pool
+# has to read one before it knows whether the page is a leaf at all - and
+# `inillucent_tree::page` is now a re-export, so every caller written against Phase
+# 1 still names the same path.
+[[crate]]
+name = "inillucent-pool"
+kind = "production"
+layer = 2
+may_depend_on = ["inillucent-base", "inillucent-vfs"]
+# The TDD's Phase 2: "`inillucent-sim` becomes a dev-dependency of `inillucent-pool`,
+# `inillucent-tree`, `inillucent-wal` and `inillucent-txn`". A buffer pool's fault campaign
+# has to inject a failure at a *site* - a read, a write, a sync - and then look
+# at the pool's own frame table, which only a test inside the crate can do.
+may_test_with = ["inillucent-sim"]
+
+# `inillucent-wal` is the TDD's Phase 3 log: segments, the record codec, group
+# commit and recovery. It sits at layer 2 **beside** `inillucent-pool` and depends
+# on neither it nor anything above it, which is the whole point of the entry.
+#
+# The obvious arrangement - the log above the pool, so a record could carry a
+# `PageId` - is the wrong way round. The log is written *before* any page is, and
+# an edge from the log to the crate that owns pages says the opposite of what the
+# write-ahead rule says. A record therefore carries a page's number as a `u64`,
+# and the rule crosses the gap in the direction that costs nothing: the pool is
+# *told* a durable LSN and refuses to write a page whose LSN is at or above it. A
+# number is not a dependency.
+#
+# Recovery is in this crate and *applying* a record is not: `recover::Redo` is a
+# trait the caller implements, so the scan lives with the format it reads while
+# the crate that owns pages and trees does the applying.
+[[crate]]
+name = "inillucent-wal"
+kind = "production"
+layer = 2
+may_depend_on = ["inillucent-base", "inillucent-vfs"]
+# The TDD names this crate in the same sentence as the pool: a log's durability
+# campaign injects a failure at a write or a sync and then reads the log's own
+# segment state, which only a test inside the crate can do.
+may_test_with = ["inillucent-sim"]
+
+# `inillucent-tree` replaces `inillucent-storage` and sits where it sits: a layer that
+# knows pages and byte records and nothing about what a column is called. Phase
+# 2 added `inillucent-pool` beneath it when the buffer pool arrived, exactly as the
+# Phase 1 note here predicted.
+#
+# It reaches `inillucent-value` for one thing only: `Collation`. The PAX leaf keeps
+# its own borrowed value type, because the executor's values borrow a pinned
+# page and `inillucent_value::Value`'s owned form is reference counted - that is the
+# allocation the design exists to avoid, and the edge does not change it. But a
+# tree is *stored* in its collation's order: an index on a `COLLATE NOCASE`
+# column holds `Blue` between two `blue`s, and a descent that compared them with
+# `memcmp` walks past the row it wants. The collation is therefore a property of
+# the column directory, and there is one definition of it in the workspace.
+[[crate]]
+name = "inillucent-tree"
+kind = "production"
+layer = 3
+# `inillucent-wal` arrived with Phase 3's write path. A tree mutation *is* a log
+# record - a delta insert, a compaction, a split - and the crate that emits one
+# has to name it. The edge points at layer 2, which the log occupies precisely so
+# that the things which write pages can depend on it and it can depend on
+# neither of them.
+may_depend_on = ["inillucent-base", "inillucent-pool", "inillucent-value", "inillucent-wal"]
+
+# `inillucent-txn` is the TDD's Phase 3 transaction manager: snapshots, the writer
+# slot, undo buffers, the version log and its garbage collection, savepoints and
+# the commit gate. It replaces `inillucent-transaction`, whose rollback journal,
+# super-journal, SQLite WAL format and lock state machines all die with it.
+#
+# It is the first crate that holds a database file and a log at the same time,
+# which is why the write-ahead rule is tied together here rather than in either
+# of them: it is the only thing that calls `Pool::set_durable_lsn`, and it calls
+# it after every sync of the log and never before one. Neither `inillucent-pool`
+# nor `inillucent-wal` can do that, because neither knows the other exists - and
+# that is the arrangement, not an oversight.
+#
+# Layer 4 puts it beside `inillucent-sql` and above `inillucent-tree`. It depends
+# on neither the parser nor the catalog: a transaction knows about trees, keys
+# and bytes, and what a column is called is somebody else's question.
+[[crate]]
+name = "inillucent-txn"
+kind = "production"
+layer = 4
+may_depend_on = [
+  "inillucent-base",
+  "inillucent-vfs",
+  "inillucent-value",
+  "inillucent-pool",
+  "inillucent-tree",
+  "inillucent-wal",
+]
+# The TDD's Phase 2 note names this crate alongside the pool, the tree and the
+# log: a transaction manager's fault campaign crashes at a chosen sync and then
+# reads back what the *file* holds, which needs the simulator inside the crate.
+may_test_with = ["inillucent-sim"]
+
+# `inillucent-exec` replaces `inillucent-vm`, and it reaches *down* to `inillucent-sql` for
+# the same reason the VM did: the planner's output is its input. It does not
+# reach the catalog - a pipeline is built against a `TreeCatalog` the caller
+# supplies, so the executor never resolves a name.
+[[crate]]
+name = "inillucent-exec"
+kind = "production"
+layer = 6
+may_depend_on = [
+  "inillucent-base",
+  "inillucent-value",
+  "inillucent-sql",
+  "inillucent-scalar",
+  "inillucent-pool",
+  "inillucent-tree",
+]
+
+# `inillucent-scalar` holds the dialect's scalar layer: SQLite's arithmetic and
+# three-valued logic, the value coercions, and the whole built-in function set -
+# `substr`, `strftime`, `LIKE`, `printf` and the rest.
+#
+# The TDD's component triage says those function bodies "port into
+# `inillucent-exec`". The obvious reading is to copy them out of `inillucent-vm`, and
+# the rearchitecture makes that the wrong reading: both executors are in the
+# tree at once until Phase 5 deletes one, and two copies of `substr` agree until
+# the next fix. So the port was done as a *move*, into a crate both depend on,
+# with `inillucent_vm::builtin` and its five siblings left as re-exports.
+#
+# It sits above `inillucent-sql` because a built-in is identified by
+# `inillucent_sql::function::ScalarFunc` and the binder is what resolves a name to
+# one. That is the only edge; nothing here parses, binds, plans or reads a page.
+[[crate]]
+name = "inillucent-scalar"
+kind = "production"
+layer = 5
+may_depend_on = ["inillucent-base", "inillucent-value", "inillucent-sql"]
+
+# `inillucent-sqlite-reader` is the read half of `inillucent-storage` behind a narrow
+# interface, kept when the rest of that crate goes. It is a tool rather than a
+# library the engine uses: the differential gate imports a fixture through it
+# and `inillucent-migrate` reads a legacy file through it, and nothing in the engine
+# depends on it. It reaches `inillucent-catalog` so that there is one schema reader
+# in the workspace rather than a second one that could disagree with the binder.
+[[crate]]
+name = "inillucent-sqlite-reader"
+kind = "production"
+layer = 7
+may_depend_on = [
+  "inillucent-base",
+  "inillucent-value",
+  "inillucent-vfs",
+  "inillucent-storage",
+  "inillucent-transaction",
+  "inillucent-catalog",
+  "inillucent-sql",
+  "inillucent-tree",
+]
+
+# `inillucent-storage` reaching into `inillucent-value` is a refinement,
+# and it is the layering rule "storage knows pages and byte records"
+# taken literally: an index cursor cannot decide which child to descend into
+# without decoding the two records it is comparing, and `sqlite_schema` cannot
+# be read for root pages without decoding a record. `inillucent-value` is a leaf
+# below storage in the TDD's own graph, so the edge is downward and adds no
+# cycle. What storage still may not reach is anything that knows what a column
+# is called: no catalog, no SQL, no expressions.
+[[crate]]
+name = "inillucent-storage"
+kind = "production"
+layer = 2
+may_depend_on = ["inillucent-base", "inillucent-value", "inillucent-vfs"]
+
+# The edge from `inillucent-transaction` down to `inillucent-storage` is the one the
+# TDD draws, and phase 7 had to decide which side of it the rollback journal
+# falls on. The crate table puts "locks, journals, WAL, savepoints, recovery"
+# here; the pager section puts the writer state machine and "journal the before
+# image inside `get_page_mut`" in storage. Both are true, so the split is by
+# knowledge rather than by code: `inillucent_storage::journal::Journal` is a trait
+# declaring the *moments* a journal is needed - which only the pager knows -
+# and this crate owns the format, the five modes, the four durability levels
+# and recovery. Moving the whole commit up would have dragged the dirty set,
+# the page cache and the lock ladder with it and left the pager as a
+# byte-shuffling helper with no state machine, which is the opposite of what
+# the TDD describes.
+[[crate]]
+name = "inillucent-transaction"
+kind = "production"
+layer = 3
+may_depend_on = ["inillucent-base", "inillucent-vfs", "inillucent-storage"]
+
+# `inillucent-sql` sitting *below* `inillucent-catalog` is a refinement.
+# The TDD places the binder in `inillucent-sql` and says it is pure over
+# an immutable catalog snapshot, and it also says the catalog parses the CREATE
+# SQL stored in `sqlite_schema` with the first-party parser. Both cannot be true
+# of two crates in the same direction. The parser is the more fundamental of the
+# two - a catalog cannot be built without it, but a parse does not need a
+# catalog - so the parser, the AST and the binder live below, and the binder is
+# written against `inillucent_sql::catalog_view::CatalogView` rather than against
+# the concrete snapshot. `inillucent-catalog` implements that view over what it
+# reads from the file. The binder is still pure and still performs no I/O; it
+# now says so in its types.
+[[crate]]
+name = "inillucent-sql"
+kind = "production"
+layer = 4
+may_depend_on = ["inillucent-base", "inillucent-value"]
+
+# The catalog reads `sqlite_schema` through the pager. Phase 7 introduces
+# `inillucent-transaction` between them; until it exists, a read transaction is a
+# pager read transaction, and the edge to storage is the same downward edge the
+# transaction crate will later carry.
+[[crate]]
+name = "inillucent-catalog"
+kind = "production"
+layer = 5
+may_depend_on = [
+  "inillucent-base",
+  "inillucent-value",
+  "inillucent-storage",
+  "inillucent-transaction",
+  "inillucent-sql",
+  "inillucent-pool",
+  "inillucent-tree",
+]
+may_test_with = ["inillucent-vfs"]
+
+# The two new edges are `paged`, which is the TDD's "inillucent-catalog over the
+# catalog tree". The schema the new engine reads is a tree in its own file, so
+# the loader has to reach the tree layer and the pool that pages it. Both are
+# below this crate, so the direction is unchanged; what is new is that one
+# catalog crate now serves two storage stacks, which is the point - a schema
+# read two ways by two derivations is a schema that can disagree with itself.
+
+# `inillucent-ext` sitting *above* `inillucent-sql` and `inillucent-storage` is a
+# refinement, and it is what a virtual table actually is. A
+# module has to answer three questions the old position could not express: what
+# schema does `CREATE VIRTUAL TABLE ... USING fts5(a, b)` declare, which needs
+# the parser; what does a `MATCH` constraint cost, which needs the planner's own
+# vocabulary; and where are my shadow rows, which needs a b-tree cursor. FTS5
+# and R-Tree are databases inside a database - their indexes live in ordinary
+# tables and are read and written a page at a time - so an extension crate that
+# may not name a pager can only be a table of pure functions.
+#
+# The direction is still downward and still acyclic: `inillucent-ext` reads the
+# front end and the storage engine, and `inillucent-vm` reads `inillucent-ext`. What it
+# still may not reach is the catalog or the session; a module never resolves a
+# name or opens a transaction of its own, and is handed the roots of its shadow
+# tables by the host that already resolved them.
+# **Both edges into the retired engine were removed.** A module reaches its
+# shadow rows through `inillucent_sql::vtab::ShadowStore`, which the new engine
+# implements over PAX trees and the old one implements in
+# `inillucent_vm::shadow_pager` - so the crate the *new* engine links no longer
+# names the storage model the rearchitecture retired. The `inillucent-transaction`
+# edge was never used by a line of code; the `inillucent-storage` one was two
+# things, a pager arm inside every `ShadowTables` method and an
+# `impl Host for Pager`, and both moved down to crates that are retired with it.
+[[crate]]
+name = "inillucent-ext"
+kind = "production"
+layer = 6
+may_depend_on = [
+  "inillucent-base",
+  "inillucent-value",
+  "inillucent-sql",
+  "inillucent-catalog",
+  # The JSON built-ins moved down into `inillucent-scalar`, for the
+  # same reason `substr` did in Phase 2: the design's Phase 4 puts them on the new
+  # executor's expression path, and `inillucent-exec` sits below this crate. This
+  # edge is what `inillucent_ext::json` re-exports across, so every path a caller
+  # wrote still resolves.
+  "inillucent-scalar",
+]
+
+[[crate]]
+name = "inillucent-vm"
+kind = "production"
+layer = 7
+may_depend_on = [
+  "inillucent-base",
+  "inillucent-value",
+  "inillucent-scalar",
+  "inillucent-sql",
+  "inillucent-catalog",
+  "inillucent-storage",
+  "inillucent-transaction",
+  "inillucent-ext",
+]
+
+# `inillucent-engine` is the rearchitected engine as a database: the pool, the
+# trees, the log, the catalog, DDL, the pragma set, the statement path and the
+# virtual-table host, assembled into something a caller can open.
+#
+# It sits at layer 8, beside `inillucent-session` rather than above or below it,
+# because it is the crate that replaces it. The two do not depend on each other
+# and must not: while both exist there are two engines in this workspace, and an
+# edge either way would make one of them the other's implementation detail.
+#
+# Its whole point is what is *absent* from `may_depend_on`: no `inillucent-storage`,
+# no `inillucent-transaction`, no `inillucent-vm`. Phases 1 to 4 built this code
+# inside `inillucent-compat`, where that separation was true by accident - a test
+# crate depends on everything - and it was later lifted out so the separation is
+# checked. When the old engine is deleted this entry loses nothing and
+# `inillucent-session`'s goes.
+[[crate]]
+name = "inillucent-engine"
+kind = "production"
+layer = 8
+may_depend_on = [
+  "inillucent-base",
+  "inillucent-value",
+  "inillucent-vfs",
+  "inillucent-sql",
+  "inillucent-catalog",
+  "inillucent-ext",
+  "inillucent-pool",
+  "inillucent-tree",
+  "inillucent-wal",
+  "inillucent-txn",
+  "inillucent-exec",
+  "inillucent-sqlite-reader",
+  # The retrieval engine, for the reason `inillucent-session` names one entry
+  # below: `Registry::with_builtins` sits two layers under it, so a database is
+  # the first thing that both builds a registry and may know the module exists.
+  "inillucent-search",
+]
+
+# The edge from `inillucent-session` down to `inillucent-search` is where the retrieval
+# engine becomes a first-party module, placed here rather than one
+# layer up for a concrete reason. `Registry::with_builtins` lives in
+# `inillucent-ext`, two layers below the retrieval engine, so the module cannot be
+# registered there without dragging a vector index into every database that only
+# wanted SQL. The connection is the first place that both builds a registry and
+# is allowed to know the engine exists, which is exactly what the TDD's crate
+# table says `inillucent-search` is for.
+[[crate]]
+name = "inillucent-session"
+kind = "production"
+layer = 8
+may_depend_on = [
+  "inillucent-base",
+  "inillucent-value",
+  "inillucent-vfs",
+  "inillucent-storage",
+  "inillucent-catalog",
+  "inillucent-transaction",
+  "inillucent-sql",
+  "inillucent-ext",
+  "inillucent-search",
+  "inillucent-vm",
+]
+
+# **The facade reaches the new engine.** `inillucent::Database`
+# is the name an application outside this workspace writes against, and until
+# now it reached `inillucent-session` - the SQLite-file-format engine the
+# rearchitecture replaced. It is a re-export rather than a wrapper: the two surfaces do not
+# differ any more, and a wrapper whose every method forwards is a file to keep
+# in step for nothing. The surface is smaller by exactly the features the new
+# engine does not have - backup, blobs, serialize, the hooks - and a facade that
+# kept their names and answered "unsupported" would stop the compiler saying so.
+[[crate]]
+name = "inillucent"
+kind = "production"
+layer = 9
+may_depend_on = [
+  "inillucent-base",
+  "inillucent-value",
+  "inillucent-tree",
+  "inillucent-sql",
+  "inillucent-engine",
+]
+
+# The old facade, under its own name, unchanged and still over the old engine.
+#
+# It has exactly one consumer left: `inillucent-capi`, the `sqlite3_*` C ABI,
+# whose replacement is the driver crate below. When that lands, this crate,
+# `inillucent-capi`, `inillucent-session`, `inillucent-vm`,
+# `inillucent-transaction` and `inillucent-storage` go together - deleting them
+# before it would leave the workspace with no C ABI at all, which is why
+# this entry stops here and says so rather than doing it anyway.
+[[crate]]
+name = "inillucent-legacy"
+kind = "production"
+layer = 9
+may_depend_on = [
+  "inillucent-base",
+  "inillucent-value",
+  "inillucent-storage",
+  "inillucent-catalog",
+  "inillucent-session",
+]
+
+# `inillucent-migrate` is the one production crate that names both engines, and it
+# has to: it reads a legacy generation directory through `inillucent-core`'s own
+# reader and writes a database through the public facade. Both edges are
+# downward. It is a tool rather than a library the engine uses, so nothing
+# depends on it.
+[[crate]]
+name = "inillucent-migrate"
+kind = "production"
+layer = 10
+may_depend_on = [
+  "inillucent-base",
+  "inillucent-value",
+  "inillucent-core",
+  "inillucent-search",
+  # The SQLite-file source and the new target. The tool depends on
+  # both engines while both exist, which is the one place in the workspace that
+  # is meant to - migrating *from* one *to* the other is what it is for.
+  # inillucent-tree is named because a digest is computed over OwnedDatums, and
+  # inillucent-sqlite-reader because the source is read through it.
+  #
+  # The edge to `inillucent` is **gone**: the legacy path was moved onto the new
+  # engine once the TDD's non-goal on file-format compatibility settled what the
+  # staged file should be.
+  "inillucent-engine",
+  "inillucent-sqlite-reader",
+  "inillucent-tree",
+  "inillucent-catalog",
+  # `--from postgres://…` and `--from mysql://…`. The wire clients
+  # live one layer down so that `inillucent-cli` can link them too; see the row
+  # for `inillucent-remote`.
+  "inillucent-remote",
+]
+
+# The wire clients for two other databases' servers, and the
+# migration procedure over them.
+#
+# **It is a separate crate for one reason: `inillucent-migrate` links the
+# retrieval engine.** That is why `inillucent migrate --kind index` refuses and
+# points at the other binary, and if the remote sources lived there then
+# `--kind postgres` would have to refuse the same way. This crate's dependency
+# list is exactly what `inillucent-cli` already links, so the CLI, the MCP
+# server and the standalone tool all call one function and the new kinds are
+# rows in the one command table rather than a fourth surface.
+#
+# It reaches `inillucent-vfs` for one call: the operating system's own random
+# bytes, for the SCRAM client nonce. A seeded generator would be predictable to
+# anybody who knows roughly when a migration ran, and SCRAM's mutual
+# authentication rests on that nonce not being.
+#
+# **No `[[external]]` row accompanies it, and that is the point.** The obvious
+# implementation was the `postgres` crate - already allowed here as a benchmark
+# baseline - plus a `mysql` one, and both bring an async runtime into a binary
+# whose peak resident set is a published number. The protocols are documented
+# and small at the subset a reader needs, and the primitives they are specified
+# in terms of (MD5, SHA-1, HMAC-SHA-256, PBKDF2) are in `auth.rs`, each checked
+# against a published vector.
+[[crate]]
+name = "inillucent-remote"
+kind = "production"
+layer = 9
+may_depend_on = [
+  "inillucent-base",
+  "inillucent-vfs",
+  "inillucent-tree",
+  "inillucent-engine",
+]
+
+[[crate]]
+name = "inillucent-capi"
+kind = "production"
+layer = 10
+may_depend_on = ["inillucent-legacy"]
+
+# The shell runs on the new engine. It reaches `inillucent-engine`
+# for the connection, `inillucent-tree` because a row is a vector of
+# `OwnedDatum`, and `inillucent-value` because that is where `Value` and the
+# affinity rules the renderer formats against live. The edge to `inillucent` is
+# gone - the shell used four of the facade's methods and now uses none of them.
+# The driver, which is what an application outside this workspace
+# binds to. It sits above `inillucent-engine` and reaches nothing else, and that
+# single edge is the whole reason it exists: Phase 6 deletes four more crates
+# and absorbs a fifth, and a consumer holding this one is unaffected by all of
+# it. The two types a caller has to be able to name - the bound-parameter map
+# and the value - are re-exported by `inillucent-engine` so that the edge stays
+# one rather than three.
+[[crate]]
+name = "inillucent-driver"
+kind = "production"
+layer = 9
+may_depend_on = ["inillucent-engine"]
+
+# The C ABI over the driver, and the reason it is a separate crate rather than a
+# feature: it builds as a `cdylib` and a `staticlib`, it is the only place in
+# the workspace with `unsafe` in it, and it must be able to depend on nothing
+# but the driver so that a marshalling layer cannot quietly start deciding
+# something. Every language that is not Rust reaches the engine through this.
+[[crate]]
+name = "inillucent-driver-capi"
+kind = "production"
+layer = 10
+may_depend_on = ["inillucent-driver"]
+
+# The command surface: the sqlite3-shaped shell, the verb-shaped `inillucent`
+# binary and the MCP server, which are three front ends over one command table.
+# The edge to `inillucent-driver` is deliberate and narrow: the
+# driver owns the classification of a failure - `unsupported` against `syntax`,
+# the distinction `drivers/README.md` argues is the whole shape of the design -
+# and it owns the checked capability table. A CLI that classified failures for
+# itself would be a second classifier that drifts the first time the engine
+# grows a construct, and a CLI that carried its own feature list would carry a
+# list nobody runs. Neither reaches the engine through the driver: statements go
+# through the shell, as they always have.
+[[crate]]
+name = "inillucent-cli"
+kind = "production"
+layer = 10
+may_depend_on = [
+    "inillucent-alloc",
+  "inillucent-base",
+  "inillucent-value",
+  "inillucent-driver",
+  "inillucent-engine",
+  "inillucent-tree",
+  # `migrate --kind postgres|mysql`. The edge is downward to layer 9
+  # and adds no third-party dependency to either shipped binary, which is the
+  # whole reason the wire clients are first-party.
+  "inillucent-remote",
+  # `setup-embeddings` (task-1900). The edge declares a link that already
+  # exists: `inillucent-engine` depends on `inillucent-search`
+  # unconditionally, and `inillucent-search` depends on `inillucent-core`
+  # unconditionally, so `inillucent-core` is in every shipped binary's
+  # dependency graph today and this adds no code to any of them.
+  #
+  # What it buys is one definition of where the embedder is installed.
+  # `inillucent_core::install` says where the weights and the ONNX Runtime
+  # library go; the setup command writes into those directories and
+  # `inillucent-search`'s `embed(TEXT)` reads out of them. Without the edge the
+  # command would have to carry a second copy of that rule, and a second copy
+  # of a path rule is a machine where the installer reports success and the
+  # engine reports that no model is loaded, with neither message naming the
+  # other's directory.
+  #
+  # It reaches `install` and `residency` and nothing else. The retrieval engine
+  # itself is still reached the way it always was, through the facade.
+  "inillucent-core",
+]
+
+[[crate]]
+name = "inillucent-core"
+kind = "production"
+layer = 0
+may_depend_on = []
+
+# `inillucent-search` reaching `inillucent-value` is the same refinement `inillucent-ext`
+# makes and for the same reason: a virtual-table module is handed
+# `Value`s and hands them back, so it cannot be written without naming the type.
+# The edge is downward to a leaf and adds no cycle.
+[[crate]]
+name = "inillucent-search"
+kind = "production"
+layer = 7
+may_depend_on = ["inillucent-base", "inillucent-value", "inillucent-ext", "inillucent-core"]
+
+[[crate]]
+name = "inillucent-sim"
+kind = "test-only"
+layer = 11
+may_depend_on = ["inillucent-base", "inillucent-vfs"]
+
+[[crate]]
+name = "inillucent-compat"
+kind = "test-only"
+layer = 12
+may_depend_on = [
+    "inillucent-alloc",
+  "inillucent-base",
+  "inillucent-value",
+  "inillucent-storage",
+  "inillucent-vfs",
+  "inillucent-sim",
+  "inillucent-sql",
+  "inillucent-catalog",
+  "inillucent-transaction",
+  "inillucent-vm",
+  "inillucent-session",
+  # The harness stands in for the session layer until Phase 5 builds
+  # one, and a virtual table needs the module registry - `CREATE VIRTUAL TABLE`
+  # asks a module what shadow tables to build, and a scan asks it for its rows.
+  # `inillucent-exec` still cannot reach this crate: the module runs on the
+  # harness's side of `TreeCatalog` and only its rows cross.
+  "inillucent-ext",
+  # Phase 5 built that layer, so the harness no longer stands in for
+  # it - it *uses* it. `inillucent_compat::newengine` is now a re-export of
+  # `inillucent-engine`, which is where the code above this line moved to, so every
+  # gate and campaign written against the old path still names the same engine.
+  "inillucent-engine",
+  # And `inillucent-migrate`, because the migration acceptance is a test: every
+  # fixture in the SQLite parity corpus through the tool, checked against the pinned SQLite shell
+  # reading the same source file. The oracle is what makes it a test rather than
+  # the tool agreeing with itself, and the oracle lives here.
+  "inillucent-migrate",
+  # `command_parity.rs` reads the command table and the MCP server's
+  # own `tools/list` out of the crate that holds both, and asserts they name the
+  # same set. Reading them any other way - a fixture, a copy of the list - would
+  # be testing the copy.
+  "inillucent-cli",
+  # The capability table the CLI reports, so the parity test can assert the
+  # `capabilities` command answers the same rows `tests/capability.rs` probes.
+  "inillucent-driver",
+  "inillucent",
+  # And the old facade, because the seven profiling binaries and the seven
+  # suites that measure and test the *old* engine still do, and moving them
+  # onto the new one would be measuring something else.
+  "inillucent-legacy",
+  "inillucent-pool",
+  "inillucent-tree",
+  "inillucent-scalar",
+  "inillucent-exec",
+  "inillucent-wal",
+  "inillucent-txn",
+  "inillucent-sqlite-reader",
+]
+
+# The grading harness reaching `inillucent-base` is because a head-to-head
+# between two embedding models is only honest if every cache, manifest and query
+# set can state its own identity, and stating it means SHA-256. The hash already
+# lives in the leaf and is already checked against its published vectors there;
+# copying it into the harness so the harness could keep a shorter dependency list
+# would be duplicating a contract, which is the one thing that file exists to
+# prevent. The edge is downward from layer 12 to layer 0 and adds no cycle.
+# The executable model of the engine's transactional semantics, from the
+# design's Phase 3. Its dependency list is one crate long **on purpose**: a reference
+# implementation that linked the engine could share a bug with it, and the two
+# agreeing would then be evidence of nothing. The engine crates reach it only as
+# dev-dependencies of the driver in `tests/`, which is an edge this contract
+# deliberately does not police for a test-only crate - so the restriction here
+# is the whole of what keeps the model honest.
+[[crate]]
+name = "inillucent-model"
+kind = "test-only"
+layer = 12
+may_depend_on = ["inillucent-base"]
+
+[[crate]]
+name = "inillucent-bench"
+kind = "test-only"
+layer = 12
+may_depend_on = ["inillucent-core", "inillucent-base"]
+
+# ---------------------------------------------------------------------------
+# Third-party crates a production crate may depend on, and where.
+#
+# Everything here is infrastructure: error plumbing, an operating-system
+# boundary, or a numeric kernel. Nothing here decides database behaviour, and
+# `docs/dependency-policy.md` records the argument for each one.
+# ---------------------------------------------------------------------------
+
+# `inillucent-compat` is on both lists for one reason and one only: what a
+# *process* cost - its peak resident set and its processor time - is something
+# only the operating system can say, and the gate has to be able to say it about
+# both arms. It is a test-only crate, the calls live in one
+# module (`procstat.rs`), and that module is on `policy.rs`'s `UNSAFE_ALLOWED`
+# list with a SAFETY note per call. No production crate gains an edge here.
+[[external]]
+name = "libc"
+category = "os-boundary"
+allowed_in = ["inillucent-vfs", "inillucent-compat", "inillucent-remote"]
+
+# `inillucent-remote` is added to both rows, for TLS and nothing else:
+# SChannel through SSPI on Windows, the system OpenSSL through `dlopen` on Unix.
+# The argument is in `docs/dependency-policy.md` under "TLS, and why it is not a
+# crate either" - in short, the alternatives were a large production dependency
+# with its own cryptographic backend, or writing a TLS stack here.
+[[external]]
+name = "windows-sys"
+category = "os-boundary"
+allowed_in = ["inillucent-vfs", "inillucent-compat", "inillucent-remote"]
+
+[[external]]
+name = "anyhow"
+category = "error-plumbing"
+allowed_in = ["inillucent-core", "inillucent-bench"]
+
+[[external]]
+name = "thiserror"
+category = "error-plumbing"
+allowed_in = ["inillucent-core", "inillucent-bench"]
+
+[[external]]
+name = "serde"
+category = "data-plumbing"
+allowed_in = ["inillucent-core", "inillucent-bench"]
+
+[[external]]
+name = "serde_json"
+category = "data-plumbing"
+allowed_in = ["inillucent-core", "inillucent-bench"]
+
+[[external]]
+name = "rayon"
+category = "numeric-kernel"
+allowed_in = ["inillucent-core", "inillucent-bench"]
+
+# Also `inillucent-ext`, for the fts5 `porter` tokenizer. SQLite's
+# `tokenize='porter'` stems the tokens of whichever tokenizer it wraps, and this
+# build accepted the declaration and read it as `unicode61` - a promise the
+# index did not keep. The alternative to the crate is a second Porter
+# implementation beside the one `inillucent-core` already uses, which is exactly
+# the duplication this table exists to prevent.
+[[external]]
+name = "rust-stemmers"
+category = "numeric-kernel"
+allowed_in = ["inillucent-core", "inillucent-ext"]
+
+[[external]]
+name = "bytemuck"
+category = "numeric-kernel"
+allowed_in = ["inillucent-core"]
+
+[[external]]
+name = "memmap2"
+category = "os-boundary"
+allowed_in = ["inillucent-core"]
+
+[[external]]
+name = "rand"
+category = "numeric-kernel"
+allowed_in = ["inillucent-core", "inillucent-bench"]
+
+[[external]]
+name = "clap"
+category = "cli"
+allowed_in = ["inillucent-bench"]
+
+[[external]]
+name = "postgres"
+category = "benchmark-baseline"
+allowed_in = ["inillucent-bench"]
+
+[[external]]
+name = "pgvector"
+category = "benchmark-baseline"
+allowed_in = ["inillucent-bench"]
+
+[[external]]
+name = "ort"
+category = "numeric-kernel"
+allowed_in = ["inillucent-core", "inillucent-bench"]
+
+[[external]]
+name = "tokenizers"
+category = "numeric-kernel"
+# Also in the grading harness. The arm served by `llama-server` sizes its
+# batches by tokens, because that server fails a whole request when a batch
+# exceeds its physical batch and 64 real chunks of this corpus measured 17,029
+# tokens against an 8,192 batch. Counting through the server own /tokenize is one
+# HTTP round trip per chunk, which is 185,078 of them before a vector exists, so
+# the count is taken locally and checked against the server once at connect time.
+allowed_in = ["inillucent-core", "inillucent-bench"]
+
+# ---------------------------------------------------------------------------
+# Crates that may never appear in a production dependency graph. These are the
+# things the first-party charter forbids delegating: another database engine,
+# another SQL parser, another storage or transaction layer.
+# ---------------------------------------------------------------------------
+
+[[forbidden]]
+pattern = "sqlite"
+reason = "SQLite is a reference and a test oracle, never a runtime component"
+
+[[forbidden]]
+pattern = "libsql"
+reason = "a SQLite fork is still another engine"
+
+[[forbidden]]
+pattern = "turso"
+reason = "Turso is a non-normative design reference only"
+
+[[forbidden]]
+pattern = "limbo"
+reason = "Turso's engine under its former name"
+
+[[forbidden]]
+pattern = "duckdb"
+reason = "another database engine"
+
+[[forbidden]]
+pattern = "sqlparser"
+reason = "inillucent owns its SQL front end"
+
+[[forbidden]]
+pattern = "sqlx"
+reason = "brings a driver and a parser"
+
+[[forbidden]]
+pattern = "diesel"
+reason = "brings a query builder and drivers"
+
+[[forbidden]]
+pattern = "rocksdb"
+reason = "another storage engine"
+
+[[forbidden]]
+pattern = "redb"
+reason = "another storage engine"
+
+[[forbidden]]
+pattern = "sled"
+reason = "another storage engine"
+
+[[forbidden]]
+pattern = "lmdb"
+reason = "another storage engine"
+
+[[forbidden]]
+pattern = "heed"
+reason = "an LMDB wrapper"
+
+[[forbidden]]
+pattern = "rusqlite"
+reason = "SQLite bindings"

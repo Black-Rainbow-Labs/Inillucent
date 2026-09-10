@@ -1,0 +1,14 @@
+[package]
+name = "inillucent-value"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party values, affinities, collations, expression primitives, and record codecs."
+
+[dependencies]
+inillucent-base = { workspace = true }
+
+# The workspace's lint table; see the note beside it in the root manifest.
+[lints]
+workspace = true

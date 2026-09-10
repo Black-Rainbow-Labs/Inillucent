@@ -1,0 +1,26 @@
+[package]
+name = "inillucent-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The benchmark arm: measures this engine against SQLite, PostgreSQL and pgvector."
+# Never published. It links PostgreSQL and pgvector so that the scorecard can
+# measure against them; nobody would `cargo add` it, and publishing it would put
+# a database client on crates.io as a dependency of a database.
+publish = false
+
+[dependencies]
+inillucent-core = { path = "../inillucent-core", features = ["onnx"] }
+inillucent-base = { path = "../inillucent-base" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+clap.workspace = true
+postgres.workspace = true
+pgvector.workspace = true
+rand.workspace = true
+# The served arm counts tokens with the model own tokenizer rather than through
+# the server one text at a time; see llamacpp.rs.
+tokenizers.workspace = true

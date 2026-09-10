@@ -1,0 +1,24 @@
+[package]
+name = "inillucent-vfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party VFS contracts and the Windows, POSIX, and in-memory implementations."
+
+[dependencies]
+inillucent-base = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[[bin]]
+name = "inillucent-lock-probe"
+path = "src/bin/lock_probe.rs"
+
+# The workspace's lint table; see the note beside it in the root manifest.
+[lints]
+workspace = true

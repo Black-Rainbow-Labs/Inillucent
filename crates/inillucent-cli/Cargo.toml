@@ -1,0 +1,58 @@
+[package]
+name = "inillucent-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "inillucent's command surface: the sqlite3-shaped shell, the verb-shaped CLI, and the MCP server."
+repository = "https://github.com/jasonmcaffee/inillucent"
+readme = "../../README.md"
+keywords = ["database", "sql", "sqlite", "mcp", "cli"]
+categories = ["database", "command-line-utilities"]
+
+[lib]
+name = "inillucent_cli"
+path = "src/lib.rs"
+
+# The sqlite3-shaped shell, whose name and behaviour are fixed by the scripts
+# that drive `sqlite3`.
+[[bin]]
+name = "inillucent-shell"
+path = "src/main.rs"
+
+# The verb-shaped command line.
+[[bin]]
+name = "inillucent"
+path = "src/bin/inillucent.rs"
+
+# The same commands, served to an agent over MCP.
+[[bin]]
+name = "inillucent-mcp"
+path = "src/bin/inillucent-mcp.rs"
+
+[features]
+default = []
+# Passes the retrieval engine's in-process embedder through, so
+# `embed(TEXT)` answers. Off by default: see `inillucent-search`.
+embed = ["inillucent-engine/embed"]
+
+[dependencies]
+inillucent-alloc = { workspace = true }
+inillucent-base = { workspace = true }
+# `setup-embeddings` reaches two modules here: `install`, which is the one
+# definition of where the weights and the ONNX Runtime library go, and
+# `residency`, which is the one definition of what the profiles mean. Neither
+# links a machine learning runtime, and the crate is already in this binary's
+# dependency graph through `inillucent-engine -> inillucent-search`.
+inillucent-core = { workspace = true }
+inillucent-driver = { workspace = true }
+inillucent-engine = { workspace = true }
+# The remote migration sources. It depends on base, vfs, tree and
+# engine and on nothing else, which is why `migrate --kind postgres` can live in
+# the one command table both this CLI and the MCP server are generated from.
+inillucent-remote = { workspace = true }
+inillucent-value = { workspace = true }
+inillucent-tree = { workspace = true }
+
+# The workspace's lint table; see the note beside it in the root manifest.
+[lints]
+workspace = true

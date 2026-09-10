@@ -1,0 +1,122 @@
+# The performance contract: what each family is worth, and what a release has
+# to reach.
+#
+# These weights were fixed before any measurement was taken, which is the whole
+# point of them being in a file rather than in the analyser. A weighting chosen
+# after the results are in is not a weighting, it is a way of writing down the
+# answer you wanted.
+#
+# The headline is the lower bound of the bootstrap 95% interval of the weighted
+# geometric mean of the paired speed ratios, SQLite over inillucent. The floor is
+# the lower bound below which a required family fails the release outright,
+# however good the headline is - because an engine that is twice as fast on
+# average and half as fast at writing is not a faster engine, it is a differently
+# shaped one, and the applications that write would be worse off.
+#
+# The unweighted table is published beside the weighted one, so a favourable mix
+# cannot hide a slow primitive.
+
+# The rearchitecture's Phase 5 raised both thresholds to the ones its design
+# document sets. The design states them as replacements rather than
+# alternatives: "**Design target**:
+# weighted geomean lower 95% bound at least **3.0x**" and "**Floor**: no family
+# below **1.0x** (lower bound), replacing 0.90x". They are written here rather
+# than in the analyser for the same reason the weights are, and they were
+# raised - a threshold that moves towards the measurement is not a threshold.
+#
+# The weights below are untouched and remain the ones fixed before any
+# measurement was taken.
+schema_version = 1
+headline = "3.00"
+floor = "1.00"
+
+# The two bars below were added before the work that had to meet them. Until
+# then, this file held ten elapsed-time families and nothing else, so an engine
+# that doubled its resident set or its processor time would still have passed
+# the gate outright - which is exactly what happened: one review measured 102%
+# more memory than SQLite on a contract that had no opinion about memory at
+# all.
+#
+# Both are **ratios of SQLite's, on the same plan and the same budget**, rather
+# than absolute byte and millisecond counts, so they survive a bigger fixture, a
+# different box and a different pool size. They are read off the child-process
+# pair `inillucent-fullgate` already spawns - one whole process each, opening a
+# finished file and running one round - because that is the only pair of numbers
+# about these two engines that is a comparison rather than two measurements.
+
+[memory]
+# **Under one, because the goal is to hold less.** A bar at 1.00 would be met by
+# a tie, and the ticket that set it says "the goal is to use less RAM than
+# SQLite". 0.95 asks for a real margin and is still not a number chosen to
+# flatter a measurement: when it was written the engine stood at 2.02.
+bar = "0.95"
+description = "peak resident set, one child process each, one round of the same plan, matched budget"
+
+[cpu]
+# **What today already reaches, so a regression fails.** One round of the whole
+# plan measured 422 ms of processor time against SQLite's 1,246 - 34%. The bar
+# is 0.40 rather than 0.34 so that ordinary run-to-run movement on
+# a shared box is not a failure, and so that the memory work is not allowed to
+# buy residency with processor time.
+bar = "0.40"
+description = "user + kernel processor time, the same child pair"
+
+[[family]]
+id = "open.prepare"
+weight = "0.08"
+required = true
+description = "opening a statement: parse, bind, step one row, reset"
+
+[[family]]
+id = "read.point"
+weight = "0.16"
+required = true
+description = "a single row by rowid, by integer key, and through a secondary index"
+
+[[family]]
+id = "read.range"
+weight = "0.12"
+required = true
+description = "selective ranges, forward and reverse, covering and not"
+
+[[family]]
+id = "read.analytical"
+weight = "0.10"
+required = true
+description = "full scans, aggregates, GROUP BY, DISTINCT and sorts"
+
+[[family]]
+id = "read.join"
+weight = "0.08"
+required = true
+description = "two and four table joins, selective and not"
+
+[[family]]
+id = "write"
+weight = "0.20"
+required = true
+description = "insert, update, delete and upsert, with and without secondary indexes"
+
+[[family]]
+id = "transaction"
+weight = "0.10"
+required = true
+description = "autocommit, small batches, large batches and savepoints"
+
+[[family]]
+id = "schema"
+weight = "0.04"
+required = true
+description = "creating an index, and the backfill that goes with it"
+
+[[family]]
+id = "extension"
+weight = "0.08"
+required = true
+description = "JSON, FTS5 and the R-Tree"
+
+[[family]]
+id = "large.values"
+weight = "0.04"
+required = true
+description = "text and blobs across the inline and overflow boundary"

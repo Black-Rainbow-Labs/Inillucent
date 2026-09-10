@@ -1,0 +1,18 @@
+[package]
+name = "inillucent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stable public Rust facade: Database, Connection, Statement, Row."
+
+[dependencies]
+inillucent-base = { workspace = true }
+inillucent-engine = { workspace = true }
+inillucent-value = { workspace = true }
+inillucent-tree = { workspace = true }
+inillucent-sql = { workspace = true }
+
+# The workspace's lint table; see the note beside it in the root manifest.
+[lints]
+workspace = true

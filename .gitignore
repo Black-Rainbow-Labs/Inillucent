@@ -1,0 +1,103 @@
+# Build output.
+/target/
+
+# The release archives packaging/release.* stages. They are built from a tag,
+# uploaded to the GitHub release, and downloaded by every installer; nothing
+# here is source and none of it is reproducible from the repository alone
+# without the toolchain that built it.
+/dist/
+
+# The corpus and its vectors. Both are large and both are rebuilt from public
+# sources by scripts/fetch-public-corpus.sh, so neither belongs in the repository.
+# Keeping the text out also means the share alike licences of the Wikipedia
+# material are satisfied by attribution rather than by redistribution.
+*.cache
+*.vectors
+corpus.jsonl
+/index.inillucent/
+
+# Engine databases and their log segments, wherever a test or a scratch run
+# leaves one. These are output, never source: no `.rdb` has ever been tracked,
+# and `drivers/inillucent-driver/other.rdb` is what an uncommitted directory
+# looks like once somebody has run its tests in place.
+*.rdb
+*.rdb-wal.*
+*.rdb-journal
+
+# Editor and operating system noise.
+.DS_Store
+/.quill/
+/runs/
+
+# The pinned SQLite reference build. Downloaded and verified by
+# tools/sqlite-reference.*, used only as a test oracle, never shipped.
+/.sqlite-ref/
+
+# Agent-produced artifacts: measurements, scratch renders, harness output. The
+# evidence that gates a release is not here - it is checked in under compat/,
+# because the compatibility report is generated from it.
+/_agent_output/
+
+# The scorecard's working databases, when a run is pointed at the release
+# directory. The reports belong in the repository; the pristine images it
+# clones per round are hundreds of megabytes and are rebuilt by any run.
+/compat/release/small/
+/compat/release/medium/
+/compat/release/large/
+
+# cargo-mutants writes its run directory here when --output is not given.
+/mutants.out/
+/mutants.out.old/
+
+# Retired tests, kept rather than deleted (task-1838 §9, Jason's ruling).
+#
+# The sixteen tests that asserted SQLite *file-format* interoperability - a
+# requirement task-1816 dropped when the new engine stopped writing SQLite files
+# - are moved here instead of being removed, so the history of what was once
+# promised is still on disk and readable. Nothing here is compiled: cargo only
+# looks in `tests/`.
+/_junk/
+
+# The reference Python binding is run from its own directory, and CPython
+# writes its bytecode cache beside it.
+__pycache__/
+*.pyc
+
+# The npm packages packages/npm/build.mjs assembles from dist/. The manifests
+# and the shims are source; the staged tree is a copy of them with the built
+# binaries beside it, and it is rebuilt from dist/ every release.
+/packages/npm/staged/
+*.tgz
+
+# The Python wheel packages/python/build.py assembles, and everything it stages
+# into the package to do it. The manifests, the shims and the __init__ are
+# source; the binaries, the C ABI library, the header, the licence copy and
+# `driver.py` are all copied in from elsewhere in the repository at build time,
+# and a second tracked copy of any of them is a copy that would go stale.
+/packages/python/build/
+/packages/python/dist/
+/packages/python/LICENSE
+**/*.egg-info/
+/packages/python/src/inillucent/_bin/
+/packages/python/src/inillucent/_lib/
+/packages/python/src/inillucent/_include/
+/packages/python/src/inillucent/driver.py
+
+# Composer's own output, and the binaries packages/php/bin/inillucent-install
+# downloads into the package at run time.
+/vendor/
+/composer.lock
+/packages/php/runtime/
+
+# The Unluminous IDE's per-workspace state: which files are open, which folders
+# are expanded. It belongs to whoever has the checkout open, not to the
+# checkout. `tests/selection.toml` has a rule for it too, so a change to it
+# selects nothing rather than every suite in the workspace.
+/.unluminous/
+
+# The release toolchain tools/cross/fetch-toolchain.ps1 downloads: zig,
+# cargo-zigbuild, rcodesign, nfpm and minisign. Somebody else's binaries, pinned
+# by SHA-256 in that script and re-fetchable in a minute, so the pin is the
+# source and these are not.
+/tools/cross/bin/
+/tools/cross/cache/

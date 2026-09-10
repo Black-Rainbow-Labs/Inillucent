@@ -1,0 +1,16 @@
+[package]
+name = "inillucent-transaction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Locks, autocommit, savepoints, rollback journal, WAL, checkpoints, and recovery."
+
+[dependencies]
+inillucent-base = { workspace = true }
+inillucent-vfs = { workspace = true }
+inillucent-storage = { workspace = true }
+
+# The workspace's lint table; see the note beside it in the root manifest.
+[lints]
+workspace = true

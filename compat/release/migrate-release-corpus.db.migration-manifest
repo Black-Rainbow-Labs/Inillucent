@@ -1,0 +1,55 @@
+manifest 1
+tool inillucent-migrate
+source.path C:/jason/dev/inillucent/_agent_output/migrate/release/index
+source.generation g000000000001
+source.file config.bin 697 30d01bbc0668357f54d3e93050bca520f2b0a6a413ff37435e2719f5d7e35ff8
+source.file graph.bin 353284 556a322b426ff1faba8521c36945dd346680ee94bdba53b8fbcbf29ffd895302
+source.file lexical.bin 1802743 dbdc3aefdad184d49255c03d7b31afc9a3835e7c5b58f985088698208e1af7d1
+source.file store.bin 1620159 f001ca11550b514115d68893596cd8eaf779779a6c1f4f957e680ae16c3ea5a4
+source.file vectors.bin 606997 81db740e59260131a3fdac511d24aa4e36ed22e27e30568e07586c7b2b8633a4
+destination.staging C:/jason/dev/inillucent/_agent_output/measurements/migrate/release\corpus.db.migrating
+destination.final C:/jason/dev/inillucent/_agent_output/measurements/migrate/release/corpus.db
+stage schema
+copied document 426
+copied chunk 512
+copied chunk 1024
+copied chunk 1536
+copied chunk 2048
+copied chunk 2371
+copied search 512
+copied search 1024
+copied search 1536
+copied search 2048
+copied search 2371
+copied indexed 2371
+stage build
+target.table document 426 88a40b8d0cbc28ac32d5d174a2dc707c2242dd6e332a66003736c821eb7b319e
+target.table chunk 2371 72f6d4400140e1b0f371a2841b7340c4cbb08aad8a042a4c534e897a9bd8cf24
+target.table document_label 852 19cd2d917ea199dd28c7ec4b72b561d29b953d1be3d235a912885fb9fd2d73f4
+target.table document_attribute 426 43727fbe429417f90d6772c8d0e3471b9f03f69c1855bee041ed1febd298afe5
+target.table document_flag 59 f3eade5dd1916f53b9628a76d94f65cf646a6898c6e53cefac6979697912fce1
+target.commit_sequence 5
+target.search_generation 1
+verify sqlite.integrity ok integrity_check ok; the other engine reads 2371/2371 rows out of chunk and out of the search index's own storage
+verify counts.document ok 426 rows
+verify counts.chunk ok 2371 rows
+verify counts.label ok 852 rows
+verify counts.attribute ok 426 rows
+verify counts.flag ok 59 rows
+verify counts.search ok 2371 indexed rows
+verify digest.chunk ok 2371 chunks, 72f6d4400140e1b0f371a2841b7340c4cbb08aad8a042a4c534e897a9bd8cf24
+verify digest.document ok 426 documents, 88a40b8d0cbc28ac32d5d174a2dc707c2242dd6e332a66003736c821eb7b319e
+verify tombstone ok 157 tombstoned documents preserved
+verify dictionary ok 2 sources and 21 labels resolve to the same text
+verify bm25.raw ok 12 probes rank identically before grouping
+verify bm25.grouped ok 12 probes answer identically once the per-document cap of 2 is applied through the document table
+verify bm25.scores ok 120 hits carry the same fused score
+verify vector.exact ok 12 probes rank identically when both graphs are traversed in full
+verify vector.recall ok at the default width the source finds 1.000 of the exact answer and the copy finds 1.000
+verify hybrid.exact ok 12 fused rankings agree when both graphs are traversed in full
+verify filter.deleted ok 157 tombstoned chunks excluded identically
+verify reopen ok 17 checks pass again on a fresh open
+stage verify
+destination.published C:/jason/dev/inillucent/_agent_output/measurements/migrate/release/corpus.db
+stage publish
+source.retained C:/jason/dev/inillucent/_agent_output/migrate/release/index
