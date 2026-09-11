@@ -26,7 +26,13 @@
 # .pkg on the site is the convenience for somebody who would rather
 # double-click. See packaging/macos/README.md.
 
-set -euo pipefail
+set -eu
+# `pipefail` is not POSIX. The documented install is `curl ... | sh`, and on
+# Debian and Ubuntu that `sh` is dash, which answers `set: Illegal option -o
+# pipefail` and stops before anything is downloaded. So it is enabled only where
+# the shell has it, in a subshell that cannot take the script down with it.
+# shellcheck disable=SC3040
+(set -o pipefail 2>/dev/null) && set -o pipefail || true
 
 base_url="https://inillucent.com/downloads"
 version=""
@@ -108,7 +114,10 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 if [ "$from_dist" -eq 1 ]; then
-  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  # `$0` rather than `${BASH_SOURCE[0]}`: the latter is a bash array and dash
+  # cannot read it. This branch only runs for a script on disk, which is the
+  # case where `$0` is that script.
+  root="$(cd "$(dirname "$0")/.." && pwd)"
   dist="$root/dist"
   if [ -z "$version" ]; then
     found="$(ls "$dist"/inillucent-*-"$target".tar.gz 2>/dev/null | head -1 || true)"
@@ -127,9 +136,26 @@ else
     [ -n "$version" ] || { echo "could not read $base_url/VERSION; pass --version" >&2; exit 1; }
   fi
   archive="$work/inillucent-$version-$target.tar.gz"
-  echo "downloading inillucent $version for $target..."
-  curl -fsSL "$base_url/inillucent-$version-$target.tar.gz" -o "$archive"
+  name="inillucent-$version-$target.tar.gz"
+
+  # SHA256SUMS lists every archive this release published, and it is fetched
+  # anyway to verify the download - so it is fetched *first*, and used to answer
+  # "is there a build for this machine" before asking for one. Without this a
+  # platform that is not published yet gets `curl -fsSL` failing on a 404, which
+  # under `set -e` ends the script with nothing printed at all.
   curl -fsSL "$base_url/SHA256SUMS" -o "$work/SHA256SUMS"
+  if ! awk -v want="$name" '$NF == want { found = 1 } END { exit !found }' "$work/SHA256SUMS"; then
+    echo "inillucent $version has no build for $target yet." >&2
+    echo "  published in this release:" >&2
+    awk '{ print "    " $NF }' "$work/SHA256SUMS" >&2
+    echo "  Build it from source instead:" >&2
+    echo "    git clone https://github.com/Black-Rainbow-Labs/Inillucent" >&2
+    echo "    cargo build --release -p inillucent-cli" >&2
+    exit 1
+  fi
+
+  echo "downloading inillucent $version for $target..."
+  curl -fsSL "$base_url/$name" -o "$archive"
   verify "$archive" "$work/SHA256SUMS"
 fi
 
