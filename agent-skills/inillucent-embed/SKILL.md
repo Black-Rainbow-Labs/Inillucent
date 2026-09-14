@@ -50,8 +50,9 @@ match connection.query(statement, &[], 0) {
 ```
 
 No SQL statement answers `Unsupported` today: the 416-case probe refuses nothing SQLite answers.
-Write the arm anyway. It costs four lines, and a caller that folds this status into a general error
-type has to be rewritten the first time a construct arrives that does return it.
+Window functions were the last twelve cases and they answer now. Write the arm anyway. A caller that
+folds this status into a general error type cannot tell a construct the engine has not built from a
+statement that is wrong, and will send the second message for the first condition.
 
 Rust does **not** go through the C ABI — the core is Rust and its first consumer is Rust, so a
 pointer round trip and a `catch_unwind` per call would buy nothing.
@@ -113,5 +114,5 @@ same object a binding sees:
 inillucent --db app.rdb query "SELECT * FROM note" --output json
 ```
 
-and `inillucent-mcp` serves 27 of those commands over MCP — see
+and `inillucent-mcp` serves 28 of those commands over MCP — see
 [`inillucent-mcp`](../inillucent-mcp/SKILL.md).

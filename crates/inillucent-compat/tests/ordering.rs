@@ -134,6 +134,13 @@ const STATEMENTS: &[&str] = &[
     "SELECT k FROM t UNION ALL SELECT k FROM t ORDER BY k DESC",
     "SELECT t.id, side.tag FROM t JOIN side ON side.owner = t.id ORDER BY t.id DESC",
     "SELECT t.id, side.tag FROM t LEFT JOIN side ON side.owner = t.id ORDER BY t.id DESC",
+    // A window reorders the rows after the walk, so the outer `ORDER BY`
+    // still has to be answered by a sort. This statement was retired on the
+    // reading that "the shipping engine refuses every `OVER (...)` clause
+    // outright"; what refused it was `compiled::try_compile` failing to bail
+    // out on `plan.select.windows` the way `prepare_any` does (task-1932, H1),
+    // and the evaluator behind it answers all forty-one forms
+    // `windows_match_the_oracle` grades.
     "SELECT id, row_number() OVER (ORDER BY k, id) FROM t ORDER BY id",
     "SELECT id FROM (SELECT id FROM t ORDER BY id DESC) ORDER BY id",
     // An empty range, and one whose bounds cross.
@@ -231,7 +238,7 @@ fn ordered_statements_match_the_oracle() {
     let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ordering");
     let _ = std::fs::create_dir_all(&directory);
     let Some((mut driver, database)) = build(&directory, "rows") else {
-        eprintln!("the pinned SQLite oracle is not built; skipping");
+        inillucent_compat::differential::skipping("the pinned SQLite oracle is not built");
         return;
     };
     let handle = Database::import_with_busy_timeout(&database, std::time::Duration::from_secs(5))
@@ -294,7 +301,7 @@ fn the_sort_is_skipped_exactly_where_the_walk_answers_the_order() {
     let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ordering");
     let _ = std::fs::create_dir_all(&directory);
     let Some((_driver, database)) = build(&directory, "plans") else {
-        eprintln!("the pinned SQLite oracle is not built; skipping");
+        inillucent_compat::differential::skipping("the pinned SQLite oracle is not built");
         return;
     };
     let handle = Database::import_with_busy_timeout(&database, std::time::Duration::from_secs(5))

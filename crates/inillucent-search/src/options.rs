@@ -44,17 +44,62 @@ pub const MAX_DIMS: usize = 16_384;
 /// The default number of hits a search returns when the caller names none.
 pub const DEFAULT_K: i64 = 10;
 
-/// The smallest delta log a table will compact.
+/// How long a delta log grows before a commit flushes it into a segment.
 ///
-/// Compaction rewrites the whole base generation, so folding a two-row delta
-/// into a million-row index would spend a linear rebuild to save two linear
-/// merges. The trigger is therefore the larger of this floor and a share of the
-/// corpus, which is what makes the amortised cost of a write independent of how
-/// big the index is.
+/// **A constant, and it stopped being a share of the corpus in task-1911.**
+/// The share existed for a reason this comment used to state: a flush rewrote
+/// the whole base generation, so folding a two-row delta into a million-row
+/// index would spend a linear rebuild to save two linear merges, and the
+/// trigger therefore had to grow with the table to keep the amortised cost of a
+/// write independent of its size.
+///
+/// Segmented generations removed that premise. A flush now builds a segment out
+/// of its own batch and writes nothing else, so flushing often is no longer
+/// expensive - and while the trigger stayed proportional to the table, **the
+/// batch was**, which is the thing the share was meant to protect against
+/// wearing a different hat. Measured on the 100,000 document arm of
+/// `write_latency` with segments in place and the share still set: the worst
+/// commit was 15.8 seconds, against 19.3 before segments existed at all. The
+/// segments were doing their work and the cadence was undoing it.
+///
+/// `COMPACT_SHARE` is gone rather than set to a large number, because a share
+/// of the corpus is not a tuning of this idea, it is the previous one.
 pub const COMPACT_FLOOR: u64 = 1024;
 
-/// The share of the corpus a delta log may reach before it is folded in.
-pub const COMPACT_SHARE: u64 = 8;
+/// How many segments a level holds before they merge into one at the next
+/// level, when the declaration names none.
+///
+/// FTS5's own `automerge` default is 4, for the same trade this is: low
+/// enough that a query never has to fold more than a handful of segments
+/// together, high enough that an ordinary write does not pay a merge every
+/// few commits. A table that writes far more often than it is queried can
+/// raise `segment_merge` to spend less time merging and more segments at
+/// query time; one that is queried far more than it is written can lower it
+/// to the opposite trade. Two is the floor - below that a "merge" would be
+/// renaming one segment, not combining anything.
+pub const DEFAULT_SEGMENT_MERGE: usize = 4;
+
+/// How many chunks one commit may fold while merging segments, before it
+/// checkpoints what it has done and leaves the rest for a later commit to
+/// continue, when the declaration names none.
+///
+/// **Chunks, because that is what a fold actually pays for.** Building an
+/// accumulator by folding a segment in costs one graph insertion per live
+/// chunk that segment holds (`merge::fold_segment`), and nothing else in a
+/// merge scales with anything but that count - not the number of segments,
+/// because a segment several levels up holds `segment_fanin` times what one
+/// at the level below it does, so a bound stated in segments would let
+/// exactly the largest merges - the ones this exists to cut down - blow
+/// straight through it.
+///
+/// Eight batches' worth by default. Large enough that an ordinary level zero
+/// or level one merge - the overwhelming majority of them - still finishes
+/// inside the single commit that triggered it, so the common case pays no
+/// extra checkpoint at all; small enough that the worst commit measured on
+/// the 100,000 document arm of `write_latency` (a merge several levels up,
+/// tens of thousands of chunks in one go) is cut into several much smaller
+/// ones instead of paying for all of it at once.
+pub const DEFAULT_MERGE_BUDGET: u64 = 8 * COMPACT_FLOOR;
 
 /// How far a result may be from the exact answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,10 +132,23 @@ impl Mode {
 }
 
 /// Which distance the vector branch minimises.
+///
+/// **The index, not the functions.** `vector_distance_cos` and
+/// `vector_distance_l2` both answer for any pair of vectors regardless of
+/// this setting - the distance functions were never the limit. What this
+/// declares is which one the graph underneath is built to minimise: the HNSW
+/// graph is a structure over one distance, and a query asking for the other
+/// one has to fall back to comparing every row, which is exactly what
+/// `crates/inillucent-sql/src/plan.rs::vector_path` refuses to paper over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Metric {
     /// One minus the cosine similarity of two unit vectors.
     Cosine,
+    /// Euclidean distance. Unlike cosine, this needs the stored vectors kept
+    /// at their original magnitude - see `inillucent_core::distance::Metric`,
+    /// which this maps onto so the store built over a `metric = 'l2'` table
+    /// actually keeps that promise.
+    L2,
 }
 
 impl Metric {
@@ -98,6 +156,7 @@ impl Metric {
     pub fn name(self) -> &'static str {
         match self {
             Metric::Cosine => "cosine",
+            Metric::L2 => "l2",
         }
     }
 
@@ -105,8 +164,9 @@ impl Metric {
     pub fn parse(text: &str) -> DbResult<Metric> {
         match text.trim().to_ascii_lowercase().as_str() {
             "cosine" => Ok(Metric::Cosine),
+            "l2" => Ok(Metric::L2),
             other => Err(failure(format!(
-                "inillucent_search: the only distance this build implements is cosine, not {other}"
+                "inillucent_search: the only distances this build implements are cosine and l2, not {other}"
             ))),
         }
     }
@@ -144,6 +204,13 @@ pub struct Options {
     /// How many delta rows may accumulate before a commit folds them in, or
     /// zero to compact only when asked.
     pub compact: Option<u64>,
+    /// How many segments accumulate at a level before they merge into one at
+    /// the next level, when the declaration named one.
+    pub segment_merge: Option<usize>,
+    /// How many chunks a single commit may fold while merging segments,
+    /// before it leaves the rest for a later commit, when the declaration
+    /// named none.
+    pub merge_budget: Option<u64>,
     /// The table this store is an index *over*, when it is one.
     ///
     /// **How a vector index survives being closed.** `CREATE INDEX ix ON t
@@ -176,8 +243,61 @@ impl Options {
         match self.compact {
             Some(0) => None,
             Some(explicit) => Some(explicit),
-            None => Some(COMPACT_FLOOR.max(rows / COMPACT_SHARE)),
+            // **A constant, not a share.** See `COMPACT_FLOOR`: a flush writes
+            // its own batch and nothing else now, so the reason this rose with
+            // the table is gone - and while it rose, the batch a flush built
+            // rose with it, which is exactly the cost segments exist to remove.
+            // `rows` is still taken so a declaration can be read against it and
+            // so this signature does not churn every caller.
+            None => {
+                let _ = rows;
+                Some(COMPACT_FLOOR)
+            }
         }
+    }
+
+    /// Returns how many segments a level holds before they merge into one at
+    /// the next level.
+    ///
+    /// Clamped to two rather than refused, the same defensive floor `positive`
+    /// enforces at parse time for the graph parameters - a stored value of
+    /// zero or one from a future build this one cannot fully read would
+    /// otherwise merge forever, one segment at a time, on every single commit.
+    pub fn segment_fanin(&self) -> usize {
+        self.segment_merge.unwrap_or(DEFAULT_SEGMENT_MERGE).max(2)
+    }
+
+    /// Returns how many chunks one commit may fold while merging segments.
+    ///
+    /// Clamped to one rather than refused, the same defensive floor
+    /// `segment_fanin` applies for the same reason: a stored zero from a
+    /// build that let it be would otherwise checkpoint after every single
+    /// chunk, and a merge would still finish, just at the cost of a
+    /// checkpoint per chunk instead of per commit.
+    pub fn merge_budget_chunks(&self) -> u64 {
+        self.merge_budget.unwrap_or(DEFAULT_MERGE_BUDGET).max(1)
+    }
+
+    /// Returns how many segments must pile up at one level before a commit
+    /// runs that level's merge to completion regardless of
+    /// `merge_budget_chunks` - the escape hatch for when the bounded merge
+    /// has fallen behind badly enough that a query's own fold, which walks
+    /// every live segment, would otherwise keep growing.
+    ///
+    /// `segment_fanin` squared. At `segment_fanin` alone a level is exactly
+    /// full and the bounded merge is expected to start clearing it this
+    /// commit or the next few; reaching the square of that means it has
+    /// filled enough times over, unmerged, that a query is already folding as
+    /// many segments as `segment_fanin` levels would ever normally let it
+    /// hold at once. Past that point, one expensive commit is the better
+    /// trade against an ever-growing per-query cost - and it scales with
+    /// `segment_fanin` rather than being a fixed number, because a table that
+    /// raises its own fanin is choosing to hold more segments per level on
+    /// purpose, and the crisis point should move with that choice rather
+    /// than second-guess it.
+    pub fn crisis_at(&self) -> usize {
+        let fanin = self.segment_fanin();
+        fanin.saturating_mul(fanin)
     }
 
     /// Returns the rows `%_config` holds for this declaration.
@@ -221,6 +341,16 @@ impl Options {
                 self.compact.map(|n| n.to_string()).unwrap_or_default(),
             ),
             (
+                "segment_merge".to_string(),
+                self.segment_merge
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "merge_budget".to_string(),
+                self.merge_budget.map(|n| n.to_string()).unwrap_or_default(),
+            ),
+            (
                 "source".to_string(),
                 self.source
                     .as_ref()
@@ -261,6 +391,8 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
     let mut ef_search: Option<usize> = None;
     let mut mode = Mode::Exact;
     let mut compact: Option<u64> = None;
+    let mut segment_merge: Option<usize> = None;
+    let mut merge_budget: Option<u64> = None;
     for argument in arguments {
         let text = String::from_utf8_lossy(argument).trim().to_string();
         if text.is_empty() {
@@ -315,6 +447,14 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
                     ))
                 })?);
             }
+            "segment_merge" => segment_merge = Some(positive(&value, "segment_merge")?),
+            "merge_budget" => {
+                merge_budget = Some(value.parse::<u64>().map_err(|_| {
+                    failure(format!(
+                        "inillucent_search: merge_budget must be a number, not {value}"
+                    ))
+                })?);
+            }
             other => {
                 return Err(failure(format!(
                     "inillucent_search: no such option: {other}"
@@ -336,6 +476,8 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
         ef_search,
         mode,
         compact,
+        segment_merge,
+        merge_budget,
         source,
         source_column,
         threads,
@@ -406,6 +548,8 @@ pub fn from_config(rows: &[(String, String)], fallback: &Options) -> DbResult<Op
         }
     }
     let compact = find("compact").and_then(|value| value.parse::<u64>().ok());
+    let segment_merge = find("segment_merge").and_then(|value| value.parse::<usize>().ok());
+    let merge_budget = find("merge_budget").and_then(|value| value.parse::<u64>().ok());
     // An empty stored value is "the build's own default", which is what a store
     // created before these three existed says - see the `%_config` rows above.
     let graph = |key: &str| find(key).and_then(|value| value.parse::<usize>().ok());
@@ -418,6 +562,8 @@ pub fn from_config(rows: &[(String, String)], fallback: &Options) -> DbResult<Op
         ef_search: graph("ef_search").or(fallback.ef_search),
         mode,
         compact: compact.or(fallback.compact),
+        segment_merge: segment_merge.or(fallback.segment_merge),
+        merge_budget: merge_budget.or(fallback.merge_budget),
         // An empty stored value is "no source", not a table called nothing:
         // every row of `%_config` is written, including the ones that were
         // never set.
@@ -487,6 +633,33 @@ mod tests {
         assert!(parse(&[b"body".to_vec(), b"metric = 'euclidean'".to_vec()]).is_err());
     }
 
+    /// `l2` is spelled, parses, and round trips through the same accessors
+    /// `cosine` does - the structure this ticket adds to, not a special case
+    /// beside it.
+    #[test]
+    fn l2_is_a_real_metric_now() {
+        let parsed = parse(&[b"body".to_vec(), b"metric = 'l2'".to_vec()]).expect("parsed");
+        assert_eq!(parsed.metric, Metric::L2);
+        assert_eq!(Metric::L2.name(), "l2");
+        assert_eq!(Metric::parse("L2").expect("case insensitive"), Metric::L2);
+        assert_eq!(
+            parsed
+                .config_rows()
+                .iter()
+                .find(|(key, _)| key == "metric")
+                .map(|(_, value)| value.as_str()),
+            Some("l2")
+        );
+    }
+
+    /// `distance` is the alias `metric` has always accepted, and it takes `l2`
+    /// exactly the way it takes `cosine`.
+    #[test]
+    fn l2_is_accepted_through_the_distance_alias_too() {
+        let parsed = parse(&[b"body".to_vec(), b"distance = 'l2'".to_vec()]).expect("parsed");
+        assert_eq!(parsed.metric, Metric::L2);
+    }
+
     /// A table with no columns has nothing to index.
     #[test]
     fn a_table_needs_a_column() {
@@ -509,6 +682,43 @@ mod tests {
         assert_eq!(read.mode, Mode::Approximate);
     }
 
+    /// A table whose `%_config` was written before this ticket has no `metric`
+    /// row at all - not an empty one, an absent one, the same way a table
+    /// written before `compact` existed has no `compact` row. It has to keep
+    /// reading as cosine, which is the only metric that table could ever have
+    /// been built with.
+    ///
+    /// This is deliberately not the same claim as `an_index_declares_cosine_by_default`
+    /// below: that one is about a `CREATE` that never named a metric, and this
+    /// one is about `%_config` rows a real pre-existing table would have, which
+    /// is the scenario a stored index actually presents on reopen.
+    #[test]
+    fn a_table_with_no_stored_metric_row_reads_as_cosine() {
+        let fallback = parse(&[b"body".to_vec()]).expect("parsed");
+        let stored = vec![
+            ("format".to_string(), "1".to_string()),
+            ("columns".to_string(), "body".to_string()),
+            ("dims".to_string(), "8".to_string()),
+            ("mode".to_string(), "exact".to_string()),
+            // No "metric" row at all.
+        ];
+        let read = from_config(&stored, &fallback).expect("read");
+        assert_eq!(read.metric, Metric::Cosine);
+    }
+
+    /// The same claim, but for a `CREATE` that never named a metric at all -
+    /// the declaration-time default, which `from_config` above falls back to
+    /// when `%_config` itself has nothing to say.
+    #[test]
+    fn an_index_declares_cosine_by_default() {
+        let declared = parse(&[b"body".to_vec()]).expect("parsed");
+        assert_eq!(
+            declared.metric,
+            Metric::Cosine,
+            "cosine remains the default"
+        );
+    }
+
     /// A table written by another format version is refused rather than read.
     #[test]
     fn another_format_is_refused() {
@@ -517,13 +727,54 @@ mod tests {
         assert!(from_config(&stored, &fallback).is_err());
     }
 
-    /// The compaction trigger scales with the corpus above its floor.
+    /// The default compaction trigger is the constant floor, at any corpus
+    /// size - segmented generations removed the reason it used to scale with
+    /// the table (see `COMPACT_FLOOR`'s own doc comment).
+    ///
+    /// **Corrected in this ticket:** this test used to assert
+    /// `compact_threshold(80_000) == Some(10_000)`, the old `rows / 8` share,
+    /// which the code stopped computing when `COMPACT_FLOOR` replaced it -
+    /// the test was simply never updated to match, and was failing on an
+    /// otherwise working engine before this fix.
     #[test]
-    fn the_compaction_trigger_scales_with_the_corpus() {
+    fn the_compaction_trigger_is_the_constant_floor_at_any_size() {
         let options = parse(&[b"body".to_vec()]).expect("parsed");
         assert_eq!(options.compact_threshold(0), Some(COMPACT_FLOOR));
-        assert_eq!(options.compact_threshold(80_000), Some(10_000));
+        assert_eq!(options.compact_threshold(80_000), Some(COMPACT_FLOOR));
         let never = parse(&[b"body".to_vec(), b"compact = 0".to_vec()]).expect("parsed");
         assert_eq!(never.compact_threshold(80_000), None);
+    }
+
+    /// A merge's per commit chunk budget defaults to eight batches' worth,
+    /// and an explicit `merge_budget` overrides it.
+    #[test]
+    fn the_merge_budget_defaults_and_can_be_overridden() {
+        let default = parse(&[b"body".to_vec()]).expect("parsed");
+        assert_eq!(default.merge_budget_chunks(), DEFAULT_MERGE_BUDGET);
+        let overridden =
+            parse(&[b"body".to_vec(), b"merge_budget = 500".to_vec()]).expect("parsed");
+        assert_eq!(overridden.merge_budget_chunks(), 500);
+    }
+
+    /// A merge_budget of zero is clamped to one rather than checkpointing
+    /// forever on nothing - the same defensive floor `segment_fanin` applies.
+    #[test]
+    fn a_zero_merge_budget_is_clamped_to_one() {
+        let options = parse(&[b"body".to_vec(), b"merge_budget = 0".to_vec()]).expect("parsed");
+        assert_eq!(options.merge_budget_chunks(), 1);
+    }
+
+    /// The crisis threshold is the fanin squared, and moves with an explicit
+    /// `segment_merge`.
+    #[test]
+    fn the_crisis_threshold_is_the_fanin_squared() {
+        let default = parse(&[b"body".to_vec()]).expect("parsed");
+        assert_eq!(default.segment_fanin(), DEFAULT_SEGMENT_MERGE);
+        assert_eq!(
+            default.crisis_at(),
+            DEFAULT_SEGMENT_MERGE * DEFAULT_SEGMENT_MERGE
+        );
+        let raised = parse(&[b"body".to_vec(), b"segment_merge = 6".to_vec()]).expect("parsed");
+        assert_eq!(raised.crisis_at(), 36);
     }
 }

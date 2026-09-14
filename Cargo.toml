@@ -22,11 +22,7 @@ members = [
     "crates/inillucent-catalog",
     "crates/inillucent-sql",
     "crates/inillucent-ext",
-    "crates/inillucent-vm",
-    "crates/inillucent-session",
     "crates/inillucent",
-    "crates/inillucent-legacy",
-    "crates/inillucent-capi",
     "crates/inillucent-cli",
     "crates/inillucent-search",
     "crates/inillucent-migrate",
@@ -87,7 +83,7 @@ doc_lazy_continuation = "allow"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 repository = "https://github.com/Black-Rainbow-Labs/Inillucent"
 readme = "README.md"
 edition = "2021"
@@ -117,10 +113,7 @@ inillucent-transaction = { path = "crates/inillucent-transaction", version = "0.
 inillucent-catalog = { path = "crates/inillucent-catalog", version = "0.1.0" }
 inillucent-sql = { path = "crates/inillucent-sql", version = "0.1.0" }
 inillucent-ext = { path = "crates/inillucent-ext", version = "0.1.0" }
-inillucent-vm = { path = "crates/inillucent-vm", version = "0.1.0" }
-inillucent-session = { path = "crates/inillucent-session", version = "0.1.0" }
 inillucent = { path = "crates/inillucent", version = "0.1.0" }
-inillucent-legacy = { path = "crates/inillucent-legacy", version = "0.1.0" }
 inillucent-core = { path = "crates/inillucent-core", version = "0.1.0" }
 inillucent-cli = { path = "crates/inillucent-cli", version = "0.1.0" }
 inillucent-search = { path = "crates/inillucent-search", version = "0.1.0" }
@@ -160,6 +153,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Credentials",
     "Win32_Networking_WinSock",
     "Win32_System_Threading",
+    # `SetConsoleCtrlHandler`, so Ctrl+C stops a statement rather than the
+    # process (task-1932, H11).
+    "Win32_System_Console",
     # `GetProcessMemoryInfo`, for the gate's memory accounting (task-1838).
     "Win32_System_ProcessStatus",
 ] }

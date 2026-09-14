@@ -19,6 +19,12 @@
 //!   the schema is as of one instant.
 //! - **A cursor rather than a whole result set.** `FETCH 10000` bounds this
 //!   process's memory to one batch no matter how large the table is.
+//!
+//! Invariant: **every number this client reads out of a message is bounded
+//! before it sizes anything, and the session's own formatting is set rather
+//! than inherited.** A value rendered under whatever zone and date style the
+//! server happened to default to is a value that can differ between two
+//! migrations of the same table.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -81,6 +87,13 @@ fn request_tls(stream: &mut Stream, url: &ConnectionUrl) -> DbResult<()> {
 
 /// How many rows one `FETCH` asks for.
 const FETCH_ROWS: usize = 10_000;
+
+/// The most columns a message may claim.
+///
+/// PostgreSQL's own hard limit on a table, so a `RowDescription` or a `DataRow`
+/// above it is a message this client should name rather than start building a
+/// vector for.
+const MAX_COLUMNS: usize = 1_600;
 
 /// The cursor a table scan runs through.
 const CURSOR: &str = "inillucent_migrate_cursor";
@@ -843,6 +856,18 @@ fn decode_bytea(bytes: &[u8]) -> Vec<u8> {
 /// @param body - the message body
 fn decode_row_description(body: &[u8]) -> DbResult<Vec<Field>> {
     let count = be_u16(body, 0)? as usize;
+    // **Not the same hazard MySQL's count is, and bounded anyway.** This count
+    // is a `u16`, so the worst `Vec::with_capacity` it can ask for is 65,535
+    // entries - large, harmless, and nothing like the `u64::MAX` a MySQL
+    // length-encoded count can claim. It is bounded here because PostgreSQL's
+    // own maximum is 1,600 columns, so a count above it is a message this
+    // client should name rather than start building a vector for (task-1932,
+    // H5's audit of the sibling decoders).
+    if count > MAX_COLUMNS {
+        return Err(protocol(format!(
+            "RowDescription claims {count} columns, past the {MAX_COLUMNS} a PostgreSQL table can have"
+        )));
+    }
     let mut fields = Vec::with_capacity(count);
     let mut at = 2usize;
     for _ in 0..count {
@@ -868,6 +893,11 @@ fn decode_row_description(body: &[u8]) -> DbResult<Vec<Field>> {
 /// @param body - the message body
 fn decode_data_row(body: &[u8]) -> DbResult<Vec<Option<Vec<u8>>>> {
     let count = be_u16(body, 0)? as usize;
+    if count > MAX_COLUMNS {
+        return Err(protocol(format!(
+            "a DataRow claims {count} values, past the {MAX_COLUMNS} columns a PostgreSQL table can have"
+        )));
+    }
     let mut row = Vec::with_capacity(count);
     let mut at = 2usize;
     for _ in 0..count {
@@ -1137,5 +1167,59 @@ mod tests {
             Some("W22ZaJ0SNY7soEsUEjb6gQ==")
         );
         assert_eq!(parsed.get("i").map(String::as_str), Some("4096"));
+    }
+}
+
+/// The door the fuzz targets come in by.
+///
+/// **A named entry point rather than a public decoder.** See the note on
+/// `mysql::fuzzing`: the fuzz crate is outside the workspace and cannot reach a
+/// private item, and these two parsers read bytes a network peer controls, so
+/// they stay private and this answers for them.
+pub mod fuzzing {
+    /// Reads an untrusted row description message.
+    ///
+    /// @param body - the message's bytes
+    pub fn row_description(body: &[u8]) -> bool {
+        super::decode_row_description(body).is_ok()
+    }
+
+    /// Reads an untrusted data row message.
+    ///
+    /// @param body - the message's bytes
+    pub fn data_row(body: &[u8]) -> bool {
+        super::decode_data_row(body).is_ok()
+    }
+}
+
+#[cfg(test)]
+mod fuzz_seeded {
+    /// How many inputs the seeded sweep below reads.
+    const CASES: usize = 20_000;
+
+    /// Returns the next value of a deterministic generator.
+    ///
+    /// @param state - the generator's state, advanced in place
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// Neither message decoder panics on arbitrary bytes.
+    ///
+    /// The stable-toolchain twin of `fuzz/fuzz_targets/postgres.rs`.
+    #[test]
+    fn the_message_decoders_never_panic_on_arbitrary_bytes() {
+        let mut state = 0x1932_0002_u64;
+        let mut accepted = 0usize;
+        for _ in 0..CASES {
+            let length = (next(&mut state) % 96) as usize;
+            let bytes: Vec<u8> = (0..length).map(|_| next(&mut state) as u8).collect();
+            accepted += usize::from(super::fuzzing::row_description(&bytes));
+            accepted += usize::from(super::fuzzing::data_row(&bytes));
+        }
+        assert!(accepted <= CASES * 2);
     }
 }

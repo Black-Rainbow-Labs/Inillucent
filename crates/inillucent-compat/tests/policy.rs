@@ -15,7 +15,22 @@ use std::process::Command;
 use inillucent_compat::workspace_root;
 
 /// The crates the policy applies to.
-const GOVERNED: [&str; 23] = [
+///
+/// **Six crates were added in task-1932 (H9), and they were the ones where the
+/// rules matter most.** The list held twenty and omitted, among others: the one
+/// crate in the workspace allowed to write `unsafe`
+/// (`inillucent-alloc`); the crate that parses bytes off a network socket and
+/// holds 72 `unsafe` occurrences in its TLS files (`inillucent-remote`, whose
+/// own module comment claimed `policy.rs` checked its `SAFETY` notes - it did
+/// not, because the crate was not here); and the crate that decodes the
+/// retrieval index straight off the database file, with no lint attributes at
+/// all (`inillucent-core`). The two driver crates are the surface every
+/// language binding reaches the engine through.
+///
+/// The argument for each is the one already written below for the engine
+/// crates: a crate that is exempt is a crate that is exempt, and the exemption
+/// is invisible from inside it.
+const GOVERNED: [&str; 26] = [
     "inillucent-base",
     "inillucent-vfs",
     "inillucent-sim",
@@ -43,12 +58,17 @@ const GOVERNED: [&str; 23] = [
     "inillucent-catalog",
     "inillucent-ext",
     "inillucent-search",
-    "inillucent-vm",
-    "inillucent-session",
     "inillucent",
-    "inillucent-capi",
     "inillucent-cli",
     "inillucent-compat",
+    // The six task-1932 added. See the doc comment above for why each one
+    // matters more than the twenty that were already here, not less.
+    "inillucent-alloc",
+    "inillucent-core",
+    "inillucent-remote",
+    "inillucent-migrate",
+    "inillucent-driver",
+    "inillucent-driver-capi",
 ];
 
 /// The crates whose whole point is an unsafe boundary.
@@ -59,7 +79,15 @@ const GOVERNED: [&str; 23] = [
 /// copies of one sentence, which is worse than useless: a reviewer would learn
 /// to skip them. What is required instead is checked by
 /// `every_exported_c_function_documents_itself` below.
-const UNSAFE_CRATES: [&str; 1] = ["inillucent-capi"];
+///
+/// `inillucent-capi` held this role until it was deleted with the old engine;
+/// `inillucent-driver-capi`, under `drivers/` rather than `crates/`, replaced
+/// it. It was never in [`GOVERNED`] - the `crates/` tree that
+/// `unsafe_code_is_confined_and_justified` walks - so this list's other
+/// consumer, that test's `UNSAFE_CRATES.contains` skip, has nothing to do for
+/// it either; `every_exported_c_function_documents_itself` below is the one
+/// that actually reads it, and reads it from `drivers/`.
+const UNSAFE_CRATES: [&str; 1] = ["inillucent-driver-capi"];
 
 /// The only files allowed to contain `unsafe`.
 ///
@@ -73,7 +101,36 @@ const UNSAFE_CRATES: [&str; 1] = ["inillucent-capi"];
 /// about what the engine is made of, and a baseline tool that never ships is
 /// not part of it - but a file with `unsafe` in it should still have to say
 /// why, in writing, in a list somebody reads.
-const UNSAFE_ALLOWED: [&str; 9] = [
+// The one file in the shell that says `unsafe`, added in task-1932 (H11).
+// Ctrl+C has no representation in the standard library, so being told about
+// it is `SetConsoleCtrlHandler` on Windows and `signal` on Unix, and both
+// are FFI. Each call installs a handler and reads nothing back; each handler
+// stores `true` into an already-allocated `AtomicBool` and returns, which is
+// the whole of what a handler is allowed to do.
+const UNSAFE_ALLOWED: [&str; 14] = [
+    "crates/inillucent-cli/src/interrupt.rs",
+    // The allocator's own concurrency suite, added in task-1932 (H9). It
+    // allocates on one thread and frees on another through `GlobalAlloc`, which
+    // is an unsafe trait - the boundary is what the suite exists to cross, and
+    // every call carries its own SAFETY note saying which thread owns the block
+    // at that point.
+    "crates/inillucent-alloc/tests/concurrency.rs",
+    // **The allocator and the two TLS files, admitted in task-1932 (H9).**
+    // None of them was here because none of their crates was in `GOVERNED`, so
+    // `unsafe` in them was not permitted - it was unexamined, which is a
+    // different thing and the worse one. `inillucent-remote`'s own module
+    // comment said `policy.rs` checked its `SAFETY` notes; it did not, because
+    // the crate was not governed.
+    //
+    // `inillucent-alloc` is a `GlobalAlloc`, which is an unsafe trait: it is
+    // the one production crate in the workspace allowed to write the word, and
+    // its whole surface is the boundary. The two TLS files are the operating
+    // system's certificate stores - Windows's SChannel and the platform trust
+    // roots on Unix - reached through FFI, which is the same ground
+    // `inillucent-vfs`'s two files stand on.
+    "crates/inillucent-alloc/src/lib.rs",
+    "crates/inillucent-remote/src/tls/unix.rs",
+    "crates/inillucent-remote/src/tls/windows.rs",
     "crates/inillucent-vfs/src/os/windows.rs",
     "crates/inillucent-vfs/src/os/unix.rs",
     "crates/inillucent-compat/src/bin/sqlperf.rs",
@@ -148,7 +205,7 @@ fn unsafe_code_is_confined_and_justified() {
         if UNSAFE_CRATES.contains(&crate_name) {
             continue;
         }
-        for file in rust_files(&root.join("crates").join(crate_name)) {
+        for file in rust_files(&crate_directory(&root, crate_name)) {
             let name = relative(&root, &file);
             // This file names the word in every check it makes.
             if name.ends_with("tests/policy.rs") {
@@ -164,13 +221,38 @@ fn unsafe_code_is_confined_and_justified() {
                 if line.trim_start().starts_with("//") || line.contains("unsafe_code") {
                     continue;
                 }
+                // **A function-pointer *type* is not an unsafe operation, and
+                // requiring a safety argument on one asks for a sentence that
+                // cannot be written (task-1932, H9).** `inillucent-remote`'s
+                // TLS files resolve OpenSSL and SChannel at run time, so their
+                // entry points are struct fields typed
+                // `unsafe extern "C" fn(...)` - nineteen of them in
+                // `tls/unix.rs` alone. The field declares what the pointer is;
+                // the *call* through it is the unsafe operation, and each of
+                // those does carry a note. A definition is told apart from a
+                // type by having a name between `fn` and its arguments.
+                if line.contains("unsafe extern \"C\" fn(") {
+                    continue;
+                }
                 if !UNSAFE_ALLOWED.contains(&name.as_str()) {
                     offenders.push(format!("{name}:{}: {}", index + 1, line.trim()));
                     continue;
                 }
                 let start = index.saturating_sub(8);
                 let preceding = lines.get(start..index).unwrap_or(&[]);
-                if preceding.iter().any(|line| line.contains("SAFETY:")) {
+                // **`# Safety` counts, and it is the right form for a
+                // declaration (task-1932, H9).** An unsafe *operation* carries
+                // a `SAFETY:` comment saying why this call is sound; an unsafe
+                // *function* carries a `# Safety` doc section saying what its
+                // caller must guarantee. They are different sentences with
+                // different subjects, and rustc's own
+                // `clippy::missing_safety_doc` asks for the second. A check
+                // that accepted only the first would push a declaration into
+                // writing the wrong one.
+                if preceding
+                    .iter()
+                    .any(|line| line.contains("SAFETY:") || line.contains("# Safety"))
+                {
                     justified += 1;
                 } else {
                     offenders.push(format!("{name}:{}: no SAFETY comment", index + 1));
@@ -198,7 +280,9 @@ fn every_exported_c_function_documents_itself() {
     let mut offenders = Vec::new();
     let mut checked = 0usize;
     for crate_name in UNSAFE_CRATES {
-        for file in rust_files(&root.join("crates").join(crate_name)) {
+        // `inillucent-driver-capi` lives under `drivers/`, not `crates/` - the
+        // only entry this list has ever held that does.
+        for file in rust_files(&root.join("drivers").join(crate_name)) {
             let name = relative(&root, &file);
             let text = std::fs::read_to_string(&file).expect("the source reads");
             let lines: Vec<&str> = text.lines().collect();
@@ -229,21 +313,39 @@ fn every_exported_c_function_documents_itself() {
         }
     }
     assert!(offenders.is_empty(), "{offenders:#?}");
+    // **A floor on the scan, not a target for the ABI.** It exists so that a
+    // glob which silently matched nothing cannot pass this test by finding no
+    // functions to fault. Sixty was calibrated against `inillucent-capi`, which
+    // exported the whole `sqlite3_*` surface; task-1911 deleted that crate and
+    // the ABI that ships is `drivers/inillucent-driver-capi`, a deliberately
+    // smaller surface of 53. Forty is below what the driver exports and far
+    // above what a broken scan would find.
     assert!(
-        checked >= 60,
+        checked >= 40,
         "the C ABI should export many symbols, found {checked}"
     );
 }
 
 /// Every governed crate must deny undocumented public items, so a public
 /// function without a doc comment is a build error rather than a review note.
+///
+/// **The match is on the whole attribute, and it used to be on the lint's name
+/// (task-1932, H9).** `text.contains("clippy::unwrap_used")` is true of a crate
+/// that *denies* the lint and equally true of one that *allows* it - and
+/// `inillucent-scalar` had a `#![cfg_attr(test, allow(clippy::expect_used,
+/// clippy::indexing_slicing, clippy::panic, clippy::unwrap_used))]` block and
+/// no `deny` for any of the four. It named all four lint paths, so it passed
+/// this test while denying none of them, with 71 `expect`s and 22 direct index
+/// expressions in `geopoly.rs`. A check that a crate can satisfy by allowing
+/// the thing it is supposed to deny is the shape
+/// `tests/inillucent-testing-tdd.md` rule 1.5 is about.
 #[test]
 fn every_governed_crate_denies_undocumented_items() {
     let root = workspace_root();
     for crate_name in GOVERNED {
         // A binary crate's root is `main.rs`; the rule is about the root, not
         // about which kind of crate it is.
-        let directory = root.join("crates").join(crate_name).join("src");
+        let directory = crate_directory(&root, crate_name).join("src");
         let lib = if directory.join("lib.rs").is_file() {
             directory.join("lib.rs")
         } else {
@@ -260,9 +362,30 @@ fn every_governed_crate_denies_undocumented_items() {
             "clippy::expect_used",
             "clippy::panic",
         ] {
-            assert!(text.contains(lint), "{crate_name} does not deny {lint}");
+            assert!(
+                text.contains(&format!("#![deny({lint})]")),
+                "{crate_name} does not carry `#![deny({lint})]`. Naming the lint in a                  `cfg_attr(test, allow(...))` block is not denying it."
+            );
         }
     }
+}
+
+/// Returns where a crate's manifest lives.
+///
+/// **Two directories, because the driver crates are in `drivers/`.** Every
+/// governed crate was under `crates/` until task-1932 added
+/// `inillucent-driver` and `inillucent-driver-capi`, and a check that looked
+/// only in `crates/` would have reported them as having no crate root rather
+/// than as being ungoverned.
+///
+/// @param root - the workspace root
+/// @param crate_name - the crate's directory name
+fn crate_directory(root: &std::path::Path, crate_name: &str) -> std::path::PathBuf {
+    let under_crates = root.join("crates").join(crate_name);
+    if under_crates.is_dir() {
+        return under_crates;
+    }
+    root.join("drivers").join(crate_name)
 }
 
 /// Every module must open with a comment, and the first paragraph must state
@@ -273,7 +396,7 @@ fn every_module_states_its_invariant() {
     let root = workspace_root();
     let mut offenders = Vec::new();
     for crate_name in GOVERNED {
-        for file in rust_files(&root.join("crates").join(crate_name)) {
+        for file in rust_files(&crate_directory(&root, crate_name)) {
             let name = relative(&root, &file);
             let text = std::fs::read_to_string(&file).expect("the source reads");
             if !text.starts_with("//!") {
@@ -362,54 +485,60 @@ fn the_dependency_policy_covers_what_the_contract_allows() {
     );
 }
 
-/// The retired engine's crates are named by a shrinking list, and the list is
-/// the test.
+/// The crates the rearchitecture retires are named by a shrinking list, and
+/// the list is the test.
 ///
-/// **A ratchet rather than a rule.** `docs/roadmap.md` has recorded the removal
-/// of the old engine as unfinished work for several tickets, and prose does not
-/// stop a new edge: the way a crate acquires one is that somebody adds a line to
-/// a manifest because the type they wanted lives there, and nothing says no. So
-/// the crates that may still name `inillucent-storage`, `inillucent-transaction`
-/// and `inillucent-vm` are listed here by name, and a crate that is not on the
-/// list fails this test the moment it grows the edge.
+/// **A ratchet rather than a rule.** Prose does not stop a new edge: the way a
+/// crate acquires one is that somebody adds a line to a manifest because the
+/// type they wanted lives there, and nothing says no. So the crates that may
+/// still name `inillucent-storage` and `inillucent-transaction` - the pager and
+/// transaction manager `inillucent-sqlite-reader` reads a SQLite file through,
+/// which stay in the workspace for exactly that - are listed here by name, and
+/// a crate that is not on the list fails this test the moment it grows the
+/// edge.
 ///
 /// The list only ever gets shorter. Removing a name is the work; adding one is
 /// a decision somebody has to argue for in a review, which is exactly the
 /// difference between this and a comment.
 ///
-/// `inillucent-ext` has been removed from this list; it was the only crate on
-/// it that the *new* engine links - and therefore the only entry that put two
-/// storage models in a shipped binary rather than merely in the workspace.
+/// `inillucent-ext` was removed from this list before `inillucent-vm` was
+/// deleted; it was the only crate on it that the *new* engine links, and
+/// therefore the only entry that put two storage models in a shipped binary
+/// rather than merely in the workspace. `inillucent-vm` itself came off the
+/// list when the crate was deleted along with the rest of the old engine
+/// (`inillucent-session`, `inillucent-legacy`, `inillucent-capi`) - there is no
+/// longer a bytecode engine anywhere in the workspace for a new crate to grow
+/// an edge to.
 #[test]
 fn no_new_crate_reaches_into_the_retired_engine() {
-    /// The crates the rearchitecture retires, whose consumers are counted.
-    const RETIRED: [&str; 3] = [
-        "inillucent-storage",
-        "inillucent-transaction",
-        "inillucent-vm",
-    ];
+    /// The crates this ratchet still watches.
+    ///
+    /// `inillucent-vm` came off this list when the crate itself was deleted:
+    /// `inillucent-session`, `inillucent-legacy` and `inillucent-capi` went with
+    /// it, and there is no longer a bytecode engine anywhere in the workspace
+    /// for a new crate to grow an edge to. What is left is the *other* half of
+    /// the rearchitecture's retirement list - `inillucent-storage` and
+    /// `inillucent-transaction`, which stay in the workspace because
+    /// `inillucent-sqlite-reader` reads SQLite's own file format through the
+    /// old pager, and migrating away from SQLite is what that reader is for.
+    /// This test is not vacuous with the bytecode engine gone: it still counts
+    /// every new edge to the pager and the transaction manager it retired.
+    const RETIRED: [&str; 2] = ["inillucent-storage", "inillucent-transaction"];
 
     /// Who may still name one, and why each is still there.
     ///
     /// - the retired crates themselves, and each other;
     /// - `inillucent-catalog`, whose old-engine schema reader is the arm the new
-    ///   engine's `paged` module replaces - it goes when the old engine does;
+    ///   engine's `paged` module already replaces - it goes once nothing calls
+    ///   that arm any more;
     /// - `inillucent-sqlite-reader`, which reads *SQLite's* file format and uses
     ///   the old pager as the format reader it is, so removing this edge means
-    ///   writing a second b-tree reader rather than deleting a dependency;
-    /// - `inillucent-session` and `inillucent-legacy`, which *are* the old
-    ///   engine's connection and facade;
-    /// - `inillucent-capi`, the `sqlite3_*` ABI over that facade, which
-    ///   `docs/invariants/layering.toml` records as going with them.
-    const ALLOWED: [&str; 8] = [
+    ///   writing a second b-tree reader rather than deleting a dependency.
+    const ALLOWED: [&str; 4] = [
         "inillucent-storage",
         "inillucent-transaction",
-        "inillucent-vm",
         "inillucent-catalog",
         "inillucent-sqlite-reader",
-        "inillucent-session",
-        "inillucent-legacy",
-        "inillucent-capi",
     ];
 
     let root = workspace_root();
@@ -427,7 +556,7 @@ fn no_new_crate_reaches_into_the_retired_engine() {
         if ALLOWED.contains(crate_name) || *crate_name == "inillucent-compat" {
             continue;
         }
-        let manifest = root.join("crates").join(crate_name).join("Cargo.toml");
+        let manifest = crate_directory(&root, crate_name).join("Cargo.toml");
         let Ok(text) = std::fs::read_to_string(&manifest) else {
             continue;
         };
@@ -455,6 +584,386 @@ fn no_new_crate_reaches_into_the_retired_engine() {
     );
 }
 
+/// How long each module is allowed to be.
+///
+/// **Hoisted out of the test that reads it (task-1932).** The argument for
+/// every number below is three hundred lines, which made
+/// `no_module_grows_past_the_size_it_is_recorded_at` the longest function in
+/// this file - reported by `no_function_grows_past_the_length_it_is_recorded_at`,
+/// the ratchet the same ticket added. The argument is worth keeping and the
+/// function is not the place for it, so it sits here beside
+/// `FUNCTION_CEILINGS`.
+/// Every module over 2,500 lines, with the ceiling it is held to.
+///
+/// `ImportedDatabase::import_into` - 493 lines that did seven things - was
+/// moved into `inillucent-engine/src/import.rs` as seven named phases,
+/// which is what took `lib.rs` from 8,415 to its number here.
+///
+/// The seek-union feature (`AccessPath::RowidSeekUnion` and
+/// `IndexSeekUnion`, turning an `IN` list and a keyset page's disjunction
+/// into seeks instead of a scan) touches four of these. `plan.rs`'s own
+/// growth was cut from 652 lines to 275 by moving the union-construction
+/// functions into `crates/inillucent-sql/src/plan/seek_union.rs`; the
+/// rest - the enum variants themselves, and the `describe`/cost/ordering
+/// match arms that must stay beside the rest of `AccessPath` - has
+/// nowhere else to go. `physical.rs`, `compile.rs` and `compile_dml.rs`
+/// each need one new executor arm per engine and are raised as measured,
+/// with no further extraction attempted this pass.
+///
+/// `physical.rs` is raised by one more line for task-1900. Making a
+/// registered function reachable from `ORDER BY` - which is what a semantic
+/// search *is*, `ORDER BY vector_distance_cos(v, embed('...')) LIMIT k` -
+/// meant handing the catalog to the space a statement's stages are viewed
+/// through, at the three call sites that already hold one. That is three
+/// added lines and two saved on a field comment whose claim had stopped
+/// being true. The extraction the message asks for is available and is not
+/// small: `literal_value` and `rowid_seek_key` would move cleanly, and they
+/// are named by path from twelve call sites in `inillucent-engine`, so it is
+/// a cross-crate rename in a file this ticket otherwise has no business in.
+/// task-1886 needed one counter and one accessor on `ImportedDatabase` -
+/// how many statements a connection has compiled, which is what the plan
+/// cache guard in `crates/inillucent/tests/budget.rs` asserts on now that it
+/// no longer asserts on a stopwatch. `lib.rs` was two lines under its
+/// ceiling, so there was no version of that addition this test would take.
+///
+/// The extraction it asked for was available and was one idea: the plan
+/// cache. `plan_key`, `cacheable`, `compiled`, `cached_plan_count` and the
+/// new `compiled_statement_count` are all about *whether* to compile, and
+/// they moved to `crates/inillucent-engine/src/plans.rs`; `compile`, which
+/// is about *how*, stayed with the parser and binder plumbing it is written
+/// in terms of. `lib.rs` went from 8,128 to 8,068, and its number here is
+/// left where it is rather than followed down to 8,070 - a ceiling two lines
+/// above the file is what sent somebody here in the first place, and this
+/// test's own slack rule allows 200.
+/// task-1907 is the second one, and it is the extraction this test's own
+/// message named. `physical.rs` needed a catalog on the fold that produces a
+/// vector index's probe vector - without one, adding an
+/// `inillucent_hnsw` index to a column made the documented semantic search
+/// refuse - and the doc comment explaining why is longer than the change.
+/// `literal_value`, `constant_value`, `fold` and the evaluation behind them
+/// are one idea, *what is constant and what is it worth*, and they moved to
+/// `crates/inillucent-exec/src/constant.rs`. 6,742 back to 6,563. `physical`
+/// re-exports `literal_value`, so the twelve call sites in
+/// `inillucent-engine` that name it by path did not move.
+/// **The `fts5/mod.rs` number went back up, and that is the record following
+/// the work rather than the other way round.** It came down to 2,899 when the
+/// segment layer was extracted to `fts5/segment.rs`; task-1911 then measured
+/// the segment format, found it cost roughly half of `extension.fts.query`
+/// for no build-side gain, and reverted it. The extraction went with the
+/// feature that needed it, so the ceiling returns to what it was before
+/// either existed. A number that stayed at 2,899 with nothing left to
+/// extract would refuse the next ordinary addition for a reason that had
+/// stopped being true.
+///
+/// task-1911's second extraction is `crates/inillucent-ext/src/vtab/fts5`.
+/// Merging the dictionary row and the doclist row into one - `%_idx` now
+/// carries the doclist where it used to carry an integer naming a `%_data`
+/// row - touches every reader of both, and `mod.rs` was 80 lines under its
+/// ceiling before it started. The doclist's encoding and decoding is one
+/// idea and moved to `fts5/doclist.rs`, which took `mod.rs` to 2,933 and is
+/// recorded here at that rather than at the 3,135 it was allowed.
+///
+/// task-1911 is the third. Fixing the vector index that answered zero rows
+/// after a reopen needed a transaction number on the connection, a `seal`,
+/// and a flush - a few lines each, in two files that were both at their
+/// ceiling. What moved is one idea, *the engine's half of a vector index a
+/// module owns*: `follow_vector_indexes`, `nearest_rowids`, `probe_module`
+/// and `refresh_vector_indexes` out of `lib.rs`, and `create_vector_index`
+/// out of `ddl.rs`, into `crates/inillucent-engine/src/vectors.rs`. They
+/// name each other and nothing else names them but the write path and the
+/// planner's one question. `lib.rs` 8,128 to 7,876 and `ddl.rs` 2,975 to
+/// 2,806, both recorded here at their new sizes.
+///
+/// Closing roadmap items 13 and 15 is the fourth. Both needed a catalog
+/// parameter threaded onto `RowSpace::compile` and the write-path callers
+/// that reach it, so a registered function stopped refusing by name in a
+/// `VALUES` row, an `UPDATE` assignment and a `RETURNING` clause - three
+/// or four lines each, at a dozen call sites, in a file that was 34 lines
+/// from its ceiling before any of them landed. What moved is one idea,
+/// *what one `INSERT`'s row looks like before any row exists to write*:
+/// `InsertPlan` and the two structs and two enums it alone uses, out of
+/// `dml.rs` into `crates/inillucent-exec/src/insert_plan.rs`. It is named
+/// from exactly the three functions in `dml.rs` that compile or drive it,
+/// and nothing else needs to see inside it. `dml.rs` 3,274 to 3,060,
+/// recorded here at its new size.
+///
+/// `lib.rs` also moves, by thirteen lines, and nothing there extracts.
+/// `WriteView` - the write path's own view of the trees, which is what
+/// `WriteTarget::catalog` hands `RowSpace::compile` - answered `None` for
+/// every registered function, because `TreeCatalog::user_scalar` defaults
+/// to that and nothing had ever overridden it on this type. The catalog
+/// parameter item 13 threads through was therefore reaching a catalog
+/// that could never resolve anything, which is the second half of why a
+/// `VALUES` row calling a registered scalar kept refusing after the first
+/// half was fixed. `WriteView` needed a reference to the registry and the
+/// two methods that read it - thirteen lines with their comments trimmed
+/// to one line each, which is as far as trimming goes without losing the
+/// argument. There is no second copy of this logic anywhere in the file to
+/// fold into it, so the number moves instead.
+///
+/// Roadmap item 3, Stage 1 - a `Cached::Select` chain reused across
+/// executions rather than rebuilt every time - is the next two moves.
+/// `physical.rs` needed `build_chain` split into the part that borrows the
+/// catalog and the part that does not, plus `Compiled`, `Slot` and
+/// `try_compile` to hold the borrow-free half with no lifetime at all.
+/// Everything actually new - `Compiled`, `Slot`, `try_compile` - is one
+/// idea, *a compiled chain kept with no lifetime*, and moved whole into
+/// `crates/inillucent-exec/src/compiled.rs`, re-exported from `physical` so
+/// no existing `physical::Slot` reference had to move with it. What did
+/// not move is `build_upper`: it is 99% the body `build_chain` already had,
+/// entangled with a dozen of this file's own translation and aggregate
+/// helpers, and splitting *that* out as well is a second, larger
+/// extraction this pass did not attempt. 6,973 down to 6,756, still short
+/// of the 6,691 this row was at, and raised to match rather than chasing
+/// the rest of the split for a number this test's own slack already
+/// tolerates. `lib.rs`'s matching half - `execute_select_cached`, deciding
+/// whether to build or reuse - moved to `plans.rs`, which already answers
+/// exactly this question for the outer, per-text cache; 7,973 down to
+/// 7,902, nine over 7,893, raised the same way and for the same reason.
+///
+/// Stage 3 is the same shape again, on the write path this time:
+/// `Cached::Update`, `Delete`, `Insert`'s `SELECT` source, `VirtualUpdate`
+/// and `VirtualDelete` each held their own `(Box<PhysicalPlan>,
+/// Box<Prepared>)` pair with no slot, so `keys_of` rebuilt the keys query
+/// on every execution the way `Cached::Select` used to. `CachedQuery` is
+/// the one struct all five now carry, and the dispatch itself -
+/// `execute_select_cached`'s try-the-slot, build-once, reuse-after body -
+/// generalised into `plans.rs`'s `run_cached_query`, which
+/// `execute_select_cached` now calls too rather than duplicating. `lib.rs`
+/// 7,902 to 7,920, eighteen over; there is no second copy of `CachedQuery`
+/// or `keys_of` to fold into, so the number moves again.
+///
+/// task-1911's delta-area work on `inillucent-tree/src/leaf.rs` and its
+/// FTS5 segment-format work on `inillucent-ext/src/vtab/fts5/mod.rs` are
+/// the next two, both extractions this test's own message asked for
+/// rather than a raised number.
+///
+/// `leaf.rs`: `locate` used to ask [`LeafRef::delta_value`] once per key
+/// column, redecoding a delta row from its first byte every time, and
+/// moved to walking the row's cursor forward once instead - which is what
+/// `delta_column_at`, `delta_key_matches` and `delta_row_values` are. The
+/// delta area is one idea, *rows a write staged since the page was last
+/// packed*, and it moved whole into `crates/inillucent-tree/src/leaf/delta.rs`:
+/// the directory (`delta_count`, `delta_start`), one row's bytes
+/// (`delta_row`), and every reader that walks a row once it has them.
+/// `locate`, `live` and `live_source` stay behind, because each reads the
+/// sorted region and the delta area together and moving them would have
+/// meant picking one of the two an arbitrary home. That left four
+/// functions the sorted-region code still calls - `validate_delta` from
+/// `parse`, `any_delta_extent_unchecked` from `integrity`,
+/// `delta_row_values` from `live` and `live_source`, `delta_key_matches`
+/// from `locate` - which is the `pub(super)` this extraction cost; every
+/// other moved item was already `pub`, since a method's visibility does
+/// not depend on which file its `impl` block sits in, only a free
+/// function's does. 5,446 down to 5,175.
+///
+/// `fts5/mod.rs`: the merged dictionary-and-doclist row from `mod.rs`'s
+/// own earlier paragraph grew a manifest of which segments are live, and
+/// `SegmentMeta` plus everything that reads or writes one -
+/// `get_segment_meta`, `put_segment_meta`, `automerge_threshold`,
+/// `tombstone_key`, `resolve_term`, `terms_with_prefix`,
+/// `merge_live_segments` - is one idea, *the segment layer*, and moved to
+/// `fts5/segment.rs` beside `doclist.rs`. `resolve_doclist` and the
+/// `TermValue` it decodes moved with it: both exist only to serve
+/// `resolve_term`'s per-segment read and calling them from nowhere else
+/// would have left a private pair in `mod.rs` with nothing left to use
+/// them. `resolve_term` and `terms_with_prefix` are named by path from
+/// `expr.rs` and `vocab.rs` as `super::resolve_term` and
+/// `super::terms_with_prefix`; `mod.rs` re-exports both, along with
+/// everything else it still calls unqualified, so neither call site
+/// changed. 3,287 down to 2,899.
+///
+/// task-1911's fourth extraction is `lib.rs` again, from two unrelated
+/// pieces of work landing together: a fix to `total_changes()`, which read
+/// `changed_ever` - one counter shared by every session a database ever
+/// hands out - and so reported a fresh connection every row a *different*
+/// connection had already written, and the write path's `CachedQuery`
+/// generalising `Cached::Select`'s compiled-chain slot onto
+/// `Update`/`Delete`/`VirtualUpdate`/`VirtualDelete`/`Insert`. Both are one
+/// idea each and neither is `lib.rs`'s to keep: the session baseline moved
+/// to `crates/inillucent-engine/src/session_changes.rs`, a new module,
+/// because nothing else in the crate reaches for it; `CachedQuery` moved
+/// to `plans.rs` beside `run_cached_query`, the method its slot exists to
+/// be read by. 8,015 down to 7,969.
+///
+/// A later pass in the same ticket raised three rows without an
+/// extraction to match, and is recorded rather than chased further: each
+/// fix is a handful of lines scattered through logic already local to the
+/// file, not a second copy of anything or a self-contained idea with
+/// somewhere else to live. `lib.rs` 7,969 to 8,030: a module's own write
+/// (`insert_into_module`, `VirtualUpdate`, `VirtualDelete`) never called
+/// `record_changes`, so `changes()`/`total_changes()` stayed at zero after
+/// one; `RELEASE` of a savepoint stack's own implicit transaction never
+/// checked whether it had emptied the stack, so `autocommit()` stayed
+/// false after the equivalent of a `COMMIT`; and `VACUUM` swaps the whole
+/// `ImportedDatabase` for a freshly opened one, which was quietly zeroing
+/// `changes()`/`total_changes()`/`last_insert_rowid()` along with every
+/// other cell a fresh connection starts at zero. `ddl.rs` 2,810 to 2,821:
+/// the `RELEASE` fix's own dispatch, and one error miscoded `SQLITE_ERROR`
+/// as `SQLITE_MISUSE`. `dml.rs` 3,060 to 3,084: a sibling of `count_row`
+/// for a view's `INSTEAD OF` trigger, which must never count as the
+/// *outer* statement's own write - only the trigger body's nested write
+/// does, and that path already counted correctly.
+///
+/// A third pass, same ticket, is `dml.rs` again: 3,084 to 3,122, for the
+/// `Stored` enum that tells `write_one`'s caller a genuine insert from an
+/// `ON CONFLICT ... DO UPDATE` resolved onto a row already there.
+/// `last_insert_rowid()` moves only for the first - SQLite's rule, and one
+/// this file answered wrong by feeding both into the same
+/// `Changes::last_rowid` - and the enum is the seam the fix needed:
+/// `write_one`'s three return points now say which happened rather than
+/// handing back a bare row. Small, and not a second copy of anything to
+/// fold into.
+///
+/// `lib.rs` 8,030 to 8,041, for the free-map checkpoint defect: eleven
+/// lines threaded into `ImportedDatabase::checkpoint` so it logs and
+/// stamps the free map's own pages, the same way `inillucent-txn`'s
+/// `Engine::checkpoint` now does, before installing them, and so that
+/// `set_log_position` reads the durable point from *after* that logging
+/// rather than before it - see
+/// `inillucent_txn::engine::log_free_map_pages`. The idea the extraction
+/// would be *about* already moved, whole, into that shared function; what
+/// is left in this file is the handful of lines that call it and keep this
+/// harness's own durability order, which has nowhere else to live.
+///
+/// `ddl.rs` 2,821 to 2,837, for a defect the same ticket found alongside
+/// the free-map one: `refresh_statistics` logged a stale catalog row's
+/// rewrite under `current_txn()`, which outside a batch or a running
+/// statement is a transaction number nobody ever commits unless
+/// `ImportedDatabase::seal` is called - and nothing called it from a
+/// checkpoint, so the rewrite sat in the log forever uncommitted and
+/// unreplayable. The fix is `refresh_statistics` calling `self.seal()`
+/// after its own writes, which is a doc comment and six lines; there is no
+/// second copy of this logic anywhere in the file to fold into.
+/// `physical.rs` 6,756 down to 6,663, the same way. `reads_a_column` gained
+/// the `used.rowid` case it was missing - a join keyed on a rowid alias
+/// read no outer column as far as it was concerned, so a value that only
+/// exists per outer row was folded once as a statement-wide constant - and
+/// the comment recording why is worth more than the eight lines it costs.
+/// `run_recursive`, `distinct_rows` and `MAX_RECURSIVE_PASSES` moved whole
+/// into `crates/inillucent-exec/src/recursive.rs`, which is one job with
+/// one caller, rather than eight lines taken from somewhere to make a
+/// number fit.
+///
+/// `lib.rs` 7,910 down to 7,863, again by moving rather than trimming.
+/// `attach_statistics`, `statistics_rows` and `apply_statistics` went into
+/// `analyze.rs`, which is where the writing half of `ANALYZE` already lives
+/// and which was already calling two of them through `super::`. What pushed
+/// `lib.rs` over was `journal_for`, and that stays: it is the one place
+/// that decides a connection in `wal` still needs a rollback journal to
+/// make a checkpoint undoable, and it belongs beside the two callers that
+/// install one.
+///
+/// `lib.rs` 8,041 down to 7,910, and this one came *down*. The durability
+/// work of task-1911 pushed it to 8,152, and the answer to that is the one
+/// this list has always asked for: `OpenedFile`, `open_file`,
+/// `read_checkpointed_catalog` and `resume_above_every_stamp` moved whole
+/// into `crates/inillucent-engine/src/recovery.rs`, which is a coherent
+/// unit - opening one file and replaying its log into it - rather than a
+/// slice taken to make a number fit. Nothing in them changed in the move.
+// **Three rows went up in task-1932 and one came down.** `lib.rs` and
+// `ddl.rs` take the three `#![deny]` lines each was missing and the
+// paragraph saying why nothing had noticed - `policy.rs` matched on the
+// lint's name, which is in the `cfg_attr(test, allow(...))` block, so a
+// crate could satisfy the check while allowing all four. `ddl.rs` takes
+// H3's undo floor, which is the paragraph explaining why a directive is
+// several writes and why nothing put the earlier ones back; `plan.rs`
+// takes M6's walk of an aggregate's `FILTER` and inner `ORDER BY`. Both
+// are arguments rather than code - the code in each is a handful of lines
+// - and the ratchet's own rule is that an argument a later reader needs is
+// not what to cut to make a number fit. `paged.rs` paid for its own
+// addition with an extraction, below.
+// `paged.rs` came down from 3,685 to 3,570 in task-1932, because H7's
+// guard - a rowid is looked up by an integer or not at all - had to go
+// somewhere and the ratchet asks for an extraction rather than a raised
+// number. `KeyEncoding` and its four encode methods moved whole into
+// `crates/inillucent-tree/src/keyenc.rs`: one question, how a key tuple
+// becomes the bytes a tree is ordered by, rather than a slice taken to
+// make a number fit. Nothing in them changed in the move, and `paged.rs`
+// re-exports the type so no caller's path moved either.
+// Four rows for `inillucent-vm/src/{compile,compile_dml,machine}.rs` and
+// `inillucent-session/src/connection.rs` came off this list along with the
+// crates that held them: a ceiling on a file that is not in the workspace
+// any more is not a ratchet, it is a row nobody can act on, and the test
+// below already fails loudly with "is not there any more; remove its row"
+// for exactly this reason - removing them here is answering that failure
+// before it happens rather than after.
+const CEILINGS: [(&str, usize); 10] = [
+    // Lowered from 7,875 in task-1932. The plan cache's value type
+    // (`Cached`) and its ceiling moved to `plans.rs`, which is the module
+    // whose header explains when a plan is reused - the two halves of one
+    // idea were ninety lines apart in a file of nearly eight thousand.
+    // Lowered again in task-1932, this time by moving the savepoint
+    // boundary - `savepoint`, `rollback_to` and `release` - to `marks.rs`.
+    // All three changed in this ticket, because a virtual table module now
+    // hears about a savepoint and a release where before it heard about
+    // neither, so the seam was where the work already was.
+    // Lowered again to 7,428 in task-1932. `LearningRows`, `shape_of`,
+    // `identifier_of` and `decode_row` - the applier that decides what a
+    // log record means - moved whole into `recovery.rs`, which is where
+    // the half that decides *which* records to replay already lives. They
+    // were seven hundred lines apart in a file of nearly eight thousand.
+    ("crates/inillucent-engine/src/lib.rs", 7428),
+    // Lowered from 6,663 in task-1932. The window pass - `run_windowed` and
+    // the seven helpers only it calls - moved whole to
+    // `crates/inillucent-exec/src/windowpass.rs`, which is 575 lines this
+    // file no longer holds. It is reached from one line of
+    // `run_any_prepared` and nothing else here called any of it, so the
+    // seam was already there.
+    //
+    // Lowered again to 5,709, for M7's union fix. The nine functions that
+    // turn a plan's constraints into the keys and spans a cursor is
+    // positioned with - `nested_key`, `point_key`, the two union key
+    // builders, `range_union_bounds`, `span_bounds`, `index_affinity`,
+    // `bound_value` and `with_affinity`, along with `SpanBounds` - moved
+    // whole to `crates/inillucent-exec/src/physical/keys.rs`. They are one
+    // question, which is what bytes a cursor is asked to find, and the
+    // three places that position a cursor already reached for them
+    // together. Nothing in them changed in the move, and `physical.rs`
+    // re-exports `nested_key` and `SpanBounds` so no caller's path moved.
+    //
+    // 5,709 became 5,732 when the function ratchet below asked for the
+    // union's own decision to come out of `plan_stages` - which was 375
+    // lines and is now 353 - and `probes_one_entry_each` carries the
+    // argument that used to sit inside it. The file is 931 lines shorter
+    // than this ticket found it either way.
+    ("crates/inillucent-exec/src/physical.rs", 5_732),
+    // task-1913 lowered this to 5,111 in the shared checkout, with this
+    // note: "the ratchet asks for an extraction, so the ten items that
+    // answer 'what does this name in a `WITH` stand for' are `bind/cte.rs`:
+    // the two CTE types, `push_ctes`, `pop_ctes`, `find_cte`,
+    // `bind_recursive_cte`, `push_recursive_self` and the three that read
+    // whether a definition names itself."
+    //
+    // **It is back at 5,315 here until that extraction is committed
+    // (task-1932).** `bind/cte.rs` and the `bind.rs` it was taken out of are
+    // still uncommitted work in the checkout, and this file had to be
+    // committed for task-1932's own rows - so a number describing a state
+    // the repository does not hold would fail every clean checkout of it.
+    // Nothing of task-1913's was reverted: only this number, and it goes
+    // back to 5,111 when the extraction beside it lands.
+    ("crates/inillucent-sql/src/bind.rs", 5_315),
+    ("crates/inillucent-tree/src/leaf.rs", 5_175),
+    ("crates/inillucent-tree/src/paged.rs", 3_570),
+    ("crates/inillucent-exec/src/dml.rs", 3_122),
+    ("crates/inillucent-ext/src/vtab/fts5/mod.rs", 2_935),
+    ("crates/inillucent-engine/src/ddl.rs", 2_920),
+    // Lowered from 2,925 in task-1932. M7 added three functions for the
+    // anchored `LIKE` and `GLOB` range and a walk of an equality prefix
+    // ahead of an `IN` list, and the ratchet asks for an extraction rather
+    // than a raised number, so two went out. `pattern_range`,
+    // `anchored_prefix` and `next_prefix` are `plan/pattern.rs`: what
+    // range an anchored pattern selects, and the pairing rule that decides
+    // whether a range may be used at all. `comparison_collation`,
+    // `collation_of`, `comparison_against_column`,
+    // `comparison_against_rowid` and `mirror` are `plan/terms.rs`: reading
+    // one `WHERE` term as a comparison against one column, which
+    // `plan/pattern.rs` and `plan/seek_union.rs` were already reaching
+    // back into `plan.rs` for.
+    ("crates/inillucent-sql/src/plan.rs", 2_851),
+    ("crates/inillucent-bench/src/synth.rs", 2_600),
+];
+
 /// No module grows past the size it is recorded at, and the record only comes
 /// down.
 ///
@@ -474,65 +983,6 @@ fn no_new_crate_reaches_into_the_retired_engine() {
 /// rather than the other way round.
 #[test]
 fn no_module_grows_past_the_size_it_is_recorded_at() {
-    /// Every module over 2,500 lines, with the ceiling it is held to.
-    ///
-    /// `ImportedDatabase::import_into` - 493 lines that did seven things - was
-    /// moved into `inillucent-engine/src/import.rs` as seven named phases,
-    /// which is what took `lib.rs` from 8,415 to its number here.
-    ///
-    /// The seek-union feature (`AccessPath::RowidSeekUnion` and
-    /// `IndexSeekUnion`, turning an `IN` list and a keyset page's disjunction
-    /// into seeks instead of a scan) touches four of these. `plan.rs`'s own
-    /// growth was cut from 652 lines to 275 by moving the union-construction
-    /// functions into `crates/inillucent-sql/src/plan/seek_union.rs`; the
-    /// rest - the enum variants themselves, and the `describe`/cost/ordering
-    /// match arms that must stay beside the rest of `AccessPath` - has
-    /// nowhere else to go. `physical.rs`, `compile.rs` and `compile_dml.rs`
-    /// each need one new executor arm per engine and are raised as measured,
-    /// with no further extraction attempted this pass.
-    ///
-    /// `physical.rs` is raised by one more line for task-1900. Making a
-    /// registered function reachable from `ORDER BY` - which is what a semantic
-    /// search *is*, `ORDER BY vector_distance_cos(v, embed('...')) LIMIT k` -
-    /// meant handing the catalog to the space a statement's stages are viewed
-    /// through, at the three call sites that already hold one. That is three
-    /// added lines and two saved on a field comment whose claim had stopped
-    /// being true. The extraction the message asks for is available and is not
-    /// small: `literal_value` and `rowid_seek_key` would move cleanly, and they
-    /// are named by path from twelve call sites in `inillucent-engine`, so it is
-    /// a cross-crate rename in a file this ticket otherwise has no business in.
-    /// task-1886 needed one counter and one accessor on `ImportedDatabase` -
-    /// how many statements a connection has compiled, which is what the plan
-    /// cache guard in `crates/inillucent/tests/budget.rs` asserts on now that it
-    /// no longer asserts on a stopwatch. `lib.rs` was two lines under its
-    /// ceiling, so there was no version of that addition this test would take.
-    ///
-    /// The extraction it asked for was available and was one idea: the plan
-    /// cache. `plan_key`, `cacheable`, `compiled`, `cached_plan_count` and the
-    /// new `compiled_statement_count` are all about *whether* to compile, and
-    /// they moved to `crates/inillucent-engine/src/plans.rs`; `compile`, which
-    /// is about *how*, stayed with the parser and binder plumbing it is written
-    /// in terms of. `lib.rs` went from 8,128 to 8,068, and its number here is
-    /// left where it is rather than followed down to 8,070 - a ceiling two lines
-    /// above the file is what sent somebody here in the first place, and this
-    /// test's own slack rule allows 200.
-    const CEILINGS: [(&str, usize); 14] = [
-        ("crates/inillucent-engine/src/lib.rs", 8_130),
-        ("crates/inillucent-exec/src/physical.rs", 6_691),
-        ("crates/inillucent-sql/src/bind.rs", 5_315),
-        ("crates/inillucent-tree/src/leaf.rs", 5_315),
-        ("crates/inillucent-vm/src/compile.rs", 5_070),
-        ("crates/inillucent-tree/src/paged.rs", 3_685),
-        ("crates/inillucent-vm/src/compile_dml.rs", 3_335),
-        ("crates/inillucent-exec/src/dml.rs", 3_240),
-        ("crates/inillucent-ext/src/vtab/fts5/mod.rs", 3_135),
-        ("crates/inillucent-engine/src/ddl.rs", 2_950),
-        ("crates/inillucent-session/src/connection.rs", 2_855),
-        ("crates/inillucent-vm/src/machine.rs", 2_700),
-        ("crates/inillucent-sql/src/plan.rs", 2_910),
-        ("crates/inillucent-bench/src/synth.rs", 2_600),
-    ];
-
     let root = workspace_root();
     let mut over: Vec<String> = Vec::new();
     let mut shrunk: Vec<String> = Vec::new();
@@ -566,4 +1016,814 @@ fn no_module_grows_past_the_size_it_is_recorded_at() {
          The ceiling follows the work rather than the other way round.",
         shrunk.join("\n")
     );
+}
+
+/// H10 (task-1920): every skip site ends its message with the one marker.
+///
+/// **A skip nobody can see is a suite that reports green having asserted
+/// nothing, which is exactly what `--strict` exists to make visible.** Before
+/// this there were three phrasings and `testrun`'s classifier held a list of
+/// six substrings trying to catch them. Two of the three matched none of the
+/// six: `crates/inillucent-remote/tests/transport.rs` printed `...; case
+/// skipped` and the ONNX suites printed `skipping: ...`. The TLS one mattered
+/// most, because that binary runs other tests too - so it was invisible to
+/// `--strict` by both routes at once, and a CI image without Python's `ssl`
+/// module passed the TLS verification suite without running any of it.
+///
+/// The rule this checks is the one `tests/inillucent-testing-tdd.md` §9 states:
+/// a message that precedes an early return ends with `; skipping`. It is a grep
+/// rather than a type because a skip is a `return`, and no type can be put on
+/// the absence of work.
+#[test]
+fn every_skip_site_carries_the_one_marker() {
+    let root = workspace_root();
+    let mut wrong: Vec<String> = Vec::new();
+    let mut found = 0usize;
+    for file in rust_sources(&root) {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        for (at, line) in lines.iter().enumerate() {
+            let Some(message) = quoted_after(line, "eprintln!(") else {
+                continue;
+            };
+            // A skip is an announcement followed by an early return. Anything
+            // else an `eprintln!` says is progress or a warning, and neither is
+            // a claim that a suite ran.
+            let follows = lines
+                .get(at..at.saturating_add(4))
+                .unwrap_or_default()
+                .join("\n");
+            let returns = follows.contains("\n        return;")
+                || follows.contains("\n            return;")
+                || follows.contains("\n                return;")
+                || follows.contains("\n    return;")
+                || follows.contains("return Ok(());");
+            if !returns {
+                continue;
+            }
+            found = found.saturating_add(1);
+            if !message.contains("; skipping") {
+                wrong.push(format!(
+                    "{}:{}: {message}",
+                    file.strip_prefix(&root).unwrap_or(&file).display(),
+                    at.saturating_add(1)
+                ));
+            }
+        }
+    }
+    assert!(
+        found > 0,
+        "no skip site was found at all, which means this check is looking in \
+         the wrong place rather than that every suite runs"
+    );
+    assert!(
+        wrong.is_empty(),
+        "these skip messages do not end with `; skipping`, so `--strict` cannot \
+         see them:\n{}\n`inillucent-testrun` matches that one phrase, and \
+         `tests/inillucent-testing-tdd.md` §9 asks for it.",
+        wrong.join("\n")
+    );
+}
+
+/// Every early return in a test says why, one way or another.
+///
+/// **The companion to the check above, and the one that would have found this
+/// class rather than waiting for somebody to run the suite without a build
+/// (task-1913).** `every_skip_site_carries_the_one_marker` reads the *message*
+/// a skip prints and demands the marker. It cannot see a skip that prints
+/// nothing at all, and eighteen of them were sitting in `cli_arguments.rs` and
+/// `confinement.rs` written as
+///
+/// ```ignore
+/// let Some(program) = binary("inillucent") else { return; };
+/// ```
+///
+/// A build that did not produce the binary made all eighteen report success
+/// having asserted nothing - including the ten that check a confined server
+/// cannot be talked into opening a file outside its root. `--strict` could not
+/// see them either, because there was no message for its classifier to read.
+/// task-1944 found the same shape behind a missing fixture, where a data-loss
+/// bug sat behind two durability tests that had been skipping rather than
+/// passing.
+///
+/// The rule: a `let ... else { return; }` in a `#[test]` function announces,
+/// and it may do so in any of the three ways this workspace already uses -
+/// `differential::skipping` in the else-block, an `eprintln!` ending in the
+/// `; skipping` marker, or an announcement inside the helper the `let` calls.
+/// A `panic!` or an `assert!` counts too: a test that fails is not a test that
+/// silently passed.
+#[test]
+fn every_early_return_in_a_test_says_why() {
+    let root = workspace_root();
+    let mut silent: Vec<String> = Vec::new();
+    let mut found = 0usize;
+    for file in rust_sources(&root) {
+        if !file.components().any(|part| part.as_os_str() == "tests") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let helpers = announcing_helpers(&lines);
+        for at in test_function_lines(&lines) {
+            let Some(line) = lines.get(at) else {
+                continue;
+            };
+            if !line.trim_end().ends_with("else {") {
+                continue;
+            }
+            let block = lines
+                .get(at..at.saturating_add(8))
+                .unwrap_or_default()
+                .join("\n");
+            let block = match block.find("};") {
+                Some(end) => block.get(..end).unwrap_or(&block).to_string(),
+                None => block,
+            };
+            if !block.lines().any(|line| line.trim() == "return;") {
+                continue;
+            }
+            found = found.saturating_add(1);
+            if announces(&block) {
+                continue;
+            }
+            // The helper the `let` called may announce instead, which is how
+            // `cli_arguments.rs` and `confinement.rs` do it: one place to get
+            // right rather than one per case. Only the `let` line is read -
+            // taking the comment above it as well let a helper *named* in
+            // prose stand in for one that was called.
+            let call = line.split("//").next().unwrap_or("");
+            if helpers
+                .iter()
+                .any(|name| call.contains(&format!("{name}(")))
+            {
+                continue;
+            }
+            silent.push(format!(
+                "{}:{}: {}",
+                file.strip_prefix(&root).unwrap_or(&file).display(),
+                at.saturating_add(1),
+                line.trim()
+            ));
+        }
+    }
+    assert!(
+        found > 10,
+        "found {found} early returns in tests, which means this is looking in the wrong place \
+         rather than that no test has one"
+    );
+    assert!(
+        silent.is_empty(),
+        "these tests return early without saying why, so a missing prerequisite makes them \
+         report success having run nothing:\n{}\n\
+         Announce it with `differential::skipping`, which `--strict` turns into a failure, or \
+         from the helper the `let` calls.",
+        silent.join("\n")
+    );
+}
+
+/// Reports whether a block announces that it did not run.
+///
+/// **Comments do not count.** The doc comment above `binary()` in
+/// `cli_arguments.rs` explains why the helper announces, so a check that read
+/// the text would go on passing after somebody deleted the call it describes -
+/// which is the check grading its own documentation rather than the code.
+///
+/// @param block - the source to read
+fn announces(block: &str) -> bool {
+    announces_by_saying_so(block)
+        || code_of(block).any(|code| code.contains("panic!") || code.contains("assert!"))
+}
+
+/// Reports whether source says, in one of this workspace's three spellings,
+/// that the work did not run.
+///
+/// @param block - the source to read
+fn announces_by_saying_so(block: &str) -> bool {
+    code_of(block).any(|code| {
+        code.contains("skipping(") || code.contains("announce_skip") || code.contains("; skipping")
+    })
+}
+
+/// Returns each line of some source with its trailing comment removed.
+///
+/// @param block - the source to read
+fn code_of(block: &str) -> impl Iterator<Item = &str> {
+    block
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or(""))
+}
+
+/// Returns the names of the functions in a file that announce a skip.
+///
+/// The body ends where its braces balance, so a function that does not
+/// announce cannot borrow the announcement of the one written after it.
+///
+/// @param lines - the file's lines
+fn announcing_helpers(lines: &[&str]) -> Vec<String> {
+    let mut names = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let Some(name) = function_name(line) else {
+            continue;
+        };
+        let mut depth = 0i32;
+        let mut opened = false;
+        let mut body: Vec<&str> = Vec::new();
+        for cursor in at..lines.len() {
+            let Some(source) = lines.get(cursor) else {
+                break;
+            };
+            depth = depth
+                .saturating_add(source.matches('{').count() as i32)
+                .saturating_sub(source.matches('}').count() as i32);
+            if source.contains('{') {
+                opened = true;
+            }
+            body.push(source);
+            if opened && depth <= 0 {
+                break;
+            }
+        }
+        // An `assert!` or a `panic!` is not an announcement when it is inside
+        // a helper: nearly every helper in these files asserts something, and
+        // accepting that made every `let ... else` whose right-hand side named
+        // one look announced. In an `else` block it does count, because a case
+        // that fails is not a case that silently passed.
+        if announces_by_saying_so(&body.join("\n")) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Returns the name a `fn` line declares.
+///
+/// @param line - the source line
+fn function_name(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let rest = trimmed
+        .strip_prefix("fn ")
+        .or_else(|| trimmed.strip_prefix("pub fn "))
+        .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+        .or_else(|| trimmed.strip_prefix("pub(super) fn "))?;
+    let name: String = rest
+        .chars()
+        .take_while(|letter| letter.is_alphanumeric() || *letter == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Returns the line numbers that lie inside a `#[test]` function.
+///
+/// @param lines - the file's lines
+fn test_function_lines(lines: &[&str]) -> Vec<usize> {
+    let mut inside = Vec::new();
+    let mut at = 0usize;
+    while at < lines.len() {
+        if lines.get(at).is_none_or(|line| line.trim() != "#[test]") {
+            at = at.saturating_add(1);
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut opened = false;
+        let mut cursor = at;
+        while cursor < lines.len() {
+            let Some(line) = lines.get(cursor) else {
+                break;
+            };
+            depth = depth
+                .saturating_add(line.matches('{').count() as i32)
+                .saturating_sub(line.matches('}').count() as i32);
+            if line.contains('{') {
+                opened = true;
+            }
+            inside.push(cursor);
+            if opened && depth <= 0 {
+                break;
+            }
+            cursor = cursor.saturating_add(1);
+        }
+        at = cursor.saturating_add(1);
+    }
+    inside
+}
+
+/// Returns the text between the first pair of quotes after a marker.
+///
+/// @param line - the source line
+/// @param marker - what the string follows
+fn quoted_after(line: &str, marker: &str) -> Option<String> {
+    let at = line.find(marker)?;
+    let rest = line.get(at.saturating_add(marker.len())..)?;
+    let open = rest.find('"')?;
+    let body = rest.get(open.saturating_add(1)..)?;
+    let close = body.find('"')?;
+    Some(body.get(..close)?.to_string())
+}
+
+/// Returns every `.rs` file in the workspace's own sources.
+///
+/// @param root - the workspace root
+fn rust_sources(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.join("crates"), root.join("drivers")];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name == "target") {
+                    continue;
+                }
+                pending.push(path);
+            } else if path.extension().is_some_and(|kind| kind == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// The shell may reach past the driver only where it is recorded, and the
+/// numbers only go down.
+///
+/// **The driver's README calls it "the one surface every language binding
+/// reaches the engine through", and the shell was not using it (task-1932,
+/// M1).** Eight files under `crates/inillucent-cli/src` named
+/// `inillucent_engine` directly, which makes the driver one of two surfaces
+/// rather than the one - and a difference between them is a difference every
+/// binding inherits while the shell, the program most people meet first, does
+/// not.
+///
+/// This is a ratchet rather than a ban, because moving the shell onto the
+/// driver is not one change. `Shell` opens sessions, registers virtual table
+/// modules, installs an authorizer, reads pool statistics and drives `ATTACH` -
+/// several of which the driver does not offer, and each one is a decision about
+/// what the driver's surface should be rather than a mechanical substitution.
+/// What a ratchet buys is that the number cannot go up while that is decided:
+/// a new file reaching past the driver fails here, and a file that moves has
+/// its row deleted.
+///
+/// The count is of *lines* naming the crate rather than of files, so a file
+/// that moves half of its uses still shows progress.
+#[test]
+fn no_shell_file_reaches_past_the_driver_more_than_it_is_recorded_at() {
+    // Every file under `crates/inillucent-cli/src` that names
+    // `inillucent_engine`, and how many lines of it do. Measured at
+    // task-1932; a row at zero is a file that has moved and whose row should
+    // be deleted.
+    const REACHES: [(&str, usize); 8] = [
+        // The shell itself: sessions, virtual table modules, the authorizer,
+        // pool statistics, `ATTACH`. The largest of the eight and the one whose
+        // move decides what the driver's surface has to become.
+        ("crates/inillucent-cli/src/shell.rs", 10),
+        // The command table's context and its budget arming.
+        ("crates/inillucent-cli/src/command/mod.rs", 8),
+        // The dot commands, which reach the engine for `.dbinfo`, `.stats` and
+        // the serialisation verbs.
+        ("crates/inillucent-cli/src/commands.rs", 7),
+        // The VFS, for `inillucent diagnose`. Reached through the engine's own
+        // re-export rather than through engine internals, so this one is a
+        // dependency question rather than a surface question.
+        ("crates/inillucent-cli/src/diagnose.rs", 2),
+        // `migrate` and `batch`, which drive a transaction.
+        ("crates/inillucent-cli/src/command/verbs.rs", 2),
+        // One function signature taking an engine connection, which follows
+        // `shell.rs`.
+        ("crates/inillucent-cli/src/import.rs", 1),
+        // A sentence in a module comment naming `inillucent_engine::pragma`.
+        // Not a dependency; it is counted because the check reads lines rather
+        // than imports, and a comment that stops being true is worth the row.
+        ("crates/inillucent-cli/src/dbconfig.rs", 1),
+        // The MCP server. Down from one to zero in task-1932: the budget types
+        // it needed are re-exported by the driver now.
+        ("crates/inillucent-cli/src/mcp.rs", 0),
+    ];
+
+    let root = workspace_root();
+    let mut over: Vec<String> = Vec::new();
+    let mut gone: Vec<String> = Vec::new();
+    for (relative, recorded) in REACHES {
+        let path = root.join(relative);
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            gone.push(format!("{relative} is not there any more; remove its row"));
+            continue;
+        };
+        let reaching = source
+            .lines()
+            .filter(|line| line.contains("inillucent_engine"))
+            .count();
+        if reaching > recorded {
+            over.push(format!(
+                "{relative}: {reaching} lines name `inillucent_engine`, past its {recorded}"
+            ));
+        }
+    }
+
+    // And no file outside the list may name it at all.
+    let mut unlisted: Vec<String> = Vec::new();
+    for path in rust_files(&root.join("crates/inillucent-cli/src")) {
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if REACHES.iter().any(|(named, _)| *named == relative) {
+            continue;
+        }
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if source.contains("inillucent_engine") {
+            unlisted.push(relative);
+        }
+    }
+
+    assert!(
+        gone.is_empty(),
+        "the ratchet names files that are not there:\n{}",
+        gone.join("\n")
+    );
+    assert!(
+        over.is_empty(),
+        "these shell files reach past the driver more than they are recorded at:\n{}\n\
+         Reach the engine through `inillucent_driver`. If the driver does not offer what \
+         the file needs, the driver gains it - that is what makes its README true.",
+        over.join("\n")
+    );
+    assert!(
+        unlisted.is_empty(),
+        "these shell files name `inillucent_engine` and are not in the ratchet:\n{}\n\
+         A new file reaching past the driver is the thing this check exists to stop.",
+        unlisted.join("\n")
+    );
+}
+
+/// Every fuzz target is in the scheduled workflow's matrix.
+///
+/// **A target nobody runs is a file, not a test (task-1932, M11).** `fuzz/`
+/// held twelve targets and no workflow mentioned it, so all twelve had run
+/// nowhere since they were written. `.github/workflows/fuzz.yml` runs them on a
+/// schedule, and its matrix is a hand-written list - which is exactly the kind
+/// of list that goes stale the first time somebody adds a target. This compares
+/// it against `fuzz/Cargo.toml`'s `[[bin]]` sections, in both directions: a
+/// target with no matrix entry would run nowhere again, and a matrix entry with
+/// no target would fail the job every night for a target that does not exist.
+#[test]
+fn every_fuzz_target_is_in_the_scheduled_workflow() {
+    let root = workspace_root();
+    let manifest = std::fs::read_to_string(root.join("fuzz/Cargo.toml"))
+        .expect("the fuzz manifest is readable");
+    let declared: Vec<String> = manifest
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("name = "))
+        .map(|name| name.trim().trim_matches('"').to_string())
+        // The package's own `name = "inillucent-fuzz"` is not a target.
+        .filter(|name| name != "inillucent-fuzz")
+        .collect();
+    assert!(
+        declared.len() >= 12,
+        "only {} fuzz targets were found in the manifest, so this test is not reading it right",
+        declared.len()
+    );
+
+    let workflow = std::fs::read_to_string(root.join(".github/workflows/fuzz.yml"))
+        .expect("the fuzz workflow is readable");
+    let scheduled: Vec<String> = workflow
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("- "))
+        .map(str::to_string)
+        // The matrix entries are bare words; every other `- ` line in the file
+        // is a step, a `uses:` or the cron entry, and each of those holds a
+        // character no target name can.
+        .filter(|entry| {
+            entry
+                .chars()
+                .all(|letter| letter.is_ascii_lowercase() || letter == '_')
+        })
+        .collect();
+
+    let unscheduled: Vec<&String> = declared
+        .iter()
+        .filter(|name| !scheduled.contains(name))
+        .collect();
+    assert!(
+        unscheduled.is_empty(),
+        "these fuzz targets are in fuzz/Cargo.toml and in no workflow, so nothing runs them:          {unscheduled:?}"
+    );
+    let missing: Vec<&String> = scheduled
+        .iter()
+        .filter(|name| !declared.contains(name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the fuzz workflow schedules targets that fuzz/Cargo.toml does not declare: {missing:?}"
+    );
+}
+
+/// How long each function over 150 lines is allowed to be.
+///
+/// **The function ratchet, beside the module one (task-1932, TDD section 7).**
+/// The review counted twenty functions over 150 lines and recommended exactly
+/// this: record each at its current length, so new code cannot add to the list
+/// and a fix that touches one of them leaves it no longer than it found it. A
+/// module ceiling alone does not do that - a file can stay the same size while
+/// one function inside it absorbs every change, which is how a five hundred
+/// line function is arrived at.
+///
+/// Measured the way `function_lengths` measures: from the line that opens the
+/// function to the first line that is exactly its indentation and a closing
+/// brace. That is a lexical rule rather than a parse, and it is the same rule
+/// for every entry, which is what a ratchet needs.
+const FUNCTION_CEILINGS: [(&str, &str, usize); 65] = [
+    ("crates/inillucent-bench/src/gradeembed.rs", "run", 531),
+    ("crates/inillucent-exec/src/physical.rs", "translate", 494),
+    ("crates/inillucent-bench/src/main.rs", "main", 488),
+    ("crates/inillucent-compat/src/perf.rs", "plan_for", 450),
+    ("crates/inillucent-bench/src/scenarios.rs", "grade", 445),
+    (
+        "crates/inillucent-compat/tests/policy.rs",
+        "no_module_grows_past_the_size_it_is_recorded_at",
+        393,
+    ),
+    ("crates/inillucent-compat/src/bin/fullgate.rs", "run", 389),
+    ("crates/inillucent-exec/src/physical.rs", "build_upper", 383),
+    ("crates/inillucent-compat/src/bin/readgate.rs", "run", 370),
+    ("crates/inillucent-exec/src/join.rs", "push", 362),
+    ("crates/inillucent-exec/src/physical.rs", "plan_stages", 353),
+    ("crates/inillucent-engine/src/lib.rs", "load_schema", 329),
+    ("crates/inillucent-compat/src/bin/writegate.rs", "run", 318),
+    (
+        "crates/inillucent-engine/src/vtab.rs",
+        "rows_of_module",
+        313,
+    ),
+    ("crates/inillucent-sql/src/bind.rs", "bind_expr", 303),
+    ("crates/inillucent-engine/src/ddl.rs", "run_directive", 273),
+    ("crates/inillucent-tree/src/paged.rs", "skip_scan", 249),
+    ("crates/inillucent-sql/src/bind.rs", "bind_call_with", 248),
+    ("crates/inillucent-bench/src/synth.rs", "build_source", 243),
+    ("crates/inillucent-exec/src/expr.rs", "compile", 242),
+    (
+        "crates/inillucent-tree/src/leaf.rs",
+        "encode_rows_with",
+        239,
+    ),
+    ("crates/inillucent-bench/src/report.rs", "render", 238),
+    (
+        "crates/inillucent-compat/src/bin/readperf.rs",
+        "measure",
+        232,
+    ),
+    ("crates/inillucent-migrate/src/verify.rs", "retrieval", 229),
+    ("crates/inillucent-storage/src/mutate.rs", "balance", 224),
+    ("crates/inillucent-compat/src/bin/analytical.rs", "run", 223),
+    ("crates/inillucent-engine/src/lib.rs", "write", 219),
+    (
+        "crates/inillucent-compat/src/bin/storageprofile.rs",
+        "run",
+        218,
+    ),
+    ("crates/inillucent-exec/src/dml.rs", "update_at_cached", 215),
+    ("crates/inillucent-bench/src/synth.rs", "check", 214),
+    ("crates/inillucent-model/tests/campaign.rs", "segment", 213),
+    ("crates/inillucent-engine/src/lib.rs", "import_into", 210),
+    ("crates/inillucent-tree/src/write.rs", "write_row", 206),
+    ("crates/inillucent-exec/src/dml.rs", "insert_at", 205),
+    ("crates/inillucent-engine/src/ddl.rs", "create_index", 192),
+    (
+        "crates/inillucent-compat/src/fixtures.rs",
+        "malformed_fixtures",
+        192,
+    ),
+    ("crates/inillucent-remote/src/migrate.rs", "run", 191),
+    ("crates/inillucent-sql/src/plan.rs", "plan_select_with", 189),
+    ("crates/inillucent-migrate/src/lib.rs", "migrate", 189),
+    (
+        "crates/inillucent-compat/src/bin/writeperf.rs",
+        "measure_scale",
+        183,
+    ),
+    ("crates/inillucent-storage/src/check.rs", "check_tree", 182),
+    (
+        "crates/inillucent-core/src/embed_onnx.rs",
+        "run_encodings",
+        182,
+    ),
+    ("crates/inillucent-compat/src/bin/release.rs", "run", 176),
+    ("crates/inillucent-engine/src/recovery.rs", "open_file", 173),
+    (
+        "crates/inillucent-compat/src/fixtures.rs",
+        "valid_fixtures",
+        173,
+    ),
+    (
+        "crates/inillucent-tree/src/paged.rs",
+        "bulk_build_rows",
+        167,
+    ),
+    ("crates/inillucent-core/src/bm25.rs", "search", 167),
+    ("crates/inillucent-tree/src/write.rs", "make_room", 166),
+    (
+        "crates/inillucent-sql/src/bind.rs",
+        "bind_column_reference",
+        165,
+    ),
+    (
+        "crates/inillucent-engine/src/import.rs",
+        "carry_tables",
+        165,
+    ),
+    ("crates/inillucent-sql/src/plan.rs", "index_candidate", 164),
+    ("crates/inillucent-compat/src/bin/testrun.rs", "report", 164),
+    ("crates/inillucent-compat/src/bin/planperf.rs", "run", 163),
+    ("crates/inillucent-bench/src/synth.rs", "build", 163),
+    (
+        "crates/inillucent-engine/src/vtab.rs",
+        "create_virtual_table",
+        161,
+    ),
+    ("crates/inillucent-tree/src/write.rs", "merge_if_small", 157),
+    ("crates/inillucent-scalar/src/builtin.rs", "call_with", 157),
+    (
+        "crates/inillucent-sql/src/plan/seek_union.rs",
+        "in_list_union_path",
+        154,
+    ),
+    (
+        "crates/inillucent-remote/src/tls/windows.rs",
+        "handshake",
+        154,
+    ),
+    ("crates/inillucent-engine/src/lib.rs", "apply_compiled", 154),
+    (
+        "crates/inillucent-compat/src/bin/probeprofile.rs",
+        "probe_stages",
+        154,
+    ),
+    (
+        "crates/inillucent-engine/src/vectors.rs",
+        "create_vector_index",
+        153,
+    ),
+    ("crates/inillucent-core/src/filter.rs", "compile", 153),
+    (
+        "crates/inillucent-remote/src/tls/windows.rs",
+        "verify_against",
+        151,
+    ),
+    (
+        "crates/inillucent-compat/src/bin/fullgate.rs",
+        "report_costs",
+        151,
+    ),
+];
+
+/// The length past which a function that is not already recorded fails.
+///
+/// The same number the review counted at, so the recorded list is exactly what
+/// was over 150 lines when the ratchet was written.
+const LONGEST_NEW_FUNCTION: usize = 150;
+
+/// Returns the length of every function in one file, longest wins per name.
+///
+/// A name that appears twice in a file - the same method on two types, or a
+/// trait method implemented several times - is recorded once, at its longest,
+/// because the ratchet is about the function that is too long rather than about
+/// which impl block it sits in.
+///
+/// @param text - the file's contents
+fn function_lengths(text: &str) -> std::collections::BTreeMap<String, usize> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut found: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (at, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let indent = line.len().saturating_sub(trimmed.len());
+        let Some(name) = opens_a_function(trimmed) else {
+            continue;
+        };
+        let closing = format!("{}}}", " ".repeat(indent));
+        for (offset, later) in lines.iter().enumerate().skip(at.saturating_add(1)) {
+            if *later == closing {
+                let length = offset.saturating_sub(at).saturating_add(1);
+                let held = found.entry(name).or_insert(0);
+                *held = (*held).max(length);
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// Returns the name a line declares, when the line opens a function.
+///
+/// Keywords are stripped in the order Rust writes them. Anything else - a `fn`
+/// inside a string, a function pointer type - answers `None`, because the name
+/// has to be followed by a parameter list or a generic list for this to be a
+/// declaration.
+///
+/// @param trimmed - the line with its leading spaces removed
+fn opens_a_function(trimmed: &str) -> Option<String> {
+    let mut rest = trimmed;
+    for keyword in [
+        "pub(crate) ",
+        "pub(super) ",
+        "pub(self) ",
+        "pub ",
+        "default ",
+        "const ",
+        "async ",
+        "unsafe ",
+    ] {
+        while let Some(shorter) = rest.strip_prefix(keyword) {
+            rest = shorter;
+        }
+    }
+    if let Some(shorter) = rest.strip_prefix("extern \"") {
+        rest = shorter
+            .split_once('"')
+            .map(|(_, after)| after.trim_start())?;
+    }
+    let rest = rest.strip_prefix("fn ")?;
+    let name: String = rest
+        .chars()
+        .take_while(|letter| letter.is_alphanumeric() || *letter == '_')
+        .collect();
+    let after = rest.get(name.len()..)?;
+    (!name.is_empty() && (after.starts_with('(') || after.starts_with('<'))).then_some(name)
+}
+
+/// No function grows past the length it is recorded at, and no new one joins
+/// the list.
+#[test]
+fn no_function_grows_past_the_length_it_is_recorded_at() {
+    let root = workspace_root();
+    let mut measured: std::collections::BTreeMap<(String, String), usize> =
+        std::collections::BTreeMap::new();
+    // `crates/` and `drivers/` are the workspace's own sources. Walking the
+    // root instead also walks `target/`, which holds a copy of several crates
+    // under `target/package/` and the retired `inillucent-vm` among them - so
+    // the ratchet reported functions nobody can edit, and took five minutes.
+    let mut sources = rust_files(&root.join("crates"));
+    sources.extend(rust_files(&root.join("drivers")));
+    for path in sources {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let named = relative(&root, &path);
+        for (name, length) in function_lengths(&text) {
+            measured.insert((named.clone(), name), length);
+        }
+    }
+
+    let mut over: Vec<String> = Vec::new();
+    let mut joined: Vec<String> = Vec::new();
+    for ((path, name), length) in &measured {
+        let recorded = FUNCTION_CEILINGS
+            .iter()
+            .find(|(held, called, _)| held == path && called == name)
+            .map(|(_, _, ceiling)| *ceiling);
+        match recorded {
+            Some(ceiling) if *length > ceiling => {
+                over.push(format!(
+                    "{path}::{name}: {length} lines, past its {ceiling}"
+                ));
+            }
+            Some(_) => {}
+            None if *length > LONGEST_NEW_FUNCTION => {
+                joined.push(format!("{path}::{name}: {length} lines"));
+            }
+            None => {}
+        }
+    }
+    let gone: Vec<String> = FUNCTION_CEILINGS
+        .iter()
+        .filter(|(path, name, _)| {
+            !measured.contains_key(&((*path).to_string(), (*name).to_string()))
+        })
+        .map(|(path, name, _)| format!("{path}::{name} is not there any more; remove its row"))
+        .collect();
+
+    assert!(
+        over.is_empty(),
+        "these functions grew past the length they are recorded at:\n{}\n\
+         Split one out rather than raising the number - a function reaches five hundred lines \
+         because every individual addition to it was reasonable.",
+        over.join("\n")
+    );
+    assert!(
+        joined.is_empty(),
+        "these functions are over {LONGEST_NEW_FUNCTION} lines and are not on the recorded \
+         list:\n{}\n\
+         The list is what already exists, not a budget: write the new one shorter.",
+        joined.join("\n")
+    );
+    assert!(gone.is_empty(), "{}", gone.join("\n"));
 }

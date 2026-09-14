@@ -1,22 +1,37 @@
 //! The public engine: one type holding the store, the vectors, the graph, the
 //! quantized codes and the inverted index, with the three query paths the current
 //! stack exposes.
+//!
+//! Invariant: **the parts agree about which chunk is which.** The store, the
+//! vectors, the graph, the quantized codes and the inverted index are five
+//! structures addressed by one chunk identifier, and a build or an append that
+//! advanced some of them and not others would return a neighbour list whose
+//! text belongs to different rows.
 
 use crate::bm25::{Bm25Index, LexicalHit, LexicalParams};
+use crate::distance::Metric;
 use crate::filter::{CompiledFilter, Filter};
 use crate::flat::{self, Neighbour};
 use crate::hnsw::{Hnsw, HnswParams};
 use crate::quantize::QuantizedSet;
 use crate::rank::{
-    self, AdaptiveWeights, Fusion, FusedHit, FusionParams, QuerySignals, ScoreBounds, PER_DOC_CAP,
+    self, AdaptiveWeights, FusedHit, Fusion, FusionParams, QuerySignals, ScoreBounds, PER_DOC_CAP,
 };
 use crate::store::{ChunkInput, Store};
 use crate::tokenize::Tokenizer;
 use crate::vectors::VectorSet;
 
+/// Every setting an index is built and queried with.
 #[derive(Debug, Clone, Copy)]
 pub struct IndexConfig {
+    /// How wide the vectors are.
     pub dims: usize,
+    /// The distance the vector branch minimises. Decided once, at
+    /// construction: it decides whether `add`/`append` normalize a vector on
+    /// the way in, so a config that changed metric after vectors were already
+    /// stored would leave old and new rows compared inconsistently.
+    pub metric: Metric,
+    /// How the graph is built and how widely it is searched.
     pub hnsw: HnswParams,
     /// Hold the full precision vectors on the heap rather than reading them from
     /// the index file as they are scored.
@@ -42,7 +57,9 @@ pub struct IndexConfig {
     pub oversample: f32,
     /// Candidates drawn from each side before fusion. The baseline uses 50.
     pub candidates: usize,
+    /// How the vector list and the lexical list are combined.
     pub fusion: Fusion,
+    /// How many chunks of one document may appear in a fused list.
     pub per_doc_cap: usize,
     /// Whether a query term also matches the terms it prefixes.
     pub lexical_prefix: bool,
@@ -86,6 +103,7 @@ impl Default for IndexConfig {
     fn default() -> Self {
         IndexConfig {
             dims: 768,
+            metric: Metric::Cosine,
             hnsw: HnswParams::default(),
             // Off. See the field for the argument; the short version is that the
             // vectors are the largest thing an index holds and the operating
@@ -100,7 +118,9 @@ impl Default for IndexConfig {
             // nDCG 0.751 against 0.434 on natural language queries, 0.981 against 0.933
             // on document identity. RRF is still available and still what `Fusion`
             // defaults to on its own; this is the engine saying which one it recommends.
-            fusion: Fusion::NormalizedScore { vector_weight: 0.35 },
+            fusion: Fusion::NormalizedScore {
+                vector_weight: 0.35,
+            },
             per_doc_cap: PER_DOC_CAP,
             // Measured off. Prefix matching lets `town` match `township`, which is what
             // PostgreSQL offers through `:*`, and on a 512,000 term dictionary it mostly
@@ -180,6 +200,8 @@ impl Default for IndexConfig {
     }
 }
 
+/// The engine: a store, its vectors, its graph, its quantized codes and its
+/// inverted index, addressed by one chunk identifier.
 pub struct Index {
     config: IndexConfig,
     store: Store,
@@ -191,14 +213,24 @@ pub struct Index {
     force_graph: bool,
 }
 
+/// What one build produced, so a report does not have to ask the index five
+/// separate questions.
 pub struct BuildStats {
+    /// How many chunks were indexed.
     pub chunks: usize,
+    /// How many documents those chunks belong to.
     pub documents: usize,
+    /// Total directed edges in the graph.
     pub graph_edges: usize,
+    /// How many layers the graph has.
     pub graph_layers: usize,
+    /// How many distinct stemmed terms the lexical index holds.
     pub lexical_terms: usize,
+    /// How many term-in-chunk appearances it holds.
     pub lexical_postings: usize,
+    /// How much the full-precision vectors occupy.
     pub vector_bytes: usize,
+    /// How much the int8 codes occupy, or zero when none were built.
     pub quantized_bytes: usize,
     /// Whether the full precision vectors are on this process's heap.
     ///
@@ -213,7 +245,9 @@ pub struct BuildStats {
 /// index a second question.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AppendStats {
+    /// How many chunks the append added.
     pub chunks_added: usize,
+    /// How many of those belonged to documents the index had not seen.
     pub documents_added: usize,
     /// Terms the lexical dictionary had never seen before this append.
     pub new_terms: usize,
@@ -223,10 +257,13 @@ pub struct AppendStats {
 }
 
 impl Index {
+    /// Returns an empty index built to this configuration.
+    ///
+    /// @param config - how it is built and queried
     pub fn new(config: IndexConfig) -> Self {
         Index {
             store: Store::default(),
-            vectors: VectorSet::new(config.dims),
+            vectors: VectorSet::with_metric(config.dims, config.metric),
             quantized: None,
             graph: None,
             lexical: None,
@@ -378,6 +415,7 @@ impl Index {
         }
     }
 
+    /// Returns the configuration this index was built with.
     pub fn config(&self) -> &IndexConfig {
         &self.config
     }
@@ -418,6 +456,20 @@ impl Index {
                 "index is inconsistent: {} vectors for {} chunks",
                 vectors.len(),
                 store.n_chunks()
+            );
+        }
+        // The same kind of inconsistency as the chunk count above, and the
+        // same answer: refuse rather than search a graph that was built over
+        // vectors stored for one metric as though it answered for another.
+        // `persist::read_index`/`load_generation` never produce this - they
+        // build `vectors` from `config.metric` themselves - so reaching this
+        // means a caller assembled the parts by hand and got two of them to
+        // disagree.
+        if vectors.metric() != config.metric {
+            anyhow::bail!(
+                "index is inconsistent: the vectors are stored for {:?}, the config declares {:?}",
+                vectors.metric(),
+                config.metric
             );
         }
         let tokenizer = Tokenizer::default();
@@ -461,24 +513,152 @@ impl Index {
         }
     }
 
+    /// Returns the corpus.
     pub fn store(&self) -> &Store {
         &self.store
     }
 
+    /// Returns the full-precision vectors.
     pub fn vectors(&self) -> &VectorSet {
         &self.vectors
+    }
+
+    // -- checkpoint recording and replay --------------------------------
+    //
+    // A merge that checkpoints its own progress across several commits
+    // (`inillucent_search::module::SearchTable::continue_merge`) needs to
+    // record exactly what one checkpoint's fold changed - not re-derive it
+    // by re-running the fold again later, which for the graph and the
+    // lexical index would cost what building them cost in the first place,
+    // on every single chain resolution. These methods are the seam that
+    // lets `inillucent_core::persist`'s segment delta format capture that
+    // real work once and replay its *result* cheaply afterwards; nothing
+    // else in this crate reaches for them.
+
+    /// Starts recording exactly what a subsequent `append`/`replace_document`
+    /// changes in the graph and the lexical index, so it can be replayed
+    /// later without recomputing it. The store and the vectors need no such
+    /// recording: appending to them is already a pure function of the rows
+    /// given, cheap to repeat, which `append_store_and_vectors` below reaches
+    /// for directly on replay.
+    pub fn start_recording(&mut self) {
+        if let Some(graph) = self.graph.as_mut() {
+            graph.start_recording();
+        }
+        if let Some(lexical) = self.lexical.as_mut() {
+            lexical.start_recording();
+        }
+    }
+
+    /// Returns and clears every adjacency list the graph has changed since
+    /// recording started or since the last drain.
+    pub fn drain_graph_recording(&mut self) -> Vec<(u8, u32, Vec<u32>)> {
+        self.graph
+            .as_mut()
+            .map(Hnsw::drain_recording)
+            .unwrap_or_default()
+    }
+
+    /// Returns and clears what the lexical index has added since recording
+    /// started or since the last drain, or `None` if nothing was indexed.
+    pub fn drain_lexical_recording(&mut self) -> Option<crate::bm25::LexicalDelta> {
+        self.lexical.as_mut().and_then(Bm25Index::drain_recording)
+    }
+
+    /// The graph's current entry point, node count and level count, for a
+    /// caller building a checkpoint that names how far the graph it is
+    /// recording has grown.
+    pub fn graph_shape(&self) -> (Option<u32>, usize, usize) {
+        match &self.graph {
+            Some(graph) => (graph.entry_point(), graph.node_count(), graph.n_layers()),
+            None => (None, 0, 0),
+        }
+    }
+
+    /// The graph's per-node top layer from `from` onward, for a caller
+    /// checkpointing only the nodes added since it last did.
+    /// @param from - the first node ordinal to include
+    pub fn graph_node_top_tail(&self, from: usize) -> Vec<u8> {
+        self.graph
+            .as_ref()
+            .map(|g| g.node_top_tail(from).to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Appends chunks and vectors to the store and the vector set alone,
+    /// leaving the graph, the lexical index and the quantized codes
+    /// untouched - the store-only half of `append`, for a caller that will
+    /// supply the other three from their own recorded content instead of
+    /// recomputing them from these rows a second time.
+    ///
+    /// Returns the chunk ordinals this call assigned, which line up with
+    /// `embeddings` in order.
+    /// @param chunks - the new chunks
+    /// @param embeddings - their vectors, in the same order
+    pub fn append_store_and_vectors(
+        &mut self,
+        chunks: Vec<ChunkInput>,
+        embeddings: &[Vec<f32>],
+    ) -> anyhow::Result<std::ops::Range<u32>> {
+        let first = self.store.n_chunks() as u32;
+        self.store.add_chunks(chunks)?;
+        for e in embeddings {
+            self.vectors.push(e);
+        }
+        Ok(first..(self.store.n_chunks() as u32))
+    }
+
+    /// Applies a graph checkpoint's recorded content directly - growing the
+    /// graph to the recorded shape and overwriting exactly the adjacency
+    /// lists that were recorded - instead of running `insert`/`insert_batch`
+    /// again over the rows that produced it.
+    ///
+    /// Builds a graph from scratch if this index was never committed with
+    /// one, which only happens when replaying a checkpoint with no base of
+    /// its own.
+    /// @param entry - the recorded entry point
+    /// @param layers_len - how many levels the graph must have afterwards
+    /// @param node_top_tail - the recorded top layer for every node added
+    ///   since the checkpoint this one continues
+    /// @param touched - every adjacency list the checkpoint changed
+    pub fn apply_graph_recording(
+        &mut self,
+        entry: Option<u32>,
+        layers_len: usize,
+        node_top_tail: &[u8],
+        touched: &[(u8, u32, Vec<u32>)],
+    ) {
+        let graph = self
+            .graph
+            .get_or_insert_with(|| Hnsw::new(self.config.hnsw));
+        graph.ensure_layers(layers_len);
+        for top in node_top_tail {
+            graph.push_node_top(*top);
+        }
+        for (layer, node, neighbours) in touched {
+            graph.apply_touched(*layer, *node, neighbours.clone());
+        }
+        graph.set_entry(entry);
+    }
+
+    /// Applies a lexical checkpoint's recorded content directly, without
+    /// re-tokenising the chunks that produced it.
+    /// @param delta - what one checkpoint's own fold added to the lexical index
+    pub fn apply_lexical_recording(&mut self, delta: &crate::bm25::LexicalDelta) {
+        let lexical = self.lexical.get_or_insert_with(Bm25Index::default);
+        lexical.apply_lexical_delta(delta);
     }
 
     /// Add chunks together with their vectors. The two slices must correspond
     /// element for element, which is the one to one chunk to vector mapping the
     /// baseline also maintains.
-    pub fn add(&mut self, chunks: Vec<ChunkInput>, embeddings: &[Vec<f32>]) {
+    pub fn add(&mut self, chunks: Vec<ChunkInput>, embeddings: &[Vec<f32>]) -> anyhow::Result<()> {
         assert_eq!(
             chunks.len(),
             embeddings.len(),
             "each chunk needs exactly one vector"
         );
-        self.store.add_chunks(chunks);
+        self.store.add_chunks(chunks)?;
         for e in embeddings {
             self.vectors.push(e);
         }
@@ -486,6 +666,7 @@ impl Index {
         self.graph = None;
         self.lexical = None;
         self.quantized = None;
+        Ok(())
     }
 
     /// Add chunks to a committed index without rebuilding anything.
@@ -502,7 +683,11 @@ impl Index {
     /// append to.
     /// @param chunks - the new chunks, one vector each
     /// @param embeddings - their vectors, in the same order
-    pub fn append(&mut self, chunks: Vec<ChunkInput>, embeddings: &[Vec<f32>]) -> AppendStats {
+    pub fn append(
+        &mut self,
+        chunks: Vec<ChunkInput>,
+        embeddings: &[Vec<f32>],
+    ) -> anyhow::Result<AppendStats> {
         assert_eq!(
             chunks.len(),
             embeddings.len(),
@@ -511,18 +696,18 @@ impl Index {
         if self.graph.is_none() || self.lexical.is_none() {
             let documents_before = self.store.n_documents();
             let chunks_added = chunks.len();
-            self.add(chunks, embeddings);
-            return AppendStats {
+            self.add(chunks, embeddings)?;
+            return Ok(AppendStats {
                 chunks_added,
                 documents_added: self.store.n_documents() - documents_before,
                 new_terms: 0,
                 committed: false,
-            };
+            });
         }
 
         let first_chunk = self.store.n_chunks() as u32;
         let documents_before = self.store.n_documents();
-        self.store.add_chunks(chunks);
+        self.store.add_chunks(chunks)?;
         for e in embeddings {
             self.vectors.push(e);
         }
@@ -550,12 +735,12 @@ impl Index {
             codes.encode_from(&self.vectors, first_chunk as usize);
         }
 
-        AppendStats {
+        Ok(AppendStats {
             chunks_added: (last_chunk - first_chunk) as usize,
             documents_added: self.store.n_documents() - documents_before,
             new_terms,
             committed: true,
-        }
+        })
     }
 
     /// Marks one document unreachable, without rebuilding anything.
@@ -608,7 +793,7 @@ impl Index {
         external_doc_id: &str,
         chunks: Vec<ChunkInput>,
         embeddings: &[Vec<f32>],
-    ) -> AppendStats {
+    ) -> anyhow::Result<AppendStats> {
         self.tombstone(source, external_doc_id);
         self.append(chunks, embeddings)
     }
@@ -668,11 +853,15 @@ impl Index {
         }
     }
 
+    /// Resolves a filter against this index's own dictionaries.
+    ///
+    /// @param filter - what the caller wrote
     pub fn compile(&self, filter: &Filter) -> CompiledFilter {
         CompiledFilter::compile(filter, &self.store)
     }
 
-    /// Exact top k by cosine distance. The reference the rest is graded against.
+    /// Exact top k under this index's declared metric. The reference the rest
+    /// is graded against.
     pub fn exhaustive_search(
         &self,
         query: &[f32],
@@ -720,6 +909,12 @@ impl Index {
         }
     }
 
+    /// The BM25 branch alone, for a caller with no embedder or one whose user
+    /// asked for keyword search.
+    ///
+    /// @param query - the query text, tokenized by this index's own tokenizer
+    /// @param filter - the compiled predicate
+    /// @param k - how many hits to return
     pub fn lexical_search(
         &self,
         query: &str,
@@ -729,7 +924,14 @@ impl Index {
         let Some(lexical) = &self.lexical else {
             return Vec::new();
         };
-        lexical.search(query, &self.store, filter, &self.tokenizer, k, self.lexical_params())
+        lexical.search(
+            query,
+            &self.store,
+            filter,
+            &self.tokenizer,
+            k,
+            self.lexical_params(),
+        )
     }
 
     /// The full pipeline: both sides, fused, capped per document, truncated.
@@ -741,7 +943,8 @@ impl Index {
         k: usize,
         ef_search: Option<usize>,
     ) -> Vec<FusedHit> {
-        self.hybrid_search_explained(query, query_vector, filter, k, ef_search).0
+        self.hybrid_search_explained(query, query_vector, filter, k, ef_search)
+            .0
     }
 
     /// The full pipeline, and what it decided on the way.
@@ -875,8 +1078,10 @@ impl Index {
             Some(l) => terms.iter().filter(|t| !l.contains_term(t)).count() as f32,
             None => n,
         };
-        let v_scores: Vec<f32> =
-            vector_hits.iter().map(|h| (1.0 - h.distance).clamp(0.0, 1.0)).collect();
+        let v_scores: Vec<f32> = vector_hits
+            .iter()
+            .map(|h| (1.0 - h.distance).clamp(0.0, 1.0))
+            .collect();
         let l_scores: Vec<f32> = lexical_hits.iter().map(|h| h.score).collect();
         QuerySignals {
             identifier_share: identifiers / n,
@@ -888,7 +1093,6 @@ impl Index {
     }
 }
 
-
 /// Which retrieval branches a search runs.
 ///
 /// A caller with a lexical-only and a semantic-only mode was otherwise forced to
@@ -898,6 +1102,7 @@ impl Index {
 /// what the hybrid path does whenever a branch finds nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Branches {
+    /// Both retrievers, which is the hybrid path.
     Both,
     /// Lexical only, for a caller whose embedder is unavailable or whose user
     /// asked for keyword search.
@@ -967,6 +1172,7 @@ impl Default for GroupedParams {
 pub struct DocumentHit {
     /// Index into `Store::documents`.
     pub document: u32,
+    /// The document's score, folded up from its chunks.
     pub score: f32,
     /// The confidence of this document's best chunk, on absolute bounds.
     ///
@@ -982,11 +1188,13 @@ pub struct DocumentHit {
 /// A grouped search, and what the engine decided while running it.
 #[derive(Debug, Clone)]
 pub struct GroupedSearch {
+    /// The documents that matched, best first.
     pub documents: Vec<DocumentHit>,
     /// `graph` or `exhaustive`. The engine already knew; it just never said, and
     /// "this search was slow" and "this search was exact" are things a person
     /// should be able to see rather than infer.
     pub path: &'static str,
+    /// What the engine decided while running this query.
     pub explanation: QueryExplanation,
 }
 
@@ -1039,7 +1247,9 @@ impl Index {
         let mut grouped: std::collections::HashMap<u32, Vec<FusedHit>> =
             std::collections::HashMap::new();
         for hit in hits {
-            let document = self.store.chunks[hit.chunk as usize].doc;
+            let Some(document) = self.store.doc_of(hit.chunk) else {
+                continue;
+            };
             let entry = grouped.entry(document).or_insert_with(|| {
                 order.push(document);
                 Vec::new()
@@ -1052,13 +1262,20 @@ impl Index {
             .map(|document| {
                 let mut chunks = grouped.remove(&document).unwrap_or_default();
                 chunks.sort_by(|a, b| {
-                    b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                         .then(a.chunk.cmp(&b.chunk))
                 });
                 let score = score_document(&chunks, params.corroboration);
                 let confidence = chunks.first().map(|c| c.confidence).unwrap_or(0.0);
                 chunks.truncate(params.chunks_per_document.max(1));
-                DocumentHit { document, score, confidence, chunks }
+                DocumentHit {
+                    document,
+                    score,
+                    confidence,
+                    chunks,
+                }
             })
             .collect();
         documents.sort_by(|a, b| {
@@ -1078,7 +1295,11 @@ impl Index {
         } else {
             "lexical"
         };
-        GroupedSearch { documents, path, explanation }
+        GroupedSearch {
+            documents,
+            path,
+            explanation,
+        }
     }
 }
 
@@ -1087,7 +1308,9 @@ impl Index {
 /// @param corroboration - what each chunk beyond the best contributes
 fn score_document(chunks: &[FusedHit], corroboration: f32) -> f32 {
     match chunks.split_first() {
-        Some((best, rest)) => best.score + corroboration * rest.iter().map(|c| c.score).sum::<f32>(),
+        Some((best, rest)) => {
+            best.score + corroboration * rest.iter().map(|c| c.score).sum::<f32>()
+        }
         None => 0.0,
     }
 }
@@ -1095,11 +1318,16 @@ fn score_document(chunks: &[FusedHit], corroboration: f32) -> f32 {
 /// What one hybrid query decided, for a run artifact to record.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct QueryExplanation {
+    /// What the query itself said about which retriever to trust.
     pub signals: QuerySignals,
     /// The weight actually used, or 0 for a rank based fusion that has none.
     pub vector_weight: f32,
+    /// The BM25 score this query could have reached at saturation, which is
+    /// what `Fusion::TheoreticalMinMax` scaled by.
     pub lexical_ceiling: f32,
+    /// How many candidates the vector branch produced.
     pub vector_candidates: usize,
+    /// How many the lexical branch produced.
     pub lexical_candidates: usize,
 }
 
@@ -1177,14 +1405,18 @@ mod tests {
             normalize(&mut v);
             vectors.push(v);
         }
-        index.add(chunks, &vectors);
+        index.add(chunks, &vectors).expect("the chunks are added");
         index.commit();
         index
     }
 
     #[test]
     fn commit_reports_the_structures_it_built() {
-        let mut index = Index::new(IndexConfig { dims: 16, quantized: true, ..Default::default() });
+        let mut index = Index::new(IndexConfig {
+            dims: 16,
+            quantized: true,
+            ..Default::default()
+        });
         let chunks: Vec<ChunkInput> = (0..100)
             .map(|i| ChunkInput {
                 source: "confluence".into(),
@@ -1212,7 +1444,7 @@ mod tests {
                 v
             })
             .collect();
-        index.add(chunks, &vectors);
+        index.add(chunks, &vectors).expect("the chunks are added");
         let stats = index.commit();
         assert_eq!(stats.chunks, 100);
         assert_eq!(stats.documents, 100);
@@ -1225,19 +1457,42 @@ mod tests {
 
     #[test]
     fn vector_search_agrees_with_exhaustive_search_on_a_small_index() {
-        let index = build(2000, 32, IndexConfig { hnsw: HnswParams { exhaustive_below: 0, ..Default::default() }, ..Default::default() });
+        let index = build(
+            2000,
+            32,
+            IndexConfig {
+                hnsw: HnswParams {
+                    exhaustive_below: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
         let f = index.compile(&Filter::default());
         let q = index.vectors().copy_of(5);
         let exact = index.exhaustive_search(&q, &f, 10);
         let approx = index.vector_search(&q, &f, 10, Some(200));
         let want: std::collections::HashSet<u32> = exact.iter().map(|n| n.chunk).collect();
         let overlap = approx.iter().filter(|n| want.contains(&n.chunk)).count();
-        assert!(overlap >= 9, "only {overlap} of 10 matched exhaustive search");
+        assert!(
+            overlap >= 9,
+            "only {overlap} of 10 matched exhaustive search"
+        );
     }
 
     #[test]
     fn hybrid_search_returns_results_under_a_selective_filter() {
-        let index = build(20000, 32, IndexConfig { hnsw: HnswParams { exhaustive_below: 0, ..Default::default() }, ..Default::default() });
+        let index = build(
+            20000,
+            32,
+            IndexConfig {
+                hnsw: HnswParams {
+                    exhaustive_below: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
         for source in ["slack", "jira"] {
             let f = index.compile(&Filter::source(source));
             let q = index.vectors().copy_of(1);
@@ -1248,8 +1503,29 @@ mod tests {
 
     #[test]
     fn quantization_keeps_the_ranking_after_rescoring() {
-        let plain = build(3000, 64, IndexConfig { hnsw: HnswParams { exhaustive_below: 0, ..Default::default() }, ..Default::default() });
-        let quant = build(3000, 64, IndexConfig { quantized: true, hnsw: HnswParams { exhaustive_below: 0, ..Default::default() }, ..Default::default() });
+        let plain = build(
+            3000,
+            64,
+            IndexConfig {
+                hnsw: HnswParams {
+                    exhaustive_below: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let quant = build(
+            3000,
+            64,
+            IndexConfig {
+                quantized: true,
+                hnsw: HnswParams {
+                    exhaustive_below: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
         let f = plain.compile(&Filter::default());
         let fq = quant.compile(&Filter::default());
         let q = plain.vectors().copy_of(9);
@@ -1268,7 +1544,9 @@ mod tests {
         let hits = index.hybrid_search("offer eligibility", &q, &f, 20, None);
         let mut per_doc = std::collections::HashMap::new();
         for h in &hits {
-            *per_doc.entry(index.store().chunks[h.chunk as usize].doc).or_insert(0) += 1;
+            *per_doc
+                .entry(index.store().chunks[h.chunk as usize].doc)
+                .or_insert(0) += 1;
         }
         assert!(per_doc.values().all(|c| *c <= PER_DOC_CAP));
     }
@@ -1280,9 +1558,23 @@ mod tests {
         let f = index.compile(&Filter::source("slack"));
         let q = index.vectors().copy_of(3);
 
-        let mut chunks: Vec<u32> = index.vector_search(&q, &f, 20, None).iter().map(|n| n.chunk).collect();
-        chunks.extend(index.lexical_search("offer eligibility", &f, 20).iter().map(|h| h.chunk));
-        chunks.extend(index.hybrid_search("offer eligibility", &q, &f, 20, None).iter().map(|h| h.chunk));
+        let mut chunks: Vec<u32> = index
+            .vector_search(&q, &f, 20, None)
+            .iter()
+            .map(|n| n.chunk)
+            .collect();
+        chunks.extend(
+            index
+                .lexical_search("offer eligibility", &f, 20)
+                .iter()
+                .map(|h| h.chunk),
+        );
+        chunks.extend(
+            index
+                .hybrid_search("offer eligibility", &q, &f, 20, None)
+                .iter()
+                .map(|h| h.chunk),
+        );
         assert!(!chunks.is_empty());
         for c in chunks {
             let doc = index.store().chunks[c as usize].doc;
@@ -1292,12 +1584,17 @@ mod tests {
 
     #[test]
     fn an_empty_index_answers_every_path_without_panicking() {
-        let mut index = Index::new(IndexConfig { dims: 8, ..Default::default() });
+        let mut index = Index::new(IndexConfig {
+            dims: 8,
+            ..Default::default()
+        });
         index.commit();
         let f = index.compile(&Filter::default());
         assert!(index.vector_search(&[0.0; 8], &f, 10, None).is_empty());
         assert!(index.lexical_search("anything", &f, 10).is_empty());
-        assert!(index.hybrid_search("anything", &[0.0; 8], &f, 10, None).is_empty());
+        assert!(index
+            .hybrid_search("anything", &[0.0; 8], &f, 10, None)
+            .is_empty());
         assert!(index.exhaustive_search(&[0.0; 8], &f, 10).is_empty());
     }
 
@@ -1305,31 +1602,33 @@ mod tests {
     fn adding_after_commit_requires_another_commit_and_still_answers() {
         let mut index = build(200, 16, IndexConfig::default());
         let before = index.store().n_chunks();
-        index.add(
-            vec![ChunkInput {
-                source: "slack".into(),
-                external_doc_id: "extra".into(),
-                chunk_index: 0,
-                heading_path: vec![],
-                content: "a brand new chunk about tirzepatide".into(),
-                title: "extra".into(),
-                url: "u".into(),
-                space_key: None,
-                author: None,
-                author_id: None,
-                updated_at: None,
-                external_chunk_id: None,
-                labels: vec![],
-                attributes: Vec::new(),
-                flags: Vec::new(),
-                deleted: false,
-            }],
-            &[{
-                let mut v = vec![0.5f32; 16];
-                normalize(&mut v);
-                v
-            }],
-        );
+        index
+            .add(
+                vec![ChunkInput {
+                    source: "slack".into(),
+                    external_doc_id: "extra".into(),
+                    chunk_index: 0,
+                    heading_path: vec![],
+                    content: "a brand new chunk about tirzepatide".into(),
+                    title: "extra".into(),
+                    url: "u".into(),
+                    space_key: None,
+                    author: None,
+                    author_id: None,
+                    updated_at: None,
+                    external_chunk_id: None,
+                    labels: vec![],
+                    attributes: Vec::new(),
+                    flags: Vec::new(),
+                    deleted: false,
+                }],
+                &[{
+                    let mut v = vec![0.5f32; 16];
+                    normalize(&mut v);
+                    v
+                }],
+            )
+            .expect("the chunks are added");
         index.commit();
         assert_eq!(index.store().n_chunks(), before + 1);
         let f = index.compile(&Filter::default());
@@ -1346,7 +1645,10 @@ mod tests {
             "offer eligibility rules",
             &q,
             &f,
-            GroupedParams { documents: 10, ..Default::default() },
+            GroupedParams {
+                documents: 10,
+                ..Default::default()
+            },
         );
         assert_eq!(grouped.documents.len(), 10);
         let unique: std::collections::HashSet<u32> =
@@ -1370,7 +1672,10 @@ mod tests {
             "offer eligibility rules",
             &q,
             &f,
-            GroupedParams { branches: Branches::Lexical, ..Default::default() },
+            GroupedParams {
+                branches: Branches::Lexical,
+                ..Default::default()
+            },
         );
         assert_eq!(lexical.path, "lexical");
         assert!(!lexical.documents.is_empty());
@@ -1380,9 +1685,15 @@ mod tests {
             "a query holding no term this corpus knows",
             &q,
             &f,
-            GroupedParams { branches: Branches::Vector, ..Default::default() },
+            GroupedParams {
+                branches: Branches::Vector,
+                ..Default::default()
+            },
         );
-        assert!(!vector_only.documents.is_empty(), "the vector branch found nothing");
+        assert!(
+            !vector_only.documents.is_empty(),
+            "the vector branch found nothing"
+        );
         assert_eq!(vector_only.explanation.lexical_candidates, 0);
     }
 
@@ -1410,19 +1721,29 @@ mod tests {
             "offer eligibility",
             &q,
             &f,
-            GroupedParams { corroboration: 0.0, ..Default::default() },
+            GroupedParams {
+                corroboration: 0.0,
+                ..Default::default()
+            },
         );
         let weighted = index.hybrid_search_grouped(
             "offer eligibility",
             &q,
             &f,
-            GroupedParams { corroboration: 1.0, ..Default::default() },
+            GroupedParams {
+                corroboration: 1.0,
+                ..Default::default()
+            },
         );
         let multi_chunk = weighted.documents.iter().find(|d| d.chunks.len() > 1);
         let Some(multi) = multi_chunk else {
             return; // nothing in this fixture matched twice; the rule is untested but not wrong
         };
-        let same = none.documents.iter().find(|d| d.document == multi.document).unwrap();
+        let same = none
+            .documents
+            .iter()
+            .find(|d| d.document == multi.document)
+            .unwrap();
         assert!(
             multi.score > same.score,
             "corroboration did not lift a document with {} matching chunks",
@@ -1439,17 +1760,28 @@ mod tests {
             "offer eligibility",
             &q,
             &f,
-            GroupedParams { documents: 5, offset: 0, ..Default::default() },
+            GroupedParams {
+                documents: 5,
+                offset: 0,
+                ..Default::default()
+            },
         );
         let second = index.hybrid_search_grouped(
             "offer eligibility",
             &q,
             &f,
-            GroupedParams { documents: 5, offset: 5, ..Default::default() },
+            GroupedParams {
+                documents: 5,
+                offset: 5,
+                ..Default::default()
+            },
         );
         let front: std::collections::HashSet<u32> =
             first.documents.iter().map(|d| d.document).collect();
-        assert!(second.documents.iter().all(|d| !front.contains(&d.document)));
+        assert!(second
+            .documents
+            .iter()
+            .all(|d| !front.contains(&d.document)));
     }
 
     #[test]
@@ -1472,23 +1804,27 @@ mod tests {
     #[test]
     fn a_grouped_search_excludes_tombstoned_documents() {
         let mut index = build(400, 16, IndexConfig::default());
-        index.append(
-            vec![chunk("doomed", 0, "a chunk about tirzepatide dosing")],
-            &[vector(16, 3.0)],
-        );
+        index
+            .append(
+                vec![chunk("doomed", 0, "a chunk about tirzepatide dosing")],
+                &[vector(16, 3.0)],
+            )
+            .expect("the chunks are added");
         let v = vector(16, 3.0);
         let f = index.compile(&Filter::default());
         let before = index.hybrid_search_grouped("tirzepatide", &v, &f, GroupedParams::default());
-        assert!(before.documents.iter().any(|d| {
-            index.store().documents[d.document as usize].external_id == "doomed"
-        }));
+        assert!(before
+            .documents
+            .iter()
+            .any(|d| { index.store().documents[d.document as usize].external_id == "doomed" }));
 
         index.tombstone("slack", "doomed");
         let f = index.compile(&Filter::default());
         let after = index.hybrid_search_grouped("tirzepatide", &v, &f, GroupedParams::default());
-        assert!(after.documents.iter().all(|d| {
-            index.store().documents[d.document as usize].external_id != "doomed"
-        }));
+        assert!(after
+            .documents
+            .iter()
+            .all(|d| { index.store().documents[d.document as usize].external_id != "doomed" }));
     }
 
     #[test]
@@ -1497,7 +1833,14 @@ mod tests {
             Fusion::ReciprocalRank { k: 60.0 },
             Fusion::NormalizedScore { vector_weight: 0.5 },
         ] {
-            let index = build(1000, 32, IndexConfig { fusion, ..Default::default() });
+            let index = build(
+                1000,
+                32,
+                IndexConfig {
+                    fusion,
+                    ..Default::default()
+                },
+            );
             let f = index.compile(&Filter::default());
             let q = index.vectors().copy_of(0);
             let hits = index.hybrid_search("offer eligibility rules", &q, &f, 10, None);
@@ -1522,7 +1865,9 @@ mod tests {
     /// A deterministic unit vector, so an appended chunk lands somewhere specific
     /// rather than somewhere random.
     fn vector(dims: usize, seed: f32) -> Vec<f32> {
-        let mut v: Vec<f32> = (0..dims).map(|d| ((d as f32 + seed) * 0.37).sin()).collect();
+        let mut v: Vec<f32> = (0..dims)
+            .map(|d| ((d as f32 + seed) * 0.37).sin())
+            .collect();
         normalize(&mut v);
         v
     }
@@ -1532,11 +1877,16 @@ mod tests {
         let mut index = build(2000, 32, IndexConfig::default());
         let before = index.store().n_chunks();
 
-        let stats = index.append(
-            vec![chunk("appended", 0, "a chunk about tirzepatide dosing")],
-            &[vector(32, 7.0)],
+        let stats = index
+            .append(
+                vec![chunk("appended", 0, "a chunk about tirzepatide dosing")],
+                &[vector(32, 7.0)],
+            )
+            .expect("the append runs");
+        assert!(
+            stats.committed,
+            "the append should not have needed a commit"
         );
-        assert!(stats.committed, "the append should not have needed a commit");
         assert_eq!(stats.chunks_added, 1);
         assert_eq!(stats.documents_added, 1);
         assert_eq!(index.store().n_chunks(), before + 1);
@@ -1544,23 +1894,40 @@ mod tests {
         // No commit call anywhere between the append and the search.
         let f = index.compile(&Filter::default());
         let hits = index.lexical_search("tirzepatide", &f, 5);
-        assert_eq!(hits.len(), 1, "the appended chunk is not lexically reachable");
+        assert_eq!(
+            hits.len(),
+            1,
+            "the appended chunk is not lexically reachable"
+        );
         assert_eq!(hits[0].chunk, before as u32);
     }
 
     #[test]
     fn an_appended_chunk_is_reachable_by_its_own_vector() {
-        let mut index = build(2000, 32, IndexConfig { hnsw: HnswParams { exhaustive_below: 0, ..Default::default() }, ..Default::default() });
-        let v = vector(32, 11.0);
-        index.append(
-            vec![chunk("appended", 0, "vector reachable")],
-            std::slice::from_ref(&v),
+        let mut index = build(
+            2000,
+            32,
+            IndexConfig {
+                hnsw: HnswParams {
+                    exhaustive_below: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
         );
+        let v = vector(32, 11.0);
+        index
+            .append(
+                vec![chunk("appended", 0, "vector reachable")],
+                std::slice::from_ref(&v),
+            )
+            .expect("the chunks are added");
 
         let f = index.compile(&Filter::default());
         let hits = index.vector_search(&v, &f, 5, Some(200));
         assert!(
-            hits.iter().any(|h| h.chunk == index.store().n_chunks() as u32 - 1),
+            hits.iter()
+                .any(|h| h.chunk == index.store().n_chunks() as u32 - 1),
             "the appended node was not found through the graph"
         );
     }
@@ -1571,16 +1938,24 @@ mod tests {
         // chunks that were already there must not.
         let mut index = build(2000, 32, IndexConfig::default());
         let f = index.compile(&Filter::default());
-        let before: Vec<u32> =
-            index.lexical_search("offer eligibility rules", &f, 20).iter().map(|h| h.chunk).collect();
+        let before: Vec<u32> = index
+            .lexical_search("offer eligibility rules", &f, 20)
+            .iter()
+            .map(|h| h.chunk)
+            .collect();
 
-        index.append(
-            vec![chunk("appended", 0, "an unrelated chunk about tirzepatide")],
-            &[vector(32, 13.0)],
-        );
+        index
+            .append(
+                vec![chunk("appended", 0, "an unrelated chunk about tirzepatide")],
+                &[vector(32, 13.0)],
+            )
+            .expect("the chunks are added");
         let f = index.compile(&Filter::default());
-        let after: Vec<u32> =
-            index.lexical_search("offer eligibility rules", &f, 20).iter().map(|h| h.chunk).collect();
+        let after: Vec<u32> = index
+            .lexical_search("offer eligibility rules", &f, 20)
+            .iter()
+            .map(|h| h.chunk)
+            .collect();
         assert_eq!(before, after, "an unrelated append reordered the results");
     }
 
@@ -1591,13 +1966,21 @@ mod tests {
         // postings, the positions or the lengths.
         let mut appended = build(500, 16, IndexConfig::default());
         let extra: Vec<ChunkInput> = (0..40)
-            .map(|i| chunk(&format!("extra{i}"), 0, &format!("extra chunk {i} about offer eligibility")))
+            .map(|i| {
+                chunk(
+                    &format!("extra{i}"),
+                    0,
+                    &format!("extra chunk {i} about offer eligibility"),
+                )
+            })
             .collect();
         let vectors: Vec<Vec<f32>> = (0..40).map(|i| vector(16, 100.0 + i as f32)).collect();
-        appended.append(extra.clone(), &vectors);
+        appended
+            .append(extra.clone(), &vectors)
+            .expect("the chunks are added");
 
         let mut rebuilt = build(500, 16, IndexConfig::default());
-        rebuilt.add(extra, &vectors);
+        rebuilt.add(extra, &vectors).expect("the chunks are added");
         rebuilt.commit();
 
         let a = appended.compile(&Filter::default());
@@ -1607,8 +1990,14 @@ mod tests {
             let right = rebuilt.lexical_search(query, &r, 20);
             assert_eq!(left.len(), right.len(), "{query} returned different counts");
             for (l, r) in left.iter().zip(right.iter()) {
-                assert_eq!(l.chunk, r.chunk, "{query} ranked differently after an append");
-                assert!((l.score - r.score).abs() < 1e-4, "{query} scored differently");
+                assert_eq!(
+                    l.chunk, r.chunk,
+                    "{query} ranked differently after an append"
+                );
+                assert!(
+                    (l.score - r.score).abs() < 1e-4,
+                    "{query} scored differently"
+                );
             }
         }
     }
@@ -1616,10 +2005,12 @@ mod tests {
     #[test]
     fn a_tombstoned_document_disappears_from_every_branch() {
         let mut index = build(400, 16, IndexConfig::default());
-        index.append(
-            vec![chunk("doomed", 0, "a chunk about tirzepatide dosing")],
-            &[vector(16, 3.0)],
-        );
+        index
+            .append(
+                vec![chunk("doomed", 0, "a chunk about tirzepatide dosing")],
+                &[vector(16, 3.0)],
+            )
+            .expect("the chunks are added");
         let f = index.compile(&Filter::default());
         assert_eq!(index.lexical_search("tirzepatide", &f, 5).len(), 1);
 
@@ -1628,18 +2019,29 @@ mod tests {
         let f = index.compile(&Filter::default());
         assert!(index.lexical_search("tirzepatide", &f, 5).is_empty());
         let v = vector(16, 3.0);
-        assert!(index.vector_search(&v, &f, 10, None).iter().all(|h| h.chunk != 400));
-        assert!(index.exhaustive_search(&v, &f, 10).iter().all(|h| h.chunk != 400));
-        assert!(index.hybrid_search("tirzepatide", &v, &f, 10, None).iter().all(|h| h.chunk != 400));
+        assert!(index
+            .vector_search(&v, &f, 10, None)
+            .iter()
+            .all(|h| h.chunk != 400));
+        assert!(index
+            .exhaustive_search(&v, &f, 10)
+            .iter()
+            .all(|h| h.chunk != 400));
+        assert!(index
+            .hybrid_search("tirzepatide", &v, &f, 10, None)
+            .iter()
+            .all(|h| h.chunk != 400));
     }
 
     #[test]
     fn tombstoning_corrects_the_counts_that_route_queries() {
         let mut index = build(400, 16, IndexConfig::default());
-        index.append(
-            vec![chunk("doomed", 0, "one"), chunk("doomed", 1, "two")],
-            &[vector(16, 3.0), vector(16, 4.0)],
-        );
+        index
+            .append(
+                vec![chunk("doomed", 0, "one"), chunk("doomed", 1, "two")],
+                &[vector(16, 3.0), vector(16, 4.0)],
+            )
+            .expect("the chunks are added");
         let live_before = index.store().live_chunks;
         let source = index.store().sources.get("slack").unwrap();
         let per_source_before = index.store().live_chunks_for_source(source);
@@ -1647,7 +2049,10 @@ mod tests {
         index.tombstone("slack", "doomed");
 
         assert_eq!(index.store().live_chunks, live_before - 2);
-        assert_eq!(index.store().live_chunks_for_source(source), per_source_before - 2);
+        assert_eq!(
+            index.store().live_chunks_for_source(source),
+            per_source_before - 2
+        );
         // The chunks are still there, and still visible to a scan that has to
         // reject them.
         assert!(index.store().chunks_of_source(source).len() as u32 >= 2);
@@ -1665,52 +2070,89 @@ mod tests {
     #[test]
     fn a_batch_tombstone_counts_only_what_it_actually_removed() {
         let mut index = build(100, 16, IndexConfig::default());
-        index.append(vec![chunk("a", 0, "one"), chunk("b", 0, "two")], &[vector(16, 1.0), vector(16, 2.0)]);
+        index
+            .append(
+                vec![chunk("a", 0, "one"), chunk("b", 0, "two")],
+                &[vector(16, 1.0), vector(16, 2.0)],
+            )
+            .expect("the chunks are added");
         let removed = index.tombstone_many(&[
             ("slack".into(), "a".into()),
             ("slack".into(), "b".into()),
             ("slack".into(), "a".into()),
             ("slack".into(), "never".into()),
         ]);
-        assert_eq!(removed, 2, "a repeat and an absent document must not be counted");
+        assert_eq!(
+            removed, 2,
+            "a repeat and an absent document must not be counted"
+        );
     }
 
     #[test]
     fn replacing_a_document_leaves_the_old_chunks_unreachable() {
         let mut index = build(400, 16, IndexConfig::default());
-        index.append(vec![chunk("edited", 0, "the original text mentions tirzepatide")], &[vector(16, 5.0)]);
+        index
+            .append(
+                vec![chunk("edited", 0, "the original text mentions tirzepatide")],
+                &[vector(16, 5.0)],
+            )
+            .expect("the chunks are added");
 
-        index.replace_document(
-            "slack",
-            "edited",
-            vec![chunk("edited", 0, "the revised text mentions semaglutide")],
-            &[vector(16, 6.0)],
-        );
+        index
+            .replace_document(
+                "slack",
+                "edited",
+                vec![chunk("edited", 0, "the revised text mentions semaglutide")],
+                &[vector(16, 6.0)],
+            )
+            .expect("the chunks are added");
 
         let f = index.compile(&Filter::default());
-        assert!(index.lexical_search("tirzepatide", &f, 5).is_empty(), "the old text is still reachable");
+        assert!(
+            index.lexical_search("tirzepatide", &f, 5).is_empty(),
+            "the old text is still reachable"
+        );
         assert_eq!(index.lexical_search("semaglutide", &f, 5).len(), 1);
     }
 
     #[test]
     fn replacing_a_document_keeps_the_live_count_right() {
         let mut index = build(400, 16, IndexConfig::default());
-        index.append(vec![chunk("edited", 0, "one"), chunk("edited", 1, "two")], &[vector(16, 5.0), vector(16, 6.0)]);
+        index
+            .append(
+                vec![chunk("edited", 0, "one"), chunk("edited", 1, "two")],
+                &[vector(16, 5.0), vector(16, 6.0)],
+            )
+            .expect("the chunks are added");
         let live = index.store().live_chunks;
 
         // Two chunks out, three in.
-        index.replace_document(
-            "slack",
-            "edited",
-            vec![chunk("edited", 0, "a"), chunk("edited", 1, "b"), chunk("edited", 2, "c")],
-            &[vector(16, 7.0), vector(16, 8.0), vector(16, 9.0)],
-        );
+        index
+            .replace_document(
+                "slack",
+                "edited",
+                vec![
+                    chunk("edited", 0, "a"),
+                    chunk("edited", 1, "b"),
+                    chunk("edited", 2, "c"),
+                ],
+                &[vector(16, 7.0), vector(16, 8.0), vector(16, 9.0)],
+            )
+            .expect("the chunks are added");
 
         assert_eq!(index.store().live_chunks, live - 2 + 3);
-        assert_eq!(index.compile(&Filter::default()).pass_count(), index.store().live_chunks as usize);
+        assert_eq!(
+            index.compile(&Filter::default()).pass_count(),
+            index.store().live_chunks as usize
+        );
         // Two documents now carry the same external id: one dead, one live.
         assert_eq!(
-            index.store().documents.iter().filter(|d| d.external_id == "edited").count(),
+            index
+                .store()
+                .documents
+                .iter()
+                .filter(|d| d.external_id == "edited")
+                .count(),
             2
         );
     }
@@ -1719,15 +2161,29 @@ mod tests {
     fn the_deleted_ratio_tracks_what_compaction_would_reclaim() {
         let mut index = build(400, 16, IndexConfig::default());
         assert_eq!(index.deleted_ratio(), 0.0);
-        index.append(vec![chunk("doomed", 0, "x")], &[vector(16, 2.0)]);
+        index
+            .append(vec![chunk("doomed", 0, "x")], &[vector(16, 2.0)])
+            .expect("the chunks are added");
         index.tombstone("slack", "doomed");
-        assert!((index.deleted_ratio() - 1.0 / 401.0).abs() < 1e-6, "got {}", index.deleted_ratio());
+        assert!(
+            (index.deleted_ratio() - 1.0 / 401.0).abs() < 1e-6,
+            "got {}",
+            index.deleted_ratio()
+        );
     }
 
     #[test]
     fn appending_to_an_index_that_was_never_committed_still_works() {
-        let mut index = Index::new(IndexConfig { dims: 16, ..Default::default() });
-        let stats = index.append(vec![chunk("d", 0, "a chunk about tirzepatide")], &[vector(16, 1.0)]);
+        let mut index = Index::new(IndexConfig {
+            dims: 16,
+            ..Default::default()
+        });
+        let stats = index
+            .append(
+                vec![chunk("d", 0, "a chunk about tirzepatide")],
+                &[vector(16, 1.0)],
+            )
+            .expect("the append runs");
         assert!(!stats.committed, "there was nothing to append to yet");
         index.commit();
         let f = index.compile(&Filter::default());
@@ -1739,22 +2195,53 @@ mod tests {
         // A month of daily syncs, then the same corpus built in one pass. The graph
         // an incremental insert produces is not identical to a rebuilt one, so this
         // measures how far apart they drift rather than asserting they agree.
-        let mut appended = build(3000, 32, IndexConfig { hnsw: HnswParams { exhaustive_below: 0, ..Default::default() }, ..Default::default() });
+        let mut appended = build(
+            3000,
+            32,
+            IndexConfig {
+                hnsw: HnswParams {
+                    exhaustive_below: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
         let mut every: Vec<ChunkInput> = Vec::new();
         let mut every_vector: Vec<Vec<f32>> = Vec::new();
         for day in 0..30u32 {
             let chunks: Vec<ChunkInput> = (0..6)
-                .map(|i| chunk(&format!("day{day}-{i}"), 0, &format!("sync {day} chunk {i} about offer eligibility")))
+                .map(|i| {
+                    chunk(
+                        &format!("day{day}-{i}"),
+                        0,
+                        &format!("sync {day} chunk {i} about offer eligibility"),
+                    )
+                })
                 .collect();
-            let vectors: Vec<Vec<f32>> =
-                (0..6).map(|i| vector(32, 500.0 + (day * 6 + i) as f32)).collect();
-            appended.append(chunks.clone(), &vectors);
+            let vectors: Vec<Vec<f32>> = (0..6)
+                .map(|i| vector(32, 500.0 + (day * 6 + i) as f32))
+                .collect();
+            appended
+                .append(chunks.clone(), &vectors)
+                .expect("the chunks are added");
             every.extend(chunks);
             every_vector.extend(vectors);
         }
 
-        let mut rebuilt = build(3000, 32, IndexConfig { hnsw: HnswParams { exhaustive_below: 0, ..Default::default() }, ..Default::default() });
-        rebuilt.add(every, &every_vector);
+        let mut rebuilt = build(
+            3000,
+            32,
+            IndexConfig {
+                hnsw: HnswParams {
+                    exhaustive_below: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        rebuilt
+            .add(every, &every_vector)
+            .expect("the chunks are added");
         rebuilt.commit();
         assert_eq!(appended.store().n_chunks(), rebuilt.store().n_chunks());
 
@@ -1766,7 +2253,11 @@ mod tests {
             let exact = appended.exhaustive_search(&q, &f, 20);
             let approximate = appended.vector_search(&q, &f, 20, Some(200));
             let want: std::collections::HashSet<u32> = exact.iter().map(|n| n.chunk).collect();
-            total += approximate.iter().filter(|n| want.contains(&n.chunk)).count() as f32 / 20.0;
+            total += approximate
+                .iter()
+                .filter(|n| want.contains(&n.chunk))
+                .count() as f32
+                / 20.0;
         }
         let recall = total / probes as f32;
         assert!(recall > 0.9, "recall after 30 appends fell to {recall}");

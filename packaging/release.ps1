@@ -277,7 +277,16 @@ Write-Host "inillucent $Version for $Target"
 
 if (-not $SkipBuild) {
     Write-Host 'building (release, locked)...'
+    # `--features inillucent-cli/embed` is what makes `embed(TEXT)` answer in a
+    # shipped binary. Without it `inillucent setup-embeddings all` downloads 620
+    # MB of ONNX Runtime and weights that the program which downloaded them
+    # cannot use, and `docs/embeddings.md`'s own first example answers
+    # `no such function: embed`. That was true of every release up to 0.1.1.
+    # It costs 3.2 MB of binary - 9.7 against 6.5 - and nothing at run time:
+    # `ort` links `load-dynamic`, so a machine with no runtime installed still
+    # runs every command that does not embed.
     & cargo build --manifest-path (Join-Path $root 'Cargo.toml') --release --locked `
+        --features inillucent-cli/embed `
         -p inillucent-cli -p inillucent-migrate -p inillucent-driver-capi
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed with $LASTEXITCODE" }
 }
@@ -399,9 +408,18 @@ function Invoke-Smoke {
 
         # 3. The MCP server initializes and answers a tool call, which is the
         #    surface an agent is handed and the one nothing downstream tests.
+        #
+        # **The whole lifecycle, because the server enforces it.** `initialize`
+        # needs `protocolVersion`, `capabilities` and `clientInfo`, and every
+        # other method is refused with -32002 until `notifications/initialized`
+        # has arrived. This check sent `params:{}` and went straight to
+        # `tools/list`, which the server answered with two errors, so the
+        # release refused to build at all.
         $mcp = Join-Path $bin "inillucent-mcp$exe"
         $requests = @(
-            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+            ('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18",' +
+             '"capabilities":{},"clientInfo":{"name":"release-smoke","version":"1"}}}'),
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}',
             '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}',
             ('{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"inillucent_query","arguments":{"db":"' +
              $database.Replace('\', '/') + '","sql":"SELECT count(*) FROM t"}}}')

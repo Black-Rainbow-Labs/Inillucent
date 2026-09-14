@@ -131,8 +131,17 @@ echo "inillucent $version for $target"
 built="$root/target/release"
 if [ "$skip_build" -eq 0 ]; then
   echo "building (release, locked)..."
+  # `--features inillucent-cli/embed` is what makes `embed(TEXT)` answer in a
+  # shipped binary. Without it `inillucent setup-embeddings all` downloads 620 MB
+  # of ONNX Runtime and weights that the program which downloaded them cannot
+  # use, and `docs/embeddings.md`'s own first example answers
+  # `no such function: embed`. That was true of every release up to 0.1.1. It
+  # costs 3.2 MB of binary and nothing at run time: `ort` links `load-dynamic`,
+  # so a machine with no runtime installed still runs every command that does
+  # not embed.
   cargo build --manifest-path "$root/Cargo.toml" --release --locked \
     --target "$target" \
+    --features inillucent-cli/embed \
     -p inillucent-cli -p inillucent-migrate -p inillucent-driver-capi
   # `--target` moves the output under target/<triple>/release, and omitting it
   # does not. Both are handled rather than one being assumed, because the macOS
@@ -308,8 +317,12 @@ smoke() {
   #    name is what a person's first use looks like, so it is the case worth
   #    checking.
   local answered
-  answered="$(cd "$scratch" && printf '%s\n%s\n%s\n' \
-    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  # The whole lifecycle, because the server enforces it: `initialize` needs
+  # `protocolVersion`, `capabilities` and `clientInfo`, and every other method
+  # is refused with -32002 until `notifications/initialized` has arrived.
+  answered="$(cd "$scratch" && printf '%s\n%s\n%s\n%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"release-smoke","version":"1"}}}' \
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
     '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
     '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"inillucent_query","arguments":{"db":"smoke.rdb","sql":"SELECT count(*) FROM t"}}}' \
     | ./inillucent/bin/inillucent-mcp)"

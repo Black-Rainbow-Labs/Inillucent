@@ -1,10 +1,11 @@
 # SQL support
 
-inillucent speaks SQLite's SQL dialect on its own storage. This page says which SQL runs, which
-thirteen cases out of 416 do not produce SQLite's exact bytes, and which constructs are refused.
+inillucent speaks SQLite's SQL dialect on its own storage. This page says which SQL runs and which
+cases out of 416 do not produce SQLite's exact bytes.
 
-**None of the thirteen is a missing feature, and none of them is silent.** All thirteen answer, and
-each reports something a caller can read. [Feature comparison](feature-comparison.md) is the same
+**Nothing is refused.** Thirteen cases are not byte for byte: seven answer differently, and six are
+vector search features SQLite has no equivalent for. None of the thirteen is silent. Each answers,
+and each reports something a caller can read. [Feature comparison](feature-comparison.md) is the same
 material in full, table by table.
 
 ## How this was measured
@@ -12,17 +13,42 @@ material in full, table by table.
 416 SQL scripts were run through `inillucent-shell` and through a pinned `sqlite3` 3.53.4, each over
 its own fresh database, and every byte of both output streams was compared.
 
-- **403 of 416 produce SQLite's exact bytes.**
-- **409 of 416 work**, once the six vector search cases are counted for what they are: features
-  SQLite does not have, so there is no SQLite output for them to match.
-- **0 are refused here that SQLite answers, and 0 are accepted here that SQLite rejects.**
+- **403 of 416 produce SQLite's exact bytes** - 96.9% of the total, and 98.3% of the 410 cases that
+  have a SQLite answer to compare against.
+- **0 are refused here that SQLite answers**, and 0 are accepted here that SQLite rejects. Window
+  functions were the last twelve cases to close: all eleven window-only functions, every frame unit,
+  every bound and every `EXCLUDE` clause now match the pinned SQLite exactly.
+- **7 answer differently, and 6 are vector search features SQLite has no equivalent for**, so there
+  is no SQLite output for them to match.
 
 208 of those cases are also a checked in test, `crates/inillucent-compat/tests/semantics.rs`, so a
 construct that changes its answer in either direction fails a build rather than waiting for somebody
 to audit it. The probe harness is `tools/feature-probe/`.
 
-Counted against SQLite's own enumerations rather than against a case list: **212 function names of
-218**, **67 pragmas of 67**, **63 dot commands of 65**, **5 collations of 5**.
+Counted against SQLite's own enumerations rather than against a case list: **172 of the 177 function
+names the pinned SQLite library answers**, **67 pragmas of 67**, **63 dot commands of 65**, **5
+collations of 5**. [The function register](#the-function-register) says where 177 comes from and names
+the five.
+
+### The function register
+
+`PRAGMA function_list` in SQLite's own shell reports **218** names, and 41 of those are extensions the
+shell itself defines rather than functions the library answers: `readfile`, `writefile`, `sha3`,
+`zipfile`, `ieee754`, the `decimal` family, the `shell_*` helpers and the rest. They are not part of
+SQLite, so they are not a gap here. That leaves **177 library names**.
+
+inillucent answers **172** of the 177. The five it does not are `fts3_tokenizer`, `fts5`,
+`fts5_get_locale`, `fts5_insttoken` and `fts5_locale`: the first two hand out a C pointer to a
+tokenizer and to the FTS5 API, and the other three are FTS5's locale machinery, which this build does
+not carry.
+
+Its own register holds **190** names: those 172, plus 18 vector functions SQLite has no equivalent
+for. `inillucent functions` prints 213 rows because it prints one row per name and argument count.
+
+```sh
+inillucent functions --output json --limit 0
+node tools/feature-probe/registers.js    # both registers, compared name by name
+```
 
 ## What runs
 
@@ -30,7 +56,7 @@ Counted against SQLite's own enumerations rather than against a case list: **212
 or a scan. `GROUP BY`, `HAVING`, `DISTINCT`, `ORDER BY`, `LIMIT` and `OFFSET`. Compound selects
 (`UNION`, `UNION ALL`, `EXCEPT`, `INTERSECT`). Common table expressions, including recursive ones.
 Derived tables in `FROM`. Subqueries in `WHERE`, in `IN`, in `EXISTS` and as values, including
-correlated ones. Window functions with all three frame units.
+correlated ones.
 
 **Writes.** `INSERT`, `UPDATE` and `DELETE`, with `RETURNING`, with `ON CONFLICT DO UPDATE` and
 `DO NOTHING`, and with `UPDATE ... FROM`. `WITH` on all three. Row values in every comparison and in
@@ -48,7 +74,7 @@ compile to triggers, so one mechanism serves `PRAGMA foreign_keys`,
 `DEFERRABLE INITIALLY DEFERRED`, `ON DELETE CASCADE`, `SET NULL`, `SET DEFAULT` and `RESTRICT`.
 
 **Values.** Type affinity applied on write. `CAST`. `COLLATE` with `BINARY`, `NOCASE` and `RTRIM`.
-`LIKE` and `GLOB`. 212 built in function names, including 28 JSON functions, 29 maths functions and
+`LIKE` and `GLOB`. 190 built in function names, including 30 JSON functions, 29 maths functions and
 7 date and time functions. User defined scalar functions, aggregates and collations.
 
 **Transactions.** `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE` and `ROLLBACK TO`. `ATTACH`
@@ -66,10 +92,10 @@ any eponymous module a caller registers.
 
 | extension | state |
 |---|---|
-| **JSON** | over a binary form, with all 28 function names |
+| **JSON** | over a binary form, with all 30 function names, `json_*` and `jsonb_*` alike |
 | **FTS5** | including `bm25()` and `fts5vocab` |
 | **R-Tree** | the module and its queries |
-| **`inillucent_search`** | this engine's own hybrid vector and keyword index — see [Vector search](vector-search.md) |
+| **`inillucent_search`** | this engine's own hybrid vector and keyword index. [Vector search](vector-search.md) covers it |
 
 Every extension's shadow tables are ordinary trees in the same file, so they commit and roll back
 with the transaction that wrote them.
@@ -104,7 +130,9 @@ That is a fabrication rather than compatibility, so none of the three will ever 
 
 ### Three are decisions this engine made, and each was measured
 
-Both experiments below were run when the weighted headline stood at 3.83x rather than today's 4.26x, and neither has been re-run since. What they measure is the *difference* between the two settings, which is why they are still quoted.
+Both experiments below were run against the earlier 3.83x weighted headline. Today's run is 4.30x,
+and neither experiment has been taken again. What each measures is the *difference* between two
+settings, and that difference is what is quoted here.
 
 **`PRAGMA page_size` reports 32768** where SQLite reports 4096. Both were measured on the same gate:
 32768 gave 3.83x weighted with the `schema` family at 1.15x; 4096 with a matched cache budget gave
@@ -114,7 +142,7 @@ The pragma reports what the file is, which is its job.
 **`PRAGMA locking_mode` reports `exclusive`.** `normal` works and gives real access from several
 processes: 37 stress rounds, two processes each writing 12,000 rows into one file, zero lost writes
 and zero failed integrity checks. `exclusive` is the *default* because running the gate with `normal`
-as the default read 3.03x with a lower bound of 2.95x, under the 3.00x bar — it takes `write` from
+as the default read 3.03x with a lower bound of 2.95x, under the 3.00x bar. It takes `write` from
 1.94x to 1.19x, `transaction` from 11% slower to 170% slower, and `schema` from 1.34x to 52% slower.
 Releasing the file between statements means reading the meta record again before each one, in every
 program, including every program that never opens a second connection.
@@ -134,8 +162,10 @@ disagrees.
 
 ## What is refused, by name
 
-A refusal is visible and an application can work around it. These say what they are, and each returns
-exit code `3` rather than `1`, so a caller can tell "not built" from "your SQL is wrong".
+**No SQL statement is refused.** What remains on this list is a shell command, five function names,
+two modules and three properties of the engine. Each says what it is, and a construct that is not
+built returns exit code `3` rather than `1`, so a caller can tell "not built" from "your SQL is
+wrong".
 
 | construct | why |
 |---|---|
@@ -154,7 +184,7 @@ exit code `3` rather than `1`, so a caller can tell "not built" from "your SQL i
 | file format | `.rdb`, with its own redo log segments | SQLite's |
 | page size | 32 KiB by default, 8 to 64 KiB allowed | 4 KiB by default |
 | page cache | a pool of frames, 4,096 frames at 128 MiB by default, set when the file is opened. A frame's page is allocated the first time that frame is claimed, so the budget is a ceiling rather than an amount taken at open | `cache_size`, 2 MiB by default, also grown into |
-| journal modes | all six, and `delete` is the default as it is in SQLite. `PRAGMA journal_mode = wal` selects the redo log, and a database left in WAL reopens in WAL | six |
+| journal modes | all six, and `delete` is the default as it is in SQLite. `PRAGMA journal_mode = wal` selects the redo log, and a database left in WAL reopens in WAL. What the mode selects here is how a **checkpoint** is protected: an application's `ROLLBACK` is undone from the log under every mode, including `off`, so `memory` and `off` are one choice rather than two | six |
 | writers | one at a time; readers never block, under snapshot isolation | one at a time; readers block in rollback mode, not in WAL |
 | processes on one file | many, under `PRAGMA locking_mode = normal` | many, over byte range locks |
 | threads | one | serialised or multi thread |

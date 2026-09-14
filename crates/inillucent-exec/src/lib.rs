@@ -43,15 +43,19 @@
 pub mod aggregate;
 pub mod autoindex;
 pub mod batch;
+pub mod compiled;
+pub mod constant;
 pub mod correlate;
 pub mod declared;
 pub mod dml;
 pub mod expr;
+pub mod insert_plan;
 pub mod join;
 pub mod lateral;
 pub mod ops;
 pub mod paged;
 pub mod physical;
+pub mod recursive;
 pub mod scalar;
 pub mod scan;
 pub mod sequence;
@@ -59,6 +63,7 @@ pub mod setop;
 pub mod subquery;
 pub mod trigger;
 pub mod window;
+pub mod windowpass;
 
 pub use aggregate::{Accumulator, AggregateKind};
 pub use batch::{Batch, Vector, BATCH_ROWS};

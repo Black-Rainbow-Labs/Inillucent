@@ -270,14 +270,57 @@ pub fn exec(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fai
 }
 
 /// `batch`: runs several statements as one transaction.
+///
+/// **It is a transaction as of task-1932, and until then it was not.** The
+/// command's own description says "either all of them take effect or none of
+/// them do, which is what you want when creating a schema or loading related
+/// rows", and the MCP tool `inillucent_batch` inherits that description - but
+/// nothing opened a transaction. `execute_batch` is a loop of `execute_any`
+/// with nothing around it, so each statement committed as it succeeded, and
+/// `inillucent batch "INSERT ...; INSERT ...; GARBAGE"` reported failure with
+/// two rows committed. That is the exact case the description names as the
+/// reason to use it.
+///
+/// A script run inside a transaction the caller already opened joins it and
+/// does not commit: closing somebody else's transaction because a command
+/// inside it finished would be a worse surprise than the one being fixed, and
+/// the outcome's `detail` says which of the two happened. An explicit `BEGIN`
+/// inside the script is left to the engine, which refuses it with "cannot
+/// start a transaction within a transaction".
 pub fn batch(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
     let sql = arguments.required_text("sql")?.to_string();
     context.refuse_if_it_writes(&sql)?;
+    let joined = !context.shell().connection().autocommit();
     let before = context.shell().connection().total_changes();
-    context
-        .shell()
-        .execute(&sql)
-        .map_err(|message| Failed::said(Status::Syntax, message))?;
+    if !joined {
+        context
+            .shell()
+            .execute("BEGIN")
+            .map_err(|message| Failed::said(Status::Syntax, message))?;
+    }
+    let ran = context.shell().execute(&sql);
+    if let Err(message) = ran {
+        if !joined {
+            // **The rollback's own failure is not reported over the
+            // statement's.** The script's error is what the caller asked
+            // about; a rollback that could not run is reported beside it
+            // rather than instead of it, because a caller who reads only
+            // "cannot rollback" learns nothing about what went wrong.
+            if let Err(second) = context.shell().execute("ROLLBACK") {
+                return Err(Failed::said(
+                    Status::Syntax,
+                    format!("{message} (and the rollback failed: {second})"),
+                ));
+            }
+        }
+        return Err(Failed::said(Status::Syntax, message));
+    }
+    if !joined {
+        context
+            .shell()
+            .execute("COMMIT")
+            .map_err(|message| Failed::said(Status::Syntax, message))?;
+    }
     let after = context.shell().connection().total_changes();
     let changes = after - before;
     let mut produced = Outcome::said(
@@ -288,6 +331,17 @@ pub fn batch(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fa
         ),
     );
     produced.changes = changes;
+    produced.extra.push((
+        "transaction".to_string(),
+        Json::Text(
+            if joined {
+                "joined the open transaction; not committed"
+            } else {
+                "committed"
+            }
+            .to_string(),
+        ),
+    ));
     Ok(produced)
 }
 
@@ -518,20 +572,50 @@ pub fn import(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
         " \"{}\" \"{table_name}\"",
         confined.to_string_lossy()
     ));
-    let before = context.shell().connection().total_changes();
+    // Counted two ways, because neither alone is right. `total_changes` is what
+    // an ordinary table's insert moves and it is exact. A **virtual** table's
+    // insert does not move it at all, so a 2,661 row load into an FTS5 table
+    // reported `imported 0 rows` while every one of those rows was in fact
+    // there - a number that says the opposite of what happened. The row count
+    // of the target covers that case, and is the fallback rather than the
+    // primary because a table with a trigger on it can change more rows than it
+    // gained.
+    let before_changes = context.shell().connection().total_changes();
+    let before_rows = row_count(context, &table_name);
     let mut produced = dot(context, "import", &line)?;
-    let after = context.shell().connection().total_changes();
-    produced.changes = after - before;
+    let after_changes = context.shell().connection().total_changes();
+    produced.changes = after_changes - before_changes;
+    if produced.changes == 0 {
+        produced.changes = row_count(context, &table_name).saturating_sub(before_rows);
+    }
     if produced.text.is_empty() {
         produced.text = format!("imported {} rows into {table_name}", produced.changes);
     }
     Ok(produced)
 }
 
+/// Returns how many rows a table holds, or zero when it holds none or is absent.
+///
+/// @param context - the open database
+/// @param table - the table to count
+fn row_count(context: &mut Context, table: &str) -> i64 {
+    let sql = format!("SELECT count(*) FROM \"{}\"", table.replace('"', "\"\""));
+    context
+        .shell()
+        .scalar(&sql)
+        .and_then(|text| text.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
 /// `export`: writes rows out in a chosen format.
 pub fn export(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
     let sql = match (arguments.text("sql"), arguments.text("table")) {
-        (Some(sql), _) => sql.to_string(),
+        (Some(_), Some(_)) => {
+            return Err(Failed::misuse(
+                "export accepts either 'sql' or 'table', not both.",
+            ))
+        }
+        (Some(sql), None) => sql.to_string(),
         (None, Some(name)) => format!("SELECT * FROM {}", quoted(name)),
         (None, None) => return Err(Failed::misuse("export needs either 'sql' or 'table'.")),
     };
@@ -998,6 +1082,11 @@ fn migrate_remote(
         ));
     }
     let mut plan = inillucent_remote::Plan::new(url, &to);
+    // The surface's own ceiling. `command::run` has already armed it on this
+    // thread, so this is belt and braces rather than the only bound - but a
+    // migration is the one verb long enough that being explicit about which
+    // budget it is under is worth the line.
+    plan.limits = Some(context.limits());
     if let Some(batch) = arguments.integer("batch") {
         plan.batch = (batch.max(1)) as u64;
     }
@@ -1312,6 +1401,17 @@ mod source_tests {
         let said = format!("{error:?}");
         assert!(said.contains("--root"), "{said}");
         assert!(said.contains(SOURCE_URL_VARIABLE), "{said}");
+    }
+
+    /// Export refuses an ambiguous request before reading either data source.
+    #[test]
+    fn export_refuses_table_and_sql_together() {
+        let mut arguments = Arguments::default();
+        arguments.set("table", crate::json::text("expected"));
+        arguments.set("sql", crate::json::text("SELECT 'other' AS v"));
+        let failure = export(&mut context(None), &arguments)
+            .expect_err("export must require one data source");
+        assert!(failure.message.contains("not both"), "{}", failure.message);
     }
 
     /// `-` with the variable set takes the variable and never touches stdin.

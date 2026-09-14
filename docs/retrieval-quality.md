@@ -5,12 +5,17 @@ passes.**
 
 Both engines read byte identical vectors and are handed the same embedded query, so the embedding
 model cancels out and what is left measures indexing and ranking. The baseline is a correctly
-configured PostgreSQL, not a default one — [The baseline](#the-baseline) says exactly how it is
+configured PostgreSQL, not a default one. [The baseline](#the-baseline) says exactly how it is
 configured and why each setting has the value it has.
 
 The corpus is 185,078 chunks assembled from public data by this repository:
 [Synthetic corpus](../tests/synthetic-corpus.md) builds it, and every number here can be reproduced
 by anyone with this repository, an internet connection and a few hours.
+
+**Every figure on this page is the grading run of 2026-09-08.** The score card checked in at the
+repository root, `inillucent-scorecard.md`, is the run of **2026-09-01**. The two runs differ on
+seven rows. [Which run a number comes from](#which-run-a-number-comes-from) lists the seven rows.
+Read the card for the method, the intervals and the p-values, which did not change.
 
 ## Ranking
 
@@ -51,9 +56,9 @@ extension's defaults it returned fewer than the 50 rows the predicate admits on 
 for every one of the six sources**. Correctly configured it still fell short on github (12 queries of
 25), jira (9 of 25) and miro (1 of 25).
 
-An engine that returns fewer rows than the filter allows is not a faster engine, it is an incomplete
-one. Completeness is graded as a gate rather than scored as relevance, because returning thirty rows
-where fifty exist is a defect however good the thirty are.
+An engine that returns fewer rows than the filter allows has answered incompletely rather than
+quickly. Completeness is therefore graded as a gate rather than scored as relevance, because
+returning thirty rows where fifty exist is a defect however good the thirty are.
 
 ## Abstention
 
@@ -68,6 +73,28 @@ of either.
 [Vector search](vector-search.md#confidence-is-a-separate-number-from-score) explains how the
 confidence is computed and why it had to stop being the same number as the score.
 
+## Which run a number comes from
+
+Two grading runs exist. This page is the later one; the checked in score card is the earlier one and
+has not been regenerated since, so a reader comparing the two finds seven rows that differ.
+
+| row | this page, 2026-09-08 | the score card, 2026-09-01 |
+|---|---|---|
+| Lexical, rare identifiers, MRR | 0.5467 against 0.1568 | 0.5442 against 0.1363 |
+| Lexical, natural language headings, MRR | 0.7246 against 0.6346 | 0.7221 against 0.5896 |
+| Hybrid, document identity, nDCG@10 | 0.9773 against 0.8101 | 0.9756 against 0.8148 |
+| Hybrid, natural language headings, nDCG@10 | 0.7540 against 0.6498 | 0.7477 against 0.6271 |
+| Passage evidence, graded nDCG@10 | 0.7745 against 0.6898 | 0.7045 against 0.6027 |
+| Passage evidence, one transposed character | 0.7616 against 0.4460 | 0.6794 against 0.3969 |
+| Abstention, confident answer rate | 0.0125 against 1.000 | 0.0050 against 1.000 |
+
+Every verdict is the same in both: 15 better, 1 equivalent, 1 inconclusive, 0 worse, and every
+correctness gate passing. What moved is the size of the margin, not the direction of any row.
+
+The 2026-09-08 run's own output file did not survive, which is why the card was not replaced with it.
+Rebuilding the corpus and re-embedding it is about ten hours before a single query runs, so the two
+are reconciled by running the grading again rather than by editing either number.
+
 ## Latency
 
 Median over the same queries, measured inside the calling process. Both pgvector columns are given
@@ -81,7 +108,7 @@ the configured one returns the rows and pays for them.
 | `source = slack`, p50 | **0.6631 ms** | 42.182 ms | **6,262% faster** | 1.398 ms | **111% faster** |
 | `source = slack`, p95 | **1.292 ms** | 101.038 ms | **7,720% faster** | 1.969 ms | **52% faster** |
 
-The filtered row is the shape of the whole comparison. pgvector's cost of being *correct* under a
+The filtered row stands for the whole comparison. pgvector's cost of being *correct* under a
 filter is to repeat the scan, and that is two orders of magnitude. inillucent's probe widens itself
 instead: ask the graph for *k*, run the residual predicate, and if fewer than *k* rows survive, ask
 for four times as many. It needs no setting, and it is why the filtered query here takes **less** time
@@ -96,10 +123,10 @@ them.
 
 | | inillucent | PostgreSQL + pgvector | |
 |---|---|---|---|
-| index on disk, 185,078 chunks | 952 MB, int8 quantised | 800 MB — 722 MB of HNSW plus 78 MB of GIN | 19% more on disk |
+| index on disk, 185,078 chunks | 952 MB, int8 quantised | 800 MB: 722 MB of HNSW plus 78 MB of GIN | 19% more on disk |
 | the whole store the queries run against | the 952 MB index | a 1,750 MB database | **46% less on disk** |
 | the serving process | **1,216 MiB**, one process, opening a saved index in **0.8 s** | a PostgreSQL server, whose `shared_buffers` alone is 10,240 MiB on this machine | see below |
-| processes to keep alive | **none** — it is a library inside the caller | PostgreSQL, plus an embedding server | **two fewer** |
+| processes to keep alive | **none**, because it is a library inside the caller | PostgreSQL, plus an embedding server | **two fewer** |
 
 **The resident set row is a note rather than a percentage** because PostgreSQL's memory is not one
 number that can be placed beside a single process's. It is a shared memory segment charged to every
@@ -176,9 +203,9 @@ rather than guessed at, and lets a run be judged again after a relevance judgeme
 ## The baseline
 
 Beating a badly configured PostgreSQL would prove nothing, so the baseline is a correctly configured
-one. It runs the same shape of SQL against the same schema with the same HNSW parameters — `m = 16`,
-`ef_construction = 64` — fuses its two result lists with the same reciprocal rank fusion constants,
-and reads the same vectors.
+one. It runs the same shape of SQL against the same schema, with `m = 16` and
+`ef_construction = 64` on its HNSW index. It fuses its two result lists with the same reciprocal
+rank fusion constants, and it reads the same vectors.
 
 Each scan setting was chosen from a measured sweep against an exhaustive comparison:
 
@@ -257,7 +284,8 @@ Defaults: `--database-url postgres://127.0.0.1:5433/inillucent_synth`,
   holds, but the absolute figures are optimistic.
 - **The graph and the keyword postings are held in memory.** This suits a corpus that fits in memory,
   which this one does. A corpus far larger than the memory available needs a different design.
-- **Only searching was measured.** Adding content to an existing index rebuilds the graph.
+- **Only searching was measured.** Adding content folds the rows from that commit into the current
+  generation. An explicit compact or rebuild operation reconstructs the full graph.
 - **A prefix of this corpus is not a sample of it.** Chunks are numbered in ingestion order and that
   order correlates with source, so `--limit N` gives nearly all one source. `strided_sample` exists
   for this reason and `synth-check` asserts the property still holds.

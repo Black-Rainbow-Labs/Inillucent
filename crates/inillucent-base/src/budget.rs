@@ -195,6 +195,24 @@ pub fn arm(limits: Limits, cancel: Arc<AtomicBool>) -> Guard {
     // that has finished, not to this one. Clearing it here is what makes the
     // flag safe to reuse across calls on one connection.
     cancel.store(false, Ordering::Relaxed);
+    arm_as_it_stands(limits, cancel)
+}
+
+/// Arms a budget without clearing the cancellation flag first.
+///
+/// **For a caller that has already decided this request is cancelled
+/// (task-1932, H11).** The clear in [`arm`] is right for a surface that arms
+/// once per call and cannot know what arrived in between; it is wrong for one
+/// that reads its input on a second thread, because there is a window between
+/// taking a request off the queue and arming it, and a cancellation that lands
+/// inside that window is wiped by the clear. `inillucent-mcp` clears the flag
+/// and publishes which request is running under one lock, so by the time this
+/// is called the flag means "this request was cancelled" and clearing it would
+/// throw that away.
+///
+/// @param limits - what the request may spend
+/// @param cancel - the flag another thread sets to stop it
+pub fn arm_as_it_stands(limits: Limits, cancel: Arc<AtomicBool>) -> Guard {
     let spending = Spending {
         // `checked_add` because the crate denies wrapping arithmetic and an
         // `Instant` plus a caller's `Duration` is a caller's number. A window
@@ -260,6 +278,51 @@ pub fn spend(rows: u64, bytes: u64) -> DbResult<()> {
                 return Err(exceeded(Exceeded::Rows, spending.rows, most));
             }
         }
+        if let Some(most) = spending.limits.bytes {
+            if spending.bytes > most {
+                return Err(exceeded(Exceeded::Bytes, spending.bytes, most));
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Counts bytes a statement had to hold on to, refusing when the byte budget
+/// runs out.
+///
+/// **The row count is deliberately not touched (task-1932, H6).** A request's
+/// row budget bounds what the caller is handed - `Limits::served()` says 10,000
+/// rows, and `Rows::total` has to keep meaning "rows in the answer" for that
+/// number to be worth anything. What a statement *materialises* on the way to
+/// that answer is a different quantity and is bounded by the byte budget:
+/// a hash join's build side, a group table, a `DISTINCT` set, a window's
+/// partition buffer and a recursive CTE's accumulated answer are all rows that
+/// occupy memory and never reach the caller.
+///
+/// Until this existed the only `spend` in the engine was `Collect::push`, the
+/// result sink. A join whose build side is a hundred million rows and whose
+/// output is one row was bounded by nothing at all: the 256 MiB cap counted the
+/// one row it handed back.
+///
+/// The cancellation and deadline checks are folded in because every caller
+/// wants both and one thread-local borrow is cheaper than two.
+///
+/// @param bytes - roughly how many bytes the statement is now holding
+pub fn materialise(bytes: u64) -> DbResult<()> {
+    ACTIVE.with(|held| {
+        let mut borrowed = held.borrow_mut();
+        let Some(spending) = borrowed.as_mut() else {
+            return Ok(());
+        };
+        if spending.cancel.load(Ordering::Relaxed) {
+            return Err(exceeded(Exceeded::Cancelled, 0, 0));
+        }
+        if let Some(deadline) = spending.deadline {
+            if Instant::now() >= deadline {
+                return Err(exceeded(Exceeded::Time, 0, 0));
+            }
+        }
+        spending.bytes = spending.bytes.saturating_add(bytes);
         if let Some(most) = spending.limits.bytes {
             if spending.bytes > most {
                 return Err(exceeded(Exceeded::Bytes, spending.bytes, most));

@@ -54,6 +54,66 @@ function Copy-Artifact {
     Copy-Item -LiteralPath $From -Destination $Into -Force
 }
 
+function Repair-StagedLink {
+    <#
+    .SYNOPSIS
+        Rewrites the Markdown links that name a repository path the archive does
+        not carry.
+
+    .DESCRIPTION
+        The archive is a subset of the repository: `drivers/README.md` is staged
+        as `DRIVER.md`, and `drivers/`, `compat/` and `tools/` are not staged at
+        all. Five links in README.md, AGENTS.md and docs/feature-comparison.md
+        named those paths, so they were dead in every archive a person
+        downloaded. The repository copies keep the links that work on GitHub;
+        only the staged copies are rewritten.
+
+    .PARAMETER Stage
+        The staged directory, already holding the documents.
+    #>
+    param([string] $Stage)
+
+    $rewrites = @(
+        @{ File = 'README.md';                   From = '](drivers/README.md)';                To = '](DRIVER.md)' },
+        @{ File = 'AGENTS.md';                   From = '](drivers/README.md)';                To = '](DRIVER.md)' },
+        @{ File = 'README.md';                   From = '[`drivers/conformance/suite.json`](drivers/conformance/suite.json)'; To = '`drivers/conformance/suite.json`, in the repository,' },
+        @{ File = 'docs/feature-comparison.md';  From = '[`tools/feature-probe/`](../tools/feature-probe/README.md)'; To = '`tools/feature-probe/`, in the repository,' },
+        @{ File = 'docs/feature-comparison.md';  From = '[`drivers/README.md`](../drivers/README.md)'; To = '[`DRIVER.md`](../DRIVER.md)' },
+        @{ File = 'docs/feature-comparison.md';  From = '[`compat/README.md`](../compat/README.md)'; To = '`compat/README.md`, in the repository' },
+        @{ File = 'DRIVER.md';                   From = '](inillucent-driver-capi/include/inillucent_driver.h)'; To = '](include/inillucent_driver.h)' },
+        @{ File = 'README.md';                   From = '[**`examples/rag-agent/`**](examples/rag-agent/README.md)'; To = '**`examples/rag-agent/`**, in the repository,' }
+    )
+
+    foreach ($rewrite in $rewrites) {
+        $path = Join-Path $Stage $rewrite.File
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $text = [System.IO.File]::ReadAllText($path)
+        if (-not $text.Contains($rewrite.From)) { continue }
+        $text = $text.Replace($rewrite.From, $rewrite.To)
+        [System.IO.File]::WriteAllText($path, $text)
+    }
+
+    # A dead link in the archive is the defect this function exists to prevent,
+    # so the staging fails rather than shipping one.
+    $dead = @()
+    foreach ($document in (Get-ChildItem -LiteralPath $Stage -Recurse -Filter '*.md')) {
+        $text = [System.IO.File]::ReadAllText($document.FullName)
+        foreach ($match in [regex]::Matches($text, '\]\(([^)\s]+)\)')) {
+            $href = $match.Groups[1].Value
+            if ($href -match '^(https?:|mailto:|#)') { continue }
+            $file = ($href -split '#')[0]
+            if (-not $file) { continue }
+            $target = Join-Path $document.DirectoryName $file
+            if (-not (Test-Path -LiteralPath $target)) {
+                $dead += "$($document.Name) -> $href"
+            }
+        }
+    }
+    if ($dead.Count -gt 0) {
+        throw "the staged documentation carries $($dead.Count) link(s) to a path the archive does not have: $($dead -join '; ')"
+    }
+}
+
 function New-InillucentStage {
     <#
     .SYNOPSIS
@@ -133,6 +193,8 @@ function New-InillucentStage {
     } else {
         Write-Warning 'LICENSE is missing from the repository root; the archive will not carry one'
     }
+
+    Repair-StagedLink -Stage $stage
 
     return $stage
 }
@@ -225,6 +287,15 @@ function Update-Sha256Sums {
 
     .PARAMETER Dist
         The dist directory.
+
+    .NOTES
+        **Written with LF, not CRLF (task-1932, H12).** `Set-Content` ends every
+        line the way Windows does, and every program that reads this file runs
+        somewhere else: `packaging/install.sh` had to add `tr -d '\r'` to stop
+        awk keeping the carriage return in the archive name, and a reader
+        without that workaround reports a correct download as unpublished.
+        `PUBLISHING.md` records this as fixed in `release.ps1`; it was not fixed
+        here, which is the copy every archive's checksum actually comes from.
     #>
     param([string] $Dist)
     $sums = Join-Path $Dist 'SHA256SUMS'
@@ -235,6 +306,10 @@ function Update-Sha256Sums {
                 $lines += "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
             }
     }
-    Set-Content -Path $sums -Value $lines
+    # The text is assembled and written whole, because there is no switch on
+    # Set-Content that changes the line ending it uses.
+    $text = ($lines -join "`n")
+    if ($lines.Count -gt 0) { $text += "`n" }
+    [System.IO.File]::WriteAllText($sums, $text, (New-Object System.Text.UTF8Encoding($false)))
     return $sums
 }

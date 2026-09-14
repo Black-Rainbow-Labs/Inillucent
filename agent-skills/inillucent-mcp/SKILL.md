@@ -5,7 +5,7 @@ description: Serve an inillucent database to an AI agent over MCP, with --readon
 
 # Giving an agent a database, over MCP
 
-`inillucent-mcp` serves 27 of the CLI's commands as MCP tools over standard input and output. They
+`inillucent-mcp` serves 28 of the CLI's commands as MCP tools over standard input and output. They
 are **generated from the same command table the CLI reads**, so the two cannot drift — a test
 (`command_parity.rs`) fails the build if they do — and a tool's description is the same sentence
 `inillucent help <command>` prints.
@@ -72,7 +72,8 @@ the difference you wanted.
 - **`limit` caps the rows returned, not the count.** The result's `total` is the real number and
   `more` says whether anything was cut.
 - The result is the same JSON object every surface produces: `ok`, `columns` with observed storage
-  classes, `rows`, `total`, `more`, `elapsedMs`, and on a failure `status` plus `message`.
+  classes, `rows`, `row_count`, `total`, `more`, `changes`, `last_insert_rowid`, `elapsed_ms`, `text`,
+  and on a failure `status` plus `message`.
 
 ## The order that avoids wasted calls
 

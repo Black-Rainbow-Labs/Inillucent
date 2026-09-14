@@ -17,6 +17,27 @@ Three surfaces, and picking the right one is most of the work:
 | keyword search over text | an **FTS5** table, with `bm25()` |
 | both at once over one corpus, fused and scored | an **`inillucent_search`** virtual table |
 
+## A corpus to try it on, with nothing to build
+
+`examples/rag-agent/` is a database of Greek philosophy that is already embedded and committed: 80
+Wikipedia articles, 2,661 passages, a 768 dimension vector on each. Install the model and search it:
+
+```sh
+inillucent setup-embeddings all
+inillucent --db examples/rag-agent/greek-philosophy.rdb query \
+  "SELECT title, body FROM passage
+   ORDER BY vector_distance_cos(v, embed('search_query: ' || ?1)) LIMIT 5" \
+  --params '["who was Seneca"]'
+```
+
+**`embed` runs once for the statement, not once per row**, because it is registered deterministic and
+its argument does not vary within one execution. Before task-1911 nothing read that flag and the same
+query took 105 seconds on that corpus instead of one and a half. A function you register yourself
+gets the same treatment only if you set `FunctionFlags::deterministic` — the default for anything
+registered from outside is `false`, which is the safe assumption about code this engine did not write.
+
+Its `AGENTS.md` is the page to copy when you build one of these for somebody else.
+
 ## Where the vectors come from
 
 You can supply them, and most callers do. inillucent can also produce them, in this process, with no
@@ -34,17 +55,19 @@ SELECT id FROM note ORDER BY vector_distance_cos(v, embed('flight details')) LIM
 `embed(TEXT)` returns the 3,072 bytes a `VECTOR(768)` column holds. Three things to know before
 reaching for it:
 
-- **It is behind `--features embed` and off by default.** A build that does not have it refuses by
-  name and tells you the command that installs the model, rather than returning a NULL or a vector of
-  zeroes. A vector whose provenance is unknown is worse than no vector: it goes into an index, and
-  every neighbour it is ever compared against is wrong.
+- **The published 0.1.2 archives carry it**, because `packaging/release-all.ps1` passes
+  `--features inillucent-cli/embed`. The 0.1.1 archives do not, and a build from a checkout needs
+  that flag as well, because the feature is off by default. A build without it says
+  `no such function: embed`; a build with it but no model installed refuses by name and tells you the
+  command that installs one, rather than returning a NULL or a vector of zeroes. A vector whose
+  provenance is unknown is worse than no vector: it goes into an index, and every neighbour it is
+  ever compared against is wrong.
 - **Nothing has to be exported after the install.** The engine finds the runtime and the weights
   where the command put them. `ORT_DYLIB_PATH` and `INILLUCENT_ONNX_DIR` still override.
-- **Write it through `INSERT ... SELECT`, not `INSERT ... VALUES`.** A registered function in a
-  `VALUES` row, an `UPDATE ... SET` or a `RETURNING` clause is refused with the `unsupported`
-  status and exit code 3: the write path builds its row space from a layout rather than from a
-  catalog, so there is no function body to look up. `INSERT INTO t (...) SELECT ..., embed(?1)`
-  goes through the read path and works. `docs/roadmap.md` records the gap.
+- **A registered function reaches the write path.** `INSERT ... VALUES`, `UPDATE ... SET` and
+  `RETURNING` all take one, so `INSERT INTO note (body, v) VALUES (?1, embed(?1))` writes the vector
+  the function returns. Until task-1911 those three were refused with the `unsupported` status and
+  `INSERT ... SELECT` was the only shape that worked.
 - **Loading the model costs 650 to 800 ms and an embedding costs 12 to 36 ms**, so when it is in
   memory matters. `--residency resident` keeps it, `on-demand` drops it after every call, and the
   default `idle:5m` keeps it through a burst of questions and lets it go afterwards. A process that
@@ -72,7 +95,8 @@ SELECT id, source FROM embedding ORDER BY vector_distance_cos(v, ?1) LIMIT 10;
   before the commit.
 - With no index the same query is an exhaustive scan and **is still correct**. Build the index when
   it is slow, not before.
-- Ordering on the index is cosine-only today. `WITH (metric = …)` is where a second metric goes;
+- Ordering on the index is cosine unless the index says `WITH (metric = 'l2')`, and a query whose
+  distance function does not match the index's metric plans as a scan rather than a probe;
   `USING ivfflat` is a second structure beside the graph.
 
 From the command line, which writes the query for you:

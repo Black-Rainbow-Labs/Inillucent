@@ -54,6 +54,12 @@ const SCHEMA: &[&str] = &[
     "INSERT INTO c VALUES (2, 'two')",
     "INSERT INTO c VALUES (NULL, 'null')",
     "INSERT INTO c VALUES (3, NULL)",
+    // The two rowids an integer overflow can fold onto, so a seek key that
+    // wrapped would find a row rather than nothing (task-1932, H7).
+    "CREATE TABLE edge (id INTEGER PRIMARY KEY, tag TEXT)",
+    "INSERT INTO edge VALUES (-9223372036854775808, 'floor')",
+    "INSERT INTO edge VALUES (9223372036854775807, 'ceiling')",
+    "INSERT INTO edge VALUES (1, 'one')",
     "CREATE VIEW blue AS SELECT id, name, score FROM a WHERE team = 'blue'",
     "CREATE VIEW ranked (who, place) AS SELECT a.name, b.rank FROM a JOIN b ON a.team = b.team",
 ];
@@ -155,7 +161,7 @@ fn grade(tag: &str, statements: &[&str]) {
     let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("advanced-sql");
     let _ = std::fs::create_dir_all(&directory);
     let Some((mut driver, database)) = build(&directory, tag) else {
-        eprintln!("the pinned SQLite oracle is not built; skipping");
+        inillucent_compat::differential::skipping("the pinned SQLite oracle is not built");
         return;
     };
     let handle = Database::import_with_busy_timeout(&database, std::time::Duration::from_secs(5))
@@ -323,6 +329,132 @@ fn ctes_match_the_oracle() {
     ]);
 }
 
+/// An aggregate's `FILTER (WHERE ...)` under a `GROUP BY` that streams.
+///
+/// **A wrong answer this ticket found rather than one the review named.** The
+/// M6 test below refused to pass until it was fixed, and it has nothing to do
+/// with subqueries: `StreamAggregate::push` has two paths, and only one of them
+/// applied `FILTER`. The dense path - one bare integer key column over a dense
+/// batch - folds each run through `fold_run`, which checks `spec.filter`. The
+/// general path, which is what a text or multi-column group key takes, pushed
+/// the argument straight into the accumulator and never looked at the filter at
+/// all. So `SELECT team, count(*) FILTER (WHERE score > 0) FROM a GROUP BY
+/// team` counted every row of every group, while the same statement grouped by
+/// an integer column answered correctly.
+///
+/// That is why it went unnoticed: the two group-key types take different paths
+/// and only one of them was wrong. Both are graded here, over the same
+/// predicate, against the same oracle.
+#[test]
+fn an_aggregate_filter_under_a_group_by_matches_the_oracle() {
+    grade(
+        "aggregate-filter",
+        &[
+            // A text group key: the general path, which ignored the filter.
+            "SELECT team, count(*) FILTER (WHERE score > 0) FROM a GROUP BY team ORDER BY team",
+            "SELECT team, sum(id) FILTER (WHERE score > 0) FROM a GROUP BY team ORDER BY team",
+            "SELECT team, count(*) FILTER (WHERE 0) FROM a GROUP BY team ORDER BY team",
+            "SELECT team, count(*) FILTER (WHERE 1) FROM a GROUP BY team ORDER BY team",
+            "SELECT team, count(*) FILTER (WHERE name IS NULL) FROM a GROUP BY team ORDER BY team",
+            "SELECT team, group_concat(name, '-') FILTER (WHERE id > 1) FROM a GROUP BY team ORDER BY team",
+            "SELECT team, min(id) FILTER (WHERE id > 2), max(id) FILTER (WHERE id > 2) FROM a GROUP BY team ORDER BY team",
+            // Two calls, one filtered and one not, so a fix that filtered
+            // everything would fail here.
+            "SELECT team, count(*), count(*) FILTER (WHERE score > 0) FROM a GROUP BY team ORDER BY team",
+            // An integer group key: the dense path, which was already right.
+            "SELECT id, count(*) FILTER (WHERE score > 0) FROM a GROUP BY id ORDER BY id",
+            "SELECT id, sum(id) FILTER (WHERE id > 2) FROM a GROUP BY id ORDER BY id",
+            // Grouped by an expression, which is neither.
+            "SELECT id % 2, count(*) FILTER (WHERE score > 0) FROM a GROUP BY id % 2 ORDER BY 1",
+            // And an inner ORDER BY, which the general path also skipped.
+            "SELECT team, group_concat(name, '-' ORDER BY id DESC) FROM a GROUP BY team ORDER BY team",
+        ],
+    );
+}
+
+/// A correlated subquery inside an aggregate's argument, its `FILTER` and its
+/// inner `ORDER BY`.
+///
+/// **What was wrong.** `correlate::gather_select` walked the columns, the
+/// filter, the having, the group by, the order by and the join constraints,
+/// and never `select.aggregates` - which is a list of its own, beside
+/// `select.columns` rather than inside it. A subquery written as an
+/// aggregate's argument was therefore never recognised as a correlated block,
+/// its slot was never filled, and `translate` reported the empty slot as
+/// `unsupported("a correlated subquery used as a value")` - a true statement
+/// about the slot and a false one about the query. The whole shape was refused
+/// with exit code 3.
+#[test]
+fn a_correlated_subquery_in_an_aggregate_argument_matches_the_oracle() {
+    grade(
+        "aggregate-subquery",
+        &[
+            "SELECT team, SUM((SELECT count(*) FROM b WHERE b.team = a.team)) FROM a GROUP BY team ORDER BY team",
+            "SELECT team, max((SELECT b.rank FROM b WHERE b.team = a.team)) FROM a GROUP BY team ORDER BY team",
+            "SELECT count((SELECT b.rank FROM b WHERE b.team = a.team)) FROM a",
+            "SELECT team, group_concat((SELECT b.region FROM b WHERE b.team = a.team), '-') FROM a GROUP BY team ORDER BY team",
+            "SELECT team, count(*) FILTER (WHERE (SELECT count(*) FROM b WHERE b.team = a.team) > 0) FROM a GROUP BY team ORDER BY team",
+            "SELECT team, sum(id + (SELECT count(*) FROM b WHERE b.team = a.team)) FROM a GROUP BY team ORDER BY team",
+            // An uncorrelated subquery in the same places, which folds rather
+            // than correlating and went through a different path.
+            "SELECT team, SUM((SELECT count(*) FROM b)) FROM a GROUP BY team ORDER BY team",
+            "SELECT sum(id) FILTER (WHERE id > (SELECT min(id) FROM b)) FROM a",
+            // And in a window function's argument, partition and order, which
+            // the same walk was missing.
+            "SELECT name, sum((SELECT count(*) FROM b WHERE b.team = a.team)) OVER (ORDER BY id) FROM a ORDER BY id",
+            "SELECT name, count(*) OVER (PARTITION BY (SELECT count(*) FROM b WHERE b.team = a.team)) FROM a ORDER BY id",
+        ],
+    );
+}
+
+/// An arithmetic overflow in a seek key, a range bound and a projection.
+///
+/// **What this catches.** `constant::fold` - the folder that turns
+/// `WHERE id = <constant expression>` into the key a scan seeks to - had its
+/// own arithmetic, built on `wrapping_add` and its siblings, while the row
+/// evaluator promotes an integer overflow to a double the way SQLite does.
+/// `WHERE id = 9223372036854775807 + 1` therefore folded to `i64::MIN`, and
+/// the fixture above has a row there: the query returned `floor` where SQLite
+/// returns nothing. An empty table would have hidden it, because an empty
+/// result is the right answer by accident. The same three statements graded
+/// through a projection instead of a seek key exercise the evaluator's own
+/// path, so a later change that fixes one and not the other fails here.
+#[test]
+fn integer_overflow_in_a_seek_key_matches_the_oracle() {
+    grade(
+        "overflow",
+        &[
+            "SELECT tag FROM edge WHERE id = 9223372036854775807 + 1",
+            "SELECT tag FROM edge WHERE id = -9223372036854775807 - 2",
+            "SELECT tag FROM edge WHERE id = 9223372036854775807 * 2",
+            "SELECT tag FROM edge WHERE id > 9223372036854775807 + 1 ORDER BY id",
+            "SELECT tag FROM edge WHERE id < -9223372036854775807 - 2 ORDER BY id",
+            "SELECT tag FROM edge WHERE id = 1 + 0 ORDER BY id",
+            "SELECT 9223372036854775807 + 1, typeof(9223372036854775807 + 1)",
+            "SELECT -9223372036854775807 - 2, typeof(-9223372036854775807 - 2)",
+            "SELECT 9223372036854775807 * 2, typeof(9223372036854775807 * 2)",
+            "SELECT 'abc' + 1, typeof('abc' + 1), '4' + 1, typeof('4' + 1)",
+            "SELECT tag FROM edge WHERE id = 'abc' + 1",
+            "SELECT tag FROM edge WHERE id = '1' + 0",
+            "SELECT tag FROM edge WHERE id = NULL + 1",
+        ],
+    );
+}
+
+/// Window functions: every frame unit, every bound, every `EXCLUDE`, and the
+/// eleven functions that only exist in a window.
+///
+/// **This test was retired and is back (task-1932, H1).** It was removed on
+/// the evidence that "the shipping engine's physical pass refuses every
+/// `OVER (...)` statement outright", and `sql.select.window` and
+/// `functions.window` were moved to `missing` in `compat/sqlite-3.53.4.toml`
+/// on that reading. The capability was not missing. `run_windowed` answered
+/// all forty-one of these statements the whole time; what refused them was
+/// `compiled::try_compile`, which bailed out on `plan.compounds` and not on
+/// `plan.select.windows`, so every application entry point - which all go
+/// through the cached path - hit `refuse_unhandled` instead of the evaluator.
+/// One `Ok(None)` in `try_compile` reconnects the two, and the grading below
+/// is what says the evaluator is right rather than merely reachable.
 /// Window functions: every frame unit, every bound, every `EXCLUDE`, and the
 /// eleven functions that only exist in a window.
 #[test]
@@ -374,7 +506,6 @@ fn windows_match_the_oracle() {
         ],
     );
 }
-
 /// The math built-ins, over a value matrix that includes the awkward cases:
 /// a domain error, a non-numeric argument, the integer/real boundary, and the
 /// two functions whose meaning changes with their argument count.
@@ -403,6 +534,70 @@ fn math_functions_match_the_oracle() {
             "SELECT round(2.5), round(-2.5), round(2.345, 2), round(1)",
             "SELECT max(1, 2, 3), min(1, 2, 3), max(1, NULL), min(NULL, 1)",
         ],
+    );
+}
+
+/// The two time zone modifiers differ from SQLite, and that is held in place.
+///
+/// **The one deliberate difference in the date and time table (task-1932, M8).**
+/// `datetime(x, 'localtime')` answers NULL here and `datetime(x, 'utc')`
+/// returns its argument unchanged; SQLite converts between the machine's zone
+/// and UTC for both. The reason is in `compat/sqlite-3.53.4.toml`'s
+/// `functions.date-time` row and in `docs/feature-comparison.md`: both of
+/// SQLite's answers depend on the operating system's time zone database and on
+/// the zone the process is running in, so the same query answers differently on
+/// two machines and differently again after a daylight saving change.
+///
+/// What this asserts is the deviation itself, in both directions: that this
+/// engine still does what it has decided to do, *and* that SQLite still does
+/// something else. A decision nobody checks becomes a defect the day somebody
+/// implements the modifier and forgets the note - and one that is checked only
+/// on this side would go on passing after SQLite changed its mind.
+#[test]
+fn the_time_zone_modifiers_are_a_deliberate_deviation() {
+    let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("advanced-sql");
+    let _ = std::fs::create_dir_all(&directory);
+    let Some((mut driver, database)) = build(&directory, "timezone") else {
+        inillucent_compat::differential::skipping("the pinned SQLite oracle is not built");
+        return;
+    };
+    let handle = Database::import_with_busy_timeout(&database, std::time::Duration::from_secs(5))
+        .expect("the fixture opens");
+    let connection = handle.connect().expect("the connection opens");
+
+    // A fixed instant, so nothing here reads a clock.
+    const STAMP: &str = "2026-09-03 14:30:00";
+
+    let local = format!("SELECT datetime('{STAMP}', 'localtime') IS NULL");
+    let ours = inillucent_rows(&connection, &local).expect("the statement runs");
+    assert_eq!(
+        ours,
+        vec!["int:1".to_string()],
+        "`datetime(x, 'localtime')` no longer answers NULL. If that is deliberate, the note \
+         on `functions.date-time` in compat/sqlite-3.53.4.toml and the row in \
+         docs/feature-comparison.md have to move with it."
+    );
+    let theirs = driver
+        .send(&Op::Query(local.clone()))
+        .expect("the oracle answers");
+    let said = theirs
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .map(|value| format!("{value:?}"))
+        .unwrap_or_default();
+    assert!(
+        theirs.ok && !said.contains('1'),
+        "SQLite now answers NULL for `localtime` as well, so this is no longer a deviation: \
+         {said}"
+    );
+
+    let utc = format!("SELECT datetime('{STAMP}', 'utc')");
+    let ours = inillucent_rows(&connection, &utc).expect("the statement runs");
+    assert_eq!(
+        ours,
+        vec![format!("text:{STAMP}")],
+        "`datetime(x, 'utc')` is no longer a no-op"
     );
 }
 
@@ -473,6 +668,24 @@ fn core_functions_match_the_oracle() {
             "SELECT printf('%g', 1234.5), printf('%g', 0.00001234), printf('%G', 1e20)",
             "SELECT printf('%s|%s', 'ab', 'cd'), printf('%10s|', 'ab'), printf('%-10s|', 'ab')",
             "SELECT printf('%.2s', 'abcdef')",
+            // The `,` flag, which was parsed and thrown away before task-1932
+            // (M8). Grouping applies to `d`, `i`, `u` and `f` and to nothing
+            // else, and for the integer conversions it is applied after the
+            // zero padding - so `%0,12d` is fifteen characters wide in a field
+            // of twelve, and `%0,14.2f` is fourteen. Both orderings are here
+            // because getting them the same way round is the mistake.
+            "SELECT printf('%,d', 1234567), printf('%,d', -1234567), printf('%,d', 123)",
+            "SELECT printf('%,12d|', 1234567), printf('%-,12d|', 1234567), printf('%+,d', 1234567)",
+            "SELECT printf('%0,12d', 1234567), printf('%0,12d', -1234567), printf('%,.8d', 1234)",
+            "SELECT printf('%,x', 255), printf('%,o', 8), printf('%,e', 1234567.0), printf('%,g', 1234567.0)",
+            "SELECT printf('%,f', 1234567.5), printf('%,14.2f|', 1234.5), printf('%0,14.2f', 1234.5)",
+            // The `!` flag, which counts the width and the precision in
+            // characters rather than bytes. Every string here is multi-byte on
+            // purpose: with ASCII the two spellings agree and the case says
+            // nothing.
+            "SELECT printf('%10s|', 'café'), printf('%!10s|', 'café'), printf('%!-10s|', 'café')",
+            "SELECT printf('%5s|', '日本語'), printf('%!5s|', '日本語')",
+            "SELECT printf('%.3s', 'éab'), printf('%!.3s', 'éab'), printf('%!8.2s|', '日本語')",
             "SELECT printf('%c%c', 65, 66)",
             "SELECT printf('%q', 'it''s'), printf('%Q', 'it''s'), printf('%Q', NULL), printf('%q', NULL)",
             "SELECT printf('%w', 'a\"b')",

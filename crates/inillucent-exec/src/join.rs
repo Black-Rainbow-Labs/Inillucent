@@ -130,6 +130,11 @@ impl RowStore {
     ///
     /// @param batch - the batch to absorb
     pub fn absorb(&mut self, batch: &Batch<'_>) -> DbResult<()> {
+        // **Every pipeline breaker that buffers a batch comes through here**,
+        // which is why the charge is here rather than in each of them: the
+        // window operator's partition buffer, the automatic index's inner side
+        // and the sort's input are all this one copy (task-1932, H6).
+        inillucent_base::budget::materialise(crate::ops::batch_bytes(batch))?;
         let width = batch.columns.len();
         self.rows.reserve(batch.live());
         for nth in 0..batch.live() {
@@ -373,6 +378,12 @@ impl<'s> HashJoin<'s> {
     ///
     /// @param batch - a batch from the build side
     pub fn build(&mut self, batch: &Batch<'_>) -> DbResult<()> {
+        // **The build side is charged here (task-1932, H6).** It is the whole
+        // of one input held in memory before a single output row exists, and
+        // before this the request budget saw none of it: a join whose build
+        // side is the large table and whose answer is one row spent one row's
+        // worth of a 256 MiB cap.
+        inillucent_base::budget::materialise(crate::ops::batch_bytes(batch))?;
         let width = batch.columns.len();
         for nth in 0..batch.live() {
             let mut row = Vec::with_capacity(width);
@@ -437,6 +448,14 @@ impl<'s> HashJoin<'s> {
 
 impl Sink for HashJoin<'_> {
     fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
+        // **Every batch, because the scan leaves are not enough (task-1932,
+        // H11).** A join reads its probe side once and then does work
+        // proportional to the matches, so a cross join over a small table
+        // checks a few hundred times at the start and then runs for as long as
+        // the product takes with nothing reading the cancellation flag. One
+        // atomic load per batch is what makes a cancel reach the statement it
+        // is about rather than the one after it.
+        inillucent_base::budget::check()?;
         let HashJoin {
             kind,
             probe_width,
@@ -458,10 +477,20 @@ impl Sink for HashJoin<'_> {
                 has_null |= value.is_null();
                 key::encode_into(&value.get(), scratch);
             }
-            let matches: Vec<u32> = if has_null {
-                Vec::new()
+            // **Copied once per probe row, including when it matched
+            // nothing (task-1932, M7).** `probe` answers a borrowed slice and
+            // this cloned it so the loop below could hold it across the
+            // `&mut self` a push needs. Reading the length first means a row
+            // that matches nothing - the common case on a selective join -
+            // allocates nothing at all.
+            let found = if has_null {
+                &[][..]
             } else {
-                table.probe(scratch).to_vec()
+                table.probe(scratch)
+            };
+            let matches: Vec<u32> = match found.is_empty() {
+                true => Vec::new(),
+                false => found.to_vec(),
             };
             match kind {
                 JoinKind::Semi => {
@@ -545,7 +574,13 @@ pub struct IndexNestedLoopJoin<'t> {
     /// The pool the inner tree's pages live in.
     pool: &'t Pool,
     /// The key expressions over the outer batch's columns.
-    outer_keys: Vec<Box<dyn Eval>>,
+    ///
+    /// Shared rather than owned: a compiled chain rebuilds this join fresh
+    /// every execution - see `inillucent_exec::compiled::JoinRecipe` - and a
+    /// `Box<dyn Eval>` cannot be cloned, so the recipe and every execution's
+    /// join share one `Rc` over the same compiled expressions instead of
+    /// re-translating them.
+    outer_keys: std::rc::Rc<[Box<dyn Eval>]>,
     /// Which inner columns to emit, in order.
     inner_projection: Projection,
     /// Whether the key is a full inner key (a probe) or a prefix (a range).
@@ -562,7 +597,8 @@ impl<'t> IndexNestedLoopJoin<'t> {
     /// @param kind - how unmatched outer rows are treated
     /// @param inner - the tree to probe
     /// @param pool - the buffer pool
-    /// @param outer_keys - the key expressions over the outer batch
+    /// @param outer_keys - the key expressions over the outer batch, shared
+    ///   with whatever else is rebuilding this join across executions
     /// @param inner_projection - which inner columns to emit
     /// @param full_key - whether the key names every inner key column
     /// @param downstream - what to push joined rows into
@@ -571,11 +607,12 @@ impl<'t> IndexNestedLoopJoin<'t> {
         kind: JoinKind,
         inner: &'t PagedTree,
         pool: &'t Pool,
-        outer_keys: Vec<Box<dyn Eval>>,
+        outer_keys: impl Into<std::rc::Rc<[Box<dyn Eval>]>>,
         inner_projection: Projection,
         full_key: bool,
         downstream: Box<dyn Sink + 't>,
     ) -> IndexNestedLoopJoin<'t> {
+        let outer_keys = outer_keys.into();
         IndexNestedLoopJoin {
             kind,
             inner,
@@ -591,6 +628,14 @@ impl<'t> IndexNestedLoopJoin<'t> {
 
 impl Sink for IndexNestedLoopJoin<'_> {
     fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
+        // **Every batch, because the scan leaves are not enough (task-1932,
+        // H11).** A join reads its probe side once and then does work
+        // proportional to the matches, so a cross join over a small table
+        // checks a few hundred times at the start and then runs for as long as
+        // the product takes with nothing reading the cancellation flag. One
+        // atomic load per batch is what makes a cancel reach the statement it
+        // is about rather than the one after it.
+        inillucent_base::budget::check()?;
         // Split the borrow so the closures below can hold the downstream sink
         // mutably while still reading the tree and the projection.
         let IndexNestedLoopJoin {
@@ -1011,6 +1056,11 @@ pub struct NestedLoopJoin<'s> {
     /// product.
     condition: Option<Box<dyn Eval>>,
     downstream: Box<dyn Sink + 's>,
+    /// The concatenated row the condition is tested over, reused.
+    ///
+    /// One buffer rather than one allocation per candidate pair; see the note
+    /// in `push` (task-1932, M7).
+    scratch: Vec<OwnedDatum>,
 }
 
 impl<'s> NestedLoopJoin<'s> {
@@ -1037,12 +1087,21 @@ impl<'s> NestedLoopJoin<'s> {
             outer_width: 0,
             condition,
             downstream,
+            scratch: Vec::new(),
         }
     }
 }
 
 impl Sink for NestedLoopJoin<'_> {
     fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
+        // **Every batch, because the scan leaves are not enough (task-1932,
+        // H11).** A join reads its probe side once and then does work
+        // proportional to the matches, so a cross join over a small table
+        // checks a few hundred times at the start and then runs for as long as
+        // the product takes with nothing reading the cancellation flag. One
+        // atomic load per batch is what makes a cancel reach the statement it
+        // is about rather than the one after it.
+        inillucent_base::budget::check()?;
         let width = batch.columns.len();
         self.outer_width = width;
         let inner_width = self.inner.first().map(Vec::len).unwrap_or(0);
@@ -1051,9 +1110,17 @@ impl Sink for NestedLoopJoin<'_> {
             let outer = materialise(batch, nth, width)?;
             let mut matched = 0usize;
             for (position, inner) in self.inner.iter().enumerate() {
-                let mut joined = outer.clone();
-                joined.extend(inner.iter().cloned());
-                if !keeps(self.condition.as_deref(), &joined)? {
+                // **The condition is tested over a reused buffer and only a
+                // surviving pair is cloned (task-1932, M7).** This used to
+                // build the joined row for *every* inner row, test it, and drop
+                // it - one allocation and a copy of both sides per candidate
+                // pair, which on a cross join is one per row of the product.
+                // `TopN::push` already had this shape; this is the same idea in
+                // the place it costs most.
+                self.scratch.clear();
+                self.scratch.extend(outer.iter().cloned());
+                self.scratch.extend(inner.iter().cloned());
+                if !keeps(self.condition.as_deref(), &self.scratch)? {
                     continue;
                 }
                 matched = matched.saturating_add(1);
@@ -1062,7 +1129,7 @@ impl Sink for NestedLoopJoin<'_> {
                 }
                 match self.kind {
                     JoinKind::Inner | JoinKind::Left | JoinKind::Right | JoinKind::Full => {
-                        produced.push(joined)
+                        produced.push(self.scratch.clone())
                     }
                     JoinKind::Semi | JoinKind::Anti => break,
                 }

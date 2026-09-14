@@ -14,11 +14,28 @@ them.
 
 | | | measured |
 |---|---|---|
-| **Faster than SQLite** | **326% faster** | 4.26x weighted over the contract's ten families, median of four consecutive 30-round runs. The 95% lower bound the gate actually grades on is **4.13x**, i.e. **313% faster**, against a 3.00x bound it clears on all four |
+| **Faster than SQLite** | **330% faster** | 4.30x weighted over the contract's ten families, median of four consecutive 30-round runs. The 95% lower bound the gate actually grades on is **4.06x**, i.e. **306% faster**, against a 3.00x bound it clears on all four |
 | **Faster than pgvector** | **175% faster unfiltered, 6,262% faster filtered** | retrieval p50 0.8954 ms against 2.459, and 0.6631 ms against 42.182 with a `source =` predicate, against the *better* of the two pgvector configurations. In production, on Nikaya's 598,560-chunk mailbox, semantic p50 went 33.7 ms warm to **4.41 ms** - **664% faster**, and recall@100 0.899 to **1.000** |
-| **Less CPU** | **67% less CPU** | 422 ms of processor against SQLite's 1,266, same plan, one child process each. Ratio 0.33x against a 0.40x bar, which it meets on all four runs |
+| **Less CPU** | **70% less CPU** | 390 ms of processor against SQLite's 1,320, same plan, one child process each. Ratio 0.30x against a 0.40x bar, which it meets on all four runs |
 | **Less RAM** | **it is not less. It is 15% MORE** | 42.6 MiB peak resident against SQLite's 37.2, on the same 128 MiB budget. It was **102% more** before review 6 and **43% more** before review 7, and the bar asks for **5% less** - so this is the one headline that is still a loss |
-| **Same features as SQLite** | **96.9% byte for byte, 98.3% working, 0 refused** | 403 of 416 probed cases produce SQLite's exact bytes; 6 of the other 13 are vector features SQLite does not have. There is **no case SQLite answers that this engine refuses**, and no silent difference - [why it is not 100%](#why-it-is-969-and-not-100) says what each of the 13 is and which can ever be closed |
+| **Same features as SQLite** | **96.9% byte for byte, 98.3% of what SQLite answers, none refused** | 403 of 416 probed cases produce SQLite's exact bytes. 6 of the other 13 are vector features SQLite does not have, and 7 answer differently. [Why it is not 100%](#why-it-is-not-100) says what each is and which can ever be closed |
+
+**This figure has read 403 twice, with a dip to 391 between.** It was first measured at **403 of 416
+with 0 refused** through `inillucent-shell` while that shell still ran an engine this project
+retired. `inillucent` re-exports `inillucent-engine` now, so the shell under the probe became a
+different program, and re-running it from scratch against the engine that ships gave **391 same, 12
+refused**. All twelve were window functions, and the cause was narrow: the compiled-statement path
+bailed out on compound selects and had no matching check for windows, so a windowed statement reached
+a pipeline builder that refused it, while a correct window implementation sat behind a path only a
+test called. Reconnecting the two restored every case. The probe now reads **403 same, 0 refused, 7
+answering differently, 6 features SQLite does not have**, and `sql.select.window` and
+`functions.window` are `pass` in `compat/sqlite-3.53.4.toml` to match.
+
+So the sentence this table used to carry — *"there is no case SQLite answers that this engine
+refuses"* — was true of a program that is no longer what you install. It is written out here rather
+than quietly restated because the correction is the useful part: a parity figure measured against a
+component that has since been replaced is a figure about nothing, and this one survived a
+rearchitecture without anybody noticing.
 
 **Three of the four performance numbers are wins and the fourth is not, which is why it is written
 out rather than rounded off.** The speed is not bought by burning cores - a quarter of the time at a
@@ -37,7 +54,7 @@ First written and then re-measured three times as review 5, re-measured again on
 review 6, and **the 416-case probe re-run from scratch for review 7**, which is where the parity
 number below comes from. It is a measurement taken on this build rather than a
 figure carried forward, and re-running it is how the two refusals in
-[Why it is 96.9% and not 100%](#why-it-is-969-and-not-100) were found. Every row below is a measurement rather than a reading of the
+[Why it is not 100%](#why-it-is-not-100) were found. Every row below is a measurement rather than a reading of the
 source: each feature is a whole SQL script run through `inillucent-shell` and through the pinned
 `sqlite3` 3.53.4, over its own fresh database, with every byte of both streams compared. That is the
 discipline `crates/inillucent-compat/tests/semantics.rs` applies - to 208 constructs - widened here to
@@ -79,11 +96,12 @@ works because somebody implemented it is the thing the probe exists to replace.
 
 ---
 
-## Why it is 96.9% and not 100%
+## Why it is not 100%
 
-**Thirteen of the 416 cases are not byte-equal to SQLite. Not one of them is a feature that is
-missing, and not one is silent - all thirteen answer.** Zero cases are refused here that SQLite
-answers, and zero are accepted here that SQLite rejects.
+**Thirteen of the 416 cases are not byte-equal to SQLite, and none of them is refused.** All
+thirteen answer - none of them is silent -
+split between vector search features SQLite has no equivalent for and three kinds of measured or
+structural difference. Zero cases are accepted here that SQLite rejects.
 
 | how many | what they are | can it ever be closed? |
 |---|---|---|
@@ -92,24 +110,29 @@ answers, and zero are accepted here that SQLite rejects.
 | **1** | **the two pinned SQLite artifacts disagreeing with each other.** `.limit` reports `trigger_depth 1000`; the downloaded `sqlite3.exe` says 100 because it was built with `SQLITE_MAX_TRIGGER_DEPTH=100`, and the locally built oracle says 1000. Twelve of its thirteen lines agree | **No.** Whichever value is printed, one of the two references disagrees with it |
 | **3** | **numbers that describe SQLite's own C structures**: `EXPLAIN`'s bytecode program, `.vfslist`'s `szOsFile`, `.stats`' lookaside counters. Each prints the same report in the same shape over the facts *this* engine has | **No.** Printing SQLite's bytes would be a statement about a library that is not linked into this program - a fabrication, not compatibility |
 
-So: **403 of 416 agree byte for byte (96.9%)**, **409 of 416 work (98.3%)** once the six vector cases
-are counted as the extras they are, and the byte-for-byte number could reach **406 (97.6%)** by
-taking SQLite's page size and locking mode at a measured cost to the gate. **The remaining ten cannot
-be closed by any value** - six because SQLite has no such feature, three because they describe
-SQLite's own internals, and one because the two reference artifacts contradict each other.
+So: **403 of 416 agree byte for byte (96.9%)**, **none are refused**, and **7 answer differently
+(1.7%)**. Excluding the six vector cases that have no SQLite answer to compare against, 403 of the
+remaining 410 agree byte for byte - **98.3%**. **None of the
+seven that differ can be closed by any value** - three because they describe SQLite's own internals,
+one because the two reference artifacts contradict each other, and three at a measured cost to the
+performance bars.
 
-**This number was re-measured for review 7, and re-measuring it is what found a regression.** The
-probe came back **401**, not 403: `DELETE ... ORDER BY ... LIMIT` and the `UPDATE` form answered
-`Parse error near line 3: ORDER` where the reference answers
-`Parse error near line 3: near "ORDER": syntax error`. **Both engines refused, so nothing that checks
-only whether a statement fails could see it** - it took a byte comparison of the message. The cause
-was one of review 6's own fixes: moving `bind::refused` from `ParseErrorKind::Unexpected` to `Refused` was
-right for the forty-seven sentence-shaped refusals in `directive.rs` and wrong for the one caller that
-passes a bare token, because `near "ORDER": syntax error` is the shape that caller wants. It builds an
-`Unexpected` directly now, the re-run is **403 / 7 / 6 with no wording difference**, and both shapes
-are cases in `crates/inillucent-compat/tests/semantics.rs` so they cannot drift back.
+**A regression in the wording of two refusals was found and fixed at review 7, before the window
+function count above existed.** The probe of that era came back **401**, not the review's usual 403:
+`DELETE ... ORDER BY ... LIMIT` and the `UPDATE` form answered `Parse error near line 3: ORDER` where
+the reference answers `Parse error near line 3: near "ORDER": syntax error`. **Both engines refused,
+so nothing that checks only whether a statement fails could see it** - it took a byte comparison of
+the message. The cause was one of review 6's own fixes: moving `bind::refused` from
+`ParseErrorKind::Unexpected` to `Refused` was right for the forty-seven sentence-shaped refusals in
+`directive.rs` and wrong for the one caller that passes a bare token, because
+`near "ORDER": syntax error` is the shape that caller wants. It builds an `Unexpected` directly now,
+the re-run reproduced **403 / 7 / 6 with no wording difference**, and both shapes are cases in
+`crates/inillucent-compat/tests/semantics.rs` so they cannot drift back. That **403** was measured
+through `inillucent-shell` while it still ran a retired engine; against the engine that ships it read
+**391 / 12 / 7 / 6** until the window path was reconnected, and it reads **403 / 0 / 7 / 6** now, as
+above.
 
-Detail for every one of the seven: [The seven rows that are not the same](#the-seven-rows-that-are-not-the-same).
+Detail for every one of the seven that differ: [The seven rows that are not the same](#the-seven-rows-that-are-not-the-same).
 
 **Separately - and this is the more useful number - the register audit found eight names absent**,
 which is a different question from whether the 416 cases agree. Auditing against enumerations SQLite
@@ -131,25 +154,25 @@ and this engine wins two of those three.
 | | SQLite 3.53.4 | inillucent | the difference |
 |---|---|---|---|
 | **SQL features probed** | 416 | 416 | - |
-| features that agree byte for byte, answers and error text alike | the reference | 403 | **96.9% of the surface** - and [here is exactly why it is not 100%](#why-it-is-969-and-not-100): 6 of the 13 are vector features SQLite does not have, and none of the 13 is missing or silent |
-| features SQLite answers and inillucent **refuses** | - | **0** | **none** |
+| features that agree byte for byte, answers and error text alike | the reference | 403 | **96.9% of the surface** - and [here is exactly why it is not 100%](#why-it-is-not-100): 12 of the other 25 are window functions this engine refuses, 6 are vector features SQLite does not have, and the remaining 7 answer differently. None of the 25 is silent |
+| features SQLite answers and inillucent **refuses** | - | **12** | **every one is a window function** |
 | features inillucent accepts that SQLite rejects | - | **0** | **none** |
 | features both answer **differently** | - | 7 | **1.7%**, none of them silent |
 | vector features with no SQLite equivalent | 0 | 6 | **6 extra** |
 | **the surface audited against SQLite's own registers**, not against our case list | 218 functions, 67 pragmas, 19 modules, 5 collations, 65 dot commands | all called in both engines, and now **compared on every build** | **4 functions, 2 modules and 2 dot commands absent**, and the **silent difference is closed** - see [Is the feature list itself complete?](#is-the-feature-list-itself-complete) |
-| **Elapsed time**, weighted over the contract's ten families | the reference | 4.26x the speed | **326% faster** |
-| Elapsed time, the 95% lower bound the contract grades on | - | 4.13x | **313% faster** (bar: 200% faster) |
-| **Processor time**, same plan, one child process each | 1,266 ms | 422 ms | **67% less CPU** (bar: 60%, met on all four runs) |
+| **Elapsed time**, weighted over the contract's ten families | the reference | 4.30x the speed | **330% faster** |
+| Elapsed time, the 95% lower bound the contract grades on | - | 4.06x | **306% faster** (bar: 200% faster) |
+| **Processor time**, same plan, one child process each | 1,320 ms | 390 ms | **70% less CPU** (bar: 60%, met on all four runs) |
 | **Peak resident memory**, same plan, matched 128 MiB budget | 37.2 MiB | 42.6 MiB | **15% MORE memory** (was 102%, then 43%; the bar asks for 5% *less*) |
 | **The database on disk**, the same fixture imported | 16.05 MiB | 16.62 MiB | **1.036x** (was 1.41x) |
-| The family that was **under the floor** | - | `transaction`, now **241% faster** (3.41x, lower bound 2.74x) | **no family is below the 1.00x floor on any of the four runs**, which is the release condition |
+| The family that was **under the floor** | - | `transaction`, now **152% faster** (2.52x, lower bound 1.99x) | **no family is below the 1.00x floor on any of the four runs**, which is the release condition. It reads 152% rather than the 241% recorded at review 7 because task-1911 made the rollback journal perform the sync it exists for, which `txn.autocommit` pays once per statement - see [Performance](performance.md#by-family) |
 | Retrieval ranking, 17 graded comparisons against pgvector | the baseline | 15 better, 2 not worse | **none worse** |
 | Retrieval latency, unfiltered, p50 | 2.459 ms | 0.8954 ms | **175% faster** |
 | Retrieval latency, filtered to a minority source, p50 | 42.182 ms | 0.6631 ms | **6,262% faster** |
 
 **Read the performance rows together.** inillucent finishes the same work in **a quarter of the
 time** while spending **about a third of the processor**, so the speed is not bought by burning
-cores - and it holds **15% more memory** to do it, where it held 102% more before review 6 and 43%
+cores - and it holds **14% more memory** to do it, where it held 102% more before review 6 and 43%
 before review 7. The budget handed to the two engines is the same 128 MiB; what differs is how much
 of it each chooses to use, and after review 7 the file itself is within **4%** of SQLite's.
 
@@ -178,34 +201,37 @@ pages and arena.
 
 | | | at review 5 |
 |---|---|---|
-| **416 probed features** | **403 agree with SQLite byte for byte** - [why not 416](#why-it-is-969-and-not-100) | 403 |
-| features SQLite answers and inillucent refuses | **0** | 0 |
+| **416 probed features** | **403 agree with SQLite byte for byte** - [why not 416](#why-it-is-not-100) | 403 |
+| features SQLite answers and inillucent refuses | **12, all window functions** | 0 |
 | features both answer, **differently** | **7** - and none of them is silent | 7 |
 | features inillucent accepts that SQLite rejects | **0** | 0 |
 | vector features with no SQLite equivalent | **6**, all working | 6 |
-| | **409 of 416 agree** | 409 |
+| | **404 of 416 answer** | 409 |
 
 A case where both engines refuse counts as agreement only when the refusal is **the same text**.
-There is no separate column for it because there is no case where the wording differs.
+There is no separate column for it because there is no case where the wording differs. The twelve
+window function refusals are not that case: SQLite answers every one of them, and this engine refuses
+all twelve.
 
 **Review 7 re-ran the whole probe on a fresh build over fresh databases, and it did not reproduce
 review 5's numbers on the first pass - it came back 401.** Two refusals had drifted in wording; both
 engines still refused, so nothing that checks only whether a statement fails could see it, and the
-cause was one of review 6's own fixes applied one caller too widely.
-[Why it is 96.9% and not 100%](#why-it-is-969-and-not-100) says which two and what they answered.
-Corrected, the re-run reproduces 403 case for case - which is what makes the number a measurement
-rather than a recollection - and both shapes are now cases in `semantics.rs`, so the next drift fails
-a build instead of a document.
+cause was one of review 6's own fixes applied one caller too widely. Corrected, review 7 reproduced
+403 case for case, and both shapes are now cases in `semantics.rs`, so the next drift fails a build
+instead of a document. **That 403 was measured through `inillucent-shell` while it still ran the
+a retired engine.** Against the engine that ships the count read 391 agree, 12 refused and 7 differ
+until the window path was reconnected, and it reads 403 agree, 0 refused and 7 differ now -
+[why it is not 100%](#why-it-is-not-100) has the full breakdown.
 
 **The five goals, measured:**
 
 | goal | state |
 |---|---|
-| Same SQL as SQLite | **Yes.** Every case in thirty-five of the thirty-eight areas agrees byte for byte, and the three that do not are `pragma`, `explain` and `shell`. |
-| Same observable semantics | **Nothing is refused, and the one silent difference is closed.** `pragma_function_list` and `pragma_module_list` answered fewer rows than SQLite's while the functionality behind the difference worked, so a caller that introspected the register was told less than the truth with no error. It was found by [auditing the list against SQLite's own enumerations](#is-the-feature-list-itself-complete) rather than by the 416 cases, and review 6 closed it and turned the audit into `crates/inillucent-compat/tests/registers.rs`, which compares all four registers on every build. Every one of the seven rows that answers differently reports something a caller can read and act on: a page size and a locking mode this engine chose and can measure the cost of choosing otherwise, a build option the two pinned reference artifacts disagree about, or a number that describes SQLite's own C structures - a VDBE program, `sizeof(sqlite3_file)`, a lookaside allocator's counters - which no engine that is not SQLite can print. |
+| Same SQL as SQLite | **Yes.** Nothing the probe runs is refused, window functions included: `sql.select.window` and `functions.window` are both `pass` in `compat/sqlite-3.53.4.toml`. Everything agrees byte for byte, or answers with a measured, explained difference in `pragma`, `explain` and `shell`. See [SQL support](sql.md). |
+| Same observable semantics | **Nothing SQLite answers is refused silently, and the one silent difference is closed.** `pragma_function_list` and `pragma_module_list` answered fewer rows than SQLite's while the functionality behind the difference worked, so a caller that introspected the register was told less than the truth with no error. It was found by [auditing the list against SQLite's own enumerations](#is-the-feature-list-itself-complete) rather than by the 416 cases, and review 6 closed it and turned the audit into `crates/inillucent-compat/tests/registers.rs`, which compares all four registers on every build. Every one of the seven rows that answers differently reports something a caller can read and act on: a page size and a locking mode this engine chose and can measure the cost of choosing otherwise, a build option the two pinned reference artifacts disagree about, or a number that describes SQLite's own C structures - a VDBE program, `sizeof(sqlite3_file)`, a lookaside allocator's counters - which no engine that is not SQLite can print. The twelve window function refusals are visible too: each returns exit code `3`, not `1`, so a caller can tell "not built" from "your SQL is wrong". |
 | The PRAGMA surface an application uses | **59 of the 67 pragmas SQLite lists answer; the other 8 answer nothing in SQLite either.** None is silent here, and none is refused here. |
 | Embedding search like pgvector | **The ranking is better and the SQL surface matches**, operator spellings included. Re-graded in full for this review. See [Vector search](#vector-search-against-postgresql--pgvector). |
-| Faster than SQLite | **Yes on time and on processor, no on memory.** 326% faster at 67% less CPU over four consecutive runs, at **15% more** resident memory - down from 102% before review 6 and 43% before review 7, and now graded by a bar in the contract rather than left ungraded. See [Performance](#performance). |
+| Faster than SQLite | **Yes on time and on processor, no on memory.** 330% faster at 70% less CPU over four consecutive runs, at **14% more** resident memory - down from 102% before review 6 and 43% before review 7, and now graded by a bar in the contract rather than left ungraded. See [Performance](#performance). |
 
 ---
 
@@ -284,19 +310,22 @@ be the same defect pointing the other way, so none was added on the strength of 
   so its own register names only the one the query provoked. Filtered, and the two front-ends now
   agree with each other and with the reference.
 
-**4. Twenty-three names reported the wrong *reason* out of context. Closed by review 6.** The eleven window functions
+**4. Twenty-three names reported the wrong *reason* out of context. Closed at review 6 for all
+twenty-three; the eleven window functions regressed in task-1911.** The eleven window functions
 (`row_number`, `rank`, `dense_rank`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`,
 `ntile`, `percent_rank`, `cume_dist`) and the FTS5 auxiliary functions (`bm25`, `highlight`,
-`snippet`, `matchinfo`, `offsets`, `optimize`, `match`) answer `no such function: X` where SQLite
-answers `misuse of window function X()` or `unable to use function X in the requested context`.
-**Every one of them is present and byte-identical when called properly** - verified in this audit,
-window frames and `bm25`/`highlight`/`snippet` over a real FTS5 index included. What differed was the
-message a caller got when they were wrong, and that message is what made an audit which probes by
-*calling* read twenty-three working functions as missing. `SELECT row_number()` now answers
-`misuse of window function row_number()` and `SELECT bm25(1)` answers
-`unable to use function bm25 in the requested context`, which is what SQLite answers.
-`registers.rs::a_name_out_of_context_reports_the_context_and_not_an_absence` compares all eleven
-window names against the reference on every run.
+`snippet`, `matchinfo`, `offsets`, `optimize`, `match`) used to answer `no such function: X` where
+SQLite answers `misuse of window function X()` or `unable to use function X in the requested
+context`. At review 6, every one of them was present and byte-identical when called properly -
+verified in this audit, window frames and `bm25`/`highlight`/`snippet` over a real FTS5 index
+included. `SELECT row_number()` answers `misuse of window function row_number()` and
+`SELECT bm25(1)` answers `unable to use function bm25 in the requested context`, both still correct
+today - `registers.rs::a_name_out_of_context_reports_the_context_and_not_an_absence` compares all
+eleven window names against the reference on every run. **Calling a window function properly is a
+different matter now.** Task-1911 replaced the engine `inillucent-shell` runs, and the new engine's
+physical pass refuses every `OVER (...)` clause outright, so `SELECT row_number() OVER (ORDER BY a)`
+- which review 6 confirmed answered correctly - is refused today. The FTS5 auxiliary functions are
+unaffected. See [SQL support](sql.md).
 
 **And the probe found a forty-eighth wording defect on its way past.** Its own scripts create a table
 twice, and the second `CREATE TABLE t(a)` answered
@@ -429,6 +458,20 @@ A `USING` or `NATURAL` join *coalesces* the named column, and the right-hand cop
 | WITH on UPDATE and DELETE | yes | **yes** |
 
 ### Window functions - 11 of 11
+
+This section said "0 of 11, not implemented" between task-1911 and task-1932. That was wrong, and the
+way it was wrong is worth recording. The evaluator - `run_windowed` in `inillucent-exec`, about a
+thousand lines - answered every form the whole time. The refusal came from one layer above it:
+`compiled::try_compile` bailed out on `plan.compounds` and had no matching check for
+`plan.select.windows`, so a windowed statement reached `build_upper`, which refused it, and
+`run_cached_query` propagated that refusal instead of falling back to the fresh path the way a
+compound does. Every entry point an application uses goes through that cached path, so the working
+evaluator was reachable only from `run_with`, which nothing but a test calls.
+
+Each row below is graded against SQLite 3.53.4 by `windows_match_the_oracle` in
+`crates/inillucent-compat/tests/advanced_sql.rs`: forty-one statements, compared row for row in
+order with storage classes included. Tracked as `sql.select.window` and `functions.window` in
+`compat/sqlite-3.53.4.toml`, both `status = "pass"`.
 
 | feature | SQLite 3.53.4 | inillucent |
 |---|---|---|
@@ -685,7 +728,7 @@ and the ordering agree.
 | sum of text and of a mixed column | yes | **yes** |
 | Integer sum overflowing | yes | **yes** |
 
-### Date and time - 9 of 9
+### Date and time - 9 of 10
 
 | feature | SQLite 3.53.4 | inillucent |
 |---|---|---|
@@ -698,6 +741,19 @@ and the ordering agree.
 | Modifiers: ceiling, floor, subsec, auto | yes | **yes** |
 | timediff | yes | **yes** |
 | Julian day round trip | yes | **yes** |
+| Modifiers: localtime, utc | yes | **no, on purpose** |
+
+The two time zone modifiers are the one deliberate difference in this table.
+`datetime(x, 'localtime')` answers NULL here and `datetime(x, 'utc')` returns
+its argument unchanged, where SQLite converts between the machine's zone and
+UTC: on a machine set to UTC-6, `datetime('2026-09-03 14:30:00', 'utc')` is
+`2026-09-03 20:30:00` in SQLite and `2026-09-03 14:30:00` here.
+
+Both of SQLite's answers depend on the operating system's time zone database
+and on the zone the process is running in, so the same query answers differently
+on two machines and differently again after a daylight saving change. Store the
+offset with the value and convert it in the application, which is what a query
+that has to give the same answer twice already does.
 
 ### Maths - 4 of 4
 
@@ -745,7 +801,7 @@ path serves `generate_series(1, t.a)` and any other table-valued function given 
 `inillucent_sql::function::every_function` is what `pragma_function_list` reports. Against the pinned
 **library** - the amalgamation, not the shell - there is no function SQLite answers that this engine
 does not. `current_date`, `current_time` and `current_timestamp` used to be the exception: they
-worked as keywords but were not named in the register, which is the shape of under-reporting that
+worked as keywords but were not named in the register, which is the kind of under-reporting that
 review 6 went after. They are named now. `load_extension` *is* registered and refuses in the platform's own
 words, because this build has no dynamic loader and a function that quietly answered NULL would be a
 function an application believed had worked.
@@ -885,7 +941,7 @@ each of those does it.
 | FTS5 external content table | yes | **yes** |
 | FTS5 contentless table | yes | **yes** |
 | FTS5 'optimize' and 'rebuild' commands | yes | **yes** |
-| FTS5 tokenizer options | yes | **yes** |
+| FTS5 tokenizer options | yes | **partly** - `unicode61` with `remove_diacritics`, `tokenchars` and `separators`, `ascii`, and `porter` over either. `trigram` is not implemented, and a name this build has not got is now refused by name rather than read as `unicode61`: the tokenizer decides what `MATCH` means, so substituting one turned `tokenize='trigram'`'s substring search into a whole-word search with no error anywhere |
 | fts5vocab | yes | **yes** |
 | FTS3/FTS4 | yes | **yes** |
 
@@ -898,7 +954,7 @@ which is the same mechanism `fts5vocab` uses to read another index. **FTS3 and F
 front on the same index: `docid`, `snippet(t, start, end, ellipsis, column, tokens)`, `offsets(t)`
 and `matchinfo(t, format)`, over the tokenizer, dictionary and doclists FTS5 already had.
 
-### R-Tree and geopoly - 3 of 3
+### R-Tree and geopoly - 2 of 3
 
 | feature | SQLite 3.53.4 | inillucent |
 |---|---|---|
@@ -1030,7 +1086,7 @@ other rather than a difference in this engine - see
 | .connection [close] [#] | yes | **yes** - five slots, `ACTIVE` on the one statements run on, an in-memory database opened in a slot that was closed |
 | .imposter INDEX TABLE | yes | **yes.** An index's entries are the indexed columns followed by the row's identity, which is a `WITHOUT ROWID` table - so the declaration reads the index's own b-tree, and `.imposter off` takes it away again |
 | .expert | `EXPERIMENTAL. Suggest indexes for queries` | **not here.** Its answer is whichever candidate index its *cost model* prefers - `WHERE a>1 ORDER BY b` recommends `(b)` and `WHERE a=1 ORDER BY b` recommends `(a, b)` - so an implementation over this planner would recommend this planner's answer, which is a different tool wearing the same name. SQLite marks it experimental for the same reason |
-| .load FILE ?ENTRY? | `Error: The specified module could not be found.` for a library it cannot open | **yes, and it answers exactly that** - the command exists, `.help` lists it, and a script written for the reference runs to the same message rather than stopping at "unknown command". What it cannot do is *find* a library: a SQLite extension is a shared object against `sqlite3_api_routines`, and presenting that C ABI is `inillucent-capi`'s subject rather than the shell's. The extension surface this engine has is Rust-native, through `inillucent_ext::registry` |
+| .load FILE ?ENTRY? | `Error: The specified module could not be found.` for a library it cannot open | **yes, and it answers exactly that** - the command exists, `.help` lists it, and a script written for the reference runs to the same message rather than stopping at "unknown command". What it cannot do is *find* a library: a SQLite extension is a shared object against `sqlite3_api_routines`, and no crate in this workspace presents that C ABI - `inillucent-driver-capi` is a bespoke API of its own rather than a `sqlite3_api_routines` workalike. The extension surface this engine has is Rust-native, through `inillucent_ext::registry` |
 | .progress N | `Invoke progress handler after every N opcodes`; prints nothing unless `--limit` is given | **yes, and it keeps the same state** - the words, `--once`, `--quiet`, `--limit` and `--reset`, reported by `.show`. What it does not do is interrupt a statement part-way: the unit is a VDBE opcode and this engine compiles none, so there is no per-opcode callback to hang one on. The reference's visible effect on an ordinary script is none either, which is why keeping the state is the whole of the parity worth having |
 | .session ?NAME? CMD ... | yes | **not here.** The session extension is changesets, patchsets, conflict resolution and a rebaser - a subsystem beside the engine rather than a command, and the largest single thing on SQLite's surface this engine has not got |
 
@@ -1065,7 +1121,7 @@ Every one, with what it measures. Nothing here is refused and nothing here is si
 and each reports something a caller can read.
 
 **Two are one decision, measured.** Both of the experiments in this section were run when the
-weighted headline stood at 3.83x rather than today's 4.26x, and neither has been re-run since. What
+weighted headline stood at 3.83x rather than today's 4.30x, and neither has been re-run since. What
 each measures is the *difference* between two settings, which is why it is still quoted.
 
 1. **`PRAGMA page_size` is 32768** where the reference is 4096. Measured both ways on the medium
@@ -1147,13 +1203,12 @@ These cannot be probed with SQL. They are read from the tree and from the design
 | processes per file | many, byte-range locks | **many**, over the same SHARED / RESERVED / PENDING / EXCLUSIVE protocol, under `PRAGMA locking_mode = NORMAL`. The default is `exclusive`; see row 7 above |
 | writers | one at a time; readers block in rollback mode, not in WAL | **one at a time; readers never block** (snapshot isolation) |
 | threading | single-thread, multi-thread and serialised modes | **single-threaded** |
-| journal modes | `DELETE`, `TRUNCATE`, `PERSIST`, `MEMORY`, `WAL`, `OFF` | **all six**, and `delete` by default, as SQLite is - review 5 measured the alternative and the reference's own default cost nothing |
+| journal modes | `DELETE`, `TRUNCATE`, `PERSIST`, `MEMORY`, `WAL`, `OFF` | **all six**, and `delete` by default, as SQLite is - review 5 measured the alternative and the reference's own default cost nothing. They mean something different here: an application's `ROLLBACK` is undone from the log under every one of them, including `OFF`, so what the journal mode selects is how a **checkpoint** is protected rather than how a transaction is. `MEMORY` and `OFF` are therefore the same choice here, where SQLite distinguishes them |
 | durability | rollback journal or WAL, `synchronous` OFF/NORMAL/FULL | **both**: a redo WAL with group commit, crc32c per record, fuzzy checkpoints that retire segments and ARIES-style recovery; and a rollback journal that takes a page's pre-image before its new image is written. `synchronous` OFF/NORMAL/FULL |
 | isolation | serialisable, one writer | snapshot isolation with a version log and garbage collection |
 | page size | 512-65536, 4096 default | 8-64 KiB, **32 KiB default** |
 | default page cache | `PRAGMA cache_size` **-2000**, so 2 MiB | `PRAGMA cache_size` **-131072**, so **128 MiB - 64x SQLite's**. It is a real switch here and setting it to SQLite's default takes a scanning shell from 23.1 MiB resident to 9.3; see [Where the memory goes](#where-the-memory-goes) |
 | C API | `sqlite3.h`, ~290 functions | **`inillucent_driver.h`, 53 symbols**, per-symbol stability in `drivers/abi.toml`, plus a capability table a caller can ask before composing a statement |
-| the legacy `sqlite3_*` ABI | - | `inillucent-capi` exports 133 `sqlite3_*` symbols over the **old** engine only |
 | language bindings | dozens, everywhere | **Python**, in the standard library only, as the reference binding |
 | backup API | `sqlite3_backup_*` | `inillucent_backup_to` in the driver, `.backup` in the shell |
 | serialize / deserialize, incremental blob I/O, authorizer, update / commit / rollback / preupdate hooks, progress handler, tracing, `unlock_notify`, snapshots, custom VFS | yes | **not on the new engine** |
@@ -1227,7 +1282,7 @@ the configured one returns the rows and pays for them.
 | `source = slack`, p50 | **0.6631 ms** | 42.182 ms | **6,262% faster** | 1.398 ms | **111% faster** |
 | `source = slack`, p95 | **1.292 ms** | 101.038 ms | **7,720% faster** | 1.969 ms | **52% faster** |
 
-The filtered row is the shape of the whole comparison: pgvector's cost of *being correct under a
+The filtered row stands for the whole comparison: pgvector's cost of *being correct under a
 filter* is to repeat the scan, and it is two orders of magnitude. inillucent's probe widens itself
 instead - ask the graph for *k*, run the residual predicate, and if fewer than *k* survive ask for
 four times as many - which needs no setting, and is why the filtered query here takes **less** time
@@ -1271,7 +1326,7 @@ to reduce; it is item 22 of [What is still missing](#what-is-still-missing).
 | `vector`, `halfvec`, `bit`, `sparsevec` types | **`VECTOR(N)`.** `HALFVEC(4)`, `BIT(8)` and `SPARSEVEC(4)` are accepted as declared type names; the storage behind all of them is the one 32-bit float vector, so what the three narrower spellings buy a caller today is that a schema written for pgvector is a schema this parses |
 | HNSW and IVFFlat index types | **both.** `CREATE INDEX ... USING inillucent_hnsw (v)` is the graph the retrieval engine builds; `CREATE INDEX ... USING ivfflat (v) WITH (lists = 20, probes = 3)` is k-means centroids and an inverted list per centroid, written as its own module because an inverted file needs no lexical half. Probing every list is **exhaustive and exact** - a graded test asserts it returns the exhaustive plan's ten rows, row for row - and three lists of twenty over four hundred vectors returned the same ten |
 | `WITH (m = ..., ef_construction = ...)`, `SET hnsw.ef_search` | **`WITH ( ... )` takes them all**: `m`, `ef_construction`, `ef_search`, `metric`, `threads` and `compact`, checked against the structure that reads them - a name it has not got is refused rather than ignored, and so is `WITH` on an index that is not `USING` a module. `PRAGMA hnsw_ef_search` is the session form of the third. The search also widens itself, which is the part that needs no knob: see below |
-| an ordering on any distance planned onto the index | **cosine**, on both structures. `ORDER BY vector_distance_l2(v, ?) LIMIT k` plans as a scan and a temp b-tree, because the graph this index is is built over unit vectors and cosine is what it minimises. pgvector spells the same restriction as an operator class - an `hnsw (v vector_l2_ops)` index answers an L2 ordering and a `vector_cosine_ops` one does not - and `WITH (metric = ...)` is where that spelling goes when the structure has a second metric to name |
+| an ordering on any distance planned onto the index | **cosine and L2**, named by `WITH (metric = 'cosine' \| 'l2')` on the index and defaulting to cosine. The index is probed only when the `ORDER BY` function matches the metric it was built under; a mismatch plans as a scan and a temp b-tree, which is what pgvector's operator classes express - an `hnsw (v vector_l2_ops)` index answers an L2 ordering and a `vector_cosine_ops` one does not. `vector_dot` has no index of its own and always plans as a scan |
 | a mismatched dimension raises | **raises** - `different vector dimensions 4 and 3`, and a non-vector argument raises `vector_distance_cos: argument 2 is not a vector`. A NULL argument is still NULL, which is what every other scalar function answers |
 | **filtered search** (`WHERE ... ORDER BY v <=> ? LIMIT k`), with `hnsw.iterative_scan` to keep recall | **yes**, and it needs no knob. See below |
 | embedding generation | pgvector has none. inillucent has **`embed(TEXT)`** - `nomic-embed-text-v1.5` through ONNX Runtime, in the database process, answering the 3,072 bytes of a 768-component vector ready to store in a `VECTOR(768)` column. It is behind `--features embed`, off by default, for the reason the retrieval engine's own `onnx` feature is off: a SQL engine that linked a native machine-learning runtime whether or not anybody asked would cost the binary and the load time to every caller who supplies their own vectors, and most do |
@@ -1321,20 +1376,32 @@ down rather than assumed.
 **Where the numbers have been.** The engine has been measured in full five times, and the headline
 has moved every time; nothing here is a figure carried forward from a previous document.
 
-| | review 5 | review 6 | review 7 | after task-1885 | **now** |
-|---|---|---|---|---|---|
-| weighted headline | - | 3.81x | 3.79x | 3.83x | **4.26x** |
-| 95% lower bound (bound 3.00x) | - | 3.55x | 3.65x | 3.60x | **4.13x** |
-| `transaction` (floor 1.00x) | - | 1.14x | 0.84x - `UNDER THE FLOOR` | 0.90x - `UNDER THE FLOOR` | **3.41x** |
-| `write` (bar 1.50x) | - | 1.93x | 1.71x | 1.60x | **1.92x** |
-| processor time | - | 406 ms | 445 ms | 414 ms | **422 ms** |
-| peak resident set | 75.25 MiB | 53.28 | 42.61 | 42.59 | **42.61 MiB** |
-| the imported `.rdb` | - | 22.66 MiB | 17,432,576 B | 17,432,576 B | **17,432,576 B** - 1.036x the `.db` |
+| | review 5 | review 6 | review 7 | after task-1885 | before task-1911 | **now** |
+|---|---|---|---|---|---|---|
+| weighted headline | - | 3.81x | 3.79x | 3.83x | 4.26x | **4.30x** |
+| 95% lower bound (bound 3.00x) | - | 3.55x | 3.65x | 3.60x | 4.13x | **4.06x** |
+| `transaction` (floor 1.00x) | - | 1.14x | 0.84x - `UNDER THE FLOOR` | 0.90x - `UNDER THE FLOOR` | 3.41x | **2.52x** |
+| `write` (bar 1.50x) | - | 1.93x | 1.71x | 1.60x | 1.92x | **2.08x** |
+| `extension` (bar 1.50x) | - | - | - | - | 1.30x | **1.52x** |
+| processor time | - | 406 ms | 445 ms | 414 ms | 422 ms | **390 ms** |
+| peak resident set | 75.25 MiB | 53.28 | 42.61 | 42.59 | 42.61 | **42.40 MiB** |
+| the imported `.rdb` | - | 22.66 MiB | 17,432,576 B | 17,432,576 B | 17,432,576 B | **17,432,576 B** - 1.036x the `.db` |
 
-The two rows that moved most are the two that were failing. `transaction` was **under the contract's
-floor on all four runs** and is now 3.41x; `write` missed its bar and now clears it. What that took
-is in [the performance page](performance.md#the-workload-that-was-measuring-nothing), and one part of
-it was a defect in the workload rather than in the engine.
+The two rows that moved most before task-1911 are the two that had been failing. `transaction` was
+**under the contract's floor on all four runs** and reached 3.41x; `write` missed its bar and cleared
+it. What that took is in
+[the performance page](performance.md#the-workload-that-was-measuring-nothing), and one part of it
+was a defect in the workload rather than in the engine.
+
+**`transaction` is the one row that moved backwards, from 3.41x to 2.52x, and it is the price of a
+durability fix.** task-1911 found that the rollback journal never synced its page images before the
+pages they protect were overwritten, so a crash during a checkpoint could destroy a database the
+power loss itself had left whole. Making it sync costs one `fsync` per checkpoint, and
+`txn.autocommit` checkpoints once per statement: that workload went from about 2.6x to **1.05x**,
+which is parity with SQLite, which performs the same sync at `synchronous = FULL`. The other two
+workloads in the family did not move. The engine was faster at autocommit than SQLite by not doing
+work SQLite does, and three more ways a crash could lose a database came out of the same thread -
+[the roadmap](roadmap.md#what-task-1911-closed) has all four.
 
 **How to read every percentage below.** A workload that takes 1 second where SQLite takes 4 is
 written as **300% faster**, and its ratio is 4.00x. A workload that takes 4 seconds where SQLite
@@ -1346,10 +1413,10 @@ is never left as the only statement of a loss. Memory and processor time are wri
 
 | | SQLite 3.53.4 | inillucent | the difference | the contract |
 |---|---|---|---|---|
-| **elapsed time**, weighted geometric mean over the ten families | the reference | 4.26x the speed | **326% faster** | - |
-| **elapsed time**, the 95% lower bound the contract grades on | - | 4.13x | **313% faster** | bound 3.00x - **MET on all four runs** |
-| **processor time**, one round of the whole plan | 1,266 ms | 422 ms | **67% less CPU** | bar 0.40x, measured **0.33x** - **MET on all four** |
-| **peak resident set**, one round of the whole plan | 37.19 MiB | 42.61 MiB | **15% more memory** | bar 0.95x, measured **1.15x** - **MISSED on all four** |
+| **elapsed time**, weighted geometric mean over the ten families | the reference | 4.30x the speed | **330% faster** | - |
+| **elapsed time**, the 95% lower bound the contract grades on | - | 4.06x | **306% faster** | bound 3.00x - **MET on all four runs** |
+| **processor time**, one round of the whole plan | 1,320 ms | 390 ms | **70% less CPU** | bar 0.40x, measured **0.30x** - **MET on all four** |
+| **peak resident set**, one round of the whole plan | 37.20 MiB | 42.40 MiB | **14% more memory** | bar 0.95x, measured **1.14x** - **MISSED on all four** |
 
 The processor and memory figures are the gate's *comparable pair*: **one child process each**, both
 opening a finished file the parent built, both running one round of the same plan, neither figure a
@@ -1361,7 +1428,11 @@ file rather than a buffer, and it has not moved since.
 [Where the memory goes](#where-the-memory-goes) has the per-workload attribution and the measured
 reason the last 5.4 MiB is not going to come from another buffer either.
 
-The four runs:
+**The four runs below are the gate run that preceded the one above**, and they are kept because they
+are the last run whose four arms were recorded one by one. Its median headline is 4.26x where the
+current one is 4.30x, and its `transaction` family reads 3.41x where the current one reads 2.52x —
+task-1911 made the rollback journal do the sync a rollback journal is for, and autocommit pays that
+sync once a statement now.
 
 | | run 1 | run 2 | run 3 | run 4 | median |
 |---|---|---|---|---|---|
@@ -1395,7 +1466,9 @@ directories holding 60 GB had built up in `%TEMP%`, one per gate run ever taken.
 
 ### Elapsed time by family
 
-Median of the four runs. **Bar** is what `compat/perf/contract.toml` asks of the family; **weight** is
+Median of the four runs in the table above, which is the run that preceded the current one.
+[Performance](performance.md#by-family) carries the current figures per family, with each family's
+own 95% lower bound. **Bar** is what `compat/perf/contract.toml` asks of the family; **weight** is
 what the contract gives it in the headline.
 
 | family | weight | measured | the difference | the bar asks | verdict | lower bounds |
@@ -1755,7 +1828,7 @@ is now a checked-in test - `crates/inillucent-compat/tests/registers.rs`.
 | 18 | **Six FTS functions are absent** | **two closed** | `fts5_source_id()` and `optimize()` answer, both faithfully - `optimize` reports `Index already optimal`, which is true here because this index keeps one doclist per term. `fts5(...)`, `fts5_locale()`, `fts5_get_locale()` and `fts5_insttoken()` hand out C pointers or belong to FTS5's locale machinery, and a stub would be a **wrong** answer rather than a missing one. `fts3_tokenizer` is absent from the pinned library too |
 | 19 | **Two modules are absent**: `fts4aux` and `fts3tokenize` | open | both absent from the pinned library as well, so they are a difference against the shell. The FTS5 analogue `fts5vocab` **is** here |
 | 20 | **Four dot commands are absent** | **two closed** | 61 → **63 of 65**. `.load` answers the reference's own words for a library it cannot open, and `.progress` accepts and keeps the same state. `.expert` and `.session` are the two left, and the shell table says what each would mean here |
-| 21 | **Twenty-three names give the wrong reason out of context** | **closed** | `SELECT row_number()` answers `misuse of window function row_number()` and `SELECT bm25(1)` answers `unable to use function bm25 in the requested context`, which is what SQLite answers. Every one was already byte-identical when called properly; the message was the whole defect, and it is what made an audit that probes by *calling* read twenty-three working functions as missing |
+| 21 | **Twenty-three names give the wrong reason out of context** | **closed at review 6; the eleven window functions regressed in task-1911** | `SELECT row_number()` answers `misuse of window function row_number()` and `SELECT bm25(1)` answers `unable to use function bm25 in the requested context`, which is what SQLite answers. At review 6 every one of the twenty-three was byte-identical when called properly, message and result alike. Task-1911 replaced the engine `inillucent-shell` runs, and the new one refuses `OVER (...)` outright: the eleven window functions still answer the bare, out-of-context message correctly, but calling one properly - inside `OVER (...)` - is now a refusal rather than an answer. `bm25`, `highlight`, `snippet` and the rest are unaffected. See [SQL support](sql.md) |
 | 22 | **The register comparison was a thing somebody had to think to do** | **closed** | `registers.rs`: six cases over the four enumerations, run on every build, written as an exclusion list so a name that differs has to be named there with why. Its own doc comment says why a suite that probes by calling cannot find this class of gap |
 
 **Forty-one further names are not a gap**: `base64`, `base85`, `decimal*`, `ieee754*`, `sha1*`,
@@ -1809,9 +1882,11 @@ node tools/feature-probe/registers.js
 ```
 
 It diffs the four registers and the two `.help` outputs, calls every one of the 218 function names
-SQLite lists in both shells, and then calls the context-scoped ones properly - window frames, and
-`bm25`/`highlight`/`snippet` over a real FTS5 index - because a bare call reports the wrong thing in
-*both* engines. Its transcripts land in `_agent_output/feature-probe/registers/`.
+SQLite lists in both shells, and then calls the context-scoped ones properly, because a bare call
+reports the wrong thing in *both* engines: `bm25`, `highlight` and `snippet` over a real FTS5 index
+answer correctly there. Window functions are the exception in the other direction - a bare call
+answers the same `misuse of window function` message SQLite gives, and calling one properly inside
+`OVER (...)` answers what SQLite answers. Its transcripts land in `_agent_output/feature-probe/registers/`.
 
 The three rules that keep it meaningful are in the file's own header: **the enumeration comes from
 SQLite, never from us**; **every name is called, not just listed**, because a register can
@@ -1857,7 +1932,7 @@ target/release/inillucent-fullgate <dir>/m.db --scale medium --rounds 12 --page-
 target/release/inillucent-childcost target/release/inillucent-allocarm <dir>/m.db --rounds 8 --scale medium
 target/release/inillucent-childcost target/release/inillucent-allocarm <dir>/m.db --rounds 8 --scale medium --system
 
-# the read-path memory: two shells, 200,000 rows each. The cache_size ladder is the same
+# the memory a read costs: two shells, 200,000 rows each. The cache_size ladder is the same
 # script with a leading `PRAGMA cache_size = -N;`, through inillucent-childcost
 target/release/inillucent-shellrss
 

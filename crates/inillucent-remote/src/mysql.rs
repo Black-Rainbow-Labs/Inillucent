@@ -14,6 +14,11 @@
 //! exchange, and this client has neither. Pretending otherwise would surface as
 //! "the server rejected my password", which is a wrong diagnosis of a correct
 //! password, so the refusal names the two ways out instead.
+//!
+//! Invariant: **every number this client reads out of a packet is bounded
+//! before it sizes anything.** A server can be hostile, buggy, or reached
+//! through a proxy, so a length-encoded count is a number an attacker chooses:
+//! the 256 MiB message cap bounds the packet and not the numbers inside it.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -62,6 +67,22 @@ const COM_QUERY: u8 = 0x03;
 
 /// `COM_QUIT`.
 const COM_QUIT: u8 = 0x01;
+
+/// The most columns a result set may claim.
+///
+/// **MySQL's own hard limit, used here as a bound on a number the server
+/// chooses (task-1932, H5).** `stream_query` read a length-encoded column count
+/// out of the first packet of a result set and ran `Vec::with_capacity` on it,
+/// and `lenenc_read` decodes up to `u64::MAX` - so a twelve-byte packet claiming
+/// `u64::MAX` columns asked for an allocation that panics with capacity overflow
+/// or exhausts memory, before the first row. The 256 MiB message cap in
+/// `stream.rs` bounds the packet, not a number inside it.
+///
+/// A migration talks to a server somebody else runs, possibly through a proxy,
+/// so the count is untrusted in exactly the way a database page is. Refusing
+/// above MySQL's own limit costs a real server nothing and turns a hostile one
+/// into a named `protocol` error.
+const MAX_COLUMNS: u64 = 4096;
 
 /// One column of a result set, as `ColumnDefinition41` describes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -308,6 +329,20 @@ impl MysqlSource {
     /// Opens the one snapshot every read happens inside.
     fn open_snapshot(&mut self) -> DbResult<()> {
         self.execute("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")?;
+        // **The session's zone is pinned, so a `TIMESTAMP` does not depend on
+        // where the migration was run from (task-1932, M10).** MySQL stores a
+        // `TIMESTAMP` in UTC and renders it in the *session's* `time_zone`,
+        // which defaults to the server's - so the same table migrated from a
+        // laptop in Denver and from a server in UTC carried two different
+        // strings for one instant. The destination's text then depended on who
+        // ran the tool, and `RowDigest` hashes the carried bytes, so a resumed
+        // migration that copied correctly failed its own verification.
+        //
+        // `+00:00` rather than `UTC`, because the named zones need the
+        // `mysql.time_zone` tables loaded and an offset never does. The
+        // PostgreSQL client pins the same three renderings in its startup
+        // packet; see `postgres::start_up`.
+        self.execute("SET SESSION time_zone = '+00:00'")?;
         // `WITH CONSISTENT SNAPSHOT` is InnoDB's, and it is what makes the read
         // as of one instant rather than as of whenever each table was reached.
         // A server whose tables are MyISAM answers it and ignores it, which is
@@ -402,10 +437,7 @@ impl MysqlSource {
             }
             _ => {}
         }
-        let mut at = 0usize;
-        let columns = lenenc_read(&first, &mut at)
-            .ok_or_else(|| protocol("the result set did not begin with a column count"))?
-            as usize;
+        let columns = column_count(&first)?;
 
         let mut fields = Vec::with_capacity(columns);
         for _ in 0..columns {
@@ -797,6 +829,15 @@ fn decode_column(body: &[u8]) -> DbResult<Field> {
 /// @param body - the packet's payload
 /// @param columns - how many values it must hold
 fn decode_row(body: &[u8], columns: usize) -> DbResult<Vec<Option<Vec<u8>>>> {
+    // **Checked here as well as at the call site.** `stream_query` bounds the
+    // count it decodes, and this is a separate entry point that a later caller
+    // could reach with a number from somewhere else; a bound that only one of
+    // two doors carries is a bound somebody walks past (task-1932, H5).
+    if columns as u64 > MAX_COLUMNS {
+        return Err(protocol(format!(
+            "a row claims {columns} values, past the {MAX_COLUMNS} columns a MySQL server can have"
+        )));
+    }
     let mut at = 0usize;
     let mut row = Vec::with_capacity(columns);
     for _ in 0..columns {
@@ -879,6 +920,25 @@ fn lenenc_read(body: &[u8], at: &mut usize) -> Option<u64> {
     Some(value)
 }
 
+/// Returns how many columns a result set's first packet claims.
+///
+/// Separate from `stream_query` so the bound can be asserted without a live
+/// server: the packet an attacker sends is twelve bytes, and a test that needed
+/// a socket to show that would not be written.
+///
+/// @param first - the first packet of a result set
+fn column_count(first: &[u8]) -> DbResult<usize> {
+    let mut at = 0usize;
+    let claimed = lenenc_read(first, &mut at)
+        .ok_or_else(|| protocol("the result set did not begin with a column count"))?;
+    if claimed > MAX_COLUMNS {
+        return Err(protocol(format!(
+            "the result set claims {claimed} columns, past the {MAX_COLUMNS} a MySQL server can have"
+        )));
+    }
+    Ok(claimed as usize)
+}
+
 /// Reads a length-encoded string, advancing past it.
 ///
 /// @param body - the packet
@@ -944,6 +1004,56 @@ pub fn is_binary(field: &Field) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H5 (task-1920): a column count the server chose is bounded before it
+    /// sizes anything.
+    ///
+    /// **What it used to do.** `stream_query` decoded the length-encoded column
+    /// count out of a result set's first packet and ran
+    /// `Vec::with_capacity(columns)` on it. `lenenc_read` decodes up to
+    /// `u64::MAX`, and the 256 MiB message cap in `stream.rs` bounds the packet
+    /// rather than a number inside it - so a twelve-byte packet claiming
+    /// `u64::MAX` columns panicked with capacity overflow or asked for an
+    /// allocation that exhausted memory, before the first row of a migration.
+    ///
+    /// A migration talks to a server somebody else runs, possibly through a
+    /// proxy, so this is a number an attacker chooses. The packets below are
+    /// each exactly what such a server would send: one byte for a small count,
+    /// `0xfc` and two, `0xfd` and three, `0xfe` and eight.
+    #[test]
+    fn a_column_count_above_the_servers_own_limit_is_refused() {
+        // `0xfd` introduces a three-byte little-endian count.
+        let mut ten_million = vec![0xfdu8];
+        ten_million.extend_from_slice(&10_000_000u32.to_le_bytes()[..3]);
+        let refused = column_count(&ten_million).expect_err("ten million columns is refused");
+        assert!(
+            refused.detail().unwrap_or_default().contains("10000000"),
+            "the refusal must name the count it refused: {refused:?}"
+        );
+
+        // `0xfe` introduces an eight-byte one, which is where `u64::MAX` lives.
+        let mut enormous = vec![0xfeu8];
+        enormous.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(column_count(&enormous).is_err());
+
+        // `0xfc` introduces two bytes, so 65,535 is the most a two-byte count
+        // can claim - still past MySQL's own 4,096.
+        let mut sixty_five_thousand = vec![0xfcu8];
+        sixty_five_thousand.extend_from_slice(&u16::MAX.to_le_bytes());
+        assert!(column_count(&sixty_five_thousand).is_err());
+
+        // An ordinary result set is unaffected, which is the half a bound that
+        // simply refused everything would break.
+        assert_eq!(column_count(&[3u8]).expect("three columns"), 3);
+        let mut four_thousand = vec![0xfcu8];
+        four_thousand.extend_from_slice(&4_000u16.to_le_bytes());
+        assert_eq!(column_count(&four_thousand).expect("four thousand"), 4_000);
+
+        // And the row decoder carries the same bound, because it is a second
+        // door into the same allocation.
+        assert!(decode_row(&[], 10_000_000).is_err());
+        assert!(decode_row(&[], 0).is_ok());
+    }
 
     /// The `mysql_native_password` response, against the worked example every
     /// implementation of this protocol is checked with: the algorithm is
@@ -1138,5 +1248,78 @@ mod tests {
             OwnedDatum::Blob(bytes.clone())
         );
         assert_eq!(carry(None, Kind::Blob), OwnedDatum::Null);
+    }
+}
+
+/// The door the fuzz targets come in by.
+///
+/// **A named entry point rather than a public decoder.** The three functions
+/// below read bytes a network peer controls, and they are private because
+/// nothing outside this module has any business calling them. The fuzz crate
+/// lives outside the workspace - `cargo-fuzz` needs a nightly toolchain, which
+/// is why - so it cannot reach a private item, and widening the decoders
+/// themselves would put three parsers in this crate's public API to serve a
+/// test. These wrappers answer whether the decode succeeded and nothing else.
+pub mod fuzzing {
+    /// Reads an untrusted greeting packet.
+    ///
+    /// @param body - the packet's bytes
+    pub fn greeting(body: &[u8]) -> bool {
+        super::Greeting::decode(body).is_ok()
+    }
+
+    /// Reads an untrusted column definition packet.
+    ///
+    /// @param body - the packet's bytes
+    pub fn column(body: &[u8]) -> bool {
+        super::decode_column(body).is_ok()
+    }
+
+    /// Reads an untrusted row packet.
+    ///
+    /// @param body - the packet's bytes
+    /// @param columns - how many columns the row description promised
+    pub fn row(body: &[u8], columns: usize) -> bool {
+        super::decode_row(body, columns).is_ok()
+    }
+}
+
+#[cfg(test)]
+mod fuzz_seeded {
+    /// How many inputs the seeded sweep below reads.
+    const CASES: usize = 20_000;
+
+    /// Returns the next value of a deterministic generator.
+    ///
+    /// @param state - the generator's state, advanced in place
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// None of the three packet decoders panics on arbitrary bytes.
+    ///
+    /// **The stable-toolchain twin of `fuzz/fuzz_targets/mysql.rs`.** The fuzz
+    /// crate needs nightly, so nothing in CI ran it for the length of this
+    /// project; this runs the same decoders over a deterministic twenty
+    /// thousand inputs in the ordinary suite, which is what makes a regression
+    /// here fail a pull request rather than a scheduled job nobody reads.
+    #[test]
+    fn the_packet_decoders_never_panic_on_arbitrary_bytes() {
+        let mut state = 0x1932_0001_u64;
+        let mut accepted = 0usize;
+        for case in 0..CASES {
+            let length = (next(&mut state) % 96) as usize;
+            let bytes: Vec<u8> = (0..length).map(|_| next(&mut state) as u8).collect();
+            accepted += usize::from(super::fuzzing::greeting(&bytes));
+            accepted += usize::from(super::fuzzing::column(&bytes));
+            accepted += usize::from(super::fuzzing::row(&bytes, case % 8));
+        }
+        // Not an assertion about how many are valid - it is that the sweep ran
+        // and the decoders answered, rather than the loop being optimised into
+        // nothing by a future edit that drops the return value.
+        assert!(accepted <= CASES * 3);
     }
 }

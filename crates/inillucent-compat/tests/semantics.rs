@@ -703,10 +703,18 @@ SELECT x.id, y.id FROM t x JOIN t y ON y.a = x.a AND y.id > x.id ORDER BY x.id;"
         script: "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 5) SELECT sum(n) FROM c;",
         expect: Agrees,
     },
+    // `select.window` was retired here and is back (task-1932, H1). It was
+    // removed because the shipping engine refused every window function -
+    // but the refusal came from `compiled::try_compile`, which checked
+    // `plan.compounds` and not `plan.select.windows`, so the cached path that
+    // every application entry point uses never reached the evaluator that
+    // answers them. One `Ok(None)` reconnects the two.
     Case {
         name: "select.window",
         kind: "read",
-        script: "CREATE TABLE t(a INTEGER);\nINSERT INTO t VALUES (3),(1),(2);\nSELECT a, row_number() OVER (ORDER BY a) FROM t ORDER BY a;",
+        script: "CREATE TABLE t(a INTEGER);
+INSERT INTO t VALUES (3),(1),(2);
+SELECT a, row_number() OVER (ORDER BY a) FROM t ORDER BY a;",
         expect: Agrees,
     },
     Case {
@@ -1689,7 +1697,7 @@ fn run(program: &PathBuf, area: &PathBuf, script: &str) -> String {
 #[test]
 fn every_probed_construct_answers_as_the_table_says() {
     let (Some(reference), Some(ours)) = (reference(), ours()) else {
-        eprintln!("a shell is missing; skipping");
+        inillucent_compat::differential::skipping("a shell is missing");
         return;
     };
     let area = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("semantics");

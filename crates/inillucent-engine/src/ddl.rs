@@ -38,7 +38,7 @@
 
 use std::collections::HashMap;
 
-use inillucent_base::error::refusal;
+use inillucent_base::error::{refusal, statement_refusal};
 use inillucent_base::DbResult;
 use inillucent_catalog::ddl::canonical_sql;
 use inillucent_catalog::load::{index_from_create_sql, table_from_create_sql};
@@ -58,6 +58,8 @@ use inillucent_tree::paged::KeyEncoding;
 use inillucent_tree::types::ColumnSpec;
 use inillucent_tree::PagedTree;
 use inillucent_value::collation::Collation;
+
+mod reindex;
 
 use crate::entries::EntrySet;
 
@@ -115,6 +117,16 @@ fn schema_change(directive: &Directive) -> bool {
     )
 }
 
+/// `(schema, transaction, whether a rollback has anything to undo, log,
+/// no-steal handle)` - what [`ImportedDatabase::catalog_write`] hands back.
+type CatalogWrite = (
+    usize,
+    u64,
+    bool,
+    std::rc::Rc<inillucent_wal::Wal>,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+);
+
 impl ImportedDatabase {
     /// Returns how many times the catalog has changed.
     ///
@@ -167,12 +179,55 @@ impl ImportedDatabase {
         // application watching it must be able to rule out. Read back by
         // `PRAGMA schema_version`; a directive that failed does not move it.
         let changes_schema = schema_change(&directive);
+        // **Statement atomicity for DDL, which only DML had (task-1932, H3).**
+        // A directive is several writes - `alter_table` rewrites every catalog
+        // row that names the table, rebuilds the connection's schema, then
+        // rebuilds the tree - and nothing put the earlier ones back when a
+        // later one failed. There was no rollback wrapper here, unlike
+        // `write`'s `abandon`, and `record`/`rewrite`/`forget` recorded no
+        // before-image at all outside an explicit transaction, so there was
+        // nothing to put back with. `next_txn` had not moved either, because
+        // `seal` was never reached, so the half-written catalog rows were
+        // committed by whatever the next successful statement committed:
+        // `ALTER TABLE t ADD COLUMN b INTEGER DEFAULT (no_such_function())`
+        // errored and left `PRAGMA table_info(t)` listing a column the tree had
+        // no slot for, on disk, across a reopen.
+        //
+        // The mark and the floor are exactly `write`'s, at exactly its cost -
+        // one integer read off a `Vec`'s length - and the reload is what puts
+        // the connection's derived schema back in step with the catalog tree
+        // the undo has just restored.
+        let autocommit = self.batch.get().is_none();
+        let mark = self.undo.borrow().len();
+        let txn = self.current_txn();
         let outcome = self.run_directive(*directive, sql);
         self.ddl_schema = previous;
-        if changes_schema && outcome.is_ok() {
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let undone = self.undo_to_floor(mark, true, txn);
+                if autocommit {
+                    self.undo.borrow_mut().clear();
+                }
+                // **The undo's own failure is the one worth reporting.** A
+                // "no such function" describing a database that is now in a
+                // state nobody intended is worse than saying so, which is the
+                // argument `abandon` already makes for DML.
+                return Err(undone.err().unwrap_or(error));
+            }
+        };
+        if autocommit {
+            // **Nothing else can abandon what a committed directive wrote.**
+            // `seal` has already gone through `commit_across` by here, so the
+            // before-images stop being useful - and leaving them would put a
+            // committed `CREATE TABLE` inside the reach of the next explicit
+            // `ROLLBACK`, which undoes to floor zero.
+            self.undo.borrow_mut().clear();
+        }
+        if changes_schema {
             self.database.bump_schema_cookie();
         }
-        outcome
+        Ok(outcome)
     }
 
     /// Runs one bound directive against the schema `execute_ddl` selected.
@@ -359,16 +414,29 @@ impl ImportedDatabase {
             },
             // A `SAVEPOINT` outside a transaction opens one, which is what
             // SQLite does: it is the only way to name a point inside a
-            // statement that would otherwise be its own transaction.
+            // statement that would otherwise be its own transaction. Recorded
+            // as `implicit_transaction` so `release` knows this transaction is
+            // the savepoint stack's own, and not one an explicit `BEGIN`
+            // opened around it - see that field's own doc comment.
             Directive::Savepoint(name) => {
                 if self.batch.get().is_none() {
                     self.begin_batch();
+                    self.implicit_transaction.set(true);
                 }
                 self.savepoint(&name)?;
                 Ok(Outcome::empty())
             }
             Directive::Release(name) => {
                 self.release(&name)?;
+                // **The last savepoint of a transaction the savepoint stack
+                // itself opened releases like a `COMMIT`.** A `SAVEPOINT`
+                // inside an explicit `BEGIN` also empties `marks` when
+                // released, and that transaction stays open for the `COMMIT`
+                // that follows - `implicit_transaction` is what tells the two
+                // apart.
+                if self.marks.is_empty() && self.implicit_transaction.get() {
+                    self.commit_batch()?;
+                }
                 Ok(Outcome::empty())
             }
             // **A second database, opened beside the one this connection was
@@ -399,9 +467,11 @@ impl ImportedDatabase {
             // Neither form may run inside an explicit transaction, which is
             // SQLite's rule and is not a formality here either: a checkpoint
             // folds committed frames into the file, and an open transaction's
-            // are not committed. The message is SQLite's.
+            // are not committed. The message is SQLite's, and so is the code:
+            // `SQLITE_ERROR` (1), not `refusal`'s `SQLITE_MISUSE` (21) -
+            // `dml_differential.rs`'s `vacuum_matches_sqlite` grades it.
             Directive::Vacuum { .. } if self.batch.get().is_some() => {
-                Err(refusal("cannot VACUUM from within a transaction"))
+                Err(statement_refusal("cannot VACUUM from within a transaction"))
             }
             Directive::Vacuum { into: None, .. } => {
                 self.vacuum_in_place()?;
@@ -554,6 +624,9 @@ impl ImportedDatabase {
         self.catalog = catalog;
         self.forget_compiled_statements();
         self.catalog_generation = self.catalog_generation.saturating_add(1);
+        // Last, after the catalog a module would read is the new one; see
+        // `vtab::schema_changed_modules` (task-1932, M2).
+        self.schema_changed_modules();
     }
 
     /// Returns one `TableInfo` per eponymous module the registry holds.
@@ -725,6 +798,25 @@ impl ImportedDatabase {
         self.statements.borrow_mut().clear();
     }
 
+    /// Returns what a catalog-row write on `self.ddl_schema` needs that is not
+    /// the borrow of `self.undo` a method cannot hand back - callers still
+    /// write their own `WalLog` literal so that borrow stays disjoint from the
+    /// `&mut self.database` they take right after, the reason
+    /// [`super::file_of`] is a free function too.
+    fn catalog_write(&self) -> DbResult<CatalogWrite> {
+        let at = self.ddl_schema;
+        let wal = self
+            .log_of(at)
+            .ok_or_else(|| refusal("a statement names a database that is not attached"))?;
+        Ok((
+            at,
+            self.current_txn(),
+            self.batch.get().is_some(),
+            wal,
+            self.uncommitted_handle_of(at),
+        ))
+    }
+
     /// Writes one row into the catalog tree and records it.
     ///
     /// @param entry - the object to record
@@ -740,23 +832,26 @@ impl ImportedDatabase {
         // row records somewhere else.
         let at = self.ddl_schema;
         entry.tree_id = self.local_of(at, root);
-        let txn = self.current_txn();
-        let open = self.batch.get().is_some();
-        let wal = self
-            .log_of(at)
-            .ok_or_else(|| refusal("a statement names a database that is not attached"))?;
         let catalog_handle = self.catalog_handle_of(at);
         {
+            let (_, txn, _open, wal, uncommitted) = self.catalog_write()?;
             let mut log = WalLog {
                 wal,
                 txn,
                 schema: at,
                 wrote: false,
-                // **A catalog row is a row.** A `CREATE TABLE` inside a
-                // transaction has to come back out when the transaction is
-                // abandoned, and the way it comes back out is the same way a
-                // deleted row does: the catalog tree's before-image, restored.
-                undo: open.then_some(&self.undo),
+                // **A before-image whether or not a transaction is open
+                // (task-1932, H3).** This was `open.then_some(&self.undo)`, so
+                // outside an explicit transaction a catalog write recorded
+                // nothing to put back - and `execute_ddl`, which now takes an
+                // undo floor the way `write` does, would have had an empty
+                // buffer to undo from. A directive is several catalog writes
+                // and a failure in a later one has to unwrite the earlier ones.
+                // `build_tree_rows` is deliberately still gated: a bulk build's
+                // before-images are one record per row of the table, and a
+                // freshly built tree has no earlier state to restore to.
+                undo: Some(&self.undo),
+                uncommitted,
             };
             let tree = self
                 .trees
@@ -943,10 +1038,26 @@ impl ImportedDatabase {
                 Some((held.rowid, moved))
             })
             .collect();
+        if stale.is_empty() {
+            return Ok(());
+        }
         for (rowid, entry) in stale {
             self.rewrite(rowid, entry)?;
         }
-        Ok(())
+        // **Sealed here, because nothing else will.** `rewrite` logs under
+        // `current_txn()`, which outside a batch and outside a running
+        // statement is `next_txn` read but not advanced - `current_txn`'s own
+        // doc comment says a fresh one there "is then committed by
+        // `ImportedDatabase::seal` at the end of the statement". A checkpoint
+        // is not a statement, so nothing called it: the rewrite's records sat
+        // in the log under a transaction number nobody ever committed, and
+        // `should_replay` never replays an uncommitted transaction's record.
+        // A crash mid-writeback of the page that landed on had no redo behind
+        // it at all - the same shape of gap `log_free_map_pages` closes for
+        // the free map's own pages, reached here because a stale row is
+        // rewritten on every checkpoint whose catalog root is small enough
+        // that the rewrite lands on the same page a torn write can still hit.
+        self.seal()
     }
 
     /// Replaces one catalog row in place, by rowid.
@@ -958,22 +1069,16 @@ impl ImportedDatabase {
     /// @param entry - what it should now say
     fn rewrite(&mut self, rowid: i64, entry: SchemaEntry) -> DbResult<()> {
         {
-            let txn = self.current_txn();
-            let open = self.batch.get().is_some();
-            let at = self.ddl_schema;
-            let wal = self
-                .log_of(at)
-                .ok_or_else(|| refusal("a statement names a database that is not attached"))?;
+            let (at, txn, _open, wal, uncommitted) = self.catalog_write()?;
             let mut log = WalLog {
                 wal,
                 txn,
                 schema: at,
                 wrote: false,
-                // **A catalog row is a row.** A `CREATE TABLE` inside a
-                // transaction has to come back out when the transaction is
-                // abandoned, and the way it comes back out is the same way a
-                // deleted row does: the catalog tree's before-image, restored.
-                undo: open.then_some(&self.undo),
+                // See `record` above: the before-image is kept whether or not
+                // an explicit transaction is open (task-1932, H3).
+                undo: Some(&self.undo),
+                uncommitted,
             };
             let catalog_handle = self.catalog_handle_of(at);
             let tree = self
@@ -1005,22 +1110,16 @@ impl ImportedDatabase {
     /// @param rowid - the row's key
     fn forget(&mut self, rowid: i64) -> DbResult<()> {
         {
-            let txn = self.current_txn();
-            let open = self.batch.get().is_some();
-            let at = self.ddl_schema;
-            let wal = self
-                .log_of(at)
-                .ok_or_else(|| refusal("a statement names a database that is not attached"))?;
+            let (at, txn, _open, wal, uncommitted) = self.catalog_write()?;
             let mut log = WalLog {
                 wal,
                 txn,
                 schema: at,
                 wrote: false,
-                // **A catalog row is a row.** A `CREATE TABLE` inside a
-                // transaction has to come back out when the transaction is
-                // abandoned, and the way it comes back out is the same way a
-                // deleted row does: the catalog tree's before-image, restored.
-                undo: open.then_some(&self.undo),
+                // See `record` above: the before-image is kept whether or not
+                // an explicit transaction is open (task-1932, H3).
+                undo: Some(&self.undo),
+                uncommitted,
             };
             let catalog_handle = self.catalog_handle_of(at);
             let tree = self
@@ -1110,24 +1209,17 @@ impl ImportedDatabase {
         layout: SourceLayout,
         rows: &dyn inillucent_tree::leaf::Rows<'d>,
     ) -> DbResult<PageId> {
-        let txn = self.current_txn();
         let at = self.ddl_schema;
         let local = self.local_of(at, root);
-        let wal = self
-            .log_of(at)
-            .ok_or_else(|| refusal("a statement names a database that is not attached"))?;
         let tree = {
-            let open = self.batch.get().is_some();
+            let (_, txn, open, wal, uncommitted) = self.catalog_write()?;
             let mut log = WalLog {
                 wal,
                 txn,
                 schema: at,
                 wrote: false,
-                // **A catalog row is a row.** A `CREATE TABLE` inside a
-                // transaction has to come back out when the transaction is
-                // abandoned, and the way it comes back out is the same way a
-                // deleted row does: the catalog tree's before-image, restored.
                 undo: open.then_some(&self.undo),
+                uncommitted,
             };
             let session = self.session.get();
             let database = super::file_of(
@@ -1200,12 +1292,23 @@ impl ImportedDatabase {
 
     /// Returns the transaction a schema change joins.
     ///
-    /// Inside a batch it is the batch's; outside one it is a fresh number that
-    /// is committed by [`ImportedDatabase::seal`] at the end of the statement.
+    /// Inside a batch it is the batch's; outside one it is the number the
+    /// statement in flight already took, and a fresh one when no statement is
+    /// in flight - which is then committed by [`ImportedDatabase::seal`] at the
+    /// end of the statement.
+    ///
+    /// **The middle case is the one that was missing.**
+    /// [`ImportedDatabase::write`] reads `next_txn` and moves it on at once, so
+    /// asking `next_txn` from inside a running statement names the transaction
+    /// *after* the one about to commit. Everything logged under that number is
+    /// written and never committed. See `statement_txn` for what that cost.
     pub(super) fn current_txn(&self) -> u64 {
         match self.batch.get() {
             Some(held) => held,
-            None => self.next_txn.get(),
+            None => self
+                .statement_txn
+                .get()
+                .unwrap_or_else(|| self.next_txn.get()),
         }
     }
 
@@ -1354,6 +1457,7 @@ impl ImportedDatabase {
             schema: at,
             wrote: false,
             undo: None,
+            uncommitted: self.uncommitted_handle_of(at),
         };
         let Some(tree) = self.trees.get_mut(&root) else {
             return Ok(());
@@ -1624,6 +1728,30 @@ impl ImportedDatabase {
         let source = entries.in_order(&order);
         let flatten = flattened.elapsed().as_nanos();
         let packed = std::time::Instant::now();
+        // **The catalog row names the new tree before the tree is filled
+        // (task-1932).** A recovery derives a tree's shape from the catalog
+        // rows it has replayed, and skips a record naming a tree no row names -
+        // which is right for a tree a rebuild has dropped and wrong for one
+        // whose row has not gone past yet. Writing the row first is what keeps
+        // those two apart: after this, every record describing a page of this
+        // tree follows a row that names it. The row below is superseded by the
+        // one at the end of this statement, in the same transaction and before
+        // anything can read either, so the only thing it changes is the order
+        // two records reach the log in. `rebuild_index` does the same, for the
+        // crash `reindex_crash.rs` found.
+        let rowid = self.next_catalog_rowid();
+        self.record(
+            root,
+            SchemaEntry {
+                kind: ObjectKind::Index,
+                name: name.to_vec(),
+                table: owner.name.clone(),
+                root: inillucent_pool::PageId(0),
+                sql: sql.clone(),
+                stats: Default::default(),
+                tree_id: 0,
+            },
+        )?;
         let page = self.build_tree_rows(root, columns, key_columns, layout, &source)?;
         let pack = packed.elapsed().as_nanos();
         // The tail is timed too, because it is not free and it is not the
@@ -1631,17 +1759,17 @@ impl ImportedDatabase {
         // catalog text, and refreshing the planner's view of it. `seal` is
         // timed after it and apart from it - see below.
         let tail = std::time::Instant::now();
-        self.record(
-            root,
+        let at = self.ddl_schema;
+        self.rewrite(
+            rowid,
             SchemaEntry {
                 kind: ObjectKind::Index,
                 name: name.to_vec(),
                 table: owner.name.clone(),
                 root: page,
                 sql,
-                stats: Default::default(),
-                // Filled by `record` from the identifier it is given.
-                tree_id: 0,
+                stats: self.tree_stats(root),
+                tree_id: self.local_of(at, root),
             },
         )?;
         // **A partial index is not a covering candidate.** The physical pass
@@ -1676,157 +1804,6 @@ impl ImportedDatabase {
             catalog,
             sealed.elapsed().as_nanos(),
         ));
-        Ok(Outcome::empty())
-    }
-
-    /// Builds an index a module owns, and backfills it from the table.
-    ///
-    /// One statement of sugar for three things that already work: a search
-    /// store, the `source=` marker that makes the association durable, and a
-    /// pass over the rows that are already there. Everything after this is
-    /// ordinary - a write reports its images and `follow_vector_indexes`
-    /// applies them.
-    ///
-    /// The store's declared column is `body`, and it holds the source row's
-    /// **rowid as text** so a hit can name the row it came from. That is what
-    /// makes the index answerable without a second map: the store's own rowid
-    /// is the source rowid too, so a delete needs no lookup at all.
-    ///
-    /// @param name - the index's name, which is the store's name
-    /// @param table - the table being indexed
-    /// @param columns - the key columns, of which there must be exactly one
-    /// @param exists - whether an index of this name is already there
-    /// @param if_not_exists - whether the statement said `IF NOT EXISTS`
-    fn create_vector_index(
-        &mut self,
-        module: &[u8],
-        name: &[u8],
-        table: &[u8],
-        columns: &[inillucent_sql::directive::IndexKeyColumn],
-        settings: &[(Vec<u8>, Vec<u8>)],
-        exists: bool,
-        if_not_exists: bool,
-    ) -> DbResult<Outcome> {
-        if exists {
-            if if_not_exists {
-                return Ok(Outcome::empty());
-            }
-            return Err(refusal(format!(
-                "index {} already exists",
-                String::from_utf8_lossy(name)
-            )));
-        }
-        let [key] = columns else {
-            return Err(
-                refusal("an index USING inillucent_hnsw takes exactly one column")
-                    .with_unsupported("a multi-column vector index"),
-            );
-        };
-        let folded = table.to_ascii_lowercase();
-        let owner = self
-            .tables
-            .iter()
-            .find(|held| held.folded == folded)
-            .cloned()
-            .ok_or_else(|| refusal(format!("no such table: {}", String::from_utf8_lossy(table))))?;
-        // A module-backed index takes a column, not an expression: the store
-        // is declared over a table column's vectors and there is nothing for it
-        // to compute one from.
-        let key_column = key.column.ok_or_else(|| {
-            refusal("an index USING inillucent_hnsw takes a column, not an expression")
-        })?;
-        let column = owner
-            .columns
-            .get(usize::from(key_column))
-            .ok_or_else(|| refusal("the indexed column is not in the table"))?;
-        // **The width has to be declared.** A store is created with a fixed
-        // number of dimensions and every vector it is given is checked against
-        // it, so an index over a column that never said how wide its vectors
-        // are would have to guess from the first row - and be wrong for the
-        // rest of them.
-        let dims = column.vector_dimensions().ok_or_else(|| {
-            refusal(format!(
-                "{}.{} is not declared VECTOR(N), so an index cannot know how wide its vectors are",
-                String::from_utf8_lossy(table),
-                String::from_utf8_lossy(&column.name)
-            ))
-        })?;
-        // The storage parameters go through as the store's own options, which
-        // is what they are: `WITH (m = 32)` and `USING inillucent_search(...,
-        // m=32)` reach the same graph, so the index form is a spelling of the
-        // table form rather than a second path into it.
-        let mut declared = String::new();
-        for (option, value) in settings {
-            declared.push_str(&format!(
-                ", {}={}",
-                String::from_utf8_lossy(option),
-                String::from_utf8_lossy(value)
-            ));
-        }
-        // **The structure the index named is the module the store uses.** An
-        // `ivfflat` is an inverted file and needs no lexical half, so it is its
-        // own module with its own three shadow tables; `inillucent_hnsw` is the
-        // graph, which is `inillucent_search` with a vector width and no text.
-        // Both answer the engine's vector probe the same way, which is the only
-        // thing above this line knows about either.
-        let store = if module == b"ivfflat" {
-            format!(
-                "CREATE VIRTUAL TABLE {} USING ivfflat(dims={}, source={}, source_column={}{declared})",
-                String::from_utf8_lossy(name),
-                dims,
-                String::from_utf8_lossy(&owner.name),
-                String::from_utf8_lossy(&column.name)
-            )
-        } else {
-            format!(
-                "CREATE VIRTUAL TABLE {} USING inillucent_search(body, dims={}, source={}, source_column={}{declared})",
-                String::from_utf8_lossy(name),
-                dims,
-                String::from_utf8_lossy(&owner.name),
-                String::from_utf8_lossy(&column.name)
-            )
-        };
-        self.execute_any(&store, &inillucent_exec::physical::Params::new())?;
-        // The association is only visible once the store is connected, and the
-        // backfill below has to be seen by it.
-        self.refresh_vector_indexes();
-        // **Read as rows and written as module changes, not as an
-        // `INSERT ... SELECT`.** A module's insert takes values, so the engine
-        // refuses an `INSERT ... SELECT` into a virtual table - and the rows
-        // that are already in the table are exactly the case an index has to
-        // cover, or a `CREATE INDEX` on a full table would build an empty one.
-        let query = format!(
-            "SELECT rowid, {} FROM {} WHERE {} IS NOT NULL",
-            String::from_utf8_lossy(&column.name),
-            String::from_utf8_lossy(&owner.name),
-            String::from_utf8_lossy(&column.name)
-        );
-        let existing = self
-            .execute_any(&query, &inillucent_exec::physical::Params::new())?
-            .rows;
-        let changes = inillucent_exec::dml::Changes {
-            written: existing
-                .into_iter()
-                .map(|row| {
-                    vec![
-                        row.first().cloned().unwrap_or(OwnedDatum::Null),
-                        row.get(1).cloned().unwrap_or(OwnedDatum::Null),
-                    ]
-                })
-                .collect(),
-            ..Default::default()
-        };
-        // The rowid is column 0 and the vector column 1 of what was just read,
-        // which is not the table's layout - so the index is told where they are
-        // for this one call rather than being asked to agree with the layout.
-        let held = self.vector_indexes.clone();
-        self.vector_indexes = std::collections::HashMap::from([(
-            owner.root,
-            vec![super::VectorIndex::at(name.to_ascii_lowercase(), 1, 0)],
-        )]);
-        let outcome = self.follow_vector_indexes(&changes);
-        self.vector_indexes = held;
-        outcome?;
         Ok(Outcome::empty())
     }
 
@@ -2558,6 +2535,29 @@ impl ImportedDatabase {
                 }
                 continue;
             }
+            // **Nothing to fill, so nothing to evaluate (task-1932, H3).**
+            // This ran whether or not the table had a row, and
+            // `constant_default` evaluates the default by running
+            // `SELECT <the default text>` through the ordinary execute path -
+            // so `ALTER TABLE t ADD COLUMN b INTEGER DEFAULT
+            // (no_such_function())` on an empty table failed here, three
+            // writes after the catalog already said the column was there, and
+            // `PRAGMA table_info(t)` then listed a column the tree had no slot
+            // for.
+            //
+            // An empty table is the only way to reach it:
+            // `AddedColumnRisk::refusal` refuses a default that is not a
+            // literal, and `alter_table` applies that refusal only when
+            // `table_has_a_row`. So on a populated table the statement never
+            // gets here, and on an empty one there is no row to give a value
+            // to. SQLite behaves the same way - it accepts the `ALTER`,
+            // records `DEFAULT (no_such_function())` in the schema text, and
+            // reports `unknown function` at the first `INSERT` that needs the
+            // value - so skipping the evaluation is what matches the reference
+            // rather than merely what avoids the failure.
+            if old_rows.is_empty() {
+                continue;
+            }
             let Some(default) = info
                 .columns
                 .get(declared)
@@ -2623,199 +2623,6 @@ impl ImportedDatabase {
         if let Some((rowid, entry)) = update {
             self.rewrite(rowid, entry)?;
         }
-        Ok(())
-    }
-
-    /// Rebuilds indexes, which for this engine is a no-op with a check.
-    ///
-    /// A `REINDEX` exists to repair an index whose collation sequence changed
-    /// under it. Every collation this engine orders a tree by is built in and
-    /// cannot change, so there is nothing to repair - but the trees are checked
-    /// rather than the statement being ignored, so `REINDEX` still answers the
-    /// question a person runs it to ask.
-    ///
-    /// @param indexes - the indexes named, empty for all of them
-    fn reindex(&mut self, indexes: &[Vec<u8>]) -> DbResult<Outcome> {
-        let wanted: Vec<Vec<u8>> = indexes
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect();
-        // **Rebuilt, not inspected.** This used to run the tree's integrity
-        // check and call that a `REINDEX`, which is the one thing a `REINDEX`
-        // is not: the statement exists so a person whose collation has changed
-        // under an index can put the entries back in the order the engine now
-        // compares them in, and a check cannot move an entry. It also meant a
-        // `REINDEX` over a `NOCASE` index *failed* - the check compared with
-        // `BINARY` while the tree was ordered by `NOCASE` - so the one
-        // statement that could have repaired such an index reported it as
-        // corrupt instead.
-        let targets: Vec<(Vec<u8>, Vec<u8>)> = self
-            .tables
-            .iter()
-            .flat_map(|table| {
-                table
-                    .indexes
-                    .iter()
-                    .map(move |index| (table.name.clone(), index.clone()))
-            })
-            // A module owns its own index and rebuilds it its own way; a b-tree
-            // rebuild has nothing to put in it.
-            .filter(|(_, index)| index.origin != inillucent_sql::catalog_view::IndexOrigin::Module)
-            .filter(|(_, index)| {
-                wanted.is_empty()
-                    || wanted.contains(&index.folded)
-                    // `REINDEX t` names a table and means every index on it;
-                    // `REINDEX NOCASE` names a collation and means every index
-                    // that uses it.
-                    || wanted.iter().any(|name| {
-                        index
-                            .columns
-                            .iter()
-                            .any(|key| key.collation.to_ascii_lowercase() == *name)
-                    })
-            })
-            .map(|(table, index)| (table, index.name.clone()))
-            .collect();
-        let named_table = self.tables.iter().any(|table| {
-            wanted
-                .iter()
-                .any(|name| table.folded == *name && !table.indexes.is_empty())
-        });
-        let targets: Vec<(Vec<u8>, Vec<u8>)> = if named_table {
-            self.tables
-                .iter()
-                .filter(|table| wanted.contains(&table.folded))
-                .flat_map(|table| {
-                    table
-                        .indexes
-                        .iter()
-                        .filter(|index| {
-                            index.origin != inillucent_sql::catalog_view::IndexOrigin::Module
-                        })
-                        .map(move |index| (table.name.clone(), index.name.clone()))
-                })
-                .chain(targets)
-                .collect()
-        } else {
-            targets
-        };
-        let mut done: Vec<Vec<u8>> = Vec::new();
-        for (table, index) in targets {
-            if done.contains(&index) {
-                continue;
-            }
-            done.push(index.clone());
-            self.rebuild_index(&table, &index)?;
-        }
-        if !done.is_empty() {
-            self.rebuild_tables()?;
-            self.refresh_catalog();
-            self.seal()?;
-        }
-        Ok(Outcome::empty())
-    }
-
-    /// Rebuilds one index's tree from the table it indexes.
-    ///
-    /// The entries are re-derived and repacked exactly the way
-    /// `create_index` derives them, so a rebuilt tree is byte-for-byte the tree
-    /// a `CREATE INDEX` would have produced now - which is the whole promise of
-    /// the statement. The catalog row keeps its name and its text and takes the
-    /// new root.
-    ///
-    /// @param table - the indexed table's name
-    /// @param name - the index's name
-    fn rebuild_index(&mut self, table: &[u8], name: &[u8]) -> DbResult<()> {
-        let folded = table.to_ascii_lowercase();
-        let owner = self
-            .tables
-            .iter()
-            .find(|held| held.folded == folded)
-            .cloned()
-            .ok_or_else(|| refusal(format!("no such table: {}", String::from_utf8_lossy(table))))?;
-        let index_folded = name.to_ascii_lowercase();
-        let declared = owner
-            .indexes
-            .iter()
-            .find(|held| held.folded == index_folded)
-            .cloned()
-            .ok_or_else(|| refusal(format!("no such index: {}", String::from_utf8_lossy(name))))?;
-        let rowid = self
-            .entries
-            .iter()
-            .find(|held| {
-                held.entry.kind == ObjectKind::Index
-                    && held.entry.name.to_ascii_lowercase() == index_folded
-            })
-            .map(|held| held.rowid)
-            .ok_or_else(|| refusal("the index has no catalog row"))?;
-        let sql = self
-            .entries
-            .iter()
-            .find(|held| held.rowid == rowid)
-            .map(|held| held.entry.sql.clone())
-            .unwrap_or_default();
-        let root = self.allocate_root()?;
-        let index = inillucent_sql::catalog_view::IndexInfo { root, ..declared };
-        let (columns, layout) = index_shape(&owner, &index, root);
-        let key_columns = columns.len();
-        let encoding = KeyEncoding::choose(&columns, key_columns);
-        let collations: Vec<Collation> = columns
-            .iter()
-            .take(key_columns)
-            .map(|spec| spec.collation)
-            .collect();
-        let directions: Vec<bool> = columns
-            .iter()
-            .take(key_columns)
-            .map(|spec| spec.descending)
-            .collect();
-        let computed =
-            index.partial_sql.is_some() || index.columns.iter().any(|key| key.expr_sql.is_some());
-        let entries = if computed {
-            self.index_entries_by_query(
-                &owner,
-                &index,
-                key_columns,
-                encoding,
-                &collations,
-                &directions,
-            )?
-        } else {
-            self.index_entries(
-                &owner,
-                &index,
-                key_columns,
-                encoding,
-                &collations,
-                &directions,
-            )?
-        };
-        let order = entries.order();
-        if index.unique {
-            refuse_duplicates(&entries, &order, &owner, &index, key_columns)?;
-        }
-        let flat = entries.to_datums(&order);
-        let rows: Vec<&[Datum<'_>]> = if key_columns == 0 {
-            Vec::new()
-        } else {
-            flat.chunks_exact(key_columns).collect()
-        };
-        let page = self.build_tree_from(root, columns, key_columns, layout, &rows)?;
-        // The statistics and the identifier come off the tree that was just
-        // built, exactly as `record` takes them, so the row cannot describe a
-        // different tree from the one it names.
-        let at = self.ddl_schema;
-        let entry = SchemaEntry {
-            kind: ObjectKind::Index,
-            name: index.name.clone(),
-            table: owner.name.clone(),
-            root: page,
-            sql,
-            stats: self.tree_stats(root),
-            tree_id: self.local_of(at, root),
-        };
-        self.rewrite(rowid, entry)?;
         Ok(())
     }
 }

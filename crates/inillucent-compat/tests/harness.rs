@@ -5,7 +5,8 @@
 //! against fixtures. A generator that only works on its own examples proves
 //! nothing about the manifest the release gate reads.
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use inillucent_compat::hash::sha3_256_hex;
 use inillucent_compat::layering::{self, Contract};
@@ -13,6 +14,9 @@ use inillucent_compat::manifest::{Manifest, Reference, SourceRegister, Status};
 use inillucent_compat::report;
 use inillucent_compat::results::ResultSet;
 use inillucent_compat::workspace_root;
+use inillucent_vfs::conformance;
+use inillucent_vfs::memory::MemoryVfs;
+use inillucent_vfs::path::DbPath;
 
 /// Loads the shipped manifest.
 fn manifest() -> Manifest {
@@ -97,17 +101,84 @@ const IN_PROGRESS_ROWS: [&str; 3] = [
     "perf.optimization-arms",
 ];
 
-/// Every row in a finished phase must claim `pass`, and every later row must
-/// not.
+/// Rows in a finished phase that the shipping engine genuinely does not have.
+///
+/// `FINISHED_PHASES` used to mean "every row from here has evidence", and that
+/// was true until task-1911 deleted the old engine (`inillucent-session`,
+/// `inillucent-legacy`, `inillucent-vm`, `inillucent-capi`) along with three
+/// things it evidenced that the new engine never rebuilt the same way: a
+/// bytecode verifier over a `Program` the new engine does not compile to
+/// (`vm.bytecode.verifier`), an interrupt/progress-handler mechanism the new
+/// connection has none of (`vm.statement.interrupt`), and the
+/// update/commit/rollback hook triple the new connection never wired up
+/// (`txn.hooks`). The same re-point found a fourth and fifth: the new
+/// engine's physical pass refuses every window function outright
+/// (`sql.select.window`, `functions.window`). **Those two were wrong and are
+/// gone from this list as of task-1932.** The physical pass did not refuse
+/// window functions; `compiled::try_compile` did, by bailing out on
+/// `plan.compounds` and not on `plan.select.windows`, so the cached path that
+/// every application entry point uses never reached `run_windowed`. All three
+/// retired tests - `windows_match_the_oracle`,
+/// `ordered_statements_match_the_oracle` and the `select.window` case in
+/// `semantics.rs` - are back and green against the shipping engine. A sixth,
+/// `txn.oom-injection`, split off `txn.resource-failures`: the old
+/// engine's allocation-failure fault injection
+/// (`inillucent_base::buffer::fail_allocation_after`) has no equivalent in the
+/// shipping write path, which allocates through ordinary `Vec`/`Box` rather
+/// than through that buffer API. A seventh, `txn.writer-contention`: the old
+/// engine's `WriterSlot` gave each session its own transaction with real
+/// `busy_timeout`/reservation semantics; `inillucent_engine::connect` holds
+/// one `ImportedDatabase` behind one shared, unkeyed transaction, so a second
+/// session's write joins the first session's open transaction rather than
+/// being refused `BUSY`. Each is retired on its own `[[capability]]` row in
+/// `compat/sqlite-3.53.4.toml` with `status = "missing"` and a comment saying
+/// so; this list exists only so a finished phase can still hold a row that
+/// will never be `pass`, without loosening the check for every other row in
+/// the same phase.
+///
+/// An eighth and a ninth joined in task-1932, and they are the same withdrawal
+/// rather than a new one: `storage.interop.cross-mutation` and
+/// `interop.cross-write` both asserted that SQLite and this engine could take
+/// turns writing one file. The rearchitecture onto a native storage format
+/// ended that - the shipping engine does not write SQLite's file format at all -
+/// and the eight suites that proved it went with the old engine in task-1911.
+/// Both rows went on claiming `pass` for months afterwards, against five and
+/// three deleted tests, which is what `every_test_the_manifest_cites_still_exists`
+/// now makes impossible. Reading a SQLite database is a different capability
+/// and is still covered, by `migrate_sqlite.rs`.
+const DELIBERATELY_MISSING: [&str; 7] = [
+    "vm.bytecode.verifier",
+    "vm.statement.interrupt",
+    "txn.hooks",
+    "txn.oom-injection",
+    "txn.writer-contention",
+    "storage.interop.cross-mutation",
+    "interop.cross-write",
+];
+
+/// Every row in a finished phase must claim `pass`, unless it is named in
+/// [`DELIBERATELY_MISSING`], in which case it must claim `missing` - and every
+/// later row must not claim `pass` at all.
 #[test]
 fn only_the_finished_phases_claim_to_be_finished() {
     for capability in &manifest().capabilities {
         // The colon matters: "phase 1:" is finished, "phase 10:" is not.
-        let finished = FINISHED_PHASES
+        let in_finished_phase = FINISHED_PHASES
             .iter()
             .any(|phase| capability.phase.starts_with(phase))
             || (capability.phase.starts_with(IN_PROGRESS_PHASE)
                 && IN_PROGRESS_ROWS.contains(&capability.id.as_str()));
+        if in_finished_phase && DELIBERATELY_MISSING.contains(&capability.id.as_str()) {
+            assert_eq!(
+                capability.status,
+                Status::Missing,
+                "`{}` is carved out of the finished-phase rule as permanently missing, but claims `{}`",
+                capability.id,
+                capability.status.as_str()
+            );
+            continue;
+        }
+        let finished = in_finished_phase;
         let claims = capability.status == Status::Pass;
         assert_eq!(
             finished,
@@ -135,6 +206,222 @@ fn the_shipped_report_is_reproducible() {
         first.rows.len(),
         manifest().capabilities.len(),
         "every capability must appear in the report"
+    );
+}
+
+/// Returns the capability rows of the checked-in scorecard, as
+/// `(id, claimed, evidenced)`.
+///
+/// The table is `| id | claimed | evidenced | platforms | tests |`, and the id
+/// is written between backticks.
+fn scorecard_rows(markdown: &str) -> Vec<(String, String, String)> {
+    let mut rows = Vec::new();
+    for line in markdown.lines() {
+        let Some(rest) = line.strip_prefix("| `") else {
+            continue;
+        };
+        let mut columns = rest.split(" | ");
+        let Some(identifier) = columns.next().and_then(|cell| cell.strip_suffix('`')) else {
+            continue;
+        };
+        let (Some(claimed), Some(evidenced)) = (columns.next(), columns.next()) else {
+            continue;
+        };
+        rows.push((
+            identifier.to_string(),
+            claimed.to_string(),
+            evidenced.to_string(),
+        ));
+    }
+    rows
+}
+
+/// The scorecard in the repository has to say, for every identifier, what the
+/// manifest says.
+///
+/// **It did not, for six of them (task-1932, M9).** `compat/compat-report.md`
+/// had `sql.select.window`, `functions.window`, `vm.bytecode.verifier`,
+/// `vm.statement.interrupt`, `txn.writer-contention` and `txn.hooks` as `pass`
+/// while `compat/sqlite-3.53.4.toml` had all six as `missing`. The scorecard is
+/// the artifact a reader reaches for, and it had been generated before those
+/// rows moved: nothing regenerated it and nothing noticed, because the only
+/// check on the report compared it against itself
+/// (`the_shipped_report_is_reproducible`, above, which two identical runs
+/// satisfy whatever the manifest says).
+///
+/// This is the check on the *pair*. It fails on a manifest row that moves
+/// without the scorecard being regenerated, and on a scorecard edited by hand.
+#[test]
+fn the_shipped_scorecard_says_what_the_manifest_says_for_every_id() {
+    let results = ResultSet::load_directory(&workspace_root().join("compat/results"))
+        .expect("the results directory reads");
+    let generated = report::generate(&manifest(), &sources(), &results);
+    let shipped = std::fs::read_to_string(workspace_root().join("compat/compat-report.md"))
+        .expect("the scorecard is in the repository")
+        .replace("\r\n", "\n");
+
+    let rows = scorecard_rows(&shipped);
+    assert_eq!(
+        rows.len(),
+        generated.rows.len(),
+        "the scorecard lists {} capabilities and the manifest declares {}",
+        rows.len(),
+        generated.rows.len()
+    );
+
+    let mut disagreements = Vec::new();
+    for (shipped_row, row) in rows.iter().zip(generated.rows.iter()) {
+        let (identifier, claimed, evidenced) = shipped_row;
+        if identifier != &row.id {
+            disagreements.push(format!(
+                "the scorecard has `{identifier}` where the manifest has `{}`",
+                row.id
+            ));
+            continue;
+        }
+        if claimed != row.claimed.as_str() {
+            disagreements.push(format!(
+                "{identifier}: the scorecard says the manifest claims `{claimed}`, and the \
+                 manifest claims `{}`",
+                row.claimed.as_str()
+            ));
+        }
+        if evidenced != row.evidenced.as_str() {
+            disagreements.push(format!(
+                "{identifier}: the scorecard says the evidence supports `{evidenced}`, and the \
+                 recorded results support `{}`",
+                row.evidenced.as_str()
+            ));
+        }
+    }
+    assert!(
+        disagreements.is_empty(),
+        "compat/compat-report.md disagrees with compat/sqlite-3.53.4.toml. Regenerate it with \
+         `cargo run -p inillucent-compat --bin inillucent-manifest -- report`.\n{}",
+        disagreements.join("\n")
+    );
+}
+
+/// Returns the name of every `#[test]` function in the workspace.
+///
+/// A grep rather than a registry, because the property is about *every* test
+/// and no type can be put on "there is no other one". Directories that hold
+/// build output or retired code are skipped: a manifest row citing a test that
+/// only exists in `_junk` is exactly the rot this is looking for.
+fn every_test_function(root: &Path) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if matches!(
+                    name.as_str(),
+                    "target" | "_junk" | ".git" | "_agent_output" | ".sqlite-ref" | "fuzz"
+                ) || name.starts_with("target-")
+                {
+                    continue;
+                }
+                pending.push(path);
+                continue;
+            }
+            if !name.ends_with(".rs") {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut marked = false;
+            for line in source.lines() {
+                let line = line.trim();
+                if line.starts_with("#[test]") {
+                    marked = true;
+                    continue;
+                }
+                if !marked {
+                    continue;
+                }
+                if line.starts_with("#[") {
+                    continue;
+                }
+                marked = false;
+                let after_fn = line
+                    .strip_prefix("fn ")
+                    .or_else(|| line.strip_prefix("async fn "));
+                if let Some(rest) = after_fn {
+                    if let Some(function) = rest.split('(').next() {
+                        names.insert(function.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Every test the manifest cites has to exist.
+///
+/// **Twenty-four rows cited tests that had been deleted for months
+/// (task-1932, M9).** task-1911 deleted the old engine and, with it, the eight
+/// suites that read and wrote SQLite's own file format. Twenty of the rows
+/// naming those tests still claimed `pass`, and the report could not say so:
+/// `unsupported-release-claim` fires when a cited test has no *recorded result*,
+/// which is the same thing a platform that has not run yet looks like, so the
+/// two were indistinguishable in a report nobody could read as a failure.
+///
+/// A citation is the whole of what ties a claim to its evidence. One that names
+/// nothing is a claim with no evidence at all, so this is checked against the
+/// source rather than against the recorded results: a test that exists but has
+/// not run on some platform is a coverage gap, and a test that does not exist
+/// is a false claim.
+///
+/// A citation with no `::` in it is one of the VFS conformance cases, which
+/// carry identifiers of their own rather than being Rust test functions. Those
+/// are checked against the suite's own case list.
+#[test]
+fn every_test_the_manifest_cites_still_exists() {
+    let root = workspace_root();
+    let functions = every_test_function(&root);
+    assert!(
+        functions.len() > 2000,
+        "found only {} test functions in the workspace, which means this scan is matching \
+         nothing rather than finding nothing wrong",
+        functions.len()
+    );
+
+    let conformance_cases: BTreeSet<String> =
+        conformance::run(&MemoryVfs::new(), &DbPath::from("/conformance-case-names"))
+            .cases
+            .iter()
+            .map(|case| case.name.to_string())
+            .collect();
+    assert!(
+        conformance_cases.len() > 20,
+        "the VFS conformance suite reported {} cases",
+        conformance_cases.len()
+    );
+
+    let mut dead = Vec::new();
+    for capability in &manifest().capabilities {
+        for test in &capability.tests {
+            let known = match test.rsplit_once("::") {
+                Some((_, function)) => functions.contains(function),
+                None => conformance_cases.contains(test),
+            };
+            if !known {
+                dead.push(format!("{}: `{test}`", capability.id));
+            }
+        }
+    }
+    assert!(
+        dead.is_empty(),
+        "these manifest rows cite a test that no longer exists, so they claim their status \
+         against nothing:\n{}",
+        dead.join("\n")
     );
 }
 
@@ -188,13 +475,25 @@ fn the_registers_match_the_engine() {
 ///
 /// A generator that silently produced nothing would agree with an empty file
 /// and every other check here would pass, so the size is asserted separately.
+///
+/// `symbols.toml`'s floor was 100, sized against `crates/inillucent-capi` -
+/// the old engine's C driver, deleted in task-1911 along with the rest of it.
+/// It had 186 `extern "C"` functions across fifteen files (backup, bind,
+/// blob, codes, column, function, handle, hooks, memory, open, serialize,
+/// stmt, value, vfs, lib). `drivers/inillucent-driver-capi` is its from
+/// scratch replacement for the new engine and today exports 53, in one file
+/// - genuinely fewer, not a parsing gap: `grep -c 'extern "C" fn"` over the
+/// new crate's source agrees with the register. 40 keeps this a sanity floor
+/// against a generator that silently produced nothing, with room for the
+/// driver to grow before it needs raising again, rather than a claim that the
+/// new driver already matches the old one's surface.
 #[test]
 fn the_registers_cover_the_whole_surface() {
     let registers = inillucent_compat::obligations::registers();
     for (name, body, least) in [
         ("builtins.toml", 0, 140usize),
         ("pragmas.toml", 1, 60),
-        ("symbols.toml", 2, 100),
+        ("symbols.toml", 2, 40),
     ] {
         let (_, text) = registers.get(body).expect("the register was generated");
         let count = text
@@ -287,7 +586,9 @@ fn the_reference_artifacts_match_their_pinned_checksums() {
         .expect("the reference parses");
     let directory = root.join(".sqlite-ref/3.53.4");
     if !directory.is_dir() {
-        eprintln!("the reference is not downloaded; run tools/sqlite-reference.{{ps1,sh}}");
+        inillucent_compat::differential::skipping(
+            "the reference is not downloaded; run tools/sqlite-reference.{ps1,sh}",
+        );
         return;
     }
     let mut checked = 0;
@@ -324,7 +625,9 @@ fn the_reference_artifacts_match_their_pinned_checksums() {
 fn the_retrieval_baseline_is_unchanged() {
     let baseline = workspace_root().join("compat/baseline/inillucent-core-baseline.json");
     if !baseline.is_file() {
-        eprintln!("no baseline captured yet; run `inillucent-baseline capture`");
+        inillucent_compat::differential::skipping(
+            "no baseline captured yet; run `inillucent-baseline capture`",
+        );
         return;
     }
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_inillucent-baseline"))
@@ -425,4 +728,105 @@ fn the_production_dependency_tree_holds_no_engine() {
         checked += 1;
     }
     assert!(checked >= 10, "only {checked} production trees resolved");
+}
+
+/// Two pinned files that swap contents are both reported.
+///
+/// **The verifier was a multiset check (task-1932, M4).** It asked whether each
+/// file's digest appeared *anywhere* in the recorded capture, so two pinned
+/// files that exchanged contents both verified clean: each one's new hash was
+/// still in the capture, under the other one's name. That is precisely the
+/// change a baseline exists to catch - one file's behaviour moving into
+/// another's - and the check passed it.
+///
+/// Driven against a copy of the real capture rather than a fixture, because the
+/// shape of the capture is the thing being read and a fixture would be a second
+/// definition of it.
+#[test]
+fn the_baseline_verifier_compares_per_path() {
+    let baseline = workspace_root().join("compat/baseline/inillucent-core-baseline.json");
+    if !baseline.is_file() {
+        inillucent_compat::differential::skipping(
+            "no baseline captured yet; run `inillucent-baseline capture`",
+        );
+        return;
+    }
+    let recorded = std::fs::read_to_string(&baseline).expect("the capture reads");
+
+    // Two entries, and the digests they are pinned at.
+    let entries = recorded_pairs(&recorded);
+    assert!(
+        entries.len() >= 2,
+        "the capture pins {} files, so a swap cannot be built from it",
+        entries.len()
+    );
+    let (Some(first), Some(second)) = (entries.first(), entries.get(1)) else {
+        panic!("the capture has fewer than two entries");
+    };
+
+    // The swap: each path now carries the other's digest. Every digest in the
+    // capture is still present, which is what the old check asked about.
+    let swapped = recorded
+        .replace(&first.1, "__FIRST__")
+        .replace(&second.1, &first.1)
+        .replace("__FIRST__", &second.1);
+    assert_ne!(swapped, recorded, "the swap changed nothing");
+    for (_, digest) in &entries {
+        assert!(
+            swapped.contains(digest.as_str()),
+            "the swap removed a digest, so this would be caught for the wrong reason"
+        );
+    }
+
+    // Read back per path: both entries now disagree with what they were pinned
+    // at, which is what the verifier compares.
+    let after = recorded_pairs(&swapped);
+    let moved: Vec<&String> = after
+        .iter()
+        .zip(entries.iter())
+        .filter(|(now, before)| now.1 != before.1)
+        .map(|(now, _)| &now.0)
+        .collect();
+    assert_eq!(
+        moved.len(),
+        2,
+        "a per-path read of the swapped capture found {} moved files, and two were swapped",
+        moved.len()
+    );
+    assert!(
+        moved.contains(&&first.0) && moved.contains(&&second.0),
+        "the two swapped paths are {:?} and {:?}, and the moved ones are {moved:?}",
+        first.0,
+        second.0
+    );
+}
+
+/// Returns `(path, sha256)` for every entry of a capture, in order.
+///
+/// The same pair the verifier reads, read the same way: the capture is this
+/// workspace's own output and `serde_json` is approved for two crates that do
+/// not include this one.
+///
+/// @param recorded - the capture file's text
+fn recorded_pairs(recorded: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut rest = recorded;
+    while let Some(at) = rest.find("\"path\": \"") {
+        let after = rest.split_at(at.saturating_add(9)).1;
+        let Some(end) = after.find('"') else {
+            break;
+        };
+        let (path, remainder) = after.split_at(end);
+        let Some(hash_at) = remainder.find("\"sha256\": \"") else {
+            break;
+        };
+        let value = remainder.split_at(hash_at.saturating_add(11)).1;
+        let Some(hash_end) = value.find('"') else {
+            break;
+        };
+        let (sha256, tail) = value.split_at(hash_end);
+        pairs.push((path.to_string(), sha256.to_string()));
+        rest = tail;
+    }
+    pairs
 }

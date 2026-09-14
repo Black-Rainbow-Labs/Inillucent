@@ -4,7 +4,7 @@ Install inillucent, make a database, run SQL against it, and understand what the
 when something goes wrong.
 
 If you would rather learn by working through examples, the tutorial at
-[inillucent.com/docs](https://inillucent.com/docs) covers the same ground in 23 chapters with the
+[inillucent.com/docs](https://inillucent.com/docs) covers the same ground in 24 chapters with the
 expected output printed beside every command.
 
 ## Install
@@ -43,8 +43,9 @@ The other five package managers are not published yet. This is what each will be
 Each of them installs the same four programs, and each downloader checks the release's published
 SHA-256 before unpacking the archive.
 
-There is no macOS archive yet, because every platform's archive is built on that platform. On macOS,
-use `cargo install inillucent-cli`.
+There is no macOS archive yet, because every platform's archive is built on that platform, and
+`cargo install` needs a crates.io release there is not one of. On macOS, build from a checkout:
+`cargo build --release -p inillucent-cli`.
 
 `packaging/README.md` is how a release is cut. `packaging/windows/README.md` and
 `packaging/macos/README.md` record what a signed installer would take on each platform and what it
@@ -54,9 +55,9 @@ would cost.
 
 | program | what it is |
 |---|---|
-| `inillucent` | the command line: 29 verbs — `query`, `exec`, `describe`, `import`, `export`, `search`, `explain`, `backup`, `migrate` and the rest |
-| `inillucent-shell` | an interactive shell shaped like `sqlite3`, with 63 of its 65 dot commands and all 48 of its command line options |
-| `inillucent-mcp` | 27 of the same commands served to an AI agent over MCP |
+| `inillucent` | the command line: 30 verbs — `query`, `exec`, `describe`, `import`, `export`, `search`, `explain`, `backup`, `migrate`, `setup-embeddings` and the rest |
+| `inillucent-shell` | an interactive shell shaped like `sqlite3`, with 63 of its 65 dot commands. It knows all 48 of `sqlite3`'s command line options: 30 it acts on, and 18 it refuses by name because this engine has no equivalent |
+| `inillucent-mcp` | 28 of the same commands served to an AI agent over MCP |
 | `inillucent-migrate` | builds a database from a SQLite file, a running PostgreSQL or MySQL server, or a legacy retrieval index |
 
 ## A first database
@@ -77,8 +78,51 @@ Or interactively:
 inillucent-shell app.rdb
 ```
 
-The shell answers `.tables`, `.schema`, `.mode`, `.import`, `.dump`, `.expert` aside, and 62 more of
-`sqlite3`'s dot commands. [SQL support](sql.md) lists the two it does not answer and why.
+The shell answers 63 of `sqlite3`'s 65 dot commands, `.tables`, `.schema`, `.mode`, `.import` and
+`.dump` among them. The two it does not answer are `.expert` and `.session`; [SQL support](sql.md)
+says why.
+
+## A first word that is not a command
+
+`inillucent` reads its first word as a command. When the command table does not have that word, it is
+read as a database to open in the shell instead, so `inillucent app.rdb "SELECT 1"` works the way
+`sqlite3 app.rdb "SELECT 1"` does. The file is created if it is not there yet, so a word read as a
+database is a file written to disk.
+
+So a word is read as a database only when it could be a file name.
+
+| the first word | what it opens |
+|---|---|
+| `:memory:` | a database held in memory |
+| `file:app.rdb?mode=ro` | the database the URI names |
+| a word that is already a file on disk | that file |
+| a word with a separator in it, such as `./ledger` or `data/app` | that path |
+| a word with a drive letter in front of it, such as `C:\tmp\app` | that path |
+| a word with an extension on the end, such as `app.rdb` | that file, created if it is not there |
+| anything else | nothing: it is refused |
+
+Anything else is a mistyped command. It is refused before anything is opened, with exit code 2:
+
+```text
+inillucent: 'qeury' is not a command, and it does not name a database file.
+  Did you mean: query?
+  Run 'inillucent help' for the 30 commands there are.
+  To open a file of that name as a database, write it as a path: inillucent ./qeury
+```
+
+To open a file whose name has no extension, write it as a path: `inillucent ./ledger "SELECT 1"`.
+
+`inillucent-shell` applies the same reasoning to its options. A word that begins with a dash and is
+not one of the options it knows is refused rather than taken for the file name, which is what
+`sqlite3` itself does:
+
+```text
+Error: unknown option: --db
+Use -help for a list of options.
+```
+
+To open a file whose name begins with a dash, put `--` in front of it, as in
+`inillucent-shell -- -ledger.rdb`.
 
 ## Bind parameters, do not paste values
 

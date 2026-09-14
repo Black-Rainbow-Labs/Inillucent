@@ -84,10 +84,15 @@ pub(super) fn rowid_in_list_path(
 /// The mirror of [`rowid_in_list_path`] for a secondary index or a
 /// `WITHOUT ROWID` table's own primary-key index: every value of the list
 /// becomes one branch, each an equality exactly a lone
-/// [`AccessPath::IndexSeek`] would use alone. Scoped to the leading column
-/// only - an `IN` list on a column *after* an equality prefix would need one
-/// branch per combination of prefix value and list value, a Cartesian
-/// question this does not answer.
+/// [`AccessPath::IndexSeek`] would use alone.
+///
+/// **An equality prefix ahead of the `IN` column is taken too (task-1932,
+/// M7).** `WHERE a = 5 AND b IN (1, 2, 3)` on an index over `(a, b)` is three
+/// seeks to `(5, 1)`, `(5, 2)` and `(5, 3)`, and this used to look at the
+/// leading column only - so the `IN` was a residual and the whole query became
+/// a scan or a one-column seek over every `a = 5`. There is no Cartesian
+/// question: every column ahead of the `IN` is pinned by a *single* equality,
+/// so the prefix is one tuple however long it is.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn in_list_union_path(
     id: usize,
@@ -101,11 +106,50 @@ pub(super) fn in_list_union_path(
     needed: &ColumnUse,
     levers: Levers,
 ) -> Option<(AccessPath, Vec<usize>)> {
-    let key_column = index.columns.first()?;
+    // Every leading key column pinned by an equality, in key order. The `IN`
+    // is looked for on the column after them.
+    let mut prefix: Vec<BoundExpr> = Vec::new();
+    let mut prefix_terms: Vec<usize> = Vec::new();
+    let mut collations: Vec<Collation> = Vec::new();
+    let mut descending: Vec<bool> = Vec::new();
+    let mut columns: Vec<Option<u16>> = Vec::new();
+    let mut at = 0usize;
+    while let Some(key_column) = index.columns.get(at) {
+        let Some(column) = key_column.column else {
+            break;
+        };
+        let collation = collation_of(&key_column.collation);
+        let found = terms.iter().enumerate().find(|(term_index, term)| {
+            !consumed.get(*term_index).copied().unwrap_or(false)
+                && !prefix_terms.contains(term_index)
+                && comparison_collation(term) == collation
+                && comparison_against_column(id, column, term).is_some_and(|(op, value)| {
+                    op == BinaryOp::Equal && is_available(position, ids, &value)
+                })
+        });
+        let Some((term_index, term)) = found else {
+            break;
+        };
+        let Some((_, value)) = comparison_against_column(id, column, term) else {
+            break;
+        };
+        prefix.push(value);
+        prefix_terms.push(term_index);
+        collations.push(collation);
+        descending.push(key_column.descending);
+        columns.push(Some(column));
+        at = at.saturating_add(1);
+    }
+
+    let key_column = index.columns.get(at)?;
     let column = key_column.column?;
     let collation = collation_of(&key_column.collation);
+    collations.push(collation);
+    descending.push(key_column.descending);
+    columns.push(Some(column));
     for (term_index, term) in terms.iter().enumerate() {
-        if consumed.get(term_index).copied().unwrap_or(false) {
+        if consumed.get(term_index).copied().unwrap_or(false) || prefix_terms.contains(&term_index)
+        {
             continue;
         }
         let BoundExpr::InList {
@@ -138,12 +182,31 @@ pub(super) fn in_list_union_path(
         let mut branches = Vec::with_capacity(list.len());
         let mut seen: Vec<&BoundExpr> = Vec::with_capacity(list.len());
         for value in list {
+            // **A NULL in the list matches nothing, so it gets no branch
+            // (task-1932, found by `tlp_differential.rs`).** `b IN ('k1', NULL)`
+            // is true for `k1`, false for nothing, and NULL for every other
+            // value - so the rows a `WHERE` keeps are exactly the rows equal to
+            // a non-NULL member. A branch for the NULL sought the index's own
+            // NULL entries and answered every row where `b IS NULL`: on a
+            // six-hundred-row table `b IN ('k1', 'k2', 'k7', NULL)` counted 95
+            // where a scan applying the same predicate counts 41, and the
+            // fifty-four extra rows were the ones whose `b` is NULL.
+            //
+            // Dropping it is sound rather than a special case: the seek answers
+            // the rows the `IN` is *true* for, and three-valued logic only
+            // separates false from NULL somewhere this path is not used - the
+            // planner does not turn a negated `IN` into a union.
+            if matches!(value, BoundExpr::Null) {
+                continue;
+            }
             if seen.contains(&value) {
                 continue;
             }
             seen.push(value);
+            let mut equalities = prefix.clone();
+            equalities.push(value.clone());
             branches.push(IndexSeekBranch {
-                equalities: vec![value.clone()],
+                equalities,
                 low: None,
                 high: None,
             });
@@ -158,9 +221,9 @@ pub(super) fn in_list_union_path(
                 index_root: index.root,
                 index_name: index.name.clone(),
                 branches,
-                collations: vec![collation],
-                descending: vec![key_column.descending],
-                columns: vec![Some(column)],
+                collations: collations.clone(),
+                descending: descending.clone(),
+                columns: columns.clone(),
                 without_rowid: table.without_rowid,
                 key_entry_slots: if table.without_rowid && index.root != table.root {
                     let leading = index.columns.len();
@@ -176,7 +239,11 @@ pub(super) fn in_list_union_path(
                 // repeat at runtime, and only the executor learns that.
                 dedup: true,
             },
-            vec![term_index],
+            {
+                let mut used = prefix_terms.clone();
+                used.push(term_index);
+                used
+            },
         ));
     }
     None
@@ -364,7 +431,13 @@ fn keyset_branches(
         {
             return None;
         }
-        by_depth[depth - 1] = Some(IndexSeekBranch {
+        // `depth` is one-based and `by_depth` was sized from the same walk, so
+        // the slot is always there; a `get_mut` says that rather than asserting
+        // it, and the crate denies `indexing_slicing` (task-1932, H9 - this was
+        // reported the moment `inillucent-scalar` was made to deny the same
+        // four lints, because clippy then walked the whole dependency chain).
+        let slot = by_depth.get_mut(depth.saturating_sub(1))?;
+        *slot = Some(IndexSeekBranch {
             equalities,
             low: Some(RangeBound {
                 kind: BoundKind::Greater,

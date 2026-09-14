@@ -407,6 +407,43 @@ pub trait ShadowStore {
         body: &mut dyn FnMut(i64, &[Value<'static>]) -> DbResult<bool>,
     ) -> DbResult<()>;
 
+    /// Runs a body over every row whose rowid is at least `from`, in rowid
+    /// order, stopping when it says so.
+    ///
+    /// **A seek, not a scan with a filter, when an implementor has one.** A
+    /// rowid table's rows are already in key order, so a caller that only
+    /// wants what is above a watermark - a delta log's `deltas_above`, chief
+    /// among them - does not need every row below it decoded and thrown
+    /// away; it needs the store to descend to `from` once and walk right
+    /// from there.
+    ///
+    /// **The default is correct rather than fast, and that is deliberate.**
+    /// It is [`Self::scan`] with a callback that skips what is below `from`,
+    /// which costs the whole table exactly as a hand-written filter would -
+    /// so an implementor with no cheap way to position by key is still right
+    /// by doing nothing, and one that can descend directly to a key
+    /// overrides this with that descent. Every rowid tree the new engine
+    /// keeps can; the retired engine's b-trees, reached only from the
+    /// differential suites that still exercise it, are left on the default
+    /// because a seek there is not worth building for a store on its way out.
+    ///
+    /// @param root - the shadow table's root
+    /// @param from - the smallest rowid to visit
+    /// @param body - what to do with each row
+    fn scan_from(
+        &mut self,
+        root: u32,
+        from: i64,
+        body: &mut dyn FnMut(i64, &[Value<'static>]) -> DbResult<bool>,
+    ) -> DbResult<()> {
+        self.scan(root, &mut |rowid, values| {
+            if rowid < from {
+                return Ok(true);
+            }
+            body(rowid, values)
+        })
+    }
+
     /// Reads one row of a keyed shadow table, or nothing when there is not one.
     ///
     /// @param root - the shadow table's root
@@ -448,6 +485,71 @@ pub trait ShadowStore {
         key_columns: usize,
         body: &mut dyn FnMut(&[Value<'static>]) -> DbResult<bool>,
     ) -> DbResult<()>;
+
+    /// Runs a body over every row of a keyed shadow table whose key sorts at
+    /// or after `from`, in key order, stopping when it says so.
+    ///
+    /// **The keyed twin of [`Self::scan_from`], for a key of more than one
+    /// column.** FTS5's `%_idx` is keyed `(segid, term)`, so a caller that
+    /// wants one segment's terms starting at a prefix - a term-major seek to
+    /// `(segid, prefix)`, once per live segment - needs to position by a key
+    /// that is not the whole row, the same shape a rowid seek already had and
+    /// a single-column keyed seek would not need a new method for.
+    ///
+    /// **The default is correct rather than fast, and that is deliberate**,
+    /// for the reason [`Self::scan_from`]'s default is: it is
+    /// [`Self::scan_keyed`] with a callback that skips whatever sorts below
+    /// `from`, so an implementor with no cheap way to position by key is
+    /// still right by doing nothing, and one that can descend directly to a
+    /// key overrides this with that descent.
+    ///
+    /// @param root - the shadow table's root
+    /// @param key_columns - how many leading columns form the key
+    /// @param from - the key to start at, compared column by column
+    /// @param body - what to do with each row
+    fn scan_keyed_from(
+        &mut self,
+        root: u32,
+        key_columns: usize,
+        from: &[Value<'static>],
+        body: &mut dyn FnMut(&[Value<'static>]) -> DbResult<bool>,
+    ) -> DbResult<()> {
+        self.scan_keyed(root, key_columns, &mut |values| {
+            if key_sorts_below(values, from) {
+                return Ok(true);
+            }
+            body(values)
+        })
+    }
+}
+
+/// Returns whether a keyed row's leading columns sort before `from`, compared
+/// column by column under [`inillucent_value::compare::compare_values`] with
+/// `BINARY` collation - what every shadow table's key compares under, since
+/// none of them declares a column collation of its own.
+///
+/// Shared by [`ShadowStore::scan_keyed_from`]'s default implementation and by
+/// a real implementor's seek, which still has to discard whatever a leaf
+/// below the seek's target key holds - `PagedTree::visit_range` positions at
+/// the leaf that *could* hold the key, not necessarily past everything
+/// smaller than it.
+///
+/// @param row - the row read back
+/// @param from - the key a caller asked to start at
+pub fn key_sorts_below(row: &[Value<'static>], from: &[Value<'static>]) -> bool {
+    use std::cmp::Ordering;
+    for (left, right) in row.iter().zip(from.iter()) {
+        match inillucent_value::compare::compare_values(
+            left,
+            right,
+            inillucent_value::Collation::Binary,
+        ) {
+            Ordering::Less => return true,
+            Ordering::Greater => return false,
+            Ordering::Equal => continue,
+        }
+    }
+    false
 }
 
 #[cfg(test)]

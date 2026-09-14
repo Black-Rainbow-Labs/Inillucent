@@ -16,6 +16,12 @@
 corpus.jsonl
 /index.inillucent/
 
+# The RAG example's chunks, which `scripts/chunk-corpus.py` splits out of the
+# corpus beside them in a second. The articles are source and are committed; a
+# second copy of the same text, cut into passages, is not.
+/examples/rag-agent/corpus/chunks.csv
+/examples/rag-agent/corpus/chunks-fts.csv
+
 # Engine databases and their log segments, wherever a test or a scratch run
 # leaves one. These are output, never source: no `.rdb` has ever been tracked,
 # and `drivers/inillucent-driver/other.rdb` is what an uncommitted directory
@@ -23,6 +29,27 @@ corpus.jsonl
 *.rdb
 *.rdb-wal.*
 *.rdb-journal
+
+# With one exception, and it is the point of the thing it belongs to.
+# `examples/rag-agent/greek-philosophy.rdb` is the example's deliverable: a
+# corpus that is already embedded, so a reader asks a question in their first
+# minute instead of spending an afternoon building one. A database that has to
+# be built before it can be searched is exactly what that example exists to
+# remove, so this one is source. `scripts/build-database.sh` rebuilds it, and
+# the log segment beside it is still output.
+!/examples/rag-agent/greek-philosophy.rdb
+
+# The same for `.db`, but only inside a crate, because `.db` is also SQLite's
+# own extension and `compat/fixtures/` holds a hundred tracked files that are
+# genuinely source - the files a reader is meant to open with SQLite to check a
+# claim. A test that opens a database on the real file system by a relative
+# name leaves it in whichever crate directory `cargo test` ran from, and the
+# ones seen so far are `app.db`, its log segments, and the scratch file a
+# `VACUUM` leaves beside them.
+/crates/*/*.db
+/crates/*/*.db-wal.*
+/crates/*/*.db-journal
+/crates/*/*.db.vacuum-*
 
 # Editor and operating system noise.
 .DS_Store

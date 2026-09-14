@@ -87,6 +87,31 @@ pub enum FrameState {
     Cooling,
 }
 
+/// Why a page is being written to the file.
+///
+/// **No-steal is a rule about the checkpointer, and only the checkpointer can
+/// obey it by doing nothing.** A checkpoint that leaves an open transaction's
+/// page out of the file has lost nothing: the frame is still resident and
+/// still dirty, and the checkpoint after that transaction ends writes it. An
+/// eviction has no such option, because the frame it would have written from
+/// is about to hold a different page - so the same skip there does not hold
+/// the page back, it throws it away.
+///
+/// That is what page 597 of `new_engine_log_lead` was. A `CREATE INDEX`
+/// through a 64-frame pool evicted 129 dirty pages during the build, every one
+/// of them skipped by no-steal and then freed, and the file was left with a
+/// hole of never-written zeros where the index's own pages should have been -
+/// `page 597 checksum 00000000 is not the computed 8d1053d3`, which is the
+/// checksum of a page of zeros. The build reported success; the `SELECT` after
+/// it did not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Writing {
+    /// A checkpoint's flush, which may leave a page for the next checkpoint.
+    Checkpoint,
+    /// An eviction, which either writes the page or keeps the frame.
+    Eviction,
+}
+
 /// What the pool has been asked to do, for the report.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PoolStats {
@@ -230,7 +255,47 @@ struct State {
 /// default because an application that has not thought about concurrency is
 /// better served by taking turns than by an error it does not handle, and
 /// `PRAGMA busy_timeout` moves it either way.
-const DEFAULT_BUSY_MILLIS: u64 = 5_000;
+pub(crate) const DEFAULT_BUSY_MILLIS: u64 = 5_000;
+
+/// Raises a lock on a file, waiting up to a budget for the holder to let go.
+///
+/// **Waiting is the whole of what a busy timeout is.** A lock another process
+/// holds is not an error - it is a lock that will be released - and reporting
+/// failure immediately would make every concurrent pair of writers fail rather
+/// than take turns. The sleep grows so that a long wait is not a spin, and the
+/// last attempt reports what it found.
+///
+/// A free function rather than a `Pool` method so that
+/// [`crate::journal::replay_hot_journal`] can escalate a lock on the file it
+/// opens for replay with the same retry `Pool::lock_within` uses, instead of
+/// a second, independently invented backoff.
+///
+/// @param file - the file to lock
+/// @param level - the level to raise to
+/// @param budget_millis - how long to keep trying
+pub(crate) fn lock_with_wait(
+    file: &dyn VfsFile,
+    level: FileLock,
+    budget_millis: u64,
+) -> DbResult<()> {
+    if file.lock_level() >= level {
+        return Ok(());
+    }
+    let mut waited = 0u64;
+    let mut pause = 1u64;
+    loop {
+        match file.lock(level) {
+            Ok(()) => return Ok(()),
+            Err(error) if waited >= budget_millis => {
+                return Err(error.into_db_error());
+            }
+            Err(_) => {}
+        }
+        std::thread::sleep(std::time::Duration::from_millis(pause));
+        waited = waited.saturating_add(pause);
+        pause = pause.saturating_mul(2).min(50);
+    }
+}
 
 /// A pinned, borrowed page.
 pub struct PageGuard<'p> {
@@ -350,6 +415,30 @@ pub struct Pool {
     /// every sync, and [`Pool::writeback`] refuses a page the log has not
     /// caught up with.
     durable_lsn: Cell<u64>,
+    /// The lowest LSN a checkpoint has ever persisted as this file's recovery
+    /// point, which is the lowest LSN `retire_segments_below` has ever been
+    /// asked to keep.
+    ///
+    /// **Not `durable_lsn`, and the difference is the whole fix.** `durable_lsn`
+    /// advances on every sync of the log - including the sync a commit does for
+    /// its own record, which happens before that commit's own change reaches
+    /// this pool's `modify`. Using it as `note_dirty_from`'s floor would clamp
+    /// a page's `rec_lsn` up past the very record that just dirtied it, so a
+    /// later checkpoint that has to hold the page back (because a *different*,
+    /// still-open transaction touched it too) would believe that record no
+    /// longer needs replay - the record is not in the file (correctly held
+    /// back) and now not replayed either, which is the data loss this field
+    /// exists to prevent rather than the one `checkpoint.rs`'s module comment
+    /// describes.
+    ///
+    /// This field only moves when a checkpoint actually persists a new
+    /// recovery point and retires segments against it, so it names exactly
+    /// what is physically still guaranteed to be on disk - never more.
+    /// `u64::MAX` means no checkpoint has run yet in this pool's lifetime
+    /// (a fresh build, or before `recovery::open_file` seeds it from the
+    /// file's own last checkpoint), which disables the clamp rather than
+    /// asserting a floor nothing has earned.
+    retained_lsn: Cell<u64>,
     /// The highest LSN this pool has written into the data file.
     ///
     /// **A page's stamp has to be a position in the stream beside the file, and
@@ -370,7 +459,7 @@ pub struct Pool {
     /// `None` means there is nothing to ask, which is a read-only open and a
     /// bulk build with no log.
     #[allow(clippy::type_complexity)]
-    advance_log: RefCell<Option<Box<dyn Fn() -> DbResult<u64>>>>,
+    advance_log: RefCell<Option<std::rc::Rc<dyn Fn() -> DbResult<u64>>>>,
     /// The LSN at or above which a page's change belongs to a transaction that
     /// has not committed.
     ///
@@ -386,6 +475,20 @@ pub struct Pool {
     /// reaching the pool through the file, and reaching the file was the one
     /// thing that could not be done at that moment.
     uncommitted_lsn: Arc<AtomicU64>,
+    /// Whether an eviction has written a page an open transaction had changed
+    /// since the current rollback journal was started.
+    ///
+    /// **What makes such a write undoable is the journal, so the journal has to
+    /// outlive the transaction that needed it.** A checkpoint disposes of the
+    /// journal once its own meta record is durable, which is right when every
+    /// page in the file belongs to a committed transaction. It is wrong while a
+    /// writer is still open and an eviction has already put one of that
+    /// writer's pages in the file: deleting the pre-images there would leave a
+    /// crash with an uncommitted page it could neither replay away - recovery
+    /// is redo-only and discards a loser rather than undoing it - nor put back.
+    /// So [`Pool::checkpoint`] keeps the journal while this is set and the
+    /// writer is still open, and [`Pool::finish_journal`] clears it.
+    stolen: Cell<bool>,
 }
 
 /// The pool's counters, one cell each.
@@ -484,12 +587,16 @@ impl Pool {
             // bulk build and a read-only open both run this way, and both are
             // correct to: a page cannot be ahead of a log that does not exist.
             durable_lsn: Cell::new(u64::MAX),
+            // No checkpoint has run yet in this pool's lifetime, so nothing is
+            // floored - see the field's own doc comment.
+            retained_lsn: Cell::new(u64::MAX),
             // Nothing has been written yet, and zero is what the meta page
             // means by "no high water recorded".
             high_water_lsn: Cell::new(0),
             advance_log: RefCell::new(None),
             // Nothing is uncommitted until a transaction says so.
             uncommitted_lsn: Arc::new(AtomicU64::new(u64::MAX)),
+            stolen: Cell::new(false),
         })
     }
 
@@ -504,6 +611,23 @@ impl Pool {
     /// @param lsn - the position past the last durable byte of the log
     pub fn set_durable_lsn(&self, lsn: u64) {
         self.durable_lsn.set(lsn);
+    }
+
+    /// Records the lowest LSN a checkpoint has persisted as this file's
+    /// recovery point - the floor [`Pool::note_dirty_from`] clamps a newly
+    /// dirtied page's `rec_lsn` against.
+    ///
+    /// A caller with a log calls this from the same place it calls
+    /// [`Pool::set_durable_lsn`] during a checkpoint - `recovery_from`, not
+    /// `durable`, because `durable` can already include a record this exact
+    /// call is about to dirty a page with. It also has to be called once at
+    /// open, from the file's own `meta.checkpoint_lsn`, or a page whose stale
+    /// stamp predates a checkpoint from a *previous* session would repeat the
+    /// bug across a reopen instead of within one.
+    ///
+    /// @param lsn - the checkpoint's own recovery point
+    pub fn set_retained_lsn(&self, lsn: u64) {
+        self.retained_lsn.set(lsn);
     }
 
     /// Registers what the pool may call when a page it must write is ahead of
@@ -524,8 +648,13 @@ impl Pool {
     /// gets a chance to satisfy it.
     ///
     /// @param advance - makes the log durable and returns its new durable point
+    ///
+    /// An `Rc` rather than a `Box` so that [`Pool::refuse_if_ahead_of_the_log`]
+    /// can take a handle to it and drop its borrow before calling it. A `Box`
+    /// would have to be moved out of the cell and put back, which loses the
+    /// closure on the error path the call is most likely to take.
     #[allow(clippy::type_complexity)]
-    pub fn on_log_behind(&self, advance: Box<dyn Fn() -> DbResult<u64>>) {
+    pub fn on_log_behind(&self, advance: std::rc::Rc<dyn Fn() -> DbResult<u64>>) {
         *self.advance_log.borrow_mut() = Some(advance);
     }
 
@@ -964,9 +1093,57 @@ impl Pool {
         if let Some(frame) = self.state.borrow_mut().free.pop() {
             return Ok(frame);
         }
+        // Nothing is evictable, and the two reasons for that are different
+        // enough to the caller that they are told apart. A pool whose frames
+        // are all pinned is a caller holding too many guards at once. A pool
+        // whose frames all hold pages an open transaction has changed, with no
+        // rollback journal to undo an eviction from, is the documented limit of
+        // a no-steal policy: such a page may not reach the file before its
+        // commit, and it may not be dropped either, so the transaction cannot
+        // dirty more pages than the pool holds. Selecting a journal mode that
+        // keeps pre-images, or a larger `PRAGMA cache_size`, is what lifts it.
+        let held = self.frames_no_steal_is_holding();
+        if held > 0 {
+            return Err(no_mem(format!(
+                "the open transaction has changed {held} of the buffer pool's {} pages, and no \
+                 rollback journal is in force to undo an eviction from, so none of them may \
+                 be written before it commits: a transaction cannot dirty more pages than \
+                 the pool holds",
+                self.buffers.len()
+            )));
+        }
         Err(no_mem(
             "every frame in the buffer pool is pinned; nothing can be evicted",
         ))
+    }
+
+    /// Returns how many resident frames hold a page no-steal will not let go.
+    ///
+    /// Only asked when the pool has nothing to give, so that the refusal names
+    /// the reason it is refusing rather than the first reason anybody wrote a
+    /// message for.
+    fn frames_no_steal_is_holding(&self) -> usize {
+        if self.can_undo_a_steal() {
+            return 0;
+        }
+        let uncommitted = self.uncommitted_lsn.load(Ordering::SeqCst);
+        if uncommitted == u64::MAX {
+            return 0;
+        }
+        let dirty: Vec<u32> = {
+            let state = self.state.borrow();
+            state
+                .frames
+                .iter()
+                .enumerate()
+                .filter(|(_, meta)| meta.dirty && meta.state != FrameState::Free)
+                .map(|(index, _)| index as u32)
+                .collect()
+        };
+        dirty
+            .into_iter()
+            .filter(|frame| self.lsn_of(*frame).is_ok_and(|lsn| lsn >= uncommitted))
+            .count()
     }
 
     /// Makes sure a claimed frame has a page-sized buffer.
@@ -1190,8 +1367,21 @@ impl Pool {
                 }
                 continue;
             }
-            if dirty {
-                self.writeback(frame, page)?;
+            if dirty && !self.writeback(frame, page, Writing::Eviction)? {
+                // No-steal held the page back and there is no durable rollback
+                // journal to undo a steal with, so this frame cannot be freed:
+                // the frame holds the only copy of the page, and emptying it
+                // would lose the change rather than defer it. Back to hot, and
+                // on to the next candidate. A pool with nothing else to give
+                // then fails the statement in `take_frame`, which is the
+                // documented limit of a no-steal policy - a transaction can
+                // dirty at most the pool - and is an error rather than a file
+                // with a hole in it.
+                let mut state = self.state.borrow_mut();
+                if let Some(meta) = state.frames.get_mut(frame as usize) {
+                    meta.state = FrameState::Hot;
+                }
+                continue;
             }
             // TDD invariant 5: a frame is never reused while a swizzled swip
             // still names it. The only thing that can name it is the parent
@@ -1228,9 +1418,14 @@ impl Pool {
     /// swizzled swips; unswizzling a page because it was written would throw
     /// away the descent work for nothing.
     ///
+    /// Returns whether the page reached the file. `false` is no-steal holding
+    /// it back, which is a decision only a [`Writing::Checkpoint`] may act on -
+    /// see [`Writing`] for why an eviction that acted on it lost the page.
+    ///
     /// @param frame - the frame to write
     /// @param page - the page it holds
-    fn writeback(&self, frame: u32, page: PageId) -> DbResult<()> {
+    /// @param why - a checkpoint's flush, or an eviction
+    fn writeback(&self, frame: u32, page: PageId, why: Writing) -> DbResult<bool> {
         // The write-ahead rule, and the only place in the engine it is
         // enforced. Phase 2 said this seam was here and that Phase 3 would add
         // "a condition rather than a caller"; this is that condition. Every
@@ -1241,9 +1436,30 @@ impl Pool {
         // No-steal: a page an open transaction has changed does not go to the
         // file. It stays dirty, so a later checkpoint - after the transaction
         // ends either way - writes it then.
+        //
+        // **That sentence is true of a checkpoint and false of an eviction**,
+        // which is what `why` is here to tell apart. An evicted frame does not
+        // stay dirty, because it does not stay: the page is dropped and the
+        // frame is handed to the next caller. So an eviction writes the page
+        // instead, and what makes that safe is the rollback journal - the
+        // pre-image is saved and synced below, before the new image goes to the
+        // file, so a crash before the transaction commits puts the page back.
+        // `crate::journal`'s own header already names this case: "a transaction
+        // whose dirty pages outgrow the buffer pool evicts, which creates the
+        // journal".
+        //
+        // **A journal whose pre-images do not reach the disk cannot undo the
+        // write**, so `memory` and `off` do not get to steal; there the frame
+        // is simply not evictable and `evict_one` moves on. Under those two
+        // modes the engine has already been told it may lose a half-written
+        // checkpoint, so refusing here is the stricter of the two answers, not
+        // a new hole.
         if self.holds_uncommitted(frame, page)? {
-            Counters::add(&self.counters.held_back, 1);
-            return Ok(());
+            if why == Writing::Checkpoint || !self.can_undo_a_steal() {
+                Counters::add(&self.counters.held_back, 1);
+                return Ok(false);
+            }
+            self.stolen.set(true);
         }
         let mut image = {
             let bytes = self
@@ -1270,7 +1486,18 @@ impl Pool {
         // reach the file by a route that skipped its pre-image, exactly as it
         // cannot skip the write-ahead rule two lines above. In WAL mode the
         // journal is not a rollback journal and this costs a branch.
-        self.journal_page(page)?;
+        //
+        // **And the pre-image is synced here, not once at the head of the
+        // checkpoint.** A writeback also reaches this line from the evictor,
+        // one page at a time, with no checkpoint around it; and the checkpoint
+        // itself used to seal before it had saved anything, so every pre-image
+        // it wrote was still in the file's buffers when the page it belonged to
+        // was overwritten. `flush` now saves the whole batch before the first
+        // page moves, which leaves this call with nothing outstanding on all
+        // but the first page - see `Journal::seal`.
+        if self.journal_page(page)? {
+            self.seal_journal()?;
+        }
         self.file
             .write_all_at(page.0.saturating_mul(self.page_size as u64), &image)
             .map_err(|error| error.into_db_error())?;
@@ -1282,7 +1509,21 @@ impl Pool {
         drop(state);
         Counters::add(&self.counters.writes, 1);
         Counters::add(&self.counters.translated, translated as u64);
-        Ok(())
+        Ok(true)
+    }
+
+    /// Reports whether a page written before its transaction committed could be
+    /// put back after a crash.
+    ///
+    /// Which is to say: whether a rollback journal whose pre-images reach the
+    /// disk is in force. `wal` takes a `delete` journal rather than none, so
+    /// this is true of every mode the engine ships with except `memory` and
+    /// `off` - see `journal_for` in `crates/inillucent-engine/src/lib.rs`.
+    fn can_undo_a_steal(&self) -> bool {
+        self.journal
+            .borrow()
+            .as_ref()
+            .is_some_and(|journal| journal.mode().is_durable())
     }
 
     /// Refuses a writeback the log has not caught up with.
@@ -1396,23 +1637,19 @@ impl Pool {
         // candidate it has carries an LSN the log has not reached, so refusing
         // outright fails a statement that has done nothing wrong.
         //
-        // The borrow is taken and released around the call so that an
-        // `advance` which reached back into the pool could not find this
-        // already borrowed.
-        let asked = self.advance_log.borrow().is_some();
-        if !asked {
+        // The handle is cloned out and the borrow dropped before the call,
+        // so an `advance` that reaches back into the pool - to register a
+        // different one, or to write a page of its own - does not find this
+        // cell already borrowed. The comment here used to say that while the
+        // borrow was held straight through the call (task-1932, M9).
+        let advance = self.advance_log.borrow().as_ref().map(std::rc::Rc::clone);
+        let Some(advance) = advance else {
             return Err(misuse(format!(
                 "page {} carries lsn {lsn} and the log is durable to {durable}: writing it would put the data file ahead of the log",
                 page.0
             )));
-        }
-        let reached = {
-            let held = self.advance_log.borrow();
-            match held.as_ref() {
-                Some(advance) => advance()?,
-                None => durable,
-            }
         };
+        let reached = advance()?;
         self.durable_lsn.set(reached);
         if lsn <= reached {
             return Ok(());
@@ -1553,19 +1790,40 @@ impl Pool {
     /// @param change - what to do to its bytes
     /// Records where recovery has to start for a page that is about to change.
     ///
-    /// **The LSN the page carried *before* the change**, kept from the moment a
-    /// clean frame first becomes dirty until it is written. This is ARIES's
-    /// `recLSN` and it exists because the obvious alternative is wrong: a
-    /// checkpoint cannot start recovery at "the oldest open transaction",
-    /// because a page held out of the file for an open transaction may *also*
-    /// carry an older committed change that is not in the file either. Starting
-    /// above that change loses it, and the model campaign found exactly that -
-    /// a committed row missing from a recovery that had nothing left to replay
-    /// it from.
+    /// **The LSN the page carried *before* the change, floored at the log's
+    /// retained point.** This is ARIES's `recLSN`, and the floor is not an
+    /// extra precaution - without it this function is wrong, not merely
+    /// conservative. A page's header LSN only changes when the page itself is
+    /// modified, not when it is merely checkpointed: a leaf page can go a dozen
+    /// checkpoints without being touched, carrying the same old stamp the whole
+    /// time while `retire_segments_below` keeps deleting the segments below
+    /// each checkpoint's own, much higher, recovery point. The page is still
+    /// perfectly correct on disk - nothing has changed about it since that old
+    /// stamp, so every checkpoint in between was right to consider it fully
+    /// caught up - but the stamp itself is now a lie about what the log still
+    /// holds. The moment this page dirties again, using that stale stamp as
+    /// `rec_lsn` asks the *next* checkpoint to point recovery at a segment that
+    /// is already gone, which is worse than the bug this field exists to fix:
+    /// reproduced directly by a page that shares a table with an unrelated
+    /// later commit (`a_checkpoint_during_a_later_open_transaction_keeps_the_earlier_commit`
+    /// in `inillucent-compat`'s `durability.rs`), where `rec_lsn` came back
+    /// below a bound an earlier checkpoint had already retired past and the
+    /// row that commit inserted did not survive a crash.
     ///
-    /// Taking the LSN from before the change rather than after it is
-    /// deliberately conservative: recovery may re-apply a record the page
-    /// already has, and the page-LSN rule makes that a no-op.
+    /// **`retained_lsn`, not `durable_lsn`, is the floor - `durable_lsn` is
+    /// already wrong by the time this runs.** `durable_lsn` advances on every
+    /// sync of the log, including the sync a commit does for its own record -
+    /// which happens *before* that same commit's change reaches this call. A
+    /// first attempt at this fix clamped to `durable_lsn` and it stayed broken:
+    /// the very insert this comment's reproduction depends on dirtied its page
+    /// with `durable_lsn` already past its own record's LSN, so the clamp
+    /// swallowed the one record a later checkpoint would need to replay for a
+    /// page it has to hold back - the same symptom, for a new reason, on a
+    /// clean build with the naive fix applied. `retained_lsn` only moves when
+    /// a checkpoint actually persists a new recovery point and retires
+    /// segments against it, so it never names a point later than what is
+    /// truly, physically retained, and never later than the record that is
+    /// dirtying this page right now.
     ///
     /// @param frame - the frame about to change
     fn note_dirty_from(&self, frame: u32) {
@@ -1580,23 +1838,64 @@ impl Pool {
             return;
         }
         let lsn = self.lsn_of(frame).unwrap_or(0);
+        let floor = self.retained_lsn.get();
+        let lsn = if floor == u64::MAX {
+            lsn
+        } else {
+            lsn.max(floor)
+        };
         let mut state = self.state.borrow_mut();
         if let Some(meta) = state.frames.get_mut(frame as usize) {
             meta.rec_lsn = lsn;
         }
     }
 
-    /// Returns the lowest LSN recovery must start at to rebuild every dirty page.
+    /// Returns the lowest LSN recovery must start at to rebuild every page a
+    /// checkpoint's flush is actually going to hold back.
     ///
     /// `u64::MAX` when nothing is dirty, which is what lets a checkpoint that
     /// wrote everything advance the recovery point to the log's durable end.
+    ///
+    /// **Only a page `holds_uncommitted` will actually hold back, not every
+    /// dirty page - counting the rest is a real bug, not extra caution.** A
+    /// freshly allocated page can sit dirty with its header LSN still at its
+    /// zeroed, never-stamped default; with no transaction open,
+    /// `holds_uncommitted` answers false for every page regardless of that
+    /// stamp, so a checkpoint's flush writes all of them and holds nothing
+    /// back. Folding that page's `rec_lsn` into this minimum anyway pinned
+    /// `recovery_from` at its stale-or-zero stamp on every such checkpoint,
+    /// forever - `retire_segments_below` then has nothing below the pinned
+    /// point to reclaim, and a build that should shrink its log to a few
+    /// kilobytes never sheds a single segment. Reproduced directly:
+    /// `a_checkpoint_reclaims_the_log` in `inillucent-compat`'s
+    /// `new_engine_log_retire.rs`, which measures exactly this - the log
+    /// shrinking after a checkpoint with nothing open at all.
+    ///
+    /// So a page only contributes when `uncommitted_lsn` names an open
+    /// transaction *and* this page's current stamp is at or above it - the
+    /// same test `holds_uncommitted` itself makes, checked here rather than
+    /// shared with it because `writeback` needs the answer for one frame at a
+    /// time and this needs the minimum over all of them before any of them
+    /// move.
     pub fn oldest_dirty_lsn(&self) -> u64 {
+        let uncommitted = self.uncommitted_lsn.load(Ordering::SeqCst);
+        if uncommitted == u64::MAX {
+            // No transaction is open, so no page is held back this
+            // checkpoint - every dirty page's stamp is about to be written,
+            // and none of them bound what recovery still needs.
+            return u64::MAX;
+        }
         let state = self.state.borrow();
         state
             .frames
             .iter()
-            .filter(|meta| meta.dirty && meta.state != FrameState::Free)
-            .map(|meta| meta.rec_lsn)
+            .enumerate()
+            .filter(|(_, meta)| meta.dirty && meta.state != FrameState::Free)
+            .filter(|(frame, _)| {
+                self.lsn_of(*frame as u32)
+                    .is_ok_and(|stamp| stamp >= uncommitted)
+            })
+            .map(|(_, meta)| meta.rec_lsn)
             .min()
             .unwrap_or(u64::MAX)
     }
@@ -1632,6 +1931,14 @@ impl Pool {
     ///
     /// Pages go out in page-id order so the write pattern is sequential, which
     /// is the checkpointer's rule and costs nothing to honour here.
+    ///
+    /// Under a rollback journal it takes two passes over the same list: every
+    /// pre-image first, then one sync, then the pages. The pre-images have to
+    /// be on the media before the first page is overwritten, and doing it in
+    /// two passes is what lets a batch of a thousand pages pay for one sync
+    /// instead of a thousand. The writeback loop still asks for the sync per
+    /// page, because the evictor reaches it without a flush around it; after
+    /// this pass there is nothing left for it to sync.
     pub fn flush(&self) -> DbResult<usize> {
         let mut dirty: Vec<(PageId, u32)> = {
             let state = self.state.borrow();
@@ -1644,8 +1951,14 @@ impl Pool {
                 .collect()
         };
         dirty.sort_unstable();
+        if self.journal.borrow().is_some() {
+            for (page, _) in &dirty {
+                self.journal_page(*page)?;
+            }
+            self.seal_journal()?;
+        }
         for (page, frame) in &dirty {
-            self.writeback(*frame, *page)?;
+            self.writeback(*frame, *page, Writing::Checkpoint)?;
         }
         Ok(dirty.len())
     }
@@ -1666,10 +1979,14 @@ impl Pool {
     ///
     /// @param meta - the record to write, with its generation already bumped
     pub fn checkpoint(&self, meta: &mut Meta) -> DbResult<()> {
-        // **The journal is sealed before the first page moves.** Everything
-        // `save` wrote is in the file's buffers until this; a page image
-        // reaching the database before its pre-image reaches the disk is the
-        // one ordering a rollback journal exists to forbid.
+        // **The journal is sealed before the first page moves**, and `flush`
+        // is where that happens: it saves every pre-image the batch needs and
+        // syncs once before it writes anything. This call used to be the only
+        // one, and it ran here - before `flush` had saved a single pre-image -
+        // so it synced an empty file and the ordering a rollback journal exists
+        // to forbid held anyway. It is kept because anything a caller saved
+        // before reaching a checkpoint is still owed a sync, and it costs
+        // nothing when there is none.
         self.seal_journal()?;
         self.flush()?;
         self.file
@@ -1682,6 +1999,29 @@ impl Pool {
         meta.high_water_lsn = meta.high_water_lsn.max(self.high_water_lsn.get());
         let mut image = vec![0u8; self.page_size];
         meta.encode(&mut image)?;
+        // **The meta pages are journaled too, and they were the last pages that
+        // were not.** A rollback journal has to hold a pre-image of every page
+        // the checkpoint overwrites, and these two are pages the checkpoint
+        // overwrites. Leaving them out left a crash here able to produce a file
+        // whose data pages the journal put back to before the checkpoint and
+        // whose meta record says the checkpoint finished: the recorded
+        // `checkpoint_lsn` then tells redo that everything up to it is already
+        // in the file, so the records that would have re-applied the pages the
+        // journal just undid are skipped, and the database comes back as
+        // neither its old self nor its new one. It came back with no tables at
+        // all, because the catalog's own page is one of the pages the journal
+        // put back.
+        //
+        // The shadow page does not cover this. Both slots take the same image
+        // in the loop below, so the second one is not an older copy to fall
+        // back on - it is a second chance for the *new* record to survive, and
+        // `Meta::choose` believing either of them is the failure. What makes
+        // the checkpoint undoable is the previous record being on the disk in
+        // the journal, which is the same thing that makes every other page
+        // undoable.
+        self.journal_page(META_PAGE)?;
+        self.journal_page(SHADOW_PAGE)?;
+        self.seal_journal()?;
         for slot in [META_PAGE, SHADOW_PAGE] {
             self.file
                 .write_all_at(slot.0.saturating_mul(self.page_size as u64), &image)
@@ -1694,11 +2034,29 @@ impl Pool {
         // **And disposed of after the meta record is durable**, which is the
         // moment the commit exists. A journal removed a line earlier would
         // leave a crash with a file it could neither trust nor repair.
+        //
+        // **Unless an eviction has already put an open transaction's page in
+        // the file**, in which case the pre-images in this journal are the only
+        // way back from that page and the journal outlives the checkpoint. The
+        // journal restores the meta record too, so keeping it does not leave a
+        // half-undone file: a crash puts the data pages, the meta page and its
+        // shadow all back to what they were before this checkpoint, and the log
+        // replays forward from the recovery point that older meta record names.
+        // The next checkpoint with no writer open disposes of it.
+        if self.stolen.get() && self.uncommitted_lsn.load(Ordering::SeqCst) != u64::MAX {
+            return Ok(());
+        }
         self.finish_journal()?;
         Ok(())
     }
 
-    /// Saves one page's current contents to the rollback journal.
+    /// Saves one page's current contents to the rollback journal, reporting
+    /// whether it saved anything.
+    ///
+    /// The answer is what tells `writeback` whether it owes a sync: a page
+    /// already saved by this checkpoint's first pass needs neither the read
+    /// below nor a second sync, and in write-ahead-log mode there is no
+    /// journal and the answer is always no.
     ///
     /// Reads the page **from the file**, not from the pool: the pre-image the
     /// journal needs is what is durably there, and the frame holds the new
@@ -1707,23 +2065,42 @@ impl Pool {
     /// transaction created.
     ///
     /// @param page - the page about to be overwritten
-    fn journal_page(&self, page: PageId) -> DbResult<()> {
+    fn journal_page(&self, page: PageId) -> DbResult<bool> {
         let mut journal = self.journal.borrow_mut();
         let Some(journal) = journal.as_mut() else {
-            return Ok(());
+            return Ok(false);
         };
-        if page.0 >= self.page_count.get() {
-            return Ok(());
+        if page.0 >= self.page_count.get() || !journal.wants(page) {
+            return Ok(false);
+        }
+        // **A read that fails is a refusal, not an absence** - unless the page
+        // is genuinely not in the file yet. This used to answer "no pre-image
+        // needed" for *any* read error, and both callers then carried on and
+        // overwrote the page, so a transient read error followed by a crash
+        // left a modified page with nothing to put back. That is the one thing
+        // the invariant at the top of `crate::journal` forbids.
+        //
+        // The page count above is not the test for "not in the file yet", and
+        // using it as one is what made the first attempt at this refuse every
+        // growing transaction: `page_count` is the pool's logical count, and it
+        // runs ahead of the file whenever pages have been allocated but not yet
+        // written. The file's own length is the answer. A page at or past it
+        // has no pre-image because it has no image, and restoring it would mean
+        // writing zeros over a page the transaction created.
+        let offset = page.0.saturating_mul(self.page_size as u64);
+        let length = self
+            .file
+            .file_size()
+            .map_err(|error| error.into_db_error())?;
+        if offset.saturating_add(self.page_size as u64) > length {
+            return Ok(false);
         }
         let mut before = vec![0u8; self.page_size];
-        if self
-            .file
-            .read_exact_at(page.0.saturating_mul(self.page_size as u64), &mut before)
-            .is_err()
-        {
-            return Ok(());
-        }
-        journal.save(page, &before)
+        self.file
+            .read_exact_at(offset, &mut before)
+            .map_err(|error| error.into_db_error())?;
+        journal.save(page, &before)?;
+        Ok(true)
     }
 
     /// Puts a rollback journal in force, or takes it out of force.
@@ -1742,11 +2119,19 @@ impl Pool {
     }
 
     /// Disposes of the journal once the commit is durable.
+    ///
+    /// Clears the record of what evictions have stolen along with it: the
+    /// pre-images are gone, so the next steal is the first one this journal
+    /// has to outlive.
     pub fn finish_journal(&self) -> DbResult<()> {
-        match self.journal.borrow_mut().as_mut() {
+        let outcome = match self.journal.borrow_mut().as_mut() {
             Some(journal) => journal.finish(),
             None => Ok(()),
+        };
+        if outcome.is_ok() {
+            self.stolen.set(false);
         }
+        outcome
     }
 
     /// Raises the lock on the database file.
@@ -1773,23 +2158,7 @@ impl Pool {
     /// @param level - the level to raise to
     /// @param budget_millis - how long to keep trying
     pub fn lock_within(&self, level: FileLock, budget_millis: u64) -> DbResult<()> {
-        if self.file.lock_level() >= level {
-            return Ok(());
-        }
-        let mut waited = 0u64;
-        let mut pause = 1u64;
-        loop {
-            match self.file.lock(level) {
-                Ok(()) => return Ok(()),
-                Err(error) if waited >= budget_millis => {
-                    return Err(error.into_db_error());
-                }
-                Err(_) => {}
-            }
-            std::thread::sleep(std::time::Duration::from_millis(pause));
-            waited = waited.saturating_add(pause);
-            pause = pause.saturating_mul(2).min(50);
-        }
+        lock_with_wait(self.file.as_ref(), level, budget_millis)
     }
 
     /// Lowers the lock on the database file.
@@ -2075,6 +2444,144 @@ mod tests {
         assert!(pool.stats().writes > 0, "nothing was written back");
         let guard = pool.fetch(PageId(5)).unwrap();
         assert_eq!(page::read_u64(&guard, 40).unwrap(), 0xABCD);
+    }
+
+    /// Fills a memory file with `pages` zeroed, checksummed pages.
+    ///
+    /// Split out of [`pool_over`] so a test that needs the VFS afterwards - to
+    /// put a rollback journal beside the database - can keep it.
+    ///
+    /// @param vfs - where the file lives
+    /// @param path - the database's name
+    /// @param page_size - how big a page is
+    /// @param frames - how many frames the pool holds
+    /// @param pages - how many pages to write
+    fn pool_beside(
+        vfs: &Arc<MemoryVfs>,
+        path: &DbPath,
+        page_size: usize,
+        frames: usize,
+        pages: u64,
+    ) -> Pool {
+        let file = vfs.open(path, OpenOptions::main_db()).unwrap();
+        for page in 0..pages {
+            let mut image = vec![0u8; page_size];
+            page::write_common(&mut image, PageKind::Leaf, 0, 1).unwrap();
+            page::write_u64(&mut image, 32, page).unwrap();
+            page::checksum_page(&mut image).unwrap();
+            file.write_all_at(page * page_size as u64, &image).unwrap();
+        }
+        Pool::new(file, page_size, frames, pages).unwrap()
+    }
+
+    /// Stamps a page with an LSN and a marker, and opens a transaction under it.
+    ///
+    /// The stamp is what `holds_uncommitted` reads, so a page stamped above the
+    /// watermark is one no-steal holds back.
+    ///
+    /// @param pool - the pool
+    /// @param page - the page to dirty
+    fn dirty_under_an_open_transaction(pool: &Pool, page: PageId) {
+        pool.modify(page, |bytes| {
+            page::write_u64(bytes, page::header::LSN, 900)?;
+            page::write_u64(bytes, 40, 0xABCD)
+        })
+        .unwrap();
+        pool.set_uncommitted_lsn(800);
+    }
+
+    /// A page an open transaction changed is written, not dropped, when its
+    /// frame is evicted.
+    ///
+    /// No-steal lets a **checkpoint** leave such a page out of the file, because
+    /// the frame keeps it and the next checkpoint writes it. An eviction does
+    /// not keep it, so the same skip there discards the change - which is what
+    /// a `CREATE INDEX` through a 64-frame pool did to 129 pages, and what
+    /// `inillucent-compat`'s `new_engine_log_lead` reported as
+    /// `page 597 checksum 00000000 is not the computed 8d1053d3`: the checksum
+    /// of a page of zeros, on a page nothing had ever written.
+    ///
+    /// The pre-image goes to the rollback journal before the new image goes to
+    /// the file, so a crash before the transaction commits can still put the
+    /// page back. See [`Writing`].
+    #[test]
+    fn an_uncommitted_page_is_written_rather_than_dropped_when_its_frame_goes() {
+        let vfs = Arc::new(MemoryVfs::new());
+        let path = DbPath::new("steal-test.rdb");
+        let pool = pool_beside(&vfs, &path, 512, 2, 12);
+        pool.set_journal(Some(crate::journal::Journal::new(
+            Arc::clone(&vfs) as Arc<dyn Vfs>,
+            &path,
+            crate::journal::JournalMode::Delete,
+            512,
+        )));
+        dirty_under_an_open_transaction(&pool, PageId(5));
+        for page in 6..12u64 {
+            let _ = pool.fetch(PageId(page)).unwrap();
+        }
+        assert!(
+            !pool.is_resident(PageId(5)),
+            "the frame was never evicted, so this proves nothing"
+        );
+        let guard = pool.fetch(PageId(5)).unwrap();
+        assert_eq!(
+            page::read_u64(&guard, 40).unwrap(),
+            0xABCD,
+            "the change was thrown away with the frame"
+        );
+    }
+
+    /// With no journal to undo a steal with, the frame is kept instead.
+    ///
+    /// `memory` and `off` hold no pre-images on disk, so an eviction there has
+    /// no way to put an uncommitted page back after a crash and must not write
+    /// it. What it must also not do is free the frame: the page is still only
+    /// in memory, and emptying the frame would lose it. So the page stays
+    /// resident and the evictor takes another frame.
+    #[test]
+    fn an_uncommitted_page_keeps_its_frame_when_nothing_can_undo_a_steal() {
+        let pool = pool_over(512, 2, 12);
+        dirty_under_an_open_transaction(&pool, PageId(5));
+        for page in 6..12u64 {
+            let _ = pool.fetch(PageId(page));
+        }
+        assert!(
+            pool.is_resident(PageId(5)),
+            "the page with nowhere to go was evicted anyway"
+        );
+        let guard = pool.fetch(PageId(5)).unwrap();
+        assert_eq!(
+            page::read_u64(&guard, 40).unwrap(),
+            0xABCD,
+            "the change was thrown away with the frame"
+        );
+    }
+
+    /// A pool with nothing left to give says which rule is refusing.
+    ///
+    /// The documented limit of a no-steal policy is that a transaction cannot
+    /// dirty more pages than the pool holds, and a caller who has hit it needs
+    /// to be told that rather than told its frames are pinned - they are not,
+    /// and no number of released guards would help.
+    #[test]
+    fn a_pool_full_of_uncommitted_pages_says_so_rather_than_blaming_pins() {
+        let pool = pool_over(512, 2, 12);
+        for page in [PageId(5), PageId(6)] {
+            pool.modify(page, |bytes| {
+                page::write_u64(bytes, page::header::LSN, 900)?;
+                page::write_u64(bytes, 40, 0xABCD)
+            })
+            .unwrap();
+        }
+        pool.set_uncommitted_lsn(800);
+        let refusal = pool
+            .fetch(PageId(7))
+            .expect_err("a full pool has to refuse");
+        let detail = refusal.detail().unwrap_or_default();
+        assert!(
+            detail.contains("the open transaction has changed 2"),
+            "the refusal did not name no-steal: {detail}"
+        );
     }
 
     /// A page installed by the loader is dirty, readable, and flushed.
