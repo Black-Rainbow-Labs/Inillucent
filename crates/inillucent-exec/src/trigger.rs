@@ -10,7 +10,7 @@
 //! doc comment warns against, and the thing this module exists to avoid.
 //!
 //! So enforcement is this: the binder already fills `triggers` on every
-//! [`BoundInsert`], [`BoundUpdate`] and [`BoundDelete`], from written triggers
+//! [`BoundInsert`], `BoundUpdate` and [`BoundDelete`], from written triggers
 //! and from `TableInfo::foreign_key_triggers` alike, and the only piece that
 //! was missing is a place that runs one.
 //!
@@ -65,13 +65,6 @@ use crate::dml::{self, Row, WriteTarget};
 use crate::expr::RAISE_IGNORE;
 use crate::physical::{self, Params};
 
-/// How deep one write may push another before the engine refuses.
-///
-/// SQLite's `SQLITE_MAX_TRIGGER_DEPTH`. A cycle of triggers is a program that
-/// does not end, and the only difference between that and a slow one is a
-/// number, so there is a number.
-pub const MAX_TRIGGER_DEPTH: usize = 1000;
-
 /// The two row images a firing trigger can read.
 ///
 /// Both are optional because an `INSERT` has no `OLD` and a `DELETE` has no
@@ -87,6 +80,27 @@ pub struct TriggerRows<'a> {
     pub old: Option<&'a [OwnedDatum]>,
     /// The row as it will be, for an `INSERT` or an `UPDATE`.
     pub new: Option<&'a [OwnedDatum]>,
+}
+
+/// What one firing of a trigger sees, apart from the trigger itself.
+///
+/// **A type rather than seven of eight arguments (task-1962, A9).** [`fire`] and
+/// `run_body` took the same seven, in the same order, and both carried
+/// `#[allow(clippy::too_many_arguments)]` to say so. Two of them are
+/// `Option<usize>` and `Depth`, which a caller can swap without the compiler
+/// noticing.
+#[derive(Clone, Copy)]
+pub struct TriggerFiring<'a> {
+    /// The row images the body reads as `OLD` and `NEW`.
+    pub rows: TriggerRows<'a>,
+    /// Which record slot each of the table's columns is at.
+    pub slots: &'a [Option<usize>],
+    /// Which slot holds the rowid, when the row carries one.
+    pub rowid: Option<usize>,
+    /// The values bound to `?1`, `?2`, ...
+    pub params: &'a Params,
+    /// How deep this firing already is.
+    pub depth: Depth,
 }
 
 /// What a fired trigger asked the write to do next.
@@ -108,15 +122,22 @@ pub enum Fired {
 pub struct Depth(pub usize);
 
 impl Depth {
-    /// Returns the depth one level further in, refusing past the cap.
-    fn deeper(self) -> DbResult<Depth> {
-        let next = self.0.saturating_add(1);
-        if next > MAX_TRIGGER_DEPTH {
-            return Err(misuse(format!(
-                "too many levels of trigger recursion: the limit is {MAX_TRIGGER_DEPTH}"
-            )));
-        }
-        Ok(Depth(next))
+    /// Returns the depth one level further in.
+    ///
+    /// **It cannot refuse, and the check that used to be here could not fire.**
+    /// This module declared its own `MAX_TRIGGER_DEPTH` at 1000 and compared
+    /// against it on every entry, but the executor walks a tree the binder has
+    /// already inlined - and the binder caps that inlining at
+    /// `Limit::TriggerDepth`, so a tree deep enough to trip this one never
+    /// reaches the executor at all (task-1946, H3). Two constants of the same
+    /// name holding different numbers is worse than one: the enforced number
+    /// was the binder's and the advertised one was this, and they disagreed by
+    /// a factor of thirty.
+    ///
+    /// The depth itself is still carried, because `fire` reports it and a
+    /// trigger body's own statements are compiled against it.
+    fn deeper(self) -> Depth {
+        Depth(self.0.saturating_add(1))
     }
 }
 
@@ -203,23 +224,27 @@ fn substitution<'a>(
 /// @param slots - the fired table's declared-to-tree column map
 /// @param rowid - which tree column of that table holds the rowid
 /// @param target - the file and its trees
-/// @param params - the bound parameters
-/// @param depth - how deep this fire already is
-#[allow(clippy::too_many_arguments)]
+/// @param firing - the row, the slots and the depth this firing runs at
 pub fn fire(
     triggers: &[BoundTrigger],
     time: TriggerTime,
-    rows: TriggerRows<'_>,
-    slots: &[Option<usize>],
-    rowid: Option<usize>,
     target: &mut dyn WriteTarget,
-    params: &Params,
-    depth: Depth,
+    firing: &TriggerFiring<'_>,
 ) -> DbResult<Fired> {
     if triggers.is_empty() {
         return Ok(Fired::Continue);
     }
-    let deeper = depth.deeper()?;
+    let TriggerFiring {
+        rows,
+        slots,
+        rowid,
+        params,
+        depth,
+    } = *firing;
+    let deeper = TriggerFiring {
+        depth: depth.deeper(),
+        ..*firing
+    };
     for trigger in triggers {
         if trigger.time != time {
             continue;
@@ -235,9 +260,7 @@ pub fn fire(
             }
         }
         for statement in &trigger.body {
-            match run_body(
-                statement, trigger, rows, slots, rowid, target, params, deeper,
-            ) {
+            match run_body(statement, trigger, target, &deeper) {
                 Ok(()) => {}
                 Err(error) if is_ignore(&error) => return Ok(Fired::SkipRow),
                 Err(error) => return Err(named(error, trigger)),
@@ -357,13 +380,16 @@ fn run_select(
 fn run_body(
     statement: &BoundTriggerStatement,
     trigger: &BoundTrigger,
-    rows: TriggerRows<'_>,
-    slots: &[Option<usize>],
-    rowid: Option<usize>,
     target: &mut dyn WriteTarget,
-    params: &Params,
-    depth: Depth,
+    firing: &TriggerFiring<'_>,
 ) -> DbResult<()> {
+    let TriggerFiring {
+        rows,
+        slots,
+        rowid,
+        params,
+        depth,
+    } = *firing;
     // **`PRAGMA recursive_triggers` lives here, and it is one assignment.** A
     // trigger body is *inlined* by the binder, and a trigger already being
     // bound is skipped - which is what makes the inlining terminate, and is

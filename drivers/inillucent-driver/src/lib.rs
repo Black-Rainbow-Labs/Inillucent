@@ -17,7 +17,7 @@
 //!
 //! ## The one thing to read before using it
 //!
-//! **This engine is deliberately incomplete, and [`capability`] is how you find
+//! **This engine is deliberately incomplete, and `capability` is how you find
 //! out what it will not do.** It cannot enforce a foreign key, answer a `LEFT
 //! JOIN`, run a recursive CTE, use a derived table in `FROM`, register a
 //! function, or stop a running statement. It refuses those rather than
@@ -38,6 +38,13 @@
 //! an oversight: two connections holding two pools over one set of bytes would
 //! be two page caches over one file. Two databases on two files are
 //! independent.
+//!
+//! [`SharedDatabase`] is how several threads use one database anyway:
+//! **serialized, not parallel**, which is SQLite's own word for it. Any number
+//! of threads, exactly one statement at a time, and a transaction that holds
+//! its turn for its whole life. The database is opened on a thread of its own
+//! and never moved, which is why this crate can offer it and still
+//! `forbid(unsafe_code)` - see the `shared` module for the argument.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -59,6 +66,7 @@ pub mod capability;
 pub mod error;
 pub mod introspect;
 pub mod rows;
+pub mod shared;
 pub mod value;
 
 use std::cell::Cell;
@@ -74,6 +82,7 @@ pub use capability::{capability, supports, Capability, Support, CAPABILITIES};
 pub use error::{Error, Result, Status};
 pub use introspect::{Item, Kind, Table};
 pub use rows::Rows;
+pub use shared::{SharedConnection, SharedDatabase, SharedTransaction};
 pub use value::{Column, Value, ValueKind};
 
 /// What one statement may spend, and the default ceiling on the plan cache.
@@ -84,6 +93,54 @@ pub use value::{Column, Value, ValueKind};
 /// it the one surface, and a surface a caller has to reach past is not one.
 pub use inillucent_engine::base::budget::Limits as StatementLimits;
 pub use inillucent_engine::DEFAULT_STATEMENT_CACHE;
+
+/// The file system layer, for a caller that reports which one it is on.
+///
+/// **Re-exported so the command line does not have to name the engine
+/// (task-1946, M11).** `inillucent diagnose` prints the VFS it opened through,
+/// which is a fact about the connection rather than a reach into the engine's
+/// internals - and `crates/inillucent-cli/src/diagnose.rs` was one of the seven
+/// files `no_shell_file_reaches_past_the_driver_more_than_it_is_recorded_at`
+/// counts, for those two lines alone.
+pub use inillucent_engine::vfs;
+
+/// The authorizer a front end installs, and what it is asked about.
+///
+/// **Re-exported because a front end that installs one is not reaching into
+/// the engine (task-1962, roadmap item 7).** `sqlite3_set_authorizer` is part
+/// of every binding's surface; the shell's `.auth on` is one, and
+/// `crates/inillucent-cli/src/commands.rs` named `inillucent_engine` seven
+/// times for this trait alone.
+pub use inillucent_engine::{AuthAction, Authorization, Authorizer};
+
+/// The virtual table modules a front end may register, and the trait they
+/// implement.
+///
+/// The shell adds `fsdir` and `zipfile` and the library does not - a
+/// table-valued function over the file system belongs to a program that asked
+/// for one, which is the line the reference draws too, with `fsdir` in
+/// `shell.c`. Registering one is a thing a caller does, so it is on this
+/// surface (task-1962, roadmap item 7).
+pub use inillucent_engine::ext::vtab;
+
+/// What the page cache has been asked to do.
+///
+/// For `.stats` and `inillucent diagnose`, which report the work a statement
+/// caused rather than the answer it gave.
+pub use inillucent_engine::connect::CacheStats;
+
+/// How many bytes at the front of a script are whitespace and semicolons.
+///
+/// A front end that has asked [`Connection::statement_length`] where one
+/// statement ends uses this to find where the next one begins, so that what it
+/// shows a person is the statement rather than the space before it.
+pub use inillucent_engine::connect::leading_trivia;
+
+/// The run-time limits `sqlite3_limit` reads and writes.
+///
+/// Re-exported for the same reason [`StatementLimits`] is: a caller naming one
+/// should not have to name the engine to do it.
+pub use inillucent_engine::base::limits::Limit;
 
 /// Arming a statement budget, for a front end that runs statements itself.
 ///
@@ -181,6 +238,21 @@ impl Default for OpenOptions {
 ///
 /// Neither `Send` nor `Sync`, by construction: it holds the engine, which holds
 /// one buffer pool over one file.
+///
+/// ```
+/// # use inillucent_driver::{Database, Result};
+/// # fn main() -> Result<()> {
+/// # let directory = std::env::temp_dir().join(format!("inillucent-doc-database-{}", std::process::id()));
+/// # std::fs::create_dir_all(&directory).ok();
+/// # let path = directory.join("app.rdb");
+/// let database = Database::open(&path)?;
+/// assert_eq!(database.path(), path.as_path());
+/// database.integrity_check()?;
+/// # drop(database);
+/// # std::fs::remove_dir_all(&directory).ok();
+/// # Ok(())
+/// # }
+/// ```
 pub struct Database {
     engine: EngineDatabase,
     path: PathBuf,
@@ -254,6 +326,35 @@ impl Database {
         let options = OpenOptions::default();
         let engine = EngineDatabase::import_with(path.as_ref(), options.cache_frames)
             .map_err(|error| Error::from_engine(&error, options.diagnostics))?;
+        Database::around(engine, options)
+    }
+
+    /// Imports a SQLite file into a database at the path named, and opens that.
+    ///
+    /// **The target is taken rather than derived (task-1962, roadmap item 7).**
+    /// `inillucent migrate` writes to a staging name and renames it once the
+    /// import is complete, because a half-written database must not sit at the
+    /// path somebody is about to open. `import_sqlite` derives the target,
+    /// which is what a fixture wants and not what a migration wants.
+    ///
+    /// @param from - the SQLite database to read
+    /// @param to - the file to write
+    pub fn import_sqlite_into(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<Database> {
+        let options = OpenOptions::default();
+        let engine = EngineDatabase::import_into(
+            from.as_ref().to_path_buf(),
+            to.as_ref().to_path_buf(),
+            options.cache_frames,
+        )
+        .map_err(|error| Error::from_engine(&error, options.diagnostics))?;
+        Database::around(engine, options)
+    }
+
+    /// Wraps an opened engine database in the driver's own handle.
+    ///
+    /// @param engine - the opened database
+    /// @param options - what it was opened with
+    fn around(engine: EngineDatabase, options: OpenOptions) -> Result<Database> {
         engine.set_statement_cache_limit(options.statement_cache);
         let path = engine.path().to_path_buf();
         Ok(Database {
@@ -296,12 +397,30 @@ impl Database {
     /// connection needs nothing more; one that hands out a connection per call
     /// wants [`Database::connect_as`], or every `CREATE TEMP TABLE` is gone by
     /// the next statement.
-    pub fn connect(&self) -> Connection<'_> {
+    ///
+    /// **It is called `session` and not `connect` because that is what it
+    /// returns (task-1961, A5).** Two of these share one transaction - a
+    /// `BEGIN` on either is joined by the other, and a write through the second
+    /// is undone by the first one's `ROLLBACK` - and `connect` reads as denying
+    /// exactly that to anyone arriving from SQLite or rusqlite. `connect` is
+    /// kept as a deprecated alias for one release.
+    pub fn session(&self) -> Connection<'_> {
         Connection {
             database: self,
-            engine: self.engine.connect(),
+            engine: self.engine.session(),
             depth: Cell::new(0),
         }
+    }
+
+    /// Returns a connection to this database.
+    ///
+    /// Renamed [`Database::session`] in task-1961.
+    #[deprecated(
+        since = "0.1.3",
+        note = "renamed `session`: two of these share one transaction"
+    )]
+    pub fn connect(&self) -> Connection<'_> {
+        self.session()
     }
 
     /// Returns a connection that continues an earlier one's session.
@@ -329,12 +448,22 @@ impl Database {
     /// to find.
     ///
     /// @param session - the number an earlier connection reported
-    pub fn connect_as(&self, session: u64) -> Connection<'_> {
+    pub fn session_as(&self, session: u64) -> Connection<'_> {
         Connection {
             database: self,
-            engine: self.engine.connect_as(session),
+            engine: self.engine.session_as(session),
             depth: Cell::new(0),
         }
+    }
+
+    /// Returns a connection that continues an earlier one's session.
+    ///
+    /// Renamed [`Database::session_as`] in task-1961, with [`Database::connect`].
+    ///
+    /// @param session - the number an earlier connection reported
+    #[deprecated(since = "0.1.3", note = "renamed `session_as`, with `connect`")]
+    pub fn connect_as(&self, session: u64) -> Connection<'_> {
+        self.session_as(session)
     }
 
     /// Returns the file this database is in.
@@ -370,6 +499,53 @@ impl Database {
             .map_err(|error| self.classify(&error))
     }
 
+    /// Registers a virtual table module this database's statements may name.
+    ///
+    /// **A program that wants `fsdir` asks for it (task-1962, roadmap item
+    /// 7).** The shell registers `fsdir` and `zipfile` and the library does
+    /// not, which is the line the reference draws too; making the registration
+    /// part of this surface is what lets a front end draw it without naming the
+    /// engine. See [`vtab`] for the modules that ship.
+    ///
+    /// @param module - the module, which the database holds for its life
+    pub fn register_module(&self, module: Arc<dyn vtab::Module>) -> Result<()> {
+        self.engine
+            .register_module(module)
+            .map_err(|error| self.classify(&error))
+    }
+
+    /// Returns what the page cache has been asked to do.
+    ///
+    /// The work a statement caused rather than the answer it gave, which is
+    /// what `.stats` reports and what a measurement compares between two runs.
+    pub fn cache_stats(&self) -> CacheStats {
+        self.engine.cache_stats()
+    }
+
+    /// Returns how many bytes the page cache is holding.
+    pub fn pool_bytes(&self) -> usize {
+        self.engine.pool_bytes()
+    }
+
+    /// Returns what one run-time limit is set to on this database.
+    ///
+    /// `sqlite3_limit`'s read half. It takes no borrow of the engine, so a
+    /// callback may ask it while a statement is running - see
+    /// `crates/inillucent-engine/src/connect.rs` and task-1962's A1 step 3.
+    ///
+    /// @param limit - which limit
+    pub fn limit(&self, limit: Limit) -> i64 {
+        self.engine.limit(limit)
+    }
+
+    /// Sets one run-time limit, and returns what it was before.
+    ///
+    /// @param limit - which limit
+    /// @param requested - the value asked for, clamped to the manifest's bounds
+    pub fn set_limit(&self, limit: Limit, requested: i64) -> i64 {
+        self.engine.set_limit(limit, requested)
+    }
+
     /// Turns an engine error into a driver error, honouring the open options.
     ///
     /// @param error - the engine's error
@@ -382,6 +558,30 @@ impl Database {
 ///
 /// It borrows the database rather than owning a handle of its own, because one
 /// file is one pool.
+///
+/// ```
+/// # use inillucent_driver::{Database, Result, Value};
+/// # fn main() -> Result<()> {
+/// # let directory = std::env::temp_dir().join(format!("inillucent-doc-connection-{}", std::process::id()));
+/// # std::fs::create_dir_all(&directory).ok();
+/// let database = Database::open(directory.join("app.rdb"))?;
+/// let connection = database.session();
+/// connection.execute_batch("CREATE TABLE note (id INTEGER PRIMARY KEY, body TEXT)")?;
+///
+/// let written = connection.execute(
+///     "INSERT INTO note (body) VALUES (?1)",
+///     &[Value::Text("hello".to_string())],
+/// )?;
+/// assert_eq!(written, 1);
+///
+/// let rows = connection.query("SELECT body FROM note", &[], 10)?;
+/// assert_eq!(rows.value(0, 0).and_then(Value::text), Some("hello"));
+/// # drop(connection);
+/// # drop(database);
+/// # std::fs::remove_dir_all(&directory).ok();
+/// # Ok(())
+/// # }
+/// ```
 pub struct Connection<'d> {
     database: &'d Database,
     engine: inillucent_engine::connect::Connection<'d>,
@@ -425,14 +625,44 @@ impl Connection<'_> {
     /// rather than a scan of the text, so it cannot be talked past by
     /// whitespace or a comment.
     ///
+    /// **`limit` is a count and not a sentinel: `0` hands back no rows.** It
+    /// is a real count because [`Connection::execute`] passes `0` to run a
+    /// statement for its effect, so there is no spare value that could mean
+    /// "all of them" - and every other embedded database treats `0` as no
+    /// limit, so `0` is what a caller reaches for. What comes back is an empty
+    /// `rows` beside a [`Rows::total`] reporting the true count and a status
+    /// saying success, which reads as a fault in the caller's own mapping
+    /// code. It cost task-1947 five of its eight storage tests at once, and
+    /// the symptom was "the board is empty" rather than "the query is wrong".
+    /// Use [`Connection::query_all`] when you want every row.
+    ///
     /// @param sql - the statement
     /// @param params - the values bound to `?1`, `?2`, ...
-    /// @param limit - how many rows to hand back
+    /// @param limit - how many rows to hand back; `0` hands back none
     pub fn query(&self, sql: &str, params: &[Value], limit: usize) -> Result<Rows> {
         if self.database.options.read_only {
             self.refuse_if_it_writes(sql)?;
         }
         self.run(sql, params, limit)
+    }
+
+    /// Runs one statement and returns every row it produced.
+    ///
+    /// **The call almost every application wants, so that no caller has to
+    /// know what number means "all of them" (task-1947).** The engine
+    /// materialises the answer either way - which is what makes
+    /// [`Rows::total`] exact - so handing all of it back costs the rows
+    /// themselves and nothing else. `Rows::more` is always false here, because
+    /// nothing was left behind.
+    ///
+    /// The consumer that found this wrote its own `ALL_ROWS: usize =
+    /// usize::MAX` constant with a comment explaining why the constant had to
+    /// exist. That constant is this function.
+    ///
+    /// @param sql - the statement
+    /// @param params - the values bound to `?1`, `?2`, ...
+    pub fn query_all(&self, sql: &str, params: &[Value]) -> Result<Rows> {
+        self.query(sql, params, usize::MAX)
     }
 
     /// Runs one statement for its effect and returns how many rows it changed.
@@ -611,7 +841,7 @@ impl Connection<'_> {
                  too.",
             ));
         }
-        let guard = self.begin()?;
+        let mut guard = self.begin()?;
         let outcome = guard.run_all(work, check);
         match outcome {
             Ok(affected) => {
@@ -653,13 +883,14 @@ impl Connection<'_> {
                  too.",
             ));
         }
-        self.engine
-            .execute_batch("BEGIN")
+        let inner = self
+            .engine
+            .begin()
             .map_err(|error| self.database.classify(&error))?;
         self.depth.set(1);
         Ok(Transaction {
             connection: self,
-            settled: Cell::new(false),
+            inner: Some(inner),
         })
     }
 
@@ -723,26 +954,107 @@ impl Connection<'_> {
     }
 
     /// Returns the rowid the last `INSERT` on this database assigned.
-    pub fn last_insert_rowid(&self) -> i64 {
-        self.engine.last_insert_rowid()
+    ///
+    /// **It answers a `Result` because the engine can be busy (task-1962,
+    /// A11).** A function registered on this connection that asks while the
+    /// statement that called it is still running is refused rather than
+    /// aborting the process.
+    pub fn last_insert_rowid(&self) -> Result<i64> {
+        self.engine
+            .last_insert_rowid()
+            .map_err(|error| self.database.classify(&error))
     }
 
     /// Returns how many rows every statement so far has changed.
-    pub fn total_changes(&self) -> i64 {
-        self.engine.total_changes()
+    pub fn total_changes(&self) -> Result<i64> {
+        self.engine
+            .total_changes()
+            .map_err(|error| self.database.classify(&error))
     }
 
     /// Returns whether a transaction is open.
-    pub fn in_transaction(&self) -> bool {
-        !self.engine.autocommit()
+    pub fn in_transaction(&self) -> Result<bool> {
+        self.engine
+            .autocommit()
+            .map(|open| !open)
+            .map_err(|error| self.database.classify(&error))
     }
 
     /// Returns the schema's generation, which changes when the schema does.
     ///
     /// A consumer that caches a table's columns compares this to know whether
     /// the cache is stale, rather than re-reading the schema per statement.
-    pub fn schema_cookie(&self) -> u64 {
-        self.engine.schema_cookie()
+    pub fn schema_cookie(&self) -> Result<u64> {
+        self.engine
+            .schema_cookie()
+            .map_err(|error| self.database.classify(&error))
+    }
+
+    /// Returns how many rows the last statement on this database changed.
+    ///
+    /// `sqlite3_changes`. The statement's own rows: a trigger body's go into
+    /// [`Connection::total_changes`] and not into this, which is SQLite's rule.
+    pub fn changes(&self) -> Result<i64> {
+        self.engine
+            .changes()
+            .map_err(|error| self.database.classify(&error))
+    }
+
+    /// Installs the authorizer every later statement is bound under, or removes
+    /// it.
+    ///
+    /// `sqlite3_set_authorizer`: the callback is consulted before a read, a
+    /// select or a function call is bound, and a `Deny` refuses the statement.
+    /// Pass `None` to allow everything again. The plan cache is emptied with
+    /// it, because a plan compiled under one authorizer is that authorizer's
+    /// answer.
+    ///
+    /// @param authorizer - the callback, or nothing
+    pub fn set_authorizer(&self, authorizer: Option<std::rc::Rc<dyn Authorizer>>) -> Result<()> {
+        self.engine
+            .set_authorizer(authorizer)
+            .map_err(|error| self.database.classify(&error))
+    }
+
+    /// Puts the connection into or out of defensive mode.
+    ///
+    /// `SQLITE_DBCONFIG_DEFENSIVE`, which the reference's shell turns on by
+    /// default: it refuses `PRAGMA journal_mode = OFF` and
+    /// `PRAGMA writable_schema = ON`, both of which let a caller lose or
+    /// corrupt a database with one statement.
+    ///
+    /// @param on - whether the flag is in force
+    pub fn set_defensive(&self, on: bool) -> Result<()> {
+        self.engine
+            .set_defensive(on)
+            .map_err(|error| self.database.classify(&error))
+    }
+
+    /// Returns the named parameters one statement declares, with their indexes.
+    ///
+    /// For a front end that binds by name and has to know which names the
+    /// statement has before it can ask for them.
+    ///
+    /// @param sql - the statement text
+    pub fn parameter_names(&self, sql: &str) -> Result<Vec<(Vec<u8>, u32)>> {
+        self.engine
+            .parameter_names(sql)
+            .map_err(|error| self.database.classify(&error))
+    }
+
+    /// Returns how many bytes of `sql` the first statement in it uses.
+    ///
+    /// **What a shell needs to know whether a line is finished.** A
+    /// `CREATE TRIGGER` spans many lines and holds semicolons inside its body,
+    /// so "ends with a semicolon" is the wrong question and the parser has to
+    /// be the one that answers it. `&sql[length..]` is what is left.
+    ///
+    /// @param sql - the script
+    pub fn statement_length(&self, sql: &str) -> Result<usize> {
+        self.engine
+            .prepare_with_tail(sql)
+            .map(|prepared| prepared.consumed)
+            .map_err(|error| self.database.classify(&error))
     }
 
     /// Asks another thread to stop a running statement.
@@ -818,8 +1130,10 @@ impl Connection<'_> {
     ///
     /// @param name - the name it was registered under
     /// @param arity - the arity it was registered for
-    pub fn remove_function(&self, name: &str, arity: i32) -> bool {
-        self.engine.remove_function(name, arity)
+    pub fn remove_function(&self, name: &str, arity: i32) -> Result<bool> {
+        self.engine
+            .remove_function(name, arity)
+            .map_err(|error| self.database.classify(&error))
     }
 
     /// Registers a collating sequence an application wrote.
@@ -972,19 +1286,36 @@ impl Connection<'_> {
 /// A `?` inside the block, a `return`, a panic: all three leave the database as
 /// it was. `commit()` is the one thing that does not.
 ///
-/// ```no_run
-/// # use inillucent_driver::{Database, Value, Result};
+/// ```
+/// # use inillucent_driver::{Database, Result, Value};
 /// # fn main() -> Result<()> {
-/// let database = Database::open("app.rdb")?;
-/// let connection = database.connect();
-/// let transaction = connection.begin()?;
-/// transaction.execute("UPDATE account SET balance = balance - ?1 WHERE id = ?2", &[Value::Integer(50), Value::Integer(1)])?;
-/// let moved = transaction.query("SELECT balance FROM account WHERE id = ?1", &[Value::Integer(1)], 1)?;
-/// if moved.rows.first().and_then(|row| row.first()) == Some(&Value::Integer(0)) {
-///     // Dropped without a commit: nothing above is kept.
-///     return Ok(());
+/// # let directory = std::env::temp_dir().join(format!("inillucent-doc-transaction-{}", std::process::id()));
+/// # std::fs::create_dir_all(&directory).ok();
+/// let database = Database::open(directory.join("app.rdb"))?;
+/// let connection = database.session();
+/// connection.execute_batch("CREATE TABLE account (id INTEGER PRIMARY KEY, balance INTEGER)")?;
+/// connection.execute("INSERT INTO account VALUES (1, 100)", &[])?;
+///
+/// // Dropped without a commit: the write is gone.
+/// {
+///     let transaction = connection.begin()?;
+///     transaction.execute("UPDATE account SET balance = 0 WHERE id = 1", &[])?;
 /// }
+/// let after = connection.query("SELECT balance FROM account WHERE id = 1", &[], 1)?;
+/// assert_eq!(after.value(0, 0), Some(&Value::Integer(100)));
+///
+/// // Committed: the write is kept.
+/// let transaction = connection.begin()?;
+/// transaction.execute(
+///     "UPDATE account SET balance = balance - ?1 WHERE id = ?2",
+///     &[Value::Integer(50), Value::Integer(1)],
+/// )?;
 /// transaction.commit()?;
+/// let after = connection.query("SELECT balance FROM account WHERE id = 1", &[], 1)?;
+/// assert_eq!(after.value(0, 0), Some(&Value::Integer(50)));
+/// # drop(connection);
+/// # drop(database);
+/// # std::fs::remove_dir_all(&directory).ok();
 /// # Ok(())
 /// # }
 /// ```
@@ -992,8 +1323,22 @@ impl Connection<'_> {
 pub struct Transaction<'c> {
     /// The connection it is open on.
     connection: &'c Connection<'c>,
-    /// Whether `commit` or `rollback` has already run, so `Drop` does nothing.
-    settled: Cell<bool>,
+    /// The engine's own transaction, which is what actually rolls back.
+    ///
+    /// **Every decision about the transaction is one layer down (task-1961,
+    /// A4).** The `BEGIN`, the refusal to nest, the `COMMIT`, the `ROLLBACK`
+    /// and the rollback on drop are all
+    /// [`inillucent_engine::connect::Transaction`]'s, so the engine's own
+    /// connection carries the guarantee rather than only the driver's, and
+    /// there is one implementation of it rather than two. What is left here is
+    /// the driver's types: [`Value`] in, [`Rows`] out, [`Error`] on the way
+    /// back.
+    ///
+    /// An `Option` so that [`Transaction::commit`] and
+    /// [`Transaction::rollback`], which take `self`, can move the inner
+    /// transaction out and call its own `commit` or `rollback` - which is what
+    /// stops the `Drop` below from discarding work that was kept.
+    inner: Option<inillucent_engine::connect::Transaction<'c>>,
 }
 
 impl Transaction<'_> {
@@ -1018,13 +1363,14 @@ impl Transaction<'_> {
     ///
     /// Takes `self`, so a committed transaction cannot be used again and the
     /// `Drop` below cannot roll back what was kept.
-    pub fn commit(self) -> Result<()> {
-        self.settled.set(true);
+    pub fn commit(mut self) -> Result<()> {
         self.connection.depth.set(0);
-        self.connection
-            .engine
-            .execute_batch("COMMIT")
-            .map_err(|error| self.connection.database.classify(&error))
+        match self.inner.take() {
+            Some(inner) => inner
+                .commit()
+                .map_err(|error| self.connection.database.classify(&error)),
+            None => Ok(()),
+        }
     }
 
     /// Discards everything this transaction wrote.
@@ -1032,13 +1378,14 @@ impl Transaction<'_> {
     /// The same thing dropping it does, said out loud. A caller that has
     /// decided to abandon the work reads better for saying so, and the error a
     /// failed rollback produces is reportable here and is not from `Drop`.
-    pub fn rollback(self) -> Result<()> {
-        self.settled.set(true);
+    pub fn rollback(mut self) -> Result<()> {
         self.connection.depth.set(0);
-        self.connection
-            .engine
-            .execute_batch("ROLLBACK")
-            .map_err(|error| self.connection.database.classify(&error))
+        match self.inner.take() {
+            Some(inner) => inner
+                .rollback()
+                .map_err(|error| self.connection.database.classify(&error)),
+            None => Ok(()),
+        }
     }
 
     /// Runs a list of statements, rolling back on the first failure or on a
@@ -1049,7 +1396,7 @@ impl Transaction<'_> {
     ///
     /// @param work - the statements and their bound values, in order
     /// @param check - what must be true of the changed-row counts before commit
-    fn run_all<F>(&self, work: &[(String, Vec<Value>)], check: F) -> Result<Vec<u64>>
+    fn run_all<F>(&mut self, work: &[(String, Vec<Value>)], check: F) -> Result<Vec<u64>>
     where
         F: Fn(&[u64]) -> Result<()>,
     {
@@ -1073,10 +1420,12 @@ impl Transaction<'_> {
     /// written.
     ///
     /// @param why - what went wrong
-    fn rolled_back(&self, why: Error) -> Error {
-        self.settled.set(true);
+    fn rolled_back(&mut self, why: Error) -> Error {
         self.connection.depth.set(0);
-        match self.connection.engine.execute_batch("ROLLBACK") {
+        let Some(inner) = self.inner.take() else {
+            return why;
+        };
+        match inner.rollback() {
             Ok(()) => why,
             Err(error) => {
                 let mut failed = self.connection.database.classify(&error);
@@ -1092,27 +1441,46 @@ impl Transaction<'_> {
 }
 
 impl Drop for Transaction<'_> {
-    /// Rolls back an uncommitted transaction.
+    /// Puts the nesting depth back; the engine's transaction rolls itself back.
     ///
-    /// **Silent, because a `Drop` has nowhere to report to.** The failure it
-    /// could hide is a rollback that did not happen, and the thing that would
-    /// have to happen for that is the engine refusing a `ROLLBACK` on a
-    /// transaction it opened. The connection is dropped or reused immediately
-    /// afterwards, and a reused one refuses the next `begin` because the depth
-    /// is put back only on the paths that succeeded.
+    /// The `ROLLBACK` is [`inillucent_engine::connect::Transaction`]'s own
+    /// `Drop`, which runs when `inner` is dropped with the rest of this value.
+    /// What is left here is the driver's bookkeeping: the depth this connection
+    /// counts so a second [`Connection::begin`] is refused by name.
     ///
-    /// A caller who wants to know calls `rollback()` and reads the answer.
+    /// A caller who wants to know whether the rollback worked calls
+    /// [`Transaction::rollback`] and reads the answer.
     fn drop(&mut self) {
-        if self.settled.get() {
-            return;
-        }
-        self.settled.set(true);
-        let _ = self.connection.engine.execute_batch("ROLLBACK");
         self.connection.depth.set(0);
     }
 }
 
 /// A statement compiled once and run more than once.
+///
+/// ```
+/// # use inillucent_driver::{Database, Result, Value};
+/// # fn main() -> Result<()> {
+/// # let directory = std::env::temp_dir().join(format!("inillucent-doc-statement-{}", std::process::id()));
+/// # std::fs::create_dir_all(&directory).ok();
+/// let database = Database::open(directory.join("app.rdb"))?;
+/// let connection = database.session();
+/// connection.execute_batch("CREATE TABLE k (id INTEGER PRIMARY KEY, label TEXT)")?;
+///
+/// let mut insert = connection.prepare("INSERT INTO k VALUES (?1, ?2)")?;
+/// for (id, label) in [(1i64, "one"), (2, "two")] {
+///     insert.query(&[Value::Integer(id), Value::Text(label.to_string())], 0)?;
+/// }
+/// assert_eq!(insert.sql(), "INSERT INTO k VALUES (?1, ?2)");
+///
+/// let counted = connection.query("SELECT count(*) FROM k", &[], 1)?;
+/// assert_eq!(counted.value(0, 0), Some(&Value::Integer(2)));
+/// # drop(insert);
+/// # drop(connection);
+/// # drop(database);
+/// # std::fs::remove_dir_all(&directory).ok();
+/// # Ok(())
+/// # }
+/// ```
 pub struct Statement<'c> {
     connection: &'c Connection<'c>,
     engine: EngineStatement<'c>,

@@ -16,7 +16,7 @@
 //! implementations traditionally go wrong.
 //!
 //! So this one does not. A balance decodes the pages it is going to touch into
-//! an ordered list of owned [`Entry`] values, decides how to lay them out again,
+//! an ordered list of owned `Entry` values, decides how to lay them out again,
 //! and writes each page from scratch. No offset into a page survives a
 //! reorganisation, because no offset is kept. The cost is a page rewrite where
 //! SQLite would shuffle bytes; the benefit is that the partitioning step is a
@@ -32,7 +32,7 @@
 //! child pointer and the largest rowid below it, so the divider is *derived*
 //! from the last entry of the page and the entry itself stays on the leaf.
 //! Getting that backwards duplicates or loses a row per split, which is why it
-//! is decided in one place, [`promotes_dividers`], and read from there.
+//! is decided in one place, `promotes_dividers`, and read from there.
 
 use std::sync::Arc;
 
@@ -1489,8 +1489,10 @@ fn find_key(pager: &mut Pager, tree: &Tree, probe: &[u8]) -> DbResult<(Vec<Step>
     let probe_record = RecordRef::with_fields(probe, &probe_fields, probe_header, encoding);
     // Reused across every comparison of the descent: the spans of the cell being
     // compared, and a buffer that is only touched when a cell overflows.
-    let mut cell_fields = Vec::new();
-    let mut overflowed = Vec::new();
+    let mut scratch = CompareScratch {
+        cell_fields: Vec::new(),
+        overflowed: Vec::new(),
+    };
     let mut path = Vec::new();
     let mut page = tree.root;
     loop {
@@ -1510,8 +1512,7 @@ fn find_key(pager: &mut Pager, tree: &Tree, probe: &[u8]) -> DbResult<(Vec<Step>
                 &tree.key,
                 encoding,
                 &limits,
-                &mut cell_fields,
-                &mut overflowed,
+                &mut scratch,
             )?;
             if ordering == std::cmp::Ordering::Less {
                 low = middle.saturating_add(1);
@@ -1528,8 +1529,7 @@ fn find_key(pager: &mut Pager, tree: &Tree, probe: &[u8]) -> DbResult<(Vec<Step>
                 &tree.key,
                 encoding,
                 &limits,
-                &mut cell_fields,
-                &mut overflowed,
+                &mut scratch,
             )? == std::cmp::Ordering::Equal;
         if equal {
             path.push(Step { page, slot: low });
@@ -1550,6 +1550,19 @@ fn find_key(pager: &mut Pager, tree: &Tree, probe: &[u8]) -> DbResult<(Vec<Step>
     }
 }
 
+/// The buffers one descent reuses across every comparison it makes.
+///
+/// **A type rather than the last two of nine arguments (task-1962, A9).** Both
+/// are `&mut Vec` and adjacent, which is the pair a call site gets wrong
+/// silently. They exist for one reason: an index insert used to cost about five
+/// heap allocations per comparison and a binary search makes a dozen of them.
+struct CompareScratch {
+    /// The field spans of the cell being compared, reused across the descent.
+    cell_fields: Vec<inillucent_value::record::FieldSpan>,
+    /// The payload of an overflowing cell, which only that case fills.
+    overflowed: Vec<u8>,
+}
+
 /// Compares one cell's key against an already-parsed probe record.
 ///
 /// The cell's payload is borrowed straight out of the pinned page whenever the
@@ -1562,9 +1575,7 @@ fn find_key(pager: &mut Pager, tree: &Tree, probe: &[u8]) -> DbResult<(Vec<Step>
 /// both records per comparison made one index insert cost about five heap
 /// allocations per comparison, and a binary search does a dozen or more of them.
 /// @param probe - the record being searched for, parsed once by the caller
-/// @param cell_fields - a span buffer reused across the whole descent
-/// @param overflowed - a payload buffer only the overflow case fills
-#[allow(clippy::too_many_arguments)]
+/// @param scratch - the buffers this descent reuses across its comparisons
 fn compare_cell_to(
     pager: &mut Pager,
     page: PageId,
@@ -1573,9 +1584,12 @@ fn compare_cell_to(
     key: &KeyInfo,
     encoding: TextEncoding,
     limits: &Limits,
-    cell_fields: &mut Vec<inillucent_value::record::FieldSpan>,
-    overflowed: &mut Vec<u8>,
+    scratch: &mut CompareScratch,
 ) -> DbResult<std::cmp::Ordering> {
+    let CompareScratch {
+        cell_fields,
+        overflowed,
+    } = scratch;
     let layout = read_layout(pager, page)?;
     let (total, head, local_offset, local_len) = {
         let pin = pager.get_page(page)?;

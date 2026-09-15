@@ -55,7 +55,7 @@ const SCHEMA: &str = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE, c INT
 
 /// Returns a fresh, leaked, in-memory database with the base schema loaded.
 ///
-/// Leaked so a test can call `.connect()` on it more than once - to open a
+/// Leaked so a test can call `.session()` on it more than once - to open a
 /// second writer, or to prove a write survived dropping the first connection -
 /// without threading a lifetime through every helper. A short-lived test
 /// process is not where a few kilobytes per case matter.
@@ -64,7 +64,7 @@ fn built() -> &'static Database {
         Database::open(":memory:").expect("an in-memory database opens"),
     ));
     database
-        .connect()
+        .session()
         .execute_batch(SCHEMA)
         .expect("the schema builds");
     database
@@ -124,7 +124,7 @@ fn record(name: &str, body: &str) {
 #[test]
 fn an_injected_allocation_failure_never_reaches_the_write_path() {
     let database = built();
-    let connection = database.connect();
+    let connection = database.session();
     let before = rows(&connection);
 
     inillucent_base::buffer::fail_allocation_after(1);
@@ -192,18 +192,25 @@ fn an_injected_allocation_failure_never_reaches_the_write_path() {
 #[test]
 fn a_second_connections_write_joins_the_first_writers_open_transaction() {
     let database = built();
-    let first = database.connect();
-    let second = database.connect();
+    let first = database.session();
+    let second = database.session();
 
     run(&first, "BEGIN IMMEDIATE").expect("the first writer reserves");
-    assert!(!first.autocommit(), "BEGIN IMMEDIATE opens a transaction");
+    assert!(
+        !first
+            .autocommit()
+            .expect("nothing is running on this connection"),
+        "BEGIN IMMEDIATE opens a transaction"
+    );
 
     run(&second, "INSERT INTO t VALUES(9, 'nine', 90)").expect(
         "the second connection's write is admitted rather than refused BUSY - \
          the gap this test pins",
     );
     assert!(
-        !second.autocommit(),
+        !second
+            .autocommit()
+            .expect("nothing is running on this connection"),
         "the second connection reports the same open transaction the first began"
     );
 
@@ -229,7 +236,7 @@ fn a_second_connections_write_joins_the_first_writers_open_transaction() {
 fn every_conflict_algorithm_undoes_what_it_says() {
     // ABORT undoes the statement and keeps the transaction.
     let database = built();
-    let connection = database.connect();
+    let connection = database.session();
     run(&connection, "BEGIN").expect("begins");
     run(&connection, "INSERT INTO t VALUES(4, 'four', 40)").expect("inserts");
     let failed = run(
@@ -238,7 +245,9 @@ fn every_conflict_algorithm_undoes_what_it_says() {
     );
     assert!(failed.is_err(), "the duplicate 'four' is refused");
     assert!(
-        !connection.autocommit(),
+        !connection
+            .autocommit()
+            .expect("nothing is running on this connection"),
         "ABORT leaves the transaction open"
     );
     run(&connection, "COMMIT").expect("commits");
@@ -247,7 +256,7 @@ fn every_conflict_algorithm_undoes_what_it_says() {
 
     // ROLLBACK undoes the transaction.
     let database = built();
-    let connection = database.connect();
+    let connection = database.session();
     run(&connection, "BEGIN").expect("begins");
     run(&connection, "INSERT INTO t VALUES(4, 'four', 40)").expect("inserts");
     let failed = run(
@@ -256,7 +265,9 @@ fn every_conflict_algorithm_undoes_what_it_says() {
     );
     assert!(failed.is_err(), "the duplicate is refused");
     assert!(
-        connection.autocommit(),
+        connection
+            .autocommit()
+            .expect("nothing is running on this connection"),
         "OR ROLLBACK ends the transaction, leaving autocommit true"
     );
     assert_eq!(
@@ -267,7 +278,7 @@ fn every_conflict_algorithm_undoes_what_it_says() {
 
     // FAIL keeps the rows the statement had already written.
     let database = built();
-    let connection = database.connect();
+    let connection = database.session();
     let failed = run(
         &connection,
         "INSERT OR FAIL INTO t VALUES(4, 'four', 40), (5, 'one', 50), (6, 'six', 60)",
@@ -282,7 +293,7 @@ fn every_conflict_algorithm_undoes_what_it_says() {
 
     // IGNORE skips the offending row and carries on.
     let database = built();
-    let connection = database.connect();
+    let connection = database.session();
     run(
         &connection,
         "INSERT OR IGNORE INTO t VALUES(4, 'four', 40), (5, 'one', 50), (6, 'six', 60)",
@@ -293,7 +304,7 @@ fn every_conflict_algorithm_undoes_what_it_says() {
 
     // REPLACE deletes what is in the way.
     let database = built();
-    let connection = database.connect();
+    let connection = database.session();
     run(&connection, "INSERT OR REPLACE INTO t VALUES(7, 'one', 70)")
         .expect("REPLACE reports no error");
     let after = rows(&connection);
@@ -309,10 +320,12 @@ fn every_conflict_algorithm_undoes_what_it_says() {
 #[test]
 fn a_savepoint_restores_rows_and_counters_together() {
     let database = built();
-    let connection = database.connect();
+    let connection = database.session();
     run(&connection, "BEGIN").expect("begins");
     run(&connection, "INSERT INTO t VALUES(4, 'four', 40)").expect("inserts");
-    let rowid_before = connection.last_insert_rowid();
+    let rowid_before = connection
+        .last_insert_rowid()
+        .expect("nothing is running on this connection");
 
     run(&connection, "SAVEPOINT s").expect("opens the savepoint");
     run(&connection, "INSERT INTO t VALUES(5, 'five', 50)").expect("inserts");
@@ -325,7 +338,9 @@ fn a_savepoint_restores_rows_and_counters_together() {
     // as unpredictable after a rollback and keeps the undone insert's rowid,
     // and parity on a value applications read is worth more than tidiness.
     assert_ne!(
-        connection.last_insert_rowid(),
+        connection
+            .last_insert_rowid()
+            .expect("nothing is running on this connection"),
         rowid_before,
         "the rowid the undone insert allocated is kept, as SQLite keeps it"
     );
@@ -342,7 +357,7 @@ fn a_savepoint_restores_rows_and_counters_together() {
 #[test]
 fn nested_savepoints_unwind_innermost_first() {
     let database = built();
-    let connection = database.connect();
+    let connection = database.session();
     run(&connection, "BEGIN").expect("begins");
     run(&connection, "SAVEPOINT s").expect("opens");
     run(&connection, "INSERT INTO t VALUES(4, 'four', 40)").expect("inserts");
@@ -364,15 +379,17 @@ fn nested_savepoints_unwind_innermost_first() {
 #[test]
 fn a_savepoint_outside_a_transaction_commits_on_release() {
     let database = built();
-    let connection = database.connect();
+    let connection = database.session();
     run(&connection, "SAVEPOINT top").expect("opens");
     assert!(
-        !connection.autocommit(),
+        !connection
+            .autocommit()
+            .expect("nothing is running on this connection"),
         "a bare SAVEPOINT starts a transaction, and SQLite reports autocommit false"
     );
     run(&connection, "INSERT INTO t VALUES(4, 'four', 40)").expect("inserts");
     run(&connection, "RELEASE top").expect("releases, which commits");
 
-    let connection = database.connect();
+    let connection = database.session();
     assert_eq!(rows(&connection).len(), 4, "the release committed");
 }

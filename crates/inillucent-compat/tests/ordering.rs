@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 
 use inillucent_compat::facade::Database;
 use inillucent_compat::oracle::{Driver, Op, TaggedValue};
+use inillucent_compat::rendering::tagged as render;
 use inillucent_compat::workspace_root;
-use inillucent_value::Value;
 
 /// Returns the pinned oracle binary, when it has been built.
 fn oracle_path() -> Option<PathBuf> {
@@ -149,23 +149,6 @@ const STATEMENTS: &[&str] = &[
     "SELECT k FROM t WHERE k < -1000 ORDER BY k",
 ];
 
-/// Renders one value as a tagged string, so a storage class difference shows.
-fn render(value: &Value<'static>) -> String {
-    match value {
-        Value::Null => "null".to_string(),
-        Value::Integer(integer) => format!("int:{integer}"),
-        Value::Real(real) => format!("real:{real:?}"),
-        Value::Text(text) => format!("text:{}", String::from_utf8_lossy(&text.utf8_bytes())),
-        Value::Blob(blob) => format!(
-            "blob:{}",
-            blob.raw()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        ),
-    }
-}
-
 /// Renders one of the oracle's tagged values the same way.
 fn render_tagged(value: &TaggedValue) -> String {
     match value {
@@ -243,7 +226,7 @@ fn ordered_statements_match_the_oracle() {
     };
     let handle = Database::import_with_busy_timeout(&database, std::time::Duration::from_secs(5))
         .expect("the fixture opens");
-    let connection = handle.connect().expect("the connection opens");
+    let connection = handle.session().expect("the connection opens");
     let mut failures = Vec::new();
     for sql in STATEMENTS {
         let observation = driver
@@ -306,7 +289,7 @@ fn the_sort_is_skipped_exactly_where_the_walk_answers_the_order() {
     };
     let handle = Database::import_with_busy_timeout(&database, std::time::Duration::from_secs(5))
         .expect("the fixture opens");
-    let connection = handle.connect().expect("the connection opens");
+    let connection = handle.session().expect("the connection opens");
 
     let walked = [
         "SELECT id FROM t ORDER BY id",

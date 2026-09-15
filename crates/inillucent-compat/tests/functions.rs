@@ -6,6 +6,12 @@
 //! and `ORDER BY`, a registration has to override a built-in of the same name,
 //! and a collation has to change what an `ORDER BY` returns rather than only
 //! what a comparison answers.
+//!
+//! **Everywhere includes the register.** `PRAGMA function_list` read the static
+//! built-in list and nothing else until task-1952, so an application that
+//! registered a function could call it and could not find it - and so could
+//! nobody else. `inillucent functions embed` listed nothing on a 0.1.2 binary
+//! that answered `SELECT length(embed('hello'))` with 3072.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -42,7 +48,7 @@ fn scratch() -> std::path::PathBuf {
 /// Opens a database of this test's own, with one connection.
 fn connect() -> inillucent_compat::facade::Connection {
     let database = Database::open(scratch()).expect("opens");
-    Box::leak(Box::new(database)).connect().expect("connects")
+    Box::leak(Box::new(database)).session().expect("connects")
 }
 
 /// A scalar an application registered is callable from SQL.
@@ -559,7 +565,7 @@ fn a_vector_index_survives_a_reopen() {
     let path = scratch();
     {
         let database = Database::open(&path).expect("opens");
-        let connection = database.connect().expect("connects");
+        let connection = database.session().expect("connects");
         connection
             .create_scalar_function("toy_embed", 1, FunctionFlags::external(), toy_embedder())
             .expect("registers");
@@ -590,7 +596,7 @@ fn a_vector_index_survives_a_reopen() {
     }
 
     let database = Database::open(&path).expect("reopens");
-    let connection = database.connect().expect("connects");
+    let connection = database.session().expect("connects");
     connection
         .create_scalar_function("toy_embed", 1, FunctionFlags::external(), toy_embedder())
         .expect("registers");
@@ -637,7 +643,7 @@ fn every_insert_into_an_indexed_table_reaches_the_index() {
     let path = scratch();
     {
         let database = Database::open(&path).expect("opens");
-        let connection = database.connect().expect("connects");
+        let connection = database.session().expect("connects");
         connection
             .create_scalar_function("toy_embed", 1, FunctionFlags::external(), toy_embedder())
             .expect("registers");
@@ -658,7 +664,7 @@ fn every_insert_into_an_indexed_table_reaches_the_index() {
     }
 
     let database = Database::open(&path).expect("reopens");
-    let connection = database.connect().expect("connects");
+    let connection = database.session().expect("connects");
     assert_eq!(
         held_rows(&connection),
         "5",
@@ -679,7 +685,7 @@ fn a_backfilled_index_takes_later_inserts() {
     let path = scratch();
     {
         let database = Database::open(&path).expect("opens");
-        let connection = database.connect().expect("connects");
+        let connection = database.session().expect("connects");
         connection
             .create_scalar_function("toy_embed", 1, FunctionFlags::external(), toy_embedder())
             .expect("registers");
@@ -706,7 +712,7 @@ fn a_backfilled_index_takes_later_inserts() {
     }
 
     let database = Database::open(&path).expect("reopens");
-    let connection = database.connect().expect("connects");
+    let connection = database.session().expect("connects");
     connection
         .create_scalar_function("toy_embed", 1, FunctionFlags::external(), toy_embedder())
         .expect("registers");
@@ -739,7 +745,7 @@ fn a_delete_leaves_the_index_without_the_row() {
     let path = scratch();
     {
         let database = Database::open(&path).expect("opens");
-        let connection = database.connect().expect("connects");
+        let connection = database.session().expect("connects");
         connection
             .create_scalar_function("toy_embed", 1, FunctionFlags::external(), toy_embedder())
             .expect("registers");
@@ -762,13 +768,86 @@ fn a_delete_leaves_the_index_without_the_row() {
     }
 
     let database = Database::open(&path).expect("reopens");
-    let connection = database.connect().expect("connects");
+    let connection = database.session().expect("connects");
     assert_eq!(
         held_rows(&connection),
         "2",
         "the deleted row is out of the index after the reopen, not back in it"
     );
 }
+
+/// A registered function is named by the register, not only callable.
+///
+/// `registers.rs` states the case for why this is worse than an error: a
+/// register that under-reports answers every call correctly and just does not
+/// admit that it can, so nothing fails and an application that introspects to
+/// decide what it may use is told less than the truth.
+#[test]
+fn a_registered_function_is_named_by_the_register() {
+    let connection = connect();
+    assert_eq!(
+        single(&connection, LISTS_TWICE),
+        Some(0),
+        "nothing is registered yet"
+    );
+    connection
+        .create_scalar_function(
+            "twice",
+            1,
+            FunctionFlags::external(),
+            Arc::new(|_| Ok(Value::Integer(0))),
+        )
+        .expect("registers");
+    assert_eq!(single(&connection, LISTS_TWICE), Some(1));
+    assert_eq!(
+        single(
+            &connection,
+            "SELECT builtin FROM pragma_function_list WHERE name = 'twice'"
+        ),
+        Some(0),
+        "it is the application's, not the engine's"
+    );
+    assert!(connection.remove_function("twice", 1), "removes");
+    assert_eq!(
+        single(&connection, LISTS_TWICE),
+        Some(0),
+        "a function taken back is not still named"
+    );
+}
+
+/// A registration that shadows a built-in replaces its row instead of adding a
+/// second one, because one name at one arity resolves to one function.
+#[test]
+fn a_registration_that_shadows_a_builtin_does_not_list_it_twice() {
+    let connection = connect();
+    let rows = "SELECT count(*) FROM pragma_function_list WHERE name = 'abs' AND narg = 1";
+    assert_eq!(single(&connection, rows), Some(1));
+    connection
+        .create_scalar_function(
+            "abs",
+            1,
+            FunctionFlags::external(),
+            Arc::new(|_| Ok(Value::Integer(-1))),
+        )
+        .expect("registers");
+    assert_eq!(single(&connection, rows), Some(1));
+    assert_eq!(
+        single(&connection, "SELECT abs(-5)"),
+        Some(-1),
+        "and the row that is left describes the one a call reaches"
+    );
+    assert_eq!(
+        single(
+            &connection,
+            "SELECT builtin FROM pragma_function_list WHERE name = 'abs' AND narg = 1"
+        ),
+        Some(0)
+    );
+}
+
+/// Counts the rows `PRAGMA function_list` holds for the scalar the two tests
+/// above register.
+const LISTS_TWICE: &str = "SELECT count(*) FROM pragma_function_list WHERE name = 'twice'";
 
 /// Returns what a vector index's own counters say it holds, rendered as text.
 ///

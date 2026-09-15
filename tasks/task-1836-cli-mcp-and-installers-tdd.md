@@ -5,7 +5,7 @@ shell, and by a program that links a C library, and by nothing in between — so
 in-between (a verb-shaped CLI and an MCP server over the same command table), and then makes the
 result something you can *install* rather than something you have to build.
 
-Written 2026-09-08 from measurements taken that day at commit `dbe8b29`, and **updated the same
+Written 2026-09-08 from measurements taken that day at commit `f1f4f7d`, and **updated the same
 day from the implementation** - every place the build disagreed with the design is marked
 *changed in build* and says what the design got wrong. Every count in §2 came from
 running the two shells side by side; none of them is an estimate.
@@ -398,7 +398,6 @@ ticket asks for it; §7 records it as the thing to confirm rather than assume.
 The bar the ticket sets is *"verify our qwen localai is able to use it effectively"*, and "we wired it
 up" is not that. So the verification is a scored run, not a screenshot:
 
-- the MCP server is registered in `opencode.json` beside `aiservice-web`;
 - the local Qwen build on `llama-server` :8080 is given a fresh database and a list of tasks it can
   only complete through the tools — create a table, insert rows, ask a question whose answer requires
   a `GROUP BY`, describe a table it did not create, and hit one thing the engine refuses;
@@ -444,8 +443,7 @@ It also runs through **opencode** against the same model, which is the studio's 
   Tokyo is larger than Delhi by 4,000,000 people.
 ```
 
-and the rows were still in the file afterwards. The server is registered in
-`claude-settings/opencode/opencode.json` beside `aiservice-web`.
+and the rows were still in the file afterwards.
 
 **The one thing the run found** is in §3.4: a second process cannot write to a database the server
 has open. The harness hit it, and it is the engine's one-writer rule rather than a defect.

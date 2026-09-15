@@ -1,97 +1,88 @@
-# Publishing: what is ready, and what each step still needs
+# Publishing: the six routes, what each one needs, and the order
 
 Everything in this repository is built, tested and verified up to the upload.
-This file is the last mile: what each registry needs, in what order, and which
-credential is missing.
+This file is the last mile: which registries inillucent ships through, how an
+archive is built and checked before it goes anywhere, and what a maintainer who
+holds the accounts runs for each route.
 
-**One of the six is published: Go**, and the GitHub release is current at v0.1.1. It needed no account and no token, only a
-git tag, so it was tagged. The other five stop at a credential that belongs to a
-person, or at one decision that is not a script's to make - and they are not all
-in the same state behind that credential, so the table below says which.
-
-Two readiness states, and they are not the same thing:
-
-- **Token is the only step.** The artifact exists on disk, it was installed from
-  that artifact on a clean machine, and it was run. The upload command is
-  written out below and nothing else has to be built.
-- **Work remains after the token.** Something still has to be built, and the
-  credential arriving does not finish it.
+Nothing here needs a credential to read. The commands that need one say so, and
+the account itself belongs to a person rather than to this repository, so the
+last step of every route is a person at a keyboard.
 
 ---
 
 ## Where it stands, at a glance
 
-Updated 2026-09-11, at **0.1.1**. **Both one-line installers work**, verified by
-running them as written against the live site: Windows, and Ubuntu 24.04. A Linux
-archive is published beside the Windows one.
+Updated 2026-09-14, at **0.1.2**. Both one-line installers work, verified by
+running them as written against the live site: Windows, and Ubuntu 24.04. Three
+archives are published - Windows, Linux x86-64 and Linux aarch64.
 
-**0.1.0 was withdrawn, not patched.** Its archives carried `README.md`,
-`docs/getting-started.md` and `agent-skills/inillucent-quickstart/SKILL.md` from
-before the Go command was renamed, so all three told a reader to run
-`go install .../packages/go/cmd/inillucent@latest` - and `@latest` resolves to a
-module where that directory no longer exists. The archive the site handed out
-contained an install command that failed. Replacing those archives in place would
-have left two different archives both called 0.1.0, and the Homebrew formula
-already recorded the 0.1.0 Linux checksum, which would have stopped matching with
-nothing to say so. The 0.1.0 archives are removed from the site and answer 404.
+**Checked against the bytes the site is serving, on 2026-09-14 (task-1951).** All
+four published files were downloaded off `inillucent.com` and hashed with
+`sha256sum` rather than `Get-FileHash`, which is the one check a vanished cmdlet
+cannot fake. All four match the published `SHA256SUMS`, and all four are
+byte-identical to `dist/` on the Windows box. `0.1.1` is still served, `0.1.0`
+answers 404 as intended, and both macOS names answer 404 because there is no
+macOS archive.
+
+**What 0.1.2 is for.** `inillucent setup-embeddings all` downloads 620 MB of ONNX
+Runtime and weights, and every archive up to 0.1.1 was built without
+`--features inillucent-cli/embed`, so the program that downloaded them answered
+`no such function: embed`. task-1900 put the flag in the release scripts;
+0.1.1 was cut before that, so cutting 0.1.2 was the whole of the fix. The
+published Windows and Linux archives both answer
+`SELECT length(embed('hello'))` with `3072`, the Linux one after
+`setup-embeddings all` on a machine that had never run it.
 
 | route | readiness | what it is waiting on |
 |---|---|---|
-| **inillucent.com, Windows** | **live** - `irm .../install.ps1 \| iex` installs and runs | nothing |
-| **inillucent.com, Linux** | **live** - `curl -fsSL .../install.sh \| sh` installs and runs | nothing |
-| **inillucent.com, macOS** | work remains - no archive | a Mac: `packaging/macos/release-macos.sh --version <v> --upload`, which builds both architectures, `lipo`s them, signs, notarises and uploads |
-| **GitHub release** | **done** - `v0.1.1` with both archives, `SHA256SUMS` and `provenance.json` | nothing |
-| **Go** | **published** - tag `packages/go/v0.1.2` | nothing, except that a private repository limits who can install it |
-| **npm** | **token is the only step** - three tarballs packed, installed and run | **the signup page answers 403 to every client** - see below |
-| **PyPI** | **token is the only step** - wheel installed into a clean venv and run | an account; the form carries an hCaptcha and uploads need 2FA |
-| **crates.io** | **token is the only step** - `--workspace --dry-run` clean for all 29 crates | a token, **and the decision to make the source public** |
-| **Packagist** | **token is the only step** - `composer install` works end to end | a Packagist account (GitHub OAuth), and a public repository |
-| **Homebrew** | **work remains after the token** - and there is no token | the macOS archive, which does not exist; then the tap repository |
+| **inillucent.com, Windows** | **live at 0.1.2** - `irm .../install.ps1 \| iex` installs and runs | nothing |
+| **inillucent.com, Linux x86-64** | **live at 0.1.2** - `curl -fsSL .../install.sh \| sh` installs and runs | nothing |
+| **inillucent.com, Linux aarch64** | **published at 0.1.2**, and **never run** - there is no ARM machine here. `tools/release-verify-linux.sh` reads its glibc floor, its shared libraries and its modes out of the archive and passes; L4 and L5 skip themselves | a machine that can run it |
+| **inillucent.com, macOS** | **no archive, at 0.1.1 or 0.1.2** - and it cannot be produced on this machine or in CI. See [the macOS archive](#the-macos-archive-the-one-thing-that-needs-a-different-machine) | **a Mac, an Apple Developer Program membership, two Developer ID certificates and a stored `notarytool` profile.** Then one command on it: `./packaging/macos/release-macos.sh --version 0.1.2 --upload` |
+| **SHA256SUMS signature** | not signed, at 0.1.1 or 0.1.2. The signing path itself is verified: run with a throwaway key it signs, the signature verifies, and a different public key is rejected on the key id | **a minisign key pair**, created once. `packaging/sign-sums.ps1` reads the secret key from `INILLUCENT_MINISIGN_KEY`, and `packaging/inillucent.pub` has to exist before it will sign at all |
+| **the .deb and the .rpm** | **not published, and the packaging is verified** - both were built from the published 0.1.2 Linux archive, the `.deb` was extracted in WSL and the program it carries wrote, reopened and read a database, and the `.rpm` header lists the same nine paths with the same modes | an OpenPGP key. `packaging/linux/package-linux.ps1` signs by default because `apt` and `dnf` will not install an unsigned package from outside a distribution's own repository. `gpg` is on the box with an empty keyring |
+| **GitHub release** | **cut for 0.1.2** on 2026-09-14, on the `v0.1.2` tag whose tree is the released tree, with all five assets. Every one was downloaded back off the release and hashed: all five match the published `SHA256SUMS` and `dist/` byte for byte. **Visible to everybody** since task-1961 made both repositories public: `tools/check-public-urls.mjs` fetches every URL a shipped package names with no credential and all nine answer 200 | nothing |
+| **Go** | **published**. `packages/go/v0.1.2` is pushed and `proxy.golang.org` serves the module to a caller with no credential: `/@latest` and `/@v/list` both answer 200, checked by `tools/check-public-urls.mjs` in `tools/validate`. See [the Go route](#the-go-route-verified-through-the-module-proxy) for what was and was not run | nothing |
+| **npm** | **token is the only step** - three tarballs packed, installed and run | an account token |
+| **PyPI** | **token is the only step** - wheel installed into a clean venv and run | an account with 2FA, and a token minted from it |
+| **crates.io** | **token is the only step** - `--workspace --dry-run` clean for every publishable crate. The source is public as of task-1961 | a token |
+| **Packagist** | **one step** - `composer install` works end to end, the package itself is ready, and the repository the submit form has to read is public now | a Packagist account (GitHub OAuth) |
+| **Homebrew** | **waiting on the macOS archive, and on nothing else.** `update.sh` fills both Linux checksums from `dist/SHA256SUMS` correctly and reports the macOS one as missing, which was run to check | the macOS archive; then the tap repository. `brew install --HEAD` additionally needs the repository to be public, because the formula's `head` spec clones it |
 
 Read across that table one more way, because it is the part that decides what to
 chase:
 
-- **npm, PyPI, crates.io and Packagist are finished except for the upload.** The
-  artifact is on disk, a clean machine installed from that exact artifact, and
-  the installed thing ran. `npm publish`, `twine upload`, `cargo publish` and the
-  Packagist submit form are the only commands left. Each is written out below.
+- **npm, PyPI and crates.io are finished except for the upload.** The artifact is
+  on disk, a clean machine installed from that exact artifact, and the installed
+  thing ran. `npm publish`, `twine upload` and `cargo publish` are the only
+  commands left. Each is written out below.
+- **Packagist needs an account and nothing else.** The submit form reads the
+  repository, which is public now.
 - **Homebrew is not waiting on a credential at all** - a formula is a pull
   request and needs no account. It is waiting on the macOS archive, which needs
   a Mac. A token would change nothing.
-- **Go is published**, and its one caveat is not a credential either: the
-  repository is private, so `sum.golang.org` cannot read the module and the
-  public proxy answers 404. A collaborator with `GOPRIVATE` set installs it
-  today; a stranger cannot until the repository is public.
+- **Go is published.** `go install` resolves through `proxy.golang.org`, which
+  clones the repository with no credential; it answers 200 for both `@latest`
+  and `@v/list` now that the repository is public.
 
 The macOS archive is the single artifact that blocks the most: the macOS
 installer, the Homebrew formula, and two of the four npm platform packages all
 wait on it and on nothing else.
 
-### What the site publishing took, and the defects it found
+---
 
-The site was already serving `/downloads/` publicly. It had a stale archive and
-none of the scripts, and two things were broken underneath:
+## The rule the release scripts are built around
 
-- **`.ps1` was served as `application/octet-stream`**, because `mime_guess` has no
-  entry for it. Against that, `Invoke-RestMethod` hands back a byte array rather
-  than a script, so `irm ... | iex` died with *"[System.Byte] does not contain a
-  method named 'Trim'"*. Fixed in the site's static handler.
-- **`install.sh` used `set -o pipefail` and `${BASH_SOURCE[0]}`**, both bash-only.
-  The documented command pipes into `sh`, which on Debian and Ubuntu is dash, and
-  dash answered *"Illegal option -o pipefail"* and stopped before downloading
-  anything. The script is POSIX now and `dash -n` parses it clean.
+**Run every command the release ships, from the release.** 0.1.0 passed every
+check that was run against the repository and still shipped four commands that
+fail, because the checks were run against the repository and the commands ship
+inside the archive. Fixing the source tree does not change the artifact.
 
-A third was found while testing macOS: `curl -fsSL` on an archive that is not
-published exits non-zero with no output, and `set -e` then ended the script in
-silence. It now reads SHA256SUMS first and names the platforms that were
-published.
+That rule is why `packaging/release.ps1` extracts what it just built and drives
+it, and it is what found each of these.
 
-### The rule: run every command the release ships, from the release
-
-0.1.0 passed every check above and still shipped four commands that fail,
-because the checks were run against the repository and the commands ship inside
-the archive. Fixing the source tree does not change the artifact. These came out
-of running each one from what the site actually serves.
+### What running the artifact found
 
 - **SHA256SUMS was written with CRLF.** `Set-Content` uses the platform's line
   ending, so a file produced on Windows ends every line with `\r\n`. Linux `awk`
@@ -102,27 +93,104 @@ of running each one from what the site actually serves.
   the `\r`, which is why every run on the machine that produced the file passed.
   `release.ps1` writes LF now, and `install.sh` strips carriage returns before
   reading, in both the download path and `--from-dist`.
-- **Two one-liners pointed at `raw.githubusercontent.com`.** That path serves
-  files out of the repository, and the repository is private, so both answered
-  404 for everybody. They were in `docs/getting-started.md` and the quickstart
-  skill, which both travel inside the archive, and in
-  `packaging/windows/README.md`. All three point at inillucent.com now.
+- **A clean checkout on Windows turns every shell script into CRLF**, when
+  `core.autocrlf` is true and the repository carries no `.gitattributes`.
+  `packaging/publish-site.ps1` publishes `packaging/install.sh` and
+  `packaging/macos/verify-macos.sh` out of the checkout, and `sh` on a CRLF
+  script dies on its first line. `packaging/install.sh` escaped by accident - it
+  carries a literal carriage return inside a `tr -d` argument, and git leaves
+  such a file alone - so the one script whose CRLF would have been noticed at
+  once is the one that was never converted. `.gitattributes` pins `*.sh` to LF.
+- **`install.sh` used `set -o pipefail` and `${BASH_SOURCE[0]}`**, both bash-only.
+  The documented command pipes into `sh`, which on Debian and Ubuntu is dash, and
+  dash answered *"Illegal option -o pipefail"* and stopped before downloading
+  anything. The script is POSIX now and `dash -n` parses it clean.
+- **`.ps1` was served as `application/octet-stream`**, because `mime_guess` has
+  no entry for it. Against that, `Invoke-RestMethod` hands back a byte array
+  rather than a script, so `irm ... | iex` died with *"[System.Byte] does not
+  contain a method named 'Trim'"*. Fixed in the site's static handler.
+- **`curl -fsSL` on an archive that is not published exits non-zero with no
+  output**, and `set -e` then ended the installer in silence. It reads
+  SHA256SUMS first now and names the platforms that were published.
 - **The Go row named a command that had been renamed.** `cmd/inillucent` became
   `cmd/inillucent-install`, and the archives still said the old one, so
   `@latest` resolved to a module where that directory does not exist.
-- **The client libraries section listed eight packages that do not exist**, under
-  a link to a repository that answers 404. PyPI is the one that can be checked
-  without a browser and its API answers `{"message": "Not Found"}`.
 
-Every `http` URL in the documents that travel inside the archive was then
-requested. The eighteen that remain all answer.
+### What cutting 0.1.2 found in the gate itself
+
+None of these is reachable by building the workspace (task-1934):
+
+- **Five checks spoke a handshake `inillucent-mcp` no longer accepts.** It
+  enforces the MCP lifecycle now - `initialize` needs `protocolVersion`,
+  `capabilities` and `clientInfo`, and every other method answers -32002 until
+  `notifications/initialized` arrives. `packaging/release.ps1`'s smoke test
+  **refused to build the archive at all**; `packaging/release.sh`,
+  `tools/release-verify-linux.sh` L5, `packaging/macos/verify-macos.sh` A5 and
+  the Homebrew formula's `test do` block all failed the same way.
+  `tools/doc-facts/check.mjs` already sent the whole handshake, which is how the
+  five were spotted.
+- **Two of those read the answer through `grep -q`**, which stops at its first
+  match and closes the pipe; the server's next write then fails, it exits
+  non-zero, and `set -o pipefail` reported a pipeline that had answered
+  correctly as failed. Both read into a variable now.
+- **No release had ever carried an ARM Linux archive**, because
+  `rust-toolchain.toml` named only the two x86-64 targets and cargo answered
+  `can't find crate for 'core'`. zig supplies the linker and the glibc floor;
+  the standard library for the target still has to be installed.
+  `rust-toolchain.toml` names it now.
+
+### What running the rest of the packaging found (task-1951)
+
+None of these is reachable by reading the scripts. Each came from running one.
+
+- **`Update-Sha256Sums` dropped the `provenance.json` line.** `release.ps1` and `release.sh` both
+  write the archives into `SHA256SUMS` and then append the provenance's hash; the shared helper in
+  `packaging/stage-layout.ps1` rewrote the file over the archives alone. So `release-all.ps1` and
+  `linux/package-linux.ps1` each turn a four line `SHA256SUMS` into a three line one, and
+  `publish-site.ps1` copies that file to the site verbatim. Its own comment says `provenance.json`
+  is published *because* `SHA256SUMS` names it, so the result is a provenance served with nothing
+  stating its hash. Measured: `release-all.ps1 -Targets macos` rewrote a file that matched the
+  published one into one that did not. The helper writes the provenance line now, last, which is
+  where the release scripts put it.
+- **`sign-sums.ps1` signed with any key and reported success.** Its check that the signature verifies
+  against the key readers would use sat inside `if (Test-Path packaging/inillucent.pub)`, and that
+  file has never existed, so the check never ran. It is a refusal with a named override now,
+  `-AllowUnverifiedKey`, like every other refusal in this directory. The signing path itself works:
+  run with a throwaway key it signs, the signature verifies, and a different public key is rejected
+  on the key id.
+- **`homebrew/update.sh` printed the push command above the reason not to push.** With an archive
+  missing it wrote the formula, printed `Then, in the tap: git add ... && git push`, and then warned
+  that the file still carried `REPLACE_WITH_THE_UNIVERSAL_DARWIN_SHA256`. The push line is printed
+  only when the formula is complete now.
+- **`rust-toolchain.toml` named three targets out of five**, so `release-all.ps1` stopped at its
+  macOS step with `can't find crate for std`. The macOS section above has it.
+- **`fetch-macos-artifacts.ps1` reported success having checked nothing, and published what it
+  refused.** It is the gate between the MacBook's artifacts and the site, and on a machine without
+  `rcodesign` the committed version printed a warning, said *"every check passed"*, exited 0, and
+  wrote the artifacts into `dist/SHA256SUMS`. Run against three text files reading
+  `this is not a Mach-O`, that is exactly what it did. Four faults in one script:
+  a missing `rcodesign` was a warning rather than a refusal, so the only check standing between an
+  unsigned Mach-O and the site could be absent; `Update-Sha256Sums` ran **before** the failure gate,
+  so a run ending with *"these artifacts must not be published"* had already listed them as
+  published; an empty `SHA256SUMS-macos` verified nothing and reported no failure, which is what a
+  `shasum` missing from the Mac's PATH produces; and `tar --force-local` is GNU tar only, so the
+  step died on Windows' own bsdtar with a usage dump. All four are fixed, the refusal has
+  `-AllowUnverifiedSignatures` as its named override, and the committed and fixed scripts were run
+  side by side in isolated trees to show the difference.
+- **The `.deb` and the `.rpm` were recorded as not built and are one command away.** Both were built
+  from the published 0.1.2 Linux archive with the shipped template and the `nfpm` already in
+  `tools/cross/bin`. The `.deb` was extracted in WSL and the program it carries created a database,
+  wrote to it, reopened it and read the rows back; the `.rpm`'s header lists the same nine paths with
+  the same modes. Signing is the only step left, and the modes the template sets survive being built
+  on a filesystem with no execute bit, which is what its own comment says went wrong the first time.
 
 ### One more thing that can fail silently
 
-An agent terminal can inherit a `PSModulePath` in which the PowerShell 7 module
-directories shadow `Microsoft.PowerShell.Utility`. Cmdlets from it - `Get-FileHash`
-among them - resolve to nothing, the script keeps going, and it exits 0. Applied
-to `release.ps1` that produces a SHA256SUMS that looks written and is empty.
+A terminal can inherit a `PSModulePath` in which the PowerShell 7 module
+directories shadow `Microsoft.PowerShell.Utility`. Cmdlets from it -
+`Get-FileHash` among them - resolve to nothing, the script keeps going, and it
+exits 0. Applied to `release.ps1` that produces a SHA256SUMS that looks written
+and is empty.
 
 `release.ps1` and `publish-site.ps1` now check for the cmdlets they need before
 doing anything, and stop with the reason rather than succeeding at nothing.
@@ -134,20 +202,333 @@ only check a vanished cmdlet cannot fake, and it is what was run for 0.1.1:
 `sha256sum` over the three served files returns exactly the three values in the
 served SHA256SUMS.
 
+### 0.1.0 was withdrawn, not patched
+
+Its archives carried `README.md`, `docs/getting-started.md` and
+`agent-skills/inillucent-quickstart/SKILL.md` from before the Go command was
+renamed, so all three told a reader to run
+`go install .../packages/go/cmd/inillucent@latest` - and `@latest` resolves to a
+module where that directory no longer exists. The archive the site handed out
+contained an install command that failed.
+
+Replacing those archives in place would have left two different archives both
+called 0.1.0, and the Homebrew formula already recorded the 0.1.0 Linux
+checksum, which would have stopped matching with nothing to say so. The 0.1.0
+archives are removed from the site and answer 404, and the GitHub release is
+marked *"inillucent 0.1.0 (withdrawn - use 0.1.1)"* with the assets left
+attached, because deleting them would remove the record of what was published.
+
+---
+
+## The macOS archive: the one thing that needs a different machine
+
+Added 2026-09-14 (task-1951).
+
+There is no macOS archive at 0.1.1 or at 0.1.2, and it is the single artifact that blocks the most:
+the macOS download on inillucent.com, the Homebrew formula, and two of the four npm platform
+packages all wait on it and on nothing else.
+
+### What is missing is an Apple identity, not a compiler
+
+The Mach-O binaries cross compile on the Windows box. `packaging/release-all.ps1 -Targets macos`
+builds `aarch64-apple-darwin` and `x86_64-apple-darwin` through cargo-zigbuild, and deliberately
+archives neither, because an archive of unsigned Mach-O is not something anybody should be able to
+pick up by accident.
+
+What cannot be done here, and cannot be done by CI either, is everything after the compiler:
+
+| step | what it needs | where it can run |
+|---|---|---|
+| `lipo` the two slices into universal binaries | macOS, or `rcodesign` | the Mac; `rcodesign` on Windows can do this part |
+| `codesign` with the hardened runtime and a trusted timestamp | **a Developer ID Application certificate** | wherever the certificate is |
+| sign the `.pkg` | **a Developer ID Installer certificate** | the same |
+| `notarytool submit` and `stapler staple` | **an Apple notarisation credential** | the same |
+| `spctl --assess` on a quarantined copy | **macOS** | a Mac, and nowhere else |
+| run the universal binary, and the x86-64 slice under Rosetta | **macOS** | a Mac, and nowhere else |
+
+The two certificates come with an Apple Developer Program membership, which is $99 a year and needs
+an Apple ID with two factor authentication. The notarisation credential is an app specific password
+stored in the Mac's keychain as the profile `inillucent-notary`.
+`packaging/macos/README.md` has the one time setup, and `release-macos.sh` refuses to start until all
+three exist and says which is missing.
+
+### Can CI produce it?
+
+**Not today, and the workflow already says so in the right place.** `.github/workflows/ci.yml` has
+`macos-latest` in the `validate` matrix, added by task-1932, so the workspace is built and tested on
+a real Mac on every commit. It is deliberately **not** in the `packages` matrix, and the comment
+there gives the reason: `packaging/release.sh` signs and notarises, which needs an Apple developer
+identity and an app specific password that a pull request from a fork cannot be given.
+
+That reasoning holds. A GitHub runner is a real Mac and could `lipo`, build the `.pkg` and run the
+binaries, but with no Developer ID certificate it can only produce an ad hoc signature, and
+`verify-macos.sh` asks `spctl` for `source=Notarized Developer ID` and would reject it. Putting the
+certificate and the notarisation credential into repository secrets would make a `workflow_dispatch`
+job possible; that is a decision about where the signing identity lives, and it is not made here.
+
+### The defect this ticket found in the build half
+
+`rust-toolchain.toml` named three targets and not the two Apple ones, so on a machine holding only
+the pinned toolchain, `pwsh packaging/release-all.ps1` stopped at its macOS step with
+
+```
+error[E0463]: can't find crate for `std`
+note: the `aarch64-apple-darwin` target may not be installed
+```
+
+This is the same fault task-1934 fixed for `aarch64-unknown-linux-gnu`, which is why no release
+before 0.1.2 carried an ARM Linux archive. It was invisible for the Apple pair because
+`target/aarch64-apple-darwin/release` already held binaries from 2026-09-12, built before the pin,
+and nothing rebuilt them. `rust-toolchain.toml` names all five targets now.
+
+### What Jason has to run, and where
+
+On the MacBook, with the repository checked out at the `v0.1.2` tag:
+
+```sh
+./packaging/macos/release-macos.sh --version 0.1.2 --upload
+```
+
+It builds both architectures, joins them, signs them, writes the `.tar.gz` and the `.zip`, builds and
+signs the `.pkg`, notarises both, staples the ticket, runs the result, and uploads the four files.
+`--upload` puts them on the `v0.1.2` release, **which exists now** with the tag naming the released
+tree; before 2026-09-14 it did not, and `gh release create` would have made one from the mirror's
+default branch, which held 0.1.1's tree. Without `--upload` the script prints the four paths and
+`packaging/fetch-macos-artifacts.ps1 -FromDirectory` takes them from a folder instead.
+
+Then, back on the Windows box:
+
+```powershell
+pwsh packaging/fetch-macos-artifacts.ps1 -Version 0.1.2     # or -FromDirectory <path>
+pwsh packaging/publish-site.ps1 -Version 0.1.2 -Stage
+```
+
+`fetch-macos-artifacts.ps1` refuses rather than warns when it cannot read the signatures, and it
+writes nothing into `dist/SHA256SUMS` unless every check passed. That was not true until task-1951;
+what it did instead is in [what running the rest of the packaging found](#what-running-the-rest-of-the-packaging-found-task-1951).
+
+and on any Mac, against the bytes the site is then serving:
+
+```sh
+curl -fsSL https://inillucent.com/downloads/verify-macos.sh | sh -s -- --version 0.1.2
+```
+
+and only once that passes:
+
+```powershell
+pwsh packaging/publish-site.ps1 -Version 0.1.2 -Link
+```
+
+task-1934 fixed `verify-macos.sh`'s A5 check before anybody had run it on a Mac: it spoke an MCP
+handshake `inillucent-mcp` refuses, and it read the answer through `grep -q`, which closes the pipe
+and made `set -o pipefail` report a correct answer as a failure. The script is the macOS release
+gate, and it was failing for two reasons before it had ever been run.
+
+---
+
+## `dist/` and `packages/npm/staged/`: generated, ignored, and not a source of truth
+
+Recorded here because a review asked which they were (task-1961, D4), and reading
+`packaging/release.ps1` is what answers it.
+
+Both are **build output**, both are in `.gitignore`, and neither is tracked:
+
+- **`dist/`** is what `packaging/release.ps1` writes: the archives for each target, `SHA256SUMS`
+  and `provenance.json`. It is the directory every publish step reads and every installer's bytes
+  come from. A copy of a file that also lives in the tree is a copy the release put there.
+- **`packages/npm/staged/`** is what `packages/npm/build.mjs` assembles out of `dist/`: the
+  manifests and the shims, which are source, copied beside the built binaries, which are not. It is
+  rebuilt from `dist/` on every release.
+
+So neither needs a "frozen at release N" note and neither can go one version behind in a way that
+matters: a stale copy on one machine is overwritten by the next release run, and nothing reads
+either directory out of a clone. What a reader needs from a release is the archive on
+`inillucent.com` or the GitHub release, and what a contributor needs is the source.
+
+---
+
+## The GitHub mirror: what it holds, and what it is for
+
+Added 2026-09-14 (task-1951).
+
+### Both repositories are public, as of task-1961
+
+There are two. `jasonmcaffee/inillucent` is where releases are cut: 335 commits, `main` at
+`40a8e3b`, the tags `v0.1.1` and `v0.1.2`, and no GitHub releases at all.
+`Black-Rainbow-Labs/Inillucent` is the one every published package names: ten commits, `main` at
+`135c5cc`, and the `v0.1.0` and `v0.1.1` releases with their assets attached.
+
+Both answered 404 to everybody who was not signed in as the owner until task-1961 made them public.
+Re-checked on 2026-09-14 with no credential of any kind, no token and no cookie:
+
+| URL | was | is |
+|---|---|---|
+| `github.com/Black-Rainbow-Labs/Inillucent` | 404 | **200** |
+| `github.com/Black-Rainbow-Labs/Inillucent/releases` | 404 | **200** |
+| `github.com/Black-Rainbow-Labs/Inillucent/issues` | 404 | **200** |
+| `github.com/Black-Rainbow-Labs/Inillucent/blob/main/drivers/README.md` | 404 | **200** |
+| `proxy.golang.org/.../packages/go/@latest` | 404 | **200** |
+
+`tools/check-public-urls.mjs` is that check, kept so it does not have to be done by hand again. It
+reads every `github.com` URL out of the tracked files a package ships, fetches each one with no
+`Authorization` header and no cookie, and prints what an anonymous reader gets. It is a
+`tools/validate` stage as of task-1961: nine links, all of them reachable without signing in. It
+was left out of the script on purpose while it was red, because a check that is red for a reason
+nobody intends to fix teaches people to ignore the script it is in.
+
+This is the same fault the Unluminous release had, found separately: a release whose download link
+answers 404 for every visitor while looking correct to the person who published it.
+
+### What being private cost, until task-1961
+
+**Nothing that a user installs.** Every archive download in every installer is `inillucent.com`:
+`install.sh`, `install.ps1`, the Homebrew formula's three release URLs, the Go
+`cmd/inillucent-install` and the PHP `bin/inillucent-install` all read `inillucent.com/downloads`,
+check the SHA-256 against the published `SHA256SUMS`, and never touch GitHub. The 0.1.2 archives
+were downloaded off the site and hashed on 2026-09-14: all four match, byte for byte.
+
+**One route does not work at all, and it is recorded below as published.** `go install` resolves a
+module through `proxy.golang.org`, and the proxy clones the repository:
+
+```
+GET https://proxy.golang.org/github.com/!black-!rainbow-!labs/!inillucent/packages/go/@latest
+404  not found: module github.com/Black-Rainbow-Labs/Inillucent/packages/go:
+     git ls-remote ... exit status 128: fatal: could not read Username
+```
+
+`pkg.go.dev` for that module is 404 as well. The Go route was verified on this machine, where git
+holds a credential, so it resolved. That is the same shape as an archive nobody opened: checked as
+the author rather than as a stranger.
+
+**Four more places hand a reader a link that 404s**: the npm package's `homepage`, `repository` and
+`bugs`; the PyPI project's `Homepage` and `Issues`; `composer.json`'s issue URL; and the
+`install.sh` fallback that tells somebody with no prebuilt archive to clone the repository. The
+Homebrew formula's `head` spec is a fifth, so `brew install --HEAD` fails while
+`brew install` would work.
+
+### The histories share nothing, and the trees have always matched
+
+`git merge-base` between the two `main` branches is empty. The mirror's history is ten squashed
+commits beginning at `Inillucent: an embedded database for agents, written in Rust`; the
+development history is 335.
+
+The content is a different matter, and it lines up exactly:
+
+| | tree |
+|---|---|
+| `v0.1.1` on the mirror (`b52e297`) | `97e516e8` |
+| `v0.1.1` here (`458992d`) | `97e516e8` |
+
+`git diff b52e297 458992d` is empty. `brl/main`'s tree is the tree of development commit `fe5a101`
+exactly, found by scanning this repository's trees for it. So the mirror was made by taking a whole
+tree and committing it as one commit, with the `task-NNNN:` prefix removed from the subject. That is
+the right way to run a public mirror. It was done by hand, written down nowhere, and never checked,
+so nobody could tell a correct tag from a plausible one.
+
+### The recommendation
+
+**Make `Black-Rainbow-Labs/Inillucent` public, holding one commit per release and nothing else.**
+Keep cutting releases from `jasonmcaffee/inillucent`.
+
+| what the mirror holds | |
+|---|---|
+| one commit per release | its tree **is** the release tag's tree, checked rather than assumed |
+| the tag `v<x.y.z>` on that commit | the same name the release has here |
+| a GitHub release on that tag | carrying the files `SHA256SUMS` names |
+| nothing else | no development branches, no ticket numbers in subjects |
+
+The three alternatives, and why each is worse:
+
+- **Make `jasonmcaffee/inillucent` public and retire the mirror.** That publishes 335 commit
+  subjects carrying ticket numbers and a `tasks/` directory of internal design documents. It also
+  changes the Go module path, and a Go module path that changes is a different module: every
+  `go install` command in every shipped document, and both published `packages/go/*` tags, stop
+  meaning anything. Every other published URL already names `Black-Rainbow-Labs/Inillucent` too.
+- **Retire GitHub and publish only from inillucent.com.** A Go module path is a repository URL, so
+  this drops the Go route or moves the module to another public host, which renames it in the same
+  way.
+- **Leave both private.** Not what was done; kept here because the argument for
+  the choice that was made is the argument against this one. Then the record
+  would have to say so: the Go row below stops saying published,
+  `packages/go/go.mod` moves or the Go route is withdrawn, and the npm and PyPI metadata point at
+  `inillucent.com` instead of a repository nobody can open.
+
+### How to carry it out
+
+```powershell
+pwsh packaging/mirror-github.ps1 -Verify                # what the mirror holds now
+pwsh packaging/mirror-github.ps1 -Version 0.1.2         # build the commit; pushes nothing
+pwsh packaging/mirror-github.ps1 -Version 0.1.2 -Push   # publish the commit and the tag
+```
+
+`mirror-github.ps1` takes the tree straight off the `v0.1.2` tag with `git commit-tree`, so there is
+no copy step for anything to go wrong in, and it refuses if the commit it built does not carry that
+tree. The result is a pure function of the tree, the parent, the message and the author, which means
+running it twice gives the same commit hash and anybody holding both repositories can recompute it.
+For 0.1.2 that commit is `703de98`, tree `4419e10`, and `git diff 703de98 v0.1.2` is empty.
+
+The tag it pushes is **annotated**, because the two already on the mirror are and because an
+annotated tag is the only kind that records who made it and when. `git tag` can only write
+`refs/tags/<name>`, and this repository already has a local `v<version>` naming a commit in the
+development history, so the tag object is written with `git mktag` and put under a ref this script
+owns.
+
+`-Verify` reads the mirror as it stands and reports one row per release tag:
+
+```
+  v0.1.0     same tree
+  v0.1.1     same tree
+  v0.1.2     same tree
+
+every release tag on the mirror holds the released tree
+```
+
+### What was done on 2026-09-14, and what was not
+
+The 0.1.2 commit and tag are **pushed**, and the v0.1.2 release is **cut**, with all five assets.
+None of that was a visibility decision: the repository was private before that day's work and
+private after it, so it published nothing to anybody at the time - the flip came later, in
+task-1961. What it did was make the mirror's record true and give the macOS upload something to
+attach to - `release-macos.sh --upload` runs `gh release create "v$version"`
+when the release is absent, and with no `v0.1.2` tag on the remote that would have created one from
+the default branch, which held 0.1.1's tree.
+
+Every asset was downloaded back off the release and hashed: all five match the published
+`SHA256SUMS`, and all five are byte-identical to `dist/` and to what inillucent.com serves. The
+release page, the release API and an asset download all still answer **404** to a signed-out reader,
+which was checked with no credential.
+
+**What was not done, because it is the decision and not a command:** making the repository public.
+That is **Settings → General → Change repository visibility → Public** on
+`Black-Rainbow-Labs/Inillucent`. After it, `node tools/check-public-urls.mjs` goes green and belongs
+in `tools/validate.*` as a network-gated check. It is deliberately not there now, because a check
+that is red from the day it lands is a check somebody deletes.
+
+### One thing to settle before making it public
+
+**`tasks/` is in the mirror's tree**, and at 0.1.2 that is 32 design documents named by ticket
+number. They are readable and they are internal, and they become public along with everything else.
+
+If they should not be public, the place to remove them is **this repository**, not the mirror. The
+mirror's whole claim is that its tree is the release tree; dropping a directory only on the mirror
+breaks the one property that makes a tag checkable, and it would mean the archive on inillucent.com
+and the repository on GitHub no longer hold the same code. Removing `tasks/` here, or moving it
+outside the released tree, keeps both true.
+
+---
 
 ## The decision that comes first
 
-**Three of the six routes require the repository to be public**, and it is
-private today:
+**Three of the six routes require the source to be public**:
 
 | route | needs a public repository? | why |
 |---|---|---|
-| npm | no | it ships binaries; the source never leaves this machine |
+| npm | no | it ships binaries; the source never leaves the build machine |
 | PyPI | no | it ships binaries plus the Python binding, in the wheel |
 | **crates.io** | **yes, effectively** | `cargo publish` uploads the crate **source**, and it can never be removed |
-| **Homebrew** | **yes** | the formula fetches a release asset, and a private repository's assets are not public |
-| **Go** | **yes** | `go install` clones the module from the repository |
-| the install scripts | **yes** | they `curl` from `raw.githubusercontent.com` and the releases |
+| Homebrew | **no**, for `brew install` | the formula's three release URLs are `inillucent.com`. Only the `head` spec clones GitHub, so `brew install --HEAD` is the one command that needs it |
+| **Go** | **yes**, and measured | `go install` resolves through `proxy.golang.org`, which clones the repository. It answers `404 ... fatal: could not read Username` today |
+| the install scripts | **no** | `install.sh` and `install.ps1` download from `inillucent.com`. They only name GitHub in the "build it yourself" message, which points at a 404 |
 
 So the first question is not "which registry" but **"does inillucent become
 public source?"** It is a one-way door: crates.io versions cannot be deleted
@@ -184,54 +565,20 @@ pwsh packaging/publish-site.ps1 -Version 0.1.2 -Stage
 pwsh packaging/publish-site.ps1 -Version 0.1.2 -Link
 ```
 
-**The distribution point is inillucent.com.** A GitHub release cannot be one
-while the repository is private, because its assets are private too. GitHub
-carries the macOS artifacts from the MacBook to the Windows box and nothing else.
+**The distribution point is inillucent.com.** GitHub carries the macOS artifacts
+from the MacBook to the Windows box; the site is what a user downloads from.
 
-**Done.** <https://github.com/Black-Rainbow-Labs/Inillucent/releases/tag/v0.1.1>
-carries both archives, `SHA256SUMS` and `provenance.json`. Every asset was
-downloaded back off the release and hashed: all four match the published
-checksums byte for byte, the released `SHA256SUMS` is LF, and the README inside
-the released zip carries the corrected Go row with no `raw.githubusercontent`
-anywhere in the archive.
-
-**No new credential was needed, and `gh` is a red herring.** `gh auth status`
-reports no host logged in, which is what made this look blocked - but `git push`
-has been working the whole time through the Windows credential manager, and that
-same credential answers the REST API:
-
-```sh
-git credential fill <<< $'protocol=https\nhost=github.com\n'
-```
-
-returns Jason's existing personal access token, scoped `gist, repo, workflow`,
-with `admin` on this repository. `repo` covers releases. Creating the release
-used the credential that was already authorising the pushes, for the same
-repository, to do the thing this file already said should happen - so it needed
-no account, no browser and no login page.
-
-**v0.1.0 is marked withdrawn rather than deleted.** Its title now reads
-*"inillucent 0.1.0 (withdrawn - use 0.1.1)"* and its notes lead with what is
-wrong inside its archives, above the original notes, which are kept. The assets
-are left attached: deleting them would remove the record of what was published,
-and they are already unreachable from inillucent.com, which answers 404 for them.
-
-An earlier v0.1.0 was cut on the old `jasonmcaffee/inillucent` repository and then
-removed: it named the wrong organisation and its archive carried the README whose
-install table was not true.
-
+`release.ps1` refuses to build an untagged archive, so the tag comes first.
 `provenance.json` records the commit, the tag, the toolchain and the six checks
-the release script made - clean checkout, tag matches HEAD, version agrees, built
-from source, installed and run, C ABI linked - with **no waivers**. The script
-refuses to build an untagged archive at all, so the tag came first rather than
-being passed over with `-AllowUntagged`.
+the release script made - clean checkout, tag matches HEAD, version agrees,
+built from source, installed and run, C ABI linked - and the release is cut with
+**no waivers**.
 
-**Still needed**: the three non-Windows archives, built on their own machines
-with `packaging/release.sh --target <triple>` and added to the same release.
+Every asset of `v0.1.1` was downloaded back off the release and hashed: all four
+match the published checksums byte for byte, the released `SHA256SUMS` is LF,
+and the README inside the released zip carries the corrected Go row.
 
-**The repository is still private**, so the release and its assets are reachable
-only by somebody with access, and the `curl`-to-shell installers in the release
-notes do not resolve for anybody else yet.
+---
 
 ## crates.io
 
@@ -241,11 +588,12 @@ pwsh packaging/cargo-publish.ps1           # dry run
 pwsh packaging/cargo-publish.ps1 -Execute  # asks you to type PUBLISH
 ```
 
-**Ready.** `cargo publish --workspace --dry-run` completes for all 30
-publishable crates, in dependency order, with no errors — that was verified on
-2026-09-08. Two crates are excluded by their own manifests: `inillucent-compat`
-(the assurance harness) and `inillucent-bench` (which links PostgreSQL and
-pgvector to measure against them).
+**Ready.** `cargo publish --workspace --dry-run` completes for every publishable
+crate, in dependency order, with no errors. The crates excluded by their own
+manifests are the ones nobody should depend on: the assurance harness, the
+benchmark (which links PostgreSQL and pgvector to measure against them), the
+test oracle, the simulator and the two crates kept only for reading SQLite
+files.
 
 Getting there needed two fixes that are now in:
 
@@ -255,14 +603,15 @@ Getting there needed two fixes that are now in:
   **above the crate directory and therefore not in the tarball**, so the crate
   could not be published and nothing above it could either. The manifests are
   now vendored into `crates/inillucent-base/manifests/` as well, the workspace
-  copy still wins, and the build **fails if the two have drifted** — a vendored
+  copy still wins, and the build **fails if the two have drifted** - a vendored
   copy nothing checks is a copy that goes stale, and this one generates the
   engine's error table.
 
 **Missing**: a crates.io API token. `cargo login` needs a browser and a GitHub
 account; there is no way to mint one from a terminal.
 
-**Consequence**: this publishes the source of 30 crates under MIT, permanently.
+**Consequence**: this publishes the source of every published crate under MIT,
+permanently.
 
 ---
 
@@ -275,7 +624,7 @@ node packages/npm/build.mjs --publish
 
 **Ready.** `npm publish --dry-run` is clean, and the packages were built,
 packed, installed from their tarballs into a scratch project and driven end to
-end — the shim resolved the platform binary, ran it, passed the exit code back,
+end - the shim resolved the platform binary, ran it, passed the exit code back,
 and the Node API returned real rows.
 
 The shape is esbuild's: `inillucent` is a shim with four
@@ -283,73 +632,24 @@ The shape is esbuild's: `inillucent` is a shim with four
 only the one that runs on the machine. No postinstall, no download at install
 time, so `npm ci` works offline and behind a proxy.
 
-**Missing: Jason's npm password.** Not the token, and not the emailed code —
-those were both chased down and neither is the thing in the way. What was
-established, on 2026-09-08:
+**Missing: a token.** A **granular access token**, made from the account's
+Access Tokens page on npmjs.com, is what a machine should use: put it in
+`~/.npmrc` as `//registry.npmjs.org/:_authToken=...` and the publish needs no
+login at all. An interactive `npm login` works too and asks for a password and a
+second factor.
 
-- `~/.npmrc` holds an `npm_…` token and it is **dead**: a direct
-  `GET /-/whoami` against the registry with it answers **401**.
-- The account exists and is **`jasonmcaffee`**, registered to
-  **`jasonlmcaffee@gmail.com`** — which *is* the mailbox Nikaya indexes, so the
-  email route was available in principle.
-- `npm login --auth-type=legacy` prompts **Username → Password → OTP**, in that
-  order.
-- **The emailed OTP is the second factor, not a way past the first.** npm's own
-  mail says so: *"It looks like you are trying to log in to npm using your
-  username and password. As an **additional** security measure you are requested
-  to enter the OTP code."* npm only sends that mail **after** the password is
-  accepted — so without the password no code is ever sent, and there is nothing
-  to go and read.
-- The Nikaya corpus was 10 days stale, so it was **synced** (`nikaya-server
-  sync`: 269 messages fetched, `lastIncrementalAt` moved from `2026-08-29T04:00Z`
-  to `2026-09-08T22:24Z`) and searched again. No npm mail from today, for the
-  reason above. The mail route itself works — the corpus holds mail through
-  2026-09-05 — it just has nothing to deliver here.
-- The **web** flow (`npm login`, the default) was the one path that could have
-  skipped the password by reusing a signed-in browser session. It cannot:
-  **neither the Chrome nor the Edge profile on this machine holds a single
-  npmjs.com cookie**, so that flow lands on a fresh sign-in page.
+**The signup page cannot be driven programmatically.** `/signup` answers HTTP
+403 to every client - to `curl` with its default user agent and to `curl` with a
+Chrome user agent alike, while `registry.npmjs.org` answers normally in the same
+second - and serves a DataDome challenge instead of a form. Creating the account
+is a browser and a person; there is no automation route past it and none is
+worth looking for.
 
-So it is one command once you supply the password:
-
-```sh
-npm login --auth-type=legacy     # username jasonmcaffee, your password, then the
-                                 # code npm emails to jasonlmcaffee@gmail.com
-node packages/npm/build.mjs --publish
-```
-
-**A second npm account does not get round this.** This was asked for on
-2026-09-10 - reuse the Black Rainbow Labs identity from task-1898 for the
-registries - and it does not help, for two reasons worth writing down so nobody
-tries it again:
-
-- **npm will not take the address.** `jasonlmcaffee@gmail.com` already belongs to
-  `jasonmcaffee`, and npm allows one account per verified address.
-- **The Black Rainbow Labs address is being deleted.**
-  `the.black.rainbow.labs@gmail.com` was flagged by Google during task-1898 and
-  has no recovery phone and no recovery email, so there is nothing to appeal
-  with. An npm account registered to it would lose its recovery address, and
-  reading a verification code out of it means putting a browser back on a Google
-  login page - which is what caused the flag, and what `~/.claude/CLAUDE.md` now
-  forbids.
-
-For a Black Rainbow Labs identity on the registries the mailbox has to come
-first, and it must not be a Google account that an automation signs into. All
-three domains - `inillucent.com`, `blackrainbowlabs.com`, `jasonmcaffee.com` -
-are on Cloudflare and **none has an MX record today**. Cloudflare Email Routing
-is free and takes a few minutes: point `npm@inillucent.com` at whichever inbox
-is already read. After that a signup needs no Google login at all.
-
-
-A **granular access token** made at <https://www.npmjs.com/settings/jasonmcaffee/tokens>
-works just as well and is better for a machine: put it in `~/.npmrc` as
-`//registry.npmjs.org/:_authToken=…` and the publish needs no login at all.
-
-**Note**: only `@inillucent/cli-win32-x64` can be built here. The other three
-platform packages need their archives from step 0. Publishing the wrapper
-without them is fine — npm treats a missing `optionalDependency` as a platform
-the package does not serve — but the wrapper should go **last**, because it pins
-them at an exact version.
+**Note**: only `@inillucent/cli-win32-x64` can be built on a Windows box. The
+other three platform packages need their archives from step 0. Publishing the
+wrapper without them is fine - npm treats a missing `optionalDependency` as a
+platform the package does not serve - but the wrapper should go **last**,
+because it pins them at an exact version.
 
 ---
 
@@ -367,21 +667,18 @@ returned rows. It carries the four binaries, the shared library, the header and
 the reference driver binding, so `pip install inillucent` gets a command *and*
 an in-process driver with no compiler.
 
-**Missing: a PyPI account, and it is deliberately not created.** There is no
-account and no `~/.pypirc` on this machine. Creating one means choosing a
-password *and* binding a second factor — PyPI has required 2FA for uploading
-since January 2024, and an API token cannot be minted without it. Both of those
-credentials would then be held by whoever created the account rather than by
-Jason, which is worse than not having the package published: it is an account in
-his name that he cannot get into.
+**Missing: an account, and it is deliberately not created here.** Creating one
+means choosing a password *and* binding a second factor - PyPI has required 2FA
+for uploading since January 2024, and an API token cannot be minted without it.
+Both of those credentials would then be held by whoever created the account
+rather than by the maintainer, which is worse than not having the package
+published: it is an account in somebody's name that they cannot get into.
 
-So this one stops here on purpose. Sign up, enable 2FA on your own authenticator,
-mint an API token, and then:
+The registration form carries a required `h-captcha-response` field and an
+hCaptcha challenge, so it is a browser and a person as well.
 
-```sh
-python -m pip install build twine
-python packages/python/build.py --publish
-```
+So this one stops here on purpose. Register, enable 2FA on your own
+authenticator, mint an API token, and then run the two commands above.
 
 **Note**: PyPI refuses a plain `linux_x86_64` wheel; the Linux one has to be
 built in a `manylinux` container. `build.py` says so rather than uploading
@@ -392,21 +689,20 @@ something that will be rejected after the fact.
 ## Homebrew
 
 ```sh
-# once: create the repository Black-Rainbow-Labs/homebrew-inillucent on GitHub
+# once: create the tap repository Black-Rainbow-Labs/homebrew-inillucent on GitHub
 ./packaging/homebrew/update.sh --tap ../homebrew-inillucent
 # then, in the tap:
-git add Formula/inillucent.rb && git commit -m "inillucent 0.1.0" && git push
+git add Formula/inillucent.rb && git commit -m "inillucent 0.1.2" && git push
 ```
 
 `brew install black-rainbow-labs/inillucent/inillucent` after that.
 
 **Ready**, except that `update.sh` fills the formula's checksums from
-`dist/SHA256SUMS` and **refuses to finish while an archive is missing** — so it
+`dist/SHA256SUMS` and **refuses to finish while an archive is missing** - so it
 needs step 0's macOS and Linux archives first. It says which are missing rather
 than leaving a placeholder in a file somebody would push.
 
-**Missing**: the tap repository, the two macOS archives and the Linux one, and a
-public `Black-Rainbow-Labs/Inillucent` for the formula's URLs to resolve.
+**Missing**: the tap repository, the two macOS archives and the Linux one.
 
 **Not verified here**: Homebrew does not run on Windows, so the formula has been
 written and reviewed but not executed. `brew audit --strict --new inillucent`
@@ -416,18 +712,51 @@ database, writes to it, reads it back and asks the MCP server for its tool list.
 
 ---
 
-## Go - published
+## Go - tagged, and not installable
 
 ```sh
-git tag packages/go/v0.1.2 && git push brl packages/go/v0.1.2
+git tag packages/go/v0.1.2 && git push origin packages/go/v0.1.2
 ```
 
-That is the whole publish. Three tags are pushed: `packages/go/v0.1.0`,
-`packages/go/v0.1.1` and `packages/go/v0.1.2`, and `@latest` resolves to the last
-of them. Go has no registry and no account: `go install` reads
-the repository directly, and a tag is the release. The tag carries the
-`packages/go/` prefix because the module is in a subdirectory, which is Go's own
-rule for a nested module.
+That is the whole publish, and all three tags are pushed: `packages/go/v0.1.0`,
+`packages/go/v0.1.1` and `packages/go/v0.1.2`. Go has no registry and no account:
+`go install` reads the repository directly, and a tag is the release. The tag
+carries the `packages/go/` prefix because the module is in a subdirectory, which
+is Go's own rule for a nested module.
+
+### The Go route, verified through the module proxy
+
+**It was not installable by anybody until task-1961 made the repository
+public.** `go install` does not clone the repository itself; it asks
+`proxy.golang.org`, and the proxy clones on its behalf with no credential. While
+the repository was private that read:
+
+```
+GET https://proxy.golang.org/github.com/!black-!rainbow-!labs/!inillucent/packages/go/@latest
+404  not found: module github.com/Black-Rainbow-Labs/Inillucent/packages/go:
+     git ls-remote ... exit status 128: fatal: could not read Username
+```
+
+Re-checked on 2026-09-14 with no credential of any kind, by
+`node tools/check-public-urls.mjs`, which `tools/validate` runs:
+
+| URL | anonymous |
+|---|---|
+| `proxy.golang.org/github.com/!black-!rainbow-!labs/!inillucent/packages/go/@latest` | **200** |
+| `proxy.golang.org/github.com/!black-!rainbow-!labs/!inillucent/packages/go/@v/list` | **200** |
+
+The proxy is the thing `go install` asks, and it answers as a signed-out caller,
+which is the whole of what being private broke. **`go install` itself was not
+re-run**, and the reason is worth writing down rather than leaving as an
+implication: the Go toolchain is not installed on this machine, and the earlier
+run that made the route look published was taken here, where git holds a
+credential - which is exactly the reading that was wrong the first time. The
+proxy answering a caller with no credential is the stronger evidence of the two,
+because it is the caller a user actually is.
+
+What is still unverified, and what would verify it: one `go install` from a
+machine or container with the Go toolchain and no git credential. It needs no
+account and no token.
 
 ```sh
 go install github.com/Black-Rainbow-Labs/Inillucent/packages/go/cmd/inillucent-install@v0.1.2
@@ -445,12 +774,12 @@ go: ...cmd/inillucent-install@packages/go/v0.1.0: invalid version:
 Every document in this repository said `@packages/go/v0.1.0` until it was run.
 `@v0.1.1` is what works, and `@latest` resolves to the newest prefixed tag.
 
-**Verified**, on this machine, with Go 1.25.1: `go build ./...` and `go vet
-./...` clean, `go test ./...` passing, `go install` resolving the published tag,
-and the installed `inillucent-install` downloading the release from
-inillucent.com, checking its SHA-256, writing all four programs, and those
-programs then creating a database, running a statement, returning a row and
-answering an MCP `initialize` handshake.
+**Verified on this machine**, with Go 1.25.1: `go build ./...` and `go vet ./...`
+clean, `go test ./...` passing, `go install` resolving the published tag, and the
+installed `inillucent-install` downloading the release from inillucent.com,
+checking its SHA-256, writing all four programs, and those programs then
+creating a database, running a statement, returning a row and answering an MCP
+`initialize` handshake.
 
 ### The two defects publishing it found
 
@@ -468,20 +797,6 @@ answering an MCP `initialize` handshake.
 Neither was reachable without installing it the way a stranger would. `go build`
 and `go test` were both clean the whole time.
 
-**The one thing still missing** is not a credential: the repository is private.
-`go install` through the public proxy fails at the checksum database, which
-cannot read a private repository:
-
-```
-verifying module: ... reading https://sum.golang.org/lookup/...: 404 Not Found
-    not found: ... invalid version: git ls-remote ... exit status 128:
-    fatal: could not read Username for 'https://github.com'
-```
-
-A collaborator installs it today by setting `GOPRIVATE=github.com/Black-Rainbow-Labs/*`,
-which is the normal way to consume a private Go module and is verified working.
-Making the repository public is the same decision crates.io waits on.
-
 ---
 
 ## Packagist (Composer)
@@ -489,6 +804,10 @@ Making the repository public is the same decision crates.io waits on.
 Submit `https://github.com/Black-Rainbow-Labs/Inillucent` at
 <https://packagist.org/packages/submit>, then add the GitHub webhook Packagist
 offers so a tag updates the package.
+
+**This needs the repository to be public**, which it is as of task-1961.
+Packagist reads the repository to find `composer.json` and to list the tags, and
+a private one answered 404 to it exactly as it did to everybody else.
 
 `composer.json` is at the **repository root**, because Packagist reads a
 repository rather than a subdirectory; it autoloads `Inillucent\` from
@@ -500,56 +819,24 @@ a bound query, a hostile value round-tripping through binding unchanged,
 `describe`, a `not_found` status raised as a typed exception, and a read-only
 handle refusing a write while still answering a read.
 
-**Missing**: a Packagist account (GitHub OAuth), and a public repository.
+**Missing**: a Packagist account, through GitHub OAuth, and a public
+repository.
 
 ---
 
-## Both signups are behind a CAPTCHA, measured 2026-09-10
-
-Creating the accounts with browser automation was tried, with Playwright driving
-real Chrome. It does not work, and the reason is the same on both: the signup is
-guarded, and `~/.claude/CLAUDE.md` says never to click a CAPTCHA control from
-automation - report what it asked for and stop.
-
-| | what the signup page did |
-|---|---|
-| **npm** `/signup` | **HTTP 403**, no form rendered at all, and a DataDome challenge iframe from `geo.captcha-delivery.com` served instead |
-| **PyPI** `/account/register/` | HTTP 200, but the form carries a required `h-captcha-response` field and an hCaptcha challenge iframe |
-
-npm's 403 is not this network and not this machine. The same URL answers 403 to
-`curl` with its default user agent and to `curl` with a Chrome user agent, while
-`registry.npmjs.org` answers normally in the same second. It is the signup page
-refusing every programmatic client, so no different automation approach gets past
-it.
-
-PyPI has a second wall behind the first: two factor authentication is required
-before an upload, so even a solved CAPTCHA leaves an account whose second factor
-has to live on somebody's authenticator.
-
-**What this means in practice.** One minute of a person's time unblocks both, and
-nothing else does:
-
-- **npm** - either sign in and make a granular token at
-  <https://www.npmjs.com/settings/jasonmcaffee/tokens>, or create the Black
-  Rainbow Labs account through the website and make a token on that. Paste it
-  into `~/.npmrc` as `//registry.npmjs.org/:_authToken=…` and the five packages
-  publish in one command.
-- **PyPI** - register, enable 2FA on your own authenticator, mint an API token.
-
-Email was not the blocker either, so it is not worth chasing again: the account
-would have needed a mailbox, and the one Nikaya indexes was reachable, but the
-signup never got far enough to send anything.
-
-
 ## The order, and why it is the order
 
-1. **The GitHub release**, because the npm platform packages, the Homebrew
-   formula, the Go installer and the PHP installer all fetch from it. Publishing
-   any of them first publishes a package that cannot install.
-2. **crates.io**, which is self-contained and is also the fallback every other
+1. **The archives on inillucent.com**, because the npm platform packages, the
+   Homebrew formula, the Go installer and the PHP installer all fetch from
+   there. Publishing any of them first publishes a package that cannot install.
+   This used to say "the GitHub release", and it was true when the installers
+   downloaded from GitHub; they download from `inillucent.com` now.
+2. **The public mirror**, because Go and Packagist need the repository to be
+   readable and because the links every other package prints point at it.
+3. **crates.io**, which is self-contained and is also the fallback every other
    route names when a platform has no prebuilt archive.
-3. **npm and PyPI**, in either order.
-4. **Homebrew and Packagist**, which are one commit and one form.
+4. **npm and PyPI**, in either order.
+5. **Homebrew and Packagist**, which are one commit and one form.
 
 ---
 
@@ -557,6 +844,6 @@ signup never got far enough to send anything.
 
 Every registry above requires an interactive login: a browser, an OAuth
 redirect, and in PyPI's case a mandatory second factor. That is deliberate on
-their part — it is what stops somebody else publishing under your name — and it
+their part - it is what stops somebody else publishing under your name - and it
 means the last step of each route belongs to a person at a keyboard, not to a
 script. Everything up to it is a command in this directory.

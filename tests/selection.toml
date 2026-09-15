@@ -349,6 +349,15 @@ name = "analyze_reopen"
 tier = "engine"
 covers = ["inillucent-engine"]
 
+# The half `analyze_reopen` cannot ask, because every case in it reopens first:
+# that the connection which ran `ANALYZE` reads the statistics it wrote.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "analyze_same_session"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-catalog", "inillucent-sql"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"
@@ -376,6 +385,13 @@ kind = "test"
 name = "functions"
 tier = "engine"
 covers = ["inillucent-engine", "inillucent-ext"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "reentrant_connection"
+tier = "engine"
+covers = ["inillucent-engine"]
 
 [[target]]
 package = "inillucent-compat"
@@ -682,10 +698,81 @@ kind = "test"
 name = "write_campaign"
 tier = "engine"
 
+# The one datum-to-value conversion, both directions, on bytes that are not
+# valid UTF-8 - the case the five hand-written copies disagreed about.
+[[target]]
+package = "inillucent-tree"
+kind = "test"
+name = "value_round_trip"
+tier = "unit"
+
+# The stable-toolchain twins of the eight codec fuzz targets (task-1961, T5).
+# `docs/repository.md` said every codec was exercised with hundreds of thousands
+# of seeded inputs; before these four files that was true of `json`, `mysql`,
+# `postgres` and `store`, and of none of the eight codecs the sentence is about.
+# In the unit tier: no file is opened and each sweep is under a second.
+[[target]]
+package = "inillucent-base"
+kind = "test"
+name = "fuzz_seeded"
+tier = "unit"
+
+[[target]]
+package = "inillucent-tree"
+kind = "test"
+name = "fuzz_seeded"
+tier = "unit"
+
+[[target]]
+package = "inillucent-pool"
+kind = "test"
+name = "fuzz_seeded"
+tier = "unit"
+
+[[target]]
+package = "inillucent-wal"
+kind = "test"
+name = "fuzz_seeded"
+tier = "unit"
+
 [[target]]
 package = "inillucent-vfs"
 kind = "test"
 name = "conformance"
+tier = "engine"
+
+# The two platform halves of the lock protocol. Each is behind a `#![cfg]` for
+# its own platform, so the other compiles to an empty binary and runs nothing -
+# which is correct rather than hollow: there is no lock protocol to test for a
+# platform this build does not target (task-1962, T4).
+# One database, several threads, one statement at a time (task-1962, roadmap
+# item 4). It spawns eight worker threads, so it is an engine-tier suite rather
+# than a unit one.
+[[target]]
+package = "inillucent-driver"
+kind = "test"
+name = "threads"
+tier = "engine"
+
+# A page the log carries whole, torn and read by a record that is not the one
+# that would have fixed it; and a page the log carries nothing for, which is
+# refused by name (task-1962, roadmap item 6).
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "torn_page_with_image"
+tier = "engine"
+
+[[target]]
+package = "inillucent-vfs"
+kind = "test"
+name = "windows_locks"
+tier = "engine"
+
+[[target]]
+package = "inillucent-vfs"
+kind = "test"
+name = "unix_locks"
 tier = "engine"
 
 # --- differential: graded against the pinned SQLite 3.53.4
@@ -865,6 +952,15 @@ tier = "differential"
 covers = ["inillucent-engine"]
 requires = ["oracle"]
 
+# One trigger depth constant, read from the connection's `Limit::TriggerDepth`.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "trigger_depth"
+tier = "differential"
+covers = ["inillucent-engine", "inillucent-sql", "inillucent-exec"]
+requires = ["oracle"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"
@@ -882,6 +978,14 @@ covers = ["inillucent-search", "inillucent-engine"]
 requires = ["oracle"]
 
 ["inillucent-engine", "inillucent-sql"]
+requires = ["oracle"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "result_names_and_codes"
+tier = "differential"
+covers = ["inillucent-engine", "inillucent-sql"]
 requires = ["oracle"]
 
 [[target]]
@@ -1025,6 +1129,14 @@ name = "reindex_crash"
 tier = "durability"
 covers = ["inillucent-engine", "inillucent-tree", "inillucent-txn"]
 
+# A statement never moves the connection onto a different file system.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "vacuum_on_vfs"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-vfs"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"
@@ -1080,6 +1192,15 @@ kind = "test"
 name = "wal_crash"
 tier = "durability"
 covers = ["inillucent-engine", "inillucent-wal"]
+
+# The ordering `journal.rs` states as its whole invariant: a page's old image is
+# on disk and synced before its new image is written.
+[[target]]
+package = "inillucent-pool"
+kind = "test"
+name = "journal_ordering"
+tier = "engine"
+covers = ["inillucent-pool"]
 
 [[target]]
 package = "inillucent-pool"
@@ -1213,6 +1334,9 @@ package = "inillucent-core"
 kind = "lib"
 tier = "retrieval"
 requires = ["onnx"]
+# 27 of this crate's tests are behind `onnx`, which the default build does
+# not turn on - so they were in the source and in no binary (task-1913).
+features = ["inillucent-core/onnx"]
 
 [[target]]
 package = "inillucent-model"
@@ -1236,6 +1360,9 @@ tier = "retrieval"
 package = "inillucent-search"
 kind = "lib"
 tier = "retrieval"
+# 3 of this crate's tests are behind `embed`, which the default build does
+# not turn on - so they were in the source and in no binary (task-1913).
+features = ["inillucent-search/embed"]
 
 # --- tooling: the checks that keep the repository's own rules true
 
@@ -1260,6 +1387,16 @@ covers = ["inillucent-alloc"]
 
 # The one command table against the two surfaces it generates. Also arrived with
 # the command surface without a row.
+# The gate programs refuse when their prerequisite is absent, and measure when
+# it is not. In the tooling tier because it drives the built gate binaries
+# rather than the engine, and because one case per gate takes a real, if small,
+# measurement.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "gates_fail_closed"
+tier = "tooling"
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"

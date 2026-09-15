@@ -15,7 +15,7 @@
 use std::io::Write;
 
 use inillucent_engine::connect::{Connection, Database};
-use inillucent_tree::datum::OwnedDatum;
+use inillucent_tree::datum::{owned_row_values, OwnedDatum};
 use inillucent_value::Value;
 
 use crate::render::{render, Layout, Mode};
@@ -249,20 +249,20 @@ impl Shell {
         // function over the file system belongs to a program that asked for
         // one; the reference draws the same line, with `fsdir` in `shell.c`.
         for module in [
-            std::sync::Arc::new(inillucent_engine::ext::vtab::fsdir::FsDirModule)
-                as std::sync::Arc<dyn inillucent_engine::ext::vtab::Module>,
-            std::sync::Arc::new(inillucent_engine::ext::vtab::zipfile::ZipFileModule),
+            std::sync::Arc::new(inillucent_driver::vtab::fsdir::FsDirModule)
+                as std::sync::Arc<dyn inillucent_driver::vtab::Module>,
+            std::sync::Arc::new(inillucent_driver::vtab::zipfile::ZipFileModule),
         ] {
             database
                 .register_module(module)
                 .map_err(|error| error.message().to_string())?;
         }
-        let session = database.connect().session();
+        let session = database.session().session();
         // **The reference's shell turns this on and this one has to as well.**
         // It is a connection flag rather than a shell one, so setting the field
         // below is not enough: the engine has to be told, or
         // `PRAGMA journal_mode = OFF` is honoured here and refused there.
-        database.connect_as(session).set_defensive(true);
+        let _ = database.session_as(session).set_defensive(true);
         Ok(Opened {
             database,
             session,
@@ -326,7 +326,22 @@ impl Shell {
     /// there for the next one.
     pub fn connection(&self) -> Connection<'_> {
         let held = self.open_slot();
-        held.database.connect_as(held.session)
+        held.database.session_as(held.session)
+    }
+
+    /// Returns what one run-time limit is set to on the open database.
+    ///
+    /// @param limit - which limit
+    pub fn limit(&self, limit: inillucent_base::limits::Limit) -> i64 {
+        self.open_slot().database.limit(limit)
+    }
+
+    /// Sets one run-time limit on the open database, returning its old value.
+    ///
+    /// @param limit - which limit
+    /// @param requested - the value asked for
+    pub fn set_limit(&mut self, limit: inillucent_base::limits::Limit, requested: i64) -> i64 {
+        self.open_slot().database.set_limit(limit, requested)
     }
 
     /// Returns whether a boolean pragma reads on.
@@ -352,12 +367,12 @@ impl Shell {
     ///
     /// @param on - whether the decisions are watched
     pub fn set_authorizer(&mut self, on: bool) {
-        let installed: Option<std::rc::Rc<dyn inillucent_engine::Authorizer>> = on.then(|| {
+        let installed: Option<std::rc::Rc<dyn inillucent_driver::Authorizer>> = on.then(|| {
             std::rc::Rc::new(crate::commands::Watching {
                 seen: std::rc::Rc::clone(&self.authorized),
-            }) as std::rc::Rc<dyn inillucent_engine::Authorizer>
+            }) as std::rc::Rc<dyn inillucent_driver::Authorizer>
         });
-        self.connection().set_authorizer(installed);
+        let _ = self.connection().set_authorizer(installed);
     }
 
     /// Prints and clears whatever the authorizer recorded.
@@ -372,12 +387,12 @@ impl Shell {
     ///
     /// @param on - whether the flag is in force
     pub fn set_defensive(&mut self, on: bool) -> bool {
-        self.connection().set_defensive(on);
+        let _ = self.connection().set_defensive(on);
         true
     }
 
     /// Returns what the page cache has been asked to do.
-    pub fn cache_stats(&self) -> inillucent_engine::connect::CacheStats {
+    pub fn cache_stats(&self) -> inillucent_driver::CacheStats {
         self.open_slot().database.cache_stats()
     }
 
@@ -593,8 +608,8 @@ impl Shell {
         // Armed for this statement and dropped after it, so a Ctrl+C that
         // arrives between two statements belongs to the one that finished and
         // is cleared rather than applied to the one that has not started.
-        let armed = inillucent_engine::base::budget::arm(
-            inillucent_engine::base::budget::Limits::unbounded(),
+        let armed = inillucent_driver::arm(
+            inillucent_driver::StatementLimits::unbounded(),
             std::sync::Arc::clone(&self.cancel),
         );
         let outcome = self.collect(sql);
@@ -642,10 +657,10 @@ impl Shell {
                     self.say(&line);
                 }
                 if self.show_changes {
-                    let changes = self.connection().changes();
+                    let changes = self.connection().changes().unwrap_or_default();
                     // The reference prints both counters, aligned with three
                     // spaces between them.
-                    let total = self.connection().total_changes();
+                    let total = self.connection().total_changes().unwrap_or_default();
                     self.say(&format!("changes: {changes}   total_changes: {total}"));
                 }
             }
@@ -743,7 +758,7 @@ impl Shell {
                 let Some(value) = self.parameters.get(&key) else {
                     continue;
                 };
-                let _ = statement.bind(index, crate::shell::datum_of(value));
+                let _ = statement.bind(index, OwnedDatum::from(value));
             }
         }
         let mut rows = Vec::new();
@@ -758,7 +773,17 @@ impl Shell {
                     })
                 }
                 Ok(false) => break,
-                Ok(true) => rows.push(statement.row().iter().map(value_of).collect()),
+                Ok(true) => match owned_row_values(statement.row()) {
+                    Ok(row) => rows.push(row),
+                    Err(error) => {
+                        return Err(Failure {
+                            message: reason(&error),
+                            offset: None,
+                            compiling: false,
+                            error: Some(error),
+                        })
+                    }
+                },
             }
         }
         // Read *after* stepping. The engine's statement materialises on its
@@ -796,11 +821,9 @@ impl Shell {
     /// @param sql - the text a caller passed as one statement
     pub fn trailing_statement(&self, sql: &str) -> Option<String> {
         let connection = self.connection();
-        let (_, consumed) = connection.prepare_with_tail(sql).ok()?;
+        let consumed = connection.prepare_with_tail(sql).ok()?.consumed;
         let left = sql.get(consumed..)?;
-        let rest = left
-            .get(inillucent_engine::connect::leading_trivia(left)..)?
-            .trim();
+        let rest = left.get(inillucent_driver::leading_trivia(left)..)?.trim();
         if rest.is_empty() {
             return None;
         }
@@ -1092,41 +1115,6 @@ pub fn mode_named(name: &str) -> Result<Mode, String> {
 
 /// Every mode name, for the message above and for `.help`.
 pub const MODE_NAMES: &str = "box column csv html insert json line list markdown quote table tabs";
-
-/// Returns a datum as the value the renderer formats.
-///
-/// The engine's rows are `OwnedDatum` and everything that prints one takes
-/// `Value`, which is `inillucent-value`'s type and the one the affinity and
-/// collation rules are written against. Converting here rather than rewriting
-/// `render.rs` keeps the formatting - `.mode`, `.nullvalue`, the width
-/// calculation - exactly as it was, which is what a caller of this shell would
-/// notice if it changed.
-///
-/// @param datum - one value out of a row
-fn value_of(datum: &OwnedDatum) -> Value<'static> {
-    match datum {
-        OwnedDatum::Null => Value::Null,
-        OwnedDatum::Int(number) => Value::Integer(*number),
-        OwnedDatum::Real(number) => Value::Real(*number),
-        OwnedDatum::Text(bytes) => Value::owned_text(bytes).unwrap_or(Value::Null),
-        OwnedDatum::Blob(bytes) => Value::owned_blob(bytes).unwrap_or(Value::Null),
-    }
-}
-
-/// Returns one value as the datum a bind takes.
-///
-/// The reverse of [`value_of`], and the shell's own half of `.parameter`.
-///
-/// @param value - the value the shell is holding
-pub fn datum_of(value: &Value<'static>) -> OwnedDatum {
-    match value {
-        Value::Null => OwnedDatum::Null,
-        Value::Integer(number) => OwnedDatum::Int(*number),
-        Value::Real(number) => OwnedDatum::Real(*number),
-        Value::Text(text) => OwnedDatum::Text(text.raw().to_vec()),
-        Value::Blob(blob) => OwnedDatum::Blob(blob.raw().to_vec()),
-    }
-}
 
 /// Reports whether a statement is an `EXPLAIN QUERY PLAN`.
 ///

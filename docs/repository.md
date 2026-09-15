@@ -41,22 +41,32 @@ them out of `vcvars64.bat` once and export them into the shell before `cargo bui
 
 | group | crates | non test lines |
 |---|---|---|
-| shared foundation | `inillucent-base`, `inillucent-vfs`, `inillucent-value`, `inillucent-sim` | 15,431 |
+| shared foundation | `inillucent-base`, `inillucent-vfs`, `inillucent-value`, `inillucent-alloc` (the counting allocator the memory bar is measured through), `inillucent-sim` | 15,431 |
 | shared SQL front end | `inillucent-sql` (lexer, parser, binder, planner), `inillucent-scalar` (functions, JSON, window frames), `inillucent-catalog`, `inillucent-ext` (registry, virtual table contract, FTS5, R-Tree) | 37,400 |
 | the engine | `inillucent-pool`, `inillucent-wal`, `inillucent-tree`, `inillucent-txn`, `inillucent-exec`, `inillucent-engine`, `inillucent-model` (a test oracle), `inillucent-sqlite-reader` (import only) | 54,341 |
 | kept for reading SQLite files | `inillucent-storage`, `inillucent-transaction` — the old engine's pager and transaction manager, kept because `inillucent-sqlite-reader` reads a SQLite file through them and migrating away from SQLite is what that reader is for | 18,764 |
 | retrieval | `inillucent-core` (the engine), `inillucent-search` (the virtual table), `inillucent-bench` (the grading harness) | 29,825 |
 | facade and tooling | `inillucent` (a re-export of the engine), `inillucent-compat` (the manifest, the oracle, the gates, 77 test files), `inillucent-cli`, `inillucent-migrate`, `inillucent-remote` | 32,031 |
 
-`inillucent-engine::connect::Database` is the entry point: `open` creates or opens and recovers,
-`import` reads a SQLite file, and `connect` gives a connection with `execute_batch`, `query`,
-`prepare_with_tail` and `explain`. `inillucent::Database` is a re-export of it — the two surfaces do
-not differ, so there is no wrapper.
+**`inillucent-driver` is the public Rust API, and `inillucent` is a name for it.** `cargo add
+inillucent` gives `pub use inillucent_driver::*;` and nothing else: `Database::open`,
+`Database::session`, `Connection::query`, `Connection::prepare`, `Connection::begin` and the
+`Transaction` that rolls back when it is dropped. There were two public surfaces over one engine
+until task-1962, with different `Value`, `Error` and `Statement` types and nothing saying which to
+depend on; the driver won because it has the transaction, the `Rows` type, the cancel flag and the
+capability table checked in both directions, and because the C ABI and the four language packages
+already reach the engine through it.
+
+`inillucent-engine::connect::Database` is what the driver is built on and what `inillucent-cli`
+drives directly: `open` creates or opens and recovers, `import` reads a SQLite file, and `session`
+gives a connection with `execute_batch`, `query`, `prepare_with_tail`, `explain` and `begin`. It is
+called `session` rather than `connect` because two of them share one transaction, which `connect`
+reads as denying.
 
 The old engine was the one that reached SQLite file format parity: 264 of 271 capabilities passed,
 with seven optional ones missing. It was measured between 30% and 95% slower than SQLite across the
 families, which is why the current engine was written, and it has now been deleted -
-[Roadmap](roadmap.md#7-the-old-engine-is-deleted) records what its four crates were and what still
+[Closed items](closed-items.md#the-old-engine-is-deleted) records what its four crates were and what still
 reads a SQLite file in their place.
 
 ## The other directories
@@ -95,16 +105,28 @@ mistaken for a green run.
 If you do use `cargo test --workspace`, pass `--no-fail-fast`. Without it the run stops at the first
 failing binary, and has reported about a quarter of the suite.
 
-**No test fails today.** `inillucent-testrun --strict` on a quiet box reports 149 targets, 2,646
-tests, 0 failed and 0 undetermined in 301 seconds. It still prints `not ok`, because `live_postgres`
-and `live_mysql` evidenced nothing and neither server is configured on this machine — which is the
-condition `--strict` exists to report. This page used to say seventeen tests failed; task-1869 had
+**No test fails today.** `inillucent-testrun --strict` reports 170 targets, 2,819 tests, 0 failed
+and 0 undetermined. The counts are exact. The wall clock was 840 seconds on a 24 processor desktop
+that was carrying other work while it ran, so read it as one run on one machine rather than as a
+figure to plan against. It still prints `not ok`, because five suites
+evidenced nothing: `inillucent-remote::live_postgres` and `inillucent-remote::live_mysql` have no
+server configured on this machine, `inillucent-remote::lib` runs only when
+`INILLUCENT_NETWORK_TESTS` is set, because it opens sockets, and `inillucent-core::lib` and
+`inillucent-bench` hold twenty-nine cases that need the embedding weights, which
+`inillucent setup-embeddings all` installs. That is the condition `--strict` exists
+to report, and `tools/doc-facts/check.mjs` accepts those four prerequisites and no others.
+
+The last two joined the list in task-1913 and are not a new absence. Those twenty-nine cases sit
+behind the `onnx` cargo feature, which the runner did not turn on, so they were in no binary at all
+and nothing reported them - the source read as coverage while no run had ever started them.
+`tests/selection.toml` now names the features a target is built with, so they are built, they run,
+and the ones that need the weights say so. This page used to say seventeen tests failed; task-1869 had
 already removed the cause and nobody re-ran it, which is recorded in
-[the roadmap](roadmap.md#what-task-1911-closed).
+[Closed items](closed-items.md#what-task-1911-closed).
 
 ## What the tests cover
 
-2,646 tests across 149 test targets in the workspace, in these classes:
+2,819 tests across 170 test targets in the workspace, in these classes:
 
 - **A differential harness** that runs the same SQL through the pinned SQLite 3.53.4 and compares
   transcripts. 208 of those cases are `semantics.rs`, and 416 are the wider feature probe.
@@ -118,8 +140,14 @@ already removed the cause and nobody re-ran it, which is recorded in
   recorded schedule must replay an identical trace event for event.
 - **Crash campaigns**, in which a crash on either side of a checkpoint or a log retirement has to
   recover the same database.
-- **Eight fuzz targets** over the codecs. Every codec is also exercised with hundreds of thousands of
-  seeded random inputs and must return an error rather than panic on any of them.
+- **Eight fuzz targets** over the codecs, and a seeded twin of every one of them that runs under
+  `cargo test` on the pinned compiler. libFuzzer needs a nightly toolchain and a scheduled job, so a
+  regression only a fuzz run finds is a regression that ships; the twins are in
+  `crates/inillucent-base/tests/fuzz_seeded.rs`, `inillucent-tree`'s, `inillucent-pool`'s and
+  `inillucent-wal`'s, and each sweeps twenty thousand deterministic inputs through the decoder and
+  counts how many reached it, so a sweep that only ever exercised a refusal fails. The four
+  non-codec targets - `json`, `mysql`, `postgres`, `store` - have had theirs beside the code since
+  they were written.
 - **The locking protocol across two real processes**, not two handles in one, because advisory locks
   are per process and a same process test would pass against a broken implementation. A dead process
   must release its locks.
@@ -127,9 +155,66 @@ already removed the cause and nobody re-ran it, which is recorded in
   simulator — so "the simulator behaves like a disk" is a checked claim rather than a hope.
 - **100% branch coverage** held on the page pool's interior, latch, meta, extent, free map and swip
   modules, and on the tree's key codec.
-- **26 of the 29 crates deny `unwrap`, `expect`, `panic` and slice indexing**, and 22 forbid
+- **28 of the 29 crates deny `unwrap`, `expect`, `panic` and slice indexing**, and 21 forbid
   `unsafe`, on every path that reads SQL text, database pages, log frames, network bytes or file
-  system results.
+  system results. The twenty-ninth is `inillucent-bench`, which has no library to put the attributes
+  in.
+
+### How much of it is covered
+
+Measured on 2026-09-15 at commit `37695de`, with `tools/validate.ps1 -Coverage`
+(`tools/validate.sh --coverage` on Unix), which runs every suite under
+`cargo llvm-cov` and prints this table. Region and line coverage, not branch:
+branch coverage needs `-Z coverage-options=branch`, a nightly option, and
+`rust-toolchain.toml` pins the compiler to stable for the reason written beside
+the pin.
+
+| crate | regions | region coverage | lines | line coverage |
+|---|---:|---:|---:|---:|
+| `inillucent-compat` | 32,460 | 40.9% | 19,717 | 42.7% |
+| `inillucent-exec` | 21,917 | 89.7% | 12,896 | 91.5% |
+| `inillucent-sql` | 20,966 | 86.0% | 12,937 | 88.0% |
+| `inillucent-engine` | 17,242 | 87.6% | 10,922 | 89.2% |
+| `inillucent-tree` | 16,992 | 92.0% | 8,465 | 93.8% |
+| `inillucent-storage` | 14,417 | 83.0% | 7,761 | 83.2% |
+| `inillucent-cli` | 13,087 | 47.9% | 7,731 | 49.5% |
+| `inillucent-scalar` | 11,724 | 84.8% | 6,441 | 84.9% |
+| `inillucent-ext` | 10,877 | 83.8% | 6,269 | 83.7% |
+| `inillucent-remote` | 8,145 | 80.8% | 4,609 | 78.5% |
+| `inillucent-pool` | 8,062 | 93.3% | 4,176 | 94.2% |
+| `inillucent-transaction` | 6,193 | 85.3% | 3,143 | 88.5% |
+| `inillucent-search` | 5,481 | 82.0% | 3,300 | 82.4% |
+| `inillucent-value` | 5,425 | 95.4% | 3,073 | 95.6% |
+| `inillucent-vfs` | 4,539 | 80.3% | 2,572 | 80.9% |
+| `inillucent-base` | 4,376 | 88.7% | 2,348 | 89.0% |
+| `inillucent-migrate` | 4,330 | 77.5% | 2,418 | 79.4% |
+| `inillucent-catalog` | 3,458 | 78.2% | 2,068 | 80.4% |
+| `inillucent-wal` | 2,650 | 93.7% | 1,683 | 96.7% |
+| `inillucent-txn` | 2,470 | 89.8% | 1,432 | 87.4% |
+| `inillucent-sim` | 2,146 | 95.2% | 1,317 | 95.7% |
+| `inillucent-driver` | 1,379 | 70.8% | 910 | 70.4% |
+| `inillucent-driver-capi` | 1,108 | 0.8% | 847 | 0.9% |
+| `inillucent-sqlite-reader` | 432 | 84.5% | 228 | 87.3% |
+| `inillucent-alloc` | 355 | 91.3% | 165 | 84.8% |
+| **total** | **220,231** | **77.2%** | **127,428** | **77.8%** |
+
+Three rows need reading rather than ranking.
+
+`inillucent-driver-capi` reads 0.8%, and the C ABI is not untested: its
+conformance suite drives the symbols through a C program that links the built
+`cdylib`, which is a separate binary from the instrumented test executables this
+measurement merges. What the number says is that no Rust test calls those
+functions, which is true and is what a C ABI is for.
+
+`inillucent-compat` at 40.9% and `inillucent-cli` at 47.9% are the two crates
+that are mostly *programs*: eighteen gate and profiling binaries between them,
+each run by hand or by a scheduled job rather than by `cargo test`. The library
+halves of both are covered by the suites that use them.
+
+The three retrieval crates - `inillucent-core`, `inillucent-bench` and
+`inillucent-model` - are excluded from the run. They need ONNX Runtime and a
+corpus, and on a machine without either they contribute uninstrumented zeros
+rather than a number.
 
 ## The contracts a test enforces
 

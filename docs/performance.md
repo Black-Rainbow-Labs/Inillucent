@@ -42,7 +42,7 @@ it, expressed as the family's own ratio.
 | `large.values` | 4% | text and blobs across the boundary where a value stops fitting in a leaf | **1,167% faster** (12.67x) | 8.81x | 1.50x, met |
 | `read.analytical` | 10% | scans, aggregates, `GROUP BY`, `DISTINCT`, sorts | **567% faster** (6.67x) | 5.45x | 5.00x, met |
 | `read.range` | 12% | selective ranges, forward and reverse, covering and not | **402% faster** (5.02x) | 4.00x | 3.00x, met |
-| `read.join` | 8% | two table and four table joins | **332% faster** (4.32x) | 3.00x | 3.00x, and two of four runs came in under it |
+| `read.join` | 8% | two table and four table joins | **332% faster** (4.32x) | 3.00x | 3.00x, met on re-measurement - see below |
 | `transaction` | 10% | autocommit, small batches, large batches, savepoints | **152% faster** (2.52x) | 1.99x | no slower than SQLite, met |
 | `write` | 20% | insert, update, delete, upsert, with and without indexes | **108% faster** (2.08x) | 1.62x | 1.50x, met |
 | `open.prepare` | 8% | parse, bind, step one row, reset | **56% faster** (1.56x) | 1.17x | 5.00x, missed |
@@ -51,9 +51,30 @@ it, expressed as the family's own ratio.
 
 **No family is below the 1.00x floor on any of the four runs**, which is the release condition.
 
-**`read.join` has not cleared its bar.** The four lower bounds were 2.97x, 3.00x, 3.00x and 2.99x.
-Two runs missed the 3.00x requirement, so `read.join` stays in
-[the roadmap](roadmap.md#2-four-per-family-bars-are-missed) with the other three.
+**`read.join` has cleared its bar since, and the number in the table above is the older one.** The
+four lower bounds in the run that produced this table were 2.97x, 3.00x, 3.00x and 2.99x, which
+straddles the 3.00x requirement rather than meeting it. The statement chain reuse that landed in
+task-1911 had never been measured against the family. Re-measured 2026-09-15, four consecutive runs
+on the same box, 30 rounds each, `--scale medium --page-size 32768 --frames 4096`:
+
+| run | `read.join` | 95% low | bar |
+|---|---:|---:|---:|
+| 1 | 6.46x | **4.11x** | 3.00x |
+| 2 | 6.26x | **4.00x** | 3.00x |
+| 3 | 6.14x | **4.02x** | 3.00x |
+| 4 | 5.60x | **3.67x** | 3.00x |
+
+`join.selective` reads 35.49x and `join.range` 1.17x; the range join is still the slow half, and the
+family it is in is met. `read.join` is off [the roadmap](roadmap.md#1-extension-misses-its-bar-on-the-lower-bound);
+`extension` stays on it.
+
+**`extension` still misses, on four runs of its own**: 1.58x, 1.60x, 1.59x and 1.67x, with lower
+bounds of 1.40x, 1.39x, 1.39x and 1.45x against a 1.50x bar. `extension.fts.build` is the worst
+workload in every one of them, at 0.56x to 0.58x, and it is what holds the bound down - the rest of
+the family is well clear, with `extension.fts.query` at **1.70x to 1.85x** and a mean of 1.77x, up from the 1.43x a
+revert left it at. The gate's own per-round breakdown says where `fts.build`'s time goes: of 11.6 ms
+for 500 rows against SQLite's 6.5 ms, the content row is 2.7 ms, the dictionary flush 2.4 ms and the
+docsize row 2.0 ms - three quarters of it in three steps.
 
 **`transaction` fell from 3.41x, and the reason is `txn.autocommit`.** The other two workloads in
 that family did not move: `txn.batched` reads 3.79x and `txn.large` 4.05x. `txn.autocommit` is now
@@ -61,7 +82,7 @@ that family did not move: `txn.batched` reads 3.79x and `txn.large` 4.05x. `txn.
 do the sync a rollback journal is for. Autocommit checkpoints once per statement, so it pays that
 sync once per statement, and SQLite at `synchronous = FULL` pays the same one. The old number was
 faster than SQLite by skipping work SQLite does; four separate ways a crash could then lose a
-database are in [the roadmap](roadmap.md#what-task-1911-closed), and that is what the 2.36x bought.
+database are in [Closed items](closed-items.md#what-task-1911-closed), and that is what the 2.36x bought.
 `transaction` was under the contract's floor on all four runs before task-1890, which took it to
 3.41x; what that took, and the defect in the measurement it uncovered, is the section after next.
 
@@ -74,11 +95,35 @@ to 43%, `join.range` from 15% to 11%, `range.lookaside` from 14% to 8%.
 | workload | family | ratio | how much slower | why |
 |---|---|---|---|---|
 | `prepare.trivial` | `open.prepare` | 0.50x | **100% slower** | `SELECT 1` compiled on every call, in 25 allocations. Split by the profiler: 417 ns to parse, 520 more to bind, and the rest to build a pipeline |
-| `extension.fts.build` | `extension` | 0.59x | **69% slower** | three tree writes per document where SQLite writes about 1,000 rows and one segment blob. It was 178% slower; [roadmap item 6](roadmap.md#6-extensionftsbuild) has what closed half the gap and what did not |
-| `write.insert.batch` | `write` | 0.70x | **43% slower** | 2,000 inserts in one transaction; a split used to write four whole page images to the log and now writes three |
+| `extension.fts.build` | `extension` | 0.59x | **69% slower** | three tree writes per document where SQLite writes about 1,000 rows and one segment blob. It was 178% slower; [Closed items](closed-items.md#extensionftsbuild) has what closed half the gap and what did not |
+| `write.insert.batch` | `write` | 0.70x | **43% slower** | 2,000 inserts in one transaction. **58% of the log it writes is split records**, 963 KiB of 1,664 KiB, at 24,656 bytes each - three whole 8 KiB page images for one row that would not fit. Measured below |
 | `join.range` | `read.join` | 0.90x | 11% slower | an index range and a row fetch per entry, where SQLite amortises one statement's overhead over two hundred rows and this does not |
 | `range.lookaside` | `read.range` | 0.93x | 8% slower | the same shape |
 | `extension.json` | `extension` | 0.96x | 4% slower | the extraction itself, plus two uncontended mutex acquisitions per call; the parse of a repeated document and path is already cached |
+
+### Where `write.insert.batch`'s time and log volume actually go
+
+Measured 2026-09-15 with `inillucent-writelogattrib` on the medium fixture: 2,000 inserts into
+`main_table`, which carries two secondary indexes, in one transaction - the gate's own shape. The
+log is read back from disk with the same decoder recovery uses, so the byte counts are exact rather
+than estimated.
+
+| record kind | records | bytes | share of the log |
+|---|---:|---:|---:|
+| `Structural` (a split) | 40 | 963.1 KiB | **58%** |
+| `InsertRow` | 6,000 | 687.5 KiB | 41% |
+| `CompactLeaf` | 187 | 11.7 KiB | 0.7% |
+| `AllocPage`, `Commit` | 41 | 1.6 KiB | 0.1% |
+
+1,664 KiB of log for about 240 KiB of rows. A split record carries the left page, the right page and
+the parent, whole: 24,656 bytes at an 8 KiB page size, for one row that would not fit.
+
+**And the delta area is not where the time is.** `LeafRef::locate` walks each leaf's unsorted delta
+area on every insert, which `docs/roadmap.md` named as the cause. Counted directly: **8,329 calls,
+119,645 entries walked, 5.1 ms**, 14.4 entries a call, against **66.8 ms** of apply time. Under
+eight per cent, and that is the whole walk - a fingerprint block over it would save less, because a
+probe that matches still decodes and the block costs a hash per insert. Removing all of it would
+move 0.70x to about 0.755x.
 
 **`txn.large` is no longer on this list.** It was the slowest workload on the board at 0.09x, it decided
 the `transaction` floor, and it is now **3.70x**, where the median round takes 2.66 ms against
@@ -195,6 +240,25 @@ Where the remaining 5.4 MiB is:
 So most of what is left is the operating system's, which neither engine escapes, and one
 `CREATE INDEX`.
 
+### Where a retrieval index's resident bytes go
+
+Measured 2026-09-15 with `inillucent-indexresidency` on the 600,589 chunk corpus at 768 dimensions,
+1,705,097 terms, with the vectors left in the file, which is the default. Each part is read in the
+order an open reads it and the resident set is sampled between them, so what a part costs is measured
+rather than derived from its file's size. Two runs, the same answer to a tenth of a mebibyte.
+
+| part | on disk MiB | resident MiB | share of resident |
+|---|---:|---:|---:|
+| `lexical.bin`, the BM25 postings | 614.8 | **890.3** | **53%** |
+| `store.bin`, the chunks and their dictionaries | 564.8 | 620.3 | 37% |
+| `graph.bin`, the HNSW adjacency | 87.7 | 154.2 | 9% |
+| `vectors.bin` | 1,759.5 | 0.0 | none |
+| total | 3,026.9 | **1,664.9** | |
+
+The postings are the largest single part and the graph is the smallest, which is the reverse of the
+order [the roadmap](roadmap.md#3-the-retrieval-indexs-footprint) had assumed. The store is 620 MiB
+resident for 565 MiB on disk - it is not expanded much by loading, it is simply all of it in memory.
+
 **And the peak is reached by that one statement.** Read afresh over four runs, the high-water mark
 after every workload:
 
@@ -277,7 +341,12 @@ since has been measured on Linux.
   bound, and that is 1.33x at both ends, so `extension` reads MISSED at all three scales. The reason
   it is better at the ends than in the middle is the same one: FTS5's build is four ordinary row
   writes per document, and a row write is where the per-statement cost lands.
-- **One machine.** Windows 11 on x64. The disk matters more than it looks: part way through a four
+- **One machine.** Windows 11 on x64, which `tests/performance-history.tsv` records in its
+  `machine` column as `machine-` and eight hex digits. That label is a digest of the
+  machine's own name rather than the name: the column exists so rows taken on two machines
+  can be told apart and rows taken on one can be read as a series, and a digest does both
+  without publishing whose machine it was. `INILLUCENT_MACHINE` sets the label directly for
+  a fleet that would rather read `ci-linux-x64`. The disk matters more than it looks: part way through a four
   run sequence, `txn.batched` is 200 commits and 200 `fsync`s, and it goes from 309 ms to 895 ms
   **on
   SQLite's own arm**, on the same fixture with the same binary, because the volume stops keeping up

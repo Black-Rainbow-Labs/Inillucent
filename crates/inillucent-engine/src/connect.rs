@@ -24,6 +24,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
+use inillucent_base::error::misuse;
 use inillucent_base::{DbError, DbResult, PrimaryCode};
 use inillucent_exec::physical::Params;
 use inillucent_tree::datum::OwnedDatum;
@@ -100,6 +101,46 @@ pub struct Database {
     /// `sqlite3_changes` reads it from: a caller asks the connection what the
     /// last statement did, having already dropped the statement.
     changes: std::cell::Cell<i64>,
+    /// The next connection number to hand out.
+    ///
+    /// **On the database rather than on the engine (task-1962, A11).** It used
+    /// to live behind the cell, so opening a connection borrowed the engine -
+    /// and a callback that asked for one while a statement was running aborted
+    /// the process. A counter is the database's own bookkeeping; the engine
+    /// learns the number on the first statement that runs under it.
+    next_session: std::cell::Cell<u64>,
+    /// The same writer the engine holds.
+    ///
+    /// **A second handle on one group, not a second group (task-1962, A1
+    /// step 3).** `Writing`'s ten fields are each behind their own cell, so the
+    /// engine writes through this `Rc` and so does everything here; there is
+    /// one transaction and both handles see it. What it buys is the questions
+    /// below - [`Connection::autocommit`] and [`Connection::decided_over`] -
+    /// which a callback asks *while* the engine is running the statement that
+    /// called it. Reading them through [`Database::engine`] took the cell the
+    /// statement was already holding, so the answer was an error rather than a
+    /// number.
+    writer: std::rc::Rc<crate::engine::state::Writing>,
+    /// The same settings the engine holds.
+    ///
+    /// **The second group A1 step 3 moved out (task-1962).** `PRAGMA` values,
+    /// the planner levers and the run-time limits, each behind its own cell.
+    /// `limit` and `set_limit` below took `self.engine.borrow()` and
+    /// `borrow_mut()` with no `try_`, so `sqlite3_limit` from inside a callback
+    /// did not return an error - it aborted the process. They read this
+    /// instead and take no borrow of the engine at all.
+    settings: std::rc::Rc<crate::engine::state::Pragmas>,
+    /// The same plan cache the engine holds.
+    ///
+    /// Every field of it was already behind a cell, so this needed nothing but
+    /// the `Rc` (task-1962, A1 step 3).
+    plans: std::rc::Rc<crate::engine::state::Compiled>,
+    /// The same counters the engine holds.
+    ///
+    /// `sqlite3_changes` from an update hook is the case this is for: an
+    /// application asks what the statement it was just told about changed,
+    /// while that statement is still running.
+    counters: std::rc::Rc<crate::engine::state::Counters>,
 }
 
 /// Reports whether a path names an in-memory database rather than a file.
@@ -139,9 +180,14 @@ impl Database {
                 std::sync::Arc::new(inillucent_vfs::MemoryVfs::new());
             let engine = ImportedDatabase::create_on(vfs, path.clone(), PAGE_SIZE, frames)?;
             return Ok(Database {
+                writer: std::rc::Rc::clone(&engine.writing),
+                settings: std::rc::Rc::clone(&engine.pragmas),
+                plans: std::rc::Rc::clone(&engine.compiled),
+                counters: std::rc::Rc::clone(&engine.counters),
                 engine: RefCell::new(engine),
                 path,
                 changes: std::cell::Cell::new(0),
+                next_session: std::cell::Cell::new(1),
             });
         }
         let engine = if path.is_file() {
@@ -150,9 +196,14 @@ impl Database {
             ImportedDatabase::create(path.clone(), PAGE_SIZE, frames)?
         };
         Ok(Database {
+            writer: std::rc::Rc::clone(&engine.writing),
+            settings: std::rc::Rc::clone(&engine.pragmas),
+            plans: std::rc::Rc::clone(&engine.compiled),
+            counters: std::rc::Rc::clone(&engine.counters),
             engine: RefCell::new(engine),
             path,
             changes: std::cell::Cell::new(0),
+            next_session: std::cell::Cell::new(1),
         })
     }
 
@@ -184,12 +235,31 @@ impl Database {
         let source = path.as_ref().to_path_buf();
         let mut target = source.clone().into_os_string();
         target.push(".rdb");
-        let target = PathBuf::from(target);
+        Database::import_into(source, PathBuf::from(target), frames)
+    }
+
+    /// Imports a SQLite file into a database at the path named, and opens that.
+    ///
+    /// **The target is taken rather than derived, because that is the property
+    /// a migration needs (task-1962, roadmap item 7).** A half-written database
+    /// must not sit at the path somebody is about to open, so `inillucent
+    /// migrate` writes to a staging name and renames it; deriving the target
+    /// here would take that choice away from the caller.
+    ///
+    /// @param source - the SQLite database to read
+    /// @param target - the file to write
+    /// @param frames - how many frames the buffer pool holds
+    pub fn import_into(source: PathBuf, target: PathBuf, frames: usize) -> DbResult<Database> {
         let engine = ImportedDatabase::import_into(source, target.clone(), PAGE_SIZE, frames)?;
         Ok(Database {
+            writer: std::rc::Rc::clone(&engine.writing),
+            settings: std::rc::Rc::clone(&engine.pragmas),
+            plans: std::rc::Rc::clone(&engine.compiled),
+            counters: std::rc::Rc::clone(&engine.counters),
             engine: RefCell::new(engine),
             path: target,
             changes: std::cell::Cell::new(0),
+            next_session: std::cell::Cell::new(1),
         })
     }
 
@@ -214,12 +284,36 @@ impl Database {
     /// `docs/roadmap.md` item 9, which is where concurrency is graded. An
     /// application that needs two independent transactions needs two processes,
     /// or two `Database` values over two files.
-    pub fn connect(&self) -> Connection<'_> {
-        let session = self.engine.borrow().open_session();
+    ///
+    /// **It is called `session` and not `connect` because that is what it
+    /// returns (task-1961, A5).** `connect()` returned something shaped exactly
+    /// like an independent connection, and the paragraph above - that two of
+    /// them share one transaction - was the only thing that said otherwise.
+    /// Anyone arriving from SQLite or rusqlite reads `connect` as "a second
+    /// handle with its own transaction", writes through it, and has the write
+    /// undone by the first handle's `ROLLBACK` with nothing reported. The name
+    /// now says which of the two things it is. `connect` is kept as a
+    /// deprecated alias for one release.
+    pub fn session(&self) -> Connection<'_> {
+        let session = self.next_session.get();
+        self.next_session.set(session.saturating_add(1));
         Connection {
             database: self,
             session,
         }
+    }
+
+    /// Returns a connection to this database.
+    ///
+    /// Renamed [`Database::session`] in task-1961, because two of these share
+    /// one transaction and `connect` says they do not. Kept for one release so
+    /// an application outside this workspace compiles while it is moved.
+    #[deprecated(
+        since = "0.1.3",
+        note = "renamed `session`: two of these share one transaction"
+    )]
+    pub fn connect(&self) -> Connection<'_> {
+        self.session()
     }
 
     /// Returns a connection that is a continuation of an earlier one.
@@ -231,12 +325,22 @@ impl Database {
     /// same session or a temporary table would not survive the statement that
     /// made it.
     ///
-    /// @param session - the number an earlier `connect` returned
-    pub fn connect_as(&self, session: u64) -> Connection<'_> {
+    /// @param session - the number an earlier [`Database::session`] returned
+    pub fn session_as(&self, session: u64) -> Connection<'_> {
         Connection {
             database: self,
             session,
         }
+    }
+
+    /// Returns a connection that is a continuation of an earlier one.
+    ///
+    /// Renamed [`Database::session_as`] in task-1961, with [`Database::connect`].
+    ///
+    /// @param session - the number an earlier [`Database::session`] returned
+    #[deprecated(since = "0.1.3", note = "renamed `session_as`, with `connect`")]
+    pub fn connect_as(&self, session: u64) -> Connection<'_> {
+        self.session_as(session)
     }
 
     /// Returns the file this database is in.
@@ -277,24 +381,40 @@ impl Database {
     /// See `ImportedDatabase::cached_statements`; this is the same count,
     /// reachable from the connection surface an application actually holds.
     pub fn cached_statements(&self) -> usize {
-        self.engine.borrow().cached_statements()
+        self.plans.held()
     }
 
     /// Returns the ceiling one session's plan cache is emptied at.
     pub fn statement_cache_limit(&self) -> usize {
-        self.engine.borrow().statement_cache_limit()
+        self.plans.limit()
     }
 
     /// Sets the ceiling one session's plan cache is emptied at.
     ///
     /// @param most - how many compiled statements one session may hold
     pub fn set_statement_cache_limit(&self, most: usize) {
-        self.engine.borrow().set_statement_cache_limit(most);
+        self.plans.set_limit(most);
     }
 
     /// Forgets every compiled statement.
     pub fn clear_statement_cache(&self) {
-        self.engine.borrow().clear_statement_cache();
+        self.plans.forget_all();
+    }
+
+    /// Returns what one run-time limit is set to on this database.
+    ///
+    /// @param limit - which limit
+    pub fn limit(&self, limit: inillucent_base::limits::Limit) -> i64 {
+        self.settings.limits.borrow().get(limit)
+    }
+
+    /// Sets one run-time limit, and returns what it was before.
+    ///
+    /// @param limit - which limit
+    /// @param requested - the value asked for
+    /// @returns the value that was in force before this call
+    pub fn set_limit(&self, limit: inillucent_base::limits::Limit, requested: i64) -> i64 {
+        self.settings.limits.borrow_mut().set(limit, requested)
     }
 
     /// Returns what the page cache has been asked to do.
@@ -372,6 +492,22 @@ impl Database {
     }
 }
 
+/// One statement compiled out of a script, and how much of the script it used.
+///
+/// **A named pair, because the second half was an unnamed `usize` on a public
+/// method (task-1961, A10).** [`Connection::prepare_with_tail`] answered
+/// `(Statement, usize)`, and the number is a byte offset into the *input*,
+/// including the terminating semicolon and the trivia after it - which nothing
+/// in the type said. A caller that read it as a row count, a column count or an
+/// offset into the statement would compile.
+pub struct Prepared<'d> {
+    /// The compiled statement.
+    pub statement: Statement<'d>,
+    /// How many bytes of the script the statement used, so `&sql[consumed..]`
+    /// is the next statement rather than the space before it.
+    pub consumed: usize,
+}
+
 /// A connection to a database.
 ///
 /// It borrows the database rather than owning a handle of its own, because this
@@ -402,15 +538,35 @@ impl<'d> Connection<'d> {
     /// that has its own temporary tables sees a different set from the one
     /// before it, and a binder handed the previous connection's is the leak
     /// `temp` exists to prevent.
-    fn engine(&self) -> std::cell::RefMut<'_, ImportedDatabase> {
+    fn engine(&self) -> DbResult<std::cell::RefMut<'_, ImportedDatabase>> {
         self.engine_mut()
     }
 
     /// Returns the engine, having told it which connection is asking.
-    fn engine_mut(&self) -> std::cell::RefMut<'_, ImportedDatabase> {
-        let mut held = self.database.engine.borrow_mut();
+    ///
+    /// **It answers an error rather than aborting the process (task-1962,
+    /// A11).** This was `borrow_mut()`, which panics when the cell is already
+    /// borrowed, and the reachable case is a scalar function registered through
+    /// [`Connection::create_scalar_function`] whose body calls back into the
+    /// connection it was registered on: the statement holds the borrow, the
+    /// function asks for it again, and the process aborts. `AGENTS.md` bans
+    /// `panic!` on a path that reads SQL text, and a panicking `borrow_mut` is
+    /// the same failure under another name.
+    ///
+    /// The refusal is `misuse`, which is the code the driver already documents
+    /// for a caller that broke this API's own contract - and calling a
+    /// connection from inside a function running on it is exactly that, because
+    /// one `RefCell` holds the whole engine. A1 step 3 splits that cell into
+    /// three and most of this goes with it.
+    fn engine_mut(&self) -> DbResult<std::cell::RefMut<'_, ImportedDatabase>> {
+        let mut held = self.database.engine.try_borrow_mut().map_err(|_| {
+            misuse(
+                "this connection is already running a statement; a function registered on a \
+                 connection cannot call back into it",
+            )
+        })?;
         held.use_session(self.session);
-        held
+        Ok(held)
     }
 
     /// Runs one or more statements for their effect.
@@ -451,14 +607,14 @@ impl<'d> Connection<'d> {
             if rest.is_empty() {
                 return Ok(());
             }
-            let consumed = self.engine().statement_length(rest)?;
+            let consumed = self.engine()?.statement_length(rest)?;
             let Some(head) = rest.get(..consumed) else {
                 return Ok(());
             };
             if head.trim().is_empty() {
                 return Ok(());
             }
-            let outcome = self.engine_mut().execute_any(head, &Params::new())?;
+            let outcome = self.engine_mut()?.execute_any(head, &Params::new())?;
             self.database.changes.set(outcome.changes.rows as i64);
             rest = rest.get(consumed..).unwrap_or("");
         }
@@ -476,7 +632,7 @@ impl<'d> Connection<'d> {
     /// @param sql - the statement
     /// @param params - the values bound to `?1`, `?2`, ...
     pub fn query_with(&self, sql: &str, params: &Params) -> DbResult<Vec<Vec<OwnedDatum>>> {
-        let outcome = self.engine_mut().execute_any(sql, params)?;
+        let outcome = self.engine_mut()?.execute_any(sql, params)?;
         self.database.changes.set(outcome.changes.rows as i64);
         Ok(outcome.rows)
     }
@@ -489,10 +645,13 @@ impl<'d> Connection<'d> {
     /// walked this way is split by the grammar rather than by a scan for `;`.
     ///
     /// @param sql - the script, positioned at the statement to compile
-    pub fn prepare_with_tail(&self, sql: &str) -> DbResult<(Statement<'d>, usize)> {
-        let consumed = self.engine().statement_length(sql)?;
+    pub fn prepare_with_tail(&self, sql: &str) -> DbResult<Prepared<'d>> {
+        let consumed = self.engine()?.statement_length(sql)?;
         let head = sql.get(..consumed).unwrap_or(sql);
-        Ok((self.prepare(head)?, consumed))
+        Ok(Prepared {
+            statement: self.prepare(head)?,
+            consumed,
+        })
     }
 
     /// Describes how a statement would be run.
@@ -540,7 +699,7 @@ impl<'d> Connection<'d> {
         flags: inillucent_ext::registry::FunctionFlags,
         body: inillucent_ext::registry::ScalarBody,
     ) -> DbResult<()> {
-        self.engine_mut()
+        self.engine_mut()?
             .create_scalar_function(name, arity, flags, body)
     }
 
@@ -557,7 +716,7 @@ impl<'d> Connection<'d> {
         flags: inillucent_ext::registry::FunctionFlags,
         body: inillucent_ext::registry::AggregateBody,
     ) -> DbResult<()> {
-        self.engine_mut()
+        self.engine_mut()?
             .create_aggregate_function(name, arity, flags, body)
     }
 
@@ -565,8 +724,8 @@ impl<'d> Connection<'d> {
     ///
     /// @param name - the name it was registered under
     /// @param arity - the arity it was registered for
-    pub fn remove_function(&self, name: &str, arity: i32) -> bool {
-        self.engine_mut().remove_function(name, arity)
+    pub fn remove_function(&self, name: &str, arity: i32) -> DbResult<bool> {
+        Ok(self.engine_mut()?.remove_function(name, arity))
     }
 
     /// Registers a collating sequence an application defined.
@@ -578,12 +737,12 @@ impl<'d> Connection<'d> {
         name: &str,
         comparator: inillucent_value::collation::Comparator,
     ) -> DbResult<()> {
-        self.engine_mut().create_collation(name, comparator)
+        self.engine_mut()?.create_collation(name, comparator)
     }
 
     /// Returns how many statements are compiled and held.
-    pub fn cached_plan_count(&self) -> usize {
-        self.engine().cached_plan_count()
+    pub fn cached_plan_count(&self) -> DbResult<usize> {
+        Ok(self.database.plans.held())
     }
 
     /// Returns how many statements this connection has compiled since it opened.
@@ -593,15 +752,19 @@ impl<'d> Connection<'d> {
     /// It is here rather than only in the engine because
     /// `crates/inillucent/tests/budget.rs` asserts on it, and that file writes
     /// against this facade.
-    pub fn compiled_statement_count(&self) -> u64 {
-        self.engine().compiled_statement_count()
+    pub fn compiled_statement_count(&self) -> DbResult<u64> {
+        Ok(self.database.plans.compiles())
     }
 
     /// Turns off one or more planner optimizations for this connection.
     ///
     /// @param mask - the levers to switch off
-    pub fn disable_optimizations(&self, mask: u32) {
-        self.engine_mut().disable_optimizations(mask);
+    pub fn disable_optimizations(&self, levers: inillucent_sql::plan::Levers) -> DbResult<()> {
+        // The plan cache is keyed by the levers rather than cleared by them -
+        // see `ImportedDatabase::disable_optimizations` - so setting the value
+        // is the whole of it, and it needs no borrow of the engine.
+        self.database.settings.levers.set(levers);
+        Ok(())
     }
 
     /// Puts the connection into or out of defensive mode.
@@ -612,8 +775,9 @@ impl<'d> Connection<'d> {
     /// corrupt a database with one statement.
     ///
     /// @param on - whether the flag is in force
-    pub fn set_defensive(&self, on: bool) {
-        self.engine_mut().set_defensive(on);
+    pub fn set_defensive(&self, on: bool) -> DbResult<()> {
+        self.database.settings.defensive.set(on);
+        Ok(())
     }
 
     /// Installs the authorizer every later statement is bound under.
@@ -623,8 +787,12 @@ impl<'d> Connection<'d> {
     /// Pass `None` to allow everything again.
     ///
     /// @param authorizer - the callback, or nothing
-    pub fn set_authorizer(&self, authorizer: Option<std::rc::Rc<dyn crate::Authorizer>>) {
-        self.engine_mut().set_authorizer(authorizer);
+    pub fn set_authorizer(
+        &self,
+        authorizer: Option<std::rc::Rc<dyn crate::Authorizer>>,
+    ) -> DbResult<()> {
+        self.engine_mut()?.set_authorizer(authorizer);
+        Ok(())
     }
 
     /// Declares a table over one index's own b-tree, or removes every such
@@ -636,17 +804,17 @@ impl<'d> Connection<'d> {
     /// @param index - the index to read, or nothing to remove them all
     /// @param name - the table name to declare it under
     pub fn imposter(&self, index: Option<&[u8]>, name: &[u8]) -> DbResult<Option<String>> {
-        self.engine_mut().imposter(index, name)
+        self.engine_mut()?.imposter(index, name)
     }
 
     /// Rereads the schema from the file.
     pub fn reload_schema(&self) -> DbResult<()> {
-        self.engine_mut().reload_catalog()
+        self.engine_mut()?.reload_catalog()
     }
 
     /// Returns the schema's generation, which changes when the schema does.
-    pub fn schema_cookie(&self) -> u64 {
-        self.engine().schema_generation()
+    pub fn schema_cookie(&self) -> DbResult<u64> {
+        Ok(self.engine()?.schema_generation())
     }
 
     /// Returns the named parameters one statement declares, with their indexes.
@@ -668,9 +836,9 @@ impl<'d> Connection<'d> {
         // asking afterwards reached into the arena the plan had just been built
         // out of. The symptom was not a crash: correlated subqueries in an
         // `UPDATE` or a `DELETE` quietly answered against the wrong rows.
-        let declared = self.engine().parameter_count(sql)?;
-        let compiled = self.engine().prepare_statement(sql)?;
-        let generation = self.engine().schema_generation();
+        let declared = self.engine()?.parameter_count(sql)?;
+        let compiled = self.engine()?.prepare_statement(sql)?;
+        let generation = self.engine()?.schema_generation();
         let mut params = Params::new();
         params.expect(declared);
         Ok(Statement {
@@ -693,7 +861,7 @@ impl<'d> Connection<'d> {
     /// @param sql - the statement
     pub fn execute(&self, sql: &str) -> DbResult<i64> {
         self.query(sql)?;
-        Ok(self.changes())
+        self.changes()
     }
 
     /// Returns how many rows the last statement on this database changed.
@@ -703,33 +871,170 @@ impl<'d> Connection<'d> {
     /// `Outcome` they got back - so a statement that failed partway left it
     /// holding the previous statement's number, and `sqlite3_changes` and
     /// `changes()` could answer differently about the same statement.
-    pub fn changes(&self) -> i64 {
-        self.engine().changes()
+    pub fn changes(&self) -> DbResult<i64> {
+        Ok(self.database.counters.last_changes.get())
     }
 
     /// Returns how many rows every statement so far has changed.
-    pub fn total_changes(&self) -> i64 {
-        self.engine().total_changes()
+    /// **This connection's own number rather than the engine's**, which is
+    /// the same answer and one fewer thing to be stale: the engine's copy is
+    /// whatever the last `use_session` set, and a connection knows which one it
+    /// is without asking.
+    pub fn total_changes(&self) -> DbResult<i64> {
+        Ok(self
+            .database
+            .counters
+            .session_change_baseline
+            .total_changes(self.session, self.database.counters.changed_ever.get()))
     }
 
     /// Returns the rowid the last `INSERT` assigned.
-    pub fn last_insert_rowid(&self) -> i64 {
-        self.engine().last_insert_rowid()
+    pub fn last_insert_rowid(&self) -> DbResult<i64> {
+        Ok(self.database.counters.last_rowid.get())
     }
 
     /// Returns how many databases the last commit was decided over.
     ///
     /// One for an ordinary statement; two or more for a transaction that wrote
     /// two files and was therefore committed through a super-journal.
-    pub fn decided_over(&self) -> usize {
-        self.engine().decided_over()
+    pub fn decided_over(&self) -> DbResult<usize> {
+        Ok(self.database.writer.decided_over.get())
     }
 
     /// Returns whether every statement is its own transaction.
     ///
     /// `false` between a `BEGIN` and its `COMMIT`.
-    pub fn autocommit(&self) -> bool {
-        self.engine().autocommit()
+    ///
+    /// **Answerable while a statement is running (task-1962, A1 step 3).** This
+    /// read the engine, so a function registered on the connection that asked
+    /// it got the `already running a statement` error - and this is exactly the
+    /// question such a function asks, because SQLite's `sqlite3_get_autocommit`
+    /// is documented as callable from a callback. It reads the writer the
+    /// database holds beside the engine instead, and takes no cell at all.
+    pub fn autocommit(&self) -> DbResult<bool> {
+        Ok(self.database.writer.batch.get().is_none())
+    }
+
+    /// Opens a transaction that rolls back unless it is committed.
+    ///
+    /// **The value is the guard (task-1961, A4).** Before this, a caller of the
+    /// engine wrote `BEGIN` through [`Connection::execute_batch`] and had to
+    /// remember the `COMMIT` on every path out of the function it was in - so
+    /// an early return, a `?` or a panic left the transaction open for the life
+    /// of the connection, holding the write lock and hiding every later
+    /// statement's work from anybody else. The driver has had this shape since
+    /// task-1932; it lives here now so the engine's own connection has it and
+    /// the driver marshals rather than decides.
+    ///
+    /// Refuses when a transaction is already open, and the check is
+    /// [`Connection::autocommit`] rather than a counter this type keeps,
+    /// because in this engine a transaction belongs to the *database* and not
+    /// to the connection that opened it: a `BEGIN` on one handle is joined by
+    /// every other handle on the same file, which is what the invariant on
+    /// [`Database::connect`] says. A counter per connection would answer "no
+    /// transaction here" while one was open on a sibling, and committing it
+    /// would settle work the sibling had not finished.
+    pub fn begin(&self) -> DbResult<Transaction<'_>> {
+        if !self.autocommit()? {
+            // `SQLITE_ERROR`, which is what the pinned reference answers for
+            // `BEGIN` inside a transaction ("cannot start a transaction within
+            // a transaction"), rather than the `SQLITE_MISUSE` `refusal`
+            // hands out.
+            return Err(inillucent_base::error::statement_refusal(
+                "a transaction is already open on this database; this engine does not nest                  them, because committing the inner one would commit the outer one's work too.",
+            ));
+        }
+        self.execute_batch("BEGIN")?;
+        Ok(Transaction {
+            connection: self,
+            settled: std::cell::Cell::new(false),
+        })
+    }
+}
+
+/// An open transaction, which rolls back unless it is committed.
+///
+/// Invariant: **when this value goes away, the transaction it opened is over.**
+/// Either [`Transaction::commit`] kept the work, or [`Transaction::rollback`]
+/// discarded it, or the `Drop` below discarded it. There is no fourth way out,
+/// which is the reason the type exists: the alternative is a `BEGIN` in text
+/// and a `COMMIT` the caller has to reach on every path.
+///
+/// It borrows the connection, so the connection cannot be dropped or used for a
+/// second transaction while one is open.
+pub struct Transaction<'c> {
+    /// The connection the `BEGIN` was issued on.
+    connection: &'c Connection<'c>,
+    /// Whether the transaction has already been settled, so `Drop` does
+    /// nothing. A `Cell` because `commit` and `rollback` take `self` by value
+    /// and `Drop` takes `&mut self`, and both have to write it.
+    settled: std::cell::Cell<bool>,
+}
+
+impl std::fmt::Debug for Transaction<'_> {
+    /// Says whether the transaction is still open, and nothing a caller wrote.
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("Transaction")
+            .field("settled", &self.settled.get())
+            .finish()
+    }
+}
+
+impl Transaction<'_> {
+    /// Runs one statement inside the transaction for its effect.
+    ///
+    /// @param sql - the statement
+    pub fn execute(&self, sql: &str) -> DbResult<i64> {
+        self.connection.execute(sql)
+    }
+
+    /// Runs one statement inside the transaction and returns its rows.
+    ///
+    /// @param sql - the statement
+    pub fn query(&self, sql: &str) -> DbResult<Vec<Vec<OwnedDatum>>> {
+        self.connection.query(sql)
+    }
+
+    /// Compiles a statement to run inside the transaction.
+    ///
+    /// @param sql - the statement
+    pub fn prepare(&self, sql: &str) -> DbResult<Statement<'_>> {
+        self.connection.prepare(sql)
+    }
+
+    /// Keeps everything this transaction wrote.
+    ///
+    /// Takes `self`, so a committed transaction cannot be used again and the
+    /// `Drop` below cannot roll back what was kept.
+    pub fn commit(self) -> DbResult<()> {
+        self.settled.set(true);
+        self.connection.execute_batch("COMMIT")
+    }
+
+    /// Discards everything this transaction wrote.
+    ///
+    /// The same thing dropping it does, said out loud. A caller that has
+    /// decided to abandon the work reads better for saying so, and a rollback
+    /// that fails is reportable here where it is not from `Drop`.
+    pub fn rollback(self) -> DbResult<()> {
+        self.settled.set(true);
+        self.connection.execute_batch("ROLLBACK")
+    }
+}
+
+impl Drop for Transaction<'_> {
+    /// Rolls back a transaction nobody committed.
+    ///
+    /// **Silent, because a `Drop` has nowhere to report to.** What it could
+    /// hide is a rollback that did not happen, and for that the engine would
+    /// have to refuse a `ROLLBACK` on a transaction it opened itself. A caller
+    /// who wants to know calls [`Transaction::rollback`] and reads the answer.
+    fn drop(&mut self) {
+        if self.settled.get() {
+            return;
+        }
+        self.settled.set(true);
+        let _ = self.connection.execute_batch("ROLLBACK");
     }
 }
 

@@ -134,7 +134,7 @@ fn produce(
             .and_then(|row| row.first())
             .cloned()
             .unwrap_or(Value::Null);
-        bound.push(crate::shell::datum_of(&held));
+        bound.push(inillucent_tree::datum::OwnedDatum::from(&held));
     }
     let started = std::time::Instant::now();
     let collected = context.shell().collect_bound(sql, &bound);
@@ -170,8 +170,8 @@ fn rows_to_outcome(
         .collect();
     let columns = columns_from(&names, &cells);
     let connection = context.shell().connection();
-    let changes = connection.total_changes();
-    let rowid = connection.last_insert_rowid();
+    let changes = connection.total_changes().unwrap_or_default();
+    let rowid = connection.last_insert_rowid().unwrap_or_default();
     let _ = connection;
     let mut text = table(&columns, &cells, &context.null);
     if kept < total {
@@ -252,9 +252,17 @@ pub fn query(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fa
 pub fn exec(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
     let sql = arguments.required_text("sql")?.to_string();
     let params = arguments.values("params");
-    let before = context.shell().connection().total_changes();
+    let before = context
+        .shell()
+        .connection()
+        .total_changes()
+        .map_err(|error| Failed::from_engine(&error))?;
     let mut produced = produce(context, "exec", &sql, &params, 0)?;
-    let after = context.shell().connection().total_changes();
+    let after = context
+        .shell()
+        .connection()
+        .total_changes()
+        .map_err(|error| Failed::from_engine(&error))?;
     produced.changes = after - before;
     produced.text = match produced.rows.is_empty() {
         true => format!(
@@ -290,8 +298,16 @@ pub fn exec(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fai
 pub fn batch(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
     let sql = arguments.required_text("sql")?.to_string();
     context.refuse_if_it_writes(&sql)?;
-    let joined = !context.shell().connection().autocommit();
-    let before = context.shell().connection().total_changes();
+    let joined = !context
+        .shell()
+        .connection()
+        .autocommit()
+        .map_err(|error| Failed::from_engine(&error))?;
+    let before = context
+        .shell()
+        .connection()
+        .total_changes()
+        .map_err(|error| Failed::from_engine(&error))?;
     if !joined {
         context
             .shell()
@@ -321,7 +337,11 @@ pub fn batch(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fa
             .execute("COMMIT")
             .map_err(|message| Failed::said(Status::Syntax, message))?;
     }
-    let after = context.shell().connection().total_changes();
+    let after = context
+        .shell()
+        .connection()
+        .total_changes()
+        .map_err(|error| Failed::from_engine(&error))?;
     let changes = after - before;
     let mut produced = Outcome::said(
         "batch",
@@ -580,10 +600,18 @@ pub fn import(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
     // of the target covers that case, and is the fallback rather than the
     // primary because a table with a trigger on it can change more rows than it
     // gained.
-    let before_changes = context.shell().connection().total_changes();
+    let before_changes = context
+        .shell()
+        .connection()
+        .total_changes()
+        .map_err(|error| Failed::from_engine(&error))?;
     let before_rows = row_count(context, &table_name);
     let mut produced = dot(context, "import", &line)?;
-    let after_changes = context.shell().connection().total_changes();
+    let after_changes = context
+        .shell()
+        .connection()
+        .total_changes()
+        .map_err(|error| Failed::from_engine(&error))?;
     produced.changes = after_changes - before_changes;
     if produced.changes == 0 {
         produced.changes = row_count(context, &table_name).saturating_sub(before_rows);
@@ -1192,13 +1220,8 @@ fn migrate_sqlite_file(from: &std::path::Path, to: &std::path::Path) -> Result<O
     let mut staged = to.as_os_str().to_os_string();
     staged.push(format!(".staging-{}", std::process::id()));
     let staged = std::path::PathBuf::from(staged);
-    let imported = inillucent_engine::ImportedDatabase::import_into(
-        from.to_path_buf(),
-        staged.clone(),
-        inillucent_engine::connect::PAGE_SIZE,
-        DEFAULT_FRAMES,
-    )
-    .map_err(|error| Failed::from_engine(&error))?;
+    let imported = inillucent_driver::Database::import_sqlite_into(from, &staged)
+        .map_err(Failed::from_driver)?;
     drop(imported);
     std::fs::rename(&staged, to).map_err(|error| {
         Failed::said(
@@ -1215,12 +1238,6 @@ fn migrate_sqlite_file(from: &std::path::Path, to: &std::path::Path) -> Result<O
     )
     .with("destination", json::text(to.to_string_lossy())))
 }
-
-/// How many frames the buffer pool holds while a migration runs.
-///
-/// The driver's own default, so a file built here is built by the same machine
-/// that a file opened there is read by.
-const DEFAULT_FRAMES: usize = 4_096;
 
 /// `version`: what this build is.
 pub fn version(context: &mut Context, _arguments: &Arguments) -> Result<Outcome, Failed> {

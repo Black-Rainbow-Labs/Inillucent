@@ -459,7 +459,7 @@ pub fn run(plan: &Plan, source: &mut dyn RemoteSource) -> DbResult<Report> {
                 error.message()
             ))
         })?;
-        let connection = database.connect();
+        let connection = database.session();
 
         for table in &tables {
             connection
@@ -513,7 +513,7 @@ pub fn run(plan: &Plan, source: &mut dyn RemoteSource) -> DbResult<Report> {
             format!("a tree is not intact: {}", error.message()),
         )),
     }
-    let connection = opened.connect();
+    let connection = opened.session();
     for (table, report) in tables.iter().zip(reports.iter()) {
         // The count, asked of the **source** as a count rather than as a scan,
         // so the check is against a different query path on the server than the
@@ -972,7 +972,7 @@ mod tests {
     /// to be attached to a bug report.
     #[test]
     fn the_report_never_carries_the_password() {
-        let url = ConnectionUrl::parse("postgres://jason:hunter2@db:5432/corpus").expect("parses");
+        let url = ConnectionUrl::parse("postgres://user:hunter2@db:5432/corpus").expect("parses");
         let report = Report {
             source: url.to_string(),
             server: "PostgreSQL 17.2".to_string(),
@@ -1016,7 +1016,7 @@ mod tests {
     fn a_paged_read_digests_the_same_value_as_a_whole_one() {
         let database = inillucent_engine::connect::Database::open(":memory:")
             .expect("an in-memory database opens");
-        let connection = database.connect();
+        let connection = database.session();
         connection
             .execute_batch("CREATE TABLE t (id INTEGER, body TEXT)")
             .expect("the schema is created");

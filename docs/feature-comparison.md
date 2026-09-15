@@ -7,6 +7,9 @@ The project has two goals and this document is the scorecard for both:
 1. a **highly performant SQLite replacement offering the same features**, and
 2. an **embedding solution that matches pgvector**.
 
+Words used here and not explained here - pragma, collation, affinity, HNSW, BM25, recall - are
+in [the glossary](glossary.md), one sentence each.
+
 ## The top-line comparison
 
 **The whole scorecard in five rows.** Everything below this section is the evidence for one of
@@ -798,9 +801,12 @@ path serves `generate_series(1, t.a)` and any other table-valued function given 
 ### The function register
 
 `compat/api/builtins.toml` lists the function names this engine registers, and
-`inillucent_sql::function::every_function` is what `pragma_function_list` reports. Against the pinned
-**library** - the amalgamation, not the shell - there is no function SQLite answers that this engine
-does not. `current_date`, `current_time` and `current_timestamp` used to be the exception: they
+`inillucent_sql::function::every_function` is what `pragma_function_list` reports, beside whatever
+the connection has registered through `inillucent_ext`'s registry - an application's own functions,
+and `embed(TEXT)` in a build carrying the `embed` feature. The registry half arrived in task-1952,
+which found the same under-report one more time in the one place the built-in list could not reach.
+Against the pinned **library** - the amalgamation, not the shell - there is no function SQLite
+answers that this engine does not. `current_date`, `current_time` and `current_timestamp` used to be the exception: they
 worked as keywords but were not named in the register, which is the kind of under-reporting that
 review 6 went after. They are named now. `load_extension` *is* registered and refuses in the platform's own
 words, because this build has no dynamic loader and a function that quietly answered NULL would be a
@@ -875,6 +881,11 @@ The eight that answer nothing do so in **both**: `case_sensitive_like`, `data_st
 `foreign_key_check`, `foreign_key_list`, `incremental_vacuum`, `optimize`, `shrink_memory` and
 `temp_store_directory`. A pragma that answers nothing is one whose whole effect is what it does, and
 each of those does it.
+
+One of the eight is on Windows only. SQLite compiles `data_store_directory` under `SQLITE_OS_WIN`,
+so a Linux build's `pragma_list` is one name shorter than the list above, and so is this engine's as
+of task-1946 - `registers.rs::the_pragma_register_agrees_exactly` compares the two on both platforms
+now, which it could not do until the Linux runs had an oracle to compare against.
 
 ---
 
@@ -1215,7 +1226,7 @@ These cannot be probed with SQL. They are read from the tree and from the design
 | encryption at rest | SEE, a commercial add-on | none. `ATTACH ... KEY` refuses by name rather than parsing the key and ignoring it, which is what a build without an encryption extension does |
 | user-defined functions and collations | yes | **yes**, scalar and aggregate, through the driver |
 | virtual-table modules a program registers | `sqlite3_create_module` | **`Database::register_module`**, which is how the shell adds `fsdir` |
-| assurance | TH3, `testfixture`, ~600 tests per line of code | **the same four red binaries as `e4b4fea`**, all pre-existing and accounted for; a differential oracle against the pinned build; SQLLogicTest; a `BTreeMap` model reference; a fault-injecting VFS; 8 fuzz targets; 23 of 29 crates deny `unwrap`/`panic`/indexing and 22 of 29 forbid `unsafe` |
+| assurance | TH3, `testfixture`, ~600 tests per line of code | **the same four red binaries as `bd9fedf`**, all pre-existing and accounted for; a differential oracle against the pinned build; SQLLogicTest; a `BTreeMap` model reference; a fault-injecting VFS; 8 fuzz targets; 23 of 29 crates deny `unwrap`/`panic`/indexing and 22 of 29 forbid `unsafe` |
 
 ### The migration path
 
@@ -1401,7 +1412,7 @@ power loss itself had left whole. Making it sync costs one `fsync` per checkpoin
 which is parity with SQLite, which performs the same sync at `synchronous = FULL`. The other two
 workloads in the family did not move. The engine was faster at autocommit than SQLite by not doing
 work SQLite does, and three more ways a crash could lose a database came out of the same thread -
-[the roadmap](roadmap.md#what-task-1911-closed) has all four.
+[Closed items](closed-items.md#what-task-1911-closed) has all four.
 
 **How to read every percentage below.** A workload that takes 1 second where SQLite takes 4 is
 written as **300% faster**, and its ratio is 4.00x. A workload that takes 4 seconds where SQLite

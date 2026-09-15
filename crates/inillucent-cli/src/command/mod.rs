@@ -28,8 +28,8 @@ pub mod verbs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use inillucent_driver::vfs::confine::{self, Root};
 use inillucent_driver::Status;
-use inillucent_engine::vfs::confine::{self, Root};
 
 use crate::json::Json;
 use crate::shell::Shell;
@@ -303,7 +303,7 @@ pub struct Context {
     /// a `SELECT` whose `WHERE` rejects everything after scanning a hundred
     /// million rows still stops. A row ceiling alone would let that run to the
     /// end and then report zero rows.
-    limits: inillucent_engine::base::budget::Limits,
+    limits: inillucent_driver::StatementLimits,
     /// Whether arming a budget clears the cancellation flag first.
     ///
     /// True everywhere but the MCP server, which reads its input on a second
@@ -324,13 +324,41 @@ pub struct Context {
     pub null: String,
 }
 
+/// Whether a command surface may write to the database it opens.
+///
+/// **An enum rather than a bare `bool` (task-1962, A9).** `Context::open(path,
+/// true, root)` at a call site says nothing about what the `true` decides, and
+/// the surface it opens is the one an operator reaches for when they want to be
+/// certain nothing is written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenMode {
+    /// Statements that write are refused.
+    ReadOnly,
+    /// The ordinary surface.
+    ReadWrite,
+}
+
+impl OpenMode {
+    /// Reads the `--readonly` flag a command surface was invoked with.
+    ///
+    /// @param readonly - whether the flag was given
+    pub fn of(readonly: bool) -> OpenMode {
+        if readonly {
+            OpenMode::ReadOnly
+        } else {
+            OpenMode::ReadWrite
+        }
+    }
+}
+
 impl Context {
     /// Opens a context on a database.
     ///
     /// @param path - the file, or an in-memory name
     /// @param readonly - whether writes are refused
     /// @param root - the directory paths are confined to, if any
-    pub fn open(path: &str, readonly: bool, root: Option<PathBuf>) -> Result<Context, Failed> {
+    pub fn open(path: &str, mode: OpenMode, root: Option<PathBuf>) -> Result<Context, Failed> {
+        let readonly = mode == OpenMode::ReadOnly;
         // **The confinement is installed before the first file is opened.**
         // The database this surface starts on is a path like any other, and
         // installing the root afterwards would exempt exactly the one path an
@@ -367,7 +395,7 @@ impl Context {
             root,
             limit: 200,
             max_rows: None,
-            limits: inillucent_engine::base::budget::Limits::unbounded(),
+            limits: inillucent_driver::StatementLimits::unbounded(),
             preserve_cancel: std::cell::Cell::new(false),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             null: String::new(),
@@ -469,7 +497,7 @@ impl Context {
     /// Sets what one command may spend inside the engine.
     ///
     /// @param limits - the budget, or `Limits::unbounded` for a command line
-    pub fn set_limits(&mut self, limits: inillucent_engine::base::budget::Limits) {
+    pub fn set_limits(&mut self, limits: inillucent_driver::StatementLimits) {
         self.limits = limits;
     }
 
@@ -478,7 +506,7 @@ impl Context {
     /// A verb that runs work outside the executor - a migration reads a remote
     /// server and writes rows through a second connection - asks so that it can
     /// put itself under the same ceiling rather than beside it.
-    pub fn limits(&self) -> inillucent_engine::base::budget::Limits {
+    pub fn limits(&self) -> inillucent_driver::StatementLimits {
         self.limits.clone()
     }
 
@@ -516,7 +544,7 @@ impl Context {
             }),
             limit: 200,
             max_rows: None,
-            limits: inillucent_engine::base::budget::Limits::unbounded(),
+            limits: inillucent_driver::StatementLimits::unbounded(),
             preserve_cancel: std::cell::Cell::new(false),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             null: String::new(),
@@ -526,7 +554,7 @@ impl Context {
     /// Refuses a path outside the root, when a root was set.
     ///
     /// **The decision is not made here.** It is made by
-    /// [`inillucent_vfs::confine`], which resolves the path through the file
+    /// `inillucent_vfs::confine`, which resolves the path through the file
     /// system rather than reading its text, and which the VFS consults again
     /// at the moment the file is opened. This method exists so that a person
     /// reading a refusal is told the path they typed and the directory they
@@ -780,14 +808,27 @@ mod tests {
             root: Some(Arc::new(Root::at(&root).unwrap())),
             limit: 200,
             max_rows: None,
-            limits: inillucent_engine::base::budget::Limits::unbounded(),
+            limits: inillucent_driver::StatementLimits::unbounded(),
             preserve_cancel: std::cell::Cell::new(false),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             null: String::new(),
         };
         assert!(context.confine("inner/app.rdb").is_ok());
         assert!(context.confine("../outside.rdb").is_err());
-        assert!(context.confine("C:/elsewhere/app.rdb").is_err());
+        // **An absolute path for this platform, not for Windows
+        // (task-1946, M5).** This was `C:/elsewhere/app.rdb`, which is absolute
+        // on Windows and a directory named `C:` on Linux - so the case that was
+        // meant to be "somewhere else entirely" resolved *inside* the root
+        // there, and the assertion that it is refused failed on the first Linux
+        // run that ever reached it. Refusing it there would have been the real
+        // defect: a relative path under the root is exactly what confinement
+        // allows.
+        let elsewhere = if cfg!(windows) {
+            "C:/elsewhere/app.rdb"
+        } else {
+            "/elsewhere/app.rdb"
+        };
+        assert!(context.confine(elsewhere).is_err());
         assert!(context.confine(":memory:").is_ok());
     }
 
@@ -817,6 +858,7 @@ mod tests {
             #[cfg(unix)]
             let made = std::os::unix::fs::symlink(&outside, &link).is_ok();
             if !made {
+                eprintln!("this machine cannot create a symlink here; skipping");
                 return;
             }
         }
@@ -827,7 +869,7 @@ mod tests {
             root: Some(Arc::new(Root::at(&root).unwrap())),
             limit: 200,
             max_rows: None,
-            limits: inillucent_engine::base::budget::Limits::unbounded(),
+            limits: inillucent_driver::StatementLimits::unbounded(),
             preserve_cancel: std::cell::Cell::new(false),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             null: String::new(),

@@ -361,10 +361,71 @@ fn dictionaries(connection: &Connection<'_>, store: &Store) -> Check {
 /// destination's ranking with the cap applied through the relational mapping,
 /// which is the claim an application actually depends on: the same question
 /// gets the same answer.
+/// Returns the chunks the legacy index answers one probe with.
+///
+/// **One place that reports a refusal, rather than six.** The probes are built
+/// from the legacy index's own vectors, so a width mismatch would be a defect in
+/// this file rather than a corpus this tool was handed - but a migration tool
+/// that panics on a query it could not run tells an operator nothing about a
+/// corpus it has half converted, and this crate denies `expect` for that reason.
+/// The refusal travels out as a failed check (task-1946, H4).
+///
+/// @param source - the legacy index
+/// @param text - the query text, empty for a vector-only probe
+/// @param vector - the query vector, empty for a lexical-only probe
+/// @param filter - which chunks the probe may see
+/// @param width - the traversal width, or the index's configured default
+/// @param branches - which branches to run
+fn probe(
+    source: &Index,
+    text: &str,
+    vector: &[f32],
+    filter: &inillucent_core::filter::CompiledFilter,
+    width: Option<usize>,
+    branches: Branches,
+) -> Result<Vec<inillucent_core::rank::FusedHit>, String> {
+    source
+        .search_branches(text, vector, filter, PROBE_K, width, branches)
+        .map(|(hits, _)| hits)
+        .map_err(|error| error.to_string())
+}
+
+/// The same probe with the approximation switched off, which is how both sides
+/// are asked whenever their two graphs would otherwise be compared.
+///
+/// @param source - the legacy index
+/// @param text - the query text, empty for a vector-only probe
+/// @param vector - the query vector
+/// @param filter - which chunks the probe may see
+/// @param branches - which branches to run
+fn exact_probe(
+    source: &Index,
+    text: &str,
+    vector: &[f32],
+    filter: &inillucent_core::filter::CompiledFilter,
+    branches: Branches,
+) -> Result<Vec<inillucent_core::rank::FusedHit>, String> {
+    probe(source, text, vector, filter, Some(usize::MAX), branches)
+}
+
 fn retrieval(source: &Index, sql: &mut SqlIndex) -> Vec<Check> {
+    match retrieval_checks(source, sql) {
+        Ok(checks) => checks,
+        // A probe the legacy index refused. It stops the comparison rather than
+        // being skipped, because every check below it reads the answer it would
+        // have produced.
+        Err(reason) => vec![Check::fail("retrieval", reason)],
+    }
+}
+
+/// The retrieval checks, or the refusal that stopped them.
+///
+/// @param source - the legacy index
+/// @param sql - the migrated index
+fn retrieval_checks(source: &Index, sql: &mut SqlIndex) -> Result<Vec<Check>, String> {
     let store = source.store();
     if store.n_chunks() == 0 {
-        return vec![Check::pass("retrieval", "the corpus is empty")];
+        return Ok(vec![Check::pass("retrieval", "the corpus is empty")]);
     }
     let everything = source.compile(&Filter {
         include_deleted: true,
@@ -379,7 +440,7 @@ fn retrieval(source: &Index, sql: &mut SqlIndex) -> Vec<Check> {
     let wide = source.config().candidates.max(PROBE_K);
     let documents = match chunk_documents(&sql.connection()) {
         Ok(map) => map,
-        Err(failure) => return vec![Check::fail("retrieval", failure)],
+        Err(failure) => return Ok(vec![Check::fail("retrieval", failure)]),
     };
     let deleted = match integers(
         &sql.connection(),
@@ -387,7 +448,7 @@ fn retrieval(source: &Index, sql: &mut SqlIndex) -> Vec<Check> {
          ORDER BY id",
     ) {
         Ok(rows) => rows,
-        Err(failure) => return vec![Check::fail("retrieval", failure)],
+        Err(failure) => return Ok(vec![Check::fail("retrieval", failure)]),
     };
     let mut checks = Vec::new();
 
@@ -434,8 +495,7 @@ fn retrieval(source: &Index, sql: &mut SqlIndex) -> Vec<Check> {
     // for and what it must be able to ask a migrated database for.
     let mut grouped = Vec::new();
     for query in &probes {
-        let (wanted, _) =
-            source.search_branches(query, &[], &everything, PROBE_K, None, Branches::Lexical);
+        let wanted = probe(source, query, &[], &everything, None, Branches::Lexical)?;
         let expected: Vec<i64> = wanted.iter().map(|hit| i64::from(hit.chunk)).collect();
         match ranked(sql, query, &[], wide) {
             Ok(found) => {
@@ -460,7 +520,7 @@ fn retrieval(source: &Index, sql: &mut SqlIndex) -> Vec<Check> {
         Check::fail("bm25.grouped", grouped.join(" | "))
     });
 
-    checks.push(scores_match(source, sql, &probes, &everything, wide));
+    checks.push(scores_match(source, sql, &probes, &everything, wide)?);
 
     if source.config().dims > 0 && source.vectors().len() == store.n_chunks() {
         // Both sides are asked with their approximation switched off, so what
@@ -485,14 +545,7 @@ fn retrieval(source: &Index, sql: &mut SqlIndex) -> Vec<Check> {
         let mut probed = 0usize;
         for ordinal in sample(store.n_chunks(), PROBES) {
             let query = source.vectors().copy_of(ordinal as u32);
-            let (wanted, _) = source.search_branches(
-                "",
-                &query,
-                &everything,
-                PROBE_K,
-                Some(usize::MAX),
-                Branches::Vector,
-            );
+            let wanted = exact_probe(source, "", &query, &everything, Branches::Vector)?;
             let expected: Vec<i64> = wanted.iter().map(|hit| i64::from(hit.chunk)).collect();
             match exhaustive(sql, "", &query, wide) {
                 Ok(found) => {
@@ -507,8 +560,7 @@ fn retrieval(source: &Index, sql: &mut SqlIndex) -> Vec<Check> {
             // The same probe again, at the width each index uses by default,
             // scored against the answer brute force says is right.
             let truth = exact_neighbours(source, &query, &everything, PROBE_K);
-            let (approximate, _) =
-                source.search_branches("", &query, &everything, PROBE_K, None, Branches::Vector);
+            let approximate = probe(source, "", &query, &everything, None, Branches::Vector)?;
             let theirs: Vec<i64> = approximate.iter().map(|hit| i64::from(hit.chunk)).collect();
             theirs_found += recall(&theirs, &truth);
             if let Ok(found) = ranked(sql, "", &query, wide) {
@@ -553,14 +605,7 @@ fn retrieval(source: &Index, sql: &mut SqlIndex) -> Vec<Check> {
                 continue;
             };
             let vector = source.vectors().copy_of(ordinal as u32);
-            let (wanted, _) = source.search_branches(
-                query,
-                &vector,
-                &everything,
-                PROBE_K,
-                Some(usize::MAX),
-                Branches::Both,
-            );
+            let wanted = exact_probe(source, query, &vector, &everything, Branches::Both)?;
             let expected: Vec<i64> = wanted.iter().map(|hit| i64::from(hit.chunk)).collect();
             match exhaustive(sql, query, &vector, wide) {
                 Ok(found) => {
@@ -587,8 +632,8 @@ fn retrieval(source: &Index, sql: &mut SqlIndex) -> Vec<Check> {
 
     checks.push(live_filter(
         source, sql, &probes, &live, &documents, &deleted, cap, wide,
-    ));
-    checks
+    )?);
+    Ok(checks)
 }
 
 /// Compares the scores, not only the order.
@@ -611,12 +656,11 @@ fn scores_match(
     probes: &[String],
     filter: &inillucent_core::filter::CompiledFilter,
     wide: usize,
-) -> Check {
+) -> Result<Check, String> {
     let mut wrong = Vec::new();
     let mut compared = 0usize;
     for query in probes {
-        let (wanted, _) =
-            source.search_branches(query, &[], filter, PROBE_K, None, Branches::Lexical);
+        let wanted = probe(source, query, &[], filter, None, Branches::Lexical)?;
         let found = match ranked_hits(sql, query, &[], wide) {
             Ok(hits) => hits,
             Err(failure) => {
@@ -641,12 +685,12 @@ fn scores_match(
         }
     }
     if wrong.is_empty() {
-        Check::pass(
+        Ok(Check::pass(
             "bm25.scores",
             format!("{compared} hits carry the same fused score"),
-        )
+        ))
     } else {
-        Check::fail("bm25.scores", wrong.join(" | "))
+        Ok(Check::fail("bm25.scores", wrong.join(" | ")))
     }
 }
 
@@ -665,17 +709,19 @@ fn live_filter(
     deleted: &[i64],
     cap: usize,
     wide: usize,
-) -> Check {
+) -> Result<Check, String> {
     if deleted.is_empty() {
-        return Check::pass("filter.deleted", "the corpus holds no tombstoned chunk");
+        return Ok(Check::pass(
+            "filter.deleted",
+            "the corpus holds no tombstoned chunk",
+        ));
     }
     let mut wrong = Vec::new();
     // Deep enough that after the tombstoned rows are dropped there are still at
     // least as many live candidates as the legacy engine fused over.
     let deep = wide.saturating_add(deleted.len());
     for query in probes {
-        let (wanted, _) =
-            source.search_branches(query, &[], live, PROBE_K, None, Branches::Lexical);
+        let wanted = probe(source, query, &[], live, None, Branches::Lexical)?;
         let expected: Vec<i64> = wanted.iter().map(|hit| i64::from(hit.chunk)).collect();
         match ranked(sql, query, &[], deep) {
             Ok(found) => {
@@ -688,12 +734,12 @@ fn live_filter(
         }
     }
     if wrong.is_empty() {
-        Check::pass(
+        Ok(Check::pass(
             "filter.deleted",
             format!("{} tombstoned chunks excluded identically", deleted.len()),
-        )
+        ))
     } else {
-        Check::fail("filter.deleted", wrong.join(" | "))
+        Ok(Check::fail("filter.deleted", wrong.join(" | ")))
     }
 }
 

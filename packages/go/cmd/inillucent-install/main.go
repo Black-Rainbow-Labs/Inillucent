@@ -37,9 +37,14 @@ import (
 
 const repository = "Black-Rainbow-Labs/Inillucent"
 
-// Where the archives live. The repository is private, so a GitHub release
-// cannot be the distribution point - its assets are private too. The site is,
-// and install.ps1 and install.sh both read from here.
+// Where the archives live. The site rather than the GitHub release, because it
+// is the one URL every installer on every platform reads: install.ps1,
+// install.sh, the Homebrew formula and the PHP bin/inillucent-install all read
+// from here and check the SHA-256 against the published SHA256SUMS. It began as
+// a necessity - a private repository's release assets are private too, and an
+// unauthenticated request for one answered 404 - and stayed a choice after
+// task-1961 made the repository public, because one place to publish is one
+// place to get wrong.
 const downloads = "https://inillucent.com/downloads"
 
 // The release this wrapper was built and tested against.
@@ -53,7 +58,7 @@ const downloads = "https://inillucent.com/downloads"
 //
 // `-version latest` still asks the server, for somebody who wants the newest on
 // purpose.
-const nativeVersion = "0.1.2"
+const nativeVersion = "0.1.3"
 
 // programs are the four the release ships.
 var programs = []string{"inillucent", "inillucent-shell", "inillucent-mcp", "inillucent-migrate"}

@@ -57,18 +57,32 @@ struct Captured {
 /// implies - has no `CREATE` text and is skipped: recreating the table recreates
 /// it, and replaying it would be a second index under the same name.
 ///
+/// **The fresh file is created on the caller's own file system.** This used to
+/// call `ImportedDatabase::create`, which constructs a fresh `OsVfs`, so a
+/// connection on `MemoryVfs` or `SimVfs` wrote its rebuild onto the real disk
+/// and then renamed a path that was not there (task-1946, H2).
+///
+/// @param vfs - the file system the database lives on
 /// @param source - the database being rebuilt
 /// @param destination - the file to write, which must not exist
 /// @param page_size - the page size the new file is laid out with
 /// @param frames - how many frames its pool is given
 pub(crate) fn rebuild_into(
+    vfs: std::sync::Arc<dyn inillucent_vfs::Vfs>,
     source: &ImportedDatabase,
     destination: &Path,
     page_size: usize,
     frames: usize,
 ) -> DbResult<()> {
     let captured = capture_schema(source);
-    let mut fresh = ImportedDatabase::create(destination.to_path_buf(), page_size, frames)?;
+    let mut fresh = ImportedDatabase::create_on(vfs, destination.to_path_buf(), page_size, frames)
+        .map_err(|error| {
+            inillucent_base::error::misuse(format!(
+                "VACUUM could not create the file to rebuild into, {}: {}",
+                destination.display(),
+                error
+            ))
+        })?;
     replay_schema(&mut fresh, &captured, |kind| kind == ObjectKind::Table)?;
     for entry in &captured {
         if entry.kind != ObjectKind::Table {
@@ -80,8 +94,14 @@ pub(crate) fn rebuild_into(
     replay_schema(&mut fresh, &captured, |kind| {
         matches!(kind, ObjectKind::View | ObjectKind::Trigger)
     })?;
-    carry_header(source, &mut fresh)?;
-    fresh.checkpoint()?;
+    carry_header(source, &mut fresh).map_err(|error| {
+        inillucent_base::error::misuse(format!("VACUUM could not carry the header: {error}"))
+    })?;
+    fresh.checkpoint().map_err(|error| {
+        inillucent_base::error::misuse(format!(
+            "VACUUM could not checkpoint the rebuilt file: {error}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -251,53 +271,31 @@ pub(crate) fn scratch_beside(target: &Path, stamp: u64) -> PathBuf {
 /// not, because NTFS journals a rename's metadata itself - the same split
 /// `inillucent_vfs`'s own directory sync draws for a delete.
 ///
+/// **Through the caller's `Vfs`, not `std::fs`.** This used to rename directly
+/// on the operating system's file system whatever VFS the connection was opened
+/// on, so an application on `MemoryVfs`, `SimVfs` or its own encrypting VFS
+/// rebuilt into a file the rename could not find (task-1946, H2). The
+/// platform-specific directory flush moved with it: `Vfs::rename` is documented
+/// to make its own directory entry durable, and `OsVfs` does exactly what this
+/// function used to do.
+///
+/// @param vfs - the file system the database lives on
 /// @param scratch - the rebuilt file, already checkpointed and therefore durable
 /// @param path - the database file it replaces
-pub(crate) fn commit_rebuild(scratch: &Path, path: &Path) -> DbResult<()> {
-    std::fs::rename(scratch, path).map_err(|error| {
+pub(crate) fn commit_rebuild(
+    vfs: &std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    scratch: &Path,
+    path: &Path,
+) -> DbResult<()> {
+    let from = inillucent_vfs::DbPath::new(scratch.to_string_lossy().as_ref());
+    let to = inillucent_vfs::DbPath::new(path.to_string_lossy().as_ref());
+    vfs.rename(&from, &to).map_err(|error| {
         inillucent_base::error::misuse(format!(
-            "cannot write the rebuilt database over {}: {error}",
-            path.display()
-        ))
-    })?;
-    sync_parent_directory(path)
-}
-
-/// Forces a rename's directory entry onto the disk, on the platform that
-/// needs to be told.
-///
-/// @param path - a path whose parent directory just gained a new entry for it
-#[cfg(unix)]
-fn sync_parent_directory(path: &Path) -> DbResult<()> {
-    let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    else {
-        return Ok(());
-    };
-    let directory = std::fs::File::open(parent).map_err(|error| {
-        inillucent_base::error::misuse(format!(
-            "cannot open {} to make the rebuilt database durable: {error}",
-            parent.display()
-        ))
-    })?;
-    directory.sync_all().map_err(|error| {
-        inillucent_base::error::misuse(format!(
-            "cannot sync {} to make the rebuilt database durable: {error}",
-            parent.display()
+            "cannot write the rebuilt database over {}: {}",
+            path.display(),
+            error.detail()
         ))
     })
-}
-
-/// A directory has nothing to flush on Windows: NTFS journals the metadata
-/// change a rename makes, rather than leaving it in a page a caller has to
-/// force out - the same fact `crates/inillucent-vfs/src/os/windows.rs`'s own
-/// `sync_directory` relies on for a delete.
-///
-/// @param path - a path whose parent directory just gained a new entry for it
-#[cfg(windows)]
-fn sync_parent_directory(_path: &Path) -> DbResult<()> {
-    Ok(())
 }
 
 /// Removes every write-ahead log segment beside a database file.
@@ -312,25 +310,39 @@ fn sync_parent_directory(_path: &Path) -> DbResult<()> {
 /// segment that cannot be removed is a warning rather than a reason to abandon
 /// a rebuild that has already succeeded.
 ///
+/// **Through the caller's `Vfs`, and by name rather than by listing.** This used
+/// to `read_dir` the containing directory and `remove_file` whatever matched,
+/// which is two more operations on the operating system's file system that a
+/// connection on another VFS never asked for (task-1946, H2). A listing is not
+/// needed: `inillucent_wal::segment::segment_name` makes a segment's name a
+/// function of the database's name and a sequence number, so the names can be
+/// generated. The walk stops at the first sequence number that is not there,
+/// with a small run of misses tolerated, because the sequence is dense in
+/// practice and an unbounded walk over a `u64` is not a walk.
+///
+/// @param vfs - the file system the database lives on
 /// @param database - the database file the segments belong to
-pub(crate) fn remove_log_segments(database: &Path) {
-    let Some(directory) = database.parent() else {
-        return;
-    };
+pub(crate) fn remove_log_segments(vfs: &std::sync::Arc<dyn inillucent_vfs::Vfs>, database: &Path) {
     let Some(base) = database.file_name().and_then(|name| name.to_str()) else {
         return;
     };
-    let prefix = format!("{base}-wal.");
-    let Ok(listing) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in listing.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.starts_with(&prefix) {
-            let _ = std::fs::remove_file(entry.path());
+    let directory = database.parent();
+    // How many consecutive absent sequence numbers end the walk. A log's
+    // segments are numbered from one without gaps; the tolerance is for a
+    // directory somebody has tidied by hand rather than for anything the engine
+    // does.
+    const TOLERATED_GAP: u64 = 16;
+    let mut missed = 0u64;
+    let mut sequence = 0u64;
+    while missed < TOLERATED_GAP {
+        let path = inillucent_wal::writer::segment_path(base, directory, sequence);
+        sequence = sequence.saturating_add(1);
+        match vfs.access(&path, inillucent_vfs::AccessMode::Exists) {
+            Ok(true) => {
+                missed = 0;
+                let _ = vfs.delete(&path, true);
+            }
+            _ => missed = missed.saturating_add(1),
         }
     }
 }
@@ -418,28 +430,28 @@ impl ConnectionSettings {
     /// @param database - the connection `VACUUM` is about to reopen
     pub(crate) fn capture(database: &ImportedDatabase) -> ConnectionSettings {
         ConnectionSettings {
-            journal_mode: database.journal_mode,
-            foreign_keys: database.foreign_keys,
-            defer_foreign_keys: database.defer_foreign_keys,
-            locking_exclusive: database.locking_exclusive,
-            defensive: database.defensive,
-            secure_delete: database.secure_delete,
-            auto_vacuum: database.auto_vacuum,
-            automatic_index: database.automatic_index,
-            ignore_check_constraints: database.ignore_check_constraints,
-            case_sensitive_like: database.case_sensitive_like,
-            cache_size: database.cache_size,
-            analysis_limit: database.analysis_limit,
-            writable_schema: database.writable_schema,
-            query_only: database.query_only,
-            recursive_triggers: database.recursive_triggers,
-            max_page_count: database.max_page_count,
-            temp_store: database.temp_store,
-            busy_timeout_ms: database.busy_timeout_ms,
-            collations: database.collations.clone(),
-            authorizer: database.authorizer.clone(),
-            levers: database.levers,
-            registry: database.registry.clone(),
+            journal_mode: database.pragmas.journal_mode.get(),
+            foreign_keys: database.pragmas.foreign_keys.get(),
+            defer_foreign_keys: database.pragmas.defer_foreign_keys.get(),
+            locking_exclusive: database.pragmas.locking_exclusive.get(),
+            defensive: database.pragmas.defensive.get(),
+            secure_delete: database.pragmas.secure_delete.get(),
+            auto_vacuum: database.pragmas.auto_vacuum.get(),
+            automatic_index: database.pragmas.automatic_index.get(),
+            ignore_check_constraints: database.pragmas.ignore_check_constraints.get(),
+            case_sensitive_like: database.pragmas.case_sensitive_like.get(),
+            cache_size: database.pragmas.cache_size.get(),
+            analysis_limit: database.pragmas.analysis_limit.get(),
+            writable_schema: database.pragmas.writable_schema.get(),
+            query_only: database.pragmas.query_only.get(),
+            recursive_triggers: database.pragmas.recursive_triggers.get(),
+            max_page_count: database.pragmas.max_page_count.get(),
+            temp_store: database.pragmas.temp_store.get(),
+            busy_timeout_ms: database.pragmas.busy_timeout_ms.get(),
+            collations: database.session_state.collations.clone(),
+            authorizer: database.session_state.authorizer.clone(),
+            levers: database.pragmas.levers.get(),
+            registry: database.session_state.registry.clone(),
         }
     }
 
@@ -461,28 +473,43 @@ impl ConnectionSettings {
     /// @param database - the freshly reopened connection
     pub(crate) fn restore(self, database: &mut ImportedDatabase) -> DbResult<()> {
         database.set_journal_mode(self.journal_mode)?;
-        database.foreign_keys = self.foreign_keys;
-        database.defer_foreign_keys = self.defer_foreign_keys;
-        database.locking_exclusive = self.locking_exclusive;
-        database.defensive = self.defensive;
-        database.secure_delete = self.secure_delete;
-        database.auto_vacuum = self.auto_vacuum;
-        database.automatic_index = self.automatic_index;
-        database.ignore_check_constraints = self.ignore_check_constraints;
-        database.case_sensitive_like = self.case_sensitive_like;
-        database.cache_size = self.cache_size;
-        database.analysis_limit = self.analysis_limit;
-        database.writable_schema = self.writable_schema;
-        database.query_only = self.query_only;
-        database.recursive_triggers = self.recursive_triggers;
-        database.max_page_count = self.max_page_count;
-        database.temp_store = self.temp_store;
-        database.busy_timeout_ms = self.busy_timeout_ms;
-        database.collations = self.collations;
-        database.authorizer = self.authorizer;
-        database.levers = self.levers;
-        database.registry = self.registry;
-        database.eponymous.clear();
+        database.pragmas.foreign_keys.set(self.foreign_keys);
+        database
+            .pragmas
+            .defer_foreign_keys
+            .set(self.defer_foreign_keys);
+        database
+            .pragmas
+            .locking_exclusive
+            .set(self.locking_exclusive);
+        database.pragmas.defensive.set(self.defensive);
+        database.pragmas.secure_delete.set(self.secure_delete);
+        database.pragmas.auto_vacuum.set(self.auto_vacuum);
+        database.pragmas.automatic_index.set(self.automatic_index);
+        database
+            .pragmas
+            .ignore_check_constraints
+            .set(self.ignore_check_constraints);
+        database
+            .pragmas
+            .case_sensitive_like
+            .set(self.case_sensitive_like);
+        database.pragmas.cache_size.set(self.cache_size);
+        database.pragmas.analysis_limit.set(self.analysis_limit);
+        database.pragmas.writable_schema.set(self.writable_schema);
+        database.pragmas.query_only.set(self.query_only);
+        database
+            .pragmas
+            .recursive_triggers
+            .set(self.recursive_triggers);
+        database.pragmas.max_page_count.set(self.max_page_count);
+        database.pragmas.temp_store.set(self.temp_store);
+        database.pragmas.busy_timeout_ms.set(self.busy_timeout_ms);
+        database.session_state.collations = self.collations;
+        database.session_state.authorizer = self.authorizer;
+        database.pragmas.levers.set(self.levers);
+        database.session_state.registry = self.registry;
+        database.session_state.eponymous.clear();
         database.refresh_catalog();
         Ok(())
     }
@@ -514,7 +541,7 @@ pub(crate) struct AttachedSchemas {
     next_handle: u32,
     /// Every built tree an attached or temporary schema owns.
     ///
-    /// **`self.trees` is connection-wide, keyed by handle rather than by
+    /// **`self.schema.trees` is connection-wide, keyed by handle rather than by
     /// schema, and `main`'s own trees are not among these** - `Attached`
     /// itself holds no `PagedTree` at all, only the catalog row that names
     /// one, so a handle here is unreachable without its matching entry moving
@@ -537,23 +564,23 @@ impl AttachedSchemas {
     /// @param database - the connection about to be reopened
     pub(crate) fn take(database: &mut ImportedDatabase) -> AttachedSchemas {
         let is_attached = |root: &u32| *root >= crate::FIRST_ATTACHED_HANDLE;
-        let trees = std::mem::take(&mut database.trees)
+        let trees = std::mem::take(&mut database.schema.trees)
             .into_iter()
             .filter(|(root, _)| is_attached(root))
             .collect();
-        let layouts = std::mem::take(&mut database.layouts)
+        let layouts = std::mem::take(&mut database.schema.layouts)
             .into_iter()
             .filter(|(root, _)| is_attached(root))
             .collect();
-        let covering = std::mem::take(&mut database.covering)
+        let covering = std::mem::take(&mut database.schema.covering)
             .into_iter()
             .filter(|(root, _)| is_attached(root))
             .collect();
         AttachedSchemas {
-            temps: std::mem::take(&mut database.temps),
-            attached: std::mem::take(&mut database.attached),
-            owner: std::mem::take(&mut database.owner),
-            next_handle: database.next_handle,
+            temps: std::mem::take(&mut database.session_state.temps),
+            attached: std::mem::take(&mut database.session_state.attached),
+            owner: std::mem::take(&mut database.session_state.owner),
+            next_handle: database.schema.next_handle,
             trees,
             layouts,
             covering,
@@ -563,20 +590,54 @@ impl AttachedSchemas {
     /// Puts every temporary table and every attached database back onto a
     /// freshly reopened connection, and rebuilds the tables that describe
     /// them - the same step `ATTACH` itself takes after adding one, needed
-    /// here because the fresh connection derived `self.tables` from `main`
+    /// here because the fresh connection derived `self.schema.tables` from `main`
     /// alone, before any of this existed to derive it from.
     ///
     /// @param database - the freshly reopened connection
     pub(crate) fn restore(self, database: &mut ImportedDatabase) -> DbResult<()> {
-        database.temps = self.temps;
-        database.attached = self.attached;
-        database.owner = self.owner;
-        database.next_handle = self.next_handle;
-        database.trees.extend(self.trees);
-        database.layouts.extend(self.layouts);
-        database.covering.extend(self.covering);
+        database.session_state.temps = self.temps;
+        database.session_state.attached = self.attached;
+        database.session_state.owner = self.owner;
+        database.schema.next_handle = self.next_handle;
+        database.schema.trees.extend(self.trees);
+        database.schema.layouts.extend(self.layouts);
+        database.schema.covering.extend(self.covering);
         database.rebuild_tables()
     }
+}
+
+/// Reopens one of the two files `VACUUM` swaps, saying which when it cannot.
+///
+/// **An error here used to say `Open: No such file or directory` and nothing
+/// else**, which names neither the file nor the step - and `VACUUM` opens two
+/// different files in sequence, so the message left a reader unable to tell a
+/// rebuild that was never written from a rename that did not land.
+///
+/// @param vfs - the file system the database lives on
+/// @param path - the file to open
+/// @param page_size - the page size to open it with
+/// @param frames - how many frames its pool is given
+/// @param which - what this file is, for the message
+fn reopened(
+    vfs: &std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    path: &Path,
+    page_size: usize,
+    frames: usize,
+    which: &str,
+) -> DbResult<ImportedDatabase> {
+    ImportedDatabase::open_on(
+        std::sync::Arc::clone(vfs),
+        path.to_path_buf(),
+        page_size,
+        frames,
+    )
+    .map_err(|error| {
+        inillucent_base::error::misuse(format!(
+            "VACUUM could not reopen {which}, {}: {}",
+            path.display(),
+            error
+        ))
+    })
 }
 
 /// Reports whether any write-ahead log segment sits beside a database file.
@@ -587,6 +648,140 @@ impl AttachedSchemas {
 /// testing the thing it claims to.
 ///
 /// @param database - the database file to check beside
+/// Rebuilds a database over itself, reclaiming everything nothing uses.
+///
+/// @param connection - the connection to rebuild, replaced in place
+///
+/// **Written beside the database and renamed over it, not copied**: see
+/// `commit_rebuild` for why a rename is what a crash
+/// cannot catch halfway and a byte copy is. The connection reopens onto
+/// the new file afterwards, because every tree handle it holds names a
+/// root that has moved.
+///
+/// **Every step is on `connection.storage.vfs`** - the rebuild, the rename, the segment
+/// removals and both reopens. It was not: the reopens constructed a fresh
+/// `OsVfs` and the rebuild called `std::fs` directly, so a connection on
+/// `MemoryVfs`, `SimVfs` or an application's own encrypting VFS either
+/// failed to find its own database or silently finished the statement on
+/// the operating system's file system and stayed there (task-1946, H2).
+/// `docs/relational-architecture.md` §6 has the argument for the rename.
+///
+/// **Every temporary table and every attached database is carried across
+/// too**, by `AttachedSchemas` (see its doc) - `main` is
+/// the only file this rewrites, so both are simply moved onto the
+/// reopened connection unchanged. Refused instead for a declared imposter
+/// table, which is bound into `main`'s own trees by page - every index
+/// below gets a fresh one, so there is nothing to move it onto.
+///
+/// **`changes()`, `total_changes()` and `last_insert_rowid()` are
+/// preserved - except when the rebuilt schema holds a view**, which moves
+/// the last one; see `last_rowid_after_vacuum`. Every
+/// other connection setting is captured before the first reopen and put
+/// back after the second, by `ConnectionSettings`.
+pub(crate) fn vacuum_in_place(connection: &mut ImportedDatabase) -> DbResult<()> {
+    if !connection.schema.imposters.is_empty() {
+        return Err(refusal(
+            "cannot VACUUM a connection with an imposter table declared - every index gets a fresh tree below",
+        ));
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos() as u64)
+        .unwrap_or(0);
+    let scratch = scratch_beside(&connection.storage.path, stamp);
+    let _ = connection.storage.vfs.delete(
+        &inillucent_vfs::DbPath::new(scratch.to_string_lossy().as_ref()),
+        false,
+    );
+    connection.rebuild_into(&scratch)?;
+    let path = connection.storage.path.clone();
+    let page_size = connection.storage.page_size;
+    let frames = connection.storage.frames;
+    // **Taken before the first `*connection`.** Every reopen and every file
+    // operation below has to land on the file system this connection was
+    // opened on, and `*connection` replaces the whole `ImportedDatabase` - so
+    // the handle is taken here, while it is still the one the caller
+    // gave us (task-1946, H2).
+    let vfs = std::sync::Arc::clone(&connection.storage.vfs);
+    // **And the writer is taken here for the same reason (task-1962, A1
+    // step 3).** `crate::connect::Database` holds a second handle on it, so a
+    // reopen that left a fresh group behind would leave that handle reading a
+    // writer nothing writes to. Put back below, with the reopen's own values
+    // copied into it.
+    let writer = std::rc::Rc::clone(&connection.writing);
+    // The settings group for the same reason, and it is put back before
+    // `settings.restore` below so that the restore writes into the group both
+    // handles hold rather than into one the reopen made.
+    let pragmas = std::rc::Rc::clone(&connection.pragmas);
+    // **`changes()`/`total_changes()`/`last_insert_rowid()` are the
+    // connection's own history, not a fact about the file `VACUUM` is
+    // rewriting, and SQLite's own `VACUUM` leaves them alone.** Assigning
+    // through `connection` below replaces the whole `ImportedDatabase` with a
+    // freshly opened one, whose `last_changes`/`changed_ever`/
+    // `last_rowid`/`session_change_baseline` all start at zero - so the
+    // differential suite's `vacuum_matches_sqlite` read `changes()` as 0
+    // and `last_insert_rowid()` as 0 straight after a `VACUUM` that
+    // changed nothing itself and inserted no row, where the reference
+    // still answered whatever the last real write left there. Saved here
+    // and restored once, after the second and final swap - nothing runs a
+    // statement on it between the two, so there is nothing to restore
+    // in between.
+    // Carrying the group itself is what keeps them, and it keeps
+    // `session_change_baseline` with them, which is the one a reopen could not
+    // have reconstructed.
+    let counters = std::rc::Rc::clone(&connection.counters);
+    let last_rowid = connection.counters.last_rowid.get();
+    // The plan cache is carried for the handle rather than for the plans:
+    // `crate::connect::Database` holds a second handle on it, and every plan in
+    // it names a tree this rebuild has moved, so it takes the reopen's own
+    // empty cache through `Compiled::adopt` below.
+    let compiled = std::rc::Rc::clone(&connection.compiled);
+    let settings = ConnectionSettings::capture(connection);
+    let schemas = AttachedSchemas::take(connection);
+    // **The old file is closed before it is replaced, not after** -
+    // assigning through `connection` drops the old value first, which is the
+    // only moment in this function when neither file is open by us. A
+    // pool still holding frames of a file whose bytes changed underneath
+    // it would answer from the database that used to be there.
+    // **On the caller's own VFS.** `ImportedDatabase::open` constructs a
+    // fresh `OsVfs`, so this used to move the whole connection onto the
+    // operating system's file system for the rest of the session whatever
+    // it was opened on (task-1946, H2).
+    *connection = reopened(&vfs, &scratch, page_size, frames, "the rebuilt file")?;
+    // **The one crash-sensitive moment.** Up to here neither `path` nor
+    // its log segments have been touched, so a crash recovers the
+    // original the ordinary way. `commit_rebuild` is a single rename, and
+    // once it returns `path` holds the rebuilt bytes durably.
+    commit_rebuild(&vfs, &scratch, &path)?;
+    // Only now, with the rename durable, do `path`'s pre-rebuild segments
+    // stop describing anything true - left beside the new file they would
+    // be replayed over it on the next open, undoing the rebuild. Removing
+    // them earlier, before the rename could be proven to land, was this
+    // function's defect: a crash between the removal and the copy left
+    // the original unrecoverable, its log already gone.
+    remove_log_segments(&vfs, &path);
+    *connection = reopened(&vfs, &path, page_size, frames, "the database it replaced")?;
+    writer.adopt(&connection.writing);
+    connection.writing = writer;
+    connection.pragmas = pragmas;
+    compiled.adopt(&connection.compiled);
+    connection.compiled = compiled;
+    connection.counters = counters;
+    connection
+        .counters
+        .last_rowid
+        .set(last_rowid_after_vacuum(connection, last_rowid));
+    // Before the settings: `ConnectionSettings::restore`'s
+    // `refresh_catalog` needs the tables `rebuild_tables` derives here
+    // already in place to describe them.
+    schemas.restore(connection)?;
+    settings.restore(connection)?;
+    // The scratch name is spent - `commit_rebuild` renamed the file away -
+    // so this is only the log segments it picked up along the way.
+    remove_log_segments(&vfs, &scratch);
+    Ok(())
+}
+
 #[cfg(test)]
 fn has_log_segments(database: &Path) -> bool {
     let Some(directory) = database.parent() else {
@@ -638,6 +833,11 @@ mod vacuum_crash {
     ///
     /// @param tag - which case this path belongs to, for a reader of the temp
     ///   directory
+    /// The operating system's file system, which is what these tests rebuild on.
+    fn os_vfs() -> std::sync::Arc<dyn inillucent_vfs::Vfs> {
+        std::sync::Arc::new(inillucent_vfs::OsVfs::new())
+    }
+
     fn temp_db_path(tag: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -714,8 +914,8 @@ mod vacuum_crash {
         drop(reopened);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&scratch);
-        remove_log_segments(&path);
-        remove_log_segments(&scratch);
+        remove_log_segments(&os_vfs(), &path);
+        remove_log_segments(&os_vfs(), &scratch);
     }
 
     /// A crash after the rename lands, but before `path`'s pre-rebuild log
@@ -750,7 +950,7 @@ mod vacuum_crash {
         // for writing.
         engine = ImportedDatabase::open(scratch.clone(), PAGE_SIZE, FRAMES)
             .expect("the scratch reopens");
-        commit_rebuild(&scratch, &path).expect("the rename lands");
+        commit_rebuild(&os_vfs(), &scratch, &path).expect("the rename lands");
         // The crash: `remove_log_segments(&path)`, the very next line in
         // `vacuum_in_place`, never runs - `path`'s pre-rebuild segments are
         // still sitting beside the rebuilt file.
@@ -766,7 +966,7 @@ mod vacuum_crash {
         );
         drop(reopened);
         let _ = std::fs::remove_file(&path);
-        remove_log_segments(&path);
+        remove_log_segments(&os_vfs(), &path);
     }
 
     /// The order `vacuum_in_place` used to run in - the original's log
@@ -792,7 +992,7 @@ mod vacuum_crash {
 
         // The defect: the original's segments are gone *before* `path` has
         // been touched at all.
-        remove_log_segments(&path);
+        remove_log_segments(&os_vfs(), &path);
         assert!(
             !has_log_segments(&path),
             "the segments this case removes early must actually have existed"
@@ -829,7 +1029,7 @@ mod vacuum_crash {
         }
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&scratch);
-        remove_log_segments(&scratch);
+        remove_log_segments(&os_vfs(), &scratch);
     }
 
     /// `VACUUM` refuses a connection with an imposter table declared.
@@ -859,6 +1059,6 @@ mod vacuum_crash {
         );
         drop(engine);
         let _ = std::fs::remove_file(&path);
-        remove_log_segments(&path);
+        remove_log_segments(&os_vfs(), &path);
     }
 }

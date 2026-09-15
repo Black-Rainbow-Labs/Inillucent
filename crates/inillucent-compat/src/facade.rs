@@ -41,41 +41,8 @@ use std::rc::Rc;
 
 use inillucent_base::DbResult;
 use inillucent_engine::connect::Database as Engine;
-use inillucent_tree::datum::OwnedDatum;
+use inillucent_tree::datum::{owned_row_values, OwnedDatum};
 use inillucent_value::Value;
-
-/// Converts one engine value into the value the suites format.
-///
-/// @param datum - the engine's value
-pub fn value_of(datum: &OwnedDatum) -> Value<'static> {
-    match datum {
-        OwnedDatum::Null => Value::Null,
-        OwnedDatum::Int(number) => Value::Integer(*number),
-        OwnedDatum::Real(number) => Value::Real(*number),
-        OwnedDatum::Text(bytes) => Value::owned_text(bytes).unwrap_or(Value::Null),
-        OwnedDatum::Blob(bytes) => Value::owned_blob(bytes).unwrap_or(Value::Null),
-    }
-}
-
-/// Converts one engine row.
-///
-/// @param row - the engine's row
-fn row_of(row: &[OwnedDatum]) -> Vec<Value<'static>> {
-    row.iter().map(value_of).collect()
-}
-
-/// Converts a value the suites bind into the engine's.
-///
-/// @param value - the value to bind
-pub fn datum_of(value: &Value<'_>) -> OwnedDatum {
-    match value {
-        Value::Null => OwnedDatum::Null,
-        Value::Integer(number) => OwnedDatum::Int(*number),
-        Value::Real(number) => OwnedDatum::Real(*number),
-        Value::Text(text) => OwnedDatum::Text(text.raw().to_vec()),
-        Value::Blob(bytes) => OwnedDatum::Blob(bytes.raw().to_vec()),
-    }
-}
 
 /// An open database file.
 pub struct Database {
@@ -170,8 +137,12 @@ impl Database {
     /// connection per call - so without a session of its own, every statement
     /// would be a different connection to the engine, and a temporary table
     /// would not survive the statement that made it.
-    pub fn connect(&self) -> DbResult<Connection> {
-        let session = self.engine.connect().session();
+    ///
+    /// Called `session` rather than `connect` for the reason
+    /// [`inillucent_engine::connect::Database::session`] is: two of them share
+    /// one transaction.
+    pub fn session(&self) -> DbResult<Connection> {
+        let session = self.engine.session().session();
         Ok(Connection {
             engine: Rc::clone(&self.engine),
             session,
@@ -212,7 +183,7 @@ pub struct Connection {
 impl Connection {
     /// Returns this connection's engine handle, on its own session.
     fn open(&self) -> inillucent_engine::connect::Connection<'_> {
-        self.engine.connect_as(self.session)
+        self.engine.session_as(self.session)
     }
 }
 
@@ -235,12 +206,11 @@ impl Connection {
     ///
     /// @param sql - the statement
     pub fn query(&self, sql: &str) -> DbResult<Vec<Vec<Value<'static>>>> {
-        Ok(self
-            .open()
+        self.open()
             .query(sql)?
             .iter()
-            .map(|row| row_of(row))
-            .collect())
+            .map(|row| owned_row_values(row))
+            .collect::<DbResult<Vec<_>>>()
     }
 
     /// Compiles a statement to be bound and stepped.
@@ -260,10 +230,11 @@ impl Connection {
     ///
     /// @param sql - the script, positioned at the statement to compile
     pub fn prepare_with_tail(&self, sql: &str) -> DbResult<(Statement<'_>, usize)> {
-        let (inner, consumed) = self.open().prepare_with_tail(sql)?;
+        let prepared = self.open().prepare_with_tail(sql)?;
+        let consumed = prepared.consumed;
         Ok((
             Statement {
-                inner,
+                inner: prepared.statement,
                 engine: Rc::clone(&self.engine),
                 sql: sql.get(..consumed).unwrap_or(sql).to_string(),
                 session: self.session,
@@ -311,7 +282,7 @@ impl Connection {
     /// @param name - the name it was registered under
     /// @param arity - the arity it was registered for
     pub fn remove_function(&self, name: &str, arity: i32) -> bool {
-        self.open().remove_function(name, arity)
+        self.open().remove_function(name, arity).unwrap_or_default()
     }
 
     /// Registers a collating sequence an application defined.
@@ -328,14 +299,14 @@ impl Connection {
 
     /// Returns how many statements are compiled and held.
     pub fn cached_plan_count(&self) -> usize {
-        self.open().cached_plan_count()
+        self.open().cached_plan_count().unwrap_or_default()
     }
 
     /// Turns off one or more planner optimizations for this connection.
     ///
     /// @param mask - the levers to switch off
-    pub fn disable_optimizations(&self, mask: u32) {
-        self.open().disable_optimizations(mask);
+    pub fn disable_optimizations(&self, levers: inillucent_sql::plan::Levers) {
+        let _ = self.open().disable_optimizations(levers);
     }
 
     /// Rereads the schema from the file.
@@ -347,27 +318,27 @@ impl Connection {
     ///
     /// @param _database - which attached database, which this engine has one of
     pub fn schema_cookie(&self, _database: usize) -> DbResult<u64> {
-        Ok(self.open().schema_cookie())
+        self.open().schema_cookie()
     }
 
     /// Returns how many rows the last statement changed.
     pub fn changes(&self) -> i64 {
-        self.open().changes()
+        self.open().changes().unwrap_or_default()
     }
 
     /// Returns how many rows every statement so far has changed.
     pub fn total_changes(&self) -> i64 {
-        self.open().total_changes()
+        self.open().total_changes().unwrap_or_default()
     }
 
     /// Returns the rowid the last `INSERT` assigned.
     pub fn last_insert_rowid(&self) -> i64 {
-        self.open().last_insert_rowid()
+        self.open().last_insert_rowid().unwrap_or_default()
     }
 
     /// Returns whether every statement is its own transaction.
     pub fn autocommit(&self) -> bool {
-        self.open().autocommit()
+        self.open().autocommit().unwrap_or(true)
     }
 
     /// Makes everything written so far durable in the file.
@@ -407,7 +378,7 @@ impl Statement<'_> {
     /// @param index - the one-based parameter number
     /// @param value - the value
     pub fn bind(&mut self, index: u32, value: Value<'static>) -> DbResult<()> {
-        self.inner.bind(index, datum_of(&value))
+        self.inner.bind(index, OwnedDatum::from(&value))
     }
 
     /// Binds an integer.
@@ -458,7 +429,7 @@ impl Statement<'_> {
     pub fn step(&mut self) -> DbResult<bool> {
         let more = self.inner.step()?;
         self.row = if more {
-            row_of(self.inner.row())
+            owned_row_values(self.inner.row())?
         } else {
             Vec::new()
         };
@@ -535,7 +506,7 @@ impl Statement<'_> {
     /// reach it - is what the chain says.
     pub fn explain(&self) -> Vec<String> {
         self.engine
-            .connect_as(self.session)
+            .session_as(self.session)
             .explain(&self.sql)
             .unwrap_or_else(|error| vec![format!("cannot describe: {error:?}")])
     }

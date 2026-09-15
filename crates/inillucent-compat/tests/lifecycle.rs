@@ -69,7 +69,7 @@ fn connect() -> Connection<'static> {
     let database: &'static Database = Box::leak(Box::new(
         Database::open(imported_path()).expect("the import opens"),
     ));
-    database.connect()
+    database.session()
 }
 
 /// A statement steps to done and then keeps reporting done.
@@ -166,7 +166,9 @@ fn every_class_binds_and_returns() {
 #[test]
 fn the_connection_is_in_autocommit() {
     let connection = connect();
-    assert!(connection.autocommit());
+    assert!(connection
+        .autocommit()
+        .expect("nothing is running on this connection"));
     let _ = connection.prepare("SELECT 1").expect("it prepares");
 }
 
@@ -175,11 +177,16 @@ fn the_connection_is_in_autocommit() {
 fn prepare_reports_the_tail() {
     let connection = connect();
     let sql = "SELECT 1; SELECT 2;";
-    let (mut first, consumed) = connection.prepare_with_tail(sql).expect("it prepares");
+    let first = connection.prepare_with_tail(sql).expect("it prepares");
+    let consumed = first.consumed;
+    let mut first = first.statement;
     assert!(first.step().expect("it steps"));
     assert_eq!(first.row().first(), Some(&OwnedDatum::Int(1)));
     let rest = sql.get(consumed..).unwrap_or("");
-    let (mut second, _) = connection.prepare_with_tail(rest).expect("it prepares");
+    let mut second = connection
+        .prepare_with_tail(rest)
+        .expect("it prepares")
+        .statement;
     assert!(second.step().expect("it steps"));
     assert_eq!(second.row().first(), Some(&OwnedDatum::Int(2)));
 }
@@ -234,7 +241,7 @@ fn a_long_session_changes_no_byte() {
     let path = imported_path().clone();
     let database = Database::open(&path).expect("the import opens");
     let before = std::fs::read(&path).expect("the database reads");
-    let connection = database.connect();
+    let connection = database.session();
     for sql in [
         "SELECT count(*) FROM people",
         "SELECT * FROM people ORDER BY name",
@@ -324,7 +331,12 @@ fn lifecycle_and_metadata_match_the_oracle() {
         assert_eq!(observation.columns, expected, "{sql}");
         assert_eq!(ours, expected, "{sql}");
         assert!(observation.autocommit);
-        assert_eq!(connection.autocommit(), observation.autocommit);
+        assert_eq!(
+            connection
+                .autocommit()
+                .expect("nothing is running on this connection"),
+            observation.autocommit
+        );
     }
 
     // Bound values reach both engines as the same bits.

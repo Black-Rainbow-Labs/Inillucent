@@ -49,11 +49,13 @@ home directory and neither needs administrator rights.
 Verified on 2026-09-11 by running each command as written: Windows installs and
 runs, and so does Ubuntu 24.04. **macOS has no prebuilt archive yet**, so the
 second command works on Linux today and reports that there is no release for
-Darwin; building it needs a Mac. Until then, macOS builds from source:
+Darwin; building it needs a Mac.
+
+Building from source is the macOS route until there is an archive:
 
 ```sh
 git clone https://github.com/Black-Rainbow-Labs/Inillucent
-cargo build --release -p inillucent-cli
+cargo install --path Inillucent/crates/inillucent-cli
 ```
 
 ### From Go
@@ -63,10 +65,15 @@ go install github.com/Black-Rainbow-Labs/Inillucent/packages/go/cmd/inillucent-i
 inillucent-install
 ```
 
-`go install` builds a small program that downloads the release for your machine,
-checks its SHA-256 and puts the four programs in `GOBIN`. It needs
-`GOPRIVATE=github.com/Black-Rainbow-Labs/*` set, because the repository is
-private and Go's public checksum database cannot read it.
+`go install` resolves a module through `proxy.golang.org`, which clones the
+repository with no credential. The proxy serves it: `@latest` and `@v/list` both
+answer 200 to a signed-out caller, which `tools/check-public-urls.mjs` checks on
+every `tools/validate` run.
+
+The module and its tags are correct and the command starts working the day the
+repository is public. What it does then: `go install` builds a small program that
+downloads the release for your machine, checks its SHA-256 and puts the four
+programs in `GOBIN`.
 
 ### The other five package managers are not published yet
 
@@ -145,12 +152,16 @@ which is public and holds the source for all eight beside the conformance suite 
 against. **None of the eight packages below is on a registry yet**, so none of these install lines
 works today. They are what the packages will be named.
 
+The Rust row is the exception, and it names something that exists: the crate is
+`drivers/inillucent-driver` in this repository and it would publish under that
+name. The other seven are names nothing answers to yet.
+
 | | |
 |---|---|
 | TypeScript | `npm install inillucent-client` |
 | JavaScript | `npm install inillucent-client` |
 | Python | `pip install inillucent-client` |
-| Rust | `cargo add inillucent-client` |
+| Rust | `cargo add inillucent-driver` |
 | Go | `go get github.com/Black-Rainbow-Labs/inillucent-clients/go` |
 | Java | `com.inillucent:inillucent-client` |
 | C# | `dotnet add package Inillucent.Client` |
@@ -162,7 +173,8 @@ What exists today, and is installed by every route in [Install](#install):
   [The driver](drivers/README.md) documents it.
 - **A reference Python binding** at `drivers/bindings/python/inillucent.py`, which the `pip` package
   ships as its in process driver.
-- **The Go module** at `packages/go`, which is published.
+- **The Go module** at `packages/go`. Its tags are pushed and `proxy.golang.org`
+  serves it - see [From Go](#from-go).
 
 ```ts
 import { connect } from 'inillucent-client';
@@ -194,7 +206,8 @@ engine. [The driver](drivers/README.md) is the C ABI underneath, for anybody wri
 
 **SQLite's SQL, on its own storage.** Joins, common table expressions including recursive ones,
 triggers, foreign keys with all five referential actions, `ATTACH`, partial and expression indexes,
-`RETURNING`, `ON CONFLICT DO UPDATE`, 190 built in function names, 67 pragmas. 416 cases were run
+`RETURNING`, `ON CONFLICT DO UPDATE`, 190 built in function names,
+the 68 pragmas this engine recognises. 416 cases were run
 through this engine and through a pinned `sqlite3` 3.53.4 over a fresh database each, and every byte
 of both streams compared: **403 produce SQLite's exact bytes, none are refused and 7 answer
 differently**. Window functions were the last twelve to close: `OVER (...)`, `PARTITION BY`, the
@@ -304,17 +317,22 @@ each cost and how each was fixed:
 | | |
 |---|---|
 | [Product overview](docs/product-overview.md) | what inillucent is, who it is for, and the case for it against PostgreSQL with pgvector |
+| [Glossary](docs/glossary.md) | every word this documentation uses that a general programmer would not know, one sentence each |
 | [Getting started](docs/getting-started.md) | install, the four programs, a first database, the exit codes |
+| [Architecture in one page](docs/architecture-overview.md) | both engines in one diagram, one query across both halves, where the bytes live |
 | [SQL support](docs/sql.md) | what runs, what differs from SQLite, and what is refused by name |
+| [Pragmas](docs/pragmas.md) | every pragma this engine recognises, generated from the register |
 | [Vector search](docs/vector-search.md) | `VECTOR(N)` columns, HNSW indexes, `inillucent_search`, hybrid ranking |
 | [Embeddings](docs/embeddings.md) | the embedding pipeline, running it on GPUs, comparing models |
 | [Migrating](docs/migrating.md) | from a SQLite file, a PostgreSQL server or a MySQL server |
-| [Architecture](docs/architecture.md) | how the retrieval engine works, from first principles |
+| [The retrieval engine](docs/architecture.md) | how searching by meaning works, from first principles |
+| [The relational engine](docs/relational-architecture.md) | the SQL half: storage, transactions, the log, recovery, backup, budgets |
 | [Performance](docs/performance.md) | against SQLite: speed, processor time, memory, disk |
 | [Feature comparison](docs/feature-comparison.md) | the full 416-case probe, feature by feature |
 | [Retrieval quality](docs/retrieval-quality.md) | against pgvector, and how the grading decides a verdict |
 | [Where the vectors live](docs/vector-residency.md) | held in memory or read from the file, and what each costs |
 | [Roadmap](docs/roadmap.md) | what is not there yet, in the order it is being worked |
+| [Closed items](docs/closed-items.md) | what came off the roadmap, with the measurement that closed each |
 | [Repository](docs/repository.md) | the crates, building it, and running the tests |
 | [Dependency policy](docs/dependency-policy.md) | what a production crate may link, and why the list is short |
 | [Synthetic corpus](tests/synthetic-corpus.md) | building the public corpus every retrieval number is measured on |

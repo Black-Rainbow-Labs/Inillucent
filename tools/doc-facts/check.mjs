@@ -19,8 +19,15 @@
  *   node tools/doc-facts/check.mjs --self-test      # shows that the test-run judgement can fail
  *
  * `--run-tests` fails when the runner is absent, when its output cannot be read, and when it reports
- * a failing or undetermined test. The one nonzero exit it accepts is `--strict` reporting that
- * `live_postgres` and `live_mysql` had no server, which `docs/repository.md` documents.
+ * a failing or undetermined test. The nonzero exits it accepts are `--strict` reporting a
+ * prerequisite this machine does not have: no PostgreSQL or MySQL server, no
+ * `INILLUCENT_NETWORK_TESTS`, and no ONNX weights. `docs/repository.md` documents all four.
+ *
+ * `onnx` joined that list in task-1913. Before it, `inillucent-core`'s twenty-seven embedding tests
+ * were behind a cargo feature the build did not turn on, so they were in no binary and nothing
+ * reported them; now they are built and run, and twenty-nine cases across two suites say
+ * `no ONNX weights found; skipping` on a machine where `inillucent setup-embeddings all` has not
+ * been run. That is the absence being reported rather than a new one appearing.
  *
  * It exits 1 when anything disagrees.
  */
@@ -170,6 +177,24 @@ function probe() {
   return { total: rows.length, same: by.same || 0, refused: by.refused || 0, differ: by['wrong-answer'] || 0, oursOnly: by['ours-only'] || 0 };
 }
 
+/**
+ * Reads the pragma register's own count out of `compat/api/pragmas.toml`.
+ *
+ * **A checked fact rather than a number somebody typed (task-1961, D3).** The
+ * engine recognised 68 and two documents said 67, which is the 67 SQLite's
+ * `pragma_list` reports rather than the 68 the register holds - a real
+ * distinction that nothing wrote down, so the two numbers read as one being
+ * wrong. `docs/pragmas.md` is generated from the register and
+ * `cargo test -p inillucent-compat --test harness` fails when they differ;
+ * this fails when a prose document names a number that is neither.
+ */
+function pragmaRegisterCount() {
+  const file = path.join(ROOT, 'compat', 'api', 'pragmas.toml');
+  if (!fs.existsSync(file)) return null;
+  const found = fs.readFileSync(file, 'utf8').match(/^count = (\d+)$/m);
+  return found ? Number(found[1]) : null;
+}
+
 /** Reads the register audit, which is where the pragma and collation counts come from. */
 function registers() {
   const file = path.join(ROOT, '_agent_output', 'feature-probe', 'registers', 'registers.json');
@@ -214,8 +239,225 @@ function crateLints() {
   return { members, forbidsUnsafe, deniesFour };
 }
 
-/** The prerequisites `--strict` is allowed to report as absent on a machine with no server on it. */
-const OPTIONAL_PREREQUISITES = ['postgres', 'mysql'];
+/* ------------------------------------- what a public repository must not carry */
+
+/**
+ * Strings that must not appear in a tracked file, and the places each is still allowed.
+ *
+ * **This is the check that says the repository can be published.** A password, a
+ * personal address, a machine's drive letter and the name of a private repository
+ * were all in tracked content at the 0.1.2 release, and nothing looked at them
+ * (task-1946, H7). Each row below is one of those, with the reason it must not be
+ * here; `allow` names the files where the same characters mean something else, and
+ * every entry says why, because an unexplained exclusion is how a check goes quiet.
+ */
+const PRIVATE_REFERENCES = [
+  { needle: 'jasonlmcaffee', why: 'a personal email address' },
+  { needle: 'black.rainbow.labs@', why: 'a personal email address' },
+  { needle: '360water', why: "a real company's domain, used as a test fixture" },
+  { needle: 'postgres:inillucent@', why: 'a database password' },
+  { needle: 'C:\\jason', why: "a path on one developer's machine" },
+  { needle: 'C:/jason', why: "a path on one developer's machine" },
+  { needle: 'J:/inillucent', why: "a drive letter on one developer's machine" },
+  { needle: 'jason-25', why: 'a personal hostname' },
+  { needle: 'Codex Sol', why: 'a reviewer by name, where the house style credits a ticket' },
+  { needle: 'codex exec', why: 'a reviewer by name, where the house style credits a ticket' },
+  { needle: 'npmjs.com/settings', why: 'a registry URL carrying an account name' },
+  {
+    needle: '~/.claude',
+    why: 'a path inside a private instruction directory',
+    // `~/.claude/skills` is where Claude Code reads skills from on any machine, so
+    // these two lines are telling a reader of `agent-skills/` what to do with it.
+    // The reference H7 was about was `~/.claude/CLAUDE.md`, a private instruction
+    // file, and that one is gone.
+    allow: ['README.md', 'agent-skills/README.md'],
+  },
+  { needle: 'opencode.json', why: 'a file in a private repository' },
+  { needle: 'aiservice-web', why: 'a private repository' },
+];
+
+/**
+ * Files this check does not read, and why.
+ *
+ * Two files necessarily hold every string in the list above, because they are where
+ * the list is written down: this file, and the review document the list came from.
+ * Excluding anything else from `tasks/` was considered and rejected - the other
+ * design documents were corrected instead, which is what the list is for.
+ */
+const PRIVATE_REFERENCE_EXEMPT = [
+  'tools/doc-facts/check.mjs',
+  'tasks/task-1946-inillucent-code-review-round-two-tdd.md',
+];
+
+/** Every file `git ls-files` reports, as repository-relative paths with forward slashes. */
+function trackedFiles() {
+  const listing = execFileSync('git', ['-C', ROOT, 'ls-files', '-z'], {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return listing.split('\0').filter((entry) => entry.length > 0);
+}
+
+/**
+ * Reports every tracked file that carries one of the strings above.
+ *
+ * Binary files are read as UTF-8 and searched the same way; a database that happens
+ * to hold the bytes of a password is exactly as much of a problem as a document
+ * that does, so there is nothing to gain by skipping them.
+ */
+function privateReferences() {
+  const problems = [];
+  let files = 0;
+  for (const relative of trackedFiles()) {
+    if (PRIVATE_REFERENCE_EXEMPT.includes(relative)) continue;
+    const full = path.join(ROOT, relative);
+    let text;
+    try {
+      text = fs.readFileSync(full, 'utf8');
+    } catch {
+      continue;
+    }
+    files += 1;
+    for (const { needle, why, allow } of PRIVATE_REFERENCES) {
+      if (allow && allow.includes(relative)) continue;
+      const at = text.indexOf(needle);
+      if (at < 0) continue;
+      const line = text.slice(0, at).split('\n').length;
+      problems.push(`${relative}:${line} carries \`${needle}\` — ${why}`);
+    }
+  }
+  return { label: 'no tracked file carries a private reference', problems, scanned: files };
+}
+
+/* --------------------------------------------- every release version pin agrees */
+
+/**
+ * Each place a release version is written down, and the pattern that reads it.
+ *
+ * **Nothing tied these together, and two of them were wrong at 0.1.2.** The Python
+ * package reported 0.1.0 and the PHP installer downloaded 0.1.1, so
+ * `composer require` followed by the installer fetched the release that cannot
+ * embed (task-1946, H9). `packaging/release.ps1` runs this check before it builds.
+ *
+ * The npm platform packages are not listed: `packages/npm/build.mjs` writes each
+ * one's manifest from the wrapper's version, so the wrapper is the only copy.
+ */
+const VERSION_PINS = [
+  { file: 'packages/python/pyproject.toml', pattern: /^version = "([^"]+)"/m, what: 'the Python distribution' },
+  { file: 'packages/python/src/inillucent/__init__.py', pattern: /^__version__ = "([^"]+)"/m, what: "the Python package's own report" },
+  { file: 'packages/npm/inillucent/package.json', pattern: /"version":\s*"([^"]+)"/, what: 'the npm wrapper' },
+  { file: 'packages/go/cmd/inillucent-install/main.go', pattern: /^const nativeVersion = "([^"]+)"/m, what: 'the Go installer' },
+  { file: 'packages/php/bin/inillucent-install', pattern: /^const NATIVE_VERSION = '([^']+)';/m, what: 'the PHP installer' },
+  { file: 'packaging/homebrew/inillucent.rb', pattern: /^\s*version "([^"]+)"/m, what: 'the Homebrew formula' },
+];
+
+/** Reports every pinned copy of the release version that is not the workspace's. */
+function versionPins() {
+  const manifest = fs.readFileSync(path.join(ROOT, 'Cargo.toml'), 'utf8');
+  const workspace = /\[workspace\.package\][\s\S]*?^version = "([^"]+)"/m.exec(manifest);
+  if (!workspace) {
+    return { label: 'every version pin equals the workspace version', problems: ['Cargo.toml has no [workspace.package] version'] };
+  }
+  const expected = workspace[1];
+  const problems = [];
+  for (const { file, pattern, what } of VERSION_PINS) {
+    const full = path.join(ROOT, file);
+    if (!fs.existsSync(full)) {
+      problems.push(`${file} is not there, and ${what} is pinned in it`);
+      continue;
+    }
+    const found = pattern.exec(fs.readFileSync(full, 'utf8'));
+    if (!found) {
+      problems.push(`${file} no longer states a version where ${what} had one`);
+      continue;
+    }
+    if (found[1] !== expected) {
+      problems.push(`${file} pins ${what} at ${found[1]}, and the workspace is ${expected}`);
+    }
+  }
+  return { label: 'every version pin equals the workspace version', problems, expected };
+}
+
+/* --------------------------------------- what the README says about the repository */
+
+/** Matches a sentence that calls this repository private, and not "a private key" or "private field". */
+const CALLS_THE_REPOSITORY_PRIVATE =
+  /\bprivate\b[^.\n]{0,40}\b(repository|repo|source|project)\b|\b(repository|repo|source|project)\b[^.\n]{0,40}\bprivate\b/i;
+
+/**
+ * Reports every sentence in the shipped documents that calls this repository private while
+ * `packaging/PUBLISHING.md` no longer does.
+ *
+ * **A sentence that is true today and false on the day the repository is published is a sentence
+ * nobody will remember to delete.** The README told a Go user to set `GOPRIVATE` "because the
+ * repository is private and Go's public checksum database cannot read it", which becomes a wrong
+ * instruction the moment the repository is public, and the person it misleads is the first stranger
+ * who tries to install it (task-1946, M6).
+ *
+ * That was answered by banning the word from `README.md` outright, and the ban had a cost nobody
+ * measured. With the sentence gone, the README said the Go module was published, and it is not:
+ * `go install` resolves through `proxy.golang.org`, the proxy clones with no credential, and a
+ * private repository answers `404 ... fatal: could not read Username`. A reader was handed a command
+ * that cannot work, which is the failure 0.1.0 was withdrawn for (task-1951).
+ *
+ * So the rule is agreement rather than absence. `packaging/PUBLISHING.md` holds the fact, because it
+ * is the file whose job is recording where each route stands. While it says the repository is
+ * private, the documents inside the archive may say so too. The moment somebody makes the repository
+ * public and updates that file, this check lists every other line still saying it, by file and line
+ * number, so the deletion is reported rather than remembered.
+ */
+function privateRepositorySentencesAgree() {
+  const label = 'the shipped documents and PUBLISHING.md agree about the repository being private';
+  const source = 'packaging/PUBLISHING.md';
+
+  /**
+   * Every line of one tracked file that calls this repository private.
+   *
+   * Each line is tested joined to the one after it, because these documents are hard wrapped at
+   * about a hundred characters and the sentence this looks for straddles the wrap often enough to
+   * matter. Tested one line at a time, "cannot clone a private" and "repository" sit on either side
+   * of a newline and the match is missed - which happened to a sentence written in task-1951 itself,
+   * in the same change that wrote this check.
+   *
+   * @param file - the repository-relative path to read
+   */
+  const hits = (file) => {
+    const lines = fs.readFileSync(path.join(ROOT, file), 'utf8').split('\n');
+    const found = [];
+    lines.forEach((line, index) => {
+      const match = CALLS_THE_REPOSITORY_PRIVATE.exec(`${line} ${lines[index + 1] ?? ''}`);
+      // Only when the sentence starts on this line. A match that starts past the end of it belongs
+      // to the next line and is reported there, so a sentence spanning two lines is one row rather
+      // than two, and a blank line is never reported for what follows it.
+      if (match && match.index < line.length) found.push(`${file}:${index + 1}: ${line.trim()}`);
+    });
+    return found;
+  };
+
+  // Everything a reader gets inside the release archive. PUBLISHING.md is not in the archive; it is
+  // the record the archive's claims are checked against.
+  const shipped = ['README.md', 'docs/getting-started.md', 'agent-skills/inillucent-quickstart/SKILL.md'];
+
+  if (hits(source).length > 0) return { label, problems: [] };
+  return {
+    label,
+    problems: shipped
+      .flatMap(hits)
+      .map((claim) => `${claim}  --  ${source} no longer calls the repository private, so this is stale`),
+  };
+}
+
+/**
+ * What `--strict` is allowed to report as absent on a developer's machine.
+ *
+ * Each is matched against the whole reason the runner printed, because the runner prints two shapes:
+ * `needs postgres` for the name of a thing, and a whole sentence for a reason that is about this
+ * machine - `set INILLUCENT_NETWORK_TESTS to run this`. Both are read; see `missingPrerequisites`.
+ *
+ * `docs/repository.md` names the same three, and a fourth name here without a line there is the
+ * drift this list exists to stop.
+ */
+const OPTIONAL_PREREQUISITES = ['postgres', 'mysql', 'INILLUCENT_NETWORK_TESTS', 'onnx'];
 
 /**
  * Runs the test runner, for the test and target counts.
@@ -235,6 +477,32 @@ const OPTIONAL_PREREQUISITES = ['postgres', 'mysql'];
  * `live_mysql` have no server to run against, and `docs/repository.md` documents that. That one
  * outcome is accepted, and only when the suites it names are on the list above.
  */
+/**
+ * Returns the suites the runner listed as having run without a prerequisite.
+ *
+ * **Both shapes the runner prints.** It puts `needs ` in front of the name of a thing and leaves a
+ * whole sentence alone, because "needs this platform would not make a directory link" is not
+ * English. Reading only the first shape made this file report that it could not read a row, which
+ * says nothing about the run.
+ *
+ * Only the block the runner introduces is read, so the `slowest:` list below it - which is also
+ * indented, also two columns - cannot be mistaken for a skip.
+ *
+ * @param text - everything the runner printed
+ * @returns one `{suite, needs}` per listed row, `needs` being the reason as printed
+ */
+function declaredRows(text) {
+  const start = /^\d+ suite\(s\) ran without a prerequisite[^\n]*\n/m.exec(text);
+  if (!start) return [];
+  const after = text.slice(start.index + start[0].length);
+  const block = after.split(/\n\s*\n/, 1)[0] ?? '';
+  return block
+    .split('\n')
+    .map((line) => /^\s+(\S+)\s\s+(.+?)\s*$/.exec(line))
+    .filter(Boolean)
+    .map((row) => ({ suite: row[1], needs: row[2].replace(/^needs /, '') }));
+}
+
 /**
  * Decides what one `inillucent-testrun --strict` outcome means.
  *
@@ -274,7 +542,7 @@ export function judgeTestRun(outcome) {
     undetermined: Number(match[4]),
     status: outcome.status,
     declaredWithoutPrerequisite: declared ? Number(declared[1]) : 0,
-    missingPrerequisites: [...outcome.text.matchAll(/^\s+(\S+)\s+needs (\S+)$/gm)].map((row) => ({ suite: row[1], needs: row[2] })),
+    missingPrerequisites: declaredRows(outcome.text),
   };
 
   const problems = [];
@@ -284,7 +552,9 @@ export function judgeTestRun(outcome) {
     problems.push(`it said ${result.declaredWithoutPrerequisite} suite(s) had no prerequisite and this could read ${result.missingPrerequisites.length} of them`);
   }
   if (outcome.status !== 0) {
-    const unexplained = result.missingPrerequisites.filter((row) => !OPTIONAL_PREREQUISITES.includes(row.needs));
+    const unexplained = result.missingPrerequisites.filter(
+      (row) => !OPTIONAL_PREREQUISITES.some((allowed) => row.needs.includes(allowed)),
+    );
     if (result.missingPrerequisites.length === 0) {
       problems.push(`it exited ${outcome.status} and named no missing prerequisite to explain it`);
     } else if (unexplained.length > 0) {
@@ -317,11 +587,12 @@ function selfTest() {
     '149 target(s), 2646 test(s), 0 failed, 0 undetermined',
     'wall 300.9s; the same work run one at a time is 3163.8s of processor time (10.5x)',
     '',
-    '2 suite(s) ran without a prerequisite and evidenced nothing:',
+    '3 suite(s) ran without a prerequisite and evidenced nothing:',
+    '  inillucent-remote::lib                       set INILLUCENT_NETWORK_TESTS to run this',
     '  inillucent-remote::live_postgres             needs postgres',
     '  inillucent-remote::live_mysql                needs mysql',
     '',
-    'not ok - every test passed, and 2 suite(s) evidenced nothing',
+    'not ok - every test passed, and 3 suite(s) evidenced nothing',
   ].join('\n');
 
   const cases = [
@@ -330,10 +601,10 @@ function selfTest() {
     { name: 'it was cut off', outcome: { built: true, text: passing, status: null, timedOut: true }, wantError: true },
     { name: 'a test failed', outcome: { built: true, text: passing.replace('0 failed', '1 failed'), status: 1, timedOut: false }, wantError: true },
     { name: 'a test was undetermined', outcome: { built: true, text: passing.replace('0 undetermined', '3 undetermined'), status: 1, timedOut: false }, wantError: true },
-    { name: 'it exited nonzero for no stated reason', outcome: { built: true, text: passing.replace(/\n2 suite\(s\)[\s\S]*$/, ''), status: 1, timedOut: false }, wantError: true },
+    { name: 'it exited nonzero for no stated reason', outcome: { built: true, text: passing.replace(/\n3 suite\(s\)[\s\S]*$/, ''), status: 1, timedOut: false }, wantError: true },
     { name: 'it exited nonzero for a prerequisite that is not optional', outcome: { built: true, text: passing.replace('needs postgres', 'needs a GPU'), status: 1, timedOut: false }, wantError: true },
-    { name: 'every test passed, and only postgres and mysql were absent', outcome: { built: true, text: passing, status: 1, timedOut: false }, wantError: false },
-    { name: 'every test passed, and nothing was absent', outcome: { built: true, text: passing.replace(/\n2 suite\(s\)[\s\S]*$/, ''), status: 0, timedOut: false }, wantError: false },
+    { name: 'every test passed, and only the documented three were absent', outcome: { built: true, text: passing, status: 1, timedOut: false }, wantError: false },
+    { name: 'every test passed, and nothing was absent', outcome: { built: true, text: passing.replace(/\n3 suite\(s\)[\s\S]*$/, ''), status: 0, timedOut: false }, wantError: false },
   ];
 
   let wrong = 0;
@@ -439,10 +710,15 @@ const lints = crateLints();
 const tests = testRun();
 const chapters = await bookChapters();
 
+// Two assertions that are not counts: what a public repository must not carry, and
+// whether every packaged copy of the release version agrees with the workspace.
+const assertions = [privateReferences(), versionPins(), privateRepositorySentencesAgree()];
+
 const checks = [
   assertWritten('command line verbs', verbs, /\b(\d+)\s+(?:command line )?(?:verbs|commands)\b(?!\s+(?:over MCP|served|an agent|as MCP))/i, /(?:dot|reference's)\s+$/),
   assertWritten('MCP tools', tools, /(\d+)\s+(?:of the (?:same|CLI's) commands served|MCP tools|tools an agent can call|tools an AI agent can call|of those commands over MCP|of the CLI's commands as MCP tools|of the same commands served)/i),
   assertWritten('shell dot commands', dots, /(\d+)\s+of (?:its|`sqlite3`'s|SQLite's) 65 dot commands/i),
+  assertWritten('pragmas in the register', pragmaRegisterCount(), /(\d+) pragmas this engine recognises/i),
   assertWritten('shell command line options', options?.total, /all (\d+) of (?:its|`sqlite3`'s) command line options/i),
   assertWritten('function names in the register', functions?.names, /(\d+) built[ -]in function names/i),
   assertWritten('JSON function names', functions?.json, /all (\d+) function names/i),
@@ -472,7 +748,7 @@ const instrumentErrors = [];
 if (tests?.error) instrumentErrors.push(tests.error);
 
 if (asJson) {
-  console.log(JSON.stringify({ measured, checks, instrumentErrors }, null, 2));
+  console.log(JSON.stringify({ measured, checks, assertions, instrumentErrors }, null, 2));
 } else {
   console.log('what the engine reports\n');
   for (const [name, value] of Object.entries(measured)) {
@@ -492,13 +768,24 @@ if (asJson) {
     for (const place of check.wrong) console.log(`          ${place.file}:${place.line} says ${place.written}`);
   }
   for (const problem of instrumentErrors) console.log(`  FAIL  the instrument itself — ${problem}`);
+  console.log('\nwhat the repository must not carry, and what it pins\n');
+  for (const assertion of assertions) {
+    if (assertion.problems.length === 0) { console.log(`  ok    ${assertion.label}`); continue; }
+    console.log(`  FAIL  ${assertion.label}`);
+    for (const problem of assertion.problems) console.log(`          ${problem}`);
+  }
 }
 
 const failed = checks.filter((check) => !check.skipped && (check.wrong.length > 0 || check.seen === 0));
-if (failed.length > 0 || instrumentErrors.length > 0) {
+const broken = assertions.filter((assertion) => assertion.problems.length > 0);
+if (failed.length > 0 || broken.length > 0 || instrumentErrors.length > 0) {
   if (!asJson) {
     const parts = [];
     if (failed.length > 0) parts.push(`${failed.length} fact(s) disagree with the engine`);
+    if (broken.length > 0) {
+      const count = broken.reduce((total, assertion) => total + assertion.problems.length, 0);
+      parts.push(`${count} thing(s) the repository must not carry or must agree on`);
+    }
     if (instrumentErrors.length > 0) parts.push(`${instrumentErrors.length} instrument(s) could not answer`);
     console.log(`\n${parts.join(', and ')}.`);
   }

@@ -42,7 +42,7 @@ fn scratch(name: &str) -> PathBuf {
 /// @param name - the file's name
 fn peopled(name: &str) -> Database {
     let database = Database::open(scratch(name)).expect("the database opens");
-    let connection = database.connect();
+    let connection = database.session();
     connection
         .execute_batch(
             "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
@@ -52,6 +52,56 @@ fn peopled(name: &str) -> Database {
     database
 }
 
+/// `query_all` hands back every row, and `query(.., 0)` hands back none.
+///
+/// **What `limit` means, written down as a test (task-1947, found by
+/// task-1913).** The first application built on this engine called
+/// `query(sql, params, 0)` because every other embedded database reads `0` as
+/// no limit, and got an empty `rows` beside a `total` reporting the true
+/// count and a status saying success. Five of its eight storage tests failed
+/// at once and the symptom was "the board is empty" rather than "the query is
+/// wrong".
+///
+/// `0` cannot be made to mean "all of them": `Connection::execute` passes it
+/// to run a statement for its effect, so the sentinel space is taken. What was
+/// missing was a call that says what it wants, and the consumer wrote one for
+/// itself - an `ALL_ROWS: usize = usize::MAX` constant with a comment
+/// explaining why it had to exist. Both halves are asserted here: the `0` that
+/// surprised somebody, so the surprise is recorded rather than rediscovered,
+/// and the `query_all` that answers it.
+#[test]
+fn query_all_returns_every_row_and_a_limit_of_zero_returns_none() {
+    let database = peopled("limits");
+    let connection = database.session();
+
+    let none = connection
+        .query("SELECT id FROM people ORDER BY id", &[], 0)
+        .expect("the query runs");
+    assert!(
+        none.rows.is_empty(),
+        "a limit of 0 handed back {} row(s)",
+        none.rows.len()
+    );
+    assert_eq!(
+        none.total, 3,
+        "the count is the rows produced, not the rows handed back"
+    );
+
+    let some = connection
+        .query("SELECT id FROM people ORDER BY id", &[], 2)
+        .expect("the query runs");
+    assert_eq!(some.rows.len(), 2, "a limit of 2 hands back two rows");
+    assert_eq!(some.total, 3);
+    assert!(some.more, "a row was left behind");
+
+    let all = connection
+        .query_all("SELECT id FROM people ORDER BY id", &[])
+        .expect("the query runs");
+    assert_eq!(all.rows.len(), 3, "query_all hands back every row");
+    assert_eq!(all.total, 3);
+    assert!(!all.more, "nothing was left behind");
+}
+
 /// A named bind reaches the right column.
 ///
 /// **The case the defect was about**: two parameters of the same type, in an
@@ -59,7 +109,7 @@ fn peopled(name: &str) -> Database {
 #[test]
 fn a_named_bind_returns_the_right_row() {
     let database = peopled("named");
-    let connection = database.connect();
+    let connection = database.session();
     let rows = connection
         .query_named(
             "SELECT name FROM people WHERE age > :least AND age < :most",
@@ -85,7 +135,7 @@ fn a_named_bind_returns_the_right_row() {
 #[test]
 fn a_named_bind_agrees_with_the_positional_one() {
     let database = peopled("agree");
-    let connection = database.connect();
+    let connection = database.session();
     let sql = "SELECT name FROM people WHERE age > :least AND age < :most";
     let named = connection
         .query_named(
@@ -111,7 +161,7 @@ fn a_named_bind_agrees_with_the_positional_one() {
 #[test]
 fn a_name_can_be_written_with_or_without_its_sigil() {
     let database = peopled("sigil");
-    let connection = database.connect();
+    let connection = database.session();
     let sql = "SELECT name FROM people WHERE id = :who";
     for spelling in [":who", "who", "@who", "$who"] {
         let rows = connection
@@ -136,7 +186,7 @@ fn a_name_can_be_written_with_or_without_its_sigil() {
 #[test]
 fn a_name_the_statement_does_not_use_is_refused() {
     let database = peopled("unknown-name");
-    let connection = database.connect();
+    let connection = database.session();
     let refused = connection
         .query_named(
             "SELECT name FROM people WHERE id = :who",
@@ -156,7 +206,7 @@ fn a_name_the_statement_does_not_use_is_refused() {
 #[test]
 fn a_parameter_with_no_value_is_refused() {
     let database = peopled("missing-value");
-    let connection = database.connect();
+    let connection = database.session();
     let refused = connection
         .query_named(
             "SELECT name FROM people WHERE age > :least AND age < :most",
@@ -175,7 +225,7 @@ fn a_parameter_with_no_value_is_refused() {
 #[test]
 fn a_named_write_reports_what_it_changed() {
     let database = peopled("named-write");
-    let connection = database.connect();
+    let connection = database.session();
     let changed = connection
         .execute_named(
             "UPDATE people SET age = :age WHERE name = :name",
@@ -208,7 +258,7 @@ fn the_plan_cache_stops_at_its_ceiling() {
     };
     let database =
         Database::open_with(scratch("cache-ceiling"), options).expect("the database opens");
-    let connection = database.connect();
+    let connection = database.session();
     connection
         .execute_batch("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)")
         .expect("the table is created");
@@ -241,7 +291,7 @@ fn a_ceiling_of_zero_caches_nothing() {
         ..OpenOptions::default()
     };
     let database = Database::open_with(scratch("cache-zero"), options).expect("the database opens");
-    let connection = database.connect();
+    let connection = database.session();
     connection
         .execute_batch("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)")
         .expect("the table is created");
@@ -264,7 +314,7 @@ fn a_ceiling_of_zero_caches_nothing() {
 #[test]
 fn the_cache_can_be_emptied() {
     let database = peopled("cache-clear");
-    let connection = database.connect();
+    let connection = database.session();
     for nth in 0..5 {
         let sql = format!("SELECT name FROM people WHERE id = {nth}");
         connection.query(&sql, &[], 1).expect("the query runs");

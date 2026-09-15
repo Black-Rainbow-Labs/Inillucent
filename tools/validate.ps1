@@ -24,6 +24,8 @@
 param(
     # Skips the long test tiers, for a check before pushing.
     [switch] $Quick,
+    # Also measures coverage, which rebuilds the workspace instrumented.
+    [switch] $Coverage,
     # Runs one stage by name and stops.
     [string] $Stage = ''
 )
@@ -105,6 +107,52 @@ Invoke-Stage -Name 'lint' -Because 'the strict lint set, which the pinned compil
     cargo clippy --manifest-path "$root/Cargo.toml" --workspace --all-targets --all-features --locked -- -D warnings
 }
 
+# **The configuration a `cargo install` produces, which nothing built until
+# task-1961 (A14).** Every stage above and every CI job passes `--all-features`,
+# so the feature set a user gets by default was never compiled anywhere, and
+# `inillucent-storage`'s two independent features were never built crossed.
+Invoke-Stage -Name 'defaults' -Because 'the feature set a cargo install produces, which --all-features never builds' -Body {
+    cargo check --manifest-path "$root/Cargo.toml" --workspace --all-targets --locked
+    if ($LASTEXITCODE -ne 0) { return }
+    cargo check --manifest-path "$root/Cargo.toml" -p inillucent-storage --features check --locked
+    if ($LASTEXITCODE -ne 0) { return }
+    cargo check --manifest-path "$root/Cargo.toml" -p inillucent-storage --features opcode-probe --locked
+    if ($LASTEXITCODE -ne 0) { return }
+    cargo check --manifest-path "$root/Cargo.toml" -p inillucent-storage --features check,opcode-probe --locked
+}
+
+# **What a declared dependency drags in behind it, and under what licence.**
+# `policy.rs` checks the edges a manifest names; nothing looked at the resolved
+# graph, so a crate with a published advisory or a licence this repository cannot
+# ship passed every check the workspace had (task-1946, M8). `deny.toml` at the
+# root says what is allowed and why.
+#
+# `cargo-deny` is installed when it is absent rather than skipped: a stage that
+# quietly does nothing on the machine that has not got the tool is a stage that
+# reports green having checked nothing, which is the failure
+# `tests/inillucent-testing-tdd.md` rule 1.5 names.
+Invoke-Stage -Name 'dependencies' -Because 'advisories, licences and the resolved graph, which the manifest checks cannot see' -Body {
+    & cargo deny --version *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host '    installing cargo-deny'
+        cargo install cargo-deny --locked
+    }
+    cargo deny --manifest-path "$root/Cargo.toml" check
+}
+
+# **A broken intra-doc link is a build failure here rather than a hole in the
+# published documentation.** `cargo doc` warns about a `[`Type`]` that resolves
+# to nothing; nothing turned that warning into an error, so the first place it
+# would have been noticed is a docs.rs page nobody was watching.
+Invoke-Stage -Name 'docs' -Because 'a link that resolves to nothing is a defect, not a warning' -Body {
+    $env:RUSTDOCFLAGS = '-D warnings'
+    try {
+        cargo doc --manifest-path "$root/Cargo.toml" --workspace --no-deps --all-features
+    } finally {
+        Remove-Item Env:RUSTDOCFLAGS -ErrorAction SilentlyContinue
+    }
+}
+
 # **Built before anything grades against it (task-1932, H10).** Sixty-nine
 # differential tests across ten files compare this engine with SQLite 3.53.4,
 # and each of them skips when the oracle is absent. `--strict` at the end of
@@ -129,14 +177,61 @@ Invoke-Stage -Name 'oracle' -Because 'the sixty-nine differential suites have no
 # reported green having asserted nothing on every machine that had not built
 # the file by hand. Eight seconds buys two durability tests that actually run.
 Invoke-Stage -Name 'fixtures' -Because 'the log-lead durability tests read a fixture that is not checked in' -Body {
-    & bash "$root/tools/build-gate-fixtures.sh" "$root/_agent_output/fixtures"
+    # **Git Bash, and forward slashes (task-1962).** This stage failed on every
+    # Windows run, for two reasons at once, and the two durability tests the
+    # fixture exists for skipped every time - which is the failure the stage was
+    # added to stop.
+    #
+    # `$root` holds a Windows path with backslashes in it, and bash reads a
+    # backslash as an escape, so every separator was eaten and the argument
+    # arrived as one run-together word. And `bash` on PATH is the WSL launcher
+    # under System32: it runs a Linux filesystem where a drive-lettered path is
+    # not a path at all, and it answers "No such file or directory" for a script
+    # that is right there. Git for Windows ships the bash every script in this
+    # repository is written for.
+    $posix = $root -replace '\\', '/'
+    $shell = @(
+        "$env:ProgramFiles/Git/bin/bash.exe",
+        "${env:ProgramFiles(x86)}/Git/bin/bash.exe",
+        "$env:LOCALAPPDATA/Programs/Git/bin/bash.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $shell) { $shell = 'bash' }
+    & $shell "$posix/tools/build-gate-fixtures.sh" "$posix/_agent_output/fixtures"
 }
 
 # The four contracts `AGENTS.md` names, plus the selection map. Each of them
 # fails a build rather than producing a review comment, which is the point of
 # having them.
+# **The examples on the crate a user depends on (task-1961, T6).** A doctest is
+# the one kind of example that cannot rot: it is compiled and run.
+Invoke-Stage -Name 'doctests' -Because 'the examples a cargo add reader depends on, compiled and run' -Body {
+    cargo test --manifest-path "$root/Cargo.toml" --doc -p inillucent-driver
+    if ($LASTEXITCODE -ne 0) { return }
+    cargo test --manifest-path "$root/Cargo.toml" --doc -p inillucent
+}
+
+# **The public URLs every shipped package names, fetched with no credential.**
+# Wired in now that both repositories are public (task-1961, S4).
+Invoke-Stage -Name 'urls' -Because 'a URL a shipped package names has to resolve for somebody with no credential' -Body {
+    node "$root/tools/check-public-urls.mjs"
+}
+
 Invoke-Stage -Name 'contracts' -Because 'dependencies, layering, the command table and the test map' -Body {
     cargo test --manifest-path "$root/Cargo.toml" -p inillucent-compat --test policy --test selection --test command_parity --test harness
+}
+
+# **A published compatibility report may not carry its own unresolved Problems
+# table (task-1946, M5).** `compat/compat-report.md` shipped fourteen rows saying
+# a capability the manifest calls `pass` has no passing result recorded on
+# linux-x86_64. `inillucent-manifest report` has always exited non-zero when it
+# finds one; nothing ever ran it, so the table grew instead.
+#
+# It regenerates the report from `compat/results` as it goes, so a run whose
+# recorded results have moved leaves the checked-in report agreeing with them.
+# That is also what makes the stage fail a checkout whose report is stale: the
+# `harness.report.reproducible` suite compares the two.
+Invoke-Stage -Name 'compat' -Because 'the published compatibility report states no unresolved problem' -Body {
+    cargo run --manifest-path "$root/Cargo.toml" -p inillucent-compat --bin inillucent-manifest -- report
 }
 
 # **The exit code is checked between the two statements (task-1932, H12).**
@@ -178,6 +273,17 @@ Invoke-Stage -Name 'security' -Because 'root confinement, the C ABI lifetimes, a
 # installed reads the same as a green on one with everything.
 Invoke-Stage -Name 'tests' -Because 'every selected suite, with missing prerequisites named' -Body {
     & "$root/target/debug/inillucent-testrun" --strict
+}
+
+# **Coverage, behind a switch, so the published number can be re-measured
+# (task-1961, T2).** Not `--branch`: that needs a nightly option and
+# `rust-toolchain.toml` pins the compiler to stable.
+if ($Coverage) {
+    # The shell the `schema_forms` cases need is built by `our_shell`, into this
+    # run's own target directory. See the note in tools/validate.sh.
+    Invoke-Stage -Name 'coverage' -Because 'the coverage number docs/repository.md publishes, re-measured' -Body {
+        node "$root/tools/coverage.mjs" --per-crate
+    }
 }
 
 Write-Host ''

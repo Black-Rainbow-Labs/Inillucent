@@ -8,6 +8,9 @@ vector search features SQLite has no equivalent for. None of the thirteen is sil
 and each reports something a caller can read. [Feature comparison](feature-comparison.md) is the same
 material in full, table by table.
 
+Words used here and not explained here - pragma, collation, affinity, rowid, storage class - are
+in [the glossary](glossary.md), one sentence each. Every pragma is in [Pragmas](pragmas.md).
+
 ## How this was measured
 
 416 SQL scripts were run through `inillucent-shell` and through a pinned `sqlite3` 3.53.4, each over
@@ -30,6 +33,12 @@ names the pinned SQLite library answers**, **67 pragmas of 67**, **63 dot comman
 collations of 5**. [The function register](#the-function-register) says where 177 comes from and names
 the five.
 
+**Two pragma counts, and they are different questions.** 67 is what SQLite's own `pragma_list`
+reports, and this engine answers every one of them.
+The register holds the **68 pragmas this engine recognises**, the extra being `defensive`, which
+SQLite exposes through `sqlite3_db_config` rather than as a pragma. [Pragmas](pragmas.md) is the whole table, generated from the register, and
+`tools/doc-facts/check.mjs` fails when a document names a different number.
+
 ### The function register
 
 `PRAGMA function_list` in SQLite's own shell reports **218** names, and 41 of those are extensions the
@@ -44,6 +53,12 @@ not carry.
 
 Its own register holds **190** names: those 172, plus 18 vector functions SQLite has no equivalent
 for. `inillucent functions` prints 213 rows because it prints one row per name and argument count.
+
+It also names what the connection itself has registered - anything an application defined through
+`create_scalar_function` or `create_aggregate_function`, and `embed(TEXT)` in a build carrying the
+`embed` feature, where the count is 214. Those rows carry `builtin = 0`. Until task-1952 the register
+read the static built-in list alone, so `embed` answered `SELECT length(embed('hello'))` with 3072
+and `inillucent functions embed` printed nothing.
 
 ```sh
 inillucent functions --output json --limit 0

@@ -14,8 +14,8 @@
 //! the direct engine underneath it.
 
 use inillucent_compat::differential::{scratch, start_inillucent};
+use inillucent_compat::rendering::datum_text as render;
 use inillucent_engine::connect::{Connection, Database};
-use inillucent_tree::datum::OwnedDatum;
 
 /// Where this suite's scratch databases live.
 const AREA: &str = "search";
@@ -55,17 +55,6 @@ fn column(connection: &Connection<'_>, sql: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|row| row.into_iter().next())
         .collect()
-}
-
-/// Renders one value as text.
-fn render(value: &OwnedDatum) -> String {
-    match value {
-        OwnedDatum::Null => "NULL".to_string(),
-        OwnedDatum::Int(number) => number.to_string(),
-        OwnedDatum::Real(number) => format!("{number:.6}"),
-        OwnedDatum::Text(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        OwnedDatum::Blob(bytes) => format!("blob:{}", bytes.len()),
-    }
 }
 
 /// The corpus every test in this file searches.
@@ -238,7 +227,7 @@ fn a_committed_write_survives_reopening() {
     let path = scratch(AREA, "reopen", "inillucent");
     {
         let database = Database::open(&path).expect("it opens");
-        let connection = database.connect();
+        let connection = database.session();
         seed(&connection);
         exec(&connection, "BEGIN");
         exec(
@@ -248,7 +237,7 @@ fn a_committed_write_survives_reopening() {
         exec(&connection, "COMMIT");
     }
     let database = Database::open(&path).expect("it reopens");
-    let connection = database.connect();
+    let connection = database.session();
     let found = column(
         &connection,
         "SELECT rowid FROM docs WHERE docs MATCH 'tirzepatide'",
@@ -689,7 +678,7 @@ fn state(connection: &Connection<'_>, table: &str, key: &str) -> i64 {
 fn open_at(path: &std::path::Path) -> Connection<'static> {
     let database: &'static Database =
         Box::leak(Box::new(Database::open(path).expect("the database opens")));
-    let connection = database.connect();
+    let connection = database.session();
     let _ = connection.execute_batch("PRAGMA busy_timeout = 5000");
     connection
 }
@@ -886,7 +875,7 @@ fn a_folded_index_reopens_and_answers() {
     let path = scratch(AREA, "fold-reopen", "inillucent");
     let expected = {
         let database = Database::open(&path).expect("the database opens");
-        let connection = database.connect();
+        let connection = database.session();
         let _ = connection.execute_batch("PRAGMA busy_timeout = 5000");
         exec(
             &connection,

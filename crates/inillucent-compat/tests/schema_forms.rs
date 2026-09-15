@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use inillucent_compat::facade::Database;
 use inillucent_compat::oracle::{Driver, Op, TaggedValue};
+use inillucent_compat::rendering::tagged as render;
 use inillucent_compat::workspace_root;
 use inillucent_value::Value;
 
@@ -31,23 +32,6 @@ fn scratch(tag: &str) -> PathBuf {
     let path = directory.join(format!("{tag}.db"));
     let _ = std::fs::remove_file(&path);
     path
-}
-
-/// Renders one value as a tagged string.
-fn render(value: &Value<'static>) -> String {
-    match value {
-        Value::Null => "null".to_string(),
-        Value::Integer(integer) => format!("int:{integer}"),
-        Value::Real(real) => format!("real:{real:?}"),
-        Value::Text(text) => format!("text:{}", String::from_utf8_lossy(&text.utf8_bytes())),
-        Value::Blob(blob) => format!(
-            "blob:{}",
-            blob.raw()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        ),
-    }
 }
 
 /// Renders one of the oracle's tagged values the same way.
@@ -190,7 +174,7 @@ fn sqlite_writes_then_reads(
 fn a_view_round_trips_through_sqlite() {
     let path = scratch("views");
     let database = Database::open(&path).expect("the database opens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     run_all(
         &connection,
         &[
@@ -248,7 +232,7 @@ fn a_view_round_trips_through_sqlite() {
 fn dropping_a_view_leaves_the_table() {
     let path = scratch("drop-view");
     let database = Database::open(&path).expect("the database opens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     run_all(
         &connection,
         &[
@@ -285,7 +269,7 @@ fn dropping_a_view_leaves_the_table() {
 fn strict_tables_refuse_the_wrong_class() {
     let path = scratch("strict");
     let database = Database::open(&path).expect("the database opens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     run_all(
         &connection,
         &["CREATE TABLE s (a INT, b TEXT, c REAL, d BLOB, e ANY) STRICT"],
@@ -384,7 +368,7 @@ fn strict_is_enforced_on_a_file_sqlite_wrote() {
 
     // A file the reference wrote is a SQLite file: it is imported, not opened.
     let database = Database::import(&path).expect("the database imports");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     assert!(run(&connection, "INSERT INTO s VALUES ('abc', 'y')").is_err());
     run_all(&connection, &["INSERT INTO s VALUES (2, 'y')"]);
     assert_eq!(
@@ -399,7 +383,7 @@ fn strict_is_enforced_on_a_file_sqlite_wrote() {
 fn explain_reports_without_running() {
     let path = scratch("explain");
     let database = Database::open(&path).expect("the database opens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     run_all(
         &connection,
         &[
@@ -472,7 +456,7 @@ fn explain_reports_without_running() {
 fn reindex_rebuilds_an_index() {
     let path = scratch("reindex");
     let database = Database::open(&path).expect("the database opens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     run_all(
         &connection,
         &[
@@ -535,7 +519,7 @@ fn reindex_rebuilds_an_index() {
 fn generated_columns_round_trip_through_sqlite() {
     let path = scratch("generated");
     let database = Database::open(&path).expect("the database opens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     run_all(
         &connection,
         &[
@@ -615,7 +599,7 @@ fn generated_columns_round_trip_through_sqlite() {
 fn alter_table_rewrites_the_schema() {
     let path = scratch("alter");
     let database = Database::open(&path).expect("the database opens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     run_all(
         &connection,
         &[
@@ -740,7 +724,7 @@ fn alter_table_rewrites_the_schema() {
 fn triggers_round_trip_through_sqlite() {
     let path = scratch("triggers");
     let database = Database::open(&path).expect("the database opens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     run_all(
         &connection,
         &[
@@ -809,7 +793,7 @@ fn triggers_round_trip_through_sqlite() {
 fn instead_of_triggers_round_trip_through_sqlite() {
     let path = scratch("instead-of");
     let database = Database::open(&path).expect("the database opens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     run_all(
         &connection,
         &[
@@ -875,7 +859,7 @@ fn instead_of_triggers_round_trip_through_sqlite() {
 fn the_trigger_forms_sqlite_omits_are_refused() {
     let path = scratch("trigger-omissions");
     let database = Database::open(&path).expect("the database opens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     run_all(
         &connection,
         &[
@@ -933,7 +917,7 @@ fn the_trigger_forms_sqlite_omits_are_refused() {
 fn without_rowid_round_trips_through_sqlite() {
     let path = scratch("without-rowid");
     let database = Database::open(&path).expect("the database opens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     run_all(
         &connection,
         &[
@@ -1016,7 +1000,7 @@ fn without_rowid_round_trips_through_sqlite() {
         )],
     );
     let database = Database::open(&carried).expect("the database re-opens");
-    let connection = database.connect().expect("the connection re-opens");
+    let connection = database.session().expect("the connection re-opens");
     assert_eq!(
         run(&connection, "SELECT a, b, c FROM w ORDER BY b, a"),
         Ok(vec![
@@ -1052,7 +1036,7 @@ fn without_rowid_round_trips_through_sqlite() {
 fn vacuum_folds_the_log_in_and_sqlite_still_reads() {
     let path = scratch("vacuum");
     let database = Database::open(&path).expect("the database opens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     run_all(
         &connection,
         &[
@@ -1169,7 +1153,7 @@ fn vacuum_into_writes_a_copy_sqlite_reads() {
     let copy = path.with_extension("copy");
     let _ = std::fs::remove_file(&copy);
     let database = Database::open(&path).expect("the database opens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     run_all(
         &connection,
         &[
@@ -1218,7 +1202,7 @@ fn vacuum_into_writes_a_copy_sqlite_reads() {
         ],
     );
     let reopened = Database::open(&copy).expect("the copy opens");
-    let connection = reopened.connect().expect("the copy connects");
+    let connection = reopened.session().expect("the copy connects");
     assert_eq!(
         run(&connection, "SELECT count(*) FROM t"),
         Ok(vec!["int:2".to_string()])
@@ -1319,7 +1303,7 @@ fn an_alter_adding_a_column_to_an_empty_table_matches_the_oracle() {
 
     let path = scratch("alter-empty-default");
     let database = Database::open(&path).expect("the database opens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     run_all(
         &connection,
         &[
@@ -1362,7 +1346,7 @@ fn an_alter_adding_a_column_to_an_empty_table_matches_the_oracle() {
     drop(connection);
     drop(database);
     let reopened = Database::open(&path).expect("the database reopens");
-    let connection = reopened.connect().expect("the reopened database connects");
+    let connection = reopened.session().expect("the reopened database connects");
     assert_eq!(
         run(&connection, "SELECT a, name, b FROM t ORDER BY a"),
         Ok(vec!["int:2|text:bob|int:5".to_string()])
@@ -1388,7 +1372,7 @@ fn an_alter_adding_a_column_to_an_empty_table_matches_the_oracle() {
 fn a_reindex_that_fails_partway_changes_nothing() {
     let path = scratch("reindex-failed");
     let database = Database::open(&path).expect("the database opens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     connection
         .create_scalar_function(
             "keeps",
@@ -1459,7 +1443,7 @@ fn a_reindex_that_fails_partway_changes_nothing() {
     drop(connection);
     drop(database);
     let reopened = Database::open(&path).expect("the database reopens");
-    let connection = reopened.connect().expect("the reopened database connects");
+    let connection = reopened.session().expect("the reopened database connects");
     assert_eq!(
         run(
             &connection,

@@ -11,6 +11,8 @@
 //! position a cursor: a nested loop's probe, a point probe, and the union and
 //! span forms that read a run of entries.
 
+use inillucent_base::error::misuse;
+
 use super::*;
 
 /// Returns the key expressions an inner stage probes with.
@@ -180,23 +182,43 @@ pub(super) fn index_union_keys(
 /// is priced through [`span_bounds`] exactly as a lone seek would be - the
 /// NULL handling and the descending-column handling are properties of one
 /// range, not of the union, so there is nothing for this to do differently.
-#[allow(clippy::too_many_arguments)]
+///
+/// **It takes the path rather than eleven pieces of it (task-1962, A9).** Nine
+/// of the fourteen arguments it used to take were fields of the same
+/// `AccessPath::IndexSeekUnion` the caller had just destructured, four of them
+/// slices of different things in a row. The destructuring is here now, and so
+/// is the refusal for a path that is not one.
+///
+/// @param tree - the index tree the branches walk
+/// @param projection - which columns each scan emits
+/// @param path - the union, which must be an `IndexSeekUnion`
+/// @param table - the indexed table
+/// @param space - the joined column space
+/// @param params - the values bound to `?1`, `?2`, ...
 pub(super) fn range_union_bounds<'t>(
     tree: &'t PagedTree,
     projection: Projection,
-    table_root: u32,
-    index_root: u32,
-    index_name: &[u8],
-    without_rowid: bool,
-    key_entry_slots: &[usize],
-    branches: &[IndexSeekBranch],
-    collations: &[Collation],
-    descending: &[bool],
-    columns: &[Option<u16>],
+    path: &AccessPath,
     table: &TableInfo,
     space: &Space<'_>,
     params: &Params,
 ) -> DbResult<Vec<SpanScan<'t>>> {
+    let AccessPath::IndexSeekUnion {
+        table_root,
+        index_root,
+        index_name,
+        branches,
+        collations,
+        descending,
+        columns,
+        without_rowid,
+        key_entry_slots,
+        ..
+    } = path
+    else {
+        return Err(misuse("a range-union stage over a path that is not one"));
+    };
+    let (table_root, index_root, without_rowid) = (*table_root, *index_root, *without_rowid);
     let mut scans = Vec::with_capacity(branches.len());
     for branch in branches {
         let branch_path = AccessPath::IndexSeek {
@@ -452,5 +474,60 @@ fn with_affinity(expr: Expr, affinity: Option<Affinity>) -> Expr {
             operand: Box::new(expr),
             affinity,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A probe takes the indexed column's affinity, and takes none when the
+    /// index has none to give.
+    ///
+    /// **A key the index computes takes no affinity (T3, task-1962).** An index
+    /// on `lower(a)` stores whatever the expression returned, so converting the
+    /// probe would compare a converted value against an unconverted one - a
+    /// seek that lands somewhere else. SQLite applies none there either.
+    #[test]
+    fn a_probe_is_cast_only_when_the_column_has_an_affinity() {
+        let bare = with_affinity(Expr::Column(0), None);
+        assert!(
+            matches!(bare, Expr::Column(0)),
+            "no affinity means the expression is unchanged"
+        );
+        let cast = with_affinity(Expr::Column(0), Some(Affinity::Integer));
+        match cast {
+            Expr::Cast { affinity, operand } => {
+                assert_eq!(affinity, Affinity::Integer);
+                assert!(matches!(*operand, Expr::Column(0)));
+            }
+            other => panic!("an affinity should wrap the probe in a cast; it gave {other:?}"),
+        }
+    }
+
+    /// An unbounded span is the whole tree, and it says so with `None` rather
+    /// than with a sentinel key.
+    ///
+    /// **The inclusivity is carried per side.** It used to be one flag for
+    /// both, so `WHERE id > 495` returned `id >= 495` - one row too many, on
+    /// every range scan with an exclusive bound.
+    #[test]
+    fn a_default_span_is_the_whole_tree() {
+        let span = SpanBounds::default();
+        assert!(
+            span.low.is_none(),
+            "no lower bound is the start of the tree"
+        );
+        assert!(span.high.is_none(), "no upper bound is the end of it");
+        let exclusive_low = SpanBounds {
+            low: Some(vec![OwnedDatum::Int(495)]),
+            low_inclusive: false,
+            high: None,
+            high_inclusive: true,
+        };
+        assert!(
+            !exclusive_low.low_inclusive && exclusive_low.high_inclusive,
+            "the two sides carry their own inclusivity, which is what `id > 495` needs"
+        );
     }
 }

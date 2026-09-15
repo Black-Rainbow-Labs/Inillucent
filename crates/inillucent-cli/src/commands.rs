@@ -72,8 +72,18 @@ pub fn system(shell: &mut Shell, arguments: &[&str]) {
 /// @param shell - the shell
 /// @param arguments - the words after the command
 pub fn crlf(shell: &mut Shell, arguments: &[&str]) {
+    // **On only where the reference honours it (task-1946, M5).** SQLite's shell
+    // implements `.crlf` by putting `stdout` into text mode, which exists on
+    // Windows and nowhere else, so `.crlf on` followed by `.crlf` answers
+    // `crlf is ON` there and `crlf is OFF` everywhere else. This shell turned it
+    // on wherever it was asked. Nothing could see the difference until the first
+    // Linux run that had an oracle to compare against: `shell.crlf` was one of
+    // three cases in `semantics.rs` that agreed on Windows and did not on Linux.
+    //
+    // The state is still printed on every platform, because the reference prints
+    // it on every platform.
     if let Some(word) = arguments.first() {
-        shell.crlf = crate::dot::truthy(Some(word));
+        shell.crlf = cfg!(windows) && crate::dot::truthy(Some(word));
     }
     let state = if shell.crlf { "ON" } else { "OFF" };
     shell.say(&format!("crlf is {state}"));
@@ -331,17 +341,17 @@ pub struct Watching {
     pub seen: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
 }
 
-impl inillucent_engine::Authorizer for Watching {
+impl inillucent_driver::Authorizer for Watching {
     /// Records one decision and allows it.
     ///
     /// @param action - what the binder is about to bind
     fn authorize(
         &self,
-        action: inillucent_engine::AuthAction<'_>,
-    ) -> inillucent_engine::Authorization {
+        action: inillucent_driver::AuthAction<'_>,
+    ) -> inillucent_driver::Authorization {
         let line = match action {
-            inillucent_engine::AuthAction::Select => "SELECT NULL NULL NULL NULL".to_string(),
-            inillucent_engine::AuthAction::Read {
+            inillucent_driver::AuthAction::Select => "SELECT NULL NULL NULL NULL".to_string(),
+            inillucent_driver::AuthAction::Read {
                 database,
                 table,
                 column,
@@ -351,12 +361,12 @@ impl inillucent_engine::Authorizer for Watching {
                 quoted(column),
                 quoted(database)
             ),
-            inillucent_engine::AuthAction::Function { name } => {
+            inillucent_driver::AuthAction::Function { name } => {
                 format!("FUNCTION NULL {} NULL NULL", quoted(name))
             }
         };
         self.seen.borrow_mut().push(format!("authorizer: {line}"));
-        inillucent_engine::Authorization::Allow
+        inillucent_driver::Authorization::Allow
     }
 }
 

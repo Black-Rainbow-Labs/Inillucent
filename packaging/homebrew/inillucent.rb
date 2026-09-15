@@ -13,6 +13,13 @@
 # repository holding only this file, so the source can stay private while the
 # formula is fetchable.
 #
+# The `head` block below is the exception, and it does not work today. It clones
+# the repository, which is private, so `brew install --HEAD` gets the same 404
+# the release URLs were moved off GitHub to avoid. `brew install` is unaffected.
+# It starts working the day the repository is public; `PUBLISHING.md` has that
+# decision, and `node tools/check-public-urls.mjs` reports this URL among the
+# others that a signed-out reader cannot open.
+#
 # To publish it: create the repository `Black-Rainbow-Labs/homebrew-inillucent` on
 # GitHub, put this file in `Formula/inillucent.rb`, and fill in the sha256
 # values from the release's own SHA256SUMS. `packaging/homebrew/update.sh` does
@@ -20,23 +27,23 @@
 class Inillucent < Formula
   desc "Embedded SQL database with full-text and vector search, and an MCP server"
   homepage "https://inillucent.com"
-  version "0.1.1"
+  version "0.1.3"
   license "MIT"
 
   # One universal archive covers both Apple architectures, so macOS needs no
   # on_arm / on_intel split: the same file is correct either way.
   on_macos do
-    url "https://inillucent.com/downloads/inillucent-0.1.1-universal-apple-darwin.tar.gz"
+    url "https://inillucent.com/downloads/inillucent-0.1.2-universal-apple-darwin.tar.gz"
     sha256 "REPLACE_WITH_THE_UNIVERSAL_DARWIN_SHA256"
   end
 
   on_linux do
     on_intel do
-      url "https://inillucent.com/downloads/inillucent-0.1.1-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://inillucent.com/downloads/inillucent-0.1.2-x86_64-unknown-linux-gnu.tar.gz"
       sha256 "REPLACE_WITH_THE_X86_64_LINUX_SHA256"
     end
     on_arm do
-      url "https://inillucent.com/downloads/inillucent-0.1.1-aarch64-unknown-linux-gnu.tar.gz"
+      url "https://inillucent.com/downloads/inillucent-0.1.2-aarch64-unknown-linux-gnu.tar.gz"
       sha256 "REPLACE_WITH_THE_AARCH64_LINUX_SHA256"
     end
   end

@@ -13,31 +13,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use inillucent_compat::facade::Database;
+use inillucent_compat::interchange::reference_shell as pinned_shell;
+use inillucent_compat::rendering::shell_text as render;
 use inillucent_compat::workspace_root;
 use inillucent_value::Value;
-
-/// Returns the pinned SQLite shell, or `None` when it has not been downloaded.
-fn pinned_shell() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("INILLUCENT_SQLITE_SHELL") {
-        let path = PathBuf::from(explicit);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    let directory = workspace_root().join(".sqlite-ref/3.53.4/shell");
-    let names: [&str; 2] = if cfg!(windows) {
-        ["sqlite3.exe", "sqlite3"]
-    } else {
-        ["sqlite3", "sqlite3.exe"]
-    };
-    for name in names {
-        let path = directory.join(name);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    None
-}
 
 /// Returns a fresh scratch path for one scenario.
 fn scratch(name: &str) -> PathBuf {
@@ -61,7 +40,7 @@ fn shell(path: &Path, script: &str) -> Option<String> {
 /// Runs a script through inillucent on one connection, statement by statement.
 fn run(path: &Path, script: &str) -> String {
     let database = Database::open(path).expect("the database opens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     report(&connection, script)
 }
 
@@ -107,17 +86,6 @@ fn report(connection: &inillucent_compat::facade::Connection, script: &str) -> S
         rest = tail;
     }
     out
-}
-
-/// Renders one value the way the shell prints it.
-fn render(value: &Value<'_>) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::Integer(number) => number.to_string(),
-        Value::Real(number) => format!("{number}"),
-        Value::Text(text) => String::from_utf8_lossy(&text.utf8_bytes()).to_string(),
-        Value::Blob(bytes) => String::from_utf8_lossy(bytes.raw()).to_string(),
-    }
 }
 
 /// Runs one script against both engines and requires the same report.
@@ -209,7 +177,7 @@ fn a_temporary_table_does_not_survive_the_connection() {
     let path = scratch("lifetime");
     {
         let database = Database::open(&path).expect("the database opens");
-        let connection = database.connect().expect("the connection opens");
+        let connection = database.session().expect("the connection opens");
         connection
             .execute_batch("CREATE TEMP TABLE scratch(a); INSERT INTO scratch VALUES (1)")
             .expect("the temporary table is written");
@@ -224,7 +192,7 @@ fn a_temporary_table_does_not_survive_the_connection() {
         );
     }
     let database = Database::open(&path).expect("the database reopens");
-    let connection = database.connect().expect("the connection opens");
+    let connection = database.session().expect("the connection opens");
     assert!(
         connection.query("SELECT count(*) FROM scratch").is_err(),
         "the temporary table outlived its connection"
@@ -236,8 +204,8 @@ fn a_temporary_table_does_not_survive_the_connection() {
 fn each_connection_has_its_own_temporary_database() {
     let path = scratch("per-connection");
     let database = Database::open(&path).expect("the database opens");
-    let first = database.connect().expect("the first connection opens");
-    let second = database.connect().expect("the second connection opens");
+    let first = database.session().expect("the first connection opens");
+    let second = database.session().expect("the second connection opens");
     first
         .execute_batch("CREATE TEMP TABLE scratch(a); INSERT INTO scratch VALUES (1)")
         .expect("the first writes its own");

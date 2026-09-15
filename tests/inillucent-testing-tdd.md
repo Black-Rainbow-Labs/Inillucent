@@ -125,26 +125,31 @@ the two numbers and what was expected of them.
 
 ## 2. The shape of the suite
 
-**149 test targets, 2,645 tests, in nine tiers.** A target is one binary
+**169 test targets, 2,789 tests, in nine tiers.** A target is one binary
 `cargo test` builds; a tier is a band you can ask for by name. Every target is
 in exactly one tier, so the tiers partition the suite rather than overlapping
 it. (Was 129 targets, 2,336 tests when this document was written; task-1911's
 re-point of 36 files onto the shipping engine, its free-map durability fix
 and its other roadmap work added 20 targets and 309 tests, mostly to `engine`,
 `differential`, `unit` and `durability` — counted fresh against
-`tests/selection.toml` and a full run rather than carried forward by hand.)
+`tests/selection.toml` and a full run rather than carried forward by hand.
+Then the two code reviews: task-1932 and task-1946 took it to 169 and
+2,789, task-1946 adding the suites for `ANALYZE` on an open connection,
+`VACUUM` on a file system that is not the disk, trigger depth against the
+oracle, and the rollback journal's ordering, and deleting 1,284 lines that
+nothing called.)
 
 | tier | targets | tests | what it is for |
 |---|---:|---:|---|
 | `smoke` | 1 | 8 | the ten-second answer: a real file opened, written, reopened, read |
-| `unit` | 26 | 1,230 | every crate's own `#[cfg(test)]` modules |
-| `engine` | 44 | 299 | SQL and storage behaviour over real database files |
-| `differential` | 29 | 292 | graded against the pinned SQLite 3.53.4 |
-| `durability` | 20 | 158 | crashes, injected faults, corruption and concurrency |
-| `e2e` | 15 | 94 | the public surfaces an application binds to, end to end |
+| `unit` | 26 | 1,242 | every crate's own `#[cfg(test)]` modules |
+| `engine` | 53 | 330 | SQL and storage behaviour over real database files |
+| `differential` | 30 | 309 | graded against the pinned SQLite 3.53.4 |
+| `durability` | 23 | 176 | crashes, injected faults, corruption and concurrency |
+| `e2e` | 21 | 130 | the public surfaces an application binds to, end to end |
 | `perf` | 1 | 6 | the cost guards — **runs alone**, see §5 |
-| `retrieval` | 6 | 506 | the embedding and retrieval engine, and its graded harness |
-| `tooling` | 7 | 49 | the checks that keep the repository's own rules true |
+| `retrieval` | 6 | 519 | the embedding and retrieval engine, and its graded harness |
+| `tooling` | 8 | 69 | the checks that keep the repository's own rules true |
 
 The map that assigns them is `tests/selection.toml`, and it is data rather than
 code so that a person can read the whole arrangement in one file.
@@ -470,6 +475,41 @@ a full run because of the same contention. **They are the floor of a full
 parallel run**: no scheduling improves on the longest single binary. Everything
 else finishes in the time they take.
 
+### 6.1.1 What the hardware has to be, and what contention means
+
+**Every figure in this section is from one machine**: Windows 11, a 24-core
+processor, 127.5 GB of memory, an NVMe disk, and an RTX 5090. The parallel
+runner uses all 24 cores, so a machine with fewer scales the wall clock roughly
+by the ratio while the processor-time total stays where it is.
+
+Two tiers want hardware the others do not, and until task-1961 the table above
+did not say so:
+
+| tier | what it needs | without it |
+|---|---|---|
+| `retrieval` | **a CUDA GPU for the embedding arm** - the figures here are an RTX 5090 - and ONNX Runtime plus the model weights, which `inillucent setup-embeddings` installs | `inillucent-core::lib` and `inillucent-bench` report success having embedded nothing. `--strict` counts them and names them, which is the only reason a green run on a machine without a GPU is not mistaken for a green run on one with it. |
+| `retrieval` | **the disk**, for the index store: the 600,589-chunk corpus is 3.1 GB on disk and the suite writes and re-reads it | the corpus-backed targets skip; the smaller ones run from a generated corpus and are disk-bound rather than GPU-bound |
+| fuzzing | **a nightly toolchain**, because libFuzzer needs one, and hours rather than seconds | nothing runs. `rust-toolchain.toml` pins stable, so `cargo fuzz` is a deliberate, separate step on a machine that has installed a nightly beside the pin. The seeded twins in `crates/*/tests/fuzz_seeded.rs` are what runs under the pinned compiler, in under a second each. |
+
+**"Under contention" means other processes on the same machine**, and in this
+repository that is nearly always other agent terminals building or testing in
+the same tree. It is not contention between the runner's own 24 jobs, which is
+what the phrase reads as: the runner schedules one binary per core and the
+binaries do not share a file. A quiet box and a busy one differ by about a
+factor of three on the two longest targets:
+
+| target | quiet box | busy box |
+|---|---:|---:|
+| `inillucent-core::lib` | ~110 s | 261 s |
+| `inillucent-bench::inillucent-bench` | ~105 s | 249 s |
+| `inillucent-testrun` (everything) | ~300 s | 771 s |
+
+The quiet-box figures are what to expect from a checkout on an idle machine;
+the busy-box column is §6.3's table, taken while several agents were working in
+this tree. **A timing read on a busy box is not a defect and is not worth
+chasing**, which is why §1.7 says a count is the thing to assert on and a
+duration is not.
+
 ### 6.2 Tier by tier
 
 Each tier run in isolation (`--tier <name>` alone), not carved out of the full
@@ -573,7 +613,7 @@ rather than months is that the differential suites ask SQLite the same question.
 
 ### 7.2 Three the review found in the fix itself
 
-The virtual-table rollback fix was reviewed by `codex exec review`, and the
+The virtual-table rollback fix was reviewed again in task-1857, and that
 review found three defects **in the fix**, all on the same two lines. They are
 listed because they are more instructive than the original bug:
 

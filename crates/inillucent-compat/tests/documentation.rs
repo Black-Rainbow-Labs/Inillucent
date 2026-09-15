@@ -480,3 +480,643 @@ fn the_skills_state_the_number_of_commands_and_tools_there_are() {
         wrong.join("\n")
     );
 }
+
+/// Returns some text with every run of whitespace as one space.
+///
+/// @param text - the text to collapse
+fn collapse(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+/// Returns the source of every crate's `lib.rs`, with the crate's name.
+///
+/// A workspace member with no library is not here, which is why the counts
+/// below are out of 28 rather than out of the 29 members: `inillucent-bench`
+/// is a binary and has nowhere to put a crate attribute.
+fn crate_libraries() -> Vec<(String, String)> {
+    let root = workspace_root();
+    let mut libraries = Vec::new();
+    for group in ["crates", "drivers"] {
+        let Ok(entries) = std::fs::read_dir(root.join(group)) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries.flat_map(|entry| entry.map(|e| e.path())).collect();
+        paths.sort();
+        for path in paths {
+            let lib = path.join("src/lib.rs");
+            let Ok(source) = std::fs::read_to_string(&lib) else {
+                continue;
+            };
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            libraries.push((name, source));
+        }
+    }
+    assert!(
+        libraries.len() > 20,
+        "found {} crate libraries, which means this is looking in the wrong place",
+        libraries.len()
+    );
+    libraries
+}
+
+/// `docs/repository.md` states how many crates carry the lint attributes, and
+/// the two numbers are the ones the crates actually carry.
+///
+/// **These are the two facts that had already drifted (task-1913).** The page
+/// said 26 crates denied the four lints and 22 forbade `unsafe`; the crates
+/// said 28 and 21. `tools/doc-facts/check.mjs` measures both and reports the
+/// disagreement, and it is run by nothing - no test, no script, no packaging
+/// step - so it caught this the day somebody ran it by hand and not before.
+/// This is the same measurement as a test, which is what makes the number in
+/// the page fail a build when a new crate arrives without its attributes.
+#[test]
+fn the_repository_page_counts_the_crates_under_each_lint_correctly() {
+    let libraries = crate_libraries();
+    let forbidding = libraries
+        .iter()
+        .filter(|(_, source)| source.contains("forbid(unsafe_code)"))
+        .count();
+    let four = ["unwrap_used", "expect_used", "panic", "indexing_slicing"];
+    let denies_four = libraries
+        .iter()
+        .filter(|(_, source)| four.iter().all(|lint| source.contains(lint)))
+        .count();
+
+    let page = workspace_root().join("docs/repository.md");
+    let text = std::fs::read_to_string(&page).expect("the repository page reads");
+    // **Matched on the words rather than the typography.** The sentence wraps
+    // across two lines, and a checkout with CRLF endings holds a different
+    // string from one with LF - so a literal that carried the newline passed on
+    // one machine and failed on the next for a reason that has nothing to do
+    // with the numbers it is checking. It failed exactly that way the first
+    // time this landed beside a rebase (task-1913).
+    let text = collapse(&text);
+    let denied = format!("{denies_four} of the 29 crates deny");
+    let forbidden = format!("and {forbidding} forbid `unsafe`");
+    assert!(
+        text.contains(&denied),
+        "docs/repository.md does not say `{denied}`, and {denies_four} crates deny the four lints. \
+         The crates that do not: {:?}",
+        libraries
+            .iter()
+            .filter(|(_, source)| !four.iter().all(|lint| source.contains(lint)))
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<&str>>()
+    );
+    assert!(
+        text.contains(&forbidden),
+        "docs/repository.md does not say `and {forbidding} forbid `unsafe``, and \
+         {forbidding} crates forbid it. The crates that do not: {:?}",
+        libraries
+            .iter()
+            .filter(|(_, source)| !source.contains("forbid(unsafe_code)"))
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<&str>>()
+    );
+}
+
+/// Returns every workspace member's crate name, read from the root manifest.
+///
+/// The manifest's own list rather than a directory walk, so a crate that is in
+/// the tree but not a member does not count as existing.
+fn workspace_members() -> BTreeSet<String> {
+    let root = workspace_root();
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("the root manifest");
+    let mut names = BTreeSet::new();
+    let mut inside = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed == "members = [" {
+            inside = true;
+            continue;
+        }
+        if inside {
+            if trimmed == "]" {
+                break;
+            }
+            let path = trimmed.trim_matches(|c| c == '"' || c == ',');
+            if let Some(name) = path.rsplit('/').next() {
+                if !name.is_empty() {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+    }
+    assert!(
+        names.len() > 20,
+        "the root manifest's member list was not read: {names:?}"
+    );
+    // The binary targets too. `inillucent-shell`, `inillucent-mcp` and the
+    // profiling harnesses are things a reader can run; they are named the same
+    // way a crate is and they exist, so a front page naming one is naming
+    // something real.
+    for page in crate_front_pages() {
+        let Some(manifest) = page.parent().and_then(Path::parent) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(manifest.join("Cargo.toml")) else {
+            continue;
+        };
+        let mut in_bin = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_bin = trimmed == "[[bin]]";
+                continue;
+            }
+            if in_bin {
+                if let Some(rest) = trimmed.strip_prefix("name = ") {
+                    names.insert(rest.trim_matches('"').to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Returns every crate front page: the `src/lib.rs` of each workspace member.
+///
+/// The front page and not every file, because that is what a `cargo doc`
+/// reader and a `cargo add` reader land on, and it is where A3 found the claim
+/// that four deleted crates were in the tree. A note further down a module
+/// about a crate that used to exist is history and reads correctly.
+fn crate_front_pages() -> Vec<PathBuf> {
+    let root = workspace_root();
+    let mut found = Vec::new();
+    for directory in ["crates", "drivers"] {
+        let Ok(entries) = std::fs::read_dir(root.join(directory)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let page = entry.path().join("src").join("lib.rs");
+            if page.is_file() {
+                found.push(page);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Returns the `inillucent-*` crate names a line of documentation claims exist.
+///
+/// Narrow in three ways, each of them deliberate:
+///
+/// - **The hyphenated spelling only.** `inillucent_engine` is a Rust path the
+///   compiler already checks, and `inillucent` on its own is the product's name
+///   as often as the crate's.
+/// - **Inside backticks only**, because that is how this tree writes the name
+///   of a thing. A crate name that is not in backticks is prose, and prose
+///   about a crate that used to exist is history rather than a claim.
+/// - **Not inside a fenced code block**, which a doctest is. A path in an
+///   example is a string the example uses, not a claim about the workspace -
+///   this test's first draft failed on the temporary directory names in the
+///   driver's own doctests, which is the false positive that shaped the rule.
+///
+/// @param line - one line of a doc comment, with its `///` or `//!` marker
+fn crate_names_in(line: &str) -> Vec<String> {
+    let bytes: Vec<char> = line.chars().collect();
+    let in_backticks = |at: usize, end: usize| {
+        let before = line[..char_offset(&bytes, at)].chars().last();
+        let after = line[char_offset(&bytes, end)..].chars().next();
+        before == Some('`') && after == Some('`')
+    };
+    let mut found = Vec::new();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        if !line[char_offset(&bytes, at)..].starts_with("inillucent-") {
+            at += 1;
+            continue;
+        }
+        let mut end = at;
+        while end < bytes.len()
+            && (bytes[end].is_ascii_alphanumeric() || bytes[end] == '-' || bytes[end] == '_')
+        {
+            end += 1;
+        }
+        let name: String = bytes[at..end].iter().collect();
+        let name = name.trim_end_matches(['-', '_']).to_string();
+        let end = at.saturating_add(name.chars().count());
+        if name.len() > "inillucent-".len() && in_backticks(at, end) {
+            found.push(name);
+        }
+        at = end.max(at + 1);
+    }
+    found
+}
+
+/// Returns the byte offset of a character position.
+///
+/// @param chars - the line as characters
+/// @param at - the character position
+fn char_offset(chars: &[char], at: usize) -> usize {
+    chars.iter().take(at).map(|c| c.len_utf8()).sum()
+}
+
+/// No crate's front page names a workspace member that does not exist.
+///
+/// **The facade's front page named four deleted crates and promised a type it
+/// did not export (task-1961, A3).** `crates/inillucent/src/lib.rs` described
+/// `inillucent-legacy`, `inillucent-capi`, `inillucent-session` and
+/// `inillucent-vm` as in the tree and said what would happen to them "when the
+/// driver lands" - the driver had landed and all four were deleted. It was the
+/// first documentation a `cargo add inillucent` reader saw, and nothing
+/// failed: a crate name in a doc comment is a string.
+///
+/// Narrow on purpose, in three ways. Only `src/lib.rs`, because that is the
+/// page a `cargo doc` reader lands on; only the hyphenated spelling, because
+/// `inillucent_engine` is a Rust path the compiler already checks; and only
+/// `//!` and `///` lines, because a name inside code is checked too.
+#[test]
+fn no_crate_front_page_names_a_member_that_does_not_exist() {
+    let members = workspace_members();
+    let mut wrong: Vec<String> = Vec::new();
+    for path in crate_front_pages() {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut fenced = false;
+        for (number, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with("//!") && !trimmed.starts_with("///") {
+                continue;
+            }
+            // A fenced block inside a doc comment is an example, and a path in
+            // an example is a string rather than a claim.
+            let body = trimmed.trim_start_matches(['/', '!']).trim_start();
+            if body.starts_with("```") {
+                fenced = !fenced;
+                continue;
+            }
+            if fenced {
+                continue;
+            }
+            for named in crate_names_in(trimmed) {
+                if !members.contains(&named) {
+                    wrong.push(format!(
+                        "{}:{}: names `{named}`, which is not a workspace member",
+                        path.display(),
+                        number + 1
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "crate front pages name crates that do not exist:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// Every skill copy is byte for byte the page in `agent-skills/`.
+///
+/// **The skills were in a directory no agent reads (task-1961, S1).**
+/// `agent-skills/README.md` told a person to symlink them into the agent's own
+/// skills directory by hand and nothing in the repository ran it, so every
+/// fresh clone started with the eight skills invisible to Claude Code's own
+/// matcher, which reads a project's `.claude/skills/`. The copies are committed
+/// now, and this is what stops them drifting from the source they were copied
+/// from - which is the one failure a copy has that a symlink does not.
+#[test]
+fn every_skill_copy_matches_its_source() {
+    let root = workspace_root();
+    let source = root.join("agent-skills");
+    let mut skills: Vec<String> = std::fs::read_dir(&source)
+        .expect("agent-skills/ is there")
+        .flatten()
+        .filter(|entry| entry.path().join("SKILL.md").is_file())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    skills.sort();
+    assert!(
+        skills.len() >= 8,
+        "agent-skills/ holds {} skill(s), which is fewer than the eight it had when this was \
+         written - if one was deleted, delete its copies too",
+        skills.len()
+    );
+
+    let mut wrong: Vec<String> = Vec::new();
+    for target in [".claude/skills", ".agents/skills"] {
+        for skill in &skills {
+            let from = source.join(skill).join("SKILL.md");
+            let to = root.join(target).join(skill).join("SKILL.md");
+            let expected = std::fs::read(&from).expect("the source skill reads");
+            match std::fs::read(&to) {
+                Err(_) => wrong.push(format!("{target}/{skill}/SKILL.md is missing")),
+                Ok(found) if found != expected => {
+                    wrong.push(format!("{target}/{skill}/SKILL.md differs from its source"))
+                }
+                Ok(_) => {}
+            }
+        }
+        // A copy of a skill that no longer exists is worse than a missing one:
+        // an agent reads it and acts on a page nobody maintains.
+        if let Ok(entries) = std::fs::read_dir(root.join(target)) {
+            for entry in entries.flatten() {
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                if entry.path().is_dir() && !skills.contains(&name) {
+                    wrong.push(format!("{target}/{name} is a copy of a skill that is gone"));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the skill copies are out of date; run `node tools/sync-skills.mjs`:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// The per-agent instruction files exist, point at `AGENTS.md`, and say nothing else.
+///
+/// **One instruction document, and a pointer for each agent that looks
+/// somewhere else (task-1961, S2).** `AGENTS.md` was the only root file, which
+/// is Codex's convention and nobody else's: Claude Code reads `CLAUDE.md`,
+/// Gemini CLI reads `GEMINI.md`, Cursor reads `.cursor/rules/*.mdc`. Each of
+/// those now holds a pointer and no content, because two copies of an
+/// instruction document is one that goes stale.
+#[test]
+fn every_agent_pointer_file_points_at_agents_md() {
+    let root = workspace_root();
+    for relative in ["CLAUDE.md", "GEMINI.md", ".cursor/rules/inillucent.mdc"] {
+        let path = root.join(relative);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("{relative} is missing; it points an agent at AGENTS.md"));
+        let lines = text.lines().count();
+        assert!(
+            lines < 20,
+            "{relative} is {lines} lines. It is a pointer: the instructions live in AGENTS.md, and \
+             a second copy of them is the one that goes stale"
+        );
+        assert!(
+            text.contains("AGENTS.md"),
+            "{relative} does not name AGENTS.md, so the agent that reads it is told nothing"
+        );
+    }
+}
+
+/// Every page in `docs/` is listed in `docs/README.md`.
+///
+/// **The index cannot drift from the directory (task-1961, D6).** There was
+/// already a check that every page is *reachable* - that something links to it
+/// - which a page linked from one other page passes while being absent from the
+/// index a reader actually starts at.
+#[test]
+fn every_page_is_listed_in_the_index() {
+    let root = workspace_root();
+    let index = std::fs::read_to_string(root.join("docs/README.md")).expect("the index is there");
+    let mut missing: Vec<String> = Vec::new();
+    for page in pages() {
+        let Ok(relative) = page.strip_prefix(root.join("docs")) else {
+            continue;
+        };
+        let name = relative
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        if name == "README.md" {
+            continue;
+        }
+        if !index.contains(&name) {
+            missing.push(name);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "docs/README.md does not list {}. A page the index does not carry is a page nobody \
+         finds and nobody updates",
+        missing.join(", ")
+    );
+}
+
+/// Every method a language package's API table names exists in its binding.
+///
+/// **Four READMEs had an install line, an example, and no method reference
+/// (task-1961, D5).** A reader who wanted to know what the binding could do had
+/// to read the source, which defeats the point of shipping a binding. The
+/// tables are the reference; this is what stops one of them naming a method
+/// that was renamed or never existed.
+///
+/// **It lives here rather than in each package's own suite**, which is what the
+/// finding asked for, and the reason is that the package suites are not run by
+/// `tools/validate` and three of the four need a toolchain this machine does
+/// not have. A check that would run on somebody's laptop once is a check that
+/// does not run. This one runs on every build, reads the same tables, and
+/// greps the same sources.
+#[test]
+fn every_method_a_package_table_names_exists_in_its_binding() {
+    let root = workspace_root();
+    // (the README, the sources a name may be declared in)
+    let packages: [(&str, &[&str]); 4] = [
+        (
+            "packages/npm/inillucent/README.md",
+            &[
+                "packages/npm/inillucent/index.mjs",
+                "packages/npm/inillucent/resolve.mjs",
+            ],
+        ),
+        // **The tracked binding, not the copy the wheel ships.**
+        // `packages/python/src/inillucent/driver.py` is in `.gitignore`:
+        // `packages/python/build.py` stages it into the package from here, so
+        // a clone does not have it and this table would have been checked
+        // against a file that is not there. A `git worktree` is what found
+        // that, being a clone.
+        (
+            "packages/python/README.md",
+            &["drivers/bindings/python/inillucent.py"],
+        ),
+        (
+            "packages/php/README.md",
+            &[
+                "packages/php/src/Inillucent.php",
+                "packages/php/src/Error.php",
+            ],
+        ),
+        ("packages/go/README.md", &["packages/go/inillucent.go"]),
+    ];
+
+    let mut missing: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for (readme, sources) in packages {
+        // **Read with the line endings normalised.** `core.autocrlf` is true
+        // on the machine this is developed on, so a fresh checkout holds these
+        // files with CRLF, and a split on a heading delimited by a newline
+        // finds nothing in one. The first version of this passed here and
+        // failed in a `git worktree`, which is a fresh checkout, and that is
+        // what found it.
+        let text = std::fs::read_to_string(root.join(readme))
+            .unwrap_or_else(|_| panic!("{readme} is there"))
+            .replace("\r\n", "\n");
+        let Some(table) = text.split("\n## The API\n").nth(1) else {
+            missing.push(format!("{readme} has no `## The API` table"));
+            continue;
+        };
+        let body: String = sources
+            .iter()
+            .map(|relative| std::fs::read_to_string(root.join(relative)).unwrap_or_default())
+            .collect::<Vec<String>>()
+            .join("\n");
+        assert!(
+            !body.is_empty(),
+            "none of {sources:?} could be read, so {readme}'s table is checked against              nothing. A source a clone does not carry - anything under `.gitignore` - is              not the one to check a table against"
+        );
+        for name in table_names(table) {
+            checked = checked.saturating_add(1);
+            if !body.contains(&name) {
+                missing.push(format!(
+                    "{readme} names `{name}`, which {sources:?} does not declare"
+                ));
+            }
+        }
+    }
+    assert!(
+        checked > 40,
+        "only {checked} method name(s) were read out of the four tables, so this test is \
+         checking almost nothing"
+    );
+    assert!(
+        missing.is_empty(),
+        "a package's API table names something its binding does not have:\n{}",
+        missing.join("\n")
+    );
+}
+
+/// Returns the identifier in each row of an API table's first column.
+///
+/// The first column is written as `` `Name.method(args)` ``, `` `new Name(x)` ``
+/// or `` `Name::method()` ``; what is looked for in the source is the last
+/// identifier before the parentheses, which is what the language declares.
+///
+/// @param table - everything after the `## The API` heading
+fn table_names(table: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for line in table.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') || trimmed.starts_with("|---") {
+            continue;
+        }
+        let Some(first) = trimmed.trim_start_matches('|').split('|').next() else {
+            continue;
+        };
+        let cell = first.trim().trim_matches('`').trim();
+        if cell.is_empty() || cell == "what" {
+            continue;
+        }
+        // `new Inillucent(path)` declares `class Inillucent`; `Args` declares
+        // `type Args`. Either way the identifier is what is looked for.
+        let head = cell.split('(').next().unwrap_or(cell);
+        let identifier = head
+            .rsplit(['.', ':', ' '])
+            .next()
+            .unwrap_or(head)
+            .trim()
+            .to_string();
+        if !identifier.is_empty() {
+            found.push(identifier);
+        }
+    }
+    found
+}
+
+/// Every ratio and speed claim in the roadmap also appears in the performance page.
+///
+/// **Nothing tested `docs/roadmap.md` at all (task-1961, section 9.1).**
+/// `grep -n roadmap tools/doc-facts/check.mjs crates/inillucent-compat/tests/documentation.rs`
+/// returned nothing, and two of the thirteen items it carried had been built
+/// inside the ticket that wrote them without the text being updated. The case
+/// this catches is the one that was found by reading: the roadmap said
+/// `write.insert.batch` was `0.50x` where `docs/performance.md` had moved to
+/// `0.70x`, so the document telling somebody what to work on named a number
+/// that was a release out of date.
+///
+/// **It is one direction on purpose.** The performance page carries far more
+/// numbers than the roadmap does; what is checked is that the roadmap does not
+/// carry one the page has moved past.
+///
+/// **A number the roadmap is asking for is exempt**, and the phrasing is what
+/// marks it: a bar, a condition an item is accepted on ("within 1.5x", "at or
+/// above its current 1.43x", "above 1.50x"). Those are targets rather than
+/// measurements, and the performance page has no reason to carry a number
+/// nothing has measured yet. Where such a condition names a *current* value -
+/// `fts.query` at 1.43x - that value is not published anywhere today, which is
+/// worth fixing when the item is worked and the family is re-measured; it is
+/// not something this test can assert into existence.
+#[test]
+fn every_measured_number_the_roadmap_carries_is_in_the_performance_page() {
+    let root = workspace_root();
+    let roadmap =
+        std::fs::read_to_string(root.join("docs/roadmap.md")).expect("the roadmap is there");
+    let performance = std::fs::read_to_string(root.join("docs/performance.md"))
+        .expect("the performance page is there");
+
+    let mut wrong: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for (number, line) in ratios_in(&roadmap) {
+        // A line that states a bar is stating what is being asked for rather
+        // than what was measured, and the page has no reason to carry it.
+        let folded = line.to_lowercase();
+        let asking_for_it = ["bar", "asks for", "wants", "within", "at or above", "above"]
+            .iter()
+            .any(|phrase| folded.contains(phrase));
+        if asking_for_it {
+            continue;
+        }
+        checked = checked.saturating_add(1);
+        if !performance.contains(&number) {
+            wrong.push(format!(
+                "the roadmap says `{number}`, which docs/performance.md does not"
+            ));
+        }
+    }
+    assert!(
+        checked > 3,
+        "only {checked} measured number(s) were read out of docs/roadmap.md, so this test is \
+         checking almost nothing"
+    );
+    assert!(
+        wrong.is_empty(),
+        "the roadmap carries a number the performance page has moved past:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// Returns every `N.NNx` ratio in a document, with the line it is on.
+///
+/// @param text - the document
+fn ratios_in(text: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let characters: Vec<char> = line.chars().collect();
+        let mut at = 0usize;
+        while at < characters.len() {
+            if !characters[at].is_ascii_digit() {
+                at = at.saturating_add(1);
+                continue;
+            }
+            let start = at;
+            let mut end = at;
+            let mut dots = 0usize;
+            while end < characters.len()
+                && (characters[end].is_ascii_digit() || characters[end] == '.')
+            {
+                if characters[end] == '.' {
+                    dots = dots.saturating_add(1);
+                }
+                end = end.saturating_add(1);
+            }
+            let is_ratio = dots == 1 && characters.get(end) == Some(&'x');
+            if is_ratio {
+                let mut number: String = characters[start..end].iter().collect();
+                number.push('x');
+                found.push((number, line.to_string()));
+            }
+            at = end.max(at.saturating_add(1));
+        }
+    }
+    found
+}

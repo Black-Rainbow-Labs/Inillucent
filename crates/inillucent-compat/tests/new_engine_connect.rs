@@ -51,7 +51,7 @@ fn a_database_opens_by_path_and_keeps_what_was_written() {
     let path = scratch("by-path");
     {
         let database = Database::open(&path).expect("a path with nothing in it is created");
-        let connection = database.connect();
+        let connection = database.session();
         connection
             .execute_batch(
                 "CREATE TABLE note (id INTEGER PRIMARY KEY, body TEXT); \
@@ -74,7 +74,7 @@ fn a_database_opens_by_path_and_keeps_what_was_written() {
     // Opened again, by the same call, with no checkpoint in between - so this is
     // the recovery path as well as the open path.
     let database = Database::open(&path).expect("a path with a database in it is opened");
-    let connection = database.connect();
+    let connection = database.session();
     assert_eq!(
         column(
             &connection
@@ -100,14 +100,14 @@ fn a_reopened_database_can_be_written_to_again() {
     {
         let database = Database::open(&path).expect("created");
         database
-            .connect()
+            .session()
             .execute_batch("CREATE TABLE first (id INTEGER PRIMARY KEY, a TEXT)")
             .expect("the first table is created");
         database.checkpoint().expect("checkpointed");
     }
     {
         let database = Database::open(&path).expect("opened");
-        let connection = database.connect();
+        let connection = database.session();
         connection
             .execute_batch(
                 "CREATE TABLE second (id INTEGER PRIMARY KEY, b TEXT); \
@@ -128,7 +128,7 @@ fn a_reopened_database_can_be_written_to_again() {
 
     // And once more, so the second table survives the same trip the first did.
     let database = Database::open(&path).expect("opened again");
-    let connection = database.connect();
+    let connection = database.session();
     assert_eq!(
         column(&connection.query("SELECT b FROM second").unwrap()),
         vec!["two".to_string()],
@@ -141,7 +141,7 @@ fn a_reopened_database_can_be_written_to_again() {
 fn a_new_database_is_usable_immediately() {
     let path = scratch("fresh");
     let database = Database::open(&path).expect("created");
-    let connection = database.connect();
+    let connection = database.session();
     assert!(
         connection
             .query("SELECT name FROM sqlite_schema")
@@ -171,7 +171,7 @@ fn a_new_database_is_usable_immediately() {
 fn cache_size_grows_the_pool_and_reads_back_what_was_asked_for() {
     let path = scratch("cache-size");
     let database = Database::open(&path).expect("a fresh database opens");
-    let connection = database.connect();
+    let connection = database.session();
     connection
         .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
         .expect("the schema is created");
@@ -227,4 +227,63 @@ fn cache_size_grows_the_pool_and_reads_back_what_was_asked_for() {
         .query("SELECT body FROM t")
         .expect("the row reads back");
     assert_eq!(column(&rows), vec!["after the grow".to_string()]);
+}
+
+/// A `VACUUM` does not leave the connection answering the wrong transaction
+/// state.
+///
+/// **`VACUUM` replaces the whole engine (task-1962, A1 step 3).**
+/// `rebuild::vacuum_in_place` reopens the rebuilt file by assigning a freshly
+/// opened `ImportedDatabase` over the connection, and `Database` holds a second
+/// handle on the group that records the open transaction. The first version of
+/// that second handle was left pointing at the group the *old* engine had, so a
+/// `BEGIN` after a `VACUUM` wrote to one group and `autocommit()` read the
+/// other, and answered `true` inside an open transaction.
+///
+/// The differential suite found it - `dml_differential::vacuum_matches_sqlite`,
+/// step 24 - but that suite needs the pinned SQLite oracle built, and this does
+/// not.
+#[test]
+fn autocommit_is_still_right_after_a_vacuum() {
+    let path = scratch("vacuum-autocommit");
+    let database = Database::open(&path).expect("the database opens");
+    let connection = database.session();
+    connection
+        .execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2), (3)")
+        .expect("the table is written");
+
+    assert!(
+        connection.autocommit().expect("the state is readable"),
+        "nothing has opened a transaction yet"
+    );
+    connection
+        .execute_batch("VACUUM")
+        .expect("the file rebuilds");
+    assert!(
+        connection.autocommit().expect("the state is readable"),
+        "a VACUUM commits itself, so the connection is back in autocommit"
+    );
+
+    connection
+        .execute_batch("BEGIN")
+        .expect("the transaction opens");
+    assert!(
+        !connection.autocommit().expect("the state is readable"),
+        "a transaction is open, so the connection is not in autocommit;          answering true here means the handle is on a group nothing writes to"
+    );
+    connection
+        .execute_batch("INSERT INTO t VALUES (4)")
+        .expect("the row is written");
+    connection
+        .execute_batch("COMMIT")
+        .expect("the transaction commits");
+    assert!(
+        connection.autocommit().expect("the state is readable"),
+        "the commit closed the transaction"
+    );
+
+    let rows = connection
+        .query("SELECT count(*) FROM t")
+        .expect("the count reads back");
+    assert_eq!(rows, vec![vec![OwnedDatum::Int(4)]]);
 }

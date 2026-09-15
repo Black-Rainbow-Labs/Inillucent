@@ -8,7 +8,7 @@
 //! implementation, and each has a case in the tests below.
 
 use inillucent_sql::function::ScalarFunc;
-use inillucent_value::{cast, compare, numeric, Affinity, Collation, TextEncoding, Value};
+use inillucent_value::{cast, compare, numeric, Collation, TextEncoding, Value};
 
 use crate::eval;
 
@@ -292,8 +292,10 @@ fn absolute(value: Value<'static>) -> Value<'static> {
     match cast::numerify(value) {
         Value::Integer(integer) => match integer.checked_abs() {
             Some(absolute) => Value::Integer(absolute),
-            // `abs(-9223372036854775808)` overflows, and SQLite reports it as
-            // an error rather than returning a wrapped negative.
+            // Unreachable through the executor: `refusal_for` raises `integer
+            // overflow` for exactly this argument before the call is made,
+            // which is what SQLite answers. The arm stays because this
+            // function is callable on its own and must not wrap a negative.
             None => Value::Real(-(integer as f64)),
         },
         Value::Real(real) => Value::Real(real.abs()),
@@ -994,15 +996,6 @@ fn pattern_call(
     Value::Integer(i64::from(matched))
 }
 
-/// Returns the affinity a scalar function's result should be given, if any.
-///
-/// Nothing in the built-in set needs one; the hook exists so a registered
-/// function can later declare one without the machine having to special-case
-/// it.
-pub fn result_affinity(_func: ScalarFunc) -> Option<Affinity> {
-    None
-}
-
 /// A vector, as this engine stores one: little-endian `f32` in a blob.
 ///
 /// **The same bytes `inillucent_search` writes**, which is what makes a column
@@ -1073,6 +1066,17 @@ pub fn refusal_for(func: ScalarFunc, arguments: &[Value<'static>]) -> Option<Str
     // and the reason is the same in each case: a NULL would be an answer the
     // caller cannot tell from a real one.
     match func {
+        // **`abs(-9223372036854775808)` has no answer (task-1913).** Its
+        // absolute value is one past the largest integer, and SQLite raises
+        // `integer overflow` rather than inventing one. This engine returned
+        // `9.22337203685478e18`, a real - a wrong answer a caller cannot tell
+        // from a right one, which is exactly the reason the three below refuse.
+        ScalarFunc::Abs => {
+            if matches!(arguments.first(), Some(Value::Integer(i64::MIN))) {
+                return Some("integer overflow".to_string());
+            }
+            return None;
+        }
         ScalarFunc::Unistr => {
             if let Some(Value::Text(text)) = arguments.first() {
                 if expand_unicode_escapes(&text.utf8_bytes()).is_none() {

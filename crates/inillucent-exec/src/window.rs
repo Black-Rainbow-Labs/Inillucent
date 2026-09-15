@@ -32,6 +32,7 @@ use inillucent_tree::datum::{Datum, OwnedDatum};
 use inillucent_tree::key;
 use inillucent_tree::types::compare_under;
 use inillucent_value::collation::Collation;
+use inillucent_value::Value;
 
 use crate::aggregate::{Accumulator, AggregateKind};
 use crate::batch::Batch;
@@ -277,7 +278,7 @@ fn integer_of(value: &Datum<'_>) -> i64 {
         Datum::Int(held) => *held,
         Datum::Real(held) => *held as i64,
         Datum::Null => 0,
-        other => inillucent_value::cast::integer_value(&crate::scalar::to_value(*other)),
+        other => inillucent_value::cast::integer_value(&Value::from(other)),
     }
 }
 
@@ -287,7 +288,25 @@ fn real_of(value: &Datum<'_>) -> f64 {
         Datum::Int(held) => *held as f64,
         Datum::Real(held) => *held,
         Datum::Null => 0.0,
-        other => inillucent_value::cast::real_value(&crate::scalar::to_value(*other)),
+        other => inillucent_value::cast::real_value(&Value::from(other)),
+    }
+}
+
+/// Returns an ordering value's double reading, or `None` when it is NULL.
+///
+/// **NULL is not a number and a `RANGE` offset cannot measure a distance to
+/// it (task-1913).** Reading it as `0.0` through `real_of` made every NULL row
+/// sit one unit from zero, so `RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING` drew
+/// the NULL rows into the frame of every row near zero and drew the numbers
+/// beside them into the NULL rows' own frames. `frames::range_bound` takes the
+/// `None` and resolves such a row to its peer group instead, which is what
+/// SQLite answers.
+///
+/// @param value - the row's ordering value
+fn real_or_null(value: &Datum<'_>) -> Option<f64> {
+    match value {
+        Datum::Null => None,
+        other => Some(real_of(other)),
     }
 }
 
@@ -463,8 +482,11 @@ fn frame_of(
         row,
         &spec,
         |member| match order_column {
-            Some(column) => real_of(&value_at(rows, member, column)),
-            None => 0.0,
+            Some(column) => real_or_null(&value_at(rows, member, column)),
+            // No ordering term at all, so no `RANGE` offset can be resolved
+            // against one. Every row reads alike, which is what the frame
+            // arithmetic did before there was a NULL to tell apart.
+            None => Some(0.0),
         },
         descending,
     )

@@ -7,7 +7,7 @@
 //! already times them; nothing printed them.
 //!
 //! Usage:
-//!   inillucent-indexprofile <sqlite fixture> [--iterations N] [--sql "CREATE INDEX ..."]
+//!   inillucent-indexprofile `<sqlite fixture>` [--iterations N] [--sql "CREATE INDEX ..."]
 
 /// The engine's own allocator, installed for this program.
 ///
@@ -77,9 +77,17 @@ fn main() -> ExitCode {
         }
         let total = started.elapsed().as_nanos() as f64 / 1e6;
         totals.push(total);
-        let (scan, sort, unique, flatten, pack, catalog, seal) = database.build_stage_nanos();
-        let measured =
-            [scan, sort, unique, flatten, pack, catalog, seal].map(|value| value as f64 / 1e6);
+        let stage = database.build_stage_nanos();
+        let measured = [
+            stage.scan,
+            stage.sort,
+            stage.unique,
+            stage.flatten,
+            stage.pack,
+            stage.catalog,
+            stage.seal,
+        ]
+        .map(|value| value as f64 / 1e6);
         let named = measured.iter().sum::<f64>();
         for (column, value) in measured.iter().enumerate() {
             if let Some(held) = stages.get_mut(column) {

@@ -768,22 +768,55 @@ fn commit_hash(root: &Path) -> String {
     }
 }
 
-/// Returns a name for this machine.
+/// The environment variable a machine labels its own rows with.
+const MACHINE_LABEL_VAR: &str = "INILLUCENT_MACHINE";
+
+/// Returns a label for this machine, stable across runs and not its hostname.
+///
+/// **The column exists so rows from two machines can be told apart, and a
+/// hostname is more than that takes.** This used to return `COMPUTERNAME`
+/// directly, so eight rows of `tests/performance-history.tsv` - a tracked,
+/// published file - carried the personal hostname of the machine the engine was
+/// written on (task-1946, M9). The comparison the column supports needs only
+/// that two machines produce two different labels and that one machine produces
+/// the same one every time, which a digest gives and a name is not needed for.
+///
+/// `INILLUCENT_MACHINE` overrides it, for a fleet that would rather its rows say
+/// `ci-linux-x64` than a digest.
 fn machine_name() -> String {
+    if let Ok(value) = std::env::var(MACHINE_LABEL_VAR) {
+        let value = value.trim();
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+    match host_identity() {
+        Some(identity) => {
+            let digest = inillucent_base::hash::sha256_hex(identity.as_bytes());
+            format!("machine-{}", &digest[..8])
+        }
+        None => "machine-unknown".to_string(),
+    }
+}
+
+/// Whatever this operating system will say this machine is called, for hashing.
+///
+/// @returns the raw name, which is never written anywhere
+fn host_identity() -> Option<String> {
     for key in ["COMPUTERNAME", "HOSTNAME"] {
         if let Ok(value) = std::env::var(key) {
-            if !value.is_empty() {
-                return value;
+            if !value.trim().is_empty() {
+                return Some(value.trim().to_string());
             }
         }
     }
-    if let Ok(output) = Command::new("hostname").output() {
-        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !name.is_empty() {
-            return name;
-        }
+    let output = Command::new("hostname").output().ok()?;
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
     }
-    "unknown".to_string()
 }
 
 /// Returns the current time as an ISO-8601 date and time in UTC.
@@ -797,37 +830,24 @@ fn timestamp() -> String {
         .unwrap_or(0);
     let (days, rest) = (seconds / 86_400, seconds % 86_400);
     let (hour, minute, second) = (rest / 3_600, (rest % 3_600) / 60, rest % 60);
-    let (year, month, day) = civil_from_days(days as i64);
+    let civil = inillucent_scalar::datetime::civil_of_unix_day(days as i64);
+    let (year, month, day) = (civil.year, civil.month, civil.day);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-/// Turns days since 1970-01-01 into a calendar date.
+/// Returns a Unix day number as a calendar date, for the test below.
 ///
-/// Howard Hinnant's `civil_from_days`, which is the standard shift-the-epoch-to
-/// -March algorithm: with the year starting in March, the leap day is the last
-/// day of the year and every month length becomes a closed form.
+/// One line over `inillucent_scalar::datetime::civil_of_unix_day`, which is the
+/// workspace's one implementation of this since task-1961's A10. The assertions
+/// the copy this file used to carry was checked by are kept, pointed at the
+/// shared routine, so the replacement is proved to agree rather than assumed
+/// to.
 ///
-/// @param days - days since the epoch
+/// @param days - days since 1970-01-01
+#[cfg(test)]
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let shifted = days + 719_468;
-    let era = if shifted >= 0 {
-        shifted
-    } else {
-        shifted - 146_096
-    } / 146_097;
-    let day_of_era = shifted - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
-    } else {
-        shifted_month - 9
-    };
-    (if month <= 2 { year + 1 } else { year }, month, day)
+    let civil = inillucent_scalar::datetime::civil_of_unix_day(days);
+    (civil.year, civil.month, civil.day)
 }
 
 #[cfg(test)]

@@ -17,7 +17,7 @@
 //! when `x` is text.
 
 use inillucent_base::limits::Limits;
-use inillucent_value::{Affinity, Collation};
+use inillucent_value::Collation;
 
 use crate::ast::{self, ConflictAction};
 use crate::bind::{
@@ -278,13 +278,30 @@ pub struct BoundUpdate {
     /// tables, and the values it assigns are not expressions over the target
     /// row: they read a *different* row, one the join found. So the query that
     /// finds the keys carries these terms too, and projects the assigned values
-    /// beside the key; see [`crate::dml::BoundUpdate::joins`].
+    /// beside the key; see [`BoundUpdate::from`], which is this field.
     ///
     /// Empty for every ordinary `UPDATE`, which is what keeps the wider row off
     /// the path the gate's `txn.large` measures.
     pub from: Vec<crate::bind::BoundSource>,
     /// The assignments, in table column order with duplicates already refused.
     pub assignments: Vec<BoundAssignment>,
+    /// The `STORED` generated columns, recomputed after the assignments.
+    ///
+    /// **A stored generated column is part of the row, so a row that is
+    /// rewritten rewrites it (task-1913).** It is never named in a `SET`, so
+    /// an `UPDATE` used to leave whatever was written when the row was
+    /// inserted: `c GENERATED ALWAYS AS (a + 1) STORED` still read 2 after
+    /// `UPDATE g SET a = 5`, where SQLite reads 6. The wrong value is on the
+    /// disk rather than in an answer, so a later read of the same file is
+    /// wrong too, and an index on the column indexes the stale value.
+    ///
+    /// A `VIRTUAL` column is not here: it has no slot in the record and is
+    /// computed when it is read, which is why only this half needed fixing.
+    ///
+    /// These are evaluated against the row *after* the assignments, which is
+    /// the one difference from [`BoundUpdate::assignments`] - those read the
+    /// before image so `SET a = b, b = a` swaps.
+    pub generated: Vec<BoundAssignment>,
     /// The `WHERE` clause.
     pub filter: Option<BoundExpr>,
     /// The statement's conflict algorithm, when it wrote one.
@@ -421,6 +438,42 @@ fn is_rowid_name(folded: &[u8]) -> bool {
     matches!(folded, b"rowid" | b"oid" | b"_rowid_")
 }
 
+/// How deep one write may drive triggers firing other triggers.
+///
+/// SQLite's own limit is `SQLITE_MAX_TRIGGER_DEPTH`, enforced when the frame is
+/// pushed. Trigger bodies are inlined here rather than run as frames, so the
+/// same limit is enforced where the inlining happens - and it has to be, or a
+/// schema in which two triggers write each other's tables would compile until
+/// the compiler ran out of memory.
+///
+/// **This is one number now, and it is the one `.limit` reports.** There used
+/// to be two constants of this name: this one at 32, which was the number
+/// actually enforced, and `inillucent-exec`'s at 1000, checked at run time over
+/// a tree the binder had already capped at 32 - so that check could never fire.
+/// `crates/inillucent-base/manifests/limits.toml` advertised 1000 and
+/// `inillucent diagnose` printed 1000, and a chain of forty distinct triggers
+/// that the oracle ran was refused here (task-1946, H3). The binder reads
+/// `Limit::TriggerDepth` from the connection now, which `.limit trigger_depth`
+/// and the driver both set; this constant is what a binder built without limits
+/// falls back to, and it is the manifest's default.
+pub const MAX_TRIGGER_DEPTH: usize = 1000;
+
+/// How deep one chain of foreign-key actions may go.
+///
+/// A cascade reaches this only when the keys form a cycle, which in practice
+/// means a table whose parent column points at itself. SQLite's own limit is a
+/// run-time recursion depth; this one is a compile-time inlining depth, and it
+/// is smaller for that reason.
+pub const MAX_FOREIGN_KEY_DEPTH: usize = 64;
+
+/// How many foreign-key action bodies one statement may inline in total.
+///
+/// The depth limit alone is not enough: a table with three keys that all cycle
+/// would inline three bodies per level, so the limit that matters is the total.
+/// A chain, which is what a self-referencing tree produces, spends one per
+/// level and reaches the depth limit first.
+pub const MAX_FOREIGN_KEY_STATEMENTS: usize = 256;
+
 impl<'a> Binder<'a> {
     /// Binds an `INSERT` or `REPLACE`.
     pub fn bind_insert(&mut self, insert: &ast::Insert) -> Result<BoundInsert, ParseError> {
@@ -541,6 +594,15 @@ impl<'a> Binder<'a> {
                 let Some(position) = table.column_position(&folded) else {
                     return Err(no_such_column(self.ast.text(*name), Span::default()));
                 };
+                // **An assignment to a generated column is refused, not
+                // ignored (task-1913).** SQLite answers `cannot UPDATE
+                // generated column "c"`; this accepted the statement, reported
+                // it as a success, and wrote nothing the caller asked for -
+                // either the record took the value and the column stopped
+                // agreeing with its own expression, or the recompute above put
+                // it back and the assignment was silently dropped. `INSERT`
+                // already refused the same thing.
+                self.refuse_generated(&table, position, "UPDATE", Span::default())?;
                 if assignments
                     .iter()
                     .any(|existing: &BoundAssignment| existing.column == position)
@@ -564,6 +626,7 @@ impl<'a> Binder<'a> {
             Some(expr) => Some(self.bind_expr(expr)?),
             None => None,
         };
+        let generated = self.bind_stored_generated(&table)?;
         let checks = self.bind_checks(&table)?;
         let not_null_defaults = self.bind_not_null_defaults(&table)?;
         let index_exprs = self.bind_index_exprs(&table)?;
@@ -595,6 +658,7 @@ impl<'a> Binder<'a> {
             source,
             from: joined,
             assignments,
+            generated,
             filter,
             on_conflict: update.on_conflict,
             checks,
@@ -704,9 +768,15 @@ impl<'a> Binder<'a> {
             if self.firing.contains(&trigger.folded) {
                 continue;
             }
-            if self.firing.len() >= crate::bind::MAX_TRIGGER_DEPTH {
+            if self.firing.len() >= self.trigger_depth {
+                // The number is in the message because a settable limit that
+                // refuses without saying what it was leaves a reader guessing
+                // between the default and whatever `.limit` last set.
                 return Err(refused(
-                    "too many levels of trigger recursion",
+                    format!(
+                        "too many levels of trigger recursion: the limit is {}",
+                        self.trigger_depth
+                    ),
                     Span::default(),
                 ));
             }
@@ -789,9 +859,7 @@ impl<'a> Binder<'a> {
         trigger: &'a TriggerInfo,
         event: &TriggerEventInfo,
     ) -> Result<BoundTrigger, ParseError> {
-        if self.foreign_key_depth >= crate::bind::MAX_FOREIGN_KEY_DEPTH
-            || self.foreign_key_budget == 0
-        {
+        if self.foreign_key_depth >= MAX_FOREIGN_KEY_DEPTH || self.foreign_key_budget == 0 {
             return Err(refused(
                 "too many levels of foreign key recursion",
                 Span::default(),
@@ -1119,11 +1187,18 @@ impl<'a> Binder<'a> {
     ///
     /// SQLite's message names the column, because the usual cause is a script
     /// that inserts every column of a table one of whose columns has since been
-    /// made generated.
+    /// made generated. It names the statement too - `INSERT` or `UPDATE` - and
+    /// so does this.
+    ///
+    /// @param table - the table being written
+    /// @param position - the column the statement named
+    /// @param verb - `INSERT into` or `UPDATE`, as SQLite writes it
+    /// @param span - where the name was written
     fn refuse_generated(
         &self,
         table: &TableInfo,
         position: u16,
+        verb: &str,
         span: Span,
     ) -> Result<(), ParseError> {
         let Some(column) = table.column(position) else {
@@ -1134,7 +1209,7 @@ impl<'a> Binder<'a> {
         }
         Err(refused(
             format!(
-                "cannot INSERT into generated column \"{}\"",
+                "cannot {verb} generated column \"{}\"",
                 String::from_utf8_lossy(&column.name)
             ),
             span,
@@ -1191,7 +1266,7 @@ impl<'a> Binder<'a> {
                 ));
             }
             if position != ROWID_TARGET {
-                self.refuse_generated(table, position, Span::default())?;
+                self.refuse_generated(table, position, "INSERT into", Span::default())?;
             }
             targets.push(position);
         }
@@ -1295,6 +1370,37 @@ impl<'a> Binder<'a> {
             return Ok(Some(BoundExpr::Null));
         };
         Ok(Some(self.bind_schema_expr(&sql)?))
+    }
+
+    /// Binds every `STORED` generated column's expression.
+    ///
+    /// Returns them as assignments, because that is what they are on the write
+    /// path: a value the statement did not write and the row has to carry. See
+    /// [`BoundUpdate::generated`] for why an `UPDATE` needs them and a
+    /// `VIRTUAL` column does not.
+    ///
+    /// @param table - the table being written
+    fn bind_stored_generated(
+        &mut self,
+        table: &TableInfo,
+    ) -> Result<Vec<BoundAssignment>, ParseError> {
+        let mut generated = Vec::new();
+        for position in 0..table.columns.len() as u16 {
+            let Some(column) = table.column(position) else {
+                continue;
+            };
+            if !column.generated || !column.stored {
+                continue;
+            }
+            let Some(expr) = self.generated_expr(table, position)? else {
+                continue;
+            };
+            generated.push(BoundAssignment {
+                column: position,
+                value: expr,
+            });
+        }
+        Ok(generated)
     }
 
     /// Binds a column's `DEFAULT`, or NULL when it has none.
@@ -1402,6 +1508,7 @@ impl<'a> Binder<'a> {
         let limits = Limits::default();
         let (ast, expr) = parse_expression(sql, &limits)?;
         let mut nested = Binder::new(self.catalog, &ast, self.authorizer);
+        nested.trigger_depth = self.trigger_depth;
         nested.sources = self.sources.clone();
         nested.scopes = self.scopes.clone();
         let bound = nested.bind_expr(expr)?;
@@ -1539,17 +1646,6 @@ fn bare_indexed_column(ast: &crate::Ast, column: &ast::IndexedColumn) -> Option<
     }
 }
 
-/// Returns the affinity and collation a table column compares with.
-pub fn column_rules(table: &TableInfo, position: u16) -> (Affinity, Collation) {
-    let Some(column) = table.column(position) else {
-        return (Affinity::Blob, Collation::Binary);
-    };
-    let collation =
-        Collation::from_name(core::str::from_utf8(&column.collation).unwrap_or("BINARY"))
-            .unwrap_or(Collation::Binary);
-    (column.affinity, collation)
-}
-
 /// The extended result codes a rejected write reports.
 ///
 /// The numbers are SQLite's own extended codes. They are written out rather
@@ -1671,4 +1767,203 @@ fn limited_dml_refusal(limited: Option<(ast::Limited, Span)>) -> Option<ParseErr
         },
         span,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog_view::{
+        ColumnInfo, IndexColumnInfo, IndexInfo, IndexOrigin, TableInfo, TableKind,
+    };
+    use inillucent_value::Affinity;
+
+    /// Returns one plain column.
+    ///
+    /// @param name - the column's name
+    fn a_column(name: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.as_bytes().to_vec(),
+            folded: name.to_ascii_lowercase().into_bytes(),
+            declared_type: b"INTEGER".to_vec(),
+            affinity: Affinity::Integer,
+            collation: b"binary".to_vec(),
+            not_null: false,
+            not_null_conflict: None,
+            primary_key_conflict: None,
+            default_sql: None,
+            primary_key_position: None,
+            hidden: false,
+            generated: false,
+            stored: false,
+            generated_sql: None,
+        }
+    }
+
+    /// Returns a rowid table with the columns named.
+    ///
+    /// @param name - the table's name
+    /// @param columns - the column names, in declaration order
+    fn a_table(name: &str, columns: &[&str]) -> TableInfo {
+        TableInfo {
+            name: name.as_bytes().to_vec(),
+            folded: name.to_ascii_lowercase().into_bytes(),
+            database: 0,
+            root: 2,
+            columns: columns.iter().map(|held| a_column(held)).collect(),
+            rowid_alias: None,
+            without_rowid: false,
+            strict: false,
+            autoincrement: false,
+            kind: TableKind::Table,
+            create_sql: Vec::new(),
+            indexes: Vec::new(),
+            view: None,
+            triggers: Vec::new(),
+            analysed_rows: None,
+            foreign_key_triggers: Vec::new(),
+            foreign_keys: Vec::new(),
+            checks: Vec::new(),
+            module: None,
+        }
+    }
+
+    /// Returns an index over the table columns named.
+    ///
+    /// @param name - the index's name
+    /// @param root - its own tree, or the table's for a `WITHOUT ROWID` key
+    /// @param columns - the table columns it keys on
+    fn an_index(name: &str, root: u32, columns: &[u16]) -> IndexInfo {
+        IndexInfo {
+            name: name.as_bytes().to_vec(),
+            folded: name.to_ascii_lowercase().into_bytes(),
+            root,
+            unique: true,
+            columns: columns
+                .iter()
+                .map(|held| IndexColumnInfo {
+                    column: Some(*held),
+                    expr_sql: None,
+                    collation: b"binary".to_vec(),
+                    descending: false,
+                    declared_descending: false,
+                })
+                .collect(),
+            partial_sql: None,
+            origin: IndexOrigin::Unique,
+            conflict: None,
+            prefix_rows: Vec::new(),
+            analysed_rows: None,
+            metric: None,
+        }
+    }
+
+    /// The three spellings of the rowid are the three SQLite accepts.
+    ///
+    /// **A fourth would be a column name a table could not have (T3,
+    /// task-1962).** `rowid`, `oid` and `_rowid_` all name the hidden key, and
+    /// a table that declares a column called any of them shadows it - so the
+    /// list decides which names a `SELECT rowid` can mean.
+    #[test]
+    fn the_rowid_has_three_names() {
+        assert!(is_rowid_name(b"rowid"));
+        assert!(is_rowid_name(b"oid"));
+        assert!(is_rowid_name(b"_rowid_"));
+        assert!(!is_rowid_name(b"row_id"));
+        assert!(!is_rowid_name(b"id"));
+        assert!(
+            !is_rowid_name(b"ROWID"),
+            "the argument is already folded, so an unfolded name is not one this asks about"
+        );
+    }
+
+    /// A unique violation names every column of the index, table-qualified.
+    ///
+    /// **The message is what an application matches on.** SQLite's wording is
+    /// `UNIQUE constraint failed: t.a, t.b`, and a library that switched on it
+    /// would stop recognising a collision if the columns were listed any other
+    /// way.
+    #[test]
+    fn a_unique_violation_names_every_column_of_the_index() {
+        let table = a_table("t", &["a", "b", "c"]);
+        let one = an_index("by_a", 3, &[0]);
+        assert_eq!(
+            unique_message(&table, &one),
+            "UNIQUE constraint failed: t.a"
+        );
+        let two = an_index("by_a_b", 4, &[0, 1]);
+        assert_eq!(
+            unique_message(&table, &two),
+            "UNIQUE constraint failed: t.a, t.b",
+            "both columns, in key order, separated the way the reference separates them"
+        );
+    }
+
+    /// A rowid collision names the aliasing column when there is one, and the
+    /// hidden `rowid` when there is not.
+    ///
+    /// The extended code differs with it: `SQLITE_CONSTRAINT_PRIMARYKEY` for an
+    /// `INTEGER PRIMARY KEY` and `SQLITE_CONSTRAINT_ROWID` for the hidden one.
+    #[test]
+    fn a_rowid_collision_names_the_column_that_aliases_it() {
+        let hidden = a_table("t", &["a"]);
+        assert_eq!(
+            rowid_message(&hidden),
+            (
+                codes::ROWID,
+                "UNIQUE constraint failed: t.rowid".to_string()
+            )
+        );
+        let mut aliased = a_table("t", &["id", "a"]);
+        aliased.rowid_alias = Some(0);
+        assert_eq!(
+            rowid_message(&aliased),
+            (
+                codes::PRIMARY_KEY,
+                "UNIQUE constraint failed: t.id".to_string()
+            )
+        );
+    }
+
+    /// A `WITHOUT ROWID` table has no rowid to name, so it names its key.
+    ///
+    /// **It used to answer `t.rowid`, naming a column the table does not
+    /// have.** Its own key *is* its primary key, held in the one index whose
+    /// root is the table's.
+    #[test]
+    fn a_without_rowid_collision_names_the_primary_key() {
+        let mut table = a_table("t", &["a", "b"]);
+        table.without_rowid = true;
+        table.indexes = vec![an_index("sqlite_autoindex_t_1", table.root, &[0, 1])];
+        assert_eq!(
+            rowid_message(&table),
+            (
+                codes::PRIMARY_KEY,
+                "UNIQUE constraint failed: t.a, t.b".to_string()
+            )
+        );
+    }
+
+    /// A constraint's own `ON CONFLICT REPLACE` makes a statement able to
+    /// replace, with no `OR REPLACE` written anywhere.
+    #[test]
+    fn a_constraint_can_make_a_plain_insert_replace() {
+        let plain = a_table("t", &["a"]);
+        assert!(!can_replace(&plain, None));
+        assert!(can_replace(&plain, Some(ConflictAction::Replace)));
+
+        let mut on_the_index = a_table("t", &["a"]);
+        let mut index = an_index("by_a", 3, &[0]);
+        index.conflict = Some(ConflictAction::Replace);
+        on_the_index.indexes = vec![index];
+        assert!(
+            can_replace(&on_the_index, None),
+            "`a UNIQUE ON CONFLICT REPLACE` replaces without the statement saying so"
+        );
+
+        let mut on_the_column = a_table("t", &["a"]);
+        if let Some(column) = on_the_column.columns.first_mut() {
+            column.not_null_conflict = Some(ConflictAction::Replace);
+        }
+        assert!(can_replace(&on_the_column, None));
+    }
 }

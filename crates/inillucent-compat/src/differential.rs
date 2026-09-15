@@ -164,7 +164,7 @@ pub fn start_inillucent(area: &str, name: &str) -> Connection<'static> {
     let database: &'static Database = Box::leak(Box::new(
         Database::open(&path).expect("inillucent opens its database"),
     ));
-    let connection = database.connect();
+    let connection = database.session();
     // Matches the old engine's default: the harness compares single-connection
     // scenarios against a separate oracle process, so nothing here contends for
     // the lock, but a scenario that does open a second connection should not
@@ -197,7 +197,8 @@ pub fn observe(connection: &Connection<'_>, sql: &str, query: bool) -> Observati
         let mut offset = 0usize;
         while offset < sql.len() {
             let rest = sql.get(offset..).unwrap_or("");
-            let (mut statement, consumed) = connection.prepare_with_tail(rest)?;
+            let prepared = connection.prepare_with_tail(rest)?;
+            let (mut statement, consumed) = (prepared.statement, prepared.consumed);
             // **Read after the first step, not before it.** This engine
             // resolves a statement's result columns when it runs rather than
             // when it is prepared - `Statement::columns` says so in as many
@@ -240,22 +241,11 @@ pub fn observe(connection: &Connection<'_>, sql: &str, query: bool) -> Observati
             observation.message = failure.message().to_string();
         }
     }
-    observation.changes = connection.changes();
-    observation.total_changes = connection.total_changes();
-    observation.last_insert_rowid = connection.last_insert_rowid();
-    observation.autocommit = connection.autocommit();
+    observation.changes = connection.changes().unwrap_or_default();
+    observation.total_changes = connection.total_changes().unwrap_or_default();
+    observation.last_insert_rowid = connection.last_insert_rowid().unwrap_or_default();
+    observation.autocommit = connection.autocommit().unwrap_or_default();
     observation
-}
-
-/// Compares one observation against the oracle's, failing on any difference.
-pub fn compare_observations(
-    label: &str,
-    sql: &str,
-    candidate: &Observation,
-    reference: &Observation,
-    query: bool,
-) {
-    compare_with_counters(label, sql, candidate, reference, query, true)
 }
 
 /// Compares one observation, saying whether the cumulative counters count.
@@ -442,7 +432,7 @@ mod tests {
             "transport: the fake server did not start; skipping",
             "no ONNX weights found; skipping",
             "could not load the model (out of memory); skipping",
-            "no models root at J:/models; skipping",
+            "no models root at /models; skipping",
             "the inillucent binary is not built; skipping",
             "budgets: the MCP server did not start; skipping",
             "running 4 tests

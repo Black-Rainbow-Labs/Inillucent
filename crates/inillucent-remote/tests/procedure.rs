@@ -190,7 +190,7 @@ fn clean(destination: &Path) {
 ///
 /// @param destination - where to publish
 fn plan(destination: &Path) -> Plan {
-    let url = ConnectionUrl::parse("postgres://jason:hunter2@example:5432/corpus").expect("parses");
+    let url = ConnectionUrl::parse("postgres://user:hunter2@example:5432/corpus").expect("parses");
     Plan::new(url, destination)
 }
 
@@ -211,7 +211,7 @@ fn a_verified_migration_publishes_and_reads_back() {
     );
 
     let database = Database::open(&destination).expect("the published database opens");
-    let connection = database.connect();
+    let connection = database.session();
     let rows = connection
         .query("SELECT id, body, price FROM note ORDER BY id")
         .expect("the query runs");
