@@ -24,11 +24,11 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use pgvector::Vector;
-use postgres::{Client, NoTls};
 use inillucent_core::filter::Filter;
 use inillucent_core::index::Index;
 use inillucent_core::rank::{self, Fusion, PER_DOC_CAP};
+use pgvector::Vector;
+use postgres::{Client, NoTls};
 
 /// A hit identified the way both engines can agree on: the chunk's identifier in
 /// the source database, as text.
@@ -69,6 +69,11 @@ pub enum PgMode {
 }
 
 impl PgMode {
+    /// What the score card calls this arm.
+    ///
+    /// The label says which pgvector is being measured, because the two
+    /// differ by more than a setting: one is the extension as installed and
+    /// one is the extension as its own documentation asks for it.
     pub fn label(&self) -> &'static str {
         match self {
             PgMode::Default => "pgvector (extension defaults)",
@@ -226,6 +231,15 @@ pub struct PgVectorEngine {
 }
 
 impl PgVectorEngine {
+    /// Opens one connection and holds it for the whole run.
+    ///
+    /// **One connection rather than a pool, because the session settings are
+    /// the arm.** `hnsw.ef_search` and the rest are set on this session per
+    /// query, and a pooled connection would hand the next query somebody
+    /// else's settings - so the arm being measured would not be the arm named.
+    ///
+    /// @param url - the PostgreSQL connection string
+    /// @param mode - which pgvector configuration this arm is
     pub fn connect(url: &str, mode: PgMode) -> Result<Self> {
         let client = Client::connect(url, NoTls).context("connecting to PostgreSQL")?;
         Ok(PgVectorEngine {
@@ -261,7 +275,11 @@ impl PgVectorEngine {
     /// approaches, and every later query would then be scaled to near zero.
     /// @param queries - calibration queries, from seeds the graded run does not use
     /// @param percentile - where in the observed scores to put the ceiling
-    pub fn calibrate_lexical_ceiling(&mut self, queries: &[String], percentile: f64) -> Result<f32> {
+    pub fn calibrate_lexical_ceiling(
+        &mut self,
+        queries: &[String],
+        percentile: f64,
+    ) -> Result<f32> {
         let filter = Filter::default();
         let mut scores: Vec<f32> = Vec::new();
         for q in queries {
@@ -275,8 +293,11 @@ impl PgVectorEngine {
         scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let at = ((percentile * scores.len() as f64).ceil() as usize)
             .saturating_sub(1)
-            .min(scores.len() - 1);
-        let ceiling = scores[at].max(f32::EPSILON);
+            .min(scores.len().saturating_sub(1));
+        // `at` is clamped to the last index and `scores` is not empty, so the
+        // fallback is unreachable; it is written rather than asserted because an
+        // absent ceiling is a floor of `f32::EPSILON` either way.
+        let ceiling = scores.get(at).copied().unwrap_or(0.0).max(f32::EPSILON);
         self.lexical_ceiling = ceiling;
         Ok(ceiling)
     }
@@ -334,8 +355,12 @@ impl PgVectorEngine {
         }
         if let Some(authors) = &filter.authors {
             if !authors.is_empty() {
-                let sources: Vec<String> =
-                    authors.iter().map(|(s, _)| s.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+                let sources: Vec<String> = authors
+                    .iter()
+                    .map(|(s, _)| s.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
                 values.push(Box::new(sources));
                 let src_idx = i;
                 i += 1;
@@ -422,7 +447,11 @@ impl SearchEngine for PgVectorEngine {
             .iter()
             .map(|r| {
                 let similarity = 1.0 - r.get::<_, f64>("distance") as f32;
-                Hit { key: r.get("key"), score: similarity, confidence: similarity.clamp(0.0, 1.0) }
+                Hit {
+                    key: r.get("key"),
+                    score: similarity,
+                    confidence: similarity.clamp(0.0, 1.0),
+                }
             })
             .collect())
     }
@@ -512,13 +541,31 @@ pub struct InillucentEngine {
 }
 
 impl InillucentEngine {
+    /// Wraps a built index as a graded arm.
+    ///
+    /// The key list is inverted here rather than searched later: the
+    /// correctness and invariant scenarios ask for the ordinal of a returned
+    /// key, and scanning the corpus keys per returned row costs more than
+    /// every query in the suite put together.
+    ///
+    /// @param index - the built index this arm searches
+    /// @param keys - the corpus key per chunk ordinal, in corpus order
+    /// @param name - what the score card calls this arm
+    /// @param ef_search - the traversal width, or the index's own default
     pub fn new(index: Index, keys: Vec<String>, name: String, ef_search: Option<usize>) -> Self {
         let ordinal_of = keys
             .iter()
             .enumerate()
             .map(|(i, k)| (k.clone(), i as u32))
             .collect();
-        InillucentEngine { index, keys, name, ef_search, filtered_ef_search: ef_search, ordinal_of }
+        InillucentEngine {
+            index,
+            keys,
+            name,
+            ef_search,
+            filtered_ef_search: ef_search,
+            ordinal_of,
+        }
     }
 
     /// The traversal width for one query: the filtered budget when the predicate
@@ -534,10 +581,31 @@ impl InillucentEngine {
         }
     }
 
-    fn key(&self, chunk: u32) -> String {
-        self.keys[chunk as usize].clone()
+    /// The source database identifier a chunk ordinal stands for.
+    ///
+    /// **Fallible, because an ordinal with no key means the index and the key
+    /// list disagree about what was loaded.** Answering an empty string there
+    /// would score a hit against a document that is not in the corpus, which
+    /// moves a published recall number rather than failing the run.
+    ///
+    /// @param chunk - the chunk ordinal a search returned
+    fn key(&self, chunk: u32) -> Result<String> {
+        self.keys.get(chunk as usize).cloned().with_context(|| {
+            format!(
+                "chunk {chunk} has no key: the index returned an ordinal past the \
+                 {} keys the harness loaded with it",
+                self.keys.len()
+            )
+        })
     }
 
+    /// The chunk ordinal a corpus key stands for, or `None` when this arm
+    /// was not built with that chunk.
+    ///
+    /// The inverse of [`InillucentEngine::key`], and the reason `new` builds a
+    /// map.
+    ///
+    /// @param key - the corpus key a hit carried
     pub fn ordinal(&self, key: &str) -> Option<u32> {
         self.ordinal_of.get(key).copied()
     }
@@ -550,16 +618,17 @@ impl SearchEngine for InillucentEngine {
 
     fn vector_search(&mut self, query: &[f32], filter: &Filter, k: usize) -> Result<Vec<Hit>> {
         let compiled = self.index.compile(filter);
-        Ok(self
-            .index
+        self.index
             .vector_search(query, &compiled, k, self.budget_for(filter))?
             .into_iter()
-            .map(|n| Hit {
-                key: self.key(n.chunk),
-                score: 1.0 - n.distance,
-                confidence: (1.0 - n.distance).clamp(0.0, 1.0),
+            .map(|n| {
+                Ok(Hit {
+                    key: self.key(n.chunk)?,
+                    score: 1.0 - n.distance,
+                    confidence: (1.0 - n.distance).clamp(0.0, 1.0),
+                })
             })
-            .collect())
+            .collect()
     }
 
     fn lexical_search(&mut self, query: &str, filter: &Filter, k: usize) -> Result<Vec<Hit>> {
@@ -567,20 +636,21 @@ impl SearchEngine for InillucentEngine {
         // The query's own BM25 saturation point, which is what turns a raw score
         // into an absolute one. It does not depend on the results.
         let ceiling = self.index.lexical_score_ceiling(query);
-        Ok(self
-            .index
+        self.index
             .lexical_search(query, &compiled, k)
             .into_iter()
-            .map(|h| Hit {
-                key: self.key(h.chunk),
-                score: h.score,
-                confidence: if ceiling > f32::EPSILON {
-                    (h.score / ceiling).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                },
+            .map(|h| {
+                Ok(Hit {
+                    key: self.key(h.chunk)?,
+                    score: h.score,
+                    confidence: if ceiling > f32::EPSILON {
+                        (h.score / ceiling).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    },
+                })
             })
-            .collect())
+            .collect()
     }
 
     fn hybrid_search(
@@ -591,16 +661,17 @@ impl SearchEngine for InillucentEngine {
         k: usize,
     ) -> Result<Vec<Hit>> {
         let compiled = self.index.compile(filter);
-        Ok(self
-            .index
+        self.index
             .hybrid_search(query, query_vector, &compiled, k, self.budget_for(filter))?
             .into_iter()
-            .map(|h| Hit {
-                key: self.key(h.chunk),
-                score: h.score,
-                confidence: h.confidence,
+            .map(|h| {
+                Ok(Hit {
+                    key: self.key(h.chunk)?,
+                    score: h.score,
+                    confidence: h.confidence,
+                })
             })
-            .collect())
+            .collect()
     }
 }
 
@@ -612,14 +683,14 @@ pub fn exhaustive_reference(
     query: &[f32],
     filter: &Filter,
     k: usize,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     let compiled = engine.index.compile(filter);
     engine
         .index
         .exhaustive_search(query, &compiled, k)
-        .expect("the harness embeds at the index's width")
+        .context("the exhaustive reference search")?
         .into_iter()
-        .map(|n| engine.keys[n.chunk as usize].clone())
+        .map(|n| engine.key(n.chunk))
         .collect()
 }
 
@@ -733,7 +804,11 @@ pub fn fuse_keyed(
         .into_iter()
         .map(|(key, score)| {
             let c = confidence.get(&key).copied().unwrap_or(0.0);
-            Hit { key, score, confidence: c }
+            Hit {
+                key,
+                score,
+                confidence: c,
+            }
         })
         .collect();
     all.sort_by(|a, b| {
@@ -746,7 +821,11 @@ pub fn fuse_keyed(
     let mut per_doc: HashMap<String, usize> = HashMap::new();
     let mut out = Vec::with_capacity(k);
     for hit in all {
-        let doc = hit.key.split_once('#').map(|(d, _)| d.to_string()).unwrap_or_default();
+        let doc = hit
+            .key
+            .split_once('#')
+            .map(|(d, _)| d.to_string())
+            .unwrap_or_default();
         let used = per_doc.entry(doc).or_insert(0);
         if *used >= per_doc_cap {
             continue;
@@ -769,13 +848,13 @@ pub fn fuse_with(
     filter: &Filter,
     k: usize,
     fusion: Fusion,
-) -> Vec<Hit> {
+) -> Result<Vec<Hit>> {
     let compiled = engine.index.compile(filter);
     let candidates = engine.index.config().candidates.max(k);
     let vector_hits = engine
         .index
         .vector_search(query_vector, &compiled, candidates, engine.ef_search)
-        .expect("the harness embeds at the index's width");
+        .context("the vector half of the fusion under test")?;
     let lexical_hits = engine.index.lexical_search(query, &compiled, candidates);
     rank::fuse(
         &vector_hits,
@@ -793,14 +872,15 @@ pub fn fuse_with(
         },
     )
     .into_iter()
-    .map(|h| Hit {
-        key: engine.keys[h.chunk as usize].clone(),
-        score: h.score,
-        confidence: h.confidence,
+    .map(|h| {
+        Ok(Hit {
+            key: engine.key(h.chunk)?,
+            score: h.score,
+            confidence: h.confidence,
+        })
     })
     .collect()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -812,7 +892,8 @@ mod tests {
     /// budget and stopped early, and nothing failed.
     #[test]
     fn a_filtered_query_sets_all_four_iterative_scan_settings() {
-        let settings = pg_session_settings(PgMode::WellConfigured, &Filter::source("confluence"), 50);
+        let settings =
+            pg_session_settings(PgMode::WellConfigured, &Filter::source("confluence"), 50);
         assert_eq!(
             settings,
             vec![
@@ -922,7 +1003,10 @@ mod tests {
     /// query onto the filtered path.
     #[test]
     fn include_deleted_alone_is_not_a_filter() {
-        let filter = Filter { include_deleted: true, ..Default::default() };
+        let filter = Filter {
+            include_deleted: true,
+            ..Default::default()
+        };
         assert_eq!(
             pg_session_settings(PgMode::WellConfigured, &filter, 50),
             pg_session_settings(PgMode::WellConfigured, &Filter::default(), 50)
@@ -933,7 +1017,10 @@ mod tests {
     /// pgvector's plan, so it must not turn the iterative scan on for nothing.
     #[test]
     fn an_empty_sources_list_is_not_a_filter() {
-        let filter = Filter { sources: Some(Vec::new()), ..Default::default() };
+        let filter = Filter {
+            sources: Some(Vec::new()),
+            ..Default::default()
+        };
         let (where_sql, _) = PgVectorEngine::where_clause(&filter, 2);
         assert_eq!(where_sql, DELETED_ONLY);
         assert_eq!(
@@ -948,7 +1035,10 @@ mod tests {
     #[test]
     fn the_labels_say_which_configuration_each_column_is() {
         assert_eq!(PgMode::Default.label(), "pgvector (extension defaults)");
-        assert_eq!(PgMode::WellConfigured.label(), "pgvector (correctly configured)");
+        assert_eq!(
+            PgMode::WellConfigured.label(),
+            "pgvector (correctly configured)"
+        );
     }
 
     /// One filter per field `where_clause` reads, each carrying exactly one
@@ -956,15 +1046,30 @@ mod tests {
     fn filters_with_a_predicate() -> Vec<Filter> {
         vec![
             Filter::source("confluence"),
-            Filter { sources: Some(vec!["slack".into(), "jira".into()]), ..Default::default() },
-            Filter { space_key: Some("ENG".into()), ..Default::default() },
-            Filter { author: Some("someone".into()), ..Default::default() },
+            Filter {
+                sources: Some(vec!["slack".into(), "jira".into()]),
+                ..Default::default()
+            },
+            Filter {
+                space_key: Some("ENG".into()),
+                ..Default::default()
+            },
+            Filter {
+                author: Some("someone".into()),
+                ..Default::default()
+            },
             Filter {
                 authors: Some(vec![("slack".into(), "U123".into())]),
                 ..Default::default()
             },
-            Filter { updated_after: Some(1_700_000_000), ..Default::default() },
-            Filter { labels: Some(vec!["runbook".into()]), ..Default::default() },
+            Filter {
+                updated_after: Some(1_700_000_000),
+                ..Default::default()
+            },
+            Filter {
+                labels: Some(vec!["runbook".into()]),
+                ..Default::default()
+            },
         ]
     }
 }

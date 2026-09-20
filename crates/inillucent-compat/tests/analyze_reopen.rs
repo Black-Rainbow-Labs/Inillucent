@@ -115,13 +115,30 @@ fn scratch(name: &str) -> PathBuf {
 /// @param path - the database file
 /// @param sql - the statements to run
 fn write_and_abandon(path: &Path, sql: &str) {
-    let database = Database::open(path).expect("the database opens");
-    let connection = database.session().expect("the connection opens");
-    connection
-        .execute_batch(&format!("{sql}\nPRAGMA locking_mode = NORMAL;"))
-        .expect("the statements run");
-    std::mem::forget(connection);
-    std::mem::forget(database);
+    // **A real crash, in a real process (task-1980).** What this has to leave
+    // behind is a log nothing has folded into the file. The default is
+    // `locking_mode = normal`, under which a connection checkpoints and
+    // releases the file after every statement that wrote - so the statements
+    // below would fold themselves down one at a time and there would be no
+    // unfolded log to reopen.
+    //
+    // This used to ask for that with `PRAGMA locking_mode = EXCLUSIVE`, the
+    // statements, and `PRAGMA locking_mode = NORMAL`, whose drop to `normal`
+    // released the file without checkpointing. That release is gone: a
+    // connection that let the file go with pages still dirty left the file
+    // describing a database without the statement that had just succeeded, and
+    // two writer processes lost 43% of their acknowledged commits to it. So the
+    // crash is a real one now - the shell is killed while it waits for its next
+    // line, and the operating system releases the locks, which is the thing
+    // this was simulating all along.
+    let Some(shell) = inillucent_compat::cliproc::program("inillucent-shell") else {
+        panic!("inillucent-shell is not built, and this case is about a crashed process");
+    };
+    let said = inillucent_compat::cliproc::write_and_crash(&shell, path, sql);
+    assert!(
+        said.contains("written"),
+        "the statements did not run before the process was killed:\n{said}"
+    );
 }
 
 /// Returns the rows a query answers over a freshly opened database.
@@ -502,9 +519,17 @@ fn a_log_below_the_files_high_water_resumes_above_it() {
         "the meta still points below the stamp: checkpoint_lsn {} against a stamp of {stamp}",
         after.checkpoint_lsn
     );
-    assert_eq!(
-        after.high_water_lsn, stamp,
-        "the high water was not carried forward through the resume's own checkpoint"
+    // **At or above the stamp, rather than exactly it.** What matters is that
+    // the number never goes backwards: a file whose recorded high water is
+    // below a stamp its pages carry is the state this whole case is about. It
+    // used to be exactly `stamp` because the resume's checkpoint was the only
+    // one a run took; with `locking_mode = normal` as the default (task-1980) a
+    // statement that wrote checkpoints on its way out, and those pages carry
+    // stamps of their own above the resumed position.
+    assert!(
+        after.high_water_lsn >= stamp,
+        "the high water went backwards through the resume's own checkpoint: {} against a stamp of {stamp}",
+        after.high_water_lsn
     );
 
     // **Once, and then again.** The resume opens a new segment and leaves a gap

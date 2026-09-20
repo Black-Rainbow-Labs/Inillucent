@@ -1,0 +1,30 @@
+# The cases that disagree with SQLite 3.53.4 and are not fixed yet.
+# One per line: the case's id, a tab, and the defect it belongs to.
+#
+# `differential_part8.rs` fails when a case here now agrees, so a fixed defect
+# cannot stay listed - which is the rule from task-1969 section 4: a test that
+# cannot fail is worse than none.
+#
+# The defect ids are task-1979 section 6's. Nine of the twenty-three are off
+# this list already: F1 (GROUP BY with no aggregate), F2 (comparison affinity),
+# F3 and F21 (the numeric prefix), F4 (ADD COLUMN's default), F10 (round),
+# F16 (char with no arguments) and F19 (a scalar min or max tie). What is left
+# is task-1981, which owns them.
+
+fk-010	F6: `DROP TABLE` ignores foreign keys with `PRAGMA foreign_keys = ON`
+dfk-001	F6: `DROP TABLE` ignores foreign keys with `PRAGMA foreign_keys = ON`
+dfk-003	F6: `DROP TABLE` ignores foreign keys with `PRAGMA foreign_keys = ON`
+gb-023	F1's neighbour: a correlated subquery in a grouped select answers NULL
+idx-003	F7: `INDEXED BY <missing index>` is silently ignored
+ixb-001	F7: `INDEXED BY <missing index>` is silently ignored
+ixb-003	F7: `INDEXED BY <missing index>` is silently ignored
+ixb-004	F7: `INDEXED BY <missing index>` is silently ignored
+lim-004	section 6.2's exit 3 gaps: `LIMIT 1+1`
+lim-005	section 6.2's exit 3 gaps: `LIMIT '2'`
+ms-006	section 8.4: a construct that is documented and not built
+rid-004	F9: `UPDATE t SET rowid = 100` is `no such column: rowid`
+rid-010	F8: an insert past the maximum rowid fails `UNIQUE constraint failed`
+rwe-001	F9: `UPDATE t SET rowid = 100` is `no such column: rowid`
+rwe-003	F8: an insert past the maximum rowid fails `UNIQUE constraint failed`
+sub-010	section 6.2's exit 3 gaps: `(a, b) IN (SELECT ...)`
+win-025	section 6.2's exit 3 gaps: a window function inside a derived table

@@ -139,11 +139,21 @@ function shellOptions() {
 
 /** Reads the engine's function register: distinct names, and the rows one per name and arity. */
 function functionRegister() {
-  const out = run('inillucent', ['functions', '--output', 'json', '--limit', '0']);
-  if (out === null) return null;
-  let answer;
-  try { answer = JSON.parse(out); } catch { return null; }
-  const names = answer.rows.map((row) => row[0]);
+  // **Read out of the generated register rather than by running the CLI
+  // (task-1962).** `run` prefers `target/release`, so this asked whichever
+  // binary happened to be there - and the shipped archive is built with
+  // `--features inillucent-cli/embed`, which registers `embed(TEXT)` and one
+  // more name than a default build. The check therefore answered 191 on a box
+  // that had just cut a release and 190 everywhere else, for one unchanged
+  // tree. Its own label says "in the register", and the register is a file:
+  // `compat/api/builtins.toml`, generated straight out of
+  // `inillucent_sql::function::every_function` and checked against the engine
+  // by `obligations::the_registers_match_the_engine`. Reading it makes this
+  // answer the same thing on every machine.
+  const file = path.join(ROOT, 'compat', 'api', 'builtins.toml');
+  if (!fs.existsSync(file)) return null;
+  const names = [...fs.readFileSync(file, 'utf8').matchAll(/^name = "(.*)"$/gm)].map((found) => found[1]);
+  if (names.length === 0) return null;
   const distinct = [...new Set(names)];
   const family = (test) => distinct.filter(test).length;
   return {
@@ -166,12 +176,47 @@ function capabilities() {
   return { total: answer.rows.length, yes: by.yes || 0, partial: by.partial || 0, no: by.no || 0 };
 }
 
-/** Reads the probe's last run, which is what the SQL and compatibility pages quote. */
+/** Returns the commit this checkout is on, or null when that cannot be read. */
+function headCommit() {
+  const shown = spawnSync('git', ['-C', ROOT, 'rev-parse', 'HEAD'], { encoding: 'utf8' });
+  const sha = (shown.stdout || '').trim();
+  return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+}
+
+/** What `probe()` could not accept about the result it read, for the exit code. */
+let probeStaleness = null;
+
+/**
+ * Reads the probe's last run, which is what the SQL and compatibility pages quote.
+ *
+ * **It is refused when it was recorded at another commit (task-1969, 4.4).**
+ * `_agent_output/feature-probe/results.json` is gitignored, so on every fresh
+ * clone it is absent and on every machine that has one it is however old that
+ * machine's last probe was. Nothing checked either. A probe from a month and
+ * forty commits ago passed as today's, and the 416-case count and the 403 that
+ * agree - the two numbers `docs/feature-comparison.md` is built on - were being
+ * held against a measurement of a different engine.
+ *
+ * A result with no `commit` is refused too. That is the old bare-array shape,
+ * and accepting it would leave the hole open for exactly as long as one stale
+ * file survives.
+ */
 function probe() {
   const file = path.join(ROOT, '_agent_output', 'feature-probe', 'results.json');
   if (!fs.existsSync(file)) return null;
   const cases = JSON.parse(fs.readFileSync(file, 'utf8'));
-  const rows = Array.isArray(cases) ? cases : cases.cases || [];
+  const head = headCommit();
+  if (!Array.isArray(cases) && head && cases.commit !== head) {
+    probeStaleness = cases.commit
+      ? `the probe result was recorded at ${cases.commit} and this tree is at ${head}; re-run \`node tools/feature-probe/run.js\``
+      : `the probe result records no commit, so it cannot be dated; re-run \`node tools/feature-probe/run.js\``;
+    return null;
+  }
+  if (Array.isArray(cases)) {
+    probeStaleness = 'the probe result is a bare array with no commit, so it cannot be dated; re-run `node tools/feature-probe/run.js`';
+    return null;
+  }
+  const rows = cases.cases || [];
   const by = {};
   for (const row of rows) by[row.verdict] = (by[row.verdict] || 0) + 1;
   return { total: rows.length, same: by.same || 0, refused: by.refused || 0, differ: by['wrong-answer'] || 0, oursOnly: by['ours-only'] || 0 };
@@ -193,6 +238,22 @@ function pragmaRegisterCount() {
   if (!fs.existsSync(file)) return null;
   const found = fs.readFileSync(file, 'utf8').match(/^count = (\d+)$/m);
   return found ? Number(found[1]) : null;
+}
+
+/**
+ * Counts the `[[target]]` rows in `tests/selection.toml`.
+ *
+ * **Three documents gave three target counts and nothing compared any of them
+ * to the map (task-1969, 4.14).** `docs/repository.md` said 170,
+ * `tests/inillucent-testing-tdd.md` said 169, and the file itself had 181.
+ * `judgeTestRun` compares a written count against what the *runner* reported,
+ * so a document that agrees with a stale run passes; the map is the thing both
+ * documents are describing, and it is the thing to compare against.
+ */
+function selectionRows() {
+  const file = path.join(ROOT, 'tests', 'selection.toml');
+  if (!fs.existsSync(file)) return null;
+  return (fs.readFileSync(file, 'utf8').match(/^\[\[target\]\]$/gm) || []).length;
 }
 
 /** Reads the register audit, which is where the pragma and collation counts come from. */
@@ -222,7 +283,14 @@ function registers() {
   };
 }
 
-/** Counts the crates under each lint, which the repository page publishes. */
+/**
+ * Counts the crates under each lint, which the repository page publishes.
+ *
+ * Reads the crate root, which is `main.rs` in a binary crate: this read
+ * `lib.rs` alone until task-1973, so `inillucent-bench` was not counted and the
+ * page's "28 of the 29" was checked against a measurement that could not see
+ * the twenty-ninth.
+ */
 function crateLints() {
   const libs = [];
   for (const group of ['crates', 'drivers']) {
@@ -230,7 +298,9 @@ function crateLints() {
     if (!fs.existsSync(base)) continue;
     for (const entry of fs.readdirSync(base)) {
       const lib = path.join(base, entry, 'src', 'lib.rs');
-      if (fs.existsSync(lib)) libs.push(fs.readFileSync(lib, 'utf8'));
+      const main = path.join(base, entry, 'src', 'main.rs');
+      const root = fs.existsSync(lib) ? lib : main;
+      if (fs.existsSync(root)) libs.push(fs.readFileSync(root, 'utf8'));
     }
   }
   const members = (fs.readFileSync(path.join(ROOT, 'Cargo.toml'), 'utf8').match(/^\s{4}"(?:crates|drivers)\/[^"]+",$/gm) || []).length;
@@ -457,7 +527,37 @@ function privateRepositorySentencesAgree() {
  * `docs/repository.md` names the same three, and a fourth name here without a line there is the
  * drift this list exists to stop.
  */
-const OPTIONAL_PREREQUISITES = ['postgres', 'mysql', 'INILLUCENT_NETWORK_TESTS', 'onnx'];
+/**
+ * The prerequisites a strict run may name without that being a failure of the run.
+ *
+ * **Read out of `tests/selection.toml` rather than written here (task-1969, 4.15).** This was
+ * `['postgres', 'mysql', 'INILLUCENT_NETWORK_TESTS', 'onnx']`, the four values the map happened to
+ * hold when it was written - so the same census that took the map from 9 prerequisite values to 19
+ * would have turned every newly declared absence into "it exited 1 for a prerequisite that is not
+ * optional". The list and the thing it describes were the same list twice, and one of them went
+ * stale the moment the other grew.
+ *
+ * What it is for is unchanged: a strict run exits non-zero when it names a hollow suite, and a
+ * hollow suite whose prerequisite the map declares is the documented condition rather than a
+ * defect. A prerequisite the map does *not* declare is still a failure, which is what makes this a
+ * check rather than a blanket permission - and `selection.rs`'s
+ * `every_target_that_can_skip_declares_it_and_vice_versa` is what keeps the map equal to the
+ * suites.
+ *
+ * `INILLUCENT_NETWORK_TESTS` is kept beside the map's values: the runner names the environment
+ * variable rather than the `network` the row declares, and the two are the same condition.
+ */
+function optionalPrerequisites() {
+  const file = path.join(ROOT, 'tests', 'selection.toml');
+  if (!fs.existsSync(file)) return ['INILLUCENT_NETWORK_TESTS'];
+  const declared = new Set(['INILLUCENT_NETWORK_TESTS']);
+  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const found = /^requires = \[(.*)\]$/.exec(line.trim());
+    if (!found) continue;
+    for (const value of found[1].matchAll(/"([^"]+)"/g)) declared.add(value[1]);
+  }
+  return [...declared];
+}
 
 /**
  * Runs the test runner, for the test and target counts.
@@ -552,8 +652,9 @@ export function judgeTestRun(outcome) {
     problems.push(`it said ${result.declaredWithoutPrerequisite} suite(s) had no prerequisite and this could read ${result.missingPrerequisites.length} of them`);
   }
   if (outcome.status !== 0) {
+    const allowed = optionalPrerequisites();
     const unexplained = result.missingPrerequisites.filter(
-      (row) => !OPTIONAL_PREREQUISITES.some((allowed) => row.needs.includes(allowed)),
+      (row) => !allowed.some((named) => row.needs.includes(named)),
     );
     if (result.missingPrerequisites.length === 0) {
       problems.push(`it exited ${outcome.status} and named no missing prerequisite to explain it`);
@@ -565,12 +666,85 @@ export function judgeTestRun(outcome) {
   return result;
 }
 
+/**
+ * Every `.rs` file under a directory, so a binary can be dated against its own sources.
+ *
+ * @param directory - where to look
+ */
+function sourcesUnder(directory) {
+  if (!fs.existsSync(directory)) return [];
+  const found = [];
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const full = path.join(directory, entry.name);
+    if (entry.isDirectory()) found.push(...sourcesUnder(full));
+    else if (entry.name.endsWith('.rs')) found.push(full);
+  }
+  return found;
+}
+
+/**
+ * Returns the test runner to measure with, and why it is that one.
+ *
+ * **The stale instrument that answered a published number (task-1970).**
+ * `binary()` prefers `target/release`, which is right for the shipped programs
+ * and wrong for this one. Both validate scripts build the runner into
+ * `target/debug` and run it from there, and the `provision` string this file
+ * carries for the instrument is that same debug build - so a
+ * `target/release/inillucent-testrun.exe` left over from an earlier release
+ * build was preferred over the one the run had just made. The copy on this
+ * machine was four days and twenty commits old, and the `tests` fact it
+ * answered was 3,010 where the debug runner, the `tests` stage of both
+ * validate scripts and a direct run all said 3,016. Nothing reported the
+ * difference, because a stale answer looks exactly like a fresh one.
+ *
+ * So the newer of the two is used, and one older than either of the two files
+ * that decide what it runs and how it reports - the map and its own source - is
+ * refused by name rather than believed.
+ *
+ * @returns `{exe, error}`; `exe` is null when there is none to trust
+ */
+function testRunner() {
+  const name = process.platform === 'win32' ? 'inillucent-testrun.exe' : 'inillucent-testrun';
+  const built = ['release', 'debug']
+    .map((profile) => path.join(ROOT, 'target', profile, name))
+    .filter((file) => fs.existsSync(file))
+    .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+  if (built.length === 0) return { exe: null, error: null };
+  const exe = built[0];
+  const made = fs.statSync(exe).mtimeMs;
+  // Its own sources, not the map: the map is read at run time, so a newer
+  // `tests/selection.toml` is a newer question rather than a stale instrument.
+  const newer = sourcesUnder(path.join(ROOT, 'crates', 'inillucent-compat', 'src')).filter(
+    (file) => fs.statSync(file).mtimeMs > made,
+  );
+  if (newer.length > 0) {
+    const named = path.relative(ROOT, newer[0]).replace(/\\/g, '/');
+    const rest = newer.length > 1 ? ` and ${newer.length - 1} other file(s)` : '';
+    return {
+      exe: null,
+      error:
+        `the test runner at ${path.relative(ROOT, exe).replace(/\\/g, '/')} was built before ${named}${rest}, ` +
+        'so its answer is a measurement of an older tree; rebuild it with ' +
+        '`cargo build -p inillucent-compat --bin inillucent-testrun --features testrun`',
+    };
+  }
+  return { exe, error: null };
+}
+
 function testRun() {
   if (!process.argv.includes('--run-tests')) return null;
-  if (!binary('inillucent-testrun')) return judgeTestRun({ built: false, text: '', status: null, timedOut: false });
+  const runner = testRunner();
+  if (runner.error) return { error: runner.error };
+  if (!runner.exe) return judgeTestRun({ built: false, text: '', status: null, timedOut: false });
   // The whole suite is about five minutes, and a two minute cap killed it and read the missing
   // summary line as "the runner is not built" rather than as "it was cut off".
-  return judgeTestRun(runDetailed('inillucent-testrun', ['--strict'], undefined, 1_800_000));
+  const said = spawnSync(runner.exe, ['--strict'], { encoding: 'utf8', timeout: 1_800_000 });
+  return judgeTestRun({
+    built: true,
+    text: `${said.stdout || ''}${said.stderr || ''}`,
+    status: said.status,
+    timedOut: said.error?.code === 'ETIMEDOUT',
+  });
 }
 
 /**
@@ -709,6 +883,52 @@ const audit = registers();
 const lints = crateLints();
 const tests = testRun();
 const chapters = await bookChapters();
+const mapRows = selectionRows();
+
+/**
+ * Every instrument, what it answered, and the command that provisions it.
+ *
+ * **An instrument that cannot answer is a failure of this program, not a
+ * reason for it to say nothing (task-1969, 4.4).** Ten of the sixteen facts
+ * returned `null` on a checkout with nothing built and no probe result - which
+ * is every fresh clone, because `_agent_output/` is gitignored - and `:789`
+ * built `failed` out of the checks that were not `skipped`. So the program
+ * printed `skip` ten times and exited 0 with "Every fact a document states is
+ * the fact the engine reports." The task-1925 fix gave `judgeTestRun` this
+ * treatment and left the other ten instruments as they were.
+ *
+ * `scopedOutWithout` is the one legitimate absence: a flag the caller did not
+ * pass puts a fact out of scope rather than leaving it unmeasured. There are
+ * two, and both are named here rather than being a property of the instrument,
+ * so adding a third is a decision somebody writes down.
+ */
+const INSTRUMENTS = [
+  { label: 'command line verbs', value: verbs, provision: 'cargo build --release -p inillucent-cli' },
+  { label: 'MCP tools', value: tools, provision: 'cargo build --release -p inillucent-cli' },
+  { label: 'shell dot commands', value: dots, provision: 'cargo build --release -p inillucent-cli' },
+  { label: 'shell command line options', value: options, provision: 'cargo build --release -p inillucent-cli' },
+  { label: 'function register', value: functions, provision: 'cargo build --release -p inillucent-cli' },
+  { label: 'driver capabilities', value: caps, provision: 'cargo build --release -p inillucent-cli' },
+  { label: 'pragma register count', value: pragmaRegisterCount(), provision: 'restore compat/api/pragmas.toml' },
+  { label: 'probe result', value: probed, provision: 'node tools/feature-probe/run.js' },
+  { label: 'register audit', value: audit, provision: 'node tools/feature-probe/registers.js' },
+  { label: 'crate lints', value: lints, provision: 'nothing - it reads the manifests, so a null here is a defect in this file' },
+  { label: 'selection map rows', value: mapRows, provision: 'restore tests/selection.toml' },
+  { label: 'test run', value: tests, provision: 'cargo build -p inillucent-compat --bin inillucent-testrun --features testrun', scopedOutWithout: '--run-tests', facts: ['tests'] },
+  { label: 'documentation book chapters', value: chapters, provision: 'a checkout of the site', scopedOutWithout: '--site <dir>', facts: ['documentation book chapters'] },
+];
+
+/**
+ * Reports whether a flag that scopes a fact out of this run was passed.
+ *
+ * `facts` on an instrument names the checks it feeds, because a check's label
+ * and its instrument's label are not the same word - the `test run` instrument
+ * answers the `tests` fact - and matching them by equality printed a genuine
+ * instrument failure as an out-of-scope line.
+ */
+function passed(flag) {
+  return flag ? args.includes(flag.split(' ')[0]) : true;
+}
 
 // Two assertions that are not counts: what a public repository must not carry, and
 // whether every packaged copy of the release version agrees with the workspace.
@@ -732,13 +952,17 @@ const checks = [
   assertWritten('crates forbidding unsafe', lints?.forbidsUnsafe, /(?:(\d+) of (?:the )?29 crates forbid|and (\d+) forbid[\s\n]+`unsafe`)/i),
   assertWritten('crates denying the four lints', lints?.deniesFour, /(\d+) of the 29 crates deny/i),
   assertWritten('tests', tests?.tests, /(?:([\d,]+) tests across \d+ test targets|'([\d,]+)',\s*label: 'tests,)/i),
-  assertWritten('test targets', tests?.targets, /tests across (\d+) test targets/i),
+  // Held against the map rather than against the runner. A document that agrees
+  // with a stale run used to pass, which is how 170, 169 and 181 coexisted.
+  assertWritten('test targets', mapRows, /tests across (\d+) test targets/i),
+  assertWritten('selection map rows', mapRows, /(\d+) (?:\[\[target\]\] )?rows in `?tests\/selection\.toml`?/i),
   assertWritten('documentation book chapters', chapters, /(?:in|carries|book has) (\d+) chapters/i),
 ];
 
 const measured = {
   verbs, mcpTools: tools, dotCommands: dots, shellOptions: options, functions, capabilities: caps,
   probe: probed, registers: audit, crates: lints, tests, bookChapters: chapters,
+  selectionRows: mapRows,
 };
 
 // A run that could not produce a fact is a failure of this file, not a reason to say nothing. The
@@ -746,6 +970,15 @@ const measured = {
 // trouble is reported beside the facts and counted in the exit code.
 const instrumentErrors = [];
 if (tests?.error) instrumentErrors.push(tests.error);
+if (probeStaleness) instrumentErrors.push(probeStaleness);
+for (const instrument of INSTRUMENTS) {
+  if (!passed(instrument.scopedOutWithout)) continue;
+  if (instrument.value !== null && instrument.value !== undefined) continue;
+  instrumentErrors.push(`${instrument.label} could not be measured; run \`${instrument.provision}\``);
+}
+if (mapRows !== null && tests?.targets !== undefined && tests?.targets !== null && tests.targets !== mapRows) {
+  instrumentErrors.push(`the runner reported ${tests.targets} targets and tests/selection.toml has ${mapRows} rows, so one of them is stale`);
+}
 
 if (asJson) {
   console.log(JSON.stringify({ measured, checks, assertions, instrumentErrors }, null, 2));
@@ -761,7 +994,18 @@ if (asJson) {
   }
   console.log('\nwhat the documents say\n');
   for (const check of checks) {
-    if (check.skipped) { console.log(`  skip  ${check.label} — nothing to compare against`); continue; }
+    // Not `skip`. A fact whose instrument could not answer is in
+    // `instrumentErrors` and fails the run; the only thing printed here without
+    // a verdict is a fact a flag put out of scope, and it says which flag.
+    if (check.skipped) {
+      const scoped = INSTRUMENTS.find(
+        (instrument) => instrument.scopedOutWithout && (instrument.facts || []).includes(check.label),
+      );
+      console.log(scoped
+        ? `  n/a   ${check.label} - out of scope without ${scoped.scopedOutWithout}`
+        : `  FAIL  ${check.label} - its instrument could not answer; see below`);
+      continue;
+    }
     if (check.seen === 0) { console.log(`  MISS  ${check.label} — the engine says ${check.expected} and no document states it`); continue; }
     if (check.wrong.length === 0) { console.log(`  ok    ${check.label} — ${check.expected}, in ${check.seen} place(s)`); continue; }
     console.log(`  FAIL  ${check.label} — the engine says ${check.expected}`);

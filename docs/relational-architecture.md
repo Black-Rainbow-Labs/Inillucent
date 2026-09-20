@@ -104,9 +104,18 @@ differential` grades 416 cases against a pinned SQLite 3.53.4, in both direction
 
 ## 4. Transactions and isolation
 
-One writer at a time, many readers, snapshot isolation. A reader takes a snapshot and sees the
-database as it was at that instant for the length of its transaction; a writer takes the writer slot
-and publishes before-images into a version log so readers can still see what they started with.
+`inillucent-txn`, the transaction manager, implements one writer at a time, many readers and
+snapshot isolation: a reader takes a snapshot and sees the database as it was at that instant for the
+length of its transaction, and a writer takes the writer slot and publishes before-images into a
+version log so readers can still see what they started with.
+
+**What a connection of the shipped engine gets is the first half of that and not the second.**
+`ImportedDatabase` holds the log directly rather than going through the transaction manager, and it
+takes the file's EXCLUSIVE lock for the length of a write. So one writer at a time holds across
+processes, and a reader of another process waits for that writer rather than reading a snapshot past
+it - there is no shared-memory index through which a reader could find the log. A reader that will
+not wait is refused with `busy` after `PRAGMA busy_timeout`. `docs/roadmap.md` has the protocol that
+would make the second half true across processes as well.
 
 The version log is collected on a threshold rather than after every commit, because collecting walks
 the whole log and doing it per commit would be quadratic in the images a batch publishes.
@@ -242,6 +251,64 @@ tier's fault campaigns, which crash at a chosen sync and then read back what the
 Those campaigns drove the retired engine until task-1911 deleted it; re-pointing them at this one is
 what found the journal defect above, and `new_engine_recovery_shapes.rs` did not, because it crashes
 at one fixed point rather than at every cut of a commit.
+
+---
+
+## 5a. What a file's format version promises
+
+The first eight bytes of a database are `RDB2` and four zero bytes, and the four bytes after them
+are the **format version**, which this build writes as `1` and is the only one it reads.
+
+The rule it stands for:
+
+- **A point release reads every file an earlier point release of the same minor version wrote.**
+  `0.1.4` opens a `0.1.0` file. The version does not move for a bug fix, and a release that changed
+  the layout of a page, a record or the header without moving it would be a release that could not
+  say which files it can read.
+- **A change to that layout raises the number, and that is a minor version with a documented
+  migration.** The migration is `inillucent-migrate`, which reads the older file and writes a new
+  one; it is not an upgrade in place, because an upgrade in place is a rewrite that a crash can
+  catch halfway.
+- **A build that meets a higher number says so rather than reading the file as damage.** The refusal
+  is `this database is format version N and this build reads version 1; upgrade inillucent to open
+  it`, it carries the status `unsupported`, and the command line exits 3 - the same answer every
+  other "this build has not got that" gives. A *lower* number is reported as corruption, because
+  there is no earlier format: a zero there is a header that has been overwritten.
+
+The number lives at byte 8 of the meta page, which is covered by the meta record's checksum, so a
+file whose version has been edited by hand fails the checksum rather than opening.
+
+### What an extent reference's class bits are, and why the number did not move
+
+An **extent reference** is the sixteen bytes a leaf holds for a value stored outside its page: a
+page number and a length. Since task-1986 it also carries, in the two bits above the page number,
+what the value reads back as - `CLASS_STATED`, and beside it `CLASS_TEXT`. Without them the column's
+declaration was the only thing that could say whether the bytes were text or a blob, so a column
+that would say the wrong thing could not have a value outside its page at all: `CREATE TABLE t (a)`
+is BLOB affinity, a text in it stayed inline however long it was, and at the default 32,768 byte
+page a text of about 32 KB could not be stored.
+
+**The format version stays 1, and the rule above is why it can.** A reference states its class only
+when the column's own answer would be wrong. Every other reference - a text in a column declared
+`TEXT`, bytes in one declared `BLOB` - is encoded as the same sixteen bytes it always was. So:
+
+- **A build from before this reads every file an earlier build wrote, unchanged**, because no file
+  an earlier build wrote contains a reference with these bits set: the only values that produce one
+  are values an earlier build refused to store.
+- **A build from before this that is handed a file written by this one** meets a stated reference as
+  a page number above 2^62. It is not a page any file has, the fetch fails, and it reports the
+  failure. It does not answer.
+- **That last point is why the bits are in the page word and not the length word.** The length word
+  has spare bits too - above the 48-bit length and below the packed-into-a-shared-page flag - and a
+  build from before this would read the page and the length out of such a reference correctly and
+  hand the bytes back labelled by the column. For exactly the values these bits exist for, that is
+  the wrong label on the right bytes: a text coming back as a blob, with nothing to say so.
+
+A file this build writes is therefore readable by an earlier one everywhere an earlier one could
+have written it, and refused rather than misread everywhere it could not. `ExtentClass` in
+`crates/inillucent-pool/src/extent.rs` holds the encoding; `extent_class_for` and `extent_datum` in
+`crates/inillucent-tree/src/leaf/layout.rs` are the writer's and the reader's halves of the rule,
+written beside each other because a disagreement between them is a wrong value rather than an error.
 
 ---
 

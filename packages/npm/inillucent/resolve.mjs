@@ -13,17 +13,26 @@
 // unresolved import. That is what `resolveBinary` is for.
 
 import { createRequire } from 'node:module';
-import { accessSync, constants } from 'node:fs';
+import { accessSync, constants, existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 const require = createRequire(import.meta.url);
 
+// **The scope here is the scope they are published under, and the two came apart (task-1995).**
+// The packages were renamed from `@inillucent/*` to `@blackrainbowlabs/*` in build.mjs and in this
+// package's optionalDependencies, and this table was missed. npm then installed
+// `@blackrainbowlabs/cli-win32-x64` correctly and the shim looked for `@inillucent/cli-win32-x64`,
+// so every install on every platform ended at "inillucent's binary for win32-x64 is not installed"
+// - naming a package that does not exist. It reached the registry, where a version cannot be
+// replaced. resolve.test.mjs compares this table against package.json and against build.mjs, and it
+// no longer hard-codes a scope, so a rename that touches one of the three fails here instead.
 /** The platform packages, by the `process.platform`-`process.arch` pair each serves. */
 const PACKAGES = {
-  'win32-x64': '@inillucent/cli-win32-x64',
-  'darwin-arm64': '@inillucent/cli-darwin-arm64',
-  'darwin-x64': '@inillucent/cli-darwin-x64',
-  'linux-x64': '@inillucent/cli-linux-x64',
-  'linux-arm64': '@inillucent/cli-linux-arm64',
+  'win32-x64': '@blackrainbowlabs/cli-win32-x64',
+  'darwin-arm64': '@blackrainbowlabs/cli-darwin-arm64',
+  'darwin-x64': '@blackrainbowlabs/cli-darwin-x64',
+  'linux-x64': '@blackrainbowlabs/cli-linux-x64',
+  'linux-arm64': '@blackrainbowlabs/cli-linux-arm64',
 };
 
 /** The four programs the release ships, and what each one is for. */
@@ -49,6 +58,32 @@ export function platformPackage() {
 export function resolveBinary(program) {
   if (!(program in PROGRAMS)) {
     throw new Error(`inillucent has no program called ${program}`);
+  }
+  // **`INILLUCENT_BIN` wins, the way it already does for the Go and PHP
+  // wrappers (task-1969, 4.5).** It names the `inillucent` binary; the others
+  // are looked for beside it, which is where a build and an install both put
+  // them. Without this the wrappers stage of `tools/validate` could point the
+  // other two languages at a freshly built binary and had no way to point this
+  // one, so the only npm test that could run was the one that reads the
+  // platform table as text.
+  //
+  // It throws rather than falling through when the named binary is not there:
+  // a caller who says where the binary is and is wrong wants to know, not to
+  // have the resolver quietly go looking somewhere else.
+  const named = process.env.INILLUCENT_BIN;
+  if (named) {
+    const suffix = process.platform === 'win32' ? '.exe' : '';
+    const beside = program === 'inillucent'
+      ? named
+      : join(dirname(named), `${program}${suffix}`);
+    if (!existsSync(beside)) {
+      throw new Error(
+        `INILLUCENT_BIN is set and ${beside} is not there.
+` +
+          `  Unset INILLUCENT_BIN to look for an installed copy instead.`,
+      );
+    }
+    return beside;
   }
   const name = platformPackage();
   if (!name) {

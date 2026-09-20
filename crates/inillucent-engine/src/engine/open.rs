@@ -207,24 +207,17 @@ impl crate::ImportedDatabase {
                 scratch_ast: std::cell::RefCell::new(None),
                 index_stages: std::cell::Cell::new(StageTimings::default()),
             }),
-            writing: std::rc::Rc::new(Writing {
-                next_txn: std::cell::Cell::new(1),
-                statement_txn: std::cell::Cell::new(None),
-                batch: std::cell::Cell::new(None),
-                undo: std::cell::RefCell::new(Vec::new()),
-                touched: std::cell::Cell::new(0),
-                decided_over: std::cell::Cell::new(0),
-                marks: std::cell::RefCell::new(Vec::new()),
-                implicit_transaction: std::cell::Cell::new(false),
-                running: std::cell::Cell::new(0),
-                settling: std::cell::Cell::new(false),
-            }),
+            writing: std::rc::Rc::new(Writing::starting_at(1)),
             storage: Storage {
                 database,
                 page_size,
                 frames,
                 path: target,
                 wal,
+                // A file this call just created has no log to recover.
+                recovery: crate::recovery::RecoveryReport::default(),
+                in_doubt: false,
+                read_only: false,
                 vfs: std::sync::Arc::clone(&vfs),
             },
             schema: Schema {
@@ -285,9 +278,9 @@ impl crate::ImportedDatabase {
         let mode = if self.storage.database.wal_mode() {
             inillucent_pool::journal::JournalMode::Wal
         } else {
-            self.pragmas.journal_mode.get()
+            self.pragmas.journal_mode()
         };
-        self.pragmas.journal_mode.set(mode);
+        self.pragmas.set_journal_mode(mode);
         let held: std::sync::Arc<dyn inillucent_vfs::Vfs> =
             std::sync::Arc::clone(&self.storage.vfs);
         let journal = journal_for(mode).map(|protection| {
@@ -392,6 +385,30 @@ impl crate::ImportedDatabase {
         ImportedDatabase::open_on(std::sync::Arc::new(OsVfs::new()), path, page_size, frames)
     }
 
+    /// Opens a database this connection will never write.
+    ///
+    /// See `crate::recovery::open_file_as`: the file handle is read only, no
+    /// step of the open touches the media, and the connection's own log is a
+    /// scratch one in memory. A statement that would write is refused by the
+    /// pool with `ReadOnly` (task-1979, section 5.2).
+    ///
+    /// @param path - the database file to open
+    /// @param page_size - the page size the file was built at
+    /// @param frames - how many frames the buffer pool holds
+    pub fn open_read_only(
+        path: PathBuf,
+        page_size: usize,
+        frames: usize,
+    ) -> DbResult<ImportedDatabase> {
+        ImportedDatabase::open_as(
+            std::sync::Arc::new(OsVfs::new()),
+            path,
+            page_size,
+            frames,
+            true,
+        )
+    }
+
     /// Opens a database on a file system of the caller's.
     ///
     /// The general form of [`ImportedDatabase::open`]; see
@@ -408,6 +425,24 @@ impl crate::ImportedDatabase {
         page_size: usize,
         frames: usize,
     ) -> DbResult<ImportedDatabase> {
+        ImportedDatabase::open_as(vfs, path, page_size, frames, false)
+    }
+
+    /// [`ImportedDatabase::open_on`], with the caller saying whether this
+    /// connection may write.
+    ///
+    /// @param vfs - the file system the database lives on
+    /// @param path - the database file to open
+    /// @param page_size - the page size the file was built at
+    /// @param frames - how many frames the buffer pool holds
+    /// @param read_only - whether this connection may write the file
+    pub fn open_as(
+        vfs: std::sync::Arc<dyn inillucent_vfs::Vfs>,
+        path: PathBuf,
+        page_size: usize,
+        frames: usize,
+        read_only: bool,
+    ) -> DbResult<ImportedDatabase> {
         let db_path = DbPath::new(path.to_string_lossy().as_ref());
         // **A file opened as `main` asks the same question an attached one
         // does.** A database this connection is opened on may have been the
@@ -419,13 +454,18 @@ impl crate::ImportedDatabase {
         // the meta page itself may be one of them. A journal whose header is
         // absent or zeroed describes nothing and is removed, which is what a
         // finished one looks like. See `inillucent_pool::journal`.
-        inillucent_pool::journal::replay_hot_journal(vfs.as_ref(), &db_path)?;
+        //
+        // A read only connection cannot do it and refuses instead - see
+        // `settle_a_hot_journal`.
+        settle_a_hot_journal(vfs.as_ref(), &db_path, read_only)?;
         let doubtful = multi::doubtful_transactions(&path)?;
-        let opened_file = open_file(&vfs, &db_path, frames, &doubtful)?;
+        let opened_file =
+            crate::recovery::open_file_as(&vfs, &db_path, frames, &doubtful, read_only)?;
         let OpenedFile {
             database,
             wal,
             catalog_tree,
+            recovery,
             highest_txn,
         } = opened_file;
         // **One derivation for every file this connection can name.** The
@@ -480,24 +520,16 @@ impl crate::ImportedDatabase {
                 scratch_ast: std::cell::RefCell::new(None),
                 index_stages: std::cell::Cell::new(StageTimings::default()),
             }),
-            writing: std::rc::Rc::new(Writing {
-                next_txn: std::cell::Cell::new(highest_txn.saturating_add(1)),
-                statement_txn: std::cell::Cell::new(None),
-                batch: std::cell::Cell::new(None),
-                undo: std::cell::RefCell::new(Vec::new()),
-                touched: std::cell::Cell::new(0),
-                decided_over: std::cell::Cell::new(0),
-                marks: std::cell::RefCell::new(Vec::new()),
-                implicit_transaction: std::cell::Cell::new(false),
-                running: std::cell::Cell::new(0),
-                settling: std::cell::Cell::new(false),
-            }),
+            writing: std::rc::Rc::new(Writing::starting_at(highest_txn.saturating_add(1))),
             storage: Storage {
                 database,
                 page_size,
                 frames,
                 path,
                 wal,
+                recovery,
+                in_doubt: !doubtful.is_empty(),
+                read_only,
                 vfs: std::sync::Arc::clone(&vfs),
             },
             schema: Schema {
@@ -666,4 +698,36 @@ pub(crate) fn let_the_pool_ask_the_log(pool: &Pool, wal: &std::rc::Rc<Wal>) {
         held.sync()?;
         Ok(held.write_ahead_point())
     }));
+}
+
+/// Replays a rollback journal left by an interrupted write, or refuses.
+///
+/// **A read only connection cannot replay one, so it refuses (task-1979,
+/// section 5.2).** The replay is a write, and a file with a hot journal is one
+/// halfway through a transaction - reading it as it stands would hand a caller
+/// pages from the middle of somebody else's write. Naming what is wrong and
+/// what would fix it is better than answering rows nobody should act on.
+///
+/// @param vfs - the file system the database lives on
+/// @param db_path - the database file
+/// @param read_only - whether this connection may write the file
+fn settle_a_hot_journal(
+    vfs: &dyn inillucent_vfs::Vfs,
+    db_path: &DbPath,
+    read_only: bool,
+) -> DbResult<()> {
+    if !read_only {
+        inillucent_pool::journal::replay_hot_journal(vfs, db_path)?;
+        return Ok(());
+    }
+    if vfs
+        .access(&db_path.journal(), inillucent_vfs::AccessMode::Exists)
+        .unwrap_or(false)
+    {
+        return Err(inillucent_base::error::refusal(
+            "this database has a rollback journal from an interrupted write, and a read only \
+             connection cannot replay it; open it for writing once to recover it",
+        ));
+    }
+    Ok(())
 }

@@ -48,7 +48,7 @@ impl crate::ImportedDatabase {
             let parsed = match inillucent_sql::parser::parse_next_statement(
                 &sql,
                 0,
-                &self.pragmas.limits.borrow(),
+                &self.pragmas.limits().borrow(),
             ) {
                 Ok(parsed) => parsed,
                 Err(_) => continue,
@@ -155,7 +155,7 @@ impl crate::ImportedDatabase {
                 schema: at,
                 wrote: false,
                 // **The before-images a rollback needs.** Every ordinary write
-                // passes `Some(&self.writing.undo)`; this path passed `None`, so a
+                // passes `Some(self.writing.undo())`; this path passed `None`, so a
                 // virtual table's writes went into the pool with nothing
                 // recorded that could put them back. `ROLLBACK` then undid
                 // every ordinary table and left the module's shadow trees as
@@ -164,7 +164,7 @@ impl crate::ImportedDatabase {
                 // only thing that corrected it. The file itself was never
                 // wrong: no commit record was written, so recovery ignored
                 // the pages. Only the live connection was.
-                undo: Some(&self.writing.undo),
+                undo: Some(self.writing.undo()),
                 uncommitted: self.uncommitted_handle_of(at),
             };
             let store = WriteStore {
@@ -182,7 +182,7 @@ impl crate::ImportedDatabase {
             let mut context = Context {
                 host: &mut nowhere,
                 database: 0,
-                limits: &self.pragmas.limits.borrow(),
+                limits: &self.pragmas.limits().borrow(),
                 catalog: Some(&self.schema.catalog),
             };
             connected.table.update(&mut context, change)
@@ -299,7 +299,15 @@ impl crate::ImportedDatabase {
         params: &inillucent_exec::physical::Params,
     ) -> DbResult<Outcome> {
         let inillucent_sql::dml::BoundInsertSource::Values(values) = &statement.source else {
-            return Err(refusal("an INSERT ... SELECT into a virtual table"));
+            // **Exit 3, because the statement is written correctly and this
+            // engine has not built it (task-1979, section 8.1, gap 5).** It
+            // reported the status `syntax` and exit 1, which tells a caller to
+            // go and look for a mistake in an `INSERT INTO ft(body) SELECT body
+            // FROM src` that has none - and that statement is the FTS5 backfill
+            // idiom, so it is the first thing somebody writes after creating
+            // the table.
+            return Err(refusal("an INSERT ... SELECT into a virtual table")
+                .with_unsupported("an INSERT ... SELECT into a virtual table"));
         };
         let width = statement.table.columns.len();
         let mut changed = 0usize;
@@ -380,7 +388,7 @@ impl crate::ImportedDatabase {
         }
         // Outside a transaction the statement is its own, so the module flushes
         // and the log commits here; inside one, `commit_batch` does both.
-        if self.writing.batch.get().is_none() {
+        if self.writing.batch().is_none() {
             self.sync_modules()?;
             self.seal()?;
         }
@@ -432,7 +440,7 @@ impl crate::ImportedDatabase {
                     // at a commit the buffer is cleared immediately after, and
                     // at a savepoint these writes are exactly what a later
                     // `ROLLBACK TO` an earlier point has to be able to undo.
-                    undo: Some(&self.writing.undo),
+                    undo: Some(self.writing.undo()),
                     uncommitted: self.uncommitted_handle_of(at),
                 };
                 let store = WriteStore {
@@ -450,7 +458,7 @@ impl crate::ImportedDatabase {
                 let mut context = Context {
                     host: &mut nowhere,
                     database: 0,
-                    limits: &self.pragmas.limits.borrow(),
+                    limits: &self.pragmas.limits().borrow(),
                     catalog: Some(&self.schema.catalog),
                 };
                 connected
@@ -618,7 +626,7 @@ impl crate::ImportedDatabase {
         let mut context = Context {
             host: &mut nowhere,
             database: 0,
-            limits: &self.pragmas.limits.borrow(),
+            limits: &self.pragmas.limits().borrow(),
             catalog: Some(&self.schema.catalog),
         };
         match moment {

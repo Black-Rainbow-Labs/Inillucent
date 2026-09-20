@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use inillucent_core::embed_onnx::Device;
 use inillucent_core::filter::Filter;
 use inillucent_core::rank::{AdaptiveWeights, Fusion};
@@ -105,7 +105,6 @@ const PRIMARY: &str = "passage evidence";
 /// @param seed_offset - added to the query set seeds, so the settings are chosen
 ///   on queries the graded run will not use
 /// @param stats_seed - fixes every interval and p-value the sweep prints
-#[allow(clippy::too_many_arguments)]
 pub fn run(
     corpus: &Corpus,
     limit: Option<usize>,
@@ -122,12 +121,16 @@ pub fn run(
     let (index, keys, stats, seconds) = build_index(corpus, limit, true)?;
     eprintln!("  {} chunks in {seconds:.1}s", stats.chunks);
 
-    let mut engine = InillucentEngine::new(index, keys.clone(), "inillucent".to_string(), Some(128));
+    let mut engine =
+        InillucentEngine::new(index, keys.clone(), "inillucent".to_string(), Some(128));
 
     // Generated from the same slice of the corpus the index holds, exactly as the
     // graded run does, so a number here is comparable with a number on the card.
     let n = limit.unwrap_or(corpus.len()).min(corpus.len());
-    let chunks = &corpus.chunks[..n];
+    let chunks = corpus
+        .chunks
+        .get(..n)
+        .with_context(|| format!("the corpus holds {} chunks, not {n}", corpus.chunks.len()))?;
     let identity = queryset::document_identity_queries(chunks, &keys, per_source, 11 + seed_offset);
     let headings = queryset::heading_queries(chunks, &keys, per_source * 3, 12 + seed_offset);
     let identifiers = queryset::identifier_queries(chunks, &keys, per_source * 3, 13 + seed_offset);
@@ -139,8 +142,7 @@ pub fn run(
     let unanswerable =
         queryset::unanswerable_queries(chunks, &df, per_source * 2, 15 + seed_offset);
     let multi = queryset::multi_source_queries(chunks, &keys, per_source * 2, 16 + seed_offset);
-    let calibration =
-        queryset::heading_queries(chunks, &keys, per_source * 2, 1012 + seed_offset);
+    let calibration = queryset::heading_queries(chunks, &keys, per_source * 2, 1012 + seed_offset);
     eprintln!(
         "  {} identity, {} heading, {} identifier, {} passage, {} typo, {} shorthand, {} multi-source, {} unanswerable",
         identity.len(),
@@ -156,10 +158,16 @@ pub fn run(
     eprintln!("embedding the query sets on {}", device.label());
     let embedder = queryset::open_query_embedder(
         model,
-        &crate::arm::ArmOptions { device, ..Default::default() },
+        &crate::arm::ArmOptions {
+            device,
+            ..Default::default()
+        },
     )?;
     let embed = |qs: &[GradedQuery]| -> Result<Vec<Vec<f32>>> {
-        queryset::embed_with(&embedder, &qs.iter().map(|q| q.text.clone()).collect::<Vec<_>>())
+        queryset::embed_with(
+            &embedder,
+            &qs.iter().map(|q| q.text.clone()).collect::<Vec<_>>(),
+        )
     };
     let identity_vectors = embed(&identity)?;
     let heading_vectors = embed(&headings)?;
@@ -179,9 +187,19 @@ pub fn run(
             &engine,
             setting,
             &[
-                ("passage evidence", &passage, &passage_vectors, Grading::Graded),
+                (
+                    "passage evidence",
+                    &passage,
+                    &passage_vectors,
+                    Grading::Graded,
+                ),
                 ("passage, transposed", &typo, &typo_vectors, Grading::Graded),
-                ("passage, keywords", &shorthand, &shorthand_vectors, Grading::Graded),
+                (
+                    "passage, keywords",
+                    &shorthand,
+                    &shorthand_vectors,
+                    Grading::Graded,
+                ),
                 ("multi-source", &multi, &multi_vectors, Grading::AllEvidence),
                 ("heading", &headings, &heading_vectors, Grading::Binary),
                 ("identity", &identity, &identity_vectors, Grading::Binary),
@@ -189,7 +207,7 @@ pub fn run(
             &identifiers,
             (&calibration, &calibration_vectors),
             (&unanswerable, &unanswerable_vectors),
-        ));
+        )?);
         eprint!(".");
     }
     eprintln!();
@@ -210,7 +228,9 @@ fn apply(engine: &mut InillucentEngine, setting: &Setting) {
     engine.index.set_mmr_lambda(setting.mmr_lambda);
     match setting.adaptive {
         Some(a) => engine.index.set_adaptive_fusion(true, a),
-        None => engine.index.set_adaptive_fusion(false, AdaptiveWeights::default()),
+        None => engine
+            .index
+            .set_adaptive_fusion(false, AdaptiveWeights::default()),
     }
 }
 
@@ -227,6 +247,32 @@ enum Grading {
     Binary,
 }
 
+/// The corpus keys a result list stands for.
+///
+/// **Fallible for the reason `InillucentEngine::key` is.** An ordinal past the
+/// end of the key list means the index and the keys disagree about what was
+/// loaded, and a sweep that scored an empty key would report a tuning setting
+/// as worse than it is.
+///
+/// @param engine - the engine whose key list the ordinals index
+/// @param chunks - the chunk ordinals a search returned, in order
+fn keys_of_chunks(
+    engine: &InillucentEngine,
+    chunks: impl Iterator<Item = u32>,
+) -> Result<Vec<String>> {
+    chunks
+        .map(|chunk| {
+            engine.keys.get(chunk as usize).cloned().with_context(|| {
+                format!(
+                    "chunk {chunk} has no key: the index returned an ordinal past the \
+                     {} keys the sweep loaded with it",
+                    engine.keys.len()
+                )
+            })
+        })
+        .collect()
+}
+
 /// Score one arm on every family.
 #[allow(clippy::type_complexity)]
 fn score_arm(
@@ -236,7 +282,7 @@ fn score_arm(
     identifiers: &[GradedQuery],
     calibration: (&Vec<GradedQuery>, &Vec<Vec<f32>>),
     unanswerable: (&Vec<GradedQuery>, &Vec<Vec<f32>>),
-) -> ArmScores {
+) -> Result<ArmScores> {
     let filter = Filter::default();
     let compiled = engine.index.compile(&filter);
     let cap = engine.index.config().per_doc_cap;
@@ -249,9 +295,8 @@ fn score_arm(
             let hits = engine
                 .index
                 .hybrid_search(&q.text, v, &compiled, 10, engine.ef_search)
-                .expect("the harness embeds at the index's width");
-            let keys: Vec<String> =
-                hits.iter().map(|h| engine.keys[h.chunk as usize].clone()).collect();
+                .context("the hybrid search this family is scored on")?;
+            let keys = keys_of_chunks(engine, hits.iter().map(|h| h.chunk))?;
             let mut space = KeySpace::new();
             let correct = space.set_of(&q.correct);
             let grades = q.grades(&mut space);
@@ -272,7 +317,7 @@ fn score_arm(
     let mut identifier_mrr: Vec<f64> = Vec::new();
     for q in identifiers {
         let hits = engine.index.lexical_search(&q.text, &compiled, 50);
-        let keys: Vec<String> = hits.iter().map(|h| engine.keys[h.chunk as usize].clone()).collect();
+        let keys = keys_of_chunks(engine, hits.iter().map(|h| h.chunk))?;
         let mut space = KeySpace::new();
         let correct = space.set_of(&q.correct);
         let got = space.ids_of(&keys);
@@ -285,25 +330,25 @@ fn score_arm(
     // on the top hit's confidence rather than its fused score: the fused score's
     // scale is read out of the candidate list, so it is the same for a good list
     // and a hopeless one and there is no threshold on it to set.
-    let top_scores = |queries: &[GradedQuery], vectors: &[Vec<f32>]| -> Vec<f64> {
+    let top_scores = |queries: &[GradedQuery], vectors: &[Vec<f32>]| -> Result<Vec<f64>> {
         queries
             .iter()
             .zip(vectors)
             .map(|(q, v)| {
-                engine
+                Ok(engine
                     .index
                     .hybrid_search(&q.text, v, &compiled, 10, engine.ef_search)
-                    .expect("the harness embeds at the index's width")
+                    .context("the hybrid search the abstention threshold is read from")?
                     .first()
                     .map(|h| h.confidence as f64)
-                    .unwrap_or(0.0)
+                    .unwrap_or(0.0))
             })
             .collect()
     };
-    let mut answerable = top_scores(calibration.0, calibration.1);
+    let mut answerable = top_scores(calibration.0, calibration.1)?;
     answerable.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let threshold = percentile(&answerable, 0.05);
-    let flags: Vec<f64> = top_scores(unanswerable.0, unanswerable.1)
+    let flags: Vec<f64> = top_scores(unanswerable.0, unanswerable.1)?
         .into_iter()
         .map(|s| if s >= threshold { 1.0 } else { 0.0 })
         .collect();
@@ -318,9 +363,8 @@ fn score_arm(
             let hits = engine
                 .index
                 .hybrid_search(&q.text, v, &compiled, 10, engine.ef_search)
-                .expect("the harness embeds at the index's width");
-            let keys: Vec<String> =
-                hits.iter().map(|h| engine.keys[h.chunk as usize].clone()).collect();
+                .context("the hybrid search success@10 is counted from")?;
+            let keys = keys_of_chunks(engine, hits.iter().map(|h| h.chunk))?;
             let mut space = KeySpace::new();
             let correct = space.set_of(&q.correct);
             let got = space.ids_of(&keys);
@@ -329,7 +373,11 @@ fn score_arm(
     }
     means.insert("passage success@10".to_string(), mean_of(&hits_at_10));
 
-    ArmScores { label: setting.label.clone(), means, series }
+    Ok(ArmScores {
+        label: setting.label.clone(),
+        means,
+        series,
+    })
 }
 
 fn mean_of(values: &[f64]) -> f64 {
@@ -344,7 +392,9 @@ fn mean_of(values: &[f64]) -> f64 {
 fn print_table(arms: &[ArmScores]) {
     let mut order: Vec<&ArmScores> = arms.iter().collect();
     order.sort_by(|a, b| {
-        b.mean(PRIMARY).partial_cmp(&a.mean(PRIMARY)).unwrap_or(std::cmp::Ordering::Equal)
+        b.mean(PRIMARY)
+            .partial_cmp(&a.mean(PRIMARY))
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     println!("## Every arm\n");
@@ -384,7 +434,9 @@ fn print_comparison(arms: &[ArmScores], stats_seed: u64) {
 
     let mut order: Vec<&ArmScores> = arms.iter().skip(1).collect();
     order.sort_by(|a, b| {
-        b.mean(PRIMARY).partial_cmp(&a.mean(PRIMARY)).unwrap_or(std::cmp::Ordering::Equal)
+        b.mean(PRIMARY)
+            .partial_cmp(&a.mean(PRIMARY))
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     for arm in order {
@@ -500,12 +552,14 @@ pub fn build_settings(baseline: Setting, sweep: &Sweep<'_>) -> Vec<Setting> {
                             for &mmr in mmrs {
                                 for rule in &adaptive_options {
                                     for &w in weights {
-                                        let Some(fusion) = fusion_named(name, w) else { continue };
+                                        let Some(fusion) = fusion_named(name, w) else {
+                                            continue;
+                                        };
                                         // Reciprocal rank fusion has no weight, so
                                         // sweeping one would repeat the same arm
                                         // once per weight.
                                         if matches!(fusion, Fusion::ReciprocalRank { .. })
-                                            && w != weights[0]
+                                            && Some(w) != weights.first().copied()
                                         {
                                             continue;
                                         }
@@ -551,7 +605,9 @@ pub fn build_settings(baseline: Setting, sweep: &Sweep<'_>) -> Vec<Setting> {
 /// A fusion by the name the command line uses.
 pub fn fusion_named(name: &str, vector_weight: f32) -> Option<Fusion> {
     match name.trim().to_ascii_lowercase().as_str() {
-        "rrf" => Some(Fusion::ReciprocalRank { k: inillucent_core::rank::RRF_K }),
+        "rrf" => Some(Fusion::ReciprocalRank {
+            k: inillucent_core::rank::RRF_K,
+        }),
         "minmax" => Some(Fusion::NormalizedScore { vector_weight }),
         "convex" => Some(Fusion::Convex { vector_weight }),
         "tmm" => Some(Fusion::TheoreticalMinMax { vector_weight }),
@@ -561,7 +617,6 @@ pub fn fusion_named(name: &str, vector_weight: f32) -> Option<Fusion> {
 
 /// A label that names every setting the arm differs by, so a table row can be
 /// turned back into a command line.
-#[allow(clippy::too_many_arguments)]
 fn label_for(dials: &Dials<'_>) -> String {
     let Dials {
         coverage,
@@ -613,7 +668,9 @@ mod tests {
             prefix: false,
             tier: false,
             phrase: 0.0,
-            fusion: Fusion::NormalizedScore { vector_weight: 0.35 },
+            fusion: Fusion::NormalizedScore {
+                vector_weight: 0.35,
+            },
             adaptive: None,
             mmr_lambda: 1.0,
         }
@@ -621,7 +678,20 @@ mod tests {
 
     #[test]
     fn the_baseline_is_always_the_first_arm() {
-        let settings = build_settings(baseline(), &Sweep { coverages: &[3.0], weights: &[0.35, 0.5], proximities: &[1.0], prefixes: &[false], tiers: &[false], phrases: &[0.0], fusions: &["minmax".to_string()], mmrs: &[1.0], adaptive: &[] });
+        let settings = build_settings(
+            baseline(),
+            &Sweep {
+                coverages: &[3.0],
+                weights: &[0.35, 0.5],
+                proximities: &[1.0],
+                prefixes: &[false],
+                tiers: &[false],
+                phrases: &[0.0],
+                fusions: &["minmax".to_string()],
+                mmrs: &[1.0],
+                adaptive: &[],
+            },
+        );
         assert_eq!(settings[0].label, "baseline");
         assert!(settings.len() > 1);
     }
@@ -631,7 +701,20 @@ mod tests {
     /// highest of the sweep.
     #[test]
     fn rank_fusion_is_not_repeated_once_per_weight() {
-        let settings = build_settings(baseline(), &Sweep { coverages: &[3.0], weights: &[0.2, 0.35, 0.5, 0.7], proximities: &[1.0], prefixes: &[false], tiers: &[false], phrases: &[0.0], fusions: &["rrf".to_string()], mmrs: &[1.0], adaptive: &[] });
+        let settings = build_settings(
+            baseline(),
+            &Sweep {
+                coverages: &[3.0],
+                weights: &[0.2, 0.35, 0.5, 0.7],
+                proximities: &[1.0],
+                prefixes: &[false],
+                tiers: &[false],
+                phrases: &[0.0],
+                fusions: &["rrf".to_string()],
+                mmrs: &[1.0],
+                adaptive: &[],
+            },
+        );
         assert_eq!(settings.len(), 2, "the baseline plus one rank fusion arm");
     }
 
@@ -639,9 +722,27 @@ mod tests {
     /// off, or it cannot show that turning it on helped.
     #[test]
     fn an_adaptive_sweep_still_contains_the_fixed_weight_arm() {
-        let rule = AdaptiveWeights { identifier_gain: 0.3, ..Default::default() };
-        let settings = build_settings(baseline(), &Sweep { coverages: &[3.0], weights: &[0.35], proximities: &[1.0], prefixes: &[false], tiers: &[false], phrases: &[0.0], fusions: &["minmax".to_string()], mmrs: &[1.0], adaptive: &[rule] });
-        assert!(settings.iter().any(|s| s.adaptive.is_none() && s.label != "baseline"));
+        let rule = AdaptiveWeights {
+            identifier_gain: 0.3,
+            ..Default::default()
+        };
+        let settings = build_settings(
+            baseline(),
+            &Sweep {
+                coverages: &[3.0],
+                weights: &[0.35],
+                proximities: &[1.0],
+                prefixes: &[false],
+                tiers: &[false],
+                phrases: &[0.0],
+                fusions: &["minmax".to_string()],
+                mmrs: &[1.0],
+                adaptive: &[rule],
+            },
+        );
+        assert!(settings
+            .iter()
+            .any(|s| s.adaptive.is_none() && s.label != "baseline"));
         assert!(settings.iter().any(|s| s.adaptive.is_some()));
     }
 
@@ -649,8 +750,25 @@ mod tests {
     /// with every gain at zero is exactly the fixed arm beside it.
     #[test]
     fn an_adaptive_arm_takes_its_base_from_the_weight_being_swept() {
-        let rule = AdaptiveWeights { identifier_gain: 0.3, base: 0.0, ..Default::default() };
-        let settings = build_settings(baseline(), &Sweep { coverages: &[3.0], weights: &[0.6], proximities: &[1.0], prefixes: &[false], tiers: &[false], phrases: &[0.0], fusions: &["minmax".to_string()], mmrs: &[1.0], adaptive: &[rule] });
+        let rule = AdaptiveWeights {
+            identifier_gain: 0.3,
+            base: 0.0,
+            ..Default::default()
+        };
+        let settings = build_settings(
+            baseline(),
+            &Sweep {
+                coverages: &[3.0],
+                weights: &[0.6],
+                proximities: &[1.0],
+                prefixes: &[false],
+                tiers: &[false],
+                phrases: &[0.0],
+                fusions: &["minmax".to_string()],
+                mmrs: &[1.0],
+                adaptive: &[rule],
+            },
+        );
         let adaptive = settings.iter().find(|s| s.adaptive.is_some()).unwrap();
         assert!((adaptive.adaptive.unwrap().base - 0.6).abs() < 1e-6);
     }

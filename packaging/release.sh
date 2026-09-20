@@ -123,6 +123,20 @@ if [ "$smoke_only" -eq 0 ]; then
       "rust-toolchain.toml pins $pinned and this is rustc $running, so the release would not be the build the repository grades itself against."
   fi
 
+  # **Every packaged copy of the version has to agree with the workspace, and no
+  # tracked file may carry a credential or a personal reference.** Both are
+  # things nothing checked: at 0.1.2 the Python package reported 0.1.0 and the
+  # PHP installer downloaded 0.1.1, so `composer require` followed by the
+  # installer fetched the release that cannot embed, and the tracked score card
+  # carried a PostgreSQL password in clear (task-1946, H7 and H9).
+  #
+  # **`release.ps1` has asked this since task-1946 and this script never did
+  # (task-1969, 4.4)**, so a release cut on Linux - which is the only way the
+  # Linux archives get cut - went out without any of it being asked.
+  if ! node "$root/tools/doc-facts/check.mjs"; then
+    deny_unless "$allow_dirty" allow-dirty       "tools/doc-facts/check.mjs failed: a document disagrees with the engine, a packaged version pin disagrees with the workspace, or a tracked file carries something a public repository must not."
+  fi
+
   [ "$skip_build" -eq 0 ] || waived+=("skip-build")
 fi
 
@@ -159,6 +173,26 @@ mkdir -p "$stage/bin" "$stage/lib" "$stage/include"
 for program in inillucent inillucent-shell inillucent-mcp inillucent-migrate; do
   [ -f "$built/$program" ] || { echo "the build did not produce $built/$program" >&2; exit 1; }
   cp "$built/$program" "$stage/bin/"
+done
+
+# **Every staged binary answers with the version on the tin (task-1979, D18).**
+# One release shipped four version numbers: the manifests said 0.1.4, the staged
+# binaries answered 0.1.1, and npm's optionalDependencies pinned 0.1.2. The lane
+# that checked this compared the three manifests against the *freshly built*
+# binary, which agreed - and the archive is made of the staged copies, which
+# were a build from an earlier tree that nothing re-checked.
+#
+# `inillucent-shell` is not on the list because its `--version` answers
+# `SQLite 3.53.4`: it mimics `sqlite3`, deliberately, and the number it reports
+# is the dialect it implements rather than its own. `inillucent-migrate` has no
+# `--version` flag at all. The two that do carry it are the two checked.
+for program in inillucent inillucent-mcp; do
+  staged_version="$("$stage/bin/$program" --version 2>&1)" || {
+    echo "the staged $program did not run: $staged_version" >&2; exit 1; }
+  case "$staged_version" in
+    *"$manifest_version"*) : ;;
+    *) echo "the staged $program reports '$staged_version', not $manifest_version - the archive would be labelled for a build it does not contain" >&2; exit 1 ;;
+  esac
 done
 
 # The C ABI, which is how every language that is not Rust reaches the engine.

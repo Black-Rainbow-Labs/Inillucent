@@ -4,13 +4,22 @@
 # each one lived in somebody's memory, so "did you run the checks" had no
 # answer.
 #
-# Every stage prints its name and its elapsed time, and the script stops at the
-# first failure with a non-zero exit code.
+# Every stage prints its name and its elapsed time. **The script runs every
+# stage and exits non-zero at the end naming all of them**, rather than stopping
+# at the first failure - the header said it stopped for two tickets while
+# `stage()` recorded the name and carried on, which is the more useful behaviour
+# and is what a reader should be told (task-1969, 4.13).
 #
 #   tools/validate.sh                # everything
-#   tools/validate.sh --quick        # fmt, lint, contracts and smoke only
+#   tools/validate.sh --quick        # stops after `smoke`: toolchain, format,
+#                                    # build, lint, dependencies, defaults,
+#                                    # docs, oracle, fixtures, doctests, urls,
+#                                    # contracts, compat, smoke - fourteen
+#                                    # stages, not the four an earlier header
+#                                    # claimed
 #   tools/validate.sh --coverage     # everything, plus the coverage measurement
-#   tools/validate.sh --stage lint   # one stage by name
+#   tools/validate.sh --stage lint   # one stage by name, wherever it sits -
+#                                    # `--quick --stage tests` runs `tests`
 
 set -u
 
@@ -112,9 +121,9 @@ dependencies() {
 stage dependencies 'advisories, licences and the resolved graph, which the manifest checks cannot see' dependencies
 
 # **The configuration a `cargo install` produces, which nothing built until
-# task-1961 (A14).** Every stage above and every CI job passes `--all-features`,
-# and `grep -rn 'no-default-features'` over every workflow, script and manifest
-# returned nothing, so the feature set a user gets by default was never compiled
+# task-1961 (A14).** Every stage above passes `--all-features`, and
+# `grep -rn 'no-default-features'` over every script and manifest returned
+# nothing, so the feature set a user gets by default was never compiled
 # anywhere. `inillucent-storage` has two independent features, `opcode-probe`
 # and `check`, with fifteen `cfg(feature)` sites between them, and no job built
 # them crossed.
@@ -187,9 +196,14 @@ stage doctests 'the examples a cargo add reader depends on, compiled and run' do
 stage urls 'a URL a shipped package names has to resolve for somebody with no credential' \
     node "$root/tools/check-public-urls.mjs"
 
+# `gates_fail_closed` is here rather than only in the full run (task-1961,
+# criterion 10; task-1969, 4.13). It is the only test any gate program has, and a
+# quick run that skipped it was a quick run with nothing holding the programs
+# that decide pass or fail.
 stage contracts 'dependencies, layering, the command table and the test map' \
     cargo test --manifest-path "$root/Cargo.toml" -p inillucent-compat \
-    --test policy --test selection --test command_parity --test harness
+    --test policy --test selection --test command_parity --test harness \
+    --test gates_fail_closed
 
 # **A published compatibility report may not carry its own unresolved Problems
 # table (task-1946, M5).** compat/compat-report.md shipped fourteen rows saying
@@ -212,6 +226,134 @@ smoke() {
         && "$root/target/debug/inillucent-testrun" --tier smoke
 }
 stage smoke 'a real file opened, written, reopened, read' smoke
+
+# **`--stage` reaches past the quick exit (task-1969, 4.13).** `--quick` means
+# "stop after smoke"; it does not mean "refuse to run the stage I named". The two
+# read the same until `coverage` moved below this line, after which
+# `--quick --coverage --stage coverage` would have measured nothing on Unix and
+# everything on Windows - which is the platform difference this whole section is
+# about.
+if [ "$quick" -eq 1 ] && [ -z "$only" ]; then
+    if [ "${#failed[@]}" -gt 0 ]; then
+        echo; echo "FAILED: ${failed[*]}"; exit 1
+    fi
+    echo; echo 'quick validation passed'; exit 0
+fi
+
+security() {
+    cargo test --manifest-path "$root/Cargo.toml" -p inillucent-compat --test confinement \
+        && cargo test --manifest-path "$root/Cargo.toml" -p inillucent-driver-capi --test abi --test conformance \
+        && cargo test --manifest-path "$root/Cargo.toml" -p inillucent-remote --test transport
+}
+stage security 'root confinement, the C ABI lifetimes, and migration transport' security
+
+# --strict is the flag that matters: several suites report success when a
+# prerequisite is absent, and without it a green on a machine with nothing
+# installed reads the same as a green on one with everything.
+stage tests 'every selected suite, with missing prerequisites named' \
+    "$root/target/debug/inillucent-testrun" --strict
+
+# **Every published count, against the engine that produced it (task-1969,
+# 4.4).** `tools/doc-facts/check.mjs` checks the 30 verbs, the 63 dot commands,
+# the 416 probe cases, the test and target counts and the private-reference
+# patterns, and it is checked by nothing else. Its only caller was
+# `packaging/release.ps1`, on Windows, without `--run-tests` - so on Unix it ran
+# at no point in any gate.
+#
+# After `build` and `tests`, because it reads the built binaries and the runner's
+# own summary, and both are fresh by the time it runs. `--run-tests` is what puts
+# the two test facts in scope; without it they report as out of scope rather than
+# as measured.
+stage doc-facts 'every count a document states, against the engine that produced it' \
+    node "$root/tools/doc-facts/check.mjs" --run-tests
+
+# **The four language wrappers, against the binary this run built (task-1969,
+# 4.5).** Each of them is somebody's entry point to this engine and each was
+# tested by reading its own source as text:
+#
+# - the Go suite's five engine tests skipped wherever the gate ran them,
+#   because the gate built `target/release/inillucent` and set neither
+#   `INILLUCENT_BIN` nor `PATH`, so `go test` exited 0 having run five cases
+#   that check a platform string table;
+# - `packages/npm/inillucent/resolve.test.mjs` and
+#   `packages/php/tests/target.php` read the platform table and never called
+#   `query` or `exec`;
+# - `drivers/bindings/python/run_conformance.py` is presented by
+#   `drivers/README.md` as the proof that a second language can implement the
+#   driver from the documents, and was run by nothing.
+#
+# `INILLUCENT_BIN` is what points all four at this build. Setting it is also
+# what makes the Go suite fail rather than skip when the binary is absent,
+# which is the shape `drivers/inillucent-driver-capi/tests/conformance.rs`
+# already uses for `INILLUCENT_CAPI_ASAN`.
+#
+# **A toolchain that is not installed is announced and skipped, not failed.**
+# The marker is the one `tests/inillucent-testing-tdd.md` §9 asks for, so a
+# reader sees which language did not run and what installs it. That is the same
+# answer `--strict` gives for a suite whose prerequisite is absent, and it is
+# why this stage can be in every validate run rather than behind a flag.
+wrappers() {
+    local binary="$root/target/release/inillucent"
+    if [ ! -x "$binary" ]; then
+        binary="$root/target/debug/inillucent"
+    fi
+    if [ ! -x "$binary" ]; then
+        echo "no built inillucent to point the wrappers at; run \`cargo build --release -p inillucent-cli\`; skipping"
+        return 1
+    fi
+    export INILLUCENT_BIN="$binary"
+    local failed=0
+
+    if command -v go >/dev/null 2>&1; then
+        # `-v` so a `--- SKIP` line is printed rather than folded away, and the
+        # grep below is what turns one into a failure: a wrapper suite that
+        # skipped every engine test is the state this stage exists to end.
+        local said
+        said="$(go -C "$root/packages/go" test ./... -v 2>&1)"
+        echo "$said"
+        if [ -n "$(printf '%s' "$said" | grep -F -- '--- SKIP')" ]; then
+            echo "the Go suite skipped a test with INILLUCENT_BIN set, which it may not"
+            failed=1
+        fi
+    else
+        echo "no go on PATH; install one from https://go.dev/dl/; skipping"
+    fi
+
+    if command -v node >/dev/null 2>&1; then
+        node --test "$root/packages/npm/inillucent/"*.test.mjs || failed=1
+    else
+        echo "no node on PATH; install one from https://nodejs.org/; skipping"
+    fi
+
+    if command -v php >/dev/null 2>&1; then
+        php "$root/packages/php/tests/target.php" || failed=1
+        php "$root/packages/php/tests/roundtrip.php" || failed=1
+    else
+        echo "no php on PATH; install one from https://www.php.net/downloads; skipping"
+    fi
+
+    # **Being on PATH is not the question; answering is (task-1970).** See the
+    # note in tools/validate.ps1: Windows puts a Python app execution alias on
+    # PATH that resolves and then will not start, and Git Bash sees the same
+    # entry. A candidate that cannot print its own version is not a Python.
+    local python=''
+    local candidate
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1 && "$candidate" --version >/dev/null 2>&1; then
+            python="$candidate"
+            break
+        fi
+    done
+    if [ -n "$python" ]; then
+        "$python" "$root/drivers/bindings/python/run_conformance.py" || failed=1
+    else
+        echo "no python on PATH; install one from https://www.python.org/downloads/; skipping"
+    fi
+
+    return "$failed"
+}
+stage wrappers 'the Go, Node, PHP and Python wrappers, against the binary this run built' wrappers
+
 
 # **Coverage, behind a flag, so the published number can be re-measured
 # (task-1961, T2).** The only numbers on record before this named `rustdb-vm`, a
@@ -240,32 +382,16 @@ stage smoke 'a real file opened, written, reopened, read' smoke
 # accepts, so the run ended with `os error 206` and no number after twenty
 # minutes of work. The wrapper re-runs that same command through a response
 # file, and prints the per-crate table `docs/repository.md` publishes.
+#
+# `--write` puts that table into the page between two marker comments instead of
+# leaving it for somebody to paste, which is why the page's prose used to say
+# 40.9% where its table said 40.6% (task-1969, 4.12).
 coverage_run() {
-    node "$root/tools/coverage.mjs" --per-crate
+    node "$root/tools/coverage.mjs" --per-crate --write
 }
 if [ "$coverage" -eq 1 ]; then
     stage coverage 'the coverage number docs/repository.md publishes, re-measured' coverage_run
 fi
-
-if [ "$quick" -eq 1 ]; then
-    if [ "${#failed[@]}" -gt 0 ]; then
-        echo; echo "FAILED: ${failed[*]}"; exit 1
-    fi
-    echo; echo 'quick validation passed'; exit 0
-fi
-
-security() {
-    cargo test --manifest-path "$root/Cargo.toml" -p inillucent-compat --test confinement \
-        && cargo test --manifest-path "$root/Cargo.toml" -p inillucent-driver-capi --test abi --test conformance \
-        && cargo test --manifest-path "$root/Cargo.toml" -p inillucent-remote --test transport
-}
-stage security 'root confinement, the C ABI lifetimes, and migration transport' security
-
-# --strict is the flag that matters: several suites report success when a
-# prerequisite is absent, and without it a green on a machine with nothing
-# installed reads the same as a green on one with everything.
-stage tests 'every selected suite, with missing prerequisites named' \
-    "$root/target/debug/inillucent-testrun" --strict
 
 echo
 if [ "${#failed[@]}" -gt 0 ]; then

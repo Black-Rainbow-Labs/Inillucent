@@ -50,8 +50,7 @@ impl crate::ImportedDatabase {
             return Ok(named_integer(
                 "cache_size",
                 self.pragmas
-                    .cache_size
-                    .get()
+                    .cache_size()
                     .unwrap_or(-((bytes / 1024) as i64)),
             ));
         };
@@ -75,7 +74,7 @@ impl crate::ImportedDatabase {
         // Still the truth rather than the request, for the one case the grow
         // could not satisfy: an allocation that the platform refused reports
         // what the pool ended up with, in the units the caller used.
-        self.pragmas.cache_size.set(Some(if pages > held {
+        self.pragmas.set_cache_size(Some(if pages > held {
             if asked < 0 {
                 -(held.saturating_mul(page_size as i64) / 1024)
             } else {
@@ -129,15 +128,19 @@ impl crate::ImportedDatabase {
         match argument {
             None => Ok(named_integer(
                 "timeout",
-                self.pragmas.busy_timeout_ms.get() as i64,
+                self.pragmas.busy_timeout_ms() as i64,
             )),
             Some(argument) => {
-                self.pragmas
-                    .busy_timeout_ms
-                    .set(argument_integer(argument).max(0) as u64);
+                let millis = argument_integer(argument).max(0) as u64;
+                self.pragmas.set_busy_timeout_ms(millis);
+                // **And the file hears about it.** Recording the number
+                // without giving it to the thing that waits is what C7 found:
+                // the pragma answered with whatever it had been set to while
+                // the wait a contended writer actually spent was a constant.
+                self.storage.database.set_busy_millis(millis);
                 Ok(named_integer(
                     "timeout",
-                    self.pragmas.busy_timeout_ms.get() as i64,
+                    self.pragmas.busy_timeout_ms() as i64,
                 ))
             }
         }
@@ -147,7 +150,7 @@ impl crate::ImportedDatabase {
         match argument {
             None => Ok(named_integer(
                 "foreign_keys",
-                i64::from(self.pragmas.foreign_keys.get()),
+                i64::from(self.pragmas.foreign_keys()),
             )),
             Some(argument) => {
                 let asked = argument_boolean(argument);
@@ -158,14 +161,54 @@ impl crate::ImportedDatabase {
                 // pragma turned them on. Which is exactly the shape of bug this
                 // pragma exists to avoid, since the symptom is a write that is
                 // accepted rather than an error that is reported.
-                if asked != self.pragmas.foreign_keys.get() {
+                if asked != self.pragmas.foreign_keys() {
                     self.forget_compiled_statements();
                 }
-                self.pragmas.foreign_keys.set(asked);
+                self.pragmas.set_foreign_keys(asked);
                 Ok(Outcome::empty())
             }
         }
     }
+    /// Reads or sets whether the connection trusts the schema it read.
+    ///
+    /// **It used to be a constant that said the opposite of what the engine did
+    /// (task-1972).** `PRAGMA trusted_schema` answered 0 from the fixed-answer
+    /// table, beside the comment "a schema object is never treated as trusted
+    /// input here", while the connection's own policy said `true` and nothing
+    /// read either one: `Registry::authorize_function` had no caller, so the
+    /// setting had no effect to be honest or dishonest about. The binder
+    /// consults it now, which makes a constant answer a lie rather than a
+    /// simplification.
+    ///
+    /// **The default is on, which is SQLite's.** Turning it off refuses every
+    /// registered function a schema names unless the registration said
+    /// `innocuous`, and that is a promise about every database the application
+    /// will ever open rather than about the one in front of it. A
+    /// `direct_only` function is refused either way.
+    ///
+    /// The compiled statements go with it, for the reason `foreign_keys`
+    /// throws them away: whether a schema may name a function is decided by the
+    /// binder, once, when a statement is compiled.
+    ///
+    /// @param argument - the value it was given, when it was given one
+    pub(crate) fn pragma_trusted_schema(
+        &mut self,
+        argument: Option<&PragmaArgument>,
+    ) -> DbResult<Outcome> {
+        let held = self.session_state.registry.policy().trusted_schema;
+        match argument {
+            None => Ok(named_integer("trusted_schema", i64::from(held))),
+            Some(argument) => {
+                let asked = argument_boolean(argument);
+                if asked != held {
+                    self.forget_compiled_statements();
+                }
+                self.session_state.registry.policy_mut().trusted_schema = asked;
+                Ok(Outcome::empty())
+            }
+        }
+    }
+
     /// Reads or sets whether every immediate key check waits for the commit.
     ///
     /// It is a transaction's setting rather than a connection's - SQLite clears
@@ -177,14 +220,14 @@ impl crate::ImportedDatabase {
         match argument {
             None => Ok(named_integer(
                 "defer_foreign_keys",
-                i64::from(self.pragmas.defer_foreign_keys.get()),
+                i64::from(self.pragmas.defer_foreign_keys()),
             )),
             Some(argument) => {
                 let asked = argument_boolean(argument);
-                if asked != self.pragmas.defer_foreign_keys.get() {
+                if asked != self.pragmas.defer_foreign_keys() {
                     self.forget_compiled_statements();
                 }
-                self.pragmas.defer_foreign_keys.set(asked);
+                self.pragmas.set_defer_foreign_keys(asked);
                 Ok(Outcome::empty())
             }
         }
@@ -285,12 +328,11 @@ impl crate::ImportedDatabase {
             let asked = argument_integer(argument);
             let held = self.storage.database.pool().page_count() as i64;
             self.pragmas
-                .max_page_count
-                .set(asked.max(held).min(DEFAULT_MAX_PAGE_COUNT));
+                .set_max_page_count(asked.max(held).min(DEFAULT_MAX_PAGE_COUNT));
         }
         Ok(named_integer(
             "max_page_count",
-            self.pragmas.max_page_count.get(),
+            self.pragmas.max_page_count(),
         ))
     }
     /// Sets whether `LIKE` compares ASCII letters exactly.
@@ -311,10 +353,10 @@ impl crate::ImportedDatabase {
             return Ok(Outcome::empty());
         };
         let asked = argument_boolean(argument);
-        if asked != self.pragmas.case_sensitive_like.get() {
+        if asked != self.pragmas.case_sensitive_like() {
             self.forget_compiled_statements();
         }
-        self.pragmas.case_sensitive_like.set(asked);
+        self.pragmas.set_case_sensitive_like(asked);
         Ok(Outcome::empty())
     }
     /// Reads or sets how many rows `ANALYZE` may sample per index.
@@ -329,12 +371,11 @@ impl crate::ImportedDatabase {
     ) -> DbResult<Outcome> {
         if let Some(argument) = argument {
             self.pragmas
-                .analysis_limit
-                .set(argument_integer(argument).max(0));
+                .set_analysis_limit(argument_integer(argument).max(0));
         }
         Ok(named_integer(
             "analysis_limit",
-            self.pragmas.analysis_limit.get(),
+            self.pragmas.analysis_limit(),
         ))
     }
     /// Reads or sets `locking_mode`.
@@ -353,16 +394,25 @@ impl crate::ImportedDatabase {
         let Some(argument) = argument else {
             return Ok(word_row("locking_mode", self.locking_word()));
         };
+        // **An unrecognised value is an error rather than a silent no-op
+        // (task-1979, C8).** The arm here was `_ => {}`, so a typo left the
+        // connection in whatever mode it was already in and reported success -
+        // and since the reported mode is the one in force, the answer looked
+        // like a refusal nobody could tell from an honoured switch.
         match argument_text(argument).trim().to_ascii_lowercase().as_str() {
             "normal" => self.set_locking_exclusive(false)?,
             "exclusive" => self.set_locking_exclusive(true)?,
-            _ => {}
+            other => {
+                return Err(refusal(format!(
+                    "no such locking mode: {other}; it is normal or exclusive"
+                )))
+            }
         }
         Ok(word_row("locking_mode", self.locking_word()))
     }
     /// Returns the word `locking_mode` reports.
     pub(crate) fn locking_word(&self) -> &'static str {
-        if self.pragmas.locking_exclusive.get() {
+        if self.pragmas.locking_exclusive() {
             "exclusive"
         } else {
             "normal"
@@ -385,10 +435,7 @@ impl crate::ImportedDatabase {
         argument: Option<&PragmaArgument>,
     ) -> DbResult<Outcome> {
         let Some(argument) = argument else {
-            return Ok(word_row(
-                "journal_mode",
-                self.pragmas.journal_mode.get().word(),
-            ));
+            return Ok(word_row("journal_mode", self.pragmas.journal_mode().word()));
         };
         let asked = argument_text(argument);
         if let Some(mode) = inillucent_pool::journal::JournalMode::named(asked.trim()) {
@@ -398,18 +445,12 @@ impl crate::ImportedDatabase {
             // mode that was already in force. `off` protects nothing, so a
             // connection that has asked to be protected from itself cannot have
             // it.
-            if self.pragmas.defensive.get() && mode == inillucent_pool::journal::JournalMode::Off {
-                return Ok(word_row(
-                    "journal_mode",
-                    self.pragmas.journal_mode.get().word(),
-                ));
+            if self.pragmas.defensive() && mode == inillucent_pool::journal::JournalMode::Off {
+                return Ok(word_row("journal_mode", self.pragmas.journal_mode().word()));
             }
             self.set_journal_mode(mode)?;
         }
-        Ok(word_row(
-            "journal_mode",
-            self.pragmas.journal_mode.get().word(),
-        ))
+        Ok(word_row("journal_mode", self.pragmas.journal_mode().word()))
     }
     /// Reads or sets `auto_vacuum`.
     ///
@@ -429,7 +470,7 @@ impl crate::ImportedDatabase {
         let Some(argument) = argument else {
             return Ok(named_integer(
                 "auto_vacuum",
-                i64::from(self.pragmas.auto_vacuum.get()),
+                i64::from(self.pragmas.auto_vacuum()),
             ));
         };
         let asked = match argument_text(argument).trim().to_ascii_lowercase().as_str() {
@@ -446,7 +487,7 @@ impl crate::ImportedDatabase {
                 .iter()
                 .all(|table| table.folded.starts_with(b"sqlite_"))
             {
-                self.pragmas.auto_vacuum.set(mode);
+                self.pragmas.set_auto_vacuum(mode);
             }
         }
         Ok(Outcome::empty())
@@ -463,7 +504,7 @@ impl crate::ImportedDatabase {
         &mut self,
         argument: Option<&PragmaArgument>,
     ) -> DbResult<Outcome> {
-        if self.pragmas.auto_vacuum.get() != 2 {
+        if self.pragmas.auto_vacuum() != 2 {
             return Ok(Outcome::empty());
         }
         let pages = argument.map(argument_integer).unwrap_or(i64::MAX).max(0);
@@ -480,10 +521,10 @@ impl crate::ImportedDatabase {
         let Some(argument) = argument else {
             return Ok(named_integer(
                 "secure_delete",
-                i64::from(self.pragmas.secure_delete.get()),
+                i64::from(self.pragmas.secure_delete()),
             ));
         };
-        self.pragmas.secure_delete.set(
+        self.pragmas.set_secure_delete(
             match argument_text(argument).trim().to_ascii_lowercase().as_str() {
                 "2" | "fast" => 2,
                 _ => u8::from(argument_boolean(argument)),
@@ -491,7 +532,7 @@ impl crate::ImportedDatabase {
         );
         Ok(named_integer(
             "secure_delete",
-            i64::from(self.pragmas.secure_delete.get()),
+            i64::from(self.pragmas.secure_delete()),
         ))
     }
     /// Reads or sets `ignore_check_constraints`.
@@ -510,14 +551,14 @@ impl crate::ImportedDatabase {
         let Some(argument) = argument else {
             return Ok(named_integer(
                 "ignore_check_constraints",
-                i64::from(self.pragmas.ignore_check_constraints.get()),
+                i64::from(self.pragmas.ignore_check_constraints()),
             ));
         };
         let asked = argument_boolean(argument);
-        if asked != self.pragmas.ignore_check_constraints.get() {
+        if asked != self.pragmas.ignore_check_constraints() {
             self.forget_compiled_statements();
         }
-        self.pragmas.ignore_check_constraints.set(asked);
+        self.pragmas.set_ignore_check_constraints(asked);
         Ok(Outcome::empty())
     }
     /// Reads or sets `automatic_index`.
@@ -530,14 +571,14 @@ impl crate::ImportedDatabase {
         let Some(argument) = argument else {
             return Ok(named_integer(
                 "automatic_index",
-                i64::from(self.pragmas.automatic_index.get()),
+                i64::from(self.pragmas.automatic_index()),
             ));
         };
         let asked = argument_boolean(argument);
-        if asked != self.pragmas.automatic_index.get() {
+        if asked != self.pragmas.automatic_index() {
             self.forget_compiled_statements();
         }
-        self.pragmas.automatic_index.set(asked);
+        self.pragmas.set_automatic_index(asked);
         // The planner reads the lever, not the field: a plan carries the levers
         // it was built under, so the two have to move together.
         self.pragmas.set_automatic_index(asked);
@@ -562,7 +603,7 @@ impl crate::ImportedDatabase {
             // refuses with it off.
             return Ok(named_integer("writable_schema", 0));
         };
-        self.pragmas.writable_schema.set(argument_boolean(argument));
+        self.pragmas.set_writable_schema(argument_boolean(argument));
         Ok(Outcome::empty())
     }
     /// Reads or sets whether this connection may write.
@@ -579,10 +620,10 @@ impl crate::ImportedDatabase {
         let Some(argument) = argument else {
             return Ok(named_integer(
                 "query_only",
-                i64::from(self.pragmas.query_only.get()),
+                i64::from(self.pragmas.query_only()),
             ));
         };
-        self.pragmas.query_only.set(argument_boolean(argument));
+        self.pragmas.set_query_only(argument_boolean(argument));
         Ok(Outcome::empty())
     }
     /// Reads or sets whether a trigger's own writes fire triggers.
@@ -600,14 +641,14 @@ impl crate::ImportedDatabase {
         let Some(argument) = argument else {
             return Ok(named_integer(
                 "recursive_triggers",
-                i64::from(self.pragmas.recursive_triggers.get()),
+                i64::from(self.pragmas.recursive_triggers()),
             ));
         };
         let asked = argument_boolean(argument);
-        if asked != self.pragmas.recursive_triggers.get() {
+        if asked != self.pragmas.recursive_triggers() {
             self.forget_compiled_statements();
         }
-        self.pragmas.recursive_triggers.set(asked);
+        self.pragmas.set_recursive_triggers(asked);
         Ok(Outcome::empty())
     }
     /// Reads or sets where temporary tables live.
@@ -624,10 +665,10 @@ impl crate::ImportedDatabase {
         argument: Option<&PragmaArgument>,
     ) -> DbResult<Outcome> {
         let Some(argument) = argument else {
-            return Ok(named_integer("temp_store", self.pragmas.temp_store.get()));
+            return Ok(named_integer("temp_store", self.pragmas.temp_store()));
         };
         let text = argument_text(argument).trim().to_ascii_lowercase();
-        self.pragmas.temp_store.set(match text.as_str() {
+        self.pragmas.set_temp_store(match text.as_str() {
             "0" | "default" => 0,
             "2" | "memory" => 2,
             other => {

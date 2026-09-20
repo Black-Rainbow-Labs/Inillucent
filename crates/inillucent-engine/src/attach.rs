@@ -174,12 +174,18 @@ impl ImportedDatabase {
         // is stale and a later `main` open of it would replay old pages back
         // over the newer ones this session wrote.
         inillucent_pool::journal::replay_hot_journal(vfs.as_ref(), &path)?;
+        let doubtful = self.doubt_for(&path)?;
+        let in_doubt = !doubtful.is_empty();
         let OpenedFile {
             database,
             wal,
             catalog_tree,
+            // An attachment's own recovery is reported by the statement that
+            // attached it rather than kept, because `PRAGMA` and the result
+            // envelope both describe the connection's main file.
+            recovery: _,
             highest_txn,
-        } = open_file(&vfs, &path, self.storage.frames, &self.doubt_for(&path)?)?;
+        } = open_file(&vfs, &path, self.storage.frames, &doubtful)?;
         // **This attachment gets its own rollback journal, matching `main`.**
         // `Pool::checkpoint` writes an attached file's pages in place exactly
         // as it does `main`'s, so without this a checkpoint interrupted on an
@@ -189,7 +195,7 @@ impl ImportedDatabase {
         // - but the page size is this file's own, read off the file it just
         // opened, because an attached file can have been created at a
         // different page size than this connection's default.
-        let journal = super::journal_for(self.pragmas.journal_mode.get()).map(|protection| {
+        let journal = super::journal_for(self.pragmas.journal_mode()).map(|protection| {
             inillucent_pool::journal::Journal::new(
                 Arc::clone(&vfs),
                 &path,
@@ -260,6 +266,7 @@ impl ImportedDatabase {
             vfs,
             database,
             wal,
+            in_doubt,
             entries,
             next_root: highest_identifier.saturating_add(1).max(FIRST_CREATED_ROOT),
             handles,
@@ -292,7 +299,7 @@ impl ImportedDatabase {
                 String::from_utf8_lossy(name)
             )));
         };
-        if self.writing.batch.get().is_some() {
+        if self.writing.batch().is_some() {
             return Err(refusal("cannot DETACH database within transaction"));
         }
         let Some(nth) = at.checked_sub(FIRST_ATTACHED) else {

@@ -235,8 +235,18 @@ impl crate::ImportedDatabase {
             return Vec::new();
         };
         let authorizer = inillucent_sql::bind::AllowAll;
+        // **The body is read as what it is: schema (task-1972).** A view over a
+        // registered function reports the columns it would produce only if the
+        // binder can resolve the name, which needs the connection's
+        // registrations; and a view naming a function a schema may not name
+        // reports no columns, which is the same answer selecting from it gives.
+        let externals = self.external_functions();
         let mut binder =
-            inillucent_sql::bind::Binder::new(&self.schema.catalog, &body.ast, &authorizer);
+            inillucent_sql::bind::Binder::new(&self.schema.catalog, &body.ast, &authorizer)
+                .with_functions(&externals)
+                .with_collations(&self.session_state.collations)
+                .with_trusted_schema(self.session_state.registry.policy().trusted_schema)
+                .in_schema();
         let Ok(bound) = binder.bind_select(body.select) else {
             return Vec::new();
         };
@@ -301,15 +311,23 @@ impl crate::ImportedDatabase {
             .enumerate()
             .map(|(seq, index)| {
                 let automatic = index.name.starts_with(b"sqlite_autoindex_");
+                // **`v` for an index a module owns, which SQLite has no value
+                // for because it has no such index (task-1979, R19).** It used
+                // to report `c`, the value for an index a `CREATE INDEX`
+                // statement made, and nothing else distinguished the two - so
+                // `inillucent indexes`, which reads `sqlite_master` and finds a
+                // vector index recorded there as a virtual table, had no second
+                // place to look. SQLite's three values keep their meanings.
+                let origin = match index.origin {
+                    inillucent_sql::catalog_view::IndexOrigin::Module => b"v".to_vec(),
+                    _ if automatic => b"pk".to_vec(),
+                    _ => b"c".to_vec(),
+                };
                 vec![
                     OwnedDatum::Int(seq as i64),
                     OwnedDatum::Text(index.name.clone()),
                     OwnedDatum::Int(i64::from(index.unique)),
-                    OwnedDatum::Text(if automatic {
-                        b"pk".to_vec()
-                    } else {
-                        b"c".to_vec()
-                    }),
+                    OwnedDatum::Text(origin),
                     // **The `partial` column, which was a hard zero while a
                     // partial index could not be created.** It can now, and an
                     // application asks this column precisely to find out

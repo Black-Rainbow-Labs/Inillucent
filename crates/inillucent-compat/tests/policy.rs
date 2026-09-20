@@ -107,7 +107,7 @@ const UNSAFE_CRATES: [&str; 1] = ["inillucent-driver-capi"];
 // are FFI. Each call installs a handler and reads nothing back; each handler
 // stores `true` into an already-allocated `AtomicBool` and returns, which is
 // the whole of what a handler is allowed to do.
-const UNSAFE_ALLOWED: [&str; 14] = [
+const UNSAFE_ALLOWED: [&str; 15] = [
     "crates/inillucent-cli/src/interrupt.rs",
     // The allocator's own concurrency suite, added in task-1932 (H9). It
     // allocates on one thread and frees on another through `GlobalAlloc`, which
@@ -133,6 +133,15 @@ const UNSAFE_ALLOWED: [&str; 14] = [
     "crates/inillucent-remote/src/tls/windows.rs",
     "crates/inillucent-vfs/src/os/windows.rs",
     "crates/inillucent-vfs/src/os/unix.rs",
+    // The local time zone, added in task-1981 and admitted here by task-1987,
+    // which found it refused. It is the same operating-system boundary the two
+    // files above stand on and it is reached the same way: `localtime_r` on
+    // Unix and `SystemTimeToTzSpecificLocalTime` on Windows, with a zeroed
+    // output structure per call. The offset between local time and UTC is not
+    // something this workspace can compute - it changes at a daylight saving
+    // boundary and it has changed by legislation - so there is no safe route
+    // to the answer to prefer. Every call site carries its own SAFETY note.
+    "crates/inillucent-vfs/src/zone.rs",
     "crates/inillucent-compat/src/bin/sqlperf.rs",
     "crates/inillucent-compat/src/bin/planperf.rs",
     // The same counting global allocator as the two profiling binaries above:
@@ -368,6 +377,141 @@ fn every_governed_crate_denies_undocumented_items() {
             );
         }
     }
+}
+
+/// Every `pub fn` in a crate whose root is `main.rs` carries a doc comment.
+///
+/// **`#![deny(missing_docs)]` compiles in a binary crate and reaches nothing
+/// in it (task-1973).** The lint fires on items that are publicly reachable
+/// from the crate root, and a binary's modules are declared `mod arm;` rather
+/// than `pub mod arm;` - so nothing inside them is reachable from outside and
+/// the lint has no surface to check. Measured: with the attribute on
+/// `crates/inillucent-bench/src/main.rs` and twenty-seven undocumented
+/// `pub fn` in the crate, the compiler reported **zero** missing-docs errors.
+/// Changing one `mod metrics;` to `pub mod metrics;` made it report two
+/// immediately, which is the proof that the attribute is live and its reach is
+/// the problem.
+///
+/// So `docs/repository.md` says 29 of the 29 crates deny `missing_docs`, and in
+/// the twenty-ninth this test is what the sentence is true because of. The
+/// attribute stays on `main.rs`: it holds the day a module becomes `pub`, and
+/// `every_governed_crate_denies_undocumented_items` above reads it.
+///
+/// A doc comment is `///` on the line above the signature, past any attribute
+/// lines, which is the same rule the task-1969 review counted by. Anything
+/// inside a `#[cfg(test)]` module is skipped, for the reason the other checks
+/// here skip it: a test function's name is its description.
+#[test]
+fn every_public_function_in_a_binary_crate_is_documented() {
+    let root = workspace_root();
+    let mut undocumented: Vec<String> = Vec::new();
+    let mut read = 0usize;
+    let mut crates = 0usize;
+    for group in ["crates", "drivers"] {
+        let Ok(entries) = std::fs::read_dir(root.join(group)) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect();
+        paths.sort();
+        for path in paths {
+            // A crate with a library is one the lint already covers.
+            if path.join("src/lib.rs").is_file() || !path.join("src/main.rs").is_file() {
+                continue;
+            }
+            crates = crates.saturating_add(1);
+            for file in rust_files(&path.join("src")) {
+                let Ok(text) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                read = read.saturating_add(1);
+                let named = relative(&root, &file);
+                undocumented.extend(
+                    undocumented_public_functions(&text)
+                        .into_iter()
+                        .map(|(at, name)| format!("{named}:{at} {name}")),
+                );
+            }
+        }
+    }
+    assert!(
+        crates >= 1,
+        "found no crate whose root is `main.rs`, which means this is looking in the wrong place \
+         rather than that the workspace has no binary crate"
+    );
+    assert!(
+        read >= 15,
+        "read {read} source files across {crates} binary crate(s), which is too few to be the \
+         whole of one"
+    );
+    assert!(
+        undocumented.is_empty(),
+        "these public functions have no doc comment:\n  {}\n\
+         `#![deny(missing_docs)]` does not reach them: a binary crate's modules are private, so \
+         nothing in them is publicly reachable and the lint has no surface to check. This test is \
+         that lint's reach, and `docs/repository.md`'s \"29 of the 29 crates deny\" is true \
+         because of it.",
+        undocumented.join("\n  ")
+    );
+}
+
+/// Returns every `pub fn` in a file with no doc comment above it.
+///
+/// The line above the signature, past any attribute lines, has to start with
+/// `///`. A `#[cfg(test)]` module is skipped whole: it ends at the first line
+/// that is exactly the closing brace at the attribute's own indent, which is
+/// how [`function_lengths`] finds the end of a body too.
+///
+/// @param text - the file's contents
+fn undocumented_public_functions(text: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut found = Vec::new();
+    let mut closing: Option<String> = None;
+    for (at, line) in lines.iter().enumerate() {
+        if let Some(brace) = &closing {
+            if *line == *brace {
+                closing = None;
+            }
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("#[cfg(test)]") {
+            let indent = line.len().saturating_sub(trimmed.len());
+            closing = Some(format!("{}}}", " ".repeat(indent)));
+            continue;
+        }
+        if !trimmed.starts_with("pub ") {
+            continue;
+        }
+        let Some(name) = opens_a_function(trimmed) else {
+            continue;
+        };
+        if declaration(&lines, at) {
+            continue;
+        }
+        // Back past the attributes, to whatever is above the signature.
+        let mut above = at;
+        while above > 0 {
+            let previous = lines
+                .get(above.saturating_sub(1))
+                .unwrap_or(&"")
+                .trim_start();
+            if previous.starts_with("#[") {
+                above = above.saturating_sub(1);
+                continue;
+            }
+            break;
+        }
+        let documented = above > 0
+            && lines
+                .get(above.saturating_sub(1))
+                .is_some_and(|previous| previous.trim_start().starts_with("///"));
+        if !documented {
+            found.push((at.saturating_add(1), name));
+        }
+    }
+    found
 }
 
 /// Returns where a crate's manifest lives.
@@ -959,7 +1103,14 @@ fn no_new_crate_reaches_into_the_retired_engine() {
 // below already fails loudly with "is not there any more; remove its row"
 // for exactly this reason - removing them here is answering that failure
 // before it happens rather than after.
-const CEILINGS: [(&str, usize); 11] = [
+const CEILINGS: [(&str, usize); 14] = [
+    // **The facade's own size, which had no ratchet (task-1979, Q2).** It is
+    // the harness that runs every assertion against `inillucent::{Database,
+    // Connection, Value}` rather than against `inillucent-engine`, so it grows
+    // whenever a suite is pointed at the facade - 39 lines when task-1962
+    // measured it, 528 now. A file that grows a hundred lines a ticket with
+    // nothing watching is the shape every module on this list started as.
+    ("crates/inillucent-compat/src/facade.rs", 700),
     // Added at its post-split size in task-1946 (M12). It was 2,728 lines
     // holding the frame table, eviction, the journal's sync gating and the
     // swip logic together; the last three are child modules now.
@@ -1087,7 +1238,47 @@ const CEILINGS: [(&str, usize); 11] = [
     // `plan/pattern.rs` and `plan/seek_union.rs` were already reaching
     // back into `plan.rs` for.
     ("crates/inillucent-sql/src/plan.rs", 2_851),
-    ("crates/inillucent-bench/src/synth.rs", 2_600),
+    // 2,600 until task-1970's `cargo fmt --all` reflowed this crate, which took the file to 2,799
+    // without changing what it does. Measured at the character level rather than assumed: with all
+    // whitespace stripped, the only differences between `ef4b630` and the formatted file are 13
+    // added commas and rebalanced braces, and every identifier removed reappears added - rustfmt
+    // reordering `use` statements. The ratchet's own rule is that the numbers only go down, so this
+    // one is raised deliberately and said out loud (task-1966).
+    // **Lowered to 2,662 in task-1973.** Its 3,214 lines were 415 past the
+    // 2,799 recorded here, from the doc comments the crate now carries and from
+    // splitting `build`, `build_source`, `check` and `embed` - and the
+    // ratchet's rule is that a module comes down by an extraction rather than
+    // up by a raised number. Two halves came out whole, each answering a
+    // question of its own and each reached from one place: `synth/check.rs`,
+    // which is the whole of what `synth-check` does, and `synth/postgres.rs`,
+    // which is the only part of the module that talks to a database.
+    ("crates/inillucent-bench/src/synth.rs", 2_662),
+    // **Its first row, added in task-1973 (the task-1969 part six review, 7.2).**
+    // It is the second largest file in the workspace after
+    // `inillucent-sql/src/bind.rs` and it has never had a ceiling, so every
+    // addition to it since the crate was written was invisible to this test.
+    // 3,048 when the review measured it, 3,430 by the time task-1973 started
+    // and 3,815 after splitting `run` into the ten functions above it - the
+    // structs and the doc comments a split needs are lines the file did not
+    // have. Recorded at its post-split size, which is what `pool.rs` above was
+    // recorded at for the same reason. **Splitting the file itself is not this
+    // ticket**: the review asked for the row.
+    //
+    // **Lowered to 3,094 in task-1977, which is the ticket that split it.**
+    // `type LaneScores` through `print_summary` was one contiguous run of 733
+    // lines answering one question - turn the collected scores into the card -
+    // and it is `gradeembed/card.rs` now. Nothing in there reads a cache,
+    // embeds a query or times a model, which is the line the split is on. The
+    // test module stayed where it is: its fixtures build a whole grading run on
+    // disk and are shared by the tests of both halves, so splitting it would
+    // mean two copies of them or a `#[cfg(test)]` module reaching into a
+    // sibling, and either is a worse thing to keep in step than one test module
+    // that imports the card by name.
+    ("crates/inillucent-bench/src/gradeembed.rs", 3_094),
+    // Its own row from the day it was split out of `gradeembed.rs`
+    // (task-1977), so it cannot do what `gradeembed.rs` did and grow through
+    // four tickets with nothing watching.
+    ("crates/inillucent-bench/src/gradeembed/card.rs", 766),
 ];
 
 /// No module grows past the size it is recorded at, and the record only comes
@@ -1144,39 +1335,62 @@ fn no_module_grows_past_the_size_it_is_recorded_at() {
     );
 }
 
-/// H10 (task-1920): every skip site ends its message with the one marker.
+/// H10 (task-1920, task-1969): every skip site goes through the one helper.
 ///
 /// **A skip nobody can see is a suite that reports green having asserted
 /// nothing, which is exactly what `--strict` exists to make visible.** Before
-/// this there were three phrasings and `testrun`'s classifier held a list of
-/// six substrings trying to catch them. Two of the three matched none of the
+/// task-1932 there were three phrasings and `testrun`'s classifier held a list
+/// of six substrings trying to catch them. Two of the three matched none of the
 /// six: `crates/inillucent-remote/tests/transport.rs` printed `...; case
 /// skipped` and the ONNX suites printed `skipping: ...`. The TLS one mattered
 /// most, because that binary runs other tests too - so it was invisible to
 /// `--strict` by both routes at once, and a CI image without Python's `ssl`
 /// module passed the TLS verification suite without running any of it.
 ///
-/// The rule this checks is the one `tests/inillucent-testing-tdd.md` §9 states:
-/// a message that precedes an early return ends with `; skipping`. It is a grep
-/// rather than a type because a skip is a `return`, and no type can be put on
-/// the absence of work.
+/// **The rule got stricter in task-1969 (4.6), and this check moved with it.**
+/// It used to read the *message* of an `eprintln!` that preceded an early
+/// return and demand the `; skipping` marker, which let a print that carried
+/// the marker pass while doing only half the job: it printed the phrase, and
+/// under `INILLUCENT_STRICT` it did not panic, so the case returned and
+/// `--strict` counted it as a run. Twenty-four sites in nine files were in that
+/// state, including the nine in `differential.rs` that shadowed the library
+/// helper with a local one of the same name.
+///
+/// So the marker is no longer a thing a print may carry. It is what
+/// `inillucent_base::testing::skipping` writes, and the check is that nothing
+/// else writes it: a print followed by an early return is a skip that did not
+/// go through the helper, whatever it says. The floor below counts helper call
+/// sites rather than print sites, because the old floor counted the thing the
+/// fix removes and would have failed the moment the fix was complete - which is
+/// how this check first reported "no skip site was found at all".
 #[test]
-fn every_skip_site_carries_the_one_marker() {
+fn every_skip_site_goes_through_the_one_helper() {
     let root = workspace_root();
-    let mut wrong: Vec<String> = Vec::new();
-    let mut found = 0usize;
+    let mut printed: Vec<String> = Vec::new();
+    let mut through_the_helper = 0usize;
     for file in rust_sources(&root) {
         let Ok(text) = std::fs::read_to_string(&file) else {
             continue;
         };
         let lines: Vec<&str> = text.lines().collect();
         for (at, line) in lines.iter().enumerate() {
-            let Some(message) = quoted_after(line, "eprintln!(") else {
+            // The needle is built rather than written, so this file does not
+            // itself carry the text it forbids - the same reason
+            // `PRIVATE_REFERENCES` in `tools/doc-facts/check.mjs` is the one
+            // place its patterns are allowed to live.
+            let a_definition = format!("fn {}", "skipping(");
+            if line.contains("skipping(") && !line.contains(&a_definition) {
+                through_the_helper = through_the_helper.saturating_add(1);
+            }
+            let message = quoted_after(line, "eprintln!(")
+                .or_else(|| quoted_after(line, "println!("))
+                .unwrap_or_default();
+            if !message.contains("skipping") {
                 continue;
-            };
+            }
             // A skip is an announcement followed by an early return. Anything
-            // else an `eprintln!` says is progress or a warning, and neither is
-            // a claim that a suite ran.
+            // else a print says is progress or a warning, and neither is a
+            // claim that a suite ran.
             let follows = lines
                 .get(at..at.saturating_add(4))
                 .unwrap_or_default()
@@ -1189,27 +1403,28 @@ fn every_skip_site_carries_the_one_marker() {
             if !returns {
                 continue;
             }
-            found = found.saturating_add(1);
-            if !message.contains("; skipping") {
-                wrong.push(format!(
-                    "{}:{}: {message}",
-                    file.strip_prefix(&root).unwrap_or(&file).display(),
-                    at.saturating_add(1)
-                ));
-            }
+            printed.push(format!(
+                "{}:{}: {message}",
+                file.strip_prefix(&root).unwrap_or(&file).display(),
+                at.saturating_add(1)
+            ));
         }
     }
     assert!(
-        found > 0,
-        "no skip site was found at all, which means this check is looking in \
-         the wrong place rather than that every suite runs"
+        through_the_helper >= 40,
+        "found {through_the_helper} calls to the skip helper, which means this check is \
+         looking in the wrong place rather than that the workspace barely skips"
     );
     assert!(
-        wrong.is_empty(),
-        "these skip messages do not end with `; skipping`, so `--strict` cannot \
-         see them:\n{}\n`inillucent-testrun` matches that one phrase, and \
-         `tests/inillucent-testing-tdd.md` §9 asks for it.",
-        wrong.join("\n")
+        printed.is_empty(),
+        "these skips print their own sentence instead of calling \
+         `inillucent_base::testing::skipping`:\n{}\n\
+         A print carries the marker `inillucent-testrun` matches and does not panic under \
+         `INILLUCENT_STRICT`, so the case returns and the run counts it. The helper does \
+         both. A production crate that cannot depend on this harness reaches it from its \
+         own `[dev-dependencies]`, which is the edge `docs/invariants/layering.toml` \
+         records for `inillucent-core`.",
+        printed.join("\n")
     );
 }
 
@@ -1560,19 +1775,107 @@ fn announces(block: &str) -> bool {
 fn announces_by_saying_so(block: &str) -> bool {
     code_of(block).any(|code| {
         code.contains("skipping(")
-            || code.contains("announce_skip")
+            // **Qualified, because the bare name was a hole (task-1969,
+            // 4.2).** `crates/inillucent-compat/tests/differential.rs` - the
+            // file the differential tier is named after - defined its own
+            // `announce_skip` that printed neither the marker nor the panic,
+            // and this check waved through all nine of its call sites because
+            // the *name* matched the library helper written for. Nine of that
+            // file's ten tests passed on a fresh clone having compared nothing
+            // to SQLite. Only the library function announces; a local one of
+            // the same name is now a defect by itself, which
+            // `no_test_file_defines_its_own_skip_helper` below refuses.
+            || code.contains("differential::announce_skip")
+            || code.contains("testing::skipping")
             || code.contains("; skipping")
-            // **`differential::compare` announces for its caller.** It has one
-            // way to return zero - `start_oracle` answering `None`, after which
-            // it calls `announce_skip()` - so `if compared == 0 { return; }` in
-            // the caller is a skip that has already been announced, by the only
-            // code that knows the oracle was the thing missing. Naming the
-            // function here rather than teaching the scan to follow calls across
-            // crates keeps the rule readable; the cost is that a second way for
-            // it to return zero would have to be added to its own doc comment.
-            || code.contains("compare(")
-            || code.contains("compare_queries(")
+            // A helper that announces for its caller - see [`ANNOUNCERS`].
+            || ANNOUNCERS
+                .iter()
+                .any(|(name, _)| code.contains(&format!("{name}(")))
     })
+}
+
+/// The helpers that announce a skip on behalf of whoever called them, and the
+/// file each is defined in.
+///
+/// **Naming them here rather than teaching the scan to follow calls across
+/// crates.** Each of these has one way to answer "nothing to do" and announces
+/// before it does: `differential::compare` returns zero only when
+/// `start_oracle` answered `None`, after which it has already called
+/// `announce_skip`; `cliproc::program` returns `None` only when the build did
+/// not produce the binary, after which it has already called `skipping`. So
+/// `let Some(binary) = program("inillucent") else { return; }` in a caller is a
+/// skip that was announced by the only code that knew what was missing.
+///
+/// The cost of naming them is that the list can go stale - a helper could stop
+/// announcing and forty call sites would silently become silent skips - and
+/// [`every_helper_this_check_trusts_actually_announces`] is what pays it.
+///
+/// **`program` joined the list in task-1970.** Forty call sites across
+/// `cli_commands.rs`, `mcp_wire.rs`, `dot_commands.rs`, `process_crash.rs` and
+/// `rag_verify.rs` were reported by this check as silent skips, and they are
+/// not: they go through a helper in `src/` rather than one in the same test
+/// file, which `announcing_helpers` below can see and this list is for.
+const ANNOUNCERS: [(&str, &str); 3] = [
+    ("compare", "crates/inillucent-compat/src/differential.rs"),
+    (
+        "compare_queries",
+        "crates/inillucent-compat/src/differential.rs",
+    ),
+    ("program", "crates/inillucent-compat/src/cliproc.rs"),
+];
+
+/// Every helper [`ANNOUNCERS`] trusts to announce a skip does announce one.
+///
+/// **A list of names is a claim, and this is the test that pays for it.**
+/// `announces_by_saying_so` accepts a call to any of them as an announcement,
+/// so a helper that stopped calling the skip helper would turn every one of its
+/// call sites into a silent skip at once - forty of them, in the case of
+/// `program` - and `every_early_return_in_a_test_says_why` would go on passing.
+/// That is the exact shape of the defect task-1969 4.2 found, one level up: a
+/// check that matched a helper by name.
+#[test]
+fn every_helper_this_check_trusts_actually_announces() {
+    let root = workspace_root();
+    let mut wrong: Vec<String> = Vec::new();
+    for (name, file) in ANNOUNCERS {
+        let path = root.join(file);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            wrong.push(format!(
+                "{file} is not there, and {name} is trusted to be in it"
+            ));
+            continue;
+        };
+        let Some(at) = text.find(&format!("pub fn {name}(")) else {
+            wrong.push(format!("{file} does not define `{name}`"));
+            continue;
+        };
+        // The body runs to the next closing brace at the file's own left
+        // margin, which is where a free function ends.
+        let rest = text.get(at..).unwrap_or_default();
+        let body = match rest.find("\n}\n") {
+            Some(end) => rest.get(..end).unwrap_or_default(),
+            None => rest,
+        };
+        let announces = body.contains("skipping(")
+            || body.contains("announce_skip(")
+            || ANNOUNCERS
+                .iter()
+                .any(|(other, _)| *other != name && body.contains(&format!("{other}(")));
+        if !announces {
+            wrong.push(format!(
+                "{file}::{name} is trusted to announce a skip for its callers and its body \
+                 calls no skip helper"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{}\n\
+         Every name in ANNOUNCERS is accepted as an announcement wherever it is called, so a \
+         helper that stops announcing turns every one of its call sites into a silent skip.",
+        wrong.join("\n")
+    );
 }
 
 /// Returns each line of some source with its trailing comment removed.
@@ -2073,70 +2376,6 @@ fn mentions_of(text: &str, name: &str) -> usize {
     count
 }
 
-/// Every fuzz target is in the scheduled workflow's matrix.
-///
-/// **A target nobody runs is a file, not a test (task-1932, M11).** `fuzz/`
-/// held twelve targets and no workflow mentioned it, so all twelve had run
-/// nowhere since they were written. `.github/workflows/fuzz.yml` runs them on a
-/// schedule, and its matrix is a hand-written list - which is exactly the kind
-/// of list that goes stale the first time somebody adds a target. This compares
-/// it against `fuzz/Cargo.toml`'s `[[bin]]` sections, in both directions: a
-/// target with no matrix entry would run nowhere again, and a matrix entry with
-/// no target would fail the job every night for a target that does not exist.
-#[test]
-fn every_fuzz_target_is_in_the_scheduled_workflow() {
-    let root = workspace_root();
-    let manifest = std::fs::read_to_string(root.join("fuzz/Cargo.toml"))
-        .expect("the fuzz manifest is readable");
-    let declared: Vec<String> = manifest
-        .lines()
-        .map(str::trim)
-        .filter_map(|line| line.strip_prefix("name = "))
-        .map(|name| name.trim().trim_matches('"').to_string())
-        // The package's own `name = "inillucent-fuzz"` is not a target.
-        .filter(|name| name != "inillucent-fuzz")
-        .collect();
-    assert!(
-        declared.len() >= 12,
-        "only {} fuzz targets were found in the manifest, so this test is not reading it right",
-        declared.len()
-    );
-
-    let workflow = std::fs::read_to_string(root.join(".github/workflows/fuzz.yml"))
-        .expect("the fuzz workflow is readable");
-    let scheduled: Vec<String> = workflow
-        .lines()
-        .map(str::trim)
-        .filter_map(|line| line.strip_prefix("- "))
-        .map(str::to_string)
-        // The matrix entries are bare words; every other `- ` line in the file
-        // is a step, a `uses:` or the cron entry, and each of those holds a
-        // character no target name can.
-        .filter(|entry| {
-            entry
-                .chars()
-                .all(|letter| letter.is_ascii_lowercase() || letter == '_')
-        })
-        .collect();
-
-    let unscheduled: Vec<&String> = declared
-        .iter()
-        .filter(|name| !scheduled.contains(name))
-        .collect();
-    assert!(
-        unscheduled.is_empty(),
-        "these fuzz targets are in fuzz/Cargo.toml and in no workflow, so nothing runs them:          {unscheduled:?}"
-    );
-    let missing: Vec<&String> = scheduled
-        .iter()
-        .filter(|name| !declared.contains(name))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "the fuzz workflow schedules targets that fuzz/Cargo.toml does not declare: {missing:?}"
-    );
-}
-
 /// How long each function over 150 lines is allowed to be.
 ///
 /// **The function ratchet, beside the module one (task-1932, TDD section 7).**
@@ -2154,33 +2393,41 @@ fn every_fuzz_target_is_in_the_scheduled_workflow() {
 /// A function that falls under 150 lines loses its row rather than keeping a
 /// lowered one: the list is what is over the threshold, and a row on a short
 /// function is a hole the width of its old number. Seven left in task-1962 A8.
-const FUNCTION_CEILINGS: [(&str, &str, usize); 59] = [
-    // 531 before task-1946 H6 moved the card's four path rows into
-    // `runs::note_inputs` and `runs::note_run_files`.
-    ("crates/inillucent-bench/src/gradeembed.rs", "run", 527),
+const FUNCTION_CEILINGS: [(&str, &str, usize); 52] = [
+    // `gradeembed.rs::run`, `main.rs::main`, `scenarios.rs::grade`,
+    // `report.rs::render`, `synth.rs::build`, `synth.rs::build_source`,
+    // `synth.rs::check` and `synth.rs::embed` came off this list in task-1973,
+    // which split all eight. They are 94, 127, 86, 14, 8, 25, 20 and 77 lines
+    // now, and a row for a function that is not over 150 is a row nobody can
+    // act on: the unrecorded bar below catches it if it ever grows back, and
+    // this list is meant to be exactly what was over 150 when it was written.
     (
         "crates/inillucent-engine/src/engine/open.rs",
         "open_on",
         160,
     ),
-    ("crates/inillucent-bench/src/main.rs", "main", 488),
-    ("crates/inillucent-compat/src/perf.rs", "plan_for", 450),
-    ("crates/inillucent-bench/src/scenarios.rs", "grade", 445),
-    ("crates/inillucent-compat/src/bin/fullgate.rs", "run", 389),
-    ("crates/inillucent-compat/src/bin/readgate.rs", "run", 370),
-    ("crates/inillucent-compat/src/bin/writegate.rs", "run", 318),
+    // Not on this list before task-1970's `cargo fmt --all`: it was 148 lines and the limit for an
+    // unrecorded function is 150. Reflow took it to 160, adding 4 commas with its identifiers
+    // unchanged character for character. Recorded rather than split, because the code did not
+    // change (task-1966).
+    (
+        "crates/inillucent-bench/src/scenarios.rs",
+        "filtered_vector",
+        160,
+    ),
+    ("crates/inillucent-compat/src/bin/fullgate.rs", "run", 263),
+    ("crates/inillucent-compat/src/bin/readgate.rs", "run", 280),
+    ("crates/inillucent-compat/src/bin/writegate.rs", "run", 226),
     ("crates/inillucent-sql/src/bind.rs", "bind_expr", 303),
     ("crates/inillucent-engine/src/ddl.rs", "run_directive", 273),
     ("crates/inillucent-tree/src/paged/skip.rs", "skip_scan", 249),
     ("crates/inillucent-sql/src/bind.rs", "bind_call_with", 248),
-    ("crates/inillucent-bench/src/synth.rs", "build_source", 243),
     ("crates/inillucent-exec/src/expr/tree.rs", "compile", 242),
     (
         "crates/inillucent-tree/src/leaf/encode.rs",
         "encode_rows_with",
         239,
     ),
-    ("crates/inillucent-bench/src/report.rs", "render", 238),
     (
         "crates/inillucent-compat/src/bin/readperf.rs",
         "measure",
@@ -2218,7 +2465,6 @@ const FUNCTION_CEILINGS: [(&str, &str, usize); 59] = [
         "update_at_cached",
         219,
     ),
-    ("crates/inillucent-bench/src/synth.rs", "check", 214),
     ("crates/inillucent-model/tests/campaign.rs", "segment", 213),
     // The group name in front of the fields it reads, from task-1962 A1
     // step 2; the formatter then wraps what it used to fit on one line.
@@ -2292,7 +2538,6 @@ const FUNCTION_CEILINGS: [(&str, &str, usize); 59] = [
     ("crates/inillucent-sql/src/plan.rs", "index_candidate", 167),
     ("crates/inillucent-compat/src/bin/testrun.rs", "report", 164),
     ("crates/inillucent-compat/src/bin/planperf.rs", "run", 163),
-    ("crates/inillucent-bench/src/synth.rs", "build", 163),
     (
         "crates/inillucent-engine/src/vtab.rs",
         "create_virtual_table",
@@ -2515,4 +2760,538 @@ fn no_function_grows_past_the_length_it_is_recorded_at() {
         joined.join("\n")
     );
     assert!(gone.is_empty(), "{}", gone.join("\n"));
+}
+
+/// No test file may define its own skip helper.
+///
+/// **The defect this refuses shipped and hid nine tests (task-1969, 4.2).**
+/// `crates/inillucent-compat/tests/differential.rs` defined
+///
+/// a private helper of its own named `announce_skip`, whose whole body was an
+/// `eprintln!` of the sentence the library helper prints - and which therefore
+/// printed neither the `; skipping` marker nor the panic.
+///
+/// It shadowed `inillucent_compat::differential::announce_skip` at nine call
+/// sites. Neither guard saw it. `every_skip_site_carries_the_one_marker` reads
+/// an `eprintln!` only when a `return;` follows within four lines, and here the
+/// `eprintln!` was a helper body followed by a closing brace.
+/// `every_early_return_in_a_test_says_why` accepted every call site because it
+/// matched the helper by name. `inillucent-testrun --strict` printed `ok`,
+/// because the output carried no `; skipping` and the tests that returned still
+/// counted as run. So the namesake of the differential tier compared nothing to
+/// SQLite on any machine without the oracle, and said it had.
+///
+/// The rule is stated on the definition rather than on the call, because a call
+/// to a local helper and a call to the library one are the same three words.
+/// There is exactly one `skipping` in this workspace -
+/// `inillucent_base::testing::skipping` - and exactly one `announce_skip` -
+/// `inillucent_compat::differential::announce_skip`, which calls it. Anything
+/// else with either name is a second implementation of a thing whose whole
+/// value is that there is one of it.
+#[test]
+fn no_test_file_defines_its_own_skip_helper() {
+    let root = workspace_root();
+    // The two definitions there are meant to be, by path rather than by name:
+    // naming them would let a third file take the same name and pass.
+    let allowed = [
+        "crates/inillucent-base/src/testing.rs",
+        "crates/inillucent-compat/src/differential.rs",
+    ];
+    let mut defined: Vec<String> = Vec::new();
+    let mut read = 0usize;
+    for file in rust_sources(&root) {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        read = read.saturating_add(1);
+        let relative = file
+            .strip_prefix(&root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if allowed.contains(&relative.as_str()) {
+            continue;
+        }
+        for (at, line) in text.lines().enumerate() {
+            let Some(name) = function_name(line) else {
+                continue;
+            };
+            if name == "skipping" || name == "announce_skip" {
+                // Matched on the parsed name rather than on the text, which is
+                // also what keeps the forbidden spelling out of this file.
+                defined.push(format!("{relative}:{}", at.saturating_add(1)));
+            }
+        }
+    }
+    assert!(
+        read >= 300,
+        "read {read} source files, which means this is looking in the wrong place \
+         rather than that the workspace has no source"
+    );
+    assert!(
+        defined.is_empty(),
+        "these files define their own `skipping` or `announce_skip`:\n  {}\n\
+         There is one of each in the workspace - `inillucent_base::testing::skipping` \
+         and `inillucent_compat::differential::announce_skip` - and a local copy \
+         prints no marker and does not panic under `INILLUCENT_STRICT`, so the \
+         suite that calls it skips invisibly. A production crate that cannot \
+         depend on this harness uses `inillucent_base::testing::skipping` from \
+         its own `[dev-dependencies]`.",
+        defined.join("\n  ")
+    );
+}
+
+/// The names the length cap lets through, and the ticket each is waiting on.
+///
+/// **A ratchet with no cap is how a criterion reading "no production function
+/// over 300 lines" was satisfied with eight functions over 300 (task-1969,
+/// 7.2).** `FUNCTION_CEILINGS` freezes a function at its current length and
+/// fails when it grows, which stops the tree getting worse and does nothing
+/// about what is already there: a new entry of any length is accepted, so a
+/// five-hundred-line function could be added tomorrow and the ratchet would
+/// record it.
+///
+/// So the list below is the whole of what is allowed to be over 300, every
+/// entry carries the ticket that removes it, and the test refuses anything
+/// else. An entry that is not on this list and not under 300 fails, and so
+/// does a *new* entry over 150 - which is the length the review counted at, so
+/// the recorded list is exactly what was over 150 when the ratchet was written.
+const OVER_THREE_HUNDRED: [(&str, &str, &str); 1] = [
+    // A15: an `Identifier` type and the `bind.rs` split. task-1962 re-measured
+    // that only 11 of the 114 byte-or-string identifier signatures are in this
+    // file, so A15 does not depend on the split; both are one ticket of their
+    // own, which section 6.4 of the task-1969 review designs.
+    ("crates/inillucent-sql/src/bind.rs", "bind_expr", "A15"),
+    // The three `inillucent-bench` rows that were here came off in task-1973,
+    // which split all three: `gradeembed.rs::run` is 94 lines, `main.rs::main`
+    // is 127 and `scenarios.rs::grade` is 86. `bind_expr` is the last function
+    // in the workspace over 300 lines.
+];
+
+/// No recorded ceiling is over 300 lines, and no new one is over 150.
+///
+/// The companion to [`no_function_grows_past_the_length_it_is_recorded_at`],
+/// which stops the list getting worse. This is what stops it staying bad:
+/// every entry over 300 is named in [`OVER_THREE_HUNDRED`] with the ticket that
+/// removes it, and the day a ticket lands its rows come out of both lists
+/// together.
+#[test]
+fn no_function_ceiling_is_over_three_hundred() {
+    let waiting: std::collections::BTreeMap<(&str, &str), &str> = OVER_THREE_HUNDRED
+        .iter()
+        .map(|(file, function, ticket)| ((*file, *function), *ticket))
+        .collect();
+
+    let mut unexcused: Vec<String> = Vec::new();
+    let mut stale: Vec<String> = Vec::new();
+    for (file, function, length) in FUNCTION_CEILINGS {
+        let excused = waiting.get(&(file, function));
+        if length > 300 && excused.is_none() {
+            unexcused.push(format!("{file}::{function} at {length}"));
+        }
+        if length <= 300 {
+            if let Some(ticket) = excused {
+                stale.push(format!(
+                    "{file}::{function} is {length} lines and is still listed as waiting on {ticket}"
+                ));
+            }
+        }
+    }
+    assert!(
+        unexcused.is_empty(),
+        "these recorded ceilings are over 300 lines and no ticket is named for them:\n  {}\n\
+         task-1961's seventh criterion is \"no production function over 300 lines\". Split one \
+         out, or add it to OVER_THREE_HUNDRED with the ticket that will.",
+        unexcused.join("\n  ")
+    );
+    assert!(
+        stale.is_empty(),
+        "these are under 300 and still listed as exceptions, so the list is describing a tree \
+         that has moved:\n  {}",
+        stale.join("\n  ")
+    );
+
+    // And the other half: a function recorded for the first time may not be
+    // over the length the review counted at. Without this the cap above is one
+    // ticket away from being wrong again.
+    let mut over: Vec<String> = Vec::new();
+    for (file, function, length) in FUNCTION_CEILINGS {
+        if length > LONGEST_NEW_FUNCTION
+            && length <= 300
+            && !waiting.contains_key(&(file, function))
+        {
+            over.push(format!("{file}::{function} at {length}"));
+        }
+    }
+    assert!(
+        over.len() <= RECORDED_OVER_THE_NEW_BAR,
+        "{} recorded ceilings are over {LONGEST_NEW_FUNCTION} lines, and {RECORDED_OVER_THE_NEW_BAR} \
+         were when this bar was written. A new function over {LONGEST_NEW_FUNCTION} lines does not \
+         get a row; it gets split.\n  {}",
+        over.len(),
+        over.join("\n  ")
+    );
+}
+
+/// How many recorded ceilings were between the new-function bar and 300 when
+/// this test was written.
+///
+/// A number rather than a list, because the list is `FUNCTION_CEILINGS` itself
+/// and a second copy of it would be a second thing to keep in step. What the
+/// count refuses is a *new* long function: the total may go down freely and may
+/// not go up.
+///
+/// 55 when this was written; 48 since task-1973 split seven `inillucent-bench`
+/// functions and took five of their rows out of this band.
+const RECORDED_OVER_THE_NEW_BAR: usize = 48;
+
+/// No function outside a test module takes more than eight parameters.
+///
+/// **There was no parameter check at all, which is how `synth_embed` keeps nine
+/// under an `#[allow]` (task-1969, 7.2).** task-1961's eighth criterion says no
+/// function takes more than eight parameters and that the ten which did now
+/// take structs; the ten do, and nothing stopped an eleventh. Fifty functions
+/// take seven or eight today - thirty-six take seven and fourteen take eight -
+/// so the bar is where the next one would cross it rather than where the tree
+/// already is.
+///
+/// Eight is also the bar `clippy.toml` sets, where
+/// `too-many-arguments-threshold = 8` carries the argument for it. Clippy
+/// lints above its threshold and counts the receiver, so it fires at nine
+/// arguments with the receiver among them, and this test fails at nine
+/// without it. They are the same bar, and
+/// `no_attribute_turns_off_the_parameter_lint` below is what stops an
+/// `#[allow]` from moving it for one function.
+///
+/// **The count was thirty-eight when this was written, and it was wrong.**
+/// `parameter_list` read `pub(crate) fn foo(` as a list whose one parameter was
+/// `crate`, so every `pub(crate) fn` and `pub(super) fn` in the workspace was
+/// counted as taking one. task-1977 fixed that and re-measured: forty-two of
+/// the functions that were invisible take five parameters or more.
+///
+/// The receiver does not count - `&self` is not an argument a caller passes -
+/// and neither does anything under `#[cfg(test)]`, because a test builder that
+/// takes ten values is a test fixture rather than an interface.
+#[test]
+fn no_function_takes_more_than_eight_parameters() {
+    // **Nothing is excused.** `synth_embed` was, in task-1970, because it took
+    // nine parameters under an `#[allow(clippy::too_many_arguments)]`; task-1973
+    // gave it a `SynthEmbedRequest` and the allow came off with the exemption.
+    // A new function that crosses the bar has no list to be added to.
+    let root = workspace_root();
+    let mut wide: Vec<String> = Vec::new();
+    let mut read = 0usize;
+    for file in rust_sources(&root) {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        read = read.saturating_add(1);
+        let relative = file
+            .strip_prefix(&root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        for (function, count) in parameter_counts(&text) {
+            if count <= 8 {
+                continue;
+            }
+            wide.push(format!("{relative}::{function} takes {count}"));
+        }
+    }
+    assert!(
+        read >= 300,
+        "read {read} source files, which means this is looking in the wrong place rather than \
+         that the workspace has no source"
+    );
+    assert!(
+        wide.is_empty(),
+        "these functions take more than eight parameters:\n  {}\n\
+         Group them into a struct, the way task-1961's A8 did for the ten that used to. A \
+         call with nine positional arguments is one nobody can read at the call site, and \
+         `#[allow(clippy::too_many_arguments)]` is not an answer - it is the warning being \
+         turned off.",
+        wide.join("\n  ")
+    );
+}
+
+/// No attribute in `crates/` or `drivers/` turns off `too_many_arguments`.
+///
+/// **Thirty-two of them were left behind by the refactors that fixed the
+/// functions they guarded (task-1977).** `clippy.toml` sets
+/// `too-many-arguments-threshold = 8` and clippy lints above its threshold, so
+/// an `#[allow]` only does something for a function taking nine arguments
+/// counting the receiver. The widest function carrying one took eight.
+/// `bench/src/tune.rs` carried one above `label_for(dials: &Dials<'_>)`, which
+/// takes one parameter, and `compat/src/bin/walperf.rs` and
+/// `compat/src/bin/writeperf.rs` carried one above `struct Timed<'a>` - not
+/// above a function at all - left there when task-1962 turned those argument
+/// lists into types, with the doc comment of the function each used to guard
+/// stranded above it.
+///
+/// **The check is for the attribute rather than for the word.** Criterion 28 of
+/// the task-1969 part six TDD asks for `grep -rn 'too_many_arguments' crates/
+/// drivers/` to return nothing, and six of that grep's hits are sentences
+/// explaining why an argument list became a struct. Deleting those would delete
+/// the argument, so no state of this tree can satisfy the criterion as it is
+/// written; what it is asking for is this.
+///
+/// An `#[expect]` is refused on the same terms as an `#[allow]`: both turn the
+/// lint off, and which one is written is a question about whether the warning
+/// is expected to come back rather than about the parameter list.
+#[test]
+fn no_attribute_turns_off_the_parameter_lint() {
+    let root = workspace_root();
+    let mut found: Vec<String> = Vec::new();
+    let mut read = 0usize;
+    for file in rust_sources(&root) {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        read = read.saturating_add(1);
+        let relative = file
+            .strip_prefix(&root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        for (at, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with("#[") || !trimmed.contains("too_many_arguments") {
+                continue;
+            }
+            found.push(format!("{relative}:{}", at.saturating_add(1)));
+        }
+    }
+    assert!(
+        read >= 300,
+        "read {read} source files, which means this is looking in the wrong place rather than \
+         that the workspace has no source"
+    );
+    assert!(
+        found.is_empty(),
+        "these attributes turn off `clippy::too_many_arguments`:\n  {}\n\
+         The threshold is set once, in `clippy.toml`, with the argument for where it is. A \
+         function that has grown past it takes a struct, the way task-1961's A8 did for the \
+         ten that used to; an attribute here moves the bar for one function and says nothing \
+         about why.",
+        found.join("\n  ")
+    );
+}
+
+/// Returns each function in a file and how many parameters it declares.
+///
+/// The receiver is not counted, and anything inside a `#[cfg(test)]` module is
+/// skipped: a test builder that takes ten values is a fixture rather than an
+/// interface, and holding it to an interface's bar would be asking the wrong
+/// question of the right rule.
+///
+/// The parameters are counted at the signature's own bracket depth, so a
+/// closure argument - `impl Fn(&str) -> bool` - is one parameter rather than
+/// two, and a generic bound with a comma in it is not two either.
+///
+/// @param text - the file's contents
+fn parameter_counts(text: &str) -> Vec<(String, usize)> {
+    let mut found = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut test_module_at: Option<usize> = None;
+    let mut depth = 0i32;
+    for (at, line) in lines.iter().enumerate() {
+        if line.trim_start().starts_with("#[cfg(test)]") {
+            test_module_at = Some(depth.max(0) as usize);
+        }
+        let opened = depth;
+        depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        if let Some(held) = test_module_at {
+            if depth <= held as i32 && opened > held as i32 {
+                test_module_at = None;
+            }
+            continue;
+        }
+        let Some(name) = function_name(line) else {
+            continue;
+        };
+        // The signature runs to the line whose brackets balance, which is the
+        // same rule `declaration` uses one test above.
+        let mut signature = String::new();
+        let mut brackets = 0i32;
+        for later in lines.iter().skip(at) {
+            signature.push_str(later);
+            brackets += later.matches('(').count() as i32 - later.matches(')').count() as i32;
+            if brackets == 0 && signature.contains('(') {
+                break;
+            }
+            signature.push(' ');
+        }
+        let Some(inside) = parameter_list(&signature) else {
+            continue;
+        };
+        found.push((name, count_parameters(&inside)));
+    }
+    found
+}
+
+/// Returns the text between a signature's parameter brackets.
+///
+/// **The bracket that closes the parameters, not the last one on the line.**
+/// This read `rfind(')')`, which for `fn f(a: u8) -> Option<(usize, T)>` is the
+/// bracket inside the *return* type - so the "parameters" it counted ran past
+/// the end of the list and `find_equality`, which takes eight, was reported as
+/// taking ten.
+///
+/// **And the bracket that opens them is not the first one either (task-1977).**
+/// This read `find('(')`, which for `pub(crate) fn create_index(` is the
+/// bracket inside `pub(crate)` - so the parameter list it returned was the text
+/// `crate`, and every `pub(crate) fn` and `pub(super) fn` in the workspace was
+/// counted as taking one parameter. Forty-two of them take five or more. None
+/// was over the bar when this was found, so the test had been passing for the
+/// wrong reason rather than hiding a failure, but a new `pub(crate) fn` taking
+/// twelve would have passed it too.
+///
+/// @param signature - the function's signature, brackets balanced
+fn parameter_list(signature: &str) -> Option<String> {
+    let open = parameter_bracket(signature)?;
+    let mut depth = 0i32;
+    for (at, character) in signature.char_indices().skip(open) {
+        match character {
+            '(' => depth = depth.saturating_add(1),
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return signature
+                        .get(open.saturating_add(1)..at)
+                        .map(str::to_string);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `parameter_counts` reads a `pub(crate) fn`'s real parameter list.
+///
+/// **The bug this holds shut made the whole check blind to two thirds of the
+/// engine (task-1977).** `parameter_list` took the signature's first `(`, which
+/// for `pub(crate) fn` is the bracket in the visibility, so the list it counted
+/// was the text `crate` and the function was recorded as taking one parameter.
+/// Every `pub(crate) fn` and `pub(super) fn` in `crates/` was counted that way.
+///
+/// The `pub(crate) fn` case is asserted at nine rather than at eight, because
+/// nine is the count that has to fail
+/// `no_function_takes_more_than_eight_parameters` and eight is the count that
+/// has to pass it - an assertion at one or the other alone would still hold if
+/// the bracket moved by one.
+#[test]
+fn parameter_counts_reads_past_a_visibility_bracket() {
+    let counts = parameter_counts(
+        "pub(crate) fn wide(a: u8, b: u8, c: u8, d: u8, e: u8, f: u8, g: u8, h: u8, i: u8) {}\n\
+         pub(super) fn narrow(&self, a: u8, b: u8) {}\n\
+         fn generic<F: Fn(u8) -> bool>(first: F, second: u8) {}\n\
+         pub fn plain(only: u8) {}\n",
+    );
+    assert_eq!(
+        counts,
+        vec![
+            ("wide".to_string(), 9),
+            ("narrow".to_string(), 2),
+            ("generic".to_string(), 2),
+            ("plain".to_string(), 1),
+        ],
+        "the parameter list is the one after the name, and the receiver is not in it"
+    );
+}
+
+/// Returns where a signature's parameter list opens.
+///
+/// The search starts after the `fn` keyword and skips the generic list, because
+/// both `pub(crate) fn f(` and `fn f<F: Fn(u8) -> bool>(` have a bracket before
+/// the one that opens the parameters.
+///
+/// @param signature - the function's signature, brackets balanced
+fn parameter_bracket(signature: &str) -> Option<usize> {
+    let keyword = signature.find("fn ")?;
+    let mut at = keyword.saturating_add(3);
+    let after_keyword = signature.get(at..)?;
+    let name_end = after_keyword
+        .char_indices()
+        .find(|(_, letter)| !(letter.is_alphanumeric() || *letter == '_' || letter.is_whitespace()))
+        .map(|(offset, _)| offset)?;
+    at = at.saturating_add(name_end);
+    if signature
+        .get(at..)
+        .is_some_and(|rest| rest.starts_with('<'))
+    {
+        at = at.saturating_add(generic_list_end(signature.get(at..)?)?);
+    }
+    signature
+        .get(at..)
+        .and_then(|rest| rest.find('('))
+        .map(|offset| at.saturating_add(offset))
+}
+
+/// Returns the offset one past a generic list's closing angle bracket.
+///
+/// The `>` of an `->` inside a bound is an arrow rather than a closing bracket,
+/// which is the same distinction `count_parameters` makes one function below.
+///
+/// @param text - the signature from its opening `<` onwards
+fn generic_list_end(text: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut previous = ' ';
+    for (offset, letter) in text.char_indices() {
+        match letter {
+            '<' => depth = depth.saturating_add(1),
+            '>' if previous == '-' => {}
+            '>' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(offset.saturating_add(1));
+                }
+            }
+            _ => {}
+        }
+        previous = letter;
+    }
+    None
+}
+
+/// Counts the parameters in a signature's bracket list.
+///
+/// Commas at the list's own depth, so a `Vec<(u8, u8)>` or an
+/// `impl Fn(&str) -> bool` is one parameter. A receiver - a parameter that is
+/// exactly `self`, `&self`, `&mut self` or `mut self` - is not counted.
+///
+/// @param inside - the text between the signature's outermost brackets
+fn count_parameters(inside: &str) -> usize {
+    let mut parameters: Vec<String> = Vec::new();
+    let mut held = String::new();
+    let mut depth = 0i32;
+    let mut previous = ' ';
+    for character in inside.chars() {
+        match character {
+            '(' | '<' | '[' => depth = depth.saturating_add(1),
+            // `->` inside a parameter - `impl Fn(&str) -> bool` - is an arrow
+            // rather than a closing angle bracket, and counting it as one put
+            // the depth below zero for the rest of the list.
+            '>' if previous == '-' => {}
+            ')' | '>' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parameters.push(std::mem::take(&mut held));
+                previous = character;
+                continue;
+            }
+            _ => {}
+        }
+        previous = character;
+        held.push(character);
+    }
+    if !held.trim().is_empty() {
+        parameters.push(held);
+    }
+    parameters
+        .iter()
+        .map(|held| held.trim())
+        .filter(|held| !held.is_empty())
+        .filter(|held| !matches!(*held, "self" | "&self" | "&mut self" | "mut self"))
+        .filter(|held| !held.starts_with("&'") || !held.ends_with(" self"))
+        .count()
 }

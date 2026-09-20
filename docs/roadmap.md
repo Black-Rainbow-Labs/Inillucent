@@ -150,8 +150,16 @@ unchanged - under 512 MiB resident, p50 within 1.5x and p99 within 2x, identical
 ## 4. Threads
 
 Access from several **processes** works: the same SHARED, RESERVED, PENDING and EXCLUSIVE protocol
-as SQLite, under `PRAGMA locking_mode = normal`, measured over 37 stress rounds with two writing
-processes and no lost writes. Threads inside one process did not.
+as SQLite, under `PRAGMA locking_mode = normal`, which is the default. One writer holds the file at
+a time and a second writer is refused with `busy` after `PRAGMA busy_timeout`. What grades it is
+`crates/inillucent-compat/tests/process_concurrency.rs`, which spawns two real writer processes and
+asserts that the rows in the file equal the commits the engine acknowledged - one process per
+statement and two long-lived ones, under both locking modes, and through `ATTACH`. Threads inside
+one process did not.
+
+The line this replaces claimed two processes and zero lost writes over a stress campaign. That
+number came from `concurrency.rs`, which runs two *sessions* inside one process. Two real processes
+lost 43% of their acknowledged commits on every round until task-1980 (task-1979, section 4).
 
 **Built: `SharedDatabase`, which is serialized mode.** Any number of threads use one database,
 exactly one statement runs at a time, and a transaction holds its turn for its whole life. A web
@@ -190,50 +198,7 @@ install inillucent-cli` builds it from source in the meantime. Everything reacha
 machine is done; what is left is `packaging/macos/release-macos.sh --version <N> --upload` run on
 one, after which the Homebrew formula and the two npm platform packages that wait on it go live.
 
-## 6. Recovery reads a page before redo has had a chance to rewrite it
-
-**Root cause named, and it is one level deeper than the hypothesis was.** The guess was a read on
-the open path, before the tolerant pass that repairs the catalog root. It is not: the read is inside
-redo itself. A logical row record changes a page by reading it - an `INSERT` into a leaf reads the
-leaf, adds the row and writes it back - so a crash that tore a page failed the replay at the
-**first** record naming that page, even when a later record in the same window carried the page
-whole. The window's end state was knowable and recovery refused the file anyway.
-
-It was found by naming every read in `open_file`. At cut 8 of
-`crates/inillucent-compat/tests/free_map_checkpoint_crash.rs`'s `journal_mode = off` sweep the
-refusal reads `replaying the log: page 4 checksum ... is not the computed ...`, and the three reads
-before redo - the bootstrap open, the catalog attach, the catalog read - are all named and none of
-them is it. Those names stay, because the next person asking this question should not have to
-instrument a build to answer it.
-
-**The fix, and where it runs.** When the logical pass fails with a corruption code, every record in
-the window that carries a whole page image is applied - `WritePage`, a `CompactLeaf` that carries
-one, and a split's three pages - and the same pass runs again. The images need no catalog and no row
-decoder, which is what lets them go first. Re-running is sound because redo is idempotent on the
-page-LSN rule: a record the first attempt applied has stamped its pages with its own LSN, so the
-second attempt skips it. The free map's own read moved inside what the retry covers, because that
-page is a page like any other and it is the one a checkpoint rewrites every time.
-
-**On the failure and not before it, and that is measured rather than chosen.** Applying the images
-unconditionally makes `read_checkpointed_catalog` succeed where it used to fail, which flips the
-`repaired` flag and seeds the logical pass with the checkpoint-time catalog rather than the
-end-of-window one. `wal_crash`'s commit campaign priced that: the one cut of twenty-three that
-reaches the new state stopped reaching it. A committed transaction lost is a worse defect than the
-one being fixed.
-
-`crates/inillucent-compat/tests/torn_page_with_image.rs` is the pair the item asks for. A page the
-window carries whole **and** that a record reads is torn and the database opens, answering all 199
-rows; a page a record reads and no record carries is torn and the open refuses with
-`SQLITE_CORRUPT`, naming the page. Both pages are chosen by reading the log rather than by being
-named, so neither goes stale when the layout moves, and the fixture crashes rather than closing -
-closing checkpoints the log away and there would be no window to be about.
-
-`journal_mode = off` is documented to mean a torn checkpoint page is not recoverable at all, and
-cuts 8 to 18 of that sweep still refuse: the log holds no image for page 4 there, so there is
-nothing to rebuild it from. That is the mode behaving as specified, and it is what the second test
-asserts deliberately rather than by accident.
-
-## 7. Two command line lines still reach past the driver
+## 6. Two command line lines still reach past the driver
 
 `drivers/README.md` says the driver is the one surface an application reaches the engine through,
 and for an application that is true: the C ABI, the four language wrappers and every published
@@ -272,6 +237,25 @@ substitution; both are a decision about which value type the command line is wri
 Done, now, means that decision is made. The claim in `drivers/README.md` is not false today,
 because it is about what an *application* reaches; it becomes false the day somebody reads it as
 being about this repository. Until the count is zero, this item is what says so.
+
+## 7. PostgreSQL parity: a server, a replica, readers beside a writer, roles and the dialect
+
+There is no listener, no replica, no reader that proceeds while a writer holds the file, no role
+and no password. A PostgreSQL client has nothing to connect to. What closing each of those looks
+like, in the order they are worked, is designed in
+[task-1998, the path from an embedded engine to PostgreSQL parity](../tasks/task-1998-postgres-parity-tdd.md):
+a server that runs as a service and speaks the PostgreSQL wire protocol first, a primary with a
+replica fed from the redo log second, snapshot readers alongside the one writer third, roles and
+row policies fourth, the PostgreSQL dialect fifth, and the operational verbs last.
+
+Two measurements sit behind it, both in the design. Under the same load and with both engines
+syncing every commit, one writer here commits 38 single rows a second against PostgreSQL's 2,837,
+because the default journal mode syncs three times a commit, and four readers complete four reads
+while a 50,000 row transaction is open, because a reader waits for the writer to release the file.
+And a probe of one statement per PostgreSQL feature, 174 of them, is accepted for 59 and says
+which tokens, types, functions and catalogue tables the dialect rung has to add. Done, for the ladder as a whole, means `psql`, the `postgres` library for
+Node and `pg_dump` work against the server unchanged, and a second server holds a copy of the data
+that stays current.
 
 ## Where to go next
 

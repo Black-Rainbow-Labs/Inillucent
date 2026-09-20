@@ -458,7 +458,19 @@ impl PagedTree {
                 Some(bytes) => {
                     let reference =
                         crate::paged::write_extent(database, log, self.tree_id(), bytes)?;
-                    crate::leaf::encode_extent_tagged(&mut encoded_row, reference);
+                    // The reference says what the bytes are whenever the column
+                    // would say something else, which is what lets a column
+                    // declared `BLOB` - or declared nothing - hold a text out
+                    // of line at all (task-1986).
+                    let physical = self
+                        .columns()
+                        .get(column)
+                        .map(|spec| spec.physical)
+                        .unwrap_or(crate::types::PhysicalType::Any);
+                    crate::leaf::encode_extent_tagged(
+                        &mut encoded_row,
+                        reference.stating(crate::leaf::extent_class_for(physical, value)),
+                    );
                     spilled = true;
                 }
                 None => value.encode_tagged(&mut encoded_row),
@@ -718,20 +730,19 @@ impl PagedTree {
             return None;
         }
         let threshold = self.page_size() / crate::leaf::EXTENT_DIVISOR;
-        let physical = self
-            .columns()
-            .get(column)
-            .map(|spec| spec.physical)
-            .unwrap_or(crate::types::PhysicalType::Any);
-        match (physical, value) {
-            (crate::types::PhysicalType::Text, Datum::Text(bytes))
-            | (crate::types::PhysicalType::Blob, Datum::Blob(bytes))
-                if bytes.len() > threshold =>
-            {
-                Some(bytes)
-            }
-            _ => None,
-        }
+        // **Any text or blob over the threshold, whatever the column is
+        // declared.** It used to be only a text in a column declared `TEXT` or
+        // bytes in one declared `BLOB`, because an extent reference said
+        // nothing about which of the two it held and the column's declaration
+        // was the only thing that could answer on the way back out. A column
+        // declared `BLOB` - which is what a column declared nothing at all is -
+        // therefore kept a text inline however long it was, and a text larger
+        // than a page could not be stored at all (task-1980, task-1986). The
+        // reference states the class when the column would answer wrongly; see
+        // `leaf::extent_class_for`, and `leaf::layout::classify_at`, which has
+        // to agree with this because the builder classifies again from the
+        // rows.
+        value.as_bytes().filter(|bytes| bytes.len() > threshold)
     }
 
     /// Deletes one row by key, returning what was there.
@@ -1137,7 +1148,6 @@ impl PagedTree {
     /// @param rows - the rows to pack, sorted
     /// @param carried - the reference each already-out-of-line value is in
     /// @param appending - whether the rows are arriving in key order
-    #[allow(clippy::too_many_arguments)]
     fn repack(
         &mut self,
         database: &mut Database,
@@ -1298,7 +1308,6 @@ impl PagedTree {
     /// @param rows - its live rows, sorted
     /// @param carried - the reference each already-out-of-line value is in
     /// @param fill - how full to pack the left half
-    #[allow(clippy::too_many_arguments)]
     fn split_carrying(
         &mut self,
         database: &mut Database,
@@ -1310,9 +1319,28 @@ impl PagedTree {
         fill: f64,
     ) -> DbResult<Vec<ExtentRef>> {
         if rows.len() < 2 {
-            return Err(misuse(
-                "a leaf holding fewer than two rows cannot be split; its one row's keys \
-                 and fixed-width columns alone are larger than a page",
+            // **The sentence a caller reads, because the one that was here was
+            // not one (task-1979, section 10, D2).** `misuse` keeps its words
+            // inside the process, so what reached every front end was the
+            // primary code's own text, `bad parameter or other API misuse`, for
+            // a statement that is written correctly.
+            //
+            // **What is left here is a narrow case, and it used to be a wide
+            // one.** Until task-1986 the reason a large value stayed inline was
+            // almost always the column's declaration - only a column declared
+            // `TEXT` holding a text or `BLOB` holding bytes could have an
+            // extent - so `CREATE TABLE t (a)` refused 32,680 bytes and this
+            // was the sentence that said why. A value of any class now goes out
+            // of line whatever the column says, so what reaches this is a row
+            // that is too large for a page with every one of its values already
+            // outside it: a key column, which is never spilled because a
+            // descent compares keys, or enough columns just under the spill
+            // threshold to fill a page between them.
+            return Err(inillucent_base::error::statement_refusal(
+                "this row is larger than a page even with its large values stored outside it; \
+                 a key column is never stored outside the page, so a key this long has to be \
+                 shortened, and a row of many values just under the page's eighth has to be \
+                 split across tables",
             ));
         }
         let builder = LeafBuilder::new(
@@ -1507,7 +1535,6 @@ impl PagedTree {
     /// @param separator - the right half's first key, encoded
     /// @param right - the right half's page
     /// @param folded_by_caller - whether the immediate caller logs this page's image itself
-    #[allow(clippy::too_many_arguments)]
     fn insert_separator(
         &mut self,
         database: &mut Database,
@@ -1873,6 +1900,34 @@ impl PagedTree {
         leaf.locate(key, self.key_columns())
     }
 
+    /// Returns the stand-in an out-of-line value takes during a repack.
+    ///
+    /// Zeroes of the value's own length, so the builder's sizing is right, and
+    /// **of the class the reference says**, so the builder states the same class
+    /// back. Reading the column's declaration here instead is what used to be
+    /// done, and it would now rewrite a text in a column declared `BLOB` as a
+    /// blob the first time the leaf was repacked (task-1986).
+    ///
+    /// @param column - which column the value is in
+    /// @param reference - the reference the leaf holds for it
+    fn placeholder_for(&self, column: usize, reference: ExtentRef) -> OwnedDatum {
+        let physical = self
+            .columns()
+            .get(column)
+            .map(|spec| spec.physical)
+            .unwrap_or(crate::types::PhysicalType::Any);
+        let blob = matches!(
+            crate::leaf::extent_datum(reference.class, physical, &[]),
+            Datum::Blob(_)
+        );
+        let filler = vec![0u8; reference.length as usize];
+        if blob {
+            OwnedDatum::Blob(filler)
+        } else {
+            OwnedDatum::Text(filler)
+        }
+    }
+
     /// Returns a leaf's live rows without reading a single out-of-line value.
     ///
     /// **This is the reader a repack uses, and the difference from
@@ -1920,16 +1975,7 @@ impl PagedTree {
             for column in 0..leaf.column_count() {
                 if leaf.column(column)?.class_at(row)? == crate::types::ValueClass::Extent {
                     let reference = leaf.extent_at(row, column)?;
-                    let blob = matches!(
-                        self.columns().get(column).map(|spec| spec.physical),
-                        Some(crate::types::PhysicalType::Blob)
-                    );
-                    let filler = vec![0u8; reference.length as usize];
-                    values.push(if blob {
-                        OwnedDatum::Blob(filler)
-                    } else {
-                        OwnedDatum::Text(filler)
-                    });
+                    values.push(self.placeholder_for(column, reference));
                     refs.push(Some(reference));
                     continue;
                 }
@@ -1950,16 +1996,7 @@ impl PagedTree {
             let mut refs = Vec::with_capacity(leaf.column_count());
             for column in 0..leaf.column_count() {
                 if let Some(reference) = leaf.delta_extent_at(index, column)? {
-                    let blob = matches!(
-                        self.columns().get(column).map(|spec| spec.physical),
-                        Some(crate::types::PhysicalType::Blob)
-                    );
-                    let filler = vec![0u8; reference.length as usize];
-                    values.push(if blob {
-                        OwnedDatum::Blob(filler)
-                    } else {
-                        OwnedDatum::Text(filler)
-                    });
+                    values.push(self.placeholder_for(column, reference));
                     refs.push(Some(reference));
                     continue;
                 }

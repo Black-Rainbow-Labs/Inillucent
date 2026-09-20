@@ -34,6 +34,30 @@ pub struct Context {
     /// because it is the same kind of thing: a fact about the connection that
     /// an expression has to know and cannot ask for itself.
     pub like_case_sensitive: bool,
+    /// The largest string or blob this connection admits, in bytes.
+    ///
+    /// **`Limit::Length` was enforced on the write path and nowhere else
+    /// (task-1979, section 5.4).** `SELECT length(zeroblob(1073741824))`
+    /// answered 1,073,741,824 from a served MCP server with a 256 MiB budget,
+    /// after taking the process's working set to 2,873 MB;
+    /// `SELECT length(printf('%2000000000d', 1))` reached 5,734 MB. A value
+    /// that is only read never reached `record.rs`, which is where the bound
+    /// was being applied.
+    ///
+    /// It rides here for the same reason `like_case_sensitive` does: it is a
+    /// fact about the connection that an expression has to know and cannot ask
+    /// for itself. Zero means unbounded, which is what a `Default` context -
+    /// every unit test of this module - gets.
+    pub length_limit: i64,
+}
+
+impl Context {
+    /// Returns whether a value of `bytes` fits this connection's value bound.
+    ///
+    /// @param bytes - the size in question
+    pub fn permits_length(&self, bytes: u64) -> bool {
+        self.length_limit <= 0 || bytes <= self.length_limit as u64
+    }
 }
 
 /// Calls a scalar function.
@@ -567,6 +591,14 @@ fn null_if(arguments: &[Value<'static>], collation: Collation) -> Value<'static>
 ///
 /// Any NULL argument makes the whole answer NULL, which is the opposite of
 /// what the aggregates do and is the single most common surprise here.
+///
+/// **A tie keeps the later argument for `min` and the earlier for `max`
+/// (task-1979, F19).** `min(1, 1.0)` is the real `1.0` in SQLite and `max(1,
+/// 1.0)` is the integer `1`: two values that compare equal are still two
+/// values, and which one comes back is decided by the direction of the
+/// comparison the reference makes - `min` replaces on "not greater", `max` on
+/// "greater". This kept the first of a tie in both directions, so `min(1, 1.0)`
+/// answered the integer.
 fn extreme(arguments: &[Value<'static>], collation: Collation, want_max: bool) -> Value<'static> {
     let mut best: Option<Value<'static>> = None;
     for argument in arguments {
@@ -580,7 +612,7 @@ fn extreme(arguments: &[Value<'static>], collation: Collation, want_max: bool) -
                 let replace = if want_max {
                     ordering == std::cmp::Ordering::Greater
                 } else {
-                    ordering == std::cmp::Ordering::Less
+                    ordering != std::cmp::Ordering::Greater
                 };
                 if replace {
                     argument.clone()
@@ -947,19 +979,97 @@ fn round(arguments: &[Value<'static>]) -> Value<'static> {
     if !real.is_finite() {
         return Value::Real(real);
     }
-    let factor = 10f64.powi(digits as i32);
-    let scaled = real * factor;
-    // **Scaling a large value past the end of the range is not a rounding.**
-    // `round(1e308, 2)` multiplied by 100, got infinity, divided it by 100 and
-    // answered `Inf` - a value the source never held and that SQLite never
-    // produces. A number with more magnitude than `digits` can move is already
-    // rounded to that many places, so it is its own answer.
-    if !scaled.is_finite() {
-        return Value::Real(real);
+    // **Zero places rounds the number; more places round its decimal text
+    // (task-1979, F10).** That is not a nicety: `2.675` as a double is
+    // 2.674999999999999822, so scaling it by a hundred and rounding half away
+    // from zero answers 2.68 while SQLite answers 2.67 - because SQLite formats
+    // the value to `n` places and reads the text back, and the text of
+    // 2.674999... to two places is "2.67". `round(1.115,2)` and
+    // `round(0.615,2)` differed the same way; `round(8.835,2)` agreed, because
+    // that double sits just above the half rather than just below it. Rust's
+    // own formatting is exact for the same reason SQLite's `%!.*f` is, so the
+    // transcription is one line.
+    if digits == 0 {
+        let factor = 10f64.powi(0);
+        let scaled = real * factor;
+        // **Scaling a large value past the end of the range is not a
+        // rounding.** `round(1e308, 2)` multiplied by 100, got infinity,
+        // divided it by 100 and answered `Inf` - a value the source never held
+        // and that SQLite never produces.
+        if !scaled.is_finite() {
+            return Value::Real(real);
+        }
+        // `f64::round` already rounds half away from zero, which is what
+        // SQLite's own zero-places branch does with `(sqlite_int64)(r+0.5)`.
+        return Value::Real(scaled.round() / factor);
     }
-    // `f64::round` already rounds half away from zero, which is what SQLite
-    // does and is not what "round half to even" would do.
-    Value::Real(scaled.round() / factor)
+    let places = usize::try_from(digits).unwrap_or(0);
+    match rounded_text(real, places).parse::<f64>() {
+        Ok(rounded) => Value::Real(rounded),
+        // A magnitude no decimal form can carry is already rounded to this many
+        // places, so it is its own answer.
+        Err(_) => Value::Real(real),
+    }
+}
+
+/// Returns a number's decimal text at `places`, rounding a tie away from zero.
+///
+/// **Rust's formatter rounds a tie to even and SQLite's does not (task-1979,
+/// F10).** `format!("{:.1}", 99.25)` is `99.2`, because 2 is even; SQLite's
+/// `%!.*f` is its own implementation and rounds an exact half away from zero,
+/// so it answers `99.3`. The same split shows on `round(0.125, 2)`: `0.12`
+/// against `0.13`. Every value that is *not* an exact half already agreed,
+/// which is why the formatter was the right idea and the wrong rounding:
+/// `2.675` is 2.674999999999999822 as a double, and both answer `2.67`.
+///
+/// The number is expanded thirty digits past the place that is being kept, and
+/// the decision is made on that text. Thirty is enough: a tie is a `5` followed
+/// by nothing but zeros, so a digit further out than that makes the value
+/// *larger* than the half, which rounds the same way a tie does.
+///
+/// @param real - the value
+/// @param places - how many decimal places to keep
+fn rounded_text(real: f64, places: usize) -> String {
+    let wide = format!("{:.*}", places.saturating_add(30), real);
+    let (sign, rest) = match wide.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", wide.as_str()),
+    };
+    let Some((whole, fraction)) = rest.split_once('.') else {
+        return wide;
+    };
+    let Some(kept) = fraction.get(..places) else {
+        return wide;
+    };
+    let up = fraction
+        .as_bytes()
+        .get(places)
+        .is_some_and(|digit| *digit >= b'5');
+    let mut digits: Vec<u8> = whole.bytes().chain(kept.bytes()).collect();
+    if up {
+        carry_one(&mut digits);
+    }
+    let text = String::from_utf8_lossy(&digits).into_owned();
+    let point = text.len().saturating_sub(places);
+    let (whole, fraction) = text.split_at(point.min(text.len()));
+    match places {
+        0 => format!("{sign}{whole}"),
+        _ => format!("{sign}{whole}.{fraction}"),
+    }
+}
+
+/// Adds one to a string of decimal digits, in place, growing it on a carry.
+///
+/// @param digits - the digits, most significant first
+fn carry_one(digits: &mut Vec<u8>) {
+    for digit in digits.iter_mut().rev() {
+        if *digit < b'9' {
+            *digit = digit.saturating_add(1);
+            return;
+        }
+        *digit = b'0';
+    }
+    digits.insert(0, b'1');
 }
 
 /// `zeroblob(n)`.
@@ -996,6 +1106,26 @@ fn pattern_call(
     Value::Integer(i64::from(matched))
 }
 
+/// Reads a vector written as a JSON array of numbers.
+///
+/// The grammar is `[` a comma separated list of numbers `]` and nothing else:
+/// a string, an object or a nested array inside it means the text is not a
+/// vector, and `None` is what leaves the caller answering NULL for it.
+///
+/// @param text - the value's bytes
+fn vector_from_json(text: &[u8]) -> Option<Vec<f32>> {
+    let held = std::str::from_utf8(text).ok()?.trim();
+    let inner = held.strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for part in inner.split(',') {
+        out.push(part.trim().parse::<f64>().ok()? as f32);
+    }
+    Some(out)
+}
+
 /// A vector, as this engine stores one: little-endian `f32` in a blob.
 ///
 /// **The same bytes `inillucent_search` writes**, which is what makes a column
@@ -1006,8 +1136,18 @@ fn pattern_call(
 /// would make `WHERE v IS NOT NULL AND vector_distance_cos(v, ?) < 0.2`
 /// impossible to write.
 ///
+/// **A JSON array of numbers is read as a vector too (task-1979, section 8.2,
+/// gap 2).** `'[1, 0, 0, 0]'` is what pgvector takes and what an `INSERT` into
+/// a `VECTOR(N)` column now accepts, so a query that wrote its query vector the
+/// same way would otherwise have had a literal the insert understood and the
+/// distance did not. Text that is not a JSON array of numbers is still not a
+/// vector.
+///
 /// @param value - the argument
 fn vector_of(value: Option<&Value<'static>>) -> Option<Vec<f32>> {
+    if let Some(Value::Text(text)) = value {
+        return vector_from_json(&text.utf8_bytes());
+    }
     let Some(Value::Blob(blob)) = value else {
         return None;
     };

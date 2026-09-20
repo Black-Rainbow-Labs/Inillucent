@@ -165,6 +165,29 @@ impl Database {
     /// @param path - the database file
     /// @param frames - how many frames the buffer pool holds
     pub fn open_with(path: impl AsRef<Path>, frames: usize) -> DbResult<Database> {
+        Database::open_as(path, frames, false)
+    }
+
+    /// Opens a database this connection will never write.
+    ///
+    /// See [`ImportedDatabase::open_read_only`]. A `:memory:` database has
+    /// nothing to protect and no file to leave alone, so it is opened the way
+    /// it always was and the statement filter above is what read only means
+    /// for it.
+    ///
+    /// @param path - the database file
+    /// @param frames - how many frames the buffer pool holds
+    pub fn open_read_only(path: impl AsRef<Path>, frames: usize) -> DbResult<Database> {
+        Database::open_as(path, frames, true)
+    }
+
+    /// [`Database::open_with`], with the caller saying whether this connection
+    /// may write.
+    ///
+    /// @param path - the database file
+    /// @param frames - how many frames the buffer pool holds
+    /// @param read_only - whether this connection may write the file
+    fn open_as(path: impl AsRef<Path>, frames: usize, read_only: bool) -> DbResult<Database> {
         let path = path.as_ref().to_path_buf();
         // **`:memory:` is a database, not a filename.** The operating system
         // refuses it as a path - on Windows with `the filename, directory name,
@@ -190,10 +213,20 @@ impl Database {
                 next_session: std::cell::Cell::new(1),
             });
         }
-        let engine = if path.is_file() {
-            ImportedDatabase::open(path.clone(), PAGE_SIZE, frames)?
-        } else {
-            ImportedDatabase::create(path.clone(), PAGE_SIZE, frames)?
+        let engine = match (path.is_file(), read_only) {
+            (true, false) => ImportedDatabase::open(path.clone(), PAGE_SIZE, frames)?,
+            (true, true) => ImportedDatabase::open_read_only(path.clone(), PAGE_SIZE, frames)?,
+            // **A read only connection does not create the file it was given.**
+            // Creating one would answer a caller who asked to read an existing
+            // database with an empty one, and would write - see task-1979's E2,
+            // which is the same mistake on the read verbs.
+            (false, true) => {
+                return Err(inillucent_base::error::refusal(
+                    "there is no database at that path, and a read only connection does not \
+                     create one",
+                ))
+            }
+            (false, false) => ImportedDatabase::create(path.clone(), PAGE_SIZE, frames)?,
         };
         Ok(Database {
             writer: std::rc::Rc::clone(&engine.writing),
@@ -348,6 +381,22 @@ impl Database {
         &self.path
     }
 
+    /// Returns which segment of its log this connection is writing.
+    ///
+    /// See [`ImportedDatabase::log_sequence`].
+    pub fn log_sequence(&self) -> u64 {
+        self.engine.borrow().log_sequence()
+    }
+
+    /// Returns what opening this database did to it.
+    ///
+    /// See [`ImportedDatabase::recovery_report`]. Cloned rather than borrowed
+    /// because the engine is behind a cell and a caller holding a borrow across
+    /// a statement would take the cell the statement needs.
+    pub fn recovery_report(&self) -> crate::recovery::RecoveryReport {
+        self.engine.borrow().recovery_report().clone()
+    }
+
     /// Makes everything written so far durable in the file.
     ///
     /// A database that is dropped without this is not lost - `open` replays the
@@ -405,7 +454,7 @@ impl Database {
     ///
     /// @param limit - which limit
     pub fn limit(&self, limit: inillucent_base::limits::Limit) -> i64 {
-        self.settings.limits.borrow().get(limit)
+        self.settings.limits().borrow().get(limit)
     }
 
     /// Sets one run-time limit, and returns what it was before.
@@ -414,7 +463,7 @@ impl Database {
     /// @param requested - the value asked for
     /// @returns the value that was in force before this call
     pub fn set_limit(&self, limit: inillucent_base::limits::Limit, requested: i64) -> i64 {
-        self.settings.limits.borrow_mut().set(limit, requested)
+        self.settings.limits().borrow_mut().set(limit, requested)
     }
 
     /// Returns what the page cache has been asked to do.
@@ -763,7 +812,7 @@ impl<'d> Connection<'d> {
         // The plan cache is keyed by the levers rather than cleared by them -
         // see `ImportedDatabase::disable_optimizations` - so setting the value
         // is the whole of it, and it needs no borrow of the engine.
-        self.database.settings.levers.set(levers);
+        self.database.settings.set_levers(levers);
         Ok(())
     }
 
@@ -774,9 +823,15 @@ impl<'d> Connection<'d> {
     /// `PRAGMA writable_schema = ON`, both of which let a caller lose or
     /// corrupt a database with one statement.
     ///
+    /// **Through the engine, so the registry hears it too (task-1972).** It
+    /// used to set the shared pragma record and nothing else, and
+    /// `Registry::authorize_shadow_write` reads `Policy::defensive` - so the
+    /// half of this flag that is about a module's private storage was set on
+    /// one copy and read from another, and refused nothing.
+    ///
     /// @param on - whether the flag is in force
     pub fn set_defensive(&self, on: bool) -> DbResult<()> {
-        self.database.settings.defensive.set(on);
+        self.engine_mut()?.set_defensive(on);
         Ok(())
     }
 
@@ -815,6 +870,17 @@ impl<'d> Connection<'d> {
     /// Returns the schema's generation, which changes when the schema does.
     pub fn schema_cookie(&self) -> DbResult<u64> {
         Ok(self.engine()?.schema_generation())
+    }
+
+    /// Returns how many parameters one statement declares.
+    ///
+    /// The bound a caller supplied bind index is checked against; see
+    /// `inillucent_driver::Connection::parameter_count` for what an unbounded
+    /// one cost.
+    ///
+    /// @param sql - the statement text
+    pub fn parameter_count(&self, sql: &str) -> DbResult<u32> {
+        self.database.engine.borrow().parameter_count(sql)
     }
 
     /// Returns the named parameters one statement declares, with their indexes.
@@ -898,7 +964,7 @@ impl<'d> Connection<'d> {
     /// One for an ordinary statement; two or more for a transaction that wrote
     /// two files and was therefore committed through a super-journal.
     pub fn decided_over(&self) -> DbResult<usize> {
-        Ok(self.database.writer.decided_over.get())
+        Ok(self.database.writer.decided_over())
     }
 
     /// Returns whether every statement is its own transaction.
@@ -912,7 +978,7 @@ impl<'d> Connection<'d> {
     /// is documented as callable from a callback. It reads the writer the
     /// database holds beside the engine instead, and takes no cell at all.
     pub fn autocommit(&self) -> DbResult<bool> {
-        Ok(self.database.writer.batch.get().is_none())
+        Ok(self.database.writer.batch().is_none())
     }
 
     /// Opens a transaction that rolls back unless it is committed.

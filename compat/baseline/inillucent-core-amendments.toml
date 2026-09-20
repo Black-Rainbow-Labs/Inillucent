@@ -8,111 +8,147 @@
 
 [[amendment]]
 path = "crates/inillucent-bench/Cargo.toml"
-ticket = "task-1953"
-reason = "task-1946 M8: inillucent-core and inillucent-base were declared here by path with no version, which cargo deny reports as error[wildcard] - a dependency that resolves to whatever is in the directory and says nothing about what a published copy would need. Both go through the workspace table now, which is where every other internal edge already is. No code and no behaviour."
-sha256 = "96da8955190374e20a9de9b984d845213c944e4846fd58478ebf5fcf34fdcbf1"
+ticket = "task-1970"
+reason = "Moved by aa63027 (task-1970, review finding 4.6): a [dev-dependencies] entry on inillucent-base with the testing feature, so the one skip helper is available to this crate's test targets and off in a shipped build. Never declared here; task-1973 declares it because the guard was red at HEAD and this file is not its work."
+sha256 = "bb4b0a0bd2523ba2f97d85ffea879878ad69ffbe500c63be074df3c724ba6307"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/arm.rs"
-ticket = "embedding model head to head grading"
-reason = "The grading harness was generalised from one embedding model to a head-to-head between several, matching the success criteria the design document set for that comparison. A model is now a manifest (id, width, Matryoshka widths, four prefixes, pooling, token bound, backend, output, tokenizer and weights digests) instead of a set of constants; a cache carries a header naming the corpus digest, the model, the manifest digest and the truncation it performed; grade-embedding compares two or more caches and refuses before it starts unless they agree on corpus, chunk count and query seeds; and the embedder gained CLS and last-token pooling, graph-driven inputs, and a llama.cpp backend for the one model with no ONNX export. ModelManifest::nomic_v1_5() reproduces every constant it replaced: the fresh baseline cache agrees with the August run at cosine 1.000000 minimum over 5000 chunks, and grade's card is unchanged on every measurement row."
-sha256 = "3b63ebd7cc8fc9dc6f5ea383ef18ddbc7456174cc20e0d6369d4a1a651f92d4f"
+ticket = "task-1967"
+reason = "Moved by b3c7477 (task-1967): the check's own re-embedding was the side that moved. Never declared here; task-1973 declares it because the guard was red at HEAD and this file is not its work."
+sha256 = "a91388417bcb354492126bd97c72b244accae4f60943d66380a35d741469efc0"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/corpus.rs"
-ticket = "embedding model head to head grading"
-reason = "The grading harness was generalised from one embedding model to a head-to-head between several, matching the success criteria the design document set for that comparison. A model is now a manifest (id, width, Matryoshka widths, four prefixes, pooling, token bound, backend, output, tokenizer and weights digests) instead of a set of constants; a cache carries a header naming the corpus digest, the model, the manifest digest and the truncation it performed; grade-embedding compares two or more caches and refuses before it starts unless they agree on corpus, chunk count and query seeds; and the embedder gained CLS and last-token pooling, graph-driven inputs, and a llama.cpp backend for the one model with no ONNX export. ModelManifest::nomic_v1_5() reproduces every constant it replaced: the fresh baseline cache agrees with the August run at cosine 1.000000 minimum over 5000 chunks, and grade's card is unchanged on every measurement row."
-sha256 = "d5a8c98d234963a18d71540a2738f672228ab6089a337910d5cc377284caf19e"
+ticket = "task-1973"
+reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. Doc comments on len, load_from_postgres and load_cache."
+sha256 = "51481630369add08d37508f8ddbac2ae5dd552feda58bc44f3914ee0e7ed1510"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/embedcheck.rs"
-ticket = "embedding model head to head grading"
-reason = "The grading harness was generalised from one embedding model to a head-to-head between several, matching the success criteria the design document set for that comparison. A model is now a manifest (id, width, Matryoshka widths, four prefixes, pooling, token bound, backend, output, tokenizer and weights digests) instead of a set of constants; a cache carries a header naming the corpus digest, the model, the manifest digest and the truncation it performed; grade-embedding compares two or more caches and refuses before it starts unless they agree on corpus, chunk count and query seeds; and the embedder gained CLS and last-token pooling, graph-driven inputs, and a llama.cpp backend for the one model with no ONNX export. ModelManifest::nomic_v1_5() reproduces every constant it replaced: the fresh baseline cache agrees with the August run at cosine 1.000000 minimum over 5000 chunks, and grade's card is unchanged on every measurement row."
-sha256 = "6292bc36a9499995c1d89b909c4aa1ff2ca3cd457169680f1f2cd23bffa9d04f"
+ticket = "task-1973"
+reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. The sampled chunk and its stored vector are looked up through chunk_at and stored_vector, which report a sampler that disagrees with the cache rather than comparing a vector against the wrong text. The three assertions clippy folded to a constant are two let bindings and one const block, which also clears the assertions_on_constants warnings that were failing cargo clippy -D warnings on main."
+sha256 = "847816e0fe492f9916183ba3cdcd813ce885ec7342441af32b65794b88e3844a"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/engine.rs"
-ticket = "task-1953"
-reason = "task-1946 H4: inillucent-core's search entry points refuse a query whose width is not the index's, so they return a Result now. The two trait implementations propagate it; exhaustive_reference and fuse_with expect it, because a probe vector this harness took out of the index itself cannot be the wrong width. No measurement is affected."
-sha256 = "7a5be6a0b5b8f36097605c76889785d6fca3b218e26cbf936b51587b59e84233"
+ticket = "task-1973"
+reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. InillucentEngine::key, exhaustive_reference and fuse_with are fallible: an ordinal with no key means the index and the key list disagree about what was loaded, and answering an empty string there scores a hit against a document that is not in the corpus. Doc comments on label, connect, new and ordinal."
+sha256 = "fb0792c4483c9ef452769c933eb5f3dcfc9bab32c8b3753840fb35d9e7b294a3"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/gradeembed.rs"
-ticket = "task-1953"
-reason = "task-1946 H6 and H4: the run's two file rows go through runs::note_run_files, which names the run rather than the disk; the exhaustive probe carries H4's refusal. No measurement is affected."
-sha256 = "adf4c23badf181f92cdacf72bf9b6b409b89311df59b521a0c1e6af388553dc4"
+ticket = "task-1977"
+reason = "task-1977: the card moved out of this file. 'type LaneScores' through 'print_summary' is crates/inillucent-bench/src/gradeembed/card.rs now, 733 lines, and this file is 3,094 rather than 3,815. The one dead #[allow(clippy::too_many_arguments)] above score_family also came off: clippy.toml sets too-many-arguments-threshold = 8 and score_family takes six. Nothing else changed and the 178 bench tests pass unchanged. This entry replaces task-1973's, which declared the lint work on the same file."
+sha256 = "26c5e8f0dfe993325b29d1ce6f4f5eb02085ff81d891316c4bf933d6a7af9c64"
+
+[[amendment]]
+path = "crates/inillucent-bench/src/gradeembed/card.rs"
+ticket = "task-1977"
+reason = "task-1977: the file the card moved into. The 733 lines are the ones deleted from gradeembed.rs, with pub(super) on the eleven items the parent still calls, pub on rejudge, render and print_summary which main.rs calls, and the use statements a module of its own needs."
+sha256 = "6b6f70a68c9c611d1ad15a0ef7290711d72b91fc1c69156e3689532f2204f4bf"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/http.rs"
-ticket = "embedding model head to head grading"
-reason = "The grading harness was generalised from one embedding model to a head-to-head between several, matching the success criteria the design document set for that comparison. A model is now a manifest (id, width, Matryoshka widths, four prefixes, pooling, token bound, backend, output, tokenizer and weights digests) instead of a set of constants; a cache carries a header naming the corpus digest, the model, the manifest digest and the truncation it performed; grade-embedding compares two or more caches and refuses before it starts unless they agree on corpus, chunk count and query seeds; and the embedder gained CLS and last-token pooling, graph-driven inputs, and a llama.cpp backend for the one model with no ONNX export. ModelManifest::nomic_v1_5() reproduces every constant it replaced: the fresh baseline cache agrees with the August run at cosine 1.000000 minimum over 5000 chunks, and grade's card is unchanged on every measurement row."
-sha256 = "23a44f8e6cff13abbbcb560968fd91429be40c4a9a9f6d7be73c25ee874f78b8"
+ticket = "task-1973"
+reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. New head_of, because &reply[..200] on a reply whose 200th byte is mid-character panics while reporting a parse that had already failed."
+sha256 = "c608e2fc48e23f1e8080e9ea3ee239c7b8ace703c28015c3237ee41acc0390f7"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/llamacpp.rs"
-ticket = "embedding model head to head grading"
-reason = "The grading harness was generalised from one embedding model to a head-to-head between several, matching the success criteria the design document set for that comparison. A model is now a manifest (id, width, Matryoshka widths, four prefixes, pooling, token bound, backend, output, tokenizer and weights digests) instead of a set of constants; a cache carries a header naming the corpus digest, the model, the manifest digest and the truncation it performed; grade-embedding compares two or more caches and refuses before it starts unless they agree on corpus, chunk count and query seeds; and the embedder gained CLS and last-token pooling, graph-driven inputs, and a llama.cpp backend for the one model with no ONNX export. ModelManifest::nomic_v1_5() reproduces every constant it replaced: the fresh baseline cache agrees with the August run at cosine 1.000000 minimum over 5000 chunks, and grade's card is unchanged on every measurement row."
-sha256 = "c606a322fe69ffecb0e7ebc0f58771217a3fda556f24940ea9a580c575e2db31"
+ticket = "task-1973"
+reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. The batch and slot indexing in the concurrent embed path, and every serde_json::Value index, which panics on a missing key. Doc comments on truncation and manifest."
+sha256 = "ab368ee7cdb99c2bb13b3c15299ac1ef2f29784b20f38137f2368703054b2777"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/main.rs"
-ticket = "task-1962"
-reason = "task-1961 A9: the one call to tune::build_settings passes a Sweep rather than nine slices, five of which were &[f32] in a row. No dial changed and no measurement moved: the struct holds the same nine values in the same order."
-sha256 = "17427e47615c7c5f002c4d3937a75e6c2bddc73adec60e0a25f71b68c6c3d0e3"
+ticket = "task-1973"
+reason = "task-1973 turned on the four lints and missing_docs for this crate (one attribute per lint, the form every governed crate uses). 191 sites answered across the crate; every one in this file now propagates a caught error or reads through .get(). main was 576 lines and is 127: one function per subcommand. The three widest subcommands carry an Args struct (TuneArgs, GradeArgs, GradeEmbeddingArgs) so their functions take one parameter rather than twenty; the command line surface is unchanged, checked with --help. synth_embed takes a SynthEmbedRequest and its allow(clippy::too_many_arguments) is gone, which is what task-1970's no_function_takes_more_than_eight_parameters exempted."
+sha256 = "e962ba3317b4dff84c5f61d10caaa724cdf0c81f1b757f0ab690e73a5d89462d"
+
+[[amendment]]
+path = "crates/inillucent-bench/src/metrics.rs"
+ticket = "task-1973"
+reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. Doc comments on push and mean."
+sha256 = "641c0bafaaaa7821837056b1f26a50d8211e10693074d87df99ab9868754bf9e"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/models.rs"
-ticket = "task-1953"
-reason = "task-1946 H7 and H10: default_models_root fell back to that same drive letter and now falls back to the directory inillucent-core's installer documents, with INILLUCENT_MODELS unchanged as the override; two skip messages carry the '; skipping' suffix the strict runner counts instead of leading with the word."
-sha256 = "5219e6619abafb4226136bdc43ef731d9a1e790186c03d53895b17e49c6fb297"
+ticket = "task-1973"
+reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. The streamed digest errors if a reader ever answers with more bytes than the buffer holds."
+sha256 = "e4e554db36ef5104f96ec0c9a4a9bc59ae72adfd640d83fcca1633612393ba9b"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/queryset.rs"
-ticket = "strict lint remediation"
-reason = "The strict lint set became a required check, and these are the findings it had in the retrieval engine. Every edit is local: bounds-checked division, a NaN comparison kept and explained, an identity map removed, a test module moved below the items it follows. No retrieval behaviour changes, and no file was reformatted - these two crates have never been formatted and doing it would move 35 files for no reason connected to a lint."
-sha256 = "2b016373543b72d64b1fc252e4c06d6826e0b7bcfc57347f871d77163c2a7444"
+ticket = "task-1973"
+reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. Twenty-six sites: the parallel chunk and key slices are walked with zip rather than by index, two unwraps that restated a guard two lines above them became the guard, and the random draws in the two cross-source builders are get with a continue, in loops that already give up after wanted * 20 tries. Doc comment on label."
+sha256 = "0b4be5a43e445bad308967880d64ef8e4a84c7de5a2fd29611e4d2e62552763d"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/report.rs"
-ticket = "embedding model head to head grading"
-reason = "The grading harness was generalised from one embedding model to a head-to-head between several, matching the success criteria the design document set for that comparison. A model is now a manifest (id, width, Matryoshka widths, four prefixes, pooling, token bound, backend, output, tokenizer and weights digests) instead of a set of constants; a cache carries a header naming the corpus digest, the model, the manifest digest and the truncation it performed; grade-embedding compares two or more caches and refuses before it starts unless they agree on corpus, chunk count and query seeds; and the embedder gained CLS and last-token pooling, graph-driven inputs, and a llama.cpp backend for the one model with no ONNX export. ModelManifest::nomic_v1_5() reproduces every constant it replaced: the fresh baseline cache agrees with the August run at cosine 1.000000 minimum over 5000 chunks, and grade's card is unchanged on every measurement row."
-sha256 = "01190f4138afa9c926334e4ad64e3a9a36f033171f7b73284f00bd721cbee627"
+ticket = "task-1973"
+reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. render was 262 lines and is 22, over nine push_* helpers, one per section of the card. Doc comment on print_summary."
+sha256 = "4da5736e689d05002bb007c06e2263250060646174574c9af20e09b3c9a2a287"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/residency.rs"
-ticket = "task-1900"
-reason = "new: the measurement that decided the residency profiles, re-runnable as embed-residency"
-sha256 = "08852e9b21b170ecc1787b4f5d78e962bee825911ecb7dcc1e675fda0910d27b"
+ticket = "task-1973"
+reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. The median of a set of load times."
+sha256 = "6c4871ee82a2fb419d0b1989b9e964eda7dbe3c82401cba6bdd48a128ac3a8c6"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/runs.rs"
-ticket = "task-1953"
-reason = "task-1946 H6: command_line joined argv as typed and --database-url is one of the arguments, so the tracked score card carried a PostgreSQL password in clear. Every token now goes through published_token, and note_inputs and note_run_files shorten the four path rows the card also carried. No measurement is affected."
-sha256 = "01565aaa80667ec257be33acaefcf74049edb50d8b40599704a670fa2a9b0097"
+ticket = "task-1973"
+reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. Doc comments on written, dir and host_facts."
+sha256 = "ab97d168e77fe4bbe9bc57da7ee278d9467c4673c72f6af6d8e497b2f08d01eb"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/scenarios.rs"
-ticket = "task-1953"
-reason = "task-1946 H6: the card's four path rows go through the two helpers in runs.rs. No measurement is affected."
-sha256 = "cc00c83ecc304470c757a8f1e7dcc7f744b6adda66dbdbf5c05e9a2fb41c5350"
+ticket = "task-1973"
+reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. grade was 540 lines and is 86, over build_the_graded_engine, generate_query_sets, query_counts_of, embed_every_family, connect_the_baselines, run_every_scenario, score_the_shared_families, manifest_for and provenance_for, plus the QuerySets, QueryVectors, Baselines and RunFacts structs. Nine query families were nine locals threaded through one function beside nine matching vector lists declared eighty lines away; they are named fields now. corpus_key is fallible for the reason engine.rs's key is. Doc comments on new, id, ids_of, set_of, seed and grade."
+sha256 = "2c383b667304df5621c7db8da3f9b0d230eeeb938144ce8f0fab43f07fcf85aa"
+
+[[amendment]]
+path = "crates/inillucent-bench/src/stats.rs"
+ticket = "task-1973"
+reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. The bootstrap resample and its two tail bounds. Doc comment on label."
+sha256 = "9b7196a4d71f168767d14f7812c7ad261d42d97ff3372ba6c1a1757234ac9755"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/synth.rs"
-ticket = "strict lint remediation"
-reason = "The strict lint set became a required check, and these are the findings it had in the retrieval engine. Every edit is local: bounds-checked division, a NaN comparison kept and explained, an identity map removed, a test module moved below the items it follows. No retrieval behaviour changes, and no file was reformatted - these two crates have never been formatted and doing it would move 35 files for no reason connected to a lint."
-sha256 = "98727e1c22c61c09fef9a0ae52fef3bf6dc8244de9c1e507dd8fee7c6a1a4cd1"
+ticket = "task-1973"
+reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. build (179 lines), build_source (281) and embed (163) are 7, 23 and 47, and build_source's seven-tuple is a RawDocument struct with one raw_from_* per material - four of the seven fields were String and two Option<String>, so tuple position was the only thing saying which was the title and which the url. The file was 3,214 lines against the 2,799 policy.rs records, so two halves came out whole into synth/check.rs and synth/postgres.rs and it is 2,662. New from_table, because twenty fixed-table lookups under deny(indexing_slicing) would otherwise be twenty unwraps in a corpus generator. Doc comment on to_input."
+sha256 = "f0f5c593c852f7bb22c62cd622ee7fdd77061dcade10fde4842e717195b02974"
+
+[[amendment]]
+path = "crates/inillucent-bench/src/synth/check.rs"
+ticket = "task-1973"
+reason = "New file, extracted whole from synth.rs, which was 415 lines past its recorded ceiling. It is the whole of what synth-check does: whether the corpus supports the three ground truths and has the structural properties the scenarios rely on. check was 236 lines and is 31, over six named checks plus a GeneratedFamilies struct. Nothing in the extraction changed behaviour."
+sha256 = "72559bee7188ee13ffd78d2c68c172da58fd45687737d3c9c10eaed862f687ce"
+
+[[amendment]]
+path = "crates/inillucent-bench/src/synth/postgres.rs"
+ticket = "task-1973"
+reason = "New file, extracted whole from synth.rs for the same reason. It is the only part of that module that talks to a database: the schema the pgvector baseline queries, and loading the generated corpus into it. Nothing in the extraction changed behaviour."
+sha256 = "fa7a8835c1902cb0416076044c595c8bd41be314ae9a51061b19727e03f31dc2"
+
+[[amendment]]
+path = "crates/inillucent-bench/src/truncation.rs"
+ticket = "task-1970"
+reason = "Moved by aa63027 (task-1970): the rustfmt pass over this crate. Never declared here; task-1973 declares it because the guard was red at HEAD and this file is not its work."
+sha256 = "056d843526453f3a1d8d0d2e64c93bd0ba9b19a97321e1839fbbc3d442bf7661"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/tune.rs"
-ticket = "task-1962"
-reason = "task-1961 A9: build_settings takes a Sweep and label_for takes a Dials, instead of nine positional arguments each. Both are the same values in the same order, and the sweep produces the same settings in the same sequence - the baseline arm first, and the same cross product after it."
-sha256 = "83e11e769024aad6ed3366f014bde3165bf0d6bcc3b84aacb5dbbf8a9d152fa8"
+ticket = "task-1977"
+reason = "task-1977: two dead #[allow(clippy::too_many_arguments)] attributes came off. clippy.toml sets too-many-arguments-threshold = 8; run takes eight arguments and label_for takes one &Dials. Nothing else in the file changed. This entry replaces task-1973's, which declared the lint work on the same file."
+sha256 = "a5cbcefa51bbf1a500e0cd6d0a96de1633eaa97e92f0f07444ecde33ffa695fd"
 
 [[amendment]]
 path = "crates/inillucent-core/Cargo.toml"
-ticket = "task-1953"
-reason = "task-1946 M6: the only crate in the workspace with no license, description, repository, readme or lints - which cargo deny reports as error[unlicensed] - and the one most likely to be depended on alone. It gains the five lines its siblings have, plus rust-version.workspace, which is 1.88 and was measured rather than guessed."
-sha256 = "a7b4b859b0e71417c09e4c9dfe56de7a1cb60d8e5b7d654a4f86a455dea546b2"
+ticket = "task-1970"
+reason = "the inillucent-base dev-dependency with its testing feature, so this crate's #[cfg(test)] modules can call the one skip helper (task-1969, 4.6)"
+sha256 = "d1da91d63e66a610e07d5e9c8d0e05362851e95db760882fe90027c25cde954f"
 
 [[amendment]]
 path = "crates/inillucent-core/src/binio.rs"
@@ -140,9 +176,9 @@ sha256 = "3f8c9918845848bba6c58be46c3b9c47a97f72ad4847bdfb707c1091cae10ccb"
 
 [[amendment]]
 path = "crates/inillucent-core/src/embed_onnx.rs"
-ticket = "task-1953"
-reason = "task-1946 H7, H10 and M8: the ONNX test's own model lookup held the same hard-coded drive letter and now reads INILLUCENT_MODEL_ROOTS; both of its ways out say '; skipping' instead of returning None in silence, which is what made five tests report green on a machine with no weights; one doc link and one warning string with eighteen spaces in it."
-sha256 = "1942f73b190969b9a3060404075f8b4bbfa7999c53eeb3dbba687b30bcb31557"
+ticket = "task-1970"
+reason = "six eprintln skips became inillucent_base::testing::skipping, which panics under INILLUCENT_STRICT so the strict runner can see them (task-1969, 4.6)"
+sha256 = "80e692f01f2f2e142813c733db563036ca2a7152d293d69d6594454bebfc9885"
 
 [[amendment]]
 path = "crates/inillucent-core/src/filter.rs"
@@ -164,9 +200,9 @@ sha256 = "bc8c99f22be1196d8381b20212f450331c583419f61d85c7451f91f5f72c8af5"
 
 [[amendment]]
 path = "crates/inillucent-core/src/index.rs"
-ticket = "task-1953"
-reason = "task-1946 H4: the six search entry points return anyhow::Result and call check_query first. The check runs only when the vector branch runs, because a lexical-only search passes an empty vector on purpose. Four tests beside them, two of which go red with the check stubbed out."
-sha256 = "44e37fbfcaa8aadd1f387b4e5382d644dacf0794cb3a7855ece31c899c267d1d"
+ticket = "task-1980"
+reason = "R16: a document with no embedding is no longer returned by the vector branch, so a pure vector query stops answering it at score zero and a hybrid query stops labelling it origin=both. The filter is on the answer rather than on the scan, so the exhaustive reference every recall number is graded against is unchanged."
+sha256 = "965325d2adbd1cae4f0005adc75c82934bed3a9dbf5878be8b92d1419394b4e2"
 
 [[amendment]]
 path = "crates/inillucent-core/src/install.rs"
@@ -206,15 +242,15 @@ sha256 = "022f1fe51faf8019de7517920c0d00798c2121dd873b2f9a18f7b8dbec44e7c4"
 
 [[amendment]]
 path = "crates/inillucent-core/src/residency.rs"
-ticket = "task-1953"
-reason = "task-1946 H10: managed_or_skip returned None through a ? when no model was installed, so five tests in this module reported green on a machine with no weights and said nothing at all. Both ways out now print the reason with the '; skipping' suffix the strict runner counts."
-sha256 = "1c490cc65c6e3df6b60a20c44d84b5b524c4f7055534f131c3bc0d997ebec242"
+ticket = "task-1970"
+reason = "the same change to the one skip in this file (task-1969, 4.6)"
+sha256 = "351e16ab8fd9c30bc60c22f2d1e5446db8578d3502edd9ed30927b57fcf943b8"
 
 [[amendment]]
 path = "crates/inillucent-core/src/store.rs"
-ticket = "task-1953"
-reason = "task-1946 M9: one doc comment line was duplicated onto itself."
-sha256 = "bd12cd15cf88756d7be2fdcc01da678e43970b6bfec7c915380555c8e728be73"
+ticket = "task-2001"
+reason = "task-2001: a tombstoned document is one document row, not one row per chunk. add_chunks kept a chunk that arrived already deleted out of doc_lookup, so the next chunk of the same document could not find it and opened another row; 53 tombstoned documents holding 183 chunks became 183 rows and n_documents answered 38,977 for a corpus of 38,847. A second derived map, tombstoned_lookup, holds the tombstoned documents, and which map answers is the incoming chunk's own state. find_document still reads only the live map, so task-1775's rule that a live append cannot attach to a dead row is unchanged, and both maps are serde(skip) so no format on disk moved. Verified on the graded corpus: the same cache and the same build command print 38847 documents with every other build statistic identical. Six tests, five of which fail on the old code."
+sha256 = "785bf751e93d400dd22a64362b7829c9b8ec31dbd17822f8844120257d0f0dae"
 
 [[amendment]]
 path = "crates/inillucent-core/src/tokenize.rs"
@@ -230,13 +266,13 @@ sha256 = "6784023d2abb05e4d0a5ddf644c92aaf0656a03f937b82fdbb058f52bd30da8f"
 
 [[amendment]]
 path = "inillucent-scorecard.json"
-ticket = "task-1961"
-reason = "task-1961 P1: the commit the card records was rewritten when the history was rewritten, so `0c14f71d` is a sha nothing answers to any more and the same tree is `db29cb97`. Four occurrences in each file, the abbreviated form and the full one. No grading run was repeated and no measurement moved: `git diff` on both files is eight lines, and every one of them is that sha."
-sha256 = "69d2a497981a47f52d836b121ec20f81e2c4bd9a8f64fd7dead8791f5aa8afde"
+ticket = "task-2001"
+reason = "Moved by b47d6d0 (task-1935): a fresh retrieval run, published to both files. Never declared here; task-2001 declares it because the guard was red at HEAD and this file is not its work. Note that the run this pins is the one whose header reads '185078 chunks across 38977 documents', which is the defect task-2001 fixed: the corpus holds 38,847 documents and the same build command prints 38847 now. Neither file was edited by hand and no measurement was touched. The header and the build cost table will read 38847 the next time the card is generated, and this pin has to move again then."
+sha256 = "54b88f1494290002f204424f80d8ac3885191e5bc2ad20fdc545f7ebfabe4bc7"
 
 [[amendment]]
 path = "inillucent-scorecard.md"
-ticket = "task-1961"
-reason = "task-1961 P1: the commit the card records was rewritten when the history was rewritten, so `0c14f71d` is a sha nothing answers to any more and the same tree is `db29cb97`. Four occurrences in each file, the abbreviated form and the full one. No grading run was repeated and no measurement moved: `git diff` on both files is eight lines, and every one of them is that sha."
-sha256 = "3a3bf8134301326084a7873f023c0e72e9744078ffb1a78bab54adab9c1526a5"
+ticket = "task-2001"
+reason = "Moved by b47d6d0 (task-1935): a fresh retrieval run, published to both files. Never declared here; task-2001 declares it because the guard was red at HEAD and this file is not its work. Note that the run this pins is the one whose header reads '185078 chunks across 38977 documents', which is the defect task-2001 fixed: the corpus holds 38,847 documents and the same build command prints 38847 now. Neither file was edited by hand and no measurement was touched. The header and the build cost table will read 38847 the next time the card is generated, and this pin has to move again then."
+sha256 = "4f82f033c640060eb53c3347f4d5ea1b198683b223a119340c8c056ddc0f0783"
 

@@ -31,10 +31,19 @@ use crate::parser::parse_expression;
 
 /// The internal tables an application may write, as SQLite allows.
 ///
-/// **Two, and neither of them is the schema.** Every table whose
-/// name begins with `sqlite_` used to be refused, which is right for
-/// `sqlite_schema` - that is what `PRAGMA writable_schema` is for - and wrong
-/// for these two, because writing them is the documented way to use them:
+/// **Four, and two of them are the schema.** Every table whose
+/// name begins with `sqlite_` used to be refused, which is wrong for all four,
+/// because writing them is the documented way to use them:
+///
+/// - `sqlite_schema`, and `sqlite_master` which is its other name, are what
+///   `PRAGMA writable_schema` is for, and `.dump` emits
+///   `INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)VALUES(...)`
+///   for a virtual table - which is the only way a dump can restore one
+///   without building empty shadow tables over the ones it is about to fill
+///   (task-1979, R2). Whether the pragma is on is the *engine's* question and
+///   not the binder's: `ImportedDatabase::refuse_schema_write` refuses the
+///   statement when it is off, the way `refuse_shadow_write` refuses a write a
+///   defensive connection may not make.
 ///
 /// - `sqlite_sequence` holds one row per `AUTOINCREMENT` table, and
 ///   `UPDATE sqlite_sequence SET seq = 0 WHERE name = 't'` is how the counter is
@@ -47,7 +56,12 @@ use crate::parser::parse_expression;
 /// They are ordinary tables in every other respect: the rows are what they are,
 /// and a value written into one is used exactly as `ANALYZE` or the rowid
 /// allocator would have used the one it replaced.
-const WRITABLE_INTERNAL: [&[u8]; 2] = [b"sqlite_sequence", b"sqlite_stat1"];
+const WRITABLE_INTERNAL: [&[u8]; 4] = [
+    b"sqlite_sequence",
+    b"sqlite_stat1",
+    b"sqlite_schema",
+    b"sqlite_master",
+];
 
 /// Where one column's value comes from in an INSERT.
 #[derive(Clone, Debug, PartialEq)]
@@ -785,6 +799,11 @@ impl<'a> Binder<'a> {
             let saved_scopes = core::mem::take(&mut self.scopes);
             let saved_aliases = self.row_aliases.take();
             let saved_target = self.view_target.take();
+            // A trigger body is schema text: the statements in it were written
+            // by whoever wrote the file, and they run because a write happened
+            // rather than because anybody submitted them.
+            let saved_site = self.call_site;
+            self.call_site = crate::function::CallSite::Schema;
             self.ast = &trigger.ast;
             self.row_aliases = Some(crate::bind::RowAliases {
                 table: table.clone(),
@@ -792,6 +811,7 @@ impl<'a> Binder<'a> {
                 new,
             });
             let result = self.bind_trigger_body(trigger, table);
+            self.call_site = saved_site;
             self.ast = saved_ast;
             self.scopes = saved_scopes;
             self.row_aliases = saved_aliases;
@@ -877,6 +897,11 @@ impl<'a> Binder<'a> {
         let saved_scopes = core::mem::take(&mut self.scopes);
         let saved_aliases = self.row_aliases.take();
         let saved_target = self.view_target.take();
+        // A synthesised key action is generated from a `REFERENCES` clause the
+        // schema wrote, so it is schema too - the same site a written trigger
+        // gets, because the binder turns both into the same text.
+        let saved_site = self.call_site;
+        self.call_site = crate::function::CallSite::Schema;
         self.ast = &trigger.ast;
         self.row_aliases = Some(crate::bind::RowAliases {
             table: table.clone(),
@@ -884,6 +909,7 @@ impl<'a> Binder<'a> {
             new,
         });
         let result = self.bind_trigger_body(trigger, table);
+        self.call_site = saved_site;
         self.ast = saved_ast;
         self.scopes = saved_scopes;
         self.row_aliases = saved_aliases;
@@ -1509,6 +1535,20 @@ impl<'a> Binder<'a> {
         let (ast, expr) = parse_expression(sql, &limits)?;
         let mut nested = Binder::new(self.catalog, &ast, self.authorizer);
         nested.trigger_depth = self.trigger_depth;
+        // **This is where a `DEFAULT`, a `CHECK`, a generated column, an index
+        // expression and a partial-index predicate all become a bound tree, so
+        // it is where all five are told they are a schema (task-1972).** The
+        // nested binder also inherits the connection's registrations and
+        // collations, which it did not before: without the registrations
+        // `bind_external_call` never sees the call at all, because the name
+        // does not resolve to a registered function and the expression fails as
+        // "no such function" - an error for the wrong reason, and one that
+        // disappears the moment an application registers the same name at a
+        // different arity.
+        nested.externals = self.externals;
+        nested.collations = self.collations;
+        nested.trusted_schema = self.trusted_schema;
+        nested.call_site = crate::function::CallSite::Schema;
         nested.sources = self.sources.clone();
         nested.scopes = self.scopes.clone();
         let bound = nested.bind_expr(expr)?;

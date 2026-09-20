@@ -39,7 +39,7 @@ published Windows and Linux archives both answer
 | **inillucent.com, Windows** | **live at 0.1.2** - `irm .../install.ps1 \| iex` installs and runs | nothing |
 | **inillucent.com, Linux x86-64** | **live at 0.1.2** - `curl -fsSL .../install.sh \| sh` installs and runs | nothing |
 | **inillucent.com, Linux aarch64** | **published at 0.1.2**, and **never run** - there is no ARM machine here. `tools/release-verify-linux.sh` reads its glibc floor, its shared libraries and its modes out of the archive and passes; L4 and L5 skip themselves | a machine that can run it |
-| **inillucent.com, macOS** | **no archive, at 0.1.1 or 0.1.2** - and it cannot be produced on this machine or in CI. See [the macOS archive](#the-macos-archive-the-one-thing-that-needs-a-different-machine) | **a Mac, an Apple Developer Program membership, two Developer ID certificates and a stored `notarytool` profile.** Then one command on it: `./packaging/macos/release-macos.sh --version 0.1.2 --upload` |
+| **inillucent.com, macOS** | **no archive, at 0.1.1 or 0.1.2** - and it cannot be produced on this machine, nor by anything else: `task-1968` removed the GitHub workflows and there is no CI at all now. See [the macOS archive](#the-macos-archive-the-one-thing-that-needs-a-different-machine) | **a Mac, an Apple Developer Program membership, two Developer ID certificates and a stored `notarytool` profile.** Then one command on it: `./packaging/macos/release-macos.sh --version 0.1.2 --upload` |
 | **SHA256SUMS signature** | not signed, at 0.1.1 or 0.1.2. The signing path itself is verified: run with a throwaway key it signs, the signature verifies, and a different public key is rejected on the key id | **a minisign key pair**, created once. `packaging/sign-sums.ps1` reads the secret key from `INILLUCENT_MINISIGN_KEY`, and `packaging/inillucent.pub` has to exist before it will sign at all |
 | **the .deb and the .rpm** | **not published, and the packaging is verified** - both were built from the published 0.1.2 Linux archive, the `.deb` was extracted in WSL and the program it carries wrote, reopened and read a database, and the `.rpm` header lists the same nine paths with the same modes | an OpenPGP key. `packaging/linux/package-linux.ps1` signs by default because `apt` and `dnf` will not install an unsigned package from outside a distribution's own repository. `gpg` is on the box with an empty keyring |
 | **GitHub release** | **cut for 0.1.2** on 2026-09-14, on the `v0.1.2` tag whose tree is the released tree, with all five assets. Every one was downloaded back off the release and hashed: all five match the published `SHA256SUMS` and `dist/` byte for byte. **Visible to everybody** since task-1961 made both repositories public: `tools/check-public-urls.mjs` fetches every URL a shipped package names with no credential and all nine answer 200 | nothing |
@@ -165,7 +165,7 @@ None of these is reachable by reading the scripts. Each came from running one.
 - **`rust-toolchain.toml` named three targets out of five**, so `release-all.ps1` stopped at its
   macOS step with `can't find crate for std`. The macOS section above has it.
 - **`fetch-macos-artifacts.ps1` reported success having checked nothing, and published what it
-  refused.** It is the gate between the MacBook's artifacts and the site, and on a machine without
+  refused.** It is the gate between the macOS artifacts and the site, and on a machine without
   `rcodesign` the committed version printed a warning, said *"every check passed"*, exited 0, and
   wrote the artifacts into `dist/SHA256SUMS`. Run against three text files reading
   `this is not a Mach-O`, that is exactly what it did. Four faults in one script:
@@ -235,7 +235,8 @@ builds `aarch64-apple-darwin` and `x86_64-apple-darwin` through cargo-zigbuild, 
 archives neither, because an archive of unsigned Mach-O is not something anybody should be able to
 pick up by accident.
 
-What cannot be done here, and cannot be done by CI either, is everything after the compiler:
+What cannot be done here, and could never have been done by a runner either, is everything after
+the compiler:
 
 | step | what it needs | where it can run |
 |---|---|---|
@@ -252,19 +253,24 @@ stored in the Mac's keychain as the profile `inillucent-notary`.
 `packaging/macos/README.md` has the one time setup, and `release-macos.sh` refuses to start until all
 three exist and says which is missing.
 
-### Can CI produce it?
+### There is no CI, and what went with it
 
-**Not today, and the workflow already says so in the right place.** `.github/workflows/ci.yml` has
-`macos-latest` in the `validate` matrix, added by task-1932, so the workspace is built and tested on
-a real Mac on every commit. It is deliberately **not** in the `packages` matrix, and the comment
-there gives the reason: `packaging/release.sh` signs and notarises, which needs an Apple developer
-identity and an app specific password that a pull request from a fork cannot be given.
+**`task-1968` removed `.github/workflows/` outright.** `task-1922` had already measured the reason:
+56 runs on this repository, none of them green, and every run after 9 September produced no jobs at
+all. Nothing on a runner builds, tests or packages this repository now. `tools/validate.ps1` and
+`tools/validate.sh`, on the machine making the change, are the whole gate.
 
-That reasoning holds. A GitHub runner is a real Mac and could `lipo`, build the `.pkg` and run the
-binaries, but with no Developer ID certificate it can only produce an ad hoc signature, and
-`verify-macos.sh` asks `spctl` for `source=Notarized Developer ID` and would reject it. Putting the
-certificate and the notarisation credential into repository secrets would make a `workflow_dispatch`
-job possible; that is a decision about where the signing identity lives, and it is not made here.
+**Two things stopped existing with the workflows.** The nightly fuzz run, which `SECURITY.md` says.
+And `macos-latest` in the `validate` matrix, which `task-1932` had added a fortnight earlier -- the
+only place the workspace was ever built and tested on a real Mac. The Mach-O binaries this box cross
+compiles are now compiled and never run, by anybody, before they are published. Read the rest of
+this page on that basis: there is no second machine that will notice.
+
+**It would not have produced the archive either**, and that reasoning is unchanged. A runner is a
+real Mac and could `lipo`, build the `.pkg` and run the binaries, but with no Developer ID
+certificate it can only produce an ad hoc signature, and `verify-macos.sh` asks `spctl` for
+`source=Notarized Developer ID` and would reject it. The archive needed a Mac with the signing
+identity on it before, and it needs one now.
 
 ### The defect this ticket found in the build half
 
@@ -282,6 +288,16 @@ before 0.1.2 carried an ARM Linux archive. It was invisible for the Apple pair b
 and nothing rebuilt them. `rust-toolchain.toml` names all five targets now.
 
 ### What Jason has to run, and where
+
+**Since task-1995 there is no second machine.** `packaging/release-all.ps1` on
+the Windows box builds, signs, packages and notarises macOS as well, because
+`rcodesign` and `tools/macos-pkg` replace every Apple program the release used
+and Apple's notary service is an HTTPS API. `packaging/macos/README.md` is the
+detail, including how the two Developer ID certificates are obtained in a
+browser rather than in Xcode.
+
+The paragraph below describes the route that was in place when this section was
+written, and it still works on a Mac.
 
 On the MacBook, with the repository checked out at the `v0.1.2` tag:
 
@@ -545,28 +561,19 @@ that reach the most people fastest.
 Two machines. `packaging/README.md` has the full sequence; the short form is:
 
 ```powershell
-# the Windows box: Windows and both Linux architectures, then the packages
+# the Windows box, all of it: every target, signed, notarised and packaged
 pwsh tools/cross/fetch-toolchain.ps1
 pwsh packaging/release-all.ps1
 pwsh packaging/linux/package-linux.ps1
-```
-
-```sh
-# the MacBook: build, sign, notarise, verify, hand over
-./packaging/macos/release-macos.sh --version 0.1.2 --upload
-```
-
-```powershell
-# the Windows box again: collect, sign the checksums, publish
-pwsh packaging/fetch-macos-artifacts.ps1 -Version 0.1.2
 pwsh packaging/sign-sums.ps1
-pwsh packaging/publish-site.ps1 -Version 0.1.2 -Stage
-#   ... verify on the Mac, then:
-pwsh packaging/publish-site.ps1 -Version 0.1.2 -Link
+pwsh packaging/publish-site.ps1 -Version 0.1.4 -Stage
+#   ... verify on any Mac that can be borrowed, then:
+pwsh packaging/publish-site.ps1 -Version 0.1.4 -Link
 ```
 
-**The distribution point is inillucent.com.** GitHub carries the macOS artifacts
-from the MacBook to the Windows box; the site is what a user downloads from.
+**The distribution point is inillucent.com**, and since task-1995 GitHub carries
+nothing at all: there are no macOS artifacts to move between machines, because
+the machine that builds them is the machine that publishes them.
 
 `release.ps1` refuses to build an untagged archive, so the tag comes first.
 `provenance.json` records the commit, the tag, the toolchain and the six checks

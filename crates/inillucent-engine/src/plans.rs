@@ -80,6 +80,13 @@ pub(crate) enum Cached {
     Program(Vec<(String, i64, i64, String, String)>),
     /// An insert into a virtual table, which the module applies.
     VirtualInsert(Box<inillucent_sql::dml::BoundInsert>),
+    /// An insert into `sqlite_schema` under `PRAGMA writable_schema`.
+    ///
+    /// It writes a catalog row through the same `record` every `CREATE` uses,
+    /// rather than through the ordinary insert path: the catalog tree has four
+    /// columns `sqlite_schema` does not declare, and a row written without them
+    /// names no tree. See `insert_into_schema` for what a dump needs it for.
+    SchemaInsert(Box<inillucent_sql::dml::BoundInsert>),
     /// A delete from a virtual table, with the query that finds its rowids.
     ///
     /// A module owns its storage, so the only handle on one of its rows is the
@@ -157,7 +164,7 @@ impl ImportedDatabase {
     ///
     /// @param limit - which limit
     pub fn limit(&self, limit: inillucent_base::limits::Limit) -> i64 {
-        self.pragmas.limits.borrow().get(limit)
+        self.pragmas.limits().borrow().get(limit)
     }
 
     /// Sets one run-time limit, and returns what it was before.
@@ -174,7 +181,7 @@ impl ImportedDatabase {
     /// @param requested - the value asked for
     /// @returns the value that was in force before this call
     pub fn set_limit(&mut self, limit: inillucent_base::limits::Limit, requested: i64) -> i64 {
-        self.pragmas.limits.borrow_mut().set(limit, requested)
+        self.pragmas.limits().borrow_mut().set(limit, requested)
     }
 
     /// Sets the ceiling one session's cache is emptied at.
@@ -203,7 +210,7 @@ impl ImportedDatabase {
     /// tables; two lever settings' plans are kept apart because a plan built
     /// with the covering-index rule on is that rule's answer.
     fn plan_key(&self) -> u64 {
-        (self.session_state.session.get() << 32) | u64::from(self.pragmas.levers.get().disabled())
+        (self.session_state.session.get() << 32) | u64::from(self.pragmas.levers().disabled())
     }
 
     /// Returns how many statements are compiled and held.
@@ -257,7 +264,7 @@ impl ImportedDatabase {
         if !self.cacheable() {
             return Ok(std::rc::Rc::new(self.compile(sql)?));
         }
-        if !self.pragmas.levers.get().has(Levers::PLAN_CACHE) {
+        if !self.pragmas.levers().has(Levers::PLAN_CACHE) {
             // The lever is off, so nothing is held and every execution
             // compiles. It exists so a measurement can price the compile.
             return Ok(std::rc::Rc::new(self.compile(sql)?));

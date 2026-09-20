@@ -56,7 +56,7 @@ impl Rng {
 }
 
 /// How a comparison between two engines came out, with the uncertainty attached.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Paired {
     /// Mean of `candidate - baseline` over the queries. Positive means the
     /// candidate scored higher, whatever the metric's direction; the caller
@@ -77,7 +77,7 @@ pub struct Paired {
 
 /// The verdict a comparison earns, once its uncertainty and a practical
 /// threshold have both been taken into account.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Verdict {
     /// The interval clears both zero and the practical threshold.
     Better,
@@ -92,6 +92,10 @@ pub enum Verdict {
 }
 
 impl Verdict {
+    /// What the score card prints for this verdict.
+    ///
+    /// `Worse` is the one that is emphasised, because a reader skimming a
+    /// table of verdicts is looking for the row that says the change lost.
     pub fn label(&self) -> &'static str {
         match self {
             Verdict::Better => "better",
@@ -125,7 +129,14 @@ pub fn compare(candidate: &[f64], baseline: &[f64], seed: u64) -> Option<Paired>
     let disagreements = diffs.iter().filter(|d| d.abs() > 1e-12).count();
     let (low, high) = bootstrap_interval(&diffs, seed);
     let p_value = randomization_p(&diffs, seed ^ 0x9E37_79B9_7F4A_7C15);
-    Some(Paired { delta, low, high, p_value, queries: n, disagreements })
+    Some(Paired {
+        delta,
+        low,
+        high,
+        p_value,
+        queries: n,
+        disagreements,
+    })
 }
 
 /// The 95% percentile bootstrap interval on the mean of `diffs`.
@@ -144,15 +155,22 @@ fn bootstrap_interval(diffs: &[f64], seed: u64) -> (f64, f64) {
     for _ in 0..ITERATIONS {
         let mut total = 0.0;
         for _ in 0..n {
-            total += diffs[rng.below(n)];
+            total += diffs.get(rng.below(n)).copied().unwrap_or(0.0);
         }
         means.push(total / n as f64);
     }
     means.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     // Nearest rank on each tail, so the bounds are values the resampling actually
     // produced rather than an interpolation between two of them.
-    let lo = means[((0.025 * ITERATIONS as f64) as usize).min(ITERATIONS - 1)];
-    let hi = means[((0.975 * ITERATIONS as f64) as usize).min(ITERATIONS - 1)];
+    let last = ITERATIONS.saturating_sub(1);
+    let lo = means
+        .get(((0.025 * ITERATIONS as f64) as usize).min(last))
+        .copied()
+        .unwrap_or(0.0);
+    let hi = means
+        .get(((0.975 * ITERATIONS as f64) as usize).min(last))
+        .copied()
+        .unwrap_or(0.0);
     (lo, hi)
 }
 
@@ -258,7 +276,10 @@ mod tests {
         let mut candidate = baseline.clone();
         candidate[0] = 1.5;
         let p = compare(&candidate, &baseline, 3).unwrap();
-        assert!(p.delta > 1e-4, "the old tolerance would have called this a win");
+        assert!(
+            p.delta > 1e-4,
+            "the old tolerance would have called this a win"
+        );
         assert_eq!(p.disagreements, 1);
         assert_ne!(verdict(&p, 0.01), Verdict::Better);
     }
@@ -270,7 +291,11 @@ mod tests {
         let baseline = vec![0.5; 500];
         let candidate = vec![0.5005; 500];
         let p = compare(&candidate, &baseline, 5).unwrap();
-        assert!(p.low > 0.0, "the difference is detectable: {:?}", (p.low, p.high));
+        assert!(
+            p.low > 0.0,
+            "the difference is detectable: {:?}",
+            (p.low, p.high)
+        );
         assert_eq!(verdict(&p, 0.01), Verdict::Equivalent);
     }
 
@@ -278,10 +303,15 @@ mod tests {
     fn a_noisy_wash_is_inconclusive_rather_than_a_win() {
         // Half the queries improve by 0.4, half get worse by 0.4.
         let baseline = vec![0.5; 80];
-        let candidate: Vec<f64> =
-            (0..80).map(|i| if i % 2 == 0 { 0.9 } else { 0.1 }).collect();
+        let candidate: Vec<f64> = (0..80)
+            .map(|i| if i % 2 == 0 { 0.9 } else { 0.1 })
+            .collect();
         let p = compare(&candidate, &baseline, 9).unwrap();
-        assert!(p.low < 0.0 && p.high > 0.0, "interval {:?}", (p.low, p.high));
+        assert!(
+            p.low < 0.0 && p.high > 0.0,
+            "interval {:?}",
+            (p.low, p.high)
+        );
         assert_eq!(verdict(&p, 0.01), Verdict::Inconclusive);
     }
 

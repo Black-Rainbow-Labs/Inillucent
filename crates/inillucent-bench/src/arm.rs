@@ -38,12 +38,30 @@ pub enum Arm {
 pub struct ArmOptions {
     pub batch_size: usize,
     pub device: Device,
-    /// `host:port` for a llama.cpp arm.
+    /// `host:port` for a llama.cpp arm that has no entry in `endpoint_overrides`.
     pub endpoint: String,
+    /// `host:port` for one named model, when several GGUF arms are compared at once.
+    ///
+    /// Gate C1 times the student's q8_0 against `nomic-embed-text-v2-moe`'s f16 **and**
+    /// its q8_0 through the same llama.cpp build, which is three served arms on one
+    /// card. A single global endpoint cannot express that: each GGUF needs its own
+    /// `llama-server`, because a server holds one model. Like `max_batch_cells` this
+    /// is a property of the machine and not of the model, so it lives here and not in
+    /// the manifest, and setting it moves no manifest digest and invalidates no cache.
+    pub endpoint_overrides: std::collections::BTreeMap<String, String>,
     /// Tokens per request for a llama.cpp arm, at or below the server's `-b`.
     pub token_budget: usize,
     /// Texts per request for a llama.cpp arm, at or below the server's `-np`.
     pub max_texts: usize,
+    /// Requests a llama.cpp arm keeps in flight at once.
+    ///
+    /// One by default, and deliberately: a served model's throughput depends on how
+    /// many requests are in flight far more than on the model, so the cost lane holds
+    /// it at one and its numbers stay comparable between arms and with what task-1818
+    /// recorded. Embedding a corpus asks for more, because there the round trip is
+    /// waste rather than measurement - v2-moe's corpus embed ran at 64.6 chunks a
+    /// second falling to 12 with the card at 6 per cent, entirely on latency.
+    pub concurrency: usize,
     /// Ceiling on `texts in an ONNX batch x longest sequence in it, squared`.
     ///
     /// A machine setting rather than a model property, which is why it is here
@@ -68,14 +86,29 @@ impl Default for ArmOptions {
             batch_size: 16,
             device: Device::Cpu,
             endpoint: format!("127.0.0.1:{DEFAULT_LLAMA_PORT}"),
+            endpoint_overrides: std::collections::BTreeMap::new(),
             // Well under the 8,192 physical batch a `llama-server` is started
             // with here. Sixty-four real chunks from this corpus measured 17,029
             // tokens, so a batch sized by count rather than by tokens fails on
             // real text and passes on whatever short fixture it was tested with.
             token_budget: 6_000,
             max_texts: 32,
+            concurrency: 1,
             max_batch_cells: 24_000_000,
         }
+    }
+}
+
+impl ArmOptions {
+    /// Where this model's `llama-server` listens.
+    ///
+    /// The model's own override when it has one, and the shared endpoint otherwise, so a
+    /// card with one GGUF arm needs no override at all and a card with three names each.
+    /// @param model_id - the model's id, as its manifest declares it
+    pub fn endpoint_for(&self, model_id: &str) -> &str {
+        self.endpoint_overrides
+            .get(model_id)
+            .map_or(self.endpoint.as_str(), |e| e.as_str())
     }
 }
 
@@ -99,7 +132,7 @@ impl Arm {
                 )?)))
             }
             Backend::LlamaCpp => {
-                let (host, port) = split_endpoint(&options.endpoint)?;
+                let (host, port) = split_endpoint(options.endpoint_for(&model.manifest.id))?;
                 Ok(Arm::Llama(Box::new(LlamaCppEmbedder::connect(
                     &model.dir,
                     &host,
@@ -107,6 +140,7 @@ impl Arm {
                     &model.manifest,
                     options.token_budget,
                     options.max_texts,
+                    options.concurrency,
                 )?)))
             }
         }
@@ -137,6 +171,21 @@ impl Arm {
         }
     }
 
+    /// Whether this arm's vectors travel over a socket to a `llama-server`.
+    ///
+    /// Asked by `embed-check`, which has one thing to say about a disagreement that
+    /// is only true of a served arm: `llama-server` picks a slot by longest common
+    /// prefix once every slot has held a prompt, and reuses that slot's cached keys
+    /// and values for the matching tokens rather than recomputing them. Every text a
+    /// corpus is embedded from shares the model's document prefix, so from the second
+    /// pass against one server onward every request reuses something, and the reused
+    /// values were computed in a different batch. An in-process ONNX graph has no
+    /// slots and no cache, so the same sentence printed under it would send its reader
+    /// after a cause that cannot apply.
+    pub fn is_served(&self) -> bool {
+        matches!(self, Arm::Llama(_))
+    }
+
     /// How much of the text handed to this arm the model actually saw.
     pub fn truncation(&self) -> TruncationFacts {
         match self {
@@ -146,10 +195,16 @@ impl Arm {
     }
 
     /// A label for progress output, so a log says which backend produced a rate.
-    pub fn backend_label(&self, options: &ArmOptions) -> String {
+    ///
+    /// The endpoint in the label is the one this arm actually connected to, not the
+    /// shared default, so a card comparing three GGUF arms does not print the same
+    /// endpoint against three different servers.
+    /// @param options - the machine settings the arm was opened with
+    /// @param model_id - the model's id, for its endpoint override
+    pub fn backend_label(&self, options: &ArmOptions, model_id: &str) -> String {
         match self {
             Arm::Onnx(_) => options.device.label(),
-            Arm::Llama(_) => format!("llama.cpp at {}", options.endpoint),
+            Arm::Llama(_) => format!("llama.cpp at {}", options.endpoint_for(model_id)),
         }
     }
 }
@@ -159,7 +214,9 @@ fn split_endpoint(endpoint: &str) -> Result<(String, u16)> {
     let (host, port) = endpoint
         .rsplit_once(':')
         .with_context(|| format!("{endpoint} is not host:port"))?;
-    let port: u16 = port.parse().with_context(|| format!("{port} is not a port"))?;
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("{port} is not a port"))?;
     anyhow::ensure!(!host.is_empty(), "{endpoint} names no host");
     Ok((host.to_string(), port))
 }
@@ -170,8 +227,14 @@ mod tests {
 
     #[test]
     fn an_endpoint_splits_into_a_host_and_a_port() {
-        assert_eq!(split_endpoint("127.0.0.1:8189").unwrap(), ("127.0.0.1".into(), 8189));
-        assert_eq!(split_endpoint("localhost:1").unwrap(), ("localhost".into(), 1));
+        assert_eq!(
+            split_endpoint("127.0.0.1:8189").unwrap(),
+            ("127.0.0.1".into(), 8189)
+        );
+        assert_eq!(
+            split_endpoint("localhost:1").unwrap(),
+            ("localhost".into(), 1)
+        );
     }
 
     #[test]
@@ -187,7 +250,62 @@ mod tests {
     #[test]
     fn the_default_llama_port_is_not_nikayas() {
         assert_ne!(DEFAULT_LLAMA_PORT, 8087);
-        assert!(ArmOptions::default().endpoint.ends_with(&DEFAULT_LLAMA_PORT.to_string()));
+        assert!(ArmOptions::default()
+            .endpoint
+            .ends_with(&DEFAULT_LLAMA_PORT.to_string()));
+    }
+
+    /// Gate C1(a) compares three GGUF arms - the student's q8_0 against v2-moe's f16
+    /// and q8_0 - and a `llama-server` serves one model, so three servers on three
+    /// ports have to be addressable from one card. Before this, every llama.cpp arm
+    /// read the same global endpoint and the second and third arms would have been
+    /// timed against the first one's model while the card reported three model ids.
+    #[test]
+    fn each_model_can_name_its_own_server() {
+        let mut options = ArmOptions {
+            endpoint: "127.0.0.1:8189".into(),
+            ..Default::default()
+        };
+        options
+            .endpoint_overrides
+            .insert("v2moe-q8".into(), "127.0.0.1:8190".into());
+        options
+            .endpoint_overrides
+            .insert("student-q8".into(), "127.0.0.1:8191".into());
+        assert_eq!(
+            options.endpoint_for("nomic-embed-text-v2-moe"),
+            "127.0.0.1:8189"
+        );
+        assert_eq!(options.endpoint_for("v2moe-q8"), "127.0.0.1:8190");
+        assert_eq!(options.endpoint_for("student-q8"), "127.0.0.1:8191");
+    }
+
+    /// An override is only useful if it is a real endpoint, and a typo in one would
+    /// otherwise surface as a connection refused against a port nobody chose.
+    #[test]
+    fn an_overridden_endpoint_is_still_split_into_a_host_and_a_port() {
+        let mut options = ArmOptions::default();
+        options
+            .endpoint_overrides
+            .insert("student-q8".into(), "127.0.0.1:8191".into());
+        assert_eq!(
+            split_endpoint(options.endpoint_for("student-q8")).unwrap(),
+            ("127.0.0.1".into(), 8191)
+        );
+        options
+            .endpoint_overrides
+            .insert("broken".into(), "127.0.0.1".into());
+        assert!(split_endpoint(options.endpoint_for("broken")).is_err());
+    }
+
+    /// A served arm's throughput depends on how many requests are in flight far more
+    /// than on the model: measured on this box against a 32 slot server, one request
+    /// gives 28 texts a second and eight give 621. So the default is one, and a number
+    /// the cost lane produces means the same thing between arms and against what
+    /// task-1818 recorded. A caller that wants the other behaviour asks for it.
+    #[test]
+    fn a_served_arm_keeps_one_request_in_flight_unless_asked() {
+        assert_eq!(ArmOptions::default().concurrency, 1);
     }
 
     #[test]

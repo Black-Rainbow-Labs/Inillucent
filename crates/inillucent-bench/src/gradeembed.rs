@@ -57,7 +57,18 @@ use crate::queryset::{self, GradedQuery, Perturbation};
 use crate::report::Role;
 use crate::runs::{self, HitRecord, QueryRecord, RunWriter};
 use crate::scenarios::{self, KeySpace};
-use crate::stats::{self, Paired, Verdict};
+use crate::stats::{Paired, Verdict};
+
+mod card;
+
+// The card is the run's other half and it is re-imported by name rather than
+// reached through `card::`, so every call site below reads as it did when the
+// two halves were one file.
+use card::{
+    abstention_lane, caveats, composite_lane, cost_lane, judge, lane_from, lexical_lane,
+    matryoshka_lane, LaneScores, LEXICAL_COLUMN,
+};
+pub use card::{print_summary, rejudge, render};
 
 /// The smallest difference in a ranking measure this card will call a win.
 ///
@@ -125,6 +136,22 @@ pub struct EmbeddingGradeOptions {
     /// Chunks re-embedded to time each model. Distinct chunks, spread across the
     /// corpus: timing a model on repeated text measures a cache rather than a
     /// model, which is a mistake this box has already made once.
+    /// Query vectors an arm's model produced elsewhere, by model id.
+    ///
+    /// An arm's queries are embedded by that arm's own model, which means the harness
+    /// has to be able to open it, and two things this ticket grades it cannot:
+    /// `Qwen3-Embedding-8B` and `-4B` are safetensors with no ONNX graph and no GGUF,
+    /// and the loop grades five weight interpolations an iteration straight out of
+    /// PyTorch. Exporting first would put the exporter inside the loop, and task-1818
+    /// measured the exporter's own effect at cosine 0.99999 over 300 chunks, which is
+    /// small but is not nothing when the kill test's threshold is 0.01.
+    ///
+    /// So the vectors can come from the same producer that made the corpus vectors,
+    /// through `query-texts` and `cache-from-vectors`. Nothing is taken on trust: the
+    /// sidecar records the corpus digest, the seed digest, the per-source count and
+    /// the model id it was made for, and every one is checked against what this run
+    /// generated before a single vector is read.
+    pub query_vectors: BTreeMap<String, PathBuf>,
     pub cost_samples: usize,
     /// Processors the cost lane times each model on.
     pub cost_devices: Vec<Device>,
@@ -156,7 +183,7 @@ pub struct EmbeddingGradeOptions {
 
 /// What one arm is, so a reader never has to trust that two columns are
 /// comparable - they can check.
-#[derive(Serialize, Clone)]
+#[derive(Serialize, serde::Deserialize, Clone)]
 pub struct ArmFacts {
     pub model_id: String,
     pub dims: usize,
@@ -188,7 +215,7 @@ pub struct ArmFacts {
     pub bytes_per_vector: BTreeMap<String, usize>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, serde::Deserialize, Clone)]
 pub struct EmbeddingRow {
     pub family: String,
     pub metric: String,
@@ -202,7 +229,7 @@ pub struct EmbeddingRow {
     pub series: BTreeMap<String, Vec<f64>>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, serde::Deserialize, Clone)]
 pub struct Lane {
     pub name: String,
     pub rationale: String,
@@ -210,7 +237,7 @@ pub struct Lane {
 }
 
 /// One candidate against the baseline on one row.
-#[derive(Serialize, Clone)]
+#[derive(Serialize, serde::Deserialize, Clone)]
 pub struct ArmJudgement {
     pub lane: String,
     pub family: String,
@@ -224,7 +251,7 @@ pub struct ArmJudgement {
     pub paired: Option<Paired>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct EmbeddingCard {
     pub run_id: String,
     pub generated_at_unix: u64,
@@ -318,12 +345,18 @@ fn resolve_arms(options: &EmbeddingGradeOptions) -> Result<Vec<Arm>> {
             header.model_id,
             model.manifest.max_tokens
         );
-        arms.push(Arm { cache: path.clone(), header, model });
+        arms.push(Arm {
+            cache: path.clone(),
+            header,
+            model,
+        });
     }
 
     // Every arm against the first, so an error names one pair rather than a set.
-    let first = &arms[0];
-    for arm in &arms[1..] {
+    let Some((first, rest)) = arms.split_first() else {
+        return Ok(arms);
+    };
+    for arm in rest {
         anyhow::ensure!(
             arm.header.corpus_sha256 == first.header.corpus_sha256,
             "{} was embedded from corpus {} and {} from corpus {}. These are two different \
@@ -439,7 +472,6 @@ fn exhaustive_top_k(vectors: &[Vec<f32>], query: &[f32], k: usize) -> Vec<usize>
 /// @param search - what a query returns under this arm
 /// @param per_doc_cap - the cap the ideal ranking is computed against
 /// @param writer - where per-query records go
-#[allow(clippy::too_many_arguments)]
 fn score_family(
     model: &str,
     lane: &str,
@@ -460,8 +492,14 @@ fn score_family(
         let got = space.ids_of(&hits.iter().map(|h| h.key.clone()).collect::<Vec<_>>());
 
         let scores: [(&str, f64); 8] = [
-            (M_NDCG_GRADED, ndcg_graded_at_k(&got, &grades, K, per_doc_cap) as f64),
-            (M_NDCG, ndcg_at_k_attainable(&got, &correct, K, per_doc_cap) as f64),
+            (
+                M_NDCG_GRADED,
+                ndcg_graded_at_k(&got, &grades, K, per_doc_cap) as f64,
+            ),
+            (
+                M_NDCG,
+                ndcg_at_k_attainable(&got, &correct, K, per_doc_cap) as f64,
+            ),
             (M_SUCCESS_1, success_at_k(&got, &correct, 1) as f64),
             (M_SUCCESS_10, success_at_k(&got, &correct, K) as f64),
             (M_MRR, reciprocal_rank(&got, &correct) as f64),
@@ -470,10 +508,16 @@ fn score_family(
                 M_EVIDENCE_RECALL,
                 graded_recall_at_k(&got, &grades, K, queryset::GRADE_ANSWER) as f64,
             ),
-            (M_TOP_SCORE, hits.first().map(|h| h.score as f64).unwrap_or(0.0)),
+            (
+                M_TOP_SCORE,
+                hits.first().map(|h| h.score as f64).unwrap_or(0.0),
+            ),
         ];
         for (metric, value) in scores {
-            per_metric.entry(metric.to_string()).or_default().push(value);
+            per_metric
+                .entry(metric.to_string())
+                .or_default()
+                .push(value);
         }
 
         if let Some(w) = writer.as_mut() {
@@ -484,7 +528,12 @@ fn score_family(
                     rank: i + 1,
                     key: h.key.clone(),
                     score: h.score as f64,
-                    grade: q.graded.iter().find(|(k, _)| *k == h.key).map(|(_, g)| *g).unwrap_or(0),
+                    grade: q
+                        .graded
+                        .iter()
+                        .find(|(k, _)| *k == h.key)
+                        .map(|(_, g)| *g)
+                        .unwrap_or(0),
                 })
                 .collect();
             // The engine column carries `<model> / <lane>`. It is what the run
@@ -523,6 +572,41 @@ const CALIBRATION: &str = "abstention calibration (not scored)";
 /// The family the confident-answer rate is measured on.
 const UNANSWERABLE: &str = "unanswerable";
 
+/// One family's query vector, by the query's position in the family.
+///
+/// **Fallible, because a family and its embedded vectors are two lists that
+/// have to be the same length.** If they ever are not, the query at that
+/// position would be scored against another query's vector, which is a score
+/// that looks ordinary and is wrong.
+///
+/// @param vectors - the family's query vectors, in the family's order
+/// @param index - the query's position in the family
+fn query_at(vectors: &[Vec<f32>], index: usize) -> Result<&Vec<f32>> {
+    vectors.get(index).with_context(|| {
+        format!(
+            "query {index} of this family has no vector: {} were embedded",
+            vectors.len()
+        )
+    })
+}
+
+/// The corpus key of every chunk, in corpus order.
+///
+/// **One function rather than the same `format!` in two places.** Both the
+/// grading run and the sidecar writer generate their query set from these
+/// keys, and a different spelling in either would produce a different query
+/// set - so the sidecar would hold vectors of text the run never asked about,
+/// and nothing would say so.
+///
+/// @param corpus - the loaded cache
+fn corpus_keys(corpus: &Corpus) -> Vec<String> {
+    corpus
+        .chunks
+        .iter()
+        .map(|c| format!("{}#{}", c.external_doc_id, c.chunk_index))
+        .collect()
+}
+
 /// Build the query families. Identical for every arm by construction: they are
 /// generated from the chunks, and the refusal above has already established that
 /// every arm's chunks are the same chunks.
@@ -530,7 +614,7 @@ const UNANSWERABLE: &str = "unanswerable";
 /// @param keys - the corpus keys, in corpus order
 /// @param per_source - queries per source for the identity family
 fn build_families(corpus: &Corpus, keys: &[String], per_source: usize, n: usize) -> Families {
-    let sliced = &corpus.chunks[..n];
+    let sliced = corpus.chunks.get(..n).unwrap_or(&corpus.chunks);
     let identity =
         queryset::document_identity_queries(sliced, keys, per_source, scenarios::seed("identity"));
     let headings =
@@ -585,7 +669,180 @@ fn build_families(corpus: &Corpus, keys: &[String], per_source: usize, n: usize)
         .chain(abstention.iter())
         .map(|(name, qs)| (name.clone(), qs.len()))
         .collect();
-    Families { named, counts, abstention }
+    Families {
+        named,
+        counts,
+        abstention,
+    }
+}
+
+/// Write every generated query, in the order an arm's vectors have to be in.
+///
+/// The order is the contract between this harness and whatever embeds the queries: the
+/// six named families in the order the composite concatenates them, then the two
+/// abstention families. It is written out rather than described, and the header line
+/// carries the corpus digest, the seed digest and the `--per-source` the queries were
+/// generated at, so the sidecar built from this file can be refused when any of them
+/// stops matching.
+/// @param cache - a cache of the corpus the queries are generated from
+/// @param per_source - queries per source for the identity family
+/// @param limit - grade only the first N chunks, as `grade-embedding`'s own `--limit` does
+/// @param out - where the JSONL goes
+pub fn write_query_texts(
+    cache: &Path,
+    per_source: usize,
+    limit: Option<usize>,
+    out: &Path,
+) -> Result<usize> {
+    use std::io::Write;
+
+    let corpus = corpus::load_cache(cache)?;
+    let n = limit.unwrap_or(corpus.len()).min(corpus.len());
+    // The same keys `run` builds, because both call the same function. A
+    // different key spelling would generate a different query set and the
+    // sidecar would be vectors of the wrong text.
+    let keys = corpus_keys(&corpus);
+    let families = build_families(&corpus, &keys, per_source, n);
+    let total: usize = families
+        .named
+        .iter()
+        .chain(families.abstention.iter())
+        .map(|(_, qs)| qs.len())
+        .sum();
+    let mut file = std::io::BufWriter::new(std::fs::File::create(out)?);
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "corpus_sha256": corpus.header.corpus_sha256,
+            "query_seed_digest": corpus.header.query_seed_digest,
+            "per_source": per_source,
+            "queries": total,
+            "chunks": n,
+        })
+    )?;
+    for (name, qs) in families.named.iter().chain(families.abstention.iter()) {
+        for q in qs {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"family": name, "text": q.text})
+            )?;
+        }
+    }
+    file.flush()?;
+    Ok(total)
+}
+
+/// What a query-vector sidecar claims about itself, written beside the `.f32` file.
+///
+/// Every field is here to be checked rather than to be read. A sidecar made against a
+/// different corpus, a different seed table, a different `--per-source` or a different
+/// model is a file that would otherwise load, produce numbers, and be wrong quietly.
+#[derive(serde::Deserialize)]
+struct QueryVectorSidecar {
+    corpus_sha256: String,
+    query_seed_digest: String,
+    per_source: usize,
+    queries: usize,
+    model_id: String,
+    dims: usize,
+}
+
+/// Read query vectors an external embedder produced, refusing anything that does not
+/// describe this run.
+///
+/// The file is little-endian f32, `dims` floats a query, in exactly the order
+/// `query-texts` wrote them: every named family in order, then the two abstention
+/// families. The sidecar JSON beside it says which corpus, which seed table, which
+/// `--per-source` and which model it was made for, and all four have to match or this
+/// refuses by name. That is the same standard the cache header is held to, and for the
+/// same reason: a number from the wrong file looks exactly like a number from the right
+/// one.
+/// @param path - the `.f32` vector file
+/// @param model_id - the arm this is supposed to belong to
+/// @param dims - the arm's declared width
+/// @param header - the cache header this run is grading against
+/// @param per_source - the queries-per-source this run generated with
+/// @param expected - how many queries were generated, named and abstention together
+fn read_query_vectors(
+    path: &Path,
+    model_id: &str,
+    dims: usize,
+    header: &CacheHeader,
+    per_source: usize,
+    expected: usize,
+) -> Result<Vec<Vec<f32>>> {
+    use std::io::Read;
+
+    let meta_path = path.with_extension("meta.json");
+    let meta: QueryVectorSidecar = serde_json::from_str(
+        &std::fs::read_to_string(&meta_path)
+            .with_context(|| format!("reading {}", meta_path.display()))?,
+    )
+    .with_context(|| format!("parsing {}", meta_path.display()))?;
+    anyhow::ensure!(
+        meta.model_id == model_id,
+        "{} was made for {} and is being read for {model_id}",
+        meta_path.display(),
+        meta.model_id
+    );
+    anyhow::ensure!(
+        meta.corpus_sha256 == header.corpus_sha256,
+        "{} was made against corpus {} and this run grades corpus {}",
+        meta_path.display(),
+        short(&meta.corpus_sha256),
+        short(&header.corpus_sha256)
+    );
+    anyhow::ensure!(
+        meta.query_seed_digest == header.query_seed_digest,
+        "{} was made against seed table {} and this run's is {}",
+        meta_path.display(),
+        short(&meta.query_seed_digest),
+        short(&header.query_seed_digest)
+    );
+    anyhow::ensure!(
+        meta.per_source == per_source,
+        "{} was made at --per-source {} and this run is {per_source}",
+        meta_path.display(),
+        meta.per_source
+    );
+    anyhow::ensure!(
+        meta.dims == dims,
+        "{} says {} dims and {model_id}'s manifest says {dims}",
+        meta_path.display(),
+        meta.dims
+    );
+    anyhow::ensure!(
+        meta.queries == expected,
+        "{} holds {} queries and this run generated {expected}",
+        meta_path.display(),
+        meta.queries
+    );
+    let size = std::fs::metadata(path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .len() as usize;
+    anyhow::ensure!(
+        size == expected * dims * 4,
+        "{} is {size} bytes and {expected} queries at {dims} dims is {} bytes",
+        path.display(),
+        expected * dims * 4
+    );
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut buf = vec![0u8; dims * 4];
+    let mut out = Vec::with_capacity(expected);
+    for _ in 0..expected {
+        reader.read_exact(&mut buf)?;
+        // `chunks_exact(4)` yields slices of exactly four bytes, so the array
+        // conversion is that fact stated where it can be checked.
+        out.push(
+            buf.chunks_exact(4)
+                .filter_map(|b| <[u8; 4]>::try_from(b).ok())
+                .map(f32::from_le_bytes)
+                .collect(),
+        );
+    }
+    Ok(out)
 }
 
 /// The per-query composite: every family's scores concatenated in a fixed order.
@@ -610,24 +867,206 @@ fn composite(per_family: &BTreeMap<String, Vec<f64>>, families: &[&str]) -> Vec<
 // The run
 // ---------------------------------------------------------------------------
 
+/// Decide where one arm's query vectors come from: its own model, or a sidecar.
+///
+/// Every arm's queries are embedded by that arm's own model with that arm's own prefixes,
+/// because a query vector produced by a different model is not a measurement of this one. The
+/// sidecar is the exception and it exists for one case: a model this harness cannot open at
+/// all, whose owner produced the vectors elsewhere. `read_query_vectors` is what makes that
+/// safe - it refuses a sidecar that does not describe this run - so the choice here is only
+/// which of the two paths to take.
+///
+/// @param arm - the arm being graded, for its model, its cache header and its dimensions
+/// @param families - the graded families, to count how many vectors a sidecar must carry
+/// @param options - the run's options, holding the sidecar map and the arm options
+fn open_query_source(
+    arm: &Arm,
+    families: &Families,
+    options: &EmbeddingGradeOptions,
+) -> Result<(
+    Option<crate::arm::Arm>,
+    Option<std::collections::VecDeque<Vec<f32>>>,
+)> {
+    let id = arm.header.model_id.clone();
+    let Some(path) = options.query_vectors.get(&id).cloned() else {
+        let embedder = queryset::open_query_embedder(
+            &arm.model,
+            &crate::arm::ArmOptions {
+                device: options.device,
+                ..options.arm_options.clone()
+            },
+        )
+        .with_context(|| format!("opening {id} to embed the query set"))?;
+        return Ok((Some(embedder), None));
+    };
+    let expected: usize = families
+        .named
+        .iter()
+        .chain(families.abstention.iter())
+        .map(|(_, qs)| qs.len())
+        .sum();
+    let rows = read_query_vectors(
+        &path,
+        &id,
+        arm.model.manifest.dims,
+        &arm.header,
+        options.per_source,
+        expected,
+    )
+    .with_context(|| format!("reading {id}'s query vectors from {}", path.display()))?;
+    eprintln!("  {expected} query vectors read from {}", path.display());
+    Ok((None, Some(rows.into())))
+}
+
+/// Time one arm on every processor the cost lane was asked for, and record what it measured.
+///
+/// A served arm runs wherever its server runs, and `--device` says nothing about that. Timing it
+/// once per requested device would put one number in a `cpu` column and the same number in a
+/// `cuda:0` column, and a reader would take that to mean this model reaches GPU throughput on a
+/// processor. It is timed once, under a label naming the backend and the endpoint, and the card
+/// says so.
+///
+/// A device that fails is reported and skipped rather than ending the run: the cost lane is one
+/// lane of several, and a card missing one throughput number is worth more than no card.
+///
+/// @param arm - the arm to time
+/// @param cost_texts - the shared sample, long enough that each repeat gets its own slice
+/// @param cost_repeats - timed passes per device
+/// @param options - the run's options, for the requested devices and the arm options
+/// @param facts - the arm's row on the card, written in place
+fn time_arm(
+    arm: &Arm,
+    cost_texts: &[String],
+    cost_repeats: usize,
+    options: &EmbeddingGradeOptions,
+    facts: &mut ArmFacts,
+) {
+    let devices: Vec<Device> = match arm.model.manifest.backend {
+        inillucent_core::model::Backend::LlamaCpp => vec![options.device],
+        inillucent_core::model::Backend::Onnx => options.cost_devices.clone(),
+    };
+    for device in &devices {
+        match time_model(
+            &arm.model,
+            cost_texts,
+            cost_repeats,
+            *device,
+            &options.arm_options,
+        ) {
+            Ok((rates, tokens, share)) => {
+                let label = match arm.model.manifest.backend {
+                    inillucent_core::model::Backend::LlamaCpp => format!(
+                        "llama.cpp at {}",
+                        options.arm_options.endpoint_for(&arm.model.manifest.id)
+                    ),
+                    inillucent_core::model::Backend::Onnx => device.label(),
+                };
+                let middle = median(&rates);
+                let printed: Vec<String> = rates.iter().map(|r| format!("{r:.1}")).collect();
+                eprintln!(
+                    "  cost lane on {label}: {middle:.1} chunks/s median of [{}], \
+                     {tokens:.1} tokens per chunk, {:.2}% truncated",
+                    printed.join(", "),
+                    100.0 * share
+                );
+                facts.chunks_per_second.insert(label.clone(), middle);
+                facts.chunks_per_second_runs.insert(label, rates);
+                facts.tokens_per_chunk = Some(tokens);
+                facts.sample_truncation_share = Some(share);
+            }
+            Err(e) => eprintln!("  cost lane on {} failed: {e:#}", device.label()),
+        }
+    }
+}
+
+/// What every arm is graded over: one corpus slice, one query set, one sample.
+///
+/// **Built once from the first arm's cache, because `resolve_arms` has already
+/// refused the run unless every arm agrees on the corpus digest, the chunk
+/// count and the query seed table.** Generating the families per arm would ask
+/// each model a different question and the card would not say so.
+struct Shared {
+    /// How many chunks of each cache are graded.
+    graded: usize,
+    /// The corpus key of every chunk, in corpus order.
+    keys: Vec<String>,
+    /// The query families every arm answers.
+    families: Families,
+    /// How many distinct documents the graded slice covers.
+    documents: usize,
+    /// The texts the cost lane times, long enough for every repeat to get its
+    /// own slice: a repeat that reused the previous repeat's text would be
+    /// timing a prompt cache on a served arm.
+    cost_texts: Vec<String>,
+    /// How many timed passes the cost lane makes.
+    cost_repeats: usize,
+    /// The chunk ordinals the Matryoshka lane narrows.
+    matryoshka_rows: Vec<usize>,
+}
+
+/// Every lane's per-query scores, keyed the way the card reads them.
+///
+/// One structure rather than six locals, because every lane writes into one of
+/// these and the assembly at the end reads all six.
+struct Tables {
+    /// family -> metric -> model -> per-query series, exhaustive cosine only.
+    dense: LaneScores,
+    /// The same, through the shipped pipeline.
+    hybrid: LaneScores,
+    /// model -> width -> recall against its own full width.
+    mrl: BTreeMap<String, BTreeMap<String, f64>>,
+    /// family -> metric -> per-query scores, for BM25 with no model at all.
+    lexical: BTreeMap<String, BTreeMap<String, Vec<f64>>>,
+    /// model -> family -> the top result's confidence on each of its queries.
+    confidences: BTreeMap<String, BTreeMap<String, Vec<f64>>>,
+}
+
+/// Where one arm's query vectors come from.
+///
+/// **Two ways, and only one of them is used per arm.** An arm whose model this
+/// harness cannot open at all - a different runtime, a format ONNX does not
+/// read - supplies its vectors from a sidecar the model produced elsewhere, and
+/// `open_query_source` has already checked that sidecar describes this run.
+struct QuerySource {
+    /// The arm's own model, when the harness could open it.
+    embedder: Option<crate::arm::Arm>,
+    /// Vectors read from a sidecar, in the order the families are asked for.
+    supplied: Option<std::collections::VecDeque<Vec<f32>>>,
+}
+
+/// Grades two or more embedding models over the same corpus.
+///
+/// **Every arm is graded over one corpus and one query set, and
+/// `resolve_arms` refuses the run otherwise.** A model that was embedded from
+/// a different corpus would score differently for a reason that has nothing to
+/// do with the model, and a card that printed both numbers side by side would
+/// look exactly like a card comparing two models.
+///
+/// **One function per stage.** The arms are resolved, the shared corpus facts
+/// are read from the first of them, each arm is scored into the tables, the
+/// lanes are assembled from those tables, and the manifest is written last - so
+/// a manifest on disk means the run finished.
+///
+/// @param options - the arms, the lanes to run and how much of the corpus to
+///   read
 pub fn run(options: &EmbeddingGradeOptions) -> Result<EmbeddingCard> {
     let arms = resolve_arms(options)?;
-    let baseline_id = match &options.baseline {
-        Some(id) => {
-            anyhow::ensure!(
-                arms.iter().any(|a| &a.header.model_id == id),
-                "--baseline names {id}, which is not among the arms: {}",
-                arms.iter().map(|a| a.header.model_id.as_str()).collect::<Vec<_>>().join(", ")
-            );
-            id.clone()
-        }
-        None => arms[0].header.model_id.clone(),
+    // The first arm's own facts, taken once. It is the default baseline, the
+    // corpus every other arm was just checked against, and the cache the shared
+    // query set is generated from - and every one of those is read after `arms`
+    // has been iterated, so they are copied rather than borrowed.
+    let (lead_header, lead_cache) = {
+        let lead = arms
+            .first()
+            .context("grade-embedding needs at least one arm")?;
+        (lead.header.clone(), lead.cache.clone())
     };
+    let baseline_id = baseline_named_by(options, &arms, &lead_header)?;
     eprintln!(
         "{} arms over corpus {} ({} chunks), baseline {baseline_id}",
         arms.len(),
-        short(&arms[0].header.corpus_sha256),
-        arms[0].header.chunk_count
+        short(&lead_header.corpus_sha256),
+        lead_header.chunk_count
     );
     for arm in &arms {
         eprintln!("  {}", arm.header.describe());
@@ -638,477 +1077,44 @@ pub fn run(options: &EmbeddingGradeOptions) -> Result<EmbeddingCard> {
     let mut writer = match RunWriter::create(&options.runs_dir, &run_id) {
         Ok(w) => Some(w),
         Err(e) => {
-            eprintln!("  could not open the run directory, continuing without per-query records: {e:#}");
+            eprintln!(
+                "  could not open the run directory, continuing without per-query records: {e:#}"
+            );
             None
         }
     };
 
-    // The query set, built once from the corpus every arm shares.
-    eprintln!("loading {} to generate the query set", arms[0].cache.display());
-    let first = corpus::load_cache(&arms[0].cache)?;
-    let n = options.limit.unwrap_or(first.len()).min(first.len());
-    let keys: Vec<String> = (0..first.len())
-        .map(|i| format!("{}#{}", first.chunks[i].external_doc_id, first.chunks[i].chunk_index))
-        .collect();
-    let families = build_families(&first, &keys, options.per_source, n);
-    let corpus_documents = first
-        .chunks
-        .iter()
-        .take(n)
-        .map(|c| c.external_doc_id.as_str())
-        .collect::<HashSet<_>>()
-        .len();
-    eprintln!(
-        "  {} queries across {} families",
-        families.counts.values().sum::<usize>(),
-        families.counts.len()
-    );
-    // The sample the cost and Matryoshka lanes use, chosen from the shared corpus
-    // so every arm is timed and narrowed over the same chunks.
-    // Enough for every repeat to get its own slice: a repeat that reused the
-    // previous repeat's text would be timing a cache on a served arm.
-    let cost_repeats = options.cost_repeats.max(1);
-    let cost_texts: Vec<String> =
-        scenarios::strided_sample(n, options.cost_samples * cost_repeats)
-            .into_iter()
-            .map(|i| crate::synth::sanitize_for_model(&first.chunks[i].content))
-            .collect();
-    let matryoshka_rows = scenarios::strided_sample(n, options.matryoshka_chunks);
-    drop(first);
-
+    let shared = read_the_shared_corpus(options, &lead_cache)?;
+    let mut tables = Tables {
+        dense: BTreeMap::new(),
+        hybrid: BTreeMap::new(),
+        mrl: BTreeMap::new(),
+        lexical: BTreeMap::new(),
+        confidences: BTreeMap::new(),
+    };
     let mut arm_facts: Vec<ArmFacts> = Vec::new();
-    // lane -> family -> metric -> model -> per-query series
-    let mut dense: BTreeMap<String, BTreeMap<String, BTreeMap<String, Vec<f64>>>> = BTreeMap::new();
-    let mut hybrid: BTreeMap<String, BTreeMap<String, BTreeMap<String, Vec<f64>>>> = BTreeMap::new();
-    let mut mrl: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
-    // family -> metric -> per-query scores, for BM25 with no model at all.
-    let mut lexical: BTreeMap<String, BTreeMap<String, Vec<f64>>> = BTreeMap::new();
-    // model -> family -> the top result's confidence on each of its queries.
-    let mut confidences: BTreeMap<String, BTreeMap<String, Vec<f64>>> = BTreeMap::new();
-
     for arm in &arms {
-        let id = arm.header.model_id.clone();
-        eprintln!("\n=== {id} ===");
-        let started = Instant::now();
-        let corpus = corpus::load_cache(&arm.cache)
-            .with_context(|| format!("loading {}", arm.cache.display()))?;
-        anyhow::ensure!(
-            corpus.dims == arm.model.manifest.dims,
-            "{} loaded at {} dimensions against a manifest declaring {}",
-            id,
-            corpus.dims,
-            arm.model.manifest.dims
-        );
-        eprintln!("  loaded {} chunks in {:.1}s", corpus.len(), started.elapsed().as_secs_f64());
-
-        // Queries, embedded by this arm's own model with this arm's own prefixes.
-        let embedder = queryset::open_query_embedder(
-            &arm.model,
-            &crate::arm::ArmOptions { device: options.device, ..options.arm_options.clone() },
-        )
-        .with_context(|| format!("opening {id} to embed the query set"))?;
-        let mut query_vectors: Vec<Vec<Vec<f32>>> = Vec::new();
-        for (name, qs) in &families.named {
-            let texts: Vec<String> = qs.iter().map(|q| q.text.clone()).collect();
-            let vectors = queryset::embed_with(&embedder, &texts)
-                .with_context(|| format!("embedding the {name} family with {id}"))?;
-            query_vectors.push(vectors);
-        }
-        eprintln!("  embedded {} queries", query_vectors.iter().map(|v| v.len()).sum::<usize>());
-
-        let mut facts = ArmFacts {
-            model_id: id.clone(),
-            dims: arm.model.manifest.dims,
-            max_tokens: arm.model.manifest.max_tokens,
-            mrl_widths: arm.model.manifest.widths(),
-            pooling: format!("{:?}", arm.model.manifest.pooling).to_lowercase(),
-            query_prefix: arm.model.manifest.prefixes.query.clone(),
-            document_prefix: arm.model.manifest.prefixes.document.clone(),
-            manifest_sha256: arm.header.manifest_sha256.clone(),
-            weights_sha256: arm.model.manifest.weights_sha256.clone(),
-            tokenizer_sha256: arm.model.manifest.tokenizer_sha256.clone(),
-            manifest_on_disk: arm.model.manifest_on_disk,
-            cache_path: arm.cache.display().to_string(),
-            cache_bytes: std::fs::metadata(&arm.cache).map(|m| m.len()).unwrap_or(0),
-            chunks: arm.header.chunk_count,
-            truncated_chunks: arm.header.truncated_chunks,
-            truncation_share: if arm.header.chunk_count == 0 {
-                0.0
-            } else {
-                arm.header.truncated_chunks as f64 / arm.header.chunk_count as f64
-            },
-            model_bytes: weights_bytes(&arm.model.dir, &arm.model.manifest.model_file),
-            source: arm.model.manifest.source.clone(),
-            chunks_per_second: BTreeMap::new(),
-            chunks_per_second_runs: BTreeMap::new(),
-            tokens_per_chunk: None,
-            sample_truncation_share: None,
-            bytes_per_vector: arm
-                .model
-                .manifest
-                .widths()
-                .into_iter()
-                .map(|w| (w.to_string(), w * 4))
-                .collect(),
-        };
-
-        // ---- dense lane ----
-        if options.dense {
-            // The same slice the queries were generated from and the same slice
-            // the hybrid lane indexes. Searching the whole cache while grading
-            // against ground truth drawn from a prefix of it would let a query
-            // be answered by a chunk no judgement covers, and every `--limit` run
-            // would quietly score lower for a reason unrelated to any model.
-            let vectors = &corpus.vectors[..n];
-            eprintln!("  dense lane: exhaustive cosine over {} chunks", vectors.len());
-            for ((name, qs), qvs) in families.named.iter().zip(&query_vectors) {
-                let started = Instant::now();
-                let mut search = |_q: &GradedQuery, index: usize| -> Result<Vec<Hit>> {
-                    let ranked = exhaustive_top_k(vectors, &qvs[index], K);
-                    Ok(ranked
-                        .into_iter()
-                        .map(|i| Hit {
-                            key: keys[i].clone(),
-                            score: dot(&vectors[i], &qvs[index]),
-                            confidence: dot(&vectors[i], &qvs[index]).clamp(0.0, 1.0),
-                        })
-                        .collect())
-                };
-                // No per-document cap here: the dense lane is the ranking the
-                // model produces, with no policy on top. The ideal is computed
-                // the same way for every arm, so the absolute value is a little
-                // pessimistic and the comparison is exact.
-                let scored = score_family(&id, "dense", qs, &mut search, K, &mut writer)?;
-                eprintln!(
-                    "    {name}: {} queries in {:.1}s, nDCG@10 {:.4}",
-                    qs.len(),
-                    started.elapsed().as_secs_f64(),
-                    mean(scored.get(M_NDCG))
-                );
-                for (metric, values) in scored {
-                    dense
-                        .entry(name.clone())
-                        .or_default()
-                        .entry(metric)
-                        .or_default()
-                        .insert(id.clone(), values);
-                }
-            }
-        }
-
-        // ---- hybrid lane ----
-        if options.hybrid {
-            eprintln!("  hybrid lane: building the index");
-            let (index, index_keys, stats, seconds) =
-                scenarios::build_index(&corpus, options.limit, true)?;
-            eprintln!(
-                "    built {} chunks / {} documents in {seconds:.1}s",
-                stats.chunks, stats.documents
-            );
-            let per_doc_cap = index.config().per_doc_cap;
-            let mut engine = InillucentEngine::new(index, index_keys, id.clone(), Some(128));
-            engine.filtered_ef_search = Some(FILTERED_EF_SEARCH);
-            // Every ranking setting is left exactly as `build_selected` built it,
-            // which is `IndexConfig::default()` - the fusion, the lexical
-            // coverage, the phrase weight, the adaptive weighting, all of it.
-            //
-            // Copying those values into setters here would say the same thing in
-            // a second place, and a second place is somewhere the two can drift:
-            // the day a default moves, this lane would keep grading against the
-            // old policy and the card would still call itself "the shipped
-            // pipeline". The one thing set is the traversal width on a filtered
-            // query, which is a harness decision rather than an engine default and
-            // is the same number `grade` uses.
-            let filter = Filter::default();
-
-            // Scored on the first arm only. The lexical ranking reads the
-            // corpus text and the query and nothing else, and both are the same
-            // for every arm, so the later arms would print the same numbers.
-            if options.lexical && lexical.is_empty() {
-                for (name, qs) in families.named.iter() {
-                    let started = Instant::now();
-                    let mut search = |q: &GradedQuery, _index: usize| -> Result<Vec<Hit>> {
-                        engine.lexical_search(&q.text, &filter, K)
-                    };
-                    let scored = score_family(
-                        LEXICAL_COLUMN,
-                        "lexical",
-                        qs,
-                        &mut search,
-                        per_doc_cap,
-                        &mut writer,
-                    )?;
-                    eprintln!(
-                        "    BM25 alone, {name}: {} queries in {:.1}s, nDCG@10 {:.4}",
-                        qs.len(),
-                        started.elapsed().as_secs_f64(),
-                        mean(scored.get(M_NDCG))
-                    );
-                    for (metric, values) in scored {
-                        lexical.entry(name.clone()).or_default().insert(metric, values);
-                    }
-                }
-            }
-
-            for ((name, qs), qvs) in families.named.iter().zip(&query_vectors) {
-                let started = Instant::now();
-                let mut search = |q: &GradedQuery, index: usize| -> Result<Vec<Hit>> {
-                    engine.hybrid_search(&q.text, &qvs[index], &filter, K)
-                };
-                let scored = score_family(&id, "hybrid", qs, &mut search, per_doc_cap, &mut writer)?;
-                eprintln!(
-                    "    {name}: {} queries in {:.1}s, nDCG@10 {:.4}",
-                    qs.len(),
-                    started.elapsed().as_secs_f64(),
-                    mean(scored.get(M_NDCG))
-                );
-                for (metric, values) in scored {
-                    hybrid
-                        .entry(name.clone())
-                        .or_default()
-                        .entry(metric)
-                        .or_default()
-                        .insert(id.clone(), values);
-                }
-            }
-        }
-
-        // ---- Matryoshka lane ----
-        if options.matryoshka {
-            let widths = arm.model.manifest.widths();
-            eprintln!("  Matryoshka lane over {} chunks at {:?}", matryoshka_rows.len(), widths);
-            let sample: Vec<&Vec<f32>> = matryoshka_rows.iter().map(|&i| &corpus.vectors[i]).collect();
-            // Queries from the identity family, which is the one family whose
-            // ground truth is a whole document and therefore the one where a
-            // narrowed ranking has the most room to go wrong.
-            let probe = &query_vectors[0];
-            // The full-width answer, computed once. It is the same reference for
-            // every width, and recomputing it inside the width loop was doing a
-            // 25,000-vector exhaustive pass three extra times per query for a
-            // result that could not change.
-            let references: Vec<HashSet<usize>> =
-                probe.iter().map(|q| top_k_of(&sample, q, K).into_iter().collect()).collect();
-            for width in &widths {
-                if *width == corpus.dims {
-                    mrl.entry(id.clone()).or_default().insert(width.to_string(), 1.0);
-                    continue;
-                }
-                let narrowed: Vec<Vec<f32>> =
-                    sample.iter().map(|v| truncate_normalized(v, *width)).collect();
-                let borrowed: Vec<&Vec<f32>> = narrowed.iter().collect();
-                let mut recalls = Vec::with_capacity(probe.len());
-                for (q, reference) in probe.iter().zip(&references) {
-                    let narrow_q = truncate_normalized(q, *width);
-                    let got = top_k_of(&borrowed, &narrow_q, K);
-                    let hit = got.iter().filter(|i| reference.contains(i)).count();
-                    recalls.push(hit as f64 / K.min(reference.len()).max(1) as f64);
-                }
-                let value = recalls.iter().sum::<f64>() / recalls.len().max(1) as f64;
-                eprintln!(
-                    "    {width} dims: recall@10 {value:.4} against its own {}",
-                    corpus.dims
-                );
-                mrl.entry(id.clone()).or_default().insert(width.to_string(), value);
-            }
-        }
-
-        // ---- abstention lane ----
-        //
-        // Dense cosine rather than the engine's fused score, and deliberately.
-        // Fusion normalises out of the candidate list, so the top hit of every
-        // query maps to the top of the scale whether the list is good or
-        // hopeless and no threshold on it exists. A cosine is computed against a
-        // bound the results had no say in, so one query's value means the same
-        // as the next one's - which is the whole premise of a threshold.
-        if options.abstention {
-            for (name, qs) in &families.abstention {
-                let texts: Vec<String> = qs.iter().map(|q| q.text.clone()).collect();
-                let vectors = queryset::embed_with(&embedder, &texts)
-                    .with_context(|| format!("embedding the {name} family with {id}"))?;
-                let vectors_slice = &corpus.vectors[..n];
-                let tops: Vec<f64> = vectors
-                    .iter()
-                    .map(|q| {
-                        exhaustive_top_k(vectors_slice, q, 1)
-                            .first()
-                            .map(|i| f64::from(dot(&vectors_slice[*i], q).clamp(0.0, 1.0)))
-                            .unwrap_or(0.0)
-                    })
-                    .collect();
-                eprintln!(
-                    "  abstention lane, {name}: {} queries, mean top confidence {:.4}",
-                    tops.len(),
-                    if tops.is_empty() { 0.0 } else { tops.iter().sum::<f64>() / tops.len() as f64 }
-                );
-                confidences
-                    .entry(id.clone())
-                    .or_default()
-                    .insert(name.clone(), tops);
-            }
-        }
-
-        // ---- cost lane ----
-        if options.cost {
-            // A served arm runs wherever its server runs, and `--device` says
-            // nothing about that. Timing it once per requested device would put
-            // one number in a `cpu` column and the same number in a `cuda:0`
-            // column, and a reader would take that to mean this model reaches GPU
-            // throughput on a processor. It is timed once, under a label naming
-            // the backend and the endpoint, and the card says so.
-            let devices: Vec<Device> = match arm.model.manifest.backend {
-                inillucent_core::model::Backend::LlamaCpp => vec![options.device],
-                inillucent_core::model::Backend::Onnx => options.cost_devices.clone(),
-            };
-            for device in &devices {
-                match time_model(
-                    &arm.model,
-                    &cost_texts,
-                    cost_repeats,
-                    *device,
-                    &options.arm_options,
-                ) {
-                    Ok((rates, tokens, share)) => {
-                        let label = match arm.model.manifest.backend {
-                            inillucent_core::model::Backend::LlamaCpp => {
-                                format!("llama.cpp at {}", options.arm_options.endpoint)
-                            }
-                            inillucent_core::model::Backend::Onnx => device.label(),
-                        };
-                        let middle = median(&rates);
-                        let printed: Vec<String> =
-                            rates.iter().map(|r| format!("{r:.1}")).collect();
-                        eprintln!(
-                            "  cost lane on {label}: {middle:.1} chunks/s median of [{}], \
-                             {tokens:.1} tokens per chunk, {:.2}% truncated",
-                            printed.join(", "),
-                            100.0 * share
-                        );
-                        facts.chunks_per_second.insert(label.clone(), middle);
-                        facts.chunks_per_second_runs.insert(label, rates);
-                        facts.tokens_per_chunk = Some(tokens);
-                        facts.sample_truncation_share = Some(share);
-                    }
-                    Err(e) => {
-                        eprintln!("  cost lane on {} failed: {e:#}", device.label());
-                    }
-                }
-            }
-        }
-
-        arm_facts.push(facts);
+        arm_facts.push(score_one_arm(
+            arm,
+            &shared,
+            options,
+            &mut tables,
+            &mut writer,
+        )?);
     }
 
-    // ---- assemble ----
-    let mut lanes = Vec::new();
-    if options.dense {
-        lanes.push(lane_from(
-            "dense only, exhaustive cosine",
-            "Every graded family answered by exhaustive cosine over the whole corpus: no graph, \
-             no lexical side, no fusion. This is the embedding on its own. The index reaches \
-             0.925 recall against exhaustive cosine on this corpus, and letting 7.5% of the \
-             answer move for reasons unrelated to the model would be larger than the effect \
-             being measured.",
-            &dense,
-        ));
-    }
-    if options.hybrid {
-        lanes.push(lane_from(
-            "hybrid, the shipped pipeline",
-            "The same families through the real pipeline with the shipped fusion and ranking \
-             settings, applied identically to every arm. A model that wins in isolation and \
-             loses once BM25 is fused beside it has not helped an agent, and this is the lane \
-             that says so.",
-            &hybrid,
-        ));
-    }
-    if options.matryoshka && !mrl.is_empty() {
-        lanes.push(matryoshka_lane(&mrl, &arm_facts));
-    }
-    if options.abstention {
-        lanes.push(abstention_lane(&confidences));
-    }
-    if options.lexical && !lexical.is_empty() {
-        lanes.push(lexical_lane(&lexical));
-    }
-    if options.cost {
-        lanes.push(cost_lane(&arm_facts));
-    }
-
-    // The composite, on both the declared families and the promoted set, so the
-    // promotion is a visible decision rather than a quiet re-aim.
-    if options.dense {
-        lanes.insert(0, composite_lane(&dense, "dense composite"));
-    }
-    if options.hybrid {
-        lanes.insert(
-            if options.dense { 1 } else { 0 },
-            composite_lane(&hybrid, "hybrid composite"),
-        );
-    }
-
+    let lanes = assemble_the_lanes(options, &tables, &arm_facts);
     let judgements = judge(&lanes, &baseline_id, options.stats_seed);
 
-    let mut provenance: BTreeMap<String, String> = BTreeMap::new();
-    provenance.insert("run id".into(), run_id.clone());
-    provenance.insert(
-        "commit".into(),
-        format!("{}{}", git_commit, if git_dirty { " (working tree dirty)" } else { "" }),
-    );
-    provenance.insert("command".into(), runs::command_line());
-    provenance.insert("corpus digest".into(), arms[0].header.corpus_sha256.clone());
-    provenance.insert("query seed digest".into(), arms[0].header.query_seed_digest.clone());
-    provenance.insert(
-        "query seeds".into(),
-        scenarios::seeds().iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", "),
-    );
-    provenance.insert("statistics seed".into(), options.stats_seed.to_string());
-    provenance.insert("query embedding device".into(), format!("{:?}", options.device));
-    provenance.insert(
-        "host".into(),
-        format!(
-            "{} {}, {} logical processors",
-            std::env::consts::OS,
-            std::env::consts::ARCH,
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
-        ),
-    );
-    for arm in &arms {
-        provenance.insert(format!("cache: {}", arm.header.model_id), arm.cache.display().to_string());
-    }
-
+    let facts = RunFacts {
+        run_id: run_id.clone(),
+        git_commit,
+        git_dirty,
+    };
+    let mut provenance = provenance_of(&facts, options, &arms, &lead_header);
     if let Some(w) = writer.take() {
         let records = w.written();
-        let manifest = runs::RunManifest {
-            run_id: run_id.clone(),
-            generated_at_unix: runs::now_unix(),
-            git_commit: git_commit.clone(),
-            git_dirty,
-            command: runs::command_line(),
-            corpus: runs::CorpusFacts {
-                chunks: arms[0].header.chunk_count,
-                documents: corpus_documents,
-                dimensions: arms[0].header.dims,
-                cache_path: arms[0].cache.display().to_string(),
-                cache_bytes: std::fs::metadata(&arms[0].cache).map(|m| m.len()).unwrap_or(0),
-                cache_modified_unix: 0,
-            },
-            model_dir: arms.iter().map(|a| a.model.dir.display().to_string()).collect::<Vec<_>>().join(", "),
-            model_file: arms.iter().map(|a| a.model.manifest.model_file.clone()).collect::<Vec<_>>().join(", "),
-            model_id: arms.iter().map(|a| a.header.model_id.clone()).collect::<Vec<_>>().join(", "),
-            model_manifest_sha256: arms.iter().map(|a| short(&a.header.manifest_sha256)).collect::<Vec<_>>().join(", "),
-            model_dims: arms[0].header.dims,
-            model_max_tokens: arms[0].header.max_tokens,
-            cache_header: arms[0].header.clone(),
-            device: format!("{:?}", options.device),
-            database: "not used: grade-embedding compares models, not engines".into(),
-            seeds: scenarios::seeds(),
-            arm: BTreeMap::new(),
-            host: runs::host_facts(),
-            query_counts: families.counts.clone(),
-            practical_thresholds: [("ranking measures".to_string(), RANKING_THRESHOLD)]
-                .into_iter()
-                .collect(),
-        };
+        let manifest = manifest_of(&facts, options, &arms, &shared, &lead_header, &lead_cache);
         let dir = w.finish(&manifest)?;
         runs::note_run_files(&mut provenance, records, &dir);
     } else {
@@ -1118,24 +1124,774 @@ pub fn run(options: &EmbeddingGradeOptions) -> Result<EmbeddingCard> {
     Ok(EmbeddingCard {
         run_id,
         generated_at_unix: runs::now_unix(),
-        corpus_sha256: arms[0].header.corpus_sha256.clone(),
+        corpus_sha256: lead_header.corpus_sha256.clone(),
         // The slice that was graded, not the size of the cache. With `--limit`
         // set they differ, and a card that prints the cache's count beside a
         // document count taken from the slice is two scopes in one sentence.
-        corpus_chunks: n,
-        corpus_documents,
-        query_seed_digest: arms[0].header.query_seed_digest.clone(),
+        corpus_chunks: shared.graded,
+        corpus_documents: shared.documents,
+        query_seed_digest: lead_header.query_seed_digest.clone(),
         baseline: baseline_id,
         arms: arm_facts,
         lanes,
         judgements,
-        query_counts: families.counts,
+        query_counts: shared.families.counts,
         stats_seed: options.stats_seed,
         ranking_threshold: RANKING_THRESHOLD,
         composite_declared: HEADLINE.join(" + "),
         provenance,
         caveats: caveats(),
     })
+}
+
+/// What a run records about itself, for the manifest and the provenance table.
+struct RunFacts {
+    /// The run directory's name.
+    run_id: String,
+    /// The commit the harness was built from.
+    git_commit: String,
+    /// Whether that commit had uncommitted changes beside it.
+    git_dirty: bool,
+}
+
+/// The model every other model is compared against.
+///
+/// The first arm by default, and `--baseline` has to name an arm that is in the
+/// run: a baseline that is not among the arms would leave every comparison
+/// without a left-hand side.
+///
+/// @param options - the run's own flags
+/// @param arms - every arm in the run
+/// @param lead_header - the first arm's cache header
+fn baseline_named_by(
+    options: &EmbeddingGradeOptions,
+    arms: &[Arm],
+    lead_header: &CacheHeader,
+) -> Result<String> {
+    match &options.baseline {
+        Some(id) => {
+            anyhow::ensure!(
+                arms.iter().any(|a| &a.header.model_id == id),
+                "--baseline names {id}, which is not among the arms: {}",
+                arms.iter()
+                    .map(|a| a.header.model_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            Ok(id.clone())
+        }
+        None => Ok(lead_header.model_id.clone()),
+    }
+}
+
+/// The query set and the samples every arm shares, read from the first cache.
+///
+/// @param options - the run's own flags
+/// @param lead_cache - the first arm's cache
+fn read_the_shared_corpus(options: &EmbeddingGradeOptions, lead_cache: &Path) -> Result<Shared> {
+    eprintln!("loading {} to generate the query set", lead_cache.display());
+    let first = corpus::load_cache(lead_cache)?;
+    let graded = options.limit.unwrap_or(first.len()).min(first.len());
+    let keys = corpus_keys(&first);
+    let families = build_families(&first, &keys, options.per_source, graded);
+    let documents = first
+        .chunks
+        .iter()
+        .take(graded)
+        .map(|c| c.external_doc_id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    eprintln!(
+        "  {} queries across {} families",
+        families.counts.values().sum::<usize>(),
+        families.counts.len()
+    );
+    let cost_repeats = options.cost_repeats.max(1);
+    let cost_texts: Vec<String> =
+        scenarios::strided_sample(graded, options.cost_samples * cost_repeats)
+            .into_iter()
+            .filter_map(|i| first.chunks.get(i))
+            .map(|c| crate::synth::sanitize_for_model(&c.content))
+            .collect();
+    let matryoshka_rows = scenarios::strided_sample(graded, options.matryoshka_chunks);
+    Ok(Shared {
+        graded,
+        keys,
+        families,
+        documents,
+        cost_texts,
+        cost_repeats,
+        matryoshka_rows,
+    })
+}
+
+/// Grades one arm through every lane the run asked for.
+///
+/// @param arm - the arm being graded
+/// @param shared - the corpus slice, query set and samples every arm shares
+/// @param options - the run's own flags
+/// @param tables - where each lane's scores are collected
+/// @param writer - the run directory, when one could be opened
+fn score_one_arm(
+    arm: &Arm,
+    shared: &Shared,
+    options: &EmbeddingGradeOptions,
+    tables: &mut Tables,
+    writer: &mut Option<RunWriter>,
+) -> Result<ArmFacts> {
+    let id = arm.header.model_id.clone();
+    eprintln!("\n=== {id} ===");
+    let started = Instant::now();
+    let corpus = corpus::load_cache(&arm.cache)
+        .with_context(|| format!("loading {}", arm.cache.display()))?;
+    anyhow::ensure!(
+        corpus.dims == arm.model.manifest.dims,
+        "{} loaded at {} dimensions against a manifest declaring {}",
+        id,
+        corpus.dims,
+        arm.model.manifest.dims
+    );
+    eprintln!(
+        "  loaded {} chunks in {:.1}s",
+        corpus.len(),
+        started.elapsed().as_secs_f64()
+    );
+
+    // Queries, embedded by this arm's own model with this arm's own prefixes - or read
+    // from a sidecar that model produced, when the harness cannot open it at all.
+    let (embedder, supplied) = open_query_source(arm, &shared.families, options)?;
+    let mut source = QuerySource { embedder, supplied };
+    let mut query_vectors: Vec<Vec<Vec<f32>>> = Vec::new();
+    for (name, qs) in &shared.families.named {
+        query_vectors.push(embed_one_family(&mut source, qs, name, &id)?);
+    }
+    eprintln!(
+        "  {} queries for {id}",
+        query_vectors.iter().map(|v| v.len()).sum::<usize>()
+    );
+
+    let mut facts = arm_facts_of(arm);
+    if options.dense {
+        run_dense_lane(&id, &corpus, shared, &query_vectors, tables, writer)?;
+    }
+    if options.hybrid {
+        run_hybrid_lane(
+            &id,
+            &corpus,
+            shared,
+            &query_vectors,
+            options,
+            tables,
+            writer,
+        )?;
+    }
+    if options.matryoshka {
+        run_matryoshka_lane(&id, arm, &corpus, shared, &query_vectors, tables)?;
+    }
+    if options.abstention {
+        run_abstention_lane(&id, &corpus, shared, &mut source, tables)?;
+    }
+    if options.cost {
+        time_arm(
+            arm,
+            &shared.cost_texts,
+            shared.cost_repeats,
+            options,
+            &mut facts,
+        );
+    }
+    Ok(facts)
+}
+
+/// One family's query vectors, from the arm's own model or from its sidecar.
+///
+/// @param source - where this arm's vectors come from
+/// @param queries - the family to embed
+/// @param name - the family's name, for the error if embedding fails
+/// @param id - the model's identifier, for the same error
+fn embed_one_family(
+    source: &mut QuerySource,
+    queries: &[GradedQuery],
+    name: &str,
+    id: &str,
+) -> Result<Vec<Vec<f32>>> {
+    if let Some(rows) = source.supplied.as_mut() {
+        return Ok(rows.drain(..queries.len()).collect());
+    }
+    let texts: Vec<String> = queries.iter().map(|q| q.text.clone()).collect();
+    queryset::embed_with(
+        source
+            .embedder
+            .as_ref()
+            .context("an arm with no sidecar must have opened its model to embed with")?,
+        &texts,
+    )
+    .with_context(|| format!("embedding the {name} family with {id}"))
+}
+
+/// What the card records about one arm, before any lane has run.
+///
+/// @param arm - the arm being graded
+fn arm_facts_of(arm: &Arm) -> ArmFacts {
+    ArmFacts {
+        model_id: arm.header.model_id.clone(),
+        dims: arm.model.manifest.dims,
+        max_tokens: arm.model.manifest.max_tokens,
+        mrl_widths: arm.model.manifest.widths(),
+        pooling: format!("{:?}", arm.model.manifest.pooling).to_lowercase(),
+        query_prefix: arm.model.manifest.prefixes.query.clone(),
+        document_prefix: arm.model.manifest.prefixes.document.clone(),
+        manifest_sha256: arm.header.manifest_sha256.clone(),
+        weights_sha256: arm.model.manifest.weights_sha256.clone(),
+        tokenizer_sha256: arm.model.manifest.tokenizer_sha256.clone(),
+        manifest_on_disk: arm.model.manifest_on_disk,
+        cache_path: arm.cache.display().to_string(),
+        cache_bytes: std::fs::metadata(&arm.cache).map(|m| m.len()).unwrap_or(0),
+        chunks: arm.header.chunk_count,
+        truncated_chunks: arm.header.truncated_chunks,
+        truncation_share: if arm.header.chunk_count == 0 {
+            0.0
+        } else {
+            arm.header.truncated_chunks as f64 / arm.header.chunk_count as f64
+        },
+        model_bytes: weights_bytes(&arm.model.dir, &arm.model.manifest.model_file),
+        source: arm.model.manifest.source.clone(),
+        chunks_per_second: BTreeMap::new(),
+        chunks_per_second_runs: BTreeMap::new(),
+        tokens_per_chunk: None,
+        sample_truncation_share: None,
+        bytes_per_vector: arm
+            .model
+            .manifest
+            .widths()
+            .into_iter()
+            .map(|w| (w.to_string(), w * 4))
+            .collect(),
+    }
+}
+
+/// Every graded family answered by exhaustive cosine: the embedding on its own.
+///
+/// **The same slice the queries were generated from**, which is also the slice
+/// the hybrid lane indexes. Searching the whole cache while grading against
+/// ground truth drawn from a prefix of it would let a query be answered by a
+/// chunk no judgement covers, and every `--limit` run would quietly score lower
+/// for a reason unrelated to any model.
+///
+/// No per-document cap: this lane is the ranking the model produces, with no
+/// policy on top. The ideal is computed the same way for every arm, so the
+/// absolute value is a little pessimistic and the comparison is exact.
+///
+/// @param id - the model's identifier, which is its column on the card
+/// @param corpus - this arm's loaded cache
+/// @param shared - the corpus slice, query set and samples every arm shares
+/// @param query_vectors - this arm's own query vectors, one list per family
+/// @param tables - where this lane's scores are collected
+/// @param writer - the run directory, when one could be opened
+fn run_dense_lane(
+    id: &str,
+    corpus: &Corpus,
+    shared: &Shared,
+    query_vectors: &[Vec<Vec<f32>>],
+    tables: &mut Tables,
+    writer: &mut Option<RunWriter>,
+) -> Result<()> {
+    let vectors = corpus.vectors.get(..shared.graded).with_context(|| {
+        format!(
+            "the cache holds {} vectors, not {}",
+            corpus.vectors.len(),
+            shared.graded
+        )
+    })?;
+    eprintln!(
+        "  dense lane: exhaustive cosine over {} chunks",
+        vectors.len()
+    );
+    let keys = &shared.keys;
+    for ((name, qs), qvs) in shared.families.named.iter().zip(query_vectors) {
+        let started = Instant::now();
+        let mut search = |_q: &GradedQuery, index: usize| -> Result<Vec<Hit>> {
+            let query = query_at(qvs, index)?;
+            exhaustive_top_k(vectors, query, K)
+                .into_iter()
+                .map(|i| {
+                    let vector = vectors
+                        .get(i)
+                        .context("the ranking named a chunk the slice does not hold")?;
+                    let score = dot(vector, query);
+                    Ok(Hit {
+                        key: keys
+                            .get(i)
+                            .context("the ranking named a chunk with no key")?
+                            .clone(),
+                        score,
+                        confidence: score.clamp(0.0, 1.0),
+                    })
+                })
+                .collect()
+        };
+        let scored = score_family(id, "dense", qs, &mut search, K, writer)?;
+        eprintln!(
+            "    {name}: {} queries in {:.1}s, nDCG@10 {:.4}",
+            qs.len(),
+            started.elapsed().as_secs_f64(),
+            mean(scored.get(M_NDCG))
+        );
+        for (metric, values) in scored {
+            tables
+                .dense
+                .entry(name.clone())
+                .or_default()
+                .entry(metric)
+                .or_default()
+                .insert(id.to_string(), values);
+        }
+    }
+    Ok(())
+}
+
+/// The same families through the real pipeline, with the shipped settings.
+///
+/// **Every ranking setting is left exactly as `build_index` built it**, which
+/// is `IndexConfig::default()` - the fusion, the lexical coverage, the phrase
+/// weight, the adaptive weighting, all of it. Copying those values into setters
+/// here would say the same thing in a second place, and a second place is
+/// somewhere the two can drift: the day a default moves, this lane would keep
+/// grading against the old policy and the card would still call itself "the
+/// shipped pipeline". The one thing set is the traversal width on a filtered
+/// query, which is a harness decision rather than an engine default and is the
+/// same number `grade` uses.
+///
+/// @param id - the model's identifier, which is its column on the card
+/// @param corpus - this arm's loaded cache
+/// @param shared - the corpus slice, query set and samples every arm shares
+/// @param query_vectors - this arm's own query vectors, one list per family
+/// @param options - the run's own flags
+/// @param tables - where this lane's scores are collected
+/// @param writer - the run directory, when one could be opened
+fn run_hybrid_lane(
+    id: &str,
+    corpus: &Corpus,
+    shared: &Shared,
+    query_vectors: &[Vec<Vec<f32>>],
+    options: &EmbeddingGradeOptions,
+    tables: &mut Tables,
+    writer: &mut Option<RunWriter>,
+) -> Result<()> {
+    eprintln!("  hybrid lane: building the index");
+    let (index, index_keys, stats, seconds) = scenarios::build_index(corpus, options.limit, true)?;
+    eprintln!(
+        "    built {} chunks / {} documents in {seconds:.1}s",
+        stats.chunks, stats.documents
+    );
+    let per_doc_cap = index.config().per_doc_cap;
+    let mut engine = InillucentEngine::new(index, index_keys, id.to_string(), Some(128));
+    engine.filtered_ef_search = Some(FILTERED_EF_SEARCH);
+    let filter = Filter::default();
+
+    if options.lexical && tables.lexical.is_empty() {
+        score_bm25_alone(&mut engine, shared, per_doc_cap, tables, writer)?;
+    }
+
+    for ((name, qs), qvs) in shared.families.named.iter().zip(query_vectors) {
+        let started = Instant::now();
+        let mut search = |q: &GradedQuery, index: usize| -> Result<Vec<Hit>> {
+            engine.hybrid_search(&q.text, query_at(qvs, index)?, &filter, K)
+        };
+        let scored = score_family(id, "hybrid", qs, &mut search, per_doc_cap, writer)?;
+        eprintln!(
+            "    {name}: {} queries in {:.1}s, nDCG@10 {:.4}",
+            qs.len(),
+            started.elapsed().as_secs_f64(),
+            mean(scored.get(M_NDCG))
+        );
+        for (metric, values) in scored {
+            tables
+                .hybrid
+                .entry(name.clone())
+                .or_default()
+                .entry(metric)
+                .or_default()
+                .insert(id.to_string(), values);
+        }
+    }
+    Ok(())
+}
+
+/// BM25 with no model at all, scored on the first arm only.
+///
+/// The lexical ranking reads the corpus text and the query and nothing else,
+/// and both are the same for every arm, so the later arms would print the same
+/// numbers.
+///
+/// @param engine - the index the first arm built
+/// @param shared - the corpus slice, query set and samples every arm shares
+/// @param per_doc_cap - the per-document result cap the index was built with
+/// @param tables - where this lane's scores are collected
+/// @param writer - the run directory, when one could be opened
+fn score_bm25_alone(
+    engine: &mut InillucentEngine,
+    shared: &Shared,
+    per_doc_cap: usize,
+    tables: &mut Tables,
+    writer: &mut Option<RunWriter>,
+) -> Result<()> {
+    for (name, qs) in shared.families.named.iter() {
+        let started = Instant::now();
+        let mut search = |q: &GradedQuery, _index: usize| -> Result<Vec<Hit>> {
+            engine.lexical_search(&q.text, &Filter::default(), K)
+        };
+        let scored = score_family(
+            LEXICAL_COLUMN,
+            "lexical",
+            qs,
+            &mut search,
+            per_doc_cap,
+            writer,
+        )?;
+        eprintln!(
+            "    BM25 alone, {name}: {} queries in {:.1}s, nDCG@10 {:.4}",
+            qs.len(),
+            started.elapsed().as_secs_f64(),
+            mean(scored.get(M_NDCG))
+        );
+        for (metric, values) in scored {
+            tables
+                .lexical
+                .entry(name.clone())
+                .or_default()
+                .insert(metric, values);
+        }
+    }
+    Ok(())
+}
+
+/// How much of the full-width ranking survives at each narrower width.
+///
+/// **Against its own full width rather than against another model's**, because
+/// the question is what narrowing costs this model. The full-width answer is
+/// computed once: it is the same reference for every width, and recomputing it
+/// inside the width loop was doing a 25,000-vector exhaustive pass three extra
+/// times per query for a result that could not change.
+///
+/// The queries are the identity family, which is the one family whose ground
+/// truth is a whole document and therefore the one where a narrowed ranking has
+/// the most room to go wrong.
+///
+/// @param id - the model's identifier, which is its column on the card
+/// @param arm - the arm being graded, for the widths its manifest declares
+/// @param corpus - this arm's loaded cache
+/// @param shared - the corpus slice, query set and samples every arm shares
+/// @param query_vectors - this arm's own query vectors, one list per family
+/// @param tables - where this lane's scores are collected
+fn run_matryoshka_lane(
+    id: &str,
+    arm: &Arm,
+    corpus: &Corpus,
+    shared: &Shared,
+    query_vectors: &[Vec<Vec<f32>>],
+    tables: &mut Tables,
+) -> Result<()> {
+    let widths = arm.model.manifest.widths();
+    eprintln!(
+        "  Matryoshka lane over {} chunks at {:?}",
+        shared.matryoshka_rows.len(),
+        widths
+    );
+    let sample: Vec<&Vec<f32>> = shared
+        .matryoshka_rows
+        .iter()
+        .filter_map(|&i| corpus.vectors.get(i))
+        .collect();
+    let probe = query_vectors
+        .first()
+        .context("no family was embedded, so there is nothing to narrow")?;
+    let references: Vec<HashSet<usize>> = probe
+        .iter()
+        .map(|q| top_k_of(&sample, q, K).into_iter().collect())
+        .collect();
+    for width in &widths {
+        if *width == corpus.dims {
+            tables
+                .mrl
+                .entry(id.to_string())
+                .or_default()
+                .insert(width.to_string(), 1.0);
+            continue;
+        }
+        let narrowed: Vec<Vec<f32>> = sample
+            .iter()
+            .map(|v| truncate_normalized(v, *width))
+            .collect();
+        let borrowed: Vec<&Vec<f32>> = narrowed.iter().collect();
+        let mut recalls = Vec::with_capacity(probe.len());
+        for (q, reference) in probe.iter().zip(&references) {
+            let narrow_q = truncate_normalized(q, *width);
+            let got = top_k_of(&borrowed, &narrow_q, K);
+            let hit = got.iter().filter(|i| reference.contains(i)).count();
+            recalls.push(hit as f64 / K.min(reference.len()).max(1) as f64);
+        }
+        let value = recalls.iter().sum::<f64>() / recalls.len().max(1) as f64;
+        eprintln!(
+            "    {width} dims: recall@10 {value:.4} against its own {}",
+            corpus.dims
+        );
+        tables
+            .mrl
+            .entry(id.to_string())
+            .or_default()
+            .insert(width.to_string(), value);
+    }
+    Ok(())
+}
+
+/// How confident each model is on questions nothing in the corpus answers.
+///
+/// **Dense cosine rather than the engine's fused score, and deliberately.**
+/// Fusion normalises out of the candidate list, so the top hit of every query
+/// maps to the top of the scale whether the list is good or hopeless and no
+/// threshold on it exists. A cosine is computed against a bound the results had
+/// no say in, so one query's value means the same as the next one's - which is
+/// the whole premise of a threshold.
+///
+/// @param id - the model's identifier, which is its column on the card
+/// @param corpus - this arm's loaded cache
+/// @param shared - the corpus slice, query set and samples every arm shares
+/// @param source - where this arm's query vectors come from
+/// @param tables - where this lane's scores are collected
+fn run_abstention_lane(
+    id: &str,
+    corpus: &Corpus,
+    shared: &Shared,
+    source: &mut QuerySource,
+    tables: &mut Tables,
+) -> Result<()> {
+    for (name, qs) in &shared.families.abstention {
+        let vectors = embed_one_family(source, qs, name, id)?;
+        let vectors_slice = corpus.vectors.get(..shared.graded).with_context(|| {
+            format!(
+                "the cache holds {} vectors, not {}",
+                corpus.vectors.len(),
+                shared.graded
+            )
+        })?;
+        let tops: Vec<f64> = vectors
+            .iter()
+            .map(|q| {
+                exhaustive_top_k(vectors_slice, q, 1)
+                    .first()
+                    .and_then(|i| vectors_slice.get(*i))
+                    .map(|v| f64::from(dot(v, q).clamp(0.0, 1.0)))
+                    .unwrap_or(0.0)
+            })
+            .collect();
+        eprintln!(
+            "  abstention lane, {name}: {} queries, mean top confidence {:.4}",
+            tops.len(),
+            if tops.is_empty() {
+                0.0
+            } else {
+                tops.iter().sum::<f64>() / tops.len() as f64
+            }
+        );
+        tables
+            .confidences
+            .entry(id.to_string())
+            .or_default()
+            .insert(name.clone(), tops);
+    }
+    Ok(())
+}
+
+/// Every lane the run asked for, in the order the card prints them.
+///
+/// The two composites go first, on both the declared families and the promoted
+/// set, so the promotion is a visible decision rather than a quiet re-aim.
+///
+/// @param options - the run's own flags
+/// @param tables - every lane's collected scores
+/// @param arm_facts - what the card records about each arm
+fn assemble_the_lanes(
+    options: &EmbeddingGradeOptions,
+    tables: &Tables,
+    arm_facts: &[ArmFacts],
+) -> Vec<Lane> {
+    let mut lanes = Vec::new();
+    if options.dense {
+        lanes.push(lane_from(
+            "dense only, exhaustive cosine",
+            "Every graded family answered by exhaustive cosine over the whole corpus: no graph, \
+             no lexical side, no fusion. This is the embedding on its own. The index reaches \
+             0.925 recall against exhaustive cosine on this corpus, and letting 7.5% of the \
+             answer move for reasons unrelated to the model would be larger than the effect \
+             being measured.",
+            &tables.dense,
+        ));
+    }
+    if options.hybrid {
+        lanes.push(lane_from(
+            "hybrid, the shipped pipeline",
+            "The same families through the real pipeline with the shipped fusion and ranking \
+             settings, applied identically to every arm. A model that wins in isolation and \
+             loses once BM25 is fused beside it has not helped an agent, and this is the lane \
+             that says so.",
+            &tables.hybrid,
+        ));
+    }
+    if options.matryoshka && !tables.mrl.is_empty() {
+        lanes.push(matryoshka_lane(&tables.mrl, arm_facts));
+    }
+    if options.abstention {
+        lanes.push(abstention_lane(&tables.confidences));
+    }
+    if options.lexical && !tables.lexical.is_empty() {
+        lanes.push(lexical_lane(&tables.lexical));
+    }
+    if options.cost {
+        lanes.push(cost_lane(arm_facts));
+    }
+
+    if options.dense {
+        lanes.insert(0, composite_lane(&tables.dense, "dense composite"));
+    }
+    if options.hybrid {
+        lanes.insert(
+            if options.dense { 1 } else { 0 },
+            composite_lane(&tables.hybrid, "hybrid composite"),
+        );
+    }
+    lanes
+}
+
+/// The provenance table the card prints.
+///
+/// @param facts - the run identifier and the commit it was built from
+/// @param options - the run's own flags
+/// @param arms - every arm in the run, for the cache each one read
+/// @param lead_header - the first arm's cache header
+fn provenance_of(
+    facts: &RunFacts,
+    options: &EmbeddingGradeOptions,
+    arms: &[Arm],
+    lead_header: &CacheHeader,
+) -> BTreeMap<String, String> {
+    let mut provenance: BTreeMap<String, String> = BTreeMap::new();
+    provenance.insert("run id".into(), facts.run_id.clone());
+    provenance.insert(
+        "commit".into(),
+        format!(
+            "{}{}",
+            facts.git_commit,
+            if facts.git_dirty {
+                " (working tree dirty)"
+            } else {
+                ""
+            }
+        ),
+    );
+    provenance.insert("command".into(), runs::command_line());
+    provenance.insert("corpus digest".into(), lead_header.corpus_sha256.clone());
+    provenance.insert(
+        "query seed digest".into(),
+        lead_header.query_seed_digest.clone(),
+    );
+    provenance.insert(
+        "query seeds".into(),
+        scenarios::seeds()
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    provenance.insert("statistics seed".into(), options.stats_seed.to_string());
+    provenance.insert(
+        "query embedding device".into(),
+        format!("{:?}", options.device),
+    );
+    provenance.insert(
+        "host".into(),
+        format!(
+            "{} {}, {} logical processors",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(0)
+        ),
+    );
+    for arm in arms {
+        provenance.insert(
+            format!("cache: {}", arm.header.model_id),
+            arm.cache.display().to_string(),
+        );
+    }
+    provenance
+}
+
+/// The run manifest: what this run was, in the form another run can be compared
+/// against.
+///
+/// @param facts - the run identifier and the commit it was built from
+/// @param options - the run's own flags
+/// @param arms - every arm in the run
+/// @param shared - the corpus slice and query counts every arm shared
+/// @param lead_header - the first arm's cache header
+/// @param lead_cache - the first arm's cache
+fn manifest_of(
+    facts: &RunFacts,
+    options: &EmbeddingGradeOptions,
+    arms: &[Arm],
+    shared: &Shared,
+    lead_header: &CacheHeader,
+    lead_cache: &Path,
+) -> runs::RunManifest {
+    runs::RunManifest {
+        run_id: facts.run_id.clone(),
+        generated_at_unix: runs::now_unix(),
+        git_commit: facts.git_commit.clone(),
+        git_dirty: facts.git_dirty,
+        command: runs::command_line(),
+        corpus: runs::CorpusFacts {
+            chunks: lead_header.chunk_count,
+            documents: shared.documents,
+            dimensions: lead_header.dims,
+            cache_path: lead_cache.display().to_string(),
+            cache_bytes: std::fs::metadata(lead_cache).map(|m| m.len()).unwrap_or(0),
+            cache_modified_unix: 0,
+        },
+        model_dir: arms
+            .iter()
+            .map(|a| a.model.dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        model_file: arms
+            .iter()
+            .map(|a| a.model.manifest.model_file.clone())
+            .collect::<Vec<_>>()
+            .join(", "),
+        model_id: arms
+            .iter()
+            .map(|a| a.header.model_id.clone())
+            .collect::<Vec<_>>()
+            .join(", "),
+        model_manifest_sha256: arms
+            .iter()
+            .map(|a| short(&a.header.manifest_sha256))
+            .collect::<Vec<_>>()
+            .join(", "),
+        model_dims: lead_header.dims,
+        model_max_tokens: lead_header.max_tokens,
+        cache_header: lead_header.clone(),
+        device: format!("{:?}", options.device),
+        database: "not used: grade-embedding compares models, not engines".into(),
+        seeds: scenarios::seeds(),
+        arm: BTreeMap::new(),
+        host: runs::host_facts(),
+        query_counts: shared.families.counts.clone(),
+        practical_thresholds: [("ranking measures".to_string(), RANKING_THRESHOLD)]
+            .into_iter()
+            .collect(),
+    }
 }
 
 fn mean(values: Option<&Vec<f64>>) -> f64 {
@@ -1154,11 +1910,25 @@ fn mean(values: Option<&Vec<f64>>) -> f64 {
 /// and counting only the graph put it *inside* gate G8's footprint budget when it
 /// is the heaviest arm on the board. That is a reporting error that changes a
 /// conclusion rather than a number.
+/// A safetensors checkpoint has the same problem in a different shape: its weights are
+/// several numbered shards and the file the manifest names is a JSON index listing them.
+/// `Qwen3-Embedding-8B` is 30 KB of index in front of 15.1 GB of shards, so the same
+/// mistake would report the heaviest arm on a board as the lightest by six orders of
+/// magnitude. When the named file is an index, the shards it names are summed.
 /// @param dir - the model directory
 /// @param model_file - the graph file named by the manifest
 fn weights_bytes(dir: &Path, model_file: &str) -> u64 {
-    let mut total = std::fs::metadata(dir.join(model_file)).map(|m| m.len()).unwrap_or(0);
-    let Ok(entries) = std::fs::read_dir(dir) else { return total };
+    if model_file.ends_with(".index.json") {
+        if let Some(total) = sharded_weights_bytes(&dir.join(model_file)) {
+            return total;
+        }
+    }
+    let mut total = std::fs::metadata(dir.join(model_file))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return total;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         // Anything named after the graph but not the graph itself: the external
@@ -1172,10 +1942,35 @@ fn weights_bytes(dir: &Path, model_file: &str) -> u64 {
     total
 }
 
+/// Sum the distinct shards a safetensors index names, or nothing if it cannot be read.
+///
+/// Distinct, because the index maps every tensor name to its shard and a checkpoint has
+/// far more tensors than shards; counting per entry would multiply the real size by the
+/// tensor count.
+/// @param index - the `model.safetensors.index.json` path
+fn sharded_weights_bytes(index: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(index).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let map = parsed.get("weight_map")?.as_object()?;
+    let dir = index.parent()?;
+    let shards: std::collections::BTreeSet<&str> =
+        map.values().filter_map(|v| v.as_str()).collect();
+    let mut total = std::fs::metadata(index).map(|m| m.len()).unwrap_or(0);
+    for shard in shards {
+        total += std::fs::metadata(dir.join(shard))
+            .map(|m| m.len())
+            .unwrap_or(0);
+    }
+    Some(total)
+}
+
 /// Top k by cosine over a borrowed sample, returning positions within it.
 fn top_k_of(vectors: &[&Vec<f32>], query: &[f32], k: usize) -> Vec<usize> {
-    let mut scored: Vec<(f32, usize)> =
-        vectors.iter().enumerate().map(|(i, v)| (dot(v, query), i)).collect();
+    let mut scored: Vec<(f32, usize)> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (dot(v, query), i))
+        .collect();
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(k.min(vectors.len()));
     scored.into_iter().map(|(_, i)| i).collect()
@@ -1190,10 +1985,17 @@ fn top_k_of(vectors: &[&Vec<f32>], query: &[f32], k: usize) -> Vec<usize> {
 fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let middle = sorted.get(sorted.len() / 2).copied().unwrap_or(0.0);
     match sorted.len() {
         0 => 0.0,
-        n if n % 2 == 1 => sorted[n / 2],
-        n => 0.5 * (sorted[n / 2 - 1] + sorted[n / 2]),
+        n if n % 2 == 1 => middle,
+        n => {
+            let below = sorted
+                .get((n / 2).saturating_sub(1))
+                .copied()
+                .unwrap_or(middle);
+            0.5 * (below + middle)
+        }
     }
 }
 
@@ -1237,7 +2039,11 @@ fn time_model(
 ) -> Result<(Vec<f64>, f64, f64)> {
     let embedder = crate::arm::Arm::open(
         model,
-        &crate::arm::ArmOptions { batch_size: 16, device, ..options.clone() },
+        &crate::arm::ArmOptions {
+            batch_size: 16,
+            device,
+            ..options.clone()
+        },
     )?;
     let repeats = repeats.max(1);
     // Checked before the warm-up, so a sample too small to split fails without
@@ -1245,13 +2051,17 @@ fn time_model(
     timing_range(texts.len(), repeats, 0)?;
     // One warm-up batch, outside every timing, so the numbers describe
     // steady-state throughput rather than the first allocation of the arena.
-    embedder.embed_documents(&texts[..texts.len().min(16)])?;
+    let warm = texts.get(..texts.len().min(16)).unwrap_or(texts);
+    embedder.embed_documents(warm)?;
     let before = embedder.truncation();
 
     let mut rates = Vec::with_capacity(repeats);
     for pass in 0..repeats {
         // Disjoint: this pass gets chunks no earlier pass has shown the model.
-        let batch = &texts[timing_range(texts.len(), repeats, pass)?];
+        let range = timing_range(texts.len(), repeats, pass)?;
+        let batch = texts
+            .get(range.clone())
+            .with_context(|| format!("pass {pass} reads {range:?} of {}", texts.len()))?;
         let started = Instant::now();
         embedder.embed_documents(batch)?;
         rates.push(batch.len() as f64 / started.elapsed().as_secs_f64().max(1e-9));
@@ -1268,612 +2078,19 @@ fn time_model(
     ))
 }
 
-// ---------------------------------------------------------------------------
-// Rendering and judging
-// ---------------------------------------------------------------------------
-
-type LaneScores = BTreeMap<String, BTreeMap<String, BTreeMap<String, Vec<f64>>>>;
-
-/// Turn one lane's accumulated scores into rows.
-///
-/// nDCG@10 is the primary row for every family and everything else is a
-/// diagnostic, for the same reason `grade` makes that distinction: six correlated
-/// measures of one behaviour are one result, and counting each of them separately
-/// turns a single win into six.
-fn lane_from(name: &str, rationale: &str, scores: &LaneScores) -> Lane {
-    let mut rows = Vec::new();
-    for (family, metrics) in scores {
-        for metric in [
-            M_NDCG,
-            M_NDCG_GRADED,
-            M_SUCCESS_1,
-            M_SUCCESS_10,
-            M_MRR,
-            M_PRECISION_10,
-            M_EVIDENCE_RECALL,
-            M_TOP_SCORE,
-        ] {
-            let Some(by_model) = metrics.get(metric) else { continue };
-            rows.push(EmbeddingRow {
-                family: family.clone(),
-                metric: metric.to_string(),
-                higher_is_better: true,
-                role: if metric == M_NDCG { Role::Primary } else { Role::Diagnostic },
-                values: by_model
-                    .iter()
-                    .map(|(m, v)| (m.clone(), v.iter().sum::<f64>() / v.len().max(1) as f64))
-                    .collect(),
-                series: by_model.clone(),
-            });
-        }
-    }
-    Lane { name: name.to_string(), rationale: rationale.to_string(), rows }
-}
-
-/// The composite lane: the declared families, and the promoted set beside it.
-fn composite_lane(scores: &LaneScores, name: &str) -> Lane {
-    let mut rows = Vec::new();
-    for (label, set, role) in [
-        (format!("composite, declared ({})", HEADLINE.join(" + ")), HEADLINE, Role::Primary),
-        (
-            format!("composite, promoted ({} families)", PROMOTED.len()),
-            PROMOTED,
-            Role::Diagnostic,
-        ),
-    ] {
-        // family -> model -> series, transposed to model -> concatenated series.
-        let mut per_model: BTreeMap<String, BTreeMap<String, Vec<f64>>> = BTreeMap::new();
-        for family in set {
-            let Some(metrics) = scores.get(*family) else { continue };
-            let Some(by_model) = metrics.get(M_NDCG) else { continue };
-            for (model, values) in by_model {
-                per_model
-                    .entry(model.clone())
-                    .or_default()
-                    .insert((*family).to_string(), values.clone());
-            }
-        }
-        let series: BTreeMap<String, Vec<f64>> =
-            per_model.iter().map(|(m, fams)| (m.clone(), composite(fams, set))).collect();
-        // Only models that answered every family in the set, or the concatenated
-        // series would be different lengths and no paired test would be valid.
-        let expected = series.values().map(|v| v.len()).max().unwrap_or(0);
-        let series: BTreeMap<String, Vec<f64>> =
-            series.into_iter().filter(|(_, v)| v.len() == expected).collect();
-        rows.push(EmbeddingRow {
-            family: label,
-            metric: M_NDCG.to_string(),
-            higher_is_better: true,
-            role,
-            values: series
-                .iter()
-                .map(|(m, v)| (m.clone(), v.iter().sum::<f64>() / v.len().max(1) as f64))
-                .collect(),
-            series,
-        });
-    }
-    Lane {
-        name: name.to_string(),
-        rationale: format!(
-            "One score per question, every family concatenated, so the composite is a paired \
-             series rather than a mean of means. The declared composite is {} and is what gate \
-             G0 and gate G1 are decided on; the promoted composite is reported beside it so \
-             that a promotion, if the declared one turns out to be blind, is a visible decision \
-             taken against a number that was already on the card.",
-            HEADLINE.join(" and ")
-        ),
-        rows,
-    }
-}
-
-fn matryoshka_lane(mrl: &BTreeMap<String, BTreeMap<String, f64>>, arms: &[ArmFacts]) -> Lane {
-    let mut widths: Vec<usize> = arms.iter().flat_map(|a| a.mrl_widths.clone()).collect();
-    widths.sort_unstable();
-    widths.dedup();
-    let mut rows = Vec::new();
-    for width in widths {
-        let key = width.to_string();
-        let values: BTreeMap<String, f64> = mrl
-            .iter()
-            .filter_map(|(model, by_width)| by_width.get(&key).map(|v| (model.clone(), *v)))
-            .collect();
-        if values.is_empty() {
-            continue;
-        }
-        rows.push(EmbeddingRow {
-            family: format!("{width} dims"),
-            metric: M_RECALL_AGAINST_FULL.to_string(),
-            higher_is_better: true,
-            role: Role::Diagnostic,
-            values,
-            series: BTreeMap::new(),
-        });
-    }
-    Lane {
-        name: "Matryoshka".to_string(),
-        rationale:
-            "Each model's narrowed ranking against its own full-width exact ranking, so the \
-             storage saving is priced per model instead of assumed from a model card. A model \
-             with no Matryoshka training appears only at its full width, which is the honest \
-             way to show that it has none."
-                .to_string(),
-        rows,
-    }
-}
-
-/// The value at a percentile of an already sorted series.
-///
-/// Nearest-rank rather than interpolated, so the threshold is always a score
-/// some calibration query actually produced.
-/// @param sorted - the series, ascending
-/// @param p - the percentile, from zero to one
-fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let rank = ((sorted.len() - 1) as f64 * p).round() as usize;
-    sorted[rank.min(sorted.len() - 1)]
-}
-
-/// Gate G4: how often each model answers confidently when nothing answers.
-///
-/// Each model is judged against its own threshold, because a cosine from one
-/// model and a cosine from another are not the same number - a model whose
-/// vectors sit in a narrower cone scores every pair higher, and a shared
-/// threshold would grade that geometry rather than the behaviour. The threshold
-/// is the fifth percentile of the model's own top-result confidence over
-/// answerable calibration queries this lane never scores.
-/// @param confidences - model to family to per-query top confidence
-fn abstention_lane(confidences: &BTreeMap<String, BTreeMap<String, Vec<f64>>>) -> Lane {
-    let mut rates = BTreeMap::new();
-    let mut series = BTreeMap::new();
-    let mut thresholds = BTreeMap::new();
-    let mut gaps = BTreeMap::new();
-
-    for (model, by_family) in confidences {
-        let (Some(calibration), Some(negative)) =
-            (by_family.get(CALIBRATION), by_family.get(UNANSWERABLE))
-        else {
-            continue;
-        };
-        if calibration.is_empty() || negative.is_empty() {
-            continue;
-        }
-        let mut sorted = calibration.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let threshold = percentile(&sorted, 0.05);
-        // One value per query, so this row can be tested pairwise like every
-        // other primary row rather than compared as two summary numbers.
-        let flags: Vec<f64> =
-            negative.iter().map(|s| if *s >= threshold { 1.0 } else { 0.0 }).collect();
-        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
-        rates.insert(model.clone(), mean(&flags));
-        series.insert(model.clone(), flags);
-        thresholds.insert(model.clone(), threshold);
-        gaps.insert(model.clone(), mean(calibration) - mean(negative));
-    }
-
-    let rows = vec![
-        EmbeddingRow {
-            family: "questions with no answer in the corpus".to_string(),
-            metric: "confident answer rate at the model's own threshold".to_string(),
-            higher_is_better: false,
-            role: Role::Primary,
-            values: rates,
-            series,
-        },
-        EmbeddingRow {
-            family: "calibration queries, 5th percentile of the top result".to_string(),
-            metric: "the model's own abstention threshold".to_string(),
-            higher_is_better: true,
-            role: Role::Diagnostic,
-            values: thresholds,
-            series: BTreeMap::new(),
-        },
-        EmbeddingRow {
-            family: "answerable minus unanswerable".to_string(),
-            metric: "mean top result confidence gap".to_string(),
-            higher_is_better: true,
-            role: Role::Diagnostic,
-            values: gaps,
-            series: BTreeMap::new(),
-        },
-    ];
-
-    Lane {
-        name: "abstention".to_string(),
-        rationale:
-            "Gate G4. Queries built by mixing the distinctive words of two documents \
-             from two sources the corpus builder draws from disjoint pools, so no chunk \
-             holds material from both and the question sounds entirely plausible with no \
-             answer. This is the failure that does not announce itself: ten confident \
-             looking passages about nothing. Each model is calibrated on its own scale - \
-             the threshold is the fifth percentile of its own top result confidence over \
-             answerable queries this lane never scores - so the comparison needs no \
-             assumption that two models' cosines mean the same thing. Lower is better."
-                .to_string(),
-        rows,
-    }
-}
-
-/// The column name the lexical lane prints under. Not a model id, because
-/// there is no model: the ranking is BM25 over the corpus text.
-const LEXICAL_COLUMN: &str = "BM25 alone, no model";
-
-/// The same query families through BM25 with no embedding model.
-///
-/// One column, because the ranking depends only on the corpus text and the
-/// query. Every row is diagnostic: there is no baseline model in this lane to
-/// compare against, so nothing here is judged. What it answers is a question
-/// the other lanes cannot: how much of what the shipped pipeline finds would
-/// be found with no embedding model at all.
-/// @param lexical - family to metric to the per-query scores BM25 produced
-fn lexical_lane(lexical: &BTreeMap<String, BTreeMap<String, Vec<f64>>>) -> Lane {
-    let mut rows = Vec::new();
-    let row = |family: String, values: &[f64]| EmbeddingRow {
-        family,
-        metric: M_NDCG.to_string(),
-        higher_is_better: true,
-        role: Role::Diagnostic,
-        values: [(
-            LEXICAL_COLUMN.to_string(),
-            values.iter().sum::<f64>() / values.len().max(1) as f64,
-        )]
-        .into_iter()
-        .collect(),
-        series: BTreeMap::new(),
-    };
-    let per_family: BTreeMap<String, Vec<f64>> = lexical
-        .iter()
-        .filter_map(|(f, m)| m.get(M_NDCG).map(|v| (f.clone(), v.clone())))
-        .collect();
-    // Both composites the other lanes print, so a reader comparing this lane
-    // against the hybrid lane is comparing the same quantity.
-    for (label, families) in [
-        (format!("composite, declared ({})", HEADLINE.join(" + ")), HEADLINE),
-        (format!("composite, promoted ({} families)", PROMOTED.len()), PROMOTED),
-    ] {
-        let values = composite(&per_family, families);
-        if !values.is_empty() {
-            rows.push(row(label, &values));
-        }
-    }
-    for (family, values) in &per_family {
-        rows.push(row(family.clone(), values));
-    }
-    Lane {
-        name: "lexical only".to_string(),
-        rationale:
-            "The same families through BM25 with no embedding model, over the index the \
-             hybrid lane builds and with every ranking setting left as the shipped \
-             defaults. One column, because the ranking reads the corpus text and the \
-             query and nothing else, so each arm would produce the same numbers. Every \
-             row is diagnostic: there is no model in this lane, so there is no baseline \
-             to judge against. Read it against the hybrid lane. The difference between \
-             the two is what the embedding model adds to the pipeline Inillucent ships, \
-             and it is the only place on this card that quantity appears."
-                .to_string(),
-        rows,
-    }
-}
-
-fn cost_lane(arms: &[ArmFacts]) -> Lane {
-    let mut rows = Vec::new();
-    let mut devices: Vec<String> =
-        arms.iter().flat_map(|a| a.chunks_per_second.keys().cloned()).collect();
-    devices.sort();
-    devices.dedup();
-    for device in devices {
-        rows.push(EmbeddingRow {
-            family: format!("throughput on {device}"),
-            metric: "chunks per second, median".to_string(),
-            higher_is_better: true,
-            role: Role::Diagnostic,
-            values: arms
-                .iter()
-                .filter_map(|a| a.chunks_per_second.get(&device).map(|v| (a.model_id.clone(), *v)))
-                .collect(),
-            series: BTreeMap::new(),
-        });
-        // The spread beside the median, because a reader cannot tell whether a
-        // gap between two arms is real without knowing how far apart two runs of
-        // one arm land. Printed as a share of the median so arms of very
-        // different speeds can be compared on it.
-        let spreads: BTreeMap<String, f64> = arms
-            .iter()
-            .filter_map(|a| {
-                let runs = a.chunks_per_second_runs.get(&device)?;
-                if runs.len() < 2 {
-                    return None;
-                }
-                let low = runs.iter().cloned().fold(f64::INFINITY, f64::min);
-                let high = runs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let middle = median(runs);
-                Some((a.model_id.clone(), 100.0 * (high - low) / middle.max(1e-9)))
-            })
-            .collect();
-        if !spreads.is_empty() {
-            rows.push(EmbeddingRow {
-                family: format!("throughput on {device}"),
-                metric: "spread across repeats, % of median".to_string(),
-                higher_is_better: false,
-                role: Role::Diagnostic,
-                values: spreads,
-                series: BTreeMap::new(),
-            });
-        }
-    }
-    for (label, metric, higher, pick) in [
-        (
-            "weights on disk",
-            "megabytes",
-            false,
-            Box::new(|a: &ArmFacts| a.model_bytes as f64 / 1e6) as Box<dyn Fn(&ArmFacts) -> f64>,
-        ),
-        (
-            "tokens per chunk",
-            "tokens",
-            false,
-            Box::new(|a: &ArmFacts| a.tokens_per_chunk.unwrap_or(0.0)),
-        ),
-        (
-            "corpus truncated at the model's bound",
-            "share of chunks",
-            false,
-            Box::new(|a: &ArmFacts| a.truncation_share),
-        ),
-        (
-            "bytes per vector at full width",
-            "bytes",
-            false,
-            Box::new(|a: &ArmFacts| (a.dims * 4) as f64),
-        ),
-    ] {
-        rows.push(EmbeddingRow {
-            family: label.to_string(),
-            metric: metric.to_string(),
-            higher_is_better: higher,
-            role: Role::Diagnostic,
-            values: arms.iter().map(|a| (a.model_id.clone(), pick(a))).collect(),
-            series: BTreeMap::new(),
-        });
-    }
-    Lane {
-        name: "cost".to_string(),
-        rationale:
-            "Throughput is timed on distinct stride-sampled chunks, never on repeated text: a \
-             repeated-input benchmark on this machine reported 300 chunks a second against a \
-             real 85 to 134, because it was measuring a prefix cache. Truncation share is \
-             printed beside throughput because a model that is fast for having read less of \
-             each chunk is not fast."
-                .to_string(),
-        rows,
-    }
-}
-
-/// Compare every candidate against the baseline on every primary row.
-fn judge(lanes: &[Lane], baseline: &str, seed: u64) -> Vec<ArmJudgement> {
-    let mut out = Vec::new();
-    for lane in lanes {
-        for row in &lane.rows {
-            if row.role != Role::Primary {
-                continue;
-            }
-            let Some(base_series) = row.series.get(baseline) else { continue };
-            let base_value = row.values.get(baseline).copied().unwrap_or(0.0);
-            // Oriented so that a positive delta always means the candidate is
-            // better. `stats::verdict` reads the interval's sign and has no idea
-            // which way a metric runs; the abstention lane is the first primary
-            // row where lower is better, and without this its verdicts would come
-            // out exactly backwards. `candidate_value` and `baseline_value` stay
-            // in the row's own units.
-            let orient = |v: &Vec<f64>| -> Vec<f64> {
-                if row.higher_is_better {
-                    v.clone()
-                } else {
-                    v.iter().map(|x| -x).collect()
-                }
-            };
-            let base_oriented = orient(base_series);
-            for (model, series) in &row.series {
-                if model == baseline {
-                    continue;
-                }
-                let paired = stats::compare(&orient(series), &base_oriented, seed);
-                let verdict = paired
-                    .as_ref()
-                    .map(|p| stats::verdict(p, RANKING_THRESHOLD))
-                    .unwrap_or(Verdict::Inconclusive);
-                out.push(ArmJudgement {
-                    lane: lane.name.clone(),
-                    family: row.family.clone(),
-                    metric: row.metric.clone(),
-                    model: model.clone(),
-                    baseline: baseline.to_string(),
-                    candidate_value: row.values.get(model).copied().unwrap_or(0.0),
-                    baseline_value: base_value,
-                    verdict,
-                    threshold: RANKING_THRESHOLD,
-                    paired,
-                });
-            }
-        }
-    }
-    out
-}
-
-fn caveats() -> Vec<String> {
-    vec![
-        "Every arm embedded the same corpus from scratch with its own model, its own prefixes, \
-         its own pooling and its own token bound. No cache is reused between arms, and the \
-         header of each one names the corpus digest, the model and the manifest digest it was \
-         made with; a run refuses before it starts if any two of those disagree."
-            .to_string(),
-        "The queries are generated once from the shared corpus and are byte-identical across \
-         arms. Each arm embeds them with its own model, which is the only honest way to ask two \
-         models the same question."
-            .to_string(),
-        "The dense lane applies no per-document cap and computes its ideal ranking the same way \
-         for every arm, so its absolute values sit below the hybrid lane's and its comparisons \
-         are exact."
-            .to_string(),
-        "Throughput is measured on distinct chunks. On this machine a repeated-input embedding \
-         benchmark reports roughly three times the real rate, because shared prefixes collapse \
-         in the cache."
-            .to_string(),
-        "A model that wins on this suite and loses on a public retrieval benchmark has \
-         overfitted to this corpus. This card cannot see that; it is the reason gate G5 exists \
-         outside it."
-            .to_string(),
-    ]
-}
-
-pub fn render(card: &EmbeddingCard) -> String {
-    let mut s = String::new();
-    s.push_str("# Embedding model head-to-head\n\n");
-    s.push_str(&format!(
-        "Run `{}`, corpus `{}` ({} chunks across {} documents), baseline `{}`. Every comparison \
-         is a paired bootstrap 95% interval plus a paired randomization test over per-query \
-         scores, against a practical threshold of {} declared before the run.\n\n",
-        card.run_id,
-        short(&card.corpus_sha256),
-        card.corpus_chunks,
-        card.corpus_documents,
-        card.baseline,
-        card.ranking_threshold
-    ));
-
-    s.push_str("## The arms\n\n");
-    s.push_str("| model | dims | max tokens | pooling | query prefix | truncated | weights MB | manifest |\n");
-    s.push_str("|---|---:|---:|---|---|---:|---:|---|\n");
-    for a in &card.arms {
-        s.push_str(&format!(
-            "| `{}` | {} | {} | {} | `{}` | {:.2}% | {:.0} | `{}`{} |\n",
-            a.model_id,
-            a.dims,
-            a.max_tokens,
-            a.pooling,
-            a.query_prefix.replace('|', "\\|"),
-            100.0 * a.truncation_share,
-            a.model_bytes as f64 / 1e6,
-            short(&a.manifest_sha256),
-            if a.manifest_on_disk { "" } else { " (assumed)" }
-        ));
-    }
-    s.push('\n');
-
-    s.push_str("## Verdicts on the primary rows\n\n");
-    if card.judgements.is_empty() {
-        s.push_str("No primary row carried per-query scores for both a candidate and the baseline.\n\n");
-    } else {
-        s.push_str("| lane | family | model | value | baseline | delta | 95% interval | p | verdict |\n");
-        s.push_str("|---|---|---|---:|---:|---:|---|---:|---|\n");
-        for j in &card.judgements {
-            let (delta, interval, p) = match &j.paired {
-                Some(p) => (
-                    format!("{:+.4}", p.delta),
-                    format!("[{:+.4}, {:+.4}]", p.low, p.high),
-                    format!("{:.4}", p.p_value),
-                ),
-                None => ("n/a".into(), "n/a".into(), "n/a".into()),
-            };
-            s.push_str(&format!(
-                "| {} | {} | `{}` | {:.4} | {:.4} | {delta} | {interval} | {p} | {} |\n",
-                j.lane,
-                j.family,
-                j.model,
-                j.candidate_value,
-                j.baseline_value,
-                j.verdict.label()
-            ));
-        }
-        s.push('\n');
-    }
-
-    for lane in &card.lanes {
-        s.push_str(&format!("## {}\n\n{}\n\n", lane.name, lane.rationale));
-        let mut models: Vec<&String> = lane.rows.iter().flat_map(|r| r.values.keys()).collect();
-        models.sort();
-        models.dedup();
-        s.push_str("| family | metric | ");
-        s.push_str(&models.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(" | "));
-        s.push_str(" |\n|---|---|");
-        s.push_str(&"---:|".repeat(models.len()));
-        s.push('\n');
-        for row in &lane.rows {
-            s.push_str(&format!(
-                "| {}{} | {} |",
-                row.family,
-                if row.role == Role::Primary { " **(primary)**" } else { "" },
-                row.metric
-            ));
-            for m in &models {
-                match row.values.get(*m) {
-                    Some(v) => s.push_str(&format!(" {} |", fmt(*v))),
-                    None => s.push_str(" - |"),
-                }
-            }
-            s.push('\n');
-        }
-        s.push('\n');
-    }
-
-    s.push_str("## Query families\n\n| family | queries |\n|---|---:|\n");
-    for (name, n) in &card.query_counts {
-        s.push_str(&format!("| {name} | {n} |\n"));
-    }
-    s.push('\n');
-
-    s.push_str("## Caveats\n\n");
-    for c in &card.caveats {
-        s.push_str(&format!("- {c}\n"));
-    }
-    s.push('\n');
-
-    s.push_str("## Provenance\n\n| | |\n|---|---|\n");
-    for (k, v) in &card.provenance {
-        s.push_str(&format!("| {k} | {v} |\n"));
-    }
-    s.push('\n');
-    s
-}
-
-fn fmt(v: f64) -> String {
-    if v >= 1000.0 {
-        format!("{v:.0}")
-    } else if v >= 1.0 {
-        format!("{v:.2}")
-    } else {
-        format!("{v:.4}")
-    }
-}
-
-pub fn print_summary(card: &EmbeddingCard) {
-    eprintln!("\nbaseline: {}", card.baseline);
-    for j in &card.judgements {
-        if j.lane.contains("composite") {
-            eprintln!(
-                "  {} / {}: {} {:.4} vs {:.4} ({:+.4}) -> {}",
-                j.lane,
-                j.family,
-                j.model,
-                j.candidate_value,
-                j.baseline_value,
-                j.candidate_value - j.baseline_value,
-                j.verdict.label()
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `percentile` is tested here and called only from inside `card`, so the
+    // parent does not import it and this is the one place that names it.
+    use super::card::percentile;
     use inillucent_core::model::{ModelManifest, Pooling, Prefixes};
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("inillucent-gradeembed-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "inillucent-gradeembed-{}-{name}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1983,7 +2200,16 @@ mod tests {
             query_seed_digest: seed_digest.to_string(),
         };
         let path = root.join(format!("{id}.cache"));
-        corpus::save_cache(&Corpus { chunks: inputs, vectors, dims, header }, &path).unwrap();
+        corpus::save_cache(
+            &Corpus {
+                chunks: inputs,
+                vectors,
+                dims,
+                header,
+            },
+            &path,
+        )
+        .unwrap();
         path
     }
 
@@ -2007,11 +2233,11 @@ mod tests {
             cost_samples: 8,
             cost_devices: vec![],
             cost_repeats: 3,
+            query_vectors: BTreeMap::new(),
             matryoshka_chunks: 8,
             arm_options: crate::arm::ArmOptions::default(),
         }
     }
-
 
     /// The lexical lane has one column and no judgement, because there is no
     /// model in it. A second column would be the same ranking printed twice, and
@@ -2024,18 +2250,27 @@ mod tests {
             ("heading", vec![0.0, 0.5]),
             ("passage evidence", vec![0.25]),
         ] {
-            lexical.entry(family.to_string()).or_default().insert(M_NDCG.to_string(), scores);
+            lexical
+                .entry(family.to_string())
+                .or_default()
+                .insert(M_NDCG.to_string(), scores);
         }
         let lane = lexical_lane(&lexical);
 
         let mut columns: Vec<&String> = lane.rows.iter().flat_map(|r| r.values.keys()).collect();
         columns.sort();
         columns.dedup();
-        assert_eq!(columns.len(), 1, "one column, because no model changes this ranking");
+        assert_eq!(
+            columns.len(),
+            1,
+            "one column, because no model changes this ranking"
+        );
         assert_eq!(columns[0], LEXICAL_COLUMN);
 
         assert!(
-            lane.rows.iter().all(|r| r.role == Role::Diagnostic && r.series.is_empty()),
+            lane.rows
+                .iter()
+                .all(|r| r.role == Role::Diagnostic && r.series.is_empty()),
             "nothing in this lane is judged, so no row is primary and none carries a series"
         );
         assert!(
@@ -2066,7 +2301,9 @@ mod tests {
         let root = scratch("corpora");
         let a = arm_at(&root, "model-a", 8, 40, "corpus-one", &seeds_now());
         let b = arm_at(&root, "model-b", 8, 40, "corpus-two", &seeds_now());
-        let err = resolve_arms(&options(&root, vec![a, b])).unwrap_err().to_string();
+        let err = resolve_arms(&options(&root, vec![a, b]))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("two different"), "{err}");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2076,7 +2313,9 @@ mod tests {
         let root = scratch("counts");
         let a = arm_at(&root, "model-a", 8, 40, "corpus-one", &seeds_now());
         let b = arm_at(&root, "model-b", 8, 36, "corpus-one", &seeds_now());
-        let err = resolve_arms(&options(&root, vec![a, b])).unwrap_err().to_string();
+        let err = resolve_arms(&options(&root, vec![a, b]))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("chunks and"), "{err}");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2085,8 +2324,17 @@ mod tests {
     fn two_caches_written_under_different_query_seeds_are_refused_by_name() {
         let root = scratch("seeds");
         let a = arm_at(&root, "model-a", 8, 40, "corpus-one", &seeds_now());
-        let b = arm_at(&root, "model-b", 8, 40, "corpus-one", "a-different-seed-table");
-        let err = resolve_arms(&options(&root, vec![a, b])).unwrap_err().to_string();
+        let b = arm_at(
+            &root,
+            "model-b",
+            8,
+            40,
+            "corpus-one",
+            "a-different-seed-table",
+        );
+        let err = resolve_arms(&options(&root, vec![a, b]))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("query seed table"), "{err}");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2098,7 +2346,9 @@ mod tests {
         let root = scratch("stale");
         let a = arm_at(&root, "model-a", 8, 40, "corpus-one", "an-older-seed-table");
         let b = arm_at(&root, "model-b", 8, 40, "corpus-one", "an-older-seed-table");
-        let err = resolve_arms(&options(&root, vec![a, b])).unwrap_err().to_string();
+        let err = resolve_arms(&options(&root, vec![a, b]))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("this harness digests to"), "{err}");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2119,7 +2369,9 @@ mod tests {
             serde_json::to_string_pretty(&manifest).unwrap(),
         )
         .unwrap();
-        let err = resolve_arms(&options(&root, vec![a, b])).unwrap_err().to_string();
+        let err = resolve_arms(&options(&root, vec![a, b]))
+            .unwrap_err()
+            .to_string();
         // The manifest digest moves with the width, so whichever check fires
         // first, the run refuses and says which model and which field.
         assert!(err.contains("model-b"), "{err}");
@@ -2141,8 +2393,13 @@ mod tests {
             serde_json::to_string_pretty(&manifest).unwrap(),
         )
         .unwrap();
-        let err = resolve_arms(&options(&root, vec![a, b])).unwrap_err().to_string();
-        assert!(err.contains("has changed since these vectors were made"), "{err}");
+        let err = resolve_arms(&options(&root, vec![a, b]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("has changed since these vectors were made"),
+            "{err}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2171,8 +2428,19 @@ mod tests {
             truncated_chunks: 0,
             query_seed_digest: String::new(),
         };
-        corpus::save_cache(&Corpus { chunks: inputs, vectors, dims: 8, header }, &b_path).unwrap();
-        let err = resolve_arms(&options(&root, vec![a, b_path])).unwrap_err().to_string();
+        corpus::save_cache(
+            &Corpus {
+                chunks: inputs,
+                vectors,
+                dims: 8,
+                header,
+            },
+            &b_path,
+        )
+        .unwrap();
+        let err = resolve_arms(&options(&root, vec![a, b_path]))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("cannot say which corpus"), "{err}");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2181,7 +2449,9 @@ mod tests {
     fn one_cache_is_not_a_comparison() {
         let root = scratch("single");
         let a = arm_at(&root, "model-a", 8, 40, "corpus-one", &seeds_now());
-        let err = resolve_arms(&options(&root, vec![a])).unwrap_err().to_string();
+        let err = resolve_arms(&options(&root, vec![a]))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("at least two caches"), "{err}");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2192,7 +2462,9 @@ mod tests {
         let a = arm_at(&root, "model-a", 8, 40, "corpus-one", &seeds_now());
         let copy = root.join("model-a-again.cache");
         std::fs::copy(&a, &copy).unwrap();
-        let err = resolve_arms(&options(&root, vec![a, copy])).unwrap_err().to_string();
+        let err = resolve_arms(&options(&root, vec![a, copy]))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("appears twice"), "{err}");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2228,6 +2500,325 @@ mod tests {
         for pair in scores.windows(2) {
             assert!(pair[0] >= pair[1] - 1e-6, "{scores:?}");
         }
+    }
+
+    /// `rejudge` has to re-take the role decision, not only re-run the statistics.
+    ///
+    /// Written after running it on the Phase 0 card, which was produced by a binary that
+    /// marked the promoted composite diagnostic: `rejudge` reported 60 judgements before and
+    /// 60 after, because it judged the roles stored in the file. A `rejudge` that cannot
+    /// change a role cannot repair a card, and the card it exists for costs nine hours of
+    /// embedding to earn again.
+    #[test]
+    fn rejudge_promotes_a_row_an_older_binary_left_diagnostic() {
+        let mut scores: LaneScores = BTreeMap::new();
+        for family in PROMOTED {
+            let mut per_metric: BTreeMap<String, BTreeMap<String, Vec<f64>>> = BTreeMap::new();
+            let mut per_model: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+            per_model.insert(
+                "base".to_string(),
+                (0..40).map(|i| 0.5 + i as f64 * 0.001).collect(),
+            );
+            per_model.insert(
+                "candidate".to_string(),
+                (0..40).map(|i| 0.6 + i as f64 * 0.001).collect(),
+            );
+            per_metric.insert(M_NDCG.to_string(), per_model);
+            scores.insert((*family).to_string(), per_metric);
+        }
+        let mut lane = composite_lane(&scores, "dense composite");
+        // The card an older binary wrote: the row is there, measured, and unjudgeable.
+        for row in &mut lane.rows {
+            if row.family.contains("promoted") {
+                row.role = Role::Diagnostic;
+            }
+        }
+        let mut card = EmbeddingCard {
+            run_id: "rejudge-role".to_string(),
+            generated_at_unix: 0,
+            corpus_sha256: String::new(),
+            corpus_chunks: 0,
+            corpus_documents: 0,
+            query_seed_digest: String::new(),
+            baseline: "base".to_string(),
+            arms: Vec::new(),
+            lanes: vec![lane],
+            judgements: Vec::new(),
+            query_counts: BTreeMap::new(),
+            stats_seed: 20260901,
+            ranking_threshold: RANKING_THRESHOLD,
+            composite_declared: HEADLINE.join(" + "),
+            provenance: BTreeMap::new(),
+            caveats: Vec::new(),
+        };
+        card.judgements = judge(&card.lanes, &card.baseline, 20260901);
+        let stale = card.judgements.len();
+
+        let dir = std::env::temp_dir().join("inillucent-rejudge-role");
+        std::fs::create_dir_all(&dir).expect("a temp directory");
+        let path = dir.join("card.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&card).expect("a card serialises"),
+        )
+        .expect("writing the card");
+
+        let (rescored, before, after) = rejudge(&path).expect("rejudging the card");
+        assert_eq!(
+            before, stale,
+            "the stored judgement count is what `before` reports"
+        );
+        assert!(
+            after > before,
+            "re-taking the role decision must produce judgements the stored card had none of: \
+             {before} -> {after}"
+        );
+        let promoted = rescored
+            .lanes
+            .iter()
+            .flat_map(|l| l.rows.iter())
+            .find(|r| r.family.contains("promoted"))
+            .expect("the promoted composite is on the card");
+        assert_eq!(
+            promoted.role,
+            Role::Primary,
+            "the promoted row must come back primary"
+        );
+        assert!(
+            rescored
+                .judgements
+                .iter()
+                .any(|j| j.family.contains("promoted")),
+            "the promoted composite must have a verdict after a rejudge"
+        );
+    }
+
+    /// The promoted six family composite has to carry a verdict, because the gates that
+    /// matter are declared on it. While it was diagnostic it had values and a per-query
+    /// series and no verdict at all - and a row nobody can get a verdict for is a row
+    /// that gets read as the row beside it, which is how three of task-1818's runs
+    /// earned "better" on the declared two family composite while passage evidence
+    /// regressed by up to 0.064 underneath.
+    #[test]
+    fn both_composites_are_judged() {
+        let mut scores: LaneScores = BTreeMap::new();
+        for family in PROMOTED {
+            let mut per_metric: BTreeMap<String, BTreeMap<String, Vec<f64>>> = BTreeMap::new();
+            let mut per_model: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+            per_model.insert("base".to_string(), vec![0.5; 40]);
+            per_model.insert("candidate".to_string(), vec![0.6; 40]);
+            per_metric.insert(M_NDCG.to_string(), per_model);
+            scores.insert((*family).to_string(), per_metric);
+        }
+        let lane = composite_lane(&scores, "dense composite");
+        let promoted = lane
+            .rows
+            .iter()
+            .find(|r| r.family.contains("promoted"))
+            .expect("the promoted composite is on the card");
+        assert_eq!(
+            promoted.role,
+            Role::Primary,
+            "the promoted composite must be judged"
+        );
+        assert!(
+            !promoted.series.is_empty(),
+            "a judged row needs its per-query series"
+        );
+
+        let judgements = judge(&[lane], "base", 20260901);
+        let families: Vec<&str> = judgements.iter().map(|j| j.family.as_str()).collect();
+        assert!(
+            families.iter().any(|f| f.contains("promoted")),
+            "the promoted composite produced no judgement: {families:?}"
+        );
+        assert!(
+            families.iter().any(|f| f.contains("declared")),
+            "judging the promoted one must not have cost the declared one its verdict: {families:?}"
+        );
+    }
+
+    /// A safetensors checkpoint names its weights from a JSON index, and the index is
+    /// tiny. `Qwen3-Embedding-8B` is 30 KB of index in front of four shards totalling
+    /// 15.1 GB, so reading the named file alone would put the heaviest arm on the board
+    /// under every footprint budget there is - the same reporting error that put
+    /// `qwen3-embedding-0.6b` inside task-1818's gate G8 at 307 MB against a real 2,401.
+    #[test]
+    fn a_sharded_checkpoint_is_weighed_by_its_shards_and_not_its_index() {
+        let dir = sidecar_dir("shards");
+        std::fs::write(
+            dir.join("model-00001-of-00002.safetensors"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("model-00002-of-00002.safetensors"),
+            vec![0u8; 2048],
+        )
+        .unwrap();
+        // Many tensors, two shards: the sum is over the shards, not over the entries.
+        let index = serde_json::json!({"weight_map": {
+            "a": "model-00001-of-00002.safetensors",
+            "b": "model-00001-of-00002.safetensors",
+            "c": "model-00002-of-00002.safetensors",
+        }});
+        let index_path = dir.join("model.safetensors.index.json");
+        std::fs::write(&index_path, index.to_string()).unwrap();
+        let index_bytes = std::fs::metadata(&index_path).unwrap().len();
+        assert_eq!(
+            weights_bytes(&dir, "model.safetensors.index.json"),
+            4096 + 2048 + index_bytes
+        );
+    }
+
+    /// A scratch directory for the sidecar tests, named by process so two runs cannot
+    /// read each other's files.
+    fn sidecar_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("inillucent-sidecar-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write a sidecar pair: the vectors and the JSON that claims what they are.
+    fn write_sidecar(dir: &Path, meta: serde_json::Value, rows: usize, dims: usize) -> PathBuf {
+        let vectors = dir.join("q.f32");
+        let mut bytes = Vec::with_capacity(rows * dims * 4);
+        for row in 0..rows {
+            for d in 0..dims {
+                bytes.extend_from_slice(&((row * dims + d) as f32).to_le_bytes());
+            }
+        }
+        std::fs::write(&vectors, bytes).unwrap();
+        std::fs::write(vectors.with_extension("meta.json"), meta.to_string()).unwrap();
+        vectors
+    }
+
+    fn sidecar_header() -> CacheHeader {
+        CacheHeader {
+            version: 4,
+            corpus_sha256: "corpus-a".into(),
+            model_id: "teacher".into(),
+            manifest_sha256: "d".into(),
+            dims: 4,
+            max_tokens: 512,
+            chunk_count: 10,
+            truncated_chunks: 0,
+            query_seed_digest: "seeds-a".into(),
+        }
+    }
+
+    fn sidecar_meta() -> serde_json::Value {
+        serde_json::json!({
+            "corpus_sha256": "corpus-a",
+            "query_seed_digest": "seeds-a",
+            "per_source": 40,
+            "queries": 3,
+            "model_id": "teacher",
+            "dims": 4,
+        })
+    }
+
+    /// The whole point of the sidecar is that vectors can come from a model this
+    /// harness cannot open. A matching one loads and keeps its row order, because the
+    /// families are split off the front of it in the order `query-texts` wrote them.
+    #[test]
+    fn a_matching_query_vector_sidecar_loads_in_order() {
+        let dir = sidecar_dir("match");
+        let path = write_sidecar(&dir, sidecar_meta(), 3, 4);
+        let rows = read_query_vectors(&path, "teacher", 4, &sidecar_header(), 40, 3).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(rows[2], vec![8.0, 9.0, 10.0, 11.0]);
+    }
+
+    /// Each of these produces a file that opens, parses and yields numbers. That is
+    /// exactly why every one has to be refused by name: a sidecar built against last
+    /// week's corpus, or at a different `--per-source`, or for a different model, is
+    /// not a bad file, it is a plausible one, and it would put a wrong number on a
+    /// gate card with nothing in the output to say so.
+    #[test]
+    fn a_sidecar_that_does_not_describe_this_run_is_refused_by_name() {
+        let header = sidecar_header();
+        let cases: Vec<(&str, serde_json::Value, &str, usize, usize, usize, &str)> = vec![
+            (
+                "corpus",
+                serde_json::json!({"corpus_sha256":"corpus-b","query_seed_digest":"seeds-a","per_source":40,"queries":3,"model_id":"teacher","dims":4}),
+                "teacher",
+                4,
+                40,
+                3,
+                "corpus",
+            ),
+            (
+                "seeds",
+                serde_json::json!({"corpus_sha256":"corpus-a","query_seed_digest":"seeds-b","per_source":40,"queries":3,"model_id":"teacher","dims":4}),
+                "teacher",
+                4,
+                40,
+                3,
+                "seed table",
+            ),
+            (
+                "per-source",
+                serde_json::json!({"corpus_sha256":"corpus-a","query_seed_digest":"seeds-a","per_source":20,"queries":3,"model_id":"teacher","dims":4}),
+                "teacher",
+                4,
+                40,
+                3,
+                "--per-source",
+            ),
+            (
+                "model",
+                serde_json::json!({"corpus_sha256":"corpus-a","query_seed_digest":"seeds-a","per_source":40,"queries":3,"model_id":"someone-else","dims":4}),
+                "teacher",
+                4,
+                40,
+                3,
+                "made for",
+            ),
+            (
+                "dims",
+                serde_json::json!({"corpus_sha256":"corpus-a","query_seed_digest":"seeds-a","per_source":40,"queries":3,"model_id":"teacher","dims":8}),
+                "teacher",
+                4,
+                40,
+                3,
+                "dims",
+            ),
+            (
+                "count",
+                serde_json::json!({"corpus_sha256":"corpus-a","query_seed_digest":"seeds-a","per_source":40,"queries":5,"model_id":"teacher","dims":4}),
+                "teacher",
+                4,
+                40,
+                3,
+                "queries",
+            ),
+        ];
+        for (name, meta, model, dims, per_source, expected, wanted) in cases {
+            let dir = sidecar_dir(name);
+            let path = write_sidecar(&dir, meta, 3, 4);
+            let error = read_query_vectors(&path, model, dims, &header, per_source, expected)
+                .expect_err("the mismatch must be refused");
+            let text = format!("{error:#}");
+            assert!(
+                text.contains(wanted),
+                "the {name} refusal should name {wanted}: {text}"
+            );
+        }
+    }
+
+    /// A sidecar whose JSON is right and whose bytes are short is the one failure the
+    /// metadata cannot catch, and reading past the end would give a partly-zero query
+    /// vector that still ranks documents.
+    #[test]
+    fn a_sidecar_shorter_than_its_own_metadata_is_refused() {
+        let dir = sidecar_dir("short");
+        let path = write_sidecar(&dir, sidecar_meta(), 2, 4);
+        let error = read_query_vectors(&path, "teacher", 4, &sidecar_header(), 40, 3)
+            .expect_err("a short file must be refused");
+        assert!(format!("{error:#}").contains("bytes"), "{error:#}");
     }
 
     /// The dense lane must agree with the exhaustive search the score card
@@ -2281,7 +2872,10 @@ mod tests {
             scenarios::build_index(&corpus, None, false).unwrap();
         let keys: Vec<String> = (0..n)
             .map(|i| {
-                format!("{}#{}", corpus.chunks[i].external_doc_id, corpus.chunks[i].chunk_index)
+                format!(
+                    "{}#{}",
+                    corpus.chunks[i].external_doc_id, corpus.chunks[i].chunk_index
+                )
             })
             .collect();
         assert_eq!(keys, index_keys);
@@ -2295,8 +2889,10 @@ mod tests {
                 .into_iter()
                 .map(|n| index_keys[n.chunk as usize].clone())
                 .collect();
-            let lane_ranking: Vec<String> =
-                exhaustive_top_k(&vectors, query, K).into_iter().map(|i| keys[i].clone()).collect();
+            let lane_ranking: Vec<String> = exhaustive_top_k(&vectors, query, K)
+                .into_iter()
+                .map(|i| keys[i].clone())
+                .collect();
             assert_eq!(card_ranking, lane_ranking, "probe {probe}");
         }
     }
@@ -2308,7 +2904,11 @@ mod tests {
         let mut seen: Vec<usize> = Vec::new();
         for pass in 0..repeats {
             let range = timing_range(texts, repeats, pass).unwrap();
-            assert_eq!(range.len(), 666, "pass {pass} is a different size from the others");
+            assert_eq!(
+                range.len(),
+                666,
+                "pass {pass} is a different size from the others"
+            );
             for i in range {
                 assert!(!seen.contains(&i), "chunk {i} was timed twice");
                 seen.push(i);
@@ -2355,7 +2955,8 @@ mod tests {
 
         let mut many = arm_facts_for("many");
         many.chunks_per_second.insert("cpu".into(), 8.3);
-        many.chunks_per_second_runs.insert("cpu".into(), vec![3.1, 11.3, 8.3]);
+        many.chunks_per_second_runs
+            .insert("cpu".into(), vec![3.1, 11.3, 8.3]);
         let lane = cost_lane(&[many]);
         let row = lane
             .rows
@@ -2364,7 +2965,11 @@ mod tests {
             .expect("a lane with three timings reports their spread");
         // (11.3 - 3.1) / 8.3 = 98.8% of the median, which is the number that says
         // this column cannot decide a gate.
-        assert!((row.values["many"] - 98.795).abs() < 0.01, "{:?}", row.values);
+        assert!(
+            (row.values["many"] - 98.795).abs() < 0.01,
+            "{:?}",
+            row.values
+        );
     }
 
     #[test]
@@ -2379,15 +2984,24 @@ mod tests {
         let negative: Vec<f64> = (0..20).map(|i| 0.40 + i as f64 * 0.01).collect();
         confidences.insert(
             "wide".into(),
-            [(CALIBRATION.to_string(), calibration.clone()), (UNANSWERABLE.to_string(), negative.clone())]
-                .into_iter()
-                .collect(),
+            [
+                (CALIBRATION.to_string(), calibration.clone()),
+                (UNANSWERABLE.to_string(), negative.clone()),
+            ]
+            .into_iter()
+            .collect(),
         );
         confidences.insert(
             "narrow".into(),
             [
-                (CALIBRATION.to_string(), calibration.iter().map(|v| v + 0.2).collect()),
-                (UNANSWERABLE.to_string(), negative.iter().map(|v| v + 0.2).collect()),
+                (
+                    CALIBRATION.to_string(),
+                    calibration.iter().map(|v| v + 0.2).collect(),
+                ),
+                (
+                    UNANSWERABLE.to_string(),
+                    negative.iter().map(|v| v + 0.2).collect(),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -2395,8 +3009,14 @@ mod tests {
 
         let lane = abstention_lane(&confidences);
         let rate = &lane.rows[0];
-        assert!(rate.role == Role::Primary, "the confident-answer rate is the row G4 is read from");
-        assert!(!rate.higher_is_better, "a confident answer to an unanswerable question is bad");
+        assert!(
+            rate.role == Role::Primary,
+            "the confident-answer rate is the row G4 is read from"
+        );
+        assert!(
+            !rate.higher_is_better,
+            "a confident answer to an unanswerable question is bad"
+        );
         assert!(
             (rate.values["wide"] - rate.values["narrow"]).abs() < 1e-12,
             "two models with the same behaviour and different scales scored differently: {:?}",
@@ -2424,19 +3044,32 @@ mod tests {
         // The candidate answers confidently on a tenth of the unanswerable
         // questions and the baseline on nine tenths. That is a large improvement,
         // and before the orientation fix it was reported as `worse`.
-        let candidate: Vec<f64> = (0..40).map(|i| if i % 10 == 0 { 1.0 } else { 0.0 }).collect();
-        let baseline: Vec<f64> = (0..40).map(|i| if i % 10 == 0 { 0.0 } else { 1.0 }).collect();
+        let candidate: Vec<f64> = (0..40)
+            .map(|i| if i % 10 == 0 { 1.0 } else { 0.0 })
+            .collect();
+        let baseline: Vec<f64> = (0..40)
+            .map(|i| if i % 10 == 0 { 0.0 } else { 1.0 })
+            .collect();
         let row = EmbeddingRow {
             family: "questions with no answer in the corpus".into(),
             metric: "confident answer rate at the model's own threshold".into(),
             higher_is_better: false,
             role: Role::Primary,
-            values: [("new".to_string(), 0.1), ("v1.5".to_string(), 0.9)].into_iter().collect(),
-            series: [("new".to_string(), candidate), ("v1.5".to_string(), baseline)]
+            values: [("new".to_string(), 0.1), ("v1.5".to_string(), 0.9)]
                 .into_iter()
                 .collect(),
+            series: [
+                ("new".to_string(), candidate),
+                ("v1.5".to_string(), baseline),
+            ]
+            .into_iter()
+            .collect(),
         };
-        let lane = Lane { name: "abstention".into(), rationale: String::new(), rows: vec![row] };
+        let lane = Lane {
+            name: "abstention".into(),
+            rationale: String::new(),
+            rows: vec![row],
+        };
         let judged = judge(&[lane], "v1.5", 7);
         assert_eq!(judged.len(), 1);
         assert_eq!(judged[0].verdict, Verdict::Better, "{:?}", judged[0].paired);

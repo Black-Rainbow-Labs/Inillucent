@@ -95,7 +95,6 @@ impl ImportedDatabase {
     /// @param arguments - the arguments inside the parentheses
     /// @param exists - whether a table of that name is already there
     /// @param if_not_exists - whether the statement said so
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn create_virtual_table(
         &mut self,
         source: &[u8],
@@ -207,7 +206,7 @@ impl ImportedDatabase {
                 schema: at,
                 wrote: false,
                 // **The before-images a rollback needs.** Every ordinary write
-                // passes `Some(&self.writing.undo)`; this path passed `None`, so a
+                // passes `Some(self.writing.undo())`; this path passed `None`, so a
                 // virtual table's writes went into the pool with nothing
                 // recorded that could put them back. `ROLLBACK` then undid
                 // every ordinary table and left the module's shadow trees as
@@ -216,7 +215,7 @@ impl ImportedDatabase {
                 // only thing that corrected it. The file itself was never
                 // wrong: no commit record was written, so recovery ignored
                 // the pages. Only the live connection was.
-                undo: Some(&self.writing.undo),
+                undo: Some(self.writing.undo()),
                 uncommitted: self.uncommitted_handle_of(at),
             };
             let store = WriteStore {
@@ -234,7 +233,7 @@ impl ImportedDatabase {
             let mut context = Context {
                 host: &mut nowhere,
                 database: 0,
-                limits: &self.pragmas.limits.borrow(),
+                limits: &self.pragmas.limits().borrow(),
                 catalog: Some(&self.schema.catalog),
             };
             let mut table = found.connect(&connect, true)?;
@@ -263,7 +262,60 @@ impl ImportedDatabase {
     /// @param term - which FROM term of the plan
     /// @param path - the access path the planner chose for it
     /// @param params - the values bound to `?1`, `?2`, ...
-    #[allow(clippy::too_many_arguments)]
+    /// Removes a virtual table's own catalog row and the shadow tables it owns.
+    ///
+    /// **A virtual table used to leave its shadow tables behind for ever
+    /// (task-1979, R18).** `DROP TABLE e_v` removed one row and left
+    /// `e_v_config`, `e_v_content`, `e_v_delta`, `e_v_gen` and `e_v_state` in
+    /// the schema, holding every vector the index had been given, with no
+    /// statement that could reach them: their names are the module's, nothing
+    /// re-derives them once the virtual table's row is gone, and `VACUUM` copied
+    /// them forward. A database that had created and dropped one index carried
+    /// its rows for the rest of its life.
+    ///
+    /// **A shadow another table owns is left alone.** An external content FTS5
+    /// index is handed the *source* table's rows as its shadow, and that table
+    /// belongs to the application - so only a shadow whose catalog row is named
+    /// after this table is removed, which is exactly the set
+    /// `create_virtual_table` made.
+    ///
+    /// @param name - the virtual table's name as written
+    pub(super) fn drop_module_table(&mut self, name: &[u8]) -> DbResult<()> {
+        let folded = name.to_ascii_lowercase();
+        let owned: Vec<Vec<u8>> = match self.session_state.virtual_tables.get(&folded) {
+            Some(connected) => connected
+                .arguments
+                .shadows
+                .iter()
+                .map(|shadow| shadow_table_name(name, &shadow.suffix).to_ascii_lowercase())
+                .filter(|held| *held != folded)
+                .collect(),
+            None => Vec::new(),
+        };
+        let at = self.schema.ddl_schema;
+        let doomed: Vec<(i64, u32)> = self
+            .entries_of(at)
+            .iter()
+            .filter(|held| {
+                let held_name = held.entry.name.to_ascii_lowercase();
+                held_name == folded || owned.contains(&held_name)
+            })
+            .map(|held| (held.rowid, held.root))
+            .collect();
+        for (rowid, root) in doomed {
+            self.forget(rowid)?;
+            if root != 0 {
+                self.release_tree(root)?;
+            }
+        }
+        // The module is disconnected here rather than left for
+        // `reconnect_modules`: the connection holds its state in memory, and a
+        // module still connected to trees that have been given back to the free
+        // map would answer out of pages another table is about to use.
+        self.session_state.virtual_tables.remove(&folded);
+        Ok(())
+    }
+
     /// Returns the root of a shadow table another object already owns.
     ///
     /// The catalog rows are the authority, as they are at open time, and a name
@@ -286,6 +338,58 @@ impl ImportedDatabase {
                     String::from_utf8_lossy(&wanted)
                 ))
             })
+    }
+
+    /// Returns whether a name is a shadow table of a connected virtual table.
+    ///
+    /// **What `PRAGMA defensive` needs to refuse a write (task-1972).**
+    /// `Registry::authorize_shadow_write` existed, said exactly this, and had
+    /// no caller - so a defensive connection refused nothing, and a shadow
+    /// table was an ordinary table that any `INSERT` could rewrite into
+    /// something no module ever wrote. That is the class of bug the flag exists
+    /// to close: a module reads its own storage trusting that it wrote it.
+    ///
+    /// The names are derived from what each connected table was handed rather
+    /// than guessed from the spelling. `reconnect_modules` connects every
+    /// virtual table in the catalog when the database is opened, so the set is
+    /// complete from the first statement; deriving it instead from "the text
+    /// before the last underscore names a virtual table" would refuse
+    /// `docs_backup` beside `docs_data`.
+    ///
+    /// **An empty suffix is not a shadow.** An external-content FTS5 index is
+    /// handed the content table itself under the empty suffix (see
+    /// [`shadow_table_name`]), and that table is the application's own.
+    ///
+    /// @param name - the table a statement is about to write
+    pub(crate) fn is_shadow_table(&self, name: &[u8]) -> bool {
+        let folded = name.to_ascii_lowercase();
+        self.session_state
+            .virtual_tables
+            .values()
+            .any(|connected| shadow_names(&connected.arguments).any(|held| held == folded))
+    }
+
+    /// Returns whether a name is a virtual table that owns shadow tables.
+    ///
+    /// **What `VACUUM` asks before it copies a table's rows (task-1979, R2).**
+    /// A virtual table's rows are already in its shadow tables, so copying both
+    /// wrote every document twice: the rebuild replayed every `CREATE TABLE`
+    /// it found, including the shadow ones, and then the `CREATE VIRTUAL TABLE`
+    /// made a second set under the same names - six `sqlite_master` rows became
+    /// eleven, the file roughly doubled, and the SQL `dump` produced could not
+    /// be replayed because every shadow row was in it twice.
+    ///
+    /// A virtual table that owns none - an eponymous one, or one whose only
+    /// shadow is another table's - answers `false`, and its rows are copied
+    /// through the module as before.
+    ///
+    /// @param name - the table's name, as written
+    pub(crate) fn owns_shadow_tables(&self, name: &[u8]) -> bool {
+        let folded = name.to_ascii_lowercase();
+        let Some(connected) = self.session_state.virtual_tables.get(&folded) else {
+            return false;
+        };
+        shadow_names(&connected.arguments).any(|held| held != folded)
     }
 
     /// Returns what a module says about its own storage.
@@ -324,7 +428,7 @@ impl ImportedDatabase {
         let mut context = Context {
             host: &mut nowhere,
             database: 0,
-            limits: &self.pragmas.limits.borrow(),
+            limits: &self.pragmas.limits().borrow(),
             catalog: Some(&self.schema.catalog),
         };
         table.integrity(&mut context).map(ModuleIntegrity::of)
@@ -426,7 +530,7 @@ impl ImportedDatabase {
         let mut context = Context {
             host: &mut nowhere,
             database: 0,
-            limits: &self.pragmas.limits.borrow(),
+            limits: &self.pragmas.limits().borrow(),
             catalog: Some(&self.schema.catalog),
         };
         self.drive_cursor(
@@ -536,11 +640,7 @@ impl ImportedDatabase {
         cursor.filter(context, plan)?;
         while !cursor.eof() {
             let row = read_row(cursor, context, shape, params)?;
-            if !passes_rechecks(
-                &row,
-                &shape.rechecks,
-                self.pragmas.case_sensitive_like.get(),
-            )? {
+            if !passes_rechecks(&row, &shape.rechecks, self.pragmas.case_sensitive_like())? {
                 cursor.next(context)?;
                 continue;
             }
@@ -1047,7 +1147,7 @@ impl ImportedDatabase {
         let mut batch: Vec<Vec<OwnedDatum>> =
             Vec::with_capacity(inillucent_exec::batch::BATCH_ROWS);
         for row in rows {
-            if !passes_rechecks(&row, &rechecks, self.pragmas.case_sensitive_like.get())? {
+            if !passes_rechecks(&row, &rechecks, self.pragmas.case_sensitive_like())? {
                 continue;
             }
             batch.push(row);
@@ -1087,6 +1187,17 @@ impl ImportedDatabase {
         let table = module.connect(&arguments, false)?;
         Ok(Some(Connected { table, arguments }))
     }
+}
+
+/// Returns the folded names of one connected table's shadow tables.
+///
+/// @param arguments - what the module was connected with
+fn shadow_names(arguments: &ModuleArguments) -> impl Iterator<Item = Vec<u8>> + '_ {
+    arguments
+        .shadows
+        .iter()
+        .filter(|shadow| !shadow.suffix.is_empty())
+        .map(|shadow| shadow_table_name(&arguments.table, &shadow.suffix).to_ascii_lowercase())
 }
 
 /// Returns the name one shadow table is created under.

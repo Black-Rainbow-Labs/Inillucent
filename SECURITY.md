@@ -28,7 +28,7 @@ the attack surface:
 - **A crafted `.rdb` file** that makes the engine read out of bounds, allocate
   without bound, loop forever, or return another file's bytes. Every path that
   reads a page, a log frame or a network byte is written without `unwrap`,
-  `expect`, `panic!` or slice indexing, and 28 of the 29 crates deny all four —
+  `expect`, `panic!` or slice indexing, and all 29 crates deny all four —
   so a panic reached from a file is a defect, not a hardening request.
 - **A crafted SQL statement** that does the same, or that escapes a limit the
   connection set.
@@ -60,9 +60,13 @@ the attack surface:
 Named here so a reporter knows what has been looked at rather than having to
 guess:
 
-- **Fuzz targets** under `fuzz/`, run on a schedule by
-  `.github/workflows/fuzz.yml`, over the file format, the SQL parser and the
-  record codec.
+- **Fuzz targets** under `fuzz/`, over the file format, the SQL parser and the
+  record codec. They are run by hand -- `fuzz/README.md` has the commands --
+  and nothing runs them on a schedule since `task-1968` removed the GitHub
+  workflows. What runs on every checkout instead is the deterministic
+  counterpart each target has in the ordinary suite, listed in that same
+  README: a seeded generator rather than coverage feedback, on the pinned
+  stable toolchain.
 - **Crash campaigns** that cut the power at every call a run makes to the file
   system, and assert the database comes back as one of the two states it is
   allowed to be in.

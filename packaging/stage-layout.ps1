@@ -80,9 +80,29 @@ function Repair-StagedLink {
         @{ File = 'docs/feature-comparison.md';  From = '[`tools/feature-probe/`](../tools/feature-probe/README.md)'; To = '`tools/feature-probe/`, in the repository,' },
         @{ File = 'docs/feature-comparison.md';  From = '[`drivers/README.md`](../drivers/README.md)'; To = '[`DRIVER.md`](../DRIVER.md)' },
         @{ File = 'docs/feature-comparison.md';  From = '[`compat/README.md`](../compat/README.md)'; To = '`compat/README.md`, in the repository' },
+        # task-1962 added a link from the glossary's Transaction entry to
+        # drivers/README.md, which the archive stages as DRIVER.md. No release
+        # was cut between then and task-1995, so the dead-link check below has
+        # been failing every target's staging - Windows and Linux as well as
+        # macOS - since that commit.
+        @{ File = 'docs/glossary.md';            From = '[`Transaction`](../drivers/README.md)'; To = '[`Transaction`](../DRIVER.md)' },
         @{ File = 'DRIVER.md';                   From = '](inillucent-driver-capi/include/inillucent_driver.h)'; To = '](include/inillucent_driver.h)' },
         @{ File = 'README.md';                   From = '[**`examples/rag-agent/`**](examples/rag-agent/README.md)'; To = '**`examples/rag-agent/`**, in the repository,' }
     )
+
+    # Directories the archive deliberately does not carry, and what to do about a link into one.
+    #
+    # **This is the third time the same defect has stopped a release.** task-1962 linked
+    # docs/glossary.md to drivers/README.md; task-1998 linked docs/roadmap.md to its own TDD under
+    # tasks/. Each was a reasonable thing to write, each was invisible until somebody cut a release,
+    # and each needed a row of its own in the table above. A row per link does not scale: a
+    # documentation change in any ticket can break the packaging in a ticket nobody is working on.
+    #
+    # So a link into one of these directories becomes its own text - the sentence still reads, and
+    # the reader is not sent to a file the archive was never going to contain. Every other dead link
+    # still fails the staging, because those are mistakes rather than policy.
+    $neverStaged = @('tasks', 'crates', 'drivers', 'compat', 'tools', 'fuzz', 'examples', 'packaging', 'scripts', 'runs', 'design')
+    $intoUnstaged = '\[([^\]]+)\]\((?:\.\./)*(?:' + ($neverStaged -join '|') + ')/[^)]*\)'
 
     foreach ($rewrite in $rewrites) {
         $path = Join-Path $Stage $rewrite.File
@@ -91,6 +111,12 @@ function Repair-StagedLink {
         if (-not $text.Contains($rewrite.From)) { continue }
         $text = $text.Replace($rewrite.From, $rewrite.To)
         [System.IO.File]::WriteAllText($path, $text)
+    }
+
+    foreach ($document in (Get-ChildItem -LiteralPath $Stage -Recurse -Filter '*.md')) {
+        $text = [System.IO.File]::ReadAllText($document.FullName)
+        $flattened = [regex]::Replace($text, $intoUnstaged, '$1')
+        if ($flattened -ne $text) { [System.IO.File]::WriteAllText($document.FullName, $flattened) }
     }
 
     # A dead link in the archive is the defect this function exists to prevent,
@@ -276,6 +302,74 @@ function New-InillucentZip {
     return $archive
 }
 
+function Import-MsvcEnvironment {
+    <#
+    .SYNOPSIS
+        Puts the MSVC compiler's own environment variables into this process, if they are missing.
+
+    .DESCRIPTION
+        **A C dependency cannot compile without them (task-1995).** The Windows target is built with
+        native cargo, and `onig_sys` compiles oniguruma with `cl.exe`. cl.exe finds its headers
+        through INCLUDE, LIB and PATH, which `vcvars64.bat` sets - a developer shell has run it, and
+        an agent terminal, a scheduled task and a service have not. The failure names the header
+        rather than the cause:
+
+            regenc.h(39): fatal error C1083: Cannot open include file: 'stddef.h'
+
+        vswhere.exe ships with every Visual Studio since 2017 and is always at the same absolute
+        path, so the installation is found rather than guessed at. Nothing happens when INCLUDE is
+        already set, so a developer shell is left exactly as it is.
+    #>
+    if ($env:INCLUDE) { return }
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio' | Join-Path -ChildPath 'Installer' | Join-Path -ChildPath 'vswhere.exe'
+    if (-not (Test-Path -LiteralPath $vswhere)) {
+        throw "INCLUDE is not set and $vswhere does not exist, so the MSVC environment cannot be found. Build from a Developer PowerShell, or install Visual Studio's C++ tools."
+    }
+    $install = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null | Select-Object -First 1)
+    if (-not $install) { throw 'vswhere found no Visual Studio with the C++ tools installed.' }
+    $vcvars = Join-Path $install 'VC' | Join-Path -ChildPath 'Auxiliary' | Join-Path -ChildPath 'Build' | Join-Path -ChildPath 'vcvars64.bat'
+    if (-not (Test-Path -LiteralPath $vcvars)) { throw "$vcvars does not exist." }
+    # `set` after the batch file prints the environment it produced; each line is copied in.
+    & cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
+        if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2] }
+    }
+    if (-not $env:INCLUDE) { throw "running $vcvars did not set INCLUDE." }
+    Write-Host "  MSVC environment from $install"
+}
+
+function Get-CrossBin {
+    <#
+    .SYNOPSIS
+        Where zig, rcodesign, minisign and nfpm are.
+
+    .DESCRIPTION
+        **It is not always inside this checkout (task-1995).** The toolchain is gitignored - a few
+        gigabytes of downloaded zig, rcodesign and the macOS SDK, not source - so a `git worktree`
+        has an empty `tools/cross/bin`, and a release is normally cut from a worktree because the
+        ordinary checkout is where work happens and is frequently dirty. Every script that reached
+        for a tool then stopped with "run fetch-toolchain", which reads as a machine that was never
+        set up rather than as a checkout that shares one.
+
+        INILLUCENT_CROSS_BIN wins, then this checkout if it has anything in it, then the repository
+        the worktree belongs to - `git rev-parse --git-common-dir` names its .git from inside any
+        worktree.
+
+    .PARAMETER Root
+        The repository root the caller is working in.
+    #>
+    param([string] $Root)
+    if ($env:INILLUCENT_CROSS_BIN) { return $env:INILLUCENT_CROSS_BIN }
+    $here = Join-Path $Root 'tools/cross/bin'
+    if (Get-ChildItem -Path $here -File -ErrorAction SilentlyContinue) { return $here }
+    $commonDir = (& git -C $Root rev-parse --git-common-dir 2>$null)
+    if ($commonDir) {
+        $resolved = if ([System.IO.Path]::IsPathRooted($commonDir)) { $commonDir } else { Join-Path $Root $commonDir }
+        $shared = Join-Path (Split-Path -Parent ([System.IO.Path]::GetFullPath($resolved))) 'tools/cross/bin'
+        if (Get-ChildItem -Path $shared -File -ErrorAction SilentlyContinue) { return $shared }
+    }
+    return $here
+}
+
 function Update-Sha256Sums {
     <#
     .SYNOPSIS
@@ -287,6 +381,9 @@ function Update-Sha256Sums {
 
     .PARAMETER Dist
         The dist directory.
+
+    .PARAMETER Version
+        Limit the file to this release's artifacts. Omitted, every archive in Dist is named.
 
     .NOTES
         **Written with LF, not CRLF (task-1932, H12).** `Set-Content` ends every
@@ -311,13 +408,34 @@ function Update-Sha256Sums {
         -Targets macos` rewrote a file that matched the published one into one
         that did not.
     #>
-    param([string] $Dist)
+    param([string] $Dist, [string] $Version)
     $sums = Join-Path $Dist 'SHA256SUMS'
     $lines = @()
-    foreach ($pattern in @('*.zip', '*.tar.gz', '*.deb', '*.rpm')) {
+    # **.pkg is in the list because the site publishes one (task-1995).** The signed, notarised
+    # macOS installer is the first thing the download page offers a Mac, and it was the one
+    # published artifact with no line in this file - so `packaging/install.sh`, which verifies what
+    # it downloaded against exactly this file, had nothing to check it against. Measured on the
+    # live site for 0.1.3: five artifacts served, four hashes published.
+    foreach ($pattern in @('*.zip', '*.tar.gz', '*.deb', '*.rpm', '*.pkg')) {
         Get-ChildItem -Path $Dist -Filter $pattern -File -ErrorAction SilentlyContinue |
             Sort-Object Name | ForEach-Object {
-                $lines += "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+                # **Two ways this file came to name something nobody can download**, both measured
+                # on the live 0.1.3 (task-1995), and both serious because `publish-site.ps1` copies
+                # this file to the site verbatim and `packaging/install.sh` verifies against exactly
+                # it. A name in here with no file behind it is indistinguishable, to anyone checking,
+                # from a download that was tampered with.
+                #
+                # One: dist/ is not emptied between releases - this machine's held 0.1.1, 0.1.2 and
+                # 0.1.3 archives at once - so without $Version the list spans every release while
+                # the site holds one.
+                #
+                # Two: the macOS zip is the notary's container rather than a download. rcodesign
+                # uploads a zip because Apple's notary takes an archive and not a directory, and the
+                # site then publishes the .pkg and the .tar.gz.
+                $mine = -not $Version -or $_.Name -like "*$Version*"
+                if ($mine -and $_.Name -notlike '*-apple-darwin.zip') {
+                    $lines += "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+                }
             }
     }
     # Last, and by name rather than by pattern, because the release scripts
@@ -325,7 +443,26 @@ function Update-Sha256Sums {
     # not see the lines in a different order.
     $provenance = Join-Path $Dist 'provenance.json'
     if (Test-Path -LiteralPath $provenance) {
-        $lines += "$((Get-FileHash -LiteralPath $provenance -Algorithm SHA256).Hash.ToLower())  provenance.json"
+        # **Named only when it describes what is being published (task-1995).** provenance.json
+        # states the version, commit, toolchain and the archive's own hash, and dist/ keeps the last
+        # one written. The 0.1.3 release shipped a Windows zip of da39cba... while the provenance
+        # beside it claimed f6d3fb..., because the archives were rebuilt from the tag and the
+        # provenance was not - and the site was still serving the 0.1.2 provenance next to 0.1.3
+        # downloads. Publishing either would put a signed, checksummed claim about the build behind
+        # a different build, which is worse than publishing none.
+        $claim = Get-Content -LiteralPath $provenance -Raw | ConvertFrom-Json
+        $named = Join-Path $Dist $claim.archive.name
+        $stale = @()
+        if ($Version -and $claim.version -ne $Version) { $stale += "it describes $($claim.version)" }
+        if (Test-Path -LiteralPath $named) {
+            $actual = (Get-FileHash -LiteralPath $named -Algorithm SHA256).Hash.ToLower()
+            if ($actual -ne $claim.archive.sha256) { $stale += "$($claim.archive.name) hashes to $($actual.Substring(0, 12))... and it claims $($claim.archive.sha256.Substring(0, 12))..." }
+        }
+        if ($stale.Count -gt 0) {
+            Write-Host "  provenance.json is left out of SHA256SUMS: $($stale -join '; '). Re-run packaging/release.ps1 to write one for this build."
+        } else {
+            $lines += "$((Get-FileHash -LiteralPath $provenance -Algorithm SHA256).Hash.ToLower())  provenance.json"
+        }
     }
     # The text is assembled and written whole, because there is no switch on
     # Set-Content that changes the line ending it uses.

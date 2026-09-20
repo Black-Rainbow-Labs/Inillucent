@@ -74,6 +74,13 @@ struct Invocation {
 
 /// Runs whatever the command line named.
 fn main() -> ExitCode {
+    // Every statement this program runs is on a stack this crate sized - see
+    // `inillucent_cli::STATEMENT_STACK`.
+    inillucent_cli::on_a_sized_stack(run)
+}
+
+/// Everything `main` does, on the sized thread.
+fn run() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if let Some(topic) = help_topic(&arguments) {
         return dispatch_help(topic);
@@ -111,7 +118,26 @@ fn main() -> ExitCode {
         return unknown_verb(&verb);
     };
     match command.name {
-        "shell" => shell_like(&invocation.rest),
+        // **The database the caller named has to reach the shell (task-1969,
+        // 5.2).** This handed over `invocation.rest` - everything after the
+        // verb - and `--db` is parsed before the verb, so
+        // `inillucent --db app.rdb shell` started `inillucent-shell` with no
+        // arguments at all and it opened `:memory:`. A statement that needed no
+        // table answered, which is why nobody noticed: `SELECT 1` worked and
+        // `SELECT body FROM note` said "no such table". `shell` is one of the
+        // eighteen verbs no test had ever passed to a spawned binary.
+        //
+        // The path goes first, which is the position the shell reads a database
+        // from, and only when one was explicitly named: without `--db` the
+        // caller wants the shell's own default rather than this process's.
+        "shell" => {
+            let mut handed: Vec<String> = Vec::new();
+            if invocation.database_was_named {
+                handed.push(invocation.database.clone());
+            }
+            handed.extend(invocation.rest.iter().cloned());
+            shell_like(&handed)
+        }
         "mcp" => serve(&invocation),
         "create" if invocation.database_was_named => {
             eprintln!("create takes its database path as its argument and does not accept --db.");
@@ -371,15 +397,20 @@ fn dispatch(command: &'static Command, invocation: &Invocation) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let database = if command.name == "create" {
+    // **`create` and `migrate` open no session database.** Each writes the file
+    // it was asked for and neither reads the one `--db` names, so pointing them
+    // at `:memory:` keeps them out of the question `Context::open_for` answers
+    // below (task-1979, E2).
+    let database = if command.name == "create" || command.name == "migrate" {
         ":memory:"
     } else {
         &invocation.database
     };
-    let mut context = match Context::open(
+    let mut context = match Context::open_for(
         database,
         OpenMode::of(invocation.readonly),
         invocation.root.clone(),
+        command.writes,
     ) {
         Ok(context) => context,
         Err(failure) => return report(&failure, invocation.json, command.name),
@@ -390,8 +421,11 @@ fn dispatch(command: &'static Command, invocation: &Invocation) -> ExitCode {
     // `migrate` can be given up on without losing what it has already reported
     // (task-1932, H11).
     inillucent_cli::interrupt::stop_on_ctrl_c(context.cancel_flag());
+    let recovery = context.recovery();
+    let strays = context.stray_log_segments().to_vec();
     match command::run(command, &mut context, &arguments) {
         Ok(produced) => {
+            let produced = produced.with_recovery(&recovery, &strays);
             let shown = match invocation.json {
                 true => produced.to_json().pretty(0),
                 false => produced.text.clone(),

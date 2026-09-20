@@ -145,7 +145,7 @@ foreach ($artifact in @("$name.tar.gz", "$name.zip", "inillucent-$Version.pkg"))
 
 # --- the signature, read out of the binaries themselves ---------------------
 
-$rcodesign = Join-Path $root 'tools/cross/bin/rcodesign.exe'
+$rcodesign = Join-Path (Get-CrossBin -Root $root) 'rcodesign.exe'
 if (Test-Path -LiteralPath $rcodesign) {
     Write-Host ''
     Write-Host 'verifying the signatures'
@@ -213,7 +213,7 @@ if ($failures -gt 0) {
 # contains. An artifact rejected here for being unsigned, self-signed, built
 # without the hardened runtime, untimestamped or not universal was listed as
 # published anyway, by the same run that refused it.
-$sums = Update-Sha256Sums -Dist $dist
+$sums = Update-Sha256Sums -Dist $dist -Version $Version
 
 Write-Host "the macOS artifacts are in $dist and every check passed"
 Write-Host "sums $sums"

@@ -43,6 +43,10 @@ struct Captured {
     name: Vec<u8>,
     /// The `CREATE` text, empty for an object that has none.
     sql: Vec<u8>,
+    /// Whether a virtual table owns it as one of its shadow tables.
+    shadow: bool,
+    /// Whether it is a virtual table that owns shadow tables of its own.
+    owns_shadows: bool,
 }
 
 /// Rebuilds a database into a fresh file, and reports what it wrote.
@@ -83,16 +87,20 @@ pub(crate) fn rebuild_into(
                 error
             ))
         })?;
-    replay_schema(&mut fresh, &captured, |kind| kind == ObjectKind::Table)?;
+    replay_schema(&mut fresh, &captured, |entry| {
+        entry.kind == ObjectKind::Table && !entry.shadow
+    })?;
     for entry in &captured {
-        if entry.kind != ObjectKind::Table {
+        if entry.kind != ObjectKind::Table || entry.owns_shadows {
             continue;
         }
-        copy_rows(source, &mut fresh, &entry.name)?;
+        copy_rows(source, &mut fresh, &entry.name, entry.shadow)?;
     }
-    replay_schema(&mut fresh, &captured, |kind| kind == ObjectKind::Index)?;
-    replay_schema(&mut fresh, &captured, |kind| {
-        matches!(kind, ObjectKind::View | ObjectKind::Trigger)
+    replay_schema(&mut fresh, &captured, |entry| {
+        entry.kind == ObjectKind::Index
+    })?;
+    replay_schema(&mut fresh, &captured, |entry| {
+        matches!(entry.kind, ObjectKind::View | ObjectKind::Trigger)
     })?;
     carry_header(source, &mut fresh).map_err(|error| {
         inillucent_base::error::misuse(format!("VACUUM could not carry the header: {error}"))
@@ -118,6 +126,8 @@ fn capture_schema(source: &ImportedDatabase) -> Vec<Captured> {
             kind: entry.kind,
             name: entry.name.clone(),
             sql: entry.sql.clone(),
+            shadow: source.is_shadow_table(&entry.name),
+            owns_shadows: source.owns_shadow_tables(&entry.name),
         })
         .collect()
 }
@@ -130,10 +140,10 @@ fn capture_schema(source: &ImportedDatabase) -> Vec<Captured> {
 fn replay_schema(
     fresh: &mut ImportedDatabase,
     captured: &[Captured],
-    wanted: impl Fn(ObjectKind) -> bool,
+    wanted: impl Fn(&Captured) -> bool,
 ) -> DbResult<()> {
     for entry in captured {
-        if !wanted(entry.kind) {
+        if !wanted(entry) {
             continue;
         }
         let sql = String::from_utf8_lossy(&entry.sql).into_owned();
@@ -167,6 +177,7 @@ fn copy_rows(
     source: &ImportedDatabase,
     fresh: &mut ImportedDatabase,
     table: &[u8],
+    shadow: bool,
 ) -> DbResult<()> {
     let name = quoted(table);
     let (rows, columns) = source.run(&format!("SELECT * FROM {name}"))?;
@@ -182,7 +193,16 @@ fn copy_rows(
         .map(|column| quoted(column.as_bytes()))
         .collect::<Vec<_>>()
         .join(", ");
-    let insert = format!("INSERT INTO {name} ({names}) VALUES ({placeholders})");
+    // **A shadow table is not empty when its rows arrive.** The module wrote
+    // its own opening rows when `CREATE VIRTUAL TABLE` connected it - a version
+    // row in `_config`, a structure row in `_data` - and those keys are in the
+    // source too, so a plain `INSERT` reports a `UNIQUE` violation on the first
+    // of them. The source's row is the one that is right.
+    let verb = match shadow {
+        true => "INSERT OR REPLACE INTO",
+        false => "INSERT INTO",
+    };
+    let insert = format!("{verb} {name} ({names}) VALUES ({placeholders})");
     for row in rows {
         let mut params = inillucent_exec::physical::Params::new();
         for (at, value) in row.iter().enumerate() {
@@ -430,27 +450,27 @@ impl ConnectionSettings {
     /// @param database - the connection `VACUUM` is about to reopen
     pub(crate) fn capture(database: &ImportedDatabase) -> ConnectionSettings {
         ConnectionSettings {
-            journal_mode: database.pragmas.journal_mode.get(),
-            foreign_keys: database.pragmas.foreign_keys.get(),
-            defer_foreign_keys: database.pragmas.defer_foreign_keys.get(),
-            locking_exclusive: database.pragmas.locking_exclusive.get(),
-            defensive: database.pragmas.defensive.get(),
-            secure_delete: database.pragmas.secure_delete.get(),
-            auto_vacuum: database.pragmas.auto_vacuum.get(),
-            automatic_index: database.pragmas.automatic_index.get(),
-            ignore_check_constraints: database.pragmas.ignore_check_constraints.get(),
-            case_sensitive_like: database.pragmas.case_sensitive_like.get(),
-            cache_size: database.pragmas.cache_size.get(),
-            analysis_limit: database.pragmas.analysis_limit.get(),
-            writable_schema: database.pragmas.writable_schema.get(),
-            query_only: database.pragmas.query_only.get(),
-            recursive_triggers: database.pragmas.recursive_triggers.get(),
-            max_page_count: database.pragmas.max_page_count.get(),
-            temp_store: database.pragmas.temp_store.get(),
-            busy_timeout_ms: database.pragmas.busy_timeout_ms.get(),
+            journal_mode: database.pragmas.journal_mode(),
+            foreign_keys: database.pragmas.foreign_keys(),
+            defer_foreign_keys: database.pragmas.defer_foreign_keys(),
+            locking_exclusive: database.pragmas.locking_exclusive(),
+            defensive: database.pragmas.defensive(),
+            secure_delete: database.pragmas.secure_delete(),
+            auto_vacuum: database.pragmas.auto_vacuum(),
+            automatic_index: database.pragmas.automatic_index(),
+            ignore_check_constraints: database.pragmas.ignore_check_constraints(),
+            case_sensitive_like: database.pragmas.case_sensitive_like(),
+            cache_size: database.pragmas.cache_size(),
+            analysis_limit: database.pragmas.analysis_limit(),
+            writable_schema: database.pragmas.writable_schema(),
+            query_only: database.pragmas.query_only(),
+            recursive_triggers: database.pragmas.recursive_triggers(),
+            max_page_count: database.pragmas.max_page_count(),
+            temp_store: database.pragmas.temp_store(),
+            busy_timeout_ms: database.pragmas.busy_timeout_ms(),
             collations: database.session_state.collations.clone(),
             authorizer: database.session_state.authorizer.clone(),
-            levers: database.pragmas.levers.get(),
+            levers: database.pragmas.levers(),
             registry: database.session_state.registry.clone(),
         }
     }
@@ -473,41 +493,36 @@ impl ConnectionSettings {
     /// @param database - the freshly reopened connection
     pub(crate) fn restore(self, database: &mut ImportedDatabase) -> DbResult<()> {
         database.set_journal_mode(self.journal_mode)?;
-        database.pragmas.foreign_keys.set(self.foreign_keys);
+        database.pragmas.set_foreign_keys(self.foreign_keys);
         database
             .pragmas
-            .defer_foreign_keys
-            .set(self.defer_foreign_keys);
+            .set_defer_foreign_keys(self.defer_foreign_keys);
         database
             .pragmas
-            .locking_exclusive
-            .set(self.locking_exclusive);
-        database.pragmas.defensive.set(self.defensive);
-        database.pragmas.secure_delete.set(self.secure_delete);
-        database.pragmas.auto_vacuum.set(self.auto_vacuum);
-        database.pragmas.automatic_index.set(self.automatic_index);
+            .set_locking_exclusive(self.locking_exclusive);
+        database.pragmas.set_defensive(self.defensive);
+        database.pragmas.set_secure_delete(self.secure_delete);
+        database.pragmas.set_auto_vacuum(self.auto_vacuum);
+        database.pragmas.set_automatic_index(self.automatic_index);
         database
             .pragmas
-            .ignore_check_constraints
-            .set(self.ignore_check_constraints);
+            .set_ignore_check_constraints(self.ignore_check_constraints);
         database
             .pragmas
-            .case_sensitive_like
-            .set(self.case_sensitive_like);
-        database.pragmas.cache_size.set(self.cache_size);
-        database.pragmas.analysis_limit.set(self.analysis_limit);
-        database.pragmas.writable_schema.set(self.writable_schema);
-        database.pragmas.query_only.set(self.query_only);
+            .set_case_sensitive_like(self.case_sensitive_like);
+        database.pragmas.set_cache_size(self.cache_size);
+        database.pragmas.set_analysis_limit(self.analysis_limit);
+        database.pragmas.set_writable_schema(self.writable_schema);
+        database.pragmas.set_query_only(self.query_only);
         database
             .pragmas
-            .recursive_triggers
-            .set(self.recursive_triggers);
-        database.pragmas.max_page_count.set(self.max_page_count);
-        database.pragmas.temp_store.set(self.temp_store);
-        database.pragmas.busy_timeout_ms.set(self.busy_timeout_ms);
+            .set_recursive_triggers(self.recursive_triggers);
+        database.pragmas.set_max_page_count(self.max_page_count);
+        database.pragmas.set_temp_store(self.temp_store);
+        database.pragmas.set_busy_timeout_ms(self.busy_timeout_ms);
         database.session_state.collations = self.collations;
         database.session_state.authorizer = self.authorizer;
-        database.pragmas.levers.set(self.levers);
+        database.pragmas.set_levers(self.levers);
         database.session_state.registry = self.registry;
         database.session_state.eponymous.clear();
         database.refresh_catalog();

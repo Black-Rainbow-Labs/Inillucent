@@ -12,7 +12,7 @@ impl crate::ImportedDatabase {
     /// `sqlite3_get_autocommit` answers and what the differential harness
     /// compares after every step.
     pub fn autocommit(&self) -> bool {
-        self.writing.batch.get().is_none()
+        self.writing.batch().is_none()
     }
 
     /// Returns the rowid the last `INSERT` assigned on this database.
@@ -80,7 +80,14 @@ impl crate::ImportedDatabase {
             seed: self.next_seed(),
             // So the `like(a, b)` function spelling follows the same pragma the
             // `LIKE` operator does.
-            like_case_sensitive: self.pragmas.case_sensitive_like.get(),
+            like_case_sensitive: self.pragmas.case_sensitive_like(),
+            // The connection's own `Limit::Length`, so a value a function
+            // builds is held to the same bound as one a row stores.
+            length_limit: self
+                .pragmas
+                .limits()
+                .borrow()
+                .get(inillucent_base::limits::Limit::Length),
         }
     }
 

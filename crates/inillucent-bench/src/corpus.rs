@@ -17,10 +17,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use inillucent_base::hash::Sha256;
-use pgvector::Vector;
-use postgres::{Client, NoTls};
 use inillucent_core::model::ModelManifest;
 use inillucent_core::store::ChunkInput;
+use pgvector::Vector;
+use postgres::{Client, NoTls};
 
 /// The layout that carries no provenance: text, vectors, width, count. Still
 /// read, because the corpus embedded before there were manifests is a real cache
@@ -100,7 +100,10 @@ impl CacheHeader {
                 short(&self.manifest_sha256)
             )
         } else {
-            format!("a version {} cache with no provenance ({} chunks, {} dims)", self.version, self.chunk_count, self.dims)
+            format!(
+                "a version {} cache with no provenance ({} chunks, {} dims)",
+                self.version, self.chunk_count, self.dims
+            )
         }
     }
 }
@@ -127,7 +130,11 @@ pub fn corpus_digest(chunks: &[ChunkInput]) -> String {
     hasher.update(b"inillucent-corpus-v1");
     hasher.update(&(chunks.len() as u64).to_le_bytes());
     for c in chunks {
-        for field in [c.source.as_str(), c.external_doc_id.as_str(), c.content.as_str()] {
+        for field in [
+            c.source.as_str(),
+            c.external_doc_id.as_str(),
+            c.content.as_str(),
+        ] {
             hasher.update(&(field.len() as u64).to_le_bytes());
             hasher.update(field.as_bytes());
         }
@@ -166,6 +173,10 @@ pub struct Corpus {
 }
 
 impl Corpus {
+    /// How many chunks the corpus holds.
+    ///
+    /// The chunk count rather than the document count, because every scenario
+    /// is scored per chunk and `--limit` is a count of chunks too.
     pub fn len(&self) -> usize {
         self.chunks.len()
     }
@@ -196,6 +207,17 @@ const CORPUS_SQL: &str = "
     ORDER BY c.id
 ";
 
+/// Reads the corpus and its vectors out of PostgreSQL.
+///
+/// **Through a portal, one batch at a time.** The result set is 186,000 rows
+/// carrying a vector each, and holding all of them on the client heap at once
+/// is what an earlier version of this did.
+///
+/// The rows come back in `c.id` order, which is the order both engines are
+/// given them in, so a score difference cannot come from ingestion order.
+///
+/// @param url - the PostgreSQL connection string
+/// @param limit - how many chunks to read, or every one of them
 pub fn load_from_postgres(url: &str, limit: Option<usize>) -> Result<Corpus> {
     let mut client = Client::connect(url, NoTls).context("connecting to PostgreSQL")?;
 
@@ -225,7 +247,11 @@ pub fn load_from_postgres(url: &str, limit: Option<usize>) -> Result<Corpus> {
                 dims = v.len();
             }
             if v.len() != dims {
-                anyhow::bail!("mixed vector widths in the corpus: {} and {}", dims, v.len());
+                anyhow::bail!(
+                    "mixed vector widths in the corpus: {} and {}",
+                    dims,
+                    v.len()
+                );
             }
 
             let updated: Option<std::time::SystemTime> = row.get("updated_at");
@@ -261,7 +287,12 @@ pub fn load_from_postgres(url: &str, limit: Option<usize>) -> Result<Corpus> {
     // Pulled out of PostgreSQL rather than embedded here, so the only provenance
     // this can honestly claim is its own shape.
     let header = CacheHeader::legacy(dims, chunks.len());
-    Ok(Corpus { chunks, vectors, dims, header })
+    Ok(Corpus {
+        chunks,
+        vectors,
+        dims,
+        header,
+    })
 }
 
 fn write_string(w: &mut impl Write, s: &str) -> Result<()> {
@@ -405,6 +436,15 @@ fn read_header_from(r: &mut impl Read, path: &Path) -> Result<CacheHeader> {
     })
 }
 
+/// Reads a corpus cache off disk, at whichever version wrote it.
+///
+/// **Version 4 names the model that embedded it and version 3 does not.** A
+/// version 3 cache is still readable, because a cache written before the
+/// header existed is not a corrupt cache; what it cannot answer is which model
+/// made its vectors, and `grade-embedding` refuses to compare two arms that
+/// cannot both answer that.
+///
+/// @param path - the cache file to read
 pub fn load_cache(path: &Path) -> Result<Corpus> {
     let mut r = BufReader::new(
         File::open(path).with_context(|| format!("opening the cache {}", path.display()))?,
@@ -477,7 +517,11 @@ pub fn load_cache(path: &Path) -> Result<Corpus> {
         let author_id = read_opt_string(&mut r)?;
         r.read_exact(&mut buf8)?;
         let raw_updated = i64::from_le_bytes(buf8);
-        let updated_at = if raw_updated == i64::MIN { None } else { Some(raw_updated) };
+        let updated_at = if raw_updated == i64::MIN {
+            None
+        } else {
+            Some(raw_updated)
+        };
         r.read_exact(&mut buf4)?;
         let n_labels = u32::from_le_bytes(buf4) as usize;
         let mut labels = Vec::with_capacity(n_labels);
@@ -514,7 +558,12 @@ pub fn load_cache(path: &Path) -> Result<Corpus> {
         vectors.push(v);
     }
 
-    Ok(Corpus { chunks, vectors, dims, header })
+    Ok(Corpus {
+        chunks,
+        vectors,
+        dims,
+        header,
+    })
 }
 
 #[cfg(test)]
@@ -559,7 +608,12 @@ mod tests {
                 v
             })
             .collect();
-        Corpus { chunks, vectors, dims, header }
+        Corpus {
+            chunks,
+            vectors,
+            dims,
+            header,
+        }
     }
 
     fn header_for(n: usize, dims: usize) -> CacheHeader {
@@ -589,7 +643,10 @@ mod tests {
         assert_eq!(read.dims, 8);
         for i in 0..9 {
             assert_eq!(read.chunks[i].content, written.chunks[i].content);
-            assert_eq!(read.chunks[i].external_doc_id, written.chunks[i].external_doc_id);
+            assert_eq!(
+                read.chunks[i].external_doc_id,
+                written.chunks[i].external_doc_id
+            );
             assert_eq!(read.vectors[i], written.vectors[i]);
         }
         std::fs::remove_dir_all(&root).ok();
@@ -603,7 +660,10 @@ mod tests {
         let root = scratch("header-only");
         let path = root.join("a.cache");
         save_cache(&corpus_of(20, 16, header_for(20, 16)), &path).unwrap();
-        assert_eq!(read_header(&path).unwrap(), load_cache(&path).unwrap().header);
+        assert_eq!(
+            read_header(&path).unwrap(),
+            load_cache(&path).unwrap().header
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -625,9 +685,16 @@ mod tests {
     /// line endings, or read back after sanitisation, digests the same.
     #[test]
     fn the_corpus_digest_does_not_move_when_line_endings_do() {
-        let unix: Vec<ChunkInput> = (0..5).map(|i| chunk(i, "first line\nsecond line")).collect();
+        let unix: Vec<ChunkInput> = (0..5)
+            .map(|i| chunk(i, "first line\nsecond line"))
+            .collect();
         let windows: Vec<ChunkInput> = (0..5)
-            .map(|i| chunk(i, &crate::synth::sanitize_for_model("first line\r\nsecond line")))
+            .map(|i| {
+                chunk(
+                    i,
+                    &crate::synth::sanitize_for_model("first line\r\nsecond line"),
+                )
+            })
             .collect();
         assert_eq!(corpus_digest(&unix), corpus_digest(&windows));
     }
@@ -670,9 +737,15 @@ mod tests {
         let a = ModelManifest::nomic_v1_5();
         let b = ModelManifest::nomic_v1_5();
         assert_eq!(manifest_digest(&a), manifest_digest(&b));
-        let changed = ModelManifest { prefixes: Prefixes::none(), ..a.clone() };
+        let changed = ModelManifest {
+            prefixes: Prefixes::none(),
+            ..a.clone()
+        };
         assert_ne!(manifest_digest(&a), manifest_digest(&changed));
-        let widened = ModelManifest { max_tokens: 8192, ..a.clone() };
+        let widened = ModelManifest {
+            max_tokens: 8192,
+            ..a.clone()
+        };
         assert_ne!(manifest_digest(&a), manifest_digest(&widened));
     }
 
@@ -693,8 +766,7 @@ mod tests {
     /// `synth-embed`, which resumes from the vectors it already has.
     #[test]
     fn the_baseline_manifests_digest_is_pinned_so_a_schema_change_is_visible() {
-        const PINNED: &str =
-            "9085067aee7e46475a13396368c0d4a85416e4814896dc1415cfa7390cdc0309";
+        const PINNED: &str = "9085067aee7e46475a13396368c0d4a85416e4814896dc1415cfa7390cdc0309";
         let digest = manifest_digest(&ModelManifest::nomic_v1_5());
         assert_eq!(
             digest, PINNED,
@@ -709,7 +781,9 @@ mod tests {
     #[test]
     fn the_seed_digest_moves_when_one_seed_does() {
         let mut seeds: std::collections::BTreeMap<String, u64> =
-            [("identity".to_string(), 11u64), ("heading".to_string(), 12)].into_iter().collect();
+            [("identity".to_string(), 11u64), ("heading".to_string(), 12)]
+                .into_iter()
+                .collect();
         let before = seed_digest(&seeds);
         seeds.insert("heading".into(), 13);
         assert_ne!(before, seed_digest(&seeds));

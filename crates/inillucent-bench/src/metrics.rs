@@ -16,11 +16,7 @@ pub fn recall_at_k(returned: &[u32], reference: &[u32], k: usize) -> f32 {
     if want.is_empty() {
         return 1.0;
     }
-    let got = returned
-        .iter()
-        .take(k)
-        .filter(|c| want.contains(c))
-        .count();
+    let got = returned.iter().take(k).filter(|c| want.contains(c)).count();
     got as f32 / want.len() as f32
 }
 
@@ -100,7 +96,11 @@ pub fn precision_at_k(returned: &[u32], correct: &HashSet<u32>, k: usize) -> f32
     if considered == 0 {
         return 0.0;
     }
-    let hits = returned.iter().take(k).filter(|c| correct.contains(c)).count();
+    let hits = returned
+        .iter()
+        .take(k)
+        .filter(|c| correct.contains(c))
+        .count();
     // The denominator is what was returned rather than `k`, so a query whose
     // filter admits only three chunks is not scored as 70% wrong for returning
     // the three that exist.
@@ -153,7 +153,11 @@ pub fn ndcg_graded_at_k(
     }
     ideal_grades.sort_unstable_by(|a, b| b.cmp(a));
     ideal_grades.truncate(k.min(attainable.max(1)));
-    let ideal: f64 = ideal_grades.iter().enumerate().map(|(i, g)| gain(*g) * discount(i)).sum();
+    let ideal: f64 = ideal_grades
+        .iter()
+        .enumerate()
+        .map(|(i, g)| gain(*g) * discount(i))
+        .sum();
     if ideal == 0.0 {
         return 0.0;
     }
@@ -170,18 +174,20 @@ pub fn ndcg_graded_at_k(
 /// @param grades - relevance grade per chunk
 /// @param k - the cutoff
 /// @param floor - the lowest grade that counts as required evidence
-pub fn graded_recall_at_k(
-    returned: &[u32],
-    grades: &HashMap<u32, u8>,
-    k: usize,
-    floor: u8,
-) -> f32 {
-    let required: HashSet<u32> =
-        grades.iter().filter(|(_, g)| **g >= floor).map(|(c, _)| *c).collect();
+pub fn graded_recall_at_k(returned: &[u32], grades: &HashMap<u32, u8>, k: usize, floor: u8) -> f32 {
+    let required: HashSet<u32> = grades
+        .iter()
+        .filter(|(_, g)| **g >= floor)
+        .map(|(c, _)| *c)
+        .collect();
     if required.is_empty() {
         return 1.0;
     }
-    let found = returned.iter().take(k).filter(|c| required.contains(c)).count();
+    let found = returned
+        .iter()
+        .take(k)
+        .filter(|c| required.contains(c))
+        .count();
     found as f32 / required.len() as f32
 }
 
@@ -195,9 +201,10 @@ pub fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
     if sorted_ms.is_empty() {
         return 0.0;
     }
+    let last = sorted_ms.len().saturating_sub(1);
     let rank = (p * sorted_ms.len() as f64).ceil() as usize;
-    let idx = rank.saturating_sub(1).min(sorted_ms.len() - 1);
-    sorted_ms[idx]
+    let idx = rank.saturating_sub(1).min(last);
+    sorted_ms.get(idx).copied().unwrap_or(0.0)
 }
 
 #[derive(Default, Clone)]
@@ -206,10 +213,22 @@ pub struct Accumulator {
 }
 
 impl Accumulator {
+    /// Adds one sample.
+    ///
+    /// The samples are kept rather than summed as they arrive, because
+    /// `len` reports how much evidence a figure rests on and the paired tests
+    /// in `stats.rs` need the per-query series rather than its mean.
+    ///
+    /// @param v - the sample
     pub fn push(&mut self, v: f32) {
         self.values.push(v);
     }
 
+    /// The mean of the samples, or zero when there are none.
+    ///
+    /// Zero rather than an error, because an empty family is a family whose
+    /// queries the corpus could not produce, and the card reports that as a
+    /// query count of zero beside the figure.
     pub fn mean(&self) -> f32 {
         if self.values.is_empty() {
             return 0.0;
@@ -292,7 +311,10 @@ mod tests {
         let uncapped = ndcg_at_k(&returned, &correct, 10);
         let capped = ndcg_at_k_attainable(&returned, &correct, 10, 2);
         assert!(uncapped < 0.5, "uncapped nDCG should look bad: {uncapped}");
-        assert!((capped - 1.0).abs() < 1e-6, "capped nDCG should be perfect: {capped}");
+        assert!(
+            (capped - 1.0).abs() < 1e-6,
+            "capped nDCG should be perfect: {capped}"
+        );
     }
 
     #[test]
@@ -361,12 +383,18 @@ mod tests {
         let g = graded(&[(1, 3), (2, 2), (3, 1)]);
         let answer_first = ndcg_graded_at_k(&[1, 2, 9], &g, 10, 2);
         let related_first = ndcg_graded_at_k(&[3, 1, 9], &g, 10, 2);
-        assert!(answer_first > related_first, "{answer_first} vs {related_first}");
+        assert!(
+            answer_first > related_first,
+            "{answer_first} vs {related_first}"
+        );
 
         // The binary metric cannot tell them apart: both put a correct chunk in
         // the list and both put one at rank one.
         let correct = set(&[1, 2, 3]);
-        assert_eq!(success_at_k(&[1, 2, 9], &correct, 1), success_at_k(&[3, 1, 9], &correct, 1));
+        assert_eq!(
+            success_at_k(&[1, 2, 9], &correct, 1),
+            success_at_k(&[3, 1, 9], &correct, 1)
+        );
     }
 
     #[test]
@@ -398,7 +426,11 @@ mod tests {
         let g = graded(&[(1, 3), (2, 3), (5, 1)]);
         assert_eq!(graded_recall_at_k(&[1, 9, 8], &g, 10, 3), 0.5);
         assert_eq!(graded_recall_at_k(&[1, 2, 9], &g, 10, 3), 1.0);
-        assert_eq!(success_at_k(&[1, 9, 8], &set(&[1, 2]), 10), 1.0, "success calls half an answer complete");
+        assert_eq!(
+            success_at_k(&[1, 9, 8], &set(&[1, 2]), 10),
+            1.0,
+            "success calls half an answer complete"
+        );
     }
 
     #[test]
@@ -406,5 +438,4 @@ mod tests {
         let g = graded(&[(1, 3), (5, 1)]);
         assert_eq!(graded_recall_at_k(&[1], &g, 10, 3), 1.0);
     }
-
 }

@@ -21,6 +21,19 @@
 //! cache. A repeated-text benchmark on this box reported 300 chunks a second
 //! against a real 85 to 134. Nothing here repeats a text, and the cost lane feeds
 //! it stride-sampled chunks from across the corpus.
+//!
+//! **One request at a time by default, and the default is not a performance
+//! choice.** A throughput number for a served model has to say how many requests
+//! were in flight, because the answer changes by an order of magnitude: measured
+//! here against a 32 slot server, one request in flight gives 28 texts a second
+//! and eight give 621. The cost lane keeps one, so its number stays comparable
+//! with what task-1818 recorded and means the same thing between arms. Building a
+//! 185,078 chunk cache asks for more, because there the latency is pure waste:
+//! embedding v2-moe's corpus at one request in flight measured 64.6 chunks a
+//! second falling to 12 as the run reached the corpus's code chunks, with the card
+//! at 6 per cent - the batch shrinks from 32 texts to 12 when 500-token chunks
+//! meet a 6,000 token budget, and with nothing else in flight throughput falls
+//! with it.
 
 use std::time::Duration;
 
@@ -52,6 +65,9 @@ pub struct LlamaCppEmbedder {
     /// Texts in one request, whatever the token budget allows. `llama-server`
     /// also bounds the number of sequences in a batch.
     max_texts: usize,
+    /// Requests in flight at once. One unless a caller asks for more; see the
+    /// module note for why the default is not a performance choice.
+    concurrency: usize,
     /// The model's own tokenizer, loaded from the model directory.
     ///
     /// Not the server's `/tokenize`, after measuring what that costs: the corpus
@@ -73,6 +89,7 @@ impl LlamaCppEmbedder {
     /// @param manifest - the model, for its prefixes, width and token bound
     /// @param token_budget - tokens per request, at or below the server's `-b`
     /// @param max_texts - texts per request, at or below the server's `-np`
+    /// @param concurrency - requests in flight at once; one for anything being timed
     pub fn connect(
         dir: &Path,
         host: &str,
@@ -80,6 +97,7 @@ impl LlamaCppEmbedder {
         manifest: &ModelManifest,
         token_budget: usize,
         max_texts: usize,
+        concurrency: usize,
     ) -> Result<LlamaCppEmbedder> {
         let health = http::get(host, port, "/health", Duration::from_secs(10))
             .with_context(|| format!("no llama-server answering on {host}:{port}"))?;
@@ -104,6 +122,7 @@ impl LlamaCppEmbedder {
             manifest: manifest.clone(),
             token_budget,
             max_texts,
+            concurrency: concurrency.max(1),
             tokenizer,
             seen: std::sync::atomic::AtomicUsize::new(0),
             truncated: std::sync::atomic::AtomicUsize::new(0),
@@ -114,7 +133,7 @@ impl LlamaCppEmbedder {
         // up but not serving embeddings fails here rather than at chunk 40,000.
         let probe = embedder.embed_prefixed(&["a probe".to_string()])?;
         anyhow::ensure!(
-            probe.len() == 1 && probe[0].len() == manifest.dims,
+            probe.len() == 1 && probe.first().map(Vec::len) == Some(manifest.dims),
             "the server returned {} dimensions and {}'s manifest declares {}",
             probe.first().map(|v| v.len()).unwrap_or(0),
             manifest.id,
@@ -154,9 +173,10 @@ impl LlamaCppEmbedder {
             let reply =
                 http::post_json(&self.host, self.port, "/tokenize", &body, REQUEST_TIMEOUT)?;
             let parsed: serde_json::Value = serde_json::from_str(&reply)
-                .with_context(|| format!("parsing /tokenize: {}", &reply[..reply.len().min(200)]))?;
-            let served = parsed["tokens"]
-                .as_array()
+                .with_context(|| format!("parsing /tokenize: {}", http::head_of(&reply, 200)))?;
+            let served = parsed
+                .get("tokens")
+                .and_then(serde_json::Value::as_array)
                 .context("the /tokenize reply carried no tokens array")?
                 .len();
             // Exact agreement is not required and would be brittle: llama.cpp may
@@ -178,6 +198,12 @@ impl LlamaCppEmbedder {
         self.tokens.store(0, Relaxed);
     }
 
+    /// How much text this arm has cut, counted since the last reset.
+    ///
+    /// **Counted here rather than read back from the server, because the
+    /// server does not say.** It silently drops what does not fit its context,
+    /// so a truncation share of zero taken from the server is a share nobody
+    /// measured - which is the failure this whole harness exists against.
     pub fn truncation(&self) -> TruncationFacts {
         use std::sync::atomic::Ordering::Relaxed;
         TruncationFacts {
@@ -187,6 +213,10 @@ impl LlamaCppEmbedder {
         }
     }
 
+    /// The manifest this arm was opened against.
+    ///
+    /// The dimensions, the token bound and the prefixes a caller has to apply
+    /// all come from it, and they are the arm's own rather than a default.
     pub fn manifest(&self) -> &ModelManifest {
         &self.manifest
     }
@@ -286,27 +316,103 @@ impl LlamaCppEmbedder {
         // The over-long ones, cut in tokens and checked. Done after the counting
         // pass so the common case - every text under the bound - pays nothing.
         for &i in &over {
-            prepared[i] = self.truncate_to_bound(&texts[i])?;
+            let text = texts
+                .get(i)
+                .with_context(|| format!("text {i} of {} is over the bound", texts.len()))?;
+            let cut = self.truncate_to_bound(text)?;
+            let held = prepared.len();
+            let slot = prepared
+                .get_mut(i)
+                .with_context(|| format!("no prepared slot {i} of {held}"))?;
+            *slot = cut;
         }
 
-        let mut out: Vec<Vec<f32>> = Vec::with_capacity(prepared.len());
+        // The batches, decided before any of them is sent, so they can be sent in
+        // whatever order and still come back in this one.
+        let mut batches: Vec<(usize, usize)> = Vec::new();
         let mut start = 0usize;
         while start < prepared.len() {
             let mut end = start;
             let mut budget = 0usize;
             while end < prepared.len() {
-                let cost = counts[end].min(bound).max(1);
+                let cost = counts.get(end).copied().unwrap_or(0).min(bound).max(1);
                 // A single text over the whole budget still goes on its own: the
                 // alternative is dropping a chunk from the corpus.
-                if end > start && (budget + cost > self.token_budget || end - start >= self.max_texts)
+                if end > start
+                    && (budget + cost > self.token_budget || end - start >= self.max_texts)
                 {
                     break;
                 }
                 budget += cost;
                 end += 1;
             }
-            out.extend(self.request(&prepared[start..end])?);
+            batches.push((start, end));
             start = end;
+        }
+
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(prepared.len());
+        if self.concurrency <= 1 || batches.len() <= 1 {
+            for &(from, to) in &batches {
+                let batch = prepared
+                    .get(from..to)
+                    .with_context(|| format!("batch {from}..{to} of {}", prepared.len()))?;
+                out.extend(self.request(batch)?);
+            }
+            anyhow::ensure!(
+                out.len() == texts.len(),
+                "the server returned {} vectors for {} texts",
+                out.len(),
+                texts.len()
+            );
+            return Ok(out);
+        }
+
+        // Several in flight. Each batch's result is written into its own slot and
+        // the slots are flattened in batch order afterwards, so concurrency cannot
+        // reorder a single vector: the order is the order of `batches`, decided
+        // above, and never the order the replies happen to arrive in.
+        let mut results: Vec<Option<Result<Vec<Vec<f32>>>>> =
+            (0..batches.len()).map(|_| None).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let slots: Vec<std::sync::Mutex<Option<Result<Vec<Vec<f32>>>>>> = (0..batches.len())
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
+        std::thread::scope(|scope| {
+            for _ in 0..self.concurrency.min(batches.len()) {
+                scope.spawn(|| loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&(from, to)) = batches.get(index) else {
+                        return;
+                    };
+                    let answer = match prepared.get(from..to) {
+                        Some(batch) => self.request(batch),
+                        None => Err(anyhow::anyhow!(
+                            "batch {from}..{to} of {} is not a range of the prepared texts",
+                            prepared.len()
+                        )),
+                    };
+                    // A slot that is not there is a slot nobody can write, and
+                    // the loop below reports the missing answer by index.
+                    if let Some(Ok(mut slot)) = slots.get(index).map(std::sync::Mutex::lock) {
+                        *slot = Some(answer);
+                    }
+                });
+            }
+        });
+        for (index, slot) in slots.into_iter().enumerate() {
+            let held = results
+                .get_mut(index)
+                .with_context(|| format!("no result slot {index} of {}", batches.len()))?;
+            *held = slot.into_inner().unwrap_or(None);
+        }
+        for (index, answer) in results.into_iter().enumerate() {
+            let vectors = answer.with_context(|| {
+                format!(
+                    "request {index} of {} produced no result at all",
+                    batches.len()
+                )
+            })??;
+            out.extend(vectors);
         }
         anyhow::ensure!(
             out.len() == texts.len(),
@@ -320,12 +426,19 @@ impl LlamaCppEmbedder {
     /// One `/v1/embeddings` request.
     fn request(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let body = serde_json::json!({ "input": texts }).to_string();
-        let reply = http::post_json(&self.host, self.port, "/v1/embeddings", &body, REQUEST_TIMEOUT)
-            .with_context(|| format!("embedding {} texts", texts.len()))?;
+        let reply = http::post_json(
+            &self.host,
+            self.port,
+            "/v1/embeddings",
+            &body,
+            REQUEST_TIMEOUT,
+        )
+        .with_context(|| format!("embedding {} texts", texts.len()))?;
         let parsed: serde_json::Value = serde_json::from_str(&reply)
-            .with_context(|| format!("parsing the reply: {}", &reply[..reply.len().min(300)]))?;
-        let data = parsed["data"]
-            .as_array()
+            .with_context(|| format!("parsing the reply: {}", http::head_of(&reply, 300)))?;
+        let data = parsed
+            .get("data")
+            .and_then(serde_json::Value::as_array)
             .context("the reply carried no data array")?;
         anyhow::ensure!(
             data.len() == texts.len(),
@@ -339,10 +452,18 @@ impl LlamaCppEmbedder {
         // which is cheaper to prevent here.
         let mut out = vec![Vec::new(); texts.len()];
         for row in data {
-            let index = row["index"].as_u64().context("a row carried no index")? as usize;
-            anyhow::ensure!(index < texts.len(), "the reply indexed row {index} of {}", texts.len());
-            let values = row["embedding"]
-                .as_array()
+            let index = row
+                .get("index")
+                .and_then(serde_json::Value::as_u64)
+                .context("a row carried no index")? as usize;
+            anyhow::ensure!(
+                index < texts.len(),
+                "the reply indexed row {index} of {}",
+                texts.len()
+            );
+            let values = row
+                .get("embedding")
+                .and_then(serde_json::Value::as_array)
                 .context("a row carried no embedding")?;
             let mut v: Vec<f32> = values
                 .iter()
@@ -357,7 +478,10 @@ impl LlamaCppEmbedder {
             // llama.cpp does not always normalise, and every scenario here
             // computes cosine as a dot product.
             normalize(&mut v);
-            out[index] = v;
+            let slot = out
+                .get_mut(index)
+                .with_context(|| format!("the reply indexed row {index} of {}", texts.len()))?;
+            *slot = v;
         }
         anyhow::ensure!(
             out.iter().all(|v| !v.is_empty()),
@@ -365,7 +489,6 @@ impl LlamaCppEmbedder {
         );
         Ok(out)
     }
-
 }
 
 impl Embedder for LlamaCppEmbedder {

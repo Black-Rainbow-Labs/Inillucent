@@ -30,6 +30,14 @@
 //! is declared. Both are typos that would otherwise turn into a suite that is
 //! never selected - a `covers` entry naming a crate that was renamed matches
 //! nothing, forever, and says nothing about it.
+//!
+//! ## And one the map can be wrong in a way no check above can see
+//!
+//! Every check here reads the map through its parser, so a line the parser
+//! drops is a line no check looks at.
+//! `every_line_of_the_map_is_one_the_parser_reads` compares the file to itself
+//! instead: a bare value the parser discards, or a key written twice in one row
+//! where it keeps only the last, is a line somebody wrote and nothing acts on.
 
 use std::collections::BTreeSet;
 
@@ -114,6 +122,88 @@ fn no_test_hides_outside_the_map() {
 }
 
 /// Every row's tier must be one the file declares.
+/// Every line of the map is one the parser reads.
+///
+/// **The two lines that made this worth writing (task-1970).** The file held
+///
+/// ```text
+/// ["inillucent-engine", "inillucent-sql"]
+/// requires = ["oracle"]
+/// ```
+///
+/// directly under the `registers` row, with no `[[target]]` header above them
+/// and no `covers = ` in front of the list - the remains of a row an earlier
+/// edit removed half of. `toml_lite` reads a bare value as nothing and a
+/// repeated key as the last one, so the file parsed, 188 rows came back, every
+/// other check in this suite passed, and the only visible trace was that
+/// `registers` had `requires = ["oracle"]` twice and the published count of
+/// `oracle` rows was 27 where a line count said 28.
+///
+/// That is the failure this whole ticket is about: a contract file quietly
+/// absorbing something nobody meant, and every check over it still reporting
+/// green. A map is a file whose content is only ever read through a parser, so
+/// the lines the parser ignores are exactly the lines nothing else looks at
+/// either.
+///
+/// The shapes allowed are a blank line, a comment, one of the three array
+/// headers, and `key = value` for a key this map defines. Anything else fails
+/// and is quoted with its line number.
+#[test]
+fn every_line_of_the_map_is_one_the_parser_reads() {
+    const KEYS: [&str; 12] = [
+        "package",
+        "kind",
+        "name",
+        "tier",
+        "purpose",
+        "exclusive",
+        "covers",
+        "requires",
+        "features",
+        "prefix",
+        "packages",
+        "reason",
+    ];
+    const HEADERS: [&str; 3] = ["[[target]]", "[[tier]]", "[[path]]"];
+
+    let text = std::fs::read_to_string(workspace_root().join("tests/selection.toml"))
+        .expect("the selection map");
+    let mut stray: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() || trimmed.trim_start().starts_with('#') {
+            continue;
+        }
+        if HEADERS.contains(&trimmed) {
+            seen.clear();
+            continue;
+        }
+        let key = trimmed.split(" = ").next().unwrap_or("");
+        if !trimmed.contains(" = ") || !KEYS.contains(&key) {
+            stray.push(format!("{}: {trimmed}", index + 1));
+            continue;
+        }
+        // The other half of the same defect. A bare value is dropped and a
+        // repeated key resolves to the last one, and the row that carried both
+        // read as correct in every check but the count.
+        if !seen.insert(key) {
+            stray.push(format!(
+                "{}: {trimmed} - `{key}` is written twice in this row",
+                index + 1
+            ));
+        }
+    }
+    assert!(
+        stray.is_empty(),
+        "these lines of tests/selection.toml are not a header, a comment or a key this map \
+         defines once, so the parser folds them into the row above, drops them, or keeps only \
+         the last of them:\n  {}\n\
+         A line nothing reads is a line nothing checks.",
+        stray.join("\n  ")
+    );
+}
+
 #[test]
 fn every_tier_is_declared() {
     let map = map();
@@ -268,26 +358,291 @@ fn an_undeclared_path_is_loud() {
     assert_eq!(choice.unmatched.len(), 1);
 }
 
-/// Every suite that needs the pinned reference says so.
+/// A suite that can skip declares what it needs, and a row that declares
+/// something has a suite that can skip.
 ///
-/// The map's `requires` is what makes `--strict` able to report a run that
-/// evidenced nothing. It is easy to add a differential suite and forget the
-/// field, and the result is a suite that is silently allowed to skip.
+/// **This is what keeps the census at 61 of 61 (task-1969, 4.9).** Before it,
+/// `every_differential_target_declares_what_it_needs` asked one tier for one
+/// half of the rule, and the other eight tiers were unchecked in both
+/// directions. The result was 47 suites in the middle: 43 that skipped, were
+/// counted by `--strict` only because their helper panics, and told a reader
+/// nothing about what was missing; and four - `gates_fail_closed`,
+/// `inillucent-driver::import`, `inillucent-cli::lib`, `inillucent-tree::lib` -
+/// that printed the marker, declared no prerequisite, and were dropped by
+/// `testrun.rs`'s classifier before it looked at them.
+///
+/// It is checked in both directions because the two failures are different and
+/// both shipped:
+///
+/// - **A suite that skips with no `requires`** is invisible to `--strict`
+///   unless its helper happens to panic, and is absent from the prerequisite
+///   table `docs/repository.md` generates from this map. That is the
+///   `gates_fail_closed` shape: seven of its fifteen cases could not run and
+///   the run said `ok`.
+/// - **A `requires` on a suite that cannot skip** is a false entry in that same
+///   table. `inillucent-compat::sql` and `::storage` declared `fixtures` and
+///   neither skips - both `.expect()` on tracked files - and so did
+///   `inillucent-migrate::corpus` and `::equivalence`, which build their
+///   corpora themselves. A reader on a machine without the gate fixtures would
+///   have read four suites as expected absences that in fact run everywhere.
+///
+/// What counts as "can skip" is a call to the one helper, by any of its three
+/// spellings. The two files that *define* it are excluded by path, and so is
+/// `src/bin/`: a program that says it cannot start is not a suite reporting a
+/// hollow pass, and those targets have no row to declare anything on.
 #[test]
-fn every_differential_target_declares_what_it_needs() {
+fn every_target_that_can_skip_declares_it_and_vice_versa() {
+    let root = workspace_root();
     let map = map();
-    let bare: Vec<String> = map
-        .rows
-        .iter()
-        .filter(|row| row.tier == "differential" && row.requires.is_empty())
-        .map(|row| row.target.label())
-        .collect();
+    let mut undeclared: Vec<String> = Vec::new();
+    let mut overdeclared: Vec<String> = Vec::new();
+    let mut with_a_skip = 0usize;
+
+    for row in &map.rows {
+        let files = sources_of(&root, &row.target);
+        let skips: Vec<String> = files
+            .iter()
+            .filter(|file| calls_the_skip_helper(file))
+            .map(|file| {
+                file.strip_prefix(&root)
+                    .unwrap_or(file)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        if !skips.is_empty() {
+            with_a_skip = with_a_skip.saturating_add(1);
+        }
+        match (skips.is_empty(), row.requires.is_empty()) {
+            (false, true) => {
+                undeclared.push(format!("{} - {}", row.target.label(), skips.join(", ")))
+            }
+            (true, false) => overdeclared.push(format!(
+                "{} declares {:?} and no source of it calls the skip helper",
+                row.target.label(),
+                row.requires
+            )),
+            _ => {}
+        }
+    }
+
     assert!(
-        bare.is_empty(),
-        "these differential suites declare no prerequisite, so a run without the \
-         pinned reference would look like a pass:\n  {}",
-        bare.join("\n  ")
+        with_a_skip >= 20,
+        "found {with_a_skip} targets that can skip, which means this is reading the wrong \
+         files rather than that the workspace has almost no skips"
     );
+    assert!(
+        undeclared.is_empty(),
+        "these suites call the skip helper and their row declares no prerequisite, so \
+         `inillucent-testrun --strict` drops the target before it examines it and the \
+         prerequisite table in `docs/repository.md` cannot name it:\n  {}\n\
+         Add `requires = [\"...\"]` to the row in `tests/selection.toml`.",
+        undeclared.join("\n  ")
+    );
+    assert!(
+        overdeclared.is_empty(),
+        "these rows declare a prerequisite their suite cannot skip on, so the table \
+         generated from this map tells a reader a suite does not run when it always \
+         does:\n  {}\n\
+         Either remove `requires` from the row, or make the suite skip through \
+         `inillucent_compat::differential::skipping` when the thing is absent.",
+        overdeclared.join("\n  ")
+    );
+}
+
+/// Returns the source files that compile into one target.
+///
+/// A `test` target is one file by name; a `lib` is everything under `src/`
+/// except the programs; a `bin` is either its own file under `src/bin/` or,
+/// when it is the package's `main.rs`, every module beside it.
+///
+/// @param root - the workspace root
+/// @param target - the target to resolve
+fn sources_of(root: &std::path::Path, target: &Target) -> Vec<std::path::PathBuf> {
+    let directory = package_directory(root, &target.package);
+    match target.kind {
+        Kind::Test => vec![directory.join("tests").join(format!("{}.rs", target.name))],
+        // A program under `src/bin/` is its own file. A `main.rs` beside a
+        // `lib.rs` is one file too: the modules under `src/` belong to the
+        // library, which has its own row, and counting them twice would put a
+        // library's skip on a program - which is what made
+        // `inillucent-cli::inillucent-shell` read as a suite that skips on a
+        // directory link. A `main.rs` with no `lib.rs` beside it does own every
+        // module under `src/`, which is how `inillucent-bench`'s seven skips,
+        // all of them in `models.rs`, belong to the `inillucent-bench` row.
+        Kind::Bin => {
+            let named = directory
+                .join("src")
+                .join("bin")
+                .join(format!("{}.rs", target.name));
+            let main = directory.join("src").join("main.rs");
+            if named.is_file() {
+                vec![named]
+            } else if !main.is_file() {
+                Vec::new()
+            } else if directory.join("src").join("lib.rs").is_file() {
+                vec![main]
+            } else {
+                under(&directory.join("src"))
+            }
+        }
+        Kind::Lib => under(&directory.join("src")),
+    }
+}
+
+/// Returns every `.rs` file under a directory, leaving the programs out.
+///
+/// `src/bin/` is excluded because those are targets of their own with rows of
+/// their own: a program that says it cannot start is not a library's test
+/// suite reporting a hollow pass.
+///
+/// @param directory - where to walk
+fn under(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(here) = pending.pop() {
+        if here.file_name().is_some_and(|name| name == "bin") {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&here) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|kind| kind == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// Returns the directory a package's manifest is in.
+///
+/// Read out of the workspace member list rather than assumed to be
+/// `crates/<name>`, because the drivers are under `drivers/`.
+///
+/// @param root - the workspace root
+/// @param package - the package name
+fn package_directory(root: &std::path::Path, package: &str) -> std::path::PathBuf {
+    for member in members() {
+        if member.rsplit('/').next() == Some(package) {
+            return root.join(member);
+        }
+    }
+    root.join("crates").join(package)
+}
+
+/// Reports whether a source file calls the one skip helper.
+///
+/// The three spellings are the qualified paths, because a bare `skipping(` in a
+/// file that imported it is the same call and a bare one in a file that did not
+/// is a different function - which is the whole reason
+/// `policy.rs`'s `no_test_file_defines_its_own_skip_helper` exists. The two
+/// files that define the helper are excluded by path so that a definition does
+/// not read as a call.
+///
+/// @param file - the file to read
+fn calls_the_skip_helper(file: &std::path::Path) -> bool {
+    let name = file.to_string_lossy().replace('\\', "/");
+    if name.ends_with("crates/inillucent-base/src/testing.rs")
+        || name.ends_with("crates/inillucent-compat/src/differential.rs")
+        // `cliproc::program` announces on behalf of the suite that called it,
+        // the way `differential::announce_skip` does. It is harness code in
+        // `src/` rather than a suite, so counting it would put a `requires` on
+        // `inillucent-compat::lib` naming a prerequisite that crate's own unit
+        // tests do not have.
+        || name.ends_with("crates/inillucent-compat/src/cliproc.rs")
+    {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return false;
+    };
+    // A file that imported the name calls it bare, and a file that did not
+    // would be calling something else. `use inillucent_compat::differential::{compare, Step}`
+    // is how the five differential suites that skip only through `compare` are
+    // written, so the import is what tells a bare `compare(` from an unrelated
+    // function of the same name.
+    let imported = text.contains("use inillucent_base::testing::skipping");
+    let brings_in = |name: &str| {
+        text.lines().any(|line| {
+            line.trim_start()
+                .starts_with("use inillucent_compat::differential::")
+                && line.contains(name)
+        })
+    };
+    // `cliproc::program` announces for its caller too, and for the same reason
+    // as `compare`: it has one way to answer `None` - the build did not produce
+    // the binary - and it calls the helper itself before returning it, so
+    // `let Some(binary) = program("inillucent") else { return; };` in the caller
+    // is a skip that has already been announced. Announcing there rather than
+    // at each of the forty call sites means the next case added cannot forget
+    // it, which is the argument `cli_arguments.rs` made first.
+    // The import may be written over several lines, which is what `rustfmt`
+    // does to a `use` of eight names, so what is looked for is the module
+    // rather than the name inside one line of its import list.
+    let uses_a_program = text.contains("cliproc");
+    let compares = brings_in("compare");
+    let compares_queries = brings_in("compare_queries");
+    let announces = brings_in("announce_skip") || brings_in("skipping");
+    // Built rather than written, so this file does not carry the text
+    // `policy.rs`'s `no_test_file_defines_its_own_skip_helper` forbids.
+    let a_definition = format!("fn {}", "skipping(");
+    text.lines().map(without_comments_or_literals).any(|code| {
+        code.contains("differential::skipping(")
+                || code.contains("differential::announce_skip(")
+                || code.contains("testing::skipping(")
+                || (imported && code.contains("skipping(") && !code.contains(&a_definition))
+                // **`differential::compare` announces for its caller**, which
+                // is the same allowance `policy.rs`'s `announces_by_saying_so`
+                // makes and for the same reason: it has one way to return zero,
+                // `start_oracle` answering `None`, after which it calls
+                // `announce_skip()`. Seven differential suites skip only that
+                // way - `dml_differential`, `json`, `planner`, `trigger_depth`,
+                // `pragma`, `registers`, `result_names_and_codes` - and each
+                // declares `requires = ["oracle"]` correctly.
+                || code.contains("differential::compare")
+                || (uses_a_program && code.contains("program(") && !code.contains("fn program("))
+                || (compares && code.contains("compare("))
+                || (compares_queries && code.contains("compare_queries("))
+                || (announces
+                    && (code.contains("skipping(") || code.contains("announce_skip("))
+                    && !code.contains("fn "))
+    })
+}
+
+/// Returns one line of source with its comment and its string literals removed.
+///
+/// **This file names the helper it looks for, so it would find itself.** It did:
+/// the first run reported `inillucent-compat::selection` as a suite that skips
+/// without declaring a prerequisite, because `calls_the_skip_helper` contains
+/// the string `"differential::skipping("` as the thing it matches on. A scan
+/// for a call has to read code rather than text, and the two things that are
+/// not code on a line are what follows `//` and what sits between quotes.
+///
+/// Escapes are not handled and do not need to be: a `\"` inside a literal ends
+/// the span early, which drops more text than it should and can only ever make
+/// this miss a call, never invent one. A missed call is caught by the other
+/// direction of the same test.
+///
+/// @param line - one line of Rust
+fn without_comments_or_literals(line: &str) -> String {
+    let code = line.split("//").next().unwrap_or("");
+    let mut kept = String::with_capacity(code.len());
+    let mut inside = false;
+    for character in code.chars() {
+        if character == '"' {
+            inside = !inside;
+            continue;
+        }
+        if !inside {
+            kept.push(character);
+        }
+    }
+    kept
 }
 
 /// Every feature a workspace crate declares is either built by the runner or
@@ -315,7 +670,17 @@ fn every_differential_target_declares_what_it_needs() {
 #[test]
 fn every_feature_is_either_built_or_written_off() {
     // A feature the runner does not build, and why that is right.
-    const UNTESTED: [(&str, &str, &str); 5] = [
+    const UNTESTED: [(&str, &str, &str); 6] = [
+        (
+            "inillucent-base",
+            "testing",
+            "carries `src/testing.rs`, the one skip helper three production crates' test \
+             modules and the compat harness call. It adds no test of its own - the \
+             module's two cases run under `cfg(test)` in `inillucent-base::lib`, which \
+             the map already names - and it is turned on by each consumer's \
+             `[dev-dependencies]` rather than by a runner row, so that a shipped build \
+             does not carry a function whose purpose is to panic",
+        ),
         (
             "inillucent-storage",
             "check",

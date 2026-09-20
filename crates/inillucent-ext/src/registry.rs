@@ -22,44 +22,15 @@ use crate::vtab::{
     fts5::Fts5Module, json_each::JsonWalkModule, rtree::RTreeModule, series::SeriesModule, Module,
 };
 
-/// What a registered function promises about itself.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FunctionFlags {
-    /// The function may only be called from top-level SQL, never from a
-    /// schema: not from a `DEFAULT`, a `CHECK`, a generated column, an index
-    /// expression, a partial-index predicate, or a view.
-    ///
-    /// This is the default for anything registered from outside, because the
-    /// safe assumption about code somebody else wrote is that it does
-    /// something.
-    pub direct_only: bool,
-    /// The function does nothing an ordinary expression could not: no side
-    /// effects, no file access, no dependence on anything but its arguments.
-    pub innocuous: bool,
-    /// The function returns the same answer for the same arguments within one
-    /// statement, so the planner may call it once.
-    pub deterministic: bool,
-}
-
-impl FunctionFlags {
-    /// Returns the flags a built-in carries: safe for a schema to call.
-    pub fn builtin() -> FunctionFlags {
-        FunctionFlags {
-            direct_only: false,
-            innocuous: true,
-            deterministic: true,
-        }
-    }
-
-    /// Returns the flags anything registered from outside carries by default.
-    pub fn external() -> FunctionFlags {
-        FunctionFlags {
-            direct_only: true,
-            innocuous: false,
-            deterministic: false,
-        }
-    }
-}
+/// What a registered function promises about itself, and where a name was
+/// written.
+///
+/// **Defined in `inillucent-sql` and re-exported here (task-1972).** The binder
+/// is the layer that enforces the promise and it sits below this crate, so the
+/// type has to live below it too. Every path an application already writes -
+/// `inillucent_ext::registry::FunctionFlags`, `::CallSite` - resolves to the
+/// same type it always did.
+pub use inillucent_sql::function::{CallSite, FunctionFlags};
 
 /// The policy flags a connection carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,16 +64,6 @@ impl Default for Policy {
             load_extension: false,
         }
     }
-}
-
-/// Which context a name is being resolved from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CallSite {
-    /// The statement an application submitted.
-    Statement,
-    /// A `DEFAULT`, `CHECK`, generated column, index expression, partial-index
-    /// predicate, view or trigger stored in the schema.
-    Schema,
 }
 
 /// What an application-defined scalar function does.
@@ -142,6 +103,36 @@ pub struct UserFunction {
 }
 
 impl UserFunction {
+    /// Returns a scalar function registered from outside, with the flags such a
+    /// function carries.
+    ///
+    /// **The constructor exists because the `Default` derive was the trap
+    /// (task-1969, 7.4).** `FunctionFlags` derives `Default`, so
+    /// `FunctionFlags { deterministic: true, ..Default::default() }` is
+    /// `direct_only: false` - a registration that reads as "I set one flag and
+    /// took the defaults for the rest" and in fact says "a schema may name
+    /// this". `inillucent-search`'s `embed` was registered that way while its
+    /// own doc comment said "It stays `direct_only`", so with a trusted schema
+    /// a 275 MB model load was callable from a `CHECK` constraint or an index
+    /// expression.
+    ///
+    /// `FunctionFlags::default()` remains, because [`FunctionFlags::builtin`]
+    /// needs a `Default` to exist for the struct-update syntax the built-ins
+    /// use. What changed is that a registrant has a name to reach for that
+    /// means what the two doc comments above already claim the default means.
+    ///
+    /// @param name - the name as it should be registered
+    /// @param arity - how many arguments it takes, or -1 for any number
+    /// @param body - what it does
+    pub fn external(name: &str, arity: i32, body: UserBody) -> UserFunction {
+        UserFunction {
+            name: name.to_string(),
+            arity,
+            flags: FunctionFlags::external(),
+            body,
+        }
+    }
+
     /// Returns whether the function reduces a group rather than a row.
     pub fn is_aggregate(&self) -> bool {
         matches!(self.body, UserBody::Aggregate(_))
@@ -300,24 +291,43 @@ impl Registry {
 
     /// Decides whether a name may be called from where it was written.
     ///
-    /// The rule reads the same way SQLite's does: a direct-only function is
-    /// never callable from a schema; anything else is callable from a schema
-    /// only when the schema is trusted or the function is innocuous.
+    /// The rule itself is [`inillucent_sql::function::schema_refusal`], because
+    /// the binder enforces the same rule on the same flags and two copies of it
+    /// would eventually be two rules. This is the entry point an application
+    /// that holds a registry asks through; the binder asks through the flags it
+    /// was handed with the name.
+    ///
+    /// @param name - the function the schema or statement wrote
+    /// @param site - where the call was written
     pub fn authorize_function(&self, name: &[u8], site: CallSite) -> DbResult<()> {
-        if site == CallSite::Statement {
-            return Ok(());
+        match inillucent_sql::function::schema_refusal(
+            self.function_flags(name),
+            site,
+            self.policy.trusted_schema,
+        ) {
+            Some(why) => Err(refused(name, why)),
+            None => Ok(()),
         }
-        let flags = self.function_flags(name);
-        if flags.direct_only {
-            return Err(refused(name, "may only be used from top-level SQL"));
-        }
-        if self.policy.trusted_schema || flags.innocuous {
-            return Ok(());
-        }
-        Err(refused(name, "is not allowed in a schema"))
     }
 
     /// Decides whether an extension at a path may be loaded.
+    ///
+    /// **It has no caller, and that is not the defect task-1972 fixed in
+    /// `authorize_function`.** There is nothing here that loads an extension:
+    /// `load_extension(path)` refuses every path in
+    /// `inillucent_scalar::builtin::refusal_for`, and the shell's `.load`
+    /// refuses every path in `inillucent_cli::dot`. Both refuse in the words
+    /// the platform uses for a library it cannot open, and a build that forbids
+    /// `unsafe` cannot call `LoadLibrary` anyway. This is the policy the day
+    /// something can load one, and the two refusals above are what
+    /// `crates/inillucent-compat/tests/schema_function_policy.rs` checks,
+    /// because those are the guarantee a caller actually has.
+    ///
+    /// There is no `authorize_module` at all, so nothing there is inert either:
+    /// `CREATE VIRTUAL TABLE` resolves a name through [`Registry::module`] and
+    /// a name that is not registered is refused by the resolution.
+    ///
+    /// @param path - the library a caller asked for
     pub fn authorize_extension(&self, path: &str) -> DbResult<()> {
         if !self.policy.load_extension {
             return Err(refused(
@@ -343,6 +353,16 @@ impl Registry {
     /// A shadow table is a module's private storage. Writing one directly is
     /// how a hostile file gets a module to read structures no module ever
     /// wrote, which is the class of bug `PRAGMA defensive` exists to close.
+    ///
+    /// **Which table is a shadow is decided by the caller**, because only the
+    /// engine knows what each connected module was handed:
+    /// `ImportedDatabase::is_shadow_table` derives the names from the roots the
+    /// modules were connected with, and `refuse_shadow_write` asks this once a
+    /// write has been bound. Until task-1972 nothing asked, and nothing set
+    /// [`Policy::defensive`] either, so `.dbconfig defensive on` refused a
+    /// `journal_mode=off` and nothing else.
+    ///
+    /// @param name - the shadow table a statement is about to write
     pub fn authorize_shadow_write(&self, name: &[u8]) -> DbResult<()> {
         if !self.policy.defensive {
             return Ok(());
@@ -355,9 +375,24 @@ impl Registry {
 }
 
 /// Returns the refusal a policy check reports.
+///
+/// **The sentence is the message, not the detail (task-1969, 7.4).** It was
+/// `with_detail`, which `inillucent-base` documents as internal diagnostic text
+/// a caller sees only with diagnostics on - so `DbError::message()` answered the
+/// primary code's manifest text and a schema refused for naming a direct-only
+/// function said `SQL logic error`. That is the same shape task-1952 fixed in
+/// `inillucent-search`'s missing-model refusal: a sentence written for a person
+/// that never reached one.
+///
+/// The name is the only thing in it that came from the database, and it is a
+/// function or table name rather than a value, so there is nothing here to keep
+/// inside the process.
+///
+/// @param name - what was refused
+/// @param why - the rest of the sentence, which follows the name
 fn refused(name: &[u8], why: &str) -> DbError {
     DbError::primary(inillucent_base::PrimaryCode::Error)
-        .with_detail(format!("{} {why}", String::from_utf8_lossy(name)))
+        .with_message(format!("{} {why}", String::from_utf8_lossy(name)))
 }
 
 #[cfg(test)]

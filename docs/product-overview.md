@@ -60,7 +60,7 @@ after the index scan has already chosen its candidates. A plain HNSW scan produc
 `hnsw.ef_search` of them, so a search restricted to a minority source can be left with almost none.
 pgvector's answer is `hnsw.iterative_scan`, which keeps restarting the scan until enough rows pass,
 and it costs latency: a filtered search that took a few milliseconds takes tens of them. Measured
-here, 42.182 ms against 0.6631.
+here, 35.583 ms against 0.6262.
 
 inillucent applies the filter inside the traversal. A node that fails the filter is still expanded,
 so the walk can pass through it to reach what is behind it, but it is never admitted to the results.
@@ -85,8 +85,11 @@ index fits in memory everything PostgreSQL does to survive a power cut is overhe
 
 ## What you give up
 
-- **One writer at a time.** Readers never block it, and several processes can share one file under
-  `PRAGMA locking_mode = normal`. Threads inside one process are not supported.
+- **One writer at a time.** Several processes can share one file under `PRAGMA locking_mode =
+  normal`, which is the default, and a second writer is refused with `busy` after
+  `PRAGMA busy_timeout` rather than being let in. A reader waits for a writer too: there is no
+  shared-memory log index for a reader to find a snapshot through. Threads inside one process are
+  not supported.
 - **This engine's own file format.** SQLite files are imported once with
   [`inillucent migrate`](migrating.md), not opened in place.
 - **No replication, no backups beyond a verified file copy, no wire protocol.** It is a library.
