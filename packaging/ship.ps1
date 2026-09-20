@@ -80,6 +80,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+
+# **-Only site,pypi arrives as one string under `pwsh -File` (task-1995).** PowerShell splits a
+# comma separated list into an array when a script is dot sourced or called from another script,
+# and does not when it is launched with -File - there the whole thing is a single element, so
+# `$Only -contains 'site'` is false and every route reports "not asked for". That looks exactly like
+# a release where nothing needed doing. Splitting here makes both spellings work.
+if ($Only) { $Only = @($Only -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+if ($Skip) { $Skip = @($Skip -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
 . (Join-Path $PSScriptRoot 'stage-layout.ps1')
 # The DPAPI sealing helpers live in apple-credentials.ps1 because that is where sealing was first
 # needed. Nothing about `Protect-AppleSecret` is Apple-specific: it is `ConvertFrom-SecureString`,
@@ -118,6 +126,8 @@ $env:INILLUCENT_CROSS_BIN = $script:CrossBin
 $script:SitePath = if ($SitePath) { $SitePath } else { Join-Path (Split-Path -Parent $script:MainCheckout) 'inillucent-site' }
 $script:TapPath = if ($TapPath) { $TapPath } else { Join-Path (Split-Path -Parent $script:MainCheckout) 'homebrew-inillucent' }
 $script:Packaging = $PSScriptRoot
+# Packagist signs in with GitHub, so the account is a person rather than the organisation.
+$script:PackagistUser = if ($env:PACKAGIST_USER) { $env:PACKAGIST_USER } else { 'jasonmcaffee' }
 $script:Root = $root
 
 function Write-Phase {
@@ -322,12 +332,17 @@ function Find-VersionStraggler {
     $carriers = @(Get-VersionCarriers -Version $Version | ForEach-Object {
             $_.Path.Substring($root.Length + 1).Replace('\', '/')
         })
+    # `Cargo.lock` matched only the one at the root. `tools/macos-pkg/Cargo.lock` is a lock file for
+    # exactly the reason the note above gives - it names every dependency's version - and it was
+    # reported on the 0.1.7 run for holding `android_system_properties 0.1.6`.
     $ignore = @('CHANGELOG.md', 'Cargo.lock', 'tasks/', 'docs/', 'dist/', 'packages/go/')
+    $ignoreLeaf = @('Cargo.lock')
     $hits = & git -C $root grep -l --fixed-strings -- $Previous 2>$null
     $unexpected = @($hits | Where-Object {
             $path = $_
             $path -notlike '*.md' -and
             $carriers -notcontains $path -and
+            $ignoreLeaf -notcontains (Split-Path -Leaf $path) -and
             -not ($ignore | Where-Object { $path -like "$_*" })
         } | Where-Object {
             # **A version named only in a comment is prose (task-1995).** The scripts in packaging/
@@ -335,7 +350,11 @@ function Find-VersionStraggler {
             # and flagging those on every release afterwards is how a warning stops being read. A
             # file counts only if the old version appears somewhere that is not a comment line.
             $lines = & git -C $root grep -h --fixed-strings -- $Previous -- $_ 2>$null
-            @($lines | Where-Object { $_ -notmatch '^\s*(#|//|\*|<#)' }).Count -gt 0
+            # **A whole version, not a substring.** `--fixed-strings` found 0.1.6 inside
+            # `iana-time-zone 0.1.65`, so a dependency's version reported the project's as a
+            # straggler. A digit or a dot on either side means it is part of a longer number.
+            $whole = "(?<![0-9.])" + [regex]::Escape($Previous) + "(?![0-9.])"
+            @($lines | Where-Object { $_ -notmatch '^\s*(#|//|\*|<#)' -and $_ -match $whole }).Count -gt 0
         })
     if ($unexpected.Count -gt 0) {
         Write-Host ''
@@ -559,7 +578,15 @@ function Get-Routes {
             Name  = 'mirror'
             What  = 'the public source mirror'
             Needs = { $null }
-            Run   = { & (Join-Path $script:Packaging 'mirror-github.ps1') -Version $Version -Push -Verify }
+            # **-Push alone. -Verify means "check the mirror as it stands and exit".** Passing both
+            # made this route print a tidy report of the mirror's existing tags and push nothing,
+            # every time, while reporting success - so the public source mirror was never updated by
+            # a release. The damage showed up two routes later: `gh release create` against a tag
+            # that does not exist makes one at the repository's current HEAD, which was the previous
+            # release's commit, and the Go module tag then followed it. proxy.golang.org caches a
+            # module version permanently on first fetch, so v0.1.5 of the Go module serves 0.1.3's
+            # source and cannot be corrected.
+            Run   = { & (Join-Path $script:Packaging 'mirror-github.ps1') -Version $Version -Push }
         },
         @{
             Name   = 'github'
@@ -584,6 +611,30 @@ function Get-Routes {
             What   = 'inillucent.com: the artifacts, then the links'
             Needs  = {
                 if (-not (Test-Path -LiteralPath $script:SitePath)) { return "$script:SitePath does not exist." }
+                # **The installers are parsed before they are published (task-1995).** install.sh is
+                # what `curl -fsSL https://inillucent.com/downloads/install.sh | sh` runs, and it
+                # shipped with an unbalanced quote for at least three releases: a literal carriage
+                # return inside `tr -d '...'` had been normalised into a newline, which split the
+                # command and left the script unparseable. It failed on line 1 with "Unterminated
+                # quoted string", so the install command the README gives for macOS and Linux did
+                # nothing, and no release noticed because nothing ever ran it.
+                foreach ($script in @('install.sh', 'macos/verify-macos.sh')) {
+                    $path = Join-Path $script:Packaging $script
+                    if (-not (Test-Path -LiteralPath $path)) { continue }
+                    $complaint = (& bash -n $path 2>&1 | Out-String).Trim()
+                    if ($LASTEXITCODE -ne 0) { return "packaging/$script does not parse: $complaint" }
+                    # **And no carriage returns, which `bash -n` does not object to.** These scripts
+                    # run under `sh`, which on Debian and Ubuntu is dash, and dash reads a CR as
+                    # part of the command: a CRLF script fails at `set: Illegal option -` on its
+                    # second line. .gitattributes marks *.sh as eol=lf, and install.sh escaped that
+                    # conversion for three releases because git leaves a file that already contains
+                    # a carriage return alone - and this one had one, inside a `tr -d` argument.
+                    $bytes = [System.IO.File]::ReadAllBytes($path)
+                    $carriageReturns = @($bytes | Where-Object { $_ -eq 13 }).Count
+                    if ($carriageReturns -gt 0) {
+                        return "packaging/$script holds $carriageReturns carriage return(s). sh on Linux is dash, which fails on the first one. Write it with LF."
+                    }
+                }
                 $null
             }
             Run    = {
@@ -674,6 +725,33 @@ function Get-Routes {
             Verify = { Test-Registry -Url "https://proxy.golang.org/github.com/black-rainbow-labs/inillucent/packages/go/@latest" -Version $Version }
         },
         @{
+            Name   = 'packagist'
+            What   = 'Composer: Packagist re-reads the tags'
+            Needs  = {
+                $sealed = Join-Path $env:LOCALAPPDATA 'inillucent\signing\packagist.token.sealed'
+                if (-not (Test-Path -LiteralPath $sealed)) {
+                    return 'no Packagist token: nothing sealed at %LOCALAPPDATA%\inillucent\signing\packagist.token.sealed.'
+                }
+                $null
+            }
+            # **Told, rather than left to notice (task-1995).** Packagist crawls on its own schedule,
+            # and it pins a version's commit the first time it sees the tag and never moves it -
+            # the same immutability the Go proxy has. v0.1.6 was crawled while the mirror's tag
+            # still pointed at the previous release's commit, so `composer require
+            # black-rainbow-labs/inillucent:0.1.6` installs 0.1.3's source and cannot be corrected.
+            # Asking for the crawl here, after the mirror route has pushed, is what makes the commit
+            # it reads the right one.
+            Run    = {
+                $token = Unprotect-AppleSecret -Path (Join-Path $env:LOCALAPPDATA 'inillucent\signing\packagist.token.sealed')
+                $url = "https://packagist.org/api/update-package?username=$script:PackagistUser&apiToken=$token"
+                $body = '{"repository":{"url":"https://github.com/Black-Rainbow-Labs/Inillucent"}}'
+                $answer = Invoke-RestMethod -Uri $url -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 60
+                Write-Host "  packagist: $($answer.status)"
+                if ($answer.status -ne 'success') { throw "Packagist answered $($answer.status)" }
+            }
+            Verify = { Test-Registry -Url 'https://repo.packagist.org/p2/black-rainbow-labs/inillucent.json' -Version $Version }
+        },
+        @{
             Name  = 'homebrew'
             What  = 'the Homebrew formula'
             Needs = {
@@ -682,7 +760,27 @@ function Get-Routes {
                 }
                 $null
             }
-            Run   = { & bash (Join-Path $script:Packaging 'homebrew/update.sh') --tap $script:TapPath }
+            Run   = {
+                & bash (Join-Path $script:Packaging 'homebrew/update.sh') --tap $script:TapPath
+                if ($LASTEXITCODE -ne 0) { throw "homebrew/update.sh failed with $LASTEXITCODE" }
+                # **And commit and push it (task-1995).** update.sh writes Formula/inillucent.rb and
+                # prints the git commands to run next, so the route reported success while the tap
+                # on GitHub - the only copy `brew install` reads - still served the previous
+                # release. Measured after the 0.1.6 run: the formula on disk said 0.1.6 and
+                # raw.githubusercontent.com served 0.1.3.
+                & git -C $script:TapPath add Formula/inillucent.rb
+                $staged = & git -C $script:TapPath diff --cached --name-only
+                if (-not $staged) { Write-Host "  the tap already has $Version"; return }
+                & git -C $script:TapPath commit -m "inillucent $Version"
+                if ($LASTEXITCODE -ne 0) { throw 'committing the formula failed' }
+                & git -C $script:TapPath push
+                if ($LASTEXITCODE -ne 0) { throw 'pushing the tap failed' }
+            }
+            Verify = {
+                # The published copy, because that is the one brew reads.
+                $url = 'https://raw.githubusercontent.com/Black-Rainbow-Labs/homebrew-inillucent/main/Formula/inillucent.rb'
+                Test-Registry -Url $url -Version $Version
+            }
         }
     )
 }
