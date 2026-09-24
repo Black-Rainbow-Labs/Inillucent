@@ -173,7 +173,7 @@ impl ImportedDatabase {
         // the connection's derived schema back in step with the catalog tree
         // the undo has just restored.
         let autocommit = self.writing.batch().is_none();
-        let mark = self.writing.undo().borrow().len();
+        let mark = self.statement_mark();
         let txn = self.current_txn();
         let outcome = self.run_directive(*directive, sql);
         self.schema.ddl_schema = previous;
@@ -183,6 +183,8 @@ impl ImportedDatabase {
                 let undone = self.undo_to_floor(mark, true, txn);
                 if autocommit {
                     self.writing.undo().borrow_mut().clear();
+                    self.writing.pending_frees().borrow_mut().clear();
+                    self.writing.built().borrow_mut().clear();
                 }
                 // **The undo's own failure is the one worth reporting.** A
                 // "no such function" describing a database that is now in a
@@ -370,8 +372,9 @@ impl ImportedDatabase {
             Directive::Pragma {
                 ref name,
                 ref argument,
+                database,
                 ..
-            } => self.pragma(name, argument.as_ref()),
+            } => self.pragma(name, argument.as_ref(), database),
             Directive::Rollback { savepoint } => match savepoint {
                 Some(name) => {
                     self.rollback_to(&name)?;
@@ -562,7 +565,7 @@ impl Outcome {
     pub fn empty() -> Outcome {
         Outcome {
             rows: Vec::new(),
-            names: Vec::new(),
+            names: std::rc::Rc::new(Vec::new()),
             changes: Changes::default(),
         }
     }

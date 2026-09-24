@@ -40,7 +40,14 @@ const ITERATIONS: u32 = 2_000;
 const PRESEEDED_ROWS: u32 = 100_000;
 
 fn main() -> ExitCode {
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let mut arguments: Vec<String> = std::env::args().skip(1).collect();
+    // **Pinned before anything is timed, and the mask printed (task-2085).**
+    // Unpinned, a hybrid processor can run this program and the arm it compares
+    // against on different core classes, and nothing else in the output says so.
+    if let Err(reason) = inillucent_compat::affinity::pin_from_arguments(&mut arguments) {
+        eprintln!("{reason}");
+        return ExitCode::from(2);
+    }
     let Some(fixture) = arguments.first().filter(|first| !first.starts_with("--")) else {
         eprintln!(
             "usage: inillucent-writelogattrib <medium sqlite fixture> [--page-size N] \
@@ -175,7 +182,97 @@ fn run(fixture: &Path, page_size: usize, frames: usize, iterations: u32) -> Resu
         plain.after.splits,
         indexed.after.splits.saturating_sub(plain.after.splits)
     );
+    // **The one number that says whether the compactions ARE the index cost.** The rows
+    // above give how many there were, not what they took, and this workload's cost has
+    // been attributed to three different things and measured to be none of them.
+    report_stage(
+        "making room",
+        indexed.after.room_nanos,
+        plain.after.room_nanos,
+    );
+    report_stage(
+        "  of which compacting",
+        indexed.after.compaction_nanos,
+        plain.after.compaction_nanos,
+    );
+    report_stage(
+        "  of which splitting",
+        indexed.after.split_nanos,
+        plain.after.split_nanos,
+    );
+    report_stage(
+        "  building the image",
+        indexed.after.choose_nanos,
+        plain.after.choose_nanos,
+    );
+    report_stage(
+        "    live_source",
+        indexed.after.source_nanos,
+        plain.after.source_nanos,
+    );
+    report_stage(
+        "    pack + encode",
+        indexed.after.image_nanos,
+        plain.after.image_nanos,
+    );
+    // **The four lines a splice is decided on.** The two stages above are each one pass
+    // a caller wants and one pass it only pays for: `live_source` decides which rows are
+    // live and then reads all of them, and `compact_image` prices the page and then
+    // writes it. A compaction that spliced its delta rows into the column-major image
+    // would still merge and still size; what it would remove is the materialisation and
+    // the encode. Printed apart because the split between them moves with the page size,
+    // and the whole of the argument about whether the splice is worth building is which
+    // side of it grows.
+    report_stage(
+        "      merge",
+        indexed.after.merge_nanos,
+        plain.after.merge_nanos,
+    );
+    report_stage(
+        "      materialise",
+        indexed
+            .after
+            .source_nanos
+            .saturating_sub(indexed.after.merge_nanos),
+        plain
+            .after
+            .source_nanos
+            .saturating_sub(plain.after.merge_nanos),
+    );
+    report_stage(
+        "      sizing pass",
+        indexed.after.sizing_nanos,
+        plain.after.sizing_nanos,
+    );
+    report_stage(
+        "      encode",
+        indexed.after.encode_nanos,
+        plain.after.encode_nanos,
+    );
+    println!(
+        "  leaf from the hint : {:>11} indexed, {:>6} without",
+        indexed.after.hinted, plain.after.hinted
+    );
+    println!(
+        "  leaf by a descent  : {:>11} indexed, {:>6} without",
+        indexed.after.descended, plain.after.descended
+    );
     Ok(())
+}
+
+/// Prints one stage's cost in both rounds and the difference between them.
+///
+/// @param label - what the stage is, indented to show what it is part of
+/// @param indexed - nanoseconds with both secondary indexes
+/// @param plain - nanoseconds with neither
+fn report_stage(label: &str, indexed: u128, plain: u128) {
+    let ms = |nanos: u128| nanos as f64 / 1e6;
+    println!(
+        "  {label:<22}: {:>9.2} ms indexed, {:>6.2} ms without, {:>6.2} ms for the two indexes",
+        ms(indexed),
+        ms(plain),
+        ms(indexed.saturating_sub(plain))
+    );
 }
 
 /// What one round of the batch cost, gathered before the log is re-read.
@@ -307,6 +404,21 @@ fn subtract(
         compactions: after.compactions.saturating_sub(before.compactions),
         splits: after.splits.saturating_sub(before.splits),
         merges: after.merges.saturating_sub(before.merges),
+        room_nanos: after.room_nanos.saturating_sub(before.room_nanos),
+        hinted: after.hinted.saturating_sub(before.hinted),
+        descended: after.descended.saturating_sub(before.descended),
+        compaction_nanos: after
+            .compaction_nanos
+            .saturating_sub(before.compaction_nanos),
+        split_nanos: after.split_nanos.saturating_sub(before.split_nanos),
+        choose_nanos: after.choose_nanos.saturating_sub(before.choose_nanos),
+        splices: after.splices.saturating_sub(before.splices),
+        splice_nanos: after.splice_nanos.saturating_sub(before.splice_nanos),
+        source_nanos: after.source_nanos.saturating_sub(before.source_nanos),
+        image_nanos: after.image_nanos.saturating_sub(before.image_nanos),
+        merge_nanos: after.merge_nanos.saturating_sub(before.merge_nanos),
+        sizing_nanos: after.sizing_nanos.saturating_sub(before.sizing_nanos),
+        encode_nanos: after.encode_nanos.saturating_sub(before.encode_nanos),
     }
 }
 

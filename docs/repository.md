@@ -52,8 +52,9 @@ them out of `vcvars64.bat` once and export them into the shell before `cargo bui
 inillucent` gives `pub use inillucent_driver::*;` and nothing else: `Database::open`,
 `Database::session`, `Connection::query`, `Connection::prepare`, `Connection::begin` and the
 `Transaction` that rolls back when it is dropped. There were two public surfaces over one engine
-until task-1962, with different `Value`, `Error` and `Statement` types and nothing saying which to
-depend on; the driver won because it has the transaction, the `Rows` type, the cancel flag and the
+until the driver was unified into a single Rust API, with different `Value`, `Error` and `Statement`
+types and nothing saying which to depend on; the driver won because it has the transaction, the
+`Rows` type, the cancel flag and the
 capability table checked in both directions, and because the C ABI and the four language packages
 already reach the engine through it.
 
@@ -105,10 +106,15 @@ mistaken for a green run.
 If you do use `cargo test --workspace`, pass `--no-fail-fast`. Without it the run stops at the first
 failing binary, and has reported about a quarter of the suite.
 
-**No test fails today.** `inillucent-testrun --strict` reports 0 failed and 0 undetermined over the
-190 rows in `tests/selection.toml`. The wall clock was 840 seconds on a 24 processor desktop that
-was carrying other work while it ran, so read it as one run on one machine rather than as a figure
-to plan against.
+**One test fails today, and it is a pinned checksum rather than a behaviour.**
+`inillucent-testrun --strict` reports 1 failed over the 231 rows in `tests/selection.toml`:
+`harness::the_retrieval_baseline_is_unchanged`, which pins the retrieval engine's source files by
+checksum so that work on the relational engine cannot disturb them. The design for a faster commit
+path deliberately changed three of those files - the distance kernel, the graph build and the index -
+and the amendment that records each file, its ticket and its new digest is written when that design
+is finished. The
+wall clock was 3,250 seconds on a 24 processor desktop, so read it as one run on one machine rather
+than as a figure to plan against.
 
 **It will still print `not ok` on your machine, and how many suites it names depends on what you
 have installed.** This page used to answer that with a list of the five suites one run on one
@@ -124,25 +130,30 @@ table.
 
 | prerequisite | rows | what provides it |
 |---|---:|---|
-| `oracle` | 29 | the pinned SQLite 3.53.4 comparison process: `pwsh tools/sqlite-reference.ps1`, `bash tools/sqlite-reference.sh` |
-| `programs` | 16 | the command surface built into this profile's target directory: `cargo build -p inillucent-cli` |
-| `shell` | 7 | the pinned `sqlite3` 3.53.4 shell, from the same two scripts as the oracle |
-| `fixtures` | 2 | the gate fixtures, which are 1.2 MB and 120 MB and are not tracked: `bash tools/build-gate-fixtures.sh _agent_output/fixtures` |
+| `oracle` | 31 | the pinned SQLite 3.53.4 comparison process: `pwsh tools/sqlite-reference.ps1`, `bash tools/sqlite-reference.sh` |
+| `shell` | 9 | the pinned `sqlite3` 3.53.4 shell, from the same two scripts as the oracle |
+| `tracked-fixtures` | 5 | the files under `compat/fixtures/`, which are in the repository - declared for a checkout that has lost them, not for a fresh clone |
 | `onnx` | 3 | ONNX Runtime and the embedding weights: `inillucent setup-embeddings all` |
-| `tracked-fixtures` | 3 | the 35 files under `compat/fixtures/`, which are in the repository - declared for a checkout that has lost them, not for a fresh clone |
+| `python` | 3 | a Python interpreter with `ssl`, for the TLS server, the `ctypes` conformance runner and the Nikaya workload extractor |
+| `fixtures` | 2 | the gate fixtures, which are 1.2 MB and 120 MB and are not tracked: `bash tools/build-gate-fixtures.sh _agent_output/fixtures` |
+| `node` | 1 | a Node.js runtime, for the npm wrapper's conformance runner: https://nodejs.org/ |
+| `go` | 1 | a Go toolchain, for the Go wrapper's conformance runner: https://go.dev/dl/ |
+| `php` | 1 | a PHP interpreter, for the PHP wrapper's conformance runner: https://www.php.net/downloads |
 | `asan` | 1 | a toolchain with the address sanitizer, which is nightly on every platform and absent on Windows |
+| `embed` | 1 | a build with `inillucent-engine/embed` compiled in, which is what registers `embed(TEXT)` as a name to refuse. The runner builds it from the target's `features` row; `tools/coverage.mjs` does not, because the feature reaches `inillucent-core/onnx` and that crate is excluded from the coverage run |
 | `baseline` | 1 | a recorded performance baseline: `cargo run -p inillucent-compat --bin inillucent-baseline -- capture` |
 | `btree-corpus` | 1 | the retained sequences under `compat/corpus/btree/`, which are tracked |
-| `capi` | 1 | the C ABI shared library, built by `cargo build -p inillucent-driver-capi` into this run's own target directory |
 | `cc` | 1 | a C compiler on `PATH`, for the program that links the C ABI |
-| `directory-link` | 1 | permission to create a directory link, which Windows gives an elevated shell or a machine in developer mode |
+| `conformance-records` | 1 | what the five conformance runners recorded under `_agent_output/conformance/`: `sh tools/run-package-tests.sh` |
+| `directory-link` | 2 | permission to create a directory link, which Windows gives an elevated shell or a machine in developer mode |
 | `local-timezone` | 1 | a configured local time zone the operating system will convert an instant through: `localtime_r` on Unix, `SystemTimeToTzSpecificLocalTime` on Windows |
 | `mysql` | 1 | a live MySQL server, named by `INILLUCENT_TEST_MYSQL_URL` |
 | `narrow-slots` | 1 | the narrow integer slots compiled in, which is a constant in `crates/inillucent-tree/src/leaf.rs` |
 | `network` | 1 | outbound network access, turned on by setting `INILLUCENT_NETWORK_TESTS` |
+| `nikaya` | 1 | a local checkout of the Nikaya application, which the workload file is extracted from - the extract is tracked, so this is only needed to check it for staleness |
 | `openssl` | 1 | the `openssl` command, which generates the certificates the TLS suite serves |
 | `postgres` | 1 | a live PostgreSQL server, named by `INILLUCENT_TEST_POSTGRES_URL` |
-| `python` | 2 | a Python interpreter with `ssl`, for the TLS server and the `ctypes` conformance runner |
+| `previous-release` | 1 | a published release's binary, downloaded and verified by `pwsh tools/build-interop-fixture.ps1 -Version <version>` into the gitignored `tools/cross/bin/releases/` |
 | `sqlite-bench` | 1 | the pinned benchmark driver, built by the same two reference scripts |
 | `testrun` | 1 | the runner itself: `cargo build -p inillucent-compat --bin inillucent-testrun --features testrun`, which a plain `cargo test` does not build |
 
@@ -153,23 +164,26 @@ declare one fails `cargo test -p inillucent-compat --test selection`, and so doe
 declares one whose suite cannot skip - which is what keeps this table equal to the workspace rather
 than equal to the last time somebody looked.
 
-The last two joined the list in task-1913 and are not a new absence. Those twenty-nine cases sit
+The last two joined the list during a differential bug hunt that found tests that were not running,
+and are not a new absence. Those twenty-nine cases sit
 behind the `onnx` cargo feature, which the runner did not turn on, so they were in no binary at all
 and nothing reported them - the source read as coverage while no run had ever started them.
 `tests/selection.toml` now names the features a target is built with, so they are built, they run,
-and the ones that need the weights say so. This page used to say seventeen tests failed; task-1869 had
-already removed the cause and nobody re-ran it, which is recorded in
-[Closed items](closed-items.md#what-task-1911-closed).
+and the ones that need the weights say so. This page used to say seventeen tests failed; an earlier
+fix had already removed the cause and nobody re-ran it, which is recorded in
+[Closed items](closed-items.md#eight-items-closed-together).
 
 ## What the tests cover
 
-3,033 tests across 190 test targets in the workspace, in these classes:
+3,499 tests across 231 test targets in the workspace, in these classes:
 
-The 190 is the `[[target]]` row count in `tests/selection.toml`, which is what
+The 231 is the `[[target]]` row count in `tests/selection.toml`, which is what
 `tools/doc-facts/check.mjs` compares this sentence against and what the runner is asked to run.
-The number of `#[test]` attributes in the tree is higher - 3,051 at the time of writing - because
-a `#[cfg(windows)]` and a `#[cfg(unix)]` pair is two attributes and one test on any one machine,
-and five `onnx` cases are built only when that feature is on.
+The number of `#[test]` attributes in the tree is 3,240, and it differs from the run's count in
+both directions. `scenario!` writes six tests from one line, so a story file holds no attribute at
+all for the six it contributes. The other way, a `#[cfg(windows)]` and a `#[cfg(unix)]` pair is two
+attributes and one test on any one machine, and five `onnx` cases are built only when that feature
+is on.
 
 - **A differential harness** that runs the same SQL through the pinned SQLite 3.53.4 and compares
   transcripts. 208 of those cases are `semantics.rs`, and 416 are the wider feature probe.
@@ -209,7 +223,8 @@ and five `onnx` cases are built only when that feature is on.
   them.
 - **29 of the 29 crates deny `unwrap`, `expect`, `panic` and slice indexing**, and 21 forbid
   `unsafe`, on every path that reads SQL text, database pages, log frames, network bytes or file
-  system results. The twenty-ninth to arrive was `inillucent-bench`, in task-1973: it is a binary
+  system results. The twenty-ninth to arrive was `inillucent-bench`, when the bench crate was brought
+  under the same four lints: it is a binary
   crate, and the attributes go on `main.rs` because a `#![deny(..)]` is a crate root inner attribute
   and `main.rs` is a crate root. Turning them on there produced 191 errors - 154 slice indexes, 18
   slices, 8 `unwrap`s and 11 `expect`s - in the harness that scores the numbers on this page and in
@@ -320,6 +335,10 @@ target/release/inillucent-vectorprobe --rows 20000 --dims 256
 # deleted and no recorded floor exists to gate against in its place, so it
 # reports rather than passing or failing.
 target/release/inillucent-searchgate  --documents 500 --rounds 30
+# the open.prepare family on its own, without a whole scorecard. It takes the
+# SQLite fixture and imports its own copy for the native arms, so one file is
+# all it is given.
+target/release/inillucent-prepareperf <dir>/medium-prepare.db 30
 
 # the parity manifest and the dependency contract
 cargo run -p inillucent-compat --bin inillucent-manifest -- check

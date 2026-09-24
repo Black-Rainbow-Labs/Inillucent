@@ -10,6 +10,7 @@ use inillucent_base::DbResult;
 use inillucent_catalog::ddl::canonical_sql;
 use inillucent_catalog::paged::{tables_from_entries, ObjectKind, SchemaEntry};
 use inillucent_catalog::rename;
+use inillucent_exec::physical::SourceLayout;
 use inillucent_pool::PageId;
 use inillucent_sql::catalog_view::TableInfo;
 use inillucent_sql::directive::AlterKind;
@@ -201,6 +202,9 @@ impl crate::ImportedDatabase {
             // so this returns to it rather than repeating it.
             return Ok(());
         }
+        // After the virtual-table branch, because a virtual table keeps
+        // no rows of its own and no foreign key can name one.
+        self.empty_before_dropping(&owner)?;
         // Every row that names the table: the table, its indexes and its
         // triggers. Collected before anything is removed, because the
         // list is what decides what to remove.
@@ -306,6 +310,41 @@ impl crate::ImportedDatabase {
         Ok(())
     }
 
+    /// Refuses an `ADD COLUMN` that would take a table past `Limit::Column`.
+    ///
+    /// **The one place a column list grows where the parser cannot count it**
+    /// (task-2066 section 4.2, item 21). `parser::ddl::parse_create_table`
+    /// charges what a `CREATE TABLE` declares, which is the whole list; an
+    /// `ADD COLUMN` declares one column and the answer depends on the table it
+    /// is added to. Without this a table is walked past the limit one
+    /// statement at a time, and the failure when it finally comes is
+    /// "the mini-columns do not fit in one page", which is the right refusal
+    /// for a reason a caller cannot act on.
+    ///
+    /// @param at - which attached database the table is in
+    /// @param folded - the table's folded name
+    fn refuse_a_column_past_the_limit(&self, at: usize, folded: &[u8]) -> DbResult<()> {
+        let held = self
+            .schema
+            .tables
+            .iter()
+            .find(|table| table.database == at && table.folded == folded)
+            .map(|table| table.columns.len())
+            .unwrap_or(0);
+        let limit = self
+            .pragmas
+            .limits()
+            .borrow()
+            .get(inillucent_base::limits::Limit::Column);
+        match held as i64 >= limit {
+            true => Err(refusal(format!(
+                "too many columns on {}",
+                String::from_utf8_lossy(folded)
+            ))),
+            false => Ok(()),
+        }
+    }
+
     /// Runs an `ALTER TABLE`.
     ///
     /// Every rewrite is a rewrite of *stored text*, and the catalog is then
@@ -335,8 +374,9 @@ impl crate::ImportedDatabase {
             )));
         }
         if let AlterKind::AddColumn { risk, .. } = action {
+            self.refuse_a_column_past_the_limit(at, &folded)?;
             if let Some(message) = risk.refusal() {
-                if self.table_has_a_row(&folded)? {
+                if self.table_has_a_row(at, &folded)? {
                     return Err(refusal(message));
                 }
             }
@@ -428,11 +468,17 @@ impl crate::ImportedDatabase {
         // A `DROP COLUMN` changes the *rows*, not only the text, and the tree is
         // rebuilt rather than edited in place: every leaf's column directory
         // would otherwise still describe a column the catalog no longer has.
-        if let AlterKind::DropColumn { .. } = action {
-            self.rebuild_table_tree(&folded)?;
+        if let AlterKind::DropColumn { position, .. } = action {
+            self.rebuild_table_tree(at, &folded, Some(usize::from(*position)))?;
         }
         if let AlterKind::AddColumn { .. } = action {
-            self.rebuild_table_tree(&folded)?;
+            self.rebuild_table_tree(at, &folded, None)?;
+        }
+        if matches!(
+            action,
+            AlterKind::DropColumn { .. } | AlterKind::AddColumn { .. }
+        ) {
+            self.refresh_index_layouts(at, &folded);
         }
         self.refresh_catalog();
         self.seal()?;
@@ -513,7 +559,30 @@ impl crate::ImportedDatabase {
         // answer, and only a connected module can give it. Deriving them from
         // the statement would be a second implementation of every module's
         // argument grammar, agreeing with the module until the day it did not.
+        //
+        // **But whether a table is virtual at all is the catalog's answer, not
+        // the module map's (task-2043).** This loop used to convert any table
+        // whose name was in `virtual_tables`, and the map is this connection's
+        // memory rather than a record of the file. So
+        //
+        // ```sql
+        // BEGIN; DROP TABLE p; CREATE VIRTUAL TABLE p USING fts5(body); ROLLBACK;
+        // ```
+        //
+        // left the fts5 connection under the name `p`, and the rollback - which
+        // had put p's own `CREATE TABLE` row back correctly, and its rows with
+        // it - was overwritten here: `PRAGMA table_info(p)` answered `body`, and
+        // `SELECT * FROM p` was planned as a scan of a module whose shadow
+        // tables no longer existed and returned nothing. Reopening the file gave
+        // the three rows, because the file had them all along.
+        //
+        // `tables_from_entries` sets `kind` to `Virtual` for a row whose text is
+        // a `CREATE VIRTUAL TABLE`, so requiring it here is requiring that the
+        // catalog and the module map agree before the module is believed.
         for table in &mut rebuilt {
+            if table.kind != inillucent_sql::catalog_view::TableKind::Virtual {
+                continue;
+            }
             let Some(connected) = self.session_state.virtual_tables.get(&table.folded) else {
                 continue;
             };
@@ -530,15 +599,6 @@ impl crate::ImportedDatabase {
         self.schema.tables = rebuilt;
         Ok(())
     }
-    /// Rebuilds one table's tree so its leaves carry the columns the catalog
-    /// now says it has.
-    ///
-    /// `ADD COLUMN` and `DROP COLUMN` both change the column directory, and a
-    /// leaf's directory is written into the page - so the rows are read out
-    /// through the old layout, re-shaped, and packed into a fresh tree. The old
-    /// tree's pages go back to the free map.
-    ///
-    /// @param folded - the table's folded name
     /// Returns whether a table holds at least one row.
     ///
     /// `ADD COLUMN` is the only caller: three of the five things it may not add
@@ -546,13 +606,14 @@ impl crate::ImportedDatabase {
     /// so an empty table takes all three and SQLite accepts them. It stops at
     /// the first row rather than counting, because the question is existence.
     ///
+    /// @param at - the schema the table is in
     /// @param folded - the table's folded name
-    fn table_has_a_row(&mut self, folded: &[u8]) -> DbResult<bool> {
+    fn table_has_a_row(&mut self, at: usize, folded: &[u8]) -> DbResult<bool> {
         let Some(root) = self
             .schema
             .tables
             .iter()
-            .find(|table| table.folded == folded)
+            .find(|table| table.database == at && table.folded == folded)
             .map(|table| table.root)
         else {
             return Ok(false);
@@ -562,12 +623,29 @@ impl crate::ImportedDatabase {
         };
         Ok(!tree.rows(self.pool_of(root)?)?.is_empty())
     }
-    fn rebuild_table_tree(&mut self, folded: &[u8]) -> DbResult<()> {
+    /// Rebuilds one table's tree so its leaves carry the columns the catalog
+    /// now says it has.
+    ///
+    /// `ADD COLUMN` and `DROP COLUMN` both change the column directory, and a
+    /// leaf's directory is written into the page - so the rows are read out
+    /// through the old layout, re-shaped, and packed into a fresh tree. The old
+    /// tree's pages go back to the free map.
+    ///
+    /// @param at - the schema the table is in
+    /// @param folded - the table's folded name
+    /// @param dropped - the declared position `DROP COLUMN` removed, when that
+    ///   is what is being rebuilt
+    fn rebuild_table_tree(
+        &mut self,
+        at: usize,
+        folded: &[u8],
+        dropped: Option<usize>,
+    ) -> DbResult<()> {
         let Some(info) = self
             .schema
             .tables
             .iter()
-            .find(|table| table.folded == folded)
+            .find(|table| table.database == at && table.folded == folded)
             .cloned()
         else {
             return Ok(());
@@ -593,6 +671,80 @@ impl crate::ImportedDatabase {
             let (columns, layout) = table_shape(&info);
             (columns, 1, layout)
         };
+        let from = self.fills_for_the_new_shape(
+            &info,
+            &layout,
+            &old_layout,
+            dropped,
+            !old_rows.is_empty(),
+        )?;
+        let rows = rows_in_the_new_shape(&old_rows, &from);
+        let rows = in_key_order(rows, &columns, key_columns);
+        // The rebuild holds owned rows, so it does its own borrow. It runs once
+        // per `ALTER TABLE` and is not on any measured path, which is exactly
+        // why the cost belongs here rather than inside the builder every caller
+        // shares.
+        let borrowed: Vec<Vec<Datum<'_>>> = rows
+            .iter()
+            .map(|row| row.iter().map(OwnedDatum::borrow).collect())
+            .collect();
+        self.release_tree(old_root)?;
+        let covering: Vec<u32> = self
+            .schema
+            .covering
+            .get(&old_root)
+            .cloned()
+            .unwrap_or_default();
+        self.build_tree_from(old_root, columns, key_columns, layout, &borrowed)?;
+        if !covering.is_empty() {
+            self.schema.covering.insert(old_root, covering);
+        }
+        // The catalog row's `rootpage` moved with the tree.
+        let page = self
+            .schema
+            .trees
+            .get(&old_root)
+            .map(PagedTree::root)
+            .unwrap_or(PageId::NONE);
+        let update = self
+            .entries_of(at)
+            .iter()
+            .find(|held| {
+                held.entry.kind == ObjectKind::Table
+                    && held.entry.name.to_ascii_lowercase() == folded
+            })
+            .map(|held| {
+                let mut moved = held.entry.clone();
+                moved.root = page;
+                (held.rowid, moved)
+            });
+        if let Some((rowid, entry)) = update {
+            self.rewrite(rowid, entry)?;
+        }
+        Ok(())
+    }
+
+    /// Returns where each column of the rebuilt tree takes its values from.
+    ///
+    /// Split out of [`Self::rebuild_table_tree`] because it is the half of the
+    /// rebuild that is about *columns* rather than about trees, and because
+    /// `policy.rs` refuses a function over 150 lines - which the argument below
+    /// took it past.
+    ///
+    /// @param info - the table as the catalog now declares it
+    /// @param layout - the layout the new tree is being built with
+    /// @param old_layout - the layout the old rows were read through
+    /// @param dropped - the declared position `DROP COLUMN` removed, when that
+    ///   is what is being rebuilt
+    /// @param populated - whether there is a row for a `DEFAULT` to fill
+    fn fills_for_the_new_shape(
+        &mut self,
+        info: &TableInfo,
+        layout: &SourceLayout,
+        old_layout: &SourceLayout,
+        dropped: Option<usize>,
+        populated: bool,
+    ) -> DbResult<Vec<Fill>> {
         // Each new tree column is filled from the old tree column that held the
         // same *declared* column. A column the declaration did not have takes
         // its `DEFAULT`, which is SQLite's rule and is what makes
@@ -600,10 +752,31 @@ impl crate::ImportedDatabase {
         // that were already there. Filling NULL instead was a wrong answer
         // rather than a refusal, and only visible to a statement that read the
         // new column on an old row.
+        //
+        // **`declared` is a position in the new declaration and `old_layout` is
+        // indexed by the old one, so the two only line up when nothing moved
+        // (task-2057).** `DROP COLUMN` at position p moved every column after p
+        // down one place, and the loop read `old_layout.slots[declared]`
+        // regardless: after `ALTER TABLE t(a,b,c,d) DROP COLUMN b`, new
+        // position 1 is `c` and it was filled from `b`, position 2 is `d` and
+        // it was filled from `c`, and `d`'s own values were dropped with `b`'s.
+        // It committed and it survived a reopen, so the file held the wrong
+        // rows rather than a connection showing them wrongly. Dropping the
+        // *last* column is the one shape it got right - every surviving
+        // position is where it already was - which is why a `(id, n)` table
+        // dropping `n` never caught it.
+        //
+        // The caller knows the mapping and nothing here can recover it: once
+        // the declaration has been rewritten, `a, c, d` says nothing about
+        // which of the four is gone.
+        let was_declared = |declared: usize| match dropped {
+            Some(position) if declared >= position => declared.saturating_add(1),
+            _ => declared,
+        };
         let mut from: Vec<Fill> = vec![Fill::Absent; layout.width];
         for (declared, slot) in layout.slots.iter().enumerate() {
             let Some(slot) = slot else { continue };
-            if let Some(Some(source)) = old_layout.slots.get(declared) {
+            if let Some(Some(source)) = old_layout.slots.get(was_declared(declared)) {
                 if let Some(cell) = from.get_mut(*slot) {
                     *cell = Fill::From(*source);
                 }
@@ -629,7 +802,7 @@ impl crate::ImportedDatabase {
             // reports `unknown function` at the first `INSERT` that needs the
             // value - so skipping the evaluation is what matches the reference
             // rather than merely what avoids the failure.
-            if old_rows.is_empty() {
+            if !populated {
                 continue;
             }
             let Some(default) = info
@@ -660,50 +833,119 @@ impl crate::ImportedDatabase {
                 *cell = Fill::From(old_rowid);
             }
         }
-        let rows = rows_in_the_new_shape(&old_rows, &from);
-        let rows = in_key_order(rows, &columns, key_columns);
-        // The rebuild holds owned rows, so it does its own borrow. It runs once
-        // per `ALTER TABLE` and is not on any measured path, which is exactly
-        // why the cost belongs here rather than inside the builder every caller
-        // shares.
-        let borrowed: Vec<Vec<Datum<'_>>> = rows
-            .iter()
-            .map(|row| row.iter().map(OwnedDatum::borrow).collect())
-            .collect();
-        self.release_tree(old_root)?;
-        let covering: Vec<u32> = self
+        Ok(from)
+    }
+
+    /// Re-derives the layout of every index on a table whose columns moved.
+    ///
+    /// **An index layout is derived once and `refresh_catalog` does not derive
+    /// it again (task-2057).** `SourceLayout::slots` is indexed by *declared*
+    /// position, and `DROP COLUMN` renumbers the declaration - so after
+    /// `ALTER TABLE t(a,b,c,d) DROP COLUMN b`, an index on `d` still had `d`
+    /// recorded at declared position 3 while the binder now asks for position
+    /// 2. The planner offered the index, the physical pass asked it for a
+    /// column its layout said it did not carry, and the statement failed with
+    /// `the tree read for FROM term 0 does not carry column 2`. Reopening the
+    /// file answered it, because the layouts are derived afresh from the
+    /// catalog on open - which is what says the file was right and only this
+    /// connection's derived view was stale.
+    ///
+    /// The *entries* are untouched: an entry is its key columns followed by
+    /// what identifies the table row, and dropping some other column changes
+    /// neither. Only the mapping from a declared position onto a tree column
+    /// moved, so the tree is left alone and its layout is replaced.
+    ///
+    /// Two indexes are left alone, and both would be wrong to touch.
+    ///
+    /// **A `WITHOUT ROWID` table's primary key is the table**, so it is listed
+    /// among the table's indexes with no tree of its own and carries the
+    /// *table's* root - which `create_table` states in the same words where it
+    /// declines to build a second tree for it. Re-deriving that one replaces
+    /// the table's own layout with an index's, and the reads that were correct
+    /// before this function existed start failing: `SELECT k, b, c` over
+    /// `t(k PRIMARY KEY, a, b, c) WITHOUT ROWID` after dropping `a` reported
+    /// that the tree did not carry column 1.
+    ///
+    /// **An index with no registered layout** is the other: a vector index's
+    /// store and an imposter are published by `refresh_catalog` itself, and
+    /// describing either with `index_shape` would call it an ordinary B-tree
+    /// index.
+    ///
+    /// @param at - the schema the table is in
+    /// @param folded - the table's folded name
+    fn refresh_index_layouts(&mut self, at: usize, folded: &[u8]) {
+        let Some(info) = self
             .schema
-            .covering
-            .get(&old_root)
+            .tables
+            .iter()
+            .find(|table| table.database == at && table.folded == folded)
             .cloned()
-            .unwrap_or_default();
-        self.build_tree_from(old_root, columns, key_columns, layout, &borrowed)?;
-        if !covering.is_empty() {
-            self.schema.covering.insert(old_root, covering);
+        else {
+            return;
+        };
+        for index in &info.indexes {
+            if index.root == info.root || !self.schema.layouts.contains_key(&index.root) {
+                continue;
+            }
+            let (_, layout) = index_shape(&info, index, index.root);
+            self.schema
+                .layouts
+                .insert(index.root, std::rc::Rc::new(layout));
         }
-        // The catalog row's `rootpage` moved with the tree.
-        let page = self
-            .schema
-            .trees
-            .get(&old_root)
-            .map(PagedTree::root)
-            .unwrap_or(PageId::NONE);
-        let update = self
-            .schema
-            .entries
-            .iter()
-            .find(|held| {
-                held.entry.kind == ObjectKind::Table
-                    && held.entry.name.to_ascii_lowercase() == folded
-            })
-            .map(|held| {
-                let mut moved = held.entry.clone();
-                moved.root = page;
-                (held.rowid, moved)
-            });
-        if let Some((rowid, entry)) = update {
-            self.rewrite(rowid, entry)?;
+    }
+
+    /// Deletes every row of a table that is about to be dropped.
+    ///
+    /// **`DROP TABLE` ignored foreign keys entirely (task-1979, F6).** It removed
+    /// the catalog rows and released the trees, so a child row left pointing at a
+    /// parent that no longer existed was never noticed and an `ON DELETE CASCADE`
+    /// never ran: with `PRAGMA foreign_keys = ON`, `DROP TABLE p` succeeded where
+    /// SQLite answers `FOREIGN KEY constraint failed`, and with a cascade the child
+    /// rows stayed.
+    ///
+    /// SQLite's own words for what it does instead: "the DROP TABLE command
+    /// performs an implicit DELETE FROM before removing the table from the database
+    /// schema... The implicit DELETE FROM does not cause any triggers to fire, but
+    /// may cause foreign key actions or foreign key constraint violations." That is
+    /// what this is: the delete is bound as an ordinary statement, so there is one
+    /// implementation of what a foreign key means rather than a second one here,
+    /// and the triggers the user wrote are dropped from it before it runs.
+    ///
+    /// Nothing happens when the pragma is off, when the object is a view or a
+    /// virtual table, or when no foreign key mentions the table - which is the
+    /// optimisation SQLite documents in the same paragraph, and the reason an
+    /// ordinary `DROP TABLE` still costs what it always did.
+    ///
+    /// @param owner - the table about to be dropped
+    fn empty_before_dropping(&mut self, owner: &TableInfo) -> DbResult<()> {
+        if !self.pragmas.foreign_keys()
+            || owner.kind != inillucent_sql::catalog_view::TableKind::Table
+            || owner.module.is_some()
+        {
+            return Ok(());
         }
+        if owner.foreign_key_triggers.is_empty() {
+            return Ok(());
+        }
+        let statement = delete_every_row(
+            inillucent_sql::catalog_view::CatalogView::database_name(
+                &self.schema.catalog,
+                owner.database,
+            ),
+            &owner.name,
+        );
+        // The parameter count is not of interest here: this is a generated
+        // `DELETE` with no parameters in it.
+        let (mut compiled, _) = self.compile(&statement)?;
+        if let Cached::Delete(delete, _) = &mut compiled {
+            delete
+                .triggers
+                .retain(|trigger| trigger.foreign_key && !trigger.self_referencing);
+        }
+        // `apply_compiled` rather than `execute_compiled`: the file lock is already
+        // held by the `DROP TABLE` this is part of, and the settle that follows a
+        // statement will run once for that statement rather than twice.
+        self.apply_compiled(&std::rc::Rc::new(compiled), &Params::new())?;
         Ok(())
     }
 }
@@ -758,4 +1000,19 @@ fn rows_in_the_new_shape(old_rows: &[Vec<OwnedDatum>], from: &[Fill]) -> Vec<Vec
                 .collect()
         })
         .collect()
+}
+
+/// Returns the `DELETE FROM` that empties one table, by its qualified name.
+///
+/// The name is quoted rather than interpolated bare, because a table may be
+/// called `my"table` and the statement this builds is parsed again.
+///
+/// @param database - the schema the table is in
+/// @param name - the table's name, as the catalog holds it
+fn delete_every_row(database: &[u8], name: &[u8]) -> String {
+    format!(
+        "DELETE FROM \"{}\".\"{}\"",
+        String::from_utf8_lossy(database).replace('"', "\"\""),
+        String::from_utf8_lossy(name).replace('"', "\"\"")
+    )
 }

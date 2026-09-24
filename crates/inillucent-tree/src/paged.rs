@@ -47,8 +47,14 @@
 // 3,565 lines, of which 2,124 were one `impl PagedTree` block whose methods
 // answered three different questions. Each module reopens the same `impl`, so
 // no signature changed and nothing outside this directory can tell.
+//
+// `occupancy` joined them for the same reason (task-2052): which pages a tree
+// holds is a fourth question, asked by `DROP` and by the integrity checker and
+// by nothing that reads a row.
+mod bulk;
 mod cursor;
 mod descent;
+mod occupancy;
 mod skip;
 
 use std::cell::RefCell;
@@ -68,6 +74,7 @@ pub use crate::keyenc::KeyEncoding;
 use crate::leaf::{Extents, Hit, LeafBuilder, LeafRef, Spill};
 use crate::tree::BULK_FILL;
 use crate::types::ColumnSpec;
+pub use occupancy::{released, PageShare, Released};
 
 /// How many times a descent retries an optimistic read before giving up.
 ///
@@ -193,7 +200,7 @@ pub fn write_extent(
     let first = database.allocate(pages)?;
     let images = extent::encode_run(value, first, page_size, tree_id)?;
     for (id, mut image) in images {
-        log_built_page(&mut Some(log), database, id, &mut image)?;
+        log_allocated_page(&mut Some(log), database, id, &mut image)?;
     }
     Ok(ExtentRef::run(first, value.len() as u64))
 }
@@ -372,23 +379,30 @@ impl Spill for Carrying<'_> {
     }
 }
 
-/// Describes one bulk-built page in the log, then installs it.
+/// Describes one freshly allocated page in the log, then installs it.
 ///
 /// Two records rather than one: the allocation and the contents are separate
 /// facts and recovery needs both. `AllocPage` is what stops a later allocation
 /// handing the same page out twice after a crash; `WritePage` is what puts the
 /// bytes back. The image is stamped with the write's LSN before it is
-/// installed, so the page-LSN rule holds for a bulk-built page exactly as it
-/// does for one a split wrote.
+/// installed, so the page-LSN rule holds for it exactly as it does for a page a
+/// split wrote.
 ///
 /// With no log the image is installed unstamped, which is the byte-for-byte
 /// behaviour the unlogged builder has always had.
+///
+/// **This is the out-of-line value run's path, and it is not the bulk builder's**
+/// (task-2000, design 2). A bulk build can write its pages past the log because
+/// it syncs the data file before the statement that names its root commits; an
+/// overflow run written in the middle of an ordinary statement has no such sync
+/// to hide behind, so its bytes are in the log like any other page's. See
+/// [`write_built_page`].
 ///
 /// @param log - where the records go, when there is one
 /// @param database - the file the page is installed in
 /// @param id - the page, already allocated
 /// @param image - the page bytes, stamped in place with the LSN
-fn log_built_page(
+fn log_allocated_page(
     log: &mut Option<&mut dyn crate::write::TreeLog>,
     database: &mut Database,
     id: PageId,
@@ -545,6 +559,154 @@ pub struct PagedTree {
     /// counter can be bumped from a `&self` method - the read side reports them
     /// and the write side is the only thing that moves them.
     pub(crate) stats: std::cell::Cell<crate::write::WriteStats>,
+    /// The page this tree's rightmost leaf was on, the last time a write looked.
+    ///
+    /// **The leaf hint** (task-2000, designs 6 and 7). A write descends from the
+    /// root for every row: `PagedTree::leaf_for` walks the interior levels and
+    /// allocates a `Vec<PageId>` for the path it took. An append at the right edge
+    /// - which is what a rowid insert into `main_table` is, and what FTS5's
+    /// dictionary flush is once its terms are in order - lands in the same leaf
+    /// every time, so the descent answers a question it has already answered.
+    ///
+    /// **A miss has to cost a comparison and nothing else, which is why the key is
+    /// kept here beside the page.** The first version held only the `PageId` and
+    /// answered by fetching the page, parsing the leaf and comparing the probe
+    /// against its first row - so every key that was *not* an append paid a page
+    /// fetch, a leaf parse and a column by column tuple comparison *before* the
+    /// descent it then had to do anyway. `write.insert.batch` inserts into a rowid
+    /// table carrying two secondary indexes, and the two index keys arrive in no
+    /// order at all: one hint in three hit, and the other two paid twice.
+    ///
+    /// The bytes are the lowest probe this connection has seen descend into the
+    /// hinted leaf, in [`PagedTree::key_encoding`]'s comparable form. A probe that
+    /// descended into a leaf is at or above that leaf's low fence by construction,
+    /// and a rightmost leaf's fence range runs from its low fence to positive
+    /// infinity, so **any key at or above those bytes belongs in the hinted leaf** -
+    /// for as long as the fence has not moved. `memcmp` order is the descent's order
+    /// because that is what the encoding is for.
+    ///
+    /// Two things keep the fence still, and the hint needs both:
+    ///
+    /// - [`PagedTree::note_leaves`] drops the hint, and every split and every merge
+    ///   calls it. Those are the only operations that move a leaf's fence.
+    /// - `leaf_for_hinted` still reads the hinted page's header on a **hit** and
+    ///   takes it only when it is a leaf, of *this* tree, with no right sibling. That
+    ///   is what covers a page freed and handed to another tree, and a fence moved by
+    ///   something other than this write path. It costs one fetch of a page the
+    ///   insert is about to fetch anyway, and it is on the hit path only, so a miss
+    ///   never pays it.
+    ///
+    /// **Any leaf, not only the rightmost one** (task-2006). The first version hinted
+    /// the rightmost leaf, which is every descent of a tree being appended to and none
+    /// of a tree being written in sorted order *through the middle*. FTS5's dictionary
+    /// flush is the second shape: the pending terms are a `BTreeMap`, so they arrive in
+    /// key order, but a term new to the index lands between terms already in it rather
+    /// than past all of them.
+    ///
+    /// **What the hint is measured to do, and what it is not.** The A/B is one box, two
+    /// adjacent gate runs, the hint the only difference. Read the two halves of it in
+    /// the right order, because they disagree and one is weaker: the stage line the gate
+    /// prints is a **single round**, while a workload's ratio is the median of thirty, so
+    /// the stage numbers below are one sample each and the ratio is not.
+    ///
+    /// The stage line says it cuts the stages it touches by about a third: FTS5's `dict write` from 2.4 ms to 1.6, its `content` row
+    /// writes from 2.0 to 1.4 and its `docsize` rows from 1.6 to 1.1, over 500
+    /// documents. It does **not** move `extension.fts.build`'s ratio, which reads 0.68x
+    /// without it and 0.69x with it, nor `write.insert.batch`, nor the weighted
+    /// headline. Where the saved time goes is not accounted for: the named stages sum to
+    /// about 5.5 ms of that workload's 8.1 and the rest is unattributed, so the saving
+    /// lands somewhere the stage timers do not name.
+    ///
+    /// It is kept because it demonstrably does less work - a descent skipped is a
+    /// descent skipped - and removing a change that does less work because a noisy
+    /// total did not move would be reading the noise. It is not kept on a claim about
+    /// any ratio, and an earlier comment here that credited it with
+    /// `extension.fts.build` at 1.24x was reading a run that had four gate processes on
+    /// one disk.
+    ///
+    /// So the hint holds a **window**: the lowest and highest probes this connection
+    /// has seen descend into the hinted leaf. A leaf's key range is contiguous, so a
+    /// key between two keys known to be in it is in it too - which is the whole of the
+    /// argument for a middle leaf, and it needs both ends.
+    ///
+    /// `rightmost` is why the window is not enough on its own. A rightmost leaf's range
+    /// runs to positive infinity, so an append is above every probe seen so far and a
+    /// window would reject it; for that leaf the test is the low end alone. Keeping the
+    /// flag is what lets one hint serve both shapes.
+    ///
+    /// A `RefCell` rather than a `Cell` because the keys are `Vec`s; the write path
+    /// holds the tree by shared reference, the same reason [`PagedTree::stats`] is a
+    /// `Cell`.
+    ///
+    /// **Several windows and not one, because one window only ever fitted the primary
+    /// key** (task-2006). A counter on each side of it, over the 6,000 writes
+    /// `inillucent-writelogattrib` makes into a table carrying two secondary indexes,
+    /// said the single slot answered 3,773 of them and sent 2,227 down the tree from its
+    /// root. The 2,000 writes to `main_table` are a rowid append and 1,999 of them hit;
+    /// the 4,000 writes to `main_key` and `main_category` arrive in the primary key's
+    /// order and not in their own, so consecutive rows land in different leaves and each
+    /// one evicted the window the row before it had just proved.
+    ///
+    /// The windows of different leaves cannot overlap, which is what makes a set of them
+    /// no weaker than one. A window is the lowest and highest probes seen to descend
+    /// into a leaf, so it lies inside that leaf's fence range, and fence ranges are
+    /// disjoint - so at most one entry claims any key, and the first that claims it is
+    /// the only one that could. Every entry is then proved the way the single entry was:
+    /// the page is still a leaf, still this tree's, and still has the right sibling it
+    /// had when the window was recorded. A split or a merge clears the whole set through
+    /// [`PagedTree::note_leaves`], and one done by another process is caught by that
+    /// sibling, per entry.
+    ///
+    /// **Eight entries take 2,227 of those descents down to 153, and the transaction's
+    /// wall time does not clearly move.** The A/B is the same binary with `LEAF_HINTS` at
+    /// 1 and at 8, nine runs each, medians 32.99 ms and 30.51 ms - but the two spreads
+    /// are 28.37..36.26 and 28.09..77.38, so 2.5 ms is inside them and this instrument is
+    /// one transaction where the gate's workload is the median of thirty rounds. What the
+    /// counters say is not in doubt: 2,074 descents of a root and its interior levels are
+    /// not made. What that is worth is a question for the gate.
+    pub(crate) leaf_hints: std::cell::RefCell<Vec<LeafHint>>,
+    /// Which entry of `leaf_hints` the next unknown leaf overwrites, round robin.
+    ///
+    /// Round robin rather than least recently used: the set is small enough that finding
+    /// the coldest entry costs more than replacing an entry that is merely old, and a
+    /// secondary index walks its leaves in a cycle, which is the case both policies get
+    /// right. It is an index into a full set and means nothing until the set is full.
+    pub(crate) hint_victim: std::cell::Cell<usize>,
+}
+
+/// How many leaves one connection remembers per tree for its next write.
+///
+/// Eight, because the miss path is what a larger set costs: every entry is two
+/// comparisons against bytes the caller already has, and they are paid in full by a key
+/// that is in none of the windows. Eight covers a secondary index whose rows arrive in
+/// another index's order while leaving that miss at a handful of `memcmp`s.
+pub(crate) const LEAF_HINTS: usize = 8;
+
+/// The leaf a write is likely to want next, and the keys that prove it.
+///
+/// See [`PagedTree::leaf_hint`] for the argument. Held rather than derived because
+/// the proof is two comparisons and deriving it is a descent.
+#[derive(Clone, Debug)]
+pub(crate) struct LeafHint {
+    /// The leaf.
+    pub(crate) page: PageId,
+    /// The lowest probe seen to descend into it, in comparable bytes.
+    pub(crate) low: Vec<u8>,
+    /// The highest probe seen to descend into it.
+    pub(crate) high: Vec<u8>,
+    /// The right sibling it had when it was recorded.
+    ///
+    /// Two jobs. `PageId::NONE` means the leaf was the rightmost one, whose range runs
+    /// to positive infinity, so the high end of the window is unnecessary for it - an
+    /// append is above every probe seen so far and a window would reject it.
+    ///
+    /// And it is **how a split by anybody is detected**. A split of this leaf points it
+    /// at the new page, and a merge changes it too, so a sibling that still matches is
+    /// a leaf whose fence range has not moved since the window was proved. That covers
+    /// the one case the window's own argument cannot: another process splitting this
+    /// leaf between two of our statements. It costs nothing, because the hit path
+    /// already reads this page's header to check the page is still a leaf of this tree.
+    pub(crate) right: PageId,
 }
 
 /// How many key-prefix columns a skip scan borrows on the stack.
@@ -584,269 +746,6 @@ enum Step {
 const WALK_BUDGET: usize = 2;
 
 impl PagedTree {
-    /// Builds a tree bottom-up from rows already sorted by key.
-    ///
-    /// Leaves are packed left to right at [`BULK_FILL`] and never revisited,
-    /// then each interior level is built from the level below it, then the root
-    /// is whatever the last level left. One pass, no per-key descent - the
-    /// TDD's bulk builder, and what the fixture import uses.
-    ///
-    /// @param database - the file the pages are allocated and installed in
-    /// @param tree_id - the identifier stamped into every page
-    /// @param columns - the column directory, key columns first
-    /// @param key_columns - how many leading columns form the key
-    /// @param rows - the rows, already sorted by the key columns
-    pub fn bulk_build<'d, R: AsRef<[Datum<'d>]>>(
-        database: &mut Database,
-        tree_id: u64,
-        columns: Vec<ColumnSpec>,
-        key_columns: usize,
-        rows: &[R],
-    ) -> DbResult<PagedTree> {
-        PagedTree::bulk_build_logged(database, None, tree_id, columns, key_columns, rows)
-    }
-
-    /// Builds a tree bottom-up, describing every page in the log first.
-    ///
-    /// The same builder as [`PagedTree::bulk_build`], with the write-ahead rule
-    /// applied to it: every page it allocates is an `AllocPage` record and every
-    /// page it packs is a `WritePage` record carrying the whole image, so redo
-    /// is a copy and a `CREATE INDEX` that crashed half-way is either wholly
-    /// there after recovery or wholly absent.
-    ///
-    /// A whole-image record per page is the right record here and a small one
-    /// would be wrong. The logical-redo argument that made a compaction
-    /// twenty-four bytes in Phase 3 relies on the page already being in the
-    /// state the operation started from; a bulk build's pages did not exist
-    /// before it, so there is no such state and the image *is* the instruction.
-    ///
-    /// `None` for the log is the import's case: it builds into a file nothing
-    /// has read, checkpoints it, and reopens it, so there is no window in which
-    /// a log would be consulted. Passing `None` writes the same bytes the
-    /// unlogged builder always wrote, LSN field included, which is what keeps
-    /// the import's byte-for-byte round-trip check meaningful.
-    ///
-    /// @param database - the file the pages are allocated and installed in
-    /// @param log - where the records go, when the build is inside a transaction
-    /// @param tree_id - the identifier stamped into every page
-    /// @param columns - the column directory, key columns first
-    /// @param key_columns - how many leading columns form the key
-    /// @param rows - the rows, already sorted by the key columns
-    pub fn bulk_build_logged<'d, R: AsRef<[Datum<'d>]>>(
-        database: &mut Database,
-        log: Option<&mut dyn crate::write::TreeLog>,
-        tree_id: u64,
-        columns: Vec<ColumnSpec>,
-        key_columns: usize,
-        rows: &[R],
-    ) -> DbResult<PagedTree> {
-        PagedTree::bulk_build_rows(
-            database,
-            log,
-            tree_id,
-            columns,
-            key_columns,
-            &crate::leaf::RowSlice(rows),
-        )
-    }
-
-    /// Builds a tree bottom-up from a row source, holding one leaf at a time.
-    ///
-    /// **Two passes over the sizing arithmetic, and one leaf image in memory.**
-    /// The builder allocates its leaves as one contiguous run, so it has to know
-    /// the leaf count before it writes the first one. It used to find
-    /// that out by packing every leaf into a `Vec<Vec<u8>>` and taking its
-    /// length, which is a whole second copy of the tree held live for the sake
-    /// of one integer: 6.2 MiB of a `CREATE INDEX` whose entire resident cost
-    /// was 28.9 MiB.
-    ///
-    /// [`LeafBuilder::fit`] answers the same question without encoding
-    /// anything, so the count is taken first, the run is allocated, and each
-    /// leaf is then packed into a buffer that is logged and dropped before the
-    /// next one is made. The two passes see the same values and price the same
-    /// spill threshold, so they agree by construction rather than by luck - and
-    /// the counting pass writes nothing, which is what makes running it twice
-    /// safe.
-    ///
-    /// One thing does move: an oversized value's extent pages are now allocated
-    /// **after** the leaf run rather than interleaved with it, because the run
-    /// is claimed before any packing happens. The leaves are therefore *more*
-    /// contiguous than they were, which is the property the run exists for.
-    ///
-    /// @param database - the file the pages are allocated and installed in
-    /// @param log - where the records go, when the build is inside a transaction
-    /// @param tree_id - the identifier stamped into every page
-    /// @param columns - the column directory, key columns first
-    /// @param key_columns - how many leading columns form the key
-    /// @param rows - the rows, already sorted by the key columns
-    pub fn bulk_build_rows<'d>(
-        database: &mut Database,
-        mut log: Option<&mut dyn crate::write::TreeLog>,
-        tree_id: u64,
-        columns: Vec<ColumnSpec>,
-        key_columns: usize,
-        rows: &dyn crate::leaf::Rows<'d>,
-    ) -> DbResult<PagedTree> {
-        let page_size = database.page_size();
-        let encoding = KeyEncoding::choose(&columns, key_columns);
-        let collations = collations_of(&columns, key_columns);
-        let directions = directions_of(&columns, key_columns);
-        let builder = LeafBuilder::new(page_size, tree_id, columns.clone(), key_columns)?;
-
-        // **The bulk builder always spills, logged or not.** The import builds
-        // unlogged - it writes into a file nothing has read and checkpoints it -
-        // and it has to produce the same tree the DDL path produces from the
-        // same rows, because `ImportedDatabase::import_with` reads the catalog
-        // back and refuses if it differs from what it wrote. A builder that
-        // spilled only when it had a log would make the two disagree about where
-        // a four-kilobyte value lives.
-        let mut nowhere = crate::write::NoLog::default();
-
-        // Pass one: how many rows each leaf takes, and each leaf's first key as
-        // a separator. Nothing is encoded, allocated or written.
-        let mut boundaries: Vec<usize> = Vec::new();
-        let mut separators: Vec<Vec<u8>> = Vec::new();
-        let mut head: Vec<Datum<'d>> = Vec::with_capacity(key_columns);
-        let mut at = 0usize;
-        let mut row_count = 0u64;
-        let total = rows.len();
-        while at < total {
-            let placed = builder.fit(rows, at, BULK_FILL, true);
-            if placed == 0 {
-                // Every oversized text and blob would have gone out of line, so
-                // what is left is keys, fixed-width slots and sixteen bytes per
-                // reference. A row that still does not fit is one whose *key* is
-                // most of a page.
-                return Err(misuse(
-                    "a row's keys and fixed-width columns alone are larger than a page",
-                ));
-            }
-            head.clear();
-            for column in 0..key_columns {
-                head.push(rows.value(at, column));
-            }
-            let mut separator = Vec::new();
-            encoding.encode_into(&head, &collations, &directions, &mut separator);
-            separators.push(separator);
-            boundaries.push(placed);
-            at = at.saturating_add(placed);
-            row_count = row_count.saturating_add(placed as u64);
-        }
-        // An empty tree is still a tree: one empty leaf, so every reader has a
-        // page to land on and nothing has to special-case a root that does not
-        // exist.
-        let empty = boundaries.is_empty();
-        if empty {
-            boundaries.push(0);
-            separators.push(Vec::new());
-        }
-
-        // Pass two: the leaves themselves. They are allocated as one run so the
-        // sibling chain is also the file's page order, which is what makes a
-        // full scan sequential - and one image is live at a time.
-        let leaf_pages = boundaries.len();
-        let first_leaf = database.allocate(leaf_pages as u64)?;
-        let mut leaves: Vec<PageId> = Vec::with_capacity(leaf_pages);
-        let mut placed_at = 0usize;
-        for (index, placed) in boundaries.iter().copied().enumerate() {
-            let mut image = if empty {
-                builder.encode_empty()?
-            } else {
-                let mut spiller = Extender {
-                    database,
-                    log: match log.as_deref_mut() {
-                        Some(log) => log,
-                        None => &mut nowhere,
-                    },
-                    tree_id,
-                    written: Vec::new(),
-                };
-                builder.encode_rows(rows, placed_at, placed, Some(&mut spiller))?
-            };
-            placed_at = placed_at.saturating_add(placed);
-            let id = PageId(first_leaf.0.saturating_add(index as u64));
-            let right = if index.saturating_add(1) < leaf_pages {
-                PageId(id.0.saturating_add(1))
-            } else {
-                PageId::NONE
-            };
-            page::set_right(&mut image, right)?;
-            log_built_page(&mut log, database, id, &mut image)?;
-            leaves.push(id);
-        }
-
-        // Pass two: the interior levels, bottom up.
-        let mut level = 1u16;
-        let mut children = leaves.clone();
-        let mut child_keys = separators;
-        let mut root = *leaves.first().unwrap_or(&PageId::NONE);
-        let mut height = 0u16;
-        while children.len() > 1 {
-            let interior = InteriorBuilder::new(page_size, tree_id, level)?;
-            let mut parents: Vec<PageId> = Vec::new();
-            let mut parent_keys: Vec<Vec<u8>> = Vec::new();
-            let mut cursor = 0usize;
-            while cursor < children.len() {
-                let remaining_keys: Vec<&[u8]> = child_keys
-                    .get(cursor.saturating_add(1)..)
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|key| key.as_slice())
-                    .collect();
-                let fit = interior
-                    .capacity(&remaining_keys)
-                    .min(children.len().saturating_sub(cursor))
-                    .max(1);
-                let group: Vec<Swip> = children
-                    .get(cursor..cursor.saturating_add(fit))
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|page| Swip::unswizzled(*page))
-                    .collect();
-                let group_separators: Vec<&[u8]> = child_keys
-                    .get(cursor.saturating_add(1)..cursor.saturating_add(fit))
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|key| key.as_slice())
-                    .collect();
-                let mut image = interior.build(&group_separators, &group)?;
-                let id = database.allocate(1)?;
-                log_built_page(&mut log, database, id, &mut image)?;
-                parents.push(id);
-                parent_keys.push(child_keys.get(cursor).cloned().unwrap_or_default());
-                cursor = cursor.saturating_add(fit);
-            }
-            children = parents;
-            child_keys = parent_keys;
-            height = level;
-            level = level.saturating_add(1);
-            root = *children.first().unwrap_or(&PageId::NONE);
-            if level > 32 {
-                return Err(corrupt(
-                    "the bulk builder made a tree deeper than 32 levels",
-                ));
-            }
-        }
-        let collations = collations_of(&columns, key_columns);
-        let directions = directions_of(&columns, key_columns);
-        Ok(PagedTree {
-            tree_id,
-            root,
-            height,
-            columns,
-            key_columns,
-            page_size,
-            encoding,
-            collations,
-            directions,
-            first_leaf: *leaves.first().unwrap_or(&PageId::NONE),
-            leaf_count: leaves.len() as u64,
-            row_count,
-            scratch: RefCell::new(Vec::new()),
-            stats: std::cell::Cell::new(crate::write::WriteStats::default()),
-        })
-    }
-
     /// Rebuilds the handle for a tree already in a file.
     ///
     /// The shape - root, height, first leaf, counts - is recorded in the
@@ -911,6 +810,8 @@ impl PagedTree {
             leaf_count,
             row_count,
             scratch: RefCell::new(Vec::new()),
+            leaf_hints: std::cell::RefCell::new(Vec::new()),
+            hint_victim: std::cell::Cell::new(0),
             stats: std::cell::Cell::new(crate::write::WriteStats::default()),
         })
     }
@@ -980,6 +881,14 @@ impl PagedTree {
     /// @param delta - how many leaves were gained or lost
     pub(crate) fn note_leaves(&mut self, delta: i64) {
         self.leaf_count = self.leaf_count.saturating_add_signed(delta);
+        // **A split and a merge are the only things that move a leaf's low fence, and
+        // both come through here**, so this is where the leaf hint is dropped. See
+        // [`PagedTree::leaf_hint`]: the hint says "a key at or above these bytes
+        // belongs in that page", and that sentence is about a fence.
+        if let Ok(mut hints) = self.leaf_hints.try_borrow_mut() {
+            hints.clear();
+        }
+        self.hint_victim.set(0);
     }
 
     /// Adjusts the row count by a signed amount.
@@ -1222,24 +1131,16 @@ impl PagedTree {
                 return Ok(Some(Hit::Sorted(row)));
             }
         }
-        let compared = probe.len().min(self.key_columns);
-        for entry in 0..leaf.delta_count() {
-            let mut matches = true;
-            for column in 0..compared {
-                let held = leaf.delta_value(entry, column)?;
-                let wanted = probe.get(column).copied().unwrap_or(Datum::Null);
-                if crate::types::compare_under(&held, &wanted, leaf.collation_of(column))
-                    != std::cmp::Ordering::Equal
-                {
-                    matches = false;
-                    break;
-                }
-            }
-            if matches {
-                return Ok(Some(Hit::Delta(entry)));
-            }
+        // The delta directory is in key order, so this is a binary search over
+        // the columns the probe names - the same rule as `probe_leaf`'s.
+        if leaf.delta_count() == 0 {
+            return Ok(None);
         }
-        Ok(None)
+        let compared = probe.len().min(self.key_columns);
+        match leaf.delta_search(probe.get(..compared).unwrap_or(probe))? {
+            Ok(entry) => Ok(Some(Hit::Delta(entry))),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Reads every out-of-line value one leaf holds.
@@ -1312,42 +1213,6 @@ impl PagedTree {
             }
         }
         Ok(refs)
-    }
-
-    /// Returns every page the tree occupies, interior pages and leaves.
-    ///
-    /// For `DROP`, which gives them back to the free map. It walks the interior
-    /// levels rather than following the sibling chain, because the chain only
-    /// reaches the leaves and a dropped tree that left its interior pages behind
-    /// would leak a page per fanout for the life of the file.
-    ///
-    /// The walk is level-order from the root, and a page that appears twice -
-    /// which a corrupt file could produce - is returned once, because handing
-    /// the same page to the free map twice is worse than leaking it.
-    ///
-    /// @param pool - the buffer pool the file is open through
-    pub fn pages(&self, pool: &Pool) -> DbResult<Vec<PageId>> {
-        let mut seen: Vec<PageId> = Vec::new();
-        let mut frontier: Vec<PageId> = vec![self.root];
-        while let Some(page) = frontier.pop() {
-            if page.is_none() || seen.contains(&page) {
-                continue;
-            }
-            seen.push(page);
-            let image = {
-                let guard = pool.fetch(page)?;
-                guard.bytes().to_vec()
-            };
-            if page::kind_of(&image)? == PageKind::Leaf {
-                continue;
-            }
-            let interior = InteriorRef::parse(&image)?;
-            for child in 0..interior.children() {
-                let swip = interior.swip(child)?;
-                frontier.push(pool.page_of_swip(swip)?);
-            }
-        }
-        Ok(seen)
     }
 
     /// Checks one subtree's separators against its children's first keys.

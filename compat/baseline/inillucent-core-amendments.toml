@@ -14,9 +14,9 @@ sha256 = "bb4b0a0bd2523ba2f97d85ffea879878ad69ffbe500c63be074df3c724ba6307"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/arm.rs"
-ticket = "task-1967"
-reason = "Moved by b3c7477 (task-1967): the check's own re-embedding was the side that moved. Never declared here; task-1973 declares it because the guard was red at HEAD and this file is not its work."
-sha256 = "a91388417bcb354492126bd97c72b244accae4f60943d66380a35d741469efc0"
+ticket = "task-2110"
+reason = "Bug 5: a manifest can say runnable false, for a model whose vectors come from outside (the Qwen3 teachers), and an installed arm that fails to open fails the arm tests rather than skipping"
+sha256 = "b5af34b3436dc579039fa0d92f87d6ffef0e3c6ccfe0722ee07e64fff674a2a1"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/corpus.rs"
@@ -26,9 +26,9 @@ sha256 = "51481630369add08d37508f8ddbac2ae5dd552feda58bc44f3914ee0e7ed1510"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/embedcheck.rs"
-ticket = "task-1973"
-reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. The sampled chunk and its stored vector are looked up through chunk_at and stored_vector, which report a sampler that disagrees with the cache rather than comparing a vector against the wrong text. The three assertions clippy folded to a constant are two let bindings and one const block, which also clears the assertions_on_constants warnings that were failing cargo clippy -D warnings on main."
-sha256 = "847816e0fe492f9916183ba3cdcd813ce885ec7342441af32b65794b88e3844a"
+ticket = "task-2110"
+reason = "Bug 5: a manifest can say runnable false, for a model whose vectors come from outside (the Qwen3 teachers), and an installed arm that fails to open fails the arm tests rather than skipping"
+sha256 = "f738cddf653d90e174034d99401d1c6f92f6c6fd8b45662958041aea0bcc4da7"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/engine.rs"
@@ -38,9 +38,9 @@ sha256 = "fb0792c4483c9ef452769c933eb5f3dcfc9bab32c8b3753840fb35d9e7b294a3"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/gradeembed.rs"
-ticket = "task-1977"
-reason = "task-1977: the card moved out of this file. 'type LaneScores' through 'print_summary' is crates/inillucent-bench/src/gradeembed/card.rs now, 733 lines, and this file is 3,094 rather than 3,815. The one dead #[allow(clippy::too_many_arguments)] above score_family also came off: clippy.toml sets too-many-arguments-threshold = 8 and score_family takes six. Nothing else changed and the 178 bench tests pass unchanged. This entry replaces task-1973's, which declared the lint work on the same file."
-sha256 = "26c5e8f0dfe993325b29d1ce6f4f5eb02085ff81d891316c4bf933d6a7af9c64"
+ticket = "task-2110"
+reason = "Bug 5: a manifest can say runnable false, for a model whose vectors come from outside (the Qwen3 teachers), and an installed arm that fails to open fails the arm tests rather than skipping"
+sha256 = "be730b4033a68e3ca632e3af9d4636b856d7c0e6ca0299eaed2a67d1593cdb9a"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/gradeembed/card.rs"
@@ -74,9 +74,9 @@ sha256 = "641c0bafaaaa7821837056b1f26a50d8211e10693074d87df99ab9868754bf9e"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/models.rs"
-ticket = "task-1973"
-reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. The streamed digest errors if a reader ever answers with more bytes than the buffer holds."
-sha256 = "e4e554db36ef5104f96ec0c9a4a9bc59ae72adfd640d83fcca1633612393ba9b"
+ticket = "task-2110"
+reason = "Bug 5: a manifest can say runnable false, for a model whose vectors come from outside (the Qwen3 teachers), and an installed arm that fails to open fails the arm tests rather than skipping"
+sha256 = "1108adb3d0aef55f0671952663087e2551c58c7724095d9f28292945c86d3c12"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/queryset.rs"
@@ -134,9 +134,9 @@ sha256 = "fa7a8835c1902cb0416076044c595c8bd41be314ae9a51061b19727e03f31dc2"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/truncation.rs"
-ticket = "task-1970"
-reason = "Moved by aa63027 (task-1970): the rustfmt pass over this crate. Never declared here; task-1973 declares it because the guard was red at HEAD and this file is not its work."
-sha256 = "056d843526453f3a1d8d0d2e64c93bd0ba9b19a97321e1839fbbc3d442bf7661"
+ticket = "task-2110"
+reason = "Bug 5: a manifest can say runnable false, for a model whose vectors come from outside (the Qwen3 teachers), and an installed arm that fails to open fails the arm tests rather than skipping"
+sha256 = "15f02de728473198d3e9c9115379d1039f1ce126ddc966039ed28dadec6027bb"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/tune.rs"
@@ -158,15 +158,15 @@ sha256 = "0c6c4ace63ffcb8104de467d93ae011623a00d0418c5bb2dcdd2a3cd97a49944"
 
 [[amendment]]
 path = "crates/inillucent-core/src/bm25.rs"
-ticket = "task-1932"
-reason = "M4: the 33rd flag name is an error rather than an abort, so add_chunks and the four Index methods over it answer a Result"
-sha256 = "a489f36745aac5bdcf9160277e1d7fd3b13161aeda88d628caf265d0e9d96f3e"
+ticket = "task-2068"
+reason = "the postings are flat arrays with an overflow map: one byte array for the terms, one for the postings, a start per term, and a binary search instead of a hash. 306.2 MiB resident to 209.4 for 211.1 on disk on a 185,078 chunk index."
+sha256 = "5385963e4c128250c4694a9ca371df1318afa2f5eeeb400c9bc6d53e5112b660"
 
 [[amendment]]
 path = "crates/inillucent-core/src/distance.rs"
-ticket = "task-1953"
-reason = "task-1946 H4: check_query refuses a query whose width is not the index's and one holding a component that is not finite, with the wording inillucent-search's vector_of already uses. dot is untouched - it is the hot loop, and the check belongs at the boundary, once per query rather than once per candidate."
-sha256 = "bcc20230f1d306dd3bf693be2063929457d95c02cc5196a5349a86483bba960f"
+ticket = "task-2006"
+reason = "task-2000 design 9: an explicit AVX2 and FMA dot product with eight 256-bit accumulators, selected once through is_x86_feature_detected! and falling back to the scalar loop. The release profile sets no target-cpu, because a published binary has to run on the processors people have, so the auto-vectorised four accumulator loop compiled to 128-bit lanes. It does not produce bit-identical answers and cannot - a different number of accumulators is a different summation order - and the measured worst absolute disagreement over ten thousand random L2 normalised pairs at 768 dimensions is 5.4e-8, under half a unit in the last place of an f32 near 1.0. Vector search p50 went 0.934 ms to 0.7974."
+sha256 = "b4533c58c4dfd3b5e73fc4449b3cba46d8fc4d320e678e62b773d6615a455e7c"
 
 [[amendment]]
 path = "crates/inillucent-core/src/embed.rs"
@@ -194,15 +194,15 @@ sha256 = "ef2b935a4f7ec6a35b8755f758e11eb863dc37fb28f7abeda781f3b9154c2e0d"
 
 [[amendment]]
 path = "crates/inillucent-core/src/hnsw.rs"
-ticket = "task-1962"
-reason = "task-1961 A9: search_layer_filtered takes a VisitBudget instead of ef, max_visits and exhausted as its last three arguments - two usize in a row, which is the pair a caller swaps. The walk is unchanged: the same budget, the same stopping condition, the same exhausted flag. task-1932 M4's two graph invariants are still there."
-sha256 = "bc8c99f22be1196d8381b20212f450331c583419f61d85c7451f91f5f72c8af5"
+ticket = "task-2068"
+reason = "the neighbour list is read through binio::read_pod_vec rather than reserved from a raw u32 off disk; a fuzz target found 14 GB asked for from a 21 byte input."
+sha256 = "a783de8198752d17fa1d349e043f47fd41d71fb25dffd0b91d7dc8527be8774c"
 
 [[amendment]]
 path = "crates/inillucent-core/src/index.rs"
-ticket = "task-1980"
-reason = "R16: a document with no embedding is no longer returned by the vector branch, so a pure vector query stops answering it at score zero and a hybrid query stops labelling it origin=both. The filter is on the answer rather than on the scan, so the exhaustive reference every recall number is graded against is unchanged."
-sha256 = "965325d2adbd1cae4f0005adc75c82934bed3a9dbf5878be8b92d1419394b4e2"
+ticket = "task-2068"
+reason = "make_text_resident, for a caller that reads every chunk once - inillucent-migrate digests a whole corpus and should not pay a positional read each."
+sha256 = "2da11e58aeb70de253f1f22fc2d67094574d53654d839341f9104e73e2ea061e"
 
 [[amendment]]
 path = "crates/inillucent-core/src/install.rs"
@@ -218,15 +218,15 @@ sha256 = "684d92dc2622ba9bd7c5032c224a3848c81d5d1531846ab355560c9de4e4896d"
 
 [[amendment]]
 path = "crates/inillucent-core/src/model.rs"
-ticket = "task-1932"
-reason = "H9: inillucent-core joins GOVERNED. The four panic lints and deny(missing_docs) are now on the crate, every module states its invariant, 167 doc comments were written and every indexing, slicing, unwrap and expect site the lints report is rewritten."
-sha256 = "194dc2057506af2b35c24b0a846baad8ae6848c42f4761268e1eeb51e3c9bd02"
+ticket = "task-2110"
+reason = "Bug 5: a manifest can say runnable false, for a model whose vectors come from outside (the Qwen3 teachers), and an installed arm that fails to open fails the arm tests rather than skipping"
+sha256 = "44b7781a6d3147e79b283e9f518b65a33d41c43ff5f3983bb31630df5e53e689"
 
 [[amendment]]
 path = "crates/inillucent-core/src/persist.rs"
-ticket = "task-1953"
-reason = "task-1946 H4: seven test call sites carry the refusal the entry points now return."
-sha256 = "1ef665261d50913cfb5336aa6fe9390d299a004b219b8e41d3072c5af1e48389"
+ticket = "task-2068"
+reason = "a load counts where the text section begins and files the arena there rather than reading it; write_to still writes the text inline, so an index written by any build opens under either."
+sha256 = "96aa68a5a91c85fdad287b5d2bc23e5b20a116580945961f6dd31370bc81c167"
 
 [[amendment]]
 path = "crates/inillucent-core/src/quantize.rs"
@@ -242,15 +242,15 @@ sha256 = "022f1fe51faf8019de7517920c0d00798c2121dd873b2f9a18f7b8dbec44e7c4"
 
 [[amendment]]
 path = "crates/inillucent-core/src/residency.rs"
-ticket = "task-1970"
-reason = "the same change to the one skip in this file (task-1969, 4.6)"
-sha256 = "351e16ab8fd9c30bc60c22f2d1e5446db8578d3502edd9ed30927b57fcf943b8"
+ticket = "task-2068"
+reason = "The skip site in managed_or_skip announced with a bare eprintln! carrying the marker and then returned None. A print does not panic under INILLUCENT_STRICT, and the policy guard could not read the message because the literal starts on the line after the eprintln!( - so all four ONNX residency cases reported green on a machine with no weights. The site now calls inillucent_base::testing::skipping, which is what task-1946 intended when it replaced a silent ? with a message. No behaviour changes on a machine that has the weights: the function returns None in exactly the same case, and the only difference is that a strict run now says so. task-2066 section 4.4.11."
+sha256 = "17e49794567b07924cf7ac27d97d8cea6b3e5725de7cec2ab2cf4489ced3f47f"
 
 [[amendment]]
 path = "crates/inillucent-core/src/store.rs"
-ticket = "task-2001"
-reason = "task-2001: a tombstoned document is one document row, not one row per chunk. add_chunks kept a chunk that arrived already deleted out of doc_lookup, so the next chunk of the same document could not find it and opened another row; 53 tombstoned documents holding 183 chunks became 183 rows and n_documents answered 38,977 for a corpus of 38,847. A second derived map, tombstoned_lookup, holds the tombstoned documents, and which map answers is the incoming chunk's own state. find_document still reads only the live map, so task-1775's rule that a live append cannot attach to a dead row is unchanged, and both maps are serde(skip) so no format on disk moved. Verified on the graded corpus: the same cache and the same build command print 38847 documents with every other build statistic identical. Six tests, five of which fail on the old code."
-sha256 = "785bf751e93d400dd22a64362b7829c9b8ec31dbd17822f8844120257d0f0dae"
+ticket = "task-2068"
+reason = "the chunk text is a TextArena that a load can leave in store.bin and read a range at a time. 156.0 MiB of a 580.2 MiB open. The file format is unchanged."
+sha256 = "10053a29c722596ec38eb5ce45ae0f7027ca007e5a07f203723fbbcc5de9a9de"
 
 [[amendment]]
 path = "crates/inillucent-core/src/tokenize.rs"
@@ -260,19 +260,19 @@ sha256 = "b6116086d1a456cf215a5ac2858f5c8c5d58a03393455fa882c2add94db49bcb"
 
 [[amendment]]
 path = "crates/inillucent-core/src/vectors.rs"
-ticket = "task-1932"
-reason = "H9: inillucent-core joins GOVERNED. The four panic lints and deny(missing_docs) are now on the crate, every module states its invariant, 167 doc comments were written and every indexing, slicing, unwrap and expect site the lints report is rewritten."
-sha256 = "6784023d2abb05e4d0a5ddf644c92aaf0656a03f937b82fdbb058f52bd30da8f"
+ticket = "task-2068"
+reason = "read_exact_at is pub(crate) so the filed text arena can use the same positional read the filed vectors do."
+sha256 = "dfa1613a5b921453856c3822f6add1db9a8245400860a07c9c5918895cf69b23"
 
 [[amendment]]
 path = "inillucent-scorecard.json"
-ticket = "task-2001"
-reason = "Moved by b47d6d0 (task-1935): a fresh retrieval run, published to both files. Never declared here; task-2001 declares it because the guard was red at HEAD and this file is not its work. Note that the run this pins is the one whose header reads '185078 chunks across 38977 documents', which is the defect task-2001 fixed: the corpus holds 38,847 documents and the same build command prints 38847 now. Neither file was edited by hand and no measurement was touched. The header and the build cost table will read 38847 the next time the card is generated, and this pin has to move again then."
-sha256 = "54b88f1494290002f204424f80d8ac3885191e5bc2ad20fdc545f7ebfabe4bc7"
+ticket = "task-2006"
+reason = "task-2000: a fresh grade against PostgreSQL with pgvector on the synthetic corpus, the protocol task-1935 published, published to both files. Re-run at the commit the documents publish, so the card and the pages are one run. The build is 16.8 s from 129.7, vector search p50 0.8462 ms from 0.934 - which is short of the TDD asking for 0.65 - and the ranking verdicts are what they were: 15 better, 1 equivalent, 1 inconclusive, 0 worse, every correctness gate passing. Latency does not reproduce between runs and is not expected to: it is wall clock against a live PostgreSQL and both engines moved by tenths of a millisecond between the 09-19 and 09-20 sittings. The ranking families reproduce to four decimal places."
+sha256 = "4088dd3c9d798a6664786cfecd1af797a1c712844dc5ce140c41e78fe8eefc01"
 
 [[amendment]]
 path = "inillucent-scorecard.md"
-ticket = "task-2001"
-reason = "Moved by b47d6d0 (task-1935): a fresh retrieval run, published to both files. Never declared here; task-2001 declares it because the guard was red at HEAD and this file is not its work. Note that the run this pins is the one whose header reads '185078 chunks across 38977 documents', which is the defect task-2001 fixed: the corpus holds 38,847 documents and the same build command prints 38847 now. Neither file was edited by hand and no measurement was touched. The header and the build cost table will read 38847 the next time the card is generated, and this pin has to move again then."
-sha256 = "4f82f033c640060eb53c3347f4d5ea1b198683b223a119340c8c056ddc0f0783"
+ticket = "task-2006"
+reason = "task-2000: a fresh grade against PostgreSQL with pgvector on the synthetic corpus, the protocol task-1935 published, published to both files. Re-run at the commit the documents publish, so the card and the pages are one run. The build is 16.8 s from 129.7, vector search p50 0.8462 ms from 0.934 - which is short of the TDD asking for 0.65 - and the ranking verdicts are what they were: 15 better, 1 equivalent, 1 inconclusive, 0 worse, every correctness gate passing. Latency does not reproduce between runs and is not expected to: it is wall clock against a live PostgreSQL and both engines moved by tenths of a millisecond between the 09-19 and 09-20 sittings. The ranking families reproduce to four decimal places."
+sha256 = "f491c9bfea4fd2f96ad3619535abc3b7ef5bfd89ce6b7f55365ff70c0c907006"
 

@@ -173,6 +173,30 @@ pub fn build<'t>(
     let prepared = prepare(plan, catalog, ForcePlan::default())?;
     build_prepared(plan, catalog, &prepared, params, sink)
 }
+/// Builds a pipeline over already-chosen stages, with the `EXPLAIN` listing.
+///
+/// The same pipeline [`build_prepared`] builds, plus `Shape::operators`. It is
+/// a second entry point rather than a flag for the reason [`source_for_run`]
+/// is a second entry point beside the description: a caller that wants the
+/// listing is asking a different question from one that wants the pipeline,
+/// and every caller that wants it is a diagnostic - `inillucent-readgate`
+/// prints it beside SQLite's plan, and the plan campaign test compares the
+/// chains one lever change produces.
+///
+/// @param plan - the planner's output
+/// @param catalog - where the trees and layouts come from
+/// @param prepared - the structural choices [`prepare`] made
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param sink - the end of the pipeline
+pub fn build_prepared_described<'t>(
+    plan: &PhysicalPlan,
+    catalog: &'t dyn TreeCatalog,
+    prepared: &Prepared,
+    params: &Params,
+    sink: Box<dyn Sink>,
+) -> DbResult<(Pipeline<'t>, Shape)> {
+    build_prepared_with(plan, catalog, prepared, params, sink, Listing::kept())
+}
 /// Builds a pipeline over already-chosen stages.
 ///
 /// @param plan - the planner's output
@@ -187,6 +211,24 @@ pub fn build_prepared<'t>(
     params: &Params,
     sink: Box<dyn Sink>,
 ) -> DbResult<(Pipeline<'t>, Shape)> {
+    build_prepared_with(plan, catalog, prepared, params, sink, Listing::dropped())
+}
+/// Builds a pipeline over already-chosen stages, keeping the listing or not.
+///
+/// @param plan - the planner's output
+/// @param catalog - where the trees and layouts come from
+/// @param prepared - the structural choices [`prepare`] made
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param sink - the end of the pipeline
+/// @param listing - whether to render the operator chain as it is built
+fn build_prepared_with<'t>(
+    plan: &PhysicalPlan,
+    catalog: &'t dyn TreeCatalog,
+    prepared: &Prepared,
+    params: &Params,
+    sink: Box<dyn Sink>,
+    listing: Listing,
+) -> DbResult<(Pipeline<'t>, Shape)> {
     // Every uncorrelated subquery is answered once, here, before anything is
     // built over it. See `crate::subquery` for why it is per execution.
     let folded = crate::subquery::fold(plan, catalog, params)?;
@@ -194,10 +236,14 @@ pub fn build_prepared<'t>(
     let held = space_of(catalog, prepared)?;
     let mut space = held.view(&prepared.stages);
     space.catalog = Some(catalog);
-    let chain = build_chain(plan, catalog, prepared, &space, params, sink)?;
-    let (source, description) = source_for(plan, catalog, &space, params, prepared, chain.limit)?;
-    let mut operators = chain.operators;
-    operators.push(description);
+    let chain = build_chain(plan, catalog, prepared, &space, params, sink, listing)?;
+    // The source is built without its description and described beside itself,
+    // so the two cannot drift apart while a listing nobody asked for costs
+    // neither the `format!` nor the `String`.
+    let source = source_for_run(plan, catalog, &space, params, prepared, chain.limit)?;
+    let mut listing = chain.operators;
+    listing.add(|| describe_source(prepared));
+    let mut operators = listing.into_lines();
     operators.reverse();
     Ok((
         Pipeline {
@@ -318,12 +364,62 @@ pub(crate) fn space_of(catalog: &dyn TreeCatalog, prepared: &Prepared) -> DbResu
         order,
     })
 }
+/// The `EXPLAIN` listing a chain writes as it assembles itself, or nothing.
+///
+/// **Because every caller but two throws the listing away (task-2026).**
+/// `Shape::operators` is the built operator chain rendered as text, and nothing
+/// in the engine reads it: `EXPLAIN` and `EXPLAIN QUERY PLAN` answer from
+/// `PhysicalPlan::describe` and `Prepared::describe`, which work off the plan
+/// rather than off the chain. The two readers are `inillucent-readgate`, which
+/// prints this engine's chain beside SQLite's, and the plan campaign test.
+/// Every other caller - including the gate's own `prepare.trivial`, which
+/// builds a pipeline on every one of its iterations - paid for a `Vec<String>`
+/// and a `format!` per operator and dropped the result: three of the
+/// twenty-one allocations compiling `SELECT 1` made.
+///
+/// The line is passed as a closure rather than as a `String` so that a listing
+/// nobody asked for costs the `format!` nothing as well as the push. A
+/// `Vec<String>` argument could not do that: the caller would have formatted
+/// before it got here.
+pub(crate) struct Listing {
+    lines: Option<Vec<String>>,
+}
+
+impl Listing {
+    /// Returns a listing that keeps what it is given.
+    pub(crate) fn kept() -> Listing {
+        Listing {
+            lines: Some(Vec::new()),
+        }
+    }
+
+    /// Returns a listing that keeps nothing and formats nothing.
+    pub(crate) fn dropped() -> Listing {
+        Listing { lines: None }
+    }
+
+    /// Adds one operator's line, when a listing is being kept.
+    ///
+    /// @param line - how to render it, called only when it is wanted
+    pub(crate) fn add(&mut self, line: impl FnOnce() -> String) {
+        if let Some(lines) = self.lines.as_mut() {
+            lines.push(line());
+        }
+    }
+
+    /// Returns the lines, sink first, or an empty vector.
+    pub(crate) fn into_lines(self) -> Vec<String> {
+        self.lines.unwrap_or_default()
+    }
+}
+
 /// Everything a built operator chain is, short of the source that drives it.
 struct Chain<'t> {
     /// The head of the chain: what the source pushes into.
     head: Box<dyn Sink + 't>,
     /// The operator descriptions, sink first; the source is appended last.
-    operators: Vec<String>,
+    /// Empty throughout when the caller did not ask for a listing.
+    operators: Listing,
     /// The output column names.
     names: Vec<Vec<u8>>,
     /// The statement's constant `LIMIT`, which the source may use.
@@ -352,8 +448,9 @@ struct Chain<'t> {
 pub(crate) struct Upper {
     /// Every operator above the source, holding no borrow of anything.
     pub(crate) head: Box<dyn Sink>,
-    /// The operator descriptions, sink first.
-    pub(crate) operators: Vec<String>,
+    /// The operator descriptions, sink first, or nothing when the caller did
+    /// not ask for a listing.
+    pub(crate) operators: Listing,
     /// The output column names.
     pub(crate) names: Vec<Vec<u8>>,
     /// The statement's constant `LIMIT`, which the source may use.
@@ -363,6 +460,10 @@ pub(crate) struct Upper {
     /// borrowed for the chain's own lifetime, which is exactly what this
     /// function does not take.
     pub(crate) correlations: Vec<crate::correlate::Correlation>,
+    /// The `WHERE` conjuncts that read no subquery, compiled for
+    /// [`crate::correlate::Correlated`] to test before it answers a block.
+    /// Empty whenever `correlations` is.
+    pub(crate) gate: Vec<Box<dyn crate::expr::Eval>>,
 }
 /// Builds every operator above the source, short of the inner join stages and
 /// the correlation operator - the part of a chain that holds no borrow of the
@@ -452,6 +553,10 @@ struct Upward<'a> {
     offset: usize,
     /// The result columns and the sort keys.
     outputs: Outputs,
+    /// The `WHERE` conjuncts the filters above the correlation operator test,
+    /// or `None` when there is no such operator and the plan's own residuals
+    /// are used as they are.
+    filters_above: Option<Vec<BoundExpr>>,
 }
 
 /// Whether the source walks its tree backwards.
@@ -512,11 +617,12 @@ fn correlated_columns(
         catalog: Some(catalog),
         correlations: &[],
     };
-    let correlations = crate::correlate::correlations_of(plan, &|expr: &BoundExpr| match expr {
-        BoundExpr::Column { source, column, .. } => outer.column(*source, *column as usize),
-        BoundExpr::Rowid { source } => outer.rowid(*source),
-        _ => None,
-    })?;
+    let correlations =
+        crate::correlate::correlations_of(plan, catalog, &|expr: &BoundExpr| match expr {
+            BoundExpr::Column { source, column, .. } => outer.column(*source, *column as usize),
+            BoundExpr::Rowid { source } => outer.rowid(*source),
+            _ => None,
+        })?;
     let joined_width = space.types.len();
     let columns: Vec<(usize, usize)> = correlations
         .iter()
@@ -640,7 +746,7 @@ fn grouping_of(
         select.group_by.iter().map(expression_collation).collect();
     let grouped_walk = plan.aggregation == AggregationMode::Grouped
         && !prepared.forced.hash_group
-        && (is_scan_prefix(&group_exprs, scan_order)
+        && (is_scan_prefix(&group_exprs, &group_collations, scan_order)
             || (is_reverse_scan(prepared) && plan.grouped_walk));
     Ok((group_exprs, group_collations, grouped_walk))
 }
@@ -711,16 +817,56 @@ fn already_sorted(
 /// It was the bare `LIMIT`, which made `WHERE id <= 5 ORDER BY id DESC LIMIT 2
 /// OFFSET 1` answer one row instead of two.
 ///
+/// **A sorter is the same argument and was missing from it** (task-2066
+/// §4.1.1). A `LIMIT` may be pushed below an `ORDER BY` only into an operator
+/// that preserves the order the `ORDER BY` names, and this asked every other
+/// question but that one. What it cost was the commonest recursive query there
+/// is:
+///
+/// ```sql
+/// WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<5)
+/// SELECT n FROM r ORDER BY n DESC LIMIT 1;
+/// ```
+///
+/// answering `1` where SQLite answers `5`, because the bound reached
+/// `run_recursive`, which reads it as "stop generating" - so one row was
+/// generated and then sorted. `LIMIT 2` answered `2, 1` against `5, 4`. The
+/// suite never saw it because any operator between the CTE and the sort blocks
+/// the pushdown, so the `WHERE`, `DISTINCT` and `GROUP BY` forms are all
+/// correct, and the one query with no such operator is the hierarchy walk for
+/// the deepest node, which returned the root at exit 0.
+///
+/// **This applies to every source the bound reaches, with no exception, and
+/// neither of the other two consumers loses anything** (task-2069):
+///
+/// - A **reverse scan** keeps its bound on every plan the planner can produce.
+///   `already_sorted` answers `!plan.needs_sort` for one, and `plan.reverse` is
+///   only set when `ordering_provided` returned `Some(true)`, which is exactly
+///   when `needs_sort` is false. `ordering_provided` also refuses a
+///   non-natural NULL placement, so the `default_nulls` gate cannot fail for a
+///   reverse plan either.
+/// - The **HNSW probe** is unaffected, because its bound is the `depth` the
+///   planner copied from the `LIMIT` when it chose the probe, not this. The
+///   chain limit only ever reached `iterative_candidates` on plans with no
+///   residual, and those return before reading it - which is why the parameter
+///   is gone from that function rather than being passed `None` forever.
+///
 /// @param plan - the planner's output
 /// @param prepared - the structural choices `prepare` made
 /// @param limit - the statement's own constant `LIMIT`
+/// @param sorted_already - whether the rows already arrive in the `ORDER BY`'s
+///   order, so that no sorter will be put above the source
+/// @param has_sort_keys - whether the statement names an `ORDER BY` at all
 fn source_limit_of(
     plan: &PhysicalPlan,
     prepared: &Prepared,
     limit: Option<usize>,
+    sorted_already: bool,
+    has_sort_keys: bool,
 ) -> Option<usize> {
     limit.filter(|_| {
-        plan.residuals.iter().all(Option::is_none)
+        (!has_sort_keys || sorted_already)
+            && plan.residuals.iter().all(Option::is_none)
             && plan.constant_filter.is_none()
             && prepared.stages.len() == 1
             && !plan.select.distinct
@@ -737,11 +883,11 @@ fn source_limit_of(
 /// @param offset - how many to throw away first
 fn push_limit(
     chain: Box<dyn Sink>,
-    operators: &mut Vec<String>,
+    operators: &mut Listing,
     limit: usize,
     offset: usize,
 ) -> Box<dyn Sink> {
-    operators.push(format!("LIMIT {limit} OFFSET {offset}"));
+    operators.add(|| format!("LIMIT {limit} OFFSET {offset}"));
     Box::new(Limit::new(limit, offset, chain))
 }
 
@@ -752,17 +898,29 @@ fn push_limit(
 /// @param up - everything the operators are built from
 fn push_trim(
     chain: Box<dyn Sink>,
-    operators: &mut Vec<String>,
+    operators: &mut Listing,
     up: &Upward<'_>,
 ) -> DbResult<Box<dyn Sink>> {
     if !up.outputs.needs_trim {
         return Ok(chain);
     }
-    operators.push("TRIM".to_string());
+    operators.add(|| "TRIM".to_string());
     Ok(Box::new(Project::new(
         trim(up.outputs.result_width, up.scan_types)?,
         chain,
     )))
+}
+
+/// Returns somewhere the sorter may spill, when the catalog offers one.
+///
+/// **`None` is the ordinary answer and it is not a failure** (task-2066
+/// §4.3.6): `TreeCatalog::spill` is defaulted to `None`, the write path and
+/// the two constant folds have no catalog at all, and a sort with nowhere to
+/// spill behaves exactly as it did before spilling existed.
+///
+/// @param up - what the chain is being built from
+fn spill_of(up: &Upward<'_>) -> Option<std::rc::Rc<dyn crate::spill::Spill>> {
+    up.space.catalog.and_then(|catalog| catalog.spill())
 }
 
 /// Puts the sorter and the `LIMIT` on, in whichever arrangement is right.
@@ -781,7 +939,7 @@ fn push_trim(
 /// @param up - everything the operators are built from
 fn push_sort(
     chain: Box<dyn Sink>,
-    operators: &mut Vec<String>,
+    operators: &mut Listing,
     up: &Upward<'_>,
 ) -> DbResult<Box<dyn Sink>> {
     let sort_keys = &up.outputs.sort_keys;
@@ -794,21 +952,25 @@ fn push_sort(
     }
     let chain = push_trim(chain, operators, up)?;
     let Some(limit) = up.limit else {
-        operators.push("SORT".to_string());
-        return Ok(Box::new(Sort::new(sort_keys.clone(), chain)));
+        operators.add(|| "SORT".to_string());
+        return Ok(Box::new(
+            Sort::new(sort_keys.clone(), chain).spilling_to(spill_of(up)),
+        ));
     };
     let bounded = limit.saturating_add(up.offset);
     if bounded > TopN::MAX_LIMIT || up.prepared.forced.full_sort {
         let chain = push_limit(chain, operators, limit, up.offset);
-        operators.push("SORT".to_string());
-        return Ok(Box::new(Sort::new(sort_keys.clone(), chain)));
+        operators.add(|| "SORT".to_string());
+        return Ok(Box::new(
+            Sort::new(sort_keys.clone(), chain).spilling_to(spill_of(up)),
+        ));
     }
     let chain = if up.offset > 0 {
         push_limit(chain, operators, limit, up.offset)
     } else {
         chain
     };
-    operators.push(format!("TOP {bounded}"));
+    operators.add(|| format!("TOP {bounded}"));
     Ok(Box::new(TopN::new(sort_keys.clone(), bounded, chain)))
 }
 
@@ -819,11 +981,7 @@ fn push_sort(
 /// @param chain - what it will push into
 /// @param operators - the description, collected sink first
 /// @param up - everything the operators are built from
-fn push_distinct(
-    chain: Box<dyn Sink>,
-    operators: &mut Vec<String>,
-    up: &Upward<'_>,
-) -> Box<dyn Sink> {
+fn push_distinct(chain: Box<dyn Sink>, operators: &mut Listing, up: &Upward<'_>) -> Box<dyn Sink> {
     let select = &up.plan.select;
     if !select.distinct || up.skipping {
         return chain;
@@ -839,12 +997,12 @@ fn push_distinct(
     let width = up.outputs.result_width;
     if up.plan.aggregation == AggregationMode::None
         && !up.prepared.forced.hash_distinct
-        && is_scan_prefix(&up.outputs.projected, &up.scan_order)
+        && is_scan_prefix(&up.outputs.projected, &collations, &up.scan_order)
     {
-        operators.push("DISTINCT ADJACENT".to_string());
+        operators.add(|| "DISTINCT ADJACENT".to_string());
         return Box::new(AdjacentDistinct::over(collations, width, chain));
     }
-    operators.push("DISTINCT HASH".to_string());
+    operators.add(|| "DISTINCT HASH".to_string());
     Box::new(Distinct::over(collations, width, chain))
 }
 
@@ -855,7 +1013,7 @@ fn push_distinct(
 /// @param up - everything the operators are built from
 fn push_projection(
     chain: Box<dyn Sink>,
-    operators: &mut Vec<String>,
+    operators: &mut Listing,
     up: &Upward<'_>,
 ) -> DbResult<Box<dyn Sink>> {
     // A skip scan hands up exactly the projected key columns, already in
@@ -871,7 +1029,7 @@ fn push_projection(
             .map(|expr| compile(expr, &up.projection_types))
             .collect::<DbResult<Vec<_>>>()?
     };
-    operators.push("PROJECT".to_string());
+    operators.add(|| "PROJECT".to_string());
     Ok(Box::new(Project::new(compiled, chain)))
 }
 
@@ -888,7 +1046,7 @@ fn push_projection(
 /// @param up - everything the operators are built from
 fn push_having(
     chain: Box<dyn Sink>,
-    operators: &mut Vec<String>,
+    operators: &mut Listing,
     up: &Upward<'_>,
 ) -> DbResult<Box<dyn Sink>> {
     let select = &up.plan.select;
@@ -896,7 +1054,7 @@ fn push_having(
         return Ok(chain);
     };
     let translated = translate_post(having, select, up.space, up.params, up.group_width)?;
-    operators.push("FILTER HAVING".to_string());
+    operators.add(|| "FILTER HAVING".to_string());
     Ok(Box::new(Filter::new(
         compile(&translated, &up.projection_types)?,
         chain,
@@ -910,14 +1068,14 @@ fn push_having(
 /// @param up - everything the operators are built from
 fn push_aggregate(
     chain: Box<dyn Sink>,
-    operators: &mut Vec<String>,
+    operators: &mut Listing,
     up: &Upward<'_>,
 ) -> DbResult<Box<dyn Sink>> {
     let select = &up.plan.select;
     match up.plan.aggregation {
         AggregationMode::None => Ok(chain),
         AggregationMode::Whole => {
-            operators.push("AGGREGATE".to_string());
+            operators.add(|| "AGGREGATE".to_string());
             Ok(Box::new(SimpleAggregate::new(
                 aggregate_specs(select, up.space, up.params, up.scan_types)?,
                 chain,
@@ -932,12 +1090,12 @@ fn push_aggregate(
             let specs = aggregate_specs(select, up.space, up.params, up.scan_types)?;
             let collations = up.group_collations.clone();
             if up.grouped_walk {
-                operators.push("GROUP STREAM".to_string());
+                operators.add(|| "GROUP STREAM".to_string());
                 Ok(Box::new(StreamAggregate::new(
                     keys, collations, specs, chain,
                 )))
             } else {
-                operators.push("GROUP HASH".to_string());
+                operators.add(|| "GROUP HASH".to_string());
                 Ok(Box::new(HashAggregate::new(keys, collations, specs, chain)))
             }
         }
@@ -962,21 +1120,90 @@ fn push_aggregate(
 /// @param up - everything the operators are built from
 fn push_filters(
     chain: Box<dyn Sink>,
-    operators: &mut Vec<String>,
+    operators: &mut Listing,
     up: &Upward<'_>,
 ) -> DbResult<Box<dyn Sink>> {
     let mut chain = chain;
+    if let Some(above) = &up.filters_above {
+        for term in above {
+            let translated = translate_scan(term, up.space, up.params)?;
+            chain = Box::new(Filter::new(compile(&translated, up.scan_types)?, chain));
+            operators.add(|| "FILTER RESIDUAL".to_string());
+        }
+        return Ok(chain);
+    }
     if let Some(constant) = &up.plan.constant_filter {
         let translated = translate_scan(constant, up.space, up.params)?;
         chain = Box::new(Filter::new(compile(&translated, up.scan_types)?, chain));
-        operators.push("FILTER CONSTANT".to_string());
+        operators.add(|| "FILTER CONSTANT".to_string());
     }
     for residual in up.plan.residuals.iter().flatten() {
         let translated = translate_scan(residual, up.space, up.params)?;
         chain = Box::new(Filter::new(compile(&translated, up.scan_types)?, chain));
-        operators.push("FILTER RESIDUAL".to_string());
+        operators.add(|| "FILTER RESIDUAL".to_string());
     }
     Ok(chain)
+}
+
+/// Splits a correlated statement's `WHERE` into the conjuncts that read a
+/// subquery and the ones that do not.
+///
+/// **The second list is tested before any block is answered** (task-2076), by
+/// [`crate::correlate::Correlated`] itself; its module comment gives the
+/// argument for why that cannot change an answer. The first list stays in the
+/// filters above that operator.
+///
+/// The rule is by the expression tree and nothing else: a conjunct holding a
+/// `Subquery` node anywhere, correlated or folded, stays above. A conjunct
+/// that is not split by `AND` at its top - `a.v = 1 OR EXISTS (...)` - is one
+/// conjunct, holds a subquery, and stays above whole.
+///
+/// Only called when the statement has a correlated block, so a statement
+/// without one allocates nothing here.
+///
+/// @param plan - the planner's output
+fn place_around_correlation(plan: &PhysicalPlan) -> (Vec<BoundExpr>, Vec<BoundExpr>) {
+    let mut above = Vec::new();
+    let mut below = Vec::new();
+    let predicates = plan
+        .constant_filter
+        .iter()
+        .chain(plan.residuals.iter().flatten());
+    for predicate in predicates {
+        for term in inillucent_sql::plan::conjunction(predicate) {
+            if inillucent_sql::plan::expression_holds_subquery(&term) {
+                above.push(term);
+            } else {
+                below.push(term);
+            }
+        }
+    }
+    (above, below)
+}
+
+/// Compiles the conjuncts the correlation operator tests before it answers a
+/// block.
+///
+/// Compiled against the row as the joins produce it, which is the row that
+/// operator receives: none of these conjuncts reads a correlated column, so
+/// none of them needs the widened types.
+///
+/// @param below - the conjuncts [`place_around_correlation`] put below
+/// @param space - the widened column space, which resolves base columns
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param joined_types - the column types before any widening
+fn compile_gate(
+    below: &[BoundExpr],
+    space: &Space<'_>,
+    params: &Params,
+    joined_types: &[StaticType],
+) -> DbResult<Vec<Box<dyn crate::expr::Eval>>> {
+    let mut gate = Vec::with_capacity(below.len());
+    for term in below {
+        let translated = translate_scan(term, space, params)?;
+        gate.push(compile(&translated, joined_types)?);
+    }
+    Ok(gate)
 }
 
 /// Builds the whole of a statement's chain above the source, and returns it
@@ -1002,6 +1229,7 @@ fn push_filters(
 /// @param space - the open databases the chain reads
 /// @param params - the values bound for this execution
 /// @param sink - where the topmost operator writes its rows
+/// @param listing - whether to render each operator as it is put on
 pub(crate) fn build_upper(
     plan: &PhysicalPlan,
     catalog: &dyn TreeCatalog,
@@ -1009,11 +1237,13 @@ pub(crate) fn build_upper(
     space: &Space<'_>,
     params: &Params,
     sink: Box<dyn Sink>,
+    listing: Listing,
 ) -> DbResult<Upper> {
     let select = &plan.select;
     refuse_unhandled(select)?;
     let (correlations, correlation_columns, widened_types) =
         correlated_columns(plan, catalog, space)?;
+    let joined_types = space.types;
     let scan_types: &[StaticType] = if correlations.is_empty() {
         space.types
     } else {
@@ -1032,6 +1262,15 @@ pub(crate) fn build_upper(
     let (group_exprs, group_collations, grouped_walk) =
         grouping_of(plan, prepared, space, params, &scan_order)?;
     let limit = constant_limit(select, params)?;
+    let (filters_above, gate) = if correlations.is_empty() {
+        (None, Vec::new())
+    } else {
+        let (above, below) = place_around_correlation(plan);
+        (
+            Some(above),
+            compile_gate(&below, space, params, joined_types)?,
+        )
+    };
     let up = Upward {
         sorted_already: already_sorted(plan, prepared, &outputs, &scan_order, grouped_walk),
         skipping: is_skip_scan(prepared),
@@ -1053,12 +1292,13 @@ pub(crate) fn build_upper(
         grouped_walk,
         limit,
         outputs,
+        filters_above,
     };
 
     // Built bottom-up, because each operator owns the one below it. The
     // description is collected in the same order and reversed at the end, so it
     // reads source-first the way a plan should.
-    let mut operators: Vec<String> = Vec::new();
+    let mut operators = listing;
     let mut chain: Box<dyn Sink> = sink;
     chain = push_sort(chain, &mut operators, &up)?;
     chain = push_distinct(chain, &mut operators, &up);
@@ -1076,8 +1316,20 @@ pub(crate) fn build_upper(
         head: chain,
         operators,
         names,
-        limit: source_limit_of(plan, prepared, limit).map(|limit| limit.saturating_add(up.offset)),
+        // `up.sorted_already` is the same answer `push_sort` acted on, read
+        // rather than derived a second time - the two used to be computed from
+        // different information about the same question, which is what let a
+        // bound reach a source that a sorter was about to sit on top of.
+        limit: source_limit_of(
+            plan,
+            prepared,
+            limit,
+            up.sorted_already,
+            !up.outputs.sort_keys.is_empty(),
+        )
+        .map(|limit| limit.saturating_add(up.offset)),
         correlations,
+        gate,
     })
 }
 /// Builds every operator above the source.
@@ -1098,6 +1350,7 @@ pub(crate) fn build_upper(
 /// @param space - the joined column space
 /// @param params - the values bound to `?1`, `?2`, ...
 /// @param sink - the end of the pipeline
+/// @param listing - whether to render each operator as it is put on
 fn build_chain<'t>(
     plan: &PhysicalPlan,
     catalog: &'t dyn TreeCatalog,
@@ -1105,21 +1358,29 @@ fn build_chain<'t>(
     space: &Space<'_>,
     params: &Params,
     sink: Box<dyn Sink>,
+    listing: Listing,
 ) -> DbResult<Chain<'t>> {
-    let upper = build_upper(plan, catalog, prepared, space, params, sink)?;
+    let upper = build_upper(plan, catalog, prepared, space, params, sink, listing)?;
     let mut operators = upper.operators;
     // The inner stages, innermost first, so each ends up above the one before
     // it in the chain the source pushes into. The chain widens from `'static`
     // to `'t` here and only here: an index nested loop borrows its inner tree,
     // and it wraps everything built so far rather than being wrapped by it.
     let mut chain: Box<dyn Sink + 't> = upper.head;
-    // The correlation operator goes *below* every join and *above* every
-    // filter: the value it computes reads the whole joined row, and the `WHERE`
-    // that tests it runs after the last join has widened that row.
+    // The correlation operator goes *above* every join and *below* every
+    // filter that reads a block: the value it computes reads the whole joined
+    // row, and the `WHERE` that tests it runs after the last join has widened
+    // that row. The conjuncts that read no block are its gate and are tested
+    // inside it, before a block is answered (task-2076); they are listed
+    // beneath it because that is where they run.
     if !upper.correlations.is_empty() {
-        operators.push("CORRELATED SUBQUERY".to_string());
+        operators.add(|| "CORRELATED SUBQUERY".to_string());
+        for _ in &upper.gate {
+            operators.add(|| "FILTER RESIDUAL".to_string());
+        }
         chain = Box::new(crate::correlate::Correlated::new(
             upper.correlations,
+            upper.gate,
             catalog,
             params,
             chain,
@@ -1131,16 +1392,18 @@ fn build_chain<'t>(
             .get(index)
             .ok_or_else(|| misuse("a stage vanished while building"))?;
         chain = build_nested(plan, catalog, space, params, stage, index, chain)?;
-        operators.push(format!(
-            "{} tree {}{}",
-            stage.kind.describe(),
-            stage.root,
-            if stage.is_lookup {
-                " (rowid lookup)"
-            } else {
-                ""
-            }
-        ));
+        operators.add(|| {
+            format!(
+                "{} tree {}{}",
+                stage.kind.describe(),
+                stage.root,
+                if stage.is_lookup {
+                    " (rowid lookup)"
+                } else {
+                    ""
+                }
+            )
+        });
     }
 
     Ok(Chain {
@@ -1194,6 +1457,12 @@ pub struct Statement<'t> {
     shape: Shape,
     /// Whether anything but the source read a parameter while building.
     rebindable: bool,
+    /// The connection's settings when the chain was built.
+    ///
+    /// The chain folds in the length limit and the `LIKE` case rule without
+    /// counting a read, so [`Statement::run`] compares these instead - see
+    /// `Params::settings` (task-2081).
+    settings: crate::scalar::Context,
     /// The cell every `Expr::Parameter` in the chain reads.
     ///
     /// **The chain holds the cell it was built with, and the caller hands a
@@ -1236,6 +1505,15 @@ impl<'t> Statement<'t> {
                 "this statement folded a parameter into its operator chain and cannot be re-run                  against different values",
             ));
         }
+        // **Refused rather than run with the old settings.** A `%` or a scalar
+        // call in the chain holds the length limit it was built under, and
+        // this statement has no plan cache to rebuild itself from, so running
+        // it would enforce a limit the connection no longer has.
+        if params.settings() != self.settings {
+            return Err(misuse(
+                "this statement was built under a different length limit or LIKE setting and cannot be re-run under this one",
+            ));
+        }
         let folded = crate::subquery::fold(self.plan, self.catalog, params)?;
         let params = folded.as_ref().unwrap_or(params);
         // The chain reads the cell it was built with; this is where that cell
@@ -1243,8 +1521,7 @@ impl<'t> Statement<'t> {
         let source = params.bindings();
         if !std::sync::Arc::ptr_eq(&self.bindings, &source) {
             if let (Ok(from), Ok(mut held)) = (source.lock(), self.bindings.lock()) {
-                held.clear();
-                held.extend_from_slice(&from);
+                held.copy_from(&from);
             }
         }
         let source = {
@@ -1290,12 +1567,25 @@ pub fn build_statement<'t>(
     let chain = {
         let mut space = held.view(&prepared.stages);
         space.catalog = Some(catalog);
-        build_chain(plan, catalog, &prepared, &space, params, sink)?
+        build_chain(
+            plan,
+            catalog,
+            &prepared,
+            &space,
+            params,
+            sink,
+            Listing::kept(),
+        )?
     };
     let rebindable = params.reads() == before;
+    let settings = params.settings();
     let bindings = params.bindings();
-    let mut operators = chain.operators;
-    operators.push(describe_source(&prepared));
+    // Kept here, unlike the pipeline path: a `Statement` builds its chain once
+    // and runs it many times, so the listing costs one render per statement
+    // rather than one per execution, and `Statement::shape` reports it.
+    let mut listing = chain.operators;
+    listing.add(|| describe_source(&prepared));
+    let mut operators = listing.into_lines();
     operators.reverse();
     let names = chain.names;
     let pool = source_pool(catalog, &prepared);
@@ -1310,6 +1600,7 @@ pub fn build_statement<'t>(
         limit: chain.limit,
         shape: Shape { names, operators },
         rebindable,
+        settings,
     })
 }
 /// Returns the pool the source stage's tree lives in, when it reads one.
@@ -1327,36 +1618,17 @@ pub(crate) fn source_pool<'t>(
 ) -> Option<&'t Pool> {
     catalog.pool_for(prepared.stages.first()?.root)
 }
-/// Returns what drives a pipeline, and the line `EXPLAIN` prints for it.
-///
-/// The one place that decides, so the three callers - a one-shot run, a reused
-/// statement's rebuild, and a statement's construction - cannot disagree about a
-/// plan with no stages.
-///
-/// @param plan - the planner's output
-/// @param catalog - where the trees come from
-/// @param space - the joined column space
-/// @param params - the bound parameters
-/// @param prepared - the structural choices `prepare` made
-/// @param limit - the statement's `LIMIT`, when it has a constant one
-fn source_for<'t>(
-    plan: &PhysicalPlan,
-    catalog: &'t dyn TreeCatalog,
-    space: &Space<'_>,
-    params: &Params,
-    prepared: &Prepared,
-    limit: Option<usize>,
-) -> DbResult<(Source<'t>, String)> {
-    let source = source_for_run(plan, catalog, space, params, prepared, limit)?;
-    Ok((source, describe_source(prepared)))
-}
 /// Returns what drives a pipeline, without the `EXPLAIN` line.
 ///
-/// The same three shapes [`source_for`] builds, for a caller that would
-/// otherwise format and throw away a `String` every execution - which is
-/// exactly what [`Statement::run`] used to do. `source_for` is this plus
-/// [`describe_source`], so the two answers about what a plan with no stages
-/// drives cannot drift apart.
+/// **The one place that decides what a plan drives**, so the callers - a
+/// one-shot run, a reused statement's rebuild, and a statement's construction -
+/// cannot disagree about a plan with no stages.
+///
+/// There used to be a `source_for` beside this that returned the source and
+/// [`describe_source`]'s line as a pair, so the two could not drift apart. Its
+/// one remaining caller calls this and `describe_source` on the next line
+/// instead, which keeps them together and lets a caller that asked for no
+/// listing skip building the `String` at all (task-2026).
 ///
 /// @param plan - the planner's output
 /// @param catalog - where the trees come from
@@ -1524,6 +1796,9 @@ fn build_source<'t>(
         }
         AccessKind::Span => {
             let bounds = span_bounds(path, table, space, params)?;
+            if bounds.matches_nothing {
+                return Ok(Source::Rows(Vec::new()));
+            }
             Ok(Source::Span(SpanScan::new(
                 tree,
                 projection,
@@ -1535,6 +1810,9 @@ fn build_source<'t>(
         }
         AccessKind::Reverse => {
             let bounds = span_bounds(path, table, space, params)?;
+            if bounds.matches_nothing {
+                return Ok(Source::Rows(Vec::new()));
+            }
             Ok(Source::Reverse(ReverseScan::new(
                 tree, projection, bounds, limit,
             )))
@@ -1562,7 +1840,7 @@ fn build_source<'t>(
                 stage,
                 probe_over: &probe_over,
             };
-            let keys = iterative_candidates(&scan, index, &wanted.borrow(), *depth, limit)?;
+            let keys = iterative_candidates(&scan, index, &wanted.borrow(), *depth)?;
             Ok(Source::Vector(probe_over, keys))
         }
         AccessKind::SeekUnion => {

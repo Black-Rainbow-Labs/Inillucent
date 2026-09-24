@@ -31,7 +31,7 @@ inillucent --db examples/rag-agent/greek-philosophy.rdb query \
 ```
 
 **`embed` runs once for the statement, not once per row**, because it is registered deterministic and
-its argument does not vary within one execution. Before task-1911 nothing read that flag and the same
+its argument does not vary within one execution. Before this was fixed, nothing read that flag and the same
 query took 105 seconds on that corpus instead of one and a half. A function you register yourself
 gets the same treatment only if you set `FunctionFlags::deterministic` — the default for anything
 registered from outside is `false`, which is the safe assumption about code this engine did not write.
@@ -72,12 +72,12 @@ reaching for it:
   neighbour it is ever compared against is wrong.
 
   The 0.1.2 archives printed `Error [syntax]: bad parameter or other API misuse` for that case, which
-  named neither the function nor the fix. task-1952 is the repair.
+  named neither the function nor the fix. This is now fixed.
 - **Nothing has to be exported after the install.** The engine finds the runtime and the weights
   where the command put them. `ORT_DYLIB_PATH` and `INILLUCENT_ONNX_DIR` still override.
 - **A registered function reaches the write path.** `INSERT ... VALUES`, `UPDATE ... SET` and
   `RETURNING` all take one, so `INSERT INTO note (body, v) VALUES (?1, embed(?1))` writes the vector
-  the function returns. Until task-1911 those three were refused with the `unsupported` status and
+  the function returns. Until this was fixed, those three were refused with the `unsupported` status and
   `INSERT ... SELECT` was the only shape that worked.
 - **Loading the model costs 650 to 800 ms and an embedding costs 12 to 36 ms**, so when it is in
   memory matters. `--residency resident` keeps it, `on-demand` drops it after every call, and the
@@ -154,6 +154,30 @@ weighting, three fusion methods, and a calibrated confidence beside every score.
 
 `inillucent-search` is also what `CREATE INDEX … USING inillucent_hnsw` builds underneath, which is
 why the two agree.
+
+## Filtering a hybrid table — facet columns
+
+A column declared `FACET` is stored and can be constrained inside the search. Its value is not
+indexed as text, so it changes no ranking of the prose beside it.
+
+```sql
+CREATE VIRTUAL TABLE store USING inillucent_search(title, body, live FACET, region FACET, dims = 768);
+INSERT INTO store (rowid, title, body, live, region, vector) VALUES (1, 'a title', 'body text', '1', 'eu', x'…');
+
+SELECT title FROM store
+ WHERE store MATCH 'body' AND k = 10 AND live = '1' AND region = 'eu'
+ ORDER BY rank;
+```
+
+**Do not filter outside the search instead.** Joining to another table and putting the predicate
+there is a different answer, not a slower spelling of the same one: the keyword ranking rescores the
+best `k * 6` hits by where the query's terms sit inside them, so which hits get rescored depends on
+which rows the scan admitted. Measured on a 400 row corpus, the two shared one hit of the top ten.
+It also returns fewer rows than the `LIMIT` asked for. Facets are how a predicate reaches the scan.
+
+A facet is otherwise an ordinary column: it comes back from a `SELECT`, and on a query that is not a
+search the engine evaluates the predicate itself. A table declaring one is stored in format 2 and an
+older build refuses to open it by name.
 
 ## Choosing between them
 

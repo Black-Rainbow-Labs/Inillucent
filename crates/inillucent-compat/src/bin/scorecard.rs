@@ -47,7 +47,14 @@ const SEED: u64 = 17_900_001;
 
 /// Runs the scorecard.
 fn main() -> ExitCode {
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let mut arguments: Vec<String> = std::env::args().skip(1).collect();
+    // **Pinned before anything is timed, and the mask printed (task-2085).**
+    // Unpinned, a hybrid processor can run this program and the arm it compares
+    // against on different core classes, and nothing else in the output says so.
+    if let Err(reason) = inillucent_compat::affinity::pin_from_arguments(&mut arguments) {
+        eprintln!("{reason}");
+        return ExitCode::from(2);
+    }
     let out = flag(&arguments, "--out")
         .map(PathBuf::from)
         // Ticket-neutral. The default used to name one ticket's output folder,
@@ -293,14 +300,11 @@ fn measure(
     Ok(paired)
 }
 
-/// Removes a database and whatever it left beside it.
+/// Removes a database and whatever it left beside it, numbered log segments included.
+///
+/// @param path - the database file
 fn remove(path: &Path) {
-    let _ = std::fs::remove_file(path);
-    for suffix in ["-journal", "-wal", "-shm"] {
-        let mut side = path.as_os_str().to_os_string();
-        side.push(suffix);
-        let _ = std::fs::remove_file(PathBuf::from(side));
-    }
+    inillucent_base::testing::remove_database(path);
 }
 
 /// Copies a pristine database into place for one round.
@@ -312,13 +316,21 @@ fn clone(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 /// Runs the reference arm and reads its samples back.
+///
+/// Started through the affinity check (task-2085): the launcher reads the
+/// child's mask back and refuses a reference arm on other processors.
 fn run_sqlite(bench: &Path, plan: &Path, database: &Path) -> Result<Vec<Sample>, String> {
-    let output = Command::new(bench)
-        .arg("run")
-        .arg(plan)
-        .arg(database)
-        .output()
-        .map_err(|error| format!("cannot run {bench:?}: {error}"))?;
+    let output = inillucent_compat::affinity::spawn_on_same_cores(
+        Command::new(bench)
+            .arg("run")
+            .arg(plan)
+            .arg(database)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+        "sqlite-bench",
+    )?
+    .wait_with_output()
+    .map_err(|error| format!("cannot run {bench:?}: {error}"))?;
     if !output.status.success() {
         return Err(format!(
             "the reference arm failed: {}",
@@ -584,6 +596,12 @@ fn bind_one(
 /// The geometric mean rather than the median, so the point estimate is the same
 /// statistic the interval brackets. A median beside a bootstrapped mean can sit
 /// outside its own interval, which reads like an arithmetic error and is one.
+///
+/// The interval is `perf::family_interval`: one value per round, the mean of
+/// that round's log ratios over the family's workloads, with the rounds
+/// resampled. Until task-2086 it bootstrapped one list of every workload's every
+/// round, and a resample of that list draws the workloads in random
+/// proportions, so the interval measured the gap between the workloads.
 /// @param measured - every workload of one scale
 /// @param family - the family to aggregate
 fn family_interval(measured: &[Paired], family: &str) -> Option<(f64, f64, f64, usize)> {
@@ -594,18 +612,17 @@ fn family_interval(measured: &[Paired], family: &str) -> Option<(f64, f64, f64, 
     if members.is_empty() {
         return None;
     }
-    let logs: Vec<f64> = members
+    let agreed: Vec<&Paired> = members
         .iter()
-        .filter(|paired| paired.agreed)
-        .flat_map(|paired| paired.log_ratios())
+        .copied()
+        .filter(|paired| paired.agreed && !paired.pairs.is_empty())
         .collect();
-    let mean = if logs.is_empty() {
-        0.0
-    } else {
-        logs.iter().sum::<f64>() / logs.len() as f64
-    };
-    let (low, high) = inillucent_compat::perf::bootstrap(&logs, SEED);
-    Some((mean.exp(), low.exp(), high.exp(), logs.len()))
+    let samples = agreed.iter().map(|paired| paired.log_ratios().len()).sum();
+    if agreed.is_empty() {
+        return Some((1.0, 1.0, 1.0, samples));
+    }
+    let (centre, low, high) = inillucent_compat::perf::family_interval(&agreed, SEED);
+    Some((centre, low, high, samples))
 }
 
 /// Renders the scorecard a person reads.

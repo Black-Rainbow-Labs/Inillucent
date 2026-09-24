@@ -13,7 +13,7 @@ The corpus is 185,078 chunks assembled from public data by this repository:
 by anyone with this repository, an internet connection and a few hours.
 
 **Every figure on this page and every figure on the score card are the same run**, taken
-**2026-09-19** at commit e2a81e1, and `inillucent-scorecard.md` at the repository root is that run's
+**2026-09-20** at commit cd53317, and `inillucent-scorecard.md` at the repository root is that run's
 own output file. Read the card for the intervals, the p-values and the diagnostics.
 
 ## Ranking
@@ -81,18 +81,28 @@ the configured one returns the rows and pays for them.
 
 | query | inillucent | pgvector, configured | | pgvector, defaults | |
 |---|---|---|---|---|---|
-| no predicate, p50 | **0.9340 ms** | 1.990 ms | **113% faster** | 1.299 ms | **39% faster** |
-| no predicate, p95 | **1.585 ms** | 3.371 ms | **113% faster** | 2.410 ms | **52% faster** |
-| `source = slack`, p50 | **0.6262 ms** | 35.583 ms | **5,582% faster** | 1.139 ms | **82% faster** |
-| `source = slack`, p95 | **0.7352 ms** | 87.733 ms | **11,833% faster** | 2.054 ms | **179% faster** |
+| no predicate, p50 | **0.8462 ms** | 2.315 ms | **174% faster** | 1.492 ms | **76% faster** |
+| no predicate, p95 | **1.389 ms** | 3.359 ms | **142% faster** | 2.046 ms | **47% faster** |
+| `source = slack`, p50 | **0.5820 ms** | 36.486 ms | **6,169% faster** | 1.114 ms | **91% faster** |
+| `source = slack`, p95 | **0.8172 ms** | 89.097 ms | **10,803% faster** | 2.015 ms | **147% faster** |
 
 **Latency is the family that moves between runs, and these are not the figures an earlier version of
-this page carried.** It read 0.8954 ms unfiltered and 0.6631 filtered, against 2.459 and 42.182. The
-ranking families reproduced to four decimal places across the two runs and latency did not, which is
-what latency does: it is measured in wall clock on a shared machine, and
+this page carried.** Two versions ago it read 0.8954 ms unfiltered and 0.6631 filtered, against 2.459
+and 42.182; one version ago 0.9340 and 0.6262, against 1.990 and 35.583; the version before this one 0.8149
+and 0.5804, against 1.990 and 35.221. The ranking families
+reproduce to four decimal places across all of those runs and latency does not, which is what latency
+does: it is measured in wall clock on a shared machine, and
 [the corpus recipe](../tests/synthetic-corpus.md) says not to compare figures taken while something
 else was running. The relationship is unchanged - the filtered query is still faster than the
 unfiltered one here and still two orders of magnitude faster than the configured baseline's.
+
+**This run is also the first with the parallel index build and the explicit AVX2 kernel**, and the
+unfiltered p50 moved with them: 0.9340 ms to **0.8462**. The build itself went from 129.7 seconds to
+**16.8** for the same 185,078 chunks at 768 dimensions, because `HnswParams::build_threads` defaults
+to every core rather than one. A parallel build's graph is not the serial one - the levels come from
+the same seeded generator but the order in which nodes link to each other is whatever the thread pool
+produced - so the condition for shipping it was the ranking verdicts on this card, and they are
+unchanged: **15 better, 1 equivalent, 1 inconclusive, 0 worse**.
 
 The filtered row stands for the whole comparison. pgvector's cost of being *correct* under a
 filter is to repeat the scan, and that is two orders of magnitude. inillucent's probe widens itself

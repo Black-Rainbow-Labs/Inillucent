@@ -68,6 +68,17 @@ purpose = "the embedding and retrieval engine, and its graded harness"
 name = "tooling"
 purpose = "the checks that keep the repository's own rules true"
 
+# The long forms, run on a schedule rather than on a change (task-2036). Every
+# target here has a short form in another tier that runs on every change: the
+# nightly one is the same question asked at a size nobody waits for - a ledger
+# day of 100,000 transactions, every published release read with a downloaded
+# binary. Not `exclusive`, because none of them measures a duration; they are
+# long because they do more, and two of them running at once changes nothing
+# about what either concludes.
+[[tier]]
+name = "nightly"
+purpose = "the long forms: a full day's workload, every released format, both directions"
+
 # ---------------------------------------------------------------------------
 # What a change outside every crate selects.
 #
@@ -95,6 +106,25 @@ reason = "the pinned manifest, the source register and the fixtures every differ
 prefix = "tests/"
 packages = ["*"]
 reason = "the shared corpora, schedules and this map itself; a change here can move any suite"
+
+# The language wrappers and their conformance runners (task-2036). A change to
+# one of them changes what `bindings` grades, and nothing else: the wrappers
+# spawn the shipped programs rather than linking anything, so a change here
+# cannot reach the engine. `sh tools/run-package-tests.sh` is what runs them,
+# and `packages/package-tests.toml` is what says a file under here has no way
+# to be run.
+[[path]]
+prefix = "packages/"
+packages = ["inillucent-compat"]
+reason = "the language wrappers; `bindings` reads what their runners produced"
+
+# The conformance suite itself, which is the specification five runners read.
+# A change to it selects both the reference implementation that runs it and the
+# guard that checks the others did.
+[[path]]
+prefix = "drivers/conformance/"
+packages = ["inillucent-driver", "inillucent-compat"]
+reason = "the shared conformance suite, read by the Rust driver and by `bindings`"
 
 [[path]]
 prefix = "tools/"
@@ -128,6 +158,16 @@ reason = "task-shaped instructions for an agent; no code reads them"
 prefix = "AGENTS.md"
 packages = []
 reason = "the agent front door; prose, and no code reads it"
+
+# The coordination notes and the agent skill pages. Markdown, and nothing
+# compiles from any of it - but without a row this is an unmatched top-level
+# directory, which selects every target in the map. Every agent working here is
+# asked to add what it learned to `.claude/repo-plan.md`, so every one of them
+# was running the whole suite to edit a paragraph (task-2071).
+[[path]]
+prefix = ".claude/"
+packages = []
+reason = "the coordination notes and the agent skill pages; prose, and no code reads them"
 
 [[path]]
 prefix = ".sqlite-ref/"
@@ -166,6 +206,19 @@ reason = "the editor's own workspace state; no code reads it"
 prefix = "target/"
 packages = []
 reason = "build output"
+
+# The per-worktree cargo configuration the Tasks board writes when it opens a
+# ticket's `git worktree` (task-2031). It sets `build.target-dir` to a directory
+# of that worktree's own, because cargo takes a file lock on the target
+# directory and a shared one would make two tickets' builds wait for each other.
+# It is untracked and nothing compiles from it, and without a rule here it
+# matched nothing - so `--changed` answered "no rule covers .cargo/config.toml,
+# so everything is selected" for every ticket worked in a worktree, which is now
+# every ticket (task-2040).
+[[path]]
+prefix = ".cargo/"
+packages = []
+reason = "the worktree's own target directory, written by the board; no code reads it"
 
 [[path]]
 prefix = "README.md"
@@ -372,7 +425,6 @@ covers = ["inillucent-engine"]
 # The case that needs a log nothing has folded into the file gets one by running
 # the statements in `inillucent-shell` and killing it, which is what a crash is
 # (task-1980). The shell has to be built for that.
-requires = ["programs"]
 
 # The half `analyze_reopen` cannot ask, because every case in it reopens first:
 # that the connection which ran `ANALYZE` reads the statistics it wrote.
@@ -436,6 +488,13 @@ name = "embed_direct_only"
 tier = "engine"
 covers = ["inillucent-engine", "inillucent-ext", "inillucent-search"]
 features = ["inillucent-engine/embed"]
+# The runner always builds the feature above, so this never skips under the
+# runner. It is declared for the one caller that does not: `tools/coverage.mjs`
+# runs a plain `cargo test --workspace`, because the feature reaches
+# `inillucent-core/onnx` and the coverage run excludes that crate on purpose
+# (task-2066). Without the row, a target that can skip and does not say so fails
+# `selection::every_target_that_can_skip_declares_it_and_vice_versa`.
+requires = ["embed"]
 
 [[target]]
 package = "inillucent-compat"
@@ -454,7 +513,6 @@ covers = ["inillucent-engine", "inillucent-ext"]
 # assert is that a statement the parser accepts cannot end the process and that
 # a refusal comes before the allocation - neither of which an in-process case on
 # the harness's own thread can see (task-1979, sections 5.3 and 5.4).
-requires = ["programs"]
 
 [[target]]
 package = "inillucent-compat"
@@ -471,7 +529,6 @@ tier = "engine"
 covers = ["inillucent-engine"]
 # The transaction that must stay undecided is written by `inillucent-shell` in a
 # process that is then killed, for the reason `analyze_reopen`'s row gives.
-requires = ["programs"]
 
 [[target]]
 package = "inillucent-compat"
@@ -484,6 +541,36 @@ covers = ["inillucent-engine"]
 package = "inillucent-compat"
 kind = "test"
 name = "multi_database_participants"
+tier = "engine"
+covers = ["inillucent-engine"]
+
+# Where a write into a virtual table spends its time, and the switch that stops
+# the measuring from moving the measurement: always-on, the timing took
+# `extension.rtree.insert` from a paired 1.29x to 1.10x, so the first case here
+# asserts the counters are silent until a harness asks (task-2025). No oracle and
+# no built program: it creates its own file and reads the engine's own counters.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "module_stages"
+tier = "engine"
+covers = ["inillucent-engine"]
+
+# Where one row's write into a leaf goes, and the switch that stops the measuring
+# from moving the measurement - `module_stages` one layer down, and off by default
+# for the same reason (task-2034). The path is the one an ordinary `INSERT` and a
+# virtual table's shadow row both reach, which is why a case here writes both.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "put_stages"
+tier = "engine"
+covers = ["inillucent-tree"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "page_sizes"
 tier = "engine"
 covers = ["inillucent-engine"]
 
@@ -512,6 +599,13 @@ covers = ["inillucent-engine", "inillucent-pool"]
 package = "inillucent-compat"
 kind = "test"
 name = "new_engine_explain"
+tier = "engine"
+covers = ["inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "new_engine_page_ownership"
 tier = "engine"
 covers = ["inillucent-engine"]
 
@@ -931,6 +1025,22 @@ name = "fts5_legacy_layout"
 tier = "engine"
 covers = ["inillucent-ext"]
 
+# An index this build cannot read refuses by name rather than answering no rows
+# (task-2053). It covers `inillucent-search` as well as `inillucent-ext`,
+# because the FTS5 layout record and the search index's format number are the
+# same question asked of the two halves of the file, and a change to either has
+# to run both. No `requires`: one case spawns the command line, which the
+# workspace builds, and the rest drive the library.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "format_refusal"
+tier = "engine"
+covers = ["inillucent-ext", "inillucent-search", "inillucent-cli"]
+# One of the eleven cases spawns `inillucent query` and reads its exit code,
+# because exit 3 for a layout this build has not got is the part of the refusal
+# an application actually has - the other ten drive the library.
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"
@@ -946,6 +1056,49 @@ name = "lifecycle"
 tier = "differential"
 covers = ["inillucent-engine"]
 requires = ["oracle"]
+
+# Migrating a database that looks like one somebody uses (task-2036).
+# `migrate_sqlite` beside it migrates fifteen small synthetic fixtures; not one
+# of them has a NOCASE collation, a DESC index, a trigger, a view, a generated
+# column or an FTS5 index with external content, and the corpus that broke the
+# migration had all of them at once.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "migrate_realistic"
+tier = "e2e"
+covers = ["inillucent-migrate"]
+requires = ["oracle", "tracked-fixtures"]
+
+# A database from every release we have shipped, read by the build under test
+# (task-2036). `tests/interop/<version>/` holds a file that release's own binary
+# wrote, and this is the only check that can answer "does today's engine still
+# read what we shipped". The quick form reads the newest fixture, which is the
+# one a storage change breaks first; `INILLUCENT_SCENARIO=full` reads all six.
+#
+# No `requires`: the fixtures are checked in, so this runs in a fresh clone.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "release_format"
+tier = "e2e"
+covers = ["inillucent-engine"]
+# task-2074: the case that writes into every release's file and crashes kills a
+# real `inillucent-shell`, the way `analyze_reopen` does, so the shell has to be
+# built.
+
+# The same question asked of every release at once, and asked backwards
+# (task-2036). The backward direction needs the released binaries, which are
+# downloaded into the gitignored `tools/cross/bin/releases/` by
+# `pwsh tools/build-interop-fixture.ps1` - so in a fresh clone the backward case
+# skips, `--strict` counts it, and `requires` is what names it.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "release_format_history"
+tier = "nightly"
+covers = ["inillucent-engine"]
+requires = ["previous-release", "tracked-fixtures"]
 
 [[target]]
 package = "inillucent-compat"
@@ -1016,7 +1169,7 @@ package = "inillucent-compat"
 kind = "test"
 name = "ordering"
 tier = "differential"
-covers = ["inillucent-engine"]
+covers = ["inillucent-engine", "inillucent-exec"]
 requires = ["oracle"]
 
 [[target]]
@@ -1158,6 +1311,16 @@ covers = ["inillucent-engine"]
 [[target]]
 package = "inillucent-compat"
 kind = "test"
+name = "fault_shapes"
+tier = "durability"
+# The two faults that are not a power loss: a misdirected write and a sync that
+# lies (task-2066 section 4.4.8). It drives `inillucent-sim` and the new engine
+# and needs nothing off disk, so it has no `requires` row.
+covers = ["inillucent-engine", "inillucent-sim"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
 name = "multi_database_crash"
 tier = "durability"
 covers = ["inillucent-engine"]
@@ -1226,6 +1389,41 @@ covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool"]
 # reference as a prerequisite, so that a run without the oracle built cannot
 # look like a pass - and a suite that never starts the oracle would be
 # declaring a prerequisite it does not have.
+# Pivoted query synthesis (task-2066 §4.4.4). It picks a row, builds a predicate
+# every atom of which it has verified true of that row in Rust, and asserts the
+# row comes back. It needs no oracle, which is the point: TLP proves the three
+# partitions agree with each other, and an agreement is not a correctness - a
+# comparison rule wrong the same way in all three passes it. This catches that,
+# and it is the one class neither TLP nor the hand-written differential cases
+# reach.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "pqs_differential"
+tier = "engine"
+covers = ["inillucent-sql", "inillucent-exec", "inillucent-engine"]
+
+# One table an order of magnitude past the buffer pool (task-2066 §4.4.5).
+# Nothing above twenty thousand rows was graded anywhere, so every claim the
+# suite made was about a table the pool holds whole. Nightly because it builds
+# that table; the properties it checks are TLP and NoREC, which need no oracle
+# and so cost nothing but the size. It runs at two page sizes, the engine's
+# 32,768 bytes and SQLite's 4,096 (task-2075), and at each one it builds, scans,
+# sorts, deletes half the table and reopens it.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "story_large_table_nightly"
+tier = "nightly"
+covers = ["inillucent-pool", "inillucent-tree", "inillucent-exec", "inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "delete_order"
+tier = "engine"
+covers = ["inillucent-pool", "inillucent-tree", "inillucent-exec", "inillucent-engine"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"
@@ -1267,6 +1465,31 @@ kind = "test"
 name = "wal_crash"
 tier = "durability"
 covers = ["inillucent-engine", "inillucent-wal"]
+
+# What a statement costs and what a fold costs, counted at the file system rather
+# than at a counter in the engine (task-2000, design 1). It is `durability`
+# because the two syncs it counts *are* the durability order, and because it
+# asserts a rollback journal is never created in wal mode - which is the
+# protection the redo log's after images replaced.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "fold_protocol"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-pool", "inillucent-wal"]
+
+# Power loss at every cut point of a `CREATE INDEX` (task-2000, design 2). The
+# bulk build stopped logging a whole page image per page it builds, and what
+# replaces the image is an ordering - pages written, data file synced, then the
+# statement's own records. This is the campaign that says the ordering holds:
+# every cut leaves the index whole or absent, and never a catalog row naming
+# pages nobody wrote.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "bulk_build_crash"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool"]
 
 # The ordering `journal.rs` states as its whole invariant: a page's old image is
 # on disk and synced before its new image is written.
@@ -1310,6 +1533,16 @@ tier = "durability"
 [[target]]
 package = "inillucent-wal"
 kind = "test"
+name = "wal_model"
+tier = "durability"
+# The log graded against an independent model, the way `btree_model` grades the
+# tree (task-2066 section 4.4.10). It runs on a memory file system and needs
+# nothing off disk, so it has no `requires` row.
+covers = ["inillucent-wal"]
+
+[[target]]
+package = "inillucent-wal"
+kind = "test"
 name = "recovery"
 tier = "durability"
 
@@ -1327,10 +1560,83 @@ kind = "test"
 name = "durability"
 tier = "e2e"
 
+# The other half of `durability`, held apart because `scenarios` refuses a file
+# that holds both a `scenario!` and a bare `#[test]` (task-2055). These are the
+# storage cases that run at every arm of the matrix; the ones that pick their own
+# page size and pool size are in `durability`.
+[[target]]
+package = "inillucent"
+kind = "test"
+name = "durability_arms"
+tier = "e2e"
+
 [[target]]
 package = "inillucent"
 kind = "test"
 name = "edges"
+tier = "e2e"
+
+# Nikaya's startup, against populated tables, at every arm (task-2036). The
+# escape it is shaped around answered `count(*)` correctly while the table it
+# corrupted was unreadable, so the story reads every column of every row back
+# after a reopen.
+[[target]]
+package = "inillucent"
+kind = "test"
+name = "story_nikaya"
+tier = "e2e"
+
+# Nikaya's own statement corpus, run at every arm (task-2036). The escape it is
+# shaped around was a refusal - a compound SELECT as a derived table - so what
+# it asserts is that every statement the consumer prepares compiles and runs,
+# with `tests/workloads/nikaya/allow.list` naming the ones that do not yet.
+[[target]]
+package = "inillucent"
+kind = "test"
+name = "story_workload_replay"
+tier = "e2e"
+
+# A retrieval application's whole lifecycle, at every arm (task-2036). Ingest,
+# query, update a third, delete a third, roll a batch back, checkpoint, reopen -
+# with the index compared to a brute force over the test's own model after every
+# phase. This is where task-2033 first fails at SQLite's page size.
+# A day of an application's transactions against a model (task-2036). Eight
+# hundred of them at two page sizes: every statement in it has its own test and
+# every one of those passes, and what this asks is what a sequence of them does
+# to a tree that has already split. The comparison comes from a `BTreeMap` in
+# the test rather than from a second query, because a corrupted index is usually
+# consistent with itself.
+[[target]]
+package = "inillucent"
+kind = "test"
+name = "story_ledger_day"
+tier = "e2e"
+
+# The same day at a hundred thousand transactions, replayed through the pinned
+# SQLite shell (task-2036). A third answer rather than a second: a divergence
+# between the engine and the model says the engine is wrong, and one between the
+# model and SQLite would say the model is.
+[[target]]
+package = "inillucent"
+kind = "test"
+name = "story_ledger_day_nightly"
+tier = "nightly"
+requires = ["oracle"]
+
+[[target]]
+package = "inillucent"
+kind = "test"
+name = "story_rag"
+tier = "e2e"
+
+# The edge catalogue of the task-2035 TDD section 6, at every arm (task-2036).
+# `edges.rs` beside it covers the value and statement corners at one page size;
+# this covers the rows that are about geometry, about a consumer's statement
+# shapes, and about what happens after a maintenance command and a reopen.
+[[target]]
+package = "inillucent"
+kind = "test"
+name = "story_edges"
 tier = "e2e"
 
 [[target]]
@@ -1369,7 +1675,31 @@ covers = ["inillucent-cli"]
 # asserting a named field of parsed `--output json` or a specific exit code.
 # Eighteen of the thirty verbs were never passed to a spawned binary before
 # this row existed, and `--output json` was read from one for two of them.
-requires = ["programs"]
+# The case for `migrate` writes its source database with the pinned `sqlite3`
+# shell. The programs themselves are not a prerequisite: they are built from
+# this workspace, and a build that fails is a failure (task-2106).
+requires = ["shell"]
+
+# Two recorded clients, replayed against the server that is built now
+# (task-2036). 0.1.2 shipped a handshake the release scripts refused, and
+# running the release was what found it; the transcripts are what those clients
+# actually sent.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "mcp_replay"
+tier = "e2e"
+covers = ["inillucent-cli"]
+
+# One agent session over MCP, and the protocol edges a client can produce
+# (task-2036). `mcp_wire` beside it calls every tool once with a well formed
+# request; nothing in this repository ever sent a malformed one until this.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "mcp_session"
+tier = "e2e"
+covers = ["inillucent-cli"]
 
 [[target]]
 package = "inillucent-compat"
@@ -1380,7 +1710,6 @@ covers = ["inillucent-cli"]
 # One `initialize` handshake over real pipes and one `tools/call` of each of
 # the 28 MCP tools. `command_parity` keeps the tool set equal to the registry;
 # nothing called a tool by name over the wire.
-requires = ["programs"]
 
 [[target]]
 package = "inillucent-compat"
@@ -1391,7 +1720,6 @@ covers = ["inillucent-cli"]
 # Every dot command `dot.rs` dispatches, driven through the built shell.
 # Thirty of the seventy dispatched names appeared in no test file, and nine of
 # those were named nowhere outside `dot.rs` and `help.rs`.
-requires = ["programs"]
 
 [[target]]
 package = "inillucent-compat"
@@ -1402,7 +1730,16 @@ covers = ["inillucent-engine"]
 # The one durability shape nothing exercised: the operating system ends a real
 # writer process and the file is reopened from the parent. Every other campaign
 # cuts at a fault the simulated file system injects.
-requires = ["programs"]
+
+# Nikaya's startup migration with the process killed inside it (task-2036). The
+# in-process half is `inillucent::story_nikaya`; this one spawns the shipped
+# shell, so it is its own target and declares what it needs.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "story_nikaya_crash"
+tier = "durability"
+covers = ["inillucent-cli"]
 
 [[target]]
 package = "inillucent-compat"
@@ -1413,7 +1750,7 @@ covers = ["inillucent-sql", "inillucent-exec", "inillucent-engine"]
 # The 644 statements task-1979 asked both engines, run from the tree with an
 # allow list of the defects that are still open - and a check that the allow
 # list has no entry that now agrees.
-requires = ["oracle", "programs"]
+requires = ["oracle"]
 
 [[target]]
 package = "inillucent-compat"
@@ -1425,6 +1762,38 @@ covers = ["inillucent-engine", "inillucent-sql"]
 # pragma register exactly: one in neither is decided by whichever branch the
 # filter falls through to (task-1979, section 5.2).
 
+# One writer, four readers and a checkpoint under them (task-2036). Nothing in
+# the tree ran a reader *while* a writer was working, and a checkpoint under a
+# reader is the second cause task-1987 had.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "process_readers"
+tier = "durability"
+covers = ["inillucent-cli"]
+
+# A kill campaign across forty seeded cut points, at two page sizes (task-2036).
+# `process_crash` beside it kills at twenty evenly spaced points at one page
+# size; the shape that found task-1987's loss of one insert in six hundred was
+# a campaign that killed in many kinds of moment and reopened after each.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "process_campaign"
+tier = "durability"
+covers = ["inillucent-cli"]
+
+# `PRAGMA busy_timeout`'s waiting half, across two real processes (task-2036).
+# The in-process version was deleted when the connection stopped being `Send`
+# and nothing replaced it, so the pragma that decides whether a busy
+# application blocks or fails had half its behaviour under test.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "busy_timeout"
+tier = "durability"
+covers = ["inillucent-cli"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"
@@ -1435,7 +1804,6 @@ covers = ["inillucent-engine", "inillucent-pool", "inillucent-wal"]
 # present must equal commits acknowledged, under both locking modes, through
 # ATTACH, and with a read only process reading a file a writer holds
 # (task-1979, section 4).
-requires = ["programs"]
 
 [[target]]
 package = "inillucent-migrate"
@@ -1444,7 +1812,7 @@ name = "cli"
 tier = "e2e"
 # `inillucent-migrate` as a process. It was the one of the four binaries that
 # no test ever spawned.
-requires = ["programs", "tracked-fixtures"]
+requires = ["tracked-fixtures"]
 
 [[target]]
 package = "inillucent-driver-capi"
@@ -1454,8 +1822,10 @@ tier = "e2e"
 # `drivers/bindings/python/run_conformance.py` drives `drivers/conformance/suite.json`
 # against the plain `ctypes` binding. `drivers/README.md` presents it as the
 # proof that a second language can implement the driver from the documents, and
-# nothing ran it.
-requires = ["python", "capi"]
+# nothing ran it. `capi` was a second prerequisite until task-2101: the suite
+# looked for the `cdylib` where only a plain `cargo build` puts it, and now reads
+# the one the `cargo test` build left beside it, through a private copy.
+requires = ["python"]
 
 [[target]]
 package = "inillucent-compat"
@@ -1499,10 +1869,13 @@ package = "inillucent-driver-capi"
 kind = "test"
 name = "conformance"
 tier = "e2e"
-# `cc` for the C program that links the `cdylib`, and `asan` for the sanitized
-# run - the case whose own doc comment says it "would have caught the defect it
-# guards", and which skipped on a toolchain without the sanitizer while the row
-# named only the compiler.
+# `cc` for the C program that links the static library, and `asan` for the sanitized
+# run, which skipped on a toolchain without the sanitizer while the row named
+# only the compiler. Since task-2103 the sanitized run instruments the Rust
+# library too, with `-Zsanitizer=address` under `RUSTC_BOOTSTRAP=1`. Before
+# that it instrumented only the C program and did not report the Rust side read
+# of freed memory that task-2098 fixed. A library that fails to build is not a
+# missing prerequisite and fails the suite with cargo's output (task-2101).
 requires = ["cc", "asan"]
 
 # --- perf: the cost guards, so a regression fails a test rather than a benchmark
@@ -1548,6 +1921,16 @@ kind = "test"
 name = "minimal"
 tier = "retrieval"
 
+# task-2074: a crash with a write campaign in the log, recovered, and every
+# page compared byte for byte - the delta directory, the splice and the page
+# checksum all have to be reproduced by redo, not only the rows.
+[[target]]
+package = "inillucent-model"
+kind = "test"
+name = "redo_bytes"
+tier = "durability"
+covers = ["inillucent-tree", "inillucent-txn", "inillucent-pool"]
+
 [[target]]
 package = "inillucent-search"
 kind = "lib"
@@ -1586,13 +1969,44 @@ covers = ["inillucent-alloc"]
 [[target]]
 package = "inillucent-compat"
 kind = "test"
+name = "crash_reports"
+tier = "tooling"
+# It reads `tests/crash/` off disk and needs nothing built, so it has no
+# `requires` row: on any machine, in any checkout, it either finds the schedules
+# or says which one is gone.
+covers = ["inillucent-compat"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
 name = "gates_fail_closed"
 tier = "tooling"
+# Three of its cases start a real `inillucent-testrun`, which asks cargo what it
+# built, and cargo answers by building. Windows will not replace an image that
+# is running, so a sibling target executing a workspace binary at that moment
+# made the nested run fail to start - and those three then announced a skip, so
+# every strict run in a worktree named three skips a person could not clear
+# (task-2066 §4.4.16). Running this one target after the rest costs about the
+# length of this file and removes the race rather than tolerating it.
+alone = true
 # Seven of its cases skip when the fixture, the pinned benchmark driver or the
 # runner is absent, and the row said nothing, so `--strict` dropped the target
 # before it looked at it. The file written so a gate cannot pass having
 # measured nothing could itself pass with seven of its cases not run.
 requires = ["fixtures", "sqlite-bench", "testrun"]
+
+# The gates pin themselves to one core class and start the reference arm
+# through a launcher that reads the child's affinity mask back (task-2085).
+# This starts a child through that launcher and fails when its mask differs
+# from the parent's, and when a child on other processors is not refused.
+# It pins only its own process, and it is its own test binary, so it needs no
+# `alone`: another target running beside it keeps its own mask.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "affinity"
+tier = "tooling"
+covers = ["inillucent-compat"]
 
 [[target]]
 package = "inillucent-compat"
@@ -1626,7 +2040,6 @@ kind = "test"
 name = "cli_batch"
 tier = "e2e"
 # It pipes statements into the built command line.
-requires = ["programs"]
 covers = ["inillucent-cli"]
 
 # What each command line does before it opens anything. Arrived in task-1936
@@ -1641,7 +2054,6 @@ name = "cli_arguments"
 tier = "e2e"
 # Every case runs the built command line; the file builds it and skips when
 # the build did not produce it.
-requires = ["programs"]
 covers = ["inillucent-cli"]
 
 # The `inillucent` binary's own unit tests, which grew a `#[test]` in task-1936
@@ -1664,7 +2076,6 @@ kind = "test"
 name = "setup_embeddings"
 tier = "e2e"
 # It runs `inillucent setup-embeddings` as a child process.
-requires = ["programs"]
 covers = ["inillucent-cli"]
 
 # `--root` against the file system rather than against path text.
@@ -1683,7 +2094,6 @@ kind = "test"
 name = "mcp_cancel"
 tier = "e2e"
 # It starts the MCP server as a child process and cancels a request in flight.
-requires = ["programs"]
 covers = ["inillucent-cli"]
 
 [[target]]
@@ -1693,7 +2103,6 @@ name = "budgets"
 tier = "e2e"
 # It starts the command line and the MCP server as child processes and skips
 # when either did not build.
-requires = ["programs"]
 covers = ["inillucent-cli"]
 
 [[target]]
@@ -1701,9 +2110,12 @@ package = "inillucent-compat"
 kind = "test"
 name = "confinement"
 tier = "e2e"
-# It drives the built command line and the MCP server under `--root`.
-requires = ["programs"]
+# It drives the built command line and the MCP server under `--root`. The
+# cases that prove a link cannot escape the root need the platform to make a
+# directory link. This row declared `programs` instead until task-2106, so a
+# machine without directory links was reported as one without the programs.
 covers = ["inillucent-cli"]
+requires = ["directory-link"]
 
 # The documentation, checked against the engine beside it. Prose
 # goes stale silently, which is what makes it different from code.
@@ -1728,6 +2140,84 @@ covers = ["inillucent-compat"]
 package = "inillucent-compat"
 kind = "test"
 name = "policy"
+tier = "tooling"
+covers = ["inillucent-compat"]
+
+# The Nikaya workload's freshness (task-2036). It runs
+# `tools/extract-nikaya-workload.py --check`, so there is one extractor rather
+# than two that agree on the day they are written. Nikaya is not part of this
+# repository, so a machine without it skips rather than passing.
+# The text a real number is printed as (task-2066 section 4.4.14).
+# `differential.rs` compares tagged values, so two renderings of the same double
+# are identical to it by construction, and nothing graded the characters a
+# person actually sees. Needs both shells, like `semantics`.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "numeric_text"
+tier = "differential"
+covers = ["inillucent-scalar", "inillucent-value", "inillucent-cli"]
+requires = ["shell"]
+
+# The coverage ratchet (task-2066 section 4.4.13). `docs/repository.md` carries
+# what `tools/coverage.mjs` measured, the measurement takes about an hour, and
+# until this target existed nothing read the table it wrote - so a refresh that
+# halved a crate's coverage was a diff nobody queried. It reads the published
+# numbers rather than the code, so it costs nothing and fails when the table is
+# refreshed downwards.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "coverage_floor"
+tier = "tooling"
+covers = ["inillucent-compat"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "workload_freshness"
+tier = "tooling"
+covers = ["inillucent-compat"]
+requires = ["nikaya", "python"]
+
+# The binding guard (task-2036). It reads the record each conformance runner
+# writes into `_agent_output/conformance/` and fails when a runner ran fewer
+# cases than its declared capabilities allow. Before it, "all the bindings pass
+# the suite" was three-fifths untrue: npm, Go and PHP each had a round trip of
+# their own and read the suite not at all.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "bindings"
+tier = "tooling"
+covers = ["inillucent-compat"]
+# It runs the npm, Go and PHP conformance runners itself now, rather than
+# reading whatever records a previous run left behind (task-2066 §4.4.3), so
+# what it needs is those three interpreters. A machine missing one skips with
+# that interpreter named, which is what `--strict` counts.
+requires = ["node", "go", "php"]
+
+# The escape ledger's guard (task-2036). It resolves every `held_by` entry in
+# `tests/escapes.toml` against the tree, so a row that claims a test holds a
+# defect fails when that test is renamed or deleted, and it fails when an escape
+# analysed in the design document has no row at all.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "escapes"
+tier = "tooling"
+covers = ["inillucent-compat"]
+
+# The matrix guard (task-2036). It reads `crates/inillucent/tests/*.rs` and
+# `crates/inillucent-compat/tests/*.rs` as text and fails when a scenario suite
+# holds a test the matrix did not expand, or when `scenario!` has stopped
+# expanding one of the quick arms. Every story in this repository ran at 32,768
+# byte pages until it existed, which is why task-2033 - FTS5 refusing on row 42
+# at SQLite's own 4,096 - was invisible to 3,169 tests.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "scenarios"
 tier = "tooling"
 covers = ["inillucent-compat"]
 

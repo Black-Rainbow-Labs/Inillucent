@@ -97,10 +97,12 @@ mod translate;
 mod catalog;
 
 pub use catalog::{ForcePlan, SourceLayout, TreeCatalog};
-pub use chain::{build, build_prepared, build_statement, Statement};
-pub use params::Params;
+pub(crate) use chain::Listing;
+pub use chain::{build, build_prepared, build_prepared_described, build_statement, Statement};
+pub use params::{Params, Slots, ENGINE_PARAMETER_BASE};
 pub use run::{
-    prepare_any, rowid_seek_key, run, run_any, run_any_prepared, run_compound, run_prepared,
+    prepare_any, rowid_seek_key, run, run_any, run_any_prepared, run_any_prepared_limited,
+    run_compound, run_prepared, run_prepared_limited,
 };
 pub use stages::prepare;
 pub use stages::{AccessKind, Pipeline, Prepared, PreparedStage, Shape, Source, VirtualScanSource};
@@ -145,7 +147,7 @@ pub(crate) use keys::{nested_key, SpanBounds};
 /// not promise it will stay that way, which is the same reason `JsonCall`'s
 /// parse cache is a `Mutex`. An uncontended lock is tens of nanoseconds and a
 /// parameter is read once per row at worst.
-pub type Bindings = std::sync::Arc<std::sync::Mutex<Vec<OwnedDatum>>>;
+pub type Bindings = std::sync::Arc<std::sync::Mutex<Slots>>;
 
 /// How many seek-key columns a point probe borrows on the stack.
 ///

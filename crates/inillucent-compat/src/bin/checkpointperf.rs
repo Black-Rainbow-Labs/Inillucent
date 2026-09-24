@@ -74,6 +74,22 @@ fn main() -> ExitCode {
     }
     let report = render(&scheduled, &all_at_once);
     println!("{report}");
+    // **Beside the table, for the release gate to read** (task-2066 §4.3.11).
+    // The markdown is for a person; `inillucent-release` needs two numbers per
+    // arm and should not be parsing a table to get them.
+    let numbers = format!(
+        "arm\tmedian_us\tworst_us\n\
+         scheduled\t{:.1}\t{:.1}\n\
+         all_at_once\t{:.1}\t{:.1}\n",
+        across(&scheduled, |sample| sample.at(0.50)),
+        across(&scheduled, |sample| sample.at(1.0)),
+        across(&all_at_once, |sample| sample.at(0.50)),
+        across(&all_at_once, |sample| sample.at(1.0)),
+    );
+    if let Err(error) = std::fs::write(out.join("checkpoint.tsv"), &numbers) {
+        eprintln!("cannot write the checkpoint numbers: {error}");
+        return ExitCode::FAILURE;
+    }
     if let Err(error) = std::fs::write(out.join("checkpoint.md"), &report) {
         eprintln!("cannot write the report: {error}");
         return ExitCode::FAILURE;
@@ -123,9 +139,7 @@ fn run(out: &std::path::Path, spread: bool, repeat: usize) -> Result<Sample, Str
         "checkpoint-{}-{repeat}.db",
         if spread { "spread" } else { "at-once" }
     ));
-    for suffix in ["", "-wal", "-shm", "-journal"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
+    inillucent_base::testing::remove_database(&path);
     let database = Database::open(&path).map_err(|error| error.message().to_string())?;
     let connection = database.session();
     for pragma in [

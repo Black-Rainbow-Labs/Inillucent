@@ -67,6 +67,12 @@
 //! turns the count into a non-zero exit. A run that evidenced nothing must not
 //! look like a pass.
 //!
+//! The same rule reaches the exit code itself. A run that never started - a
+//! build that did not compile, a named selection that matched nothing, an MSVC
+//! environment that is not there - exits **2** rather than 1, so that "nothing
+//! was graded" is a state a caller can branch on instead of a sentence it has
+//! to find in the log. `main` has the three codes and why they are three.
+//!
 //! ## Building it
 //!
 //! ```text
@@ -90,6 +96,7 @@ use std::time::{Duration, Instant};
 
 use inillucent_compat::layering;
 use inillucent_compat::selection::{self, Kind, Map, Row, Target};
+use inillucent_compat::supervise::{self, Limits, Stopped};
 use inillucent_compat::verdict::{self, Undetermined, Verdict};
 use inillucent_compat::workspace_root;
 use inillucent_scalar::json::node::Node;
@@ -127,6 +134,13 @@ struct Options {
     no_build: bool,
     /// Pass a filter through to each test binary.
     filter: Option<String>,
+    /// What `--timeout` asked for, in seconds.
+    ///
+    /// `None` works each target's budget out from its own recorded time, which
+    /// is what an ordinary run wants. `Some(0)` turns the budget off and leaves
+    /// only the half of this that needs no judgement: reporting a target whose
+    /// child has exited instead of waiting on its pipe.
+    timeout: Option<u64>,
 }
 
 impl Options {
@@ -147,6 +161,7 @@ impl Options {
             record: other.record,
             no_build: other.no_build,
             filter: other.filter.clone(),
+            timeout: other.timeout,
         }
     }
 }
@@ -173,6 +188,7 @@ impl Default for Options {
             record: false,
             no_build: false,
             filter: None,
+            timeout: None,
         }
     }
 }
@@ -206,6 +222,14 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
                     .map_err(|_| format!("`--test-threads` wants a number, not `{value}`"))?;
             }
             "--filter" => options.filter = Some(take("--filter")?),
+            "--timeout" => {
+                let value = take("--timeout")?;
+                options.timeout = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("`--timeout` wants seconds, not `{value}`"))?,
+                );
+            }
             "--changed" => {
                 // The revision is optional: `--changed` alone means the working
                 // tree against HEAD, which is what somebody about to commit
@@ -251,13 +275,30 @@ fn usage() -> String {
      Execution:\n  \
        --jobs <n>          test binaries at once (default: the machine's cores)\n  \
        --test-threads <n>  threads inside each binary (default: 2)\n  \
-       --no-build          do not build first\n\
+       --no-build          do not build first\n  \
+       --timeout <secs>    how long one target may run; 0 never stops one\n\
      \n\
      Reporting:\n  \
        --list              print the selection and stop\n  \
        --list-tiers        print the tiers and stop\n  \
        --strict            fail when a selected suite's prerequisite is missing\n  \
-       --record            write the measured times to tests/timings.toml\n"
+       --record            write the measured times to tests/timings.toml\n\
+     \n\
+     Exit codes:\n  \
+       0                   everything selected ran and passed\n  \
+       1                   the run happened and was red\n  \
+       2                   the run did not happen: nothing was graded\n\
+     \n\
+     A target is stopped only when it is BOTH past its budget and has\n\
+     printed nothing for ten minutes, because a suite that shells out to\n\
+     the pinned SQLite oracle is legitimately silent for a long time. The\n\
+     budget is eight times what tests/timings.toml recorded for that\n\
+     target, and never under two hours. `--timeout <secs>` replaces\n\
+     it, and `--timeout 0` removes it.\n\
+     \n\
+     Read the code, not the last line. In a shell, `$?` after a pipeline is the\n\
+     status of the last command in it, so `inillucent-testrun | tail` reports\n\
+     tail's 0 however the run went.\n"
         .to_string()
 }
 
@@ -303,14 +344,39 @@ struct Outcome {
     retry_of: Option<String>,
 }
 
+/// The exit code for a run that did not happen. See `main`.
+///
+/// A function rather than a `const` because `ExitCode::from` is not const.
+fn did_not_run() -> ExitCode {
+    ExitCode::from(2)
+}
+
 /// Runs the whole thing.
+///
+/// **Three exit codes, because "the run was red" and "the run did not happen"
+/// are different facts (task-2047).** A build that does not compile printed
+/// `the build failed` and exited 1, which is the code a failing test exits, so
+/// nothing reading the status could tell a broken toolchain from a real defect.
+/// An agent read one as the other and had to go back through 60 KB of log to
+/// find out. The command line already spends a third code on `unsupported` for
+/// the same reason: a caller should be able to branch without matching on a
+/// message.
+///
+/// - `0` - every selected target ran and passed.
+/// - `1` - the run happened and was red: a target failed, a target was still
+///   undetermined after its second attempt, or `--strict` found a suite whose
+///   prerequisite was absent.
+/// - `2` - the run did not happen. The command line was wrong, a named
+///   selection matched nothing, the MSVC environment could not be found, the
+///   build failed, or cargo could not say what it had built. Nothing was
+///   graded, so nothing here may be read as a pass.
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let options = match parse_options(&arguments) {
         Ok(options) => options,
         Err(reason) => {
             eprintln!("{reason}");
-            return ExitCode::FAILURE;
+            return did_not_run();
         }
     };
     match run(&options) {
@@ -318,7 +384,7 @@ fn main() -> ExitCode {
         Ok(false) => ExitCode::FAILURE,
         Err(reason) => {
             eprintln!("inillucent-testrun: {reason}");
-            ExitCode::FAILURE
+            did_not_run()
         }
     }
 }
@@ -344,8 +410,7 @@ fn run(options: &Options) -> Result<bool, String> {
 
     let selected = choose(&root, &map, options)?;
     if selected.is_empty() {
-        println!("nothing selected");
-        return Ok(true);
+        return empty_selection(options);
     }
 
     if options.list {
@@ -361,6 +426,9 @@ fn run(options: &Options) -> Result<bool, String> {
         return Ok(true);
     }
 
+    // Before either cargo call, because `locate` compiles too: it asks cargo
+    // what it built, and cargo answers that by building.
+    import_msvc_environment()?;
     if !options.no_build {
         build(&root, &selected)?;
     }
@@ -373,6 +441,7 @@ fn run(options: &Options) -> Result<bool, String> {
         .map(|one| (one.target.clone(), one.clone()))
         .collect();
     let ordered = schedule(built, &ledger);
+    let budgets = budgets(&executables, &ledger, options);
 
     // Split off the targets whose tier asked for the machine to itself. They
     // go last, one at a time: see `selection::Tier::exclusive` for why a timing
@@ -387,9 +456,12 @@ fn run(options: &Options) -> Result<bool, String> {
     let mut shared = Vec::new();
     let mut alone = Vec::new();
     for built in ordered {
+        // A target runs alone because its tier asked for the machine, or
+        // because the row itself did. The second is for a target that starts a
+        // nested run: see `selection::Row::alone`.
         let solo = map
             .row(&built.target)
-            .is_some_and(|row| exclusive_tiers.contains(row.tier.as_str()));
+            .is_some_and(|row| exclusive_tiers.contains(row.tier.as_str()) || row.alone);
         if solo {
             alone.push(built);
         } else {
@@ -412,7 +484,7 @@ fn run(options: &Options) -> Result<bool, String> {
         }
     );
     let started = Instant::now();
-    let mut outcomes = execute(shared, options);
+    let mut outcomes = execute(shared, options, &budgets);
     if !alone.is_empty() {
         // **One binary at a time, and one thread inside it.** `jobs: 1` alone
         // gave an exclusive target the machine to itself among the *binaries*
@@ -426,15 +498,25 @@ fn run(options: &Options) -> Result<bool, String> {
             test_threads: 1,
             ..Options::from(options)
         };
-        outcomes.extend(execute(alone, &solo));
+        outcomes.extend(execute(alone, &solo, &budgets));
     }
-    let outcomes = settle_undetermined(outcomes, &executables, options);
+    let outcomes = settle_undetermined(outcomes, &executables, options, &budgets);
     let wall = started.elapsed();
 
     report(&outcomes, wall, &map, options.strict);
     if options.record {
-        write_ledger(&root.join("tests/timings.toml"), &ledger, &outcomes)?;
-        println!("recorded {} timing(s)", outcomes.len());
+        // **A ledger that could not be written is not "the run did not happen"
+        // (task-2047).** The targets ran and the report above is what they
+        // said, so returning `Err` here would give that run exit code 2 and
+        // throw its verdict away. Saying so and keeping the run red records the
+        // failure without pretending nothing was graded.
+        match write_ledger(&root.join("tests/timings.toml"), &ledger, &outcomes) {
+            Ok(()) => println!("recorded {} timing(s)", outcomes.len()),
+            Err(reason) => {
+                eprintln!("inillucent-testrun: the timings were not recorded: {reason}");
+                return Ok(false);
+            }
+        }
     }
 
     // Undetermined counts as red, and deliberately so. The run is a gate, and
@@ -443,7 +525,53 @@ fn run(options: &Options) -> Result<bool, String> {
     // undetermined here when a second, solitary attempt could not read it either.
     let red = outcomes.iter().any(|outcome| !outcome.verdict.is_green());
     let hollow = options.strict && !missing_prerequisites(&outcomes, &map).is_empty();
+    if !red && nothing_was_graded(&outcomes) {
+        return Err(graded_nothing(options, outcomes.len()));
+    }
     Ok(!red && !hollow)
+}
+
+/// Returns whether every target that ran counted no test.
+///
+/// Read by `report` as well as by `run`, so the word the report ends on and the
+/// code the process exits with come from the same question. The comment on
+/// `report`'s `ok` says why that matters: a report and an exit status that
+/// disagree end with one of the two being ignored.
+///
+/// @param outcomes - what the run produced
+fn nothing_was_graded(outcomes: &[Outcome]) -> bool {
+    !outcomes.is_empty() && outcomes.iter().all(|outcome| outcome.ran == 0)
+}
+
+/// Refuses a run whose binaries all started and graded no test.
+///
+/// **`--filter` with a name no test carries prints `ok` and exits zero
+/// (task-2047).** Every selected binary really did run, so no verdict is red,
+/// and the summary line reads `1 target(s), 0 test(s), 0 failed, 0
+/// undetermined` above a green word. It is the build-that-did-not-happen
+/// wearing a report: no test was graded, so there is nothing in the run to
+/// pass on, and `--filter` takes free text so a typo in a test name reaches it
+/// on the first try.
+///
+/// Zero across a whole run is always the filter and never the map.
+/// `selection.rs`'s `every_target_has_a_row` attributes every source file
+/// holding a `#[test]` to the target that compiles it, so a target the map
+/// names has tests in it by construction.
+///
+/// Checked only when nothing is red: a binary that died before its first test
+/// also ran none, and that is an undetermined target with its own reason,
+/// which the report has already said better than this sentence would.
+///
+/// @param options - what the command line asked for
+/// @param targets - how many targets ran
+fn graded_nothing(options: &Options, targets: usize) -> String {
+    match &options.filter {
+        Some(filter) => format!(
+            "{targets} target(s) ran and no test matched `--filter {filter}`, so nothing was \
+             graded"
+        ),
+        None => format!("{targets} target(s) ran and graded no test at all"),
+    }
 }
 
 /// Works out which rows to run.
@@ -506,6 +634,167 @@ fn choose<'map>(root: &Path, map: &'map Map, options: &Options) -> Result<Vec<&'
     Ok(rows)
 }
 
+/// Answers a selection that came back empty.
+///
+/// **A request that could not be honoured is not a passing run (task-2047).**
+/// `--target inillucent-compat::dml --tier smoke` names a real target and a
+/// real tier, so neither guard in `choose` fires - those catch a name the map
+/// does not hold at all - and the intersection of the two is empty. The runner
+/// printed `nothing selected` and exited zero, which is the shape
+/// `tests/inillucent-testing-tdd.md` rule 1.5 is about: a gate that graded
+/// nothing read as a pass. Two real names are easier to type than one wrong
+/// one, so this was the reachable half of the defect.
+///
+/// `--changed` is the one case where an empty selection is an answer rather
+/// than a failure: it asks what the working tree can break, and "nothing" is
+/// both true and useful. So a derived selection stays green and only one the
+/// caller named by hand refuses.
+///
+/// @param options - what the command line asked for
+fn empty_selection(options: &Options) -> Result<bool, String> {
+    if options.changed.is_some() {
+        println!("nothing selected");
+        return Ok(true);
+    }
+    let mut named = Vec::new();
+    if !options.targets.is_empty() {
+        named.push(format!("--target {}", options.targets.join(", ")));
+    }
+    if !options.tiers.is_empty() {
+        named.push(format!("--tier {}", options.tiers.join(", ")));
+    }
+    if named.is_empty() {
+        return Err(
+            "tests/selection.toml names no target, so there was nothing to run".to_string(),
+        );
+    }
+    Err(format!(
+        "{} selected no target, so nothing ran. Each name is in tests/selection.toml; \
+         no target carries all of them.",
+        named.join(" with ")
+    ))
+}
+
+/// Puts the MSVC compiler's own environment into this process, when it is missing.
+///
+/// **`onig_sys` compiles oniguruma with `cl.exe`, and an agent terminal has
+/// never run `vcvars64.bat` (task-1995, task-2047).** cl.exe finds its headers
+/// through INCLUDE, LIB and PATH, so without them the whole run stops on
+///
+/// ```text
+/// regenc.h(39): fatal error C1083: Cannot open include file: 'stddef.h'
+/// ```
+///
+/// which names the header rather than the cause. `Import-MsvcEnvironment` in
+/// `packaging/stage-layout.ps1` has done this for the release path since
+/// task-1995 and nothing in the test path called it, so every agent running the
+/// suite from a terminal that was not a Developer PowerShell got a failed build
+/// where a test result should have been. That is one cause of the exit code
+/// this ticket is about, and the exit code being right does not make the run
+/// have happened.
+///
+/// Nothing happens when INCLUDE is already set, so a developer shell is left
+/// exactly as it is, and nothing happens off an MSVC host.
+///
+/// A failure here returns the sentence that fixes it instead of letting cargo
+/// fail on the header: the build cannot succeed either way, and only one of the
+/// two says what to do about it.
+#[cfg(all(windows, target_env = "msvc"))]
+fn import_msvc_environment() -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    if std::env::var_os("INCLUDE").is_some() {
+        return Ok(());
+    }
+    let vswhere = PathBuf::from(std::env::var("ProgramFiles(x86)").map_err(|_| {
+        "INCLUDE is not set and ProgramFiles(x86) is not in this environment, so Visual \
+             Studio cannot be found. Run from a Developer PowerShell."
+            .to_string()
+    })?)
+    .join("Microsoft Visual Studio")
+    .join("Installer")
+    .join("vswhere.exe");
+    if !vswhere.is_file() {
+        return Err(format!(
+            "INCLUDE is not set and {} does not exist, so the MSVC environment cannot be found \
+             and `onig_sys` cannot compile oniguruma. Run from a Developer PowerShell, or \
+             install Visual Studio's C++ tools.",
+            vswhere.display()
+        ));
+    }
+    let found = Command::new(&vswhere)
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ])
+        .output()
+        .map_err(|error| format!("cannot run {}: {error}", vswhere.display()))?;
+    let install = String::from_utf8_lossy(&found.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if install.is_empty() {
+        return Err(
+            "INCLUDE is not set and vswhere found no Visual Studio with the C++ tools, so \
+             `onig_sys` cannot compile oniguruma. Install Visual Studio's \"Desktop development \
+             with C++\" workload."
+                .to_string(),
+        );
+    }
+    let vcvars = PathBuf::from(&install)
+        .join("VC")
+        .join("Auxiliary")
+        .join("Build")
+        .join("vcvars64.bat");
+    if !vcvars.is_file() {
+        return Err(format!(
+            "INCLUDE is not set and {} does not exist, so the MSVC environment cannot be \
+             imported. Run from a Developer PowerShell.",
+            vcvars.display()
+        ));
+    }
+    // `set` after the batch file prints the environment it produced, and each
+    // line is copied into this process - which is what the cargo children then
+    // inherit. `raw_arg` rather than `arg`: cmd.exe does not parse a command
+    // line the way Rust quotes one, and the path holds a space.
+    let printed = Command::new("cmd")
+        .arg("/c")
+        .raw_arg(format!("\"\"{}\" >nul 2>&1 && set\"", vcvars.display()))
+        .output()
+        .map_err(|error| format!("cannot run {}: {error}", vcvars.display()))?;
+    if !printed.status.success() {
+        return Err(format!("{} did not run.", vcvars.display()));
+    }
+    for line in String::from_utf8_lossy(&printed.stdout).lines() {
+        if let Some((name, value)) = line.split_once('=') {
+            if !name.is_empty() {
+                std::env::set_var(name, value);
+            }
+        }
+    }
+    if std::env::var_os("INCLUDE").is_none() {
+        return Err(format!("running {} did not set INCLUDE.", vcvars.display()));
+    }
+    println!("the MSVC environment from {install}");
+    Ok(())
+}
+
+/// Nothing to import: the C dependency is not built with cl.exe here.
+///
+/// `target_env` rather than `windows` alone, so a Windows host on the GNU
+/// toolchain is not refused for a compiler it does not use.
+#[cfg(not(all(windows, target_env = "msvc")))]
+fn import_msvc_environment() -> Result<(), String> {
+    Ok(())
+}
+
 /// Asks git which paths differ from a revision, including untracked files.
 ///
 /// An untracked file is a new suite or a new crate, and a selector that could
@@ -547,12 +836,11 @@ fn changed_paths(root: &Path, revision: &str) -> Result<Vec<String>, String> {
 
 /// Builds every test binary, and the two programs the shell suites run.
 ///
-/// The second half matters for parallelism. `cli.rs` and `semantics.rs` in this
-/// crate, and `conformance.rs` in `inillucent-driver-capi`, each shell out to
-/// `cargo build` from inside the test, because they drive a *program* rather
-/// than a library. Run at once, they would each wait on cargo's lock on the
-/// target directory. Building those programs here, before anything starts,
-/// makes each of those in-test builds a no-op.
+/// The second half is the only build of the programs in a run. The suites that
+/// drive a *program* rather than a library find it through
+/// `cliproc::program`, and `run_one` sets `cliproc::PROGRAMS_BUILT` so that
+/// function builds nothing: a build from inside one suite that had to relink a
+/// program another suite was running failed on Windows (task-2106).
 ///
 /// @param root - the workspace root
 /// @param rows - the rows that were selected, for the features they name
@@ -884,6 +1172,48 @@ fn write_ledger(
     std::fs::write(path, text).map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
+/// Returns how long each target may run before the runner stops waiting for it.
+///
+/// Drawn from the same ledger the schedule is drawn from, so the number that
+/// says a target is slow and the number that says it is stuck are the same
+/// measurement. A target the ledger has never seen gets the floor rather than a
+/// multiple of a guess - `supervise::budget` is where that arithmetic and its
+/// tests live.
+///
+/// **A budget is not what stops a target on its own.** It is one of the two
+/// conditions `supervise` requires; the other is that the target has printed
+/// nothing for ten minutes. A suite that replays its work through the pinned
+/// SQLite shell sits at flat processor time for as long as the shell takes, and
+/// a bound that fired on that would kill working suites - which is a mistake
+/// that was made three times by hand on this machine in one evening, and cost a
+/// legitimate thirty minute run once.
+///
+/// @param targets - every target this run will start
+/// @param ledger - the recorded times
+/// @param options - what the command line asked for
+fn budgets(
+    targets: &BTreeMap<Target, Built>,
+    ledger: &BTreeMap<String, u64>,
+    options: &Options,
+) -> BTreeMap<Target, Option<Duration>> {
+    targets
+        .keys()
+        .map(|target| {
+            let limit = match options.timeout {
+                Some(0) => None,
+                Some(seconds) => Some(Duration::from_secs(seconds)),
+                None => Some(supervise::budget(
+                    ledger
+                        .get(&target.label())
+                        .copied()
+                        .map(Duration::from_millis),
+                )),
+            };
+            (target.clone(), limit)
+        })
+        .collect()
+}
+
 /// Puts the longest targets first.
 ///
 /// Longest-processing-time-first is the classic answer to this shape of
@@ -915,7 +1245,12 @@ fn schedule(mut built: Vec<Built>, ledger: &BTreeMap<String, u64>) -> Vec<Built>
 ///
 /// @param ordered - the targets, longest first
 /// @param options - what the command line asked for
-fn execute(ordered: Vec<Built>, options: &Options) -> Vec<Outcome> {
+/// @param budgets - how long each target may run
+fn execute(
+    ordered: Vec<Built>,
+    options: &Options,
+    budgets: &BTreeMap<Target, Option<Duration>>,
+) -> Vec<Outcome> {
     let total = ordered.len();
     let (sender, receiver) = mpsc::channel::<Outcome>();
     let mut pending = ordered.into_iter();
@@ -931,10 +1266,11 @@ fn execute(ordered: Vec<Built>, options: &Options) -> Vec<Outcome> {
         let threads = options.test_threads.to_string();
         let filter = options.filter.clone();
         let strict = options.strict;
+        let budget = budgets.get(&built.target).copied().flatten();
         let _ = std::thread::Builder::new()
             .name(built.target.label())
             .spawn(move || {
-                let outcome = run_one(&built, &threads, filter.as_deref(), strict);
+                let outcome = run_one(&built, &threads, filter.as_deref(), strict, budget);
                 let _ = sender.send(outcome);
             });
         true
@@ -971,15 +1307,29 @@ fn execute(ordered: Vec<Built>, options: &Options) -> Vec<Outcome> {
 /// @param threads - what to pass as `--test-threads`
 /// @param filter - a name filter, when one was asked for
 /// @param strict - whether a suite that skips should panic rather than pass
-fn run_one(built: &Built, threads: &str, filter: Option<&str>, strict: bool) -> Outcome {
+/// @param budget - how long it may run before it is stopped; `None` never stops it
+fn run_one(
+    built: &Built,
+    threads: &str,
+    filter: Option<&str>,
+    strict: bool,
+    budget: Option<Duration>,
+) -> Outcome {
     let mut command = Command::new(&built.executable);
     command
         .current_dir(&built.directory)
-        // `cli.rs` and its two siblings read `CARGO` to find the cargo that is
-        // driving them. Started from here rather than from cargo, they would
+        // `conformance.rs` in `inillucent-driver-capi` reads `CARGO` to find
+        // the cargo that is driving it. Started from here rather than from cargo, they would
         // fall back to whatever `cargo` is on PATH, which on a machine with
         // several toolchains is not necessarily this one.
         .env("CARGO", cargo())
+        // **The suites use the programs `build` made, and build nothing
+        // themselves (task-2106).** `cliproc::program` used to run `cargo build
+        // -p inillucent-cli` from inside every suite, and a build that had to
+        // relink while another suite was running `inillucent-shell.exe` failed
+        // with `Access is denied. (os error 5)` and was reported as a missing
+        // prerequisite.
+        .env(inillucent_compat::cliproc::PROGRAMS_BUILT, "1")
         // **What `--strict` means, handed to the suite itself.** The
         // classifier below reads a suite's captured output and decides whether
         // it skipped, which works and is the backstop; this is the same
@@ -1018,36 +1368,84 @@ fn run_one(built: &Built, threads: &str, filter: Option<&str>, strict: bool) -> 
     if let Some(filter) = filter {
         command.arg(filter);
     }
+    let limits = Limits {
+        budget,
+        ..Limits::default()
+    };
+    // **Not `Command::output()`, and that is the whole of task-2071.**
+    // `output()` waits for the child's pipes to reach end of file, which is a
+    // different event from the child exiting: anything the child started with
+    // inherited standard output holds the write end after the child is gone, so
+    // `output()` goes on waiting with no child of its own and no verdict to
+    // report. The runner did exactly that - alive at 1.625 seconds of processor
+    // time, no children, no result line, no summary and no exit code - and had
+    // to be stopped by its process id. `supervise` waits on the child.
     let started = Instant::now();
-    let output = command.output();
-    let elapsed = started.elapsed();
-    match output {
-        Ok(output) => {
-            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-            let summary = verdict::read_summary(&text).unwrap_or_default();
-            Outcome {
-                target: built.target.clone(),
-                verdict: verdict::classify(&text, output.status.success()),
-                elapsed,
-                ran: summary.passed + summary.failed,
-                output: text,
-                status: match output.status.code() {
-                    Some(code) => format!("exit status {code}"),
-                    None => "killed by a signal".to_string(),
-                },
-                retry_of: None,
-            }
-        }
+    match supervise::supervise(&mut command, &limits) {
+        Ok(run) => read_run(built, run),
         Err(error) => Outcome {
             target: built.target.clone(),
             verdict: Verdict::Undetermined(Undetermined::NeverStarted),
-            elapsed,
+            elapsed: started.elapsed(),
             ran: 0,
             output: format!("cannot start {}: {error}", built.executable.display()),
             status: "never started".to_string(),
             retry_of: None,
         },
+    }
+}
+
+/// Turns what the supervisor saw into the outcome the report prints.
+///
+/// @param built - which target ran
+/// @param run - what the supervisor produced
+fn read_run(built: &Built, run: supervise::Supervised) -> Outcome {
+    let mut text = String::from_utf8_lossy(&run.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&run.stderr));
+    let summary = verdict::read_summary(&text).unwrap_or_default();
+    let ran = summary.passed + summary.failed;
+    if let Stopped::Killed {
+        ran_for,
+        silent_for,
+    } = run.stopped
+    {
+        // Undetermined rather than FAILED, and the distinction is not cosmetic.
+        // Nothing was graded here: the tests this target got through before it
+        // was stopped are not evidence that the rest would have passed, and they
+        // are not evidence that any of them would have failed either. The run
+        // goes red and the target is named, which is what was missing.
+        return Outcome {
+            target: built.target.clone(),
+            verdict: Verdict::Undetermined(Undetermined::TimedOut),
+            elapsed: run.elapsed,
+            ran,
+            output: text,
+            status: format!(
+                "killed after {:.1}s, having printed nothing for the last {:.1}s of it",
+                ran_for.as_secs_f64(),
+                silent_for.as_secs_f64()
+            ),
+            retry_of: None,
+        };
+    }
+    let mut status = match run.status.and_then(|status| status.code()) {
+        Some(code) => format!("exit status {code}"),
+        None => "killed by a signal".to_string(),
+    };
+    if run.stopped == Stopped::ExitedHoldingPipes {
+        // Said out loud, because it is the one case where the transcript below
+        // may be short of what the target actually printed - and because it
+        // names a real thing about the suite: it left a process running.
+        status.push_str(" (something it started outlived it holding its output pipe)");
+    }
+    Outcome {
+        target: built.target.clone(),
+        verdict: verdict::classify(&text, run.status.is_some_and(|status| status.success())),
+        elapsed: run.elapsed,
+        ran,
+        output: text,
+        status,
+        retry_of: None,
     }
 }
 
@@ -1064,13 +1462,21 @@ fn run_one(built: &Built, threads: &str, filter: Option<&str>, strict: bool) -> 
 /// Whatever the second attempt says stands, and the first attempt's reason and
 /// exit status travel with it into the report either way.
 ///
+/// A target the runner **stopped** is not retried either, and for the opposite
+/// reason. Its first attempt was not an absence of information: the runner
+/// refused to wait any longer, and a second attempt would refuse again at the
+/// same budget, having spent it twice. What there is to say about a stopped
+/// target is in the report.
+///
 /// @param outcomes - what the first pass produced
 /// @param executables - the built binaries, by target
 /// @param options - what the command line asked for
+/// @param budgets - how long each target may run
 fn settle_undetermined(
     outcomes: Vec<Outcome>,
     executables: &BTreeMap<Target, Built>,
     options: &Options,
+    budgets: &BTreeMap<Target, Option<Duration>>,
 ) -> Vec<Outcome> {
     let unread: Vec<(Target, Undetermined, String)> = outcomes
         .iter()
@@ -1078,6 +1484,7 @@ fn settle_undetermined(
             outcome
                 .verdict
                 .undetermined()
+                .filter(|reason| *reason != Undetermined::TimedOut)
                 .map(|reason| (outcome.target.clone(), reason, outcome.status.clone()))
         })
         .collect();
@@ -1094,7 +1501,14 @@ fn settle_undetermined(
         let Some(built) = executables.get(&target) else {
             continue;
         };
-        let mut again = run_one(built, &threads, options.filter.as_deref(), options.strict);
+        let budget = budgets.get(&target).copied().flatten();
+        let mut again = run_one(
+            built,
+            &threads,
+            options.filter.as_deref(),
+            options.strict,
+            budget,
+        );
         again.retry_of = Some(format!(
             "{} on the first attempt ({status})",
             reason.reason()
@@ -1237,10 +1651,18 @@ fn missing_prerequisites<'run>(
         let silent = outcome.ran == 0;
         let announced = inillucent_compat::differential::announces_a_skip(&outcome.output);
         if silent || announced {
-            let said = if row.requires.is_empty() {
-                strict_reasons
-            } else {
+            // **What the suite said comes first, and the row is the fallback
+            // (task-2101).** The row lists everything a suite *could* be
+            // missing, and the suite names what it *was* missing. With the row
+            // first, `conformance` failing to relink a DLL that Python had
+            // loaded was printed as `needs cc, asan`, which sent the reader
+            // looking for a missing toolchain when the suite itself had said
+            // "the C ABI static library did not build". A non-strict run has no
+            // panic to read the reason from, so it still prints the row.
+            let said = if strict_reasons.is_empty() {
                 row.requires.clone()
+            } else {
+                strict_reasons
             };
             hollow.push((outcome, said));
         }
@@ -1338,6 +1760,14 @@ fn report(outcomes: &[Outcome], wall: Duration, map: &Map, strict: bool) {
         .iter()
         .filter(|outcome| outcome.verdict.undetermined().is_some())
         .collect();
+    // Listed apart from the rest of `unread` below, because the sentence that
+    // list ends on - that a second attempt did not settle it either - is not
+    // true of these and must not be printed over them. A stopped target was
+    // never retried, on purpose.
+    let stopped: Vec<&Outcome> = outcomes
+        .iter()
+        .filter(|outcome| outcome.verdict.undetermined() == Some(Undetermined::TimedOut))
+        .collect();
     // The transcript of a target that could not be read is printed for the same
     // reason a failure's is: it is the only account of what happened, and the
     // summary line inside it is what says the tests themselves passed.
@@ -1417,6 +1847,13 @@ fn report(outcomes: &[Outcome], wall: Duration, map: &Map, strict: bool) {
         // nothing installed pass for evidence, and as a target recorded FAILED
         // with all 156 of its tests passing: the report and the exit status
         // have to agree, or one of them stops being read.
+        // A run where every binary started and counted no test is the same
+        // defect reached through `--filter`, and `run` exits 2 for it. The word
+        // here has to agree with that code for the reason above.
+        if nothing_was_graded(outcomes) {
+            println!("\nnot ok - every target ran and no test was graded");
+            return;
+        }
         if strict && hollow > 0 {
             println!("\nnot ok - every test passed, and {hollow} suite(s) evidenced nothing");
             return;
@@ -1436,9 +1873,19 @@ fn report(outcomes: &[Outcome], wall: Duration, map: &Map, strict: bool) {
             println!("  {:<44} {}", failure.target.label(), failure.status);
         }
     }
-    if !unread.is_empty() {
+    if !stopped.is_empty() {
+        println!("\nSTOPPED - the runner would not wait any longer, so nothing here was graded:");
+        for outcome in &stopped {
+            println!("  {:<44} {}", outcome.target.label(), outcome.status);
+        }
+    }
+    let unsettled: Vec<&&Outcome> = unread
+        .iter()
+        .filter(|outcome| outcome.verdict.undetermined() != Some(Undetermined::TimedOut))
+        .collect();
+    if !unsettled.is_empty() {
         println!("\nUNDETERMINED - a second attempt alone did not settle these either:");
-        for outcome in &unread {
+        for outcome in &unsettled {
             println!(
                 "  {:<44} {}, {}",
                 outcome.target.label(),

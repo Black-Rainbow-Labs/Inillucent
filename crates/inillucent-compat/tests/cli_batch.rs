@@ -16,6 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use inillucent_compat::cliproc;
 use inillucent_compat::workspace_root;
 
 /// Where this suite's scratch databases live.
@@ -25,34 +26,12 @@ fn area() -> PathBuf {
     path
 }
 
-/// Returns one of the shipped binaries, building them first.
-///
-/// @param name - which binary
-fn binary(name: &str) -> Option<PathBuf> {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let status = Command::new(cargo)
-        .current_dir(workspace_root())
-        .args(["build", "-p", "inillucent-cli"])
-        .status()
-        .ok()?;
-    if !status.success() {
-        return None;
-    }
-    let mut directory = std::env::current_exe().unwrap_or_default();
-    directory.pop();
-    directory.pop();
-    let path = directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-    path.is_file().then_some(path)
-}
-
 /// Returns a fresh database path with no files left over from a previous run.
 ///
 /// @param name - the file's name, so no two cases share one
 fn scratch(name: &str) -> PathBuf {
     let path = area().join(name);
-    for suffix in ["", "-wal", "-journal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
+    inillucent_base::testing::remove_database(&path);
     path
 }
 
@@ -119,10 +98,7 @@ fn only_value(stdout: &str) -> String {
 /// asserted is what reached the file rather than what one process believed.
 #[test]
 fn a_batch_whose_script_fails_commits_nothing() {
-    let Some(program) = binary("inillucent") else {
-        inillucent_compat::differential::skipping("the inillucent binary is not built");
-        return;
-    };
+    let program = cliproc::program("inillucent");
     let database = scratch("failing-batch.rdb");
     let (code, _, stderr) = run(
         &program,
@@ -193,10 +169,7 @@ fn a_batch_whose_script_fails_commits_nothing() {
 /// reason as above.
 #[test]
 fn a_batch_that_succeeds_commits_every_statement() {
-    let Some(program) = binary("inillucent") else {
-        inillucent_compat::differential::skipping("the inillucent binary is not built");
-        return;
-    };
+    let program = cliproc::program("inillucent");
     let database = scratch("succeeding-batch.rdb");
     let (code, _, stderr) = run(
         &program,

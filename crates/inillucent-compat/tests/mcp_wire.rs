@@ -343,12 +343,8 @@ const CALLS: [(&str, &str, &str); 28] = [
 /// tool call would pass all of them.
 #[test]
 fn every_tool_answers_over_one_session() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
-    let Some(server) = program("inillucent-mcp") else {
-        return;
-    };
+    let binary = program("inillucent");
+    let server = program("inillucent-mcp");
     let database = populated(&binary);
     let directory = database
         .parent()
@@ -438,12 +434,8 @@ fn every_tool_answers_over_one_session() {
 /// never for an `INSERT`, a write pragma, an `ATTACH` or a `VACUUM INTO`.
 #[test]
 fn a_read_only_server_refuses_every_write_and_leaves_the_file_alone() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
-    let Some(server) = program("inillucent-mcp") else {
-        return;
-    };
+    let binary = program("inillucent");
+    let server = program("inillucent-mcp");
     let database = populated_at(&binary, "readonly");
     let before = std::fs::read(&database).expect("the database reads");
 
@@ -483,6 +475,70 @@ fn a_read_only_server_refuses_every_write_and_leaves_the_file_alone() {
     );
 }
 
+/// **A read only server can still use `run`, and a write inside it is refused.**
+///
+/// `run` is how every dot command is reached from MCP, and `--readonly` is the
+/// mode an agent is meant to be given - so refusing the verb wholesale took
+/// `.schema`, `.tables`, `.eqp on` and `.parameter set` away from exactly the
+/// caller they were built for. The command table marked `run` as a write
+/// because one flag answered two questions: whether `--readonly` refuses the
+/// verb, and whether the verb may create the file it was pointed at
+/// (task-2066 section 4.2, item 26).
+///
+/// The refusal that has to survive is the one inside: the shell classifies
+/// each statement through `inillucent_driver::readonly::admits` and refuses a
+/// write with "attempt to write a readonly database". So both halves are
+/// asserted here, and the file is compared before and after, because a verb
+/// gate that stood aside and a refusal per statement that did not fire would
+/// pass the first assertion on its own.
+#[test]
+fn a_read_only_server_can_run_dot_commands_and_still_refuses_a_write() {
+    let binary = program("inillucent");
+    let server = program("inillucent-mcp");
+    let database = populated_at(&binary, "readonly-run");
+    let before = std::fs::read(&database).expect("the database reads");
+
+    let mut session = Session::start_with(&server, &database, &["--readonly"]);
+    let listed = session.tool("inillucent_run", "{\"input\":\".tables\"}");
+    assert!(
+        listed.contains("\"isError\":false"),
+        "a read only server refused `.tables` through run:
+{listed}"
+    );
+    assert!(
+        listed.contains("note"),
+        "`.tables` through a read only server did not list the table:
+{listed}"
+    );
+    let read = session.tool(
+        "inillucent_run",
+        "{\"input\":\"SELECT count(*) FROM note;\"}",
+    );
+    assert!(
+        read.contains("\"isError\":false"),
+        "a read only server refused a SELECT through run:
+{read}"
+    );
+    let refused = session.tool(
+        "inillucent_run",
+        "{\"input\":\"INSERT INTO note (body) VALUES ('written');\"}",
+    );
+    assert!(
+        refused.contains("readonly") || refused.contains("read only"),
+        "a read only server did not refuse a write inside run:
+{refused}"
+    );
+    drop(session);
+
+    let after = std::fs::read(&database).expect("the database reads");
+    assert_eq!(
+        before,
+        after,
+        "the file changed under a read only server, by {} bytes",
+        after.len() as i64 - before.len() as i64
+    );
+}
+
 /// A server refuses every dot command that reaches the operating system or a
 /// path outside its root (task-1979, H1).
 ///
@@ -493,12 +549,8 @@ fn a_read_only_server_refuses_every_write_and_leaves_the_file_alone() {
 /// server's standard output, which is the JSON-RPC channel.
 #[test]
 fn a_server_refuses_the_dot_commands_that_reach_outside_it() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
-    let Some(server) = program("inillucent-mcp") else {
-        return;
-    };
+    let binary = program("inillucent");
+    let server = program("inillucent-mcp");
     let database = populated_at(&binary, "confined");
     let root = database
         .parent()
@@ -578,12 +630,8 @@ fn a_server_refuses_the_dot_commands_that_reach_outside_it() {
 /// 0xC00000FD and a client whose next request is never answered.
 #[test]
 fn a_statement_past_the_depth_limit_does_not_end_the_server() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
-    let Some(server) = program("inillucent-mcp") else {
-        return;
-    };
+    let binary = program("inillucent");
+    let server = program("inillucent-mcp");
     let database = populated_at(&binary, "deep");
     let mut session = Session::start(&server, &database);
     let deep = format!("SELECT {}1{}", "abs(".repeat(2_000), ")".repeat(2_000));

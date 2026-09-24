@@ -1,6 +1,6 @@
 # inillucent
 
-**An embedded database for agents, written in Rust. It runs SQLite's SQL dialect 330% faster than
+**An embedded database for agents, written in Rust. It runs SQLite's SQL dialect 397% faster than
 SQLite does, and it holds vector search and keyword search in the same file. A local AI agent can
 query a body of written material by meaning and by exact term without standing up PostgreSQL,
 pgvector and an embedding server.**
@@ -17,14 +17,17 @@ tables, a full text index and a vector index, and all three commit and roll back
 
 |  |  |  |
 |---|---|---|
-| **330% faster than SQLite 3.53.4** | the same ten workload families at 100,000 rows | [Performance](docs/performance.md) |
-| **70% less processor time** | 390 ms against SQLite's 1,320 for the same plan | [Performance](docs/performance.md) |
-| **403 of 416 SQL cases byte for byte, none refused** | every case run through both engines and compared byte by byte. Of the thirteen that differ, six are vector search features SQLite has no equivalent for | [SQL support](docs/sql.md) |
+| **397% faster than SQLite 3.53.4** | the same ten workload families at 100,000 rows, both engines on the same cores | [Performance](docs/performance.md) |
+| **50% less processor time** | 555 ms against SQLite's 1,082 for the same plan | [Performance](docs/performance.md) |
+| **404 of 416 SQL cases byte for byte, none refused** | every case run through both engines and compared byte by byte. Of the twelve that differ, six are vector search features SQLite has no equivalent for | [SQL support](docs/sql.md) |
 | **Better than pgvector on 15 of 17 graded comparisons, worse on none** | both engines reading identical vectors | [Retrieval quality](docs/retrieval-quality.md) |
-| **14% more memory than SQLite** | 42.4 MiB against 37.2. The one measurement SQLite still wins | [Performance](docs/performance.md#memory) |
+| **9.5% more memory than SQLite** | 40.8 MiB against 37.2. The one measurement SQLite still wins | [Performance](docs/performance.md#memory) |
 
 [Performance](docs/performance.md) carries every figure with its 95% interval, and names the six
-workloads that are slower than SQLite along with what each one costs.
+weighted workloads that are slower than SQLite along with what each one costs. These are the graded
+run of 2026-09-23. Four passes at `52c4b5f` on 2026-09-24 were not graded because the machine was
+busy; they show the correlated subqueries 99% cheaper and the processor figure at 67% less, and
+Performance has them in their own section.
 
 ---
 
@@ -56,7 +59,7 @@ outside your home directory and neither needs administrator rights.
 | **Homebrew** | `brew install black-rainbow-labs/inillucent/inillucent` |
 | **npm** | `npm install -g inillucent`, or `npx inillucent help` with nothing installed |
 | **pip** | `pip install inillucent` - the wheel carries the programs and an in-process driver |
-| **cargo** | `cargo install inillucent-cli` - builds from source, and works on any platform |
+| **cargo** | `cargo install --git https://github.com/Black-Rainbow-Labs/Inillucent inillucent-cli` - builds from source, and works on any platform. `inillucent-cli` is not on crates.io yet, so `cargo install inillucent-cli` on its own finds nothing |
 | **Go** | `go install github.com/Black-Rainbow-Labs/Inillucent/packages/go/cmd/inillucent-install@latest && inillucent-install` |
 | **Composer** | `composer require black-rainbow-labs/inillucent && vendor/bin/inillucent-install` |
 
@@ -213,16 +216,13 @@ triggers, foreign keys with all five referential actions, `ATTACH`, partial and 
 `RETURNING`, `ON CONFLICT DO UPDATE`, 190 built in function names,
 the 68 pragmas this engine recognises. 416 cases were run
 through this engine and through a pinned `sqlite3` 3.53.4 over a fresh database each, and every byte
-of both streams compared: **403 produce SQLite's exact bytes, none are refused and 7 answer
-differently**. Window functions were the last twelve to close: `OVER (...)`, `PARTITION BY`, the
-`ROWS`, `RANGE` and `GROUPS` frame clauses, every `EXCLUDE` bound and all eleven window-only
-functions now match the pinned SQLite exactly.
-
-**This figure has read 403 before, so you may remember a different number for it.** It was first
-measured at 403 through a shell that still ran an engine this project has since retired. Re-measured against the engine that ships, it read 391, because twelve window function
-cases were reaching a pipeline builder that refused them. The window path is connected now, and the
-probe reads 403 again against the shipping engine. →
-[SQL support](docs/sql.md)
+of both streams compared: **404 produce SQLite's exact bytes, none are refused, 6 answer differently
+and 6 are vector search features SQLite has no equivalent for**. Window functions were the last
+twelve to close: `OVER (...)`, `PARTITION BY`, the `ROWS`, `RANGE` and `GROUPS` frame clauses, every
+`EXCLUDE` bound and all eleven window-only functions now match the pinned SQLite exactly. The six
+that answer differently are a page size this engine chose, the `.recover` line that prints it, a
+build option the two pinned SQLite artifacts disagree about, and three reports about SQLite's own C
+structures. → [SQL support](docs/sql.md)
 
 **Vector search in the same file.** A `VECTOR(N)` column, `vector_distance_cos`, `vector_distance_l2`
 and `vector_dot`, `CREATE INDEX ... USING inillucent_hnsw`, and a planner that turns
@@ -343,29 +343,38 @@ each cost and how each was fixed:
 
 ## Limits
 
-- **One writer at a time**, and the readers never block it. Several processes can share one file
-  under `PRAGMA locking_mode = normal`; the default is `exclusive`, because releasing the file
-  between statements has to re-read the meta record before every one. Measured when the headline
-  stood at 3.78x, `normal` took it to 3.03x. Threads inside one process are not supported.
+- **One writer at a time**, and the readers never block it. `PRAGMA locking_mode = normal` is the
+  default, so several processes can share one file without asking for anything: a statement releases
+  the file when it finishes and re-reads the meta record before the next one. That used to cost a
+  third of the headline, because releasing also folded the log into the file; a commit is one append
+  and one sync now and the fold is deferred, so it does not. Threads inside one process are not
+  supported.
 - **The file format is this engine's own.** SQLite files are imported, not opened. A SQLite
   application moves its data across once with `inillucent migrate`.
-- **Six of the thirty workloads are slower than SQLite**: building an FTS5 index (69% slower),
-  compiling `SELECT 1` on every call (100% slower), a 2,000 row insert batch (43% slower), a join over
-  an index range (11% slower), the same shape as a plain range scan (8% slower) and `json_extract`
-  (4% slower). [Performance](docs/performance.md#the-workloads-that-are-slower) says what each one
-  costs and what is being done about it. 2,000 updates in one transaction used to lead this list at
-  669% slower; it is now 270% *faster*.
+- **Six of the thirty weighted workloads are slower than SQLite**: compiling `SELECT 1` on every call
+  (75% slower), a join over an index range (18% slower), building an FTS5 index (5% slower), the
+  same shape as a plain range scan (4% slower), `json_extract` (3% slower) and an autocommit `UPDATE`
+  of one row (2% slower).
+  [Performance](docs/performance.md#the-workloads-that-are-slower) says what each one costs and what
+  is being done about it. The autocommit `UPDATE` joined that list by getting seven times faster - it
+  was 669% slower - and 2,000 updates in one transaction used to lead it at 1,011% slower and are now
+  280% *faster*.
+- **A correlated subquery is run once per outer row**, where SQLite turns it into a join. The last
+  graded run put a correlated `EXISTS` over 400 outer rows at 59.69 ms against SQLite's 0.29 ms.
+  A later fix stopped each execution building a 3.2 MB array, and at `52c4b5f`, on passes the gate
+  did not grade because the machine was busy, the same `EXISTS` takes 0.40 ms against 0.30 (35%
+  slower) and a correlated `IN` 0.92 ms against 0.10 (809% slower). A correlated `IN` against a
+  large table is still worth writing as a join.
 - **On Linux the same binary measured 53% faster** where Windows measured 279% at the time. That
   difference was traced to what SQLite pays the operating system on each platform rather than to
   anything this engine does differently there, and the finding is in
-  [Performance](docs/performance.md#linux). The Linux arm has not been re-measured since the Windows
-  headline reached 330%.
+  [Performance](docs/performance.md#linux). The Linux arm has not been re-measured since, and the Windows
+  headline has moved to 397%.
 - **Publishing a retrieval generation costs the whole corpus.** Adding content folds each new row
   into the published generation. Writing the generation still reads and writes the full index,
   however few rows changed, because a generation is one serialised structure. A build from scratch,
-  which is what `INSERT INTO t(t) VALUES('compact')` asks for, is 132.6 s over 185,078 passages on
-  one thread.
-- **There is no macOS archive yet**, because each platform's archive is built on that platform.
+  which is what `INSERT INTO t(t) VALUES('compact')` asks for, is 16.8 s over 185,078 passages at
+  768 dimensions, using every core. It was 129.7 s on one thread.
 
 ## Building it
 

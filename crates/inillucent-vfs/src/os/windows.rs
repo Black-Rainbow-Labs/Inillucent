@@ -93,6 +93,18 @@ pub fn sync_directory(_path: &DbPath) -> VfsResult<()> {
     Ok(())
 }
 
+/// Flushes a file the strongest way this platform can.
+///
+/// `FlushFileBuffers`, which is what `sync_all` calls and which Windows
+/// documents as reaching the disk. There is no second, stronger barrier the
+/// way Darwin's `F_FULLFSYNC` is stronger than its `fsync` - see
+/// `os::unix::full_sync`.
+///
+/// @param file - the file to flush
+pub fn full_sync(file: &File) -> std::io::Result<()> {
+    file.sync_all()
+}
+
 /// Fills `output` with randomness from the system preferred generator.
 pub fn system_randomness(output: &mut [u8]) -> VfsResult<()> {
     if output.is_empty() {
@@ -424,9 +436,34 @@ impl LockState {
     }
 
     /// Lowers the lock to `target`, which must be `Shared` or `None`.
+    ///
+    /// **A handle at SHARED holds neither RESERVED nor PENDING, so releasing it
+    /// unlocks one byte range and not three** (task-2046). RESERVED is taken
+    /// only on the way to RESERVED, and `take_shared` gives PENDING back before
+    /// it returns, so unlocking both on the way down from SHARED was two
+    /// `UnlockFileEx` calls that answered `ERROR_NOT_LOCKED` and were swallowed.
+    /// That is two of the six byte-range calls an ordinary statement made:
+    /// under `locking_mode = normal` every statement outside a transaction
+    /// takes the file and gives it back, and `leave` was 6.8 us of the 21.5 us
+    /// such a statement cost once the meta record was no longer being reread.
+    ///
+    /// A handle above SHARED still unlocks both, whether or not it took them.
+    /// `acquire` reaches EXCLUSIVE from SHARED without passing through
+    /// RESERVED when a caller asks for it directly, so "the level says it is
+    /// held" is not true there - and an unlock of a range nobody holds is the
+    /// harmless call this is removing from the path where it is provably
+    /// pointless, rather than a thing to reason about per level.
     pub fn release(&self, file: &File, target: FileLock) -> VfsResult<()> {
         let mut level = guard(&self.level);
         if target >= *level {
+            return Ok(());
+        }
+        // The line above has already returned for a target at or above the
+        // level held, so a handle at SHARED that reaches here is going to NONE
+        // and the read range is the one range it holds.
+        if *level == FileLock::Shared {
+            unlock_bytes(file, SHARED_FIRST, SHARED_SIZE, VfsOperation::Unlock)?;
+            *level = target;
             return Ok(());
         }
         if *level == FileLock::Exclusive {

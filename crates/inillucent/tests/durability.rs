@@ -20,6 +20,15 @@
 //! unwind to it, check a point, close, open - agrees with itself **through the
 //! public name**, across a reopen, with no harness in the way.
 //!
+//! ## The other half of this file
+//!
+//! `durability_arms.rs` beside it holds the cases that run at every arm of
+//! `inillucent_compat::matrix`, and the split is not a preference:
+//! `crates/inillucent-compat/tests/scenarios.rs` refuses a file holding both a
+//! `scenario!` and a bare `#[test]`, because a file that grades one story six
+//! ways and another once produces output nobody can read. What both files build
+//! is in `inillucent_compat::durable`.
+//!
 //! ## Why some of these look like they are testing the same thing twice
 //!
 //! `a_commit_survives` and `a_commit_survives_without_a_checkpoint` differ by
@@ -31,6 +40,10 @@
 
 use std::path::PathBuf;
 
+use inillucent_compat::durable::{
+    count, migrate_and_index, the_three_rows, three_rows, values_after_reopen, MIGRATED_ROWS,
+};
+use inillucent_compat::matrix::Arm;
 use inillucent_engine::connect::Database;
 use inillucent_tree::datum::OwnedDatum;
 
@@ -46,19 +59,6 @@ fn scratch(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).expect("a scratch directory");
     directory
-}
-
-/// Returns the one integer a single-row, single-column answer holds.
-///
-/// @param rows - what the query returned
-fn count(rows: &[Vec<OwnedDatum>]) -> i64 {
-    match rows {
-        [row] => match row.as_slice() {
-            [OwnedDatum::Int(value)] => *value,
-            other => panic!("expected one integer, got {other:?}"),
-        },
-        other => panic!("expected one row, got {}", other.len()),
-    }
 }
 
 /// Counts the rows in `t` through a freshly opened handle, and checks the file.
@@ -438,4 +438,263 @@ fn a_checkpoint_changes_nothing_a_reader_can_see() {
         .query("SELECT id, v FROM t ORDER BY id")
         .expect("read after the reopen");
     assert_eq!(before, after_reopen);
+}
+
+/// The same index, in write-ahead-log mode, where there is no journal to route
+/// around.
+///
+/// **The case the page stamp is for, and the matrix cannot reach it** - none of
+/// its six arms selects `journal_mode = wal` (task-2055). In that mode there is
+/// no rollback journal, so `Journal::holds` is false for every page and a bulk
+/// build always writes straight into the data file. What can then put the
+/// pages' previous life back is the log, and the stamp on the page is what
+/// stops it: leave the built page at an LSN of zero, or read a page's LSN off
+/// the pool's page count rather than off the file, and redo applies the records
+/// that filled those pages when they were leaves of `doc`.
+///
+/// The close folds nothing, because the read in `migrate_and_index` evicted
+/// every dirty frame, so the reopen really does replay the window.
+#[test]
+fn an_index_built_in_wal_mode_survives_a_reopen() {
+    let directory = scratch("wal-built-index");
+    let path = directory.join("d.rdb");
+    {
+        let database = Database::open_at(&path, 4_096, 64).expect("the database opens");
+        let connection = database.session();
+        connection
+            .execute("PRAGMA journal_mode = wal")
+            .expect("write-ahead-log mode");
+        migrate_and_index(&connection);
+    }
+    let database = Database::open_at(&path, 4_096, 64).expect("the database reopens");
+    database.check().expect("the file is sound");
+    let connection = database.session();
+    assert_eq!(
+        count(
+            &connection
+                .query("SELECT count(*) FROM doc INDEXED BY doc_seen WHERE seen = 7")
+                .expect("read through the index")
+        ),
+        MIGRATED_ROWS,
+        "the index built in write-ahead-log mode does not agree with the table"
+    );
+}
+
+/// A closed database file is a database on its own, with no log beside it.
+///
+/// **The property `inillucent backup` and anybody copying an `.rdb` rely on**,
+/// stated where it can fail. `ImportedDatabase::drop` folds the log into the
+/// file so that a closed file is self contained, and it decided whether it owed
+/// a fold by asking whether any frame was still dirty - which is the wrong half
+/// of the question at a small buffer pool, because eviction is what clears
+/// dirty flags. A session that read its corpus back through 64 frames left
+/// nothing dirty, folded nothing, and left a 686 KB rollback journal and an
+/// unfolded log beside a file whose meta record still said the database was
+/// four pages long (task-2055).
+///
+/// The copy is what makes that visible: reopening in place finds the log and
+/// the journal and recovers, so the file alone is the only thing that can say
+/// whether the close finished its work.
+#[test]
+fn a_closed_file_is_a_database_by_itself() {
+    let directory = scratch("self-contained");
+    let path = directory.join("d.rdb");
+    {
+        let database = Database::open_at(&path, 4_096, 64).expect("the database opens");
+        let connection = database.session();
+        migrate_and_index(&connection);
+    }
+    let alone = directory.join("copied.rdb");
+    std::fs::copy(&path, &alone).expect("the database file is copied");
+    let database = Database::open_at(&alone, 4_096, 64).expect("the copy opens");
+    database.check().expect("the copy is sound");
+    let connection = database.session();
+    assert_eq!(
+        count(
+            &connection
+                .query("SELECT count(*) FROM doc NOT INDEXED WHERE seen = 7")
+                .expect("read the copy")
+        ),
+        MIGRATED_ROWS,
+        "the closed file needed the log beside it to hold its rows"
+    );
+}
+
+/// The geometry a case that is not about the configuration runs at.
+///
+/// The seven cases in `durability_arms.rs` go through `scenario!`, because what
+/// they hold in place is only visible where the pool evicts (task-2055). The
+/// four task-2051 cases below are about what one session can see after its own
+/// rollback, which no page size or pool size changes, so they run once - at the
+/// geometry `Database::open` picks, which is what they were written against and
+/// what they still open with.
+fn the_default_arm() -> Arm {
+    inillucent_compat::matrix::default_arm()
+}
+
+/// Returns the three rows plus the fourth these tests write after a rollback.
+fn the_four_rows() -> Vec<Vec<OwnedDatum>> {
+    let mut rows = the_three_rows();
+    rows.push(vec![OwnedDatum::Int(4), OwnedDatum::Int(40)]);
+    rows
+}
+
+/// A rolled-back `DROP COLUMN` leaves the column readable again.
+///
+/// The ticket's own reproduction. Before the fix `SELECT n FROM p` answered
+/// `the tree read for FROM term 0 does not carry column 1` for the rest of the
+/// connection's life, while a reopen of the same file read both columns and all
+/// three rows.
+///
+/// `ALTER TABLE ... DROP COLUMN` rebuilds: it releases the table's tree and
+/// registers a new one, holding only the surviving columns, under the same
+/// handle. The rollback restores the catalog row naming the original root page,
+/// and `reattach_entries` skipped the table because the handle was occupied -
+/// so the schema described two columns and the tree attached to it had one.
+///
+/// Asserted in the session that rolled back, because that is the only thing
+/// that is wrong: a reopen builds its trees from the catalog and cannot see it.
+#[test]
+fn a_rolled_back_dropped_column_is_readable_again() {
+    let directory = scratch("alter-drop-column");
+    let path = directory.join("d.rdb");
+    three_rows(&the_default_arm(), &path);
+    {
+        let database = Database::open(&path).expect("the database opens");
+        let connection = database.session();
+        connection
+            .execute_batch("BEGIN; ALTER TABLE p DROP COLUMN n; ROLLBACK")
+            .expect("the transaction is abandoned");
+        assert_eq!(
+            connection
+                .query("SELECT id, n FROM p ORDER BY id")
+                .expect("the column the rollback put back is readable"),
+            the_three_rows(),
+            "the connection still reads p through the tree the ALTER built"
+        );
+    }
+    assert_eq!(
+        values_after_reopen(&the_default_arm(), &path),
+        the_three_rows()
+    );
+}
+
+/// A row written after a rolled-back `DROP COLUMN` reaches the file.
+///
+/// **The read error above is the visible half of this defect and this is the
+/// expensive half.** The tree the `ALTER` built is an orphan once the rollback
+/// has restored the catalog row: no row names its root page, so nothing will
+/// ever read it again. A connection still attached to it accepted the `INSERT`,
+/// reported success, read the row back from its own buffer, and the reopened
+/// file did not have it.
+///
+/// The `INSERT` names only `id`, because before the fix this session could not
+/// write `n` at all - so a test that inserted both columns would fail on the
+/// write and never reach the question it is asking.
+#[test]
+fn a_rolled_back_dropped_column_does_not_strand_a_later_write() {
+    let directory = scratch("alter-drop-column-write");
+    let path = directory.join("d.rdb");
+    three_rows(&the_default_arm(), &path);
+    {
+        let database = Database::open(&path).expect("the database opens");
+        let connection = database.session();
+        connection
+            .execute_batch("BEGIN; ALTER TABLE p DROP COLUMN n; ROLLBACK")
+            .expect("the transaction is abandoned");
+        connection
+            .execute_batch("INSERT INTO p (id, n) VALUES (4, 40)")
+            .expect("a write after the rollback");
+    }
+    assert_eq!(
+        values_after_reopen(&the_default_arm(), &path),
+        the_four_rows(),
+        "the write after the rollback went into a tree the catalog does not name"
+    );
+}
+
+/// The same for `ADD COLUMN`, which rebuilds too and shows nothing at all.
+///
+/// **This case has no symptom a reader can see, which is why it is held
+/// separately.** The ticket recorded `ADD COLUMN` as fine, and every read in the
+/// session that rolled one back does answer correctly - because the tree the
+/// `ALTER` built carries a *superset* of the catalog's columns, so every column
+/// the restored catalog names still finds a slot in it. `SELECT c FROM p` is a
+/// parse error against the restored catalog, which looks like the rollback
+/// having worked.
+///
+/// The tree is stranded exactly as above, and the only thing that says so is the
+/// reopen: the `INSERT` below reports success, reads back in the same session,
+/// and is not in the file. A version of this test without the reopen passes
+/// against the bug.
+#[test]
+fn a_rolled_back_added_column_does_not_strand_a_later_write() {
+    let directory = scratch("alter-add-column-write");
+    let path = directory.join("d.rdb");
+    three_rows(&the_default_arm(), &path);
+    {
+        let database = Database::open(&path).expect("the database opens");
+        let connection = database.session();
+        connection
+            .execute_batch("BEGIN; ALTER TABLE p ADD COLUMN c INTEGER DEFAULT 9; ROLLBACK")
+            .expect("the transaction is abandoned");
+        connection
+            .execute_batch("INSERT INTO p (id, n) VALUES (4, 40)")
+            .expect("a write after the rollback");
+        assert_eq!(
+            connection
+                .query("SELECT id, n FROM p ORDER BY id")
+                .expect("read in the same session"),
+            the_four_rows(),
+            "the session cannot see its own write",
+        );
+    }
+    assert_eq!(
+        values_after_reopen(&the_default_arm(), &path),
+        the_four_rows(),
+        "the write after the rollback went into a tree the catalog does not name"
+    );
+}
+
+/// `ROLLBACK TO` a savepoint re-attaches, and the `COMMIT` after it is sound.
+///
+/// The third shape the ticket asked about. It fails the same way and it fails
+/// *past the commit*: the transaction goes on to commit successfully, writing
+/// the orphan tree's pages into the file where nothing will read them, while the
+/// connection goes on answering out of the tree the `ALTER` built.
+///
+/// The `INSERT` sits between the `ROLLBACK TO` and the `COMMIT` on purpose, so
+/// the row it writes is part of the committed transaction rather than a
+/// statement after it - which is what says the re-attach happened at the
+/// savepoint and not merely by the end of the transaction.
+#[test]
+fn an_alter_rolled_back_to_a_savepoint_reattaches() {
+    let directory = scratch("alter-savepoint");
+    let path = directory.join("d.rdb");
+    three_rows(&the_default_arm(), &path);
+    {
+        let database = Database::open(&path).expect("the database opens");
+        let connection = database.session();
+        connection
+            .execute_batch(
+                "BEGIN; \
+                 SAVEPOINT here; \
+                 ALTER TABLE p DROP COLUMN n; \
+                 ROLLBACK TO here; \
+                 INSERT INTO p (id, n) VALUES (4, 40); \
+                 COMMIT",
+            )
+            .expect("the savepoint unwinds and the rest commits");
+        assert_eq!(
+            connection
+                .query("SELECT id, n FROM p ORDER BY id")
+                .expect("read in the same session"),
+            the_four_rows(),
+            "the connection still reads p through the tree the ALTER built"
+        );
+    }
+    assert_eq!(
+        values_after_reopen(&the_default_arm(), &path),
+        the_four_rows()
+    );
 }

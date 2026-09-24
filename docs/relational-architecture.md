@@ -158,7 +158,7 @@ last, so a page **freed and then allocated again inside the replayed range** cam
 while it was live — and the next allocation was handed a page something else already owned. It is
 silent at write time: the statement that takes the page reports success, and nothing is wrong until
 something reads a row whose value lived there. A free-map bit carries no LSN, so nothing below
-recovery can catch a wrong answer about it. Fixed in task-1888; the case study in
+recovery can catch a wrong answer about it. This is fixed; the case study in
 [Removing PostgreSQL from a 5.8 GB Gmail assistant](real-world-use-cases/nikaya-postgres-to-inillucent.md)
 is where it was diagnosed.
 
@@ -172,8 +172,8 @@ device's write-behind cache, and the unlink passed `sync_dir: false`, so the dir
 was not durable either. A power loss in that window leaves the directory still naming a journal that
 looks perfectly hot and whose last bytes are torn - and the next cold open's `replay_hot_journal`
 puts that garbled pre-image back over a good page. The result is `database disk image is malformed`
-on a database whose commit had completed, which reads like a recovery failure and is not one. Fixed
-in task-1911: the journal's own bytes are synced before the handle goes, and the unlink syncs the
+on a database whose commit had completed, which reads like a recovery failure and is not one. This
+is fixed: the journal's own bytes are synced before the handle goes, and the unlink syncs the
 directory.
 
 **Then the same campaigns were run in `TRUNCATE` and `PERSIST` mode, which nothing had ever done,
@@ -240,7 +240,7 @@ That is the cost the default mode already pays, and it makes an interrupted chec
 every mode rather than in three of the five. `off` is the one mode that gets nothing, because that
 is what it asks for.
 
-All four are fixed in task-1911, and the evidence is checked in: `tests/crash/truncate-full-crash.txt`
+All four are fixed now, and the evidence is checked in: `tests/crash/truncate-full-crash.txt`
 and `tests/crash/persist-full-crash.txt` record 101 cut points each, every one recovering to the old
 database or the new one, with no detected damage at any of them. The files are seeded, so a diff on
 them is a change in what the engine does under failure.
@@ -248,7 +248,7 @@ them is a change in what the engine does under failure.
 **Checked by:** `crates/inillucent-compat/tests/new_engine_free_map_recovery.rs`,
 `new_engine_recovery_shapes.rs`, `wal_crash.rs`, `multi_database_crash.rs`, and the `durability`
 tier's fault campaigns, which crash at a chosen sync and then read back what the *file* holds.
-Those campaigns drove the retired engine until task-1911 deleted it; re-pointing them at this one is
+Those campaigns drove the retired engine until it was deleted; re-pointing them at this one is
 what found the journal defect above, and `new_engine_recovery_shapes.rs` did not, because it crashes
 at one fixed point rather than at every cut of a commit.
 
@@ -257,7 +257,7 @@ at one fixed point rather than at every cut of a commit.
 ## 5a. What a file's format version promises
 
 The first eight bytes of a database are `RDB2` and four zero bytes, and the four bytes after them
-are the **format version**, which this build writes as `1` and is the only one it reads.
+are the **format version**, which this build writes as `2`. It reads `2` and `1`.
 
 The rule it stands for:
 
@@ -265,15 +265,45 @@ The rule it stands for:
   `0.1.4` opens a `0.1.0` file. The version does not move for a bug fix, and a release that changed
   the layout of a page, a record or the header without moving it would be a release that could not
   say which files it can read.
-- **A change to that layout raises the number, and that is a minor version with a documented
-  migration.** The migration is `inillucent-migrate`, which reads the older file and writes a new
-  one; it is not an upgrade in place, because an upgrade in place is a rewrite that a crash can
-  catch halfway.
+- **A change to that layout raises the number, and that is a minor version.** Where the new build
+  can read the old layout it does, as it does format 1 (below); where it cannot, the migration is
+  `inillucent-migrate`, which reads the older file and writes a new one rather than rewriting it in
+  place, because an upgrade in place is a rewrite that a crash can catch halfway.
 - **A build that meets a higher number says so rather than reading the file as damage.** The refusal
-  is `this database is format version N and this build reads version 1; upgrade inillucent to open
+  is `this database is format version N and this build reads version 2; upgrade inillucent to open
   it`, it carries the status `unsupported`, and the command line exits 3 - the same answer every
-  other "this build has not got that" gives. A *lower* number is reported as corruption, because
+  other "this build has not got that" gives. A number below 1 is reported as corruption, because
   there is no earlier format: a zero there is a header that has been overwritten.
+
+### Format 2: what changed, and how a format 1 file still opens
+
+Two things in a page changed, and a build of format 1 can read neither:
+
+- **A leaf's delta area has a directory.** The delta area holds the rows written to a leaf since it
+  was last packed. In format 1 it was a run of rows in arrival order, capped at 32 and scanned on
+  every lookup. In format 2 it opens with a directory of two-byte entries in key order, a lookup is
+  a binary search, and the area is as large as the free gap - which is what stopped an index leaf of
+  thousands of rows compacting after every 32 writes. `crates/inillucent-tree/src/leaf/delta.rs`
+  has the layout.
+- **A page's checksum covers its LSN.** Format 1's covered bytes 12 onward and left the eight-byte
+  LSN out, so a flipped bit there was a page that read as valid while telling recovery the wrong
+  thing about which log records it held. `crates/inillucent-pool/src/page.rs` has the rule.
+
+**This build reads format 1, page by page.** A leaf carries a flag, `LEAF_DELTA_DIRECTORY`, that
+says which layout its delta area is in, and a page's checksum is accepted under either rule. A leaf
+format 1 wrote is read as it is and **written by format 1's rules until a compaction or a split
+rewrites it**, and that rewrite is logged with the page's image. The reason is recovery: it replays
+the log onto the pages the file holds, and for a file an earlier release wrote those are format 1
+pages, so a replay has to follow the rules the log was written under to land on the same bytes. The
+file's own number becomes 2 the next time this build writes the meta record, which a checkpoint
+does. `tests/interop/` holds a file from every release, and `release_format.rs` reads each one,
+writes to it, crashes, and recovers.
+
+**No release before this one reads a format 2 file, and each of them refuses it.** 0.1.5, 0.1.6
+and 0.1.7 answer `Error [unsupported]: this database is format version 2 and this build reads
+version 1; upgrade inillucent to open it`. 0.1.1, 0.1.2 and 0.1.3 predate that refusal and answer
+`database disk image is malformed: neither meta page is readable`. None of them reads the file and
+answers from it. `release_format_history.rs` asserts both, against the released binaries.
 
 The number lives at byte 8 of the meta page, which is covered by the meta record's checksum, so a
 file whose version has been edited by hand fails the checksum rather than opening.
@@ -281,7 +311,7 @@ file whose version has been edited by hand fails the checksum rather than openin
 ### What an extent reference's class bits are, and why the number did not move
 
 An **extent reference** is the sixteen bytes a leaf holds for a value stored outside its page: a
-page number and a length. Since task-1986 it also carries, in the two bits above the page number,
+page number and a length. It also carries, in the two bits above the page number,
 what the value reads back as - `CLASS_STATED`, and beside it `CLASS_TEXT`. Without them the column's
 declaration was the only thing that could say whether the bytes were text or a blob, so a column
 that would say the wrong thing could not have a value outside its page at all: `CREATE TABLE t (a)`
@@ -310,6 +340,88 @@ have written it, and refused rather than misread everywhere it could not. `Exten
 `crates/inillucent-tree/src/leaf/layout.rs` are the writer's and the reader's halves of the rule,
 written beside each other because a disagreement between them is a wrong value rather than an error.
 
+### The layouts inside the file, and what they promise separately
+
+The format version at byte 8 covers the pages, the records and the header. It does **not** cover
+what a virtual table keeps inside its own shadow tables, and treating it as though it did is what
+made the one compatibility break this project has had invisible.
+
+The break: the FTS5 index layout changed in 0.1.2. `%_idx`'s third column used to hold an integer
+naming the `%_data` row a term's doclist lived in, and now it holds the doclist itself. Nothing
+about the page format moved, so the format version correctly stayed at 1 - and 0.1.1 opens a file a
+later build wrote, reads its tables, reads its `WITHOUT ROWID` entries, reads a blob stored over a
+page, reads the row that exists only in the log, reads `SELECT count(*) FROM note_fts` as 5 and
+`SELECT rowid, title FROM note_fts` as all five rows. The only thing it gets wrong is
+`WHERE note_fts MATCH 'segment'`, which comes back as **no rows at all**: it read the doclist blob
+as a page number, found no such page, and a term with no doclist is a term in no documents.
+
+That is the worst answer a compatibility break can give. An empty result set is a legitimate answer
+to a search, so an application has nothing to tell it apart from "there are no matching documents".
+0.1.1 is published and its answer can never be fixed. What changed is the next one.
+
+**Every durable layout in the file now names itself, and a reader that meets one it has not got
+refuses with the status `unsupported` and names the release that wrote it.** Three places, three
+records:
+
+| what | where the number is | what a newer number does |
+|---|---|---|
+| the pages, records and header | byte 8 of the meta page, `crates/inillucent-pool/src/meta.rs` | the database will not open: `this database is format version N and this build reads version 2; upgrade inillucent to open it` |
+| an FTS5 index | a `%_data` row, `crates/inillucent-ext/src/vtab/fts5/layout.rs` | the database opens and the table's rows read; `MATCH`, any write, and `fts5vocab` refuse with `the full-text index on T is in layout N, written by inillucent X.Y.Z, and this build reads layouts up to 2` |
+| an `inillucent_search` index | the `format` row of `%_config`, `crates/inillucent-search/src/options.rs` | the database opens; every read and every write of the table refuses with `the table is in format N, written by inillucent X.Y.Z, and this build reads formats 1 and 2` |
+
+There are two numbers for a search table because there are two shapes of one. A table that declares
+no facet column stores `1`, which is what every build has always written and every build reads. A
+table that declares one stores `2`, so a build that does not know the word refuses it by name
+instead of reading the facet's value as ordinary indexed text and answering a ranking the table was
+not written to answer. Raising the one number would have refused every table already on disk, which
+is a wider refusal than the change deserves.
+
+All three carry `unsupported`, so the command line exits 3 and a driver reports the status
+`unsupported` - the same answer every other "this engine has not built that" gives, and the reason
+an application can tell "upgrade and try again" from "your query is wrong", and either of those from
+"there are no matching rows".
+
+The two virtual table records refuse the *table* rather than the *file*, and that is deliberate: a
+database has to open before the table in it can be dropped, and a database holding one index a
+reader cannot use is still a database whose other tables it can read perfectly well.
+
+**A missing record means "some layout up to and including this build's", and is read rather than
+refused.** Every file published before the change that made every durable layout name itself has no FTS5 layout record, and a reader that
+refused them would refuse every database in existence. The FTS5 record is written at
+`CREATE VIRTUAL TABLE` and again by `rebuild` and `delete-all` - the two places the whole index is
+written from scratch - and deliberately **not** by an ordinary insert, because a file 0.1.2 through
+0.1.7 wrote may hold rows in both layouts at once and a record stamped on the next write would be
+claiming something the file cannot support. Those mixed files are read by the per-row rule in
+`fts5/index.rs::term_value`, which decides from the value's own type.
+
+### The promise, in four sentences
+
+- **A point release reads every file an earlier point release of the same minor version wrote**, and
+  every layout inside it.
+- **A build reads a file written by any earlier build, or refuses it by name.** There is no version
+  this project has dropped: the file format version was 1 from the first release until a later
+  release made it 2, and this build reads both. How far back that is *checked* is 0.1.1, the oldest release
+  with a fixture in `tests/interop/` - 0.1.0 was withdrawn the day after it was published and nobody
+  is running it.
+- **A build reads a file written by a later build where the later build changed nothing, and refuses
+  it by name where it did.** That is the direction the records above exist for, and it is the
+  direction that costs somebody their afternoon: an application that upgrades one machine and not
+  another has both builds pointed at the same file.
+- **A layout change is a minor version with a documented migration**, and the migration is
+  `inillucent-migrate` reading the older file and writing a new one, rather than an upgrade in place
+  that a crash can catch halfway.
+
+### What holds the promise
+
+`crates/inillucent-compat/tests/release_format_history.rs` runs every published release's own
+downloaded binary against a database this build just wrote, and asks it `tests/interop/verify.sql`
+and `tests/interop/retrieval.sql`. `tests/interop/<version>/` holds a database each release's own
+binary wrote, which the current build is asked the same questions of. The 0.1.1 `MATCH` difference
+is a row in that file's `KNOWN_GAPS`, asserted to **still happen** - a published binary's answer can
+never be fixed, so a change that made 0.1.1 read the new index turns the suite red and gets the row
+deleted. `crates/inillucent-compat/tests/format_refusal.rs` manufactures a record from a build that
+does not exist and checks each refusal, including through the command line's exit code.
+
 ---
 
 ## 6. Backup, restore and copies
@@ -336,8 +448,8 @@ written beside each other because a disagreement between them is a wrong value r
   rather than by listing the directory, because `inillucent_wal::segment::segment_name` makes the
   name a function of the base path and a sequence number - so no listing method was needed on the
   trait.
-- **This was not always true, and the difference is worth knowing.** Until task-1946's H2, the
-  rebuild used `std::fs` directly and `vacuum_in_place` reopened with `ImportedDatabase::open`,
+- **This was not always true.** Until the review before the
+  public release caught this, the rebuild used `std::fs` directly and `vacuum_in_place` reopened with `ImportedDatabase::open`,
   which constructs a fresh `OsVfs`. A connection on any other `Vfs` therefore got one of two
   things from `VACUUM` or `PRAGMA incremental_vacuum`: a failure to find its own database, or - if a
   real file happened to exist at the path string - a silent move onto the operating system's file
@@ -346,9 +458,71 @@ written beside each other because a disagreement between them is a wrong value r
   possible: it runs on `SimVfs` like every other one, and one of its cases cuts the machine inside
   the rename.
 
-`integrity-check` walks every tree. **It is not a proof that a database opens**: the case study
-above records a file that answered `ok` and could not be opened, because the damage was in the log
-rather than in the file. If you are checking a database you are about to rely on, open it.
+`PRAGMA integrity_check` reads the file three times over, and the three find different things:
+
+- **every tree on its own** - each leaf parses, keys increase within a leaf and across the sibling
+  chain, every interior separator is the first key of the child it precedes, and the sibling chain
+  reaches as many leaves as the interior levels do;
+- **every page against every other page, and against the free map** - a page two trees both reach,
+  a page a tree reaches that the free map calls free, and a page the free map calls allocated that
+  no tree reaches;
+- **every index against its table** - a duplicate under one key in a `UNIQUE` index, a row whose
+  entry is missing, an entry naming a row the table does not hold.
+
+**The page pass is there because the other two cannot see a page two tables both own.** Each tree
+is a well formed tree and neither is an index of the other, so both of them pass over a file where
+`SELECT count(*) FROM p` answers with `q`'s rows. That state loses rows durably and without a
+symptom at the time, and `PRAGMA integrity_check` called it `ok` until this check was added.
+
+**The third of those is a leak - dead space rather than lost data - and it reached the pragma only
+later, when a fix made a dropped tree, an abandoned `CREATE` and a `REINDEX` all give their pages
+back**, because until then the engine left that state behind itself in two places, both measured
+earlier, when the integrity check was extended to account for every page. A rolled-back `CREATE TABLE` or `CREATE INDEX` kept its tree's root page: the
+undo is row-level, so nothing gave the allocation back. And `DROP TABLE` kept every page the table's
+out-of-line values sat on, because `release_tree` gave back the interior pages and the leaves and
+`paged::free_extent` is reached only from the tree's own write paths. `DELETE FROM t` before the drop
+gave that space back, and so did `VACUUM`.
+
+Both are closed. An open transaction now records every tree it builds, and abandoning it gives those
+pages back to the in-memory free map - no log record, because an allocation that was never committed
+is one recovery never replays. And the list a commit drains now carries a dropped tree's out-of-line
+values as the references their leaves held, so the commit calls `paged::free_extent` for each: a
+value written as a run of whole pages takes its pages with it, and a value packed onto a page shared
+with other trees clears its slot and gives the page back only when the last live slot on it goes.
+
+Neither fix moves that boundary. A drop's frees still happen at the commit and
+not at the statement, and a build's pages are released only on the path where there is going to be
+no commit. `ImportedDatabase::report_leaked_pages` is still there as a public entry point, because a
+leak is now the one state of the three that no statement produces - so showing the arm one means
+damaging a file on purpose.
+
+**Wiring the arm to the pragma immediately found a third leak, which is the argument for having
+built the walk at all.** `REINDEX` rebuilds an index into a freshly allocated tree under a *new*
+handle and rewrites the catalog row to name it, and nothing released the tree it replaced: one
+tree's worth of pages per rebuild. Releasing it then turned up what the leak had been hiding.
+`rewrite` replaces a catalog entry and leaves the recorded *handle* alone - correct for every other
+caller, because they rewrite a row that goes on naming the tree it already named - so after a
+`REINDEX` the connection went on reading the index it had just replaced, and only a reopen moved it
+onto the new one. The rows agreed, so there was no symptom; the leaked page was the only trace. That
+is the same shape as the earlier bug where a dropped page could be freed before its transaction
+committed, and it is why a page that nothing reaches is worth reporting even
+though it loses no data.
+
+**`PRAGMA quick_check` reads every tree and accounts for every page, and leaves out the index
+pass.** The two pragmas used to be one pass under two names, because there was no cheaper variant to
+offer. The obvious candidate for the cheaper one was to drop the page pass, and counting it said
+otherwise: over a table of sixty out-of-line values the whole page walk cost 4 page fetches on top
+of 133. It reads a tree's interior pages and its leaves, and it takes an out-of-line value's pages
+from the reference in the leaf it is already holding rather than by reading the value. The index
+pass is the expensive one - it walks each index and the table it is on and merges them - so that is
+what `quick_check` leaves out.
+
+The pinned SQLite draws its line in the same place: its `quick_check` omits index content against
+table content, `UNIQUE`, `CHECK` and `NOT NULL`, and still accounts for every page of the file.
+
+**Neither is a proof that a database opens**: the case study above records a file that answered `ok`
+and could not be opened, because the damage was in the log rather than in the file. If you are
+checking a database you are about to rely on, open it.
 
 ---
 
@@ -419,6 +593,11 @@ A `inillucent_search` table keeps its index in five shadow tables. `%_content` h
 `%_delta` is a log of what changed, `%_gen` holds published generations of the built index, `%_state`
 names which generation is current and how far it covers, and `%_config` records the declaration.
 
+`%_content` holds one column per declared column, facets among them, so a facet costs a stored value
+per row and nothing else. What a facet changes is the build: its value goes into the index as an
+attribute of the row rather than into the text, which is what lets a search constrain it before it
+ranks. `%_config` records which columns those are, by name, so a reopen agrees with the build.
+
 Four things happen to that index, and they cost different amounts.
 
 **A write appends.** An `INSERT`, `UPDATE` or `DELETE` writes the row and one delta row. It does not
@@ -439,7 +618,7 @@ generation. **The graph work is one insert per delta entry**, not one per row in
 inserts every chunk into a fresh graph, which is how the chunks a fold tombstoned leave the index.
 The command is an ordinary write, so it lands atomically in the caller's transaction like any other.
 
-Until task-1894 the commit path did the single-pass build. One ordinary `INSERT` could therefore pay
+The commit path used to do the single-pass build. One ordinary `INSERT` could therefore pay
 a whole-corpus graph construction — nine and a half minutes over 598,560 chunks — inside a
 transaction the application could neither schedule nor interrupt.
 
@@ -447,7 +626,7 @@ transaction the application could neither schedule nor interrupt.
 
 `inillucent-foldgate` runs both behaviours side by side: same corpus, same vectors, same commit
 boundaries, same generation sizes, one row per transaction, each arm in its own process. The `build`
-arm is the pre task-1894 behaviour, reproduced by declaring `compact = 0` and issuing the `compact`
+arm is the original single-pass behaviour, reproduced by declaring `compact = 0` and issuing the `compact`
 command at exactly the commits where the `fold` arm folds.
 
 40,000 documents, 64 dimensions, `mode = 'approximate'`, one row per transaction, on a
@@ -487,7 +666,7 @@ publishing commit that is slower, not ordinary writes.
 
 The gap narrows as the corpus grows — at 12,000 documents it was 1,215 ms against 881 ms, and at
 40,000 it is 5,189.0 ms against 4,085.1 ms — because graph construction grows faster than a byte copy
-did. **Segmented generations closed it in task-1911**, and the paragraph below says what they cost
+did. **Segmented generations closed the gap**, and the paragraph below says what they cost
 instead.
 
 ### The supported operating range
@@ -505,7 +684,7 @@ how much work one flush does rather than how much of the file it rewrites. Raisi
 larger segments — less to fold at query time, more work in the commit that flushes. Lowering it means
 the opposite. Leave it alone unless one of those two is what you are short of.
 
-**The default stopped being a share of the table in task-1911.** It was `max(1024, rows / 8)`, and the
+**The default stopped being a share of the table.** It was `max(1024, rows / 8)`, and the
 reason was sound at the time: a flush rewrote the whole base generation, so flushing often was
 expensive and the trigger had to grow with the table to keep a write's amortised cost independent of
 its size. Segments removed that premise — and while the trigger was still proportional to the table,

@@ -136,9 +136,11 @@ mod schema_write;
 use recovery::OpenedFile;
 /// Session-scoped `total_changes()` accounting.
 mod session_changes;
+mod spillfile;
 /// The engine's half of a vector index a module owns.
 mod vectors;
 pub mod vtab;
+pub use vtab::ModuleStages;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -284,6 +286,38 @@ pub struct ImportedDatabase {
     /// from inside a callback by applications that have one, and the canonical
     /// case is `sqlite3_changes` from an update hook.
     pub(crate) counters: std::rc::Rc<Counters>,
+}
+
+impl Drop for ImportedDatabase {
+    /// Folds the log into every file this connection holds, so a closed file is
+    /// self contained.
+    ///
+    /// **The property `inillucent backup` and anybody copying an `.rdb` rely on**
+    /// (task-2000, design 1b). Until design 1b a statement folded on its way out,
+    /// so a connection that had run one left the file complete whether it was
+    /// closed tidily or not, and nothing in this engine checkpointed at close -
+    /// `RECLAIM_BYTES`'s own note records that, and records that the
+    /// per-statement fold was what hid it. With the fold lazy, a file whose
+    /// connection went away with less than four mebibytes of log behind it would
+    /// need that log to be read, which is true of a SQLite database in WAL mode
+    /// and is not what this engine has ever promised for a file it has finished
+    /// with.
+    ///
+    /// **Best effort, because a `Drop` has nobody to tell.** A fold that fails
+    /// here leaves the file and its log exactly as they were, and the next open
+    /// replays the log and reaches the same database - which is the whole reason
+    /// swallowing the failure is honest rather than convenient. It is not a
+    /// silent loss of anything: every acknowledged statement is in the log and is
+    /// durable, because `release_if_idle` synced it before it let the file go.
+    ///
+    /// **Nothing is folded while a transaction is open.** Its records are in the
+    /// log, uncommitted, and recovery discards them; a fold would hold its pages
+    /// back by no-steal and bound the recovery point beneath them, so the file
+    /// would not be self contained anyway. A connection dropped mid-transaction
+    /// is a rollback, and that is what the next open performs.
+    fn drop(&mut self) {
+        let _ = self.fold_on_close();
+    }
 }
 
 /// A database file this connection has attached beside the one it was opened
@@ -490,13 +524,12 @@ impl ImportedDatabase {
     pub fn write_stats(&self) -> inillucent_tree::write::WriteStats {
         let mut total = inillucent_tree::write::WriteStats::default();
         for tree in self.schema.trees.values() {
-            let held = tree.write_stats();
-            total.inserted = total.inserted.saturating_add(held.inserted);
-            total.deleted = total.deleted.saturating_add(held.deleted);
-            total.updated_in_place = total.updated_in_place.saturating_add(held.updated_in_place);
-            total.compactions = total.compactions.saturating_add(held.compactions);
-            total.splits = total.splits.saturating_add(held.splits);
-            total.merges = total.merges.saturating_add(held.merges);
+            // **`+` rather than one field at a time.** This added thirteen of the
+            // sixteen counters by name, so three added later - the merge, the sizing
+            // pass and the encode - read zero in every total printed from here, which
+            // is a measurement that looks taken and is not. `WriteStats::add` is a
+            // struct literal and does not compile until a new field is named in it.
+            total = total + tree.write_stats();
         }
         total
     }
@@ -902,6 +935,19 @@ impl ImportedDatabase {
 }
 
 impl TreeCatalog for ImportedDatabase {
+    /// Returns this database's own file system, to spill sort runs onto.
+    ///
+    /// **The database's own rather than a fresh one** (task-2066 §4.3.6).
+    /// `MemoryVfs` is a file system per instance, so a spill made on a new one
+    /// would be invisible to everything else and a `:memory:` database would
+    /// spill into a void - the same reason `ImportedDatabase` holds its VFS at
+    /// all.
+    fn spill(&self) -> Option<std::rc::Rc<dyn inillucent_exec::spill::Spill>> {
+        Some(std::rc::Rc::new(crate::spillfile::VfsSpill::new(
+            std::sync::Arc::clone(&self.storage.vfs),
+        )))
+    }
+
     fn covering_candidates(&self, table_root: u32) -> Vec<u32> {
         self.schema
             .covering

@@ -18,7 +18,16 @@ use crate::eval;
 /// their arguments, and one of them is not even deterministic. Passing the
 /// answers in keeps `call` a pure function of what it is given, which is what
 /// lets the whole of this module be tested without a database.
-#[derive(Clone, Copy, Debug, Default)]
+///
+/// **Two kinds of field, and only the first kind is true of one execution
+/// only (task-2081).** `changes`, `total_changes`, `last_insert_rowid` and
+/// `seed` move between two executions of the same statement, so a compiled
+/// node that holds one may not be kept for the next. `like_case_sensitive`
+/// and `length_limit` are settings: they stay put until somebody changes them,
+/// so a node that holds one may be kept for as long as they have not changed.
+/// [`Context::settings`] is the second kind on its own, and
+/// [`reads_execution_constants`] says which functions read the first kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Context {
     /// What `changes()` returns.
     pub changes: i64,
@@ -58,6 +67,41 @@ impl Context {
     pub fn permits_length(&self, bytes: u64) -> bool {
         self.length_limit <= 0 || bytes <= self.length_limit as u64
     }
+
+    /// Returns this context with only the connection's settings kept.
+    ///
+    /// The counters and the seed are zero, so two contexts taken under the same
+    /// settings compare equal however many statements ran between them. That
+    /// equality is what a cached chain is checked against before it is reused.
+    pub fn settings(&self) -> Context {
+        Context {
+            like_case_sensitive: self.like_case_sensitive,
+            length_limit: self.length_limit,
+            ..Context::default()
+        }
+    }
+}
+
+/// Returns whether a function reads a field that changes between executions.
+///
+/// **These five and no others.** `changes()`, `total_changes()` and
+/// `last_insert_rowid()` read the counters, and `random()` and `randomblob()`
+/// read the seed; every other use of [`Context`] in [`call_with`] reads a
+/// setting. A compiled call to anything else answers the same way on the next
+/// execution, so building one must not stop a statement from being re-run.
+/// Before task-2081 every call counted, and so did every `%`, `/` and `||`,
+/// which read `length_limit` through the same route.
+///
+/// @param func - the function being compiled
+pub fn reads_execution_constants(func: ScalarFunc) -> bool {
+    matches!(
+        func,
+        ScalarFunc::Changes
+            | ScalarFunc::TotalChanges
+            | ScalarFunc::LastInsertRowid
+            | ScalarFunc::Random
+            | ScalarFunc::RandomBlob
+    )
 }
 
 /// Calls a scalar function.
@@ -145,7 +189,7 @@ pub fn call_with(
         ScalarFunc::Printf => crate::printf::format(arguments, encoding),
         ScalarFunc::OctetLength => octet_length(arguments.first()),
         ScalarFunc::Random => Value::Integer(scramble(context.seed)),
-        ScalarFunc::RandomBlob => random_blob(arguments.first(), context.seed),
+        ScalarFunc::RandomBlob => blob_call(func, arguments, &context),
         ScalarFunc::Changes => Value::Integer(context.changes),
         ScalarFunc::TotalChanges => Value::Integer(context.total_changes),
         ScalarFunc::LastInsertRowid => Value::Integer(context.last_insert_rowid),
@@ -221,7 +265,7 @@ pub fn call_with(
         ScalarFunc::Unhex => unhex(arguments, encoding),
         ScalarFunc::Unicode => unary(arguments, |value| unicode(&value, encoding)),
         ScalarFunc::Upper => unary(arguments, |value| change_case(&value, true, encoding)),
-        ScalarFunc::ZeroBlob => zero_blob(arguments.first().cloned().unwrap_or(Value::Null)),
+        ScalarFunc::ZeroBlob => blob_call(func, arguments, &context),
         ScalarFunc::Version => {
             Value::owned_text(inillucent_base::REFERENCE_SQLITE_VERSION.as_bytes())
                 .unwrap_or(Value::Null)
@@ -279,9 +323,60 @@ fn octet_length(value: Option<&Value<'static>>) -> Value<'static> {
     }
 }
 
+/// `randomblob(n)` and `zeroblob(n)`, which share a ceiling.
+///
+/// One arm rather than two, because `call_with` is a dispatch table and the
+/// two functions differ only in what they fill the bytes with.
+///
+/// @param func - which of the two was called
+/// @param arguments - the call's arguments
+/// @param context - what this statement knows about its connection
+fn blob_call(func: ScalarFunc, arguments: &[Value<'static>], context: &Context) -> Value<'static> {
+    match func {
+        ScalarFunc::RandomBlob => {
+            random_blob(arguments.first(), context.seed, context.length_limit)
+        }
+        _ => zero_blob(
+            arguments.first().cloned().unwrap_or(Value::Null),
+            context.length_limit,
+        ),
+    }
+}
+
+/// The largest blob `randomblob` and `zeroblob` will build.
+///
+/// **The connection's own `Limit::Length` when it has one, and SQLite's
+/// default when it does not.** `randomblob` used to clamp at 1,000,000 - a
+/// number from nowhere, one eight hundredth of the bound the same connection
+/// applies to `zeroblob` - so `randomblob(2000000)` answered a megabyte and
+/// `length()` on it said 1000000. A caller who asked for two megabytes was
+/// told it had them (task-2066 section 4.2, item 20).
+///
+/// The refusal above the bound is not here. `inillucent-exec`'s scalar
+/// evaluator reads the size out of the argument before this function is
+/// called and returns "string or blob too big", which is what SQLite does and
+/// what keeps the allocation from happening at all. What is left here is the
+/// clamp that stops a `Default` context - every unit test of this module, and
+/// nothing on a connection - from being asked for `i64::MAX` bytes.
+///
+/// @param length_limit - the connection's value bound, zero for unbounded
+fn blob_ceiling(length_limit: i64) -> i64 {
+    if length_limit > 0 {
+        length_limit
+    } else {
+        1_000_000_000
+    }
+}
+
 /// `randomblob(n)`: n pseudo-random bytes, at least one.
-fn random_blob(value: Option<&Value<'static>>, seed: u64) -> Value<'static> {
-    let wanted = value.map_or(1, cast::integer_value).clamp(1, 1_000_000) as usize;
+///
+/// @param value - how many bytes were asked for
+/// @param seed - this statement's seed
+/// @param length_limit - the connection's value bound, zero for unbounded
+fn random_blob(value: Option<&Value<'static>>, seed: u64, length_limit: i64) -> Value<'static> {
+    let wanted = value
+        .map_or(1, cast::integer_value)
+        .clamp(1, blob_ceiling(length_limit)) as usize;
     let mut bytes = Vec::with_capacity(wanted);
     let mut state = seed;
     while bytes.len() < wanted {
@@ -870,8 +965,10 @@ fn substring(arguments: &[Value<'static>], encoding: TextEncoding) -> Value<'sta
     }
     let is_blob = matches!(subject, Value::Blob(_));
     let bytes = eval::text_bytes(subject, encoding);
-    let units: Vec<Vec<u8>> = if is_blob {
-        bytes.iter().map(|byte| vec![*byte]).collect()
+    // A blob counts in bytes and text counts in characters, which is SQLite's
+    // rule. Both borrow from `bytes`, so neither allocates per unit.
+    let units: Vec<&[u8]> = if is_blob {
+        bytes.chunks(1).collect()
     } else {
         characters(&bytes)
     };
@@ -921,12 +1018,52 @@ fn substring(arguments: &[Value<'static>], encoding: TextEncoding) -> Value<'sta
     Value::owned_text(&out).unwrap_or(Value::Null)
 }
 
-/// Splits UTF-8 bytes into characters.
-fn characters(bytes: &[u8]) -> Vec<Vec<u8>> {
-    let text = String::from_utf8_lossy(bytes);
-    text.chars()
-        .map(|character| character.to_string().into_bytes())
-        .collect()
+/// Splits bytes into characters, borrowing rather than copying.
+///
+/// **This used to go through `String::from_utf8_lossy`, and the replacement was
+/// what got written back** (task-2066 §4.1.9). Every byte that is not valid
+/// UTF-8 became U+FFFD, so
+/// `hex(substr(CAST(x'fffe80' AS TEXT),1,2))` answered `EFBFBDEFBFBD` where
+/// SQLite answers `FFFE80`, and `UPDATE t SET c = trim(c)` over a column of
+/// latin1-derived text rewrote every non-ASCII value irreversibly. Nothing else
+/// in this file does that: `length`, `upper`, `lower`, `replace`, `instr`,
+/// `printf`, `||`, `unicode` and `char` all carry invalid bytes through
+/// unchanged, and TEXT is bytes here rather than a `String` precisely so they
+/// can.
+///
+/// It was also one heap allocation per character, which made the family
+/// quadratic - 8.4 s for `substr(x,2,3)` over a 1 MB value against SQLite's
+/// 77 ms, and no answer at all at 10 MB. Borrowing removes that with the
+/// replacement, because both came from the same line.
+///
+/// **A character is one byte plus every continuation byte after it**, which is
+/// the reference's rule rather than a decoder's. It does not ask whether the
+/// leader is valid or whether it promised that many: `sqlite3Utf8CharLen`
+/// advances one byte and then skips every byte whose top two bits are `10`. It
+/// matters on exactly the input this function exists to stop mangling -
+/// `x'fffe80'` is two characters by that rule, `FF` and `FE 80`, so
+/// `substr(...,1,2)` is all three bytes. Counting `80` as a character of its
+/// own because `FE` is not a legal leader gives two bytes and disagrees with
+/// SQLite.
+///
+/// @param bytes - the value's bytes
+fn characters(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut units = Vec::new();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let mut end = at.saturating_add(1);
+        while bytes
+            .get(end)
+            .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
+        {
+            end = end.saturating_add(1);
+        }
+        if let Some(unit) = bytes.get(at..end) {
+            units.push(unit);
+        }
+        at = end;
+    }
+    units
 }
 
 /// `trim(x[, chars])`, and its one-sided forms.
@@ -942,12 +1079,15 @@ fn trim(
     if subject.is_null() {
         return Value::Null;
     }
-    let cutset = match arguments.get(1) {
+    // Held rather than inlined because `characters` borrows from them.
+    let cutset_bytes = match arguments.get(1) {
         Some(value) if value.is_null() => return Value::Null,
-        Some(value) => characters(&eval::text_bytes(value, encoding)),
-        None => vec![b" ".to_vec()],
+        Some(value) => eval::text_bytes(value, encoding),
+        None => b" ".to_vec(),
     };
-    let mut units = characters(&eval::text_bytes(subject, encoding));
+    let subject_bytes = eval::text_bytes(subject, encoding);
+    let cutset = characters(&cutset_bytes);
+    let mut units = characters(&subject_bytes);
     if left {
         while units.first().is_some_and(|unit| cutset.contains(unit)) {
             units.remove(0);
@@ -1073,8 +1213,11 @@ fn carry_one(digits: &mut Vec<u8>) {
 }
 
 /// `zeroblob(n)`.
-fn zero_blob(value: Value<'static>) -> Value<'static> {
-    let length = cast::integer_value(&value).clamp(0, 1_000_000_000) as usize;
+///
+/// @param value - how many bytes were asked for
+/// @param length_limit - the connection's value bound, zero for unbounded
+fn zero_blob(value: Value<'static>, length_limit: i64) -> Value<'static> {
+    let length = cast::integer_value(&value).clamp(0, blob_ceiling(length_limit)) as usize;
     Value::owned_blob(&vec![0u8; length]).unwrap_or(Value::Null)
 }
 
@@ -1091,15 +1234,18 @@ fn pattern_call(
     if pattern.is_null() || subject.is_null() {
         return Value::Null;
     }
+    // The whole of it rather than its first byte: the escape is one
+    // *character*, and `refusal_for` has already turned away anything that is
+    // not exactly one (task-2066 section 4.2, item 27).
     let escape = match arguments.get(2) {
         Some(value) if value.is_null() => return Value::Null,
-        Some(value) => eval::text_bytes(value, encoding).first().copied(),
+        Some(value) => Some(eval::text_bytes(value, encoding)),
         None => None,
     };
     let pattern_bytes = eval::text_bytes(pattern, encoding);
     let subject_bytes = eval::text_bytes(subject, encoding);
     let matched = if is_like {
-        crate::pattern::like_folding(&pattern_bytes, &subject_bytes, escape, fold_case)
+        crate::pattern::like_folding(&pattern_bytes, &subject_bytes, escape.as_deref(), fold_case)
     } else {
         crate::pattern::glob(&pattern_bytes, &subject_bytes)
     };
@@ -1108,22 +1254,14 @@ fn pattern_call(
 
 /// Reads a vector written as a JSON array of numbers.
 ///
-/// The grammar is `[` a comma separated list of numbers `]` and nothing else:
-/// a string, an object or a nested array inside it means the text is not a
-/// vector, and `None` is what leaves the caller answering NULL for it.
+/// **One parser, in `inillucent-value`** (task-2066 §4.1.2). There were three
+/// copies of this grammar in the tree and the one path that had none of them
+/// was the HNSW probe, which read the text's raw bytes and divided the byte
+/// length by four. Three copies is how a fourth caller comes to have none.
 ///
 /// @param text - the value's bytes
 fn vector_from_json(text: &[u8]) -> Option<Vec<f32>> {
-    let held = std::str::from_utf8(text).ok()?.trim();
-    let inner = held.strip_prefix('[')?.strip_suffix(']')?.trim();
-    if inner.is_empty() {
-        return None;
-    }
-    let mut out = Vec::new();
-    for part in inner.split(',') {
-        out.push(part.trim().parse::<f64>().ok()? as f32);
-    }
-    Some(out)
+    inillucent_value::vector::vector_from_json(text)
 }
 
 /// A vector, as this engine stores one: little-endian `f32` in a blob.
@@ -1190,6 +1328,21 @@ fn vector_pair(arguments: &[Value<'static>], measure: fn(&[f32], &[f32]) -> f64)
     Value::Real(answer)
 }
 
+/// Returns the escape's bytes, or the sentence SQLite refuses it with.
+///
+/// One *character*, which is one to four bytes of UTF-8. SQLite's wording is
+/// exact and is what a caller matching on the message will have been written
+/// against.
+///
+/// @param bytes - the escape as it was written
+pub fn single_character_escape(bytes: &[u8]) -> Result<&[u8], String> {
+    let text = core::str::from_utf8(bytes).unwrap_or_default();
+    match text.chars().count() == 1 && !bytes.is_empty() {
+        true => Ok(bytes),
+        false => Err("ESCAPE expression must be a single character".to_string()),
+    }
+}
+
 /// Returns the sentence a function refuses with, before it is called at all.
 ///
 /// A scalar returns a `Value`, so a function that has to *fail* cannot say so
@@ -1216,6 +1369,19 @@ pub fn refusal_for(func: ScalarFunc, arguments: &[Value<'static>]) -> Option<Str
                 return Some("integer overflow".to_string());
             }
             return None;
+        }
+        // **An `ESCAPE` that is not exactly one character is refused, as
+        // SQLite refuses it** (task-2066 section 4.2, item 27). Both this and
+        // the `LIKE` operator took the first byte of whatever was written and
+        // silently meant "no escape" for an empty string - so
+        // `'a%b' LIKE 'a%b' ESCAPE ''` answered 1 where SQLite raises, and
+        // `ESCAPE 'ab'` quietly escaped on `a`.
+        ScalarFunc::Like => {
+            let asked = arguments.get(2)?;
+            if asked.is_null() {
+                return None;
+            }
+            return single_character_escape(&eval::text_bytes(asked, TextEncoding::Utf8)).err();
         }
         ScalarFunc::Unistr => {
             if let Some(Value::Text(text)) = arguments.first() {

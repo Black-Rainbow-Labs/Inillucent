@@ -1,0 +1,13 @@
+# The retrieval lifecycle's known failures, and the ticket that owns each.
+#
+# One per line: what fails, a tab, and the ticket. `story_rag.rs` reads it when
+# an ingest is refused, and **an entry that no longer describes a failure is
+# itself a failure** - so when the ticket lands, this story goes red until the
+# line is removed. That is the rule from task-1969 section 4: a list that only
+# grows is a list of things nobody will take off it.
+# **Empty, and the guard is what emptied it.** Every line here named task-2033 -
+# an ordinary FTS5 insert refusing with `database disk image is malformed` on
+# document 42 at a 4,096 byte page - and the fix landed while this ticket was
+# being worked. `refuse_to_be_allow_listed_for_nothing` failed the next run and
+# named all four lines, which is the rule from task-1969 section 4 doing exactly
+# what it is for: a fixed defect left listed reads as coverage and is not.

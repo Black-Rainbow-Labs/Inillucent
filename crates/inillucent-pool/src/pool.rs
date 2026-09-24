@@ -131,6 +131,35 @@ pub struct PoolStats {
     pub writes: u64,
     /// Swips translated back to page ids on writeback.
     pub translated: u64,
+    /// Calls to the data file's `sync`.
+    ///
+    /// **What design 1 of task-2000 is graded on.** A commit is one log append
+    /// and one sync of the *log*; the data file is synced only by a fold, twice
+    /// - once behind the pages and once behind the meta record. A per-statement
+    /// number above zero here means a fold is back on the release path.
+    pub file_syncs: u64,
+    /// Folds: page writes into the data file followed by a meta record.
+    pub folds: u64,
+    /// Reads of both meta slots in full: two whole pages, allocated, read and
+    /// checksummed.
+    ///
+    /// **The number task-2046 was about.** The multi-process protocol asks the
+    /// file whether another process has folded on the way into every statement
+    /// run outside a transaction, and it asked by reading both slots in full,
+    /// twice - once through `Database::begin_read` and once through the
+    /// engine's `the_meta_moved`. At the 32 KiB default page size that is four
+    /// allocations of one page each, four reads of a whole page and four crc32 passes
+    /// over a whole page, to compare a record 116 bytes long, and it was 89 of
+    /// the 132 microseconds `SELECT 1` cost through `Connection`. A statement
+    /// that finds the file unchanged now moves this by nothing at all.
+    pub meta_reads: u64,
+    /// Reads of the bytes a meta record occupies, without the page around them.
+    ///
+    /// The cheap half of the same check - see
+    /// `Database::disk_record_is_as_last_read`. One per lock acquisition, and
+    /// none at all for a statement inside a transaction, which never lets the
+    /// file go.
+    pub meta_probes: u64,
 }
 
 /// One frame's bookkeeping, held apart from its bytes.
@@ -237,6 +266,17 @@ type PageHashing = std::hash::BuildHasherDefault<PageHasher>;
 struct State {
     /// One entry per frame.
     frames: Vec<FrameMeta>,
+    /// How many frames are dirty and not free.
+    ///
+    /// **Kept rather than counted** (task-2066 §4.3.2). `Pool::dirty_pages`
+    /// walked all 4,096 frames, and `engine/locks.rs` asks it on the release
+    /// path of every statement - a read included, past a short circuit that
+    /// fires only for writers. That is about four microseconds on statements
+    /// whose whole cost is one to two.
+    ///
+    /// It is the number of frames for which `dirty && state != Free` holds,
+    /// and nothing but [`State::amend`] may move it.
+    dirty: usize,
     /// Which frame holds which page.
     table: HashMap<PageId, u32, PageHashing>,
     /// Frames holding nothing.
@@ -246,6 +286,50 @@ struct State {
     /// The clock's position, so successive sweeps do not resample the same
     /// frames.
     clock: Rng,
+}
+
+impl State {
+    /// Changes one frame's bookkeeping, keeping the dirty count in step.
+    ///
+    /// **The one way the dirty bit moves, and the reason the count can be
+    /// trusted** (task-2066 §4.3.2). The frame's contribution to the count is
+    /// `dirty && state != Free`, and this reads that expression before the
+    /// change and after it and moves the counter by the difference. A site
+    /// that sets the bit, a site that clears it, a site that installs a page
+    /// over a dirty frame and a site that frees one are all the same operation
+    /// here, so none of them can be the one that forgets.
+    ///
+    /// Writing `self.dirty += 1` at each of the seven sites would have been
+    /// the same code and a different property: it would be right about the
+    /// sites somebody checked.
+    ///
+    /// @param frame - which frame to change
+    /// @param change - what to do to it
+    fn amend(&mut self, frame: u32, change: impl FnOnce(&mut FrameMeta)) {
+        let Some(meta) = self.frames.get_mut(frame as usize) else {
+            return;
+        };
+        let before = meta.dirty && meta.state != FrameState::Free;
+        change(meta);
+        let after = meta.dirty && meta.state != FrameState::Free;
+        match (before, after) {
+            (false, true) => self.dirty = self.dirty.saturating_add(1),
+            (true, false) => self.dirty = self.dirty.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    /// Counts the dirty frames by walking them.
+    ///
+    /// Kept because it is what [`Pool::dirty_pages`] is asserted against in a
+    /// debug build: a counter that replaces a scan is only as good as the
+    /// thing that says the two agree, and the whole test suite runs in debug.
+    fn dirty_by_walking(&self) -> usize {
+        self.frames
+            .iter()
+            .filter(|meta| meta.dirty && meta.state != FrameState::Free)
+            .count()
+    }
 }
 
 /// How long a lock request waits before it reports the file as busy.
@@ -385,6 +469,41 @@ pub struct Pool {
     /// `None` is the write-ahead log, which is the default and costs a branch
     /// per page write. See [`crate::journal`].
     journal: RefCell<Option<crate::journal::Journal>>,
+    /// Whether the redo log holds an after image of every page a fold is about
+    /// to write, so the fold needs no rollback journal of pre images.
+    ///
+    /// **Set by the engine for `journal_mode = wal`, and false everywhere else**
+    /// (task-2000, design 1a). A fold writes pages in place, so a crash inside
+    /// one can leave a page that is neither its old bytes nor its new ones, and
+    /// a logical record cannot rebuild that. Two different things can make it
+    /// recoverable: a pre image in a rollback journal, which is what every mode
+    /// used, or an after image in the redo log, which the log can carry because
+    /// `Body::WritePage` exists and recovery already installs one idempotently
+    /// by page LSN. The second is cheaper by the whole of the journal's read
+    /// before write, its two seals and its unlink with the directory sync, and
+    /// the images ride in one sequential append the fold is making anyway.
+    ///
+    /// It is a property of the *fold* and not of the pool. An eviction that
+    /// steals an uncommitted page still needs a pre image, because that is undo
+    /// and the redo log has none - so the journal object stays in place and
+    /// [`Pool::writeback`] asks it only for [`Writing::Eviction`]. The journal
+    /// file is created at the first pre image, so a connection that never
+    /// steals never creates one.
+    fold_protected_by_log: Cell<bool>,
+    /// One page's worth of scratch, reused by every writeback and every after
+    /// image.
+    ///
+    /// **Design 1d of task-2000.** `Pool::writeback` cloned the frame into a
+    /// fresh `Vec` per page, so a fold of two hundred pages allocated and freed
+    /// two hundred times 32 KiB for nothing. The buffer is the pool's and the
+    /// page size never changes for the life of a pool, so one allocation at
+    /// construction serves every fold the connection will ever take.
+    ///
+    /// A `RefCell` because a writeback takes `&self`: the pool's whole write
+    /// path is `&self` so that a `PageGuard` can borrow a frame while another
+    /// page is written. Nothing re-enters a writeback from inside one, so the
+    /// borrow is uncontended.
+    scratch: RefCell<Vec<u8>>,
     /// How many pages the file holds.
     page_count: Cell<u64>,
     /// The most pages the pool holds at once, which `PRAGMA cache_size` sets.
@@ -512,6 +631,14 @@ struct Counters {
     translated: Cell<u64>,
     /// Writebacks skipped because an open transaction had changed the page.
     held_back: Cell<u64>,
+    /// Calls to the data file's `sync`.
+    file_syncs: Cell<u64>,
+    /// Folds: page writes into the data file followed by a meta record.
+    folds: Cell<u64>,
+    /// Reads of both meta slots in full.
+    meta_reads: Cell<u64>,
+    /// Reads of the record bytes alone.
+    meta_probes: Cell<u64>,
 }
 
 impl Counters {
@@ -529,6 +656,7 @@ impl Counters {
 // reading the same private state: privacy in Rust reaches a module's
 // descendants, so the move needed no field to become `pub(crate)`.
 mod eviction;
+mod fold;
 mod journal_gate;
 mod locking;
 mod swizzle;
@@ -581,6 +709,7 @@ impl Pool {
             pins,
             state: RefCell::new(State {
                 frames: vec![FrameMeta::empty(); frames],
+                dirty: 0,
                 table: HashMap::with_capacity_and_hasher(frames, PageHashing::default()),
                 free: (0..frames as u32).rev().collect(),
                 cooling: VecDeque::new(),
@@ -588,6 +717,8 @@ impl Pool {
             }),
             file,
             journal: RefCell::new(None),
+            fold_protected_by_log: Cell::new(false),
+            scratch: RefCell::new(vec![0u8; page_size]),
             page_count: Cell::new(page_count),
             // The whole pool until `PRAGMA cache_size` says otherwise.
             budget: Cell::new(frames.max(1)),
@@ -760,7 +891,24 @@ impl Pool {
         }
         {
             let mut state = self.state.borrow_mut();
+            // **`try_reserve` here too** (task-2066 §4.1.8). The three vectors
+            // above reserve fallibly and this one did not, so a growth the
+            // platform could not satisfy aborted the process rather than
+            // answering the caller - which is the one outcome a pool that
+            // refuses to grow is supposed to avoid.
+            let short_by = frames.saturating_sub(state.frames.len());
+            state
+                .frames
+                .try_reserve(short_by)
+                .map_err(|_| no_mem(format!("{more} more frame records")))?;
+            state
+                .free
+                .try_reserve(more)
+                .map_err(|_| no_mem(format!("{more} more entries in the free frame list")))?;
+            // A frame dropped by shrinking takes its contribution with it,
+            // and one added by growing is free and contributes nothing.
             state.frames.resize(frames, FrameMeta::empty());
+            state.dirty = state.dirty_by_walking();
             // Pushed in reverse, the way `new` builds the list, so the next
             // claim takes the lowest new index.
             for index in (held..frames).rev() {
@@ -791,6 +939,10 @@ impl Pool {
             reads: self.counters.reads.get(),
             writes: self.counters.writes.get(),
             translated: self.counters.translated.get(),
+            file_syncs: self.counters.file_syncs.get(),
+            folds: self.counters.folds.get(),
+            meta_reads: self.counters.meta_reads.get(),
+            meta_probes: self.counters.meta_probes.get(),
         }
     }
 
@@ -811,6 +963,10 @@ impl Pool {
         self.counters.reads.set(0);
         self.counters.writes.set(0);
         self.counters.translated.set(0);
+        self.counters.file_syncs.set(0);
+        self.counters.folds.set(0);
+        self.counters.meta_reads.set(0);
+        self.counters.meta_probes.set(0);
     }
 
     /// Returns how many frames hold a page right now.
@@ -918,12 +1074,12 @@ impl Pool {
             return Err(error);
         }
         let mut state = self.state.borrow_mut();
-        if let Some(meta) = state.frames.get_mut(frame as usize) {
+        state.amend(frame, |meta| {
             meta.page = page;
             meta.state = FrameState::Hot;
             meta.dirty = false;
             meta.parent = None;
-        }
+        });
         if let Some(slot) = self.pins.get(frame as usize) {
             slot.set(0);
         }
@@ -1012,26 +1168,37 @@ impl Pool {
             }
             self.stolen.set(true);
         }
-        let mut image = {
+        // **The pool's own scratch rather than a fresh `Vec` a page**, which is
+        // design 1d of task-2000: a fold of two hundred pages allocated two
+        // hundred times 32 KiB and freed all of it again. See `Pool::scratch`.
+        let mut image = self
+            .scratch
+            .try_borrow_mut()
+            .map_err(|_| misuse("the pool's writeback scratch is already in use"))?;
+        {
             let bytes = self
                 .buffers
                 .get(frame as usize)
                 .ok_or_else(|| misuse("frame index out of range"))?
                 .try_borrow()
                 .map_err(|_| misuse("a frame chosen for writeback was mutably borrowed"))?;
-            bytes.clone()
-        };
-        let translated = self.translate_swips(&mut image)?;
+            if image.len() != bytes.len() {
+                image.resize(bytes.len(), 0);
+            }
+            image.copy_from_slice(&bytes);
+        }
+        let image = &mut *image;
+        let translated = self.translate_swips(image)?;
         // **Read before the checksum is recomputed, off the image that is about
         // to reach the file.** The stamp is what a later recovery compares a
         // record's LSN against, so the number recorded here has to be the one
         // the file will carry rather than anything a caller remembers - the
         // same argument `refuse_if_ahead_of_the_log` makes for reading the
         // header rather than the bookkeeping beside it.
-        let stamp = page::read_u64(&image, page::header::LSN)?;
+        let stamp = page::read_u64(image, page::header::LSN)?;
         self.high_water_lsn
             .set(self.high_water_lsn.get().max(stamp));
-        page::checksum_page(&mut image)?;
+        page::checksum_page(image)?;
         // **The old image goes to the journal before the new one goes to the
         // file**, and this is the one place either happens - so a page cannot
         // reach the file by a route that skipped its pre-image, exactly as it
@@ -1046,17 +1213,25 @@ impl Pool {
         // was overwritten. `flush` now saves the whole batch before the first
         // page moves, which leaves this call with nothing outstanding on all
         // but the first page - see `Journal::seal`.
-        if self.journal_page(page)? {
+        // **A fold's pre image is in the redo log, so only an eviction asks the
+        // journal** (task-2000, design 1a). See `Pool::fold_protected_by_log`:
+        // the caller has appended a `Body::WritePage` after image of every page
+        // this flush will write and synced the log behind them, which is what
+        // makes a torn in place write recoverable. An eviction is the other
+        // case and is unchanged - it puts an *uncommitted* page in the file, and
+        // taking that back out is undo, which a redo log cannot do.
+        let ask_the_journal = why == Writing::Eviction || !self.fold_protected_by_log.get();
+        if ask_the_journal && self.journal_page(page)? {
             self.seal_journal()?;
         }
         self.file
-            .write_all_at(page.0.saturating_mul(self.page_size as u64), &image)
+            .write_all_at(page.0.saturating_mul(self.page_size as u64), image)
             .map_err(|error| error.into_db_error())?;
         let mut state = self.state.borrow_mut();
-        if let Some(meta) = state.frames.get_mut(frame as usize) {
+        state.amend(frame, |meta| {
             meta.dirty = false;
             meta.rec_lsn = u64::MAX;
-        }
+        });
         drop(state);
         Counters::add(&self.counters.writes, 1);
         Counters::add(&self.counters.translated, translated as u64);
@@ -1154,9 +1329,7 @@ impl Pool {
             bytes.copy_from_slice(image);
         }
         let mut state = self.state.borrow_mut();
-        if let Some(meta) = state.frames.get_mut(frame as usize) {
-            meta.dirty = true;
-        }
+        state.amend(frame, |meta| meta.dirty = true);
         drop(state);
         if page.0 >= self.page_count.get() {
             self.page_count.set(page.0.saturating_add(1));
@@ -1301,152 +1474,8 @@ impl Pool {
             change(bytes.as_mut_slice())?
         };
         let mut state = self.state.borrow_mut();
-        if let Some(meta) = state.frames.get_mut(frame as usize) {
-            meta.dirty = true;
-        }
+        state.amend(frame, |meta| meta.dirty = true);
         Ok(outcome)
-    }
-
-    /// Writes every dirty frame to the file.
-    ///
-    /// Pages go out in page-id order so the write pattern is sequential, which
-    /// is the checkpointer's rule and costs nothing to honour here.
-    ///
-    /// Under a rollback journal it takes two passes over the same list: every
-    /// pre-image first, then one sync, then the pages. The pre-images have to
-    /// be on the media before the first page is overwritten, and doing it in
-    /// two passes is what lets a batch of a thousand pages pay for one sync
-    /// instead of a thousand. The writeback loop still asks for the sync per
-    /// page, because the evictor reaches it without a flush around it; after
-    /// this pass there is nothing left for it to sync.
-    pub fn flush(&self) -> DbResult<usize> {
-        let mut dirty: Vec<(PageId, u32)> = {
-            let state = self.state.borrow();
-            state
-                .frames
-                .iter()
-                .enumerate()
-                .filter(|(_, meta)| meta.dirty && meta.state != FrameState::Free)
-                .map(|(index, meta)| (meta.page, index as u32))
-                .collect()
-        };
-        dirty.sort_unstable();
-        if self.journal.borrow().is_some() {
-            for (page, _) in &dirty {
-                self.journal_page(*page)?;
-            }
-            self.seal_journal()?;
-        }
-        for (page, frame) in &dirty {
-            self.writeback(*frame, *page, Writing::Checkpoint)?;
-        }
-        Ok(dirty.len())
-    }
-
-    /// Writes every dirty frame, then the meta page and its shadow, then syncs.
-    ///
-    /// The order is the durability order: data first, then the record that says
-    /// the data is there. A crash between them leaves the previous meta page
-    /// describing a file whose pages are a superset of what it claims, which is
-    /// exactly what a checkpoint is allowed to leave behind.
-    ///
-    /// The record is taken mutably because one of its fields is only knowable
-    /// **after** the flush: the high water is the highest stamp any page in the
-    /// file carries, and the pages this checkpoint is about to write are part
-    /// of the file it describes. Setting it before the flush would leave the
-    /// meta page one checkpoint behind the stamps it is meant to bound, which
-    /// is the state the next open resumes the log above.
-    ///
-    /// @param meta - the record to write, with its generation already bumped
-    pub fn checkpoint(&self, meta: &mut Meta) -> DbResult<()> {
-        // **The journal is sealed before the first page moves**, and `flush`
-        // is where that happens: it saves every pre-image the batch needs and
-        // syncs once before it writes anything. This call used to be the only
-        // one, and it ran here - before `flush` had saved a single pre-image -
-        // so it synced an empty file and the ordering a rollback journal exists
-        // to forbid held anyway. It is kept because anything a caller saved
-        // before reaching a checkpoint is still owed a sync, and it costs
-        // nothing when there is none.
-        self.seal_journal()?;
-        self.flush()?;
-        self.file
-            .sync(SyncMode::Normal)
-            .map_err(|error| error.into_db_error())?;
-        // Every page this checkpoint wrote has now raised the high water, so
-        // the number recorded here bounds the stamps the file actually holds
-        // rather than the ones it held a checkpoint ago. It never goes
-        // backwards: a run that writes no stamped page keeps what it read.
-        meta.high_water_lsn = meta.high_water_lsn.max(self.high_water_lsn.get());
-        let mut image = vec![0u8; self.page_size];
-        meta.encode(&mut image)?;
-        // **The meta pages are journaled too, and they were the last pages that
-        // were not.** A rollback journal has to hold a pre-image of every page
-        // the checkpoint overwrites, and these two are pages the checkpoint
-        // overwrites. Leaving them out left a crash here able to produce a file
-        // whose data pages the journal put back to before the checkpoint and
-        // whose meta record says the checkpoint finished: the recorded
-        // `checkpoint_lsn` then tells redo that everything up to it is already
-        // in the file, so the records that would have re-applied the pages the
-        // journal just undid are skipped, and the database comes back as
-        // neither its old self nor its new one. It came back with no tables at
-        // all, because the catalog's own page is one of the pages the journal
-        // put back.
-        //
-        // The shadow page does not cover this. Both slots take the same image
-        // in the loop below, so the second one is not an older copy to fall
-        // back on - it is a second chance for the *new* record to survive, and
-        // `Meta::choose` believing either of them is the failure. What makes
-        // the checkpoint undoable is the previous record being on the disk in
-        // the journal, which is the same thing that makes every other page
-        // undoable.
-        self.journal_page(META_PAGE)?;
-        self.journal_page(SHADOW_PAGE)?;
-        self.seal_journal()?;
-        for slot in [META_PAGE, SHADOW_PAGE] {
-            self.file
-                .write_all_at(slot.0.saturating_mul(self.page_size as u64), &image)
-                .map_err(|error| error.into_db_error())?;
-        }
-        self.file
-            .sync(SyncMode::Normal)
-            .map_err(|error| error.into_db_error())?;
-        Counters::add(&self.counters.writes, 2);
-        // **And disposed of after the meta record is durable**, which is the
-        // moment the commit exists. A journal removed a line earlier would
-        // leave a crash with a file it could neither trust nor repair.
-        //
-        // **Unless an eviction has already put an open transaction's page in
-        // the file**, in which case the pre-images in this journal are the only
-        // way back from that page and the journal outlives the checkpoint. The
-        // journal restores the meta record too, so keeping it does not leave a
-        // half-undone file: a crash puts the data pages, the meta page and its
-        // shadow all back to what they were before this checkpoint, and the log
-        // replays forward from the recovery point that older meta record names.
-        // The next checkpoint with no writer open disposes of it.
-        if self.stolen.get() && self.uncommitted_lsn.load(Ordering::SeqCst) != u64::MAX {
-            return Ok(());
-        }
-        self.finish_journal()?;
-        Ok(())
-    }
-
-    /// Reads the two meta slots straight from the file.
-    ///
-    /// **Past the pool, deliberately.** A connection asking whether another
-    /// process has committed cannot ask its own cache: the whole question is
-    /// whether the cache is stale.
-    ///
-    /// @param page_size - how big a page is
-    pub fn read_meta_slots(&self, page_size: usize) -> DbResult<(Vec<u8>, Vec<u8>)> {
-        let mut primary = vec![0u8; page_size];
-        let mut shadow = vec![0u8; page_size];
-        self.file
-            .read_exact_at(0, &mut primary)
-            .map_err(|error| error.into_db_error())?;
-        self.file
-            .read_exact_at(page_size as u64, &mut shadow)
-            .map_err(|error| error.into_db_error())?;
-        Ok((primary, shadow))
     }
 
     /// Grows the file by one page and returns its id.
@@ -1491,7 +1520,7 @@ impl Pool {
     /// resemble a slot array would otherwise be silently rewritten.
     ///
     /// @param image - the page image about to be written
-    fn translate_swips(&self, image: &mut [u8]) -> DbResult<usize> {
+    pub(super) fn translate_swips(&self, image: &mut [u8]) -> DbResult<usize> {
         if page::kind_of(image)? != PageKind::Interior {
             return Ok(0);
         }
@@ -1517,26 +1546,6 @@ impl Pool {
             translated = translated.saturating_add(1);
         }
         Ok(translated)
-    }
-
-    /// Writes one of the two meta pages straight to the file.
-    ///
-    /// The meta pages are not pool pages: they carry no common header, they are
-    /// written twice, and one of them has to be readable before the pool's own
-    /// page size is known. Keeping them off the page table is what stops an
-    /// eviction from ever choosing one.
-    ///
-    /// @param page - [`META_PAGE`] or [`SHADOW_PAGE`]
-    /// @param image - the encoded meta record, one page long
-    pub fn write_meta_slot(&self, page: PageId, image: &[u8]) -> DbResult<()> {
-        if page != META_PAGE && page != SHADOW_PAGE {
-            return Err(misuse(format!("page {} is not a meta page", page.0)));
-        }
-        self.file
-            .write_all_at(page.0.saturating_mul(self.page_size as u64), image)
-            .map_err(|error| error.into_db_error())?;
-        Counters::add(&self.counters.writes, 1);
-        Ok(())
     }
 
     /// Returns one frame's version latch.
@@ -1575,377 +1584,4 @@ impl Pool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use inillucent_vfs::{DbPath, MemoryVfs, OpenOptions, Vfs};
-
-    /// Returns a pool over a memory file of `pages` zeroed, checksummed pages.
-    fn pool_over(page_size: usize, frames: usize, pages: u64) -> Pool {
-        let vfs = MemoryVfs::new();
-        let path = DbPath::new("pool-test.rdb");
-        let file = vfs.open(&path, OpenOptions::main_db()).unwrap();
-        for page in 0..pages {
-            let mut image = vec![0u8; page_size];
-            page::write_common(&mut image, PageKind::Leaf, 0, 1).unwrap();
-            page::write_u64(&mut image, 32, page).unwrap();
-            page::checksum_page(&mut image).unwrap();
-            file.write_all_at(page * page_size as u64, &image).unwrap();
-        }
-        Pool::new(file, page_size, frames, pages).unwrap()
-    }
-
-    /// A fetch of an absent page reads it; a second fetch does not.
-    #[test]
-    fn a_second_fetch_is_a_hit() {
-        let pool = pool_over(512, 8, 10);
-        {
-            let guard = pool.fetch(PageId(3)).unwrap();
-            assert_eq!(page::read_u64(&guard, 32).unwrap(), 3);
-        }
-        assert_eq!(pool.stats().misses, 1);
-        assert_eq!(pool.stats().reads, 1);
-        {
-            let _guard = pool.fetch(PageId(3)).unwrap();
-        }
-        assert_eq!(pool.stats().misses, 1, "the second fetch read nothing");
-        assert_eq!(pool.stats().hits, 1);
-    }
-
-    /// Two guards on one page coexist, and the pin count returns to zero.
-    #[test]
-    fn two_guards_on_one_page_coexist() {
-        let pool = pool_over(512, 8, 10);
-        let first = pool.fetch(PageId(4)).unwrap();
-        let second = pool.fetch(PageId(4)).unwrap();
-        assert_eq!(first.frame(), second.frame());
-        drop(first);
-        drop(second);
-        let frame = pool.state.borrow().table[&PageId(4)];
-        assert_eq!(pool.pins_of(frame), 0);
-    }
-
-    /// A pool smaller than the working set evicts, and every page still reads
-    /// correctly afterwards. This is the eviction campaign in miniature; the
-    /// 64-frame version lives in `tests/`.
-    #[test]
-    fn a_small_pool_evicts_and_stays_correct() {
-        let pool = pool_over(512, 4, 40);
-        for round in 0..3 {
-            for page in 2..40u64 {
-                let guard = pool.fetch(PageId(page)).unwrap();
-                assert_eq!(
-                    page::read_u64(&guard, 32).unwrap(),
-                    page,
-                    "round {round} page {page}"
-                );
-            }
-        }
-        assert!(pool.stats().evicted > 0, "nothing was evicted");
-        assert!(pool.resident() <= 4);
-    }
-
-    /// A frame every caller has pinned cannot be evicted, and the pool says so
-    /// rather than corrupting one.
-    #[test]
-    fn a_fully_pinned_pool_refuses_to_evict() {
-        let pool = pool_over(512, 2, 10);
-        let _a = pool.fetch(PageId(2)).unwrap();
-        let _b = pool.fetch(PageId(3)).unwrap();
-        let error = pool.fetch(PageId(4)).unwrap_err();
-        assert!(error.detail().unwrap_or("").contains("pinned"), "{error:?}");
-    }
-
-    /// A dirty page survives eviction: it is written back and read again.
-    #[test]
-    fn a_dirty_page_is_written_back_before_it_is_evicted() {
-        let pool = pool_over(512, 2, 12);
-        pool.modify(PageId(5), |bytes| page::write_u64(bytes, 40, 0xABCD))
-            .unwrap();
-        for page in 6..12u64 {
-            let _ = pool.fetch(PageId(page)).unwrap();
-        }
-        assert!(pool.stats().writes > 0, "nothing was written back");
-        let guard = pool.fetch(PageId(5)).unwrap();
-        assert_eq!(page::read_u64(&guard, 40).unwrap(), 0xABCD);
-    }
-
-    /// Fills a memory file with `pages` zeroed, checksummed pages.
-    ///
-    /// Split out of [`pool_over`] so a test that needs the VFS afterwards - to
-    /// put a rollback journal beside the database - can keep it.
-    ///
-    /// @param vfs - where the file lives
-    /// @param path - the database's name
-    /// @param page_size - how big a page is
-    /// @param frames - how many frames the pool holds
-    /// @param pages - how many pages to write
-    fn pool_beside(
-        vfs: &Arc<MemoryVfs>,
-        path: &DbPath,
-        page_size: usize,
-        frames: usize,
-        pages: u64,
-    ) -> Pool {
-        let file = vfs.open(path, OpenOptions::main_db()).unwrap();
-        for page in 0..pages {
-            let mut image = vec![0u8; page_size];
-            page::write_common(&mut image, PageKind::Leaf, 0, 1).unwrap();
-            page::write_u64(&mut image, 32, page).unwrap();
-            page::checksum_page(&mut image).unwrap();
-            file.write_all_at(page * page_size as u64, &image).unwrap();
-        }
-        Pool::new(file, page_size, frames, pages).unwrap()
-    }
-
-    /// Stamps a page with an LSN and a marker, and opens a transaction under it.
-    ///
-    /// The stamp is what `holds_uncommitted` reads, so a page stamped above the
-    /// watermark is one no-steal holds back.
-    ///
-    /// @param pool - the pool
-    /// @param page - the page to dirty
-    fn dirty_under_an_open_transaction(pool: &Pool, page: PageId) {
-        pool.modify(page, |bytes| {
-            page::write_u64(bytes, page::header::LSN, 900)?;
-            page::write_u64(bytes, 40, 0xABCD)
-        })
-        .unwrap();
-        pool.set_uncommitted_lsn(800);
-    }
-
-    /// A page an open transaction changed is written, not dropped, when its
-    /// frame is evicted.
-    ///
-    /// No-steal lets a **checkpoint** leave such a page out of the file, because
-    /// the frame keeps it and the next checkpoint writes it. An eviction does
-    /// not keep it, so the same skip there discards the change - which is what
-    /// a `CREATE INDEX` through a 64-frame pool did to 129 pages, and what
-    /// `inillucent-compat`'s `new_engine_log_lead` reported as
-    /// `page 597 checksum 00000000 is not the computed 8d1053d3`: the checksum
-    /// of a page of zeros, on a page nothing had ever written.
-    ///
-    /// The pre-image goes to the rollback journal before the new image goes to
-    /// the file, so a crash before the transaction commits can still put the
-    /// page back. See [`Writing`].
-    #[test]
-    fn an_uncommitted_page_is_written_rather_than_dropped_when_its_frame_goes() {
-        let vfs = Arc::new(MemoryVfs::new());
-        let path = DbPath::new("steal-test.rdb");
-        let pool = pool_beside(&vfs, &path, 512, 2, 12);
-        pool.set_journal(Some(crate::journal::Journal::new(
-            Arc::clone(&vfs) as Arc<dyn Vfs>,
-            &path,
-            crate::journal::JournalMode::Delete,
-            512,
-        )));
-        dirty_under_an_open_transaction(&pool, PageId(5));
-        for page in 6..12u64 {
-            let _ = pool.fetch(PageId(page)).unwrap();
-        }
-        assert!(
-            !pool.is_resident(PageId(5)),
-            "the frame was never evicted, so this proves nothing"
-        );
-        let guard = pool.fetch(PageId(5)).unwrap();
-        assert_eq!(
-            page::read_u64(&guard, 40).unwrap(),
-            0xABCD,
-            "the change was thrown away with the frame"
-        );
-    }
-
-    /// With no journal to undo a steal with, the frame is kept instead.
-    ///
-    /// `memory` and `off` hold no pre-images on disk, so an eviction there has
-    /// no way to put an uncommitted page back after a crash and must not write
-    /// it. What it must also not do is free the frame: the page is still only
-    /// in memory, and emptying the frame would lose it. So the page stays
-    /// resident and the evictor takes another frame.
-    #[test]
-    fn an_uncommitted_page_keeps_its_frame_when_nothing_can_undo_a_steal() {
-        let pool = pool_over(512, 2, 12);
-        dirty_under_an_open_transaction(&pool, PageId(5));
-        for page in 6..12u64 {
-            let _ = pool.fetch(PageId(page));
-        }
-        assert!(
-            pool.is_resident(PageId(5)),
-            "the page with nowhere to go was evicted anyway"
-        );
-        let guard = pool.fetch(PageId(5)).unwrap();
-        assert_eq!(
-            page::read_u64(&guard, 40).unwrap(),
-            0xABCD,
-            "the change was thrown away with the frame"
-        );
-    }
-
-    /// A pool with nothing left to give says which rule is refusing.
-    ///
-    /// The documented limit of a no-steal policy is that a transaction cannot
-    /// dirty more pages than the pool holds, and a caller who has hit it needs
-    /// to be told that rather than told its frames are pinned - they are not,
-    /// and no number of released guards would help.
-    #[test]
-    fn a_pool_full_of_uncommitted_pages_says_so_rather_than_blaming_pins() {
-        let pool = pool_over(512, 2, 12);
-        for page in [PageId(5), PageId(6)] {
-            pool.modify(page, |bytes| {
-                page::write_u64(bytes, page::header::LSN, 900)?;
-                page::write_u64(bytes, 40, 0xABCD)
-            })
-            .unwrap();
-        }
-        pool.set_uncommitted_lsn(800);
-        let refusal = pool
-            .fetch(PageId(7))
-            .expect_err("a full pool has to refuse");
-        let detail = refusal.detail().unwrap_or_default();
-        assert!(
-            detail.contains("the open transaction has changed 2"),
-            "the refusal did not name no-steal: {detail}"
-        );
-    }
-
-    /// A page installed by the loader is dirty, readable, and flushed.
-    #[test]
-    fn an_installed_page_is_dirty_and_flushes() {
-        let pool = pool_over(512, 8, 4);
-        let mut image = vec![0u8; 512];
-        page::write_common(&mut image, PageKind::Leaf, 0, 9).unwrap();
-        page::write_u64(&mut image, 32, 777).unwrap();
-        pool.install(PageId(6), &image).unwrap();
-        assert_eq!(pool.page_count(), 7);
-        assert_eq!(pool.flush().unwrap(), 1);
-        // Reading it back through a fresh pool proves the checksum was written.
-        let guard = pool.fetch(PageId(6)).unwrap();
-        assert_eq!(page::read_u64(&guard, 32).unwrap(), 777);
-        assert!(pool.install(PageId(7), &[0u8; 8]).is_err());
-    }
-
-    /// The cooling FIFO takes frames, and a fetch of a cooling page rewarms it
-    /// without any I/O.
-    #[test]
-    fn a_cooling_page_rewarms_without_a_read() {
-        let pool = pool_over(512, 16, 20);
-        for page in 2..10u64 {
-            let _ = pool.fetch(PageId(page)).unwrap();
-        }
-        let reads_before = pool.stats().reads;
-        let cooled = pool.cool().unwrap();
-        assert!(cooled > 0, "nothing cooled");
-        let cooling: Vec<u32> = pool.state.borrow().cooling.iter().copied().collect();
-        let frame = cooling[0];
-        let page = pool.state.borrow().frames[frame as usize].page;
-        assert_eq!(pool.frame_state(frame), Some(FrameState::Cooling));
-        let _guard = pool.fetch(page).unwrap();
-        assert_eq!(pool.frame_state(frame), Some(FrameState::Hot));
-        assert_eq!(pool.stats().reads, reads_before, "a rewarm read nothing");
-        assert!(pool.stats().rewarms > 0);
-    }
-
-    /// A corrupt page is refused rather than returned.
-    #[test]
-    fn a_corrupt_page_is_refused() {
-        let vfs = MemoryVfs::new();
-        let path = DbPath::new("corrupt.rdb");
-        let file = vfs.open(&path, OpenOptions::main_db()).unwrap();
-        let mut image = vec![0u8; 512];
-        page::write_common(&mut image, PageKind::Leaf, 0, 1).unwrap();
-        page::checksum_page(&mut image).unwrap();
-        image[100] ^= 0xFF;
-        file.write_all_at(2 * 512, &image).unwrap();
-        let pool = Pool::new(file, 512, 4, 3).unwrap();
-        let error = pool.fetch(PageId(2)).unwrap_err();
-        assert!(
-            error.detail().unwrap_or("").contains("checksum"),
-            "{error:?}"
-        );
-    }
-
-    /// An observation of a frame is invalidated when the frame is loaded over,
-    /// which is the whole reason a descent validates rather than trusting what
-    /// it read.
-    #[test]
-    fn loading_over_a_frame_invalidates_an_observation() {
-        let pool = pool_over(512, 1, 8);
-        let frame = {
-            let guard = pool.fetch(PageId(2)).unwrap();
-            guard.frame()
-        };
-        let observed = pool.observe(frame).expect("a free frame admits a reader");
-        assert!(pool.validate(frame, observed));
-        // One frame, so fetching a different page must reuse this one.
-        let _ = pool.fetch(PageId(3)).unwrap();
-        assert!(
-            !pool.validate(frame, observed),
-            "the frame holds a different page and said so"
-        );
-        assert!(pool.observe(99).is_none());
-        assert!(pool.latch(99).is_none());
-    }
-
-    /// A pool with no frames or no page size is a misuse, not a panic.
-    #[test]
-    fn a_degenerate_pool_is_refused() {
-        let vfs = MemoryVfs::new();
-        let path = DbPath::new("degenerate.rdb");
-        let file = vfs.open(&path, OpenOptions::main_db()).unwrap();
-        assert!(Pool::new(file, 512, 0, 0).is_err());
-        let file = vfs.open(&path, OpenOptions::main_db()).unwrap();
-        assert!(Pool::new(file, 0, 4, 0).is_err());
-    }
-
-    /// The reported size is frames times the page size, and the counters reset.
-    #[test]
-    fn the_pool_reports_its_own_size() {
-        let pool = pool_over(512, 6, 8);
-        assert_eq!(pool.frames(), 6);
-        assert_eq!(pool.page_size(), 512);
-        assert_eq!(pool.byte_size(), 6 * 512);
-        let _ = pool.fetch(PageId(2)).unwrap();
-        assert!(pool.stats().reads > 0);
-        pool.reset_stats();
-        assert_eq!(pool.stats(), PoolStats::default());
-        assert!(pool.is_resident(PageId(2)));
-        assert!(!pool.is_resident(PageId(7)));
-        assert_eq!(pool.frame_state(99), None);
-    }
-
-    /// Growing hands out the page after the last one and moves the count.
-    #[test]
-    fn growing_hands_out_the_next_page() {
-        let pool = pool_over(512, 4, 5);
-        assert_eq!(pool.grow(), PageId(5));
-        assert_eq!(pool.page_count(), 6);
-        pool.set_page_count(2);
-        assert_eq!(pool.grow(), PageId(2));
-    }
-
-    /// A checkpoint writes the meta page and its shadow, and both decode.
-    #[test]
-    fn a_checkpoint_writes_both_meta_pages() {
-        let pool = pool_over(512, 4, 6);
-        let mut meta = Meta::fresh(512, 1234);
-        meta.page_count = 6;
-        meta.generation = 2;
-        pool.checkpoint(&mut meta).unwrap();
-        let mut primary = vec![0u8; 512];
-        let mut shadow = vec![0u8; 512];
-        pool.read_raw(META_PAGE, &mut primary).unwrap();
-        pool.read_raw(SHADOW_PAGE, &mut shadow).unwrap();
-        assert_eq!(Meta::choose(&primary, &shadow).unwrap(), meta);
-    }
-
-    /// The watermark reports low only when the free and cooling frames really
-    /// are below the fraction.
-    #[test]
-    fn the_watermark_reports_a_full_pool() {
-        let pool = pool_over(512, 4, 8);
-        assert!(!pool.under_watermark(), "a fresh pool is all free");
-        for page in 2..6u64 {
-            let _ = pool.fetch(PageId(page)).unwrap();
-        }
-        assert!(pool.under_watermark());
-    }
-}
+mod tests;

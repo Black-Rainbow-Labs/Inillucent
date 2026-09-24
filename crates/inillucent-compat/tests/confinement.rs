@@ -23,6 +23,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use inillucent_compat::cliproc;
 use inillucent_compat::workspace_root;
 
 /// Where this suite's scratch directories live.
@@ -38,39 +39,6 @@ fn area(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&path);
     let _ = std::fs::create_dir_all(&path);
     path
-}
-
-/// Returns the verb-shaped command line, building it first.
-///
-/// **`None` is announced as a skip rather than returned quietly (task-1913).**
-/// Ten cases in this file opened with `let Some(program) = binary(...) else {
-/// return; };`, so a build that did not produce the binary made all ten pass
-/// without running anything - and these are the cases that check a confined
-/// server cannot be talked into opening a file outside its root, which is the
-/// last place a silent pass belongs. `--strict` turns the announced skip into
-/// a failure; the two link cases in this file already announced theirs.
-///
-/// @param name - the binary's name, without the platform's suffix
-fn binary(name: &str) -> Option<PathBuf> {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let built = Command::new(cargo)
-        .current_dir(workspace_root())
-        .args(["build", "-p", "inillucent-cli"])
-        .status();
-    let found = match built {
-        Ok(status) if status.success() => {
-            let mut directory = std::env::current_exe().unwrap_or_default();
-            directory.pop();
-            directory.pop();
-            let path = directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-            path.is_file().then_some(path)
-        }
-        _ => None,
-    };
-    if found.is_none() {
-        inillucent_compat::differential::skipping(&format!("{name} did not build"));
-    }
-    found
 }
 
 /// What one run of the command line printed and what it returned.
@@ -161,9 +129,7 @@ fn link_directory(link: &Path, target: &Path) -> bool {
 /// database in a completely different directory.
 #[test]
 fn a_link_below_the_root_does_not_reach_outside_it() {
-    let Some(program) = binary("inillucent") else {
-        return;
-    };
+    let program = cliproc::program("inillucent");
     let base = area("link");
     let root = base.join("root");
     let outside = base.join("outside");
@@ -227,9 +193,7 @@ fn a_link_below_the_root_does_not_reach_outside_it() {
 /// resolving one must not lose the case it was right about.
 #[test]
 fn a_path_that_climbs_out_of_the_root_is_refused() {
-    let Some(program) = binary("inillucent") else {
-        return;
-    };
+    let program = cliproc::program("inillucent");
     let base = area("climb");
     let root = base.join("root");
     let _ = std::fs::create_dir_all(&root);
@@ -245,9 +209,7 @@ fn a_path_that_climbs_out_of_the_root_is_refused() {
 /// An absolute path outside the root is refused.
 #[test]
 fn an_absolute_path_outside_the_root_is_refused() {
-    let Some(program) = binary("inillucent") else {
-        return;
-    };
+    let program = cliproc::program("inillucent");
     let base = area("absolute");
     let root = base.join("root");
     let outside = base.join("outside");
@@ -268,9 +230,7 @@ fn an_absolute_path_outside_the_root_is_refused() {
 /// above and be useless.
 #[test]
 fn a_path_inside_the_root_is_admitted() {
-    let Some(program) = binary("inillucent") else {
-        return;
-    };
+    let program = cliproc::program("inillucent");
     let base = area("inside");
     let root = base.join("root");
     let _ = std::fs::create_dir_all(root.join("nested"));
@@ -295,6 +255,138 @@ fn a_path_inside_the_root_is_admitted() {
     );
 }
 
+/// `params-file` outside the root is refused, and its contents do not leak.
+///
+/// **This was a bare `read_to_string` with no check at all** (task-2066
+/// §4.1.5). `params-file` is a parameter of `query` and `exec`, both served
+/// over MCP, so a server started `--root <root> --readonly` answered a request
+/// naming `C:/Windows/Temp/probe.json` with that file's contents. Every other
+/// path into the file system - ATTACH, VACUUM INTO, backup, restore, import,
+/// export - was confined, which is what made one hole worth a case of its own
+/// rather than a symptom of a missing design.
+///
+/// The assertion is on the refusal *and* on the absence of the contents,
+/// because a check that only looked for the word "refused" would pass against
+/// a version that printed the file and then complained.
+#[test]
+fn a_params_file_outside_the_root_is_refused() {
+    let program = cliproc::program("inillucent");
+    let base = area("params-file-outside");
+    let root = base.join("root");
+    let outside = base.join("outside");
+    let _ = std::fs::create_dir_all(&root);
+    let _ = std::fs::create_dir_all(&outside);
+    let secret = outside.join("probe.json");
+    let _ = std::fs::write(&secret, r#"["ARBITRARY-FILE-READ-FROM-OUTSIDE-THE-ROOT"]"#);
+    let named = secret.to_string_lossy().into_owned();
+
+    let refused = run(
+        &program,
+        &root,
+        &[
+            "--db",
+            "app.rdb",
+            "query",
+            "SELECT ?1 AS leaked",
+            "--params-file",
+            &named,
+        ],
+    );
+    let said = refused.text().to_lowercase();
+    assert!(
+        !refused.text().contains("ARBITRARY-FILE-READ"),
+        "the file's contents came back through params-file: {}",
+        refused.text()
+    );
+    assert!(
+        said.contains("confined") || said.contains("outside") || said.contains("root"),
+        "a params-file outside the root was not refused by name: {said}"
+    );
+}
+
+/// A `params-file` inside the root still works.
+///
+/// The falsifier for the case above: a confinement that refused every
+/// `params-file` would pass it and would have broken the parameter.
+#[test]
+fn a_params_file_inside_the_root_is_admitted() {
+    let program = cliproc::program("inillucent");
+    let base = area("params-file-inside");
+    let root = base.join("root");
+    let _ = std::fs::create_dir_all(&root);
+    let _ = std::fs::write(root.join("values.json"), r#"["admitted"]"#);
+    // The database has to exist, or the run is refused for that instead and the
+    // case grades the wrong refusal.
+    assert!(
+        run(&program, &root, &["create", "app.rdb"]).ok,
+        "the fixture database was not created"
+    );
+    let ran = run(
+        &program,
+        &root,
+        &[
+            "--db",
+            "app.rdb",
+            "query",
+            "SELECT ?1 AS bound",
+            "--params-file",
+            "values.json",
+        ],
+    );
+    assert!(
+        ran.ok,
+        "a params-file inside the root was refused: {}",
+        ran.text()
+    );
+    assert!(
+        ran.text().contains("admitted"),
+        "the value in the admitted file was not bound: {}",
+        ran.text()
+    );
+}
+
+/// `--params-file -` is refused on a confined surface.
+///
+/// A confined surface has no standard input of its own, and over MCP reading it
+/// would make the server consume its own JSON-RPC stream - so the request after
+/// it would never be answered. `resolve_source` already refuses `-` for exactly
+/// this reason, and `params-file` did not.
+#[test]
+fn a_params_file_of_standard_input_is_refused_when_confined() {
+    let program = cliproc::program("inillucent");
+    let base = area("params-file-stdin");
+    let root = base.join("root");
+    let _ = std::fs::create_dir_all(&root);
+    // The database has to exist, or the run is refused for that instead and the
+    // case grades the wrong refusal.
+    assert!(
+        run(&program, &root, &["create", "app.rdb"]).ok,
+        "the fixture database was not created"
+    );
+    let refused = run(
+        &program,
+        &root,
+        &[
+            "--db",
+            "app.rdb",
+            "query",
+            "SELECT ?1 AS bound",
+            "--params-file",
+            "-",
+        ],
+    );
+    let said = refused.text().to_lowercase();
+    assert!(
+        !refused.ok,
+        "'-' was accepted on a confined surface: {}",
+        refused.text()
+    );
+    assert!(
+        said.contains("standard input") || said.contains("confined"),
+        "'-' was refused without saying why: {said}"
+    );
+}
+
 /// `ATTACH DATABASE` with an absolute path outside the root is refused.
 ///
 /// The second of the two reproductions above. The SQL path never reached the
@@ -302,9 +394,7 @@ fn a_path_inside_the_root_is_admitted() {
 /// disk and read it with a qualified name.
 #[test]
 fn attaching_a_database_outside_the_root_is_refused() {
-    let Some(program) = binary("inillucent") else {
-        return;
-    };
+    let program = cliproc::program("inillucent");
     let base = area("attach");
     let root = base.join("root");
     let outside = base.join("outside");
@@ -342,9 +432,7 @@ fn attaching_a_database_outside_the_root_is_refused() {
 /// through the statement that never saw the check.
 #[test]
 fn attaching_through_a_link_is_refused() {
-    let Some(program) = binary("inillucent") else {
-        return;
-    };
+    let program = cliproc::program("inillucent");
     let base = area("attach-link");
     let root = base.join("root");
     let outside = base.join("outside");
@@ -390,9 +478,7 @@ fn attaching_through_a_link_is_refused() {
 /// to stop.
 #[test]
 fn vacuuming_into_a_path_outside_the_root_is_refused() {
-    let Some(program) = binary("inillucent") else {
-        return;
-    };
+    let program = cliproc::program("inillucent");
     let base = area("vacuum");
     let root = base.join("root");
     let outside = base.join("outside");
@@ -424,9 +510,7 @@ fn vacuuming_into_a_path_outside_the_root_is_refused() {
 /// read from outside it.
 #[test]
 fn backup_and_restore_stay_inside_the_root() {
-    let Some(program) = binary("inillucent") else {
-        return;
-    };
+    let program = cliproc::program("inillucent");
     let base = area("backup");
     let root = base.join("root");
     let outside = base.join("outside");
@@ -461,9 +545,7 @@ fn backup_and_restore_stay_inside_the_root() {
 /// outside it.
 #[test]
 fn import_and_export_stay_inside_the_root() {
-    let Some(program) = binary("inillucent") else {
-        return;
-    };
+    let program = cliproc::program("inillucent");
     let base = area("transfer");
     let root = base.join("root");
     let outside = base.join("outside");
@@ -513,9 +595,7 @@ fn import_and_export_stay_inside_the_root() {
 /// got wrong was the one path that was never checked.
 #[test]
 fn the_startup_database_is_confined_too() {
-    let Some(program) = binary("inillucent") else {
-        return;
-    };
+    let program = cliproc::program("inillucent");
     let base = area("startup");
     let root = base.join("root");
     let outside = base.join("outside");
@@ -542,9 +622,7 @@ fn the_startup_database_is_confined_too() {
 /// A root that names nothing is refused rather than confining to nothing.
 #[test]
 fn a_root_that_is_not_a_directory_is_refused() {
-    let Some(program) = binary("inillucent") else {
-        return;
-    };
+    let program = cliproc::program("inillucent");
     let base = area("absent");
     let missing = base.join("not-there");
     let refused = run(&program, &missing, &["--db", ":memory:", "query"])
@@ -563,9 +641,7 @@ fn a_root_that_is_not_a_directory_is_refused() {
 /// documented on `inillucent-mcp` and that is the program an agent is handed.
 #[test]
 fn the_mcp_server_refuses_a_path_outside_the_root() {
-    let Some(program) = binary("inillucent-mcp") else {
-        return;
-    };
+    let program = cliproc::program("inillucent-mcp");
     let base = area("mcp");
     let root = base.join("root");
     let outside = base.join("outside");
@@ -613,5 +689,144 @@ fn the_mcp_server_refuses_a_path_outside_the_root() {
     assert!(
         answered.contains("confined") || answered.contains("outside"),
         "the MCP server read a database outside the root: {answered}"
+    );
+}
+
+/// Runs a confined MCP server over one pipe and returns everything it answered.
+///
+/// The handshake is the whole of it: `initialize` carrying `protocolVersion`,
+/// then `notifications/initialized`, and only then the calls. A server that is
+/// sent a tool call before that answers `initialization must complete`, which
+/// is a sentence that contains none of the words a case is looking for - so a
+/// test that skips the handshake fails or passes for a reason that has nothing
+/// to do with what it is about.
+///
+/// @param program - the built `inillucent-mcp`
+/// @param root - the directory to confine the server to
+/// @param calls - the `tools/call` bodies, in order, each already JSON
+fn ask_the_server(program: &Path, root: &Path, calls: &[String]) -> String {
+    let mut request = String::from(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"confinement"}}}"#,
+    );
+    request.push('\n');
+    request.push_str(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    request.push('\n');
+    for call in calls {
+        request.push_str(call);
+        request.push('\n');
+    }
+    let mut child = match Command::new(program)
+        .arg("--root")
+        .arg(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => panic!("could not start the MCP server: {error}"),
+    };
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().expect("the server takes standard input");
+        let _ = stdin.write_all(request.as_bytes());
+    }
+    let produced = child.wait_with_output().expect("the server ends");
+    String::from_utf8_lossy(&produced.stdout).into_owned()
+}
+
+/// `export` over MCP writes its rows into a file inside the root.
+///
+/// **The confinement is the control, and the file is the point (task-2044).**
+/// `export --out` assembled a `.once` and ran it through the collecting
+/// caller, so over MCP it answered `.once is prohibited in safe mode` - which
+/// is accurate about the dot command it had built and says nothing a caller
+/// could act on, since the caller never asked for a dot command. It is also
+/// inconsistent with the three commands beside it: `backup`, `import` and
+/// `restore` all reach a file through `Context::confine` and all work on a
+/// confined server, for the reason `verbs.rs::dot` sets out - the path was
+/// admitted before the shell ever saw it.
+///
+/// A typed `.once` is still refused, which the case below asserts, because
+/// that one is a caller asking the shell to open a path the command surface
+/// never checked.
+#[test]
+fn the_mcp_server_exports_into_a_file_inside_the_root() {
+    let server = cliproc::program("inillucent-mcp");
+    let program = cliproc::program("inillucent");
+    let base = area("mcp-export");
+    let root = base.join("root");
+    let _ = std::fs::create_dir_all(&root);
+    for statement in [
+        "CREATE TABLE note (id INTEGER PRIMARY KEY, body TEXT)",
+        "INSERT INTO note (body) VALUES ('hello'), ('goodbye')",
+    ] {
+        let made = run(&program, &root, &["--db", "app.rdb", "exec", statement]);
+        assert!(made.ok, "setup failed at `{statement}`: {}", made.text());
+    }
+
+    let answered = ask_the_server(
+        &server,
+        &root,
+        &[
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"inillucent_export","arguments":{"db":"app.rdb","sql":"SELECT id, body FROM note ORDER BY id","out":"note.csv","format":"csv"}}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"inillucent_export","arguments":{"db":"app.rdb","table":"note","out":"../escaped.csv","format":"csv"}}}"#.to_string(),
+        ],
+    );
+    let written = root.join("note.csv");
+    let found = std::fs::read_to_string(&written).unwrap_or_else(|error| {
+        panic!("the MCP export wrote no file: {error}\nthe server answered: {answered}")
+    });
+    assert_eq!(
+        found, "id,body\r\n1,hello\r\n2,goodbye\r\n",
+        "the MCP export did not write the rows: {found:?}\nthe server answered: {answered}"
+    );
+    // The same call with a path that leaves the root is still refused, and
+    // refused by the confinement rather than by safe mode - so the message
+    // names the root, which is the thing the caller has to change.
+    assert!(
+        answered.to_lowercase().contains("confined") || answered.to_lowercase().contains("outside"),
+        "an export to a path outside the root was not refused: {answered}"
+    );
+    assert!(
+        !base.join("escaped.csv").exists(),
+        "the refused export still created the file outside the root"
+    );
+}
+
+/// A `.once` typed into a script is still refused on a confined server.
+///
+/// The reference refuses `.once` under `-safe` and so does this shell; the
+/// change that made `export --out` work over MCP must not have lifted it,
+/// because that path is one a caller names and the command surface never
+/// checks.
+#[test]
+fn a_typed_once_is_still_refused_on_a_confined_server() {
+    let server = cliproc::program("inillucent-mcp");
+    let program = cliproc::program("inillucent");
+    let base = area("mcp-once");
+    let root = base.join("root");
+    let _ = std::fs::create_dir_all(&root);
+    let made = run(
+        &program,
+        &root,
+        &["--db", "app.rdb", "exec", "CREATE TABLE note (a INTEGER)"],
+    );
+    assert!(made.ok, "setup failed: {}", made.text());
+
+    let answered = ask_the_server(
+        &server,
+        &root,
+        &[
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"inillucent_run","arguments":{"db":"app.rdb","input":".once typed.txt\nSELECT 1;"}}}"#.to_string(),
+        ],
+    );
+    assert!(
+        answered.contains("safe mode"),
+        "a typed `.once` was not refused on a confined server: {answered}"
+    );
+    assert!(
+        !root.join("typed.txt").exists(),
+        "the refused `.once` created its file anyway"
     );
 }

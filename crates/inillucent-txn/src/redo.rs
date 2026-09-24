@@ -378,16 +378,18 @@ impl RowRedo for TreeRows {
             let leaf = LeafRef::parse(&guard)?
                 .with_collations(&collations)
                 .with_directions(&directions);
-            let rows = leaf.live_source()?;
             let builder =
                 LeafBuilder::new(page_size, tree, shape.columns.clone(), shape.key_columns)?;
-            // **The same fill ladder the write path walked**, and for the same
-            // reason it is a shared function: a compaction is logged without its
-            // page when it is deterministic, and "deterministic" means this
-            // replay lands on the same bytes. A leaf packed above `COMPACT_FILL`
-            // by a bulk build compacts at `TIGHT_FILL` rather than splitting, and
-            // a replay that only knew the first fill declared the file corrupt.
-            let Some(mut image) = inillucent_tree::write::compact_image(&builder, &rows)? else {
+            // **The same choice the write path made**, and for the same reason
+            // it is a shared function: a compaction is logged without its page
+            // when it is deterministic, and "deterministic" means this replay
+            // lands on the same bytes. That covers the fill - a leaf packed
+            // above `COMPACT_FILL` by a bulk build compacts at `TIGHT_FILL` - and
+            // since task-2074 it covers whether the leaf is spliced or repacked,
+            // which the page decides and the replay reads off the same page.
+            let Some(mut image) =
+                inillucent_tree::write::replay_compaction(&builder, &leaf, page_size)?
+            else {
                 // The write path only logs a compaction when every live row
                 // fits; a replay that cannot fit them is looking at a different
                 // page than the one the record was written against.
@@ -400,7 +402,7 @@ impl RowRedo for TreeRows {
                 // area that add up to more live rows than the tree can hold in
                 // a page is the first, and an LSN at or above this record's is
                 // the second.
-                let live = rows.len();
+                let live = leaf.live_rows()?;
                 let sorted = leaf.row_count();
                 let delta = leaf.delta_count();
                 let mut tombstoned = 0usize;
@@ -478,11 +480,18 @@ impl RowRedo for TreeRows {
             // **Under the tree's own order.** See `key_order`: without the
             // collations and the directions this searches a leaf that is not
             // sorted the way it thinks it is.
-            let located = leaf
+            //
+            // **And into the directory position the write path chose**, which
+            // is the same search over the same page: the row's place in key
+            // order after whatever the key named has gone. A replay that put it
+            // anywhere else would produce a page whose bytes differ from the
+            // one the write left - valid, readable, and not the page the rest
+            // of the log was written against.
+            let (located, slot) = leaf
                 .view()?
                 .with_collations(&collations)
                 .with_directions(&directions)
-                .locate(&key, shape.key_columns)?;
+                .locate_slot(&key, shape.key_columns)?;
             match located {
                 Located::Sorted(at) => {
                     leaf.set_tombstone(at)?;
@@ -490,7 +499,7 @@ impl RowRedo for TreeRows {
                 Located::Delta(index) => leaf.remove_delta(index)?,
                 Located::Absent => {}
             }
-            if leaf.insert_delta_encoded(row)? == Applied::NoRoom {
+            if leaf.insert_delta_encoded(row, slot)? == Applied::NoRoom {
                 // The leaf had room when the record was written, so it has room
                 // now unless the page in the file is not the page the record was
                 // written against. Reporting it is the only honest answer; the
@@ -605,6 +614,15 @@ pub struct RedoStats {
     pub skipped: u64,
     /// The newest commit timestamp seen.
     pub latest_cts: u64,
+    /// Pages a bulk build wrote straight to the data file inside this window.
+    ///
+    /// **Not applied, counted** (task-2000, design 2). The build syncs the data
+    /// file before the statement's own records are appended, so by the time this
+    /// record is in the log its pages are durable and recovery has nothing to do
+    /// with them. What the count is for is a reader: without it the log holds
+    /// `AllocPage` records for a run of pages no record describes, which reads as
+    /// a gap. See `inillucent_wal::record::Body::BulkBuilt`.
+    pub bulk_built: u64,
     /// Whether a catalog change was replayed.
     pub catalog_changed: bool,
 }
@@ -636,6 +654,14 @@ pub struct Applier<'a, R: RowRedo> {
     /// applied first, and the logical pass then reads pages the log has already
     /// made whole.
     images_only: bool,
+    /// How many pages the file held when this applier was made, or `None` until
+    /// something asks.
+    ///
+    /// See [`Applier::page_lsn`] for why the question has to be put to the file
+    /// rather than to the pool's page count. Read once and kept, because the
+    /// file can only grow while a replay runs and the pool's own count grows
+    /// with it, so the larger of the two is an upper bound that stays true.
+    pages_in_the_file: Option<u64>,
 }
 
 impl<'a, R: RowRedo> Applier<'a, R> {
@@ -650,6 +676,7 @@ impl<'a, R: RowRedo> Applier<'a, R> {
             stats: RedoStats::default(),
             free_map: Vec::new(),
             images_only: false,
+            pages_in_the_file: None,
         }
     }
 
@@ -752,6 +779,16 @@ impl<'a, R: RowRedo> Applier<'a, R> {
         &self.free_map
     }
 
+    /// Returns the row applier this was built with.
+    ///
+    /// So a caller can ask it what it did. The engine's applier counts the
+    /// records it dropped for want of a tree's shape, and that count has to
+    /// reach the recovery's outcome - see `Recovered::dropped` (task-2066
+    /// §4.1.10).
+    pub fn rows(&self) -> &R {
+        &self.rows
+    }
+
     /// Copies a whole page image into the file and stamps its LSN.
     ///
     /// @param page - the page's number
@@ -771,12 +808,49 @@ impl<'a, R: RowRedo> Applier<'a, R> {
         self.stats.images = self.stats.images.saturating_add(1);
         Ok(())
     }
+
+    /// Returns how many pages this replay may find in the file.
+    ///
+    /// **Read from the file's own length. Asking the pool's page count instead
+    /// corrupted a database (task-2055).** The pool's count comes from the meta
+    /// record, which is the *last checkpoint's* - and every page allocated since
+    /// that checkpoint is past it, described only by the `AllocPage` records
+    /// this replay has not applied yet. Asking the pool therefore answered "the
+    /// file does not hold that page" about pages the file was holding perfectly
+    /// well, [`Applier::page_lsn`] returned `None` for all of them, and the
+    /// page-LSN rule - the one thing that stops redo writing an old record over
+    /// newer contents - was switched off for the whole tail of the file.
+    ///
+    /// What that cost: a `CREATE INDEX` bulk built onto pages an `ALTER TABLE`
+    /// had freed in the same session, on a file whose log had not been folded,
+    /// came back after the reopen as pieces of the table it was built beside.
+    ///
+    /// The larger of the two is taken because a replay can grow the file - a
+    /// `WritePage` for a page past the end installs it - and the pool's count
+    /// grows with it, while the length read here does not.
+    fn pages_the_file_holds(&mut self) -> DbResult<u64> {
+        let held = match self.pages_in_the_file {
+            Some(held) => held,
+            None => {
+                let size = self
+                    .database
+                    .pool()
+                    .file()
+                    .file_size()
+                    .map_err(inillucent_vfs::VfsError::into_db_error)?;
+                let held = size / self.database.page_size().max(1) as u64;
+                self.pages_in_the_file = Some(held);
+                held
+            }
+        };
+        Ok(held.max(self.database.pool().page_count()))
+    }
 }
 
 impl<R: RowRedo> Redo for Applier<'_, R> {
     fn page_lsn(&mut self, page: u64) -> DbResult<Option<u64>> {
         let id = PageId(page);
-        if page >= self.database.pool().page_count() {
+        if page >= self.pages_the_file_holds()? {
             return Ok(None);
         }
         match self.database.pool().fetch(id) {
@@ -889,6 +963,14 @@ impl<R: RowRedo> Redo for Applier<'_, R> {
             // Pure filler - see `inillucent_wal::record::Body::Pad` - so
             // replaying one changes nothing.
             Body::Pad { .. } => {}
+            // **A bulk build's pages were durable before this record was
+            // appended**, so there is nothing to apply - see
+            // `inillucent_wal::record::Body::BulkBuilt` for the commit order that
+            // makes that true. It is counted so a recovery report can say a build
+            // happened in the window, which is the only reason the record exists.
+            Body::BulkBuilt { count, .. } => {
+                self.stats.bulk_built = self.stats.bulk_built.saturating_add(count)
+            }
         }
         Ok(())
     }

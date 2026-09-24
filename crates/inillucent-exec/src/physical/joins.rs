@@ -19,6 +19,7 @@ use inillucent_sql::ast::SortOrder;
 use inillucent_sql::bind::BoundExpr;
 use inillucent_sql::plan::{AccessPath, AggregationMode, PhysicalPlan};
 use inillucent_tree::datum::{Datum, OwnedDatum};
+use inillucent_value::collation::Collation;
 
 use crate::batch::Batch;
 use crate::expr::{compile, Expr, StaticType};
@@ -90,7 +91,6 @@ pub(crate) fn iterative_candidates(
     index: &[u8],
     wanted: &Datum<'_>,
     depth: usize,
-    limit: Option<usize>,
 ) -> DbResult<Vec<i64>> {
     let CandidateProbe {
         plan,
@@ -113,10 +113,23 @@ pub(crate) fn iterative_candidates(
     if predicates.is_empty() {
         return Ok(keys);
     }
-    // The rows the statement is asking for. `LIMIT` is what a vector path is
-    // chosen by, so this is nearly always `depth` - but a plan that arrived
-    // here with a smaller chain limit should stop at the smaller number.
-    let target = limit.unwrap_or(depth).min(depth).max(1);
+    // The rows the statement is asking for, which is `depth`.
+    //
+    // **This used to take a chain limit as well, and that value could never
+    // arrive** (task-2069). It was read only here, in the branch reached when
+    // there is a residual or a constant filter - and `source_limit_of` returns
+    // `None` for exactly those, so the expression
+    // `limit.unwrap_or(depth).min(depth).max(1)` could only ever produce
+    // `depth`. Its comment described a plan with a smaller chain limit, and the
+    // planner cannot produce one: `vector_probe` requires the statement's
+    // `LIMIT` to be a literal integer and refuses the path under `DISTINCT`,
+    // `GROUP BY`, an aggregate, an `OFFSET` or a compound, so `depth` *is* the
+    // `LIMIT` on every plan that gets here.
+    //
+    // Removed rather than left taking `None` forever, because a parameter that
+    // is always `None` is a claim the code makes about a case that does not
+    // exist, and the next reader has to prove it again.
+    let target = depth.max(1);
     let Some(pool) = catalog.pool_for(stage.root) else {
         return Ok(keys);
     };
@@ -779,17 +792,44 @@ pub(crate) fn projected_prefix(
 /// and not a permutation, because "the rows arrive sorted by these" is only
 /// true of a prefix.
 ///
+/// **And every expression must be compared under `BINARY`** (task-2079). The
+/// walk's order is always `BINARY`: `SourceLayout::key_columns` is left empty
+/// for any tree keyed under another collation, so a `scan_order` that names a
+/// column says the rows arrive in byte order. That says nothing about
+/// `ORDER BY s COLLATE NOCASE`, whose order puts `a` before `B`, and it does
+/// not bring `A` and `a` together for a `GROUP BY` or a `DISTINCT` under
+/// NOCASE. `COLLATE` is stripped from the expression by the time it gets here,
+/// so without the collations this said yes to all three: with a `BINARY` index
+/// on `s` and the rows `b A a B c`, `ORDER BY s COLLATE NOCASE` answered
+/// `A B a b c`, `GROUP BY s COLLATE NOCASE` five groups and
+/// `SELECT DISTINCT s COLLATE NOCASE` five rows, where SQLite answers
+/// `A a B b c`, three groups and three rows.
+///
 /// @param exprs - the expressions to test
+/// @param collations - the collation each expression is compared under; a
+///   short list means `BINARY` for the rest
 /// @param scan_order - the tree columns the leaves are ordered by
-pub(crate) fn is_scan_prefix(exprs: &[Expr], scan_order: &[Vec<usize>]) -> bool {
+pub(crate) fn is_scan_prefix(
+    exprs: &[Expr],
+    collations: &[Collation],
+    scan_order: &[Vec<usize>],
+) -> bool {
     if exprs.is_empty() || exprs.len() > scan_order.len() {
         return false;
     }
-    exprs.iter().enumerate().all(|(position, expr)| match expr {
-        Expr::Column(index) => scan_order
+    exprs.iter().enumerate().all(|(position, expr)| {
+        let binary = collations
             .get(position)
-            .is_some_and(|held| held.contains(index)),
-        _ => false,
+            .is_none_or(|collation| *collation == Collation::Binary);
+        match expr {
+            Expr::Column(index) => {
+                binary
+                    && scan_order
+                        .get(position)
+                        .is_some_and(|held| held.contains(index))
+            }
+            _ => false,
+        }
     })
 }
 /// Returns, for each column the walk is ordered by, every joined column that
@@ -861,9 +901,13 @@ pub(crate) fn output_is_sorted_by(
 ) -> bool {
     match plan.aggregation {
         AggregationMode::Grouped => {
+            // The walk grouped the rows in byte order, so it answers an
+            // `ORDER BY` over the group columns only under `BINARY`; see
+            // `is_scan_prefix` (task-2079).
             grouped_walk
                 && sort_keys.iter().enumerate().all(|(position, term)| {
-                    matches!(projected.get(term.column), Some(Expr::Column(index)) if *index == position)
+                    term.collation == Collation::Binary
+                        && matches!(projected.get(term.column), Some(Expr::Column(index)) if *index == position)
                 })
         }
         AggregationMode::Whole => false,
@@ -872,7 +916,8 @@ pub(crate) fn output_is_sorted_by(
                 .iter()
                 .filter_map(|term| projected.get(term.column).cloned())
                 .collect();
-            ordered.len() == sort_keys.len() && is_scan_prefix(&ordered, scan_order)
+            let collations: Vec<Collation> = sort_keys.iter().map(|term| term.collation).collect();
+            ordered.len() == sort_keys.len() && is_scan_prefix(&ordered, &collations, scan_order)
         }
     }
 }
@@ -952,29 +997,69 @@ mod tests {
     #[test]
     fn an_order_matches_the_scan_only_from_its_start() {
         let scan_order = vec![vec![0usize], vec![1usize]];
-        assert!(is_scan_prefix(&[Expr::Column(0)], &scan_order));
+        assert!(is_scan_prefix(&[Expr::Column(0)], &[], &scan_order));
         assert!(is_scan_prefix(
             &[Expr::Column(0), Expr::Column(1)],
+            &[],
             &scan_order
         ));
         assert!(
-            !is_scan_prefix(&[Expr::Column(1)], &scan_order),
+            !is_scan_prefix(&[Expr::Column(1)], &[], &scan_order),
             "the second key alone is not a prefix of the walk's order"
         );
         assert!(
-            !is_scan_prefix(&[], &scan_order),
+            !is_scan_prefix(&[], &[], &scan_order),
             "an empty order asks for nothing and cannot skip a sort"
         );
         assert!(
             !is_scan_prefix(
                 &[Expr::Column(0), Expr::Column(1), Expr::Column(2)],
+                &[],
                 &scan_order
             ),
             "an order longer than the walk's cannot be satisfied by it"
         );
         assert!(
-            !is_scan_prefix(&[Expr::Literal(OwnedDatum::Int(1))], &scan_order),
+            !is_scan_prefix(&[Expr::Literal(OwnedDatum::Int(1))], &[], &scan_order),
             "only a column can match a walk's key position"
         );
+    }
+
+    /// A walk in byte order is not an order under any other collation
+    /// (task-2079).
+    ///
+    /// The walk's order is always `BINARY`, so a `NOCASE` term over the
+    /// walk's own column still needs its sort, its hash grouping or its hash
+    /// de-duplication, whichever position it is in.
+    #[test]
+    fn an_order_under_another_collation_is_not_the_walks() {
+        let scan_order = vec![vec![0usize], vec![1usize]];
+        assert!(is_scan_prefix(
+            &[Expr::Column(0)],
+            &[Collation::Binary],
+            &scan_order
+        ));
+        for other in [Collation::NoCase, Collation::RTrim, Collation::Decimal] {
+            assert!(
+                !is_scan_prefix(&[Expr::Column(0)], &[other], &scan_order),
+                "{other:?} over a byte ordered walk"
+            );
+            assert!(
+                !is_scan_prefix(
+                    &[Expr::Column(0), Expr::Column(1)],
+                    &[other, Collation::Binary],
+                    &scan_order
+                ),
+                "{other:?} on the first term, BINARY on the second"
+            );
+            assert!(
+                !is_scan_prefix(
+                    &[Expr::Column(0), Expr::Column(1)],
+                    &[Collation::Binary, other],
+                    &scan_order
+                ),
+                "BINARY on the first term, {other:?} on the second"
+            );
+        }
     }
 }

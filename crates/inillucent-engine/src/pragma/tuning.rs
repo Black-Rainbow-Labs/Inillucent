@@ -63,6 +63,42 @@ impl crate::ImportedDatabase {
         } else {
             asked.max(1)
         };
+        // **Refused by name above a declared ceiling** (task-2066 §4.1.8).
+        // `grow_frames` allocates a buffer, a latch and a pin counter per
+        // frame, so this converted a caller's number straight into memory:
+        // `PRAGMA cache_size = -1000000000` reached a 3.3 GB working set in
+        // five seconds and a larger value was still climbing at 84 GB when it
+        // was killed. Windows over-commits, so it grows into the page file
+        // rather than failing.
+        //
+        // Refused rather than clamped, because a cache silently a thousand
+        // times smaller than the one that was asked for is a performance
+        // mystery later, and the caller can ask for a number that fits.
+        let ceiling = inillucent_base::limits::LIMIT_ROWS
+            .iter()
+            .find(|row| row.limit == inillucent_base::limits::Limit::CacheSize)
+            .map_or(i64::MAX, |row| row.hard_max);
+        if pages > ceiling {
+            // **Built rather than taken from a helper, because no helper gives
+            // both halves.** `too_big` has the right code and puts the sentence
+            // in the detail, where the command line does not show it - so a
+            // caller reading `--output json` got the canned "string or blob too
+            // big", which is wrong here and does not name the limit. `refusal`
+            // shows the sentence and carries `Misuse`, which the driver maps to
+            // `syntax`, and a limit is not a syntax error. This is the right
+            // code with the sentence a caller can act on.
+            let said = format!(
+                "PRAGMA cache_size asks for {pages} pool frames, past the {ceiling} this build \
+                 allows. A frame costs a page of memory plus its latch, so the request would \
+                 have been about {} MiB.",
+                pages.saturating_mul(page_size as i64) / (1024 * 1024)
+            );
+            return Err(inillucent_base::DbError::primary(
+                inillucent_base::error::PrimaryCode::TooBig,
+            )
+            .with_message(said.clone())
+            .with_detail(said));
+        }
         let wanted = usize::try_from(pages).unwrap_or(usize::MAX);
         if wanted > self.storage.database.pool().frames() {
             self.storage.database.pool_mut().grow_frames(wanted)?;
@@ -259,7 +295,7 @@ impl crate::ImportedDatabase {
         }
         Ok(Outcome {
             rows: vec![vec![OwnedDatum::Text(fixed.to_vec())]],
-            names: vec![name.into()],
+            names: std::rc::Rc::new(vec![name.into()]),
             changes: Default::default(),
         })
     }
@@ -273,18 +309,20 @@ impl crate::ImportedDatabase {
     /// other meta field.
     ///
     /// @param argument - the value it was given, when it was given one
+    /// @param at - the attached database the pragma was qualified with
     pub(crate) fn pragma_user_version(
         &mut self,
         argument: Option<&PragmaArgument>,
+        at: Option<usize>,
     ) -> DbResult<Outcome> {
         let Some(argument) = argument else {
             return Ok(named_integer(
                 "user_version",
-                i64::from(self.storage.database.user_version()),
+                i64::from(self.file_of(at)?.user_version()),
             ));
         };
         let value = argument_integer(argument) as i32;
-        self.storage.database.set_user_version(value);
+        self.file_of_mut(at)?.set_user_version(value);
         // **Checkpointed, because the meta page is not in the log.** Every
         // other write here is replayed from the WAL on the next open; a meta
         // field only reaches the file at a checkpoint, so one that was set and
@@ -297,18 +335,20 @@ impl crate::ImportedDatabase {
     /// Reads or writes the four bytes that say what application owns the file.
     ///
     /// @param argument - the value it was given, when it was given one
+    /// @param at - the attached database the pragma was qualified with
     pub(crate) fn pragma_application_id(
         &mut self,
         argument: Option<&PragmaArgument>,
+        at: Option<usize>,
     ) -> DbResult<Outcome> {
         let Some(argument) = argument else {
             return Ok(named_integer(
                 "application_id",
-                i64::from(self.storage.database.application_id()),
+                i64::from(self.file_of(at)?.application_id()),
             ));
         };
         let value = argument_integer(argument) as i32;
-        self.storage.database.set_application_id(value);
+        self.file_of_mut(at)?.set_application_id(value);
         self.checkpoint()?;
         Ok(Outcome::empty())
     }

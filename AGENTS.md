@@ -20,6 +20,13 @@
 > worktree belongs to, so a worktree on another drive needs no arguments. `-SitePath` and `-TapPath`
 > override them.
 >
+> **Start it with the release worktree as the working directory**, for example
+> `pwsh -WorkingDirectory J:/build/release -File J:/build/release/packaging/ship.ps1 -Part patch`.
+> Cargo reads `.cargo/config.toml` from the working directory, not from the manifest it is given. An
+> agent's terminal sits in its ticket's worktree, whose `.cargo/config.toml` points the target
+> directory at that ticket's build folder, so a release started from there tests and builds into the
+> wrong place. The 0.1.8 release's first attempt did exactly that.
+>
 > ### What it publishes
 >
 > Twelve routes: the five build targets, the Linux packages, the signature over `SHA256SUMS`, the
@@ -210,6 +217,87 @@ target/debug/inillucent-testrun --strict          # fail on a missing prerequisi
 oracle, a corpus, a live PostgreSQL — and they *report success* when it is absent. `--strict` counts
 those and names them, so a green with nothing installed cannot be mistaken for a green.
 
+**Read the exit code, and read all three of them**:
+
+| code | what happened |
+|---|---|
+| `0` | every selected target ran and passed |
+| `1` | the run happened and was red: a target failed, a target could not be read, or `--strict` found a suite whose prerequisite was absent |
+| `2` | **the run did not happen.** The build failed, a named selection matched nothing, `--filter` matched no test, or cargo could not say what it had built. Nothing was graded, so nothing in that run may be read as a pass |
+
+The code is the thing to branch on. `2` used to be `1`, so a build that would not compile was
+indistinguishable from a real defect, and an agent read one as the other.
+
+**A run that never ends used to be a fourth state none of those codes could describe.**
+`run_one` called `Command::output()`, which reads the child's pipes to end of file rather than
+waiting for the child - and a pipe reaches end of file when the last handle to its write end closes,
+so anything the child started with inherited standard output holds it after the child is gone. The
+runner then sat there with no child of its own, no result line for the target, no summary and no exit
+code, and had to be stopped by its process id. It needed nobody to kill anything: `interchange.rs`
+ran cargo through `Command::status()`, which inherits standard output, so a cargo that outlived its
+test binary did it. Any child a suite starts with inherited standard output still can.
+
+It now waits on the child. Two things follow that are worth knowing before you read a report:
+
+- A target whose child has exited is reported, and if something it started still held the pipe open
+  its status line says so. That case has no threshold in it and cannot report a working target
+  wrongly.
+- A target is **killed** only when it is both past a budget drawn from its own row in
+  `tests/timings.toml` - eight times that time, never under two hours - **and** has printed nothing
+  for ten minutes. It is then `UNKNOWN`, listed under `STOPPED` with both numbers, never retried, and
+  the run exits 1. `--timeout <secs>` replaces the budget and `--timeout 0` removes it.
+
+**Do not narrow that budget because it looks generous.** `inillucent::story_ledger_day_nightly` has
+no row in `tests/timings.toml` at all - it is in the `nightly` tier, so `--record` has never seen it -
+and it takes **1800.37s** while printing nothing, because libtest holds a test's own output back
+until the test ends. A thirty minute floor would have killed it four tenths of a second before it
+finished.
+
+**No suite builds the programs during a run.** `cliproc::program` is the one place a test
+finds `inillucent`, `inillucent-shell` or `inillucent-mcp`. The runner builds them before any suite
+starts and sets `INILLUCENT_PROGRAMS_BUILT`, so `program` runs no cargo; under a plain `cargo test`
+it builds once per test process and captures cargo's output. A build that fails panics with that
+output. It used to be a skip, which `--strict` reported as a missing `programs` prerequisite, and a
+build that had to relink while another suite ran `inillucent-shell.exe` failed on Windows with
+`Access is denied. (os error 5)`. `programs` is no longer a prerequisite any row declares.
+
+**In a shell, `$?` after a pipeline is the status of the last command in it**, so
+`inillucent-testrun --changed | tail -40` reports tail's `0` however the run went. That is easy to
+get wrong, and reading 60 KB of log to find out is the cost. Redirect to a file and read the
+code from the runner itself:
+
+```sh
+target/debug/inillucent-testrun --changed > run.log 2>&1; echo $?
+```
+
+**`.sqlite-ref/` is what a `git worktree` does not have.** It is gitignored, so a worktree starts
+without it, and every suite graded against the reference then skips silently — `semantics.rs` and
+everything using `differential::compare` among them. Pass **`--strict`** to turn those skips into
+named failures, which is how to tell a run that passed from a run that did not happen. Setting
+`INILLUCENT_STRICT=1` in the shell does **not** do it: the runner sets that variable on every child
+from its own `--strict` flag, so a value inherited from the shell is overwritten. Copy the directory
+from the repository the worktree belongs to, or run `pwsh tools/sqlite-reference.ps1`.
+
+**`_agent_output/fixtures/` is the second thing a worktree does not have.** It holds
+`small.db`, `medium.db` and `large.db`, built by `tools/build-gate-fixtures.sh`, and it is gitignored
+for the same reason. Without it `inillucent-compat::new_engine_log_lead` and
+`inillucent-compat::gates_fail_closed` report red under `--strict` and green without it — which is
+the exact confusion `--strict` exists to remove, so they read as defects in whatever was just
+changed. `new_engine_log_lead` is the one to notice: its two tests build an index bigger than the
+buffer pool and reopen it, which is the engine's open and recovery path under real pressure. Copy the
+directory from the repository the worktree belongs to.
+
+**The MSVC environment is now the runner's own job.** `onig_sys` compiles oniguruma with
+`cl.exe`, and a terminal that is not a Developer PowerShell has no `INCLUDE`, so the whole run used
+to stop at `regenc.h(39): fatal error C1083: Cannot open include file: 'stddef.h'`. The runner finds
+Visual Studio through `vswhere`, runs `vcvars64.bat` and copies the result into the environment its
+cargo children inherit — the same thing `Import-MsvcEnvironment` in `packaging/stage-layout.ps1`
+has done for the release path, which nothing in the test path called. It does
+nothing when `INCLUDE` is already set, so a developer shell is untouched, and when Visual Studio
+genuinely is not installed it refuses with the sentence that fixes it rather than letting cargo
+fail on a header. **Every other program in `packaging/` still needs
+`Import-MsvcEnvironment` dot-sourced by hand.**
+
 ### Writing a test that is worth having
 
 The standard is `tests/inillucent-testing-tdd.md` and its six rules. The two that get broken most:
@@ -239,6 +327,13 @@ Read three neighbouring files before writing one. The conventions that carry wei
   pages, journal frames, network bytes or VFS results. The governed crates `deny` all four and relax
   them only under `#[cfg(test)]`.
 - `cargo fmt` before you finish — `policy.rs` fails on an unformatted governed crate.
+- **Never put a ticket number in a published document.** `task-NNNN` names a card on a private
+  board, and nobody reading this repository or inillucent.com can look it up. That covers
+  `README.md`, `CHANGELOG.md`, this file, `CLAUDE.md`, everything under `docs/`, `agent-skills/` and
+  `packaging/`, and the driver and example readmes. Say what the change did instead, or give a
+  commit hash or a date. A path to a design document under `tasks/` is a file name and may stay.
+  `node tools/doc-facts/check.mjs` fails on any other ticket number in those files. Commit messages,
+  code comments and the design documents under `tasks/` are not covered.
 
 ### The shape of a finished change
 

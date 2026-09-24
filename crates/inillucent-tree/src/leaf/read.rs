@@ -72,6 +72,13 @@ impl<'p> LeafRef<'p> {
     pub fn extent_at(&self, row: usize, column: usize) -> DbResult<ExtentRef> {
         self.column(column)?.extent(row)
     }
+    /// Reports whether the leaf is in format 2's layout, with a delta directory.
+    ///
+    /// See [`LEAF_DELTA_DIRECTORY`]. `false` is a leaf format 1 wrote.
+    pub fn has_delta_directory(&self) -> bool {
+        self.flags & LEAF_DELTA_DIRECTORY != 0
+    }
+
     /// Returns where the heap begins, which is where the delta area ends.
     pub fn heap_start(&self) -> usize {
         self.heap_start
@@ -223,14 +230,59 @@ impl<'p> LeafRef<'p> {
             descending: false,
         })
     }
+    /// Returns one column's directory entry, eight or sixteen bytes.
+    ///
+    /// @param index - the column's position in the directory
+    fn directory_entry(&self, index: usize) -> DbResult<&'p [u8]> {
+        if index >= self.column_count {
+            return Err(misuse(format!("column {index} does not exist")));
+        }
+        let entry = leaf_header::DIRECTORY
+            .checked_add(index.saturating_mul(self.entry_size))
+            .ok_or_else(|| corrupt("directory index overflows"))?;
+        self.page
+            .get(entry..entry.saturating_add(self.entry_size))
+            .ok_or_else(|| corrupt("directory entry runs past the page"))
+    }
     /// Returns a view over one mini-column.
+    ///
+    /// **The directory entry is read once, as one slice.** `column` runs on
+    /// every probe - once for each key column the search compares and once for
+    /// each inner column an index nested loop projects - and it used to ask
+    /// `spec`, `column_width`, `column_base` and `column_offset` in turn, each
+    /// of which located the same entry again, bounds checked it again, and
+    /// between them parsed the type byte twice. `column_base`, the fourth
+    /// lookup, is what task-1870's follow-ups added here. task-2091 measured
+    /// reading the entry once, pinned, on the read gate: `join.range` 28.36 ms
+    /// to 26.11, `range.lookaside` 28.3 to 24.5, and PointProbe 345 ns to 307,
+    /// with every workload's digest still agreeing with SQLite's. Every answer
+    /// is the same as the four calls give, including which error a bad entry
+    /// produces; `a_column_reads_its_entry_the_way_the_accessors_do` checks it.
     ///
     /// @param index - the column's position in the directory
     pub fn column(&self, index: usize) -> DbResult<MiniColumn<'p>> {
-        let spec = self.spec(index)?;
-        let width = self.column_width(index)?;
-        let base = self.column_base(index)?;
-        let start = self.column_offset(index)?;
+        let entry = self.directory_entry(index)?;
+        let head: [u8; 8] = entry
+            .get(..8)
+            .and_then(|head| head.try_into().ok())
+            .ok_or_else(|| corrupt("directory entry runs past the page"))?;
+        let [type_byte, flags, width_low, width_high, offset_0, offset_1, offset_2, offset_3] =
+            head;
+        let physical = PhysicalType::from_code(type_byte)?;
+        let width = u16::from_le_bytes([width_low, width_high]) as usize;
+        if !physical.admits_width(width) {
+            return Err(corrupt(format!(
+                "column {index} claims a slot width of {width}"
+            )));
+        }
+        let base = match entry.get(8..16) {
+            Some(tail) => {
+                let raw: [u8; 8] = tail.try_into().unwrap_or([0; 8]);
+                u64::from_le_bytes(raw) as i64
+            }
+            None => 0,
+        };
+        let start = u32::from_le_bytes([offset_0, offset_1, offset_2, offset_3]) as usize;
         let class_len = class_bytes(self.row_count);
         let value_len = self.row_count.saturating_mul(width);
         let class = self
@@ -243,8 +295,8 @@ impl<'p> LeafRef<'p> {
             .get(values_at..values_at.saturating_add(value_len))
             .ok_or_else(|| corrupt(format!("values of column {index} run past the page")))?;
         Ok(MiniColumn {
-            physical: spec.physical,
-            flags: spec.flags,
+            physical,
+            flags,
             width,
             base,
             class,
@@ -313,177 +365,188 @@ impl<'p> LeafRef<'p> {
     /// @param key - the key, one value per key column
     /// @param key_columns - how many leading columns form the key
     pub fn locate(&self, key: &[Datum<'_>], key_columns: usize) -> DbResult<crate::write::Located> {
-        for index in 0..self.delta_count() {
-            if self.delta_key_matches(index, key, key_columns)? {
-                return Ok(crate::write::Located::Delta(index));
+        Ok(self.locate_slot(key, key_columns)?.0)
+    }
+
+    /// Returns where a key sits, and the delta directory position a row for it takes.
+    ///
+    /// **The position is the one the directory will have after the write has
+    /// displaced whatever the key named**, which is what the write path and
+    /// recovery both hand to [`crate::mutate::LeafMut::plan_encoded`]. A key in
+    /// the delta area at `i` is removed first and its replacement goes back in
+    /// at `i`; a key anywhere else goes where the binary search stopped. Both
+    /// come out of the one search, so a write pays for the delta area once.
+    ///
+    /// @param key - the key, one value per key column
+    /// @param key_columns - how many leading columns form the key
+    pub fn locate_slot(
+        &self,
+        key: &[Datum<'_>],
+        key_columns: usize,
+    ) -> DbResult<(crate::write::Located, usize)> {
+        // **The two halves are timed apart because they answer to different
+        // changes** (task-2034). The delta search and the sorted search are
+        // both binary searches now, over a few hundred rows and a few thousand,
+        // and a write path that costs a microsecond or two here cannot be aimed
+        // at until it is known which of the two is paying. Both clocks are
+        // `None` unless a harness asked - see `crate::stages`.
+        let scanning = crate::stages::clock();
+        let slot = match self.delta_index_of(key, key_columns)? {
+            Ok(index) => {
+                crate::stages::add_locate(crate::stages::elapsed(scanning), 0);
+                return Ok((crate::write::Located::Delta(index), index));
             }
+            Err(slot) => slot,
+        };
+        let deltas = crate::stages::elapsed(scanning);
+        let searching = crate::stages::clock();
+        // The tombstone is read inside the timed region because it is part of
+        // deciding where the key sits: a tombstoned row reads as absent from
+        // the sorted region, and the delta area has already been searched.
+        let in_sorted_region = match self.search(key)? {
+            Ok(row) => Some((row, self.is_tombstoned(row)?)),
+            Err(_) => None,
+        };
+        crate::stages::add_locate(deltas, crate::stages::elapsed(searching));
+        if let Some((row, false)) = in_sorted_region {
+            return Ok((crate::write::Located::Sorted(row), slot));
         }
-        if let Ok(row) = self.search(key)? {
-            if !self.is_tombstoned(row)? {
-                return Ok(crate::write::Located::Sorted(row));
-            }
-        }
-        Ok(crate::write::Located::Absent)
+        Ok((crate::write::Located::Absent, slot))
     }
     /// Returns the leaf's live rows in key order, as a source the builder reads
     /// through.
     ///
     /// **The allocation-free half of [`LeafRef::live`], and the one a compaction
-    /// wants.** It also does asymptotically less work: the sorted region is
-    /// already in key order, so the delta rows, at most [`DELTA_LIMIT`] of
-    /// them, are merged into it by **binary search** rather than the whole leaf
-    /// being sorted again.
+    /// wants.** It also does asymptotically less work: the sorted region and the
+    /// delta directory are both in key order, so the two are **merged** rather
+    /// than the whole leaf being sorted again.
     ///
     /// The shadowing rules are `live`'s, and the two are checked against each
     /// other by `live_order_agrees_with_live`.
     pub fn live_source(&self) -> DbResult<LiveSource<'p>> {
+        self.live_order()?.materialise()
+    }
+
+    /// Returns which rows are live, in key order, without reading their values.
+    ///
+    /// **The half of [`LeafRef::live_source`] that does not depend on what the
+    /// caller intends to do with the rows.** Deciding which rows are live is a
+    /// tombstone scan, a decode of the delta rows and a merge; reading every
+    /// value of every live row afterwards is a separate pass, and a caller that
+    /// copies slots rather than values - the compaction splice - does not need
+    /// it.
+    ///
+    /// **A merge of two sorted runs** (task-2074). The delta directory is in key
+    /// order, so each delta row is placed by a binary search over the part of
+    /// the sorted region not yet emitted, and the sorted rows below it are
+    /// copied across in one step. That is `d log n` key comparisons and one pass
+    /// over the positions. The version this replaced inserted each delta row
+    /// into a vector of every sorted row, which moved the whole vector once per
+    /// delta row - harmless at 32 delta rows and quadratic at the hundreds the
+    /// area now holds - and it compared every delta row with every earlier one
+    /// to find a key held twice, which the directory's order makes a comparison
+    /// with the row before it (task-2066's audit, C6).
+    ///
+    /// The shadowing rules are the ones every reader follows: a tombstoned
+    /// sorted row is not live; where the delta area holds a key twice the first
+    /// in the directory, the newer, wins; and a delta row replaces the sorted
+    /// row it shadows rather than joining it. `live_order_agrees_with_the_reference`
+    /// checks them against a direct implementation of those three sentences.
+    pub fn live_order(&self) -> DbResult<LiveOrder<'p>> {
         let mut columns = Vec::with_capacity(self.column_count);
         for index in 0..self.column_count {
             columns.push(self.column(index)?);
         }
         // Each delta row decoded once, through `delta_row_values`, and reused
-        // by every comparison below - `compare_live` reads from this `Vec`
-        // rather than the page, so a row placed by binary search against `n`
-        // entries already here is not `n` more trips through `delta_value`.
+        // by every comparison below.
         let mut delta: Vec<Vec<Datum<'p>>> = Vec::with_capacity(self.delta_count);
         for index in 0..self.delta_count {
             delta.push(self.delta_row_values(index)?);
         }
-
-        let mut order: Vec<LiveRow> =
-            Vec::with_capacity(self.row_count.saturating_add(self.delta_count));
-        for row in 0..self.row_count {
-            if self.is_tombstoned(row)? {
-                continue;
-            }
-            order.push(LiveRow::Sorted(row as u32));
-        }
-        // The newest entry for a key wins and "newest" is the lowest delta
-        // index, so an entry whose key a lower index already placed is dropped.
-        let mut placed: Vec<u32> = Vec::new();
-        for index in 0..self.delta_count {
-            let entry = LiveRow::Delta(index as u32);
-            let mut shadowed = false;
-            for earlier in &placed {
-                if self.compare_live(&columns, &delta, LiveRow::Delta(*earlier), entry)?
-                    == std::cmp::Ordering::Equal
-                {
-                    shadowed = true;
-                    break;
-                }
-            }
-            if shadowed {
-                continue;
-            }
-            placed.push(index as u32);
-            // Binary search, not a scan: the delta area holds at most
-            // `DELTA_LIMIT` rows and the sorted region holds thousands, and a
-            // scan per delta row made a compaction quadratic in the leaf.
-            let mut low = 0usize;
-            let mut high = order.len();
-            let mut found = None;
-            while low < high {
-                let mid = low.saturating_add(high.saturating_sub(low) / 2);
-                let held = order.get(mid).copied().unwrap_or(LiveRow::Sorted(0));
-                match self.compare_live(&columns, &delta, held, entry)? {
-                    std::cmp::Ordering::Less => low = mid.saturating_add(1),
-                    std::cmp::Ordering::Greater => high = mid,
-                    std::cmp::Ordering::Equal => {
-                        found = Some(mid);
-                        break;
-                    }
-                }
-            }
-            // A delta row is newer than the sorted region, so it *replaces* the
-            // row it shadows rather than joining it.
-            match found {
-                Some(at) => {
-                    if let Some(slot) = order.get_mut(at) {
-                        *slot = entry;
-                    }
-                }
-                None => order.insert(low, entry),
-            }
-        }
-        // The order is settled; now one flat pass to materialise it. Reading
-        // through the mini-columns here rather than in the builder's two passes
-        // means each value is decoded once instead of twice.
-        let mut values = Vec::with_capacity(order.len().saturating_mul(self.column_count));
-        for at in &order {
-            for column in 0..self.column_count {
-                values.push(live_value(&columns, &delta, *at, column)?);
-            }
-        }
-        Ok(LiveSource {
-            values,
+        let order = self.merge_order(&delta)?;
+        Ok(LiveOrder {
+            columns,
+            delta,
+            order,
             width: self.column_count,
         })
     }
-    /// Materialises every live row, sorted region merged with the delta.    /// Materialises every live row, sorted region merged with the delta.
+
+    /// Merges the delta rows into the sorted region, by position.
     ///
-    /// This is what compaction, the property tests and every read path over a
-    /// leaf that has been written to all need, and it is deliberately the one
-    /// place the merge is written. A leaf that has *not* been written to never
-    /// comes here: [`LeafRef::has_writes`] is false and the caller takes the
+    /// Reads only the rows' keys - the first `key_columns` values of each entry
+    /// of `delta`, which may hold more - so a caller that has decoded nothing but
+    /// the keys can call it, and a delta row holding an out-of-line value it has
+    /// no use for is never asked for that value.
+    ///
+    /// @param delta - each delta row's values, at least its keys, by delta index
+    fn merge_order(&self, delta: &[Vec<Datum<'p>>]) -> DbResult<Vec<LiveRow>> {
+        let tombstones = match self.has_tombstones() {
+            true => Some(self.tombstones()?),
+            false => None,
+        };
+        let view = self.key_view()?;
+        let mut order: Vec<LiveRow> =
+            Vec::with_capacity(self.row_count.saturating_add(self.delta_count));
+        let mut next_sorted = 0usize;
+        let mut previous: Option<usize> = None;
+        // The directory's own order, or a format 1 area sorted into it.
+        for index in self.delta_in_key_order()? {
+            let Some(values) = delta.get(index) else {
+                continue;
+            };
+            let key = values.get(..self.key_columns).unwrap_or(values);
+            // A key the directory holds twice keeps its first entry, which is
+            // the newer; the second sorts straight after it.
+            if let Some(earlier) = previous.and_then(|at| delta.get(at)) {
+                if self.compare_keys(earlier, values) == std::cmp::Ordering::Equal {
+                    continue;
+                }
+            }
+            previous = Some(index);
+            let (at, shadows) =
+                match self.search_between(&view, key, next_sorted, self.row_count)? {
+                    Ok(row) => (row, true),
+                    Err(row) => (row, false),
+                };
+            push_live_sorted(&mut order, tombstones, next_sorted, at)?;
+            order.push(LiveRow::Delta(index as u32));
+            // The sorted row a delta row shadows is skipped whether or not it
+            // was tombstoned: the delta row is the newer copy of that key.
+            next_sorted = if shadows { at.saturating_add(1) } else { at };
+        }
+        push_live_sorted(&mut order, tombstones, next_sorted, self.row_count)?;
+        Ok(order)
+    }
+    /// Materialises every live row, sorted region merged with the delta.
+    ///
+    /// This is what the property tests and every read path over a leaf that has
+    /// been written to need. A leaf that has *not* been written to never comes
+    /// here: [`LeafRef::has_writes`] is false and the caller takes the
     /// vectorised path, which is the whole design.
     ///
-    /// **A key the delta area holds twice keeps the newest.** The delta area
-    /// grows downwards, so index 0 is the most recent insert; the merge below
-    /// walks it in order and the first entry for a key wins. The write path
-    /// removes the old entry rather than shadowing it, so this is a belt on top
-    /// of braces - and it is the belt that makes `live()` correct on a page
-    /// recovery replayed rather than on one this process built.
+    /// **It is [`LeafRef::live_order`] with the values read out, and that is
+    /// deliberate** (task-2074). It used to be its own merge: every delta row
+    /// was compared with every sorted row to find the one it shadowed, and the
+    /// result was sorted again at the end - quadratic in a delta area that is
+    /// now sized by the free gap rather than capped at 32 rows. One merge is
+    /// one set of shadowing rules, and two were two chances for them to drift.
     pub fn live(&self) -> DbResult<Vec<Vec<Datum<'p>>>> {
-        let mut rows: Vec<Vec<Datum<'p>>> =
-            Vec::with_capacity(self.row_count.saturating_add(self.delta_count));
-        for row in 0..self.row_count {
-            if self.is_tombstoned(row)? {
-                continue;
+        let order = self.live_order()?;
+        let mut rows: Vec<Vec<Datum<'p>>> = Vec::with_capacity(order.len());
+        for at in order.order() {
+            if let LiveRow::Delta(index) = at {
+                if let Some(values) = order.delta().get(*index as usize) {
+                    rows.push(values.clone());
+                    continue;
+                }
             }
-            let mut values = Vec::with_capacity(self.column_count);
-            for column in 0..self.column_count {
-                values.push(self.value(row, column)?);
+            let mut values = Vec::with_capacity(order.width());
+            for column in 0..order.width() {
+                values.push(live_value(order.columns(), order.delta(), *at, column)?);
             }
             rows.push(values);
         }
-        let sorted_rows = rows.len();
-        for index in 0..self.delta_count {
-            // One pass over the row rather than one `delta_value` call per
-            // column - see `delta_row_values` for why that used to cost the
-            // square of the column count instead of the column count.
-            let values = self.delta_row_values(index)?;
-            // The newest wins, and "newest" is the *lowest* delta index. A
-            // shadowed entry is dropped here rather than sorted and deduped
-            // afterwards, because a stable sort would keep whichever the
-            // comparison happened to leave first.
-            let shadowed = rows
-                .get(sorted_rows..)
-                .unwrap_or(&[])
-                .iter()
-                .any(|held| self.compare_keys(held, &values) == std::cmp::Ordering::Equal);
-            if shadowed {
-                continue;
-            }
-            // **A delta row is newer than the sorted region, so it replaces the
-            // row it shadows rather than joining it.** Comparing only against
-            // the other delta entries - which is what this did - emitted both
-            // copies of every row that had been written after it was packed,
-            // and a table read back twice as many rows as it held. It survived
-            // for as long as it did because the two copies only exist together
-            // after a compaction has moved rows into the sorted region and a
-            // later write has put them back in the delta area, which is a state
-            // a freshly written table never reaches and a reopened one does.
-            let position = rows
-                .get(..sorted_rows)
-                .unwrap_or(&[])
-                .iter()
-                .position(|held| self.compare_keys(held, &values) == std::cmp::Ordering::Equal);
-            match position.and_then(|at| rows.get_mut(at)) {
-                Some(slot) => *slot = values,
-                None => rows.push(values),
-            }
-        }
-        rows.sort_by(|left, right| self.compare_keys(left, right));
         Ok(rows)
     }
     /// Visits every live row, projecting only the columns asked for.
@@ -515,85 +578,195 @@ impl<'p> LeafRef<'p> {
         columns: &[usize],
         visit: &mut dyn FnMut(&[Datum<'p>]) -> DbResult<()>,
     ) -> DbResult<()> {
-        // The delta area's keys, read once. Almost every leaf has none, and
-        // then the sorted region needs no shadow test at all.
-        let mut delta_keys: Vec<Vec<Datum<'p>>> = Vec::with_capacity(self.delta_count);
-        for index in 0..self.delta_count {
-            let mut key = Vec::with_capacity(self.key_columns);
-            for column in 0..self.key_columns {
-                key.push(self.delta_value(index, column)?);
-            }
-            delta_keys.push(key);
-        }
         let projected_columns: Vec<MiniColumn<'p>> = columns
             .iter()
             .map(|column| self.column(*column))
             .collect::<DbResult<Vec<MiniColumn<'p>>>>()?;
-        let key_columns: Vec<MiniColumn<'p>> = if delta_keys.is_empty() {
-            Vec::new()
-        } else {
-            (0..self.key_columns)
-                .map(|column| self.column(column))
-                .collect::<DbResult<Vec<MiniColumn<'p>>>>()?
-        };
-        // The tombstone bitmap, derived once rather than per row.
-        let tombstones = if self.has_tombstones() {
-            Some(self.tombstones()?)
-        } else {
-            None
-        };
-        let mut row_key: Vec<Datum<'p>> = Vec::with_capacity(self.key_columns);
         let mut projected: Vec<Datum<'p>> = Vec::with_capacity(columns.len());
-        for row in 0..self.row_count {
-            if let Some(bitmap) = tombstones {
-                let byte = bitmap
-                    .get(row / 8)
-                    .copied()
-                    .ok_or_else(|| corrupt(format!("row {row} is outside the tombstone bitmap")))?;
-                if byte & (1u8 << (row % 8)) != 0 {
-                    continue;
-                }
-            }
-            if !delta_keys.is_empty() {
-                row_key.clear();
-                for column in &key_columns {
-                    row_key.push(column.value(row)?);
-                }
-                if delta_keys
-                    .iter()
-                    .any(|held| self.compare_keys(held, &row_key) == std::cmp::Ordering::Equal)
-                {
-                    // A delta entry for this key replaces the sorted row, so
-                    // the sorted one is skipped and the delta one emitted below.
-                    continue;
-                }
-            }
-            projected.clear();
-            for column in &projected_columns {
-                projected.push(column.value(row)?);
-            }
-            visit(&projected)?;
-        }
-        for index in 0..self.delta_count {
-            let Some(key) = delta_keys.get(index) else {
-                continue;
+        // **A leaf with no delta rows needs no merge**, which is almost every
+        // leaf: the sorted region minus its tombstones, straight off the
+        // mini-columns.
+        if self.delta_count == 0 {
+            let tombstones = match self.has_tombstones() {
+                true => Some(self.tombstones()?),
+                false => None,
             };
-            let shadowed = delta_keys
-                .get(..index)
-                .unwrap_or(&[])
-                .iter()
-                .any(|held| self.compare_keys(held, key) == std::cmp::Ordering::Equal);
-            if shadowed {
-                continue;
+            for row in 0..self.row_count {
+                if is_set(tombstones, row)? {
+                    continue;
+                }
+                projected.clear();
+                for column in &projected_columns {
+                    projected.push(column.value(row)?);
+                }
+                visit(&projected)?;
             }
+            return Ok(());
+        }
+        // Otherwise the positions come from the one merge every reader shares,
+        // fed the delta rows' **keys** only. A delta row can hold a value out of
+        // line, and decoding it needs the leaf's extents; a caller projecting
+        // other columns has not read them and must not be asked to. So only the
+        // key columns and the projected ones are decoded, as before the merge
+        // was shared. The rows are visited in key order, which the callers do
+        // not need and which costs nothing more than visiting them out of it.
+        let mut delta_keys: Vec<Vec<Datum<'p>>> = Vec::with_capacity(self.delta_count);
+        for index in 0..self.delta_count {
+            delta_keys.push(self.delta_key(index)?);
+        }
+        for at in self.merge_order(&delta_keys)? {
             projected.clear();
-            for column in columns {
-                projected.push(self.delta_value(index, *column)?);
+            match at {
+                LiveRow::Sorted(row) => {
+                    for column in &projected_columns {
+                        projected.push(column.value(row as usize)?);
+                    }
+                }
+                LiveRow::Delta(index) => {
+                    for column in columns {
+                        projected.push(self.delta_value(index as usize, *column)?);
+                    }
+                }
             }
             visit(&projected)?;
         }
         Ok(())
     }
+    /// Materialises the live rows whose key matches a probe.
+    ///
+    /// **The merge an index probe needs, over the span it asked for**
+    /// (task-2066 §4.3.4). A probe into a written leaf used to call
+    /// [`LeafRef::live_between`] with the probe as both bounds, which calls
+    /// [`LeafRef::live`] - every row of the leaf materialised, a shadow scan
+    /// per delta entry over the delta entries already merged, and a sort of
+    /// the result - and then threw away everything outside the probe. A leaf
+    /// `CREATE INDEX` built before the load holds its whole contents in the
+    /// delta area, so that ran once per probe over the whole leaf: a join over
+    /// such an index took 2,634 ms against 2.91 ms for the same index built
+    /// after the load.
+    ///
+    /// The rules are [`LeafRef::live`]'s, unchanged: a tombstoned sorted row
+    /// is not live; the newest delta entry for a key wins and newest is the
+    /// lowest index; a delta entry replaces the sorted row it shadows rather
+    /// than joining it. What changes is that the probe filters the delta area
+    /// *before* the shadow scans instead of after the merge, so the quadratic
+    /// part applies to the rows that match rather than to the leaf.
+    ///
+    /// @param probe - the key, one value per column it names
+    /// @param scan_cap - how far a run is walked before its end is bisected
+    pub fn live_matching(
+        &self,
+        probe: &[Datum<'_>],
+        scan_cap: usize,
+    ) -> DbResult<Vec<Vec<Datum<'p>>>> {
+        let (begin, end) = self.equal_run(probe, scan_cap)?;
+        let mut sorted: Vec<Vec<Datum<'p>>> = Vec::new();
+        for row in begin..end {
+            if self.is_tombstoned(row)? {
+                continue;
+            }
+            let mut values = Vec::with_capacity(self.column_count);
+            for column in 0..self.column_count {
+                values.push(self.value(row, column)?);
+            }
+            sorted.push(values);
+        }
+        // The delta rows that match are a run of the directory, found by two
+        // binary searches, and a key held twice keeps its first entry.
+        let mut delta: Vec<Vec<Datum<'p>>> = Vec::new();
+        for index in self.delta_matching(probe)? {
+            let values = self.delta_row_values(index)?;
+            if let Some(earlier) = delta.last() {
+                if self.compare_keys(earlier, &values) == std::cmp::Ordering::Equal {
+                    continue;
+                }
+            }
+            delta.push(values);
+        }
+        Ok(self.merge_runs(sorted, delta))
+    }
+
+    /// Merges two runs of rows that are each in key order, the second newer.
+    ///
+    /// A row of the newer run replaces the row of the older run with the same
+    /// key rather than joining it, which is the rule a delta row follows over
+    /// the sorted row it shadows.
+    ///
+    /// @param older - the sorted region's rows, in key order
+    /// @param newer - the delta area's rows, in key order and one per key
+    fn merge_runs(
+        &self,
+        older: Vec<Vec<Datum<'p>>>,
+        newer: Vec<Vec<Datum<'p>>>,
+    ) -> Vec<Vec<Datum<'p>>> {
+        let mut merged = Vec::with_capacity(older.len().saturating_add(newer.len()));
+        let mut older = older.into_iter().peekable();
+        for row in newer {
+            while let Some(held) = older.peek() {
+                match self.compare_keys(held, &row) {
+                    std::cmp::Ordering::Less => merged.extend(older.next()),
+                    std::cmp::Ordering::Equal => {
+                        older.next();
+                        break;
+                    }
+                    std::cmp::Ordering::Greater => break,
+                }
+            }
+            merged.push(row);
+        }
+        merged.extend(older);
+        merged
+    }
+
+    /// How many bytes of the page this leaf occupies.
+    ///
+    /// The page minus its free gap. The slots and the delta area grow up from
+    /// the directory and the heap grows *down* from the end of the page - see
+    /// `LeafBuilder`, where `heap_end` starts at the page size and decreases -
+    /// so everything outside `delta_start..heap_start` is in use.
+    ///
+    /// Two integers already parsed, which is the point: it lets a caller ask
+    /// how full a leaf is without materialising it (task-2066 §4.3.7).
+    ///
+    /// @param page_size - the page size the leaf was built at
+    pub fn used_bytes(&self, page_size: usize) -> usize {
+        let gap = self.heap_start.saturating_sub(self.delta_start);
+        page_size.saturating_sub(gap)
+    }
+
+    /// Whether any live row of this leaf sorts after a probe.
+    ///
+    /// **The question an equality walk has to ask before it follows the right
+    /// sibling** (task-2066 §4.3.4). The leaves of a tree are ordered, so a run
+    /// of rows equal to a probe can continue into the next leaf only if nothing
+    /// in this one already sorts past it. The sorted region answers that with
+    /// `begin >= rows`; the delta area has to be asked directly, and a leaf
+    /// `CREATE INDEX` built before the load has its whole contents there.
+    ///
+    /// The delta directory is in key order, so the last entry holds the
+    /// largest key and one comparison answers for the whole area. A format 1
+    /// area is in arrival order and is scanned.
+    ///
+    /// A tombstoned sorted row is not live and does not count; a delta row
+    /// shadowing a sorted one is the same key either way, so shadowing does not
+    /// change the answer and is not resolved here.
+    ///
+    /// @param probe - the key, one value per column it names
+    pub(crate) fn holds_a_key_past(&self, probe: &[Datum<'_>]) -> DbResult<bool> {
+        if !self.has_delta_directory() {
+            for index in 0..self.delta_count {
+                if self.compare_delta_key(index, probe)? == std::cmp::Ordering::Greater {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        let Some(last) = self.delta_count.checked_sub(1) else {
+            return Ok(false);
+        };
+        Ok(self.compare_delta_key(last, probe)? == std::cmp::Ordering::Greater)
+    }
+
     /// Materialises the live rows inside a key range.
     ///
     /// The merged counterpart of the sorted region's `lower_bound`/`upper_bound`
@@ -601,11 +774,111 @@ impl<'p> LeafRef<'p> {
     /// the leaf's own collations, which is what keeps a range over a `NOCASE`
     /// column agreeing with the order the tree is stored in.
     ///
+    /// **Only the rows inside the bounds are read** (task-2082). This used to
+    /// call [`LeafRef::live`] and filter, so a range probe into a leaf holding
+    /// 1,700 index entries decoded all of them and every delta row as well to
+    /// return the handful it wanted. Since task-2074 sized the delta area by
+    /// the free gap, a leaf that took writes keeps its delta rows, and so stays
+    /// on this path, for much longer than it did at 32 rows. The sorted region
+    /// is now bounded by `lower_bound`/`upper_bound` and the delta area by the
+    /// same searches over its directory, and the two runs are merged with the
+    /// rule [`LeafRef::live_matching`] uses.
+    ///
+    /// The gate's `join.range` does not reach this: its round reads before it
+    /// writes, so every leaf it probes is clean. task-2082 measured its time
+    /// unchanged by this and by task-2074 alike.
+    ///
+    /// A format 1 area is not in key order, and a bound naming more columns
+    /// than the key compares columns no search here can, so both still take
+    /// the whole leaf and filter it.
+    ///
     /// @param low - the lower bound, or `None` for the start
     /// @param low_inclusive - whether a key equal to `low` is in the range
     /// @param high - the upper bound, or `None` for the end
     /// @param high_inclusive - whether a key equal to `high` is in the range
     pub fn live_between(
+        &self,
+        low: Option<&[Datum<'_>]>,
+        low_inclusive: bool,
+        high: Option<&[Datum<'_>]>,
+        high_inclusive: bool,
+    ) -> DbResult<Vec<Vec<Datum<'p>>>> {
+        let too_wide =
+            |bound: Option<&[Datum<'_>]>| bound.is_some_and(|b| b.len() > self.key_columns);
+        if !self.has_delta_directory() || too_wide(low) || too_wide(high) {
+            return self.live_between_scanned(low, low_inclusive, high, high_inclusive);
+        }
+        let (sorted_begin, sorted_end) =
+            self.sorted_span(low, low_inclusive, high, high_inclusive)?;
+        let mut sorted: Vec<Vec<Datum<'p>>> = Vec::new();
+        for row in sorted_begin..sorted_end {
+            if self.is_tombstoned(row)? {
+                continue;
+            }
+            let mut values = Vec::with_capacity(self.column_count);
+            for column in 0..self.column_count {
+                values.push(self.value(row, column)?);
+            }
+            sorted.push(values);
+        }
+        let delta_begin = match low {
+            Some(bound) => self.delta_bound(bound, !low_inclusive)?,
+            None => 0,
+        };
+        let delta_end = match high {
+            Some(bound) => self.delta_bound(bound, high_inclusive)?,
+            None => self.delta_count,
+        };
+        // A key held twice keeps its first entry, which is the newer.
+        let mut delta: Vec<Vec<Datum<'p>>> = Vec::new();
+        for index in delta_begin..delta_end.max(delta_begin) {
+            let values = self.delta_row_values(index)?;
+            if let Some(earlier) = delta.last() {
+                if self.compare_keys(earlier, &values) == std::cmp::Ordering::Equal {
+                    continue;
+                }
+            }
+            delta.push(values);
+        }
+        Ok(self.merge_runs(sorted, delta))
+    }
+
+    /// Returns the sorted rows inside a key range, as a half-open span.
+    ///
+    /// @param low - the lower bound, or `None` for the start
+    /// @param low_inclusive - whether a key equal to `low` is in the range
+    /// @param high - the upper bound, or `None` for the end
+    /// @param high_inclusive - whether a key equal to `high` is in the range
+    fn sorted_span(
+        &self,
+        low: Option<&[Datum<'_>]>,
+        low_inclusive: bool,
+        high: Option<&[Datum<'_>]>,
+        high_inclusive: bool,
+    ) -> DbResult<(usize, usize)> {
+        let begin = match low {
+            Some(bound) if low_inclusive => self.lower_bound(bound)?,
+            Some(bound) => self.upper_bound(bound)?,
+            None => 0,
+        };
+        let end = match high {
+            Some(bound) if high_inclusive => self.upper_bound(bound)?,
+            Some(bound) => self.lower_bound(bound)?,
+            None => self.row_count,
+        };
+        Ok((begin, end.clamp(begin, self.row_count.max(begin))))
+    }
+
+    /// Materialises every live row and keeps the ones inside a key range.
+    ///
+    /// What [`LeafRef::live_between`] did for every leaf before task-2082, and
+    /// still does for the two cases it cannot bound by searching.
+    ///
+    /// @param low - the lower bound, or `None` for the start
+    /// @param low_inclusive - whether a key equal to `low` is in the range
+    /// @param high - the upper bound, or `None` for the end
+    /// @param high_inclusive - whether a key equal to `high` is in the range
+    fn live_between_scanned(
         &self,
         low: Option<&[Datum<'_>]>,
         low_inclusive: bool,
@@ -658,6 +931,41 @@ impl<'p> LeafRef<'p> {
     }
 }
 
+/// Reports whether one row's bit is set in a tombstone bitmap.
+///
+/// @param bitmap - the bitmap, or `None` for a leaf that has none
+/// @param row - the row's position in the sorted region
+fn is_set(bitmap: Option<&[u8]>, row: usize) -> DbResult<bool> {
+    let Some(bitmap) = bitmap else {
+        return Ok(false);
+    };
+    let byte = bitmap
+        .get(row / 8)
+        .copied()
+        .ok_or_else(|| corrupt(format!("row {row} is outside the tombstone bitmap")))?;
+    Ok(byte & (1u8 << (row % 8)) != 0)
+}
+
+/// Appends the live sorted rows of a range to a merge's output.
+///
+/// @param order - the merge's output
+/// @param bitmap - the tombstone bitmap, or `None` for a leaf that has none
+/// @param from - the first sorted row of the range
+/// @param to - one past the last
+fn push_live_sorted(
+    order: &mut Vec<LiveRow>,
+    bitmap: Option<&[u8]>,
+    from: usize,
+    to: usize,
+) -> DbResult<()> {
+    for row in from..to {
+        if !is_set(bitmap, row)? {
+            order.push(LiveRow::Sorted(row as u32));
+        }
+    }
+    Ok(())
+}
+
 /// Reads one value of a live row through the derived views.
 ///
 /// @param columns - the mini-columns
@@ -696,6 +1004,87 @@ pub enum LiveRow {
     /// In the delta area, at this index.
     Delta(u32),
 }
+/// Which rows of a leaf are live, in key order, before any of them is read.
+///
+/// **The merge on its own, so the merge and the read can be priced apart.**
+/// A compaction pays for both and a splice pays only for this one: it needs to
+/// know which rows it is keeping and in what order, and then it moves their
+/// slots rather than their values. The views it carries - the mini-columns and
+/// the decoded delta rows - are what [`LiveOrder::materialise`] reads through,
+/// and what a slot-level caller would read through instead.
+pub struct LiveOrder<'p> {
+    /// One view per column of the sorted region.
+    columns: Vec<MiniColumn<'p>>,
+    /// The delta rows, each decoded once.
+    delta: Vec<Vec<Datum<'p>>>,
+    /// Which row is live, in key order.
+    order: Vec<LiveRow>,
+    /// How many columns each row has.
+    width: usize,
+}
+
+impl<'p> LiveOrder<'p> {
+    /// How many live rows the leaf holds.
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Reports whether the leaf holds none.
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    /// How many columns each row has.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Where each live row sits, in key order.
+    pub fn order(&self) -> &[LiveRow] {
+        &self.order
+    }
+
+    /// The sorted region's columns, one view each.
+    pub fn columns(&self) -> &[MiniColumn<'p>] {
+        &self.columns
+    }
+
+    /// The delta rows, decoded.
+    pub fn delta(&self) -> &[Vec<Datum<'p>>] {
+        &self.delta
+    }
+
+    /// Returns one value of one live row, by its place in key order.
+    ///
+    /// @param row - the row's position among the live rows
+    /// @param column - which column
+    pub fn value(&self, row: usize, column: usize) -> DbResult<Datum<'p>> {
+        let at = self
+            .order
+            .get(row)
+            .copied()
+            .ok_or_else(|| corrupt(format!("live row {row} does not exist")))?;
+        live_value(&self.columns, &self.delta, at, column)
+    }
+
+    /// Reads every value of every live row into one flat vector.
+    ///
+    /// One allocation of `rows * width`, and each value decoded once rather
+    /// than once per pass the builder makes over it.
+    pub fn materialise(self) -> DbResult<LiveSource<'p>> {
+        let mut values = Vec::with_capacity(self.order.len().saturating_mul(self.width));
+        for at in &self.order {
+            for column in 0..self.width {
+                values.push(live_value(&self.columns, &self.delta, *at, column)?);
+            }
+        }
+        Ok(LiveSource {
+            values,
+            width: self.width,
+        })
+    }
+}
+
 /// A leaf's live rows in key order, as a [`Rows`] the builder packs from.
 ///
 /// **One allocation, and a direct index per value.** `live` produces a
@@ -1040,3 +1429,6 @@ impl<'p> MiniColumn<'p> {
         Ok(read_slot_offset(slice, narrow))
     }
 }
+
+#[cfg(test)]
+mod tests;

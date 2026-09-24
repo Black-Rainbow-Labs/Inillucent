@@ -795,10 +795,14 @@ pub struct Between {
     pub low: Box<dyn Eval>,
     /// The upper bound.
     pub high: Box<dyn Eval>,
-    /// The affinity applied to the comparisons.
-    pub affinity: Option<Affinity>,
-    /// The collation the comparisons use.
-    pub collation: Collation,
+    /// The affinity `operand >= low` applies.
+    pub low_affinity: Option<Affinity>,
+    /// The collation `operand >= low` uses.
+    pub low_collation: Collation,
+    /// The affinity `operand <= high` applies.
+    pub high_affinity: Option<Affinity>,
+    /// The collation `operand <= high` uses.
+    pub high_collation: Collation,
 }
 
 impl Eval for Between {
@@ -811,16 +815,16 @@ impl Eval for Between {
             BinaryOp::GreaterEqual,
             &operand,
             &Value::from(&low.get()).into_owned()?,
-            self.affinity,
-            self.collation,
+            self.low_affinity,
+            self.low_collation,
             ENCODING,
         );
         let below = eval::comparison(
             BinaryOp::LessEqual,
             &operand,
             &Value::from(&high.get()).into_owned()?,
-            self.affinity,
-            self.collation,
+            self.high_affinity,
+            self.high_collation,
             ENCODING,
         );
         let inside = eval::logical_and(&above, &below);
@@ -900,8 +904,9 @@ pub struct Case {
     pub branches: Vec<(Box<dyn Eval>, Box<dyn Eval>)>,
     /// The `ELSE` arm.
     pub otherwise: Option<Box<dyn Eval>>,
-    /// The collation comparisons in the base form use.
-    pub collation: Collation,
+    /// The affinity and collation each `WHEN` comparison uses in the base
+    /// form, one per branch, and empty in the searched form.
+    pub comparisons: Vec<(Option<Affinity>, Collation)>,
 }
 
 impl Eval for Case {
@@ -910,17 +915,22 @@ impl Eval for Case {
             Some(operand) => Some(Value::from(&operand.value(batch, nth)?.get()).into_owned()?),
             None => None,
         };
-        for (when, then) in &self.branches {
+        for (branch, (when, then)) in self.branches.iter().enumerate() {
             let candidate = when.value(batch, nth)?;
             let matched = match &base {
                 // `CASE x WHEN y` compares; `CASE WHEN p` tests a predicate.
                 Some(base) => {
+                    let (affinity, collation) = self
+                        .comparisons
+                        .get(branch)
+                        .copied()
+                        .unwrap_or((None, Collation::Binary));
                     let equal = eval::comparison(
                         BinaryOp::Equal,
                         base,
                         &Value::from(&candidate.get()).into_owned()?,
-                        None,
-                        self.collation,
+                        affinity,
+                        collation,
                         ENCODING,
                     );
                     eval::truth(&equal) == compare::Truth::True
@@ -978,24 +988,33 @@ impl Eval for Pattern {
         if operand.is_null() || pattern.is_null() {
             return Ok(Computed::Borrowed(Datum::Null));
         }
+        // **The escape is one character, and one that is not is refused**
+        // (task-2066 section 4.2, item 27). This took the first byte of
+        // whatever was written, so `ESCAPE ''` silently meant "no escape" -
+        // `'a%b' LIKE 'a\%b' ESCAPE ''` answered where SQLite raises - and a
+        // escape character of more than one byte escaped on its first byte.
         let escape = match &self.escape {
             Some(expression) => {
                 let value = expression.value(batch, nth)?;
                 if value.is_null() {
                     return Ok(Computed::Borrowed(Datum::Null));
                 }
-                eval::text_bytes(&Value::from(&value.get()).into_owned()?, ENCODING)
-                    .first()
-                    .copied()
+                let bytes = eval::text_bytes(&Value::from(&value.get()).into_owned()?, ENCODING);
+                inillucent_scalar::builtin::single_character_escape(&bytes)
+                    .map_err(inillucent_base::error::misuse)?;
+                Some(bytes)
             }
             None => None,
         };
         let subject = eval::text_bytes(&Value::from(&operand.get()).into_owned()?, ENCODING);
         let pattern_bytes = eval::text_bytes(&Value::from(&pattern.get()).into_owned()?, ENCODING);
         let matched = match self.kind {
-            PatternKind::Like => {
-                pattern::like_folding(&pattern_bytes, &subject, escape, !self.case_sensitive)
-            }
+            PatternKind::Like => pattern::like_folding(
+                &pattern_bytes,
+                &subject,
+                escape.as_deref(),
+                !self.case_sensitive,
+            ),
             PatternKind::Glob => pattern::glob(&pattern_bytes, &subject),
         };
         Ok(Computed::Borrowed(Datum::Int(i64::from(
@@ -1182,8 +1201,10 @@ mod tests {
             operand: column(0, 3),
             low: column(1, 3),
             high: column(2, 3),
-            affinity: None,
-            collation: Collation::Binary,
+            low_affinity: None,
+            low_collation: Collation::Binary,
+            high_affinity: None,
+            high_collation: Collation::Binary,
         };
         for (value, wanted) in [(4i64, 0i64), (5, 1), (7, 1), (10, 1), (11, 0)] {
             assert_eq!(
@@ -1196,6 +1217,42 @@ mod tests {
             eval_one(&node, &[Datum::Null, Datum::Int(5), Datum::Int(10)]),
             OwnedDatum::Null
         );
+    }
+
+    /// Each bound of `BETWEEN` compares with its own collation (task-2088).
+    ///
+    /// `'b' BETWEEN 'a' AND 'B' COLLATE NOCASE` is `'b' >= 'a'` under BINARY
+    /// and `'b' <= 'B'` under NOCASE, which 3.53.4 answers 1. With one
+    /// collation for both halves the answer is 0 under BINARY, where `'b' >
+    /// 'B'`, and 1 under NOCASE only by accident. The swapped node shows the
+    /// collations are read from their own halves: NOCASE on the lower half and
+    /// BINARY on the upper makes `'b' <= 'B'` false.
+    #[test]
+    fn between_compares_each_bound_with_its_own_collation() {
+        let text = |bytes: &'static [u8]| Datum::Text(bytes);
+        let row = [text(b"b"), text(b"a"), text(b"B")];
+        let node = Between {
+            negated: false,
+            operand: column(0, 3),
+            low: column(1, 3),
+            high: column(2, 3),
+            low_affinity: None,
+            low_collation: Collation::Binary,
+            high_affinity: None,
+            high_collation: Collation::NoCase,
+        };
+        assert_eq!(eval_one(&node, &row), OwnedDatum::Int(1));
+        let swapped = Between {
+            negated: false,
+            operand: column(0, 3),
+            low: column(1, 3),
+            high: column(2, 3),
+            low_affinity: None,
+            low_collation: Collation::NoCase,
+            high_affinity: None,
+            high_collation: Collation::Binary,
+        };
+        assert_eq!(eval_one(&swapped, &row), OwnedDatum::Int(0));
     }
 
     /// `IN` follows SQLite's NULL rule, including the empty list.
@@ -1254,7 +1311,7 @@ mod tests {
             operand: None,
             branches: vec![(column(0, 4), column(1, 4)), (column(2, 4), column(3, 4))],
             otherwise: None,
-            collation: Collation::Binary,
+            comparisons: Vec::new(),
         };
         assert_eq!(
             eval_one(
@@ -1275,7 +1332,7 @@ mod tests {
             operand: Some(column(0, 3)),
             branches: vec![(column(1, 3), column(2, 3))],
             otherwise: None,
-            collation: Collation::Binary,
+            comparisons: vec![(None, Collation::Binary)],
         };
         assert_eq!(
             eval_one(&simple, &[Datum::Int(7), Datum::Int(7), Datum::Int(99)]),

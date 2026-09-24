@@ -91,6 +91,30 @@ impl crate::ImportedDatabase {
         physical::build_prepared(plan, self, prepared, params, sink)
     }
 
+    /// Builds a pipeline over an already-prepared statement, with the
+    /// `EXPLAIN` listing of the chain it built.
+    ///
+    /// The same pipeline [`ImportedDatabase::pipeline`] builds, plus
+    /// `Shape::operators`. Separate rather than a flag because every caller
+    /// that wants the listing is a diagnostic - `inillucent-readgate` prints
+    /// this engine's chain beside SQLite's - and the caller that does not want
+    /// it is the gate, which builds a pipeline on every iteration of
+    /// `prepare.trivial`.
+    ///
+    /// @param plan - a plan from [`ImportedDatabase::plan`]
+    /// @param prepared - the choices [`ImportedDatabase::prepare`] made
+    /// @param params - the values bound to `?1`, `?2`, ...
+    /// @param sink - the end of the pipeline
+    pub fn pipeline_described(
+        &self,
+        plan: &PhysicalPlan,
+        prepared: &physical::Prepared,
+        params: &Params,
+        sink: Box<dyn inillucent_exec::Sink>,
+    ) -> DbResult<(physical::Pipeline<'_>, physical::Shape)> {
+        physical::build_prepared_described(plan, self, prepared, params, sink)
+    }
+
     /// Builds a statement whose operator chain is reused across executions.
     ///
     /// The difference from [`ImportedDatabase::pipeline`] is the difference
@@ -188,8 +212,11 @@ impl crate::ImportedDatabase {
             .with_foreign_keys(
                 self.pragmas.foreign_keys(),
                 self.pragmas.defer_foreign_keys(),
-            );
-        let bound = binder.bind_statement(&parsed.statement).map_err(refused)?;
+            )
+            .with_scratch(self.compiled.take_binder_scratch());
+        let outcome = binder.bind_statement(&parsed.statement);
+        self.compiled.recycle_binder(binder.into_scratch());
+        let bound = outcome.map_err(refused)?;
         let mut names: Vec<(&'static str, Vec<u8>)> = Vec::new();
         let mut written = None;
         match &bound {
@@ -213,7 +240,7 @@ impl crate::ImportedDatabase {
     pub(crate) fn statement_shape(&self, sql: &str) -> (i64, bool) {
         let columns = match self.compiled(sql) {
             Ok(cached) => match &*cached {
-                Cached::Select(plan, _, _) => plan.select.columns.len() as i64,
+                Cached::Select(plan, _, _, _) => plan.select.columns.len() as i64,
                 _ => 0,
             },
             Err(_) => 0,
@@ -237,7 +264,7 @@ impl crate::ImportedDatabase {
     pub fn describe_cached(&self, sql: &str) -> DbResult<Vec<String>> {
         match &*self.compiled(sql)? {
             Cached::Nothing => Ok(vec!["nothing".to_string()]),
-            Cached::Select(_, prepared, _) => Ok(prepared.describe()),
+            Cached::Select(_, prepared, _, _) => Ok(prepared.describe()),
             Cached::Ddl(_) => Ok(vec!["a directive".to_string()]),
             Cached::QueryPlan(_) => Ok(vec!["a query plan".to_string()]),
             Cached::Program(_) => Ok(vec!["a program listing".to_string()]),
@@ -295,8 +322,14 @@ impl ImportedDatabase {
             .with_foreign_keys(
                 self.pragmas.foreign_keys(),
                 self.pragmas.defer_foreign_keys(),
-            );
-        let mut bound = binder.bind_statement(&parsed.statement).map_err(refused)?;
+            )
+            .with_scratch(self.compiled.take_binder_scratch());
+        let outcome = binder.bind_statement(&parsed.statement);
+        // Before the `?`, so a statement that fails to bind still hands its
+        // vectors back: a connection whose application sends a syntax error
+        // now and then would otherwise be re-allocating them for ever.
+        self.compiled.recycle_binder(binder.into_scratch());
+        let mut bound = outcome.map_err(refused)?;
         // **A correlated `IN` becomes `EXISTS` before anything plans it.** The
         // physical pass computes a correlated block once per outer row and
         // hands the operator one column, which is not a list, so it refused one
@@ -431,8 +464,10 @@ impl ImportedDatabase {
                 self.pragmas.foreign_keys(),
                 self.pragmas.defer_foreign_keys(),
             )
-            .in_schema();
+            .in_schema()
+            .with_scratch(self.compiled.take_binder_scratch());
         let bound = binder.bind_statement(&parsed.statement).map_err(refused);
+        self.compiled.recycle_binder(binder.into_scratch());
         self.compiled.recycle(parsed);
         bound.map(|_| ())
     }
@@ -461,10 +496,12 @@ impl ImportedDatabase {
     ///
     /// @param sql - the statement text
     pub fn prepare_statement(&self, sql: &str) -> DbResult<Statement> {
+        let (cached, parameters) = self.compiled_with_parameters(sql)?;
         Ok(Statement {
-            cached: std::cell::RefCell::new(self.compiled(sql)?),
+            cached: std::cell::RefCell::new(cached),
             sql: sql.to_string(),
             generation: std::cell::Cell::new(self.schema_generation()),
+            parameters,
         })
     }
 
@@ -571,7 +608,7 @@ impl ImportedDatabase {
             Cached::SchemaInsert(statement) => {
                 self.insert_into_schema(statement, params)?;
             }
-            Cached::Select(plan, prepared, _) => {
+            Cached::Select(plan, prepared, _, _) => {
                 physical::run_any_prepared(plan, self, prepared, params)?;
             }
             Cached::Insert(statement, ..) => {
@@ -662,6 +699,24 @@ pub struct Statement {
     pub(crate) sql: String,
     /// The schema generation `cached` was compiled against.
     pub(crate) generation: std::cell::Cell<u64>,
+    /// How many parameters the statement declares.
+    ///
+    /// **Carried so that preparing does not parse twice** (task-2066 §4.3.3).
+    /// It is what `sqlite3_bind_parameter_count` answers and what a bind index
+    /// is checked against, and it comes out of the same parse that built the
+    /// plan. It does not move when the schema does: `?1` is `?1` whatever the
+    /// catalog says, so a reprepare leaves it alone.
+    pub(crate) parameters: u32,
+}
+
+impl Statement {
+    /// Returns how many parameters the statement declares.
+    ///
+    /// What `sqlite3_bind_parameter_count` answers: the highest index written,
+    /// so `SELECT ?3` is three and `SELECT ?1, ?1` is one.
+    pub fn parameter_count(&self) -> u32 {
+        self.parameters
+    }
 }
 
 /// What running one statement produced.
@@ -670,7 +725,14 @@ pub struct Outcome {
     /// The rows a `SELECT` answered, or the rows `RETURNING` named.
     pub rows: Vec<Vec<OwnedDatum>>,
     /// The result column names, for a `SELECT`.
-    pub names: Vec<String>,
+    ///
+    /// **Shared rather than copied** (task-2066 §4.3.5). They are
+    /// `plan.select.columns`'s own names decoded from UTF-8 and they cannot
+    /// change between executions of one compiled statement, so building them
+    /// per execution was one `String` allocation per column per execution on
+    /// every `Connection`-driven read. `CachedQuery` builds them at compile
+    /// and this hands out the pointer.
+    pub names: std::rc::Rc<Vec<String>>,
     /// What a write changed.
     pub changes: Changes,
 }

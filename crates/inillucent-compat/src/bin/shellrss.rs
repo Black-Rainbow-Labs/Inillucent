@@ -94,13 +94,15 @@ fn rows_in(exe: &Path, database: &Path) -> Result<String, String> {
 /// @param database - the file to open
 /// @param script - the statements to feed it
 fn run_script(exe: &Path, database: &Path, script: &str) -> Result<ProcessCost, String> {
-    let mut child = Command::new(exe)
-        .arg(database)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("{} did not start: {error}", exe.display()))?;
+    // Started through the affinity check (task-2085).
+    let mut child = inillucent_compat::affinity::spawn_on_same_cores(
+        Command::new(exe)
+            .arg(database)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+        &exe.display().to_string(),
+    )?;
     if let Some(mut input) = child.stdin.take() {
         let _ = input.write_all(script.as_bytes());
     }
@@ -133,18 +135,24 @@ fn build(exe: &Path, name: &str) -> Result<std::path::PathBuf, String> {
     let root = workspace_root().join("_agent_output/shellrss");
     std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
     let target = root.join(name);
-    for suffix in ["", "-journal", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(root.join(format!("{name}{suffix}")));
-    }
+    inillucent_base::testing::remove_database(&target);
     run_script(exe, &target, BUILD)?;
     Ok(target)
 }
 
 fn main() -> ExitCode {
+    let mut arguments: Vec<String> = std::env::args().skip(1).collect();
+    // **Pinned before anything is timed, and the mask printed (task-2085).**
+    // Unpinned, a hybrid processor can run this program and the arm it compares
+    // against on different core classes, and nothing else in the output says so.
+    if let Err(reason) = inillucent_compat::affinity::pin_from_arguments(&mut arguments) {
+        eprintln!("{reason}");
+        return ExitCode::from(2);
+    }
     // An optional statement list, so the four reads can be measured one at a
     // time when a number needs explaining. Default: all four.
-    let script = std::env::args()
-        .skip(1)
+    let script = arguments
+        .into_iter()
         .find(|value| !value.starts_with("--"))
         .unwrap_or_else(|| SCRIPT.to_string());
     let sqlite = workspace_root().join(format!(

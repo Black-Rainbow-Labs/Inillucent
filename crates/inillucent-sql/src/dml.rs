@@ -184,6 +184,25 @@ pub struct BoundTrigger {
     pub when: Option<BoundExpr>,
     /// The body statements, in written order.
     pub body: Vec<BoundTriggerStatement>,
+    /// Whether the binder synthesised this from a `REFERENCES` clause rather
+    /// than reading it from a `CREATE TRIGGER`.
+    ///
+    /// **Read by `DROP TABLE` (task-1979, F6).** Dropping a table with foreign
+    /// keys on runs an implicit `DELETE FROM` first, so the keys that reference
+    /// it are enforced - and SQLite's rule is that the implicit delete fires no
+    /// triggers of its own while still performing every foreign key action. A
+    /// delete bound for that purpose keeps the triggers this flag marks and
+    /// drops the rest.
+    pub foreign_key: bool,
+    /// Whether the foreign key this enforces has one table as both its child
+    /// and its parent.
+    ///
+    /// **Also read by `DROP TABLE` (task-1979, F6).** The implicit delete keeps
+    /// the foreign key triggers and drops this one, because emptying a table
+    /// cannot leave a row of that same table pointing at nothing - see
+    /// `ForeignKeyTrigger::self_referencing`, which is where the value comes
+    /// from. Always false on a trigger the schema wrote.
+    pub self_referencing: bool,
 }
 
 /// A bound `INSERT`.
@@ -266,8 +285,18 @@ pub struct BoundUpsert {
 /// One `SET` assignment.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundAssignment {
-    /// The column being assigned.
+    /// The column being assigned, as a declared position.
     pub column: u16,
+    /// Whether the assignment names the row's own rowid rather than a declared
+    /// column, in which case `column` says nothing.
+    ///
+    /// **`UPDATE t SET rowid = 100` was `no such column: rowid` (task-1979,
+    /// F9).** An assignment target was looked up with `column_position`, which
+    /// only knows the columns the table declares, and a table with no INTEGER
+    /// PRIMARY KEY declares none for its rowid. SQLite accepts all three
+    /// spellings of the rowid on either kind of table and moves the row to the
+    /// new key.
+    pub rowid: bool,
     /// The new value.
     pub value: BoundExpr,
 }
@@ -326,6 +355,9 @@ pub struct BoundUpdate {
     pub not_null_defaults: Vec<BoundDefault>,
     /// The expressions the table's partial and expression indexes need.
     pub index_exprs: Vec<BoundIndexExprs>,
+    /// `INDEXED BY` or `NOT INDEXED` on the target, which the query that finds
+    /// the rows to change obeys; `inillucent_exec::dml::hint_target` puts it there.
+    pub index_hint: crate::bind::IndexChoice,
     /// The `RETURNING` columns.
     pub returning: Vec<BoundResultColumn>,
     /// The `LIMIT`.
@@ -353,6 +385,8 @@ pub struct BoundDelete {
     /// the row was in it, and a key the index computed has to be recomputed to
     /// be found.
     pub index_exprs: Vec<BoundIndexExprs>,
+    /// `INDEXED BY` or `NOT INDEXED` on the target, as on [`BoundUpdate`].
+    pub index_hint: crate::bind::IndexChoice,
     /// The statement-wide number of the FROM term being written.
     ///
     /// It used to be implicitly zero, because a DML statement had exactly one
@@ -420,6 +454,7 @@ fn fault_applies(
 /// only difference between the two is which constraint asked - so it is set
 /// here, on the bodies this binder generated, and nowhere else.
 fn report_as_foreign_key(trigger: &mut BoundTrigger) {
+    trigger.foreign_key = true;
     for statement in &mut trigger.body {
         let BoundTriggerStatement::Select(select) = statement else {
             continue;
@@ -605,6 +640,26 @@ impl<'a> Binder<'a> {
             let bound = self.bind_expr(*value)?;
             for name in names {
                 let folded = self.ast.folded(*name).to_vec();
+                // `rowid`, `oid` and `_rowid_` name the row's key rather than a
+                // declared column, unless the table declares a column by one of
+                // those names - which is what `is_rowid_name` decides.
+                if table.is_rowid_name(&folded) {
+                    if assignments.iter().any(|held: &BoundAssignment| held.rowid) {
+                        return Err(refused(
+                            format!(
+                                "column {} is assigned twice",
+                                String::from_utf8_lossy(self.ast.text(*name))
+                            ),
+                            Span::default(),
+                        ));
+                    }
+                    assignments.push(BoundAssignment {
+                        column: 0,
+                        rowid: true,
+                        value: bound.clone(),
+                    });
+                    continue;
+                }
                 let Some(position) = table.column_position(&folded) else {
                     return Err(no_such_column(self.ast.text(*name), Span::default()));
                 };
@@ -631,11 +686,15 @@ impl<'a> Binder<'a> {
                 }
                 assignments.push(BoundAssignment {
                     column: position,
+                    rowid: false,
                     value: bound.clone(),
                 });
             }
         }
-        assignments.sort_by_key(|assignment| assignment.column);
+        // The rowid assignment sorts with the declared columns rather than
+        // ahead of them, because `column` says nothing for it and the order
+        // only has to be stable.
+        assignments.sort_by_key(|assignment| (assignment.rowid, assignment.column));
         let filter = match update.filter {
             Some(expr) => Some(self.bind_expr(expr)?),
             None => None,
@@ -653,8 +712,11 @@ impl<'a> Binder<'a> {
             Some(expr) => Some(self.bind_expr(expr)?),
             None => None,
         };
+        // The rowid is not a declared column, so no `UPDATE OF` trigger and no
+        // foreign key can be keyed on it and it contributes no name here.
         let changed: Vec<Vec<u8>> = assignments
             .iter()
+            .filter(|assignment| !assignment.rowid)
             .filter_map(|assignment| table.column(assignment.column))
             .map(|column| column.folded.clone())
             .collect();
@@ -666,9 +728,11 @@ impl<'a> Binder<'a> {
             &changed,
         )?);
         let view_rows = self.view_rows(&table, filter.clone());
+        let index_hint = self.write_hint(source, &index_exprs, filter.as_ref(), &joined)?;
         Ok(BoundUpdate {
             table,
             index_exprs,
+            index_hint,
             source,
             from: joined,
             assignments,
@@ -719,9 +783,11 @@ impl<'a> Binder<'a> {
         let mut triggers = self.bind_triggers(&table, TriggerEventInfo::Delete, &[])?;
         triggers.extend(self.bind_foreign_keys(&table, TriggerEventInfo::Delete, &[])?);
         let view_rows = self.view_rows(&table, filter.clone());
+        let index_hint = self.write_hint(source, &index_exprs, filter.as_ref(), &[])?;
         Ok(BoundDelete {
             table,
             index_exprs,
+            index_hint,
             source,
             filter,
             returning,
@@ -863,7 +929,9 @@ impl<'a> Binder<'a> {
             if self.firing_foreign_keys.contains(&trigger.folded) {
                 continue;
             }
-            bound.push(self.bind_foreign_key_trigger(table, trigger, &event)?);
+            let mut one = self.bind_foreign_key_trigger(table, trigger, &event)?;
+            one.self_referencing = planned.self_referencing;
+            bound.push(one);
         }
         Ok(bound)
     }
@@ -947,6 +1015,8 @@ impl<'a> Binder<'a> {
             time: trigger.time,
             when,
             body,
+            foreign_key: false,
+            self_referencing: false,
         })
     }
 
@@ -1065,10 +1135,26 @@ impl<'a> Binder<'a> {
         let Some(term) = self.ast.from_term(id) else {
             return Err(unsupported("missing target", Span::default()));
         };
-        let ast::FromSource::Table { database, name, .. } = term.source else {
+        let ast::FromSource::Table {
+            database,
+            name,
+            indexed_by,
+            ..
+        } = term.source
+        else {
             return Err(unsupported("a target that is not a table", term.span));
         };
         let table = self.writable_target(database, name, term.span, event)?;
+        // The same rule as a SELECT's: an `INDEXED BY` that names no index of
+        // the table is refused rather than ignored (task-1979, F7). This path
+        // has the table in hand rather than a bound source, so it asks the
+        // table directly.
+        if let ast::IndexHint::IndexedBy(index) = indexed_by {
+            let folded = self.ast.folded(index).to_vec();
+            if !table.indexes.iter().any(|held| held.folded == folded) {
+                return Err(crate::bind::no_such_index(self.ast.text(index), term.span));
+            }
+        }
         let alias = match term.alias {
             Some(alias) => self.ast.text(alias).to_vec(),
             None => table.name.clone(),
@@ -1080,6 +1166,7 @@ impl<'a> Binder<'a> {
             // re-pointing afterwards would be two chances to disagree.
             let inner = self.view_query(&table, term.span)?;
             let source = BoundSource {
+                index_hint: crate::bind::IndexChoice::Any,
                 id: self.sources.len(),
                 rows: crate::bind::SourceRows::Subquery(Box::new(inner)),
                 table: std::rc::Rc::new(table.clone()),
@@ -1096,6 +1183,10 @@ impl<'a> Binder<'a> {
             return Ok((table, scope));
         }
         let scope = self.push_write_source(table.clone(), alias);
+        let choice = self.index_choice(indexed_by);
+        if let Some(source) = self.sources.get_mut(scope) {
+            source.index_hint = choice;
+        }
         Ok((table, scope))
     }
 
@@ -1188,6 +1279,42 @@ impl<'a> Binder<'a> {
         Some(Box::new(crate::bind::block_over(source, filter, columns)))
     }
 
+    /// Returns the target's index hint, or refuses a write whose `INDEXED BY`
+    /// index cannot find its rows.
+    ///
+    /// The same rule and the same test a `SELECT` gets from
+    /// `crate::bind::refuse_unanswerable_hints`, asked of the query the write
+    /// will run to find its rows: the target, any `UPDATE ... FROM` terms, and
+    /// the statement's `WHERE`. The pinned 3.53.4 shell refuses
+    /// `DELETE FROM h INDEXED BY h_part WHERE a = 1`, where `h_part` is declared
+    /// `WHERE c > 3`, with `no query solution`.
+    /// @param source - the target's statement-wide number
+    /// @param index_exprs - the target's bound index expressions
+    /// @param filter - the statement's `WHERE`
+    /// @param joined - the `UPDATE ... FROM` terms, empty for a `DELETE`
+    fn write_hint(
+        &self,
+        source: usize,
+        index_exprs: &[BoundIndexExprs],
+        filter: Option<&BoundExpr>,
+        joined: &[BoundSource],
+    ) -> Result<crate::bind::IndexChoice, ParseError> {
+        let Some(target) = self.sources.get(source) else {
+            return Ok(crate::bind::IndexChoice::Any);
+        };
+        if target.index_hint == crate::bind::IndexChoice::Any {
+            return Ok(crate::bind::IndexChoice::Any);
+        }
+        let mut probe = target.clone();
+        probe.index_exprs = index_exprs.to_vec();
+        let mut block = crate::bind::block_over(probe, filter.cloned(), Vec::new());
+        block.sources.extend(joined.iter().cloned());
+        if crate::plan::unanswerable_index_hint(&block).is_some() {
+            return Err(crate::bind::no_query_solution(Span::default()));
+        }
+        Ok(target.index_hint.clone())
+    }
+
     /// Makes the target table the statement's one visible source.
     ///
     /// It opens a scope holding just the target, so every name in the
@@ -1196,6 +1323,7 @@ impl<'a> Binder<'a> {
     fn push_write_source(&mut self, table: TableInfo, alias: Vec<u8>) -> usize {
         let id = self.sources.len();
         self.sources.push(BoundSource {
+            index_hint: crate::bind::IndexChoice::Any,
             id,
             rows: crate::bind::SourceRows::Table,
             table: std::rc::Rc::new(table),
@@ -1423,6 +1551,7 @@ impl<'a> Binder<'a> {
             };
             generated.push(BoundAssignment {
                 column: position,
+                rowid: false,
                 value: expr,
             });
         }
@@ -1644,6 +1773,7 @@ impl<'a> Binder<'a> {
                 };
                 assignments.push(BoundAssignment {
                     column: position,
+                    rowid: false,
                     value: bound.clone(),
                 });
             }

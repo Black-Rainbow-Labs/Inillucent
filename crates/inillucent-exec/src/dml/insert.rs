@@ -155,7 +155,7 @@ pub fn insert_at(
             supplied_row,
             &space,
             &mut next_rowid,
-            || highest_rowid(&mut Borrowed(target), table),
+            &mut TableKeys::over(target, table),
             table.autoincrement.then_some(table),
         )?;
         // **`BEFORE` fires on the row as it will be written**, which is where
@@ -321,7 +321,9 @@ fn insert_into_view(
     let mut changes = Changes::default();
     let mut never = None;
     for supplied_row in &rows {
-        let image = plan.build_row(supplied_row, &space, &mut never, || Ok(0), None)?;
+        // A view has no tree to allocate a key in, and its rows never reach one:
+        // an `INSTEAD OF` trigger writes whatever it writes.
+        let image = plan.build_row(supplied_row, &space, &mut never, &mut NoKeys, None)?;
         if trigger::fire(
             &statement.triggers,
             TriggerTime::InsteadOf,
@@ -604,8 +606,9 @@ fn place_row(
     // in-place update since the leaf was written - logged, undone and recovered
     // by its own record - and nothing in the write path ever called it: every
     // `UPDATE` went through `put`, which tombstones the row and appends a whole
-    // new one to the delta area, so a leaf compacted every `DELTA_LIMIT`
-    // updates and the log carried a full row each time. It applies when exactly
+    // new one to the delta area, so a leaf compacted every 32 updates (the
+    // delta area's limit until task-2074) and the log carried a full row each
+    // time. It applies when exactly
     // one non-key column differs and the tree can write it where it lies; when
     // it cannot, `put` is still the answer and nothing has been written.
     if let Some(previous) = before {
@@ -613,7 +616,7 @@ fn place_row(
         // `only_change` used to answer `None` both when *nothing* differed and
         // when *several* columns did, and the caller then took the most
         // expensive path it has - a tombstone, a delta insert, and a compaction
-        // every `DELTA_LIMIT` writes - for the cheapest case there is. Measured
+        // whenever the delta area filled - for the cheapest case there is. Measured
         // with `inillucent-execprofile`, running the same `UPDATE` twice over
         // the same rows: the pass that changed a value cost **1,723 ns and 13.3
         // allocations**, and the pass that wrote back what was already there
@@ -682,27 +685,14 @@ fn vector_from_json(value: Option<&OwnedDatum>, width: usize) -> Option<OwnedDat
 
 /// Returns the numbers of a JSON array, or `None` for anything else.
 ///
-/// A hand parser rather than the JSON reader, because the whole grammar here is
-/// `[` a comma separated list of numbers `]`: anything with a string, an
-/// object, a nested array or a name in it is not a vector, and answering `None`
-/// for it is what leaves the ordinary refusal in place.
+/// **One parser, in `inillucent-value`** (task-2066 §4.1.2). This is the
+/// width checked caller, so it is the one that wants `Some(vec![])` for `[]`
+/// rather than `None`: zero numbers against a column declaring three is a
+/// refusal that names the width, where "not an array" is a different message.
 ///
 /// @param text - the value's bytes
 fn json_numbers(text: &[u8]) -> Option<Vec<f64>> {
-    let held = std::str::from_utf8(text).ok()?.trim();
-    let inner = held.strip_prefix('[')?.strip_suffix(']')?.trim();
-    if inner.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut numbers = Vec::new();
-    for part in inner.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            return None;
-        }
-        numbers.push(part.parse::<f64>().ok()?);
-    }
-    Some(numbers)
+    inillucent_value::vector::numbers_from_json(text)
 }
 
 /// Refuses a value a `VECTOR(N)` column does not admit.
@@ -934,5 +924,49 @@ mod tests {
             Unwind::Transaction,
             "the clause a deeper statement set survives a caller that has none"
         );
+    }
+}
+
+/// One table's keys, for the allocation an insert with no rowid needs.
+struct TableKeys<'a> {
+    /// The file and its trees.
+    target: Borrowed<'a>,
+    /// The table being written.
+    table: &'a TableInfo,
+}
+
+impl<'a> TableKeys<'a> {
+    /// Returns the keys of one table, borrowing the write target.
+    ///
+    /// @param target - the file and its trees
+    /// @param table - the table being written
+    fn over(target: &'a mut dyn WriteTarget, table: &'a TableInfo) -> TableKeys<'a> {
+        TableKeys {
+            target: Borrowed(target),
+            table,
+        }
+    }
+}
+
+impl crate::insert_plan::RowidKeys for TableKeys<'_> {
+    fn highest(&mut self) -> DbResult<i64> {
+        highest_rowid(&mut self.target, self.table)
+    }
+
+    fn holds(&mut self, rowid: i64) -> DbResult<bool> {
+        row_exists(self.table, &mut self.target, &[OwnedDatum::Int(rowid)])
+    }
+}
+
+/// The keys of a table that is not there, for the `INSTEAD OF` path.
+struct NoKeys;
+
+impl crate::insert_plan::RowidKeys for NoKeys {
+    fn highest(&mut self) -> DbResult<i64> {
+        Ok(0)
+    }
+
+    fn holds(&mut self, _rowid: i64) -> DbResult<bool> {
+        Ok(false)
     }
 }

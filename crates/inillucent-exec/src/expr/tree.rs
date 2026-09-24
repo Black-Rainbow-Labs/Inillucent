@@ -385,10 +385,14 @@ pub enum Expr {
         low: Box<Expr>,
         /// The upper bound.
         high: Box<Expr>,
-        /// The affinity applied to the comparisons.
-        affinity: Option<Affinity>,
-        /// The collation the comparisons use.
-        collation: Collation,
+        /// The affinity `operand >= low` applies.
+        low_affinity: Option<Affinity>,
+        /// The collation `operand >= low` uses.
+        low_collation: Collation,
+        /// The affinity `operand <= high` applies.
+        high_affinity: Option<Affinity>,
+        /// The collation `operand <= high` uses.
+        high_collation: Collation,
     },
     /// `IN` over a value list.
     InList {
@@ -411,8 +415,9 @@ pub enum Expr {
         branches: Vec<(Expr, Expr)>,
         /// The `ELSE` arm.
         otherwise: Option<Box<Expr>>,
-        /// The collation comparisons in the base form use.
-        collation: Collation,
+        /// The affinity and collation each `WHEN` comparison uses in the base
+        /// form, one per branch, and empty in the searched form.
+        comparisons: Vec<(Option<Affinity>, Collation)>,
     },
     /// `LIKE` or `GLOB`.
     Pattern {
@@ -666,15 +671,19 @@ pub fn compile(expr: &Expr, types: &[StaticType]) -> DbResult<Box<dyn Eval>> {
             operand,
             low,
             high,
-            affinity,
-            collation,
+            low_affinity,
+            low_collation,
+            high_affinity,
+            high_collation,
         } => Box::new(crate::scalar::Between {
             negated: *negated,
             operand: compile(operand, types)?,
             low: compile(low, types)?,
             high: compile(high, types)?,
-            affinity: *affinity,
-            collation: *collation,
+            low_affinity: *low_affinity,
+            low_collation: *low_collation,
+            high_affinity: *high_affinity,
+            high_collation: *high_collation,
         }),
         Expr::InList {
             negated,
@@ -682,18 +691,12 @@ pub fn compile(expr: &Expr, types: &[StaticType]) -> DbResult<Box<dyn Eval>> {
             list,
             affinity,
             collation,
-        } => Box::new(crate::scalar::InList {
-            negated: *negated,
-            operand: compile(operand, types)?,
-            list: compile_all(list, types)?,
-            affinity: *affinity,
-            collation: *collation,
-        }),
+        } => in_list(*negated, operand, list, *affinity, *collation, types)?,
         Expr::Case {
             operand,
             branches,
             otherwise,
-            collation,
+            comparisons,
         } => {
             let mut compiled = Vec::with_capacity(branches.len());
             for (when, then) in branches {
@@ -709,7 +712,7 @@ pub fn compile(expr: &Expr, types: &[StaticType]) -> DbResult<Box<dyn Eval>> {
                     Some(otherwise) => Some(compile(otherwise, types)?),
                     None => None,
                 },
-                collation: *collation,
+                comparisons: comparisons.clone(),
             })
         }
         Expr::Pattern {
@@ -783,6 +786,37 @@ fn general_arith(
         op,
         left: compile(left, types)?,
         right: compile(right, types)?,
+    }))
+}
+
+/// Compiles `IN` over a value list.
+///
+/// Its own function for the reason `general_arith` above is: `compile` has a
+/// recorded length in `crates/inillucent-compat/tests/policy.rs`, and
+/// task-2088 gave the `BETWEEN` arm a collation and an affinity per bound.
+/// This arm is the one whose call fits on one line, so lifting it takes more
+/// lines out of `compile` than lifting `BETWEEN` would.
+///
+/// @param negated - whether `NOT` was written
+/// @param operand - the value being tested
+/// @param list - the list
+/// @param affinity - the affinity applied before comparing
+/// @param collation - the collation the comparison uses
+/// @param types - the static types of the columns in scope
+fn in_list(
+    negated: bool,
+    operand: &Expr,
+    list: &[Expr],
+    affinity: Option<Affinity>,
+    collation: Collation,
+    types: &[StaticType],
+) -> DbResult<Box<dyn Eval>> {
+    Ok(Box::new(crate::scalar::InList {
+        negated,
+        operand: compile(operand, types)?,
+        list: compile_all(list, types)?,
+        affinity,
+        collation,
     }))
 }
 

@@ -9,11 +9,34 @@ Every ratio and percentage on this page also appears in [Performance](performanc
 where it was measured, and a test in `crates/inillucent-compat/tests/documentation.rs` fails when
 this page carries a number that page has moved past.
 
-## 1. `extension` misses its bar on the lower bound
+## 1. The extension and join families, either side of their bars
 
-`read.join` no longer does. It was on this list because its four lower bounds read 2.97x, 3.00x,
+**Measured 2026-09-23 inside the whole plan, both engines on the performance cores.** `extension`
+reads 1.73x with lower bounds of 1.56x, 1.48x, 1.54x and 1.57x, so it clears its 1.50x requirement on
+three runs of four. `read.join` reads 4.21x with lower bounds of 2.73x, 2.83x, 2.78x and 2.90x, so it
+misses its 3.00x requirement on all four. [Performance](performance.md#by-family) has both. The rest
+of this item is how each got here.
+
+**Those lower bounds are the pooled statistic, and grading a family one round at a time replaced
+it.** A pooled bound mostly measures how far apart a family's workloads are. Graded one round at a
+time, four pinned passes of `main` read `read.join`'s lower bound at 4.27x, 4.08x, 4.18x and 4.19x,
+so **`read.join` meets its 3.00x bar**, and the bar stays at 3.00x; every build since has met it
+that way. `extension` reads 1.54x, 1.67x, 1.60x and 1.54x, so it meets its bar on all four passes,
+by 2.7% at the narrowest. A follow-up experiment found that the passes that moved it were taken on
+a busy machine, which inflates every ratio, and on a quiet machine `extension`'s lowest bound in six
+passes was 1.58x. A verdict should come from one pass on a machine the pass shows was quiet, not
+from several passes, and now the full, read and write gates check that themselves: a pass whose SQLite arm ran
+more than 3% slower than on a recorded idle reference is NOT GRADED and exits 4
+([Performance](performance.md#how-a-verdict-should-be-taken)).
+[Performance](performance.md#how-a-familys-interval-is-computed) has both statistics for
+every family. `read.join` stays on this list for `join.range`, which is still slower than SQLite.
+
+A pinned walk back through `read.join`'s history is in
+[Performance](performance.md#why-readjoin-misses-its-300x-bar-and-when-it-last-met-it), and it has three follow-up tickets.
+
+**`read.join` was taken off this list on a run of the join family alone.** It was on it because its four lower bounds read 2.97x, 3.00x,
 3.00x and 2.99x against a 3.00x bar, and a number that straddles a threshold has not met it. The
-chain reuse that landed in task-1911 had never been measured against the family. Re-measured
+chain reuse that landed earlier had never been measured against the family. Re-measured
 2026-09-15, four consecutive runs on the same box, 30 rounds each, `--scale medium --page-size 32768
 --frames 4096`:
 
@@ -26,10 +49,15 @@ chain reuse that landed in task-1911 had never been measured against the family.
 
 Every lower bound clears the bar, by a third at the narrowest. `join.selective` reads 35.49x and
 `join.range` 1.17x; the range join is still the slow half and still the one an ordered probe reuse
-would reach, but the family it is in is met and the item does not need it.
+would reach. Inside the whole plan, which is what the contract grades, the family misses, as above;
+A pinned rerun found this engine's time for `join.range` unchanged across three builds, with the bound
+following SQLite's arm of the same workload.
+That same walk then measured further back, pinned: this engine's `join.range` time rose from 22.4 ms
+at the oldest build it measured to 28.0 ms at HEAD in four steps, and on the full plan no build it
+measured cleared the bar.
 
-**`extension` still misses, and re-applying the reverted segment format cannot close it.** Four runs
-the same way:
+**`extension` missed, and re-applying the reverted segment format could not have closed it.** Four
+runs the same way, on 2026-09-15:
 
 | run | `extension` | 95% low | bar |
 |---|---:|---:|---:|
@@ -37,6 +65,18 @@ the same way:
 | 2 | 1.60x | 1.39x | 1.50x |
 | 3 | 1.59x | 1.39x | 1.50x |
 | 4 | 1.67x | 1.45x | 1.50x |
+
+**And it missed inside the whole plan, measured 2026-09-20**: 1.57x with lower bounds of 1.17x,
+1.33x, 1.38x and 1.45x. `extension.fts.build` at 0.69x is what holds the bound down, and what that
+workload's time is has now been measured rather than described: a timer around the whole of
+`Fts5Table::add` puts **52% of the workload outside the index**, 8.4 µs a document between the `INSERT`
+and the indexing against 7.8 µs for all of the indexing. The stages inside are `content 1.4 ms`,
+`docsize 1.1`, `tokenize 0.4`, `dict write 1.7` and `new terms 0.4` over 507 terms, for five hundred
+documents. So this item's lever is the virtual table write path as much as the index, and **the one
+change that looked obvious cannot ship**: moving the per column token counts out of `%_docsize` and
+into the content row saves one shadow row write a document, and `%_content`'s shape is compared against
+SQLite's own FTS5 shadow tables by `fts5::the_content_table_holds_the_rows`, which fails on the extra
+column.
 
 `extension.fts.build` is the worst workload in every run, at 0.56x to 0.58x, and it is what holds
 the bound down. The rest of the family is well clear, with `extension.fts.query` at **1.70x to
@@ -69,47 +109,7 @@ the dictionary. SQLite writes about 1,000 rows and one segment blob for the same
 means a design against those three numbers rather than against the segment format, and it is not
 designed here.
 
-## 2. `write.insert.batch` is 43% slower than SQLite
-
-**0.70x**: 2,000 inserts in one transaction. It was 72% slower; the improvement came with the
-delta log seek in task-1911. It sits inside a family that clears its bar, so it blocks nothing.
-
-**The cause named here was the wrong one, and the measurement says so.** The text said `locate()`'s
-walk of each leaf's unsorted delta area, and the fix designed for it was a 16 bit fingerprint per
-delta entry so an insert that misses the delta area would pay halfword compares and no decode. That
-design carried its own stop condition - "if the saving is under a fifth of the gap, record it and
-stop" - and the stop condition is met before the format change, on the numbers below.
-
-`inillucent-writelogattrib` on the medium fixture, 2,000 inserts into `main_table` with its two
-secondary indexes, which is the gate's own shape:
-
-| where the log goes | records | bytes | share |
-|---|---:|---:|---:|
-| `Structural` (a split) | 40 | 963.1 KiB | **58%** |
-| `InsertRow` | 6,000 | 687.5 KiB | 41% |
-| `CompactLeaf` | 187 | 11.7 KiB | 0.7% |
-| `AllocPage` and the commit | 41 | 1.6 KiB | 0.1% |
-
-1,664 KiB of log for about 240 KiB of rows, and a split costs **24,656 bytes** - three whole 8 KiB
-page images for one row that would not fit.
-
-And `locate`'s delta walk, counted directly: **8,329 calls, 119,645 entries walked, 5.1 ms**, 14.4
-entries a call, against **66.8 ms** of apply time across both arms. Under eight per cent, and that
-is the whole walk rather than what a fingerprint block would save - a probe that matches still
-decodes, and the block itself costs a hash per insert and 64 bytes a leaf. Removing all of it would
-move 0.70x to about 0.755x: five and a half points of a forty-three point gap, where a fifth is
-eight and a half. `crates/inillucent-compat/src/bin/writelogattrib.rs`'s own header already recorded
-that a previous fix to that decode "did not move the gate ratio"; this is the number behind that
-sentence.
-
-Done, now, means the lever the measurement points at rather than the one that was guessed: **a
-split that logs less than three whole pages.** A batch insert at the end of a key range splits
-right, and the right page it creates is nearly empty - so the record carries an 8 KiB image of a
-page that holds one row. Nothing here designs it; a format change to the split record is its own
-ticket with its own crash campaigns, and the honest state of this item is that its cause is now
-measured rather than supposed.
-
-## 3. The retrieval index's footprint
+## 2. The retrieval index's footprint
 
 **1.3 GB resident for a 3.1 GB index of 600,589 chunks** with the vectors read from the file, and
 3.1 GB with them held in memory. The vectors are out of the default resident set; the graph and the
@@ -147,7 +147,75 @@ the doclist already is; the store the same way, a block per chunk; and the graph
 lists as fixed width pages. Each with its number on the performance page, and the acceptance
 unchanged - under 512 MiB resident, p50 within 1.5x and p99 within 2x, identical top k.
 
-## 4. Threads
+### Landings 2 and 3, as far as no format change takes them
+
+Both were done as *filings* rather than as blocks behind the buffer pool, which is less than the
+paragraph above asks for and needed no change to what is written on disk. An index written by any
+build opens under this one and the other way round.
+
+**The postings stopped paying per term.** They were a `HashMap<String, Vec<Posting>>` beside a second
+`Vec<String>` of the same terms in sorted order, so each of the 1,705,097 terms was charged for three
+times over: a string in the map and a string in the list, a `Vec` header and its own heap block
+however few postings the term had, and a hash map slot with its stored hash and its load factor. They
+are flat arrays now - one byte array for the terms, one array for the postings, a start per term, and
+a binary search instead of a hash - with an overflow map that takes appends and is folded back in
+once it holds an eighth of the postings.
+
+**The chunk text is read from the file**, the way `vectors.bin` already was. A search reading ten
+results reads ten ranges; a process that opens the index and searches nothing reads none. It needed
+no format change because the offset a load has to know is one the reader can count rather than one
+the file has to carry.
+
+Measured with `inillucent-indexresidency` on a **185,078 chunk, 494,293 term** index built for this
+from the public corpus cache - a third of the corpus above, so read these as a ratio rather than as a
+replacement for that table. Same index, same binary built twice, each figure taken twice and agreeing
+to 0.2 MiB:
+
+| part | on disk MiB | resident before | resident after |
+|---|---:|---:|---:|
+| `lexical.bin`, the BM25 postings | 211.1 | 306.2 | **209.4** |
+| `store.bin`, the chunks and their dictionaries | 171.7 | 189.4 | 189.4 |
+| `graph.bin`, the HNSW adjacency | 26.3 | 45.7 | 45.6 |
+| `vectors.bin` | 542.2 | 0.0 | 0.0 |
+| total | 951.4 | 541.3 | **444.3** |
+
+**The postings are 31.6% smaller resident and the whole index 17.9% smaller**, and the postings are
+now 0.99x their own file where they were 1.45x it. What was being paid for was per term rather than
+per posting, so the saving follows the term count: at the 1,705,097 terms of the corpus in the table
+above, the same ratio puts 890.3 MiB at about 610.
+
+**`store.bin` does not move in that table, and that is the table's limit rather than the change's.**
+`indexresidency` reads the four parts directly with the same public readers `load` calls, which is
+what lets it attribute a cost to each one - and it reads the store with `Store::read_from`, the
+resident reader, because that is the function whose cost it is reporting. The filing is a decision
+`persist::load` makes and the readers do not.
+
+`inillucent-indexresidency --through-load` answers the other question: what a process that opens this
+index holds. One number rather than four, because an open is one call. It samples three times in the
+same process, so the arena is the only thing that differs between the readings rather than two
+compilations being compared:
+
+| | resident MiB | peak MiB |
+|---|---:|---:|
+| after `persist::load` | **424.2** | 436.1 |
+| after reading every chunk's text once | 424.3 | 436.1 |
+| with the chunk text held instead | 580.2 | 584.2 |
+
+Run twice, agreeing to 0.2 MiB. **The text costs 156.0 MiB of a 580.2 MiB open, which is 26.9% of
+it**, and 163,556,613 bytes of chunk text is 156.0 MiB - so the difference is the arena and nothing
+else. Reading every chunk once adds 0.1 MiB, which is what says the filed arena streams rather than
+accumulates.
+
+The two filings together take an open of this index from 677.0 MiB to 424.2 MiB, **37.3%**.
+
+**The acceptance is not met and is not claimed.** Under 512 MiB resident at the default pool is the
+bar and this index is under it at 424.2 MiB, but the corpus in the table above is three times its
+size and nothing here has been run against that one. The graph, landing 3, is untouched. And p50,
+p99 and identical top k were not re-measured: the postings change is a change to how they are laid
+out in memory rather than to what they hold, and `inillucent-core`'s 282 cases say the same postings
+come back, but that is an argument and the acceptance asks for a measurement.
+
+## 3. Threads
 
 Access from several **processes** works: the same SHARED, RESERVED, PENDING and EXCLUSIVE protocol
 as SQLite, under `PRAGMA locking_mode = normal`, which is the default. One writer holds the file at
@@ -159,7 +227,7 @@ one process did not.
 
 The line this replaces claimed two processes and zero lost writes over a stress campaign. That
 number came from `concurrency.rs`, which runs two *sessions* inside one process. Two real processes
-lost 43% of their acknowledged commits on every round until task-1980 (task-1979, section 4).
+lost 43% of their acknowledged commits on every round until this was fixed.
 
 **Built: `SharedDatabase`, which is serialized mode.** Any number of threads use one database,
 exactly one statement runs at a time, and a transaction holds its turn for its whole life. A web
@@ -191,14 +259,7 @@ transaction nobody opened.
 Statements still do not run in parallel. A parallel executor is not on this list, and
 [the architecture overview](architecture-overview.md) says so where a reader meets it.
 
-## 5. A macOS archive
-
-Every platform's archive is built on that platform, and there is no macOS build machine. `cargo
-install inillucent-cli` builds it from source in the meantime. Everything reachable without the
-machine is done; what is left is `packaging/macos/release-macos.sh --version <N> --upload` run on
-one, after which the Homebrew formula and the two npm platform packages that wait on it go live.
-
-## 6. Two command line lines still reach past the driver
+## 4. Two command line lines still reach past the driver
 
 `drivers/README.md` says the driver is the one surface an application reaches the engine through,
 and for an application that is true: the C ABI, the four language wrappers and every published
@@ -238,12 +299,12 @@ Done, now, means that decision is made. The claim in `drivers/README.md` is not 
 because it is about what an *application* reaches; it becomes false the day somebody reads it as
 being about this repository. Until the count is zero, this item is what says so.
 
-## 7. PostgreSQL parity: a server, a replica, readers beside a writer, roles and the dialect
+## 5. PostgreSQL parity: a server, a replica, readers beside a writer, roles and the dialect
 
 There is no listener, no replica, no reader that proceeds while a writer holds the file, no role
 and no password. A PostgreSQL client has nothing to connect to. What closing each of those looks
 like, in the order they are worked, is designed in
-[task-1998, the path from an embedded engine to PostgreSQL parity](../tasks/task-1998-postgres-parity-tdd.md):
+[the path from an embedded engine to PostgreSQL parity](../tasks/task-1998-postgres-parity-tdd.md):
 a server that runs as a service and speaks the PostgreSQL wire protocol first, a primary with a
 replica fed from the redo log second, snapshot readers alongside the one writer third, roles and
 row policies fourth, the PostgreSQL dialect fifth, and the operational verbs last.
@@ -260,6 +321,6 @@ that stays current.
 ## Where to go next
 
 - [Closed items](closed-items.md): what came off this list, and the measurement that closed each
-- [Performance](performance.md): the measurements behind items 1 to 3
+- [Performance](performance.md): the measurements behind items 1 and 2
 - [Feature comparison](feature-comparison.md): the full run, per workload
 - [Repository](repository.md): the crates and the test runner

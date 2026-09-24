@@ -89,6 +89,33 @@ pub struct HnswParams {
     pub build_threads: usize,
 }
 
+/// How many threads a build uses when nothing says otherwise.
+///
+/// **Design 9 of task-2000: the parallel build is on by default.** It was 1, and
+/// `inillucent-search`'s SQL table was the only caller that overrode it - so
+/// `inillucent-core`'s own builds, the command line's, and the grading harness's
+/// all ran an index build on one of this machine's twenty-four threads. 185,078
+/// chunks at 768 dimensions took **129.7 s**.
+///
+/// **What it costs is reproducibility, and that is why the number is not 1 any
+/// more rather than why it was.** `Hnsw::build_parallel`'s own comment records the
+/// bargain: levels come from the same seeded generator so the level distribution is
+/// identical, but the order in which nodes link to each other is whatever the
+/// thread pool produced, and neighbour selection depends on who was already there.
+/// Both graphs are valid and measure the same on recall; neither is byte-comparable
+/// to the other. A caller that needs a byte-reproducible index sets
+/// `build_threads` to 1, which is one field rather than a rebuild, and the grading
+/// harness records the number it used in the run's manifest so a card can never be
+/// read without it.
+///
+/// One when the operating system will not say, which is the answer that behaves
+/// exactly as the old default did.
+fn available_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+}
+
 impl Default for HnswParams {
     fn default() -> Self {
         HnswParams {
@@ -99,7 +126,7 @@ impl Default for HnswParams {
             exhaustive_below: 1_000,
             entry_points: 1,
             keep_pruned_connections: true,
-            build_threads: 1,
+            build_threads: available_parallelism(),
         }
     }
 }
@@ -507,23 +534,42 @@ impl Hnsw {
             Some(raw_entry)
         };
 
-        let mut node_top = vec![0u8; n_nodes];
-        r.read_exact(&mut node_top)?;
+        // **Read rather than reserved** (task-2066 §4.1.12). `n_nodes` is a
+        // header field of a `.rdb` segment, which is a page somebody else could
+        // have written, and `vec![0u8; n_nodes]` on a claimed length of a few
+        // hundred gigabytes aborts the process through `handle_alloc_error`
+        // rather than returning an error. `binio`'s module comment states this
+        // rule and `read_records` is what follows it: the buffer never grows
+        // past what has already arrived plus one step, so a length the source
+        // cannot satisfy costs one megabyte and then fails with
+        // `UnexpectedEof`.
+        let node_top = crate::binio::read_pod_vec::<u8>(r, n_nodes)?;
 
-        let mut layers = Vec::with_capacity(n_layers);
+        // The same argument for the three counts below, and the neighbour list
+        // is the one that was still reserving (task-2066 section 4.4.7). The
+        // comment here used to say "the two counts below, which is why neither
+        // reserves either" while the line building a neighbour list called
+        // `Vec::with_capacity(degree)` on a raw `u32` read out of the file -
+        // 17 GB for `0xFFFFFFFF`, which is `handle_alloc_error` and an abort
+        // rather than a refusal, reachable from an ordinary `SELECT` over an
+        // `inillucent_search` table. It is the same defect section 4.1.12
+        // fixed for `n_nodes`, one field along, and the comment was already
+        // claiming it was fixed.
+        //
+        // Found by the `segment_header` fuzz target on its first run, in a
+        // twenty-one byte input. `read_pod_vec` is the bounded reader this
+        // comment names: the buffer never grows past what has arrived plus one
+        // step, so a length the source cannot satisfy costs one megabyte and
+        // then fails with `UnexpectedEof`.
+        let mut layers = Vec::new();
         for _ in 0..n_layers {
             r.read_exact(&mut buf4)?;
             let count = u32::from_le_bytes(buf4) as usize;
-            let mut layer = Vec::with_capacity(count);
+            let mut layer = Vec::new();
             for _ in 0..count {
                 r.read_exact(&mut buf4)?;
                 let degree = u32::from_le_bytes(buf4) as usize;
-                let mut neighbours = Vec::with_capacity(degree);
-                for _ in 0..degree {
-                    r.read_exact(&mut buf4)?;
-                    neighbours.push(u32::from_le_bytes(buf4));
-                }
-                layer.push(neighbours);
+                layer.push(crate::binio::read_pod_vec::<u32>(r, degree)?);
             }
             layers.push(layer);
         }
@@ -1648,6 +1694,64 @@ fn search_layer_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A neighbour count no file can satisfy is refused, not allocated.**
+    ///
+    /// The stable counterpart of the `segment_header` fuzz target, and the
+    /// input is the one it found: twenty-one bytes, with `degree` at
+    /// `0xFFFFFFFF`. `Vec::with_capacity(degree)` asked for 14,361,296,892
+    /// bytes and libfuzzer stopped the process; `handle_alloc_error` would have
+    /// done the same to a caller running an ordinary `SELECT` over an
+    /// `inillucent_search` table (task-2066 sections 4.1.12 and 4.4.7).
+    ///
+    /// The bytes are written out rather than described, because the case is the
+    /// input: a header that is plausible up to the field that is not.
+    #[test]
+    fn a_neighbour_count_no_file_can_satisfy_is_refused() {
+        let mut blob: Vec<u8> = Vec::new();
+        blob.extend_from_slice(&1u32.to_le_bytes()); // one layer
+        blob.extend_from_slice(&0u32.to_le_bytes()); // no nodes
+        blob.extend_from_slice(&u32::MAX.to_le_bytes()); // no entry point
+        blob.extend_from_slice(&1u32.to_le_bytes()); // one node in the layer
+        blob.extend_from_slice(&u32::MAX.to_le_bytes()); // and it claims 2^32-1 neighbours
+
+        let mut reader = blob.as_slice();
+        // `Hnsw` is not `Debug`, so the refusal is taken out by hand rather
+        // than with `expect_err`.
+        let refused = match Hnsw::read_graph(&mut reader, HnswParams::default()) {
+            Err(refused) => refused,
+            Ok(_) => panic!("a neighbour count of 2^32-1 must be refused"),
+        };
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "the refusal was not about the file running out: {refused}"
+        );
+
+        // The control: the same header with a count the bytes can satisfy
+        // reads back, so the arm above is about the count rather than about a
+        // reader that refuses every graph.
+        let mut good: Vec<u8> = Vec::new();
+        good.extend_from_slice(&1u32.to_le_bytes());
+        good.extend_from_slice(&0u32.to_le_bytes());
+        good.extend_from_slice(&u32::MAX.to_le_bytes());
+        good.extend_from_slice(&1u32.to_le_bytes());
+        good.extend_from_slice(&2u32.to_le_bytes());
+        good.extend_from_slice(&7u32.to_le_bytes());
+        good.extend_from_slice(&9u32.to_le_bytes());
+        let mut reader = good.as_slice();
+        let graph = Hnsw::read_graph(&mut reader, HnswParams::default())
+            .expect("a graph whose counts the bytes satisfy reads back");
+        assert_eq!(
+            graph
+                .layers
+                .first()
+                .and_then(|layer| layer.first())
+                .cloned(),
+            Some(vec![7u32, 9]),
+            "the control graph did not read back its neighbours"
+        );
+    }
     use crate::filter::Filter;
     use crate::store::ChunkInput;
 
@@ -2283,11 +2387,28 @@ mod tests {
 
     /// More entry points must never make the answer worse; the walk starts from a
     /// superset of where it started before.
+    ///
+    /// **`build_threads: 1`, because this test's premise is that the two graphs are
+    /// the same one** (task-2006). It says so three lines down: "same seed, same
+    /// insertion order, so the two graphs are identical and only the number of
+    /// starting points differs". `HnswParams::default().build_threads` became
+    /// `available_parallelism()` in design 9 of task-2000, and a parallel build's
+    /// link order is whatever the thread pool produced - see
+    /// `available_parallelism`'s own note - so under the new default the two builds
+    /// produce two different valid graphs and this comparison has two variables in
+    /// it. It measured as eight entry points scoring 5.9 against one entry point's
+    /// 6.0 over six probes, which is the difference between two graphs rather than
+    /// a property of entry points.
+    ///
+    /// Pinning the threads here is what isolates the variable the test is named
+    /// for. `a_parallel_batch_insert_is_as_accurate_as_the_sequential_one` is where
+    /// the parallel build's own accuracy is measured.
     #[test]
     fn extra_entry_points_do_not_lower_recall() {
         let (vectors, store) = fixture(6000, 32);
         let base = HnswParams {
             exhaustive_below: 0,
+            build_threads: 1,
             ..Default::default()
         };
         let mut one = Hnsw::new(base);

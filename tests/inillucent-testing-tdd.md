@@ -125,7 +125,7 @@ the two numbers and what was expected of them.
 
 ## 2. The shape of the suite
 
-**190 test targets, 2,806 tests, in nine tiers.** A target is one binary
+**221 test targets, 3,493 tests, in ten tiers.** A target is one binary
 `cargo test` builds; a tier is a band you can ask for by name. Every target is
 in exactly one tier, so the tiers partition the suite rather than overlapping
 it. (Was 129 targets, 2,336 tests when this document was written; task-1911's
@@ -148,17 +148,26 @@ written count against what the *runner* last reported, so a document that agreed
 with a stale run passed (task-1969, 4.14). The test count per tier is a property
 of a run rather than of the map and is not checked here.
 
+**The test counts below were taken from one full run rather than maintained by
+hand** (task-2066). Nothing reads them, so they had drifted: `differential` said
+334 where the run reported 349, `durability` 220 where it reported 234, and
+`unit` 1,430 where it reported 1,446. They are what a `--changed` selection of
+225 of the 228 targets reported, plus `numeric_text`'s three, which that
+selection predated. Read them as the size of a tier rather than as a number to
+check a run against.
+
 | tier | targets | tests | what it is for |
 |---|---:|---:|---|
-| `smoke` | 1 | 8 | the ten-second answer: a real file opened, written, reopened, read |
-| `unit` | 31 | 1,242 | every crate's own `#[cfg(test)]` modules |
-| `engine` | 61 | 347 | SQL and storage behaviour over real database files |
-| `differential` | 33 | 309 | graded against the pinned SQLite 3.53.4 |
-| `durability` | 25 | 176 | crashes, injected faults, corruption and concurrency |
-| `e2e` | 26 | 130 | the public surfaces an application binds to, end to end |
-| `perf` | 1 | 6 | the cost guards — **runs alone**, see §5 |
-| `retrieval` | 7 | 519 | the embedding and retrieval engine, and its graded harness |
-| `tooling` | 9 | 69 | the checks that keep the repository's own rules true |
+| `smoke` | 1 | 10 | the ten-second answer: a real file opened, written, reopened, read |
+| `unit` | 31 | 1,446 | every crate's own `#[cfg(test)]` modules |
+| `engine` | 68 | 447 | SQL and storage behaviour over real database files |
+| `differential` | 34 | 349 | graded against the pinned SQLite 3.53.4 |
+| `durability` | 34 | 234 | crashes, injected faults, corruption and concurrency |
+| `e2e` | 36 | 432 | the public surfaces an application binds to, end to end |
+| `perf` | 1 | 8 | the cost guards — **runs alone**, see §5 |
+| `retrieval` | 7 | 570 | the embedding and retrieval engine, and its graded harness |
+| `tooling` | 16 | 147 | the checks that keep the repository's own rules true |
+| `nightly` | 3 | 6 | the long forms, run on a schedule rather than on a change |
 
 The map that assigns them is `tests/selection.toml`, and it is data rather than
 code so that a person can read the whole arrangement in one file.
@@ -171,7 +180,12 @@ code so that a person can read the whole arrangement in one file.
 | a construct SQLite also has | `inillucent-compat/tests/`, graded against the oracle — tier `differential` |
 | SQL or storage behaviour with no SQLite equivalent | `inillucent-compat/tests/` — tier `engine` |
 | what an application does with the public API | `crates/inillucent/tests/` — tier `e2e` |
+| **a sequence an application performs, at every configuration** | `crates/inillucent/tests/story_*.rs`, through `scenario!` — tier `e2e`, see §2.2 |
 | what survives a crash or an injected fault | `inillucent-compat/tests/`, under the simulator — tier `durability` |
+| **what a language binding must answer** | a case in `drivers/conformance/suite.json`, which all five runners read |
+| **what an earlier release wrote, or will read** | a fixture in `tests/interop/<version>/` — tier `e2e`, see §2.2 |
+| **a defect that escaped, and what holds it now** | a row in `tests/escapes.toml` — tier `tooling` |
+| **the same question at a size nobody waits for** | a second target in tier `nightly`, see §2.2 |
 | a cost that must not change shape | `crates/inillucent/tests/budget.rs` — tier `perf` |
 
 **The public facade is the newest of these and the one most easily forgotten.**
@@ -183,6 +197,60 @@ public, a method that moves down a layer — none of those are engine defects,
 none of them fail an engine test, and every one of them breaks every caller.
 The facade was moved from one engine to another and nothing in the suite would
 have noticed if it had moved to neither.
+
+---
+
+### 2.2 Stories, the configuration matrix, and the long forms
+
+**Every test above asks about a construct. A story asks about a sequence.** The
+distinction is not stylistic: `CREATE TABLE`, `ALTER TABLE ADD COLUMN`, `CREATE
+INDEX` and `ANALYZE` each have their own tests and each of those passes, and the
+four of them in the order an application's startup performs them corrupted a
+table beside the one being migrated. A suite made only of construct tests cannot
+find that, because there is nothing wrong with any of the constructs.
+
+**And every test above runs at one configuration.** Until the matrix, every
+story in the tree ran at a 32,768 byte page with 4,096 frames and an untouched
+journal, because that is what `Database::open` gives — so a defect that needs a
+4,096 byte page was invisible to all of them, and one of those was found the day
+the matrix was written.
+
+`crates/inillucent-compat/src/matrix.rs` declares the arms and expands them:
+
+```rust
+scenario!(a_startup_migration_leaves_every_neighbour_readable);
+```
+
+That is one `#[test]` per arm — `default`, `sqlite_page`, `small_pool`,
+`truncate_journal`, `persist_journal`, `waiting` — each with its own scratch
+directory, its own database and the arm's geometry written into the open. A
+story that calls `scenario!` is asking its question six times; a story that
+writes a bare `#[test]` is asking it once, and
+`tooling::scenarios_run_every_quick_arm` is what notices.
+
+**The long forms live in tier `nightly` as a second target**, because a target
+is in exactly one tier and the tiers partition the suite. The pattern is a pair:
+`story_ledger_day` issues eight hundred transactions in `e2e`, and
+`story_ledger_day_nightly` issues a hundred thousand and replays them through
+the pinned SQLite shell; `release_format` reads the newest interop fixture in
+`e2e`, and `release_format_history` reads all six and hands a file this build
+wrote to every released binary. `pwsh tools/run-nightly.ps1` runs the tier under
+`--strict` and appends a row per target to `tests/nightly-history.tsv` — the
+date, the commit, the machine, the verdict and the seconds — because a green run
+nobody recorded cannot answer "when did this last actually pass".
+
+**The interop fixtures are evidence rather than input.** `tests/interop/0.1.1/`
+holds a database written by 0.1.1's own binary, the log segment it left and the
+answers it gave; nothing but `pwsh tools/build-interop-fixture.ps1` ever writes
+one, and every reader stages a copy first, because opening a database replays
+its log and would change the thing being measured. `packaging/ship.ps1` builds
+the fixture for each version it publishes.
+
+**`tests/escapes.toml` is the ledger of what got out.** One row per escaped
+defect: the ticket, the surface, one sentence about what happened, and the test
+that holds it now. A row with `held_by = []` must say why in `open`, and
+`tooling::escapes` fails when a `held_by` names a test that does not exist — so
+the ledger cannot quietly become a list of tests somebody deleted.
 
 ---
 
@@ -326,6 +394,41 @@ Only `profile.test` tells them apart, so a reader that took the first would run
 
 **Some tiers cannot share a machine** — §5.
 
+### 4.3.1 Three exit codes, because a run that did not happen is not a red run
+
+Rule 1.5 says a test that cannot fail is worse than no test, and §9 exists
+because a suite whose prerequisite was absent reported green. The runner's own
+answer had the same defect one level up: `the build failed` exited **1**, which
+is the code a failing test exits, so a caller branching on the status could not
+tell a broken toolchain from a real defect. task-2041 read one as the other.
+
+| code | what it means |
+|---|---|
+| `0` | every selected target ran and passed |
+| `1` | the run happened and was red — a target failed, a target could not be read, or `--strict` found a suite that evidenced nothing |
+| `2` | **the run did not happen.** The build failed, a `--target`/`--tier` pair matched nothing, `--filter` matched no test, or cargo could not say what it had built |
+
+`2` is the code that carries the rule: nothing in that run was graded, so
+nothing in it may be read as a pass. The command line spends a third code on
+`unsupported` for the same reason — a caller should be able to branch without
+matching on a message.
+
+**The report and the exit status have to agree**, or one of the two stops being
+read. A run that graded no test prints `not ok` and exits 2 from the same
+question, `nothing_was_graded`; there is no path that prints `ok` over a
+non-zero code.
+
+**Two empty selections, and only one of them is a failure.** `--changed` that
+finds nothing is a true answer and stays green. A `--target` and `--tier` the
+caller named by hand that do not overlap is a request that could not be
+honoured, and it refuses naming both — it used to print `nothing selected` and
+exit 0, with both names real so neither existing guard fired.
+
+The five cases holding this are in `crates/inillucent-compat/tests/gates_fail_closed.rs`,
+and each asserts an **exact** code rather than "non-zero". A test that only
+asserts non-zero on a broken build passes against a runner that refuses
+everything, which is a worse program than the one being fixed.
+
 ### 4.4 How many at a time
 
 Measured over `engine + differential + durability`:
@@ -362,6 +465,7 @@ same run:
 | a keyset page costs the same wherever it starts | pages fetched | 502 against 502 | start ≤ 4x end |
 | rewriting the same 5,000 rows ten times does not grow the file | bytes on disk | — | ≤ 3x |
 | a full scan of 20,000 rows stays proportional to the table | pages fetched, **and** the clock | 20 pages, 2.99 ms | ≤ 200 pages, under 10 s |
+| a statement outside a transaction rereads nothing the file has not changed | full meta reads, record reads | 0 and 200 over 200 statements | 0 full reads, ≤ 1 record read a statement |
 
 Every threshold is a fraction of what it measures. That is the trade: these
 catch a change of *kind* — an index dropped, a commit per row, a cache turned
@@ -528,19 +632,40 @@ build-plus-run rather than a slice of one shared build.
 | tier | wall | targets | tests |
 |---|---:|---:|---:|
 | `smoke` | 0.8 s | 1 | 8 |
-| `tooling` | 5.0 s | 7 | 49 |
-| `e2e` | 8.6 s | 15 | 94 |
-| `unit` | 6.8 s | 26 | 1,230 |
+| `unit` | 7.8 s | 31 | 1,388 |
+| `e2e` | 25.4 s | 36 | 412 |
 | `perf` | 35.1 s | 1 | 6 |
-| `durability` | 134.7 s | 20 | 158 |
 | `differential` | 36.1 s | 29 | 292 |
 | `engine` | 37.8 s | 44 | 299 |
 | `retrieval` | 213.8 s | 6 | 506 |
+| `tooling` | 242.4 s | 13 | 122 |
+| `durability` | 988.2 s | 31 | 216 |
+| `nightly` | 1,650.3 s | 2 | 3 |
 
 `perf`'s 35.1 s agrees with §5.1's "about half a minute" where the old 9.1 s
 in this table did not; that inconsistency predates this pass and is corrected
 here rather than carried forward. Each figure includes the runner's own
 startup and its `cargo` target listing, about 1.2 s.
+
+**`unit`, `e2e`, `tooling`, `durability` and `nightly` were measured again for
+task-2036**, which added 26 targets across them; the other four rows are
+carried forward from the pass that measured them. **`e2e` was measured again
+for task-2055**, which split `durability` into two targets so that the cases
+running at every arm sit apart from the cases picking their own geometry - 36
+targets and 412 tests, at 25.4 s on a box that had one other agent on it.
+
+**`e2e` is 23.5 s and the design asked for fifteen.** A tier's wall is its
+slowest target, and three of them are within a second of the whole tier:
+`story_nikaya` at 23.5 s, `cli_commands` at 23.2 s and `story_edges` at 21.8 s.
+`cli_commands` is not one of this ticket's suites and is over fifteen seconds on
+its own, so cutting the stories would not bring the tier under it. What the
+number bought is 370 tests where the tier had 130: nine stories, each asked at
+six configurations.
+
+**`durability` and `tooling` are minutes rather than seconds, and both are one
+target.** `vacuum_crash` is the whole of `durability`'s wall and
+`gates_fail_closed` is the whole of `tooling`'s; the other suites in each finish
+while those two are still going.
 
 ### 6.3 The eight that matter
 
@@ -740,6 +865,40 @@ fail until you do, and its message names the target.
 **A tier.** Add a `[[tier]]` row and move targets into it. A declared tier that
 holds nothing fails `every_tier_is_declared`, so a tier cannot be added
 speculatively.
+
+**A story.** Put it in `crates/inillucent/tests/story_*.rs` and write it as a
+function taking `(&Arm, &Path)`, then `scenario!(its_name);`. It runs at all six
+arms, and `tooling::scenarios_run_every_quick_arm` fails if a story in that
+directory asks its question once. Give it a sequence an application actually
+performs rather than one invented to look like one: the escape a story is shaped
+around was in the order the real program goes in.
+
+**A long form.** Write it as a second target in tier `nightly`, not as a bigger
+number in the `e2e` one — a target is in exactly one tier. Name it
+`<the short form>_nightly` so the pair is obvious, and state its cadence rather
+than deriving it: the short form's phase boundaries are tuned for a run that
+finishes in seconds, and the same cadence over a hundred thousand transactions
+spends its night on `VACUUM`. `pwsh tools/run-nightly.ps1` picks it up with no
+further wiring.
+
+**An interop fixture.** `pwsh tools/build-interop-fixture.ps1 -Version <version>`
+downloads that release, verifies it against the published `SHA256SUMS` and its
+minisign signature, and writes `tests/interop/<version>/`. Never write one by
+hand and never open one in place. A question every release should answer goes in
+`tests/interop/verify.sql`, and every fixture is then rebuilt — one list, two
+readers, and `expected.tsv` is what each release answered.
+
+**A conformance case.** Add it to `drivers/conformance/suite.json` with the
+group it belongs to and the capabilities it needs. All five runners read that
+file, `tooling::bindings` fails when a runner ran fewer cases than the suite
+holds, and a runner that filters a group must name the group and the reason in
+`skipped_by` rather than skipping quietly.
+
+**An escape.** When a defect gets out, its fix adds a row to `tests/escapes.toml`
+in the same commit: the ticket, the surface, one sentence, and the `held_by` test
+that would now catch it. If nothing holds it yet, `held_by = []` and `open` says
+why. `tooling::escapes` checks that every `held_by` resolves to a test that
+exists.
 
 **A performance workload.** Add a `Workload` to `perfhistory.rs` with an untimed
 `setup` and a timed `script`, and a `repeat` large enough that the timed part is

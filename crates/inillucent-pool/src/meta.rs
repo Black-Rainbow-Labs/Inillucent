@@ -19,15 +19,41 @@ use crate::PageId;
 /// The eight bytes that begin every inillucent data file.
 pub const MAGIC: [u8; 8] = *b"RDB2\0\0\0\0";
 
-/// The format version this build writes and is the only one it reads.
+/// The format version this build writes.
 ///
 /// **The compatibility rule, which `docs/relational-architecture.md` states in
 /// full.** A point release reads every file an earlier point release of the
 /// same minor version wrote, so this number does not move for a bug fix. A
-/// change to the layout of a page, a record or this header raises it, and that
-/// is a minor version with a documented migration; a build that meets a file
-/// with a higher number says so rather than reading it as damage.
-pub const FORMAT_VERSION: u32 = 1;
+/// change to the layout of a page, a record or this header raises it; a build
+/// that meets a file with a higher number says so rather than reading it as
+/// damage.
+///
+/// **Two, since task-2074, for two changes to the page.** A leaf's delta area
+/// has a directory in key order, and a page's checksum covers its LSN - which
+/// format 1's did not, so a flipped bit in a page's LSN was a page that read as
+/// valid (task-2066 section 4.2, item 17). A build of format 1 cannot read
+/// either, and the number is what makes it say so by name instead of reporting
+/// a checksum failure on the first page it reads.
+///
+/// This build still reads format 1, which is [`OLDEST_FORMAT_VERSION`]: a leaf
+/// says which layout it is in, and a page's checksum is accepted under either
+/// rule. A format 1 file becomes format 2 the first time this build writes its
+/// meta record, which a checkpoint does.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// The oldest format version this build reads.
+///
+/// Every published release before task-2074 wrote format 1, and
+/// `tests/interop/` holds a file from each of them that
+/// `crates/inillucent-compat/tests/release_format.rs` reads with this build.
+pub const OLDEST_FORMAT_VERSION: u32 = 1;
+
+/// Reports whether this build reads a file of this format version.
+///
+/// @param found - the version a file's header carries
+pub fn reads_format(found: u32) -> bool {
+    (OLDEST_FORMAT_VERSION..=FORMAT_VERSION).contains(&found)
+}
 
 /// Returns the refusal a file of another format version reports.
 ///
@@ -39,9 +65,9 @@ pub const FORMAT_VERSION: u32 = 1;
 /// got that" gives - and the message says what to do about it.
 ///
 /// A *lower* number would mean a format this build has dropped, and there is
-/// none: version 1 is the first. It is still named rather than folded into the
-/// newer case, because a zero here is a file whose header was zeroed rather
-/// than a file from the future.
+/// none: this build reads every format from version 1, the first. So a number
+/// below [`OLDEST_FORMAT_VERSION`] is zero, and a zero here is a file whose
+/// header was zeroed rather than a file from the past.
 ///
 /// @param found - the version the file's header carries
 pub(crate) fn wrong_format(found: u32) -> inillucent_base::DbError {
@@ -53,8 +79,8 @@ pub(crate) fn wrong_format(found: u32) -> inillucent_base::DbError {
         .with_unsupported(format!("a database of format version {found}"));
     }
     corrupt(format!(
-        "format version {found} is not {FORMAT_VERSION}, and there is no earlier format: the \
-         header has been overwritten"
+        "format version {found} is not one of {OLDEST_FORMAT_VERSION} to {FORMAT_VERSION}, and \
+         there is no earlier format: the header has been overwritten"
     ))
 }
 
@@ -152,6 +178,23 @@ mod at {
 
 /// The smallest a meta page can be and still hold every field.
 pub const META_BYTES: usize = at::RESERVED;
+
+/// How many bytes at the front of a meta page the record itself occupies.
+///
+/// Everything after it is the zero padding [`Meta::encode`] writes over the
+/// rest of the page, so two meta pages whose first `META_RECORD_BYTES` bytes
+/// agree describe the same database. That is what lets a connection ask
+/// "has another process folded since I last looked" by reading 116 bytes
+/// instead of a whole page - see `Database::disk_record_is_as_last_read`,
+/// where it was four 32 KiB reads and four crc32 passes over 32 KiB per
+/// statement (task-2046).
+///
+/// **A field added to the reserved region has to move this.** The region
+/// begins at [`at::RESERVED`] and the last field in it ends here;
+/// `every_field_lives_below_the_record_length` fails when one is added past
+/// it, because a check that read 116 bytes of a record 124 bytes long would
+/// answer "unchanged" about a change it could not see.
+pub const META_RECORD_BYTES: usize = at::HIGH_WATER_LSN + 8;
 
 /// What the meta page says about the database.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -274,7 +317,7 @@ impl Meta {
             return Err(corrupt("the file does not begin with the inillucent magic"));
         }
         let format = u32(page, at::FORMAT)?;
-        if format != FORMAT_VERSION {
+        if !reads_format(format) {
             return Err(wrong_format(format));
         }
         let stored = u32(page, at::CHECKSUM)?;
@@ -455,6 +498,135 @@ mod tests {
         assert_eq!(Meta::decode(&page).unwrap(), meta);
     }
 
+    /// Every field a record carries is written below [`META_RECORD_BYTES`],
+    /// so a comparison that reads only that many bytes sees every change.
+    ///
+    /// **Written as a sweep over the fields rather than as a length
+    /// assertion**, because the number this protects is not the constant but
+    /// the claim behind it: a field added to the reserved region past the
+    /// constant would leave a change that a staleness check reading
+    /// `META_RECORD_BYTES` bytes could not see, and would report a database
+    /// another process had folded as unchanged.
+    #[test]
+    fn every_field_lives_below_the_record_length() {
+        let base = Meta {
+            page_size: 8_192,
+            page_count: 4_096,
+            catalog_root: PageId(7),
+            free_map: PageId(2),
+            checkpoint_lsn: 900_001,
+            cts_watermark: 42,
+            wal_sequence: 3,
+            generation: 11,
+            uuid: 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef,
+            user_version: 42,
+            application_id: -7,
+            schema_cookie: 3,
+            wal: true,
+            high_water_lsn: 900_000,
+        };
+        let moved: [(&str, Meta); 14] = [
+            (
+                "page_size",
+                Meta {
+                    page_size: 4_096,
+                    ..base
+                },
+            ),
+            (
+                "page_count",
+                Meta {
+                    page_count: 4_097,
+                    ..base
+                },
+            ),
+            (
+                "catalog_root",
+                Meta {
+                    catalog_root: PageId(8),
+                    ..base
+                },
+            ),
+            (
+                "free_map",
+                Meta {
+                    free_map: PageId(3),
+                    ..base
+                },
+            ),
+            (
+                "checkpoint_lsn",
+                Meta {
+                    checkpoint_lsn: 900_002,
+                    ..base
+                },
+            ),
+            (
+                "cts_watermark",
+                Meta {
+                    cts_watermark: 43,
+                    ..base
+                },
+            ),
+            (
+                "wal_sequence",
+                Meta {
+                    wal_sequence: 4,
+                    ..base
+                },
+            ),
+            (
+                "generation",
+                Meta {
+                    generation: 12,
+                    ..base
+                },
+            ),
+            ("uuid", Meta { uuid: 1, ..base }),
+            (
+                "user_version",
+                Meta {
+                    user_version: 43,
+                    ..base
+                },
+            ),
+            (
+                "application_id",
+                Meta {
+                    application_id: -8,
+                    ..base
+                },
+            ),
+            (
+                "schema_cookie",
+                Meta {
+                    schema_cookie: 4,
+                    ..base
+                },
+            ),
+            ("wal", Meta { wal: false, ..base }),
+            (
+                "high_water_lsn",
+                Meta {
+                    high_water_lsn: 900_001,
+                    ..base
+                },
+            ),
+        ];
+        let mut original = vec![0u8; 8_192];
+        base.encode(&mut original).unwrap();
+        for (field, other) in moved {
+            let mut page = vec![0u8; 8_192];
+            other.encode(&mut page).unwrap();
+            assert_ne!(
+                original.get(..META_RECORD_BYTES),
+                page.get(..META_RECORD_BYTES),
+                "moving {field} changed no byte below META_RECORD_BYTES, so a \
+                 staleness check reading that many bytes cannot see it"
+            );
+        }
+    }
+
     /// Corrupting any single byte of any field is detected. This is the
     /// "corrupt every field" table the TDD's coverage tier asks for, written as
     /// a sweep rather than as a list so a field added later is covered without
@@ -504,9 +676,29 @@ mod tests {
         let slot = page
             .get_mut(at::FORMAT..at::FORMAT + 4)
             .expect("the format field is inside the page");
-        slot.copy_from_slice(&2u32.to_le_bytes());
+        slot.copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
         let error = Meta::decode(&page).unwrap_err();
         assert!(error.detail().unwrap_or("").contains("format"), "{error:?}");
+    }
+
+    /// A meta record format 1 wrote is read, and the next one written says 2.
+    ///
+    /// Every release before task-2074 wrote format 1, and this build reads
+    /// their files; the version moves when this build writes the record, which
+    /// is the first checkpoint.
+    #[test]
+    fn a_format_one_record_is_read_and_rewritten_as_format_two() {
+        let mut page = vec![0u8; 8_192];
+        Meta::fresh(8_192, 1).encode(&mut page).unwrap();
+        put(&mut page, at::FORMAT, &OLDEST_FORMAT_VERSION.to_le_bytes()).unwrap();
+        let sum = checksum(&page).unwrap();
+        put(&mut page, at::CHECKSUM, &sum.to_le_bytes()).unwrap();
+        let read = Meta::decode(&page).expect("a format 1 record reads");
+        let mut again = vec![0u8; 8_192];
+        read.encode(&mut again).unwrap();
+        assert_eq!(u32(&again, at::FORMAT).unwrap(), FORMAT_VERSION);
+        assert!(reads_format(1) && reads_format(2));
+        assert!(!reads_format(0) && !reads_format(3));
     }
 
     /// The newer generation wins, a damaged copy is ignored, and two damaged

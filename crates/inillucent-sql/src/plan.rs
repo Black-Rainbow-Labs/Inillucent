@@ -20,12 +20,17 @@ use crate::bind::{BoundExpr, BoundSelect, BoundSource, ColumnUse, SourceRows};
 use crate::catalog_view::{IndexInfo, TableInfo};
 use crate::cost;
 
+mod hint;
 mod partial;
 mod pattern;
+mod range;
 mod terms;
+pub use hint::unanswerable_index_hint;
+use hint::{forced_path, index_usable, outer_terms, statement_terms};
 use partial::implies;
 use terms::{
-    collation_of, comparison_against_column, comparison_against_rowid, comparison_collation,
+    collation_of, compares_unconverted, comparison_against_column, comparison_against_rowid,
+    comparison_collation, indexable_comparison,
 };
 mod seek_union;
 
@@ -49,6 +54,9 @@ pub struct RangeBound {
     pub kind: BoundKind,
     /// The value to compare against.
     pub value: BoundExpr,
+    /// Whether the seek compares `value` without converting it to the
+    /// column's affinity. See [`AccessPath::IndexSeek`]'s `unconverted`.
+    pub unconverted: bool,
 }
 
 /// One seek over an index, as a branch of an [`AccessPath::IndexSeekUnion`].
@@ -57,6 +65,9 @@ pub struct IndexSeekBranch {
     /// The equality prefix this branch pins, one value per leading index
     /// column.
     pub equalities: Vec<BoundExpr>,
+    /// The positions in `equalities` whose value is compared unconverted.
+    /// See [`AccessPath::IndexSeek`]'s `unconverted`.
+    pub unconverted: Vec<usize>,
     /// The lower bound on the column after the prefix, when there is one.
     pub low: Option<RangeBound>,
     /// The upper bound on that same column.
@@ -97,6 +108,26 @@ pub enum AccessPath {
         index_name: Vec<u8>,
         /// The equality prefix, one value per leading index column.
         equalities: Vec<BoundExpr>,
+        /// The positions in `equalities` whose value the seek compares without
+        /// converting it to the column's affinity.
+        ///
+        /// **The comparison decides this, and only the planner sees the
+        /// comparison (task-2083).** A seek converts the probe value to the
+        /// indexed column's affinity, except when both sides of the `=` have
+        /// an affinity and neither is numeric: then `WHERE` converts nothing
+        /// and neither may the seek. That is SQLite's `codeAllEqualityTerms`.
+        /// The executor used to decide it from the probe expression alone,
+        /// and a correlated subquery replaces the outer column with a
+        /// parameter before planning. The parameter has no affinity, so
+        /// `(SELECT id FROM h WHERE h.a = s.k)` with `h.a TEXT` and `s.k`
+        /// untyped converted the number 3 to `'3'` and found a row SQLite
+        /// does not.
+        ///
+        /// A list of positions rather than a flag per equality because it is
+        /// almost always empty, and an empty `Vec` does not allocate. A flag per
+        /// equality cost two allocations to compile `WHERE email = ?1`, which
+        /// `inillucent::budget` counts.
+        unconverted: Vec<usize>,
         /// A range on the column after the equality prefix.
         low: Option<RangeBound>,
         /// The upper end of that range.
@@ -359,17 +390,23 @@ impl AccessPath {
                 covering,
                 ..
             } => {
-                if equalities.is_empty() && low.is_none() && high.is_none() {
-                    return format!(
-                        "SCAN {table} USING COVERING INDEX {}",
-                        String::from_utf8_lossy(index_name)
-                    );
-                }
                 let kind = if covering.is_some() {
                     "COVERING INDEX"
                 } else {
                     "INDEX"
                 };
+                // A walk with nothing to seek used to be covering by
+                // construction, so this line said so unconditionally. A
+                // partial index and an `INDEXED BY` are walked whole while a
+                // lookup per entry fetches the row, and SQLite says `USING
+                // INDEX` for that: `SELECT * FROM h INDEXED BY h_a` is
+                // `SCAN h USING INDEX h_a` in the pinned 3.53.4 shell.
+                if equalities.is_empty() && low.is_none() && high.is_none() {
+                    return format!(
+                        "SCAN {table} USING {kind} {}",
+                        String::from_utf8_lossy(index_name)
+                    );
+                }
                 let detail = index_seek_detail(
                     index_name,
                     info,
@@ -773,18 +810,7 @@ impl Levers {
 pub fn plan_select_with(select: BoundSelect, levers: Levers) -> PhysicalPlan {
     let mut select = select;
     let compound_arms = core::mem::take(&mut select.compounds);
-    let mut terms = Vec::new();
-    if let Some(filter) = &select.filter {
-        split_conjunction(filter, &mut terms);
-    }
-    for source in &select.sources {
-        if is_outer(source.join) {
-            continue;
-        }
-        if let Some(constraint) = &source.constraint {
-            split_conjunction(constraint, &mut terms);
-        }
-    }
+    let terms = statement_terms(&select);
     // The order the terms are visited in is chosen before their paths are, and
     // then the paths are chosen in that order - because a path may use a value
     // from a term visited earlier, and which terms those are is exactly what the
@@ -833,10 +859,7 @@ pub fn plan_select_with(select: BoundSelect, levers: Levers) -> PhysicalPlan {
             match source.table.module.clone() {
                 Some(_) => choose_path(level, &ids, source, &select, &terms, &mut consumed, levers),
                 None => {
-                    let mut on_terms = Vec::new();
-                    if let Some(constraint) = &source.constraint {
-                        split_conjunction(constraint, &mut on_terms);
-                    }
+                    let on_terms = outer_terms(source);
                     let mut on_consumed = vec![false; on_terms.len()];
                     let chosen = choose_path(
                         level,
@@ -1784,26 +1807,32 @@ pub fn split_conjunction(expr: &BoundExpr, into: &mut Vec<BoundExpr>) {
             operand,
             low,
             high,
-            affinity,
-            collation,
+            low_affinity,
+            low_collation,
+            high_affinity,
+            high_collation,
         } if matches!(
             **operand,
             BoundExpr::Column { .. } | BoundExpr::Rowid { .. }
         ) =>
         {
+            // Each half keeps the affinity and collation of its own bound,
+            // which is what SQLite's two comparisons use (task-2088). The
+            // `between-index*` cases in `differential-part8/task2088.cases`
+            // grade this path with and without `INDEXED BY`.
             into.push(BoundExpr::Compare {
                 op: BinaryOp::GreaterEqual,
                 left: operand.clone(),
                 right: low.clone(),
-                affinity: *affinity,
-                collation: *collation,
+                affinity: *low_affinity,
+                collation: *low_collation,
             });
             into.push(BoundExpr::Compare {
                 op: BinaryOp::LessEqual,
                 left: operand.clone(),
                 right: high.clone(),
-                affinity: *affinity,
-                collation: *collation,
+                affinity: *high_affinity,
+                collation: *high_collation,
             });
         }
         other => into.push(other.clone()),
@@ -1903,11 +1932,30 @@ fn choose_path(
     // b-tree paths because none of them apply: an index a module owns has no
     // key to seek and no range to walk, and the shape it answers - a distance
     // ordered ascending with a `LIMIT` - is one no other path can improve on.
+    let forced = match &source.index_hint {
+        crate::bind::IndexChoice::Only(wanted) => Some(wanted.as_slice()),
+        _ => None,
+    };
     if let Some(path) = vector_path(id, position, source, select) {
-        return path;
+        // `INDEXED BY` a b-tree index rules the probe out like every other
+        // path; `INDEXED BY` the probe's own index is the one way to keep it.
+        let named = match &path {
+            AccessPath::VectorProbe { index, .. } => table
+                .indexes
+                .iter()
+                .find(|held| &held.name == index)
+                .map(|held| held.folded.as_slice()),
+            _ => None,
+        };
+        if forced.is_none() || forced == named {
+            return path;
+        }
     }
     if let Some(module) = table.module.clone() {
         return virtual_path(id, position, ids, source, select, module, terms, consumed);
+    }
+    if forced.is_some() {
+        return forced_path(id, position, ids, source, select, terms, consumed, levers);
     }
     // Every candidate is built against a *copy* of the consumed list, because a
     // path that is not chosen must not leave its predicates marked as handled.
@@ -1919,12 +1967,24 @@ fn choose_path(
     if let Some(path) = rowid_path(id, position, ids, table, terms, &mut trial) {
         candidates.push((path, trial));
     }
-    let mut trial = consumed.to_vec();
-    let needed = select.columns_read(id);
-    if let Some(path) = index_path(
-        id, position, ids, source, terms, &mut trial, &needed, levers,
-    ) {
-        candidates.push((path, trial));
+    // **`NOT INDEXED` removes the index candidates and nothing else.** SQLite's
+    // rule is that the clause prohibits every index on the table while leaving
+    // the INTEGER PRIMARY KEY usable, which is why `rowid_path` above is
+    // unconditional and this is the one candidate the hint takes away.
+    //
+    // `crates/inillucent-cli/src/diagnose.rs` is what this is for. Its integrity
+    // digest reads every table `SELECT * FROM "t" NOT INDEXED`, and its comment
+    // says that is what makes the digest a fact about the rows - which was not
+    // true while the hint was dropped, because a corrupt index would then be
+    // read in place of the table it was meant to be checked against.
+    if source.index_hint != crate::bind::IndexChoice::NotIndexed {
+        let mut trial = consumed.to_vec();
+        let needed = select.columns_read(id);
+        if let Some(path) = index_path(
+            id, position, ids, source, terms, &mut trial, &needed, levers,
+        ) {
+            candidates.push((path, trial));
+        }
     }
     candidates.push((
         AccessPath::TableScan { root: table.root },
@@ -2164,6 +2224,7 @@ pub fn write_path_with(
         return path;
     }
     let source = BoundSource {
+        index_hint: crate::bind::IndexChoice::Any,
         id: source_id,
         rows: SourceRows::Table,
         table: std::rc::Rc::new(table.clone()),
@@ -2266,6 +2327,7 @@ fn rowid_path(
                 low = Some(RangeBound {
                     kind: BoundKind::Greater,
                     value,
+                    unconverted: false,
                 });
                 used.push(index);
             }
@@ -2273,6 +2335,7 @@ fn rowid_path(
                 low = Some(RangeBound {
                     kind: BoundKind::GreaterEqual,
                     value,
+                    unconverted: false,
                 });
                 used.push(index);
             }
@@ -2280,6 +2343,7 @@ fn rowid_path(
                 high = Some(RangeBound {
                     kind: BoundKind::Less,
                     value,
+                    unconverted: false,
                 });
                 used.push(index);
             }
@@ -2287,6 +2351,7 @@ fn rowid_path(
                 high = Some(RangeBound {
                     kind: BoundKind::LessEqual,
                     value,
+                    unconverted: false,
                 });
                 used.push(index);
             }
@@ -2320,6 +2385,10 @@ fn index_path(
     levers: Levers,
 ) -> Option<AccessPath> {
     let table = &source.table;
+    let forced = match &source.index_hint {
+        crate::bind::IndexChoice::Only(wanted) => Some(wanted.as_slice()),
+        _ => None,
+    };
     let context = CandidateContext {
         id,
         position,
@@ -2329,6 +2398,7 @@ fn index_path(
         consumed,
         needed,
         levers,
+        forced: forced.is_some(),
     };
     let mut best: Option<(f64, AccessPath, Vec<usize>)> = None;
     for (at, index) in table.indexes.iter().enumerate() {
@@ -2338,12 +2408,15 @@ fn index_path(
         if index.origin == crate::catalog_view::IndexOrigin::Module {
             continue;
         }
+        if forced.is_some_and(|wanted| wanted != index.folded.as_slice()) {
+            continue;
+        }
         // The expressions this index needs, when the binder could bind them.
         // `None` for every ordinary index, and for one whose schema text did
         // not bind - which leaves a partial index unusable and an expression
         // key unmatched, both the conservative answer.
         let computed = source.index_exprs.iter().find(|held| held.position == at);
-        let usable = index.partial_sql.is_none() || implies(computed, terms);
+        let usable = index_usable(source, at, index, terms);
         if !usable && index.partial_sql.is_some() {
             // **A partial index only holds the rows its predicate accepts.**
             // Using one over a query that does not imply the predicate would
@@ -2409,6 +2482,9 @@ pub(crate) struct CandidateContext<'a> {
     pub(crate) needed: &'a ColumnUse,
     /// The planner's tuning knobs.
     pub(crate) levers: Levers,
+    /// The term was written `INDEXED BY`, so the one index left must produce a
+    /// path even when nothing seeks it: a walk of every entry.
+    pub(crate) forced: bool,
 }
 
 /// Folds one more index candidate into whichever is cheapest so far.
@@ -2453,8 +2529,10 @@ fn index_candidate(
         consumed,
         needed,
         levers,
+        forced,
     } = *context;
     let mut equalities = Vec::new();
+    let mut unconverted = Vec::new();
     let mut used = Vec::new();
     let mut collations = Vec::new();
     let mut descending = Vec::new();
@@ -2483,6 +2561,9 @@ fn index_candidate(
         let Some((term_index, value, column)) = found else {
             break;
         };
+        if terms.get(term_index).is_some_and(compares_unconverted) {
+            unconverted.push(equalities.len());
+        }
         equalities.push(value);
         used.push(term_index);
         collations.push(collation);
@@ -2490,64 +2571,25 @@ fn index_candidate(
         columns.push(column);
         key = key.saturating_add(1);
     }
-    let mut low = None;
-    let mut high = None;
-    if let Some(key_column) = index.columns.get(key) {
-        if let Some(column) = key_column.column {
-            let collation = collation_of(&key_column.collation);
-            for (term_index, term) in terms.iter().enumerate() {
-                if consumed.get(term_index).copied().unwrap_or(false) || used.contains(&term_index)
-                {
-                    continue;
-                }
-                // An anchored pattern is a range; see `plan::pattern`, which
-                // also says why the term is left as a residual (task-1932, M7).
-                if let Some((low_bound, high_bound)) =
-                    pattern::pattern_range(id, column, term, collation, key_column.descending)
-                {
-                    if low.is_none() && high.is_none() {
-                        low = low_bound;
-                        high = high_bound;
-                    }
-                    continue;
-                }
-                let Some((op, value)) = comparison_against_column(id, column, term) else {
-                    continue;
-                };
-                if !is_available(position, ids, &value) || comparison_collation(term) != collation {
-                    continue;
-                }
-                // `low` and `high` are the two ends of the *walk*, not of the
-                // value. A column the index holds descending runs the other
-                // way, so `k > 5` is where its walk starts rather than where it
-                // stops - and reading it as a low bound seeks past every row it
-                // was meant to return. It did: `WHERE k > 5` on a descending
-                // index returned nothing at all, silently, with no ORDER BY
-                // anywhere near it.
-                let (kind, at_low) = match (op, key_column.descending) {
-                    (BinaryOp::Greater, false) => (BoundKind::Greater, true),
-                    (BinaryOp::GreaterEqual, false) => (BoundKind::GreaterEqual, true),
-                    (BinaryOp::Less, false) => (BoundKind::Less, false),
-                    (BinaryOp::LessEqual, false) => (BoundKind::LessEqual, false),
-                    (BinaryOp::Greater, true) => (BoundKind::Less, false),
-                    (BinaryOp::GreaterEqual, true) => (BoundKind::LessEqual, false),
-                    (BinaryOp::Less, true) => (BoundKind::Greater, true),
-                    (BinaryOp::LessEqual, true) => (BoundKind::GreaterEqual, true),
-                    _ => continue,
-                };
-                let slot = if at_low { &mut low } else { &mut high };
-                if slot.is_none() {
-                    *slot = Some(RangeBound { kind, value });
-                    used.push(term_index);
-                }
-            }
-            if low.is_some() || high.is_some() {
-                collations.push(collation);
-                descending.push(key_column.descending);
-                columns.push(Some(column));
-            }
+    // **A range is an outermost-term path only**, the rule `rowid_path` and
+    // `seek_union` already follow and this candidate did not. The physical
+    // pass refuses an inner index seek with a bound, so
+    // `SELECT count(*) FROM s CROSS JOIN h WHERE h.b > 595` was refused with
+    // exit code 3 on the release build, with no hint anywhere (task-2078).
+    // Left unconsumed, the bound is a residual over the pair, which answers.
+    let range = match index.columns.get(key) {
+        Some(key_column) if position == 0 => range::key_range(context, key_column, &mut used),
+        _ => None,
+    };
+    let (low, high) = match range {
+        Some(found) => {
+            collations.push(found.collation);
+            descending.push(found.descending);
+            columns.push(Some(found.column));
+            (found.low, found.high)
         }
-    }
+        None => (None, None),
+    };
     let covering = levers
         .has(Levers::COVERING_INDEX)
         .then(|| covering_slots(table, index, needed, usable))
@@ -2575,6 +2617,7 @@ fn index_candidate(
         && high.is_none()
         && covering.is_none()
         && !partial_walk
+        && !(forced && usable)
     {
         // Nothing to seek to and nothing to save by reading the entries: this
         // index has no part in answering the query.
@@ -2586,6 +2629,7 @@ fn index_candidate(
             index_root: index.root,
             index_name: index.name.clone(),
             equalities,
+            unconverted,
             low,
             high,
             collations,
@@ -2668,7 +2712,7 @@ fn find_equality(
         if consumed.get(index).copied().unwrap_or(false) || used.contains(&index) {
             continue;
         }
-        let Some((op, value)) = comparison_against_column(id, column, term) else {
+        let Some((op, value)) = indexable_comparison(id, column, term) else {
             continue;
         };
         if op != BinaryOp::Equal || !is_available(position, ids, &value) {

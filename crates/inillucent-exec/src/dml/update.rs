@@ -119,6 +119,12 @@ pub struct UpdateSetup {
     /// of one execution only, and each of them counts a read. A setup that
     /// counted one is used for the execution that built it and then thrown away.
     reusable: bool,
+    /// The connection's settings when this was built.
+    ///
+    /// A `%`, a `||` or a scalar call in an assignment holds the length limit
+    /// without counting a read, so a setup built under another limit is built
+    /// again rather than reused - see `Params::settings` (task-2081).
+    settings: crate::scalar::Context,
 }
 /// Runs an `UPDATE`, reusing the setup a previous execution built.
 ///
@@ -379,7 +385,10 @@ fn update_setup(
     catalog: &dyn TreeCatalog,
 ) -> DbResult<std::rc::Rc<UpdateSetup>> {
     if let Some(held) = cache.borrow().as_ref() {
-        if held.reusable && std::rc::Rc::ptr_eq(&held.layout, layout) {
+        if held.reusable
+            && std::rc::Rc::ptr_eq(&held.layout, layout)
+            && held.settings == params.settings()
+        {
             adopt_bindings(&held.bindings, params);
             return Ok(std::rc::Rc::clone(held));
         }
@@ -406,8 +415,7 @@ fn adopt_bindings(bindings: &crate::physical::Bindings, params: &Params) {
     let (Ok(from), Ok(mut held)) = (source.lock(), bindings.lock()) else {
         return;
     };
-    held.clear();
-    held.extend_from_slice(&from);
+    held.copy_from(&from);
 }
 /// Builds everything an `UPDATE` needs before it looks at a row.
 ///
@@ -432,7 +440,7 @@ fn build_update_setup(
     // `crate::correlate` - the same operator a `SELECT` uses, so there is one
     // implementation of what a correlated block means rather than a second in
     // the write path.
-    let correlated = update_correlations(statement, layout)?;
+    let correlated = update_correlations(statement, layout, catalog)?;
     let space = RowSpace::new(&sources_for(statement.source, &statement.triggers), layout)
         .with_correlations(
             &correlated
@@ -450,11 +458,18 @@ fn build_update_setup(
     let mut assignments = Vec::with_capacity(statement.assignments.len());
     let mut projected_slots: Vec<Option<usize>> = Vec::new();
     for assignment in &statement.assignments {
-        let slot = layout
-            .slots
-            .get(usize::from(assignment.column))
-            .copied()
-            .flatten();
+        // A rowid assignment writes the row image's rowid cell, which is the
+        // same cell an INTEGER PRIMARY KEY column is mapped to. That is what
+        // makes `UPDATE t SET rowid = 100` move the row exactly as
+        // `UPDATE t SET id = 100` already did on a table that declares one.
+        let slot = match assignment.rowid {
+            true => layout.rowid,
+            false => layout
+                .slots
+                .get(usize::from(assignment.column))
+                .copied()
+                .flatten(),
+        };
         if joined {
             projected_slots.push(slot);
             continue;
@@ -502,11 +517,13 @@ fn build_update_setup(
         joined,
         bindings: params.bindings(),
         reusable: params.reads() == before,
+        settings: params.settings(),
     })
 }
 fn update_correlations(
     statement: &BoundUpdate,
     layout: &SourceLayout,
+    catalog: &dyn TreeCatalog,
 ) -> DbResult<Vec<crate::correlate::Correlation>> {
     let mut exprs: Vec<&BoundExpr> = statement
         .assignments
@@ -514,7 +531,7 @@ fn update_correlations(
         .map(|assignment| &assignment.value)
         .collect();
     exprs.extend(statement.returning.iter().map(|column| &column.expr));
-    crate::correlate::correlations_in(&exprs, &row_resolver(statement.source, layout))
+    crate::correlate::correlations_in(&exprs, catalog, &row_resolver(statement.source, layout))
 }
 /// Returns how an outer reference maps onto one row image's tree columns.
 ///
@@ -550,10 +567,16 @@ fn answer_correlations(
         return Ok(Vec::new());
     }
     let catalog = target.catalog();
-    let bare = params.without_subqueries();
+    // **One set for every block of this row, written into rather than cloned
+    // per block** (task-2066 §4.3.1). `without_subqueries` copies the whole
+    // parameter vector, and a correlation's own numbers start at 100,000 - so
+    // a statement with two correlated blocks used to copy two hundred thousand
+    // slots to write two of them. Each block writes only its own numbers and
+    // they are past anything a statement can write, so one set is safe.
+    let mut bare = params.without_subqueries();
     let mut answers = Vec::with_capacity(correlated.len());
     for correlation in correlated {
-        answers.push(correlation.answer(catalog, &bare, row)?);
+        answers.push(correlation.answer(catalog, &mut bare, row)?);
     }
     Ok(answers)
 }

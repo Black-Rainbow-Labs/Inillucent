@@ -49,7 +49,7 @@
 //! accounting methods and calling the difference an engine.
 //!
 //! Usage:
-//!   `cargo run -p inillucent-compat --bin inillucent-perfhistory -- [--rounds N] [--dry-run]`
+//!   `cargo run -p inillucent-compat --bin inillucent-perfhistory -- [--rounds N] [--dry-run] [--only PREFIX] [--label NAME]`
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -116,6 +116,39 @@ const SOURCE: &str = "CREATE TABLE source (i INTEGER PRIMARY KEY);\n\
      INSERT INTO source (i) \
        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000) \
        SELECT i FROM n;\n";
+
+/// The table every arm of the index count sweep starts from.
+///
+/// Twenty thousand rows of ten integer columns, each column the row id times its
+/// own prime, so an insert lands in a different leaf of every index. The
+/// indexes are created after the rows are loaded, so they are bulk built on
+/// both engines.
+///
+/// A macro rather than a `const` because `concat!` takes literals, and each arm
+/// is this text followed by its own `CREATE INDEX` statements.
+macro_rules! sweep_table {
+    () => {
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, c0 INTEGER, c1 INTEGER, c2 INTEGER, c3 INTEGER, \
+         c4 INTEGER, c5 INTEGER, c6 INTEGER, c7 INTEGER, c8 INTEGER, c9 INTEGER);\n\
+         INSERT INTO t SELECT i, (i * 7919) % 20000, (i * 104729) % 20000, (i * 1299709) % 20000, \
+         (i * 15485863) % 20000, (i * 3) % 20000, (i * 31) % 20000, (i * 541) % 20000, \
+         (i * 7907) % 20000, (i * 65537) % 20000, (i * 999983) % 20000 FROM source;\n"
+    };
+}
+
+/// The timed half of every arm of the index count sweep: twenty thousand rows
+/// past the seeded ones, in one transaction.
+///
+/// **Twenty thousand rather than five, because SQLite has to be measurable.**
+/// Five thousand rows into a table with no index cost SQLite about 5 ms, which
+/// is half of what starting its shell costs - and the ratio is taken net of
+/// startup, so it was a ratio of two numbers mostly made of noise.
+const SWEEP_INSERT: &str = "BEGIN;\n\
+     INSERT INTO t SELECT i + 20000, ((i + 20000) * 7919) % 20000, ((i + 20000) * 104729) % 20000, \
+     ((i + 20000) * 1299709) % 20000, ((i + 20000) * 15485863) % 20000, ((i + 20000) * 3) % 20000, \
+     ((i + 20000) * 31) % 20000, ((i + 20000) * 541) % 20000, ((i + 20000) * 7907) % 20000, \
+     ((i + 20000) * 65537) % 20000, ((i + 20000) * 999983) % 20000 FROM source;\n\
+     COMMIT;\n";
 
 /// The workloads, chosen to cost different things.
 ///
@@ -206,6 +239,50 @@ const WORKLOADS: &[Workload] = &[
                  COMMIT;\n",
         repeat: 3,
     },
+    // **The index count sweep** (task-2074). Twenty thousand inserts in one
+    // transaction into a twenty thousand row table that carries 0, 2, 5 and 10
+    // secondary indexes. The gate's `write.insert.batch` measures one point of
+    // this curve - its `main_table` has two - and a change to how an index leaf
+    // absorbs writes has to be graded along the curve, because the cost it
+    // attacks is per index. `inillucent-writeprofile --sweep` is the same sweep
+    // in process, with the write path's own counters beside the time.
+    Workload {
+        name: "insert.indexes.0",
+        setup: sweep_table!(),
+        script: SWEEP_INSERT,
+        repeat: 1,
+    },
+    Workload {
+        name: "insert.indexes.2",
+        setup: concat!(
+            sweep_table!(),
+            "CREATE INDEX t_c0 ON t (c0);\nCREATE INDEX t_c1 ON t (c1);\n"
+        ),
+        script: SWEEP_INSERT,
+        repeat: 1,
+    },
+    Workload {
+        name: "insert.indexes.5",
+        setup: concat!(
+            sweep_table!(),
+            "CREATE INDEX t_c0 ON t (c0);\nCREATE INDEX t_c1 ON t (c1);\n",
+            "CREATE INDEX t_c2 ON t (c2);\nCREATE INDEX t_c3 ON t (c3);\nCREATE INDEX t_c4 ON t (c4);\n"
+        ),
+        script: SWEEP_INSERT,
+        repeat: 1,
+    },
+    Workload {
+        name: "insert.indexes.10",
+        setup: concat!(
+            sweep_table!(),
+            "CREATE INDEX t_c0 ON t (c0);\nCREATE INDEX t_c1 ON t (c1);\n",
+            "CREATE INDEX t_c2 ON t (c2);\nCREATE INDEX t_c3 ON t (c3);\nCREATE INDEX t_c4 ON t (c4);\n",
+            "CREATE INDEX t_c5 ON t (c5);\nCREATE INDEX t_c6 ON t (c6);\nCREATE INDEX t_c7 ON t (c7);\n",
+            "CREATE INDEX t_c8 ON t (c8);\nCREATE INDEX t_c9 ON t (c9);\n"
+        ),
+        script: SWEEP_INSERT,
+        repeat: 1,
+    },
 ];
 
 /// What one arm of one round cost.
@@ -221,9 +298,22 @@ struct Reading {
 
 /// Runs the history and appends its rows.
 fn main() -> std::process::ExitCode {
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let mut arguments: Vec<String> = std::env::args().skip(1).collect();
+    // **Pinned before anything is timed, and the mask recorded in every row
+    // (task-2085).** Unpinned, the two shells of one round can run on
+    // different core classes of a hybrid processor, and a history whose rows
+    // were taken on different hardware says nothing about the engine.
+    let placement = match inillucent_compat::affinity::pin_from_arguments(&mut arguments) {
+        Ok(placement) => placement,
+        Err(reason) => {
+            eprintln!("inillucent-perfhistory: {reason}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     let mut rounds = DEFAULT_ROUNDS;
     let mut dry_run = false;
+    let mut only: Option<String> = None;
+    let mut label: Option<String> = None;
     let mut index = 0usize;
     while let Some(argument) = arguments.get(index) {
         index += 1;
@@ -243,13 +333,45 @@ fn main() -> std::process::ExitCode {
                 }
             }
             "--dry-run" => dry_run = true,
+            // **A prefix of the workload names, so one series can be taken on
+            // its own.** The index count sweep is graded before and after a
+            // leaf format change, and each reading of it wants a quiet machine;
+            // running the other eight workloads with it doubles how long the
+            // machine has to be kept quiet for.
+            "--only" => {
+                let Some(value) = arguments.get(index) else {
+                    eprintln!("`--only` needs a workload name prefix");
+                    return std::process::ExitCode::FAILURE;
+                };
+                index += 1;
+                only = Some(value.clone());
+            }
+            // **A name for the build, appended to the commit column.** Two arms
+            // of a before and after are often built from one working tree - one
+            // of them with a change switched off - and both would otherwise be
+            // recorded as the same `<commit>-dirty`, which is a history that
+            // cannot say which row measured what.
+            "--label" => {
+                let Some(value) = arguments.get(index) else {
+                    eprintln!("`--label` needs a name");
+                    return std::process::ExitCode::FAILURE;
+                };
+                index += 1;
+                label = Some(value.clone());
+            }
             other => {
                 eprintln!("unknown option `{other}`");
                 return std::process::ExitCode::FAILURE;
             }
         }
     }
-    match run(rounds, dry_run) {
+    match run(
+        rounds,
+        dry_run,
+        only.as_deref(),
+        label.as_deref(),
+        &placement,
+    ) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(reason) => {
             eprintln!("inillucent-perfhistory: {reason}");
@@ -262,7 +384,16 @@ fn main() -> std::process::ExitCode {
 ///
 /// @param rounds - how many times to run each arm
 /// @param dry_run - print the rows instead of appending them
-fn run(rounds: usize, dry_run: bool) -> Result<(), String> {
+/// @param only - a prefix of the workload names to run, or every workload
+/// @param label - a name for the build, recorded after the commit
+/// @param placement - the processors both shells run on, recorded in every row
+fn run(
+    rounds: usize,
+    dry_run: bool,
+    only: Option<&str>,
+    label: Option<&str>,
+    placement: &inillucent_compat::affinity::Placement,
+) -> Result<(), String> {
     let root = workspace_root();
     let ours = shell_path(&root, "inillucent-shell")
         .ok_or("inillucent-shell is not built; run `cargo build --release -p inillucent-cli`")?;
@@ -273,9 +404,13 @@ fn run(rounds: usize, dry_run: bool) -> Result<(), String> {
         .map_err(|error| format!("cannot make {}: {error}", area.display()))?;
 
     let calibration_before = calibrate();
-    let commit = commit_hash(&root);
+    let commit = match label {
+        Some(name) => format!("{}+{name}", commit_hash(&root)),
+        None => commit_hash(&root),
+    };
     let stamp = timestamp();
     let machine = machine_name();
+    let cores = placement.row_field();
     let mut rows = Vec::new();
 
     // What starting each process costs, measured the same way and interleaved
@@ -302,7 +437,10 @@ fn run(rounds: usize, dry_run: bool) -> Result<(), String> {
         theirs_base.wall, theirs_base.cpu, theirs_base.peak,
     );
 
-    for workload in WORKLOADS {
+    for workload in WORKLOADS
+        .iter()
+        .filter(|workload| only.is_none_or(|prefix| workload.name.starts_with(prefix)))
+    {
         let mut ours_readings = Vec::new();
         let mut theirs_readings = Vec::new();
         // Interleaved: each round runs both arms back to back, so anything else
@@ -331,6 +469,7 @@ fn run(rounds: usize, dry_run: bool) -> Result<(), String> {
             stamp: stamp.clone(),
             commit: commit.clone(),
             machine: machine.clone(),
+            cores: cores.clone(),
             workload: workload.name,
             rounds,
             ours: ours_total,
@@ -365,7 +504,7 @@ fn run(rounds: usize, dry_run: bool) -> Result<(), String> {
         );
     }
 
-    let history = root.join("tests/performance-history.tsv");
+    let history = root.join(HISTORY);
     let text = render(&rows, calibration_before, calibration_after);
     if dry_run {
         println!("\n--- would append to {} ---\n{text}", history.display());
@@ -384,6 +523,9 @@ struct Row {
     commit: String,
     /// Which machine it ran on.
     machine: String,
+    /// The core class and affinity mask both shells ran on,
+    /// `performance:0xC03C03`.
+    cores: String,
     /// The workload's name.
     workload: &'static str,
     /// How many rounds the median came from.
@@ -490,13 +632,16 @@ fn run_fresh(program: &Path, directory: &Path, script: &str) -> Result<Reading, 
 /// @param script - what to feed it on standard input
 fn time_only(program: &Path, path: &Path, script: &str) -> Result<Reading, String> {
     let started = Instant::now();
-    let mut child = Command::new(program)
-        .arg(path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("cannot start {}: {error}", program.display()))?;
+    // Started through the affinity check (task-2085): a shell running on other
+    // processors from this program is refused rather than timed.
+    let mut child = inillucent_compat::affinity::spawn_on_same_cores(
+        Command::new(program)
+            .arg(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+        &program.display().to_string(),
+    )?;
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
         stdin
@@ -642,7 +787,7 @@ fn render(rows: &[Row], before: f64, after: f64) -> String {
         let ours = row.ours.net_of(&row.ours_startup);
         let theirs = row.theirs.net_of(&row.theirs_startup);
         text.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.3}\t{:.3}\t{:.3}\t{:.1}\t{:.3}\n",
+            "{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.3}\t{:.3}\t{:.3}\t{:.1}\t{:.3}\t{}\n",
             row.stamp,
             row.commit,
             row.machine,
@@ -661,6 +806,7 @@ fn render(rows: &[Row], before: f64, after: f64) -> String {
             ratio(row.theirs.peak, row.ours.peak),
             before,
             ratio(after, before),
+            row.cores,
         ));
     }
     text
@@ -692,7 +838,12 @@ const HEADER: &str = "# The performance history: what each workload costs, besid
      # loop timed again afterwards, divided by the first - a row whose drift is far from\n\
      # 1.000 was taken on a machine that changed under it and should be distrusted.\n\
      #\n\
-     stamp\tcommit\tmachine\tworkload\trounds\tours_wall_ms\tours_cpu_ms\tours_peak_mib\tsqlite_wall_ms\tsqlite_cpu_ms\tsqlite_peak_mib\tstartup_ours_wall_ms\tstartup_sqlite_wall_ms\twall_ratio\tcpu_ratio\trss_ratio\tcalibration_ms\tdrift\n";
+     # `cores` is the core class and affinity mask both shells ran on, such as\n\
+     # `performance:0xC03C03`. The program pins itself to one class of a hybrid processor\n\
+     # before timing, and `--cores any` records `any:<mask>` for a run left unpinned.\n\
+     # Rows written before task-2085 have no `cores` value and were not pinned.\n\
+     #\n\
+     stamp\tcommit\tmachine\tworkload\trounds\tours_wall_ms\tours_cpu_ms\tours_peak_mib\tsqlite_wall_ms\tsqlite_cpu_ms\tsqlite_peak_mib\tstartup_ours_wall_ms\tstartup_sqlite_wall_ms\twall_ratio\tcpu_ratio\trss_ratio\tcalibration_ms\tdrift\tcores\n";
 
 /// Appends the rows, writing the header when the file is new.
 ///
@@ -716,14 +867,56 @@ fn append(path: &Path, text: &str) -> Result<(), String> {
 
 /// Returns this workspace's shell, release build preferred.
 ///
+/// **Beside this binary first, because `target/` beside the manifest is only
+/// the default.** A `.cargo/config.toml` can move it to another drive, which is
+/// what an agent worktree does to keep its builds off the repository - and this
+/// then looked for a shell that was never going to be there and refused with
+/// `inillucent-shell is not built` against a shell that was. `run-nightly.ps1`
+/// carries the same note for the same reason; it asks `cargo metadata`, and this
+/// does not need to: the shell is built by the same command that built this, so
+/// it lands in the same directory.
+///
+/// The `root/target` arms are kept for a caller that built the shell and not
+/// this - `cargo run --bin inillucent-perfhistory` from a checkout with no
+/// override puts both in the same place anyway, so they cost nothing and cover
+/// the case where the two were built separately.
+///
 /// @param root - the workspace root
 /// @param name - the binary's name
 fn shell_path(root: &Path, name: &str) -> Option<PathBuf> {
+    // **Three places, most specific first** - task-2068 and task-2076 both hit
+    // this and fixed it differently, and both reasons are right.
+    //
+    // *Beside this binary*, because the shell is built by the same command that
+    // built this one and lands in the same directory. This is the arm that works
+    // when a worktree's `.cargo/config.toml` moves the target directory without
+    // exporting anything, which is the usual case and the one that produced
+    // `inillucent-shell is not built` against a shell that was.
+    //
+    // *`CARGO_TARGET_DIR`*, for a caller that built the shell into a directory
+    // this binary does not sit in. Looking only under the workspace root either
+    // found nothing or found a shell the main checkout built from other source,
+    // and the second is a history row about somebody else's code.
+    //
+    // *`<root>/target`*, which is cargo's default and what a plain checkout has.
+    let named = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    let mut places = Vec::new();
+    if let Some(beside) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    {
+        places.push(beside);
+    }
+    if let Some(held) = std::env::var_os("CARGO_TARGET_DIR") {
+        for profile in ["release", "debug"] {
+            places.push(PathBuf::from(&held).join(profile));
+        }
+    }
     for profile in ["release", "debug"] {
-        let path = root
-            .join("target")
-            .join(profile)
-            .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        places.push(root.join("target").join(profile));
+    }
+    for place in places {
+        let path = place.join(&named);
         if path.is_file() {
             return Some(path);
         }
@@ -758,15 +951,51 @@ fn commit_hash(root: &Path) -> String {
     }
     // A dirty tree is not the commit it says it is, and a history row that
     // claimed otherwise would be unreproducible in the most misleading way.
+    //
+    // **Except this file, which this program is the one writing** (task-2066
+    // §4.5.2). Taking a reading twice and keeping the second is the standing
+    // practice on this machine, and the first run appends here - so the second
+    // run read its own output as an uncommitted change and recorded
+    // `<commit>-dirty` about code that was committed. A row that says dirty when
+    // nothing but the history moved sends a reader looking for a change that is
+    // not there, which is the same class of misleading the check exists to
+    // prevent.
     match Command::new("git")
         .current_dir(root)
         .args(["status", "--porcelain"])
         .output()
     {
-        Ok(status) if !status.stdout.is_empty() => format!("{text}-dirty"),
+        Ok(status) => {
+            match anything_but_the_history_changed(&String::from_utf8_lossy(&status.stdout)) {
+                true => format!("{text}-dirty"),
+                false => text,
+            }
+        }
         _ => text,
     }
 }
+
+/// Whether `git status --porcelain` reports anything but the history itself.
+///
+/// A porcelain line is two status characters, a space, and the path, so the
+/// path begins at the fourth byte. A line naming anything else - or a line this
+/// cannot read the path out of, which is the conservative answer - makes the
+/// tree dirty.
+///
+/// @param porcelain - what `git status --porcelain` printed
+fn anything_but_the_history_changed(porcelain: &str) -> bool {
+    porcelain
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .any(|line| !line.get(3..).is_some_and(|path| path.trim() == HISTORY))
+}
+
+/// Where the history lives, relative to the workspace root.
+///
+/// Named once because two things read it: the writer, and the dirty check in
+/// [`commit_hash`], which has to recognise its own output among the changes git
+/// reports.
+const HISTORY: &str = "tests/performance-history.tsv";
 
 /// The environment variable a machine labels its own rows with.
 const MACHINE_LABEL_VAR: &str = "INILLUCENT_MACHINE";
@@ -853,6 +1082,53 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The history's own row does not make the tree dirty, and anything else does.**
+    ///
+    /// Taking a reading twice and keeping the second is the practice on this
+    /// machine, and the first run appends to the history - so without this the
+    /// second run reads its own output as an uncommitted change and records
+    /// `<commit>-dirty` about code that was committed (task-2066 section 4.5.2).
+    /// A row that says dirty when nothing but the history moved sends a reader
+    /// looking for a change that is not there.
+    ///
+    /// Both directions, because a check that answered `false` to everything
+    /// would pass the first half and be the more dangerous mistake: it would
+    /// record a clean commit for a tree with uncommitted code in it.
+    #[test]
+    fn only_the_history_moving_leaves_the_commit_clean() {
+        assert!(!anything_but_the_history_changed(""));
+        assert!(!anything_but_the_history_changed(
+            " M tests/performance-history.tsv
+"
+        ));
+        assert!(!anything_but_the_history_changed(
+            "M  tests/performance-history.tsv
+
+"
+        ));
+
+        assert!(anything_but_the_history_changed(
+            " M crates/inillucent-core/src/bm25.rs
+"
+        ));
+        assert!(anything_but_the_history_changed(
+            " M tests/performance-history.tsv
+ M crates/inillucent-core/src/bm25.rs
+"
+        ));
+        // A file whose name merely contains the history's is a different file.
+        assert!(anything_but_the_history_changed(
+            " M tests/performance-history.tsv.bak
+"
+        ));
+        // A line too short to hold a path is unreadable, and unreadable is
+        // dirty rather than clean.
+        assert!(anything_but_the_history_changed(
+            "??
+"
+        ));
+    }
 
     /// The date arithmetic has to be right, or every row is stamped wrongly and
     /// the history cannot be read in order.

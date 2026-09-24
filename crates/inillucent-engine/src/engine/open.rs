@@ -183,16 +183,27 @@ impl crate::ImportedDatabase {
             // which one a caller gets without asking, and the answer is now the
             // one every other SQLite gives.
             //
-            // `exclusive` because it does not. The same gate with
-            // `locking_mode = normal` as the default reads **3.03x with a lower
-            // bound of 2.95x - under the contract's 3.00x bar** - and takes
-            // `write` from 1.94x to 1.19x, `transaction` from 0.89x to 0.37x
-            // and `schema` from 1.34x to 0.66x, because releasing the file
-            // between statements means re-reading the meta record before each
-            // one. `PRAGMA locking_mode = normal` is a real switch and a second
-            // process can then open the file; making it the default would pay
-            // for that on every statement of every program that never opens a
-            // second connection.
+            // **The second half of this comment argued for `exclusive` as the
+            // default, and the default is `normal` - it has been since task-1980
+            // and the comment was never corrected** (task-2000, design 1d). It
+            // said `locking_mode = normal` took the weighted headline to 3.03x
+            // with `write` at 1.19x, `transaction` at 0.37x and `schema` at
+            // 0.66x, and concluded that a program which never opens a second
+            // connection should not pay for one that does. What settled it the
+            // other way is that a default a second process cannot share is not a
+            // default an embedded database can ship, and the multi-process
+            // protocol task-1979 and task-1980 built is what the roadmap
+            // advertises.
+            //
+            // Those numbers were also a measurement of one particular commit
+            // path, not of the mode. What made `normal` expensive was that a
+            // statement's release *folded the log into the file*: six to eight
+            // fsync class calls a statement, with a rollback journal protecting
+            // the fold's in place page writes. Design 1 of task-2000 took the
+            // fold off the release path - a commit is one log append and one
+            // sync, and the fold runs every four mebibytes of log - so the mode
+            // costs the two cheap staleness checks `enter_within` makes and
+            // nothing else.
             counters: std::rc::Rc::new(Counters {
                 last_rowid: std::cell::Cell::new(0),
                 last_changes: std::cell::Cell::new(0),
@@ -205,6 +216,7 @@ impl crate::ImportedDatabase {
                 statement_cache_limit: std::cell::Cell::new(plans::DEFAULT_STATEMENT_CACHE),
                 compiles: std::cell::Cell::new(0),
                 scratch_ast: std::cell::RefCell::new(None),
+                scratch_binder: std::cell::RefCell::new(None),
                 index_stages: std::cell::Cell::new(StageTimings::default()),
             }),
             writing: std::rc::Rc::new(Writing::starting_at(1)),
@@ -292,6 +304,23 @@ impl crate::ImportedDatabase {
             )
         });
         self.storage.database.pool().set_journal(journal);
+        // **And the fold's protection follows the mode** (task-2000, design 1a).
+        // Under `wal` the fold appends an after image of every page it is about
+        // to write to the log it already has, so it asks the journal for
+        // nothing; the journal stays in place for an eviction, which is undo and
+        // needs a pre image. See `Pool::fold_protected_by_log`.
+        self.storage
+            .database
+            .pool()
+            .set_fold_protected_by_log(mode == inillucent_pool::journal::JournalMode::Wal);
+        // **And the owner replays whenever this cache is thrown away**
+        // (task-2000, design 1b). With the fold lazy, a connection holds dirty
+        // pages between statements, so a take where another process has folded
+        // finds a cache that is stale and dirty at once. `resync_from_file`
+        // replays the log from the file's own checkpoint on every such take,
+        // which is what makes dropping those frames rather than refusing them
+        // lose nothing. See `Database::replayed_by_its_owner`.
+        self.storage.database.set_replayed_by_its_owner(true);
         Ok(())
     }
 
@@ -518,6 +547,7 @@ impl crate::ImportedDatabase {
                 statement_cache_limit: std::cell::Cell::new(plans::DEFAULT_STATEMENT_CACHE),
                 compiles: std::cell::Cell::new(0),
                 scratch_ast: std::cell::RefCell::new(None),
+                scratch_binder: std::cell::RefCell::new(None),
                 index_stages: std::cell::Cell::new(StageTimings::default()),
             }),
             writing: std::rc::Rc::new(Writing::starting_at(highest_txn.saturating_add(1))),
@@ -573,8 +603,43 @@ impl crate::ImportedDatabase {
         opened.reconnect_modules()?;
         opened.rebuild_tables()?;
         opened.refresh_catalog();
+        // **The tail is given back only now, because every step above can
+        // refuse** (task-2070). See `header_accounts_for_every_object`.
+        if !read_only
+            && header_accounts_for_every_object(&opened.schema.entries, &opened.storage.database)
+        {
+            opened.storage.database.give_back_the_unclaimed_tail()?;
+        }
         Ok(opened)
     }
+}
+
+/// Reports whether every page the catalog names lies inside the page count the
+/// meta record carries.
+///
+/// **What makes giving the file's tail back safe** (task-2070).
+/// `Database::give_back_the_unclaimed_tail` cuts the file to
+/// `page_count * page_size`, and `page_count` comes from the meta record - so a
+/// meta record that is behind the file turns the trim from reclaiming a tail
+/// nothing owns into deleting pages the catalog is pointing at. Measured: a
+/// database of 360,448 bytes carrying the meta record its *creation* wrote came
+/// back as 131,072 bytes, the four pages that record describes, with its
+/// catalog still naming a table rooted in the part that had just been deleted.
+///
+/// Leaving the tail in place instead costs a file longer than it needs to be,
+/// which the next checkpoint's own count reclaims. That is the cheaper of the
+/// two wrong answers by a wide margin, and it is why this skips rather than
+/// refuses: a database that opens and reads correctly is not one to turn away
+/// over its length.
+///
+/// @param entries - the catalog rows this open read
+/// @param database - the file they were read from
+pub(crate) fn header_accounts_for_every_object(
+    entries: &[Recorded],
+    database: &inillucent_pool::Database,
+) -> bool {
+    let count = database.pool().page_count();
+    entries.iter().all(|held| held.entry.root.0 < count)
 }
 
 /// Returns a built tree's shape as the catalog records it.

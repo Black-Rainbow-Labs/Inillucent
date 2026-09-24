@@ -160,6 +160,19 @@ pub struct Recovered {
     pub scanned: u64,
     /// How many records the second pass applied.
     pub applied: u64,
+    /// How many records the replay **dropped** rather than applied.
+    ///
+    /// **Separate from `applied`, because it used to be counted in it**
+    /// (task-2066 §4.1.10). A `Redo` that answers `Ok(())` without applying a
+    /// record - which is what the engine's applier does for a record naming a
+    /// tree it has no shape for - was indistinguishable here from one that
+    /// applied it. A recovery that silently dropped rows reported the same
+    /// numbers as one that did not, and `PRAGMA integrity_check` answered `ok`
+    /// on the result.
+    ///
+    /// Filled by the caller after the replay, from the applier, because only
+    /// the applier knows: this loop sees an `Ok` either way.
+    pub dropped: u64,
     /// How many transactions committed.
     pub committed: u64,
     /// How many transactions were open at the end of the log and were discarded.
@@ -201,6 +214,10 @@ pub fn recover(
     let chain = read_chain(vfs, base, &start)?;
     let analysis = analyse(&chain, &start)?;
     let mut outcome = Recovered {
+        // Filled by the caller after the replay, from the applier - this loop
+        // cannot tell a dropped record from an applied one. See
+        // `Recovered::dropped`.
+        dropped: 0,
         next_lsn: analysis.valid_end,
         sequence: analysis.last_sequence,
         latest_cts: analysis.latest_cts,
@@ -423,7 +440,12 @@ fn analyse(chain: &Chain, start: &RecoveryStart) -> DbResult<Analysis> {
     let mut valid_end = start.checkpoint_lsn;
     let mut last_sequence = start.sequence.max(1);
 
-    for index in 0..chain.segments.len() {
+    // **One exit, labelled, rather than a copy of the report per reason.** The
+    // scan stops for four, and the two below were missing: a hole broke the
+    // inner loop and let the outer one carry on into the next segment, and a
+    // record claiming bytes past its segment did the same (task-2066 section
+    // 4.2, item 18).
+    'scan: for index in 0..chain.segments.len() {
         last_sequence = chain.sequence(index);
         let body = chain.body(index);
         let first = chain.first_lsn(index);
@@ -438,6 +460,27 @@ fn analyse(chain: &Chain, start: &RecoveryStart) -> DbResult<Analysis> {
         while let Some(tail) = body.get(at..) {
             let decoded = match Record::decode(tail) {
                 Ok(Some(record)) => record,
+                // **A length word of all zeros is padding if the rest of the
+                // segment is zeroes too, and a hole if it is not.** A segment
+                // is rolled when the next record does not fit, so the tail of
+                // every rolled segment is zeroes by design and the LSN stream
+                // runs over it. Zeroes with records after them are a dropped
+                // sector, and stepping over one replays a later record without
+                // the earlier one it depends on - the property this module's
+                // second invariant exists to prevent.
+                Ok(None)
+                    if !body
+                        .get(at..)
+                        .is_none_or(|rest| rest.iter().all(|byte| *byte == 0)) =>
+                {
+                    stopped_because = Some(format!(
+                        "segment {}: the records stop {} bytes before its end and more \
+                         bytes follow the gap",
+                        chain.sequence(index),
+                        body.len().saturating_sub(at)
+                    ));
+                    break 'scan;
+                }
                 Ok(None) => break,
                 Err(error) => {
                     stopped_because = Some(format!(
@@ -446,18 +489,7 @@ fn analyse(chain: &Chain, start: &RecoveryStart) -> DbResult<Analysis> {
                         valid_end,
                         error.detail().unwrap_or("damaged")
                     ));
-                    return Ok(Analysis {
-                        losers: count_losers(&open, &committed, &aborted),
-                        committed,
-                        aborted,
-                        valid_end,
-                        last_sequence,
-                        latest_cts,
-                        scanned,
-                        stopped_because,
-                        last_checkpoint,
-                        highest_txn,
-                    });
+                    break 'scan;
                 }
             };
             let expected = first.saturating_add(at as u64);
@@ -471,18 +503,7 @@ fn analyse(chain: &Chain, start: &RecoveryStart) -> DbResult<Analysis> {
                     chain.sequence(index),
                     decoded.lsn
                 ));
-                return Ok(Analysis {
-                    losers: count_losers(&open, &committed, &aborted),
-                    committed,
-                    aborted,
-                    valid_end,
-                    last_sequence,
-                    latest_cts,
-                    scanned,
-                    stopped_because,
-                    last_checkpoint,
-                    highest_txn,
-                });
+                break 'scan;
             }
             scanned = scanned.saturating_add(1);
             highest_txn = highest_txn.max(decoded.txn);
@@ -525,6 +546,18 @@ fn analyse(chain: &Chain, start: &RecoveryStart) -> DbResult<Analysis> {
             }
             at = at.saturating_add(decoded.length);
             valid_end = expected.saturating_add(decoded.length as u64);
+        }
+        // **And a record claiming more bytes than the segment has.** The loop
+        // above ends when `body.get(at..)` is `None`, which is the same shape
+        // as reaching the end exactly - so an overrun looked like a clean
+        // finish and the scan moved on.
+        if at > body.len() {
+            stopped_because = Some(format!(
+                "segment {}: a record claims {} bytes past the end of the segment",
+                chain.sequence(index),
+                at.saturating_sub(body.len())
+            ));
+            break 'scan;
         }
     }
     Ok(Analysis {

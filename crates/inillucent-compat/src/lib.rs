@@ -27,18 +27,28 @@
 // Running the shipped programs as processes, and reading what they printed.
 // Every end-to-end suite added by task-1969 section 5 goes through it, so the
 // way a binary is found and a JSON envelope is read is written once.
+// Which processors a measurement runs on, and pinning both arms of a gate to
+// one core class (task-2085).
+pub mod affinity;
 pub mod cliproc;
 pub mod corpus;
 pub mod crashcampaign;
+pub mod damage;
 pub mod differential;
+pub mod durable;
 pub mod facade;
 pub mod fixtures;
 pub mod hash;
 pub mod history;
 pub mod interchange;
+pub mod interop;
 pub mod layering;
+pub mod ledger;
 pub mod manifest;
+pub mod matrix;
+pub mod mcpclient;
 pub mod model;
+pub mod nikaya;
 /// The rearchitected engine, which now lives in `inillucent-engine`.
 ///
 /// **Moved rather than copied.** Phases 1 to 4 built the new
@@ -52,11 +62,18 @@ pub mod obligations;
 pub mod oracle;
 pub mod perf;
 pub mod procstat;
+pub mod quiet;
 pub mod rendering;
 pub mod report;
 pub mod results;
 pub mod selection;
 pub mod slt;
+pub mod stories;
+// Running one child and knowing when to stop waiting for it. `Command::output`
+// waits for the child's pipes to close rather than for the child to exit, which
+// are different events as soon as anything inherits a handle - and the runner
+// sat on that difference with no verdict and no exit code at all (task-2071).
+pub mod supervise;
 pub mod syntax;
 pub mod toml_lite;
 pub mod verdict;

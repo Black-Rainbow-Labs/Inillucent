@@ -18,6 +18,23 @@
 //! journal leaves nothing on disk beside the database, which is what an
 //! application shipping a database as one file needs.
 //!
+//! **And since task-2000 the fold no longer runs on every commit**, in this mode
+//! or any other, which makes the paragraph below true of the whole of a
+//! connection's life rather than of the gap between an eviction and the next
+//! statement. A commit is an append to the log and a sync of it; the fold happens
+//! when the log passes `RECLAIM_BYTES`, when somebody asks for a checkpoint, or
+//! when the connection is dropped, and this journal protects it whenever it runs.
+//! That is the same protection as before and it covers the same moment - what
+//! changed is how often that moment arrives.
+//!
+//! One thing did go with the per-commit fold, and it is named here because a test
+//! used to assert it. An eager fold left every acknowledged commit in the log
+//! *and* in the data file, so a device that acknowledges a write and stores half
+//! of it could lose one copy and not both. That was redundancy - the second write
+//! and the second sync - rather than anything this journal did, and
+//! `durability.rs`'s short write campaign is where the argument and the
+//! measurement now live.
+//!
 //! **In `delete` mode that is true after a checkpoint, not after a commit**,
 //! and the difference is visible to the same application. A journal is created
 //! by the first page this connection writes back, which is a checkpoint or an
@@ -487,6 +504,38 @@ impl Journal {
     /// @param page - the page about to be overwritten
     pub fn wants(&self, page: PageId) -> bool {
         self.mode.is_rollback() && !self.saved.contains(&page.0)
+    }
+
+    /// Reports whether this journal could put this page back.
+    ///
+    /// **The question a bulk build has to ask before it writes a page straight
+    /// into the data file** (task-2055). Such a page's contents are in the file
+    /// and in no log record, so a replay of this journal restores the page's
+    /// previous life and nothing anywhere can rebuild what was written over it.
+    /// See `inillucent_tree`'s `write_built_page`, which logs the page instead
+    /// when the answer is yes.
+    ///
+    /// The exact complement of [`Journal::wants`] within a rollback mode: a page
+    /// this journal wants a pre-image of is one it has not got, and a page it
+    /// does not want is one it already holds.
+    ///
+    /// @param page - the page about to be written
+    pub fn holds(&self, page: PageId) -> bool {
+        self.mode.is_rollback() && self.saved.contains(&page.0)
+    }
+
+    /// Reports whether this journal would be hot to the next open.
+    ///
+    /// **A durable mode with pre-images in it, and nothing else.** `memory`
+    /// keeps its pre-images in this process and writes none, so it is never on
+    /// the disk for an open to find; `wal` and `off` are not rollback journals
+    /// at all.
+    ///
+    /// Asked by the fold a connection does on its way out - see
+    /// `ImportedDatabase::fold_on_close` - because a journal is disposed of by
+    /// [`Journal::finish`] and only a checkpoint reaches it (task-2055).
+    pub fn is_hot(&self) -> bool {
+        self.mode.is_durable() && !self.saved.is_empty()
     }
 
     /// Returns the pre-images a `memory` journal is holding.

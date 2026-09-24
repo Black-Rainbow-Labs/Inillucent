@@ -111,12 +111,110 @@
 //! the test binaries and runs it with one test thread, so its own guards do not
 //! contend with each other either.
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use inillucent_engine::connect::{Connection, Database};
+use inillucent_engine::connect::{Connection, Database, Statement};
 use inillucent_sql::plan::Levers;
 use inillucent_tree::datum::OwnedDatum;
+
+thread_local! {
+    /// How many allocations the calling thread has made.
+    ///
+    /// **Per thread rather than per process, so another test cannot move it.**
+    /// A `#[global_allocator]` sees every allocation in the binary, and this
+    /// file's guards run one at a time only because the runner asks for one
+    /// test thread. A counter that depended on that would read whatever a
+    /// parallel `cargo test --test budget` happened to be doing, which is the
+    /// class of number this file exists to refuse.
+    ///
+    /// `const`-initialised and holding a type with no destructor, so reading it
+    /// from inside the allocator cannot itself allocate.
+    static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// An allocator that counts per thread, and otherwise delegates to the system one.
+struct CountingAllocator;
+
+// SAFETY: every method forwards to the system allocator with the same
+// arguments; the counter is the only addition and it touches no memory the
+// allocator owns.
+unsafe impl GlobalAlloc for CountingAllocator {
+    // SAFETY: the layout is the caller's, forwarded unchanged.
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        count_one();
+        // SAFETY: forwarded unchanged to the system allocator.
+        unsafe { System.alloc(layout) }
+    }
+
+    // SAFETY: the pointer and layout are the ones this allocator handed out.
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        // SAFETY: forwarded unchanged to the allocator that made the pointer.
+        unsafe { System.dealloc(pointer, layout) }
+    }
+
+    // SAFETY: the pointer and layout are the ones this allocator handed out.
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        count_one();
+        // SAFETY: forwarded unchanged to the allocator that made the pointer.
+        unsafe { System.realloc(pointer, layout, size) }
+    }
+}
+
+/// Adds one to the calling thread's count, if the thread still has one.
+///
+/// `try_with` rather than `with`, because a thread being torn down has already
+/// dropped its locals and an allocation made after that must not panic inside
+/// the allocator.
+fn count_one() {
+    let _ = ALLOCATIONS.try_with(|count| count.set(count.get().saturating_add(1)));
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+/// Returns how many allocations the calling thread made while running a closure.
+///
+/// @param body - the work to count
+fn allocations(body: impl FnOnce()) -> u64 {
+    let before = ALLOCATIONS.with(Cell::get);
+    body();
+    ALLOCATIONS.with(Cell::get).saturating_sub(before)
+}
+
+/// How many times a statement run outside a transaction may read both meta
+/// slots in full.
+///
+/// **Zero, and the margin is deliberately absent.** A statement outside a
+/// transaction takes the file lock, asks whether another process has folded
+/// since this connection last held it, and gives the lock back. Asking that
+/// question by reading both slots in full allocates and zeroes a buffer one
+/// page long for each slot, reads a whole page into each, and checksums both,
+/// and nothing
+/// about a file that has not changed needs any of it - the record's own 116
+/// bytes, compared against the ones this connection last read and verified,
+/// answer it. One is not a rounding of zero here: one means a caller went back
+/// to the full read, and the only reason to is that the file moved.
+const META_READS_PER_UNCHANGED_STATEMENT: u64 = 0;
+
+/// How many times a statement run outside a transaction may read the record's
+/// own bytes.
+///
+/// One per statement, because one lock acquisition is one chance for another
+/// process to have written. Two means the two callers that ask - the pool's
+/// `begin_read` and the engine's `the_meta_moved` - have stopped sharing the
+/// answer they both make under the same SHARED lock, which no writer can hold
+/// at the same time.
+const META_PROBES_PER_UNCHANGED_STATEMENT: u64 = 1;
+
+/// How many statements each arm of
+/// [`a_statement_outside_a_transaction_rereads_nothing`] runs.
+///
+/// Enough that one stray read would be visible against a bound of zero, and
+/// small enough that the guard costs nothing.
+const RUNS: u64 = 200;
 
 /// How many rows the guards build their table from.
 ///
@@ -124,6 +222,118 @@ use inillucent_tree::datum::OwnedDatum;
 /// enough that the whole file stays in the page pool and the guard is measuring
 /// the engine rather than the disk.
 const ROWS: i64 = 20_000;
+
+/// How many allocations compiling `SELECT 1` may make on a warm connection.
+///
+/// **Exactly what this reads, with no margin, and that is deliberate.** Three
+/// runs of the guard taken while four agents were building this repository
+/// returned 15 every time - an allocation count is a property of the code path
+/// rather than of the machine, so there is no run-to-run movement for a margin
+/// to absorb. A margin would only buy room for a regression to hide in: each of
+/// the four changes task-2026 made is worth between one and three allocations
+/// here, so a bound of 18 would let two of them be undone silently.
+///
+/// The standard library decides how a vector grows, and `rust-toolchain.toml`
+/// pins the toolchain, so an upgrade is the one thing that can move this
+/// number without the engine changing. It is a deliberate edit when it
+/// happens, and the assertion prints what it read.
+/// **Sixteen rather than fifteen since task-2066 §4.3.5.** A compiled `SELECT`
+/// carries its result column names now, decoded once, behind an `Rc` - and
+/// that `Rc` is the one allocation. What it buys is the `Vec` and the `String`
+/// per column that every *execution* used to build: `SELECT 1` stepped through
+/// a connection made 11 allocations a step before and makes 8 now, which
+/// [`STEP_ALLOCATIONS`] records. A statement stepped twice is already ahead.
+const TRIVIAL_COMPILE_ALLOCATIONS: u64 = 16;
+
+/// How many allocations one step of `SELECT 1` may make through a connection.
+///
+/// **Eight, and it was eleven until task-2066 section 4.3.5.** A cached
+/// `SELECT` rebuilt its result column names on every execution - a `Vec` and a
+/// `String` per column - and they are `plan.select.columns`'s own names, which
+/// cannot change between executions of one compiled statement. They are
+/// decoded once at compile now and handed out behind an `Rc`.
+///
+/// Exactly what this reads, with no margin, for the reason
+/// [`TRIVIAL_COMPILE_ALLOCATIONS`] gives: an allocation count is a property of
+/// the code path rather than of the machine, so there is no run-to-run movement
+/// for a margin to absorb, and a margin is room for a regression to hide in.
+const STEP_ALLOCATIONS: u64 = 8;
+
+/// How many allocations compiling `SELECT id FROM t WHERE email = ?1` may make
+/// on a warm connection.
+///
+/// Higher than [`TRIVIAL_COMPILE_ALLOCATIONS`] because this statement names
+/// things and `SELECT 1` does not.
+///
+/// **120 when this guard was written, 92 since task-2039.** Interning a name
+/// cost four allocations - the written spelling copied out of the source, the
+/// folded key, and the map's owned key cloned twice - and it cost them on a
+/// name the arena already held, because the lookup had to build the key it
+/// looked up with. `Ast::interned` is keyed on a hash of the spelling and
+/// quote form now, so a hit allocates nothing, and `Ast::clear` keeps the
+/// names' byte buffers instead of dropping them, so a warm compile does not
+/// buy them again.
+///
+/// **Twenty-eight rather than the fourteen the statement's own three names
+/// account for**, because compiling it also reparses the `CREATE TABLE` text
+/// the catalog stores, and that declaration names every column of the table.
+/// It is the same saving twice over, and it is why this guard is worth more
+/// than the profile of one statement: `inillucent-prepareprofile` reads 93 to
+/// 79 on the gate's path, and the path an application takes saves twice that.
+///
+/// Read exactly, with no margin, for the reason
+/// [`TRIVIAL_COMPILE_ALLOCATIONS`] gives.
+/// **Ninety-three rather than ninety-two since task-2066 section 4.3.5**, for
+/// the same one `Rc` [`TRIVIAL_COMPILE_ALLOCATIONS`] gained and the same reason.
+const POINT_COMPILE_ALLOCATIONS: u64 = 93;
+
+/// How many more allocations a compile makes when the in-process embedder is
+/// compiled in.
+///
+/// **The two bounds above are not one number, they are two, and which one
+/// applies is decided by a cargo feature (task-2039).** `inillucent-engine/embed`
+/// registers the retrieval engine's embedder so `embed(TEXT)` answers, and a
+/// compile then costs three allocations more - the same three whatever the
+/// statement is, so `SELECT 1` reads 15 without it and 18 with it, the point
+/// statement reads 92 and 95, and even the cold first compile reads 674 and
+/// 677.
+///
+/// It is not academic and it is why this is here rather than in a comment.
+/// `inillucent-testrun` builds the workspace twice: once with default features,
+/// and once more with every feature the selected suites ask for, which for any
+/// ordinary selection includes `inillucent-engine/embed`. The binary it then
+/// runs this guard from is the second one. So the numbers a developer sees from
+/// `cargo test -p inillucent --test budget` and the numbers the runner sees are
+/// three apart, and a bound written from either one alone is wrong in the other
+/// - which is how this guard came to fail in a 158-target run while passing
+/// every way it was checked by hand.
+///
+/// Widening the bounds by three to cover both was the other option and is worse:
+/// it would leave three allocations of room for a regression to hide in on the
+/// build most people run, which is the argument
+/// [`TRIVIAL_COMPILE_ALLOCATIONS`] already makes against a margin. So the guard
+/// asks the engine which build it is in and stays exact in both.
+const EMBEDDER_COMPILE_ALLOCATIONS: u64 = 3;
+
+/// Reports whether this build has the in-process embedder compiled in.
+///
+/// Asked of the running engine rather than read from a `cfg`, because the
+/// feature belongs to `inillucent-engine` and this crate's tests are compiled
+/// without it being named on *this* package - `--features inillucent-engine/embed`
+/// turns the engine's embedder on and sets no `cfg` here at all, so
+/// `#[cfg(feature = "embed")]` would read false in exactly the build that needs
+/// it to read true.
+///
+/// `embed(TEXT)` is the function the feature registers, so a statement that
+/// calls it binds in one build and fails to bind in the other. It is asked on
+/// its own connection so that the arena this warms is not the one the guard is
+/// about to measure a cold compile on.
+///
+/// @param database - the database the guard is running against
+fn embedder_is_compiled_in(database: &Database) -> bool {
+    let connection = database.session();
+    connection.prepare("SELECT embed('probe')").is_ok()
+}
 
 /// Returns a fresh, empty directory for one test's files.
 ///
@@ -187,6 +397,14 @@ fn build(path: &PathBuf) -> Database {
 fn fetches(database: &Database) -> u64 {
     let stats = database.cache_stats();
     stats.hits.saturating_add(stats.misses)
+}
+
+/// Runs a statement from the beginning and reads its row.
+///
+/// @param statement - the prepared statement
+fn step_once(statement: &mut Statement<'_>) {
+    statement.reset();
+    assert!(statement.step().expect("the statement steps"));
 }
 
 /// Inserts `count` rows of one integer column, one statement per row.
@@ -754,5 +972,223 @@ fn a_keyset_page_costs_the_same_wherever_it_starts() {
          {start} page(s) and one near the end fetched {end}, against \
          {materialised} for the whole range; the guard asks the start for at \
          most four times the end"
+    );
+}
+
+/// Compiling a statement again does not re-allocate the scratch the last
+/// compile filled, and one compile's allocations are a small fixed number.
+///
+/// **An allocation count is the one absolute number this file is allowed to
+/// assert.** Everything else here is a ratio, because a duration is a reading
+/// of the machine. This is not: the same code compiling the same statement
+/// makes the same allocations on an idle box and on a saturated one, so the
+/// bound below is tight on purpose rather than loose on principle. When it
+/// fails, something changed what a compile does - and the new number belongs in
+/// this test rather than the bound being widened to admit it.
+///
+/// What it guards, all of which were paid on every compile before task-2026:
+/// the binder re-allocating its scope stack and its alias list instead of
+/// taking the connection's `BinderScratch`; `finish_select` cloning the result
+/// columns to hand `bind_order_by` a copy of something it only reads;
+/// `Shape::operators` rendering the operator chain as text for a caller that
+/// drops it; and the alias list being filled for a statement with no `GROUP
+/// BY`, `HAVING`, `ORDER BY`, `LIMIT` or `OFFSET` to read one.
+///
+/// The plan cache is switched off, because a cached prepare is a hash lookup
+/// and would report a compile as costing nothing. `prepare.trivial` on the
+/// scorecard compiles on every iteration for the same reason.
+#[test]
+fn compiling_again_reuses_the_scratch_rather_than_allocating_it_afresh() {
+    let directory = scratch("compile-allocations");
+    let database = build(&directory.join("b.rdb"));
+    let connection = database.session();
+    connection
+        .disable_optimizations(Levers::without(Levers::PLAN_CACHE))
+        .expect("the engine is free");
+
+    // The two shapes `open.prepare` is made of: a statement that names nothing,
+    // and one that reads a table through a parameter.
+    let trivial = "SELECT 1";
+    let point = "SELECT id FROM t WHERE email = ?1";
+
+    let compile = |sql: &str| {
+        let statement = connection.prepare(sql).expect("the statement prepares");
+        drop(statement);
+    };
+
+    // The first compile on a connection fills the parse arena and the binder's
+    // scratch as well as doing the work, so it is read here rather than
+    // described: the run that asserts the guard contains the number the guard
+    // is against.
+    let cold = allocations(|| compile(trivial));
+    for _ in 0..20 {
+        compile(trivial);
+        compile(point);
+    }
+    let warm_trivial = allocations(|| compile(trivial));
+    let warm_point = allocations(|| compile(point));
+
+    // Asked after the measurements, on a connection of its own: the probe
+    // compiles a statement, and doing that first would warm the arena the cold
+    // reading above depends on being cold.
+    let embedder = match embedder_is_compiled_in(&database) {
+        true => EMBEDDER_COMPILE_ALLOCATIONS,
+        false => 0,
+    };
+    let trivial_bound = TRIVIAL_COMPILE_ALLOCATIONS.saturating_add(embedder);
+    let point_bound = POINT_COMPILE_ALLOCATIONS.saturating_add(embedder);
+
+    // The runner gives this tier `--show-output`, so the numbers the guard was
+    // measured at are in the log of every run rather than only in this comment.
+    println!("compile allocations, warm connection, plan cache off:");
+    println!("  embedder compiled in: {}", embedder > 0);
+    println!("  {trivial:<34} cold {cold:>4}, warm {warm_trivial:>4} (bound {trivial_bound})");
+    println!("  {point:<34}             warm {warm_point:>4} (bound {point_bound})");
+
+    assert!(
+        warm_trivial < cold,
+        "the first compile of `{trivial}` on a fresh connection made {cold} \
+         allocation(s) and a later one made {warm_trivial}; the guard asks the \
+         later one for fewer, which is what reusing the arena and the binder's \
+         scratch means"
+    );
+    assert!(
+        warm_trivial <= trivial_bound,
+        "compiling `{trivial}` made {warm_trivial} allocation(s) against a bound \
+         of {trivial_bound}"
+    );
+    assert!(
+        warm_point <= point_bound,
+        "compiling `{point}` made {warm_point} allocation(s) against a bound of \
+         {point_bound}"
+    );
+}
+
+/// A statement outside a transaction rereads nothing the file has not changed.
+///
+/// **The guard task-2046 exists to leave behind.** `SELECT 1` through
+/// `Connection` cost 132,884 nanoseconds outside a transaction and 1,126 inside
+/// one, on the same connection over the same file, with nothing differing
+/// between the two but an open `BEGIN` - 118 times, and about 132 microseconds
+/// in absolute terms. Every application that uses the shipped API without
+/// wrapping its reads in an explicit transaction paid it, per statement, and
+/// nothing measured it: `inillucent-fullgate`, which is what the scorecard and
+/// the performance contract are graded with, drives the engine's own `plan`,
+/// `prepare` and `pipeline` calls and never opens a connection, so the cost was
+/// invisible to every number this project publishes.
+///
+/// Eighty-nine of those microseconds were the meta record being read twice a
+/// statement, a whole page at a time, to compare 116 bytes. The rest was the
+/// Windows lock release unlocking two byte ranges a handle at SHARED does not
+/// hold.
+///
+/// **It is a count and not a ratio of two clocks**, for the reason this file's
+/// own header gives at length: the ratio it would assert reads between 1.18 and
+/// 59.22 for one unchanged commit depending on what else is on the box, and a
+/// threshold that survives that is a threshold that guards nothing. These two
+/// counts read the same on an idle machine and on a saturated one, and each
+/// names one thing the fix removed rather than the sum of both.
+///
+/// **What it does not see:** a cost that is neither of these counts. A future
+/// change that reads the slots into a buffer it keeps, or that adds a third
+/// syscall to the take, moves neither number. `inillucent-prepareperf`'s
+/// breakdown table is where the whole per-statement cost is still visible, and
+/// its `+step` and `+step in txn` columns are the measurement this guard is
+/// derived from rather than a second copy of.
+#[test]
+fn a_statement_outside_a_transaction_rereads_nothing() {
+    let directory = scratch("implicit-transaction");
+    let database = build(&directory.join("b.rdb"));
+    let connection = database.session();
+    let mut statement = connection
+        .prepare("SELECT 1")
+        .expect("the statement prepares");
+
+    // The first run of a fresh statement reads the slots in full, because this
+    // connection has not yet written down the bytes it is going to compare
+    // against. That is once per connection and it is not what the guard is
+    // about, so it happens before the counters are read.
+    step_once(&mut statement);
+
+    let before = database.cache_stats();
+    let outside_allocations = allocations(|| step_once(&mut statement));
+    for _ in 0..(RUNS - 1) {
+        step_once(&mut statement);
+    }
+    let after = database.cache_stats();
+    let meta_reads = after.meta_reads.saturating_sub(before.meta_reads);
+    let meta_probes = after.meta_probes.saturating_sub(before.meta_probes);
+
+    connection
+        .execute_batch("BEGIN")
+        .expect("the transaction opens");
+    let inside_allocations = allocations(|| step_once(&mut statement));
+    let inside_before = database.cache_stats();
+    for _ in 0..RUNS {
+        step_once(&mut statement);
+    }
+    let inside_after = database.cache_stats();
+    connection
+        .execute_batch("COMMIT")
+        .expect("the transaction commits");
+    let inside_reads = inside_after
+        .meta_reads
+        .saturating_sub(inside_before.meta_reads);
+    let inside_probes = inside_after
+        .meta_probes
+        .saturating_sub(inside_before.meta_probes);
+
+    // The runner gives this tier `--show-output`, so the numbers are in the log
+    // of every run and not only in the comment above.
+    println!("`SELECT 1` stepped {RUNS} times through a connection:");
+    println!(
+        "  outside a transaction: {meta_reads} full meta read(s), \
+         {meta_probes} record read(s), {outside_allocations} allocation(s) \
+         for one step"
+    );
+    println!(
+        "  inside one:            {inside_reads} full meta read(s), \
+         {inside_probes} record read(s), {inside_allocations} allocation(s) \
+         for one step"
+    );
+
+    assert_eq!(
+        inside_reads, 0,
+        "a statement inside a transaction read both meta slots in full \
+         {inside_reads} time(s) over {RUNS} statements; a transaction holds \
+         the file from its first statement to its commit, so there is no lock \
+         acquisition for a staleness check to belong to"
+    );
+    assert_eq!(
+        inside_probes, 0,
+        "a statement inside a transaction read the meta record \
+         {inside_probes} time(s) over {RUNS} statements, against none"
+    );
+    assert!(
+        meta_reads <= META_READS_PER_UNCHANGED_STATEMENT.saturating_mul(RUNS),
+        "{RUNS} statements outside a transaction read both meta slots in \
+         full {meta_reads} time(s), against \
+         {META_READS_PER_UNCHANGED_STATEMENT} per statement; nothing wrote the \
+         file between them"
+    );
+    assert!(
+        meta_probes <= META_PROBES_PER_UNCHANGED_STATEMENT.saturating_mul(RUNS),
+        "{RUNS} statements outside a transaction read the meta record \
+         {meta_probes} time(s), against \
+         {META_PROBES_PER_UNCHANGED_STATEMENT} per statement"
+    );
+    assert!(
+        outside_allocations <= inside_allocations,
+        "one step outside a transaction made {outside_allocations} \
+         allocation(s) and one inside a transaction made {inside_allocations}; \
+         taking and giving back the file lock is not work that allocates"
+    );
+    // **A number, because the assertion above is a comparison** (task-2066
+    // section 4.3.5). Both sides of it moved together when a `SELECT`'s result
+    // column names were built on every execution, so three allocations a step
+    // could be added without it noticing. This reads what one step costs.
+    assert!(
+        inside_allocations <= STEP_ALLOCATIONS,
+        "one step of `SELECT 1` made {inside_allocations} allocation(s) against a bound of {STEP_ALLOCATIONS}"
     );
 }

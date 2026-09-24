@@ -1,0 +1,9 @@
+# The Nikaya stories that are known to fail, and the ticket that owns each.
+#
+# One per line: `<story>::<arm>`, a tab, and the ticket. `story_nikaya.rs` reads
+# it when a reopened database does not pass its own check.
+#
+# **An entry that no longer describes a failure is itself a failure**, so when
+# the ticket lands the story goes red until the line is removed. That is the
+# rule from task-1969 section 4: a fixed defect left listed reads as coverage
+# and is not.

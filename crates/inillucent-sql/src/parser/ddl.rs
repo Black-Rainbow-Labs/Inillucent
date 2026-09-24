@@ -6,6 +6,8 @@
 //! it writes `sqlite_schema`, and a reordered constraint list is a schema that
 //! no longer round-trips.
 
+use inillucent_base::limits::Limit;
+
 use super::Parser;
 use crate::ast::{
     AlterAction, ColumnConstraint, ColumnDef, CreateTableBody, ForeignKeyAction, ForeignKeyClause,
@@ -76,6 +78,21 @@ impl Parser<'_> {
                 constraints.push((named, self.parse_table_constraint()?));
             } else {
                 columns.push(self.parse_column_def()?);
+                // **Charged here, the way a result set is charged in
+                // `parse_result_columns`** (task-2066 section 4.2, item 21).
+                // `Limit::Column` was enforced on what a `SELECT` returns and
+                // on nothing a table declares, so a 2,100-column
+                // `CREATE TABLE` succeeded here and was refused by SQLite
+                // with "too many columns"; at about five thousand it failed
+                // with "the mini-columns do not fit in one page", which is
+                // the right outcome for the wrong reason and says nothing a
+                // caller can act on.
+                if columns.len() as i64 > self.limits.get(Limit::Column) {
+                    return Err(ParseError::new(
+                        ParseErrorKind::LimitExceeded("too many columns on table"),
+                        Span::at(self.cursor()),
+                    ));
+                }
             }
             if !self.eat(Punctuator::Comma)? {
                 break;
@@ -679,7 +696,46 @@ impl Parser<'_> {
                 Span::at(self.cursor()),
             ));
         }
+        self.refuse_trigger_index_hint(&statement)?;
         Ok(statement)
+    }
+
+    /// Refuses `INDEXED BY` and `NOT INDEXED` on the target of an `UPDATE` or
+    /// `DELETE` in a trigger body, in SQLite's words.
+    ///
+    /// Both used to be accepted and stored, and `INDEXED BY` was not even
+    /// checked for an index that exists, because a trigger body is only bound
+    /// when the trigger fires: `CREATE TRIGGER t AFTER INSERT ON s BEGIN DELETE
+    /// FROM h INDEXED BY nope; END` created a trigger here, and the pinned
+    /// 3.53.4 shell refuses it with the message below. A `SELECT` in a body
+    /// may still carry either clause, as it may there.
+    /// @param statement - one statement of the trigger body
+    fn refuse_trigger_index_hint(&self, statement: &Statement) -> Result<(), ParseError> {
+        let target = match statement {
+            Statement::Update(update) => update.target,
+            Statement::Delete(delete) => delete.target,
+            _ => return Ok(()),
+        };
+        let Some(term) = self.ast.from_term(target) else {
+            return Ok(());
+        };
+        let clause = match term.source {
+            crate::ast::FromSource::Table {
+                indexed_by: crate::ast::IndexHint::IndexedBy(_),
+                ..
+            } => "INDEXED BY",
+            crate::ast::FromSource::Table {
+                indexed_by: crate::ast::IndexHint::NotIndexed,
+                ..
+            } => "NOT INDEXED",
+            _ => return Ok(()),
+        };
+        Err(ParseError::new(
+            ParseErrorKind::Refused(format!(
+                "the {clause} clause is not allowed on UPDATE or DELETE statements within triggers"
+            )),
+            Span::default(),
+        ))
     }
 
     /// Parses `CREATE VIRTUAL TABLE`, whose module arguments are opaque text.

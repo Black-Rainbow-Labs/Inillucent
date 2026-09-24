@@ -132,9 +132,7 @@ fn succeeded(verb: &str, ran: &Ran) {
 /// and the exact one is the promise AGENTS.md makes about the JSON object.
 #[test]
 fn query_returns_rows_and_an_exact_total() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "query");
     let ran = run(
         &binary,
@@ -162,9 +160,7 @@ fn query_returns_rows_and_an_exact_total() {
 /// `exec` reports the number of rows it changed.
 #[test]
 fn exec_reports_the_rows_it_changed() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "exec");
     let ran = run(
         &binary,
@@ -184,9 +180,7 @@ fn exec_reports_the_rows_it_changed() {
 /// `batch` runs several statements as one transaction.
 #[test]
 fn batch_runs_several_statements_as_one_transaction() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "batch");
     let path = database.to_string_lossy().to_string();
     let ran = run(
@@ -223,9 +217,7 @@ fn batch_runs_several_statements_as_one_transaction() {
 /// `run` drives the shell, dot commands and all.
 #[test]
 fn run_drives_the_shell_including_dot_commands() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "run");
     let ran = run(
         &binary,
@@ -247,14 +239,124 @@ fn run_drives_the_shell_including_dot_commands() {
     assert_eq!(text_field(&ran.stdout, "command"), "run", "{}", ran.stdout);
 }
 
+/// **`run` exits 1 on a statement the shell refused, the way `exec` does.**
+///
+/// It used to answer `Ok` with a `shell_reported_an_error` field beside the
+/// printed text, so `inillucent run "SELECT * FROM nothing;"` exited 0 while
+/// `inillucent exec` on the same statement exits 1 - and the same refusal over
+/// MCP came back with `"isError": false`, so an agent branching on the status
+/// was told the command had run (task-2066 section 4.2, item 27). The other
+/// four verbs that drive the shell go through `command::verbs::dot`, which has
+/// reported this as a failure all along.
+///
+/// The second half is what stops the fix from being a verb that fails on
+/// everything: a script that works still exits 0, which the case above this
+/// one already asserts and this one asserts again beside its failure so the
+/// pair is read together.
+#[test]
+fn run_reports_a_failing_statement_as_a_failure() {
+    let binary = program("inillucent");
+    let database = populated(&binary, "run-failing");
+    let refused = run(
+        &binary,
+        &[
+            "--db",
+            &database.to_string_lossy(),
+            "run",
+            "SELECT * FROM nothing;",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(
+        refused.code, 1,
+        "`run` on a statement the shell refused exited {}:
+{}
+{}",
+        refused.code, refused.stdout, refused.stderr
+    );
+    let said = format!("{}{}", refused.stdout, refused.stderr);
+    assert!(
+        said.contains("nothing"),
+        "the refusal did not name the table that is not there:
+{said}"
+    );
+
+    let ran = run(
+        &binary,
+        &[
+            "--db",
+            &database.to_string_lossy(),
+            "run",
+            "SELECT count(*) FROM note;",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(
+        ran.code, 0,
+        "`run` on a statement that works exited {}:
+{}
+{}",
+        ran.code, ran.stdout, ran.stderr
+    );
+}
+
+/// A `.once` in a script handed to `run` writes its file.
+///
+/// **The defect `export --out` was reported for was the shell's, not the
+/// export verb's (task-2044), and this is where the rest of it showed.**
+/// `run` collects what the script printed, `.once` opens a file, and `say`
+/// preferred the collecting caller - so the file was created, stayed empty,
+/// and the rows came back in `text` instead, with nothing reporting that the
+/// redirect the script asked for had not happened. Any command that collects
+/// output from a script a caller wrote has the same shape, which is why this
+/// case is on `run` rather than only on `export`.
+#[test]
+fn run_writes_the_file_a_once_in_the_script_names() {
+    let binary = program("inillucent");
+    let database = populated(&binary, "run-once");
+    let file = database
+        .parent()
+        .map(|directory| directory.join("redirected.txt"))
+        .expect("the fixture is in a directory");
+    let script = format!(
+        ".once \"{}\"\nSELECT body FROM note ORDER BY id;\n.print done",
+        file.to_string_lossy()
+    );
+    let ran = run(
+        &binary,
+        &[
+            "--db",
+            &database.to_string_lossy(),
+            "run",
+            &script,
+            "--output",
+            "json",
+        ],
+    );
+    succeeded("run", &ran);
+    let found = std::fs::read_to_string(&file)
+        .unwrap_or_else(|error| panic!("`.once` through `run` wrote no file: {error}"));
+    assert!(
+        found.contains("hello") && found.contains("goodbye"),
+        "`.once` through `run` left the file without the rows in it: {found:?}"
+    );
+    // `.once` covers the next statement only, so what the caller collected is
+    // the line printed after it and not the rows.
+    let printed = text_field(&ran.stdout, "text");
+    assert!(
+        printed.contains("done") && !printed.contains("goodbye"),
+        "the redirected rows came back in the report as well:\n{printed}"
+    );
+}
+
 // --- the verbs that describe the database -----------------------------------
 
 /// `create` makes a file, and says which one.
 #[test]
 fn create_makes_a_file_and_names_it() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = area("create").join("fresh.rdb");
     let ran = run(
         &binary,
@@ -275,9 +377,7 @@ fn create_makes_a_file_and_names_it() {
 /// `tables` lists the tables that are there.
 #[test]
 fn tables_lists_the_tables_that_are_there() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "tables");
     let ran = run(
         &binary,
@@ -303,9 +403,7 @@ fn tables_lists_the_tables_that_are_there() {
 /// `describe` returns one row per column, with the column names as its own.
 #[test]
 fn describe_returns_one_row_per_column() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "describe");
     let ran = run(
         &binary,
@@ -339,9 +437,7 @@ fn describe_returns_one_row_per_column() {
 /// `schema` returns the statement that would recreate the table.
 #[test]
 fn schema_returns_the_statement_that_recreates_the_table() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "schema");
     let ran = run(
         &binary,
@@ -364,9 +460,7 @@ fn schema_returns_the_statement_that_recreates_the_table() {
 /// `indexes` names the index that was created.
 #[test]
 fn indexes_names_the_index_that_was_created() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "indexes");
     let ran = run(
         &binary,
@@ -392,9 +486,7 @@ fn indexes_names_the_index_that_was_created() {
 /// `databases` names the main database and its file.
 #[test]
 fn databases_names_the_main_database_and_its_file() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "databases");
     let ran = run(
         &binary,
@@ -417,9 +509,7 @@ fn databases_names_the_main_database_and_its_file() {
 /// `explain` returns a plan naming the table it would read.
 #[test]
 fn explain_returns_a_plan_naming_the_table() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "explain");
     let ran = run(
         &binary,
@@ -448,9 +538,7 @@ fn explain_returns_a_plan_naming_the_table() {
 /// `functions` lists a built-in by name.
 #[test]
 fn functions_lists_a_builtin_by_name() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "functions");
     let ran = run(
         &binary,
@@ -477,9 +565,7 @@ fn functions_lists_a_builtin_by_name() {
 /// `capabilities` reports every row with a support value.
 #[test]
 fn capabilities_reports_every_row_with_a_support_value() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let ran = run(&binary, &["capabilities", "--output", "json"]);
     succeeded("capabilities", &ran);
     assert_eq!(
@@ -510,9 +596,7 @@ fn capabilities_reports_every_row_with_a_support_value() {
 /// `version` reports the version this binary was built at.
 #[test]
 fn version_reports_the_version_it_was_built_at() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let ran = run(&binary, &["version", "--output", "json"]);
     succeeded("version", &ran);
     let reported = text_field(&ran.stdout, "cli");
@@ -527,9 +611,7 @@ fn version_reports_the_version_it_was_built_at() {
 /// `help` lists every verb the registry holds.
 #[test]
 fn help_lists_every_verb_the_registry_holds() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let ran = run(&binary, &["help", "--output", "json"]);
     succeeded("help", &ran);
     let listed: Vec<String> = rows(&ran.stdout)
@@ -553,9 +635,7 @@ fn help_lists_every_verb_the_registry_holds() {
 /// `import` loads a CSV file and says how many rows it took.
 #[test]
 fn import_loads_a_csv_file() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "import");
     let csv = database.with_file_name("rows.csv");
     // Both columns, because `import` maps a file's columns onto the table's by
@@ -598,12 +678,19 @@ fn import_loads_a_csv_file() {
     );
 }
 
-/// `export` writes the rows it was asked for, in the format it was asked for.
+/// `export` with no file answers the rows it was asked for, in the format it
+/// was asked for.
+///
+/// **This case passed the whole time `export --out` wrote nothing
+/// (task-2044).** It reads the `text` field, and `text` was where the rows
+/// went whether or not a file had been named - the shell's `.once` opened the
+/// file and the collecting caller took every line - so the one assertion here
+/// was true in exactly the arrangement that was broken. A file is asserted on
+/// by reading the file, which is what
+/// `export_to_a_file_writes_the_rows_in_every_format` below does.
 #[test]
 fn export_writes_the_rows_in_the_format_asked_for() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "export");
     let ran = run(
         &binary,
@@ -627,12 +714,195 @@ fn export_writes_the_rows_in_the_format_asked_for() {
     );
 }
 
+/// `export --out` puts the rows in the file, in every format it offers.
+///
+/// **Read back off the disk, never out of the command's own report.** The
+/// report said `"ok": true` with `"wrote": "<path>"` over a zero byte file in
+/// all eight formats, so a case that believes what the command says about
+/// itself is the case that cannot see this defect. What each format is checked
+/// for is a value from the row - `goodbye` is in the table and in no header,
+/// no rule and no column name - and the file's size, because an empty file
+/// contains every substring nobody looked for.
+#[test]
+fn export_to_a_file_writes_the_rows_in_every_format() {
+    let binary = program("inillucent");
+    let database = populated(&binary, "export-out");
+    // The database's own directory, not a second `area` call: `area` empties
+    // what it returns, and asking for this one again would delete the fixture
+    // that was just built in it.
+    let directory = database
+        .parent()
+        .map(Path::to_path_buf)
+        .expect("the fixture is in a directory");
+    // Every format the verb accepts, and for each one something that is only
+    // in the rows. `line` writes `body = goodbye`, `insert` writes it as a
+    // quoted literal, and the drawn modes pad it, so the value alone is what
+    // they have in common.
+    for format in [
+        "csv", "json", "tabs", "markdown", "insert", "quote", "line", "html",
+    ] {
+        let file = directory.join(format!("rows.{format}"));
+        let named = file.to_string_lossy().into_owned();
+        let ran = run(
+            &binary,
+            &[
+                "--db",
+                &database.to_string_lossy(),
+                "export",
+                "--table",
+                "note",
+                "--out",
+                &named,
+                "--format",
+                format,
+                "--output",
+                "json",
+            ],
+        );
+        succeeded("export", &ran);
+        let found = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("`export --format {format}` wrote no file: {error}"));
+        assert!(
+            !found.is_empty(),
+            "`export --format {format}` created the file and left it empty, while reporting:\n{}",
+            ran.stdout
+        );
+        assert!(
+            found.contains("goodbye") && found.contains("hello"),
+            "`export --format {format}` wrote a file without the rows in it:\n{found}"
+        );
+        // The count in the report is the count of rows, not of lines: `line`
+        // mode writes two lines to the row and `markdown` writes a rule.
+        assert_eq!(
+            number_field(&ran.stdout, "total"),
+            2.0,
+            "`export --format {format}` did not report the two rows it wrote:\n{}",
+            ran.stdout
+        );
+        assert_eq!(
+            number_field(&ran.stdout, "bytes"),
+            found.len() as f64,
+            "`export --format {format}` reported a size the file does not have:\n{}",
+            ran.stdout
+        );
+        // And the rows are in the file rather than in both places. A million
+        // row export that also carried a million rows back through the report
+        // is a copy of the table nobody asked for.
+        let reported = text_field(&ran.stdout, "text");
+        assert!(
+            !reported.contains("goodbye"),
+            "`export --format {format}` repeated the rows in its report as well as writing \
+             them:\n{reported}"
+        );
+        assert!(
+            reported.contains(&named),
+            "`export --format {format}` did not say where it wrote:\n{reported}"
+        );
+    }
+}
+
+/// `export --out` of a table with no rows reports no rows, over a file that
+/// is not empty.
+///
+/// **The one case that separates a count of rows from a count of lines.** A
+/// header is written whatever the table holds, so an implementation that read
+/// its number back out of the file would say one row here, and the caller
+/// checking whether the export found anything would be told it had.
+#[test]
+fn export_to_a_file_of_an_empty_table_reports_no_rows() {
+    let binary = program("inillucent");
+    let database = populated(&binary, "export-empty");
+    let file = database
+        .parent()
+        .map(|directory| directory.join("none.csv"))
+        .expect("the fixture is in a directory");
+    // A query that matches nothing rather than a second table, so the case
+    // needs no fixture of its own and the columns are the ones above.
+    let ran = run(
+        &binary,
+        &[
+            "--db",
+            &database.to_string_lossy(),
+            "export",
+            "--sql",
+            "SELECT id, body FROM note WHERE id < 0",
+            "--out",
+            &file.to_string_lossy(),
+            "--output",
+            "json",
+        ],
+    );
+    succeeded("export", &ran);
+    let found = std::fs::read_to_string(&file).expect("the export wrote a file");
+    assert_eq!(
+        found, "id,body\r\n",
+        "a query matching nothing wrote something other than its header: {found:?}"
+    );
+    assert_eq!(
+        number_field(&ran.stdout, "total"),
+        0.0,
+        "the header was counted as a row:\n{}",
+        ran.stdout
+    );
+    assert_eq!(
+        number_field(&ran.stdout, "bytes"),
+        found.len() as f64,
+        "the reported size is not the file's:\n{}",
+        ran.stdout
+    );
+}
+
+/// A CSV file `export --out` writes ends its records the way the reference
+/// does, with one carriage return.
+///
+/// **Measured against the pinned 3.53.4 shell rather than assumed.** Its CSV
+/// mode ends a record with CR LF and it writes that through a text-mode C
+/// stream, so what arrives on standard output on Windows is CR CR LF - and
+/// this shell reproduces that, deliberately. Its *file* is not such a stream,
+/// so `.once out.csv` on the reference holds plain CR LF. This wrote the
+/// standard-output form into the file and into the text an agent reads back,
+/// which matched neither destination of the thing it replaces.
+#[test]
+fn export_to_a_csv_file_ends_records_the_way_the_reference_does() {
+    let binary = program("inillucent");
+    let database = populated(&binary, "export-crlf");
+    let file = database
+        .parent()
+        .map(|directory| directory.join("rows.csv"))
+        .expect("the fixture is in a directory");
+    let ran = run(
+        &binary,
+        &[
+            "--db",
+            &database.to_string_lossy(),
+            "export",
+            // Ordered, because the record separator is what this case is
+            // about and the order rows come back in is not: `SELECT * FROM
+            // note` is free to walk the index on `body`, and does.
+            "--sql",
+            "SELECT id, body FROM note ORDER BY id",
+            "--out",
+            &file.to_string_lossy(),
+            "--format",
+            "csv",
+            "--output",
+            "json",
+        ],
+    );
+    succeeded("export", &ran);
+    let bytes = std::fs::read(&file).expect("the export wrote a file");
+    let found = String::from_utf8_lossy(&bytes).into_owned();
+    assert_eq!(
+        found, "id,body\r\n1,hello\r\n2,goodbye\r\n",
+        "the CSV file does not hold RFC 4180 records: {:?}",
+        found
+    );
+}
+
 /// `dump` produces SQL that recreates the schema and the rows.
 #[test]
 fn dump_produces_sql_that_recreates_the_database() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "dump");
     let ran = run(
         &binary,
@@ -655,9 +925,7 @@ fn dump_produces_sql_that_recreates_the_database() {
 /// `backup` writes a copy that opens and holds the same rows.
 #[test]
 fn backup_writes_a_copy_that_holds_the_same_rows() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "backup");
     let copy = database.with_file_name("copy.rdb");
     let ran = run(
@@ -712,9 +980,7 @@ fn backup_writes_a_copy_that_holds_the_same_rows() {
 /// (task-1969, 5.2).
 #[test]
 fn restore_refuses_a_backup_that_is_not_there_and_reopens_one_that_is() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "restore");
     let copy = database.with_file_name("copy.rdb");
     succeeded(
@@ -789,9 +1055,7 @@ fn restore_refuses_a_backup_that_is_not_there_and_reopens_one_that_is() {
 /// nonzero exit code rather than an empty destination.
 #[test]
 fn migrate_refuses_a_source_that_is_not_there() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let directory = area("migrate");
     let absent = directory.join("no-such-source.db");
     let destination = directory.join("out.rdb");
@@ -832,9 +1096,7 @@ fn migrate_refuses_a_source_that_is_not_there() {
 /// `checkpoint` reports how much of the log it moved.
 #[test]
 fn checkpoint_reports_what_it_moved() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "checkpoint");
     let ran = run(
         &binary,
@@ -859,12 +1121,164 @@ fn checkpoint_reports_what_it_moved() {
     );
 }
 
+/// Returns a database holding the four table names that broke `dump`.
+///
+/// A reserved word as a column, a reserved word as a table, an empty column
+/// name, and one ordinary table so that a total wipe cannot pass. Built by the
+/// binary under test, like every other fixture here.
+///
+/// @param binary - the built `inillucent`
+/// @param case - what to name this case's directory after
+fn awkwardly_named(binary: &Path, case: &str) -> (PathBuf, PathBuf) {
+    let directory = area(case);
+    let source = directory.join("source.rdb");
+    let path = source.to_string_lossy().to_string();
+    let mut steps: Vec<Vec<&str>> = vec![vec!["create", path.as_str(), "--output", "json"]];
+    for statement in [
+        r#"CREATE TABLE d1 ("select" TEXT, b INT)"#,
+        "INSERT INTO d1 VALUES('x',1)",
+        r#"CREATE TABLE d2 ("order" TEXT)"#,
+        "INSERT INTO d2 VALUES('y')",
+        r#"CREATE TABLE d4 ("" TEXT, b INT)"#,
+        "INSERT INTO d4 VALUES('w',5)",
+        r#"CREATE TABLE "select"(x TEXT)"#,
+        r#"INSERT INTO "select" VALUES('v')"#,
+        "CREATE TABLE plain(a INT)",
+        "INSERT INTO plain VALUES(7)",
+    ] {
+        steps.push(vec!["--db", path.as_str(), "exec", statement]);
+    }
+    for arguments in &steps {
+        let ran = run(binary, arguments);
+        assert_eq!(
+            ran.code,
+            0,
+            "building the fixture failed at {arguments:?}:\n{}",
+            ran.said()
+        );
+    }
+    (directory, source)
+}
+
+/// Returns the row count of each fixture table, in one list.
+///
+/// One list rather than an assertion each, so a failure names every table that
+/// lost rows instead of stopping at the first.
+///
+/// @param binary - the built `inillucent`
+/// @param path - the database to count in
+fn fixture_counts(binary: &Path, path: &str) -> Vec<String> {
+    [
+        "SELECT count(*) FROM d1",
+        "SELECT count(*) FROM d2",
+        "SELECT count(*) FROM d4",
+        r#"SELECT count(*) FROM "select""#,
+        "SELECT count(*) FROM plain",
+    ]
+    .iter()
+    .map(|sql| {
+        let ran = run(binary, &["--db", path, "query", sql, "--output", "json"]);
+        assert_eq!(
+            ran.code,
+            0,
+            "`{sql}` on {path} exited {}:\n{}",
+            ran.code,
+            ran.said()
+        );
+        rows(&ran.stdout)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<String>>()
+            .join("")
+    })
+    .collect()
+}
+
+/// Returns both columns of the table whose first column has no name.
+///
+/// @param binary - the built `inillucent`
+/// @param path - the database to read
+fn empty_named_column(binary: &Path, path: &str) -> Vec<Vec<String>> {
+    let ran = run(
+        binary,
+        &[
+            "--db",
+            path,
+            "query",
+            r#"SELECT "", b FROM d4"#,
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(ran.code, 0, "reading d4 on {path}:\n{}", ran.said());
+    rows(&ran.stdout)
+}
+
+/// A dump round trip keeps every row of a table whose names are awkward.
+///
+/// **`dump` lost every row of a table with a reserved word in it, at exit 0**
+/// (task-2066 §4.1.3). The row-emitting half built its `SELECT` with the same
+/// quoting rule the *emitted* text uses - "a bare word needs nothing" - so a
+/// column named `"select"` produced `SELECT select,b FROM d1`, which does not
+/// parse. `shell.collect` answered `Err`, the function returned, and the dump
+/// carried the table's `CREATE` and none of its rows. A column named `""` was
+/// worse: it was dropped from the projection, so a two column row dumped as
+/// `INSERT INTO d4 VALUES(5)` and replayed into the wrong column.
+///
+/// Losing rows at exit 0 is the worst shape a backup tool can have, which is
+/// why this grades the *replay* rather than the dump: a test that read the dump
+/// text would have to know what it should say, and one that checked the exit
+/// code would have passed throughout.
+#[test]
+fn a_dump_round_trip_keeps_every_row_of_an_awkwardly_named_table() {
+    let binary = program("inillucent");
+    let (directory, source) = awkwardly_named(&binary, "dump-round-trip");
+    let source_path = source.to_string_lossy().to_string();
+    let dumped = run(&binary, &["--db", source_path.as_str(), "dump"]);
+    succeeded("dump", &dumped);
+
+    let target = directory.join("target.rdb");
+    let target_path = target.to_string_lossy().to_string();
+    succeeded(
+        "create",
+        &run(
+            &binary,
+            &["create", target_path.as_str(), "--output", "json"],
+        ),
+    );
+    succeeded(
+        "run",
+        &run(
+            &binary,
+            &["--db", target_path.as_str(), "run", dumped.stdout.as_str()],
+        ),
+    );
+
+    let before = fixture_counts(&binary, &source_path);
+    let after = fixture_counts(&binary, &target_path);
+    assert!(
+        before.iter().all(|count| count == "1"),
+        "the fixture itself is wrong: {before:?}"
+    );
+    assert_eq!(
+        after, before,
+        "the replayed database holds different row counts:\nbefore {before:?}\nafter  {after:?}\n\nthe dump was:\n{}",
+        dumped.stdout
+    );
+    // The empty-named column keeps its own value rather than the second
+    // column's, which is the arity defect and which a row count cannot see.
+    assert_eq!(
+        empty_named_column(&binary, &target_path),
+        empty_named_column(&binary, &source_path),
+        "the empty-named column did not survive the round trip; the dump was:\n{}",
+        dumped.stdout
+    );
+}
+
 /// `integrity-check` answers `ok` on a database it just wrote.
 #[test]
 fn integrity_check_answers_ok_on_a_healthy_file() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "integrity-check");
     let ran = run(
         &binary,
@@ -888,12 +1302,276 @@ fn integrity_check_answers_ok_on_a_healthy_file() {
     );
 }
 
+/// `integrity-check` exits non-zero and answers `"ok": false` on a corrupt file.
+///
+/// **The counterpart the suite never had** (task-2066 §4.1.4).
+/// `integrity_check_answers_ok_on_a_healthy_file` runs the verb on a file it
+/// has just written, so exit 0 had never been asserted to be *wrong*. The
+/// pragma reports damage as a row of text, the way SQLite does, and the verb
+/// listed the rows without reading them - so `outcome.rs`'s unconditional
+/// `("ok", Json::Bool(true))` told every caller a corrupt database was sound.
+/// Any health check written as `inillucent integrity-check && echo healthy` was
+/// told the wrong thing by the one command whose purpose is to answer that
+/// question.
+#[test]
+fn integrity_check_refuses_a_corrupt_file() {
+    let binary = program("inillucent");
+    let database = populated(&binary, "integrity-check-corrupt");
+    // Enough rows that the damage lands in a page the check reads rather than
+    // in the header, which is refused at open and would grade a different path.
+    let path = database.to_string_lossy().to_string();
+    succeeded(
+        "exec",
+        &run(
+            &binary,
+            &[
+                "--db",
+                path.as_str(),
+                "exec",
+                "CREATE TABLE wide (id INTEGER PRIMARY KEY, body TEXT)",
+            ],
+        ),
+    );
+    succeeded(
+        "exec",
+        &run(
+            &binary,
+            &[
+                "--db",
+                path.as_str(),
+                "exec",
+                "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<2000) \
+             INSERT INTO wide SELECT i, 'row-' || i || '-padding-padding' FROM s",
+            ],
+        ),
+    );
+    succeeded(
+        "checkpoint",
+        &run(&binary, &["--db", path.as_str(), "checkpoint"]),
+    );
+
+    let Ok(mut bytes) = std::fs::read(&database) else {
+        panic!("the fixture could not be read back");
+    };
+    let at = bytes.len() / 2;
+    let Some(byte) = bytes.get_mut(at) else {
+        panic!("the fixture is too small to damage");
+    };
+    *byte ^= 0xFF;
+    let _ = std::fs::write(&database, &bytes);
+
+    let ran = run(
+        &binary,
+        &["--db", path.as_str(), "integrity-check", "--output", "json"],
+    );
+    assert_ne!(
+        ran.code,
+        0,
+        "`integrity-check` exited 0 on a file with a flipped byte in it:\n{}",
+        ran.said()
+    );
+    assert!(
+        ran.stdout.contains("\"ok\": false") || ran.said().contains("corrupt"),
+        "`integrity-check` did not report the damage as a failure:\n{}",
+        ran.said()
+    );
+}
+
+/// A `params-file` nested past the parser's bound is refused, not fatal.
+///
+/// **This exited 127** (task-2066 §4.1.6): a stack overflow, which is a
+/// different thing from a refusal and which no caller can handle. `--params`
+/// from argv reaches the same parser, and so does every MCP request line.
+#[test]
+fn a_deeply_nested_params_file_is_refused_rather_than_fatal() {
+    let binary = program("inillucent");
+    let directory = area("deep-params-file");
+    let database = directory.join("app.rdb");
+    let path = database.to_string_lossy().to_string();
+    succeeded(
+        "create",
+        &run(&binary, &["create", path.as_str(), "--output", "json"]),
+    );
+    let deep = directory.join("deep.json");
+    let levels = 120_000;
+    let mut document = String::with_capacity(levels * 2);
+    for _ in 0..levels {
+        document.push('[');
+    }
+    for _ in 0..levels {
+        document.push(']');
+    }
+    let _ = std::fs::write(&deep, &document);
+
+    let ran = run(
+        &binary,
+        &[
+            "--db",
+            path.as_str(),
+            "query",
+            "SELECT 1",
+            "--params-file",
+            &deep.to_string_lossy(),
+        ],
+    );
+    assert_ne!(
+        ran.code,
+        0,
+        "a document nested {levels} deep was accepted:\n{}",
+        ran.said()
+    );
+    // 127 is what a stack overflow leaves behind, and 101 is a panic. Either
+    // means the process died rather than refused, which is the defect.
+    assert!(
+        ran.code == 1 || ran.code == 2,
+        "a deeply nested params-file ended the process with {} rather than being refused:\n{}",
+        ran.code,
+        ran.said()
+    );
+    assert!(
+        ran.said().contains("deep"),
+        "the refusal does not say what was wrong:\n{}",
+        ran.said()
+    );
+}
+
+/// Returns the pinned SQLite shell, which builds this case's source.
+///
+/// The tracked fixture has no FTS5 table and no schema pragmas, and both are
+/// what this case is about, so it writes its own source with the same shell
+/// every differential comparison in this repository is graded against.
+fn pinned_shell() -> Option<PathBuf> {
+    let path = workspace_root()
+        .join(".sqlite-ref/3.53.4/shell")
+        .join(format!("sqlite3{}", std::env::consts::EXE_SUFFIX));
+    if path.is_file() {
+        return Some(path);
+    }
+    inillucent_base::testing::skipping(
+        "the pinned SQLite 3.53.4 shell is not built, so this case cannot write its source; \
+         run tools/sqlite-reference.ps1",
+    );
+    None
+}
+
+/// `inillucent migrate` carries an FTS5 table and the two schema pragmas.
+///
+/// **The shipped verb used to do none of the verification it is documented to
+/// do** (task-2066 §4.1.7). `AGENTS.md` and `agent-skills/inillucent-migrate`
+/// both say a migration is verified by row count and digest and published only
+/// if every check passes; `migrate_sqlite_file` called
+/// `Database::import_sqlite_into` and renamed the result. Measured on the
+/// shipped binary, that meant a database whose only content was an FTS5 table
+/// migrated to an empty file and reported success at exit 0, and
+/// `application_id` and `user_version` were dropped from every migration.
+///
+/// This drives `inillucent migrate`, not the `inillucent-migrate` tool beside
+/// it. The tool was always right. Two implementations of one job, and the
+/// shipped one was the one nobody graded.
+#[test]
+fn the_shipped_verb_carries_a_full_text_table_and_the_schema_pragmas() {
+    let Some(shell) = pinned_shell() else {
+        return;
+    };
+    let binary = program("inillucent");
+    let directory = area("migrate-shipped-verb");
+    let source = directory.join("src.db");
+    let built = std::process::Command::new(&shell)
+        .arg(&source)
+        .arg(
+            "CREATE VIRTUAL TABLE docs USING fts5(body); \
+             INSERT INTO docs VALUES('the quick brown fox'),('a second document'); \
+             CREATE TABLE plain(a INT); INSERT INTO plain VALUES(1),(2),(3); \
+             PRAGMA user_version=42; PRAGMA application_id=1234;",
+        )
+        .status();
+    assert!(
+        built.is_ok_and(|status| status.success()) && source.is_file(),
+        "the pinned shell did not write the source"
+    );
+
+    let destination = directory.join("out.rdb");
+    let ran = run(
+        &binary,
+        &[
+            "migrate",
+            &source.to_string_lossy(),
+            "--destination",
+            &destination.to_string_lossy(),
+            "--kind",
+            "sqlite",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(
+        ran.code,
+        0,
+        "the migration did not succeed:\n{}",
+        ran.said()
+    );
+
+    // The report carries its checks, which is what makes a failure readable
+    // rather than an exit code.
+    for wanted in [
+        "\"name\": \"carried.docs\"",
+        "\"name\": \"pragma.user_version\"",
+        "\"name\": \"pragma.application_id\"",
+        "\"name\": \"count.plain\"",
+        "\"name\": \"digest.plain\"",
+    ] {
+        assert!(
+            ran.stdout.contains(wanted),
+            "the report has no {wanted}:\n{}",
+            ran.stdout
+        );
+    }
+    assert!(
+        !ran.stdout.contains("\"passed\": false"),
+        "a check failed and the migration was published anyway:\n{}",
+        ran.stdout
+    );
+
+    // And the destination holds what the source did. The FTS5 table is the one
+    // that used to vanish; the two pragmas used to come back zero.
+    let published = destination.to_string_lossy().to_string();
+    for (sql, expected) in [
+        ("SELECT count(*) FROM docs", "2"),
+        ("SELECT count(*) FROM plain", "3"),
+        ("PRAGMA user_version", "42"),
+        ("PRAGMA application_id", "1234"),
+    ] {
+        let asked = run(
+            &binary,
+            &["--db", published.as_str(), "query", sql, "--output", "json"],
+        );
+        assert_eq!(asked.code, 0, "`{sql}` failed:\n{}", asked.said());
+        assert!(
+            asked.stdout.contains(expected),
+            "`{sql}` did not answer {expected}:\n{}",
+            asked.stdout
+        );
+    }
+    // A successful migration used to leave its staging file and log segments
+    // beside the destination, because `remove_staged` ran only on the error
+    // path.
+    let leftovers: Vec<String> = std::fs::read_dir(&directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| name.contains(".staging-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a successful migration left staging files behind: {leftovers:?}"
+    );
+}
+
 /// `analyze` writes statistics the planner can read back.
 #[test]
 fn analyze_writes_statistics_the_planner_reads() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "analyze");
     let ran = run(
         &binary,
@@ -932,9 +1610,7 @@ fn analyze_writes_statistics_the_planner_reads() {
 /// `stats` reports the page pool's size in bytes.
 #[test]
 fn stats_reports_the_page_pool_size() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "stats");
     let ran = run(
         &binary,
@@ -959,9 +1635,7 @@ fn stats_reports_the_page_pool_size() {
 /// `search` finds the row whose text matches.
 #[test]
 fn search_finds_the_row_whose_text_matches() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "search");
     let ran = run(
         &binary,
@@ -1000,9 +1674,7 @@ fn search_finds_the_row_whose_text_matches() {
 /// engine, which is where a ranking question belongs.
 #[test]
 fn vector_search_answers_with_a_distance_column() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "vector-search");
     let ran = run(
         &binary,
@@ -1039,9 +1711,7 @@ fn vector_search_answers_with_a_distance_column() {
 /// names the model it would fetch and where it would put it.
 #[test]
 fn setup_embeddings_reports_what_is_installed() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let ran = run(&binary, &["setup-embeddings", "--output", "json"]);
     succeeded("setup-embeddings", &ran);
     assert!(
@@ -1065,9 +1735,7 @@ fn setup_embeddings_reports_what_is_installed() {
 /// drive one from a test is to write to it and close the pipe.
 #[test]
 fn shell_runs_what_is_written_to_its_standard_input() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "shell");
     let ran = run_with_input(
         &binary,
@@ -1089,9 +1757,7 @@ fn shell_runs_what_is_written_to_its_standard_input() {
 /// belongs to the command table.
 #[test]
 fn mcp_answers_an_initialize_over_its_standard_input() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "mcp");
     let request = concat!(
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"#,
@@ -1145,9 +1811,7 @@ const NOT_BUILT: [&str; 3] = [
 /// script's `$?` were untested.
 #[test]
 fn an_unbuilt_statement_exits_three_and_says_unsupported() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "exit-code-three");
     let mut tried: Vec<String> = Vec::new();
     // A flag rather than a `return` out of the loop: `policy.rs`'s
@@ -1203,9 +1867,7 @@ fn an_unbuilt_statement_exits_three_and_says_unsupported() {
 /// could not tell it from the live log.
 #[test]
 fn query_names_a_log_segment_the_chain_does_not_reach() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let database = populated(&binary, "stray-segment");
     let path = database.to_string_lossy().to_string();
 
@@ -1326,9 +1988,7 @@ fn every_registry_command_has_a_subprocess_test() {
 /// file and says so in its own help.
 #[test]
 fn a_read_verb_on_a_missing_path_refuses_and_creates_nothing() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let directory = area("missing");
     let database = directory.join("not-there.rdb");
     for verb in ["tables", "schema", "indexes", "databases", "stats"] {
@@ -1389,9 +2049,7 @@ fn a_read_verb_on_a_missing_path_refuses_and_creates_nothing() {
 /// test writes it through the engine first rather than assembling a header.
 #[test]
 fn a_newer_format_version_is_refused_as_unsupported() {
-    let Some(binary) = program("inillucent") else {
-        return;
-    };
+    let binary = program("inillucent");
     let directory = area("format");
     let database = directory.join("newer.rdb");
     let made = run(&binary, &["create", &database.to_string_lossy()]);

@@ -23,10 +23,10 @@ wiki, a repository, a set of tickets. It needs both meaning and exact term, and 
 enough to run several searches inside one answer. Today that means PostgreSQL, the pgvector extension,
 and an embedding model served over a socket. inillucent replaces all three with a library.
 
-**Somebody who already uses SQLite and wants it faster.** The SQL is the same: 403 of 416 probed
-cases produce SQLite's exact bytes, nothing is refused, 7 answer differently, and 6 are vector search
+**Somebody who already uses SQLite and wants it faster.** The SQL is the same: 404 of 416 probed
+cases produce SQLite's exact bytes, nothing is refused, 6 answer differently, and 6 are vector search
 features SQLite has no equivalent for. What changes is the
-storage underneath, and the measurement is 330% faster at 100,000 rows.
+storage underneath, and the measurement is 397% faster at 100,000 rows.
 
 ## Where it stands
 
@@ -34,17 +34,23 @@ Everything here is measured, and each row links to the page carrying the run.
 
 | | | |
 |---|---|---|
-| **330% faster than SQLite 3.53.4** | 4.30x weighted over ten workload families at 100,000 rows, four consecutive 30-round runs, every answer hashed and compared before its timing counts | [Performance](performance.md) |
-| **70% less processor time** | 390 ms against 1,320 for the same plan, one child process each | [Performance](performance.md) |
-| **14% more memory** | 42.40 MiB against 37.20, on the same 128 MiB budget. The one measurement SQLite wins | [Performance](performance.md#memory) |
+| **397% faster than SQLite 3.53.4** | 4.97x weighted over ten workload families at 100,000 rows, four consecutive 30-round runs with both engines on the performance cores, every answer hashed and compared before its timing counts | [Performance](performance.md) |
+| **50% less processor time** | 555 ms against 1,082 for the same plan, one child process each | [Performance](performance.md) |
+| **9.5% more memory** | 40.76 MiB against 37.22, on the same 128 MiB budget. The one measurement SQLite wins | [Performance](performance.md#memory) |
 | **A file within 4% of SQLite's** | 1.036x on the same imported data | [Performance](performance.md#disk) |
-| **403 of 416 SQL cases byte for byte, none refused** | every case run through both shells over a fresh database and compared byte by byte | [SQL support](sql.md) |
+| **404 of 416 SQL cases byte for byte, none refused** | every case run through both shells over a fresh database and compared byte by byte | [SQL support](sql.md) |
 | **Better than pgvector on 15 of 17 graded comparisons, worse on none** | both engines reading byte identical vectors | [Retrieval quality](retrieval-quality.md) |
-| **175% faster unfiltered and 6,262% faster filtered** than pgvector | median in the calling process, against the correctly configured baseline | [Retrieval quality](retrieval-quality.md#latency) |
+| **174% faster unfiltered and 6,169% faster filtered** than pgvector | median in the calling process, against the correctly configured baseline | [Retrieval quality](retrieval-quality.md#latency) |
 
-Six of the thirty timed workloads are slower than SQLite. **All ten families meet the 1.00x floor
-the performance contract sets.** The `transaction` family missed the floor in four earlier runs and
-now measures 152% faster.
+Six of the thirty weighted workloads are slower than SQLite. So were all four correlated subquery
+workloads the contract does not weight, by far more, in the graded run. At `52c4b5f`, on passes the
+gate did not grade because the machine was busy, two of those four are faster than SQLite and a
+correlated `EXISTS` over 400 outer rows takes 0.40 ms where it took 59.69; see
+[Performance](performance.md#measured-again-at-52c4b5f-on-2026-09-24-and-not-graded). **Every family but one clears the 1.00x floor
+the performance contract sets on all four runs**; `schema` went under it on three, with lower bounds
+of 0.81x to 0.95x against a 1.31x ratio - it is a family of one workload, with the widest interval on
+the page. The `transaction` family missed the floor on all four runs of two earlier measurements and now
+measures 137% faster.
 [The workloads that are slower](performance.md#the-workloads-that-are-slower) names each one and what
 it costs.
 
@@ -102,8 +108,6 @@ index fits in memory everything PostgreSQL does to survive a power cut is overhe
   to choose `N`.
 - **Six of the thirty workloads are slower than SQLite**, listed on
   [the performance page](performance.md#the-workloads-that-are-slower).
-- **No macOS archive yet.** Build it from a checkout with `cargo build --release -p inillucent-cli`;
-  `cargo install` needs a crates.io release, and there is not one yet.
 
 ## In production
 

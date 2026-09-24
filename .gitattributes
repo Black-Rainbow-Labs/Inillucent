@@ -13,3 +13,31 @@
 # one alone, so the one script whose CRLF would have been noticed immediately is
 # the one that was never converted. Seventeen others were.
 *.sh text eol=lf
+
+# The interop fixtures are bytes, not text (task-2036). `tests/interop/<version>/`
+# holds a database one published release wrote, the log segment it left, and the
+# answers it gave. The databases must never be converted, and `expected.tsv` is
+# compared byte for byte between releases - so it is LF everywhere, whatever
+# `core.autocrlf` says on the machine that checked it out.
+/tests/interop/*/app.rdb binary
+/tests/interop/*/app.rdb-wal.* binary
+/tests/interop/*/expected.tsv text eol=lf
+
+# The crash schedules are written by the campaigns that produce them, with
+# `std::fs::write` and LF, and they are read as a diff - a change in one is a
+# change in what the engine does under failure. With `core.autocrlf` true, git
+# checks them out with CRLF, so every run of the durability tier left seven of
+# them modified with an empty diff (task-2066 §4.4.9). A reviewer who has to
+# skip past seven files that did not change stops reading the one that did, and
+# a dirty tree is refused by both `packaging/ship.ps1` and `cargo publish`.
+/tests/crash/** text eol=lf
+
+# The fuzzing corpus is bytes (task-2066, "Done means"). `fuzz/corpus/<target>/`
+# holds the inputs libfuzzer kept because they reached new coverage, and each
+# one is whatever byte string reached it - SQL text, a page image, a segment
+# header, a run of bytes that is none of those. Left as text, `core.autocrlf`
+# on the Windows machine releases are cut on rewrites every `0x0a` in them to
+# `0x0d 0x0a` on checkout, and the corpus stops being the input that found the
+# coverage. It would not fail visibly: the fuzzer would run happily on the
+# rewritten bytes and reach less than it did.
+fuzz/corpus/** -text

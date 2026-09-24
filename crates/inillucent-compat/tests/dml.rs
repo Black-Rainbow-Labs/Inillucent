@@ -14,10 +14,7 @@ fn scratch(name: &str) -> std::path::PathBuf {
     let directory = workspace_root().join("_agent_output/dml");
     let _ = std::fs::create_dir_all(&directory);
     let path = directory.join(name);
-    for suffix in ["", "-journal"] {
-        let candidate = directory.join(format!("{name}{suffix}"));
-        let _ = std::fs::remove_file(candidate);
-    }
+    inillucent_base::testing::remove_database(&path);
     path
 }
 
@@ -82,6 +79,94 @@ fn a_table_round_trips_through_the_public_api() {
     );
     assert_eq!(integer(&rows, 2, 0), Some(7));
     assert!(is_null(&rows, 2, 2));
+}
+
+/// An insert with no rowid, into a table whose largest rowid is `i64::MAX`,
+/// finds a free one - and so does the next row of the same statement.
+///
+/// **It failed `UNIQUE constraint failed` (task-1979, F8).** The allocation was
+/// `largest + 1`, saturating, so at `i64::MAX` it answered `i64::MAX` again and
+/// the new row collided with the one already holding it. SQLite picks an unused
+/// key instead.
+///
+/// The *second* row is what this test is for, and what the differential corpus
+/// does not reach: the high-water mark stays at `i64::MAX` once the counting-up
+/// path is exhausted, so each row looks for its own key. A mark that moved to
+/// the first free key would make the second row count up from it and collide
+/// with whatever sits above it.
+#[test]
+fn an_insert_past_the_largest_rowid_finds_a_free_one_per_row() {
+    let (database, _path) = database(
+        "past-max-rowid.db",
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+         INSERT INTO t VALUES(9223372036854775807, 'held');
+         INSERT INTO t(b) VALUES('first'), ('second');",
+    );
+    let rows = query(&database, "SELECT count(*), count(DISTINCT a) FROM t");
+    assert_eq!(integer(&rows, 0, 0), Some(3), "three rows were inserted");
+    assert_eq!(
+        integer(&rows, 0, 1),
+        Some(3),
+        "each row should have taken a key of its own"
+    );
+    let held = query(&database, "SELECT b FROM t WHERE a = 9223372036854775807");
+    assert_eq!(
+        held.len(),
+        1,
+        "the row that held the largest rowid is still there"
+    );
+}
+/// A table whose foreign key points at itself can still be dropped, and a table
+/// another table points at still cannot.
+///
+/// **Both halves are the test (task-1979, F6).** Dropping a table with foreign
+/// keys on now runs an implicit `DELETE FROM` first, which is what makes the
+/// refusal happen at all - and that delete would refuse a self-referencing
+/// table too, because this engine checks an immediate foreign key as each row
+/// is written and deleting the first row leaves the second pointing at nothing.
+/// SQLite counts those violations to the end of the statement instead, so its
+/// count is back to nought once the last row is gone and the drop succeeds. The
+/// drop therefore keeps every foreign key trigger but the self-referencing one,
+/// and this is the pair that says so: without the second half the first could
+/// be passed by dropping the foreign key checks altogether.
+///
+/// A plain `DELETE FROM` on a self-referencing table is still refused here and
+/// still accepted by SQLite. That is the engine's per-row checking and it is a
+/// wider change than this ticket; the drop path is what F6 touched.
+#[test]
+fn a_self_referencing_table_drops_and_a_referenced_one_does_not() {
+    let (database, _path) = database(
+        "drop-self-reference.db",
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE node(id INTEGER PRIMARY KEY, parent REFERENCES node(id));
+         INSERT INTO node VALUES(1, NULL), (2, 1);
+         CREATE TABLE parent(id INTEGER PRIMARY KEY);
+         CREATE TABLE child(pid REFERENCES parent(id));
+         INSERT INTO parent VALUES(1);
+         INSERT INTO child VALUES(1);",
+    );
+    {
+        let connection = database.session();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON; DROP TABLE node;")
+            .expect("a table that only references itself can be dropped");
+        let refused = connection.execute_batch("PRAGMA foreign_keys = ON; DROP TABLE parent;");
+        assert!(
+            refused.is_err(),
+            "a table a live child row points at cannot be dropped"
+        );
+    }
+    let gone = query(
+        &database,
+        "SELECT count(*) FROM sqlite_master WHERE name = 'node'",
+    );
+    assert_eq!(integer(&gone, 0, 0), Some(0), "node was dropped");
+    let kept = query(&database, "SELECT count(*) FROM parent");
+    assert_eq!(
+        integer(&kept, 0, 0),
+        Some(1),
+        "the refused drop left the parent row where it was"
+    );
 }
 
 /// The change counters report what a statement did.
@@ -339,3 +424,57 @@ fn writes_survive_a_close_and_reopen() {
 // is deleted rather than given a hollow replacement. If hooks are added to the
 // new engine later, these three cases (and their SQL scripts, preserved above
 // in this comment's neighbourhood in source history) are what to restore.
+
+/// **The `CHECK` that failed is the one the refusal names.**
+///
+/// `source_text_of` looked the constraint up by comparing `declared.name`
+/// against the bound constraint's name, and every unnamed `CHECK` has
+/// `name == None` - so `None == None` matched the first unnamed constraint
+/// whatever had actually failed, and a row violating the second of two was
+/// told the first one's text (task-2066 section 4.2, item 27).
+///
+/// The named arm beside it is the control: names are distinct, so the lookup
+/// by name was right for those all along, and a fix that broke them would be
+/// trading one wrong answer for another. `differential_part8`'s `t2066-017`
+/// and `t2066-018` grade the same two scripts against the reference, but the
+/// corpus compares answers rather than refusal text - both engines refuse and
+/// that is agreement - so the sentence itself is asserted here.
+#[test]
+fn the_check_that_failed_is_the_one_named() {
+    let (database, _) = database(
+        "check-names.rdb",
+        "CREATE TABLE unnamed (a INTEGER CHECK (a > 0), b INTEGER CHECK (b > 100))",
+    );
+    let connection = database.session();
+    let refusal = connection
+        .execute("INSERT INTO unnamed VALUES (1, 5)")
+        .expect_err("the second CHECK must refuse the row");
+    let said = refusal.message().to_string();
+    assert!(
+        said.contains("b > 100"),
+        "the refusal did not name the constraint that failed: {said}"
+    );
+    assert!(
+        !said.contains("a > 0"),
+        "the refusal named the constraint that passed: {said}"
+    );
+
+    connection
+        .execute_batch(
+            "CREATE TABLE named (a INTEGER, b INTEGER, \
+             CONSTRAINT first CHECK (a > 0), CONSTRAINT second CHECK (b > 100))",
+        )
+        .expect("the named table is created");
+    let refusal = connection
+        .execute("INSERT INTO named VALUES (1, 5)")
+        .expect_err("the second CHECK must refuse the row");
+    let said = refusal.message().to_string();
+    assert!(
+        said.contains("second"),
+        "the refusal did not name the constraint that failed: {said}"
+    );
+    assert!(
+        !said.contains("first"),
+        "the refusal named the constraint that passed: {said}"
+    );
+}

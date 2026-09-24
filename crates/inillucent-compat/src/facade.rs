@@ -60,6 +60,24 @@ impl Database {
         })
     }
 
+    /// Opens a database at a page size and pool the caller names.
+    ///
+    /// **The page size goes into the open because it cannot be set after it.**
+    /// `PRAGMA page_size` in this engine reports the geometry and does not
+    /// change it, so a suite that opened with [`Database::open`] and then asked
+    /// for 4,096 byte pages would still be running at 32,768 and would not be
+    /// told. This is the facade's form of `matrix::Arm::open`, for a suite that
+    /// holds this handle rather than the engine's (task-2075).
+    ///
+    /// @param path - the database file
+    /// @param page_size - the page size to build at, or the one the file already has
+    /// @param frames - how many frames the buffer pool holds
+    pub fn open_at(path: impl AsRef<Path>, page_size: usize, frames: usize) -> DbResult<Database> {
+        Ok(Database {
+            engine: Rc::new(Engine::open_at(path, page_size, frames)?),
+        })
+    }
+
     /// Opens a database, accepting a busy timeout there is nothing to wait for.
     ///
     /// **The timeout is accepted and not used, deliberately.** It exists in the
@@ -116,6 +134,16 @@ impl Database {
             inillucent_base::error::misuse(format!("cannot stage {}: {error}", source.display()))
         })?;
         Database::import(staged)
+    }
+
+    /// Returns what the page cache has been asked to do, across every
+    /// connection opened from this handle.
+    ///
+    /// For a story that grades how many pages a statement read, which is a
+    /// count and so means the same thing on a busy machine as on an idle one
+    /// (task-2077).
+    pub fn cache_stats(&self) -> inillucent_engine::connect::CacheStats {
+        self.engine.cache_stats()
     }
 
     /// Imports a SQLite file, accepting a busy timeout there is nothing to wait

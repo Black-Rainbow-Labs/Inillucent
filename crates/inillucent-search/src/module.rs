@@ -36,7 +36,7 @@
 //! FTS5's convention and there is no reason to have two.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use inillucent_base::DbResult;
 use inillucent_value::Value;
@@ -70,6 +70,15 @@ const ROLE_RECALL: char = 'r';
 /// The rowid, for a point lookup.
 const ROLE_ROWID: char = 'i';
 
+/// The first character a facet constraint is recorded under.
+///
+/// A facet's role character is `ROLE_FACET_FIRST + the column's position`, so
+/// the cursor reads which column the value belongs to out of the plan rather
+/// than having to guess it from the order the constraints were claimed in. The
+/// range is upper case and every other role is lower case, so the two cannot
+/// collide; `options::MAX_FACET_COLUMN` is what keeps a position inside it.
+const ROLE_FACET_FIRST: u8 = b'A';
+
 /// The module.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SearchModule;
@@ -99,12 +108,32 @@ impl Module for SearchModule {
             options: declared,
             store,
             cache: Arc::new(Cache::new()),
+            stored_config: Arc::new(OnceLock::new()),
             creating,
             pending: None,
             marks: Vec::new(),
             touched: false,
         }))
     }
+}
+
+/// Refuses when the stored configuration names a format this build does not
+/// read, reading it the first time and remembering it after.
+///
+/// @param context - the running statement
+/// @param store - the table's shadow tables
+/// @param stored - where this connection keeps what `%_config` said
+fn readable_here(
+    context: &mut Context<'_>,
+    store: &Store,
+    stored: &OnceLock<Vec<(String, String)>>,
+) -> DbResult<()> {
+    if let Some(rows) = stored.get() {
+        return options::readable(rows);
+    }
+    let rows = store.read_config(context)?;
+    let held = stored.get_or_init(|| rows);
+    options::readable(held)
 }
 
 /// Returns the columns a declaration produces, visible ones first.
@@ -131,6 +160,16 @@ struct SearchTable {
     store: Store,
     declaration: Declaration,
     cache: Arc<Cache>,
+    /// The rows `%_config` holds, read the first time anything asks.
+    ///
+    /// **Read once per connection rather than once per query** (task-2053).
+    /// The question it answers - which format this table is in - is a property
+    /// of the file, and it cannot change under a connection without another
+    /// build writing to the same file at the same time. Reading it per query
+    /// would put a scan of `%_config` in front of every search. It is shared
+    /// with the cursors the table opens, which is why it is an `Arc`: the read
+    /// path is the one that was not asking.
+    stored_config: Arc<OnceLock<Vec<(String, String)>>>,
     creating: bool,
     /// The commit sequence this transaction is publishing under, once it has
     /// written anything.
@@ -974,6 +1013,32 @@ impl VirtualTable for SearchTable {
                 }
             }
         }
+        // **Only when the plan is a search** (task-2067). A facet constraint is
+        // claimed so that the ranking runs over the rows it admits; on a scan
+        // there is no ranking, and claiming it would take the predicate away
+        // from the engine that was about to evaluate it correctly.
+        if searching {
+            for index in 0..query.constraints.len() {
+                let Some(spec) = query.constraints.get(index).copied() else {
+                    continue;
+                };
+                if !spec.usable || spec.op != ConstraintOp::Eq || spec.column < 0 {
+                    continue;
+                }
+                let position = spec.column as usize;
+                if !self.options.is_facet(position) || position >= options::MAX_FACET_COLUMN {
+                    continue;
+                }
+                // The cast cannot truncate: the line above bounds the position
+                // by `MAX_FACET_COLUMN`, which is what the one character of
+                // plan string can hold. A position past it is left unclaimed
+                // rather than encoded wrongly, so the engine evaluates the
+                // predicate itself and the answer is still the right rows.
+                let role = ROLE_FACET_FIRST.saturating_add(position as u8);
+                query.use_constraint(index, true);
+                roles.push(char::from(role));
+            }
+        }
         let mut plan = if searching { PLAN_SEARCH } else { PLAN_SCAN };
         if plan == PLAN_SEARCH {
             if let Some(order) = query.order_by.first() {
@@ -1002,6 +1067,7 @@ impl VirtualTable for SearchTable {
             options: self.options.clone(),
             store: self.store.clone(),
             cache: Arc::clone(&self.cache),
+            stored_config: Arc::clone(&self.stored_config),
             query_column: self.query_column(),
             limit_column: self.limit_column(),
             vector_column: self.vector_column(),
@@ -1246,6 +1312,8 @@ struct SearchCursor {
     options: Options,
     store: Store,
     cache: Arc<Cache>,
+    /// The rows `%_config` holds, shared with the table that opened this.
+    stored_config: Arc<OnceLock<Vec<(String, String)>>>,
     query_column: i32,
     limit_column: i32,
     vector_column: i32,
@@ -1276,6 +1344,11 @@ impl SearchCursor {
 impl VirtualCursor for SearchCursor {
     /// Positions the cursor on the first row of a plan.
     fn filter(&mut self, context: &mut Context<'_>, plan: &FilterPlan) -> DbResult<()> {
+        // **A read asks which format the table is in, and it did not**
+        // (task-2053). `from_config` runs in `begin`, which only a write
+        // reaches, so every `SELECT` against a table a later build wrote was
+        // answered out of a store whose layout had not been checked.
+        readable_here(context, &self.store, &self.stored_config)?;
         self.rows.clear();
         self.at = 0;
         self.current = None;
@@ -1301,6 +1374,16 @@ impl VirtualCursor for SearchCursor {
                         .or_else(|| value.as_integer().map(|whole| whole as f32));
                 }
                 ROLE_ROWID => wanted_rowid = value.as_integer(),
+                // A facet, whose role character carries its column's position.
+                // The value is read as text because a facet's stored value is
+                // text, so `live = 1` and `live = '1'` constrain the same rows
+                // rather than one of them matching nothing.
+                facet if facet.is_ascii_uppercase() => {
+                    let position = (facet as u8).saturating_sub(ROLE_FACET_FIRST) as usize;
+                    self.request
+                        .facets
+                        .push((position, text_of(Some(value)).unwrap_or_default()));
+                }
                 _ => {}
             }
         }

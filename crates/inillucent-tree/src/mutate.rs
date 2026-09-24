@@ -19,11 +19,27 @@
 //!                                                       delta_start
 //! ```
 //!
-//! An insert moves `delta_start` **down** by the row's size and writes the row
-//! at the new `delta_start`. Existing delta rows do not move, so an insert is
-//! one bounds check and one copy rather than a memmove of the whole area - and
-//! the newest row is therefore *first*, which is what makes "the first match
-//! wins" the right rule for a key the delta area holds twice.
+//! The delta area opens with a directory of two-byte entries in key order and
+//! then holds the rows those entries name. An insert moves `delta_start`
+//! **down** by the row's size plus one entry, writes the row just below the rows
+//! already there, and moves the directory down with a new entry at the row's
+//! place in key order. Existing rows do not move, so an insert copies the
+//! directory - two bytes a row - and never the rows themselves. Where the area
+//! holds one key twice the newer entry is placed first, which is what makes
+//! "the first match wins" the right rule for it. `leaf/delta.rs` carries the
+//! layout and why the directory exists.
+//!
+//! ## A leaf format 1 wrote is written by format 1's rules
+//!
+//! A leaf without `LEAF_DELTA_DIRECTORY` has no directory: an insert puts the
+//! row at the new `delta_start` and the area holds at most 32 rows. This module
+//! keeps writing such a leaf that way - the row, the room and the limit are
+//! format 1's - until a compaction or a split rewrites the page, and those are
+//! logged with the page's image. That is what lets recovery replay a log a
+//! format 1 build wrote: it lands on the bytes that build produced, and a room
+//! check it repeats gives the answer that build got. Converting the area in
+//! place on the first write would be a change recovery never saw, and every
+//! later record in the log was written against the page as it stood without it.
 //!
 //! The tombstone bitmap sits immediately below `delta_start`, so it moves when
 //! `delta_start` does. That is `row_count / 8` bytes - 223 for the 1,782-row
@@ -41,8 +57,8 @@ use inillucent_base::DbResult;
 
 use crate::datum::Datum;
 use crate::leaf::{
-    class_bytes, leaf_header, tombstone_bytes, LeafRef, DELTA_LIMIT, LEAF_HAS_DELTA,
-    LEAF_HAS_TOMBSTONES,
+    class_bytes, leaf_header, tombstone_bytes, LeafRef, DELTA_ENTRY, FORMAT_ONE_DELTA_LIMIT,
+    LEAF_HAS_DELTA, LEAF_HAS_TOMBSTONES,
 };
 use crate::page::{self, header};
 use crate::types::{ColumnSpec, PhysicalType};
@@ -52,8 +68,8 @@ use crate::types::{ColumnSpec, PhysicalType};
 pub enum Applied {
     /// The change is in the page.
     Yes,
-    /// The page has no room, or the delta area is at its limit. The caller
-    /// compacts and tries again, and if it still does not fit, splits.
+    /// The page has no room for the row. The caller compacts and tries
+    /// again, and if it still does not fit, splits.
     NoRoom,
 }
 
@@ -81,6 +97,12 @@ pub struct DeltaPlan {
     bitmap: usize,
     /// How many delta rows the page holds now.
     delta_count: usize,
+    /// Where the heap starts, which the new directory entry is measured from.
+    heap_start: usize,
+    /// The directory position the row takes: its place in key order.
+    slot: usize,
+    /// Whether the leaf is in format 1's layout, with no directory.
+    format_one: bool,
 }
 
 impl DeltaPlan {
@@ -88,6 +110,74 @@ impl DeltaPlan {
     pub fn encoded(&self) -> &[u8] {
         &self.encoded
     }
+
+    /// Returns the plan for a row of the size these offsets were computed for.
+    ///
+    /// **What lets the write path cost the insert once instead of twice**
+    /// (task-2034). The offsets and the row's bytes are found in different
+    /// places - the offsets by the room check, before the log record, and the
+    /// bytes by the encoder, before either - and the only reason they were not
+    /// joined until after the log record is that displacing the row under the
+    /// key moves them. A write that displaces nothing does not move them, and
+    /// that is the ordinary write: 1,505 of task-2025's 1,508 shadow row writes
+    /// were an append at the right edge over a key that was not there.
+    ///
+    /// The caller is what knows whether anything was displaced. See
+    /// `PagedTree::apply_row`, which recomputes rather than calling this when
+    /// the write tombstoned a sorted row or removed a delta one.
+    ///
+    /// @param offsets - where a row of `encoded.len()` bytes lands
+    /// @param encoded - the row's tagged bytes, of exactly that length
+    /// @param slot - the directory position the row takes, from `LeafRef::locate_slot`
+    pub fn at(offsets: DeltaOffsets, encoded: Vec<u8>, slot: usize) -> DeltaPlan {
+        DeltaPlan {
+            encoded,
+            new_delta_start: offsets.new_delta_start,
+            old_delta_start: offsets.old_delta_start,
+            bitmap: offsets.bitmap,
+            delta_count: offsets.delta_count,
+            heap_start: offsets.heap_start,
+            slot: slot.min(offsets.delta_count),
+            format_one: offsets.format_one,
+        }
+    }
+}
+
+/// The four header fields every delta arithmetic reads.
+#[derive(Clone, Copy, Debug)]
+struct DeltaShape {
+    /// How many rows the delta area holds.
+    delta_count: usize,
+    /// Where the delta area starts.
+    delta_start: usize,
+    /// How many rows the sorted region holds, which sizes the tombstone bitmap.
+    row_count: usize,
+    /// Whether the page already carries a tombstone bitmap.
+    has_tombstones: bool,
+    /// Where the heap starts, which every directory entry is measured from.
+    heap_start: usize,
+    /// Whether the leaf is in format 1's layout, with no directory.
+    format_one: bool,
+}
+
+/// Where a row of a given size would land in a leaf's delta area.
+///
+/// A [`DeltaPlan`] without the row, so the arithmetic can be done before the
+/// bytes are handed over and carried to where they are. See [`DeltaPlan::at`].
+#[derive(Clone, Copy, Debug)]
+pub struct DeltaOffsets {
+    /// Where the delta area will start afterwards.
+    new_delta_start: usize,
+    /// Where it starts now.
+    old_delta_start: usize,
+    /// How many bytes of tombstone bitmap have to move with it.
+    bitmap: usize,
+    /// How many delta rows the page holds now.
+    delta_count: usize,
+    /// Where the heap starts.
+    heap_start: usize,
+    /// Whether the leaf is in format 1's layout, with no directory.
+    format_one: bool,
 }
 
 /// A leaf page being changed.
@@ -138,9 +228,18 @@ impl<'p> LeafMut<'p> {
         page::write_u64(self.page, leaf_header::MAX_CTS, current.max(cts))
     }
 
-    /// Returns where the mini-columns end, which is the floor for everything
-    /// that grows downwards.
     /// Reports whether a row of this size and a tombstone would both fit.
+    ///
+    /// For a caller that wants the answer and not the offsets - a compaction
+    /// checking the image it just packed. The write path wants the offsets and
+    /// calls [`LeafMut::room_for_row_and_tombstone`] directly.
+    ///
+    /// @param encoded_len - how many bytes the row's tagged form occupies
+    pub fn room_for(&self, encoded_len: usize) -> DbResult<bool> {
+        Ok(self.room_for_row_and_tombstone(encoded_len)?.is_some())
+    }
+
+    /// Returns where a row of this size would land, if it and a tombstone both fit.
     ///
     /// **One question, one page parse, one walk of the column directory.** The
     /// two halves used to be asked separately and each of them recomputed where
@@ -149,53 +248,77 @@ impl<'p> LeafMut<'p> {
     /// was the most expensive phase of a put, ahead of the descent that found
     /// the page.
     ///
-    /// Both halves have to hold: the row needs room in the delta area, and the
-    /// write may also have to tombstone whatever was under the key, which needs
-    /// the bitmap to exist or to have room to.
+    /// **The row and the bitmap are costed together, and costing them apart is
+    /// what made an ordinary insert answer `SQLITE_CORRUPT` (task-2033).** Both
+    /// grow downwards into the same gap: the delta area starts at
+    /// `delta_start - encoded_len - 2` afterwards, and the tombstone bitmap
+    /// sits immediately below wherever the delta area starts. This used to ask
+    /// two separate questions of a leaf that had no bitmap yet - does the row
+    /// fit above the floor, and would a bitmap fit at the *current*
+    /// `delta_start` - and a leaf with room for either one alone answered yes
+    /// to both. [`LeafMut::set_tombstone`] then created the bitmap, and
+    /// [`LeafMut::plan_encoded`], which asks the page as it now stands, found
+    /// there was no longer room for the row. Two hundred FTS5 documents refused
+    /// on row 42 at a 4,096-byte page for that reason, and on row 14, 37, 89
+    /// and 182 at 1,024, 2,048, 8,192 and 16,384; only the 32,768 the engine
+    /// defaults to was large enough that two hundred documents never reached a
+    /// leaf that tight.
+    ///
+    /// The bitmap is charged whether or not the page has one, because the write
+    /// this answers for may displace a row in the sorted region and creating
+    /// the bitmap is how that row is displaced. That is exact for such a write
+    /// and it over-charges an insert of an absent key by the bitmap's size -
+    /// eight bytes on a leaf under 64 rows, 224 on the 1,782-row leaves an
+    /// index holds - which buys a compaction marginally sooner and is the same
+    /// reservation the second question above was already making.
+    ///
+    /// **The offsets are returned rather than discarded, because the caller was
+    /// computing them again** (task-2034). The write path asked this, logged
+    /// the row, and then called [`LeafMut::plan_encoded`], which is the same
+    /// parse, the same `columns_end` walk and the same arithmetic a second
+    /// time. Measured on `extension.fts.build`, those two were 0.61 and 0.40 of
+    /// the 3.3 microseconds a write with no compaction costs - together the
+    /// largest thing in it. The offsets this returns are the stricter of the
+    /// two answers, since a row that leaves room for a tombstone as well fits
+    /// wherever a row that does not would have.
     ///
     /// @param encoded_len - how many bytes the row's tagged form occupies
-    pub fn room_for(&self, encoded_len: usize) -> DbResult<bool> {
-        let leaf = LeafRef::parse(self.page)?;
-        let (delta_count, delta_start, row_count, has_tombstones) = (
-            leaf.delta_count(),
-            leaf.delta_start(),
-            leaf.row_count(),
-            leaf.has_tombstones(),
-        );
-        // `LeafRef` is `Copy` and borrows the guard, so this ends the borrow
-        // rather than releasing anything.
-        let _ = leaf;
-        if delta_count >= DELTA_LIMIT || encoded_len > u16::MAX as usize {
-            return Ok(false);
-        }
+    pub fn room_for_row_and_tombstone(&self, encoded_len: usize) -> DbResult<Option<DeltaOffsets>> {
+        let shape = self.delta_shape()?;
         let floor = self.columns_end()?;
-        let bitmap = if has_tombstones {
-            tombstone_bytes(row_count)
-        } else {
-            0
+        let Some(offsets) = self.offsets_within(shape, floor, encoded_len)? else {
+            return Ok(None);
         };
-        let Some(new_delta_start) = delta_start.checked_sub(encoded_len.saturating_add(2)) else {
-            return Ok(false);
-        };
-        if new_delta_start.saturating_sub(bitmap) < floor {
-            return Ok(false);
+        // The bitmap charged whether or not the page has one, which is the
+        // paragraph above and task-2033's fix. `offsets_within` charges the
+        // bitmap the page actually carries, because it describes where the row
+        // lands rather than what the write has to reserve; this is the
+        // reservation, and it is the stricter of the two.
+        if offsets
+            .new_delta_start
+            .saturating_sub(tombstone_bytes(shape.row_count))
+            < floor
+        {
+            return Ok(None);
         }
-        if !has_tombstones && delta_start.saturating_sub(tombstone_bytes(row_count)) < floor {
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(Some(offsets))
     }
 
     fn columns_end(&self) -> DbResult<usize> {
         columns_end(self.page)
     }
 
-    /// Inserts a row into the delta area.
+    /// Inserts a row into the delta area, at its place in key order.
     ///
-    /// Returns [`Applied::NoRoom`] when the delta area is at [`DELTA_LIMIT`] or
-    /// the row would collide with the mini-columns or the tombstone bitmap. The
-    /// caller compacts; nothing is written in that case, so a refused insert
-    /// leaves the page exactly as it was.
+    /// Returns [`Applied::NoRoom`] when the row would collide with the
+    /// mini-columns or the tombstone bitmap. The caller compacts; nothing is
+    /// written in that case, so a refused insert leaves the page exactly as it
+    /// was.
+    ///
+    /// The directory position is found here, under `BINARY` and ascending
+    /// order, which is what the tests and the in-memory tree want. The write
+    /// path and recovery know the tree's collations and directions, find the
+    /// position with `LeafRef::locate_slot` and call [`LeafMut::plan_encoded`].
     ///
     /// @param columns - the column directory, so the row's width is known
     /// @param row - the row's values, one per column
@@ -211,9 +334,10 @@ impl<'p> LeafMut<'p> {
 
     /// Costs a delta insert without performing it.
     ///
-    /// Returns `None` when the delta area is at [`DELTA_LIMIT`] or the row would
-    /// collide with the mini-columns or the tombstone bitmap. Nothing is
-    /// written either way.
+    /// Returns `None` when the row would collide with the mini-columns or the
+    /// tombstone bitmap. Nothing is written either way. The directory position
+    /// is found under `BINARY` and ascending order; see
+    /// [`LeafMut::insert_delta`].
     ///
     /// @param columns - the column directory, so the row's width is known
     /// @param row - the row's values, one per column
@@ -233,7 +357,10 @@ impl<'p> LeafMut<'p> {
         for value in row {
             value.encode_tagged(&mut encoded);
         }
-        self.plan_encoded(encoded)
+        let leaf = LeafRef::parse(self.page)?;
+        let key = row.get(..leaf.key_columns()).unwrap_or(row);
+        let (_, slot) = leaf.locate_slot(key, leaf.key_columns())?;
+        self.plan_encoded(encoded, slot)
     }
 
     /// Writes one already-encoded row into the delta area, as it was logged.
@@ -245,8 +372,9 @@ impl<'p> LeafMut<'p> {
     /// byte-identical to the one the write path produced.
     ///
     /// @param encoded - the row's tagged bytes, as the log record carries them
-    pub fn insert_delta_encoded(&mut self, encoded: &[u8]) -> DbResult<Applied> {
-        let Some(plan) = self.plan_encoded(encoded.to_vec())? else {
+    /// @param slot - the directory position it takes, from `LeafRef::locate_slot`
+    pub fn insert_delta_encoded(&mut self, encoded: &[u8], slot: usize) -> DbResult<Applied> {
+        let Some(plan) = self.plan_encoded(encoded.to_vec(), slot)? else {
             return Ok(Applied::NoRoom);
         };
         self.apply_delta(&plan)?;
@@ -268,55 +396,98 @@ impl<'p> LeafMut<'p> {
     /// arithmetic over four fields.
     ///
     /// @param encoded - the row's tagged bytes
-    pub fn plan_encoded(&self, encoded: Vec<u8>) -> DbResult<Option<DeltaPlan>> {
+    /// @param slot - the directory position it takes, from `LeafRef::locate_slot`
+    pub fn plan_encoded(&self, encoded: Vec<u8>, slot: usize) -> DbResult<Option<DeltaPlan>> {
         let Some(offsets) = self.delta_offsets(encoded.len())? else {
             return Ok(None);
         };
-        Ok(Some(DeltaPlan {
-            encoded,
-            new_delta_start: offsets.0,
-            old_delta_start: offsets.1,
-            bitmap: offsets.2,
-            delta_count: offsets.3,
-        }))
+        Ok(Some(DeltaPlan::at(offsets, encoded, slot)))
     }
 
     /// Returns where a row of this size would land, or `None` if it would not.
     ///
     /// @param encoded_len - how many bytes the row's tagged form occupies
-    fn delta_offsets(&self, encoded_len: usize) -> DbResult<Option<(usize, usize, usize, usize)>> {
-        // Every field this needs is copied out and the view is dropped, because
-        // the writes below take a mutable borrow of the same bytes. Keeping the
-        // view alive and reaching around it is what the borrow checker is for.
-        let (delta_count, delta_start, row_count, has_tombstones) = {
-            let leaf = LeafRef::parse(self.page)?;
-            (
-                leaf.delta_count(),
-                leaf.delta_start(),
-                leaf.row_count(),
-                leaf.has_tombstones(),
-            )
-        };
-        if delta_count >= DELTA_LIMIT {
+    fn delta_offsets(&self, encoded_len: usize) -> DbResult<Option<DeltaOffsets>> {
+        let shape = self.delta_shape()?;
+        self.offsets_within(shape, self.columns_end()?, encoded_len)
+    }
+
+    /// Returns the four header fields every delta arithmetic reads.
+    ///
+    /// **One parse, named, because three functions were each doing their own**
+    /// (task-2034). The view is copied out and dropped rather than held,
+    /// because the writes that follow take a mutable borrow of the same bytes.
+    fn delta_shape(&self) -> DbResult<DeltaShape> {
+        let leaf = LeafRef::parse(self.page)?;
+        Ok(DeltaShape {
+            delta_count: leaf.delta_count(),
+            delta_start: leaf.delta_start(),
+            row_count: leaf.row_count(),
+            has_tombstones: leaf.has_tombstones(),
+            heap_start: leaf.heap_start(),
+            format_one: !leaf.has_delta_directory(),
+        })
+    }
+
+    /// Returns where a row of this size lands in a leaf of this shape.
+    ///
+    /// Pure arithmetic over what has already been read, so a caller that needs
+    /// the answer twice - the room check, which also asks about the tombstone
+    /// bitmap - parses the page once.
+    ///
+    /// **The free gap is the only limit** (task-2074). The area grows by the
+    /// row, its two-byte length and one two-byte directory entry, and a row is
+    /// refused when that would reach the tombstone bitmap or the mini-columns.
+    /// There was a count limit of 32 here as well, and it decided when every
+    /// leaf compacted; see `leaf::DELTA_ENTRY`.
+    ///
+    /// The floor arrives already computed, which means a caller pays the column
+    /// directory walk even when the delta area is full and the answer was going
+    /// to be `None`. That is the write that is about to compact the leaf, and a
+    /// compaction is forty microseconds against the tenth of one this costs;
+    /// paying it there is what lets the common write parse the page once.
+    ///
+    /// @param shape - the header fields, from [`LeafMut::delta_shape`]
+    /// @param floor - where the mini-columns end, from `columns_end`
+    /// @param encoded_len - how many bytes the row's tagged form occupies
+    fn offsets_within(
+        &self,
+        shape: DeltaShape,
+        floor: usize,
+        encoded_len: usize,
+    ) -> DbResult<Option<DeltaOffsets>> {
+        if shape.delta_count >= u16::MAX as usize {
+            return Ok(None);
+        }
+        // Format 1's own limit, which its writer enforced and a replay of its
+        // log has to enforce the same way.
+        if shape.format_one && shape.delta_count >= FORMAT_ONE_DELTA_LIMIT {
             return Ok(None);
         }
         if encoded_len > u16::MAX as usize {
             return Ok(None);
         }
-        let bitmap = if has_tombstones {
-            tombstone_bytes(row_count)
+        let bitmap = if shape.has_tombstones {
+            tombstone_bytes(shape.row_count)
         } else {
             0
         };
-        let entry = encoded_len.saturating_add(2);
-        let Some(new_delta_start) = delta_start.checked_sub(entry) else {
+        let directory = if shape.format_one { 0 } else { DELTA_ENTRY };
+        let entry = encoded_len.saturating_add(2).saturating_add(directory);
+        let Some(new_delta_start) = shape.delta_start.checked_sub(entry) else {
             return Ok(None);
         };
-        let floor = self.columns_end()?;
         if new_delta_start.saturating_sub(bitmap) < floor {
             return Ok(None);
         }
-        Ok(Some((new_delta_start, delta_start, bitmap, delta_count)))
+        Ok(Some(DeltaOffsets {
+            new_delta_start,
+            old_delta_start: shape.delta_start,
+            bitmap,
+            delta_count: shape.delta_count,
+            heap_start: shape.heap_start,
+            format_one: shape.format_one,
+        }))
     }
 
     /// Performs a delta insert that [`LeafMut::plan_delta`] costed.
@@ -328,6 +499,73 @@ impl<'p> LeafMut<'p> {
     ///
     /// @param plan - what [`LeafMut::plan_delta`] returned
     pub fn apply_delta(&mut self, plan: &DeltaPlan) -> DbResult<()> {
+        if plan.format_one {
+            return self.apply_format_one_delta(plan);
+        }
+        let old = plan.old_delta_start;
+        let new = plan.new_delta_start;
+        let entries = plan.delta_count.saturating_mul(DELTA_ENTRY);
+        let before = plan.slot.saturating_mul(DELTA_ENTRY);
+        // **Four moves, in this order, and each one is safe only because the
+        // one before it has already happened.** Everything moves down, so each
+        // copy's destination is below its source and `copy_within` handles the
+        // overlap.
+        //
+        // 1. The tombstone bitmap, which sits just below the area and has to
+        //    get out of the way of the directory's new position.
+        if plan.bitmap > 0 {
+            let from = old.saturating_sub(plan.bitmap);
+            let to = new.saturating_sub(plan.bitmap);
+            self.page
+                .copy_within(from..from.saturating_add(plan.bitmap), to);
+        }
+        // 2. The directory entries before the new row's place, which move down
+        //    by the row, its length and one entry.
+        if before > 0 {
+            self.page.copy_within(old..old.saturating_add(before), new);
+        }
+        // 3. The entries after it, which move down one entry less, leaving the
+        //    gap the new entry goes into.
+        if entries > before {
+            self.page.copy_within(
+                old.saturating_add(before)..old.saturating_add(entries),
+                new.saturating_add(before).saturating_add(DELTA_ENTRY),
+            );
+        }
+        // 4. The row, just below the rows already there. Its bytes land where
+        //    the old directory was, which the two copies above have emptied.
+        let rows_start = old.saturating_add(entries);
+        let at = rows_start
+            .checked_sub(plan.encoded.len().saturating_add(2))
+            .ok_or_else(|| corrupt("the delta row ran below the page"))?;
+        page::write_u16(self.page, at, plan.encoded.len() as u16)?;
+        let body = self
+            .page
+            .get_mut(at.saturating_add(2)..rows_start)
+            .ok_or_else(|| corrupt("the delta row ran past the page"))?;
+        body.copy_from_slice(&plan.encoded);
+        let distance = u16::try_from(plan.heap_start.saturating_sub(at))
+            .map_err(|_| corrupt("a delta row is too far from the heap"))?;
+        page::write_u16(self.page, new.saturating_add(before), distance)?;
+        page::write_u32(self.page, leaf_header::DELTA_START, new as u32)?;
+        page::write_u16(
+            self.page,
+            leaf_header::DELTA_COUNT,
+            plan.delta_count.saturating_add(1) as u16,
+        )?;
+        self.set_flag(LEAF_HAS_DELTA, true)?;
+        Ok(())
+    }
+
+    /// Performs a delta insert into a leaf in format 1's layout.
+    ///
+    /// Format 1's insert, byte for byte: the bitmap moves down, and the row goes
+    /// at the new `delta_start`, ahead of every row already there, so the newest
+    /// row is the first. See the module's note on why a format 1 leaf is still
+    /// written this way.
+    ///
+    /// @param plan - what [`LeafMut::plan_encoded`] returned for this page
+    fn apply_format_one_delta(&mut self, plan: &DeltaPlan) -> DbResult<()> {
         // The bitmap moves down with the delta area. Copied *before* the row is
         // written, because the row's bytes land where part of the old bitmap
         // may still be.
@@ -374,8 +612,9 @@ impl<'p> LeafMut<'p> {
     ///
     /// A delta row cannot be marked dead in place - its encoding has no room for
     /// a flag and inventing one would make every reader check it - so the area
-    /// is rebuilt. That is a copy of at most [`DELTA_LIMIT`] short rows, which
-    /// is what the limit is for.
+    /// is rebuilt. That is a copy of the area, which is at most the free gap a
+    /// compaction left; it is taken by an update or a delete of a row written
+    /// since the leaf was last packed, and never by an insert of a new key.
     ///
     /// @param index - the row's position in the delta area
     pub fn remove_delta(&mut self, index: usize) -> DbResult<()> {
@@ -409,19 +648,28 @@ impl<'p> LeafMut<'p> {
         Ok(())
     }
 
-    /// Replaces the whole delta area with the given rows, newest first.
+    /// Replaces the whole delta area with the given rows, in directory order.
     ///
-    /// @param rows - the encoded rows, in the order they should be read
+    /// The rows are laid out in the order given, from just past the new
+    /// directory up to the heap, and the directory names them in that order.
+    /// Deterministic in the rows alone, which is what lets recovery replay a
+    /// removal onto the same bytes.
+    ///
+    /// @param rows - the encoded rows, in the order the directory should name them
     fn rewrite_delta(&mut self, rows: &[Vec<u8>]) -> DbResult<()> {
-        let (heap_start, row_count, has_tombstones, old_delta_start) = {
+        let (heap_start, row_count, has_tombstones, old_delta_start, format_one) = {
             let leaf = LeafRef::parse(self.page)?;
             (
                 leaf.heap_start(),
                 leaf.row_count(),
                 leaf.has_tombstones(),
                 leaf.delta_start(),
+                !leaf.has_delta_directory(),
             )
         };
+        // Format 1 keeps its own layout: the rows, in the order given, and no
+        // directory. See the module's note.
+        let entry_size = if format_one { 0 } else { DELTA_ENTRY };
         let bitmap = if has_tombstones {
             tombstone_bytes(row_count)
         } else {
@@ -429,7 +677,7 @@ impl<'p> LeafMut<'p> {
         };
         let total: usize = rows
             .iter()
-            .map(|row| row.len().saturating_add(2))
+            .map(|row| row.len().saturating_add(2).saturating_add(entry_size))
             .fold(0usize, usize::saturating_add);
         let new_delta_start = heap_start
             .checked_sub(total)
@@ -450,8 +698,14 @@ impl<'p> LeafMut<'p> {
         } else {
             Vec::new()
         };
-        let mut at = new_delta_start;
-        for row in rows {
+        let mut at = new_delta_start.saturating_add(rows.len().saturating_mul(entry_size));
+        for (index, row) in rows.iter().enumerate() {
+            if !format_one {
+                let distance = u16::try_from(heap_start.saturating_sub(at))
+                    .map_err(|_| corrupt("a delta row is too far from the heap"))?;
+                let entry = new_delta_start.saturating_add(index.saturating_mul(DELTA_ENTRY));
+                page::write_u16(self.page, entry, distance)?;
+            }
             page::write_u16(self.page, at, row.len() as u16)?;
             let body = self
                 .page
@@ -667,7 +921,7 @@ impl<'p> LeafMut<'p> {
     ///
     /// **The third case is what put the `transaction` family under its floor.**
     /// Refusing a length change is one branch, and the caller's route out of it
-    /// is a tombstone plus a delta insert plus, every [`DELTA_LIMIT`] writes, a
+    /// is a tombstone plus a delta insert plus, whenever the free gap fills, a
     /// compaction over every live row of the leaf. The gate's `txn.large` is two
     /// thousand `UPDATE side_table SET note = ?2` in one transaction, replacing
     /// an eight-byte `note 1234` with a forty-two byte `row 1234 lorem ipsum
@@ -677,8 +931,8 @@ impl<'p> LeafMut<'p> {
     ///
     /// **Moving the delta area is bounded work and repacking the leaf is not.**
     /// What moves is the tombstone bitmap and the delta area, which is
-    /// `row_count / 8` bytes and at most [`DELTA_LIMIT`] rows - about two
-    /// kilobytes on the leaves this fixture holds. A compaction rewrites every
+    /// `row_count / 8` bytes and at most the free gap a compaction left - about
+    /// two kilobytes on the leaves this fixture holds. A compaction rewrites every
     /// live row, and a `side_table` leaf holds about fifteen hundred of them.
     ///
     /// **Bytes nothing points at are not a leak.** They are what SQLite calls
@@ -1100,27 +1354,47 @@ mod tests {
         view.integrity().expect("the page is sound");
     }
 
-    /// The delta limit is enforced whatever the page size.
+    /// The delta area takes rows until the free gap is gone, in key order.
+    ///
+    /// **It used to stop at 32 rows whatever the page size** (task-2074), which
+    /// is what made an index leaf of thousands of rows compact as often as a
+    /// table leaf of two hundred. The rows arrive in a scrambled key order, so
+    /// this also checks that the directory comes out sorted however they came.
     #[test]
-    fn the_delta_limit_is_enforced() {
+    fn the_delta_area_fills_the_gap_in_key_order() {
         let mut page = leaf_of(65_536, 4);
         let mut leaf = LeafMut::new(&mut page).expect("a leaf");
-        for round in 0..DELTA_LIMIT {
-            assert_eq!(
-                leaf.insert_delta(
-                    &columns(),
-                    &[Datum::Int(1_000 + round as i64), Datum::Null, Datum::Int(1)]
-                )
-                .expect("an insert"),
-                Applied::Yes,
-                "row {round} of the limit did not fit a 64 KiB page"
-            );
+        let mut inserted = 0i64;
+        loop {
+            // 10,007 is prime, so this visits distinct keys in a scrambled order.
+            let key = 1_000 + (inserted * 7_919) % 10_007;
+            let outcome = leaf
+                .insert_delta(&columns(), &[Datum::Int(key), Datum::Null, Datum::Int(1)])
+                .expect("an insert");
+            if outcome == Applied::NoRoom {
+                break;
+            }
+            inserted += 1;
+            assert!(inserted < 10_007, "the page never filled up");
         }
-        assert_eq!(
-            leaf.insert_delta(&columns(), &[Datum::Int(9_999), Datum::Null, Datum::Int(1)])
-                .expect("an insert"),
-            Applied::NoRoom,
-            "the delta limit was not enforced"
+        assert!(
+            inserted > 1_000,
+            "{inserted} rows filled a 64 KiB page, so something other than the gap stopped them"
+        );
+        let view = leaf.view().expect("the page parses");
+        view.integrity().expect("the page is sound");
+        let keys: Vec<i64> = (0..view.delta_count())
+            .map(|index| {
+                view.delta_value(index, 0)
+                    .expect("a key")
+                    .as_int()
+                    .expect("an integer key")
+            })
+            .collect();
+        assert_eq!(keys.len() as i64, inserted);
+        assert!(
+            keys.windows(2).all(|pair| pair[0] < pair[1]),
+            "the directory is not in key order"
         );
     }
 
@@ -1193,14 +1467,15 @@ mod tests {
             )
             .expect("an insert");
         }
-        // Newest first, so index 0 holds round 4.
+        // The directory is in key order, and the keys rise with the rounds, so
+        // index 2 holds round 2.
         leaf.remove_delta(2).expect("a removal");
         let view = leaf.view().expect("the page parses");
         assert_eq!(view.delta_count(), 4);
         let remaining: Vec<i64> = (0..4)
             .map(|index| view.delta_value(index, 2).unwrap().as_int().unwrap_or(-1))
             .collect();
-        assert_eq!(remaining, vec![4, 3, 1, 0], "the wrong row was removed");
+        assert_eq!(remaining, vec![0, 1, 3, 4], "the wrong row was removed");
         assert!(view.is_tombstoned(5).unwrap(), "the bitmap was lost");
         view.integrity().expect("the page is sound");
         assert!(leaf.remove_delta(9).is_err());
@@ -1551,5 +1826,69 @@ mod tests {
                 "page {page_size}, value {length}: costed {costed} but applied {applied:?}"
             );
         }
+    }
+
+    /// A write the room check passed can always place its row, even when the
+    /// same write has to create the tombstone bitmap first.
+    ///
+    /// **The exact arithmetic that answered `SQLITE_CORRUPT` for an ordinary
+    /// `INSERT` (task-2033).** The two grow downwards into the same gap, and
+    /// [`LeafMut::room_for`] used to cost them one at a time: the row against a
+    /// page with no bitmap, and the bitmap against a page with no row. A leaf
+    /// with room for either alone answered yes, [`LeafMut::set_tombstone`]
+    /// created the bitmap, and [`LeafMut::plan_encoded`] then found nowhere to
+    /// put the row.
+    ///
+    /// The loop walks the row length across the boundary rather than asserting
+    /// at one length, because the window that was wrong is exactly the size of
+    /// the bitmap - eight bytes on these leaves - and a single length is as
+    /// likely to miss it as to land in it.
+    #[test]
+    fn a_row_the_room_check_passed_fits_beside_the_tombstone_it_creates() {
+        let mut agreed = 0usize;
+        for length in 1..1_000usize {
+            let mut page = leaf_of(1_024, 8);
+            let value = vec![b'x'; length];
+            let mut encoded = Vec::new();
+            for value in [Datum::Int(3), Datum::Text(&value), Datum::Int(30)] {
+                value.encode_tagged(&mut encoded);
+            }
+            let mut leaf = LeafMut::new(&mut page).expect("a leaf");
+            if !leaf.room_for(encoded.len()).expect("a room check") {
+                continue;
+            }
+            agreed = agreed.saturating_add(1);
+            // What `Tree::apply_row` does to displace the row under the key: a
+            // key already in the sorted region is tombstoned, and on a leaf
+            // that has no bitmap yet that is what creates one.
+            assert_eq!(
+                leaf.set_tombstone(3).expect("a tombstone"),
+                Applied::Yes,
+                "a {length}-byte value: the room check passed and the tombstone did not fit"
+            );
+            // The delta area is empty, so the row is the directory's first entry.
+            let plan = leaf
+                .plan_encoded(encoded.clone(), 0)
+                .expect("a plan")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a {length}-byte value: `room_for` passed a {}-byte row and                          `plan_encoded` then had nowhere to put it",
+                        encoded.len()
+                    )
+                });
+            leaf.apply_delta(&plan).expect("the plan applies");
+            leaf.view()
+                .expect("the page parses")
+                .integrity()
+                .expect("the page is sound");
+        }
+        // §1.2 of the testing standard: a loop whose body never ran asserts
+        // nothing. Most lengths fit a 1,024-byte leaf holding eight rows, so a
+        // count near zero means the leaf was built wrong rather than that the
+        // check is strict.
+        assert!(
+            agreed > 100,
+            "the room check accepted only {agreed} of 999 row lengths, so this case is no              longer exercising the boundary it was written for"
+        );
     }
 }

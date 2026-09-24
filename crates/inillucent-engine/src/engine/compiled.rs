@@ -108,7 +108,7 @@ impl crate::ImportedDatabase {
         self.record_changes(changed as i64, changed as i64);
         Ok(Outcome {
             rows: Vec::new(),
-            names: Vec::new(),
+            names: std::rc::Rc::new(Vec::new()),
             changes: Changes {
                 rows: changed,
                 ..Default::default()
@@ -120,7 +120,7 @@ impl crate::ImportedDatabase {
     ///
     /// @param cached - the compiled statement
     /// @param params - the bound parameters
-    fn apply_compiled(
+    pub(crate) fn apply_compiled(
         &mut self,
         cached: &std::rc::Rc<Cached>,
         params: &Params,
@@ -149,8 +149,8 @@ impl crate::ImportedDatabase {
             Cached::Program(rows) => Ok(program_rows(rows)),
             Cached::VirtualInsert(statement) => self.insert_into_module(statement, params),
             Cached::SchemaInsert(statement) => self.insert_into_schema(statement, params),
-            Cached::Select(plan, prepared, slot) => {
-                self.execute_select_cached(plan, prepared, slot, params)
+            Cached::Select(plan, prepared, slot, names) => {
+                self.execute_select_cached(plan, prepared, slot, names, params)
             }
             Cached::Insert(statement, source, values_hold_subquery) => {
                 let rows = match source {
@@ -216,7 +216,7 @@ impl crate::ImportedDatabase {
                 self.record_changes(changed as i64, changed as i64);
                 Ok(Outcome {
                     rows: Vec::new(),
-                    names: Vec::new(),
+                    names: std::rc::Rc::new(Vec::new()),
                     changes: Changes {
                         rows: changed,
                         ..Default::default()
@@ -314,8 +314,11 @@ impl crate::ImportedDatabase {
             .with_foreign_keys(
                 self.pragmas.foreign_keys(),
                 self.pragmas.defer_foreign_keys(),
-            );
-        let bound = binder.bind_statement(inner).map_err(refused)?;
+            )
+            .with_scratch(self.compiled.take_binder_scratch());
+        let outcome = binder.bind_statement(inner);
+        self.compiled.recycle_binder(binder.into_scratch());
+        let bound = outcome.map_err(refused)?;
         let lines = match bound {
             BoundStatement::Select(select) => {
                 plan_select_with(*select, self.pragmas.levers()).describe()
@@ -332,6 +335,8 @@ impl crate::ImportedDatabase {
                     statement.filter.as_ref(),
                     statement.limit.as_ref(),
                     statement.offset.as_ref(),
+                    &statement.index_hint,
+                    &statement.index_exprs,
                 )?
                 .0
                 .describe(),
@@ -342,6 +347,8 @@ impl crate::ImportedDatabase {
                     statement.filter.as_ref(),
                     statement.limit.as_ref(),
                     statement.offset.as_ref(),
+                    &statement.index_hint,
+                    &statement.index_exprs,
                 )?
                 .0
                 .describe(),
@@ -355,8 +362,12 @@ impl crate::ImportedDatabase {
 
     /// Compiles one statement as far as its parameters allow.
     ///
+    /// Answers the parameter count beside the plan, because the parse that
+    /// produces the plan has already read it (task-2066 §4.3.3). A caller
+    /// that wanted both used to ask twice and parse twice.
+    ///
     /// @param sql - the statement text
-    pub(crate) fn compile(&self, sql: &str) -> DbResult<Cached> {
+    pub(crate) fn compile(&self, sql: &str) -> DbResult<(Cached, u32)> {
         // Counted here rather than at the three call sites, so a fourth path to
         // a compilation cannot be added without moving this number with it.
         self.compiled
@@ -368,19 +379,46 @@ impl crate::ImportedDatabase {
         // there is no program, and that difference is the whole of the
         // `query_plan` split below.
         let parsed = self.parse_once(sql)?;
+        // **Read before the arena goes back**, which is the whole of why
+        // `Connection::prepare` used to parse twice: the count lives in the
+        // recycled parse and asking for it afterwards reads an arena
+        // something else has been built out of.
+        let parameters = parsed.parameters.count;
         if let inillucent_sql::ast::Statement::Explain { query_plan, inner } = &parsed.statement {
-            return self.compile_explain(sql, *query_plan, inner, &parsed);
+            return self
+                .compile_explain(sql, *query_plan, inner, &parsed)
+                .map(|cached| (cached, parameters));
         }
         let bound = self.bind_parsed(sql, &parsed);
         self.compiled.recycle(parsed);
-        match bound? {
+        self.compile_bound(sql, bound?)
+            .map(|cached| (cached, parameters))
+    }
+
+    /// Turns one bound statement into the compiled thing it becomes.
+    ///
+    /// **Split out of [`ImportedDatabase::compile`]** because that function
+    /// was 160 lines and the ratchet in `policy.rs` allows 150 for one that
+    /// is not on its recorded list. The seam was already in the shape:
+    /// everything above this was about getting a bound statement out of some
+    /// text, and this is about which kind of compiled thing that statement
+    /// becomes.
+    ///
+    /// @param sql - the statement text, for the variants that keep it
+    /// @param bound - the binder's output
+    fn compile_bound(&self, sql: &str, bound: BoundStatement) -> DbResult<Cached> {
+        match bound {
             BoundStatement::Select(select) => {
                 let plan = plan_select_with(*select, self.pragmas.levers());
                 let prepared = physical::prepare_any(&plan, self)?;
+                // The names are decoded here, once, rather than on every
+                // execution - see `CachedQuery::names` (task-2066 §4.3.5).
+                let names = std::rc::Rc::new(crate::plans::column_names(&plan));
                 Ok(Cached::Select(
                     Box::new(plan),
                     Box::new(prepared),
                     std::cell::RefCell::new(physical::Slot::default()),
+                    names,
                 ))
             }
             BoundStatement::Insert(statement)
@@ -485,6 +523,8 @@ impl crate::ImportedDatabase {
                     statement.filter.as_ref(),
                     statement.limit.as_ref(),
                     statement.offset.as_ref(),
+                    &statement.index_hint,
+                    &statement.index_exprs,
                 )?;
                 Ok(Cached::Delete(statement, CachedQuery::new(plan, prepared)))
             }
@@ -512,6 +552,8 @@ impl crate::ImportedDatabase {
     /// @param filter - the statement's `WHERE`
     /// @param limit - the statement's `LIMIT`
     /// @param offset - the statement's `OFFSET`
+    /// @param hint - `INDEXED BY` or `NOT INDEXED` on the target
+    /// @param index_exprs - the target's bound index expressions
     fn keys_plan(
         &self,
         table: &TableInfo,
@@ -519,13 +561,16 @@ impl crate::ImportedDatabase {
         filter: Option<&inillucent_sql::bind::BoundExpr>,
         limit: Option<&inillucent_sql::bind::BoundExpr>,
         offset: Option<&inillucent_sql::bind::BoundExpr>,
+        hint: &inillucent_sql::bind::IndexChoice,
+        index_exprs: &[inillucent_sql::dml::BoundIndexExprs],
     ) -> DbResult<(PhysicalPlan, physical::Prepared)> {
         let layout = self
             .schema
             .layouts
             .get(&table.root)
             .ok_or_else(|| refusal("no layout imported for the table being written"))?;
-        let select = dml::keys_query(table, source, filter, limit, offset, layout)?;
+        let mut select = dml::keys_query(table, source, filter, limit, offset, layout)?;
+        dml::hint_target(&mut select, hint, index_exprs);
         let mut plan = plan_select_with(select, self.pragmas.levers());
         // **The one place `Levers::INDEXED_WRITE` has to be applied by hand.**
         // `plan_select_with` is the ordinary read planner, shared with every
@@ -581,6 +626,8 @@ impl crate::ImportedDatabase {
                 statement.filter.as_ref(),
                 statement.limit.as_ref(),
                 statement.offset.as_ref(),
+                &statement.index_hint,
+                &statement.index_exprs,
             );
         }
         let layout = self
@@ -593,7 +640,7 @@ impl crate::ImportedDatabase {
             .iter()
             .map(|assignment| assignment.value.clone())
             .collect();
-        let select = dml::keys_query_joined(
+        let mut select = dml::keys_query_joined(
             &statement.table,
             statement.source,
             statement.filter.as_ref(),
@@ -603,6 +650,7 @@ impl crate::ImportedDatabase {
             &statement.from,
             &assigned,
         )?;
+        dml::hint_target(&mut select, &statement.index_hint, &statement.index_exprs);
         let plan = plan_select_with(select, self.pragmas.levers());
         let prepared = physical::prepare_any(&plan, self)?;
         Ok((plan, prepared))
@@ -656,13 +704,9 @@ impl crate::ImportedDatabase {
         // the one buffer, because a rollback undoes one *transaction* rather
         // than one file - and each record carries the schema it came out of.
         let undo = Some(self.writing.undo());
-        // **Where this statement's writes begin.** The success path does
-        // nothing with it; the failure path rolls back to it. That asymmetry is
-        // the whole cost of statement atomicity inside a transaction - one
-        // integer read off a `Vec`'s length - which is why there is no
-        // per-statement savepoint here and `txn.large`'s two thousand
-        // statements do not pay for two thousand of them.
-        let mark = self.writing.undo().borrow().len();
+        // Where this statement's writes begin, in both of the transaction's
+        // records. See `statement_mark` for why it costs nothing.
+        let mark = self.statement_mark();
         let main_log = WalLog {
             wal: std::rc::Rc::clone(&self.storage.wal),
             txn,
@@ -833,7 +877,7 @@ impl crate::ImportedDatabase {
         committed?;
         Ok(Outcome {
             rows: changes.returned.clone(),
-            names,
+            names: std::rc::Rc::new(names),
             changes,
         })
     }
@@ -854,14 +898,14 @@ impl crate::ImportedDatabase {
     /// intended is worse than saying so.
     ///
     /// @param error - what the statement failed with
-    /// @param mark - the undo buffer's length before the statement wrote
+    /// @param mark - where the statement's writes began, in both records
     /// @param autocommit - whether the statement was its own transaction
     /// @param wrote - the schemas the statement wrote, as a participant set
     /// @param txn - the transaction the statement wrote under
     fn abandon(
         &mut self,
         error: DbError,
-        mark: usize,
+        mark: crate::engine::state::StatementMark,
         autocommit: bool,
         wrote: u16,
         txn: u64,
@@ -875,12 +919,22 @@ impl crate::ImportedDatabase {
             // and there is no batch to close. Inside one it is the existing
             // `rollback` in full - the savepoints gone, the batch closed, the
             // schema refreshed.
-            Unwind::Transaction if autocommit => self.undo_to_floor(0, false, txn),
+            Unwind::Transaction if autocommit => self.undo_to_floor(
+                crate::engine::state::StatementMark {
+                    undo: 0,
+                    dropped: 0,
+                    built: 0,
+                },
+                false,
+                txn,
+            ),
             Unwind::Transaction => self.rollback(),
         };
         if autocommit {
             self.writing.undo().borrow_mut().clear();
             self.writing.marks().borrow_mut().clear();
+            self.writing.pending_frees().borrow_mut().clear();
+            self.writing.built().borrow_mut().clear();
             if matches!(unwind, Unwind::Nothing) && undone.is_ok() {
                 // **`OR FAIL` outside a transaction commits.** The rows written
                 // before the failure are kept, and keeping them only in the

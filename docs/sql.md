@@ -3,8 +3,8 @@
 inillucent speaks SQLite's SQL dialect on its own storage. This page says which SQL runs and which
 cases out of 416 do not produce SQLite's exact bytes.
 
-**Nothing is refused.** Thirteen cases are not byte for byte: seven answer differently, and six are
-vector search features SQLite has no equivalent for. None of the thirteen is silent. Each answers,
+**Nothing is refused.** Twelve cases are not byte for byte: six answer differently, and six are
+vector search features SQLite has no equivalent for. None of the twelve is silent. Each answers,
 and each reports something a caller can read. [Feature comparison](feature-comparison.md) is the same
 material in full, table by table.
 
@@ -16,12 +16,12 @@ in [the glossary](glossary.md), one sentence each. Every pragma is in [Pragmas](
 416 SQL scripts were run through `inillucent-shell` and through a pinned `sqlite3` 3.53.4, each over
 its own fresh database, and every byte of both output streams was compared.
 
-- **403 of 416 produce SQLite's exact bytes** - 96.9% of the total, and 98.3% of the 410 cases that
+- **404 of 416 produce SQLite's exact bytes** - 97.1% of the total, and 98.5% of the 410 cases that
   have a SQLite answer to compare against.
 - **0 are refused here that SQLite answers**, and 0 are accepted here that SQLite rejects. Window
   functions were the last twelve cases to close: all eleven window-only functions, every frame unit,
   every bound and every `EXCLUDE` clause now match the pinned SQLite exactly.
-- **7 answer differently, and 6 are vector search features SQLite has no equivalent for**, so there
+- **6 answer differently, and 6 are vector search features SQLite has no equivalent for**, so there
   is no SQLite output for them to match.
 
 208 of those cases are also a checked in test, `crates/inillucent-compat/tests/semantics.rs`, so a
@@ -56,8 +56,8 @@ for. `inillucent functions` prints 213 rows because it prints one row per name a
 
 It also names what the connection itself has registered - anything an application defined through
 `create_scalar_function` or `create_aggregate_function`, and `embed(TEXT)` in a build carrying the
-`embed` feature, where the count is 214. Those rows carry `builtin = 0`. Until task-1952 the register
-read the static built-in list alone, so `embed` answered `SELECT length(embed('hello'))` with 3072
+`embed` feature, where the count is 214. Those rows carry `builtin = 0`. Until this was fixed, the
+register read the static built-in list alone, so `embed` answered `SELECT length(embed('hello'))` with 3072
 and `inillucent functions embed` printed nothing.
 
 **Where a registered function may be called from is decided by its flags.** A registration is
@@ -78,7 +78,11 @@ node tools/feature-probe/registers.js    # both registers, compared name by name
 ## What runs
 
 **Queries.** `SELECT` with inner, cross and outer joins, planned as a hash join, an index nested loop
-or a scan. `GROUP BY`, `HAVING`, `DISTINCT`, `ORDER BY`, `LIMIT` and `OFFSET`. Compound selects
+or a scan. `GROUP BY`, `HAVING`, `DISTINCT`, `ORDER BY`, `LIMIT` and `OFFSET`. A `HAVING` needs no `GROUP BY`
+before it: a query with an aggregate among its result columns is one group over the whole table, and
+`SELECT count(*) AS n FROM t HAVING n > 0` filters that one group. A `HAVING` on a query with no
+`GROUP BY` and no aggregate among its result columns is refused, in SQLite's words -
+`HAVING clause on a non-aggregate query` - because SQLite refuses it too. Compound selects
 (`UNION`, `UNION ALL`, `EXCEPT`, `INTERSECT`). Common table expressions, including recursive ones.
 Derived tables in `FROM`. Subqueries in `WHERE`, in `IN`, in `EXISTS` and as values, including
 correlated ones. A correlated `IN` is answered by rewriting it as `EXISTS`, which keeps SQLite's NULL
@@ -129,7 +133,7 @@ any eponymous module a caller registers.
 Every extension's shadow tables are ordinary trees in the same file, so they commit and roll back
 with the transaction that wrote them.
 
-## The thirteen cases that are not byte for byte
+## The twelve cases that are not byte for byte
 
 ### Six are vector search, which SQLite does not have
 
@@ -157,19 +161,19 @@ pcache overflow bytes are facts about SQLite's allocator.
 Printing SQLite's numbers in these three would mean printing facts about a library that is not here.
 That is a fabrication rather than compatibility, so none of the three will ever be closed.
 
-### Three are decisions this engine made, and each was measured
+### Two follow from a decision this engine made, and it was measured
 
-Both experiments below were run against the earlier 3.83x weighted headline. Today's run is 4.30x,
-and neither experiment has been taken again. What each measures is the *difference* between two
-settings, and that difference is what is quoted here.
+The experiment below was run against the earlier 3.83x weighted headline and has not been taken
+again. What it measures is the *difference* between two settings, and that difference is what is
+quoted here.
 
 **`PRAGMA page_size` reports 32768** where SQLite reports 4096. Both were measured on the same gate:
 32768 gave 3.83x weighted with the `schema` family at 1.15x; 4096 with a matched cache budget gave
 3.44x with `schema` at **6% slower than SQLite**, under the floor the performance contract requires.
 The pragma reports what the file is, which is its job.
 
-**`PRAGMA locking_mode` reports `normal`**, where SQLite also reports `normal`, so this is no
-longer a difference. It is the default because `exclusive` never releases the file between
+**`PRAGMA locking_mode` used to be a third row here and is not any more.** It reports `normal`, where
+SQLite also reports `normal`. It is the default because `exclusive` never releases the file between
 statements, so a second process either waits out the whole life of the first or reads state from
 before it. `exclusive` is still a real switch, and a program that never opens a second connection
 can take it for the throughput: releasing the file between statements means reading the meta record
@@ -182,8 +186,8 @@ Rows in the file equal commits acknowledged, which
 
 **`.recover`** differs on one line of nineteen, and it is the line that names the page size.
 
-Adopting SQLite's values in the first two would take the byte for byte number from 403 to 406, at a
-measured cost to the performance bars.
+Adopting SQLite's 4,096 byte page would close both `PRAGMA page_size` and `.recover`, and take the
+byte for byte number from 404 to 406, at the measured cost to the `schema` family above.
 
 ### One is the two pinned reference artifacts disagreeing with each other
 
@@ -228,6 +232,22 @@ wrong".
 Two of those are limits worth planning around. A transaction that writes more pages than the pool
 holds needs a larger pool, set when the file is opened. And a `DROP TABLE` cannot be undone inside a
 transaction: attempting it leaves the connection unable to read that table.
+
+### Four smaller differences, each with a test that holds it still
+
+A correctness audit measured these and they are not fixed. Each one has a test asserting
+the behaviour as it is, so a change to any of them is a change somebody made on purpose.
+
+| | inillucent | SQLite 3.53.4 |
+|---|---|---|
+| `pragma_foreign_keys` as a table-valued function | not offered. The table-valued forms are the pragmas that answer rows; `foreign_keys` is a setting and is reachable as `PRAGMA foreign_keys` | offered, one row holding the flag |
+| an index on a `VIRTUAL` generated column | refused. `CREATE INDEX` needs a stored value to key on, and a `VIRTUAL` column has none in the row | allowed; the index stores the computed value |
+| `vector-search`'s result columns | the primary key appears twice: once as the table's own column and once as the column the search names | no equivalent; SQLite has no vector search |
+| a JSON-text vector handed to the `inillucent_search` hybrid table | refused as `syntax`, which does not say that the argument was the wrong shape | no equivalent |
+
+The first two are also absent from `inillucent capabilities`, which is why they are written down
+here: the capability table is checked against the running engine in both directions, and a row that
+does not exist is the one thing it cannot check.
 
 ## Reproducing the probe
 

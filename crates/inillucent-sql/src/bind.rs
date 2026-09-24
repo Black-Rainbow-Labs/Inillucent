@@ -13,9 +13,28 @@
 //! and only when no real column shadows them.
 
 mod cte;
+mod refusal;
+// The refusals live in `bind/refusal.rs` and are named here so every call
+// site reads as it did. See that file for why they moved.
+pub(crate) use refusal::{
+    ambiguous_column, compound_order_unmatched, no_query_solution, no_such_collation,
+    no_such_column, no_such_column_quoted, no_such_function, no_such_index, no_such_table,
+    order_out_of_range, schema_refused, unsupported, wrong_arguments,
+};
+mod aggregate;
+mod collation;
+mod having;
+mod literal;
+mod rowvalue;
+mod scratch;
+
+use collation::{apply_collation, explicit_argument_collation};
+pub use collation::{comparison_rules, result_collation};
+use literal::integer_literal;
 
 pub use cte::CteBinding;
 use cte::RecursiveTarget;
+pub use scratch::BinderScratch;
 
 use inillucent_value::{Affinity, Collation};
 
@@ -254,6 +273,15 @@ pub enum BoundExpr {
         collation: Collation,
     },
     /// `BETWEEN`, kept as one node so its operand is evaluated once.
+    ///
+    /// **Each bound has its own affinity and collation (task-2088).** SQLite
+    /// codes `x BETWEEN lo AND hi` as `x >= lo AND x <= hi`, and each of those
+    /// comparisons takes its rules from its own two operands. One pair of rules
+    /// taken from `x` and `lo` ignored `hi` entirely: measured against 3.53.4,
+    /// `s BETWEEN 'a' AND 'B' COLLATE NOCASE` returned no rows where SQLite
+    /// returns `a` and `b`, and `'5' BETWEEN 1 AND CAST('9' AS INTEGER)`
+    /// answered 0 where SQLite applies the upper bound's INTEGER affinity and
+    /// answers 1.
     Between {
         /// Whether `NOT` was written.
         negated: bool,
@@ -263,10 +291,14 @@ pub enum BoundExpr {
         low: Box<BoundExpr>,
         /// The upper bound.
         high: Box<BoundExpr>,
-        /// The affinity applied to the comparisons.
-        affinity: Option<Affinity>,
-        /// The collation the comparisons use.
-        collation: Collation,
+        /// The affinity `operand >= low` applies.
+        low_affinity: Option<Affinity>,
+        /// The collation `operand >= low` uses.
+        low_collation: Collation,
+        /// The affinity `operand <= high` applies.
+        high_affinity: Option<Affinity>,
+        /// The collation `operand <= high` uses.
+        high_collation: Collation,
     },
     /// `IN` over a value list.
     InList {
@@ -289,8 +321,16 @@ pub enum BoundExpr {
         branches: Vec<(BoundExpr, BoundExpr)>,
         /// The `ELSE` arm.
         otherwise: Option<Box<BoundExpr>>,
-        /// The collation comparisons in the base form use.
-        collation: Collation,
+        /// The affinity and collation each `WHEN` comparison uses in the base
+        /// form, one per branch, and empty in the searched form.
+        ///
+        /// SQLite codes `CASE x WHEN y` as `x = y` for each branch, so each
+        /// comparison takes its rules from `x` and its own `y` through
+        /// [`comparison_rules`]. One collation taken from `x` for every branch
+        /// made `CASE 'a' WHEN 'A' COLLATE NOCASE` answer 0 where 3.53.4
+        /// answers 1, and no affinity made `CASE id WHEN '1'` answer 0 on an
+        /// INTEGER column where 3.53.4 answers 1 (task-2094).
+        comparisons: Vec<(Option<Affinity>, Collation)>,
     },
     /// `CAST`.
     Cast {
@@ -354,11 +394,29 @@ pub enum BoundExpr {
     WindowRef {
         /// Which window call, by position in the block's list.
         slot: usize,
+        /// The explicit collation the call's arguments carry, if one does.
+        ///
+        /// The arguments live in the block's window list, out of reach of
+        /// [`BoundExpr::explicit_collation`], so the binder copies the answer
+        /// here (task-2094). The `PARTITION BY` and the `ORDER BY` of the
+        /// window do not count: 3.53.4 answers `max(s) OVER (PARTITION BY s
+        /// COLLATE NOCASE) = 'C'` with 0.
+        collation: Option<Collation>,
     },
     /// A reference to an aggregate accumulator computed for this row group.
     Aggregate {
         /// Which accumulator, by position.
         slot: usize,
+        /// The explicit collation the call's arguments carry, if one does.
+        ///
+        /// SQLite marks the aggregate call `EP_Collate` from its arguments, so
+        /// `max(s COLLATE NOCASE) = 'C'` compares with NOCASE. The arguments
+        /// live in the binder's aggregate list, out of reach of
+        /// [`BoundExpr::explicit_collation`], so the binder copies the answer
+        /// here (task-2094). An argument's `ORDER BY` and a `FILTER` do not
+        /// count: 3.53.4 answers `group_concat(s ORDER BY s COLLATE NOCASE) =
+        /// 'A,A,B,B,C,C'` with 0.
+        collation: Option<Collation>,
     },
     /// A column of the current sorter row, used after an ORDER BY sort.
     SorterColumn {
@@ -417,28 +475,6 @@ impl BoundExpr {
             BoundExpr::Cast { affinity, .. } => Some(*affinity),
             BoundExpr::Rowid { .. } => Some(Affinity::Integer),
             BoundExpr::Collate { operand, .. } => operand.affinity(),
-            _ => None,
-        }
-    }
-
-    /// Returns the collation this expression carries, if it forces one.
-    pub fn collation(&self) -> Option<Collation> {
-        match self {
-            BoundExpr::Column { collation, .. } => Some(*collation),
-            BoundExpr::Collate { collation, .. } => Some(*collation),
-            _ => None,
-        }
-    }
-
-    /// Returns the collation an explicit `COLLATE` forced on this expression.
-    ///
-    /// This is *not* the same question as [`BoundExpr::collation`]. A column
-    /// declared `COLLATE NOCASE` has an implicit collation; `x COLLATE BINARY`
-    /// has an explicit one, and an explicit collation on either side of a
-    /// comparison beats an implicit one on the other side.
-    pub fn explicit_collation(&self) -> Option<Collation> {
-        match self {
-            BoundExpr::Collate { collation, .. } => Some(*collation),
             _ => None,
         }
     }
@@ -991,6 +1027,62 @@ pub struct BoundSource {
     /// planner unable to choose it - the conservative answer, and the one that
     /// was in force while these forms were refused outright.
     pub index_exprs: Vec<crate::dml::BoundIndexExprs>,
+    /// `INDEXED BY name` or `NOT INDEXED`, as the FROM term wrote it.
+    ///
+    /// **The planner could not see this until task-2066 section 4.4.14.** The
+    /// parser built it, `check_index_hint` checked that an `INDEXED BY` named a
+    /// real index, and then nothing carried it any further - so both hints were
+    /// accepted and ignored. Measured against the pinned 3.53.4 shell on a
+    /// 2,000 row table with an index on each of two columns:
+    /// `SELECT count(*) FROM h NOT INDEXED WHERE a = 3 AND b = 100` planned as
+    /// `SCAN h` there and as `SEARCH h USING INDEX h_b (b=?)` here.
+    ///
+    /// Both are honoured now. `INDEXED BY` was the second half, in task-2078:
+    /// the same statement with `INDEXED BY h_a` planned as
+    /// `SEARCH h USING INDEX h_a (a=?)` there and as `h_b` here, and it is
+    /// held as the index's folded name rather than as the parser's name id
+    /// because the planner has no syntax tree to look the id up in.
+    pub index_hint: IndexChoice,
+}
+
+/// Which indexes the planner may use for one FROM term.
+///
+/// SQLite's two clauses are opposite restrictions and the planner reads them
+/// in one place, `choose_path`. `NOT INDEXED` takes every index away and leaves
+/// the rowid. `INDEXED BY` takes everything *else* away, the rowid and the
+/// table scan included: the pinned 3.53.4 shell plans
+/// `SELECT * FROM h INDEXED BY h_a WHERE id = 5` as `SCAN h USING INDEX h_a`,
+/// a walk of the whole index, with a rowid seek sitting unused beside it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum IndexChoice {
+    /// Nothing was written, so every path is a candidate.
+    #[default]
+    Any,
+    /// `NOT INDEXED`: no index, and the rowid is still allowed.
+    NotIndexed,
+    /// `INDEXED BY name`: that index and nothing else, by its folded name.
+    Only(Vec<u8>),
+}
+
+/// Refuses a block, or one of its compound arms, that forces an index which
+/// cannot answer it.
+///
+/// Here rather than in the planner because this is the last point with a
+/// `Result` to put the refusal in, and every block reaches it: a nested query,
+/// a view body and a CTE body are all bound through `bind_select`. The block's
+/// sources and its `ORDER BY` and `LIMIT` are attached by now, which the
+/// nearest neighbour probe needs.
+/// The refusal points at nothing, because SQLite's does not: the pinned 3.53.4
+/// shell prints `no query solution` with no caret under the statement.
+/// @param bound - the block, with its sources attached
+fn refuse_unanswerable_hints(bound: &BoundSelect) -> Result<(), ParseError> {
+    let arms = core::iter::once(bound).chain(bound.compounds.iter().map(|(_, arm)| arm));
+    for arm in arms {
+        if crate::plan::unanswerable_index_hint(arm).is_some() {
+            return Err(no_query_solution(Span::default()));
+        }
+    }
+    Ok(())
 }
 
 /// One aggregate the statement computes.
@@ -1019,18 +1111,6 @@ pub struct BoundAggregate {
     /// depends on the order the rows arrive in - `group_concat` and the JSON
     /// group aggregates - and SQLite accepts it on any of them.
     pub order_by: Vec<BoundOrderTerm>,
-}
-
-/// Returns the collation a result column compares with.
-///
-/// `DISTINCT` and `GROUP BY` compare result values, and a NOCASE column makes
-/// `blue` and `Blue` the same value for both. Comparing them with BINARY
-/// instead returns more rows than SQLite does, which looks like a duplicate
-/// rather than like a bug.
-pub fn result_collation(expr: &BoundExpr) -> Collation {
-    expr.explicit_collation()
-        .or_else(|| expr.collation())
-        .unwrap_or(Collation::Binary)
 }
 
 /// One result column, after star expansion.
@@ -1297,22 +1377,6 @@ pub enum BoundStatement {
     Empty,
 }
 
-/// The per-block binder state saved while a nested block is bound.
-///
-/// Aggregates, result aliases and the correlation list all belong to one query
-/// block. Without a frame, an aggregate written inside a subquery would be
-/// added to the enclosing block's accumulator list and finalised at the wrong
-/// level - which is a wrong answer rather than an error.
-struct BlockFrame {
-    windows: Vec<BoundWindow>,
-    named_windows: Vec<(Vec<u8>, ast::WindowId)>,
-    aggregates: Vec<BoundAggregate>,
-    result_aliases: Vec<(Vec<u8>, BoundExpr)>,
-    allow_aggregates: bool,
-    inside_aggregate: bool,
-    correlations: Vec<usize>,
-}
-
 /// The binder's working state for one statement.
 pub struct Binder<'a> {
     pub(crate) catalog: &'a dyn CatalogView,
@@ -1366,6 +1430,26 @@ pub struct Binder<'a> {
     pub(crate) scopes: Vec<Vec<usize>>,
     aggregates: Vec<BoundAggregate>,
     result_aliases: Vec<(Vec<u8>, BoundExpr)>,
+    /// Whether anything bound after this block's result columns can name one of
+    /// them by its alias.
+    ///
+    /// **Recording an alias costs an allocation per result column, and almost
+    /// no statement reads one (task-2026).** `result_aliases` is consulted in
+    /// exactly one place - `bind_column_reference`, after a real column has
+    /// failed to match - and the only clauses that reach it are `GROUP BY`,
+    /// `HAVING` and the statement's `ORDER BY`, `LIMIT` and `OFFSET`, all of
+    /// which are bound after the result columns and inside the same block. A
+    /// `SELECT` with none of them fills the list and never reads it, which on
+    /// `SELECT 1` was a lowercased copy of the name `1`, and on a wider select
+    /// is that plus a clone of every result expression.
+    ///
+    /// It is per block and restored by [`BlockFrame`] for the reason the alias
+    /// list itself is: a subquery's tail clauses are its own, and an outer
+    /// `ORDER BY` cannot name an inner block's alias.
+    ///
+    /// It starts `true`, so a binder reached by a path that does not set it
+    /// records aliases exactly as it did before.
+    tail_may_name_an_alias: bool,
     dependencies: Dependencies,
     inside_aggregate: bool,
     allow_aggregates: bool,
@@ -1597,6 +1681,7 @@ impl<'a> Binder<'a> {
             scopes: Vec::new(),
             aggregates: Vec::new(),
             result_aliases: Vec::new(),
+            tail_may_name_an_alias: true,
             dependencies: Dependencies {
                 schemas: Vec::new(),
                 generation: catalog.generation(),
@@ -1738,6 +1823,14 @@ impl<'a> Binder<'a> {
             ));
         }
         let frame = self.enter_block();
+        // Decided here because this is the only place that holds both the block
+        // and the tail clauses bound into it. A compound arm opens its own
+        // frame inside `finish_select` and inherits this, which is right: the
+        // statement's `ORDER BY` is resolved against the compound's columns
+        // rather than through any one arm's aliases, so an arm that inherits a
+        // `true` records aliases it will not read, and never the other way.
+        self.tail_may_name_an_alias =
+            !select.order_by.is_empty() || select.limit.is_some() || select.offset.is_some();
         let bound = self.bind_arm(select.first);
         let mut bound = match bound {
             Ok(bound) => bound,
@@ -1753,24 +1846,29 @@ impl<'a> Binder<'a> {
             .iter()
             .filter_map(|id| self.sources.get(*id).cloned())
             .collect();
+        refuse_unanswerable_hints(&bound)?;
         Ok(bound)
     }
 
     /// Binds the compound arms and the tail clauses onto a first arm.
+    ///
+    /// **An arm goes through [`Binder::bind_isolated_arm`] (task-2042).** A
+    /// bare `enter_block` / `bind_arm` / `leave_block` threw the arm's
+    /// aggregates and windows away, because `leave_block` restores the
+    /// enclosing block's lists, so every arm but the head reached the planner
+    /// claiming to compute nothing: refused, or - with a `GROUP BY` on that
+    /// arm - one blank row per group. `compound.arm.aggregate` and
+    /// `compound.arm.grouped` in `tests/semantics.rs` name both shapes.
+    ///
+    /// @param select - the statement as written
+    /// @param bound - the head arm the arms and clauses are added to
     fn finish_select(
         &mut self,
         select: &'a ast::Select,
         bound: &mut BoundSelect,
     ) -> Result<(), ParseError> {
         for (op, arm) in &select.compounds {
-            let arm_frame = self.enter_block();
-            let armed = self.bind_arm(*arm);
-            let arm_ids = self.leave_block(arm_frame);
-            let mut armed = armed?;
-            armed.sources = arm_ids
-                .iter()
-                .filter_map(|id| self.sources.get(*id).cloned())
-                .collect();
+            let armed = self.bind_isolated_arm(*arm)?;
             if armed.columns.len() != bound.columns.len() {
                 return Err(ParseError::new(
                     ParseErrorKind::Unsupported(
@@ -1781,12 +1879,21 @@ impl<'a> Binder<'a> {
             }
             bound.compounds.push((*op, armed));
         }
-        let columns = bound.columns.clone();
-        bound.order_by = if bound.compounds.is_empty() {
-            self.bind_order_by(&select.order_by, &columns)?
-        } else {
-            self.bind_compound_order_by(&select.order_by, &columns)?
+        // **The result columns are read where they are, not copied first
+        // (task-2026).** `bound` is a parameter rather than a field, so a
+        // shared borrow of its columns and the mutable borrow of the binder are
+        // two different objects and the compiler accepts both at once. The
+        // clone that used to stand here was a `Vec<BoundResultColumn>` plus one
+        // allocation for every name, origin and declared type in it - six of
+        // the 109 allocations `SELECT a FROM t WHERE id = ?1` made, and two of
+        // `SELECT 1`'s 21 - spent to hand `bind_order_by` a copy of something
+        // it only reads, on every statement including the ones with no
+        // `ORDER BY` at all.
+        let order_by = match bound.compounds.is_empty() {
+            true => self.bind_order_by(&select.order_by, &bound.columns)?,
+            false => self.bind_compound_order_by(&select.order_by, &bound.columns)?,
         };
+        bound.order_by = order_by;
         bound.limit = match select.limit {
             Some(expr) => Some(self.bind_expr(expr)?),
             None => None,
@@ -1854,9 +1961,12 @@ impl<'a> Binder<'a> {
             let Some(column) = columns.get(index) else {
                 return Err(order_out_of_range(index.saturating_add(1), span));
             };
-            let collation = named
-                .or_else(|| column.expr.collation())
-                .unwrap_or(Collation::Binary);
+            // With no `COLLATE` on the term, the result column's own collation
+            // governs, read the same way the compound's duplicate removal reads
+            // it - an explicit `COLLATE` on the result column beats the implicit
+            // one - so the sort and the duplicate removal cannot disagree about
+            // a column.
+            let collation = named.unwrap_or_else(|| result_collation(&column.expr));
             let nulls = term.nulls.unwrap_or(match term.order {
                 SortOrder::Ascending => NullOrder::First,
                 SortOrder::Descending => NullOrder::Last,
@@ -1900,46 +2010,6 @@ impl<'a> Binder<'a> {
         };
         Ok((*operand, Some(named)))
     }
-    /// Opens a query block: a fresh scope, and fresh per-block state.
-    fn enter_block(&mut self) -> BlockFrame {
-        self.scopes.push(Vec::new());
-        BlockFrame {
-            windows: core::mem::take(&mut self.windows),
-            named_windows: core::mem::take(&mut self.named_windows),
-            aggregates: core::mem::take(&mut self.aggregates),
-            result_aliases: core::mem::take(&mut self.result_aliases),
-            allow_aggregates: core::mem::replace(&mut self.allow_aggregates, false),
-            inside_aggregate: core::mem::replace(&mut self.inside_aggregate, false),
-            correlations: core::mem::take(&mut self.correlations),
-        }
-    }
-
-    /// Closes a query block, returning the FROM terms it owned.
-    ///
-    /// A correlation the closing block recorded is passed outward when the
-    /// block that is now innermost does not own the term either, which is what
-    /// makes correlation transitive through two levels of nesting.
-    fn leave_block(&mut self, frame: BlockFrame) -> Vec<usize> {
-        let ids = self.scopes.pop().unwrap_or_default();
-        let inner = core::mem::replace(&mut self.correlations, frame.correlations);
-        for id in inner {
-            if ids.contains(&id) {
-                continue;
-            }
-            let owned = self.scopes.last().is_some_and(|scope| scope.contains(&id));
-            if !owned && !self.correlations.contains(&id) {
-                self.correlations.push(id);
-            }
-        }
-        self.windows = frame.windows;
-        self.named_windows = frame.named_windows;
-        self.aggregates = frame.aggregates;
-        self.result_aliases = frame.result_aliases;
-        self.allow_aggregates = frame.allow_aggregates;
-        self.inside_aggregate = frame.inside_aggregate;
-        ids
-    }
-
     /// Returns the FROM-term ids the innermost block owns.
     pub(crate) fn scope(&self) -> &[usize] {
         self.scopes.last().map_or(&[], |scope| scope.as_slice())
@@ -2041,10 +2111,19 @@ impl<'a> Binder<'a> {
         }
         self.allow_aggregates = true;
         let bound_columns = self.bind_result_columns(columns)?;
-        for column in &bound_columns {
-            if !column.name.is_empty() {
-                self.result_aliases
-                    .push((column.name.to_ascii_lowercase(), column.expr.clone()));
+        // Read before the `HAVING` is bound, because by then `self.aggregates`
+        // holds the ones the `HAVING` itself introduced. `bind::having` says
+        // why that distinction is the whole rule.
+        let aggregates_in_columns = self.aggregates.len();
+        // See `tail_may_name_an_alias`. This core's own `GROUP BY` and `HAVING`
+        // are read here rather than from the flag because they belong to the
+        // core and the flag belongs to the statement around it.
+        if self.tail_may_name_an_alias || !group_by.is_empty() || having.is_some() {
+            for column in &bound_columns {
+                if !column.name.is_empty() {
+                    self.result_aliases
+                        .push((column.name.to_ascii_lowercase(), column.expr.clone()));
+                }
             }
         }
         let mut bound_group = Vec::with_capacity(group_by.len());
@@ -2055,12 +2134,11 @@ impl<'a> Binder<'a> {
             Some(expr) => Some(self.bind_expr(*expr)?),
             None => None,
         };
-        if bound_having.is_some() && bound_group.is_empty() && self.aggregates.is_empty() {
-            return Err(unsupported(
-                "HAVING requires GROUP BY or an aggregate",
-                core.span,
-            ));
-        }
+        having::refuse_when_nothing_aggregates(
+            bound_having.is_some(),
+            bound_group.len(),
+            aggregates_in_columns,
+        )?;
         // The sources stay in the binder's scope: `ORDER BY` and `LIMIT` belong
         // to the whole statement and are bound after this returns, and
         // `ORDER BY b.id` needs the same scope the result columns had.
@@ -2082,6 +2160,50 @@ impl<'a> Binder<'a> {
         })
     }
 
+    /// Refuses an `INDEXED BY` that names no index of the table just bound.
+    ///
+    /// **It was read and thrown away (task-1979, F7).** The hint reached the
+    /// AST and nothing below the parser looked at it, so
+    /// `SELECT * FROM t INDEXED BY nosuch WHERE a = 1` answered rows where
+    /// SQLite refuses the statement with `no such index: nosuch`. A caller who
+    /// wrote the hint to make a plan use a particular index, and misspelled it,
+    /// got a plan that did something else and no way to tell.
+    ///
+    /// `NOT INDEXED` names nothing and is a planner instruction rather than a
+    /// reference, so it passes through here untouched.
+    ///
+    /// @param hint - the hint as written
+    /// @param span - where to point the diagnostic
+    fn check_index_hint(&mut self, hint: ast::IndexHint, span: Span) -> Result<(), ParseError> {
+        let ast::IndexHint::IndexedBy(name) = hint else {
+            return Ok(());
+        };
+        let folded = self.ast.folded(name).to_vec();
+        let Some(source) = self.sources.last() else {
+            return Ok(());
+        };
+        if source
+            .table
+            .indexes
+            .iter()
+            .any(|index| index.folded == folded)
+        {
+            return Ok(());
+        }
+        Err(no_such_index(self.ast.text(name), span))
+    }
+
+    /// Turns a hint as the parser wrote it into the form the planner reads.
+    ///
+    /// @param hint - the hint as written
+    pub(crate) fn index_choice(&self, hint: ast::IndexHint) -> IndexChoice {
+        match hint {
+            ast::IndexHint::None => IndexChoice::Any,
+            ast::IndexHint::NotIndexed => IndexChoice::NotIndexed,
+            ast::IndexHint::IndexedBy(name) => IndexChoice::Only(self.ast.folded(name).to_vec()),
+        }
+    }
+
     /// Binds one FROM term, registering it as a source of the current block.
     ///
     /// A table, a CTE reference, a view and a parenthesised subquery all end up
@@ -2098,10 +2220,19 @@ impl<'a> Binder<'a> {
                 database,
                 name,
                 arguments,
+                indexed_by,
                 ..
             } => {
                 let arguments = arguments.clone();
+                let indexed_by = *indexed_by;
                 self.bind_table_term(*database, *name, term.alias, join, span)?;
+                self.check_index_hint(indexed_by, span)?;
+                // The hint belongs to the term that was just pushed, and this
+                // is the only place that knows both.
+                let choice = self.index_choice(indexed_by);
+                if let Some(source) = self.sources.last_mut() {
+                    source.index_hint = choice;
+                }
                 if let Some(arguments) = arguments {
                     self.bind_table_arguments(&arguments, span)?;
                 }
@@ -2245,6 +2376,7 @@ impl<'a> Binder<'a> {
         };
         let id = self.sources.len();
         self.sources.push(BoundSource {
+            index_hint: crate::bind::IndexChoice::Any,
             id,
             rows: SourceRows::Table,
             table,
@@ -2355,7 +2487,16 @@ impl<'a> Binder<'a> {
         nested.collations = self.collations;
         nested.trusted_schema = self.trusted_schema;
         nested.call_site = function::CallSite::Schema;
-        nested.sources = vec![alone.clone()];
+        // **The term sits at its own id, not at zero (task-2078).** A column is
+        // resolved by looking its term up in `sources` by statement-wide id,
+        // and this list used to hold the one term at position zero. For the
+        // first FROM term those agree. For every later one the lookup found
+        // nothing, the expression did not bind, and the index was left out
+        // without a word: `CREATE INDEX h_part ON h(c) WHERE c > 3` served
+        // `FROM h, s WHERE h.c > 3` and not `FROM s, h WHERE h.c > 3`. The
+        // positions below the term's are filled with copies of it, and the
+        // scope names only the term's own id, so nothing can resolve to them.
+        nested.sources = vec![alone.clone(); alone.id.saturating_add(1)];
         nested.scopes = vec![vec![alone.id]];
         nested.bind_expr(expr).ok()
     }
@@ -2464,6 +2605,7 @@ impl<'a> Binder<'a> {
         let table = subquery_table(&alias, &columns, &bound);
         let id = self.sources.len();
         self.sources.push(BoundSource {
+            index_hint: crate::bind::IndexChoice::Any,
             id,
             rows: SourceRows::Subquery(Box::new(bound)),
             table: std::rc::Rc::new(table),
@@ -2597,6 +2739,7 @@ impl<'a> Binder<'a> {
             ));
         }
         let slot = self.windows.len();
+        let explicit = explicit_argument_collation(&bound_arguments);
         self.windows.push(BoundWindow {
             call,
             distinct,
@@ -2611,7 +2754,10 @@ impl<'a> Binder<'a> {
             end,
             exclude: spec.exclude,
         });
-        Ok(BoundExpr::WindowRef { slot })
+        Ok(BoundExpr::WindowRef {
+            slot,
+            collation: explicit,
+        })
     }
 
     /// Resolves an `OVER` clause into one fully-written window specification.
@@ -2857,7 +3003,12 @@ impl<'a> Binder<'a> {
         &mut self,
         columns: &[ast::ResultColumn],
     ) -> Result<Vec<BoundResultColumn>, ParseError> {
-        let mut bound = Vec::new();
+        // One column of the AST is usually one bound column, so this is the
+        // right answer rather than a guess; `*` expands to more and the vector
+        // grows from here, which is still fewer growths than starting empty.
+        // `Vec::new` grew to four for a one-column select, which is 704 bytes
+        // asked for to hold 176 (task-2026).
+        let mut bound = Vec::with_capacity(columns.len());
         for column in columns {
             match self.ast.expr(column.expr) {
                 Some(Expr::Star { table }) => {
@@ -2955,95 +3106,21 @@ impl<'a> Binder<'a> {
     /// SQLite does, and is the only way `sqlite3_create_collation` can be used
     /// to change how an existing schema compares.
     fn collation_named(&self, name: &[u8]) -> Option<Collation> {
-        let folded = name.to_ascii_uppercase();
+        // **The name is compared where it is (task-2026).** `create_collation`
+        // stores the name uppercased, so an uppercase-insensitive comparison
+        // against a stored name answers exactly what building an uppercase copy
+        // of `name` and comparing bytes answered. Building the copy cost an
+        // allocation per column reference, whether or not the connection had
+        // registered any collation at all - two of the 109 allocations
+        // `SELECT a FROM t WHERE id = ?1` made.
         if let Some((_, collation)) = self
             .collations
             .iter()
-            .find(|(candidate, _)| candidate.as_bytes() == folded)
+            .find(|(candidate, _)| candidate.as_bytes().eq_ignore_ascii_case(name))
         {
             return Some(*collation);
         }
         Collation::from_name(core::str::from_utf8(name).unwrap_or(""))
-    }
-
-    /// Binds a call to a function an application registered, if there is one.
-    ///
-    /// Registered functions are consulted before the built-ins, which is what
-    /// makes `sqlite3_create_function("upper", 1, ...)` replace `upper` rather
-    /// than collide with it - the same order SQLite resolves in.
-    fn bind_external_call(
-        &mut self,
-        folded: &[u8],
-        arguments: &[ExprId],
-        distinct: bool,
-        span: Span,
-    ) -> Result<Option<BoundExpr>, ParseError> {
-        let Some(found) = function::lookup_external(self.externals, folded, arguments.len()) else {
-            return Ok(None);
-        };
-        // **Where a schema is stopped from choosing what code runs
-        // (task-1972).** The rule is `inillucent-sql`'s own, and
-        // `Registry::authorize_function` reads the same one over the same
-        // flags, so an application that asks the registry directly and a
-        // statement the binder compiles get the same answer.
-        if let Some(why) =
-            function::schema_refusal(found.flags, self.call_site, self.trusted_schema)
-        {
-            return Err(refused(
-                format!("{} {why}", String::from_utf8_lossy(folded)),
-                span,
-            ));
-        }
-        let aggregate = found.aggregate;
-        if !aggregate {
-            if distinct {
-                return Err(unsupported("DISTINCT on a scalar function", span));
-            }
-            let mut bound = Vec::with_capacity(arguments.len());
-            for argument in arguments {
-                bound.push(self.bind_expr(*argument)?);
-            }
-            return Ok(Some(BoundExpr::External {
-                name: folded.to_vec(),
-                arguments: bound,
-            }));
-        }
-        if !self.allow_aggregates || self.inside_aggregate {
-            return Err(unsupported("misuse of aggregate function", span));
-        }
-        self.inside_aggregate = true;
-        let mut bound = Vec::with_capacity(arguments.len());
-        for argument in arguments {
-            bound.push(self.bind_expr(*argument)?);
-        }
-        self.inside_aggregate = false;
-        let collation = bound
-            .first()
-            .and_then(BoundExpr::collation)
-            .unwrap_or(Collation::Binary);
-        let candidate = BoundAggregate {
-            func: AggregateFunc::External,
-            external: Some(folded.to_vec()),
-            distinct,
-            arguments: bound,
-            star: false,
-            collation,
-            // A registered aggregate reaches this path without a `FILTER` or an
-            // `ORDER BY`; both are read where a built-in is bound.
-            filter: None,
-            order_by: Vec::new(),
-        };
-        if let Some(slot) = self
-            .aggregates
-            .iter()
-            .position(|existing| existing == &candidate)
-        {
-            return Ok(Some(BoundExpr::Aggregate { slot }));
-        }
-        self.aggregates.push(candidate);
-        Ok(Some(BoundExpr::Aggregate {
-            slot: self.aggregates.len().saturating_sub(1),
-        }))
     }
 
     /// Binds `f(table, ...)` as a module's auxiliary function, if that is what
@@ -3185,8 +3262,7 @@ impl<'a> Binder<'a> {
     ///
     /// A bare column reference is named after its declared name rather than
     /// the query's text - `rowid`/`oid`/`_rowid_` resolve to the column they
-    /// alias and take its name too, and are called `rowid` when they alias no
-    /// column. Everything else keeps the source text.
+    /// alias and take its name too. Everything else keeps the source text.
     fn default_column_name(&self, id: ExprId, bound: &BoundExpr) -> Vec<u8> {
         let name = match bound {
             BoundExpr::Column { source, column, .. } => self
@@ -3202,14 +3278,13 @@ impl<'a> Binder<'a> {
         if let Some(name) = name {
             return name.name.clone();
         }
-        // **A rowid with no alias column is called `rowid`, whichever of the
-        // three spellings was written (task-1979, F22).** `SELECT rowid, oid,
-        // _rowid_ FROM t` answers three columns all named `rowid` in SQLite,
-        // and the case written is not kept either: `SELECT OID FROM t` is
-        // `rowid`. Falling through to the source text below named them `oid`
-        // and `_rowid_`, so a caller reading results by column name got a name
-        // SQLite never reports. A table whose INTEGER PRIMARY KEY *is* the
-        // rowid is the branch above and keeps that column's own name.
+        // **The three spellings of the rowid are one column name (task-1979,
+        // F22).** `SELECT rowid, oid, _rowid_ FROM t` answers three columns
+        // called `rowid` in SQLite, whichever way each was written. On a table
+        // with no INTEGER PRIMARY KEY there is no declared column to take the
+        // name from, and the fallback below took the text as typed, so the
+        // last two came back called `oid` and `_rowid_` - names no caller
+        // could match against the one SQLite reports.
         if matches!(bound, BoundExpr::Rowid { .. }) {
             return b"rowid".to_vec();
         }
@@ -3454,12 +3529,49 @@ impl<'a> Binder<'a> {
         self.record_dependency(database);
     }
 
+    /// Binds a unary operator over one expression.
+    ///
+    /// **A negated integer literal is one literal, not an operator over one.**
+    /// `-9223372036854775808` is the smallest integer there is; `9223372036854775808` on
+    /// its own is one past the largest, so binding the operand first turned it into a real
+    /// and the negation then produced `-9.2233720368547758e+18`. Every comparison, every
+    /// affinity and every write of that value is a different value from the one that was
+    /// written. SQLite folds the sign into the literal in its own parser for exactly this
+    /// reason.
+    ///
+    /// @param op - the operator
+    /// @param operand - the expression it applies to
+    fn bind_unary(&mut self, op: UnaryOp, operand: ExprId) -> Result<BoundExpr, ParseError> {
+        if op == UnaryOp::Negate {
+            if let Some(Expr::Literal(Literal::Integer(text))) = self.ast.expr(operand) {
+                let mut negated = Vec::with_capacity(text.len().saturating_add(1));
+                negated.push(b'-');
+                negated.extend_from_slice(text);
+                return Ok(integer_literal(&negated));
+            }
+        }
+        let operand = Box::new(self.bind_expr(operand)?);
+        match op {
+            UnaryOp::Not => Ok(BoundExpr::Not(operand)),
+            _ => Ok(BoundExpr::Unary { op, operand }),
+        }
+    }
+
     /// Binds one expression.
     pub fn bind_expr(&mut self, id: ExprId) -> Result<BoundExpr, ParseError> {
         let span = self.ast.expr_span(id);
         let Some(expr) = self.ast.expr(id) else {
             return Err(unsupported("missing expression", span));
         };
+        // **A literal is bound off the arena, before the clone** (task-2006). `Literal`
+        // owns its digits, so `SELECT 1` allocated one byte to copy the byte `1` in order
+        // to match on it, and a statement full of literals paid that per literal. The
+        // clone below is a borrow split rather than a choice - the arms call `&mut self`
+        // methods and need the owned names and sub-expression lists their variants hold -
+        // but a literal needs neither.
+        if let Expr::Literal(literal) = expr {
+            return self.bind_literal(literal, span);
+        }
         match expr.clone() {
             Expr::Literal(literal) => self.bind_literal(&literal, span),
             Expr::Parameter { index, .. } => Ok(BoundExpr::Parameter(index)),
@@ -3475,30 +3587,7 @@ impl<'a> Binder<'a> {
                 },
                 span,
             )),
-            Expr::Unary { op, operand } => {
-                // **A negated integer literal is one literal, not an operator
-                // over one.** `-9223372036854775808` is the smallest integer
-                // there is; `9223372036854775808` on its own is one past the
-                // largest, so binding the operand first turned it into a real
-                // and the negation then produced `-9.2233720368547758e+18`.
-                // Every comparison, every affinity and every write of that
-                // value is a different value from the one that was written.
-                // SQLite folds the sign into the literal in its own parser for
-                // exactly this reason.
-                if op == UnaryOp::Negate {
-                    if let Some(Expr::Literal(Literal::Integer(text))) = self.ast.expr(operand) {
-                        let mut negated = Vec::with_capacity(text.len().saturating_add(1));
-                        negated.push(b'-');
-                        negated.extend_from_slice(text);
-                        return Ok(integer_literal(&negated));
-                    }
-                }
-                let operand = Box::new(self.bind_expr(operand)?);
-                match op {
-                    UnaryOp::Not => Ok(BoundExpr::Not(operand)),
-                    _ => Ok(BoundExpr::Unary { op, operand }),
-                }
-            }
+            Expr::Unary { op, operand } => self.bind_unary(op, operand),
             Expr::Binary { op, left, right } => self.bind_binary(op, left, right),
             Expr::Collate { operand, collation } => {
                 let name = self.ast.text(collation);
@@ -3582,14 +3671,17 @@ impl<'a> Binder<'a> {
                 let operand = self.bind_expr(operand)?;
                 let low = self.bind_expr(low)?;
                 let high = self.bind_expr(high)?;
-                let (affinity, collation) = comparison_rules(&operand, &low);
+                let (low_affinity, low_collation) = comparison_rules(&operand, &low);
+                let (high_affinity, high_collation) = comparison_rules(&operand, &high);
                 Ok(BoundExpr::Between {
                     negated,
                     operand: Box::new(operand),
                     low: Box::new(low),
                     high: Box::new(high),
-                    affinity,
-                    collation,
+                    low_affinity,
+                    low_collation,
+                    high_affinity,
+                    high_collation,
                 })
             }
             Expr::In {
@@ -3683,15 +3775,18 @@ impl<'a> Binder<'a> {
                     Some(expr) => Some(Box::new(self.bind_expr(expr)?)),
                     None => None,
                 };
-                let collation = bound_operand
-                    .as_ref()
-                    .and_then(|operand| operand.collation())
-                    .unwrap_or(Collation::Binary);
+                let comparisons = match &bound_operand {
+                    Some(operand) => bound_branches
+                        .iter()
+                        .map(|(when, _)| comparison_rules(operand, when))
+                        .collect(),
+                    None => Vec::new(),
+                };
                 Ok(BoundExpr::Case {
                     operand: bound_operand,
                     branches: bound_branches,
                     otherwise: bound_otherwise,
-                    collation,
+                    comparisons,
                 })
             }
             Expr::Function {
@@ -4209,220 +4304,6 @@ impl<'a> Binder<'a> {
             .is_some_and(crate::catalog_view::ColumnInfo::is_vector)
     }
 
-    /// Binds `(a, b) IN (VALUES (...), (...))`.
-    ///
-    /// Only the value-list form, because that is what the row-value `IN` is for:
-    /// a written list of tuples. `(a, b) IN (SELECT x, y FROM u)` is a
-    /// correlated membership test over a query and is refused by name.
-    ///
-    /// @param parts - the operand row's parts
-    /// @param rhs - what was written after `IN`
-    /// @param negated - whether `NOT IN` was written
-    /// @param span - where the test was written
-    fn bind_row_in(
-        &mut self,
-        parts: &[ExprId],
-        rhs: &InRhs,
-        negated: bool,
-        span: Span,
-    ) -> Result<BoundExpr, ParseError> {
-        let rows = self.row_value_list(rhs).ok_or_else(|| {
-            ParseError::new(
-                ParseErrorKind::Unsupported("a row value IN a query rather than a value list"),
-                span,
-            )
-        })?;
-        let mut bound_lefts = Vec::with_capacity(parts.len());
-        for part in parts {
-            bound_lefts.push(self.bind_expr(*part)?);
-        }
-        let mut chain: Option<BoundExpr> = None;
-        for row in &rows {
-            if row.len() != parts.len() {
-                return Err(ParseError::new(
-                    ParseErrorKind::Refused(format!(
-                        "row value misused: {} values on the left and {} on the right",
-                        parts.len(),
-                        row.len()
-                    )),
-                    span,
-                ));
-            }
-            let mut bound_rights = Vec::with_capacity(row.len());
-            for value in row {
-                bound_rights.push(self.bind_expr(*value)?);
-            }
-            let one = equality_chain(&bound_lefts, &bound_rights);
-            chain = Some(match chain {
-                None => one,
-                Some(held) => BoundExpr::Or(Box::new(held), Box::new(one)),
-            });
-        }
-        // An empty list is false, and `NOT IN ()` is true, whatever the
-        // operand - including a NULL one. That is SQLite's rule and it is the
-        // one place `IN` is not three-valued.
-        let bound = chain.unwrap_or(BoundExpr::Integer(0));
-        Ok(if negated {
-            BoundExpr::Not(Box::new(bound))
-        } else {
-            bound
-        })
-    }
-
-    /// Returns the rows of a written `VALUES` list, when the right-hand side is
-    /// one.
-    ///
-    /// @param rhs - what was written after `IN`
-    fn row_value_list(&self, rhs: &InRhs) -> Option<Vec<Vec<ExprId>>> {
-        match rhs {
-            InRhs::Select(select) => {
-                let held = self.ast.select(*select)?;
-                if !held.compounds.is_empty() || !held.with.ctes.is_empty() {
-                    return None;
-                }
-                let core = self.ast.core(held.first)?;
-                match &core.body {
-                    SelectBody::Values(rows) => Some(rows.clone()),
-                    _ => None,
-                }
-            }
-            // `IN ((1,2), (3,4))` is a list of row values rather than a
-            // `VALUES` clause, and means the same thing.
-            InRhs::List(items) => {
-                let mut rows = Vec::with_capacity(items.len());
-                for item in items {
-                    rows.push(self.row_value_parts(*item)?);
-                }
-                Some(rows)
-            }
-            InRhs::Table { .. } => None,
-        }
-    }
-
-    /// Returns the parts of a row value, or `None` when the expression is not
-    /// one.
-    ///
-    /// @param id - the expression
-    fn row_value_parts(&self, id: ExprId) -> Option<Vec<ExprId>> {
-        match self.ast.expr(id)? {
-            Expr::RowValue(parts) => Some(parts.clone()),
-            _ => None,
-        }
-    }
-
-    /// Binds a comparison between a row value and a one-row query.
-    ///
-    /// **The query is bound once and read column by column.** Each part becomes
-    /// its own scalar subquery over the same block with the other result
-    /// columns trimmed away - which is what makes `(a, b) = (SELECT x, y ...)`
-    /// mean `a = x AND b = y` over *one* row rather than two independent
-    /// lookups: the block is the same block, so it plans and folds once, and
-    /// `crate::subquery` answers an uncorrelated one exactly once per
-    /// execution.
-    ///
-    /// The comparison is then the ordinary lexicographic desugaring the
-    /// row-against-a-row form already uses, so `<` and `<=` mean here what they
-    /// mean there.
-    ///
-    /// @param op - the operator
-    /// @param lefts - the left row's parts
-    /// @param select - the query on the right
-    /// @param span - where the comparison was written
-    fn bind_row_against_query(
-        &mut self,
-        op: BinaryOp,
-        lefts: &[ExprId],
-        select: ast::SelectId,
-        span: Span,
-    ) -> Result<BoundExpr, ParseError> {
-        let block = self.bind_value_subquery(select, span)?;
-        if block.columns.len() != lefts.len() {
-            return Err(refused(
-                format!(
-                    "row value misused: {} values on the left and {} on the right",
-                    lefts.len(),
-                    block.columns.len()
-                ),
-                span,
-            ));
-        }
-        let mut bound_lefts = Vec::with_capacity(lefts.len());
-        for part in lefts {
-            bound_lefts.push(self.bind_expr(*part)?);
-        }
-        let mut bound_rights = Vec::with_capacity(block.columns.len());
-        for at in 0..block.columns.len() {
-            let mut one = block.clone();
-            one.columns = block
-                .columns
-                .get(at..at.saturating_add(1))
-                .map_or_else(Vec::new, <[crate::bind::BoundResultColumn]>::to_vec);
-            let collation = one
-                .columns
-                .first()
-                .map(|column| result_collation(&column.expr))
-                .unwrap_or(Collation::Binary);
-            bound_rights.push(BoundExpr::Subquery {
-                id: self.next_subquery_id(),
-                kind: SubqueryKind::Scalar,
-                negated: false,
-                operand: None,
-                block: Box::new(one),
-                affinity: None,
-                collation,
-            });
-        }
-        compare_bound_rows(op, &bound_lefts, &bound_rights, span)
-    }
-
-    /// Binds a comparison between two row values.
-    ///
-    /// @param op - the operator
-    /// @param lefts - the left row's parts
-    /// @param rights - the right row's parts
-    /// @param span - where the comparison was written
-    fn bind_row_comparison(
-        &mut self,
-        op: BinaryOp,
-        lefts: &[ExprId],
-        rights: &[ExprId],
-        span: Span,
-    ) -> Result<BoundExpr, ParseError> {
-        if lefts.len() != rights.len() || lefts.is_empty() {
-            return Err(ParseError::new(
-                ParseErrorKind::Refused(format!(
-                    "row value misused: {} values on the left and {} on the right",
-                    lefts.len(),
-                    rights.len()
-                )),
-                span,
-            ));
-        }
-        let mut bound_lefts = Vec::with_capacity(lefts.len());
-        let mut bound_rights = Vec::with_capacity(rights.len());
-        for (left, right) in lefts.iter().zip(rights.iter()) {
-            bound_lefts.push(self.bind_expr(*left)?);
-            bound_rights.push(self.bind_expr(*right)?);
-        }
-        match op {
-            BinaryOp::Equal => Ok(equality_chain(&bound_lefts, &bound_rights)),
-            // `<>` is the negation of `=` rather than an inequality of its own,
-            // which is what makes `(1, NULL) <> (1, 2)` unknown rather than
-            // true: the equality is unknown, and NOT of unknown is unknown.
-            BinaryOp::NotEqual => Ok(BoundExpr::Not(Box::new(equality_chain(
-                &bound_lefts,
-                &bound_rights,
-            )))),
-            BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
-                Ok(lexicographic_chain(op, &bound_lefts, &bound_rights, 0))
-            }
-            _ => Err(ParseError::new(
-                ParseErrorKind::Refused("row value misused".to_string()),
-                span,
-            )),
-        }
-    }
-
     /// Binds a call that may carry a `FILTER` and an in-argument `ORDER BY`.
     ///
     /// Both belong to an *aggregate* call and are dropped for anything else,
@@ -4545,21 +4426,7 @@ impl<'a> Binder<'a> {
                 filter: bound_filter,
                 order_by: bound_order,
             };
-            // The same aggregate written twice is one accumulator. It is not
-            // only cheaper: `... ORDER BY count(*)` has to name the *same* slot
-            // the result column named, or the two are different values that
-            // happen to be spelt alike.
-            if let Some(slot) = self
-                .aggregates
-                .iter()
-                .position(|existing| existing == &candidate)
-            {
-                return Ok(BoundExpr::Aggregate { slot });
-            }
-            self.aggregates.push(candidate);
-            return Ok(BoundExpr::Aggregate {
-                slot: self.aggregates.len().saturating_sub(1),
-            });
+            return Ok(self.aggregate_slot(candidate));
         }
         if let Some(func) = function::lookup_time(&folded) {
             if star {
@@ -4637,7 +4504,7 @@ impl<'a> Binder<'a> {
             // A JSON group aggregate carries the subtype too, and its function
             // is in the binder's list rather than in the expression - so the
             // slot is resolved here, where the list is.
-            if let BoundExpr::Aggregate { slot } = &bound {
+            if let BoundExpr::Aggregate { slot, .. } = &bound {
                 let carries = matches!(
                     self.aggregates.get(*slot).map(|held| held.func),
                     Some(
@@ -4685,97 +4552,6 @@ impl<'a> Binder<'a> {
     }
 }
 
-/// Returns the affinity and collation a comparison between two operands uses.
-///
-/// SQLite's rule, in order: if either side has a column affinity the comparison
-/// applies it, with the left side winning; the collation is the left operand's
-/// if it has one, otherwise the right's, otherwise BINARY.
-pub fn comparison_rules(left: &BoundExpr, right: &BoundExpr) -> (Option<Affinity>, Collation) {
-    let affinity = match (left.affinity(), right.affinity()) {
-        (Some(left), Some(right)) => inillucent_value::compare::comparison_affinity(left, right),
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
-    };
-    let collation = left
-        .explicit_collation()
-        .or_else(|| right.explicit_collation())
-        .or_else(|| left.collation())
-        .or_else(|| right.collation())
-        .unwrap_or(Collation::Binary);
-    (affinity, collation)
-}
-
-/// Wraps an expression in the collation an explicit `COLLATE` names.
-///
-/// **A `COLLATE` above a comparison does not reach the comparison (task-1979,
-/// F5).** `a = b COLLATE NOCASE` parses as `a = (b COLLATE NOCASE)`, because
-/// `COLLATE` binds tighter than `=`, and the comparison then reads NOCASE off
-/// its own right operand through [`comparison_rules`]. `(a = b) COLLATE
-/// NOCASE` is the other tree: the comparison is finished and NOCASE applies to
-/// the integer it produced, where a text collation does nothing. This function
-/// used to stamp the collation onto a `BoundExpr::Compare` it was handed, which
-/// made the two trees answer the same and made the outer name win over the
-/// inner one: measured against 3.53.4, `SELECT ('B'<'a') COLLATE NOCASE`
-/// answered 0 where SQLite answers 1, and
-/// `SELECT ('a' = 'A' COLLATE NOCASE) COLLATE BINARY` answered 0 where SQLite
-/// answers 1 because the inner NOCASE is the comparison's and the outer BINARY
-/// is the result's.
-///
-/// The wrapper is what carries the collation onward: [`comparison_rules`] asks
-/// an operand for its [`BoundExpr::explicit_collation`], so a `COLLATE` on a
-/// literal still reaches the comparison that uses it.
-///
-/// @param expr - the operand the `COLLATE` was written on
-/// @param collation - the collation it names
-fn apply_collation(expr: BoundExpr, collation: Collation) -> BoundExpr {
-    BoundExpr::Collate {
-        operand: Box::new(expr),
-        collation,
-    }
-}
-
-/// Converts an integer literal's text into a bound value.
-///
-/// A decimal literal too large for `i64` becomes a real, which is what SQLite
-/// does rather than failing, and a hexadecimal literal wraps into `i64`, which
-/// is also what SQLite does.
-fn integer_literal(text: &[u8]) -> BoundExpr {
-    // The sign is read off first, so `0x` is still recognised under one: the
-    // binder folds a unary minus into the literal (see `Expr::Unary`), and
-    // `-0x10` arrives here as `-0x10` rather than as an operator over `0x10`.
-    let (negative, digits) = match text.first() {
-        Some(b'-') => (true, text.get(1..).unwrap_or(&[])),
-        _ => (false, text),
-    };
-    if digits.len() > 2
-        && digits.first() == Some(&b'0')
-        && digits
-            .get(1)
-            .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'x'))
-    {
-        let mut value: u64 = 0;
-        for byte in digits.get(2..).unwrap_or(&[]) {
-            let digit = (*byte as char).to_digit(16).unwrap_or(0) as u64;
-            value = value.wrapping_mul(16).wrapping_add(digit);
-        }
-        let value = value as i64;
-        return BoundExpr::Integer(if negative {
-            value.wrapping_neg()
-        } else {
-            value
-        });
-    }
-    let cleaned: Vec<u8> = text.iter().copied().filter(|byte| *byte != b'_').collect();
-    let (value, syntax) =
-        inillucent_value::numeric::atoi64(&cleaned, inillucent_value::TextEncoding::Utf8);
-    if syntax.is_exact() {
-        return BoundExpr::Integer(value);
-    }
-    let parsed = inillucent_value::numeric::atof(&cleaned, inillucent_value::TextEncoding::Utf8);
-    BoundExpr::Real(parsed.value)
-}
-
 /// Returns a refusal whose text is computed rather than a fixed phrase.
 ///
 /// `Unsupported` carries a `&'static str` because most refusals are one of a
@@ -4795,203 +4571,6 @@ fn integer_literal(text: &[u8]) -> BoundExpr {
 /// wants said in the reference's words, and it renders as one.
 pub(crate) fn refused(detail: impl Into<String>, span: Span) -> ParseError {
     ParseError::new(ParseErrorKind::Refused(detail.into()), span)
-}
-
-/// Returns a refusal that carries its own wording.
-pub(crate) fn schema_refused(message: impl Into<String>, span: Span) -> ParseError {
-    ParseError::new(ParseErrorKind::Refused(message.into()), span)
-}
-
-/// Returns an "unsupported construct" failure.
-pub(crate) fn unsupported(what: &'static str, span: Span) -> ParseError {
-    ParseError::new(ParseErrorKind::Unsupported(what), span)
-}
-
-/// Returns a "no such table" failure in SQLite's wording.
-///
-/// It deliberately carries no position. SQLite reports one for `no such
-/// column` and not for this, and a caller that draws a caret under the offset -
-/// the shell does - would otherwise point at a table name where the reference
-/// points at nothing.
-pub(crate) fn no_such_table(name: &[u8], span: Span) -> ParseError {
-    let _ = span;
-    ParseError::new(
-        ParseErrorKind::Refused(format!("no such table: {}", String::from_utf8_lossy(name))),
-        Span::default(),
-    )
-}
-
-/// Returns a "no such column" failure in SQLite's wording, with the hint a
-/// double-quoted name earns.
-///
-/// A bare `"word"` is an identifier that *may* fall back to a string literal,
-/// and this build refuses the fallback the way the reference's does. The
-/// reference does not simply refuse it, though: it re-quotes the name and adds
-/// the sentence that tells the author what they probably meant. The hint is
-/// only for the unqualified form, because `t."b"` cannot be a string literal in
-/// any dialect and the reference prints `no such column: t.b` for it.
-///
-/// @param name - the column name as written, with quoting already removed
-/// @param quote - how it was quoted
-/// @param span - where it was written
-pub(crate) fn no_such_column_quoted(name: &[u8], quote: QuoteForm, span: Span) -> ParseError {
-    if quote != QuoteForm::Double {
-        return no_such_column(name, span);
-    }
-    ParseError::new(
-        ParseErrorKind::Refused(format!(
-            "no such column: \"{}\" - should this be a string literal in single-quotes?",
-            String::from_utf8_lossy(name)
-        )),
-        span,
-    )
-}
-
-/// Returns a "no such column" failure in SQLite's wording.
-pub(crate) fn no_such_column(name: &[u8], span: Span) -> ParseError {
-    ParseError::new(
-        ParseErrorKind::Refused(format!("no such column: {}", String::from_utf8_lossy(name))),
-        span,
-    )
-}
-
-/// Returns an "ambiguous column name" failure.
-fn ambiguous_column(name: &[u8], span: Span) -> ParseError {
-    ParseError::new(
-        ParseErrorKind::Refused(format!(
-            "ambiguous column name: {}",
-            String::from_utf8_lossy(name)
-        )),
-        span,
-    )
-}
-
-/// The names that exist but only inside a window frame.
-///
-/// A call to one of these outside `OVER (...)` is a misuse, not an absence, and
-/// SQLite says so. Reporting it as "no such function" made an audit that
-/// enumerated by calling names count eleven functions as missing that are
-/// present and byte-identical over a real frame.
-const WINDOW_ONLY: &[&[u8]] = &[
-    b"cume_dist",
-    b"dense_rank",
-    b"first_value",
-    b"lag",
-    b"last_value",
-    b"lead",
-    b"nth_value",
-    b"ntile",
-    b"percent_rank",
-    b"rank",
-    b"row_number",
-];
-
-/// The names that exist but only where a virtual table can answer them.
-///
-/// FTS5's and FTS3/4's auxiliary functions take the table as their first
-/// argument and are answered by the module's cursor; called anywhere else there
-/// is no cursor to ask. SQLite refuses those with "unable to use function X in
-/// the requested context", and so does this - the twelve of them were the rest
-/// of the twenty-three names the audit read as missing.
-const CONTEXT_ONLY: &[&[u8]] = &[
-    b"bm25",
-    b"fts5",
-    b"fts5_get_locale",
-    b"fts5_insttoken",
-    b"fts5_locale",
-    b"highlight",
-    b"match",
-    b"matchinfo",
-    b"offsets",
-    b"optimize",
-    b"snippet",
-];
-
-/// Returns the failure a name that did not resolve deserves.
-///
-/// **Three different facts, three different sentences.** A name nobody has is
-/// "no such function". A window function outside a frame is a misuse. An
-/// auxiliary function outside the virtual table that answers it is a context
-/// error. The engine used to say the first about all three, which is the only
-/// one of the three that is a claim about *existence* - so an audit that probed
-/// by calling read twenty-three present functions as absent.
-///
-/// @param name - the folded name that did not resolve
-/// @param span - where it was written
-fn no_such_function(name: &[u8], span: Span) -> ParseError {
-    if let Some(said) = crate::function::needs_a_component(name) {
-        return ParseError::new(ParseErrorKind::Unsupported(said), span);
-    }
-    if WINDOW_ONLY.contains(&name) {
-        return ParseError::new(
-            ParseErrorKind::Refused(format!(
-                "misuse of window function {}()",
-                String::from_utf8_lossy(name)
-            )),
-            span,
-        );
-    }
-    if CONTEXT_ONLY.contains(&name) {
-        // SQLite spells `MATCH` in upper case here and the rest as written,
-        // because `MATCH` reaches this path as the operator's keyword.
-        let spelled = if name == b"match" {
-            "MATCH".to_string()
-        } else {
-            String::from_utf8_lossy(name).into_owned()
-        };
-        return ParseError::new(
-            ParseErrorKind::Refused(format!(
-                "unable to use function {spelled} in the requested context"
-            )),
-            span,
-        );
-    }
-    ParseError::new(
-        ParseErrorKind::Refused(format!(
-            "no such function: {}",
-            String::from_utf8_lossy(name)
-        )),
-        span,
-    )
-}
-
-/// Returns a "wrong number of arguments" failure.
-fn wrong_arguments(name: &[u8], span: Span) -> ParseError {
-    ParseError::new(
-        ParseErrorKind::Refused(format!(
-            "wrong number of arguments to function {}()",
-            String::from_utf8_lossy(name)
-        )),
-        span,
-    )
-}
-
-/// Returns a "no such collation" failure.
-fn no_such_collation(name: &[u8], span: Span) -> ParseError {
-    ParseError::new(
-        ParseErrorKind::Refused(format!(
-            "no such collation sequence: {}",
-            String::from_utf8_lossy(name)
-        )),
-        span,
-    )
-}
-
-/// Returns an "ORDER BY term out of range" failure.
-fn order_out_of_range(ordinal: usize, span: Span) -> ParseError {
-    ParseError::new(ParseErrorKind::Refused(format!(
-                "{ordinal}th ORDER BY term out of range - should be between 1 and the number of result columns"
-            )), span)
-}
-
-/// Returns the failure a compound's `ORDER BY` gives when it names nothing.
-fn compound_order_unmatched(span: Span) -> ParseError {
-    ParseError::new(
-        ParseErrorKind::Refused(
-            "ORDER BY term does not match any column in the result set".to_string(),
-        ),
-        span,
-    )
 }
 
 /// Builds the table a nested query's rows are read through.
@@ -5098,115 +4677,6 @@ fn no_such_window(name: &[u8], span: Span) -> ParseError {
 /// Returns an authorizer refusal.
 fn denied(what: &'static str, span: Span) -> ParseError {
     ParseError::new(ParseErrorKind::Unsupported(what), span)
-}
-
-/// Returns the `AND` chain that a row-value equality means.
-///
-/// @param lefts - the left row's parts, bound
-/// @param rights - the right row's parts, bound
-fn equality_chain(lefts: &[BoundExpr], rights: &[BoundExpr]) -> BoundExpr {
-    let mut chain: Option<BoundExpr> = None;
-    for (left, right) in lefts.iter().zip(rights.iter()) {
-        let (affinity, collation) = comparison_rules(left, right);
-        let one = BoundExpr::Compare {
-            op: BinaryOp::Equal,
-            left: Box::new(left.clone()),
-            right: Box::new(right.clone()),
-            affinity,
-            collation,
-        };
-        chain = Some(match chain {
-            None => one,
-            Some(held) => BoundExpr::And(Box::new(held), Box::new(one)),
-        });
-    }
-    chain.unwrap_or(BoundExpr::Null)
-}
-
-/// Returns the chain a lexicographic row-value comparison means.
-///
-/// `(a, b, c) < (x, y, z)` is `a < x OR (a = x AND (b < y OR (b = y AND c <
-/// z)))`, and the strictness only ever applies to the last part: everything
-/// before it is compared for equality to decide whether the next part matters.
-///
-/// @param op - the operator
-/// @param lefts - the left row's parts, bound
-/// @param rights - the right row's parts, bound
-/// @param at - which part this level compares
-fn lexicographic_chain(
-    op: BinaryOp,
-    lefts: &[BoundExpr],
-    rights: &[BoundExpr],
-    at: usize,
-) -> BoundExpr {
-    let (Some(left), Some(right)) = (lefts.get(at), rights.get(at)) else {
-        return BoundExpr::Null;
-    };
-    let (affinity, collation) = comparison_rules(left, right);
-    let last = at.saturating_add(1) >= lefts.len();
-    // The last part carries the operator as written, including its
-    // or-equal half; every earlier part is compared strictly, with the
-    // equal case handled by the branch beside it.
-    let strict = match op {
-        BinaryOp::LessEqual if !last => BinaryOp::Less,
-        BinaryOp::GreaterEqual if !last => BinaryOp::Greater,
-        other => other,
-    };
-    let decided = BoundExpr::Compare {
-        op: strict,
-        left: Box::new(left.clone()),
-        right: Box::new(right.clone()),
-        affinity,
-        collation,
-    };
-    if last {
-        return decided;
-    }
-    let same = BoundExpr::Compare {
-        op: BinaryOp::Equal,
-        left: Box::new(left.clone()),
-        right: Box::new(right.clone()),
-        affinity,
-        collation,
-    };
-    BoundExpr::Or(
-        Box::new(decided),
-        Box::new(BoundExpr::And(
-            Box::new(same),
-            Box::new(lexicographic_chain(op, lefts, rights, at.saturating_add(1))),
-        )),
-    )
-}
-
-/// Returns the comparison a row value against a row value means.
-///
-/// **One desugaring, shared by both spellings.** `=` is a chain of equalities,
-/// `<>` is the negation of that chain rather than an inequality of its own -
-/// which is what makes `(1, NULL) <> (1, 2)` unknown - and the ordering
-/// operators are lexicographic. The row-against-a-query form binds different
-/// operands and then means exactly this.
-///
-/// @param op - the operator
-/// @param lefts - the left row, already bound
-/// @param rights - the right row, already bound
-/// @param span - where the comparison was written
-fn compare_bound_rows(
-    op: BinaryOp,
-    lefts: &[BoundExpr],
-    rights: &[BoundExpr],
-    span: Span,
-) -> Result<BoundExpr, ParseError> {
-    match op {
-        BinaryOp::Equal => Ok(equality_chain(lefts, rights)),
-        BinaryOp::NotEqual => Ok(BoundExpr::Not(Box::new(equality_chain(lefts, rights)))),
-        BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
-            Ok(lexicographic_chain(op, lefts, rights, 0))
-        }
-        _ => Err(ParseError::new(
-            ParseErrorKind::Refused("row value misused".to_string()),
-            span,
-        )),
-    }
 }
 
 /// Whether a bound expression carries the JSON subtype.

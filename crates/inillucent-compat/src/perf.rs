@@ -641,6 +641,62 @@ pub fn weighted_headline(
     (centre, low.exp(), high.exp())
 }
 
+/// Returns a family's centre and 95% bootstrap interval, resampling rounds.
+///
+/// Each round contributes one value: the mean of that round's log ratios over
+/// the family's workloads. The bootstrap then resamples those per-round means.
+/// That is the statistic [`weighted_headline`] already uses for every family
+/// inside the headline, so a family is now graded by the same number it
+/// contributes to the headline.
+///
+/// **Why not one list of every workload's every round (task-2086).** That is
+/// what every gate did until task-2086, and it makes the interval measure how
+/// far apart the family's workloads are rather than how precisely they were
+/// measured. A resample of the pooled list draws the workloads in random
+/// proportions, and when the workloads differ that proportion moves the mean
+/// more than any timing noise does. `read.join` is the case that exposed it:
+/// on the nine pinned passes task-2082 took, `join.selective` read about 21x
+/// with its own interval 20.3x to 21.2x and `join.range` read 0.87x with its
+/// own interval 0.86x to 0.89x, and the pooled family interval printed beside
+/// them was 2.8x to 6.5x. The family's lower bound missed a 3.00x bar on every
+/// build because the two workloads are a factor of 24 apart. The family's
+/// composition is fixed by the plan, so the proportion of each workload is not
+/// a random quantity and the interval should not treat it as one.
+///
+/// A family whose workloads ran a different number of rounds is cut to the
+/// shortest, so every per-round mean has every workload in it. For the same
+/// reason a round in which any workload has a zero or negative time is left
+/// out whole: dropping only that workload would give that one round a
+/// different mix of workloads, which is the defect above in a smaller form.
+/// @param members - the workloads in the family, each with its paired timings
+/// @param seed - the seed the resampling uses
+pub fn family_interval(members: &[&Paired], seed: u64) -> (f64, f64, f64) {
+    let depth = members
+        .iter()
+        .map(|paired| paired.pairs.len())
+        .min()
+        .unwrap_or(0);
+    let per_round: Vec<f64> = (0..depth)
+        .filter_map(|round| {
+            let logs: Option<Vec<f64>> = members
+                .iter()
+                .map(|paired| {
+                    let (ours, theirs) = paired.pairs.get(round).copied()?;
+                    (ours > 0.0 && theirs > 0.0).then(|| (theirs / ours).ln())
+                })
+                .collect();
+            let logs = logs.filter(|logs| !logs.is_empty())?;
+            Some(logs.iter().sum::<f64>() / logs.len() as f64)
+        })
+        .collect();
+    if per_round.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let centre = per_round.iter().sum::<f64>() / per_round.len() as f64;
+    let (low, high) = bootstrap(&per_round, seed);
+    (centre.exp(), low.exp(), high.exp())
+}
+
 /// Returns one round's weighted mean log ratio.
 ///
 /// A family with several workloads contributes the mean of its workloads, so a
@@ -747,6 +803,7 @@ pub fn plan_for(scale: &str) -> Plan {
     workloads.extend(range_read_workloads(point));
     workloads.extend(analytical_read_workloads(scan));
     workloads.extend(join_read_workloads(point));
+    workloads.extend(correlated_read_workloads(point));
     workloads.extend(write_workloads(write));
     workloads.extend(transaction_workloads(write));
     workloads.extend(schema_workloads());
@@ -1025,6 +1082,134 @@ fn join_read_workloads(point: u32) -> Vec<Workload> {
             grouping: Grouping::Autocommit,
             prepare_each: false,
             binds: vec![Bind::Scatter],
+            mutates: false,
+        },
+    ]
+}
+
+/// Returns the `correlated` workloads: a block answered once per outer row.
+///
+/// **Graded against the join that answers the same question** (task-2066
+/// §4.3.1). A correlated block and its join are one query written two ways, so
+/// the join is the bar, and nothing measured either shape before this.
+///
+/// What it caught: a correlated `EXISTS` over 5,000 outer rows took 11,497 ms
+/// and the three causes were a parameter set cloned per outer row, the same
+/// set cloned again on every *read* of a parameter, and a structural choice
+/// remade per row. It is 2,616 ms now. On this fixture `EXISTS` is 51.75 ms
+/// against the join's 1.85, so the shape is still the expensive way to ask and
+/// this is what will say when that changes.
+///
+/// **The outer table is `wide`, which holds 400 rows.** When these arms were
+/// written the correlation operator sat *below* the filter - it computed a
+/// block for every row the source produced and the `WHERE` then discarded most
+/// of them - so `a.key BETWEEN ?1 AND ?1 + 200` over `main_table` added a
+/// predicate and removed no work, and measured slower than the unbounded form
+/// for the extra iterations alone. task-2076 moved every conjunct that reads no
+/// subquery in front of the block, and the two `.selective` arms are the ones
+/// that measure it.
+///
+/// `EXISTS` and `IN (SELECT ...)` both, because they reach different code:
+/// `crate::correlate` answers the first and refuses the second, so a workload
+/// with only one of them says nothing about the other.
+///
+/// **They belong to no weighted family, deliberately.** Folded into
+/// `read.join` they took that family from 3.64x to 0.10x, which would be a
+/// 36-fold regression in a published number caused by the workload set
+/// changing rather than by the engine. And they cannot have a family of their
+/// own either: `compat/perf/contract.toml` says in its own first paragraph
+/// that the weights were fixed before any measurement was taken, and that a
+/// weighting chosen after the results are in is not a weighting but a way of
+/// writing down the results.
+///
+/// So the family name here is one no table knows. `report_results` prints
+/// these two and compares their digests against SQLite like every other
+/// workload; `report_families`, the floor and the headline iterate `FAMILIES`
+/// and never see them. The correctness half is graded and the timing is
+/// reported next to the join a reader should compare it with.
+///
+/// @param point - how many times a point workload repeats at this scale
+fn correlated_read_workloads(point: u32) -> Vec<Workload> {
+    // One iteration answers 400 correlated blocks and costs tens of
+    // milliseconds, which is already at the top of what the other read
+    // workloads cost for their whole repeat. The rounds are what provide the
+    // samples.
+    let repeat = (point / 4_000).max(1);
+    vec![
+        Workload {
+            name: "correlated.exists".to_string(),
+            family: "read.correlated".to_string(),
+            sql: "SELECT count(*) FROM wide a WHERE EXISTS (SELECT 1 FROM side_table b WHERE                   b.owner = a.id)"
+                .to_string(),
+            pre: None,
+            post: None,
+            repeat,
+            grouping: Grouping::Autocommit,
+            prepare_each: false,
+            binds: Vec::new(),
+            mutates: false,
+        },
+        Workload {
+            name: "correlated.in".to_string(),
+            family: "read.correlated".to_string(),
+            sql: "SELECT count(*) FROM wide a WHERE a.id IN (SELECT b.owner FROM side_table b                   WHERE b.owner = a.id)"
+                .to_string(),
+            pre: None,
+            post: None,
+            repeat,
+            grouping: Grouping::Autocommit,
+            prepare_each: false,
+            binds: Vec::new(),
+            mutates: false,
+        },
+        // **The two arms with a selective filter beside the block** (task-2076).
+        // `a.id % 100 = 0` keeps 4 of `wide`'s 400 rows, one in a hundred, and
+        // no index or rowid range can answer a modulo, so it stays a residual
+        // predicate. The arms above keep every outer row, so they cost
+        // the same whether the correlation operator answers a block before or
+        // after the filter; these two are the arms where that order is the
+        // whole of the difference.
+        //
+        // Measured in a quiet window, release builds alternated, medians of 12
+        // and then 30 rounds: `correlated.exists.selective` went from 54.90 ms
+        // to 1.963 ms and `correlated.scalar.selective` from 55.48 ms to
+        // 1.948 ms, which is 27.97x and 28.48x. The two unfiltered arms did not
+        // move by more than two readings of the same build differ from each
+        // other. SQLite answers both selective arms in about 26 us, so against
+        // SQLite they are still 0.01x.
+        //
+        // Those timings were taken with `a.id + 0 > 396`, which keeps the same
+        // four rows. task-2076 tried the modulo first and the gate refused it:
+        // `Expr::General` read the connection's length limit through
+        // `Params::context`, which counted against `Statement::rebindable`.
+        // task-2081 made that read a setting, which does not count, and put
+        // the modulo back.
+        Workload {
+            name: "correlated.exists.selective".to_string(),
+            family: "read.correlated".to_string(),
+            sql: "SELECT count(*) FROM wide a WHERE a.id % 100 = 0 AND EXISTS \
+                  (SELECT 1 FROM side_table b WHERE b.owner = a.id)"
+                .to_string(),
+            pre: None,
+            post: None,
+            repeat,
+            grouping: Grouping::Autocommit,
+            prepare_each: false,
+            binds: Vec::new(),
+            mutates: false,
+        },
+        Workload {
+            name: "correlated.scalar.selective".to_string(),
+            family: "read.correlated".to_string(),
+            sql: "SELECT count(*) FROM wide a WHERE a.id % 100 = 0 AND a.id * 4 > \
+                  (SELECT count(*) FROM side_table b WHERE b.owner = a.id)"
+                .to_string(),
+            pre: None,
+            post: None,
+            repeat,
+            grouping: Grouping::Autocommit,
+            prepare_each: false,
+            binds: Vec::new(),
             mutates: false,
         },
     ]
@@ -1327,18 +1512,28 @@ pub fn eat_borrowed(digest: &mut Digest, value: &inillucent_tree::datum::Datum<'
 ///
 /// @param bench - the `sqlite-bench` binary
 /// @param plan - the plan file both engines run
+/// **Started through [`crate::affinity::spawn_on_same_cores`] (task-2085)**, so
+/// a gate that pinned itself refuses to time a reference arm that is running on
+/// other processors. The child inherits the gate's mask, and this reads it back.
+///
 /// @param database - the SQLite database it runs against
 pub fn run_sqlite(
     bench: &std::path::Path,
     plan: &std::path::Path,
     database: &std::path::Path,
 ) -> Result<Vec<Sample>, String> {
-    let output = std::process::Command::new(bench)
-        .arg("run")
-        .arg(plan)
-        .arg(database)
-        .output()
-        .map_err(|error| format!("sqlite-bench did not start: {error}"))?;
+    let child = crate::affinity::spawn_on_same_cores(
+        std::process::Command::new(bench)
+            .arg("run")
+            .arg(plan)
+            .arg(database)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+        "sqlite-bench",
+    )?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("sqlite-bench did not finish: {error}"))?;
     if !output.status.success() {
         return Err(format!(
             "sqlite-bench failed: {}",
@@ -1512,6 +1707,84 @@ mod tests {
             .collect();
         let (wide_low, wide_high) = bootstrap(&loose, 7);
         assert!(wide_high - wide_low > high - low);
+    }
+
+    /// Builds a workload whose every round has the given speedup, nudged by a
+    /// small repeating amount so the rounds are not identical.
+    ///
+    /// @param name - the workload name
+    /// @param speedup - SQLite's time over this engine's, before the nudge
+    fn steady_workload(name: &str, speedup: f64) -> Paired {
+        Paired {
+            workload: name.to_string(),
+            family: "read.join".to_string(),
+            pairs: (0..30)
+                .map(|round| {
+                    let nudge = 1.0 + ((round % 5) as f64 - 2.0) * 0.005;
+                    (1.0, speedup * nudge)
+                })
+                .collect(),
+            agreed: true,
+            disagreement: String::new(),
+        }
+    }
+
+    /// Two workloads measured to within 1% give a family interval about as
+    /// narrow as theirs, however far apart the two are (task-2086).
+    ///
+    /// These are `read.join`'s pinned figures from task-2082. A single list of
+    /// all sixty rounds gave 2.8x to 6.5x for the same two workloads; this
+    /// asserts the interval stays within 3% of the centre, and the pooled
+    /// figure is computed beside it so the test fails if the two ever agree.
+    #[test]
+    fn a_family_interval_measures_noise_not_the_gap_between_workloads() {
+        let selective = steady_workload("join.selective", 21.0);
+        let range = steady_workload("join.range", 0.875);
+        let members = [&selective, &range];
+        let (centre, low, high) = family_interval(&members, 7);
+        let expected = (21.0_f64 * 0.875).sqrt();
+        assert!(
+            (centre / expected - 1.0).abs() < 0.01,
+            "{centre} {expected}"
+        );
+        assert!(
+            low > centre * 0.97 && high < centre * 1.03,
+            "{low} {centre} {high}"
+        );
+        assert!(low > 3.0, "{low}");
+        let pooled: Vec<f64> = members
+            .iter()
+            .flat_map(|paired| paired.log_ratios())
+            .collect();
+        let (pooled_low, _) = bootstrap(&pooled, 7);
+        assert!(pooled_low.exp() < 3.0, "{}", pooled_low.exp());
+    }
+
+    /// A family whose workloads ran different numbers of rounds is cut to the
+    /// shortest, and a family with no rounds reports zeros.
+    #[test]
+    fn a_family_interval_uses_the_rounds_every_workload_has() {
+        let long = steady_workload("join.selective", 4.0);
+        let mut short = steady_workload("join.range", 1.0);
+        short.pairs.truncate(10);
+        let (centre, _, _) = family_interval(&[&long, &short], 7);
+        assert!((centre - 2.0).abs() < 0.02, "{centre}");
+        short.pairs.clear();
+        assert_eq!(family_interval(&[&long, &short], 7), (0.0, 0.0, 0.0));
+    }
+
+    /// A round in which one workload has no usable time is left out whole
+    /// (task-2093). Keeping the other workload's value would make that round
+    /// 4.0x alone instead of about 2.0x, and move the centre to about 2.05x.
+    #[test]
+    fn a_family_interval_leaves_out_a_round_a_workload_is_missing_from() {
+        let fast = steady_workload("join.selective", 4.0);
+        let mut even = steady_workload("join.range", 1.0);
+        if let Some(pair) = even.pairs.get_mut(3) {
+            *pair = (0.0, 1.0);
+        }
+        let (centre, _, _) = family_interval(&[&fast, &even], 7);
+        assert!((centre - 2.0).abs() < 0.01, "{centre}");
     }
 
     /// The verdicts are the thresholds the TDD names.

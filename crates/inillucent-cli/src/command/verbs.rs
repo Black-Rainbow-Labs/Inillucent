@@ -22,9 +22,17 @@ use crate::json::{self, Json};
 
 /// Turns one engine value into the JSON a result carries.
 ///
-/// A blob becomes its hexadecimal spelling with an `x''` wrapper, because that
-/// is a form the engine will read back as the same bytes, and because JSON has
-/// no byte string. It is text in the document and says so in the column type.
+/// **A blob is `{"blob": "<hex>"}`, which is the grammar it goes in as**
+/// (task-2066 §4.1.15). It used to be the string `"x'00ff'"`, typed `text` in
+/// the column list while `typeof` said `blob` - so nothing distinguished it
+/// from a TEXT column that literally holds that text, and bytes went in through
+/// `--params` and could not come back. That affects Node, Go, PHP and the
+/// subprocess half of Python: four of the six bindings advertised.
+///
+/// The envelope matches `literal_of`'s input grammar exactly, so a value read
+/// out of one result can be bound into the next statement with no conversion -
+/// which is what "read back" has to mean for a wire format. `class_of` reports
+/// an object as `blob`, so the column type follows without a second rule.
 ///
 /// @param value - the cell the engine produced
 pub fn value_to_json(value: &Value<'static>) -> Json {
@@ -34,12 +42,11 @@ pub fn value_to_json(value: &Value<'static>) -> Json {
         Value::Real(number) => Json::Real(*number),
         Value::Text(text) => json::text(String::from_utf8_lossy(text.raw()).into_owned()),
         Value::Blob(bytes) => {
-            let mut rendered = String::from("x'");
+            let mut hex = String::with_capacity(bytes.raw().len().saturating_mul(2));
             for byte in bytes.raw() {
-                rendered.push_str(&format!("{byte:02x}"));
+                hex.push_str(&format!("{byte:02x}"));
             }
-            rendered.push('\'');
-            json::text(rendered)
+            json::object(vec![("blob", json::text(hex))])
         }
     }
 }
@@ -315,8 +322,9 @@ fn refuse_a_script(context: &mut Context, command: &str, sql: &str) -> Result<()
 /// that supplied two sets of values has made a mistake and guessing which one
 /// it meant is how the wrong values get bound.
 ///
+/// @param context - the surface, which says whether it is confined
 /// @param arguments - the command line as it was parsed
-fn bound_values(arguments: &Arguments) -> Result<Vec<Json>, Failed> {
+fn bound_values(context: &Context, arguments: &Arguments) -> Result<Vec<Json>, Failed> {
     let inline = arguments.values("params");
     let Some(named) = arguments.text("params-file") else {
         return Ok(inline);
@@ -327,15 +335,53 @@ fn bound_values(arguments: &Arguments) -> Result<Vec<Json>, Failed> {
         ));
     }
     let text = match named {
+        // **A confined surface has no standard input of its own** (task-2066
+        // §4.1.5), and over MCP reading it would make the server consume its
+        // own JSON-RPC stream. `resolve_source` already refuses `-` for the
+        // same reason and in the same words.
+        "-" if context.confined() => {
+            return Err(Failed::said(
+                Status::InvalidState,
+                "this surface is confined to a directory with --root, and '-' reads the \
+                 parameters from standard input, which such a surface does not have to itself. \
+                 Write them with 'params', or name a file inside the root.",
+            ))
+        }
         "-" => {
             let mut held = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut held)
                 .map_err(|error| Failed::said(Status::Io, format!("standard input: {error}")))?;
             held
         }
-        path => std::fs::read_to_string(path)
-            .map_err(|error| Failed::said(Status::Io, format!("{path}: {error}")))?,
+        // **This read any file on the machine** (task-2066 §4.1.5). It was a
+        // bare `read_to_string`, and `params-file` is a parameter of `query`
+        // and `exec`, both of which are served over MCP - so a server started
+        // `--root <root> --readonly` answered a request naming
+        // `C:/Windows/Temp/probe.json` with that file's contents. A file that
+        // is not a JSON array still leaked its opening bytes and its existence
+        // through the parse error. `confinement.rs` covered ATTACH, VACUUM
+        // INTO, backup, restore, import and export, and had no case for this.
+        path => {
+            let admitted = context.confine(path)?;
+            std::fs::read_to_string(&admitted)
+                .map_err(|error| Failed::said(Status::Io, format!("{path}: {error}")))?
+        }
     };
+    // **A size cap, because this is `read_to_string` of a whole file**
+    // (task-2066 §4.1.6). The JSON parser below is now depth bounded, which
+    // stops a deep document overflowing the stack; this stops a large one
+    // being read into memory before the parser ever sees it. A megabyte is the
+    // same bound `mcp.rs` puts on a request line.
+    if text.len() > MAX_PARAMS_FILE_BYTES {
+        return Err(Failed::said(
+            Status::TooBig,
+            format!(
+                "'params-file' is {} bytes, past the {MAX_PARAMS_FILE_BYTES} byte limit. \
+                 Parameters are a list of values, not a data file.",
+                text.len()
+            ),
+        ));
+    }
     let parsed = json::parse(text.trim())
         .map_err(|why| Failed::misuse(format!("'params-file' is not JSON: {why}")))?;
     match parsed {
@@ -344,10 +390,17 @@ fn bound_values(arguments: &Arguments) -> Result<Vec<Json>, Failed> {
     }
 }
 
+/// The most a `params-file` may hold.
+///
+/// One mebibyte, matching `MAX_REQUEST_BYTES` in `mcp.rs`: a list of bound
+/// values is small, and a file larger than this is a mistake rather than a
+/// parameter list.
+const MAX_PARAMS_FILE_BYTES: usize = 1024 * 1024;
+
 /// `query`: runs a statement that returns rows.
 pub fn query(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
     let sql = arguments.required_text("sql")?.to_string();
-    let params = bound_values(arguments)?;
+    let params = bound_values(context, arguments)?;
     let limit = limit_of(context, arguments)?;
     produce(context, "query", &sql, &params, limit)
 }
@@ -355,7 +408,7 @@ pub fn query(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fa
 /// `exec`: runs one statement for its effect.
 pub fn exec(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
     let sql = arguments.required_text("sql")?.to_string();
-    let params = bound_values(arguments)?;
+    let params = bound_values(context, arguments)?;
     let before = context
         .shell()
         .connection()
@@ -484,9 +537,18 @@ pub fn run_input(context: &mut Context, arguments: &Arguments) -> Result<Outcome
     let printed = context.collect_output(&input);
     let failed = context.shell().failed;
     context.shell().failed = false;
-    let mut produced = Outcome::said("run", printed.trim_end());
-    produced = produced.with("shell_reported_an_error", Json::Bool(failed));
-    Ok(produced)
+    // **A failing statement is a failure** (task-2066 section 4.2, item 27).
+    // This used to answer `Ok` with a `shell_reported_an_error` field beside
+    // the printed text, so `inillucent run "SELECT * FROM nothing;"` exited 0
+    // where `exec` exits 1, and the same refusal over MCP came back with
+    // `"isError": false` - an agent branching on the status was told the
+    // command had run. The other four verbs that drive the shell go through
+    // `dot`, which has reported this as a failure all along; `run` was the one
+    // that did not, and it is the one an agent reaches for.
+    if failed {
+        return Err(Failed::said(Status::Syntax, printed.trim_end().to_string()));
+    }
+    Ok(Outcome::said("run", printed.trim_end()))
 }
 
 /// `create`: makes a new database file.
@@ -889,24 +951,85 @@ pub fn export(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
         }
     };
     context.refuse_if_it_writes(&sql)?;
-    let mut script = format!(".mode {mode}\n.headers on\n");
-    if let Some(out) = arguments.text("out") {
-        let confined = context.confine(out)?;
-        script.push_str(&format!(".once \"{}\"\n", confined.to_string_lossy()));
+    // **The redirect is taken here rather than written into the script
+    // (task-2044).** This built `.once "<path>"` at the top of the script and
+    // then ran the script through `collect_output`, which is two callers
+    // claiming the shell's output stream; `say` gave it to the collecting one,
+    // so the file was created, stayed empty, and the rows came back in the
+    // report while `"ok": true` said the export had happened. `say` now gives
+    // a redirect the rows, and asking for it directly is what the command
+    // meant in the first place - it removes a path assembled into a quoted
+    // argument, it makes a file that will not open an `io` failure instead of
+    // a syntax one, and it is what `backup` beside this already does.
+    //
+    // It also settles the question safe mode was answering by accident. A
+    // typed `.once` is still refused on a server started `--root`, which is
+    // the reference's behaviour and is kept; this is not a typed `.once`, it
+    // is a command whose path `confine` has already admitted, exactly as for
+    // `backup`, `import` and `restore` - see the argument in `dot` above.
+    let destination = match arguments.text("out") {
+        None => None,
+        Some(out) => Some(context.confine(out)?),
+    };
+    if let Some(path) = destination.as_ref() {
+        let named = path.to_string_lossy().into_owned();
+        context
+            .shell()
+            .redirect(Some(&named), true)
+            .map_err(|message| {
+                Failed::said(Status::Io, format!("cannot open \"{named}\": {message}"))
+            })?;
     }
-    script.push_str(&sql);
-    script.push(';');
+    let script = format!(".mode {mode}\n.headers on\n{sql};");
     let printed = context.collect_output(&script);
+    let rows = context.shell().rows_since_redirect;
+    // The `.once` releases itself after the statement, and this releases it
+    // after a statement that never ran - an empty `sql`, or one the parser
+    // refused before the shell reached it. A redirect left open on a server
+    // that stays up would send the next command's rows into this file.
+    if destination.is_some() {
+        let _ = context.shell().redirect(None, false);
+    }
     let failed = context.shell().failed;
     context.shell().failed = false;
     if failed {
         return Err(Failed::said(Status::Syntax, printed.trim_end().to_string()));
     }
-    let produced = Outcome::said("export", printed.trim_end());
-    Ok(match arguments.text("out") {
-        Some(out) => produced.with("wrote", json::text(out)),
-        None => produced,
-    })
+    let Some(path) = destination else {
+        return Ok(Outcome::said("export", printed.trim_end()));
+    };
+    wrote_a_file(&path, rows)
+}
+
+/// Reports an export that went to a file rather than into the answer.
+///
+/// **The rows are not repeated here.** They are in the file, and a caller that
+/// asked for a file asked for them to be there; an export of a million rows
+/// that also carried a million rows back through the report would cost a copy
+/// of the whole table in memory and a second one in the JSON, for something
+/// nobody reads. What the report carries instead is the three things a caller
+/// checks: where it went, how many rows went into it, and how large it is -
+/// the last of which is read back off the file rather than counted up, so a
+/// short write is visible in the report that claims the write happened.
+///
+/// @param path - the file that was written
+/// @param rows - how many result rows the renderer was handed
+fn wrote_a_file(path: &std::path::Path, rows: usize) -> Result<Outcome, Failed> {
+    let named = path.to_string_lossy().into_owned();
+    let bytes = std::fs::metadata(path)
+        .map(|found| found.len())
+        .unwrap_or(0);
+    let mut produced = Outcome::said(
+        "export",
+        format!(
+            "wrote {rows} row{} ({bytes} bytes) to {named}",
+            if rows == 1 { "" } else { "s" }
+        ),
+    );
+    produced.total = rows;
+    Ok(produced
+        .with("wrote", json::text(&named))
+        .with("bytes", Json::Int(bytes as i64)))
 }
 
 /// `backup`: copies the database to a file.
@@ -954,8 +1077,55 @@ pub fn checkpoint(context: &mut Context, _arguments: &Arguments) -> Result<Outco
 }
 
 /// `integrity-check`: reads every page and says whether it holds together.
+///
+/// **The exit code and the `ok` field follow the answer** (task-2066 §4.1.4).
+/// `PRAGMA integrity_check` reports damage as a *row of text*, the way SQLite
+/// does, and this verb listed the rows and stopped there - so
+/// `outcome.rs`'s unconditional `("ok", Json::Bool(true))` said a corrupt file
+/// was fine, at exit 0. Any health check written as
+/// `inillucent integrity-check && echo healthy` was told the wrong thing, and
+/// this is the one command whose entire purpose is to answer whether a database
+/// is sound. The pinned SQLite 3.53.4 exits 1 on the equivalent.
+///
+/// The pragma still returns rows. What changed is that the verb reads them.
 pub fn integrity_check(context: &mut Context, _arguments: &Arguments) -> Result<Outcome, Failed> {
-    listing(context, "integrity-check", "PRAGMA integrity_check")
+    let produced = listing(context, "integrity-check", "PRAGMA integrity_check")?;
+    if let Some(damage) = first_damage(&produced) {
+        return Err(Failed::said(Status::Corrupt, damage));
+    }
+    Ok(produced)
+}
+
+/// Returns what an integrity report says is wrong, or `None` when it says `ok`.
+///
+/// SQLite's contract is one row reading `ok` for a healthy file, and one row
+/// per problem otherwise. Anything that is not exactly `ok` is damage, so a
+/// future check that reports something this does not recognise is read as
+/// damage rather than as health - which is the direction a health check has to
+/// fail in.
+///
+/// @param produced - what the pragma answered
+fn first_damage(produced: &Outcome) -> Option<String> {
+    let said: Vec<String> = produced
+        .rows
+        .iter()
+        .flatten()
+        .map(|value| match value {
+            Json::Text(text) => text.clone(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    if said.is_empty() {
+        return Some(
+            "PRAGMA integrity_check returned no rows at all, so this database's soundness is \
+             unknown rather than confirmed"
+                .to_string(),
+        );
+    }
+    if said.iter().all(|line| line.trim() == "ok") {
+        return None;
+    }
+    Some(said.join("; "))
 }
 
 /// `analyze`: gathers the statistics the planner reads.
@@ -1472,75 +1642,72 @@ fn migrate_remote(
         .with("notCarried", json::Json::Array(not_carried)))
 }
 
-/// Imports a SQLite database file into a new `.rdb`.
+/// Migrates a SQLite file, verified, the way the tool of the same name does.
 ///
-/// **Staged and then published, never written where an application looks.**
-/// `import_into` takes the target rather than deriving it because that is the
-/// property a migration needs: a half-written database must not sit at the path
-/// somebody is about to open. The staging name carries the process id so two
-/// migrations at once cannot collide, and the rename is the publish.
+/// **This used to import and rename, and call that a migration** (task-2066
+/// §4.1.7). `AGENTS.md` and `agent-skills/inillucent-migrate` both say a
+/// migration is verified by row count and digest and published only if every
+/// check passes. The verb did none of it: `Database::import_sqlite_into`
+/// followed by `std::fs::rename`. Measured on the shipped binary, that meant an
+/// FTS5 table was dropped and the migration exited 0 with no warning even under
+/// `--output json` - so a database whose only content was an FTS5 table
+/// migrated to an empty file and reported success. `application_id` and
+/// `user_version` went the same way, and every *successful* migration leaked
+/// its staging segments, because the cleanup ran only on the error path.
 ///
-/// @param from - the SQLite file
-/// @param to - the file to write
+/// `inillucent_migrate::sqlite::migrate` is the implementation that does what
+/// the documentation says, and the `inillucent-migrate` binary has used it
+/// since it was written. Two implementations of one job, and the shipped verb
+/// had the one nobody was grading.
+///
+/// The report is carried out rather than reduced to a sentence: `checks`,
+/// `rows`, `tables` and anything the source held that the destination does not,
+/// which is the shape the PostgreSQL path already reports.
+///
+/// @param from - the SQLite file to read
+/// @param to - the `.rdb` to publish
 fn migrate_sqlite_file(from: &std::path::Path, to: &std::path::Path) -> Result<Outcome, Failed> {
-    let mut staged = to.as_os_str().to_os_string();
-    staged.push(format!(".staging-{}", std::process::id()));
-    let staged = std::path::PathBuf::from(staged);
-    // **A source the reader could not read whole is refused here (task-1979,
-    // M1).** The import used to drop a table whose rows it could not read and
-    // carry on, so one flipped bit in a leaf page produced a published,
-    // integrity-clean database with the table gone and exit code 0. The engine
-    // refuses instead, and the staging file is left where it fell rather than
-    // renamed over the destination.
-    let imported = match inillucent_driver::Database::import_sqlite_into(from, &staged) {
-        Ok(imported) => imported,
-        Err(error) => {
-            // **The staging file goes with the refusal.** A migration that
-            // published nothing used to leave a half-built database and its log
-            // segments beside the destination, named after this process, for
-            // somebody to find later and wonder about.
-            remove_staged(&staged);
-            return Err(Failed::from_driver(error));
-        }
-    };
-    drop(imported);
-    std::fs::rename(&staged, to).map_err(|error| {
-        Failed::said(
-            Status::Io,
+    // The staging file is left where it fell on a failure, by design, so there
+    // is something to look at; `migrate`'s message says where.
+    let report = inillucent_migrate::sqlite::migrate(from, to)
+        .map_err(|error| Failed::from_engine(&error))?;
+    let failures: Vec<String> = report
+        .failures()
+        .iter()
+        .map(|check| format!("{}: {}", check.name, check.detail))
+        .collect();
+    let checks = Json::Array(
+        report
+            .checks
+            .iter()
+            .map(|check| {
+                json::object(vec![
+                    ("name", json::text(&check.name)),
+                    ("passed", Json::Bool(check.passed)),
+                    ("detail", json::text(&check.detail)),
+                ])
+            })
+            .collect(),
+    );
+    // **A report that did not pass is a failure, not a note.** `migrate`
+    // answers `Ok(report)` for one, because publishing is its decision and
+    // reporting is the caller's - and the caller used to have no opinion.
+    if !report.passed() {
+        return Err(Failed::said(
+            Status::Corrupt,
             format!(
-                "built {} but could not publish it: {error}",
-                staged.display()
+                "{} was not published: {}",
+                to.display(),
+                failures.join("; ")
             ),
-        )
-    })?;
+        ));
+    }
     Ok(Outcome::said(
         "migrate",
         format!("imported {} into {}", from.display(), to.display()),
     )
-    .with("destination", json::text(to.to_string_lossy())))
-}
-
-/// Removes a staging database and every log segment beside it.
-///
-/// A `.rdb` is a file plus its own log segments, named after it, so removing
-/// the first and leaving the rest is leaving most of the bytes.
-///
-/// @param staged - the staging database
-fn remove_staged(staged: &std::path::Path) {
-    let _ = std::fs::remove_file(staged);
-    let (Some(directory), Some(stem)) = (staged.parent(), staged.file_name()) else {
-        return;
-    };
-    let stem = stem.to_string_lossy().into_owned();
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&format!("{stem}-wal.")) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
+    .with("destination", json::text(to.to_string_lossy()))
+    .with("checks", checks))
 }
 
 /// `version`: what this build is.

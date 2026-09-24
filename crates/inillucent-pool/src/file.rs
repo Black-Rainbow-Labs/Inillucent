@@ -18,7 +18,7 @@ use inillucent_base::DbResult;
 use inillucent_vfs::{DbPath, FileLock, OpenOptions, Vfs};
 
 use crate::freemap::FreeMap;
-use crate::meta::{Meta, FIRST_DATA_PAGE, META_PAGE, SHADOW_PAGE};
+use crate::meta::{Meta, FIRST_DATA_PAGE, META_PAGE, META_RECORD_BYTES, SHADOW_PAGE};
 use crate::pool::Pool;
 use crate::PageId;
 
@@ -29,6 +29,90 @@ use crate::PageId;
 /// fairness section of a measurement states the pool size it ran at, and the
 /// gate harness sets it explicitly on both engines.
 pub const DEFAULT_FRAMES: usize = 4_096;
+
+/// What the two meta slots held when this connection last read them in full.
+///
+/// See [`Database::slots`] for what it is for, and
+/// [`Database::disk_record_is_as_last_read`] for the check it makes possible.
+#[derive(Clone, Copy, Debug, Default)]
+struct LastReadSlots {
+    /// The record bytes of slot 0 and slot 1, or `None` before either has been
+    /// read in full.
+    ///
+    /// **The bytes rather than the decoded record**, because the question is
+    /// whether the file changed and not what it now says. Two encodings of the
+    /// same record are the same bytes - [`Meta::encode`] writes the fields at
+    /// fixed offsets and zeroes everything else - so comparing bytes answers it
+    /// without decoding, and decoding is what costs a crc32 pass over a whole
+    /// page.
+    read: Option<[[u8; META_RECORD_BYTES]; 2]>,
+    /// What the cheap check answered under the lock this connection holds, or
+    /// `None` when it has not been asked since the file was last let go.
+    ///
+    /// Remembered because `begin_read` and the engine's `the_meta_moved` ask
+    /// the same question of the same bytes moments apart, inside one lock
+    /// acquisition. A writer takes EXCLUSIVE, which excludes the SHARED this
+    /// connection holds between them, so the second read could not see anything
+    /// the first did not - and this is cleared everywhere `trusted` is, which
+    /// is the two places the file is let go.
+    ///
+    /// **`Some(true)` is the only value that short circuits anything**, and
+    /// only [`LastReadSlots`]'s own comparison ever sets it. A full read sets
+    /// this to `Some(false)` rather than to `Some(true)`, for the reason
+    /// [`LastReadSlots::record`] gives: after a full read the caller that
+    /// follows has a *different* comparison to make, against `disk_meta`, and
+    /// it has to make it.
+    checked: Option<bool>,
+}
+
+impl LastReadSlots {
+    /// Writes down the record bytes of two slots just read in full.
+    ///
+    /// **Only bytes that decoded, and never a short circuit.** Two rules, and
+    /// each one is there so that the cheap check cannot answer a question the
+    /// full read would have answered differently:
+    ///
+    /// - a page pair that did not decode is not written down, because
+    ///   `the_meta_moved` answers "moved" for an unreadable record and a cheap
+    ///   check that matched those bytes would answer "unchanged" about a file
+    ///   nobody could read;
+    /// - `checked` is left saying no. A full read has just happened, so the
+    ///   next caller in the same statement is the one that compares the record
+    ///   against `disk_meta` - and that comparison is not the one the cheap
+    ///   check makes. Letting it short circuit here would have
+    ///   `the_meta_moved` report "not moved" on the statement that had just
+    ///   found the file moved.
+    ///
+    /// A page shorter than a record cannot carry one, and is not written down
+    /// for the same reason as a page that did not decode.
+    ///
+    /// @param primary - slot 0's page
+    /// @param shadow - slot 1's page
+    /// @param decoded - whether one of the two slots yielded a record
+    fn record(&mut self, primary: &[u8], shadow: &[u8], decoded: bool) {
+        self.checked = Some(false);
+        let (Some(first), Some(second)) = (
+            primary.get(..META_RECORD_BYTES),
+            shadow.get(..META_RECORD_BYTES),
+        ) else {
+            self.read = None;
+            return;
+        };
+        if !decoded {
+            self.read = None;
+            return;
+        }
+        let mut records = [[0u8; META_RECORD_BYTES]; 2];
+        let (head, rest) = records.split_at_mut(1);
+        let (Some(slot), Some(other)) = (head.first_mut(), rest.first_mut()) else {
+            self.read = None;
+            return;
+        };
+        slot.copy_from_slice(first);
+        other.copy_from_slice(second);
+        self.read = Some(records);
+    }
+}
 
 /// How a database is opened.
 #[derive(Clone, Copy, Debug)]
@@ -72,6 +156,59 @@ pub struct Database {
     pool: Pool,
     /// What the meta record last said, with the caller's edits applied.
     meta: Meta,
+    /// The record the **file** held the last time this connection looked at it or
+    /// wrote it.
+    ///
+    /// **`meta` is what this connection means the file to say; this is what it
+    /// last saw it say** (task-2000, design 1b). The two were the same field until
+    /// the fold became lazy, because a statement folded on its way out and the
+    /// connection's record therefore reached the file before the lock was
+    /// released. They are not the same any more: a `CREATE TABLE` bumps
+    /// `schema_cookie`, a `PRAGMA user_version = 7` sets `user_version`, and
+    /// neither reaches the file until a fold is due.
+    ///
+    /// **Why that matters, measured.** `ImportedDatabase::the_meta_moved` asks
+    /// "has another process folded since I last held the lock", and it asked it by
+    /// comparing the whole of `meta` with the record on disk - which is sound only
+    /// while the two cannot differ for this connection's own reasons. With the lazy
+    /// fold they can, so the very next statement after a `CREATE TABLE` read *its
+    /// own* pending cookie as another process's write, resynchronised, and threw
+    /// the catalog row away with the pool. `new_engine_ddl`'s
+    /// `creating_a_table_writes_the_row_sqlite_writes` found it: `CREATE TABLE
+    /// plain (a, b)` ran, reported success, and was not in `sqlite_schema`
+    /// afterwards. Eleven of its twelve cases failed the same way, and so did
+    /// `new_engine_vtab`, `schema_forms`, `temp_objects` and every other suite that
+    /// runs a DDL statement and then reads.
+    ///
+    /// Comparing against this instead answers the question that was always meant:
+    /// the record on the disk is compared with the last one this connection saw
+    /// there, so a change by anybody else shows and a change of its own does not.
+    /// The whole record is still compared - see `the_meta_moved` for why one field
+    /// is not enough.
+    disk_meta: Meta,
+    /// The record bytes both slots held the last time this connection read them
+    /// in full, and whether they were still those bytes when it last looked.
+    ///
+    /// **The per-statement staleness check, made cheap** (task-2046).
+    /// [`Database::meta_on_disk`] allocates and zeroes a buffer one page long
+    /// for each of the two slots, reads a whole page into each and checksums
+    /// both, and the engine reached it twice for every statement run outside a
+    /// transaction - once through [`Database::begin_read`] and once through
+    /// `the_meta_moved`. At the 32 KiB default page size that was four 32 KiB
+    /// allocations, four 32 KiB reads and four crc32 passes over 32 KiB, to
+    /// compare a record 116 bytes long, and it was 89 of the 132 microseconds
+    /// `SELECT 1` cost through `Connection` against 1.1 microseconds for the
+    /// same statement inside a transaction.
+    ///
+    /// The bytes are what [`Database::disk_record_is_as_last_read`] compares
+    /// against; `checked` is that comparison's answer, remembered for as long
+    /// as the lock it was made under is held, because the two callers ask
+    /// moments apart under one SHARED lock and no writer can hold the file at
+    /// the same time. Both are only ever a *fast* answer: a difference, an
+    /// unreadable file and an empty memo all fall through to the full read and
+    /// its checksum, which is still the only thing that says what the record
+    /// is.
+    slots: LastReadSlots,
     /// The free map, held resident because it is consulted on every allocation.
     free: FreeMap,
     /// The shared extent page a small out-of-line value goes on next.
@@ -103,6 +240,25 @@ pub struct Database {
     /// and refuses a write here rather than relying on somebody above to have
     /// asked.
     read_only: bool,
+    /// Whether the owner replays the log after this cache is thrown away.
+    ///
+    /// **Set by `ImportedDatabase`, false for anything holding a `Database` on
+    /// its own** (task-2000, design 1b). A connection that no longer folds on the
+    /// way out of a statement holds dirty pages between statements, so the moment
+    /// another process folds, this cache is both stale and dirty at once - which
+    /// is the ordinary case now and used to be a defect.
+    ///
+    /// The two answers to it differ in what happens to the dirty frames.
+    /// `discard_all` writes them back on its way out, which is exactly wrong when
+    /// the file is ahead of the cache; `abandon_all` drops them, which loses
+    /// nothing **if and only if** the owner then replays the log from the file's
+    /// own checkpoint, because the write-ahead rule means every change a dirty
+    /// frame holds is in a record there. `ImportedDatabase::resync_from_file` is
+    /// that replay and it runs on every take where the meta record or the log
+    /// moved. A caller with no replay - the benchmark binaries and the model
+    /// campaigns, which hold one `Database` in one process - gets the refusal it
+    /// always got, because for it the changes really would be gone.
+    replayed_by_its_owner: bool,
     /// Whether what this connection holds was derived while it held the file.
     ///
     /// **False from `open` until the owner says otherwise.** The open path
@@ -152,10 +308,13 @@ impl Database {
         let mut database = Database {
             pool,
             meta,
+            disk_meta: meta,
+            slots: LastReadSlots::default(),
             free: FreeMap::new(options.page_size),
             shared_extent: None,
             busy_millis: DEFAULT_BUSY_MILLIS,
             read_only: false,
+            replayed_by_its_owner: false,
             trusted: false,
         };
         let mut next = FIRST_DATA_PAGE.0;
@@ -163,6 +322,13 @@ impl Database {
         database.pool.set_page_count(next);
         database.meta.page_count = next;
         database.meta.free_map = database.free.first();
+        // **`disk_meta` is deliberately left at what the two slots above hold**,
+        // which is the record as it was before these three lines. That is the whole
+        // invariant: `disk_meta` says what the file says, `meta` says what this
+        // connection means it to say, and a fresh database's page count and free map
+        // are the connection's first pending edit. Nothing checkpoints here, so the
+        // first statement's `the_meta_moved` compares the file's record against the
+        // record the file holds and correctly answers no.
         let _ = created;
         database.write_free_map()?;
         // **The file is let go once it exists.** The exclusive lock above is
@@ -186,10 +352,13 @@ impl Database {
         Ok(Database {
             pool,
             meta,
+            disk_meta: meta,
+            slots: LastReadSlots::default(),
             free,
             shared_extent: None,
             busy_millis: DEFAULT_BUSY_MILLIS,
             read_only: false,
+            replayed_by_its_owner: false,
             trusted: false,
         })
     }
@@ -214,10 +383,13 @@ impl Database {
         Ok(Database {
             pool,
             meta,
+            disk_meta: meta,
+            slots: LastReadSlots::default(),
             free,
             shared_extent: None,
             busy_millis: DEFAULT_BUSY_MILLIS,
             read_only: true,
+            replayed_by_its_owner: false,
             trusted: false,
         })
     }
@@ -255,10 +427,13 @@ impl Database {
         Ok(Database {
             pool,
             meta,
+            disk_meta: meta,
+            slots: LastReadSlots::default(),
             free,
             shared_extent: None,
             busy_millis: DEFAULT_BUSY_MILLIS,
             read_only: false,
+            replayed_by_its_owner: false,
             trusted: false,
         })
     }
@@ -423,6 +598,69 @@ impl Database {
             .file()
             .truncate(wanted)
             .map_err(inillucent_vfs::VfsError::into_db_error)
+    }
+
+    /// Refuses a database whose header claims a page count nothing can address.
+    ///
+    /// **`page_count` was read and never checked against anything** (task-2066
+    /// section 4.2, item 16). A 163,840-byte file with both meta pages carrying
+    /// a `PAGE_COUNT` of 2^60 and both checksums resealed answered
+    /// `SELECT count(*)` with 10, answered `integrity-check` with `ok`, and
+    /// accepted an `INSERT` - all of them exit 0. The number is not decoration:
+    /// `paged::cursor` uses `pool.page_count()` as the only bound on the leaf
+    /// sibling chain, so inflating it disables that cycle guard as well.
+    ///
+    /// **What it checks is the arithmetic, not the file's length, and the
+    /// difference was measured.** The obvious check - refuse a count larger
+    /// than `file_size / page_size` - is unsound in this format, because the
+    /// file grows when a page is *written* and the count grows when a page is
+    /// *allocated*. A page allocated and never written leaves the count ahead
+    /// of the file for ever, and that is a state this engine produces itself: a
+    /// rolled-back `CREATE TABLE` keeps its root page, and
+    /// `new_engine_page_ownership`'s `the_leak_report_names_a_page_no_tree_reaches`
+    /// builds one deliberately and then reopens it. That check refused it, with
+    /// "the header claims 6 pages but the file holds 5" - a healthy database,
+    /// turned away over a leak the checker is there to *report*.
+    ///
+    /// So what is left is the claim that cannot be true of any file: a count
+    /// whose byte length does not fit in a `u64`. 2^60 pages of 4,096 bytes is
+    /// 2^72 bytes, and every offset this pager computes is `page * page_size`.
+    /// A count that overflows that multiplication describes no file on any
+    /// device, and no allocation can reach it.
+    ///
+    /// A count that is merely large and does fit is indistinguishable from a
+    /// leak, and is left to `check_page_ownership`, which reads the free map
+    /// and says which pages nothing reaches.
+    pub fn refuse_a_page_count_that_cannot_be_addressed(&self) -> DbResult<()> {
+        let claimed = self.meta.page_count;
+        if claimed
+            .checked_mul(self.pool.page_size().max(1) as u64)
+            .is_none()
+        {
+            // The sentence is the message as well as the detail, which most
+            // `corrupt` refusals here leave to the stock "database disk image
+            // is malformed". That text sends an operator to a repair tool; a
+            // header carrying a number no file can have wants the number.
+            let said = format!(
+                "the header claims {claimed} pages of {} bytes, which is longer than any file",
+                self.pool.page_size()
+            );
+            return Err(corrupt(said.clone()).with_message(said));
+        }
+        Ok(())
+    }
+
+    /// Reports whether the free map says a page is handed out.
+    ///
+    /// **For the integrity checker, which is the only reader that has a second
+    /// opinion to compare this against.** Everything else asks the map by
+    /// allocating from it. A page past the end of the map answers `true`,
+    /// because a page nothing can describe is a page nothing may hand out -
+    /// see [`crate::freemap::FreeMap::is_allocated`].
+    ///
+    /// @param page - the page to ask about
+    pub fn page_is_allocated(&self, page: PageId) -> bool {
+        self.free.is_allocated(page)
     }
 
     /// Returns the buffer pool, so a caller that owns the file can grow it.
@@ -659,7 +897,23 @@ impl Database {
         if self.pool.lock_level() != FileLock::None {
             return Ok(false);
         }
-        self.pool.lock(FileLock::Shared)?;
+        // **The reader waits for as long as this connection's own
+        // `busy_timeout` says** (task-2066 section 4.2, item 23). `Pool::lock`
+        // waits [`DEFAULT_BUSY_MILLIS`], which is the constant a connection
+        // that never set the pragma gets - so a reader that had been told to
+        // wait thirty seconds gave up after five, and one told to give up at
+        // once waited five seconds first. `set_busy_millis` has pushed the
+        // pragma down into this object since task-1979 and only the write path
+        // read it.
+        //
+        // **Through this module's own wait rather than `Pool::lock_within`,
+        // because the two build different refusals.** `Pool`'s hands back the
+        // file system's own error, which is the `a writer holds PENDING` that
+        // task-1979 C6 replaced: it names a lock level a caller cannot act on
+        // and it says "writer" whoever is holding. [`file_is_busy`] names what
+        // the holder is doing, what this caller wanted, and which pragma
+        // changes the answer.
+        wait_for_lock_within(self.pool.file(), FileLock::Shared, self.busy_millis)?;
         self.reload_if_moved()
     }
 
@@ -714,9 +968,11 @@ impl Database {
             // writes. The reload is after the raise rather than before it for
             // the reason `attempt_write` gives.
             let held = self.pool.lock_level() != FileLock::None;
-            self.pool.lock(FileLock::Shared)?;
-            self.pool.lock(FileLock::Reserved)?;
-            self.pool.lock(FileLock::Exclusive)?;
+            // This connection's own `busy_timeout`, and this module's own
+            // wait, for the two reasons `begin_read` gives above it.
+            for level in [FileLock::Shared, FileLock::Reserved, FileLock::Exclusive] {
+                wait_for_lock_within(self.pool.file(), level, self.busy_millis)?;
+            }
             if held {
                 return Ok(false);
             }
@@ -778,6 +1034,9 @@ impl Database {
     /// on some earlier round the writer then lost.
     fn attempt_write(&mut self) -> DbResult<bool> {
         self.trusted = false;
+        // The file is let go on the next line, so the staleness check made
+        // under the lock this attempt is giving up no longer says anything.
+        self.slots.checked = None;
         self.pool.unlock(FileLock::None)?;
         self.pool.lock_within(FileLock::Shared, 0)?;
         self.pool.lock_within(FileLock::Reserved, 0)?;
@@ -806,6 +1065,9 @@ impl Database {
     /// file before this connection takes it again.
     pub fn end_access(&mut self) -> DbResult<()> {
         self.trusted = false;
+        // The check is only true for as long as the lock it was made under is
+        // held. See [`Database::slots`].
+        self.slots.checked = None;
         self.pool.unlock(FileLock::None)
     }
 
@@ -839,6 +1101,25 @@ impl Database {
         self.busy_millis = millis;
     }
 
+    /// Returns the record the file held the last time this connection looked.
+    ///
+    /// See [`Database::disk_meta`] for what it is for. A caller asking "has anybody
+    /// else folded" compares the file's record with this one and never with
+    /// [`Database::meta`], which carries this connection's own pending edits.
+    pub fn seen_on_disk(&self) -> &Meta {
+        &self.disk_meta
+    }
+
+    /// Says that the owner replays the log whenever this cache is thrown away.
+    ///
+    /// See [`Database::replayed_by_its_owner`]. `ImportedDatabase` sets it for
+    /// every file it holds, at open and at `ATTACH`; nothing else does.
+    ///
+    /// @param replayed - whether the owner replays
+    pub fn set_replayed_by_its_owner(&mut self, replayed: bool) {
+        self.replayed_by_its_owner = replayed;
+    }
+
     /// Returns how long this connection waits for a contended file.
     pub fn busy_millis(&self) -> u64 {
         self.busy_millis
@@ -852,10 +1133,62 @@ impl Database {
     /// `None` when neither slot decodes, which is not this function's to
     /// report: the read that follows says so, with the message the open path
     /// uses.
-    pub fn meta_on_disk(&self) -> DbResult<Option<Meta>> {
+    pub fn meta_on_disk(&mut self) -> DbResult<Option<Meta>> {
         let page_size = self.pool.page_size();
         let (primary, shadow) = self.pool.read_meta_slots(page_size)?;
-        Ok(Meta::choose(&primary, &shadow).ok())
+        let chosen = Meta::choose(&primary, &shadow).ok();
+        // **What the cheap check compares against, recorded by the expensive
+        // one** (task-2046). Every path that reads the slots in full comes
+        // through here, so there is one place where the bytes this connection
+        // has verified are written down, and no way to read the file in full
+        // without them being brought up to date.
+        self.slots.record(&primary, &shadow, chosen.is_some());
+        Ok(chosen)
+    }
+
+    /// Reports whether the file's meta record is byte for byte the one this
+    /// connection last read from it in full.
+    ///
+    /// **The per-statement staleness check, and why it stopped costing 89 of
+    /// the 132 microseconds a `SELECT 1` cost** (task-2046). The question both
+    /// callers ask - the engine's `the_meta_moved`, and
+    /// [`Database::reload_if_moved`] underneath [`Database::begin_read`] - is
+    /// whether another process has folded since this connection last held the
+    /// lock. Answering it through [`Database::meta_on_disk`] read a whole page
+    /// into a freshly zeroed buffer one page long for each of the two slots and
+    /// checksummed both, twice per statement; at the 32 KiB default page size
+    /// that is four 32 KiB allocations, four 32 KiB reads and four crc32 passes
+    /// over 32 KiB, to compare a record 116 bytes long.
+    ///
+    /// This reads those 116 bytes from each slot and compares them, and
+    /// remembers the answer for as long as the lock is held, so the second
+    /// caller reads nothing at all.
+    ///
+    /// **`false` is always safe and `true` is the claim.** A difference, a file
+    /// too short to read, and a connection that has not yet read the slots in
+    /// full all answer `false`, which sends the caller to the full read and its
+    /// checksum - still the only path that decides what the record is. `true`
+    /// says the bytes are the ones this connection already decoded and verified
+    /// under a lock, which is the reasoning [`Database::begin_read`]'s own
+    /// short circuit already rests on: a writer takes EXCLUSIVE, so nothing can
+    /// have changed while this connection held SHARED.
+    pub fn disk_record_is_as_last_read(&mut self) -> DbResult<bool> {
+        if let Some(checked) = self.slots.checked {
+            return Ok(checked);
+        }
+        let Some(last) = self.slots.read else {
+            self.slots.checked = Some(false);
+            return Ok(false);
+        };
+        let unchanged = match self.pool.read_meta_records(self.pool.page_size()) {
+            Ok(found) => found == last,
+            // A file too short to hold two slots, or one the operating system
+            // refused: the full read that follows reports it with the message
+            // the open path uses, which is where a caller can act on it.
+            Err(_) => false,
+        };
+        self.slots.checked = Some(unchanged);
+        Ok(unchanged)
     }
 
     /// Returns the generation this connection's cache describes.
@@ -894,6 +1227,8 @@ impl Database {
         // long-lived writer processes lost 261 of 599 acknowledged inserts.
         self.pool.note_high_water_lsn(found.high_water_lsn);
         self.meta = found;
+        // Adopted from the file, so it is also the last record seen there.
+        self.disk_meta = found;
         self.free = FreeMap::new(self.pool.page_size());
         self.shared_extent = None;
         Ok(())
@@ -935,16 +1270,41 @@ impl Database {
     ///
     /// Returns whether anything was thrown away.
     fn reload_if_moved(&mut self) -> DbResult<bool> {
+        // **The file's own bytes, unchanged, answer this without decoding
+        // anything** (task-2046). What this function tests is whether the
+        // file's generation is above the one this connection's cache
+        // describes; a record byte for byte the one last read in full is the
+        // record whose generation was compared then, and `meta` only ever
+        // moves forward from there - so the answer it gave then is the answer
+        // now.
+        if self.disk_record_is_as_last_read()? {
+            return Ok(false);
+        }
         let Some(found) = self.meta_on_disk()? else {
             return Ok(false);
         };
         if found.generation <= self.meta.generation {
             return Ok(false);
         }
-        self.refuse_if_the_cache_is_dirty()?;
-        self.pool.discard_all()?;
+        // **Abandoned when the owner replays, refused when it does not.** See
+        // `Database::replayed_by_its_owner` for why the two come apart, and
+        // `adopt_from_file`, which is the same pair of lines for the same reason.
+        match self.replayed_by_its_owner {
+            true => {
+                self.pool.abandon_all()?;
+                // The high water the adopted file carries, folded in before a
+                // page is written - `adopt_from_file`'s own comment carries the
+                // 261 of 599 acknowledged inserts that went missing without it.
+                self.pool.note_high_water_lsn(found.high_water_lsn);
+            }
+            false => {
+                self.refuse_if_the_cache_is_dirty()?;
+                self.pool.discard_all()?;
+            }
+        }
         self.pool.set_page_count(found.page_count);
         self.meta = found;
+        self.disk_meta = found;
         self.free = read_free_map(&self.pool, self.meta.free_map)?;
         Ok(true)
     }
@@ -1037,6 +1397,9 @@ impl Database {
         let mut meta = self.meta;
         self.pool.checkpoint(&mut meta)?;
         self.meta = meta;
+        // The file now holds this record, so it is what the next staleness check
+        // compares against - see [`Database::disk_meta`].
+        self.disk_meta = meta;
         Ok(())
     }
 }
@@ -1061,12 +1424,36 @@ pub const DEFAULT_BUSY_MILLIS: u64 = 5_000;
 /// while a torn page might still be resident there gets a cache hit rather
 /// than a checksum failure - see [`Database::open_before_recovery`].
 ///
+/// **The walk is bounded and remembers where it has been** (task-2066
+/// §4.1.11). It followed `right_of` with no visited set and no limit, pushing a
+/// page image per hop, so a free map page whose right link points at itself is
+/// an open that never returns and never stops allocating. That is reachable
+/// from an ordinary `inillucent --db <file> integrity-check` on a damaged file,
+/// which is the one command whose job is to survive one.
+///
+/// The leaf sibling walk in `paged/cursor.rs` already carries the bound and
+/// makes the same argument for it: a chain cannot be longer than the file has
+/// pages, whatever any statistic says. The visited set is here as well because
+/// a bound alone turns an infinite loop into a long one, and the page count of
+/// a large file is long enough to look like a hang.
+///
 /// @param pool - the buffer pool the file is open through
 /// @param head - the free map's first page, from the meta record
 fn read_free_map(pool: &Pool, head: PageId) -> DbResult<FreeMap> {
     let mut free = FreeMap::new(pool.page_size());
     let mut next = head;
+    let mut seen: std::collections::BTreeSet<PageId> = std::collections::BTreeSet::new();
     while !next.is_none() {
+        if !seen.insert(next) {
+            return Err(corrupt(
+                "a free map chain that does not terminate: it returns to a page it has already                  read",
+            ));
+        }
+        if seen.len() as u64 > pool.page_count().max(1) {
+            return Err(corrupt(
+                "a free map chain that does not terminate: it is longer than the file has pages",
+            ));
+        }
         let image = {
             let guard = pool.fetch(next)?;
             guard.bytes().to_vec()
@@ -1170,7 +1557,7 @@ fn declared_page_size(file: &dyn inillucent_vfs::VfsFile) -> Option<usize> {
     }
     let mut format = [0u8; 4];
     format.copy_from_slice(head.get(8..12)?);
-    if u32::from_le_bytes(format) != crate::meta::FORMAT_VERSION {
+    if !crate::meta::reads_format(u32::from_le_bytes(format)) {
         return None;
     }
     let mut size = [0u8; 4];
@@ -1197,10 +1584,10 @@ fn is_a_sqlite_file(file: &dyn inillucent_vfs::VfsFile) -> bool {
     head == *b"SQLite format 3\0"
 }
 
-/// Returns the format version a file carries when it is not this build's.
+/// Returns the format version a file carries when this build does not read it.
 ///
-/// `None` means the file is either this build's format or not an inillucent
-/// database at all - the second is the caller's "neither meta page is
+/// `None` means the file is either a format this build reads or not an
+/// inillucent database at all - the second is the caller's "neither meta page is
 /// readable", which is the right answer for a file whose magic is missing.
 ///
 /// @param file - the open data file
@@ -1213,7 +1600,7 @@ fn foreign_format_version(file: &dyn inillucent_vfs::VfsFile) -> Option<u32> {
     let mut format = [0u8; 4];
     format.copy_from_slice(head.get(8..12)?);
     let found = u32::from_le_bytes(format);
-    (found != crate::meta::FORMAT_VERSION).then_some(found)
+    (!crate::meta::reads_format(found)).then_some(found)
 }
 
 /// Returns the page size the shadow meta page declares, by trying sizes.
@@ -1253,6 +1640,66 @@ fn discover_page_size(file: &dyn inillucent_vfs::VfsFile) -> Option<usize> {
 mod tests {
     use super::*;
     use inillucent_vfs::MemoryVfs;
+
+    /// A free map page whose right link points at itself is refused.
+    ///
+    /// **It used to never return** (task-2066 §4.1.11). `read_free_map`
+    /// followed `right_of` with no visited set and no bound, pushing a page
+    /// image per hop, so the open loops and allocates until somebody kills the
+    /// process. It is reached from `Database::open`, which means from every
+    /// command there is - including `integrity-check`, whose whole job is to
+    /// survive a damaged file and say what is wrong with it.
+    ///
+    /// The damage is the one a per-page checksum cannot object to on its own:
+    /// the page is well formed and its link names a page that exists. The page
+    /// is rewritten whole through the VFS, checksum included, the way
+    /// `a_torn_primary_falls_back_to_the_shadow` rewrites the meta page.
+    ///
+    /// The bound is asserted by the test finishing. A wall-clock assertion
+    /// would be a different test on every machine; a walk that does not
+    /// terminate fails this by never returning, which is what the runner's
+    /// timeout is for.
+    #[test]
+    fn a_free_map_chain_that_returns_to_itself_is_refused() {
+        const PAGE: usize = 512;
+        let vfs = MemoryVfs::new();
+        let path = DbPath::new("cycle.rdb");
+        let head = {
+            let mut database =
+                Database::create(&vfs, &path, Options::default().with_page_size(PAGE)).unwrap();
+            // A page freed, so the map has a chain to walk rather than being
+            // empty and skipped.
+            let page = database.allocate(1).unwrap();
+            database.release(page, 1).unwrap();
+            database.checkpoint().unwrap();
+            database.meta().free_map
+        };
+        assert!(!head.is_none(), "the fixture has no free map to damage");
+
+        let file = vfs.open(&path, OpenOptions::main_db()).unwrap();
+        let at = head.0.saturating_mul(PAGE as u64);
+        let mut image = vec![0u8; PAGE];
+        file.read_exact_at(at, &mut image).unwrap();
+        assert_eq!(
+            crate::page::right_of(&image).unwrap(),
+            PageId::NONE,
+            "the head of a one-page chain should point at nothing, so this is not the page              this test thinks it is"
+        );
+        crate::page::set_right(&mut image, head).unwrap();
+        crate::page::checksum_page(&mut image).unwrap();
+        file.write_all_at(at, &image).unwrap();
+        drop(file);
+
+        let Err(error) = Database::open(&vfs, &path, 16) else {
+            panic!("a free map chain pointing at itself was accepted");
+        };
+        let said =
+            format!("{} {}", error.message(), error.detail().unwrap_or_default()).to_lowercase();
+        assert!(
+            said.contains("free map") && said.contains("terminate"),
+            "the refusal does not name the free map chain: {said}"
+        );
+    }
 
     /// A fresh database has its two meta pages, a free map, and nothing else.
     ///

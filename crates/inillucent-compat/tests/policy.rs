@@ -95,19 +95,39 @@ const UNSAFE_CRATES: [&str; 1] = ["inillucent-driver-capi"];
 /// safe Rust. Everything else in the engine is safe code, and the crate-level
 /// `forbid(unsafe_code)` in `inillucent-base` says so to the compiler as well.
 ///
-/// The last two are measurement binaries, not the engine: a global allocator is
-/// the only way to count heap allocations, and `GlobalAlloc` is an unsafe
-/// trait. They are admitted here rather than quietly because the charter is
-/// about what the engine is made of, and a baseline tool that never ships is
+/// Most of the rest are measurement binaries, not the engine: a global
+/// allocator is the only way to count heap allocations, and `GlobalAlloc` is an
+/// unsafe trait. They are admitted here rather than quietly because the charter
+/// is about what the engine is made of, and a baseline tool that never ships is
 /// not part of it - but a file with `unsafe` in it should still have to say
 /// why, in writing, in a list somebody reads.
+///
+/// The last entry is the first one that is a `cargo test` rather than a
+/// binary, and it carries its own argument for why that is the same ground.
 // The one file in the shell that says `unsafe`, added in task-1932 (H11).
 // Ctrl+C has no representation in the standard library, so being told about
 // it is `SetConsoleCtrlHandler` on Windows and `signal` on Unix, and both
 // are FFI. Each call installs a handler and reads nothing back; each handler
 // stores `true` into an already-allocated `AtomicBool` and returns, which is
 // the whole of what a handler is allowed to do.
-const UNSAFE_ALLOWED: [&str; 15] = [
+const UNSAFE_ALLOWED: [&str; 18] = [
+    // **The AVX2 dot product, added by task-2000's design 9.** It is the one place
+    // in the engine where safe Rust cannot express the thing that has to happen: a
+    // 256-bit fused multiply-add is an intrinsic, every intrinsic in
+    // `std::arch::x86_64` is `unsafe` because calling one on a processor that does
+    // not have the feature is undefined, and there is no safe wrapper for them in
+    // the standard library. The alternative is not a safe version of this kernel -
+    // it is not having one, and relying on the optimiser to vectorise a scalar loop
+    // it compiles to 128-bit lanes without `target-cpu`, which a published binary
+    // cannot set because it has to run on the processors people have.
+    //
+    // The whole of the unsafety is confined to one function: `dot_wide` carries a
+    // `# Safety` section naming `avx2` and `fma` as its requirement, `dot` is the
+    // only caller and checks for both immediately above the call, and every block
+    // inside it carries its own `SAFETY:` note about the one load or the one
+    // arithmetic instruction it contains. Nothing in it allocates, frees, or holds a
+    // reference past the statement it was made in.
+    "crates/inillucent-core/src/distance.rs",
     "crates/inillucent-cli/src/interrupt.rs",
     // The allocator's own concurrency suite, added in task-1932 (H9). It
     // allocates on one thread and frees on another through `GlobalAlloc`, which
@@ -155,6 +175,14 @@ const UNSAFE_ALLOWED: [&str; 15] = [
     // measurement rather than engine, which is the same ground the three above
     // stand on, and every call site carries its own SAFETY note.
     "crates/inillucent-compat/src/procstat.rs",
+    // **Which processors a gate runs on (task-2085).** Both arms of a gate were
+    // measured on different core classes of a hybrid processor because nothing
+    // pinned them, and pinning a process is an operating system call with no
+    // standard library form: `GetSystemCpuSetInformation`,
+    // `GetProcessAffinityMask` and `SetProcessAffinityMask` on Windows,
+    // `sched_getaffinity` and `sched_setaffinity` on Linux. Each is an FFI call
+    // into a buffer the calling frame owns, and each carries its own SAFETY note.
+    "crates/inillucent-compat/src/affinity.rs",
     // The allocator arm. A `GlobalAlloc` is the only way to
     // ask what the system allocator costs, and the question had to be asked:
     // the TDD expected the Linux gap to be the heap. Every path either forwards
@@ -172,6 +200,27 @@ const UNSAFE_ALLOWED: [&str; 15] = [
     // the stack runs out. Every method still forwards to the system allocator
     // unchanged and each one carries its own SAFETY note.
     "crates/inillucent-compat/src/bin/execprofile.rs",
+    // **The first counting allocator in a `cargo test`, rather than in a
+    // measurement binary (task-2026).** `budget.rs` guards what a compile
+    // costs in allocations - the number the binder's scratch, the operator
+    // listing and the result-column clone all move - and counting an
+    // allocation needs a `GlobalAlloc`, which is an unsafe trait. Every method
+    // forwards to the system allocator unchanged and carries its own SAFETY
+    // note; the only addition is a counter.
+    //
+    // It differs from the five above in one way: the counter is
+    // a `thread_local!`, not a global, because a `#[global_allocator]` in a
+    // test binary sees every test in that binary and this file would otherwise
+    // read whatever a parallel `cargo test` happened to be doing. The local is
+    // `const`-initialised and holds a type with no destructor, so reading it
+    // from inside the allocator cannot itself allocate and cannot recurse.
+    //
+    // This is a test rather than a binary, so the "a baseline tool that never
+    // ships is not part of the engine" argument above does not quite cover it.
+    // The narrower one does: a `tests/` file is not linked into anything an
+    // application receives, and what it is measuring is precisely a cost that
+    // has no safe instrument.
+    "crates/inillucent/tests/budget.rs",
 ];
 
 /// Returns every `.rs` file under a directory.
@@ -956,7 +1005,7 @@ fn no_new_crate_reaches_into_the_retired_engine() {
 /// `leaf.rs`: `locate` used to ask [`LeafRef::delta_value`] once per key
 /// column, redecoding a delta row from its first byte every time, and
 /// moved to walking the row's cursor forward once instead - which is what
-/// `delta_column_at`, `delta_key_matches` and `delta_row_values` are. The
+/// `delta_column_at`, `row_key_matches` and `delta_row_values` are. The
 /// delta area is one idea, *rows a write staged since the page was last
 /// packed*, and it moved whole into `crates/inillucent-tree/src/leaf/delta.rs`:
 /// the directory (`delta_count`, `delta_start`), one row's bytes
@@ -966,7 +1015,7 @@ fn no_new_crate_reaches_into_the_retired_engine() {
 /// meant picking one of the two an arbitrary home. That left four
 /// functions the sorted-region code still calls - `validate_delta` from
 /// `parse`, `any_delta_extent_unchecked` from `integrity`,
-/// `delta_row_values` from `live` and `live_source`, `delta_key_matches`
+/// `delta_row_values` from `live` and `live_source`, `row_key_matches`
 /// from `locate` - which is the `pub(super)` this extraction cost; every
 /// other moved item was already `pub`, since a method's visibility does
 /// not depend on which file its `impl` block sits in, only a free
@@ -1103,7 +1152,19 @@ fn no_new_crate_reaches_into_the_retired_engine() {
 // below already fails loudly with "is not there any more; remove its row"
 // for exactly this reason - removing them here is answering that failure
 // before it happens rather than after.
-const CEILINGS: [(&str, usize); 14] = [
+// **Two rows added and one lowered in task-2006.** `pool.rs` had grown 295 lines
+// past its ceiling and `paged.rs` 74, both while designs 1 and 2 of task-2000
+// changed what a fold and a bulk build do, and this list's own rule is that the
+// answer is an extraction. `crates/inillucent-pool/src/pool/fold.rs` took the fold
+// and the meta record - how a dirty page reaches the file and how the file is made
+// to account for it - and `crates/inillucent-tree/src/paged/bulk.rs` took the bulk
+// build. Both are whole units with nothing changed in the move, and both get a row
+// here at their post-split size, because a new file of four hundred lines with
+// nothing watching it is the shape every module on this list started as. `paged.rs`
+// is recorded at 2,300 from 2,450, which is what the shrunk check below asks for.
+const CEILINGS: [(&str, usize); 17] = [
+    ("crates/inillucent-pool/src/pool/fold.rs", 600),
+    ("crates/inillucent-tree/src/paged/bulk.rs", 600),
     // **The facade's own size, which had no ratchet (task-1979, Q2).** It is
     // the harness that runs every assertion against `inillucent::{Database,
     // Connection, Value}` rather than against `inillucent-engine`, so it grows
@@ -1114,7 +1175,7 @@ const CEILINGS: [(&str, usize); 14] = [
     // Added at its post-split size in task-1946 (M12). It was 2,728 lines
     // holding the frame table, eviction, the journal's sync gating and the
     // swip logic together; the last three are child modules now.
-    ("crates/inillucent-pool/src/pool.rs", 1_994),
+    ("crates/inillucent-pool/src/pool.rs", 1_587),
     // Lowered from 7,875 in task-1932. The plan cache's value type
     // (`Cached`) and its ceiling moved to `plans.rs`, which is the module
     // whose header explains when a plan is reused - the two halves of one
@@ -1190,7 +1251,44 @@ const CEILINGS: [(&str, usize); 14] = [
     // the repository does not hold would fail every clean checkout of it.
     // Nothing of task-1913's was reverted: only this number, and it goes
     // back to 5,111 when the extraction beside it lands.
-    ("crates/inillucent-sql/src/bind.rs", 5_315),
+    //
+    // **Lowered to 4,968 in task-2048.** Row values are `bind/rowvalue.rs`:
+    // the four that bind one - `bind_row_in`, `bind_row_against_query`,
+    // `bind_row_comparison` and the `row_value_parts` they read the parse
+    // arena with - and the three chains they desugar through,
+    // `equality_chain`, `lexicographic_chain` and `compare_bound_rows`, which
+    // sat 700 lines away at the bottom of the file and had no other caller.
+    // The seam is that nothing below the binder has a row value in it:
+    // `BoundExpr` has no tuple, so every spelling is rewritten into scalar
+    // comparisons here and the idea ends at this module's edge.
+    //
+    // The ticket was filed because this row was red on `main` for four
+    // commits at 5,422, and it went green on its own when task-2026's
+    // allocation work happened to take 136 lines out. That is the argument
+    // for extracting rather than raising: the number had moved 5,282 to
+    // 5,422 and back to 5,290 in four days without anyone deciding it
+    // should, and 25 lines of headroom in the file four tickets edited that
+    // week is a gate that fails next on somebody who did not cause it.
+    //
+    // **Lowered to 4,788 in task-2088.** Which collation a comparison, a sort
+    // or a grouping uses is `bind/collation.rs`: `BoundExpr::collation`,
+    // `BoundExpr::explicit_collation`, `comparison_rules`,
+    // `result_collation`, `apply_collation` and their tests. task-2088 and
+    // task-2089 made those rules walk an expression's operands, which took
+    // this file to 5,033, and the rules are one question with no other
+    // business in the binder.
+    //
+    // **Lowered to 4,728 in task-2094.** `bind/aggregate.rs` took
+    // `bind_external_call` and the new `aggregate_slot`, which is where every
+    // aggregate reference is made and where it picks up its arguments'
+    // explicit collation. Without the move the aggregate and window references
+    // carrying a collation took this file to 4,824.
+    ("crates/inillucent-sql/src/bind.rs", 4_728),
+    // Its own row from the day it was split out of `bind.rs` (task-2088).
+    // Lowered to 158 in task-2094, when its tests moved to
+    // `bind/collation/tests.rs`; the aggregate and window rules and a test
+    // for them had taken it to 319.
+    ("crates/inillucent-sql/src/bind/collation.rs", 158),
     // **Lowered to 2,200 in task-1962 (A8).** 5,026 lines, the largest file
     // in the workspace, became four modules under `leaf/` beside the `delta.rs`
     // that was already there: `layout` (where a value goes in the page),
@@ -1198,14 +1296,20 @@ const CEILINGS: [(&str, usize); 14] = [
     // `compare` (ordering two rows, and searching a page with that order).
     // `impl LeafRef` alone was 1,470 lines; `read` and `compare` hold half of
     // it each and reopen it, so no signature changed.
-    ("crates/inillucent-tree/src/leaf.rs", 2_200),
+    //
+    // **Lowered to 1,856 in task-2074.** The delta area gained a directory,
+    // format 1's rules and a reference merge to grade `live_order` against,
+    // and its tests went with it into `leaf/delta/tests.rs`: the delta area was
+    // already its own module, and its hand-built pages and their tests are
+    // about that module rather than about the leaf.
+    ("crates/inillucent-tree/src/leaf.rs", 1_856),
     // **Lowered to 2,450 in task-1962 (A8).** The 2,124 line `impl PagedTree`
     // block became three modules under `paged/`: `descent` (root to leaf),
     // `cursor` (walking leaves between two bounds, in either direction) and
     // `skip` (the distinct prefix walk). What is left here is the tree itself:
     // its fields, its statistics, its key encoding, the extent store and the
     // integrity check.
-    ("crates/inillucent-tree/src/paged.rs", 2_450),
+    ("crates/inillucent-tree/src/paged.rs", 2_300),
     // **Lowered to 200 in task-1962 (A7).** 3,003 lines holding the write
     // target, the key search and the four statements became six modules under
     // `dml/`, beside the `index.rs` that was already there: `target` (where a
@@ -1382,27 +1486,9 @@ fn every_skip_site_goes_through_the_one_helper() {
             if line.contains("skipping(") && !line.contains(&a_definition) {
                 through_the_helper = through_the_helper.saturating_add(1);
             }
-            let message = quoted_after(line, "eprintln!(")
-                .or_else(|| quoted_after(line, "println!("))
-                .unwrap_or_default();
-            if !message.contains("skipping") {
+            let Some(message) = announces_its_own_skip(&lines, at) else {
                 continue;
-            }
-            // A skip is an announcement followed by an early return. Anything
-            // else a print says is progress or a warning, and neither is a
-            // claim that a suite ran.
-            let follows = lines
-                .get(at..at.saturating_add(4))
-                .unwrap_or_default()
-                .join("\n");
-            let returns = follows.contains("\n        return;")
-                || follows.contains("\n            return;")
-                || follows.contains("\n                return;")
-                || follows.contains("\n    return;")
-                || follows.contains("return Ok(());");
-            if !returns {
-                continue;
-            }
+            };
             printed.push(format!(
                 "{}:{}: {message}",
                 file.strip_prefix(&root).unwrap_or(&file).display(),
@@ -1802,27 +1888,24 @@ fn announces_by_saying_so(block: &str) -> bool {
 /// crates.** Each of these has one way to answer "nothing to do" and announces
 /// before it does: `differential::compare` returns zero only when
 /// `start_oracle` answered `None`, after which it has already called
-/// `announce_skip`; `cliproc::program` returns `None` only when the build did
-/// not produce the binary, after which it has already called `skipping`. So
-/// `let Some(binary) = program("inillucent") else { return; }` in a caller is a
-/// skip that was announced by the only code that knew what was missing.
+/// `announce_skip`. So a caller that returns early on that zero is a skip that
+/// was announced by the only code that knew what was missing.
 ///
 /// The cost of naming them is that the list can go stale - a helper could stop
 /// announcing and forty call sites would silently become silent skips - and
 /// [`every_helper_this_check_trusts_actually_announces`] is what pays it.
 ///
-/// **`program` joined the list in task-1970.** Forty call sites across
-/// `cli_commands.rs`, `mcp_wire.rs`, `dot_commands.rs`, `process_crash.rs` and
-/// `rag_verify.rs` were reported by this check as silent skips, and they are
-/// not: they go through a helper in `src/` rather than one in the same test
-/// file, which `announcing_helpers` below can see and this list is for.
-const ANNOUNCERS: [(&str, &str); 3] = [
+/// **`cliproc::program` was on this list from task-1970 until task-2106.** It
+/// returned `None` and announced a skip when the build of `inillucent-cli`
+/// failed, which `--strict` then reported as a missing prerequisite. It now
+/// panics with cargo's output and returns the path, so its callers have no
+/// early return left to account for and it announces nothing.
+const ANNOUNCERS: [(&str, &str); 2] = [
     ("compare", "crates/inillucent-compat/src/differential.rs"),
     (
         "compare_queries",
         "crates/inillucent-compat/src/differential.rs",
     ),
-    ("program", "crates/inillucent-compat/src/cliproc.rs"),
 ];
 
 /// Every helper [`ANNOUNCERS`] trusts to announce a skip does announce one.
@@ -1831,7 +1914,8 @@ const ANNOUNCERS: [(&str, &str); 3] = [
 /// `announces_by_saying_so` accepts a call to any of them as an announcement,
 /// so a helper that stopped calling the skip helper would turn every one of its
 /// call sites into a silent skip at once - forty of them, in the case of
-/// `program` - and `every_early_return_in_a_test_says_why` would go on passing.
+/// `cliproc::program` while it was on the list - and
+/// `every_early_return_in_a_test_says_why` would go on passing.
 /// That is the exact shape of the defect task-1969 4.2 found, one level up: a
 /// check that matched a helper by name.
 #[test]
@@ -1977,9 +2061,140 @@ fn test_function_lines(lines: &[&str]) -> Vec<usize> {
     inside
 }
 
+/// Returns the message of a skip a test announces itself, or `None`.
+///
+/// A skip is a print whose message carries the marker followed by an early
+/// return. Anything else a print says is progress or a warning, and neither is
+/// a claim that a suite ran.
+///
+/// **Both reads used to be narrower than the code they read** (task-2066
+/// §4.4.11). The message was taken off the line the macro opens on, so a
+/// `rustfmt`-wrapped
+///
+/// ```ignore
+/// eprintln!(
+///     "... is not set, so no server is available to \
+///      migrate; skipping. ..."
+/// );
+/// return None;
+/// ```
+///
+/// read as an empty message and was passed over; and the early return was
+/// matched against four exact spellings of an indented `return;`, none of which
+/// is `return None;`. `live_postgres.rs` and `live_mysql.rs` were written in
+/// exactly that shape, so both were invisible here and neither panicked under
+/// `INILLUCENT_STRICT`. `the_guard_sees_a_wrapped_macro_that_returns_none`
+/// hands this function that text, so the guard can be shown to fail rather than
+/// assumed to.
+///
+/// @param lines - the file's source lines
+/// @param at - the line the print opens on
+fn announces_its_own_skip(lines: &[&str], at: usize) -> Option<String> {
+    /// How many lines past a print's opening line this reads.
+    ///
+    /// Eight covers a `rustfmt`-wrapped macro whose literal runs to three
+    /// source lines and whose early return follows the closing `);`, which is
+    /// the shape both live-server suites were written in. Their return sits
+    /// five lines below the `eprintln!(`, where the old window was four.
+    const MACRO_WINDOW: usize = 8;
+
+    // The window is clamped rather than demanded, because `get` on a range
+    // past the end answers `None`: a skip inside the last eight lines of a
+    // file would have been passed over, which is exactly the class of
+    // blindness this check exists to remove.
+    let end = at.saturating_add(MACRO_WINDOW).min(lines.len());
+    let window = lines.get(at..end)?;
+    let invocation = window.join("\n");
+    let message = quoted_after(&invocation, "eprintln!(")
+        .or_else(|| quoted_after(&invocation, "println!("))?;
+    if !message.contains("skipping") {
+        return None;
+    }
+    let returns = window.iter().skip(1).any(|following| {
+        let trimmed = following.trim();
+        trimmed == "return;" || trimmed == "return None;" || trimmed.starts_with("return Ok(());")
+    });
+    returns.then_some(message)
+}
+
+/// The guard sees a wrapped macro that ends `return None;`.
+///
+/// This is `live_postgres.rs` as it stood at `8607adf`, the one shape the check
+/// was written to catch and could not. It fails before the §4.4.11 fix by both
+/// routes at once - an empty message and an unrecognised return - so one of the
+/// two being restored still fails it.
+#[test]
+fn the_guard_sees_a_wrapped_macro_that_returns_none() {
+    // The marker is assembled rather than written, so this file does not
+    // itself carry the text it forbids - the same reason the scan above
+    // builds the name of the helper it looks for.
+    // Both the marker and the early return are assembled rather than written.
+    // The sibling check `every_early_return_in_a_test_says_why` reads a bare
+    // `return None;` as a test bailing out in silence, and a fixture that spells
+    // one out is indistinguishable from the thing it describes.
+    let marker = format!("{}ping", "skip");
+    let bail = format!("return {};", "None");
+    let source = format!(
+        r#"fn url() -> Option<ConnectionUrl> {{
+    let Ok(text) = std::env::var("INILLUCENT_TEST_POSTGRES_URL") else {{
+        eprintln!(
+            "INILLUCENT_TEST_POSTGRES_URL is not set, so no PostgreSQL server is available to \
+             migrate; {marker}. See this file header for the two psql commands."
+        );
+        {bail}
+    }};
+}}"#
+    );
+    let lines: Vec<&str> = source.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.trim() == "eprintln!(")
+        .expect("the fixture opens a print");
+    let found = announces_its_own_skip(&lines, at).expect("the guard reads the wrapped literal");
+    assert!(
+        found.contains(&marker),
+        "the message came back without the marker: {found}"
+    );
+}
+
+/// A print that says `skipping` and does not return is not a skip.
+///
+/// The counterpart to the case above: widening the window is only correct if it
+/// did not also widen what counts as a skip. A suite that announces it is
+/// skipping one fixture and carries on running is reporting progress.
+#[test]
+fn a_print_with_no_early_return_is_not_a_skip() {
+    let marker = format!("{}ping", "skip");
+    let source = format!(
+        r#"fn run() {{
+    eprintln!(
+        "the optional fixture is absent, so {marker} that one case and running the rest"
+    );
+    for case in cases() {{
+        check(case);
+    }}
+}}"#
+    );
+    let lines: Vec<&str> = source.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.trim() == "eprintln!(")
+        .expect("the fixture opens a print");
+    assert!(
+        announces_its_own_skip(&lines, at).is_none(),
+        "a print with no early return was read as a skip"
+    );
+}
+
 /// Returns the text between the first pair of quotes after a marker.
 ///
-/// @param line - the source line
+/// The haystack may be several source lines joined by newlines, because a
+/// `rustfmt`-wrapped macro puts its literal below the line that opens it. A
+/// literal continued with a trailing backslash therefore comes back with the
+/// backslash and the newline still in it, which is harmless: every caller here
+/// asks whether a word appears in the message, not what the message renders as.
+///
+/// @param line - the source line, or several joined by newlines
 /// @param marker - what the string follows
 fn quoted_after(line: &str, marker: &str) -> Option<String> {
     let at = line.find(marker)?;
@@ -2422,7 +2637,8 @@ const FUNCTION_CEILINGS: [(&str, &str, usize); 52] = [
     ("crates/inillucent-engine/src/ddl.rs", "run_directive", 273),
     ("crates/inillucent-tree/src/paged/skip.rs", "skip_scan", 249),
     ("crates/inillucent-sql/src/bind.rs", "bind_call_with", 248),
-    ("crates/inillucent-exec/src/expr/tree.rs", "compile", 242),
+    // 237 in task-2088, which lifted the `IN` list arm into `in_list`.
+    ("crates/inillucent-exec/src/expr/tree.rs", "compile", 237),
     (
         "crates/inillucent-tree/src/leaf/encode.rs",
         "encode_rows_with",
@@ -2439,10 +2655,16 @@ const FUNCTION_CEILINGS: [(&str, &str, usize); 52] = [
     // `inillucent-migrate` denies `clippy::expect_used`, so a refused probe has
     // to travel out as a value, and `retrieval` is now the four lines that turn
     // that value into a failed check for a caller that wants a `Vec<Check>`.
+    //
+    // **Lowered from 213 in task-2067**, which added a check and took it to 214.
+    // The vector and hybrid comparisons - everything guarded by the source
+    // having a vector per chunk - are `vector_checks` now, which is a hundred
+    // and twenty lines this one no longer holds. They were already one
+    // contiguous block behind one `if`, so the seam was where the work was.
     (
         "crates/inillucent-migrate/src/verify.rs",
         "retrieval_checks",
-        213,
+        116,
     ),
     ("crates/inillucent-storage/src/mutate.rs", "balance", 224),
     ("crates/inillucent-compat/src/bin/analytical.rs", "run", 223),
@@ -2515,10 +2737,14 @@ const FUNCTION_CEILINGS: [(&str, &str, usize); 52] = [
         "valid_fixtures",
         173,
     ),
+    // Moved to `paged/bulk.rs` in task-2006 and split into three named passes -
+    // `plan_leaves`, `write_leaf_run` and `build_interior_levels` - which took it
+    // from 197 lines to 71. Recorded where it lives now, because the `gone` check
+    // below matches on the path as well as the name.
     (
-        "crates/inillucent-tree/src/paged.rs",
+        "crates/inillucent-tree/src/paged/bulk.rs",
         "bulk_build_rows",
-        167,
+        80,
     ),
     ("crates/inillucent-core/src/bm25.rs", "search", 167),
     // 166 before task-1946 M12 moved the decision into `choose_fit`, which is

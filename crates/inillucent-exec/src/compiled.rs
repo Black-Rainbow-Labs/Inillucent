@@ -9,7 +9,6 @@
 
 use inillucent_base::error::misuse;
 use inillucent_base::DbResult;
-use inillucent_sql::bind::BoundExpr;
 use inillucent_sql::plan::{AccessPath, PhysicalPlan};
 use inillucent_tree::datum::OwnedDatum;
 
@@ -229,6 +228,14 @@ pub struct Compiled {
     /// same way. A `Compiled` that answered `false` is never kept: see
     /// [`try_compile`].
     rebindable: bool,
+    /// The connection's settings when `upper` was built.
+    ///
+    /// **`upper` folds them in and nothing counts that as a read (task-2081).**
+    /// A `%`, a `/`, a `||` and every scalar call hold the connection's
+    /// `Limit::Length` and `LIKE`'s case rule, and those move only when somebody
+    /// changes them. So a kept chain is valid for as long as they are what they
+    /// were, and [`Compiled::built_under`] is how a caller asks.
+    settings: crate::scalar::Context,
     /// The cell every `Expr::Parameter` in `upper` reads. See
     /// `Statement::bindings` for why this has to be shared rather than
     /// re-read.
@@ -253,6 +260,17 @@ impl Compiled {
         self.rebindable
     }
 
+    /// Reports whether this chain was built under the settings an execution has now.
+    ///
+    /// A chain that answers `false` holds a length limit or a `LIKE` case rule
+    /// that has since changed, and has to be built again rather than run. See
+    /// `Compiled::settings`.
+    ///
+    /// @param params - the next execution's parameters, carrying its context
+    pub fn built_under(&self, params: &Params) -> bool {
+        self.settings == params.settings()
+    }
+
     /// Runs the statement against one parameter set, over a catalog borrowed
     /// only for the length of this call.
     ///
@@ -275,8 +293,7 @@ impl Compiled {
         let bound = params.bindings();
         if !std::sync::Arc::ptr_eq(&self.bindings, &bound) {
             if let (Ok(from), Ok(mut held)) = (bound.lock(), self.bindings.lock()) {
-                held.clear();
-                held.extend_from_slice(&from);
+                held.copy_from(&from);
             }
         }
         let source = {
@@ -443,12 +460,7 @@ pub fn try_compile(
     // subquery - so a shape they refuse costs this call nothing beyond the
     // walk itself, and `run_any_prepared`'s build is the only one that ever
     // happens for it.
-    let correlations = crate::correlate::correlations_of(plan, &|expr: &BoundExpr| match expr {
-        BoundExpr::Column { source, column, .. } => space.column(*source, *column as usize),
-        BoundExpr::Rowid { source } => space.rowid(*source),
-        _ => None,
-    })?;
-    if !correlations.is_empty() {
+    if crate::correlate::has_correlations(plan) {
         return Ok(None);
     }
     let mut joins = Vec::with_capacity(prepared.stages.len().saturating_sub(1));
@@ -469,7 +481,19 @@ pub fn try_compile(
     let before = params.reads();
     let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let sink = Box::new(CollectInto::new(std::rc::Rc::clone(&collected)));
-    let upper = crate::physical::build_upper(plan, catalog, prepared, &space, params, sink)?;
+    // The listing is kept here: a `Compiled` builds its chain once and every
+    // later execution reuses it, so rendering the operators costs one render
+    // per compiled statement rather than one per execution, and
+    // `Compiled::shape` is what reports it.
+    let upper = crate::physical::build_upper(
+        plan,
+        catalog,
+        prepared,
+        &space,
+        params,
+        sink,
+        crate::physical::Listing::kept(),
+    )?;
     if !upper.correlations.is_empty() {
         // Should not happen - the cheap check above already refused any plan
         // with one - but `build_upper` is the ground truth here, and a
@@ -479,8 +503,9 @@ pub fn try_compile(
     }
     let rebindable = params.reads() == before;
     let bindings = params.bindings();
-    let mut operators = upper.operators;
-    operators.push(describe_source(prepared));
+    let mut listing = upper.operators;
+    listing.add(|| describe_source(prepared));
+    let mut operators = listing.into_lines();
     operators.reverse();
     Ok(Some(Compiled {
         prepared: prepared.clone(),
@@ -493,6 +518,7 @@ pub fn try_compile(
         },
         limit: upper.limit,
         rebindable,
+        settings: params.settings(),
         bindings,
         collected,
     }))
