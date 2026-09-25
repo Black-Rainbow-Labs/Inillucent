@@ -496,18 +496,7 @@ impl ImportedDatabase {
                 String::from_utf8_lossy(&column.name)
             ))
         })?;
-        // The storage parameters go through as the store's own options, which
-        // is what they are: `WITH (m = 32)` and `USING inillucent_search(...,
-        // m=32)` reach the same graph, so the index form is a spelling of the
-        // table form rather than a second path into it.
-        let mut declared = String::new();
-        for (option, value) in settings {
-            declared.push_str(&format!(
-                ", {}={}",
-                String::from_utf8_lossy(option),
-                String::from_utf8_lossy(value)
-            ));
-        }
+        let declared = store_options(module, settings)?;
         // **The structure the index named is the module the store uses.** An
         // `ivfflat` is an inverted file and needs no lexical half, so it is its
         // own module with its own three shadow tables; `inillucent_hnsw` is the
@@ -597,6 +586,62 @@ impl ImportedDatabase {
     }
 }
 
+/// The mode an `inillucent_hnsw` index gets when its `WITH ( ... )` names none.
+///
+/// **Approximate, because an HNSW index that is never traversed is not an HNSW
+/// index.** The store behind `CREATE INDEX ... USING inillucent_hnsw` is an
+/// `inillucent_search` table, and that table's own default is `exact`, which
+/// sets `exhaustive_below = usize::MAX` and compares every stored vector on
+/// every query. Until this was added the index inherited that default and
+/// offered no way out of it (`mode` was not an index setting), so the graph was
+/// built at full `m` and `ef_construction` and then never read, and every
+/// vector query on an indexed table was a linear scan. pgvector users read
+/// `CREATE INDEX ... USING hnsw` as "walk the graph", and so does every example
+/// in `docs/vector-search.md`.
+///
+/// Only a new index gets this. A store records its mode in `%_config` when it
+/// is created and reads it back on every open, so an index created by an older
+/// build keeps answering exactly as it did; `DROP INDEX` and `CREATE INDEX`
+/// again is how it moves to the new default.
+const DEFAULT_HNSW_MODE: &str = "approximate";
+
+/// Renders `WITH ( ... )` as the store's own options, adding the index's
+/// default mode when the statement did not name one.
+///
+/// The storage parameters go through as the store's own options, which is what
+/// they are: `WITH (m = 32)` and `USING inillucent_search(..., m=32)` reach the
+/// same graph, so the index form is a spelling of the table form rather than a
+/// second path into it.
+///
+/// `mode` on an `ivfflat` is refused rather than passed on. That module ignores
+/// an option it does not know (`Settings::of` in
+/// `inillucent-ext/src/vtab/ivfflat.rs`), and an inverted file has no exact
+/// mode to switch to, so `WITH (mode = 'exact')` there would be accepted and
+/// then not honoured.
+///
+/// @param module - `inillucent_hnsw` or `ivfflat`
+/// @param settings - the folded `(name, value)` pairs `WITH ( ... )` carried
+fn store_options(module: &[u8], settings: &[(Vec<u8>, Vec<u8>)]) -> DbResult<String> {
+    let names_mode = settings.iter().any(|(option, _)| option == b"mode");
+    if names_mode && module == b"ivfflat" {
+        return Err(refusal(
+            "an index USING ivfflat has no mode setting: an inverted file is always approximate",
+        ));
+    }
+    let mut declared = String::new();
+    for (option, value) in settings {
+        declared.push_str(&format!(
+            ", {}={}",
+            String::from_utf8_lossy(option),
+            String::from_utf8_lossy(value)
+        ));
+    }
+    if !names_mode && module != b"ivfflat" {
+        declared.push_str(&format!(", mode={DEFAULT_HNSW_MODE}"));
+    }
+    Ok(declared)
+}
+
 /// Returns the distance a connected vector index's own store was declared to
 /// minimise, for the planner to weigh against an `ORDER BY` function.
 ///
@@ -637,7 +682,7 @@ fn declared_metric(connected: &vtab::Connected) -> inillucent_sql::catalog_view:
                 // with nothing to show it happened. `configuration` now sets
                 // `IndexConfig::metric` from the table's own declaration
                 // (`core_metric` in `merge.rs`), `VectorSet::push` reads it to
-                // decide whether to normalize, and `crates/inillucent-compat/tests/vector_metric.rs`
+                // decide whether to normalize, and `crates/inillucent-compat/tests/engine/vector_metric.rs`
                 // is the test that has to fail if the two ever disagree again.
                 Ok(inillucent_search::options::Metric::L2) => IndexMetric::L2,
                 // Unreachable in practice - a value the store itself would have

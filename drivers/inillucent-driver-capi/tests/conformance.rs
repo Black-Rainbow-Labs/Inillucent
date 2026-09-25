@@ -65,8 +65,14 @@
 //! was instrumented, so the case also looks for the sanitizer's
 //! `__asan_report_load` calls in the library before it runs the program.
 //!
-//! This has been run on Windows with MSVC. The Linux branch builds with the
-//! same flags and links with `cc -fsanitize=address`, and it has not been run.
+//! This has been run on Windows with MSVC, and on Linux (Ubuntu 24.04 under
+//! WSL 2, x86-64, the pinned 1.95.0) on 2026-09-24. On Linux `cc` is gcc 13, so
+//! the program links gcc's `libasan.so.8` while the Rust objects were
+//! instrumented by LLVM. That works: the two share the `__asan_*` interface,
+//! the static library carries no sanitizer runtime of its own, and gcc's
+//! runtime reported the canary's `heap-use-after-free` in `canary_read` with a
+//! Rust stack. With `INILLUCENT_STRICT=1 INILLUCENT_CAPI_ASAN=1` both cases
+//! passed. The aarch64 branch has not been run.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -326,7 +332,17 @@ fn place_asan_runtime(out: &Path) -> bool {
 }
 
 /// Returns the batch file that puts a C compiler on the path, on Windows.
+///
+/// Asked of `vswhere` first, the way `inillucent-testrun` finds the MSVC
+/// environment. The GitHub Windows image has Visual Studio 2026 at
+/// `Microsoft Visual Studio/18/Enterprise`, which the fixed list of 2022
+/// folders below did not name, so this suite skipped there with "no usable C
+/// compiler" on a machine that had one. The list stays for a machine whose
+/// installer has no `vswhere`.
 fn vcvars() -> Option<PathBuf> {
+    if let Some(found) = vcvars_from_vswhere() {
+        return Some(found);
+    }
     for root in [
         "C:/Program Files/Microsoft Visual Studio/2022/Community",
         "C:/Program Files/Microsoft Visual Studio/2022/Professional",
@@ -339,6 +355,39 @@ fn vcvars() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Asks `vswhere` for the newest Visual Studio with the C++ tools and returns
+/// its `vcvars64.bat`, or `None` when there is no `vswhere` or no such install.
+fn vcvars_from_vswhere() -> Option<PathBuf> {
+    let vswhere = PathBuf::from(std::env::var("ProgramFiles(x86)").ok()?)
+        .join("Microsoft Visual Studio/Installer/vswhere.exe");
+    if !vswhere.is_file() {
+        return None;
+    }
+    let found = Command::new(&vswhere)
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ])
+        .output()
+        .ok()?;
+    let install = String::from_utf8_lossy(&found.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if install.is_empty() {
+        return None;
+    }
+    let candidate = PathBuf::from(install).join("VC/Auxiliary/Build/vcvars64.bat");
+    candidate.is_file().then_some(candidate)
 }
 
 /// Compiles a C program from `tests/c` against the header and links it to a

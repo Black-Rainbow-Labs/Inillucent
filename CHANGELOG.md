@@ -10,6 +10,90 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**`embed(TEXT)` works in an `inillucent_search` or FTS5 table's `VALUES` row, and as a search's
+query vector.** Release 1.0.29 refused `INSERT INTO chunk_search (..., vector) VALUES (...,
+embed('...'))` and `WHERE vector = embed('search_query: ' || ?1)` with the status `unsupported`,
+while the same call worked on an ordinary table and in `ORDER BY`.
+
+**`INSERT ... SELECT` into a virtual table runs.** `INSERT INTO docs(body) SELECT body FROM t` fills
+an FTS5 or `inillucent_search` table from a query. The query is read in full before the first row is
+written. The capability `insert_select_into_virtual_table` is now `yes`, and 17 capabilities are
+`no`.
+
+**`inillucent batch` reports the engine's status.** A failure inside a batch was always `syntax`
+with exit code 1. A statement the engine has not built is now `unsupported` with exit code 3, as
+under `exec`.
+
+**The `inillucent` and `inillucent-driver` crates have an `embed` feature.** It forwards to
+`inillucent-engine`, so a Rust application no longer names the engine crate to get `embed(TEXT)`.
+
+**`inillucent_search` takes a `vector_weight` option.** It fixes the vector list's weight in a search
+with both parts, in place of the weight chosen for each query. The default is unchanged. On the
+`examples/rag-agent` corpus, a fixed 0.5 raised the mean reciprocal rank from 0.681 to 0.789 and made
+`confidence` separate answerable questions from unrelated ones. `docs/vector-search.md` also says
+when `confidence` is not reliable, and what the first search in a process costs.
+
+**A change is tested by what it touched, and the rest runs on a merge or at night.** Every tier in
+`tests/selection.toml` now has a cadence. `inillucent-testrun --changed` runs a `durability` or
+`perf` target only when a crate that changed is in the target's `covers`, and never runs the
+`nightly` tier. CI runs every tier but `nightly` on each push, and a pull request runs what its
+change can break at that cadence. A new workflow, `nightly.yml`, runs every tier on Linux once a day.
+The runner builds only the packages and targets it selected, instead of the whole workspace. A
+change to the parser alone now gets a strict verdict in 159 seconds, 165 targets. A one line change
+to the command line program gets one in 116 seconds, and links 24 executables where the build step
+used to link 283.
+
+**`gates_fail_closed` no longer builds a second workspace.** Its nested runners read the executables
+the outer run located from an artifact list, `--artifacts`, and start no cargo. The target took 36
+minutes of a 37 minute run, alone at the end. Through the runner it now takes about 30 seconds, beside
+the other targets.
+
+**`inillucent-compat`'s 149 integration test files are seven binaries, one per tier.** Each file is a
+module, `tests/<tier>/<name>.rs`, and its target is `inillucent-compat::<tier>::<name>`. The runner
+still runs each suite in a process of its own. The test names in every suite were compared before and
+after the move: 149 suites and 1,189 tests, identical. With debug and test builds keeping line tables
+only, a cold test build of the workspace takes 50 seconds instead of 102, an edit to
+`inillucent-base` rebuilds in 30 seconds instead of 78, and the target directory after a full test
+build is 10.2 GB instead of 41.1 GB.
+
+**A machine can declare the prerequisites it will never have.** The gitignored
+`tests/prerequisites.local.toml` lists them. A strict run reports the suites they excuse under their
+own heading and does not fail for them.
+
+**A release relies on the nightly.** `packaging/nightly.ps1`, registered as a scheduled task by
+`packaging/register-nightly.ps1`, runs every tier, builds all five release targets in parallel, runs
+the gates and the scorecard on that build, replaces a rolling `nightly` pre release, commits the
+timings, and files a ticket when anything is red. `ship.ps1` reads its verdict for the commit being
+released instead of running a suite of its own, and says so in the release notes. The five release
+builds now run at once: 257 seconds cold, against 646 seconds one after another. `--strict` passes
+on the development machine for the first time, with four suites reported as not evidenced there by
+declaration.
+
+**A gate that misses only a known bar does not make the night red.** `inillucent-fullgate` exits 1
+on any missed bar, and three bars have been missed on every graded run: `open.prepare`, `schema` and
+the peak resident set. `compat/perf/known-misses.txt` lists them, and the nightly is red only when a
+gate misses a bar that is not on the list, disagrees with SQLite, puts a family under the floor, or
+does not finish. A gate that was not graded because the machine was busy is reported and is not red.
+The first nightly also failed to publish, because `gh` was never logged in on the machine; it now
+uses the token `git push` already uses, as `ship.ps1` does. And `latest.json` now records a commit
+hash: the first night recorded git's `HEAD is now at` message, which no release commit could match.
+
+**A new `CREATE INDEX ... USING inillucent_hnsw` index walks its HNSW graph.** An index used to be
+created in exact mode, which compares the query with every stored vector on every query. There was
+no setting to change that, so the graph the index built was never used. A new index is now
+approximate unless it says `WITH (mode = 'exact')`, which matches pgvector's `USING hnsw`. `mode` is
+an accepted index setting. `mode` on a `USING ivfflat` index is refused, because that module would
+ignore it. An index created by 1.0.29 or earlier recorded exact mode in its own configuration and
+keeps it, so the rows it returns do not change on upgrade. Drop it and create it again to get the new
+default. A table declared `USING inillucent_search` directly is still exact unless it says otherwise.
+
+Measured on 200,000 random vectors of 256 numbers, a query through a new index is 361% faster than
+through an exact one (0.858 ms against 3.952 ms at the median), and its recall of the top 10 is
+0.074. Random vectors are the worst case for a graph. On the 185,078 chunk corpus the same graph has
+recall 0.8775 at the default `ef_search` of 64. `docs/vector-search.md` has both measurements and
+says how to check recall on your own vectors. That page used to tell readers to write
+`WHERE mode = 'approximate'` in a query, which fails with `no such column: mode`.
+
 ## 1.0.29 — 2026-09-24
 
 **`DELETE` and `UPDATE` take `ORDER BY`, `LIMIT` and `OFFSET`.** They were refused with

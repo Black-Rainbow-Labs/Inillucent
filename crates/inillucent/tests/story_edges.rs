@@ -18,10 +18,10 @@
 //!
 //! | row | where |
 //! |---|---|
-//! | MCP | `crates/inillucent-compat/tests/mcp_session.rs` |
-//! | CLI golden output, exit code 3 | `crates/inillucent-compat/tests/cli_commands.rs` |
+//! | MCP | `crates/inillucent-compat/tests/e2e/mcp_session.rs` |
+//! | CLI golden output, exit code 3 | `crates/inillucent-compat/tests/e2e/cli_commands.rs` |
 //! | bindings, a temp table across two calls | `drivers/conformance/suite.json` |
-//! | a writer killed holding the lock, a stale index | `crates/inillucent-compat/tests/process_campaign.rs` |
+//! | a writer killed holding the lock, a stale index | `crates/inillucent-compat/tests/durability/process_campaign.rs` |
 //! | FTS5 at 2,500 documents at 4 KiB | `crates/inillucent/tests/story_rag.rs` |
 //!
 //! ## The allow list
@@ -124,7 +124,6 @@ fn the_empty_and_the_absent_are_different(arm: &Arm, area: &Path) {
         "0,0"
     );
 
-    drop(connection);
     drop(database);
     let database = reopen_and_check(arm, &path);
     let connection = database.session();
@@ -845,7 +844,6 @@ fn a_path_that_is_awkward_still_opens_and_writes(arm: &Arm, area: &Path) {
         "a path with a space and an accent did not round trip at the {} arm",
         arm.name
     );
-    drop(connection);
     drop(database);
 
     // A long path. Windows refuses a path past 260 characters without the long

@@ -77,8 +77,8 @@ fn lower_one(expr: &mut BoundExpr, next: &mut usize) {
             operand: (**operand).clone(),
             listed,
             negated: *negated,
-            affinity: affinity.clone(),
-            collation: collation.clone(),
+            affinity: *affinity,
+            collation: *collation,
         },
         block,
         next,
@@ -109,7 +109,7 @@ fn liftable(block: &BoundSelect) -> bool {
 /// What one `IN` was written as, which is what the lowering needs.
 ///
 /// A struct rather than six parameters, because
-/// `crates/inillucent-compat/tests/policy.rs` refuses an
+/// `crates/inillucent-compat/tests/tooling/policy.rs` refuses an
 /// `#[allow(clippy::too_many_arguments)]`: the threshold is set once in
 /// `clippy.toml` with the argument for where it is, and an attribute moves the
 /// bar for one function and says nothing about why.
@@ -151,8 +151,8 @@ fn lowered(about: &Lowering, block: &BoundSelect, next: &mut usize) -> BoundExpr
             op: BinaryOp::Equal,
             left: Box::new(about.listed.clone()),
             right: Box::new(about.operand.clone()),
-            affinity: about.affinity.clone(),
-            collation: about.collation.clone(),
+            affinity: about.affinity,
+            collation: about.collation,
         }),
         next,
     );

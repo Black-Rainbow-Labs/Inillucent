@@ -14,7 +14,7 @@
  * rather than passed over, so deleting a sentence does not make the check green.
  *
  * Usage:
- *   node tools/doc-facts/check.mjs [--site <path to inillucent-site>] [--json]
+ *   node tools/doc-facts/check.mjs [--site <path to black-rainbow-labs-sites/sites/inillucent>] [--json]
  *   node tools/doc-facts/check.mjs --run-tests      # adds the test counts, about five minutes
  *   node tools/doc-facts/check.mjs --self-test      # shows that the test-run judgement can fail
  *
@@ -44,10 +44,28 @@ const asJson = args.includes('--json');
 const siteIndex = args.indexOf('--site');
 const SITE = siteIndex >= 0 ? path.resolve(args[siteIndex + 1]) : null;
 
+/**
+ * Returns the directory cargo builds into for this checkout.
+ *
+ * A git worktree made for a ticket builds somewhere other than `target/`, because its
+ * `.cargo/config.toml` names a `target-dir` of its own. Asking cargo gives the right answer in both
+ * cases; `target/` is the answer when cargo cannot be asked.
+ */
+function targetDirectory() {
+  try {
+    const metadata = execFileSync('cargo', ['metadata', '--format-version', '1', '--no-deps', '--manifest-path', path.join(ROOT, 'Cargo.toml')], { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
+    return JSON.parse(metadata).target_directory;
+  } catch {
+    return path.join(ROOT, 'target');
+  }
+}
+
+const TARGET = targetDirectory();
+
 /** Picks the release binaries when they are there and the debug ones otherwise. */
 function binary(name) {
   for (const profile of ['release', 'debug']) {
-    const candidate = path.join(ROOT, 'target', profile, process.platform === 'win32' ? `${name}.exe` : name);
+    const candidate = path.join(TARGET, profile, process.platform === 'win32' ? `${name}.exe` : name);
     if (fs.existsSync(candidate)) return candidate;
   }
   return null;
@@ -230,7 +248,7 @@ function probe() {
  * `pragma_list` reports rather than the 68 the register holds - a real
  * distinction that nothing wrote down, so the two numbers read as one being
  * wrong. `docs/pragmas.md` is generated from the register and
- * `cargo test -p inillucent-compat --test harness` fails when they differ;
+ * `cargo test -p inillucent-compat --test tooling harness::` fails when they differ;
  * this fails when a prose document names a number that is neither.
  */
 function pragmaRegisterCount() {
@@ -741,7 +759,7 @@ function sourcesUnder(directory) {
 function testRunner() {
   const name = process.platform === 'win32' ? 'inillucent-testrun.exe' : 'inillucent-testrun';
   const built = ['release', 'debug']
-    .map((profile) => path.join(ROOT, 'target', profile, name))
+    .map((profile) => path.join(TARGET, profile, name))
     .filter((file) => fs.existsSync(file))
     .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
   if (built.length === 0) return { exe: null, error: null };

@@ -1,363 +1,722 @@
-# Vector search and hybrid retrieval
+# Vector search and keyword search
 
-inillucent does semantic search and keyword search in the same file as your tables, and it fuses the
-two result lists into one ranking. There is no separate vector database, no extension to load, and no
-embedding server to keep alive.
+inillucent can find rows by meaning and by keyword, from SQL, in the same `.rdb` file as your other
+tables. A search index and the table it covers commit and roll back together. There is no extension
+to load and no second server to run.
 
-There are two ways in. **From SQL**, through `VECTOR(N)` columns and an HNSW index the planner uses.
-**From the library**, through the retrieval engine directly, which is what the grading harness drives
-and what the measurements in [Retrieval quality](retrieval-quality.md) were taken against.
+This page shows how to store vectors, how to search them, how to add keyword search, and how to
+combine the two. Every example on this page was run against inillucent 1.0.29, and the output shown
+is what that build printed.
 
-## From SQL
+## Terms used on this page
+
+| Term | Meaning |
+|---|---|
+| vector | A list of numbers that stands for the meaning of a piece of text. A model produces it. [Embeddings](embeddings.md) explains how |
+| `VECTOR(N)` | A column type that holds a vector of exactly N numbers |
+| nearest neighbor | The stored vector closest to a query vector |
+| cosine distance | How far apart two vectors point, from 0 (same direction) to 2 (opposite). The default measure |
+| L2 distance | The straight line distance between two vectors |
+| exact search | Comparing the query with every stored vector. The answer is always the true nearest rows |
+| HNSW | A graph of vectors that a search can walk to find near neighbors without comparing every vector. See [the glossary](glossary.md) |
+| recall | The share of the true nearest rows that a search returned. Exact search has recall 1.000 |
+| FTS5 | SQLite's full text search table |
+| BM25 | The standard formula for ranking keyword matches. See [the glossary](glossary.md) |
+| hybrid search | One search that ranks rows by keyword and by vector together |
+| facet | A column of a search table that a search can filter on inside the search |
+
+## Choose a method
+
+```mermaid
+flowchart TB
+    A["What do you search by?"] -->|"keywords only"| B["FTS5 table with bm25"]
+    A -->|"vectors only"| C{"Is exact search fast enough?"}
+    A -->|"keywords and vectors together"| D{"Is exact search fast enough?"}
+    C -->|"yes"| F["VECTOR(N) column with no index, or an inillucent_hnsw index WITH (mode = 'exact')"]
+    C -->|"no"| G["VECTOR(N) column with an inillucent_hnsw index, approximate by default"]
+    D -->|"yes"| I["inillucent_search table, mode = 'exact' by default"]
+    D -->|"no"| J["inillucent_search table with mode = 'approximate'"]
+```
+
+| You want | Use | Section |
+|---|---|---|
+| nearest rows by vector, in a table you already have | a `VECTOR(N)` column, and later an `inillucent_hnsw` index | [Store vectors](#store-vectors) |
+| rows that match keywords | an FTS5 table and `bm25()` | [Keyword search](#keyword-search-with-fts5-and-bm25) |
+| one ranking that uses keywords and vectors | an `inillucent_search` table | [Hybrid search](#hybrid-search) |
+| a search from a script, without writing SQL | `inillucent search` or `inillucent vector-search` | [From the command line](#search-from-the-command-line) |
+
+Exact search is correct by construction. Start with it. Switch to approximate mode when a measured
+search is too slow.
+
+## Store vectors
 
 ```sql
-CREATE TABLE passage (
-  id     INTEGER PRIMARY KEY,
-  source TEXT,
-  body   TEXT,
-  v      VECTOR(768)
-);
+CREATE TABLE passage (id INTEGER PRIMARY KEY, body TEXT, v VECTOR(3));
 
+INSERT INTO passage (body, v) VALUES
+  ('red apple',   '[1, 0, 0]'),
+  ('green apple', '[0.9, 0.1, 0]'),
+  ('blue sky',    '[0, 0, 1]'),
+  ('grey cloud',  '[0, 0.2, 0.9]');
+```
+
+A `VECTOR(N)` column holds N 32 bit floating point numbers. A real embedding model produces 384,
+768 or more numbers. The examples here use three so the output fits on the page.
+
+You can write a vector three ways. All three store the same bytes:
+
+| Form | Example |
+|---|---|
+| a JSON array of numbers | `'[1, 0, 0]'` |
+| a blob of little endian 32 bit floats | `x'0000803F0000000000000000'`, which is what `hex(v)` prints |
+| a bound parameter | `--params '[[1, 0, 0]]'` on the command line, or a byte string from a driver |
+
+```sql
+SELECT hex(v), vector_dims(v), vector_norm(v) FROM passage WHERE id = 1;
+```
+
+```
+hex(v)                    vector_dims(v)  vector_norm(v)
+------------------------  --------------  --------------
+0000803F0000000000000000  3               1.0
+```
+
+The engine refuses a bad vector when you write it. The statement fails with a `constraint` error
+that names the column, and the command line exits with code 1:
+
+| You write | The error |
+|---|---|
+| a vector of the wrong width, `'[1, 0]'` | `cannot store this value in passage.v: it is not a vector, and the column is declared VECTOR(3)` |
+| a value that is not a vector, `'hello'` | the same message |
+| a component that is NaN or infinite | `cannot store this value in passage.v: one of its components is not a finite number, and the column is declared VECTOR(3)` |
+
+A NaN component would make every distance to that row NaN and would make a later `CREATE INDEX`
+fail, so the engine stops it at the write.
+
+A row whose vector is NULL is allowed. It is left out of any vector index on the column.
+
+## Find the nearest rows
+
+```sql
+SELECT id, body, vector_distance_cos(v, '[1, 0, 0]') AS d
+FROM passage
+ORDER BY d
+LIMIT 2;
+```
+
+```
+id  body         d
+--  -----------  --------------------
+1   red apple    0.0
+2   green apple  0.006116265828075562
+```
+
+With no index, this query compares the query vector with every row. That is an exact search. The
+answer is always correct. It gets slower as the table grows.
+
+### The vector functions
+
+`inillucent functions` lists every function the engine has. These are the vector functions:
+
+| Function | What it returns |
+|---|---|
+| `vector_distance_cos(a, b)` | cosine distance. Also spelled `cosine_distance(a, b)` |
+| `vector_distance_l2(a, b)` | L2 (straight line) distance. Also spelled `l2_distance(a, b)` |
+| `vector_dot(a, b)` | the inner product. Also spelled `inner_product(a, b)` |
+| `l1_distance(a, b)` | the sum of the absolute differences |
+| `hamming_distance(a, b)`, `jaccard_distance(a, b)` | distances over binary vectors, as in pgvector |
+| `vector_dims(v)` | the number of components |
+| `vector_norm(v)` | the length of the vector |
+| `l2_normalize(v)` | the vector scaled to length 1 |
+| `vector_add(a, b)`, `vector_sub(a, b)`, `vector_mul(a, b)` | the vector computed component by component |
+| `vector_concat(a, b)`, `subvector(v, start, count)` | a longer or shorter vector |
+| `binary_quantize(v)` | a binary vector with one bit per component |
+
+The pgvector operators also work: `<=>` is cosine distance, `<->` is L2 distance, `<#>` is the
+negative inner product, `<+>` is L1 distance, and `<~>` and `<%>` are Hamming and Jaccard distance.
+
+```sql
+SELECT vector_distance_cos('[1,0,0]', '[0,1,0]') AS cos,
+       vector_distance_l2('[1,0,0]', '[0,1,0]')  AS l2,
+       vector_dot('[1,2,3]', '[4,5,6]')           AS dot,
+       '[1,2,3]' <#> '[4,5,6]'                    AS neg_ip;
+```
+
+```
+cos  l2                  dot   neg_ip
+---  ------------------  ----  ------
+1.0  1.4142135623730951  32.0  -32.0
+```
+
+## Add an index: `USING inillucent_hnsw`
+
+```sql
 CREATE INDEX passage_v ON passage USING inillucent_hnsw (v);
 
-INSERT INTO passage (source, body, v)
-VALUES ('handbook.md', 'the discount applies here', '[0.10, -0.25, 0.81, ...]');
-
-SELECT id, body
-FROM   passage
-ORDER  BY vector_distance_cos(v, ?1)
-LIMIT  10;
+EXPLAIN QUERY PLAN
+SELECT id, body FROM passage ORDER BY vector_distance_cos(v, '[1, 0, 0]') LIMIT 2;
 ```
 
-**That query does not use the index.** `mode` defaults to `exact`, which is a linear scan over
-every row, and the HNSW graph the `CREATE INDEX` built is opt in. The scan is the correct answer by
-construction and it is the slow one, so the query a reader copies out of here should say which it
-wants:
+```
+id  parent  notused  detail
+--  ------  -------  -------------------------------------------------
+0   0       0        SEARCH passage USING VECTOR INDEX passage_v (k=2)
+1   0       0        USE TEMP B-TREE FOR ORDER BY
+```
+
+The query itself does not change. The planner sees `ORDER BY` a distance function with a `LIMIT`,
+and asks the index for the nearest `k` rows. `SEARCH ... USING VECTOR INDEX` in the plan shows that
+the index was used.
+
+What `CREATE INDEX ... USING inillucent_hnsw` does:
+
+- It fills the index from the rows already in the table.
+- Every later `INSERT`, `UPDATE` and `DELETE` on the table updates the index in the same
+  transaction. The table and the index commit together and roll back together.
+- The index takes exactly one column, and that column must be declared `VECTOR(N)`.
+
+### Exact and approximate search with an index
+
+There are two ways to answer a nearest neighbor query:
+
+| Mode | What a query does | Recall | Time as the table grows |
+|---|---|---|---|
+| exact | compares the query with every stored vector | always 1.000 | grows in step with the table |
+| approximate | walks the HNSW graph toward closer vectors and compares the query only with the vectors it visits | can be below 1.000, because the walk can miss a true neighbor | grows slowly |
+
+Recall is the share of the true nearest rows that a query returns. A query for 10 rows that returns
+9 of the true 10 has a recall of 0.9.
+
+**A new `inillucent_hnsw` index is approximate.** A query walks the HNSW graph, the way a query on a
+pgvector `USING hnsw` index does. To compare every vector instead, say so when you create the index:
 
 ```sql
-SELECT id, body
-FROM   passage
-WHERE  mode = 'approximate'
-ORDER  BY vector_distance_cos(v, ?1)
-LIMIT  10;
+CREATE INDEX passage_exact ON passage USING inillucent_hnsw (v) WITH (mode = 'exact');
 ```
 
-Which of the two ought to be the default is a decision rather than a defect, and it is open.
-Until it is made, every example on this page names the mode it is using
-rather than leaving a reader to find out from a benchmark.
+`mode` belongs to the index. It is not a column, so `WHERE mode = 'approximate'` in a query fails
+with `no such column: mode`. To change the mode of an existing index, drop the index and create it
+again. `mode` on a `USING ivfflat` index is refused, because an inverted file has no exact mode.
 
-### Writing a vector
+**An index created by inillucent 1.0.29 or earlier stays exact.** Those releases created every
+`inillucent_hnsw` index in exact mode and had no `mode` setting. Each index records its mode when it
+is created and reads it back every time the database opens, so an upgrade does not change the rows an
+existing index returns. Drop the index and create it again to make it approximate.
 
-A `VECTOR(N)` column holds N finite 32-bit floats. Three spellings reach it, and they store the same
-bytes:
+**A small table is searched exactly in either mode.** When the table holds fewer rows than
+`ef_search` times `2m` (64 times 32, or 2,048 rows, with the default settings), comparing every
+vector costs less than walking the graph, and the index does that instead. The graph is walked once
+the table is larger. The same rule decides a filtered query: the index compares every row the filter
+keeps when that number is small enough.
 
-| | |
-|---|---|
-| a JSON array of numbers | `'[0.10, -0.25, 0.81]'` into a `VECTOR(3)` column, which is pgvector's own spelling |
-| a blob of little-endian `f32` | `x'cdcccc3d0000803e...'`, which is what the column stores and what `hex(v)` prints |
-| a parameter | `--params '[[0.10, -0.25, 0.81]]'` on the command line, and a byte string from a driver |
+### What the two modes cost
 
-The JSON form is also what the distance functions read, so `vector_distance_cos(v, '[1,0,0]')` works
-against a literal as well as against a bound parameter.
+`inillucent-vectorprobe` times `ORDER BY vector_distance_cos(v, ?) LIMIT 10` through an index, and
+checks each answer against a cosine it computes itself over the same vectors. These numbers are from
+25 September 2026, with the process pinned to the performance cores and nothing else running. Each
+row is 200 queries. A 20,000 row time is the mean of the medians of two runs. The vectors are 256
+numbers drawn uniformly at random.
 
-**Anything else is refused where it is written.** A vector of the wrong width, a value that is not a
-vector at all, and a component that is NaN or infinite each report a `constraint` error naming the
-column. That is deliberate: a NaN component makes every distance against the row NaN, sorts it ahead
-of every real neighbour, and makes a later `CREATE INDEX` fail, so the write is the last place it can
-be caught by the application that made it.
+| Rows | Mode | Median time | Recall of the top 10 |
+|---|---|---|---|
+| 20,000 | exact | 0.537 ms | 1.000 |
+| 20,000 | approximate, `ef_search = 64` | 0.401 ms (34% faster) | 0.36 |
+| 200,000 | exact | 3.952 ms | 1.000 |
+| 200,000 | approximate, `ef_search = 64` | 0.858 ms (361% faster) | 0.074 |
 
-`CREATE INDEX ... USING inillucent_hnsw (v)` builds a store over the column and backfills the rows
-already in the table. It is kept in step by the engine applying a statement's row images to the index
-after the write and before the commit, so **the table and its index are one change**: they commit
-together and they roll back together.
+Exact search grows in step with the table, and the graph walk grows much more slowly. At 20,000 rows
+the difference is small.
 
-`ORDER BY vector_distance_cos(v, ?) LIMIT k` is recognised by the planner and turned into a probe of
-that index followed by an exact rescore. Measured against a cosine the test computes itself over
-20,000 vectors at 256 dimensions, **recall is 1.000**, and the SQL path costs 7.204 ms against the
-store's own 7.325 ms — so going through SQL is free.
+**Random vectors are the hardest case for a graph, so treat these recall numbers as the floor.** In
+random vectors every point is almost the same distance from every other point, so the walk has
+nothing to follow. Real embeddings form clusters. On the 185,078 chunk corpus at 768 dimensions in
+[Exact and approximate mode](#exact-and-approximate-mode), the same graph code has recall 0.8775 at
+`ef_search = 64` and 0.9875 at 512. On the random vectors at 20,000 rows, raising `ef_search`
+raises recall from 0.36 at 64 to 0.55 at 128, 0.75 at 256 and 0.91 at 512. At 200,000 random
+rows, `ef_search = 512` raises it from 0.074 to 0.36.
 
-### The distance functions
+Measure recall on your own vectors before you rely on approximate mode. Compare an index's answers
+with the same query on a table that has no index, or on an index created `WITH (mode = 'exact')`.
+If recall is too low, raise `ef_search`, or use exact mode.
 
-| | |
-|---|---|
-| `vector_distance_cos(a, b)` | cosine distance over vectors normalised to unit length |
-| `vector_distance_l2(a, b)` | Euclidean distance |
-| `vector_dot(a, b)` | inner product |
-
-pgvector's operator spellings `<->`, `<#>`, `<=>`, `<+>`, `<~>` and `<%>` all parse and bind, as do
-its distance and vector function names, and `CREATE INDEX ... USING ivfflat` builds a second index
-structure beside the graph. That means a query written for pgvector usually runs here unchanged.
-
-### Which metric the index minimises
-
-Cosine, unless the index says otherwise:
+### Index settings
 
 ```sql
-CREATE INDEX passage_v ON passage USING inillucent_hnsw (v) WITH (metric = 'l2');
+CREATE INDEX passage_l2 ON passage USING inillucent_hnsw (v) WITH (metric = 'l2', m = 32);
 ```
 
-`'cosine'` is the default and `'l2'` is Euclidean. The metric decides more than the comparison — a
-cosine index normalises every vector it stores to unit length, and an L2 index must not, because
-normalising destroys the magnitude L2 measures. So it is fixed when the index is built, recorded in
-the generation, and a generation whose metric disagrees with the table's declaration is refused
-naming both rather than searched.
-
-**The planner probes the index only when the `ORDER BY` function matches the metric the index was
-built under.** `ORDER BY vector_distance_l2(...)` over a cosine index, or `vector_distance_cos` over
-an L2 one, falls back to the exhaustive scan and a temporary tree. That is a correct answer rather
-than a refusal, and it is slower — if a query is scanning where you expected a probe, the metric is
-the first thing to check.
-
-An index built before this existed reads as cosine, which is what it was.
-
-`vector_dot` has no index of its own: an inner product ordering plans as a scan whatever the index
-says.
-
-## From the library
-
-```rust
-use inillucent_core::filter::Filter;
-use inillucent_core::index::{Index, IndexConfig};
-
-let mut index = Index::new(IndexConfig { dims: 768, quantized: true, ..Default::default() });
-index.add(chunks, &vectors);   // one vector per chunk
-index.commit();                // builds the graph, the keyword index and the codes
-
-let filter   = Filter::source("slack");
-let compiled = index.compile(&filter);
-let hits     = index.hybrid_search(
-    "how does the release process work",
-    &query_vector,
-    &compiled,
-    10,
-    None,
-);
-```
-
-Each hit carries a `score`, which decides the order, and a `confidence`, which is a separate number
-computed on absolute bounds. [Confidence](#confidence-is-a-separate-number-from-score) explains why
-those are two numbers and not one.
-
-## What is inside
-
-**Semantic search** is an HNSW graph, `m = 16`, `ef_construction = 64`, over vectors normalised to
-unit length so cosine and the inner product agree. The build runs on every core.
-
-**Exhaustive search is a real query plan, not a test fixture.** When a filter admits a small enough
-slice of the corpus, comparing the query against every admitted vector is both exactly correct and
-faster than walking a graph over the whole corpus. A cost model counts what the filter admits and
-picks the exhaustive scan when it wins. The consequence is that a narrow filter is the case where
-accuracy is perfect, rather than the case where it collapses.
-
-**Filters are applied inside the traversal, not after it.** A node that fails the filter is still
-expanded, so the walk can pass through it to reach the region behind it, but it is never admitted to
-the results. The walk continues until it has collected enough passing rows. The cost is a longer
-walk; what it avoids is a result set that comes back short.
-
-From SQL, a predicate reaches the traversal through a `VECTOR(N)` column's own `WHERE` clause, and
-on an `inillucent_search` table through a [facet column](#filtering-a-search-table-facet-columns).
-A predicate written anywhere else runs after the ranking, which is a different answer rather than a
-slower spelling of the same one.
-
-That is the difference that shows up most in the measurements. pgvector evaluates a `WHERE` clause
-after the index scan has already chosen its candidates, so a plain HNSW scan produces only
-`hnsw.ef_search` candidates and a filter on a minority source can be left with almost none of them.
-pgvector's answer is `hnsw.iterative_scan`, which keeps restarting the scan until enough rows pass.
-It works, and it costs latency: a filtered search that took a few milliseconds takes tens of them.
-
-**Int8 quantisation with full precision rescoring.** One byte per number instead of four, with the
-top candidates rescored against the full precision vectors. Measured on the graded corpus, it is a
-quarter of the memory at identical accuracy: 0.995 either way.
-
-**Vectors are read from the file by default** rather than held in memory. Holding them resident costs
-1.76 GB on a 600,589 chunk index and buys about 6% on a scan that reads every vector, consistently,
-and nothing outside the run to run spread on a graph search. [Where the vectors live](vector-residency.md)
-has both modes and how to choose.
-
-## Keyword search
-
-Semantic search is bad at exact tokens. A user who types `PROJ-1932` or `parse_headers` wants that
-identifier, not passages about vaguely similar ones. So there is an inverted index beside the graph:
-BM25, Snowball stemming, and identifiers kept whole rather than split.
-
-Five weights sit on top of plain BM25, each measured rather than assumed, and each with an off switch
-that restores plain BM25:
-
-| setting | what it does | default |
+| Setting | What it does | Default |
 |---|---|---|
-| `lexical_coverage` | scales a score by the share of the query's inverse document frequency the chunk holds, raised to this exponent | 3.0 |
-| `lexical_proximity` | scales it by matched terms divided by the smallest window holding one of each, blended by this weight | 1.0 |
-| `lexical_phrase` | scales it by whether the matched terms arrived in the query's own order inside that window, blended by this weight | 0.75 |
-| `lexical_tier` | rank by how many query terms a chunk holds first and by score second | off |
-| `lexical_prefix` | let a query term match the terms it is a prefix of | off |
+| `mode` | `'approximate'` walks the HNSW graph. `'exact'` compares the query with every stored vector | `'approximate'` |
+| `metric` (or `distance`) | the distance the index is built for: `'cosine'` or `'l2'` | `'cosine'` |
+| `m` | how many neighbors each node of the HNSW graph links to | 16 |
+| `ef_construction` | how many candidates the graph build considers for each new node | 64 |
+| `ef_search` | how many candidates a graph walk keeps. A larger number raises recall and costs time. An index in exact mode does not walk the graph, so it ignores this | 64 |
+| `threads` | how many threads a build uses | every core |
+| `compact` | how many pending changes a commit collects before it writes them into the index | 1,024 |
 
-PostgreSQL full text search has two properties plain BM25 lacks, and both of them matter on a corpus
-of this size. `to_tsquery` joins query terms with `&`, so a chunk missing one word never appears at
-all. And `ts_rank_cd` is cover density ranking, so a chunk whose query terms sit close together
-outranks one that mentions the same words in different paragraphs.
+An `ivfflat` index takes `lists` and `probes` instead. Any other name fails with
+`no such index setting`. The defaults come from `HnswParams::default` in
+`crates/inillucent-core/src/hnsw.rs` and `COMPACT_FLOOR` in `crates/inillucent-search/src/options.rs`.
 
-inillucent takes both as gradients rather than as gates. Scoring any term with BM25 finds far more of
-the right chunks — 49.5 rows of 50 against 6.7 — and `lexical_coverage` and `lexical_proximity` then
-put the right ones on top instead of throwing the rest away.
-
-`lexical_phrase` is the one `ts_rank_cd` has no answer to. Cover density asks how tightly the terms
-sit. It does not ask whether they came in the order the question asked them in, and "offer
-eligibility rules" and "rules for eligibility of an offer" have the same window width and are not the
-same answer.
-
-`lexical_tier` is off because `lexical_coverage` does the same job better where the two disagree, and
-it is there because it rescues a caller who sets the coverage exponent to 0. `lexical_prefix` is off
-because on a dictionary of 494,000 terms it credits a chunk with holding a query term it does not
-hold, which is the exact judgement coverage weighting depends on.
-
-## Filtering a search table: facet columns
-
-A column of an `inillucent_search` table declared `FACET` is stored and can be constrained inside a
-search. Its value is not indexed as text.
+**The planner uses the index only when the `ORDER BY` function matches the index's metric.**
+`vector_distance_cos` (or `<=>`) uses a cosine index. `vector_distance_l2` (or `<->`) uses an L2
+index. Any other pairing, and any ordering by `vector_dot`, runs as a scan:
 
 ```sql
-CREATE VIRTUAL TABLE docs USING inillucent_search(
-    body,
-    live FACET,
-    region FACET,
-    dims = 768
-);
-
-INSERT INTO docs(rowid, body, live, region, vector) VALUES (1, 'the discount applies here', '1', 'eu', ?1);
-
-SELECT rowid, body
-FROM   docs
-WHERE  docs MATCH 'discount eligibility' AND k = 10 AND live = '1' AND region = 'eu'
-ORDER  BY rank;
+EXPLAIN QUERY PLAN
+SELECT id FROM passage ORDER BY vector_distance_l2(v, '[1, 0, 0]') LIMIT 2;
 ```
 
-Several facet constraints narrow rather than widen, which is what the `AND` reads as. A facet is an
-ordinary column otherwise: it comes back from a `SELECT`, and on a query that is not a search it is
-an ordinary predicate the engine evaluates itself. `FACET` is read without case and only as the last
-word of a column's declaration, so quote a column whose name ends in it: `"live facet"` is one
-column called `live facet`, and `"live" FACET` is a facet called `live`.
+```
+id  parent  notused  detail
+--  ------  -------  ----------------------------
+0   0       0        SCAN passage
+1   0       0        USE TEMP B-TREE FOR ORDER BY
+```
 
-**The constraint is applied inside the scan, and that is the difference the feature is for.** Writing
-the same predicate outside the search - joining to another table and filtering there, which is what
-FTS5 leaves you with - is not the same answer. The keyword ranking rescores the best `k * 6` hits by
-where the query's terms sit inside them, the rescore only ever lowers a score, and a hit below that
-window keeps its full score and competes against rescored ones. Which hits are in the window depends
-on which rows the scan admitted, so removing rows afterwards produces a different order. Measured on
-a 400 row corpus: one hit of the top ten survived. Filtering afterwards also returns fewer rows than
-the `LIMIT` asked for, because some of what it ranked is then thrown away.
+The table has only the cosine index `passage_v`, so the L2 ordering scans. The answer is still
+correct. If a query scans where you expected the index, check the metric first.
 
-A value is matched as text, so `live = 1` and `live = '1'` select the same rows. Write every row's
-facet: a column left `NULL` reads back as the empty string, which is a value no query is likely to
-ask for, so the row answers nothing.
+The metric is fixed when the index is built. A cosine index scales every vector to length 1 before
+it stores it. An L2 index must keep the original length, because L2 distance depends on it.
 
-**What it costs.** A constrained search makes the engine count how many rows pass before it runs,
-which is one pass over the table, because that count is what chooses between walking the graph and
-comparing every admitted vector. Measured on a 20,000 row table in a debug build, 40 queries each
-way interleaved: 45.4 ms against 48.7 ms, so about 7% on top. Both the count and the scoring pass
-grow with the table, so the share stays about the same as the table does not.
+`CREATE INDEX ... USING ivfflat (v)` builds pgvector's other index type. It groups the vectors into
+`lists` clusters and searches the `probes` clusters nearest to the query.
 
-**A table that declares a facet is stored in format 2** and a build older than this one refuses to
-open it, by name, saying which release to install. A table that declares none is stored in format 1
-exactly as before, so nothing already written becomes unreadable.
+## Keyword search with FTS5 and bm25
 
-## Hybrid retrieval
+```sql
+CREATE VIRTUAL TABLE note USING fts5(title, body);
 
-The two result lists are fused into one. The default is a normalised score fusion: each list is
-rescaled onto its own range and the two are added with a weight of 0.35 on the vector side, adapted
-per query between 0.05 and 0.95 from the query's own shape. Reciprocal rank fusion and a convex
-combination are also available and were measured against it; the normalised score fusion won on every
-hybrid metric of the graded corpus, which is why it is the one that ships.
+INSERT INTO note (title, body) VALUES
+  ('Release process', 'Tag the commit, then run the release script.'),
+  ('Parser notes',    'parse_headers reads the request headers.'),
+  ('Lunch',           'The cafe closes at three.');
 
-Fusing is what lets one query answer both `PROJ-1932` and "how does the release process work". The
-graded comparison in [Retrieval quality](retrieval-quality.md) runs the whole pipeline, not either
-branch on its own, because a ranking that wins in isolation and loses once the other branch is fused
-beside it has not helped anybody.
+SELECT title, round(bm25(note), 3) AS score
+FROM note
+WHERE note MATCH 'release OR headers'
+ORDER BY rank;
+```
 
-## Confidence is a separate number from score
+```
+title            score
+---------------  ------
+Parser notes     -0.702
+Release process  -0.656
+```
 
-The failure that does not announce itself is ten confident looking passages for a question nothing
-in the corpus answers, from which an agent then writes a paragraph. Measuring that needs an absolute
-notion of confidence, and the usual per list normalisation destroys one by construction: it maps the
-best hit of every list to exactly 1.0, whether the list is good or hopeless.
+FTS5 in inillucent reads and writes the same tables as SQLite's FTS5. `bm25()` returns a negative
+number, and a lower number is a better match, so `ORDER BY rank` puts the best match first.
 
-Dividing each side by a bound the results had no say in fixes that. Cosine over normalised vectors is
-bounded by one, and BM25 by the query's own inverse document frequency mass at saturation. It took
-the confident answer rate on unanswerable questions from 1.000 to 0.000.
+The query syntax is FTS5's. Bare words must all match. `"a phrase"` matches the words in order. `OR`
+and `NOT` are available. The `porter` tokenizer adds stemming, so `release` also matches
+`released`.
 
-**As a ranker it lost**, for a structural reason. Its keyword bound assumes some chunk could hold
-every query term, and a question drawing on two sources is built so that none can, so the whole
-keyword side collapses towards zero and the ranking becomes vector only: 0.446 against 0.690 on that
-family. That is correct behaviour for a confidence and wrong behaviour for an order.
+`highlight()` and `snippet()` mark where the words matched:
 
-So the engine stopped asking one number to do both jobs. Every hit carries a **`score`**, from
-whichever fusion ranks best, and a **`confidence`**, always computed on absolute bounds whatever
-fusion ordered the list. An abstention threshold is set on confidence; the ranking is decided by
-score.
+```sql
+SELECT highlight(note, 1, '[', ']') AS body FROM note WHERE note MATCH 'release';
+SELECT snippet(note, 1, '[', ']', '...', 4) AS body FROM note WHERE note MATCH 'headers';
+```
 
-Asked 200 questions the corpus does not answer, PostgreSQL with pgvector returns a confident top
-result **every single time**. inillucent does it on **one question in two hundred**.
+```
+body
+----------------------------------------------
+Tag the commit, then run the [release] script.
+body
+----------------------------
+parse_[headers] reads the...
+```
 
-## Trading accuracy against speed
+## Hybrid search
 
-`ef_search` is how wide the graph traversal keeps its candidate list, and it is the one setting most
-callers turn. Accuracy here is against an exhaustive comparison over the whole corpus:
+An `inillucent_search` table holds text and vectors together. It is a virtual table: it looks like
+a table to SQL, and the engine stores its rows and its index in tables of its own inside the file. One query can rank its rows by
+keyword, by vector, or by both at once.
 
-| `ef_search` | accuracy | time |
+```sql
+CREATE VIRTUAL TABLE docs USING inillucent_search(title, body, region FACET, dims = 3);
+
+INSERT INTO docs (rowid, title, body, region, vector) VALUES
+  (1, 'Release process',  'Tag the commit, then run the release script.', 'eu', '[1, 0, 0]'),
+  (2, 'Parser notes',     'parse_headers reads the request headers.',     'us', '[0, 1, 0]'),
+  (3, 'Release calendar', 'The next release ships in May.',               'us', '[0.9, 0.1, 0]');
+```
+
+An `INSERT ... SELECT` fills the table from an ordinary table in one statement. Here `page` holds
+the same four columns and a `VECTOR(3)` column `v`:
+
+```sql
+INSERT INTO docs (rowid, title, body, region, vector)
+SELECT id, title, body, region, v FROM page;
+```
+
+The query is read in full before the first row is written. Release 1.0.29 refuses this statement
+with the status `unsupported`. [Embeddings](embeddings.md) shows the same statement with
+`embed(TEXT)` computing the vectors.
+
+Keyword only:
+
+```sql
+SELECT rowid, title FROM docs WHERE docs MATCH 'release' ORDER BY rank;
+```
+
+```
+rowid  title
+-----  ----------------
+3      Release calendar
+1      Release process
+```
+
+Vector only:
+
+```sql
+SELECT rowid, title FROM docs WHERE vector = '[1, 0, 0]' AND k = 2;
+```
+
+```
+rowid  title
+-----  ----------------
+1      Release process
+3      Release calendar
+```
+
+Both, combined into one ranking:
+
+```sql
+SELECT rowid, title,
+       round(score(docs), 3) AS score,
+       round(confidence(docs), 3) AS confidence,
+       origin(docs) AS origin
+FROM docs
+WHERE docs MATCH 'release' AND vector = '[1, 0, 0]' AND k = 3
+ORDER BY rank;
+```
+
+```
+rowid  title             score  confidence  origin
+-----  ----------------  -----  ----------  ------
+3      Release calendar  0.998  0.753       both
+1      Release process   0.296  0.736       both
+2      Parser notes      0.0    0.0         vector
+```
+
+**Give a cosine table a query vector of length 1.** The table scales the stored vectors to length 1,
+and the query vector is used as you pass it. The order of the hits does not change with the query
+vector's length, but `confidence(docs)` does. On the table above, the query `'[0.2, 0, 0]'` returns
+the same order with a confidence of 0.517 for row 3, against 0.753 for `'[1, 0, 0]'`. Most embedding
+models already return vectors of length 1. `l2_normalize(v)` scales any other vector to length 1.
+
+### What a search query can name
+
+| Hidden column | As a constraint | Meaning |
 |---|---|---|
-| 64 | 0.850 | 0.43 ms |
-| 128 (default) | 0.907 | 0.65 ms |
-| 256 | 0.938 | 1.17 ms |
-| 512 | 0.973 | 2.10 ms |
+| the table's own name | `docs MATCH 'text'` | the keyword query, in FTS5 syntax |
+| `vector` | `vector = ?1`, or `vector = embed('search_query: ' \|\| ?1)` | the query vector |
+| `k` | `k = 20` | how many hits the search collects. Defaults to 10 |
+| `recall` | `recall = 0.9` | in approximate mode, widens the graph walk to reach this recall. Exact mode ignores it |
+| `rank` | `ORDER BY rank` | the combined ranking. Ascending order is best first, as in FTS5 |
 
-Below the crossover the cost model does not use the graph at all, so a narrow filter reaches 1.000
-whatever this is set to.
+The same arguments also work as a table function, in the order query text, `k`, vector, recall:
+`SELECT rowid, title FROM docs('release', 2)`.
 
-## Limits
+`k` and `LIMIT` are different. `k` decides how many hits the search collects. `LIMIT` trims the
+rows the query returns.
 
-- **Adding content folds into the graph rather than rebuilding it.** A commit loads the published
-  generation and inserts each entry of the delta log into it, so the cost is one graph insert per row
-  written rather than one per row in the table. **Publishing is proportional to the batch too**:
-  a flush builds a new immutable segment out of its own rows and writes nothing else,
-  and a search folds the live segments, with a newer one shadowing an older for the same row. The
-  default flush trigger is a constant 1,024 entries rather than a share of the table, because the
-  share existed only to make a whole-index rewrite rare and there is no longer a whole-index rewrite. The single-pass build over everything is still reachable, by
-  `INSERT INTO t(t) VALUES('compact')`.
-- **The graph and the keyword postings are held in memory.** The vectors are not, by default. A
-  3.1 GB index of 600,589 chunks serves from 1.3 GB resident with the vectors filed.
-- **The index probe orders by the metric the index was built under**, cosine by default and L2 when
-  the index says `WITH (metric = 'l2')`. The distance functions answer for every metric whether or
-  not an index does; an ordering by one the index was not built under plans as a scan.
-- **Deleting and reinserting the same rows grows the file, and `VACUUM` is what gives the space
-  back.** Measured on 2,000 rows of `VECTOR(16)` with a `USING inillucent_hnsw` index, where each
-  cycle deletes 1,000 rows and reinserts the same 1,000 in one transaction, checkpointing after
-  each:
+Three functions describe each hit:
 
-  | after | bytes |
-  |---|---|
-  | the build | 1,605,632 |
-  | 1 cycle | 2,064,384 |
-  | 3 cycles | 4,390,912 |
-  | 5 cycles | 5,308,416 |
-  | 10 cycles | 8,880,128 |
+| Function | What it returns |
+|---|---|
+| `score(docs)` | the combined score that decided the order |
+| `confidence(docs)` | how good the hit is on an absolute scale, from 0 to 1. See [below](#confidence-is-a-separate-number-from-score) |
+| `origin(docs)` | which search found the row: `lexical` (the keyword search), `vector` or `both` |
 
-  The row count is 2,000 at every measurement and recall is unaffected. `compact` does not shrink
-  the file - it writes a new generation, so the file grows again, to 9,666,560 - and
-  `drop-old-generations` frees b-tree pages without returning them to the operating system. The
-  sequence that reclaims is all three in order:
+### Table options
 
-  ```sql
-  INSERT INTO c_v(c_v) VALUES('compact');
-  INSERT INTO c_v(c_v) VALUES('drop-old-generations');
-  VACUUM;
-  ```
+| Option | What it does | Default |
+|---|---|---|
+| `dims = N` | the vector width. Without it the table is keyword only and refuses a vector | none |
+| `mode` | `'exact'` compares every vector. `'approximate'` walks the HNSW graph | `'exact'` |
+| `vector_weight` | a fixed weight from 0 to 1 for the vector list in a search with both parts. See [How the two rankings are combined](#how-the-two-rankings-are-combined) | chosen for each query |
+| `metric` (or `distance`) | `'cosine'` or `'l2'`. Any other value is refused | `'cosine'` |
+| `m`, `ef_construction`, `ef_search` | the HNSW graph settings, as in [Index settings](#index-settings) | 16, 64, 64 |
+| `tokenize` | the tokenizer. `porter` is the only one | `porter` |
+| `compact` | how many pending changes a commit collects before it writes them into the index | 1,024 |
+| `segment_merge` | how many segments of one size are merged into one larger segment | 4 |
+| `merge_budget` | how many rows one commit may merge before it leaves the rest for a later commit | 8,192 |
+| `threads` | how many threads a build uses | every core |
 
-  After it the file is **1,966,080 bytes, which is a fresh build of the same 2,000 rows to the
-  byte**. It was 2.5 times a fresh build until a fix stopped `VACUUM` writing a second copy of
-  every shadow table.
+The table records its options in the `<table>_config` table, so you can read back what a table was
+declared with: `SELECT k, v FROM docs_config`.
+
+### Exact and approximate mode
+
+```sql
+CREATE VIRTUAL TABLE docs_fast USING inillucent_search(body, dims = 3, mode = 'approximate');
+```
+
+`mode = 'exact'` is the default for a table declared with `USING inillucent_search`. It compares the
+query with every stored vector and returns the true nearest rows. An index made with
+`CREATE INDEX ... USING inillucent_hnsw` has the opposite default, `'approximate'`, as
+[Exact and approximate search with an index](#exact-and-approximate-search-with-an-index) says.
+
+`mode = 'approximate'` walks the HNSW graph. It compares far fewer vectors, so it is faster on a
+large table, and it can miss some true neighbors. `ef_search` sets how wide the walk is. The
+default is 64. A larger `ef_search` finds more of the true neighbors and takes longer.
+
+These numbers are from the graded run recorded in `inillucent-scorecard.md` (20 September 2026,
+commit `cd53317`), over 185,078 chunks at 768 dimensions with no filter. Recall is measured against
+an exact search over the whole corpus:
+
+| `ef_search` | Recall of the top 10 | Median time per vector search |
+|---|---|---|
+| 64, the default | 0.8775 | 0.61 ms |
+| 128 | 0.9525 | 1.08 ms |
+| 256 | 0.9575 | 1.94 ms |
+| 512 | 0.9875 | 3.27 ms |
+
+In approximate mode the engine still uses exact search when a filter leaves few enough rows. It
+counts the rows the filter admits and compares the cost of the two methods. For a narrow filter the
+exact search is both faster and correct.
+
+### Filtering a search table: facet columns
+
+A column declared `FACET` is stored with the row, and a search can filter on it. Its value is not
+indexed as text, so it does not change the keyword ranking.
+
+```sql
+SELECT rowid, title FROM docs
+WHERE docs MATCH 'release' AND region = 'us' AND k = 10
+ORDER BY rank;
+```
+
+```
+rowid  title
+-----  ----------------
+3      Release calendar
+```
+
+**Filter with a facet column, inside the search.** A filter written anywhere else runs after the
+ranking and gives a different answer. The keyword ranking rescores its best `k * 6` hits by where
+the query words sit, and which hits reach that group depends on which rows the search admitted.
+When the filtering change was measured on a 400 row corpus, a filter applied after the search shared
+one hit of the top ten with the same filter applied inside it. A filter after the search can also
+return fewer rows than `k`.
+
+Rules for facet columns:
+
+- Several facet constraints joined by `AND` must all hold.
+- A facet value is compared as text, so `region = 1` and `region = '1'` select the same rows.
+- Write a value for every row. A facet left NULL reads back as the empty string, so no ordinary
+  filter matches it.
+- `FACET` must be the last word of the column's declaration. `"live facet"` in quotes is one column
+  named `live facet`. `"live" FACET` is a facet named `live`.
+- A filtered search first counts the rows that pass the filter, which is one pass over the table.
+  That count decides between the graph walk and exact search.
+- A table with a facet column is stored in format 2. A build older than the one that added facets
+  refuses to open it and names the release to install. A table with no facet column stays in
+  format 1.
+
+### How the two rankings are combined
+
+The keyword list and the vector list are each scaled to the range 0 to 1, then added. The vector
+list gets a weight of 0.35 by default. The engine adjusts that weight for each query, between 0.05
+and 0.95, from signals in the query itself. A query full of identifiers such as `parse_headers`
+moves the weight toward keywords. These defaults are in `IndexConfig::default` in
+`crates/inillucent-core/src/index.rs`.
+
+Combining the two lets one table answer an exact identifier and a question in plain language. A
+vector search alone ranks `parse_headers` below passages about similar functions. A keyword search
+alone misses a passage that uses different words for the same idea.
+
+The default weights were measured on a different corpus, with the queries described in the comments
+of `IndexConfig::default`. Questions in plain language, asked of prose that uses different words,
+can need a larger vector weight. `vector_weight = 0.5` in the declaration fixes the weight for that table and
+turns off the adjustment for each query:
+
+```sql
+CREATE VIRTUAL TABLE chunk_search USING inillucent_search(title, text, dims = 768, vector_weight = 0.5);
+```
+
+Measured on `examples/rag-agent`: 3,696 chunks of 80 Wikipedia articles about Greek and Roman
+philosophy, 20 questions the articles answer and 3 on other subjects, with each question's words
+joined by `OR` as the keyword query. A question counts as found when a chunk of the right article is
+in the top 5.
+
+| Vector weight | Found | Mean reciprocal rank | Lowest `confidence` of an answerable question | Highest `confidence` of a question on another subject |
+|---|---|---|---|---|
+| chosen for each query (the default) | 19 of 20 | 0.681 | 0.0065 | 0.060 |
+| 0.35, fixed | 19 of 20 | 0.708 | 0.005 | 0.053 |
+| 0.5 | 19 of 20 | 0.789 | 0.332 | 0.235 |
+| 0.65 | 18 of 20 | 0.793 | 0.430 | 0.379 |
+| 0.8 | 18 of 20 | 0.789 | 0.528 | 0.466 |
+
+A search of a plain `VECTOR(768)` column holding the same vectors found 18 of 20 with a mean
+reciprocal rank of 0.798. Measure a weight on your own questions before you set one. The option was
+added after release 1.0.29.
+
+### Confidence is a separate number from score
+
+`score` decides the order. `confidence` says whether the best hit is any good.
+
+The usual way to combine two lists scales each list so that its best hit scores 1.0. That happens
+even when nothing in the table answers the question, so a scaled score cannot tell an agent to stop.
+`confidence` divides each side by a fixed upper bound instead. Cosine similarity cannot exceed 1.
+BM25 cannot exceed the score a chunk would get if it held every query word. A confidence near 0
+means nothing in the table matched well.
+
+Set an abstention threshold on `confidence`, and order by `score`.
+
+In the graded comparison in [Retrieval quality](retrieval-quality.md), asked 200 questions the
+corpus does not answer, inillucent returned a confident top result for one of them. PostgreSQL with
+pgvector returned one for all 200.
+
+**`confidence` is low for a hit that only the keyword list found.** Such a hit has no cosine
+similarity in the sum, so its confidence is its BM25 score over the ceiling, times the keyword
+weight. A question of many words joined by `OR` has a high ceiling, because no chunk holds every
+word, so that share stays small. On the corpus in the table above, with the default weight, the top
+hit of 4 of the 20 answerable questions was found by keywords alone, and their confidence was 0.0065
+to 0.1017. The three questions on other subjects scored 0.009 to 0.060, so no threshold separated the
+two groups.
+
+Check `origin(docs)` before you trust a low `confidence`. When the top hit's origin is `keyword`,
+the number says little about whether the table can answer. Two things worked on that corpus:
+
+- a fixed `vector_weight = 0.5`, which put a hit found by both lists first for every answerable
+  question. Every answerable question then scored 0.332 or more and every other one 0.235 or less;
+- the cosine distance of the best hit from a plain `VECTOR` column. Every answerable question was
+  0.341 or closer and the questions on other subjects were 0.417 to 0.530.
+
+### Maintenance commands
+
+A maintenance command is an `INSERT` into the table's own name column, as in FTS5:
+
+```sql
+INSERT INTO docs(docs) VALUES('compact');
+```
+
+| Command | What it does |
+|---|---|
+| `compact` | builds one clean index from every row in one pass, and drops deleted rows from the graph |
+| `rebuild` | rebuilds the whole index from the stored rows and discards every older version. Use it when an index segment cannot be read |
+| `drop-old-generations` | frees the space held by index versions no reader needs |
+| `integrity-check` | checks the index against the rows and fails with the problem it found |
+
+An `inillucent_hnsw` index takes the same commands through its own name:
+`INSERT INTO passage_v(passage_v) VALUES('compact')`.
+
+### The first search in a process
+
+The first search of an `inillucent_search` table in a process reads the table's index into memory.
+Later searches in the same process use that copy until a write changes the table. The index is
+stored as segments, plus the rows written since the last compaction. On the first search the engine
+joins the segments into one and adds those rows to it, and that is most of the cost.
+
+Measured on the `examples/rag-agent` database after a first sync: 3,696 chunks with 768 number
+vectors, stored as 3 segments and 472 rows not yet compacted.
+
+| Search | Before `compact` | After `compact` |
+|---|---|---|
+| the first keyword search in a new process | 848 ms | 106 ms |
+| the next search in the same process | under 1 ms | under 1 ms |
+| the example's first search, not counting the 780 ms that loading the embedding model takes | about 990 ms | about 115 ms |
+
+`compact` took 0.54 seconds and did not change any answer. A search of a plain `VECTOR` column reads
+no such index: the first one took 26 ms on the same file. A table collects rows until the `compact`
+option's count, 1,024 by default, so a program that opens the database often can run `compact` after
+a large load to keep the first search short.
+
+## Search from the command line
+
+`inillucent search` runs a keyword search on an FTS5 or `inillucent_search` table:
+
+```sh
+inillucent --db app.rdb search 'release' --table note --k 5
+```
+
+```
+rowid  title            body
+-----  ---------------  --------------------------------------------
+1      Release process  Tag the commit, then run the release script.
+```
+
+`inillucent vector-search` finds the nearest rows to a vector you supply, over a `VECTOR(N)` column.
+It uses an index on the column when there is one:
+
+```sh
+inillucent --db app.rdb vector-search passage --column v --vector '[1, 0, 0]' --k 2
+```
+
+```
+id  id  body         v                                    distance
+--  --  -----------  -----------------------------------  --------------------
+1   1   red apple    {"blob":"0000803f0000000000000000"}  0.0
+2   2   green apple  {"blob":"6666663fcdcccc3d00000000"}  0.006116265828075562
+```
+
+| Parameter | `search` | `vector-search` |
+|---|---|---|
+| first argument | the query, in FTS5 syntax | the table |
+| `--table` | the table to search | |
+| `--column` | | the `VECTOR(N)` column |
+| `--vector` | | the query vector, a JSON array with exactly N numbers |
+| `--k` | how many results. Defaults to 10 | how many results. Defaults to 10 |
+| `--measure` | | `cos` (the default), `l2` or `dot` |
+| `--output json` | the result as JSON | the result as JSON |
+
+The MCP server has the same two commands as the tools `inillucent_search` and
+`inillucent_vector_search`.
+
+## Keyword ranking settings in the Rust library
+
+The ranking of an `inillucent_search` table comes from the retrieval engine in the
+`inillucent-core` crate. A program that uses that crate directly can change five keyword weights in
+`IndexConfig`. Setting each one to 0 or `false` gives plain BM25:
+
+| Setting | What it does | Default |
+|---|---|---|
+| `lexical_coverage` | ranks a chunk higher when it holds more of the query's rare words. The value is an exponent | 3.0 |
+| `lexical_proximity` | ranks a chunk higher when the matched words sit close together | 1.0 |
+| `lexical_phrase` | ranks a chunk higher when the matched words appear in the query's order | 0.75 |
+| `lexical_tier` | ranks first by how many query words a chunk holds, then by score | off |
+| `lexical_prefix` | lets a query word match longer words that start with it | off |
+
+## Space after deletes
+
+Deleting rows from a table with a vector index and inserting them again makes the file grow.
+`VACUUM` gives the space back after two maintenance commands.
+
+Measured with inillucent 1.0.29 on 24 September 2026: 2,000 rows of `VECTOR(16)` with an
+`inillucent_hnsw` index. Each cycle deletes 1,000 rows and inserts the same 1,000 in one
+transaction, then checkpoints.
+
+| After | File size in bytes |
+|---|---|
+| the build | 1,605,632 |
+| 1 cycle | 2,064,384 |
+| 3 cycles | 4,325,376 |
+| 5 cycles | 5,242,880 |
+| 10 cycles | 8,781,824 |
+| `compact` | 9,568,256 |
+| `drop-old-generations` | 9,568,256 |
+| `VACUUM` | 1,966,080 |
+
+The table held 2,000 rows at every step. `compact` writes a new version of the index, so the file
+grows again. `drop-old-generations` frees pages inside the file without shrinking the file.
+`VACUUM` then shrinks the file. The final size matches a fresh build of the same 2,000 rows followed
+by `VACUUM`, which was also 1,966,080 bytes. Run the three in this order:
+
+```sql
+INSERT INTO passage_v(passage_v) VALUES('compact');
+INSERT INTO passage_v(passage_v) VALUES('drop-old-generations');
+VACUUM;
+```
 
 ## Where to go next
 
-- [Retrieval quality](retrieval-quality.md) — the 17 graded comparisons against pgvector
-- [Embeddings](embeddings.md) — producing the vectors, in your process
-- [Where the vectors live](vector-residency.md) — resident or filed, and what each costs
-- [Architecture](architecture.md) — how the graph, the filter and the fusion work
+- [Embeddings](embeddings.md): produce the vectors inside inillucent with `embed()`
+- [Retrieval quality](retrieval-quality.md): the graded comparison with PostgreSQL and pgvector
+- [Where the vectors live](vector-residency.md): vectors held in memory or read from the file
+- [Architecture](architecture.md): how the HNSW graph, the filter and the combined ranking work
