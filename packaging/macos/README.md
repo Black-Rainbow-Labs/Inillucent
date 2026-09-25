@@ -225,6 +225,16 @@ each part is written by hand rather than called, including the three faults in
 every entry's offset and signs the archive, so a package the writer got wrong
 fails on the machine that built it rather than on somebody's Mac.
 
+**Neither `rcodesign` nor Apple's notary opens the `Bom`.** The 0.1.8 package
+was signed, notarised and published with a `Bom` that stopped at the end of its
+block table, with no free list after it. Installer.app opens the `Bom` before
+it installs anything, and on every Mac it aborted in `_ReadFreeList` with
+`EXC_CRASH (SIGABRT)`. The tests in `tools/macos-pkg/src/bom.rs` now check the
+layout macOS reads, compared against a `Bom` Apple's tools wrote:
+`cargo test --manifest-path tools/macos-pkg/Cargo.toml`. A change to the writer
+ships through `packaging/ship.ps1` like any other fix, since this machine builds,
+signs and notarises the `.pkg`. The one thing it cannot do is run Installer.app.
+
 ## A note on where it installs
 
 `/usr/local`, which is the conventional place for a package that is not from
