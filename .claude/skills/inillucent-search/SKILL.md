@@ -142,6 +142,10 @@ The query uses FTS5 syntax: bare words must all match, `"a phrase"` matches the 
 `OR` and `NOT` work. The `porter` tokenizer reduces words to their stem, so `run` matches `running`.
 Write `tokenize = 'porter unicode61'` in the `CREATE VIRTUAL TABLE` to use it.
 
+To keep an FTS5 table in step with an ordinary table, write triggers on the ordinary table that
+insert, update and delete the FTS5 rows by rowid. They commit and roll back with the write that
+fired them. `docs/vector-search.md` has the three triggers.
+
 ## Keyword and vector search together: `inillucent_search`
 
 ```sql
@@ -168,7 +172,7 @@ the rows one `VALUES` row at a time, and run `SELECT embed(?1)` first and bind t
 |---|---|
 | `dims = N` | makes the table hold vectors of N numbers. Without `dims`, an insert with a vector is refused with the status `constraint` |
 | `mode = 'exact'` or `mode = 'approximate'` | how the vector half searches. The default is `exact` |
-| `vector_weight = 0.5` | fixes the vector list's weight, from 0 to 1, in place of the weight chosen for each query. Added after 1.0.29 |
+| `vector_weight = 0.5` | fixes the vector list's weight, from 0 to 1, in place of the weight chosen for each query. Added in 1.0.30 |
 | `store MATCH '...'` | the keyword query, in FTS5 syntax |
 | `vector = ?` | the query vector |
 | `k = 10` | how many results to retrieve |

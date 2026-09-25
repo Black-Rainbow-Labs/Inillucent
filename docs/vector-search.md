@@ -330,6 +330,31 @@ body
 parse_[headers] reads the...
 ```
 
+### Keeping an FTS5 table in step with a table
+
+Triggers on the content table can write the FTS5 table, the way SQLite's FTS5 documentation shows.
+Each write to `todo` then updates `todo_fts` in the same transaction, so both commit or roll back
+together:
+
+```sql
+CREATE TABLE todo (id INTEGER PRIMARY KEY, title TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '');
+CREATE VIRTUAL TABLE todo_fts USING fts5(title, notes);
+
+CREATE TRIGGER todo_fts_insert AFTER INSERT ON todo BEGIN
+  INSERT INTO todo_fts (rowid, title, notes) VALUES (NEW.id, NEW.title, NEW.notes);
+END;
+CREATE TRIGGER todo_fts_delete AFTER DELETE ON todo BEGIN
+  DELETE FROM todo_fts WHERE rowid = OLD.id;
+END;
+CREATE TRIGGER todo_fts_update AFTER UPDATE ON todo BEGIN
+  UPDATE todo_fts SET title = NEW.title, notes = NEW.notes WHERE rowid = NEW.id;
+END;
+```
+
+The same works for an `inillucent_search` table. inillucent makes a trigger's writes to a virtual
+table after the statement's writes to ordinary tables and before the commit. A statement that fails
+undoes both.
+
 ## Hybrid search
 
 An `inillucent_search` table holds text and vectors together. It is a virtual table: it looks like
@@ -555,7 +580,8 @@ in the top 5.
 
 A search of a plain `VECTOR(768)` column holding the same vectors found 18 of 20 with a mean
 reciprocal rank of 0.798. Measure a weight on your own questions before you set one. The option was
-added after release 1.0.29.
+added in release 1.0.30, and release 1.0.29 or earlier cannot open a database with a table that
+declares it.
 
 ### Confidence is a separate number from score
 

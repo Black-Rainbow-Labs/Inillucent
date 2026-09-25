@@ -161,7 +161,11 @@ inillucent --db examples/rag-agent/cli-example/greek-philosophy.rdb query \
 
 [`examples/rag-agent/rust-example/`](examples/rag-agent/rust-example/README.md) serves the same
 articles to an agent through an MCP server written in Rust, which chunks, embeds and syncs them
-itself. [`examples/`](examples/README.md) describes every example.
+itself. [`examples/todo-mvc/`](examples/todo-mvc/README.md) is a todo service with a REST API in
+Rust, whose SQL uses foreign keys that cascade, triggers, recursive CTEs, window functions and FTS5.
+[`examples/coffee-shop/`](examples/coffee-shop/README.md) is a coffee shop's till and back office,
+with orders, stock and double entry books kept by triggers.
+[`examples/`](examples/README.md) describes every example.
 
 ## For AI agents
 

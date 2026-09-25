@@ -25,6 +25,10 @@ examples/rag-agent/cli-example/README.md
 examples/rag-agent/cli-example/AGENTS.md
 examples/rag-agent/rust-example/README.md
 examples/rag-agent/rust-example/AGENTS.md
+examples/todo-mvc/README.md
+examples/todo-mvc/AGENTS.md
+examples/coffee-shop/README.md
+examples/coffee-shop/AGENTS.md
 packaging/README.md
 packaging/PUBLISHING.md
 packaging/macos/README.md
