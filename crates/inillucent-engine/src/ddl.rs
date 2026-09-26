@@ -74,6 +74,7 @@ use super::{index_shape, ImportedDatabase, Outcome};
 fn schema_of(directive: &Directive) -> usize {
     match directive {
         Directive::CreateTable { database, .. }
+        | Directive::CreateTableAsSelect { database, .. }
         | Directive::CreateVirtualTable { database, .. }
         | Directive::CreateView { database, .. }
         | Directive::CreateIndex { database, .. }
@@ -207,6 +208,46 @@ impl ImportedDatabase {
         Ok(outcome)
     }
 
+    /// Runs `BEGIN`, `COMMIT` or `ROLLBACK` with no savepoint named.
+    ///
+    /// **The three transaction statements refuse what SQLite refuses.**
+    /// `begin_batch`, `commit_batch` and `rollback` are deliberately tolerant -
+    /// they are called at boundaries by code that does not know whether a
+    /// transaction is open - and the *statements* are not: SQLite reports all
+    /// three of these, and before the write path had a statement boundary, this
+    /// engine reported none of them. It is how a caller finds out that an `OR
+    /// ROLLBACK` ended the transaction underneath it: the `COMMIT` that follows
+    /// has nothing left to commit and has to say so. Each refusal is
+    /// `SQLITE_ERROR` (1), which is what the pinned reference answers; `refusal`
+    /// would answer `SQLITE_MISUSE` (21), and the statement matrix's transaction
+    /// cases found exactly that.
+    ///
+    /// @param which - `begin`, `commit` or `rollback`
+    fn transaction_statement(&mut self, which: &str) -> DbResult<Outcome> {
+        let open = self.writing.batch().is_some();
+        match (which, open) {
+            ("begin", true) => {
+                return Err(statement_refusal(
+                    "cannot start a transaction within a transaction",
+                ))
+            }
+            ("begin", false) => self.begin_batch(),
+            ("commit", false) => {
+                return Err(statement_refusal(
+                    "cannot commit - no transaction is active",
+                ))
+            }
+            ("commit", true) => self.commit_batch()?,
+            (_, false) => {
+                return Err(statement_refusal(
+                    "cannot rollback - no transaction is active",
+                ))
+            }
+            (_, true) => self.rollback()?,
+        }
+        Ok(Outcome::empty())
+    }
+
     /// Runs one bound directive against the schema `execute_ddl` selected.
     ///
     /// @param directive - the bound statement
@@ -228,8 +269,15 @@ impl ImportedDatabase {
                 exists,
                 create_sql,
                 select_sql,
-                ..
-            } => self.create_table_as_select(&name, exists, if_not_exists, create_sql, &select_sql),
+                database,
+            } => self.create_table_as_select(
+                database,
+                &name,
+                exists,
+                if_not_exists,
+                create_sql,
+                &select_sql,
+            ),
             // **`USING inillucent_hnsw` is sugar for a store plus a promise.**
             // The store is an ordinary `inillucent_search` virtual table over
             // the same HNSW `inillucent-core` builds for the retrieval engine,
@@ -343,32 +391,10 @@ impl ImportedDatabase {
                 ..
             } => self.drop_object(kind, &name, exists, if_exists),
             Directive::Alter { table, action, .. } => self.alter_table(source, &table, &action),
-            Directive::Analyze { table, .. } => self.analyze(table.as_deref()),
+            analyze @ Directive::Analyze { .. } => self.run_analyze(analyze),
             Directive::Reindex { indexes, .. } => self.reindex(&indexes),
-            // **The three transaction statements refuse what SQLite refuses.**
-            // `begin_batch`, `commit_batch` and `rollback` are deliberately
-            // tolerant - they are called at boundaries by code that does not
-            // know whether a transaction is open - and the *statements* are
-            // not: SQLite reports all three of these, and before the write
-            // path had a statement boundary, this engine reported none of
-            // them. It is the same defect three times,
-            // and it is how a caller finds out that an `OR ROLLBACK` ended the
-            // transaction underneath it: the `COMMIT` that follows has nothing
-            // left to commit and has to say so.
-            Directive::Begin(_) => {
-                if self.writing.batch().is_some() {
-                    return Err(refusal("cannot start a transaction within a transaction"));
-                }
-                self.begin_batch();
-                Ok(Outcome::empty())
-            }
-            Directive::Commit => {
-                if self.writing.batch().is_none() {
-                    return Err(refusal("cannot commit - no transaction is active"));
-                }
-                self.commit_batch()?;
-                Ok(Outcome::empty())
-            }
+            Directive::Begin(_) => self.transaction_statement("begin"),
+            Directive::Commit => self.transaction_statement("commit"),
             Directive::Pragma {
                 ref name,
                 ref argument,
@@ -380,13 +406,7 @@ impl ImportedDatabase {
                     self.rollback_to(&name)?;
                     Ok(Outcome::empty())
                 }
-                None => {
-                    if self.writing.batch().is_none() {
-                        return Err(refusal("cannot rollback - no transaction is active"));
-                    }
-                    self.rollback()?;
-                    Ok(Outcome::empty())
-                }
+                None => self.transaction_statement("rollback"),
             },
             // A `SAVEPOINT` outside a transaction opens one, which is what
             // SQLite does: it is the only way to name a point inside a
@@ -518,10 +538,15 @@ pub(crate) fn refuse_duplicates(
                     format!("{}.{}", String::from_utf8_lossy(&owner.name), name)
                 })
                 .collect();
-            return Err(refusal(format!(
-                "UNIQUE constraint failed: {}",
-                columns.join(", ")
-            )));
+            // `SQLITE_CONSTRAINT_UNIQUE` (2067), which is what SQLite reports
+            // when the rows already there break the new index; `refusal`
+            // answered `SQLITE_MISUSE` (21).
+            let said = format!("UNIQUE constraint failed: {}", columns.join(", "));
+            return Err(inillucent_base::DbError::new(inillucent_base::ExtendedCode(
+                inillucent_sql::dml::codes::UNIQUE,
+            ))
+            .with_message(said.clone())
+            .with_detail(said));
         }
     }
     Ok(())

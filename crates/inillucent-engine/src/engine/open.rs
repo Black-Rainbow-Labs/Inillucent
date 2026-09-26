@@ -209,7 +209,8 @@ impl crate::ImportedDatabase {
                 last_changes: std::cell::Cell::new(0),
                 seed: std::cell::Cell::new(fresh_seed()),
                 changed_ever: std::cell::Cell::new(0),
-                session_change_baseline: session_changes::SessionChanges::default(),
+                total_changes: std::cell::Cell::new(0),
+                sessions: session_changes::SessionChanges::default(),
             }),
             compiled: std::rc::Rc::new(Compiled {
                 statements: std::cell::RefCell::new(HashMap::new()),
@@ -259,6 +260,8 @@ impl crate::ImportedDatabase {
             },
             pragmas: std::rc::Rc::new(Pragmas::fresh()),
             session_state: SessionState {
+                sessions_read: std::cell::RefCell::new(std::collections::HashSet::new()),
+                nesting: std::cell::Cell::new(0),
                 modules_begun: std::cell::Cell::new(false),
                 authorizer: None,
                 collations: Vec::new(),
@@ -287,6 +290,10 @@ impl crate::ImportedDatabase {
     /// pragma reports and nothing writes a pre-image, which is a durability
     /// hole rather than a cosmetic one.
     fn settle_journal(&mut self) -> DbResult<()> {
+        // The vacuum mode is the other setting the file carries, read here for
+        // the same reason: a connection starts with what the file says.
+        self.pragmas
+            .set_auto_vacuum(self.storage.database.auto_vacuum());
         let mode = if self.storage.database.wal_mode() {
             inillucent_pool::journal::JournalMode::Wal
         } else {
@@ -540,7 +547,8 @@ impl crate::ImportedDatabase {
                 last_changes: std::cell::Cell::new(0),
                 seed: std::cell::Cell::new(fresh_seed()),
                 changed_ever: std::cell::Cell::new(0),
-                session_change_baseline: session_changes::SessionChanges::default(),
+                total_changes: std::cell::Cell::new(0),
+                sessions: session_changes::SessionChanges::default(),
             }),
             compiled: std::rc::Rc::new(Compiled {
                 statements: std::cell::RefCell::new(HashMap::new()),
@@ -579,6 +587,8 @@ impl crate::ImportedDatabase {
             },
             pragmas: std::rc::Rc::new(Pragmas::fresh()),
             session_state: SessionState {
+                sessions_read: std::cell::RefCell::new(std::collections::HashSet::new()),
+                nesting: std::cell::Cell::new(0),
                 modules_begun: std::cell::Cell::new(false),
                 attached: Vec::new(),
                 temps: Vec::new(),

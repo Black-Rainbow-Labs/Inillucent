@@ -23,6 +23,7 @@ use crate::cost;
 mod hint;
 mod partial;
 mod pattern;
+mod pushdown;
 mod range;
 mod terms;
 pub use hint::unanswerable_index_hint;
@@ -809,6 +810,7 @@ impl Levers {
 /// @param levers - which optimizations are on
 pub fn plan_select_with(select: BoundSelect, levers: Levers) -> PhysicalPlan {
     let mut select = select;
+    pushdown::push_into_derived_tables(&mut select);
     let compound_arms = core::mem::take(&mut select.compounds);
     let terms = statement_terms(&select);
     // The order the terms are visited in is chosen before their paths are, and
@@ -1301,7 +1303,7 @@ fn path_ordering(table: &TableInfo, path: &AccessPath) -> Option<PathOrdering> {
             for (at, key_column) in index.columns.iter().enumerate() {
                 // An expression key orders by something no ORDER BY term here
                 // can name, so the walk stops describing itself at that point.
-                let Some(column) = key_column.column else {
+                let Some(column) = key_column.plain_column() else {
                     break;
                 };
                 let named = named_key(table, OrderedBy::Column(column));
@@ -1336,7 +1338,7 @@ fn path_ordering(table: &TableInfo, path: &AccessPath) -> Option<PathOrdering> {
                 .find(|candidate| candidate.name == *index_name)?;
             let mut columns: Vec<(OrderedBy, bool, Collation)> = Vec::new();
             for key_column in &index.columns {
-                let Some(column) = key_column.column else {
+                let Some(column) = key_column.plain_column() else {
                     break;
                 };
                 let named = named_key(table, OrderedBy::Column(column));
@@ -2095,16 +2097,17 @@ fn virtual_path(
         let Some((column, op, value)) = virtual_constraint(id, table, term) else {
             continue;
         };
+        let usable = is_available(position, ids, &value);
         offer.push(VirtualConstraint {
-            spec: crate::vtab::ConstraintSpec {
-                column,
-                op,
-                usable: is_available(position, ids, &value),
-            },
+            spec: crate::vtab::ConstraintSpec { column, op, usable },
             value,
             predicate: term.clone(),
         });
-        if let Some(slot) = consumed.get_mut(index) {
+        // **Only a usable constraint is this term's to answer.** In `FROM
+        // json_each(...) s, json_each(s.value) r`, `s` took `s.value = r.json`
+        // as its own, which left `r` with no document and failed. SQLite offers
+        // such a constraint as not usable and tests it at the later loop.
+        if let Some(slot) = consumed.get_mut(index).filter(|_| usable) {
             *slot = true;
         }
     }
@@ -2550,7 +2553,7 @@ fn index_candidate(
     let mut key = 0usize;
     while let Some(key_column) = index.columns.get(key) {
         let collation = collation_of(&key_column.collation);
-        let found = match key_column.column {
+        let found = match key_column.plain_column() {
             Some(column) => {
                 find_equality(id, position, ids, column, collation, terms, consumed, &used)
                     .map(|(term_index, value)| (term_index, value, Some(column)))
@@ -2701,7 +2704,7 @@ fn covering_slots(
         let position = index
             .columns
             .iter()
-            .position(|key| key.column == Some(*slot))?;
+            .position(|key| key.plain_column() == Some(*slot))?;
         slots.push((*slot, position));
     }
     Some(slots)

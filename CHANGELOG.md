@@ -10,6 +10,49 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**The statement matrix's first run found 67 ways inillucent answered differently from SQLite
+3.53.4, and 66 of them are fixed.** Fixing them and running the matrix's random layer found seven
+more, and six of those are fixed. The matrix runs every case against the pinned SQLite and
+compares rows, result codes and counters. What changed, by what a caller sees:
+
+- **Result codes.** A refused `BEGIN`, `COMMIT` or `ROLLBACK`, an `ATTACH` past ten, an `ADD COLUMN
+  NOT NULL` with no default, an `ESCAPE` that is not one character and a write to `sqlite_schema`
+  answer code 1, where they answered 21. A unique index built over duplicates answers 19 and 2067. A
+  `LIMIT` of 2.7 or NULL answers 20, `datatype mismatch`. `ON DELETE RESTRICT` reports 1811, and a
+  `UNIQUE` index over a `WITHOUT ROWID` key reports 2067.
+- **Counters.** `changes()`, `total_changes()` and `last_insert_rowid()` belong to each
+  connection, so another connection's statement no longer moves them. `CREATE TABLE ... AS SELECT`
+  moves none of them. A row that `OR IGNORE`, a `CHECK` or `RAISE(IGNORE)` skips gives its rowid
+  back, so the rows are stored as 1, 2, 3 where they were 1, 3, 6. An immediate foreign key is
+  checked when the statement ends, so one `INSERT` can write a child before its parent.
+- **SQL that was refused as not built.** `LIMIT` and `OFFSET` take any expression that reads no
+  row. `UPDATE ... SET (a, b) = (...)` and `= (SELECT ...)`, and row values with `IS`, `BETWEEN`
+  and a `CASE` operand, all run. A full text `MATCH` under an `OR`, and a `MATCH` written on one
+  FTS5 column, run. An `IN` list on a joined table, a correlated subquery over a nested subquery,
+  an `UPDATE` of a virtual table computed from the row, and a correlated `EXISTS` in a join's `ON`
+  clause all run. `CREATE TABLE ... AS WITH ...`,
+  `CREATE INDEX` on a temporary table, `CREATE TEMP TABLE temp.t` and `ANALYZE` of an attached
+  schema run. Every pragma that returns a value has its `pragma_<name>` table function.
+- **Wrong answers.** A `RIGHT` or `FULL JOIN` put the right table's values in the left table's
+  columns; it no longer does. `UNION`, `EXCEPT` and `INTERSECT` return their rows in key order,
+  and when two rows are equal but not identical, such as `0` and `0.0`, they keep the row SQLite
+  keeps. `sum()` over text holding integers is an integer, the remainder of a
+  real is a real, a `STRICT` table's `ANY` column keeps text as text, and negative zero, `unicode()`,
+  `substr()`, `replace()`, a unary minus on text and a division by text answer what SQLite answers.
+  An `OR` conflict clause no longer applies to a `STRICT` column's type check. A `DROP COLUMN` a
+  view uses is refused, `PRAGMA auto_vacuum` survives a reopen, and VACUUM keeps a
+  table with a stored generated column.
+- **The Rust driver can cancel a statement from another thread.** `Database::cancel_handle()`
+  returns a `CancelHandle` that is `Send` and `Sync`, and `inillucent_cancel` in the C library now
+  sets the flag and touches nothing else.
+
+Two are left. A table whose columns do not fit one page, such as 2,000 columns at a page of 4,096
+bytes, is refused with exit code 3 and a message that names the column count and says a larger
+page size holds it. And when the query of an `INSERT ... SELECT` fails part way, SQLite has already
+written and undone the earlier rows, so `last_insert_rowid()` names the last of them, while
+inillucent evaluates the query before it writes any row and leaves `last_insert_rowid()` where it
+was. The table ends the same in both.
+
 **A new example, `examples/coffee-shop`: a coffee shop's orders, stock and double entry books, as a
 REST API in Rust.** It takes orders with sizes and modifiers, prices them with promotion codes,
 loyalty points and sales tax, takes split cash and card payments, and keeps the stock and the books
@@ -25,6 +68,72 @@ lists, todos with subtasks to any depth, tags and comments in one database built
 triggers that write a history, a view, recursive CTEs, window functions, filtered aggregates,
 `UPSERT`, JSON functions and FTS5 search. Its README also lists six ways 1.0.30 answers differently
 from SQLite, and what the example does in each case.
+
+**`RAISE()` takes any expression as its message.** `SELECT RAISE(ABORT, 'too big: ' || NEW.n)` and
+`RAISE(FAIL, printf('huge: %d', NEW.n))` in a trigger body report the computed text, as SQLite
+does. Release 1.0.30 refused both `CREATE TRIGGER` statements with a syntax error at the `||`.
+NULL is an empty message and a number is its text.
+
+**A `json_group_array` or `json_group_object` result nests inside another JSON function.**
+`json_object('day', day, 'items', json_group_array(item))` answered
+`{"day":"2026-09-20","items":"[\"Latte\",\"Croissant\"]"}`, the array quoted as a string, where
+SQLite answers `{"day":"2026-09-20","items":["Latte","Croissant"]}`. The same holds for
+`json_array(...)` around one, and for a scalar subquery whose one column is a JSON value.
+
+**A table valued function over another one's column, and a join on an expression of one.**
+`FROM json_each(doc) s, json_each(s.value) r` and a `json_tree` or `generate_series` over an outer
+`json_each` failed with "the tree read for FROM term 1 does not carry column 8", and `JOIN
+ingredient i ON i.id = c.value ->> '$.id'` failed with "a seek key or range bound reads a column".
+Both now answer as SQLite does. The same planner fix applies to a registered function's call and to
+an FTS5 auxiliary function in a join condition.
+
+**A `WHERE` on a view or derived table filters inside it.** `SELECT * FROM order_summary WHERE id
+= 57` built every row of the view, correlated subqueries included, before it applied the `WHERE`,
+so its cost grew with the table: 2.50 ms against 0.048 ms for the same query written without the
+view, on the coffee shop example's 270 orders. A condition that reads only the view's columns is
+now copied into the view's own query, which can then search by key. In a debug build, 30 runs of
+that lookup over 2,000 orders went from 4,581 ms to 88 ms, the same as the query written out. The
+copy is not made where it could change the answer: the right side of a `LEFT JOIN`, a view with
+`DISTINCT`, `LIMIT`, `GROUP BY`, a window function or a compound, and a condition holding a
+subquery or `random()`.
+
+**Two window function queries that were refused now run.** A correlated scalar subquery in the
+select list beside a window function, such as a count of each order's lines next to `row_number()
+OVER (ORDER BY paid_at)`, was refused with "a correlated subquery used as a value". A windowed
+query ordered by an expression, such as `ORDER BY low DESC` over `on_hand <= reorder_level AS low`
+or `ORDER BY lower(name)`, was refused with "a windowed query ordered by a computed expression".
+
+**`ORDER BY` a name that is both an alias and a table column sorts by the alias.**
+`SELECT item, sum(quantity) AS quantity FROM order_line GROUP BY item ORDER BY quantity DESC`
+sorted by `order_line.quantity`, read from whichever row stood for each group, so a list of best
+sellers came out in the wrong order with nothing to say so. In a `SELECT`'s `ORDER BY`, a bare name
+that matches an alias written in the result list now names that result column first, as in SQLite.
+A name inside an expression, such as `quantity + 0`, still reads the table column in both engines.
+
+**`UPDATE ... FROM` changes a target row once when several rows of the join match it.** It was
+changed once per match, `changes()` counted every match, and `RETURNING` listed the row once per
+match. SQLite changes it once, with the values of one match.
+
+**`inillucent describe` lists generated columns.** It read `PRAGMA table_info`, which leaves them
+out as SQLite's does, so a table with 18 columns was described as having 16. It now lists every
+column, and a new `kind` column says `generated stored`, `generated virtual`, or `hidden` for a
+hidden column of a virtual table. The MCP tool `inillucent_describe` answers the same.
+
+**`inillucent-shell` no longer cuts a trigger at the `END` of a `CASE`.** A body written as
+`SELECT CASE WHEN NEW.n < 0 THEN RAISE(ABORT, 'negative') END; END;` was sent to the parser after
+the first `END;` and refused as incomplete. The shell now ends a trigger only at an `END` that
+follows a semicolon, which is SQLite's rule.
+
+**An index on a `VIRTUAL` generated column.** `CREATE INDEX payment_day ON payment (business_day)`
+over `business_day TEXT GENERATED ALWAYS AS (date(at)) VIRTUAL` was refused with "an index on a
+column the tree does not carry". The index is now kept as an index on the column's expression, so a
+query on the column seeks it, every write keeps it current, and a `UNIQUE` one refuses a duplicate
+computed value.
+
+**`julianday()` gives SQLite's digits.** `julianday('2026-09-25T17:30:00Z')` answered
+`2461309.229166667` where SQLite answers `2461309.2291666665`. The value is now computed in whole
+milliseconds, as SQLite keeps it, so a difference of two Julian days multiplied by 24 gives the
+same number of hours in both engines.
 
 **The Rust rag example uses what 1.0.30 added.** It depends on `inillucent` alone with
 `features = ["embed"]`, fills `chunk_search` from `chunk` with one `INSERT ... SELECT` per document,

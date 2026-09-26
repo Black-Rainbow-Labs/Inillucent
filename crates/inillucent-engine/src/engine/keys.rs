@@ -98,7 +98,13 @@ impl ImportedDatabase {
         if !self.pragmas.foreign_keys() || !self.has_deferred_foreign_keys() {
             return Ok(());
         }
+        // `PRAGMA defer_foreign_keys` defers every key, so every key is the
+        // commit's to check while it is on.
+        let every_key = self.pragmas.defer_foreign_keys();
         for query in self.schema.violation_queries(None)? {
+            if !query.deferred && !every_key {
+                continue;
+            }
             if self.query_internally(&query.sql)?.is_empty() {
                 continue;
             }
@@ -106,11 +112,38 @@ impl ImportedDatabase {
                 inillucent_sql::dml::codes::FOREIGN_KEY,
             ))
             .with_message("FOREIGN KEY constraint failed")
-            .with_detail(format!(
-                "deferred key {} of {}",
-                query.key,
-                String::from_utf8_lossy(&query.child)
-            )));
+            .with_detail("FOREIGN KEY constraint failed"));
+        }
+        Ok(())
+    }
+
+    /// Checks, at the end of a statement, the immediate keys a row broke
+    /// while the statement ran.
+    ///
+    /// Each name is a foreign key trigger's, `sqlite_fk_<child>_<key>_<event>`,
+    /// so it says which key of which table to ask about. The key's whole
+    /// violation query runs, but only for a key a row of this statement broke
+    /// on the way, so a statement that breaks nothing asks nothing. A key the
+    /// rest of the statement repaired - the child inserted before its parent,
+    /// in one `INSERT` - answers no rows and the statement stands.
+    ///
+    /// @param triggers - the names of the triggers whose checks failed
+    pub(crate) fn check_pending_keys(&mut self, triggers: &[Vec<u8>]) -> DbResult<()> {
+        for trigger in triggers {
+            let Some((child, key)) = key_of_trigger(trigger) else {
+                continue;
+            };
+            let child = String::from_utf8_lossy(&child).into_owned();
+            for query in self.schema.violation_queries(Some(&child))? {
+                if query.key != key || self.query_internally(&query.sql)?.is_empty() {
+                    continue;
+                }
+                return Err(DbError::new(inillucent_base::ExtendedCode(
+                    inillucent_sql::dml::codes::FOREIGN_KEY,
+                ))
+                .with_message("FOREIGN KEY constraint failed")
+                .with_detail("FOREIGN KEY constraint failed"));
+            }
         }
         Ok(())
     }
@@ -159,4 +192,30 @@ pub(crate) struct ViolationQuery {
     pub(crate) parent: Vec<u8>,
     /// The key's position in its table, which the pragma reports as `fkid`.
     pub(crate) key: u16,
+    /// Whether the key is `DEFERRABLE INITIALLY DEFERRED`.
+    ///
+    /// Only such a key can be broken when a transaction commits: an immediate
+    /// key was checked by the statement that wrote the row. A row that broke
+    /// an immediate key while `foreign_keys` was off is not the commit's
+    /// business, and SQLite commits over it.
+    pub(crate) deferred: bool,
+}
+
+/// Reads the child table and key number out of a foreign key trigger's name.
+///
+/// The name is `sqlite_fk_<child>_<key>_<event>`, built by
+/// `inillucent_sql::foreign_key`. A table name may hold underscores, so the
+/// key and the event are read from the right.
+///
+/// @param trigger - the trigger's name
+fn key_of_trigger(trigger: &[u8]) -> Option<(Vec<u8>, u16)> {
+    let rest = trigger.strip_prefix(b"sqlite_fk_")?;
+    let event_at = rest.iter().rposition(|byte| *byte == b'_')?;
+    let before_event = rest.get(..event_at)?;
+    let key_at = before_event.iter().rposition(|byte| *byte == b'_')?;
+    let key = std::str::from_utf8(before_event.get(key_at.saturating_add(1)..)?)
+        .ok()?
+        .parse()
+        .ok()?;
+    Some((before_event.get(..key_at)?.to_vec(), key))
 }

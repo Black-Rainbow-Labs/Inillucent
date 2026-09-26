@@ -1,0 +1,9 @@
+# Differences a Layer 4 random case shows that are recorded defects, matched by
+# construct because a random case id changes whenever the generator does.
+# Same format as deliberate.toml; every rule names its bug number on the board
+# in its name, and its reason says which bug. A rule here is a defect, never a
+# deliberate difference: those go in deliberate.toml.
+
+# Every rule that was here named a bug the statement matrix found, and each of
+# those bugs is fixed, so the list is empty: a random case that differs from
+# SQLite fails until it is fixed or a rule for its new bug is added here.

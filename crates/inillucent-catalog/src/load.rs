@@ -184,11 +184,12 @@ pub fn apply_statistic(tables: &mut [TableInfo], table: &[u8], index: Option<&[u
         return;
     };
     let index_folded = index.to_ascii_lowercase();
-    let Some(entry) = info
-        .indexes
-        .iter_mut()
-        .find(|candidate| candidate.folded == index_folded)
-    else {
+    // A `WITHOUT ROWID` table's primary key is named after the table in
+    // `sqlite_stat1`, which is how SQLite's `analyzeOneTable` writes it.
+    let primary = info.without_rowid && index_folded == folded;
+    let Some(entry) = info.indexes.iter_mut().find(|candidate| {
+        candidate.folded == index_folded || (primary && candidate.origin == IndexOrigin::PrimaryKey)
+    }) else {
         return;
     };
     let partial = entry.partial_sql.is_some();
@@ -382,6 +383,7 @@ pub fn trigger_from_create_sql(sql: &[u8]) -> DbResult<TriggerInfo> {
         event,
         when,
         body,
+        table_database,
         ..
     } = &parsed.statement
     else {
@@ -408,6 +410,7 @@ pub fn trigger_from_create_sql(sql: &[u8]) -> DbResult<TriggerInfo> {
         event,
         when: *when,
         body: body.clone(),
+        table_database: table_database.map(|id| parsed.ast.folded(id).to_vec()),
         ast: parsed.ast,
     })
 }
@@ -496,7 +499,16 @@ pub fn table_from_create_sql(sql: &[u8], database: usize, root: u32) -> DbResult
         module: None,
     };
     for column in columns {
-        info.columns.push(column_info(sql, &parsed.ast, column));
+        let mut built = column_info(sql, &parsed.ast, column);
+        // **An `ANY` column of a `STRICT` table converts nothing.** SQLite
+        // gives it BLOB affinity, so `' 7'` stays the text `' 7'` and `-0.0`
+        // stays a real. Outside `STRICT`, `ANY` is an ordinary declared type
+        // and the naming rules make it NUMERIC, which is what it was given here
+        // in both kinds of table.
+        if info.strict && built.declared_type.eq_ignore_ascii_case(b"ANY") {
+            built.affinity = affinity::Affinity::Blob;
+        }
+        info.columns.push(built);
     }
     info.checks = collect_checks(sql, &parsed.ast, columns, constraints);
     info.foreign_keys = collect_foreign_keys(&info, &parsed.ast, columns, constraints);
@@ -515,6 +527,7 @@ pub fn table_from_create_sql(sql: &[u8], database: usize, root: u32) -> DbResult
         }
     }
     info.rowid_alias = rowid_alias(&info, &parsed.ast, columns, constraints);
+    strict_primary_key_not_null(&mut info);
     info.autoincrement = info.rowid_alias.is_some() && declares_autoincrement(columns, constraints);
     let (automatic, rowid_key_conflict) =
         automatic_indexes(&info, &parsed.ast, columns, constraints);
@@ -775,6 +788,27 @@ fn apply_table_constraints(
                     column.not_null = true;
                 }
             }
+        }
+    }
+}
+
+/// Marks a STRICT table's primary key columns NOT NULL.
+///
+/// Every one except the rowid alias, which cannot hold NULL anyway. That is
+/// SQLite's `sqlite3EndTable`, and without it `PRAGMA table_info` reported
+/// `notnull` 0 for `a REAL PRIMARY KEY` in a STRICT table where SQLite reports
+/// 1, and an INSERT of NULL into the key was accepted.
+///
+/// @param info - the table, with its rowid alias already decided
+fn strict_primary_key_not_null(info: &mut TableInfo) {
+    if !info.strict {
+        return;
+    }
+    let alias = info.rowid_alias;
+    for (position, column) in info.columns.iter_mut().enumerate() {
+        let is_alias = alias == Some(position as u16);
+        if column.primary_key_position.is_some() && !is_alias {
+            column.not_null = true;
         }
     }
 }
@@ -1088,10 +1122,22 @@ pub fn index_from_create_sql(sql: &[u8], table: &TableInfo, root: u32) -> DbResu
             Some(Expr::Column { column, .. }) => table.column_position(parsed.ast.folded(*column)),
             _ => None,
         };
+        // **A `VIRTUAL` generated column is indexed as its expression.** It is
+        // in no record, so the scan that fills an ordinary index has nothing to
+        // read, and `CREATE INDEX` on one was refused with "an index on a
+        // column the tree does not carry". SQLite accepts it, and it is the way
+        // to give an expression index a name. Carrying the column's expression
+        // here makes the build, every write and the integrity check compute
+        // the key, as they already do for `CREATE INDEX ix ON t(date(at))`,
+        // while `column` still names the column for the pragmas and messages.
+        let virtual_expression = column
+            .and_then(|index| table.column(index))
+            .filter(|info| info.generated && !info.stored)
+            .and_then(|info| info.generated_sql.clone());
         let expr_sql = if column.is_none() {
             Some(parsed.ast.expr_span(key.expr).slice(sql).to_vec())
         } else {
-            None
+            virtual_expression
         };
         let collation = match written_collation {
             Some(name) => parsed.ast.folded(name).to_vec(),

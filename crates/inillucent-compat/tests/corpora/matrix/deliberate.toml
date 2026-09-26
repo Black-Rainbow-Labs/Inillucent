@@ -1,0 +1,214 @@
+# Differences between inillucent and the pinned SQLite 3.53.4 oracle that are
+# not defects.
+#
+# Read by `statement_matrix::known`. A rule matches a failing statement by
+# construct rather than by case id: every word in `contains` must appear in the
+# statement, ignoring case; `detail`, when given, must appear in the description
+# of the difference, which holds each engine's error message; and `kinds`, when
+# given, limits the rule to those kinds of difference. A defect never goes
+# here. A defect goes in `known.list` with its number on the board.
+#
+# Most of these are one fact: the oracle is the SQLite library as the
+# amalgamation builds it, and the corpora the matrix took its first cases from
+# ran through the `sqlite3` shell, which compiles in extensions the library
+# does not have and switches off double quoted strings. Each such construct is
+# still graded: the `vtab` and `function` families hold `oracle none` cases
+# whose answers were recorded from the pinned shell.
+
+[[rule]]
+name = "generate-series-is-a-shell-extension"
+detail = "no such table: generate_series"
+kinds = ["outcome", "fixture", "reopen"]
+reason = "generate_series is ext/misc/series.c, which shell.c compiles in and the library does not. The vtab family grades it against answers recorded from the pinned shell."
+
+[[rule]]
+name = "regexp-is-a-shell-extension"
+detail = "no such function: REGEXP"
+kinds = ["outcome"]
+reason = "REGEXP comes from ext/misc/regexp.c, which shell.c compiles in and the library does not."
+
+[[rule]]
+name = "geopoly-is-a-compile-option"
+detail = "no such module: geopoly"
+kinds = ["outcome"]
+reason = "The oracle is built without SQLITE_ENABLE_GEOPOLY."
+
+[[rule]]
+name = "fts4-is-a-compile-option"
+detail = "no such module: fts4"
+kinds = ["outcome"]
+reason = "The oracle is built without SQLITE_ENABLE_FTS4; inillucent answers fts4 with its FTS5 engine."
+
+[[rule]]
+name = "dbpage-is-a-compile-option"
+detail = "no such table: sqlite_dbpage"
+kinds = ["outcome"]
+reason = "The oracle is built without SQLITE_ENABLE_DBPAGE_VTAB."
+
+[[rule]]
+name = "sqlite-offset-is-a-compile-option"
+detail = "no such function: sqlite_offset"
+kinds = ["outcome"]
+reason = "The oracle is built without SQLITE_ENABLE_OFFSET_SQL_FUNC."
+
+[[rule]]
+name = "shell-collations"
+contains = ["collation_list"]
+kinds = ["rows"]
+reason = "The shell registers the decimal and uint collations from its own extensions; inillucent registers them too. The library has only BINARY, NOCASE and RTRIM."
+
+[[rule]]
+name = "double-quoted-strings-are-off"
+detail = "should this be a string literal in single-quotes?"
+kinds = ["outcome"]
+reason = "inillucent runs with double quoted string literals off, which is what the sqlite3 shell does since 3.41 and what SQLite recommends (SQLITE_DQS=0). The oracle library is built with the default, which reads an unknown double quoted name as a string."
+
+[[rule]]
+name = "default-page-size"
+contains = ["page_size"]
+kinds = ["rows", "reopen"]
+reason = "inillucent builds a file at 32,768 byte pages by default and SQLite at 4,096. The sqlite_page arm runs both at 4,096. docs/feature-comparison.md, the page size."
+
+[[rule]]
+name = "default-page-count"
+contains = ["page_count"]
+kinds = ["rows", "reopen"]
+reason = "Follows from the page size: the same data fills a different number of pages."
+
+[[rule]]
+name = "default-cache-size"
+contains = ["cache_size"]
+kinds = ["rows", "reopen"]
+reason = "inillucent's default cache is sized for its 32,768 byte pages: -131072, against SQLite's -2000."
+
+[[rule]]
+name = "default-busy-timeout"
+contains = ["busy_timeout"]
+kinds = ["rows", "reopen"]
+reason = "inillucent waits 5,000 ms for a lock by default and SQLite does not wait. docs/architecture-overview.md."
+
+[[rule]]
+name = "file-names"
+contains = ["database_list"]
+kinds = ["rows", "reopen"]
+reason = "The two engines open two different files, sqlite.db and inillucent.rdb, so the path column differs by construction."
+
+[[rule]]
+name = "limited-delete-without-rowid"
+contains = ["LIMIT"]
+detail = "no such column: rowid"
+kinds = ["outcome"]
+reason = "A DELETE or UPDATE with LIMIT is sent to the oracle as a rowid IN subquery (limited.rs), which a WITHOUT ROWID table cannot answer."
+
+[[rule]]
+name = "limited-update-from"
+contains = ["UPDATE", "FROM", "LIMIT"]
+detail = "syntax error"
+kinds = ["outcome"]
+reason = "An UPDATE ... FROM with LIMIT cannot be rewritten into a rowid subquery, and the pinned build has no UPDATE ... LIMIT."
+
+[[rule]]
+name = "limited-returning"
+contains = ["LIMIT", "RETURNING"]
+detail = "syntax error"
+kinds = ["outcome"]
+reason = "A limited DELETE or UPDATE with RETURNING cannot be rewritten into a rowid subquery, and the pinned build has no DELETE ... LIMIT."
+
+[[rule]]
+name = "vacuum-into-moves-sqlite-last-insert-rowid"
+contains = ["VACUUM", "INTO"]
+detail = "last_insert_rowid()"
+kinds = ["counters"]
+reason = "SQLite's VACUUM INTO copies the file with INSERT statements of its own, and they move last_insert_rowid() to the last row they copied. inillucent copies pages, runs no INSERT, and leaves the counter where the caller's own last INSERT put it."
+
+[[rule]]
+name = "random-rowid-after-the-largest"
+cases = ["rid-004", "rwe-001"]
+detail = "last_insert_rowid()"
+kinds = ["counters", "fixture"]
+reason = "Once a table holds rowid 9223372036854775807, both engines choose the next rowid at random, as SQLite documents. The two draws are not meant to agree; the rows that follow are compared."
+
+[[rule]]
+name = "settings-this-engine-refuses"
+detail = "cannot be set to"
+kinds = ["outcome", "reopen"]
+reason = "inillucent refuses to change a setting it does not implement, such as legacy_alter_table or cell_size_check, instead of accepting the PRAGMA and ignoring it. The refusal names the setting and its fixed value; the pragma family grades the reads."
+
+[[rule]]
+name = "temp-store-is-memory"
+detail = "temp_store file is not available here"
+kinds = ["outcome"]
+reason = "inillucent keeps temporary tables in memory and refuses PRAGMA temp_store = FILE rather than accepting it and ignoring it."
+
+[[rule]]
+name = "reading-a-setting-this-engine-refused"
+contains = ["legacy_alter_table"]
+kinds = ["rows", "reopen"]
+reason = "After a PRAGMA legacy_alter_table = ON that inillucent refuses (settings-this-engine-refuses), reading the setting back answers the value inillucent keeps."
+
+[[rule]]
+name = "reading-cell-size-check-this-engine-refused"
+contains = ["cell_size_check"]
+kinds = ["rows", "reopen"]
+reason = "After a PRAGMA cell_size_check = ON that inillucent refuses, reading the setting back answers the value inillucent keeps."
+
+[[rule]]
+name = "reading-temp-store-this-engine-refused"
+contains = ["temp_store"]
+kinds = ["rows", "reopen"]
+reason = "After a PRAGMA temp_store = FILE that inillucent refuses, reading the setting back answers MEMORY."
+
+[[rule]]
+name = "reading-fullfsync-this-engine-refused"
+contains = ["fullfsync"]
+kinds = ["rows", "reopen"]
+reason = "After a PRAGMA fullfsync = 1 that inillucent refuses (settings-this-engine-refuses), reading the setting back answers the value inillucent keeps, 0."
+
+[[rule]]
+name = "reading-journal-size-limit-this-engine-refused"
+contains = ["journal_size_limit"]
+kinds = ["rows", "reopen"]
+reason = "inillucent rolls its log at a checkpoint rather than trimming it to a size, so journal_size_limit is always -1 and setting it to anything else is refused."
+
+[[rule]]
+name = "reading-read-uncommitted-this-engine-refused"
+contains = ["read_uncommitted"]
+kinds = ["rows", "reopen"]
+reason = "inillucent has one writer and no shared cache to read uncommitted rows from, so read_uncommitted is always 0 and setting it to 1 is refused."
+
+[[rule]]
+name = "cache-spill-is-zero"
+contains = ["cache_spill"]
+kinds = ["rows", "reopen"]
+reason = "inillucent's buffer pool evicts by clock rather than spilling at a threshold, so it reports cache_spill as 0 against SQLite's page count. The comment on reported_value in crates/inillucent-engine/src/pragma.rs gives the reason."
+
+[[rule]]
+name = "wal-autocheckpoint-is-zero"
+contains = ["wal_autocheckpoint"]
+kinds = ["rows", "reopen"]
+reason = "inillucent folds its log in at an explicit checkpoint rather than every thousand frames, so it reports wal_autocheckpoint as 0. The comment on reported_value in crates/inillucent-engine/src/pragma.rs gives the reason."
+
+[[rule]]
+name = "journal-mode-arm"
+contains = ["PRAGMA journal_mode"]
+kinds = ["rows", "reopen"]
+reason = "One configuration arm runs inillucent with PRAGMA journal_mode = truncate to exercise that commit path, and SQLite is left at delete, so reading the mode back differs by construction. At the default arm the two agree, and a difference there would still fail."
+
+[[rule]]
+name = "journal-mode-arm-table-function"
+contains = ["pragma_journal_mode"]
+kinds = ["rows", "reopen"]
+reason = "The same arm as journal-mode-arm, read through the pragma_journal_mode table function, which every pragma that returns a value now has: inillucent runs that arm with journal_mode = truncate and SQLite is left at delete."
+
+[[rule]]
+name = "update-from-with-several-matching-rows"
+cases = ["compound-a19c80b8df3c", "compound-022aadab40a9", "compound-d6fca0360e3c", "compound-8d88896b953c"]
+kinds = ["rows", "reopen"]
+reason = "The UNION holds two rows whose c1 compare equal but differ in type (5.0 and 5), and both match one row of u. SQLite documents that UPDATE ... FROM then uses one of them and does not say which, so the value written is a draw."
+
+[[rule]]
+name = "match-under-or-in-a-joined-derived-table"
+contains = ["MATCH", "OR"]
+detail = "unable to use function MATCH in the requested context"
+kinds = ["outcome"]
+reason = "SQLite answers a full text MATCH under an OR by running each branch of the OR as a search of its own. When the query around it joins that derived table to another table, SQLite flattens it into the join first and then has no such plan, so it refuses the statement with this message. inillucent runs the MATCH branch as a search of its own in every placement and answers. Refusing here would copy a limit of SQLite's planner, not its semantics."

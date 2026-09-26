@@ -292,3 +292,106 @@ fn a_shared_database_keeps_one_session_between_statements() {
     drop(database);
     let _ = std::fs::remove_dir_all(path.parent().expect("the scratch directory"));
 }
+
+/// A TEMP table lasts from one statement to the next, and a statement does not
+/// pay for a new session.
+///
+/// **Each statement used to open a session of its own**, so `CREATE TEMP TABLE`
+/// succeeded and the next statement's `INSERT` failed with "no such table", and
+/// every statement paid for building a session: measured at about 2.5 ms for
+/// `SELECT 1` on the coffee shop example's database, where keeping one session
+/// takes about 0.02 ms. The bound here is the median of fifty runs, so one slow
+/// run on a busy machine does not decide it. Measured in a debug build over the
+/// schema below: 58 microseconds with one session, 7.8 ms with a session per
+/// statement.
+#[test]
+fn a_temp_table_lasts_and_a_statement_opens_no_session() {
+    let path = scratch("temp-table");
+    let database = SharedDatabase::open(&path).expect("the database opens");
+    // A schema about the size of the coffee shop example's: what a new
+    // session costs grows with the schema it loads, and over an empty one it
+    // is too small to tell from the channel round trip.
+    let mut schema = String::new();
+    for table in 0..30 {
+        schema.push_str(&format!(
+            "CREATE TABLE t{table} (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b INTEGER REFERENCES t0(id),              c REAL CHECK (c >= 0), d TEXT GENERATED ALWAYS AS (upper(a)) STORED);              CREATE INDEX t{table}_b ON t{table} (b, a);              CREATE VIEW v{table} AS SELECT t.id, t.a, (SELECT count(*) FROM t0 WHERE t0.b = t.id) AS n FROM t{table} t;              CREATE TRIGGER g{table} BEFORE UPDATE ON t{table} WHEN NEW.c < 0 BEGIN SELECT RAISE(ABORT, 'negative'); END; "
+        ));
+    }
+    database
+        .execute_batch(&schema)
+        .expect("the schema is created");
+    let mut times: Vec<std::time::Duration> = (0..50)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            database
+                .query_all("SELECT 1", &[])
+                .expect("the select runs");
+            started.elapsed()
+        })
+        .collect();
+    times.sort();
+    let median = times[times.len() / 2];
+    eprintln!("median SELECT 1 through a shared database: {median:?}");
+    assert!(
+        median < std::time::Duration::from_millis(1),
+        "a statement took {median:?} at the median, which is the cost of a new session"
+    );
+
+    database
+        .execute("CREATE TEMP TABLE scratch (x INTEGER)", &[])
+        .expect("the temporary table is created");
+    database
+        .execute("INSERT INTO scratch VALUES (1)", &[])
+        .expect("the next statement sees the temporary table");
+    assert_eq!(count(&database, "SELECT count(*) FROM scratch"), 1);
+    drop(database);
+    let _ = std::fs::remove_dir_all(path.parent().expect("the scratch directory"));
+}
+
+/// A statement is stopped from another thread through a [`CancelHandle`].
+///
+/// **The half of cancelling that safe Rust could not reach.** `Database` and
+/// `Connection` are neither `Send` nor `Sync`, so `Connection::cancel` could
+/// only run on the thread running the statement, where it stops nothing. The
+/// handle holds only the flag the executor reads, so it crosses threads: a
+/// query counting to a hundred million is stopped part way with
+/// `Interrupted`, and the connection answers the next statement.
+///
+/// [`CancelHandle`]: inillucent_driver::CancelHandle
+#[test]
+fn a_cancel_handle_stops_a_statement_running_on_another_thread() {
+    fn crosses_threads<T: Send + Sync + 'static>(_: &T) {}
+    let path = scratch("cancel-handle");
+    let database = inillucent_driver::Database::open(&path).expect("the database opens");
+    let connection = database.session();
+    let handle = database.cancel_handle();
+    crosses_threads(&handle);
+    let started = std::time::Instant::now();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        handle.cancel();
+    });
+    let long = "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c \
+                WHERE n < 100000000) SELECT count(*) FROM c";
+    let refused = connection
+        .query(long, &[], 1)
+        .expect_err("the statement is cancelled before it counts that far");
+    canceller.join().expect("the cancelling thread finishes");
+    assert_eq!(
+        refused.status,
+        inillucent_driver::Status::Interrupted,
+        "{refused}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "the cancel took {:?} to stop the statement",
+        started.elapsed()
+    );
+    let after = connection
+        .query("SELECT 1", &[], 1)
+        .expect("the connection is usable after the cancel");
+    assert_eq!(
+        after.rows.first().and_then(|row| row.first()),
+        Some(&Value::Integer(1))
+    );
+}

@@ -291,6 +291,38 @@ pub struct Database {
     cancel: Arc<AtomicBool>,
 }
 
+/// Stops the statement running on a database, from any thread.
+///
+/// **What [`Connection::cancel`] could not be.** `Database` and `Connection`
+/// hold `Rc`, `RefCell` and `Cell`, so neither is `Send` or `Sync`, and a
+/// connection's `cancel` could only be called on the thread running the
+/// statement, between statements, where it stops nothing. This holds nothing
+/// but the flag the executor reads, so it is `Send + Sync`: take one before
+/// the statement starts, hand it to another thread, and call
+/// [`CancelHandle::cancel`] there. The statement fails with `Interrupted`
+/// and the connection stays usable. The C API's `inillucent_cancel` uses the
+/// same handle for the same reason.
+///
+/// What it stops is bounded the way the `cancel` capability row says: every
+/// leaf of a scan and every batch of a result reads the flag, and one
+/// operator part way through one indivisible piece of work finishes it first.
+#[derive(Clone, Debug)]
+pub struct CancelHandle {
+    /// The flag the executor reads, shared with the database.
+    flag: Arc<AtomicBool>,
+}
+
+impl CancelHandle {
+    /// Asks the statement running on the database to stop.
+    ///
+    /// A cancel with nothing running sets the flag, and the next statement
+    /// clears it when it starts, so it cancels nothing rather than cancelling
+    /// whatever comes next.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+}
+
 impl std::fmt::Debug for Database {
     /// Names the file and the mode, and never anything a caller bound.
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -333,6 +365,15 @@ pub struct Recovery {
 }
 
 impl Database {
+    /// Returns a handle another thread can stop a running statement with.
+    ///
+    /// See [`CancelHandle`].
+    pub fn cancel_handle(&self) -> CancelHandle {
+        CancelHandle {
+            flag: Arc::clone(&self.cancel),
+        }
+    }
+
     /// Opens a database, creating it when the path holds nothing.
     ///
     /// @param path - the database file
@@ -1025,7 +1066,9 @@ impl Connection<'_> {
         }
     }
 
-    /// Returns the rowid the last `INSERT` on this database assigned.
+    /// Returns the rowid the last `INSERT` on this connection assigned.
+    ///
+    /// Another connection's inserts do not move it, which is SQLite's rule.
     ///
     /// **It answers a `Result` because the engine can be busy (task-1962,
     /// A11).** A function registered on this connection that asks while the
@@ -1037,7 +1080,7 @@ impl Connection<'_> {
             .map_err(|error| self.database.classify(&error))
     }
 
-    /// Returns how many rows every statement so far has changed.
+    /// Returns how many rows every statement on this connection has changed.
     pub fn total_changes(&self) -> Result<i64> {
         self.engine
             .total_changes()
@@ -1062,7 +1105,7 @@ impl Connection<'_> {
             .map_err(|error| self.database.classify(&error))
     }
 
-    /// Returns how many rows the last statement on this database changed.
+    /// Returns how many rows the last statement on this connection changed.
     ///
     /// `sqlite3_changes`. The statement's own rows: a trigger body's go into
     /// [`Connection::total_changes`] and not into this, which is SQLite's rule.

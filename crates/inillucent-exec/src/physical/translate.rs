@@ -14,7 +14,7 @@ use inillucent_base::DbResult;
 // `physical::Slot` / `physical::Compiled` / `physical::try_compile` reference
 // - `inillucent-engine`'s `Cached::Select` among them - did not have to move
 // with them.
-use inillucent_sql::ast::{BinaryOp, PatternOp, SortOrder, UnaryOp};
+use inillucent_sql::ast::{BinaryOp, PatternOp, SortOrder};
 use inillucent_sql::bind::{BoundExpr, BoundSelect, SubqueryKind};
 use inillucent_sql::function::{AggregateFunc, ScalarFunc};
 use inillucent_tree::datum::OwnedDatum;
@@ -92,6 +92,29 @@ pub(crate) fn translate(
         return Ok(found);
     }
     if let Some(found) = translate_literal(expr, params)? {
+        // `RAISE(ABORT, 'too big: ' || NEW.n)`: the node itself is a leaf, and
+        // its message is an expression over the row, translated here where the
+        // row's columns can be resolved.
+        if let (
+            Expr::Raise {
+                code,
+                message,
+                unwind,
+                ..
+            },
+            BoundExpr::Raise {
+                computed: Some(computed),
+                ..
+            },
+        ) = (&found, expr)
+        {
+            return Ok(Expr::Raise {
+                code: *code,
+                message: message.clone(),
+                computed: Some(Box::new(translate(computed, space, params, frame)?)),
+                unwind: *unwind,
+            });
+        }
         return Ok(found);
     }
     if let Some(found) = translate_reference(expr, space, params, frame)? {
@@ -234,7 +257,11 @@ fn translate_literal(expr: &BoundExpr, params: &Params) -> DbResult<Option<Expr>
             action,
             message,
             foreign_key,
+            ..
         } => Expr::Raise {
+            // A computed message has a child, which only `translate` can
+            // resolve; it attaches the translated child after this returns.
+            computed: None,
             code: match (action, foreign_key) {
                 (inillucent_sql::ast::RaiseAction::Ignore, _) => 0,
                 (_, true) => inillucent_sql::dml::codes::FOREIGN_KEY,
@@ -600,6 +627,18 @@ fn translate_pattern(
                 // an application-defined function or a module, and a query that
                 // uses one without registering it is an error rather than a
                 // false.
+                //
+                // **A `MATCH` that reaches here is one SQLite refuses too.** The
+                // planner offers a plain conjunct to the module, and the binder
+                // turns one under an `OR` into a rowid search; what is left is
+                // under a `NOT`, a `CASE` or a function, where SQLite answers
+                // "unable to use function MATCH in the requested context" with
+                // code 1. It was reported as a feature not built yet.
+                PatternOp::Match => {
+                    return Err(inillucent_base::error::statement_refusal(
+                        "unable to use function MATCH in the requested context",
+                    ))
+                }
                 other => return unsupported(&format!("the {other:?} operator")),
             };
             Expr::Pattern {
@@ -1177,21 +1216,13 @@ pub(crate) fn constant_count(
     let number = match expr {
         None => return Ok(None),
         Some(BoundExpr::Integer(number)) => *number,
-        // A negative literal binds as a negation of a literal rather than as a
-        // literal, which is why `LIMIT -1` was refused as "not a constant".
-        Some(BoundExpr::Unary {
-            op: UnaryOp::Negate,
-            operand,
-        }) => match operand.as_ref() {
-            BoundExpr::Integer(number) => number.saturating_neg(),
-            _ => return unsupported("a LIMIT or OFFSET that is not a constant"),
-        },
-        Some(BoundExpr::Parameter(index)) => match params.get(*index) {
-            OwnedDatum::Int(number) => number,
-            OwnedDatum::Null => return Ok(None),
-            _ => return unsupported("a LIMIT bound to a non-integer"),
-        },
-        Some(_) => return unsupported("a LIMIT or OFFSET that is not a constant"),
+        Some(BoundExpr::Parameter(index)) => must_be_integer(params.get(*index))?,
+        // Anything else that reads no row - `LIMIT -1`, `LIMIT 2.7`, `LIMIT
+        // NULL`, `LIMIT '2'`, `LIMIT 1 + 1` - is folded once and then held to
+        // the same rule a bound value is. All but a negated integer were
+        // refused as not built, with `SQLITE_MISUSE`; SQLite answers every one
+        // of them.
+        Some(other) => must_be_integer(crate::constant::literal_value(other, params)?)?,
     };
     if number < 0 {
         return Ok(match negative {
@@ -1200,6 +1231,35 @@ pub(crate) fn constant_count(
         });
     }
     Ok(Some(number as usize))
+}
+
+/// Returns a `LIMIT` or `OFFSET` value as an integer, or SQLite's refusal.
+///
+/// This is SQLite's `OP_MustBeInt`: numeric affinity is applied, trying for an
+/// integer, so `2.0`, `'2'` and `'2.0'` are all 2. Whatever is still not an
+/// integer after that - `2.7`, `NULL`, a blob, text that is not a number - is
+/// `SQLITE_MISMATCH` (20), "datatype mismatch". A bound NULL is refused the
+/// same way; it used to mean "no limit", which SQLite never answers.
+///
+/// @param value - the clause's value
+fn must_be_integer(value: OwnedDatum) -> DbResult<i64> {
+    let converted = match &value {
+        OwnedDatum::Int(number) => return Ok(*number),
+        OwnedDatum::Real(_) => {
+            inillucent_value::affinity::integer_affinity(inillucent_value::Value::from(&value))
+        }
+        OwnedDatum::Text(_) => inillucent_value::affinity::apply_numeric_affinity(
+            inillucent_value::Value::from(&value),
+            true,
+        ),
+        OwnedDatum::Null | OwnedDatum::Blob(_) => inillucent_value::Value::Null,
+    };
+    match converted {
+        inillucent_value::Value::Integer(number) => Ok(number),
+        _ => Err(inillucent_base::DbError::primary(
+            inillucent_base::PrimaryCode::Mismatch,
+        )),
+    }
 }
 /// Reports whether two translated expressions are the same expression.
 ///

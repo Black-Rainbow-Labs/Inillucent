@@ -150,7 +150,7 @@ fn no_test_hides_outside_the_map() {
 /// and is quoted with its line number.
 #[test]
 fn every_line_of_the_map_is_one_the_parser_reads() {
-    const KEYS: [&str; 16] = [
+    const KEYS: [&str; 17] = [
         "builds",
         "module",
         "package",
@@ -170,6 +170,7 @@ fn every_line_of_the_map_is_one_the_parser_reads() {
         "prefix",
         "packages",
         "reason",
+        "shards",
     ];
     const HEADERS: [&str; 3] = ["[[target]]", "[[tier]]", "[[path]]"];
 
@@ -884,6 +885,9 @@ fn every_timing_row_names_a_live_target() {
             continue;
         };
         named = named.saturating_add(1);
+        // A shard is timed as `<target>#<index>/<count>`, and the map names
+        // the target once, with its `shards`.
+        let target = target.split('#').next().unwrap_or(target);
         // A lib harness is written `package` with no `::`, and the map names it
         // with the package's own name as the target name.
         let known = live.contains(target)
@@ -908,8 +912,9 @@ fn every_timing_row_names_a_live_target() {
     );
 }
 
-/// Every tier says when it runs, and the three the design names run when it
-/// says they do.
+/// Every tier says when it runs, and the ones the design names run when it
+/// says they do: nightly at night; durability, perf and the statement matrix's
+/// `matrix_deep` at every merge; everything else on every change.
 ///
 /// The parser already refuses a tier with no cadence. What this adds is the
 /// assignment itself: the nightly tier running on a change is the 3,991 s story
@@ -921,7 +926,7 @@ fn every_tier_has_the_cadence_the_design_gives_it() {
     for tier in &map.tiers {
         let expected = match tier.name.as_str() {
             "nightly" => Cadence::Nightly,
-            "durability" | "perf" => Cadence::Merge,
+            "durability" | "perf" | "matrix_deep" => Cadence::Merge,
             _ => Cadence::Change,
         };
         assert_eq!(

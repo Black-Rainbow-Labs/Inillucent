@@ -36,8 +36,14 @@ impl Parser<'_> {
 
     /// The body of [`Parser::parse_select`], with the depth charge applied.
     fn parse_select_inner(&mut self) -> Result<SelectId, ParseError> {
-        let with = self.parse_with_prefix()?;
+        // The span starts before the `WITH`, because it is the whole query:
+        // `CREATE TABLE ... AS` fills the table by running the text this span
+        // covers, and a span that began after the prefix ran the query without
+        // its CTEs, so `CREATE TABLE x AS WITH c AS (...) SELECT a FROM c` was
+        // "no such table: c".
         let start = self.cursor();
+        let with = self.parse_with_prefix()?;
+        let mut last_is_values = self.at_keyword(Keyword::VALUES)?;
         let first = self.parse_select_core()?;
         let mut compounds = Vec::new();
         while let Some(op) = self.parse_compound_operator()? {
@@ -47,7 +53,20 @@ impl Parser<'_> {
                     Span::at(self.cursor()),
                 ));
             }
+            last_is_values = self.at_keyword(Keyword::VALUES)?;
             compounds.push((op, self.parse_select_core()?));
+        }
+        // **`ORDER BY` and `LIMIT` belong to a `SELECT`, never to a
+        // `VALUES`.** In SQLite's grammar they are the tail of a `SELECT`
+        // core, and the compound's last core carries them for the whole
+        // compound; a `VALUES` core has no tail. So when the last arm is a
+        // `VALUES`, one row or several, the `ORDER` or `LIMIT` after it is
+        // a syntax error there - `SELECT 1, 2 INTERSECT VALUES (1, 1), (2, 2)
+        // ORDER BY 1, 2` included - and it was accepted here.
+        if last_is_values
+            && (self.at_keyword(Keyword::ORDER)? || self.at_keyword(Keyword::LIMIT)?)
+        {
+            return Err(self.unexpected(&["the end of the statement"])?);
         }
         let order_by = if self.at_keyword(Keyword::ORDER)? {
             self.bump()?;

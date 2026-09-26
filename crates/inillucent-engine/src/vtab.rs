@@ -165,10 +165,10 @@ impl ImportedDatabase {
                 continue;
             }
             // `%` stands for the virtual table's own name, which is what makes
-            // one declaration serve every table the module ever creates.
-            let text = shadow
-                .create_sql
-                .replace('%', &String::from_utf8_lossy(name));
+            // one declaration serve every table the module ever creates. The
+            // name is written inside the quotes the declaration put around
+            // `%`, so a quote of that kind in the name is doubled.
+            let text = substitute_shadow_name(&shadow.create_sql, name);
             let shadow_name = shadow_table_name(name, &shadow.suffix);
             let root = self.define_table(&shadow_name, text.into_bytes())?;
             connect.shadows.push(ShadowRoot {
@@ -972,7 +972,10 @@ fn rechecks_of(
     let width = connected.table.declaration().columns.len();
     let mut rechecks: Vec<Recheck> = Vec::new();
     for (position, constraint) in offer.iter().enumerate() {
-        if promised(query, position) {
+        // A constraint that was not usable here reads a term the loop reaches
+        // later. The planner leaves it among the statement's filters, which
+        // test it where its value exists, so it is not tested here as well.
+        if promised(query, position) || !constraint.spec.usable {
             continue;
         }
         // A negative column is the rowid. It is not one of the module's
@@ -982,7 +985,11 @@ fn rechecks_of(
         // it, and `Collation::Binary` is what a rowid - always an integer -
         // compares under.
         let (column, collation) = match usize::try_from(constraint.spec.column) {
-            Ok(column) => (column, connected.table.collation(column)),
+            Ok(column) => (
+                column,
+                comparison_collation(&constraint.predicate)
+                    .unwrap_or_else(|| connected.table.collation(column)),
+            ),
             Err(_) => (width, inillucent_value::collation::Collation::Binary),
         };
         rechecks.push((
@@ -993,6 +1000,29 @@ fn rechecks_of(
         ));
     }
     Ok(rechecks)
+}
+
+/// Returns the collation a comparison predicate was bound with.
+///
+/// **The comparison's collation, not the column's.** The binder has already
+/// decided which collation `s.value = 'ABC' COLLATE NOCASE` compares under,
+/// by SQLite's rules, and wrote it on the node: the explicit `COLLATE` on the
+/// right wins over the column's own. Testing the recheck under the column's
+/// collation compared that as BINARY, so `json_each` counted one of `'abc'`,
+/// `'ABC'` and `'aBc'` where SQLite counts all three.
+///
+/// `None` for a predicate that is not a comparison, such as `LIKE`, which
+/// keeps the column's collation.
+///
+/// @param predicate - the whole predicate the constraint was taken from
+fn comparison_collation(
+    predicate: &inillucent_sql::bind::BoundExpr,
+) -> Option<inillucent_value::collation::Collation> {
+    match predicate {
+        inillucent_sql::bind::BoundExpr::Compare { collation, .. }
+        | inillucent_sql::bind::BoundExpr::Is { collation, .. } => Some(*collation),
+        _ => None,
+    }
 }
 
 /// One constraint the engine has to test for itself: which column, which
@@ -1141,12 +1171,17 @@ impl ImportedDatabase {
         let Some(pragma) = table.folded.strip_prefix(b"pragma_".as_slice()) else {
             return Ok(false);
         };
-        let hidden: Vec<usize> = table
+        // **The hidden columns are found by name.** A pragma that takes an
+        // argument has `arg` first; a setting such as `page_count` has only
+        // `schema`, which is SQLite's own layout for it, so taking the first
+        // hidden column to be the argument would read `pragma_page_count('aux')`
+        // as a page count of "aux".
+        let hidden: Vec<(usize, bool)> = table
             .columns
             .iter()
             .enumerate()
             .filter(|(_, column)| column.hidden)
-            .map(|(at, _)| at)
+            .map(|(at, column)| (at, column.folded == b"arg"))
             .collect();
         let mut argument = OwnedDatum::Null;
         let mut schema = OwnedDatum::Null;
@@ -1157,10 +1192,13 @@ impl ImportedDatabase {
             let Ok(column) = usize::try_from(constraint.spec.column) else {
                 continue;
             };
+            let Some((_, is_argument)) = hidden.iter().find(|(at, _)| *at == column) else {
+                continue;
+            };
             let value = inillucent_exec::physical::literal_value(&constraint.value, params)?;
-            if hidden.first() == Some(&column) {
+            if *is_argument {
                 argument = value;
-            } else if hidden.get(1) == Some(&column) {
+            } else {
                 schema = value;
             }
         }
@@ -1173,7 +1211,19 @@ impl ImportedDatabase {
                 pragma_argument_text(other),
             )),
         };
-        let Some(answer) = self.pragma_rows(pragma, spelled.as_ref())? else {
+        let at = match &schema {
+            OwnedDatum::Null => None,
+            named => {
+                let name = pragma_argument_text(named);
+                Some(self.schema_named(&name).ok_or_else(|| {
+                    inillucent_base::error::refusal(format!(
+                        "unknown database {}",
+                        String::from_utf8_lossy(&name)
+                    ))
+                })?)
+            }
+        };
+        let Some(answer) = self.pragma_function_answer(pragma, spelled.as_ref(), at)? else {
             return Ok(false);
         };
         let width = answer.names.len();
@@ -1184,16 +1234,21 @@ impl ImportedDatabase {
             while held.len() < width {
                 held.push(OwnedDatum::Null);
             }
-            held.push(argument.clone());
-            held.push(schema.clone());
+            for (_, is_argument) in &hidden {
+                held.push(if *is_argument {
+                    argument.clone()
+                } else {
+                    schema.clone()
+                });
+            }
             rows.push(held);
         }
-        // The two hidden columns *are* the arguments and were applied above;
+        // The hidden columns *are* the arguments and were applied above;
         // every other offered predicate was taken out of the residual on the
         // promise that something would test it, and this is the something.
         let applied: Vec<i32> = hidden
             .iter()
-            .filter_map(|at| i32::try_from(*at).ok())
+            .filter_map(|(at, _)| i32::try_from(*at).ok())
             .collect();
         self.emit_filtered(rows, offer, params, &applied, downstream)?;
         Ok(true)
@@ -1313,6 +1368,33 @@ fn shadow_names(arguments: &ModuleArguments) -> impl Iterator<Item = Vec<u8>> + 
         .iter()
         .filter(|shadow| !shadow.suffix.is_empty())
         .map(|shadow| shadow_table_name(&arguments.table, &shadow.suffix).to_ascii_lowercase())
+}
+
+/// Writes a virtual table's name into a shadow table's declaration.
+///
+/// Every `%` becomes the name. When the `%` sits just inside a quote, a quote of
+/// that kind in the name is doubled, so a table named `it's` gives FTS5's
+/// `CREATE TABLE 'it''s_data'(...)` rather than text that does not parse.
+///
+/// @param template - the declaration, with `%` for the name
+/// @param name - the virtual table's name
+fn substitute_shadow_name(template: &str, name: &[u8]) -> String {
+    let name = String::from_utf8_lossy(name);
+    let mut out = String::with_capacity(template.len().saturating_add(name.len()));
+    let mut previous = None;
+    for character in template.chars() {
+        if character == '%' {
+            match previous {
+                Some('\'') => out.push_str(&name.replace('\'', "''")),
+                Some('"') => out.push_str(&name.replace('"', "\"\"")),
+                _ => out.push_str(&name),
+            }
+        } else {
+            out.push(character);
+        }
+        previous = Some(character);
+    }
+    out
 }
 
 /// Returns the name one shadow table is created under.

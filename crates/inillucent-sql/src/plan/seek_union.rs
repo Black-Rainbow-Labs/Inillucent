@@ -39,6 +39,16 @@ pub(super) fn rowid_in_list_path(
     terms: &[BoundExpr],
     consumed: &mut [bool],
 ) -> Option<AccessPath> {
+    // **An outermost-term path only.** The physical pass drives an inner
+    // term by probing it once per outer row, and it has no join operator that
+    // drives a union of probes there: a union chosen for an inner term was
+    // refused as "a seek union as an inner join term", so `SELECT 1 FROM t0
+    // CROSS JOIN t1 WHERE t1.a IN (...)` failed where SQLite answers. Not
+    // choosing it leaves the `IN` unconsumed, and it is tested as a residual
+    // over the pair, which is the same rule the rowid range follows.
+    if position != 0 {
+        return None;
+    }
     for (index, term) in terms.iter().enumerate() {
         if consumed.get(index).copied().unwrap_or(false) {
             continue;
@@ -108,6 +118,12 @@ pub(super) fn in_list_union_path(
         levers,
         ..
     } = *context;
+    // **An outermost-term path only**, for the reason `rowid_in_list_path`
+    // gives: the physical pass has no join operator that drives a union from
+    // an inner loop, and choosing one there refused the statement.
+    if position != 0 {
+        return None;
+    }
     // Every leading key column pinned by an equality, in key order. The `IN`
     // is looked for on the column after them.
     let mut prefix: Vec<BoundExpr> = Vec::new();
@@ -118,7 +134,7 @@ pub(super) fn in_list_union_path(
     let mut columns: Vec<Option<u16>> = Vec::new();
     let mut at = 0usize;
     while let Some(key_column) = index.columns.get(at) {
-        let Some(column) = key_column.column else {
+        let Some(column) = key_column.plain_column() else {
             break;
         };
         let collation = collation_of(&key_column.collation);
@@ -148,7 +164,7 @@ pub(super) fn in_list_union_path(
     }
 
     let key_column = index.columns.get(at)?;
-    let column = key_column.column?;
+    let column = key_column.plain_column()?;
     let collation = collation_of(&key_column.collation);
     collations.push(collation);
     descending.push(key_column.descending);
@@ -292,7 +308,7 @@ pub(super) fn keyset_range_union_path(
         for key_column in index.columns.iter().take(depth) {
             collations.push(collation_of(&key_column.collation));
             descending.push(key_column.descending);
-            columns.push(key_column.column);
+            columns.push(key_column.plain_column());
         }
         let covering = levers
             .has(Levers::COVERING_INDEX)
@@ -435,7 +451,7 @@ fn keyset_branches(
         let mut unconverted = Vec::new();
         for (at, eq_term) in equality_terms.iter().enumerate() {
             let key_column = index.columns.get(at)?;
-            let column = key_column.column?;
+            let column = key_column.plain_column()?;
             let collation = collation_of(&key_column.collation);
             let (op, value) = indexable_comparison(id, column, eq_term)?;
             if op != BinaryOp::Equal
@@ -450,7 +466,7 @@ fn keyset_branches(
             equalities.push(value);
         }
         let key_column = index.columns.get(equality_terms.len())?;
-        let column = key_column.column?;
+        let column = key_column.plain_column()?;
         if key_column.descending {
             return None;
         }

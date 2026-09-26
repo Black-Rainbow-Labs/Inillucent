@@ -14,6 +14,7 @@
 
 mod cte;
 mod refusal;
+mod using;
 // The refusals live in `bind/refusal.rs` and are named here so every call
 // site reads as it did. See that file for why they moved.
 pub(crate) use refusal::{
@@ -24,7 +25,11 @@ pub(crate) use refusal::{
 mod aggregate;
 mod collation;
 mod having;
+mod json_subtype;
 mod literal;
+mod matching;
+mod order_alias;
+mod raise;
 mod rowvalue;
 mod scratch;
 
@@ -157,8 +162,15 @@ pub enum BoundExpr {
     Raise {
         /// Which action.
         action: crate::ast::RaiseAction,
-        /// The message, when the action takes one.
+        /// The message, when the action takes one and it is a string literal.
         message: Option<Vec<u8>>,
+        /// The message, when it is any other expression.
+        ///
+        /// Evaluated when the `RAISE` fires, and read as text: NULL is an empty
+        /// message and a number is its text, which is what SQLite reports. A
+        /// literal stays in `message`, so the bodies the binder synthesises for
+        /// foreign keys compile as they always have.
+        computed: Option<Box<BoundExpr>>,
         /// Whether the abort is a foreign key's rather than a trigger's.
         ///
         /// The two are the same expression and report different codes, and
@@ -585,7 +597,7 @@ impl BoundExpr {
             | BoundExpr::Text(_)
             | BoundExpr::Blob(_)
             | BoundExpr::Parameter(_)
-            | BoundExpr::Raise { .. }
+            | BoundExpr::Raise { computed: None, .. }
             | BoundExpr::Column { .. }
             | BoundExpr::Rowid { .. }
             | BoundExpr::WindowRef { .. }
@@ -595,7 +607,11 @@ impl BoundExpr {
             | BoundExpr::Not(operand)
             | BoundExpr::IsNull { operand, .. }
             | BoundExpr::Collate { operand, .. }
-            | BoundExpr::Cast { operand, .. } => vec![operand],
+            | BoundExpr::Cast { operand, .. }
+            | BoundExpr::Raise {
+                computed: Some(operand),
+                ..
+            } => vec![operand],
             BoundExpr::Arithmetic { left, right, .. }
             | BoundExpr::Compare { left, right, .. }
             | BoundExpr::Is { left, right, .. }
@@ -672,7 +688,7 @@ impl BoundExpr {
             | BoundExpr::Text(_)
             | BoundExpr::Blob(_)
             | BoundExpr::Parameter(_)
-            | BoundExpr::Raise { .. }
+            | BoundExpr::Raise { computed: None, .. }
             | BoundExpr::Column { .. }
             | BoundExpr::Rowid { .. }
             | BoundExpr::WindowRef { .. }
@@ -682,7 +698,11 @@ impl BoundExpr {
             | BoundExpr::Not(operand)
             | BoundExpr::IsNull { operand, .. }
             | BoundExpr::Collate { operand, .. }
-            | BoundExpr::Cast { operand, .. } => vec![operand],
+            | BoundExpr::Cast { operand, .. }
+            | BoundExpr::Raise {
+                computed: Some(operand),
+                ..
+            } => vec![operand],
             BoundExpr::Arithmetic { left, right, .. }
             | BoundExpr::Compare { left, right, .. }
             | BoundExpr::Is { left, right, .. }
@@ -858,7 +878,11 @@ impl BoundExpr {
             | BoundExpr::Not(operand)
             | BoundExpr::IsNull { operand, .. }
             | BoundExpr::Collate { operand, .. }
-            | BoundExpr::Cast { operand, .. } => operand.sources_used(into),
+            | BoundExpr::Cast { operand, .. }
+            | BoundExpr::Raise {
+                computed: Some(operand),
+                ..
+            } => operand.sources_used(into),
             BoundExpr::Arithmetic { left, right, .. }
             | BoundExpr::Compare { left, right, .. }
             | BoundExpr::Is { left, right, .. }
@@ -909,9 +933,27 @@ impl BoundExpr {
                     escape.sources_used(into);
                 }
             }
+            // **A JSON call and a registered function's call read their
+            // arguments' terms too.** Both were missing here, so `i.id =
+            // c.value ->> '$.id'` looked like it read no term: the planner put
+            // `i` first and sought it with a key that reads `c`, which had not
+            // been read yet, and the statement failed with "a seek key or range
+            // bound reads a column".
             BoundExpr::Function { arguments, .. }
             | BoundExpr::Math { arguments, .. }
-            | BoundExpr::Time { arguments, .. } => {
+            | BoundExpr::Time { arguments, .. }
+            | BoundExpr::Json { arguments, .. }
+            | BoundExpr::External { arguments, .. } => {
+                for argument in arguments {
+                    argument.sources_used(into);
+                }
+            }
+            BoundExpr::VirtualFunction {
+                source, arguments, ..
+            } => {
+                if !into.contains(source) {
+                    into.push(*source);
+                }
                 for argument in arguments {
                     argument.sources_used(into);
                 }
@@ -1890,7 +1932,10 @@ impl<'a> Binder<'a> {
         // it only reads, on every statement including the ones with no
         // `ORDER BY` at all.
         let order_by = match bound.compounds.is_empty() {
-            true => self.bind_order_by(&select.order_by, &bound.columns)?,
+            true => {
+                let aliases = self.order_aliases(select, &bound.columns);
+                self.bind_order_by(&select.order_by, &bound.columns, &aliases)?
+            }
             false => self.bind_compound_order_by(&select.order_by, &bound.columns)?,
         };
         bound.order_by = order_by;
@@ -2108,6 +2153,10 @@ impl<'a> Binder<'a> {
                 Some(existing) => BoundExpr::And(Box::new(existing), Box::new(constraint)),
                 None => constraint,
             });
+        }
+        // See `matching`: a `MATCH` the planner cannot offer to its module.
+        if let Some(filter) = bound_filter.as_mut() {
+            self.match_by_rowid(filter)?;
         }
         self.allow_aggregates = true;
         let bound_columns = self.bind_result_columns(columns)?;
@@ -2685,7 +2734,7 @@ impl<'a> Binder<'a> {
         for expr in &spec.partition_by {
             partition_by.push(self.bind_expr(*expr)?);
         }
-        let order_by = self.bind_order_by(&spec.order_by, &[])?;
+        let order_by = self.bind_order_by(&spec.order_by, &[], &[])?;
         // SQLite's defaults, and they are not the same clause: with an
         // `ORDER BY` the frame ends at the current row's peer group, and
         // without one it covers the whole partition. Using one default for both
@@ -2721,7 +2770,10 @@ impl<'a> Binder<'a> {
                 span,
             ));
         }
-        if unit != FrameUnit::Rows
+        // Only `RANGE` measures an offset in ordering values, so only `RANGE`
+        // needs a single ordering term. A `GROUPS` offset counts peer groups,
+        // which any number of terms defines, and SQLite accepts it with none.
+        if unit == FrameUnit::Range
             && matches!(
                 (&start, &end),
                 (BoundFrameBound::Preceding(_), _)
@@ -2830,163 +2882,6 @@ impl<'a> Binder<'a> {
         Ok(bound)
     }
 
-    /// Turns `ON`, `USING` and `NATURAL` into ordinary predicates.
-    ///
-    /// The output-column rules survive the rewrite: a `USING` or `NATURAL`
-    /// column is suppressed from the right-hand term's contribution to `*`,
-    /// which is the only visible difference between a `USING` join and the
-    /// equality predicate it means.
-    ///
-    /// The terms are addressed by their position in *this block's* FROM list,
-    /// which the scope turns into the statement-wide source id. A parenthesised
-    /// join has already flattened itself into the same list by the time this
-    /// runs, so a position is always a real term.
-    pub(crate) fn desugar_join_constraints(
-        &mut self,
-        terms: &[ast::FromTermId],
-    ) -> Result<(), ParseError> {
-        let base = self
-            .scope()
-            .len()
-            .saturating_sub(terms.iter().map(|_| 1usize).sum::<usize>());
-        for (offset, id) in terms.iter().enumerate() {
-            let Some(term) = self.ast.from_term(*id) else {
-                continue;
-            };
-            if matches!(term.source, FromSource::Join(_)) {
-                // Its own constraints were desugared when it was flattened.
-                continue;
-            }
-            let position = base.saturating_add(offset);
-            let constraint = term.constraint.clone();
-            let natural = term.natural;
-            let span = term.span;
-            if natural {
-                let names = self.natural_columns(position);
-                let predicate = self.equality_over(position, &names)?;
-                self.set_constraint(position, predicate);
-                continue;
-            }
-            match constraint {
-                JoinConstraint::None => {}
-                JoinConstraint::On(expr) => {
-                    let bound = self.bind_expr(expr)?;
-                    self.set_constraint(position, Some(bound));
-                }
-                JoinConstraint::Using(names) => {
-                    let folded: Vec<Vec<u8>> = names
-                        .iter()
-                        .map(|name| self.ast.folded(*name).to_vec())
-                        .collect();
-                    for name in &folded {
-                        if self.find_column_in(position, name).is_none() {
-                            return Err(no_such_column(name, span));
-                        }
-                    }
-                    let predicate = self.equality_over(position, &folded)?;
-                    if predicate.is_none() {
-                        return Err(unsupported("empty USING list", span));
-                    }
-                    self.set_constraint(position, predicate);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Stores a join constraint on a source of the current block.
-    fn set_constraint(&mut self, position: usize, constraint: Option<BoundExpr>) {
-        let Some(id) = self.scope_id(position) else {
-            return;
-        };
-        if let Some(source) = self.sources.get_mut(id) {
-            source.constraint = constraint;
-        }
-    }
-
-    /// Returns the column names a NATURAL join equates: every name the right
-    /// term shares with any term to its left in the same block.
-    fn natural_columns(&self, position: usize) -> Vec<Vec<u8>> {
-        let Some(right) = self.source_at(position) else {
-            return Vec::new();
-        };
-        let mut names = Vec::new();
-        for column in &right.table.columns {
-            if column.hidden {
-                continue;
-            }
-            let shared = (0..position).any(|earlier| {
-                self.source_at(earlier)
-                    .is_some_and(|left| left.table.column_position(&column.folded).is_some())
-            });
-            if shared {
-                names.push(column.folded.clone());
-            }
-        }
-        names
-    }
-
-    /// Returns one source of the current block by its position in the block.
-    fn source_at(&self, position: usize) -> Option<&BoundSource> {
-        let id = self.scope_id(position)?;
-        self.sources.get(id)
-    }
-
-    /// Builds `left.name = right.name AND ...` for a USING or NATURAL join,
-    /// and suppresses the right-hand columns from star expansion.
-    fn equality_over(
-        &mut self,
-        position: usize,
-        names: &[Vec<u8>],
-    ) -> Result<Option<BoundExpr>, ParseError> {
-        let mut predicate: Option<BoundExpr> = None;
-        for name in names {
-            let Some((left_source, left_column)) = self.find_column_left_of(position, name) else {
-                continue;
-            };
-            let Some((right_source, right_column)) = self.find_column_in(position, name) else {
-                continue;
-            };
-            if let Some(id) = self.scope_id(position) {
-                if let Some(source) = self.sources.get_mut(id) {
-                    source.suppressed.push(right_column);
-                }
-            }
-            let left = self.column_expr(left_source, left_column)?;
-            let right = self.column_expr(right_source, right_column)?;
-            let (affinity, collation) = comparison_rules(&left, &right);
-            let equality = BoundExpr::Compare {
-                op: BinaryOp::Equal,
-                left: Box::new(left),
-                right: Box::new(right),
-                affinity,
-                collation,
-            };
-            predicate = Some(match predicate {
-                Some(existing) => BoundExpr::And(Box::new(existing), Box::new(equality)),
-                None => equality,
-            });
-        }
-        Ok(predicate)
-    }
-
-    /// Finds a column by folded name in one source, returning its source id.
-    fn find_column_in(&self, position: usize, folded: &[u8]) -> Option<(usize, u16)> {
-        let id = self.scope_id(position)?;
-        let source = self.sources.get(id)?;
-        source.table.column_position(folded).map(|c| (id, c))
-    }
-
-    /// Finds a column by folded name in the sources before one.
-    fn find_column_left_of(&self, position: usize, folded: &[u8]) -> Option<(usize, u16)> {
-        for index in (0..position).rev() {
-            if let Some(found) = self.find_column_in(index, folded) {
-                return Some(found);
-            }
-        }
-        None
-    }
-
     /// Records that the statement depends on a database's schema cookie.
     fn record_dependency(&mut self, database: usize) {
         if self
@@ -3022,7 +2917,7 @@ impl<'a> Binder<'a> {
                     let expr = self.bind_expr(column.expr)?;
                     let name = match column.alias {
                         Some(alias) => self.ast.text(alias).to_vec(),
-                        None => self.default_column_name(column.expr, &expr),
+                        None => self.default_column_name(column.expr, &expr, column.span),
                     };
                     let (origin, declared_type) = self.column_origin(&expr);
                     bound.push(BoundResultColumn {
@@ -3214,6 +3109,7 @@ impl<'a> Binder<'a> {
             ));
         }
         let mut matched = false;
+        let scope_ids = scope.clone();
         for id in scope {
             let Some(source) = self.sources.get(id) else {
                 continue;
@@ -3231,7 +3127,9 @@ impl<'a> Binder<'a> {
             let synthetic = source.table.kind == TableKind::Subquery;
             for (index, column) in columns.iter().enumerate() {
                 let position_u16 = index as u16;
-                if column.hidden || suppressed.contains(&position_u16) {
+                // A `USING` column is left out of a bare `*` only. `r.*` names
+                // the term, and SQLite shows every column of it.
+                if column.hidden || (qualifier.is_none() && suppressed.contains(&position_u16)) {
                     continue;
                 }
                 if self.authorizer.authorize(AuthAction::Read {
@@ -3242,7 +3140,11 @@ impl<'a> Binder<'a> {
                 {
                     return Err(denied("not authorized", span));
                 }
-                let expr = self.column_expr(id, position_u16)?;
+                // `l.*` goes through the same rule as `*`: SQLite expands a
+                // column a later `USING` names as the bare name even when the
+                // star is qualified, so `l.*` over `l FULL JOIN r USING (a)`
+                // shows `coalesce(l.a, r.a)`.
+                let expr = self.star_using_column(&scope_ids, id, position_u16, span)?;
                 into.push(BoundResultColumn {
                     expr,
                     name: column.name.clone(),
@@ -3266,7 +3168,12 @@ impl<'a> Binder<'a> {
     /// A bare column reference is named after its declared name rather than
     /// the query's text - `rowid`/`oid`/`_rowid_` resolve to the column they
     /// alias and take its name too. Everything else keeps the source text.
-    fn default_column_name(&self, id: ExprId, bound: &BoundExpr) -> Vec<u8> {
+    ///
+    /// @param id - the expression as written
+    /// @param bound - the expression, bound
+    /// @param written - the result column's span, which ends where the next
+    ///   token starts
+    fn default_column_name(&self, id: ExprId, bound: &BoundExpr, written: Span) -> Vec<u8> {
         let name = match bound {
             BoundExpr::Column { source, column, .. } => self
                 .sources
@@ -3298,8 +3205,20 @@ impl<'a> Binder<'a> {
         // exactly as written - `SELECT 1 +  2` has a column called
         // `1 +  2`, spaces and all, because SQLite cuts the span rather
         // than re-rendering the expression.
-        let span = self.ast.expr_span(id);
-        span.slice(self.source).to_vec()
+        //
+        // **The span runs to where the next token starts**, so a comment
+        // between the expression and the comma, the `FROM` or the end of the
+        // statement is part of the name: `SELECT 1 -- trailing` has a column
+        // called `1 -- trailing`. Only the whitespace at the end is trimmed,
+        // which is what SQLite's `sqlite3DbSpanDup` does. The expression's
+        // own span stopped at its last token and left the comment out.
+        let start = self.ast.expr_span(id).start;
+        let text = Span::new(start as usize, written.end as usize).slice(self.source);
+        let kept = text
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())
+            .map_or(0, |last| last.saturating_add(1));
+        text.get(..kept).unwrap_or(text).to_vec()
     }
 
     /// Returns the origin triple and declared type of a bound column.
@@ -3383,10 +3302,16 @@ impl<'a> Binder<'a> {
     }
 
     /// Binds an `ORDER BY` list, resolving ordinals and result aliases.
+    ///
+    /// @param terms - the terms as written
+    /// @param columns - the result columns an ordinal or an alias names
+    /// @param aliases - the written aliases, which a bare identifier matches
+    ///   before a table column; see `bind::order_alias`
     fn bind_order_by(
         &mut self,
         terms: &[ast::OrderTerm],
         columns: &[BoundResultColumn],
+        aliases: &[(Vec<u8>, usize)],
     ) -> Result<Vec<BoundOrderTerm>, ParseError> {
         let mut bound = Vec::with_capacity(terms.len());
         for term in terms {
@@ -3401,7 +3326,13 @@ impl<'a> Binder<'a> {
                     };
                     column.expr.clone()
                 }
-                None => self.bind_expr(term.expr)?,
+                None => match self
+                    .ordered_by_alias(term.expr, aliases)
+                    .and_then(|at| columns.get(at))
+                {
+                    Some(column) => column.expr.clone(),
+                    None => self.bind_expr(term.expr)?,
+                },
             };
             let collation = expr.collation().unwrap_or(Collation::Binary);
             let nulls = term.nulls.unwrap_or(match term.order {
@@ -3552,6 +3483,16 @@ impl<'a> Binder<'a> {
                 negated.extend_from_slice(text);
                 return Ok(integer_literal(&negated));
             }
+            // A negated real literal is folded the same way, as SQLite's
+            // `codeReal` does. Unary minus on anything else is `0 - x`, and
+            // `0 - 0.0` is a positive zero, so without this `-0.0` would lose
+            // the sign SQLite keeps: `INSERT INTO t VALUES (-0.0)` into an ANY
+            // column of a STRICT table reads back `-0.0`.
+            if let Some(Expr::Literal(Literal::Float(text))) = self.ast.expr(operand) {
+                let parsed =
+                    inillucent_value::numeric::atof(text, inillucent_value::TextEncoding::Utf8);
+                return Ok(BoundExpr::Real(-parsed.value));
+            }
         }
         let operand = Box::new(self.bind_expr(operand)?);
         match op {
@@ -3671,6 +3612,9 @@ impl<'a> Binder<'a> {
                 low,
                 high,
             } => {
+                if let Some(parts) = self.row_value_parts(operand) {
+                    return self.bind_row_between(negated, &parts, low, high, span);
+                }
                 let operand = self.bind_expr(operand)?;
                 let low = self.bind_expr(low)?;
                 let high = self.bind_expr(high)?;
@@ -3741,6 +3685,11 @@ impl<'a> Binder<'a> {
                 left,
                 right,
             } => {
+                if let (Some(lefts), Some(rights)) =
+                    (self.row_value_parts(left), self.row_value_parts(right))
+                {
+                    return self.bind_row_is(negated != distinct_from, &lefts, &rights, span);
+                }
                 let left = self.bind_expr(left)?;
                 let right = self.bind_expr(right)?;
                 let (affinity, collation) = comparison_rules(&left, &right);
@@ -3766,6 +3715,9 @@ impl<'a> Binder<'a> {
                 branches,
                 otherwise,
             } => {
+                if let Some(parts) = operand.and_then(|operand| self.row_value_parts(operand)) {
+                    return self.bind_row_case(&parts, &branches, otherwise, span);
+                }
                 let bound_operand = match operand {
                     Some(expr) => Some(Box::new(self.bind_expr(expr)?)),
                     None => None,
@@ -3841,19 +3793,15 @@ impl<'a> Binder<'a> {
                     collation: Collation::Binary,
                 })
             }
-            Expr::RowValue(_) => Err(unsupported("row values", span)),
-            Expr::Raise { action, message } => {
-                // Outside a trigger body there is nothing for it to abandon, so
-                // SQLite refuses it there rather than treating it as a no-op.
-                if self.row_aliases.is_none() {
-                    return Err(unsupported("RAISE outside a trigger", span));
-                }
-                Ok(BoundExpr::Raise {
-                    action,
-                    message: message.clone(),
-                    foreign_key: false,
-                })
-            }
+            // **A row value anywhere else is SQLite's "row value misused"**, a
+            // refusal with code 1 about the statement. Every place SQLite
+            // takes a row value - a comparison, `IS`, `BETWEEN`, `IN`, a
+            // `CASE` operand and a `SET` list - is handled before this is
+            // reached, so what is left is a statement SQLite refuses too, and
+            // reporting it as a feature not built yet told a caller to wait
+            // for something that will never come.
+            Expr::RowValue(_) => Err(rowvalue::misused(span)),
+            Expr::Raise { action, message } => self.bind_raise(action, message, span),
         }
     }
 
@@ -4014,6 +3962,7 @@ impl<'a> Binder<'a> {
                 .get(level)
                 .map_or(Vec::new(), |scope| scope.clone());
             let mut found: Option<(usize, u16)> = None;
+            let mut coalesced: Vec<(usize, u16)> = Vec::new();
             let mut rowid_here: Option<usize> = None;
             for id in ids {
                 let Some(source) = self.sources.get(id) else {
@@ -4043,7 +3992,19 @@ impl<'a> Binder<'a> {
                     // `ambiguous column name: k`, and why four of the five join
                     // spellings failed on one message. A qualified `b.k` still
                     // reaches the right-hand copy, which is what SQLite does.
+                    //
+                    // **A `RIGHT` or `FULL` join is the exception.** Its left
+                    // copy is NULL on a row only the right side has, so SQLite
+                    // resolves the name to the right copy under `RIGHT` and to
+                    // `coalesce()` of every copy under `FULL`; see
+                    // `step_using_match`.
                     if table_folded.is_none() && source.suppressed.contains(&index) {
+                        using::step_using_match(
+                            source.join,
+                            (id, index),
+                            &mut found,
+                            &mut coalesced,
+                        );
                         continue;
                     }
                     if found.is_some() {
@@ -4056,6 +4017,9 @@ impl<'a> Binder<'a> {
                     rowid_here = Some(id);
                 }
             }
+            if coalesced.len() > 1 {
+                return self.coalesce_using_copies(&coalesced, span);
+            }
             if found.is_some() {
                 resolved = found;
                 break;
@@ -4066,30 +4030,7 @@ impl<'a> Binder<'a> {
             }
         }
         if let Some((source, index)) = resolved {
-            let (database_name, table_name, column_name) = {
-                let Some(bound) = self.sources.get(source) else {
-                    return Err(unsupported("unknown source", span));
-                };
-                let Some(info) = bound.table.column(index) else {
-                    return Err(unsupported("unknown column", span));
-                };
-                (
-                    self.catalog.database_name(bound.table.database).to_vec(),
-                    bound.table.name.clone(),
-                    info.name.clone(),
-                )
-            };
-            match self.authorizer.authorize(AuthAction::Read {
-                database: &database_name,
-                table: &table_name,
-                column: &column_name,
-            }) {
-                Authorization::Allow => {}
-                Authorization::Deny => return Err(denied("not authorized", span)),
-                Authorization::Ignore => return Ok(BoundExpr::Null),
-            }
-            self.note_correlation(source);
-            return self.column_expr(source, index);
+            return self.authorized_column(source, index, span);
         }
         if let Some(source) = rowid_of {
             self.note_correlation(source);
@@ -4147,6 +4088,46 @@ impl<'a> Binder<'a> {
                 ))
             }
         }
+    }
+
+    /// Returns a column reference the authorizer has been asked about.
+    ///
+    /// The authorizer may allow the read, refuse the statement, or ask for
+    /// the column to read as NULL, which is what `Ignore` means in SQLite.
+    ///
+    /// @param source - the source id the column belongs to
+    /// @param index - the column's position in that source
+    /// @param span - where the reference is, for an error
+    pub(super) fn authorized_column(
+        &mut self,
+        source: usize,
+        index: u16,
+        span: Span,
+    ) -> Result<BoundExpr, ParseError> {
+        let (database_name, table_name, column_name) = {
+            let Some(bound) = self.sources.get(source) else {
+                return Err(unsupported("unknown source", span));
+            };
+            let Some(info) = bound.table.column(index) else {
+                return Err(unsupported("unknown column", span));
+            };
+            (
+                self.catalog.database_name(bound.table.database).to_vec(),
+                bound.table.name.clone(),
+                info.name.clone(),
+            )
+        };
+        match self.authorizer.authorize(AuthAction::Read {
+            database: &database_name,
+            table: &table_name,
+            column: &column_name,
+        }) {
+            Authorization::Allow => {}
+            Authorization::Deny => return Err(denied("not authorized", span)),
+            Authorization::Ignore => return Ok(BoundExpr::Null),
+        }
+        self.note_correlation(source);
+        self.column_expr(source, index)
     }
 
     /// Binds a binary operator, choosing comparison or arithmetic semantics.
@@ -4476,47 +4457,19 @@ impl<'a> Binder<'a> {
             }
             let mut bound = Vec::with_capacity(list.len());
             for argument in &list {
-                bound.push(self.bind_expr(*argument)?);
+                let argument = self.bind_expr(*argument)?;
+                bound.push(self.marked_as_json(argument));
             }
             return Ok(BoundExpr::Json {
                 func,
                 arguments: bound,
             });
         }
-        // **`subtype` is answered where the producing function is known.**
-        // A subtype is not a property of a value here - `Value` has no slot
-        // for one - it is a property of the *call* that made it, which is
-        // exactly what the reference records at run time and what the binder
-        // can see. The one call whose answer depends on the data is
-        // `json_extract`, which carries the JSON subtype only when what it
-        // extracted was itself an array or an object; that one is left to run.
         if folded == b"subtype" && list.len() == 1 {
             let Some(argument) = list.first().copied() else {
                 return Err(wrong_arguments(&folded, span));
             };
-            let bound = self.bind_expr(argument)?;
-            // A JSON group aggregate carries the subtype too, and its function
-            // is in the binder's list rather than in the expression - so the
-            // slot is resolved here, where the list is.
-            if let BoundExpr::Aggregate { slot, .. } = &bound {
-                let carries = matches!(
-                    self.aggregates.get(*slot).map(|held| held.func),
-                    Some(
-                        function::AggregateFunc::JsonGroupArray
-                            | function::AggregateFunc::JsonGroupObject
-                    )
-                );
-                return Ok(BoundExpr::Integer(if carries { 74 } else { 0 }));
-            }
-            return Ok(match json_subtype(&bound) {
-                Subtyped::Always => BoundExpr::Integer(74),
-                Subtyped::Never => BoundExpr::Integer(0),
-                Subtyped::WhenShaped => BoundExpr::Function {
-                    func: function::ScalarFunc::Subtype,
-                    arguments: vec![bound],
-                    collation: Collation::Binary,
-                },
-            });
+            return self.bind_subtype(argument);
         }
         let Some(func) = function::lookup_scalar(&folded) else {
             return Err(no_such_function(&folded, span));
@@ -4673,52 +4626,4 @@ fn no_such_window(name: &[u8], span: Span) -> ParseError {
 /// Returns an authorizer refusal.
 fn denied(what: &'static str, span: Span) -> ParseError {
     ParseError::new(ParseErrorKind::Unsupported(what), span)
-}
-
-/// Whether a bound expression carries the JSON subtype.
-///
-/// SQLite marks a value with the subtype `74` - the letter `J` - when it was
-/// produced by a function that returns JSON *text*. The binary spellings do
-/// not carry it (a `jsonb_` result is a blob, and a blob read back out of a
-/// column has no subtype either), and the functions that answer a number or a
-/// type name are not JSON at all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Subtyped {
-    /// The call always marks its answer.
-    Always,
-    /// The call never does.
-    Never,
-    /// It depends on what came out: `json_extract` marks an array or an
-    /// object and does not mark the scalar it may equally have found.
-    WhenShaped,
-}
-
-/// Returns whether an expression's value carries the JSON subtype.
-///
-/// @param bound - the argument to `subtype`
-fn json_subtype(bound: &BoundExpr) -> Subtyped {
-    let BoundExpr::Json { func, .. } = bound else {
-        return Subtyped::Never;
-    };
-    use function::JsonFunc;
-    match func {
-        JsonFunc::Extract | JsonFunc::Arrow => Subtyped::WhenShaped,
-        JsonFunc::Jsonb
-        | JsonFunc::ArrayB
-        | JsonFunc::ExtractB
-        | JsonFunc::InsertB
-        | JsonFunc::ObjectB
-        | JsonFunc::PatchB
-        | JsonFunc::RemoveB
-        | JsonFunc::ReplaceB
-        | JsonFunc::SetB
-        | JsonFunc::ArrayInsertB
-        | JsonFunc::ArrowShift
-        | JsonFunc::ArrayLength
-        | JsonFunc::ErrorPosition
-        | JsonFunc::Type
-        | JsonFunc::Valid
-        | JsonFunc::Pretty => Subtyped::Never,
-        _ => Subtyped::Always,
-    }
 }

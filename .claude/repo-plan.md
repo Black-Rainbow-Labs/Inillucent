@@ -96,7 +96,7 @@ they are touching do not collide; two that have not, do.
   `needs oracle` and run nothing - which is most of what checks a parser or planner change against
   3.53.4. `inillucent-fullgate` refuses outright with "sqlite-bench is not built". Junction it in
   before you read any result:
-  `New-Item -ItemType Junction -Path <worktree>\.sqlite-ref -Target C:\jason\dev\inillucent\.sqlite-ref`.
+  `New-Item -ItemType Junction -Path <worktree>\.sqlite-ref -Target <main-checkout>\.sqlite-ref`.
   Remove the junction before you retire the worktree. (task-2039)
 - **There is one copy of that oracle and every worktree junctions to it, so a recursive delete of
   your own junction empties it for everybody.** `Remove-Item -Recurse` and `rm -rf` both follow a
@@ -349,7 +349,7 @@ they are touching do not collide; two that have not, do.
 - **`_agent_output/fixtures/` is missing from a worktree in the same way `.sqlite-ref/` is, and a
   junction handles both.** task-2041 recorded copying `small.db` across; a junction is one command
   and covers `medium.db` and `large.db` too:
-  `New-Item -ItemType Junction -Path <worktree>\_agent_output\fixtures -Target C:\jason\dev\inillucent\_agent_output\fixtures`.
+  `New-Item -ItemType Junction -Path <worktree>\_agent_output\fixtures -Target <main-checkout>\_agent_output\fixtures`.
   Remove both junctions before retiring the worktree. (task-2051)
 - **A position in the new declaration is not a position in the old one, and `DROP COLUMN` is where
   they part.** `rebuild_table_tree` filled each surviving column from `old_layout.slots[declared]`
@@ -527,7 +527,7 @@ they are touching do not collide; two that have not, do.
   `J:/build/nightly`: the scheduled task forces it to `origin/main` every night. (task-2125)
 - **Copy `.sqlite-ref/` into the worktree rather than junctioning it.** task-2048 records a
   recursive delete of a junction emptying the one shared copy for every worktree at once.
-  `Copy-Item -Recurse C:\jason\dev\inillucent\.sqlite-ref <worktree>\.sqlite-ref` costs about four
+  `Copy-Item -Recurse <main-checkout>\.sqlite-ref <worktree>\.sqlite-ref` costs about four
   seconds and 40 MB and cannot do that, and the directory goes when the worktree is retired.
   (task-2061)
 - **What `--strict` counts as a prerequisite failure on this box, in one place.** The list above is
@@ -574,7 +574,7 @@ they are touching do not collide; two that have not, do.
   green from the same binary a minute later; a whole sweep of deliberately built corpora passed in
   between. Start the run, then leave the tree alone until it is finished. (task-2067)
 - **Copy `.sqlite-ref/` into your worktree rather than junctioning it.** `cp -r
-  C:/jason/dev/inillucent/.sqlite-ref <worktree>/.sqlite-ref` costs 42 MB and about ten seconds, and
+  <main-checkout>/.sqlite-ref <worktree>/.sqlite-ref` costs 42 MB and about ten seconds, and
   retiring the worktree deletes it like any other file. A junction has to be removed with a command
   that does not follow it, and the entry above records the day somebody's `rm -rf` followed one and
   emptied the only copy for every worktree at once. The copy has no way to do that. (task-2067)
@@ -838,3 +838,26 @@ they are touching do not collide; two that have not, do.
   Cargo takes the patch and the other internal crates follow by path. Build with the MSVC environment
   imported. A first `sync` of the corpus embeds 3,696 chunks and took 11 minutes on the processor;
   keep the synced database and copy it for each variant rather than syncing again. (task-2130)
+
+## The SQL statement matrix (tiers `matrix` and `matrix_deep`)
+
+- A fix to the engine can make a `matrix` case start agreeing with SQLite. The group then fails
+  and names the `known.list` line to take off (`crates/inillucent-compat/tests/corpora/matrix/`).
+  Taking the line off is part of the fix, not somebody else's cleanup.
+- A change to a template in `statement_matrix/templates/` renames the generated cases it touches, and
+  `matrix::lists` then names the orphaned `known.list` lines. Rewrite them in the same change.
+  `inillucent-matrix origins <file of ids>` prints each id's axis values for triage.
+- `inillucent-testrun` caps each test process at 8 GiB and everything it starts at a quarter of the
+  machine's memory. `inillucent-matrix` caps itself at 8 GiB. A matrix run against an old engine
+  once reached 66 GB with the machine nearly out of memory, so do not run matrix code outside these.
+- The change tier takes about 57 s and the merge tier about 15 minutes on this machine, measured with
+  their times recorded in `tests/timings.toml`. A merge run holds most of the machine for that long.
+- **Two `inillucent-matrix` runs from one worktree share `_agent_output/matrix/run/t0..tN` and corrupt
+  each other.** A single case run beside a full run wiped `t0`'s fixtures, and 1,141 failure lines
+  said `no such table` for tables the cases had just created. Give every side run its own scratch
+  root with `INILLUCENT_MATRIX_ROOT=<folder>`, and copy the binary (`matrix-run.exe`) before a long
+  run so a rebuild does not fail on a locked executable. (task-2136)
+- **A known.list line that is not reported stale still differs; it is not proof the line is
+  right.** Three lanes removed lines whose own cases still disagreed for a different reason. To see
+  what a listed case differs on, run it from a `.slt` under a new case id (`case x-<id>`), which
+  the list does not hide. (task-2136)

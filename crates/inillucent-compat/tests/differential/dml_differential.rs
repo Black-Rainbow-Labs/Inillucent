@@ -465,6 +465,120 @@ fn trigger_raise_matches_sqlite() {
     assert!(compared == 0 || compared == 20, "compared {compared} steps");
 }
 
+/// `RAISE()` with a message that is an expression over the row.
+///
+/// SQLite takes any expression as the message and evaluates it when the `RAISE`
+/// fires, so a guard trigger can say which value broke the rule. This engine
+/// took a string literal only and refused `'too big: ' || NEW.n` as a syntax
+/// error at `CREATE TRIGGER`. The harness compares a `RAISE`'s message, so each
+/// failing step below is graded on the text SQLite reports as well as its code.
+#[test]
+fn trigger_raise_message_expressions_match_sqlite() {
+    let compared = compare(
+        "trigger-raise-expression",
+        &[
+            Step::Exec("CREATE TABLE o(id INTEGER PRIMARY KEY, n INTEGER, s TEXT)"),
+            Step::Exec("INSERT INTO o VALUES(1, 1, 'open')"),
+            Step::Exec(
+                "CREATE TRIGGER r1 BEFORE UPDATE ON o WHEN NEW.n > 10 BEGIN
+                   SELECT RAISE(ABORT, 'too big: ' || NEW.n);
+                 END",
+            ),
+            Step::Exec(
+                "CREATE TRIGGER r2 BEFORE UPDATE ON o WHEN NEW.n > 100 BEGIN
+                   SELECT RAISE(FAIL, printf('huge: %d', NEW.n));
+                 END",
+            ),
+            Step::Exec(
+                "CREATE TRIGGER r3 BEFORE UPDATE ON o WHEN NEW.s IN ('x', 'y', 'w') BEGIN
+                   SELECT RAISE(ABORT, CASE NEW.s WHEN 'x' THEN NULL WHEN 'y' THEN 42 ELSE 1.5 END);
+                 END",
+            ),
+            Step::Exec(
+                "CREATE TRIGGER r4 BEFORE UPDATE OF s ON o WHEN NEW.s = 'paid' AND OLD.s = 'open' BEGIN
+                   SELECT RAISE(ABORT, 'an order cannot move from ' || OLD.s || ' to ' || NEW.s);
+                 END",
+            ),
+            Step::Exec("UPDATE o SET n = 11"),
+            Step::Exec("UPDATE o SET n = 101"),
+            Step::Exec("UPDATE o SET s = 'x'"),
+            Step::Exec("UPDATE o SET s = 'y'"),
+            Step::Exec("UPDATE o SET s = 'w'"),
+            Step::Exec("UPDATE o SET s = 'paid'"),
+            Step::Exec("UPDATE o SET n = 5"),
+            Step::Query("SELECT id, n, s FROM o"),
+            // A message read from another table, through the body's own FROM.
+            Step::Exec("CREATE TABLE item(id INTEGER PRIMARY KEY, name TEXT, stock INTEGER)"),
+            Step::Exec("CREATE TABLE line(id INTEGER PRIMARY KEY, item_id INTEGER, qty INTEGER)"),
+            Step::Exec("INSERT INTO item VALUES(1, 'beans', 3)"),
+            Step::Exec(
+                "CREATE TRIGGER stock BEFORE INSERT ON line BEGIN
+                   SELECT RAISE(ABORT, 'not enough ' || i.name || ': have ' || i.stock || ', need ' || NEW.qty)
+                   FROM item i WHERE i.id = NEW.item_id AND i.stock < NEW.qty;
+                 END",
+            ),
+            Step::Exec("INSERT INTO line(item_id, qty) VALUES(1, 2)"),
+            Step::Exec("INSERT INTO line(item_id, qty) VALUES(1, 5)"),
+            // And one from a scalar subquery, and one inside a CASE.
+            Step::Exec(
+                "CREATE TRIGGER keep BEFORE DELETE ON item BEGIN
+                   SELECT RAISE(FAIL, (SELECT 'item ' || OLD.id || ' has ' || count(*) || ' lines' FROM line WHERE item_id = OLD.id));
+                 END",
+            ),
+            Step::Exec("DELETE FROM item"),
+            Step::Exec(
+                "CREATE TRIGGER floor AFTER UPDATE ON item BEGIN
+                   SELECT CASE WHEN NEW.stock < 0 THEN RAISE(ROLLBACK, format('%s went to %d', NEW.name, NEW.stock)) END;
+                 END",
+            ),
+            Step::Exec("UPDATE item SET stock = stock - 10"),
+            Step::Query("SELECT id, name, stock FROM item"),
+            Step::Query("SELECT item_id, qty FROM line"),
+        ],
+    );
+    assert!(compared == 0 || compared == 26, "compared {compared} steps");
+}
+
+/// `UPDATE ... FROM` changes and returns each target row once.
+///
+/// Two ways it went wrong: a derived table in `FROM` was joined a second time
+/// through its own inner table, so `RETURNING` listed every row twice; and a
+/// target row that two rows of the join matched was changed once per match,
+/// counted in `changes()` once per match and returned once per match. SQLite
+/// changes it once and uses one match's values. The harness compares the
+/// counters after every step as well as the rows.
+#[test]
+fn update_from_changes_each_row_once() {
+    let compared = compare(
+        "update-from-once",
+        &[
+            Step::Exec("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)"),
+            Step::Exec("INSERT INTO t VALUES(1, 10), (2, 20), (3, 30)"),
+            Step::Exec("CREATE TABLE u(id INTEGER, w INTEGER)"),
+            Step::Exec("INSERT INTO u VALUES(1, 1), (2, 2)"),
+            Step::Query("UPDATE t SET v = v + u.w FROM u WHERE u.id = t.id RETURNING t.id, t.v"),
+            Step::Query(
+                "UPDATE t SET v = v + p.w FROM (SELECT id, sum(w) AS w FROM u GROUP BY id) AS p
+                 WHERE p.id = t.id RETURNING t.id, t.v",
+            ),
+            Step::Query("SELECT changes()"),
+            Step::Exec("INSERT INTO u VALUES(2, 5)"),
+            Step::Query(
+                "UPDATE t SET v = v + u.w FROM u WHERE u.id = t.id AND t.id = 2 RETURNING t.id",
+            ),
+            Step::Query("SELECT changes()"),
+            Step::Exec("UPDATE t SET v = 0 FROM u WHERE u.id = t.id"),
+            Step::Query("SELECT changes()"),
+            Step::Query(
+                "UPDATE t SET v = v + 1 FROM (SELECT id FROM u WHERE w > 1) AS p
+                 WHERE p.id = t.id RETURNING t.id, v",
+            ),
+            Step::Query("SELECT id, v FROM t ORDER BY id"),
+        ],
+    );
+    assert!(compared == 0 || compared == 14, "compared {compared} steps");
+}
+
 /// A trigger whose body writes a table that has triggers of its own.
 ///
 /// With SQLite's default `recursive_triggers = off` a trigger already on the

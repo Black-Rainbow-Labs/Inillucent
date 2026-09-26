@@ -1,0 +1,31 @@
+# The matrix cases that disagree with the pinned SQLite 3.53.4 because of a
+# defect that is not fixed yet.
+#
+# One per line: the case id, a tab, the bug's number in the description of
+# task-2136 ("Inillucent Test Suite Bugs Found"), a tab, and one sentence.
+#
+# A listed case that still disagrees passes. A listed case that now agrees at
+# every arm it ran at fails, with a message saying to take its line off: a fix
+# cannot land without this list shrinking. A listed id that no case has fails
+# `matrix::lists`. Differences that are not defects are rules in
+# deliberate.toml, not lines here.
+#
+# A defect that shows only at some arms writes them after the number:
+# `65@small-pool,sqlite-page`. The line is then stale only when the case agrees
+# at one of those arms, so a cadence that runs the case only at the default arm
+# does not call it fixed.
+
+
+# Generated cases, grouped by bug. Written from the triage of an inillucent-matrix run;
+# each line's case fails in the way its bug's section on task-2136 describes.
+
+# The retained corpus: the smallest case for each bug (retained/bugs.slt).
+retained-bug-65-wide-table-small-page	65@small-pool,sqlite-page	The smallest case for bug 65.
+function-2c26c5b0e1a2	70	An INSERT ... SELECT whose query fails part way leaves last_insert_rowid() unchanged; SQLite reads the last row it wrote before the failure.
+probe-lim.columns	65@small-pool,sqlite-page	CREATE TABLE with 2,000 columns fails at a 4,096 byte page and with the small buffer pool.
+function-1dafb9cd4199	70	An INSERT ... SELECT whose query fails part way leaves last_insert_rowid() unchanged; SQLite reads the last row it wrote before the failure.
+
+vtab-5835c39738da	33	SQLite refuses this UPDATE ... FROM, whose derived table has a MATCH under OR (the deliberate rule match-under-or-in-a-joined-derived-table), so the rows read afterwards differ.
+vtab-743db933170b	33	SQLite refuses this UPDATE ... FROM, whose derived table has a MATCH under OR (the deliberate rule match-under-or-in-a-joined-derived-table), so the rows read afterwards differ.
+vtab-88f783eb2300	33	SQLite refuses this UPDATE ... FROM, whose derived table has a MATCH under OR (the deliberate rule match-under-or-in-a-joined-derived-table), so the rows read afterwards differ.
+vtab-d7ae003224c1	33	SQLite refuses this UPDATE ... FROM, whose derived table has a MATCH under OR (the deliberate rule match-under-or-in-a-joined-derived-table), so the rows read afterwards differ.

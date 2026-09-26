@@ -232,6 +232,10 @@ pub enum Expr {
         code: i32,
         /// The message the caller sees.
         message: Vec<u8>,
+        /// The expression the message is computed from, when it was not a
+        /// string literal. Evaluated when the node fires, in place of
+        /// `message`.
+        computed: Option<Box<Expr>>,
         /// How much of what has been written the action undoes.
         ///
         /// The whole of the difference between `RAISE(ABORT)`, `RAISE(FAIL)`
@@ -532,12 +536,9 @@ pub fn compile(expr: &Expr, types: &[StaticType]) -> DbResult<Box<dyn Eval>> {
         Expr::Raise {
             code,
             message,
+            computed,
             unwind,
-        } => Box::new(Raise {
-            code: *code,
-            message: String::from_utf8_lossy(message).into_owned(),
-            unwind: *unwind,
-        }),
+        } => compile_raise(*code, message, computed.as_deref(), *unwind, types)?,
         Expr::CompareWith {
             op,
             affinity,
@@ -836,6 +837,31 @@ fn in_list(
 fn compile_all(exprs: &[Expr], types: &[StaticType]) -> DbResult<Vec<Box<dyn Eval>>> {
     exprs.iter().map(|expr| compile(expr, types)).collect()
 }
+/// Compiles `RAISE(...)`.
+///
+/// @param code - the extended result code it reports
+/// @param message - the message, when it was a string literal
+/// @param computed - the message expression, when it was anything else
+/// @param unwind - how much of what has been written the action undoes
+/// @param types - the static type of each input column
+fn compile_raise(
+    code: i32,
+    message: &[u8],
+    computed: Option<&Expr>,
+    unwind: Unwind,
+    types: &[StaticType],
+) -> DbResult<Box<dyn Eval>> {
+    Ok(Box::new(Raise {
+        code,
+        message: String::from_utf8_lossy(message).into_owned(),
+        computed: match computed {
+            Some(expr) => Some(compile(expr, types)?),
+            None => None,
+        },
+        unwind,
+    }))
+}
+
 /// Returns what the compiler can prove about an expression's type.
 ///
 /// @param expr - the expression to inspect

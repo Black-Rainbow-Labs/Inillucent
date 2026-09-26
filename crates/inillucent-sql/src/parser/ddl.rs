@@ -184,9 +184,15 @@ impl Parser<'_> {
         let mut constraints = Vec::new();
         loop {
             let named = self.parse_constraint_name()?;
+            // **A name with no constraint after it is legal.** SQLite's
+            // grammar has `ccons ::= CONSTRAINT nm` as a constraint of its own,
+            // which only names whatever constraint comes next, so
+            // `CREATE TABLE t (a CONSTRAINT c)` is accepted and
+            // `CREATE TABLE t (a CONSTRAINT c foo)` fails at `foo`, which the
+            // caller reports when it finds neither a comma nor a parenthesis.
             let Some(constraint) = self.parse_column_constraint()? else {
                 if named.is_some() {
-                    return Err(self.unexpected(&["a column constraint"])?);
+                    continue;
                 }
                 break;
             };
@@ -622,7 +628,10 @@ impl Parser<'_> {
             TriggerEvent::Update(columns)
         };
         self.expect_keyword(Keyword::ON)?;
-        let table = self.parse_name()?;
+        // `ON main.t` is SQLite's grammar too: a temporary trigger may name a
+        // table in any database, and a trigger in a named database may repeat
+        // that database's name.
+        let (table_database, table) = self.parse_qualified_name()?;
         let for_each_row = if self.eat_keyword(Keyword::FOR)? {
             self.expect_keyword(Keyword::EACH)?;
             self.expect_keyword(Keyword::ROW)?;
@@ -660,6 +669,7 @@ impl Parser<'_> {
             time,
             event,
             table,
+            table_database,
             for_each_row,
             when,
             body,

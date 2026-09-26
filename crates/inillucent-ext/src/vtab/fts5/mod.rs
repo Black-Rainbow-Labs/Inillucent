@@ -192,7 +192,7 @@ impl Module for Fts5Module {
     /// The five shadow tables the index lives in.
     fn shadow_tables(&self, arguments: &ModuleArguments) -> DbResult<Vec<ShadowTable>> {
         let options = parse_options(&arguments.arguments)?;
-        let mut content = String::from("CREATE TABLE \"%_content\"(id INTEGER PRIMARY KEY");
+        let mut content = String::from("CREATE TABLE '%_content'(id INTEGER PRIMARY KEY");
         // The suffix an external table's rows are reached under is empty,
         // because the name is the owner's own rather than one derived from it.
         for index in 0..options.columns.len() {
@@ -202,8 +202,7 @@ impl Module for Fts5Module {
         Ok(vec![
             ShadowTable {
                 suffix: b"data".to_vec(),
-                create_sql: "CREATE TABLE \"%_data\"(id INTEGER PRIMARY KEY, block BLOB)"
-                    .to_string(),
+                create_sql: "CREATE TABLE '%_data'(id INTEGER PRIMARY KEY, block BLOB)".to_string(),
                 owner: None,
             },
             ShadowTable {
@@ -212,10 +211,9 @@ impl Module for Fts5Module {
                 // number from a file an older build wrote just as readily as
                 // the blob doclist this build writes - see the module's own
                 // doc comment for why the two coexist.
-                create_sql:
-                    "CREATE TABLE \"%_idx\"(segid, term, doclist, PRIMARY KEY(segid, term)) \
+                create_sql: "CREATE TABLE '%_idx'(segid, term, doclist, PRIMARY KEY(segid, term)) \
                      WITHOUT ROWID"
-                        .to_string(),
+                    .to_string(),
                 owner: None,
             },
             // **Named rather than made** for an external content table: the
@@ -238,13 +236,12 @@ impl Module for Fts5Module {
             },
             ShadowTable {
                 suffix: b"docsize".to_vec(),
-                create_sql: "CREATE TABLE \"%_docsize\"(id INTEGER PRIMARY KEY, sz BLOB)"
-                    .to_string(),
+                create_sql: "CREATE TABLE '%_docsize'(id INTEGER PRIMARY KEY, sz BLOB)".to_string(),
                 owner: None,
             },
             ShadowTable {
                 suffix: b"config".to_vec(),
-                create_sql: "CREATE TABLE \"%_config\"(k PRIMARY KEY, v) WITHOUT ROWID".to_string(),
+                create_sql: "CREATE TABLE '%_config'(k PRIMARY KEY, v) WITHOUT ROWID".to_string(),
                 owner: None,
             },
         ]
@@ -342,6 +339,14 @@ const PLAN_ROWID: i32 = 1;
 const PLAN_MATCH: i32 = 2;
 /// The plan bit that says the rows come back ranked.
 const PLAN_RANKED: i32 = 4;
+/// Where a plan keeps the column a `MATCH` was written on, plus one.
+///
+/// **`body MATCH 'ships'` searches one column**, as SQLite's FTS5 does: it
+/// means `{body} : (ships)`. Only the table's own hidden column was accepted,
+/// so a match written on an indexed column was declined, and the engine,
+/// which cannot evaluate `MATCH` itself, refused the statement. The column
+/// travels in the plan number above the three plan bits.
+const PLAN_COLUMN_SHIFT: u32 = 8;
 
 /// One connected FTS5 table.
 struct Fts5Table {
@@ -525,6 +530,14 @@ impl VirtualTable for Fts5Table {
             if constraint.op == ConstraintOp::Match && constraint.column == self.match_column() {
                 query.use_constraint(index, true);
                 plan = PLAN_MATCH;
+                break;
+            }
+            // A match on one indexed column; see `PLAN_COLUMN_SHIFT`.
+            if constraint.op == ConstraintOp::Match
+                && (0..self.match_column()).contains(&constraint.column)
+            {
+                query.use_constraint(index, true);
+                plan = PLAN_MATCH | (constraint.column.saturating_add(1) << PLAN_COLUMN_SHIFT);
                 break;
             }
             // **`docid` is the rowid**, so a predicate on it is a rowid
