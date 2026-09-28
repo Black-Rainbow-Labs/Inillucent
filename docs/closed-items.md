@@ -30,7 +30,7 @@ it, with its date. The current numbers are in [Performance](performance.md) and
 | Item | How it closed | The number that closed it | Date |
 |---|---|---|---|
 | [A macOS archive](#a-macos-archive) | built, signed and notarised on the Windows machine | every release since 0.1.7 ships macOS binaries | 2026-09-19 |
-| [Memory](#memory) | settled at its current level | 40.76 MiB against SQLite's 37.22, 9.5% more | 2026-09-23 |
+| [Memory](#memory) | settled at its current level | 40.76 MiB against SQLite's 37.22, 9.5% more. 41.48 against 37.21 on 2026-09-26 | 2026-09-23 |
 | [`write.insert.batch`](#writeinsertbatch-is-faster-than-sqlite) | a new delta area and a compaction splice | 1.47x, 7.0 µs a row against 10.2 | 2026-09-23 |
 | [Four performance designs](#what-the-performance-designs-closed) | built and measured | weighted 3.55x before, 4.53x after | 2026-09-20 |
 | [Two family bars](#two-family-bars-the-workloads-cannot-reach) | settled: a decision about the contract | `open.prepare` needs `SELECT 1` in 83 ns | 2026-09-23 |
@@ -74,6 +74,10 @@ first `.pkg`. `AGENTS.md` says how a release is run.
 SQLite's 37.22, which is 9.5% more**. Both ran on the same 128 MiB buffer pool budget. In the same
 run inillucent was 397% faster and used 50% less processor time.
 
+**Measured again on 2026-09-26** at release 1.0.32: 41.48 MiB against 37.21, 11.5% more, the median
+of the two middle runs of four. `schema.index` still sets the peak. The write workloads now raise it
+by 4.82 MiB before `schema.index` runs. [Memory](performance.md#memory) has the table.
+
 **How it came down.** The gap was 102%, then 43%, then 14%, then 9.5%.
 
 | Step | What changed |
@@ -100,7 +104,7 @@ Closed by decision. The memory figure stays where it is.
 inserts 2,000 rows in one transaction into a table with two secondary indexes. It read about 0.60x.
 
 **Result on 2026-09-23.** **1.47x, 7.0 µs a row against SQLite's 10.2.** The `write` family went from
-2.12x on 2026-09-20 to 3.04x. [Performance](performance.md#what-moved-since-2026-09-20) has the run.
+2.12x on 2026-09-20 to 3.04x. [Performance](performance.md#what-moved-since-2026-09-23) has the run.
 
 **What was done.** Two changes to the leaf page:
 
@@ -275,7 +279,7 @@ The two systems then ran at the same speed. SQLite's time is what changes betwee
 Windows charges more than Linux for the calls SQLite makes to the operating system on each statement.
 
 **Status.** Settled. Nothing since the allocator change has been measured on Linux, so the Linux
-figure is older than the Windows figure of 397%. A new measurement needs a Linux machine that is not
+figure is older than the Windows figure of 419%. A new measurement needs a Linux machine that is not
 also running the Windows arm. [Linux](performance.md#linux) has the details.
 
 ## Threads

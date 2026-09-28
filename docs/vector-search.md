@@ -5,7 +5,7 @@ tables. A search index and the table it covers commit and roll back together. Th
 to load and no second server to run.
 
 This page shows how to store vectors, how to search them, how to add keyword search, and how to
-combine the two. Every example on this page was run against inillucent 1.0.29, and the output shown
+combine the two. Every example on this page was run against inillucent 1.0.32, and the output shown
 is what that build printed.
 
 ## Terms used on this page
@@ -378,9 +378,9 @@ INSERT INTO docs (rowid, title, body, region, vector)
 SELECT id, title, body, region, v FROM page;
 ```
 
-The query is read in full before the first row is written. Release 1.0.29 refuses this statement
-with the status `unsupported`. [Embeddings](embeddings.md) shows the same statement with
-`embed(TEXT)` computing the vectors.
+The query is read in full before the first row is written. Release 1.0.29 refused this statement
+with the status `unsupported`. Release 1.0.30 fixed it. [Embeddings](embeddings.md) shows the same
+statement with `embed(TEXT)` computing the vectors.
 
 Keyword only:
 
@@ -607,7 +607,7 @@ hit of 4 of the 20 answerable questions was found by keywords alone, and their c
 to 0.1017. The three questions on other subjects scored 0.009 to 0.060, so no threshold separated the
 two groups.
 
-Check `origin(docs)` before you trust a low `confidence`. When the top hit's origin is `keyword`,
+Check `origin(docs)` before you trust a low `confidence`. When the top hit's origin is `lexical`,
 the number says little about whether the table can answer. Two things worked on that corpus:
 
 - a fixed `vector_weight = 0.5`, which put a hit found by both lists first for every answerable
@@ -676,10 +676,10 @@ inillucent --db app.rdb vector-search passage --column v --vector '[1, 0, 0]' --
 ```
 
 ```
-id  id  body         v                                    distance
---  --  -----------  -----------------------------------  --------------------
-1   1   red apple    {"blob":"0000803f0000000000000000"}  0.0
-2   2   green apple  {"blob":"6666663fcdcccc3d00000000"}  0.006116265828075562
+id  body         v                                             distance
+--  -----------  --------------------------------------------  --------------------
+1   red apple    [1.0,0.0,0.0]                                 0.0
+2   green apple  [0.8999999761581421,0.10000000149011612,0.0]  0.006116265828075562
 ```
 
 | Parameter | `search` | `vector-search` |
@@ -742,6 +742,8 @@ VACUUM;
 
 ## Where to go next
 
+- [Search explained from the start](search-explained.md): keyword search, search by meaning and
+  hybrid search for a reader who has never built a search
 - [Embeddings](embeddings.md): produce the vectors inside inillucent with `embed()`
 - [Retrieval quality](retrieval-quality.md): the graded comparison with PostgreSQL and pgvector
 - [Where the vectors live](vector-residency.md): vectors held in memory or read from the file

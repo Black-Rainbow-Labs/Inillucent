@@ -141,6 +141,7 @@ If a word on another page is not here and should be, add it.
 |---|---|
 | both engines in one diagram | [Architecture in one page](architecture-overview.md) |
 | how the SQL engine works | [Relational architecture](relational-architecture.md) |
+| search explained from the start, with examples | [Search explained](search-explained.md) |
 | how the search engine works | [Architecture](architecture.md) |
 | which SQL runs | [SQL support](sql.md) |
 | every pragma | [Pragmas](pragmas.md) |

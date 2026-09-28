@@ -68,21 +68,21 @@ inillucent replaces all three with one library.
 | `DELETE ... LIMIT` and `UPDATE ... LIMIT`, which the pinned SQLite build refuses and inillucent runs | 2 |
 
 No case is refused. The storage engine is where inillucent differs from SQLite, and at 100,000 rows
-inillucent is 397% faster than SQLite 3.53.4.
+inillucent is 419% faster than SQLite 3.53.4.
 
 ## The measurements
 
 Each number below comes from the page linked beside it. The SQLite numbers are from the run on
-2026-09-23 at 100,000 rows: four runs of 30 paired rounds, both engines on the same performance
+2026-09-26 at 100,000 rows: four runs of 30 paired rounds, both engines on the same performance
 cores. Each workload's answer is hashed and compared with SQLite's before its time counts. The
 pgvector numbers are from the graded run on 2026-09-20 over 185,078 passages at 768 dimensions,
 with both engines reading the same vectors.
 
 | Result | Detail | Source |
 |---|---|---|
-| **397% faster than SQLite 3.53.4** | 4.97x, weighted over ten workload families | [Performance](performance.md) |
-| **49% less processor time** | 555 ms against 1,082 ms for one round of the same plan | [Performance](performance.md) |
-| **9.5% more memory** | 40.76 MiB against 37.22 MiB peak, with the same 128 MiB cache. SQLite wins this one | [Performance](performance.md#memory) |
+| **419% faster than SQLite 3.53.4** | 5.19x, weighted over ten workload families | [Performance](performance.md) |
+| **67% less processor time** | 344 ms against 1,043 ms for one round of the same plan | [Performance](performance.md) |
+| **11.5% more memory** | 41.48 MiB against 37.21 MiB peak, with the same 128 MiB cache. SQLite uses less | [Performance](performance.md#memory) |
 | **A file 3.6% larger** | 17,432,576 bytes against 16,830,464 bytes for the same imported data | [Performance](performance.md#disk) |
 | **402 of 416 SQL cases give SQLite's exact answer** | each case runs through both shells on a new database, and the output bytes are compared | [Feature comparison](feature-comparison.md) |
 | **Better than pgvector on 15 of 17 graded comparisons** | equivalent on 1, inconclusive on 1, worse on none | [Retrieval quality](retrieval-quality.md) |

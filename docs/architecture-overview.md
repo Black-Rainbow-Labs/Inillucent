@@ -126,9 +126,9 @@ list and the vector list are combined into one ranking.
 `inillucent explain` prints the plan the engine chose for the same query:
 
 ```text
-SCAN n
-SEARCH a USING INTEGER PRIMARY KEY (rowid=?)
 SCAN s VIRTUAL TABLE INDEX
+SEARCH n USING INTEGER PRIMARY KEY (rowid=?)
+SEARCH a USING INTEGER PRIMARY KEY (rowid=?)
 USE TEMP B-TREE FOR ORDER BY
 ```
 
@@ -154,10 +154,11 @@ flowchart TB
    which column, which type. A missing table or column fails here. The error names the column, for
    example `no such column: x`.
 3. **Plan.** The planner chooses how to read each table and the order to join them in. In this query
-   it reads `note` in the outer loop (`SCAN n`). It finds each note's author by primary key
-   (`SEARCH a USING INTEGER PRIMARY KEY`). It hands the constraints on `note_search` to the search
-   module (`SCAN s VIRTUAL TABLE INDEX`). It sorts the result by `rank` at the end
-   (`USE TEMP B-TREE FOR ORDER BY`).
+   it hands the constraints on `note_search` to the search module first
+   (`SCAN s VIRTUAL TABLE INDEX`), because that search already narrows the result to `k` rows. It
+   finds each hit's note by primary key (`SEARCH n USING INTEGER PRIMARY KEY`), then each note's
+   author by primary key (`SEARCH a USING INTEGER PRIMARY KEY`). It sorts the result by `rank` at the
+   end (`USE TEMP B-TREE FOR ORDER BY`).
 4. **Execute.** The executor runs the plan a batch of rows at a time. A batch reads values directly
    from the [pinned](glossary.md#storage) page in the buffer pool. Values are copied only when an
    operator has to keep them, such as a sort, a hash join or an aggregate.

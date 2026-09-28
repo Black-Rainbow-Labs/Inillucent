@@ -8,7 +8,7 @@ A fixture lives here so that no single crate owns it.
 
 | Document | What it covers |
 |---|---|
-| [`inillucent-testing-tdd.md`](inillucent-testing-tdd.md) | the testing standard: where a new test goes, its six rules, and how the parallel runner works |
+| [`inillucent-testing-tdd.md`](inillucent-testing-tdd.md) | the testing standard: where a new test goes, its seven rules, and how the parallel runner works |
 | [`synthetic-corpus.md`](synthetic-corpus.md) | how to build the public corpus that every retrieval measurement uses, from download to graded run |
 | `inillucent-e2e-scenarios-tdd.md` | the design for the end to end scenarios and the harness that runs them |
 
@@ -62,3 +62,14 @@ target/debug/inillucent-testrun --changed        # the targets your uncommitted 
 target/debug/inillucent-testrun --list-tiers     # the tiers in selection.toml
 target/debug/inillucent-testrun --strict         # fail when a prerequisite is missing
 ```
+
+## Continuous integration and the nightly
+
+`.github/workflows/tests.yml` runs the merge cadence, on Windows and on Linux, on every push and
+every pull request. A pull request runs `--changed` against its base branch, widened to the merge
+tiers; a push runs every tier but `nightly`.
+
+The nightly cadence runs on two schedules. `.github/workflows/nightly.yml` runs it once a day on a
+Linux runner and uploads its summary as a workflow artifact. `packaging/nightly.ps1` runs it a
+second time, once a night on the Windows development machine, and also builds that night's release,
+runs the performance gates, and appends a row per target to `nightly-history.tsv`.

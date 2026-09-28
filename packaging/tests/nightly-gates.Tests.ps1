@@ -110,7 +110,7 @@ Describe 'Resolve-GateOutcome' {
 Describe 'Read-KnownGateMisses' {
     It 'reads the checked in list without its comments' {
         $path = Join-Path (Split-Path -Parent (Split-Path -Parent $here)) 'compat/perf/known-misses.txt'
-        (Read-KnownGateMisses -Path $path) -join '|' | Should Be 'open.prepare|schema|peak resident set|processor time'
+        (Read-KnownGateMisses -Path $path) -join '|' | Should Be 'open.prepare|schema|peak resident set'
     }
 
     It 'reads no known misses from a file that is not there' {

@@ -118,6 +118,14 @@ A new git worktree is missing two gitignored folders:
 | `.sqlite-ref/` | every suite graded against the pinned SQLite | copy it from the main checkout, or run `pwsh tools/sqlite-reference.ps1` |
 | `_agent_output/fixtures/` | `small.db`, `medium.db` and `large.db`, used by `inillucent-compat::engine::new_engine_log_lead` and `inillucent-compat::tooling::gates_fail_closed` | copy it from the main checkout, or run `tools/build-gate-fixtures.sh` |
 
+### CI and the nightly
+
+`.github/workflows/tests.yml` runs the merge cadence, on Windows and on Linux, on every push and
+every pull request. `.github/workflows/nightly.yml` runs the nightly cadence once a day, on Linux
+only, and uploads its summary as a workflow artifact. `packaging/nightly.ps1` runs the nightly
+cadence a second time, once a night on the Windows development machine, then builds that night's
+release and its performance gates, and appends a row per target to `tests/nightly-history.tsv`.
+
 ## Adding a dependency
 
 You probably cannot add one. Production crates may not link another database engine, SQL parser,

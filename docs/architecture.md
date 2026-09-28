@@ -8,7 +8,8 @@ confidence to return nothing when nothing is good enough.
 You need to know SQL. You do not need to know anything about vector search. The other engine, the
 SQL engine, is described in [Relational architecture](relational-architecture.md), and
 [Architecture overview](architecture-overview.md) shows how the two fit together. For the SQL you
-write day to day, read [Vector search](vector-search.md).
+write day to day, read [Vector search](vector-search.md). If search is new to you, start with
+[Search explained from the start](search-explained.md).
 
 ## Terms used on this page
 
@@ -43,7 +44,7 @@ page. Vector search is weak at exact strings: a query for the ticket key `PROJ-1
 ticket and not tickets that are about similar things. Keyword search finds it.
 
 The retrieval engine runs both kinds of search and combines the two result lists. Here is one query
-that does all of it, run with the release build of inillucent 1.0.29:
+that does all of it, run with the release build of inillucent 1.0.32:
 
 ```sql
 CREATE VIRTUAL TABLE notes USING inillucent_search(body, dims = 3);

@@ -86,15 +86,48 @@ set to 7:
 {
   "ok": true,
   "command": "migrate",
+  "columns": [],
+  "rows": [],
+  "row_count": 0,
+  "total": 0,
+  "more": false,
+  "changes": 0,
+  "last_insert_rowid": 0,
+  "elapsed_ms": 122.5779,
   "destination": "app.rdb",
   "checks": [
-    { "name": "columns.note", "passed": true, "detail": "4 columns, in the order the source declares" },
-    { "name": "count.note", "passed": true, "detail": "3 rows" },
-    { "name": "digest.note", "passed": true, "detail": "9a02e0926c1cd9a092a23f47c01ded55d009f0b2a686011c3185d753eec7c9a1" },
-    { "name": "carried.docs", "passed": true, "detail": "2 rows rebuilt through this engine's own fts5" },
-    { "name": "pragma.application_id", "passed": true, "detail": "0 carried from the source" },
-    { "name": "pragma.user_version", "passed": true, "detail": "7 carried from the source" }
-  ]
+    {
+      "name": "columns.note",
+      "passed": true,
+      "detail": "4 columns, in the order the source declares"
+    },
+    {
+      "name": "count.note",
+      "passed": true,
+      "detail": "3 rows"
+    },
+    {
+      "name": "digest.note",
+      "passed": true,
+      "detail": "9a02e0926c1cd9a092a23f47c01ded55d009f0b2a686011c3185d753eec7c9a1"
+    },
+    {
+      "name": "carried.docs",
+      "passed": true,
+      "detail": "2 rows rebuilt through this engine's own fts5"
+    },
+    {
+      "name": "pragma.application_id",
+      "passed": true,
+      "detail": "0 carried from the source"
+    },
+    {
+      "name": "pragma.user_version",
+      "passed": true,
+      "detail": "7 carried from the source"
+    }
+  ],
+  "text": "imported legacy.db into app.rdb"
 }
 ```
 

@@ -196,10 +196,10 @@ WHERE note_search MATCH ?1 AND vector = embed('search_query: ' || ?1) AND k = 10
 ORDER BY rank;
 ```
 
-Release 1.0.29 refuses three of these with the status `unsupported`: `embed(TEXT)` in a `VALUES` row
+Release 1.0.29 refused three of these with the status `unsupported`: `embed(TEXT)` in a `VALUES` row
 of an `inillucent_search` or FTS5 table, an `INSERT ... SELECT` into either kind of table, and
-`vector = embed(...)` in a search. With 1.0.29, run `SELECT embed(?1)` first and bind the bytes it
-returns.
+`vector = embed(...)` in a search. Release 1.0.30 fixed all three. On 1.0.29, run `SELECT embed(?1)`
+first and bind the bytes it returns.
 
 `nomic-embed-text-v1.5` was trained with a prefix on every text. Put `search_document: ` in front of
 text you store and `search_query: ` in front of a question. `embed(TEXT)` embeds exactly the text it

@@ -8,7 +8,6 @@
 # One name per line, exactly as the gate prints it in its report. Remove a line when the
 # work that meets that bar lands; the nightly names a known miss it met.
 
-open.prepare        # 1.69x against a 5.00x bar
-schema              # 1.31x against a 3.00x bar
-peak resident set   # 9.5% more than SQLite against a bar of 5% less
-processor time      # 0.500 against a bar of 0.400 on the graded run of 23 September 2026
+open.prepare        # 1.65x against a 5.00x bar on the graded runs of 26 September 2026
+schema              # 1.27x against a 3.00x bar on the same runs
+peak resident set   # 11.5% more than SQLite against a bar of 5% less on the same runs

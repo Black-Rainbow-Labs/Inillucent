@@ -65,6 +65,17 @@ builds the oracle and the fixtures first, then runs:
   `transport` suite;
 - every selected test with `inillucent-testrun --strict`.
 
+## What runs after you push
+
+`.github/workflows/tests.yml` runs the merge cadence again, on Windows and on Linux, on every push
+and every pull request. A pull request runs what your change can break, widened to the merge tiers;
+a push runs every tier but `nightly`.
+
+The nightly cadence, which a change never runs, runs on two schedules of its own.
+`.github/workflows/nightly.yml` runs it once a day on Linux and uploads its summary as a workflow
+artifact. `packaging/nightly.ps1` runs it a second time, once a night on the maintainer's Windows
+machine, and also builds that night's release and runs the performance gates.
+
 ## Update the rule files in the same change
 
 A test checks each of these files. If a change leaves one out, the build fails on the next person's

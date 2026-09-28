@@ -89,12 +89,36 @@ result of a migration of a table `note` with three rows and an FTS5 table `doc`:
   "elapsed_ms": 106.0701,
   "destination": "app.rdb",
   "checks": [
-    { "name": "columns.note", "passed": true, "detail": "3 columns, in the order the source declares" },
-    { "name": "count.note", "passed": true, "detail": "3 rows" },
-    { "name": "digest.note", "passed": true, "detail": "c49ee80130e38a4eadd292ae05452225521ea9758ab159d42aac23215b2e1e25" },
-    { "name": "carried.doc", "passed": true, "detail": "1 rows rebuilt through this engine's own fts5" },
-    { "name": "pragma.application_id", "passed": true, "detail": "0 carried from the source" },
-    { "name": "pragma.user_version", "passed": true, "detail": "7 carried from the source" }
+    {
+      "name": "columns.note",
+      "passed": true,
+      "detail": "3 columns, in the order the source declares"
+    },
+    {
+      "name": "count.note",
+      "passed": true,
+      "detail": "3 rows"
+    },
+    {
+      "name": "digest.note",
+      "passed": true,
+      "detail": "c49ee80130e38a4eadd292ae05452225521ea9758ab159d42aac23215b2e1e25"
+    },
+    {
+      "name": "carried.doc",
+      "passed": true,
+      "detail": "1 rows rebuilt through this engine's own fts5"
+    },
+    {
+      "name": "pragma.application_id",
+      "passed": true,
+      "detail": "0 carried from the source"
+    },
+    {
+      "name": "pragma.user_version",
+      "passed": true,
+      "detail": "7 carried from the source"
+    }
   ],
   "text": "imported legacy.db into app.rdb"
 }

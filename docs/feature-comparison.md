@@ -6,7 +6,7 @@ you need behaves the same way it does in SQLite.
 
 The SQL rows come from the 416 case probe in
 [`tools/feature-probe/`](../tools/feature-probe/README.md). The results on this page are from the
-probe run of 24 September 2026 against commit `d38fa00`, which is version 1.0.29.
+probe run of 26 September 2026 against commit `bc46bc9`, which is version 1.0.32.
 
 ## Terms used on this page
 
@@ -1127,17 +1127,17 @@ scan in all 12 combinations.
 
 ## Speed and memory against SQLite
 
-These numbers are from the graded run of 23 September 2026 on `main` at `6f84ce6`, four runs of 30
-paired rounds at 100,000 rows, with both engines on the same processor cores and the same 128 MiB
-memory budget. Each figure is the median of the four runs. [Performance](performance.md) has every
+These numbers are from the graded run of 26 September 2026 on `main` at `bc46bc9`, which is release
+1.0.32: four runs of 30 paired rounds at 100,000 rows, with both engines on the same processor cores
+and the same 128 MiB memory budget. Each figure is the median of the two middle runs of four. [Performance](performance.md) has every
 workload, the method and the later runs.
 
 | | SQLite 3.53.4 | inillucent | Result |
 |---|---|---|---|
-| elapsed time, weighted over ten workload families | the reference | 4.97x | **397% faster** |
-| elapsed time, the 95% lower bound the gate grades | | 4.62x | 362% faster. The bar asks for 200% faster: met on all four runs |
-| processor time for one round of the whole plan | 1,082 ms | 555 ms | **50% less processor**. The bar asks for 60% less: missed on all four runs |
-| peak memory for one round of the whole plan | 37.22 MiB | 40.76 MiB | **9.5% more memory**. The bar asks for 5% less: missed |
+| elapsed time, weighted over ten workload families | the reference | 5.19x | **419% faster** |
+| elapsed time, the 95% lower bound the gate grades | | 5.05x | 405% faster. The bar asks for 200% faster: met on all four runs |
+| processor time for one round of the whole plan | 1,043 ms | 344 ms | **67% less processor**. The bar asks for 60% less: met on all four runs |
+| peak memory for one round of the whole plan | 37.21 MiB | 41.48 MiB | **11.5% more memory**. The bar asks for 5% less: missed |
 | the database file, the same data imported | 16,830,464 bytes | 17,432,576 bytes | 3.6% larger |
 
 Memory is the one result where inillucent is worse than SQLite. About 3.6 MiB of the process is what
@@ -1146,25 +1146,24 @@ the page cache and one `CREATE INDEX`. [Performance](performance.md#memory) brea
 
 | Family | Weight | Result | Bar |
 |---|---:|---|---|
-| `read.point` | 16% | 29.85x, 2,885% faster | met |
-| `large.values` | 4% | 12.35x, 1,135% faster | met |
-| `read.analytical` | 10% | 10.71x, 971% faster | met |
-| `read.range` | 12% | 5.02x, 402% faster | met |
-| `read.join` | 8% | 4.21x, 321% faster | met on the per round bound, missed on the pooled bound |
-| `write` | 20% | 3.04x, 204% faster | met |
-| `transaction` | 10% | 2.37x, 137% faster | met |
-| `extension` | 8% | 1.73x, 73% faster | met |
-| `open.prepare` | 8% | 1.69x, 69% faster | missed: the bar asks for 5.00x |
-| `schema` | 4% | 1.31x, 31% faster | missed: the bar asks for 3.00x |
+| `read.point` | 16% | 31.61x, 3,061% faster | met |
+| `large.values` | 4% | 12.32x, 1,132% faster | met |
+| `read.analytical` | 10% | 11.13x, 1,013% faster | met |
+| `read.range` | 12% | 5.35x, 435% faster | met |
+| `read.join` | 8% | 4.69x, 369% faster | met |
+| `write` | 20% | 3.57x, 257% faster | met |
+| `transaction` | 10% | 2.38x, 138% faster | met |
+| `extension` | 8% | 1.79x, 79% faster | met |
+| `open.prepare` | 8% | 1.65x, 65% faster | missed: the bar asks for 5.00x |
+| `schema` | 4% | 1.27x, 27% faster | missed: the bar asks for 3.00x |
 
 ## Known gaps
 
 | Gap | Where it stands |
 |---|---|
-| Memory is 9.5% more than SQLite's | open. See [Performance](performance.md#memory) |
-| Processor time misses its bar | open. 50% less than SQLite, where the bar asks for 60% less |
+| Memory is 11.5% more than SQLite's | open. See [Performance](performance.md#memory) |
 | `open.prepare` and `schema` miss their speed bars | open. Both are faster than SQLite |
-| A correlated `IN` subquery over many outer rows is much slower than SQLite | open. Write it as a join. See [Performance](performance.md) |
+| A correlated `IN` subquery over many outer rows is slower than SQLite | open. 807% slower over 400 outer rows. Write it as a join. See [Performance](performance.md#the-workloads-that-are-slower) |
 | The C API has 53 functions where SQLite has about 290 | open. The list of what is missing is in [Architecture and operations](#architecture-and-operations) |
 | One thread per database | open |
 | A SQLite file cannot be opened directly | by design. `inillucent migrate` copies it |

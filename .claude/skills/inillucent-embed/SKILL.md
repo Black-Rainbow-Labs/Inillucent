@@ -30,7 +30,7 @@ release archive, has the full contract.
 | Go | `go get github.com/Black-Rainbow-Labs/Inillucent/packages/go` | starts `inillucent --output json` and parses the JSON |
 | PHP | `composer require black-rainbow-labs/inillucent` | starts `inillucent --output json` and parses the JSON |
 
-All four language packages are published at version 1.0.29. The Python wheel holds the C library
+All four language packages are published at version 1.0.32. The Python wheel holds the C library
 and the four programs, so it needs no compiler.
 
 A package that starts the program gets JSON. A blob comes back as `{"blob": "<hex>"}`. An integer

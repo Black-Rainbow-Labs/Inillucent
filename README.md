@@ -15,7 +15,7 @@ search and keyword search built in. Everything lives in one file.
 - SQLite's SQL dialect. 402 of 416 probed SQL cases give SQLite's exact answer. A PostgreSQL dialect
   is on the roadmap.
 - A storage engine written from scratch in Rust.
-- 397% faster than SQLite overall, and 2,885% faster on reads by key.[^1]
+- 419% faster than SQLite overall, and 3,061% faster on reads by key.[^1]
 - 174% faster than PostgreSQL with pgvector for semantic search.[^3]
 - 302% better than PostgreSQL full text search at finding identifiers.[^3]
 - A command line and an MCP server with the same commands.
@@ -103,8 +103,8 @@ Every install gives you four programs:
 
 Your SQLite queries, schemas and `sqlite3` scripts run unchanged: joins, recursive CTEs, window
 functions, triggers, foreign keys, upserts, `RETURNING`, JSON, FTS5 and more. The storage engine
-under that SQL is written from scratch in Rust. It runs 397% faster than SQLite overall and 2,885%
-faster on reads by key,[^1] and it uses 49% less processor time.[^2]
+under that SQL is written from scratch in Rust. It runs 419% faster than SQLite overall and 3,061%
+faster on reads by key,[^1] and it uses 67% less processor time.[^2]
 [SQL support](docs/sql.md)
 
 ### Search by meaning and by keyword
@@ -222,14 +222,15 @@ MIT. See [LICENSE](LICENSE).
 
 [^1]: Measured against SQLite 3.53.4, built from the official source and run as a separate program
     over the same data, with the same SQL, the same durability setting and the same cache size.
-    Thirty paired rounds, four runs in a row, at 100,000 rows on Windows x64, on 23 September 2026,
-    with both programs on the same eight performance cores. Overall: 397% faster, the weighted
-    geometric mean across ten families of work, with a 95% lower bound of 362%. Reads by key:
-    2,885% faster. Every result is hashed and compared with SQLite's before its time counts. Six of
-    the thirty workloads are slower than SQLite. [Performance](docs/performance.md) names each one.
+    Thirty paired rounds, four runs in a row, at 100,000 rows on Windows x64, on 26 September 2026
+    with release 1.0.32, with both programs on the same eight performance cores. Overall: 419%
+    faster, the weighted geometric mean across ten families of work, with a 95% lower bound of 405%.
+    Reads by key: 3,061% faster. Every result is hashed and compared with SQLite's before its time
+    counts. Five of the thirty workloads are slower than SQLite. [Performance](docs/performance.md)
+    names each one.
 
-[^2]: Processor time was 555 ms against 1,082 ms for SQLite for one round of the same plan at
-    100,000 rows, on 23 September 2026.
+[^2]: Processor time was 344 ms against 1,043 ms for SQLite for one round of the same plan at
+    100,000 rows, on 26 September 2026.
 
 [^3]: Graded on 20 September 2026 against PostgreSQL with pgvector over a corpus of 185,078
     passages at 768 dimensions. Both engines were loaded with the same vectors and given the same

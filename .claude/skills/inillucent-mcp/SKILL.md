@@ -128,8 +128,17 @@ With `"output": "json"`, the text of the tool result is this object:
 {
   "ok": true,
   "command": "query",
-  "columns": [{ "name": "one", "type": "integer" }],
-  "rows": [[5]],
+  "columns": [
+    {
+      "name": "one",
+      "type": "integer"
+    }
+  ],
+  "rows": [
+    [
+      5
+    ]
+  ],
   "row_count": 1,
   "total": 1,
   "more": false,

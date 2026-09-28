@@ -171,9 +171,12 @@ target failed. Exit code 2 means the run did not happen, for example because the
 
 Each tier has a cadence. `change` tiers run on every change that can reach them. The `durability`,
 `perf` and `matrix_deep` tiers are `merge`: a change run selects one of their targets only when a
-crate that actually changed is in its `covers`, and CI runs all of them on every push. The `nightly`
-tier runs once a night in `packaging/nightly.ps1`, which also builds the release and runs the gates.
-The runner builds only the targets it selected.
+crate that actually changed is in its `covers`. `.github/workflows/tests.yml` runs the merge cadence
+on Windows and on Linux, on every push and every pull request. The `nightly` tier never runs on a
+change or a push. `.github/workflows/nightly.yml` runs it once a day on Linux, at 03:00 UTC, and
+uploads its summary as a workflow artifact. `packaging/nightly.ps1` runs the nightly tier a second
+time, once a night on the Windows development machine, and also builds that night's release and runs
+the performance gates. The runner builds only the targets it selected.
 
 The SQL statement matrix is two tiers and part of the nightly one. The `matrix` tier runs every
 statement form with every pair of contexts, graded against the pinned SQLite, on every change in
@@ -246,7 +249,8 @@ a prerequisite and its suite cannot skip. Those two checks keep this table equal
 
 ## What the tests cover
 
-The workspace has 3,499 tests across 285 test targets. There are 285 rows in `tests/selection.toml`,
+The workspace has 4,008 tests across 285 test targets, counted tier by tier on 26 September 2026 in
+the tier table of `tests/inillucent-testing-tdd.md`. There are 285 rows in `tests/selection.toml`,
 and each row is one `[[target]]` that the runner runs. `tools/doc-facts/check.mjs` fails when this
 page gives a different count from `tests/selection.toml`.
 

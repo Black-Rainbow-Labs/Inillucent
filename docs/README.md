@@ -36,18 +36,19 @@ this index.
 |---|---|---|
 | 8 | [SQL support](sql.md) | The SQL that runs, the cases that differ from SQLite, and the statements the engine refuses |
 | 9 | [Pragmas](pragmas.md) | Every pragma the engine recognises. A program writes this page from the engine's own list |
-| 10 | [Vector search](vector-search.md) | `VECTOR(N)` columns, HNSW indexes, the `inillucent_search` table, and how hybrid search ranks results |
-| 11 | [Embeddings](embeddings.md) | Running the embedding model inside your process, installing it, and choosing a model |
-| 12 | [Migrating](migrating.md) | Copying a SQLite file, a PostgreSQL database or a MySQL database into inillucent |
+| 10 | [Search explained from the start](search-explained.md) | Keyword search, search by meaning and hybrid search for a reader who has never built a search, with every term defined and examples to run |
+| 11 | [Vector search](vector-search.md) | `VECTOR(N)` columns, HNSW indexes, the `inillucent_search` table, and how hybrid search ranks results |
+| 12 | [Embeddings](embeddings.md) | Running the embedding model inside your process, installing it, and choosing a model |
+| 13 | [Migrating](migrating.md) | Copying a SQLite file, a PostgreSQL database or a MySQL database into inillucent |
 
 ## Measurements
 
 | | Page | What it covers |
 |---|---|---|
-| 13 | [Performance](performance.md) | Speed, processor time, memory and file size against SQLite 3.53.4, and the workloads that are slower |
-| 14 | [Feature comparison](feature-comparison.md) | The full 416 case differential probe against SQLite, feature by feature, and the retrieval engine against pgvector |
-| 15 | [Retrieval quality](retrieval-quality.md) | The 17 graded comparisons with PostgreSQL and pgvector, and how a measurement becomes a verdict |
-| 16 | [Synthetic corpus](../tests/synthetic-corpus.md) | How to build the public corpus that every retrieval number is measured on |
+| 14 | [Performance](performance.md) | Speed, processor time, memory and file size against SQLite 3.53.4, and the workloads that are slower |
+| 15 | [Feature comparison](feature-comparison.md) | The full 416 case differential probe against SQLite, feature by feature, and the retrieval engine against pgvector |
+| 16 | [Retrieval quality](retrieval-quality.md) | The 17 graded comparisons with PostgreSQL and pgvector, and how a measurement becomes a verdict |
+| 17 | [Synthetic corpus](../tests/synthetic-corpus.md) | How to build the public corpus that every retrieval number is measured on |
 
 `inillucent-scorecard.md` in the repository root is the full score card from the grading run. It has
 every interval, every p-value and every diagnostic. `inillucent-bench grade` writes
@@ -59,11 +60,11 @@ on 2026-09-20.
 
 | | Page | What it covers |
 |---|---|---|
-| 17 | [Repository and building](repository.md) | The crates and what each one does, building, running the tests, and the test coverage table |
-| 18 | [Dependency policy](dependency-policy.md) | Which crates a production crate may use, and why the allowed list is short |
-| 19 | [Writing style](writing-style.md) | How to write and check a page in this folder or a chapter on inillucent.com |
-| 20 | [Roadmap](roadmap.md) | What is not built yet, in the order it is being worked on |
-| 21 | [Closed items](closed-items.md) | What came off the roadmap, and the measurement that closed each item |
+| 18 | [Repository and building](repository.md) | The crates and what each one does, building, running the tests, and the test coverage table |
+| 19 | [Dependency policy](dependency-policy.md) | Which crates a production crate may use, and why the allowed list is short |
+| 20 | [Writing style](writing-style.md) | How to write and check a page in this folder or a chapter on inillucent.com |
+| 21 | [Roadmap](roadmap.md) | What is not built yet, in the order it is being worked on |
+| 22 | [Closed items](closed-items.md) | What came off the roadmap, and the measurement that closed each item |
 | | [`AGENTS.md`](../AGENTS.md) | The starting page for an AI agent that uses or changes this repository |
 | | [`agent-skills/`](../agent-skills/README.md) | One page for each common job, readable by any AI agent |
 

@@ -99,7 +99,7 @@ build. The two unchecked rows are `cancel` and `readonly_open`, and both say `pa
 is not in the table is the status `not_found` and means no.
 
 [`docs/feature-comparison.md`](../../docs/feature-comparison.md) compares inillucent with the pinned
-SQLite 3.53.4, case by case. On the 1.0.29 build, 402 of 416 probed cases produce the same answer.
+SQLite 3.53.4, case by case. On the 1.0.32 build, 402 of 416 probed cases produce the same answer.
 Of the other fourteen:
 
 | Cases | What they are |
@@ -120,7 +120,7 @@ Of the other fourteen:
 | `'exec' changes the database, and this is read only.` | the connection was opened with `--readonly` | drop `--readonly`, or run a `SELECT` |
 
 `inillucent backup <file>` does replace an existing file at `<file>`. Never give `backup` the path of
-the database it is copying: on the 1.0.29 build that fails with `io` and leaves the database
+the database it is copying: on the 1.0.32 build that fails with `io` and leaves the database
 damaged.
 
 `--readonly` decides by what a statement does. The SQL parser classifies the statement, so
@@ -129,7 +129,7 @@ damaged.
 ## "The database is busy"
 
 One process writes at a time. A second process waits up to `PRAGMA busy_timeout`, which is 5000
-milliseconds by default, and then fails with the status `busy`. On the 1.0.29 build, while one
+milliseconds by default, and then fails with the status `busy`. On the 1.0.32 build, while one
 process held a write transaction open, a second process could not open the file at all. It waited
 5013 ms and failed:
 

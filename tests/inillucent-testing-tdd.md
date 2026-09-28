@@ -4,7 +4,9 @@
 only the part a change can break, and what all of it costs.**
 
 Written on 2026-09-08, with the target/test counts and §6's timings refreshed on
-2026-09-13 after task-1911. Every number below was measured on the machine
+2026-09-13 after task-1911, and the tier count, §2's target count, and the `matrix`
+and `matrix_deep` rows of §2 and §6.2 refreshed on 2026-09-26 after the SQL
+statement matrix landed. Every number below was measured on the machine
 described in [Timings](#6-timings), by the tools this document describes, and the
 commands that produce them are given so they can be taken again.
 
@@ -125,7 +127,7 @@ the two numbers and what was expected of them.
 
 ## 2. The shape of the suite
 
-**221 test targets, 3,493 tests, in ten tiers.** A target is one binary
+**285 test targets, 4,008 tests, in twelve tiers.** A target is one binary
 `cargo test` builds; a tier is a band you can ask for by name. Every target is
 in exactly one tier, so the tiers partition the suite rather than overlapping
 it. (Was 129 targets, 2,336 tests when this document was written; task-1911's
@@ -258,10 +260,14 @@ is in exactly one tier and the tiers partition the suite. The pattern is a pair:
 `story_ledger_day_nightly` issues a hundred thousand and replays them through
 the pinned SQLite shell; `release_format` reads the newest interop fixture in
 `e2e`, and `release_format_history` reads all six and hands a file this build
-wrote to every released binary. The nightly job, `packaging/nightly.ps1`, runs the
-tier under `--strict` and appends a row per target to `tests/nightly-history.tsv` — the
-date, the commit, the machine, the verdict and the seconds — because a green run
-nobody recorded cannot answer "when did this last actually pass".
+wrote to every released binary. The nightly cadence runs on two schedules.
+`.github/workflows/nightly.yml` runs the tier under `--strict` on a Linux runner at
+03:00 UTC and uploads its summary as a workflow artifact. `packaging/nightly.ps1`
+runs it a second time under `--strict --record` on the Windows development
+machine, then builds that night's release and its performance gates, and appends
+a row per target to `tests/nightly-history.tsv` — the date, the commit, the
+machine, the verdict and the seconds — because a green run nobody recorded cannot
+answer "when did this last actually pass".
 
 **The interop fixtures are evidence rather than input.** `tests/interop/0.1.1/`
 holds a database written by 0.1.1's own binary, the log segment it left and the
@@ -974,7 +980,7 @@ number in the `e2e` one — a target is in exactly one tier. Name it
 `<the short form>_nightly` so the pair is obvious, and state its cadence rather
 than deriving it: the short form's phase boundaries are tuned for a run that
 finishes in seconds, and the same cadence over a hundred thousand transactions
-spends its night on `VACUUM`. The nightly job picks it up with no further
+spends its night on `VACUUM`. Both nightly jobs pick it up with no further
 wiring, and `pwsh tools/run-nightly.ps1` runs the tier alone by hand.
 
 **An interop fixture.** `pwsh tools/build-interop-fixture.ps1 -Version <version>`

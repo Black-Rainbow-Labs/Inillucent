@@ -195,6 +195,13 @@ quietly. CI passes `--absent` for what a runner cannot have, per operating syste
 `.github/workflows/tests.yml`. `--summary <file>` writes the verdict, the failures and the declared
 absences as JSON.
 
+**Two workflows, two cadences.** `.github/workflows/tests.yml` runs the merge cadence, on Windows and
+on Linux, on every push and every pull request: what the change can break on a pull request, and
+every tier but `nightly` on a push. `.github/workflows/nightly.yml` runs the nightly cadence once a
+day, on Linux only, at 03:00 UTC, and uploads its summary as a workflow artifact. It commits nothing.
+`packaging/nightly.ps1` runs the nightly cadence a second time, once a night on the Windows
+development machine, and section 3 below covers what else that run does.
+
 **When the runner stops a target.** The runner stops a target only when both of these are true:
 
 - the target has run for longer than its budget. The budget is eight times the target's recorded
@@ -246,7 +253,7 @@ engine's open and recovery path under real memory pressure. Treat a failure ther
 
 ### Writing a test
 
-The standard is [`tests/inillucent-testing-tdd.md`](tests/inillucent-testing-tdd.md) and its six
+The standard is [`tests/inillucent-testing-tdd.md`](tests/inillucent-testing-tdd.md) and its seven
 rules. The two broken most often:
 
 - **A test asserts a value.** `assert!(result.is_ok())` on a migration that published nothing passes
@@ -351,9 +358,12 @@ fail without a trace runs before it.
 
 ### The nightly, and the tests a release relies on
 
-A release runs no full suite of its own. `packaging/nightly.ps1` runs every night at 02:00 as the
-scheduled task `inillucent nightly`, which `pwsh packaging/register-nightly.ps1` registers. It works
-in its own worktree, `J:/build/nightly`, moved to `origin/main`, and:
+A release runs no full suite of its own. `.github/workflows/nightly.yml` also runs the nightly
+cadence once a day, on Linux, but that run writes no evidence a release reads: it only uploads its
+summary as a workflow artifact. The evidence a release reads comes from `packaging/nightly.ps1`,
+which runs every night at 02:00 as the scheduled task `inillucent nightly`, which
+`pwsh packaging/register-nightly.ps1` registers. It works in its own worktree, `J:/build/nightly`,
+moved to `origin/main`, and:
 
 1. runs `inillucent-testrun --cadence nightly --strict --record`, with this machine's declared
    absences;

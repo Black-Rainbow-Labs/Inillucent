@@ -47,7 +47,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-__version__ = "1.0.32"
+__version__ = "1.0.33"
 
 _HERE = Path(__file__).resolve().parent
 

@@ -149,11 +149,20 @@ inillucent --db app.rdb query "SELECT * FROM note" --output json
   "ok": true,
   "command": "query",
   "columns": [
-    { "name": "id", "type": "integer" },
-    { "name": "body", "type": "text" }
+    {
+      "name": "id",
+      "type": "integer"
+    },
+    {
+      "name": "body",
+      "type": "text"
+    }
   ],
   "rows": [
-    [1, "hello"]
+    [
+      1,
+      "hello"
+    ]
   ],
   "row_count": 1,
   "total": 1,
@@ -247,7 +256,7 @@ To open a file whose name starts with a dash, put `--` before it: `inillucent-sh
 inillucent capabilities
 ```
 
-`inillucent capabilities` lists 49 features, each marked `yes`, `partial` or `no`. A test runs
+`inillucent capabilities` lists 50 features, each marked `yes`, `partial` or `no`. A test runs
 every row against the engine, so the list matches what the engine does.
 
 ## Bring in an existing database

@@ -1016,8 +1016,14 @@ function Copy-TestPrerequisite {
         }
     }
     $declaration = Join-Path $MainCheckout 'tests/prerequisites.local.toml'
-    if (Test-Path -LiteralPath $declaration) {
-        Copy-Item -LiteralPath $declaration -Destination (Join-Path $Root 'tests/prerequisites.local.toml') -Force
+    $declarationTarget = Join-Path $Root 'tests/prerequisites.local.toml'
+    # **A release cut from the main checkout itself, not a worktree, has $Root
+    # equal to $MainCheckout.** Then $declaration and $declarationTarget are the
+    # same file, and Copy-Item refuses to overwrite an item with itself. Nothing
+    # needs copying in that case - the declaration is already exactly where it
+    # is meant to be.
+    if ((Test-Path -LiteralPath $declaration) -and $declaration -ne $declarationTarget) {
+        Copy-Item -LiteralPath $declaration -Destination $declarationTarget -Force
     }
 }
 
@@ -1117,6 +1123,15 @@ function Invoke-ReleaseTests {
     # `--strict` counts a suite that skipped them as evidence of nothing. nightly.ps1 and both CI
     # workflows set it. The 1.0.30 release was refused for its absence alone, every test passing.
     $env:INILLUCENT_NETWORK_TESTS = '1'
+    # `tooling::workload_freshness` compares tests/workloads/nikaya against the Nikaya checkout,
+    # which it looks for beside the workspace. A release worktree on another drive has nothing
+    # beside it, so `--strict` counted the suite as evidence of nothing and refused the 1.0.33
+    # release with every test passing (task-2148). The checkout is found beside the main one, the
+    # same way the site and the Homebrew tap are.
+    if (-not $env:NIKAYA_ROOT) {
+        $nikaya = Join-Path (Split-Path -Parent (Get-MainCheckout -Root $Root)) 'nikaya/server'
+        if (Test-Path -LiteralPath $nikaya) { $env:NIKAYA_ROOT = $nikaya }
+    }
     Write-Host "   $runner $($arguments -join ' ')"
     & $runner @arguments
     $code = $LASTEXITCODE

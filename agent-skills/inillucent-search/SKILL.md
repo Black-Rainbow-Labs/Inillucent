@@ -165,8 +165,9 @@ SELECT title FROM store
 WHERE store MATCH ?1 AND vector = embed('search_query: ' || ?1) AND k = 10 ORDER BY rank;
 ```
 
-Release 1.0.29 refuses the last two statements with the status `unsupported`. With 1.0.29, insert
-the rows one `VALUES` row at a time, and run `SELECT embed(?1)` first and bind the bytes.
+Release 1.0.29 refused the last two statements with the status `unsupported`. Release 1.0.30 fixed
+both. On 1.0.29, insert the rows one `VALUES` row at a time, and run `SELECT embed(?1)` first and
+bind the bytes.
 
 | Declaration or column | What it does |
 |---|---|
@@ -179,7 +180,7 @@ the rows one `VALUES` row at a time, and run `SELECT embed(?1)` first and bind t
 | `ORDER BY rank` | best result first |
 
 When a query has both a keyword part and a vector part, inillucent runs both searches and combines
-the two ranked lists into one. A hit whose `origin(store)` is `keyword` has a low `confidence` even
+the two ranked lists into one. A hit whose `origin(store)` is `lexical` has a low `confidence` even
 when it is the right answer, so check the origin before using `confidence` to decide that the table
 cannot answer. On natural language questions over prose, `vector_weight = 0.5` ranked better and
 made `confidence` separate answerable questions from unrelated ones. [Vector search](../../docs/vector-search.md) explains how the lists

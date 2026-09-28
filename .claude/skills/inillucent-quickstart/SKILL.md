@@ -94,11 +94,26 @@ inillucent --db app.rdb query "SELECT * FROM note" --output json
   "ok": true,
   "command": "query",
   "columns": [
-    { "name": "id", "type": "integer" },
-    { "name": "body", "type": "text" },
-    { "name": "created", "type": "text" }
+    {
+      "name": "id",
+      "type": "integer"
+    },
+    {
+      "name": "body",
+      "type": "text"
+    },
+    {
+      "name": "created",
+      "type": "text"
+    }
   ],
-  "rows": [[1, "first note", "2026-01-02"]],
+  "rows": [
+    [
+      1,
+      "first note",
+      "2026-01-02"
+    ]
+  ],
   "row_count": 1,
   "total": 1,
   "more": false,
