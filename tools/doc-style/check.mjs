@@ -268,9 +268,10 @@ export async function checkSite(site, rules) {
   const file = path.join(site, 'src', 'data', 'documentation.ts');
   const module = await import(`file://${file.replace(/\\/g, '/')}`);
   const problems = [];
-  const check = (where, value) => {
-    for (const rule of problemsIn(stripInline(value), value, rules)) problems.push({ file, line: where, rule, text: value.slice(0, 140) });
+  const checkIn = (source) => (where, value) => {
+    for (const rule of problemsIn(stripInline(value), value, rules)) problems.push({ file: source, line: where, rule, text: value.slice(0, 140) });
   };
+  const check = checkIn(file);
   for (const group of module.documentationGroups) {
     check(`group ${group.id}`, group.title);
     check(`group ${group.id}`, group.description);
@@ -278,12 +279,62 @@ export async function checkSite(site, rules) {
   for (const chapter of module.documentationChapters) {
     const where = `chapter ${chapter.number} ${chapter.id}`;
     for (const value of [chapter.title, chapter.summary, ...chapter.paragraphs, ...(chapter.points ?? [])]) check(where, value);
+    for (const entry of chapter.terms ?? []) check(`${where}, term ${entry.term}`, entry.meaning);
+    for (const value of figureProse(chapter.figure)) check(`${where}, figure`, value);
+    for (const part of chapter.parts ?? []) {
+      for (const value of [part.title, ...part.paragraphs, ...(part.points ?? []), ...tableProse(part.table), ...figureProse(part.figure)]) check(`${where}, part ${part.id}`, value);
+    }
     for (const example of chapter.examples) {
       check(`${where}, example "${example.title}"`, example.title);
       check(`${where}, example "${example.title}"`, example.explanation);
     }
   }
+  await checkResearch(site, checkIn);
   return problems;
+}
+
+/**
+ * Checks the research page's studies, which the site keeps in `src/data/research.ts`.
+ *
+ * The studies are prose a reader reads beside the documentation, and they link into it, so they
+ * follow the same rules. A site without the file has no research page yet, and nothing is checked.
+ *
+ * @param site - the site folder
+ * @param checkIn - returns a check that records problems against one source file
+ */
+async function checkResearch(site, checkIn) {
+  const file = path.join(site, 'src', 'data', 'research.ts');
+  if (!fs.existsSync(file)) return;
+  const module = await import(`file://${file.replace(/\\/g, '/')}`);
+  const check = checkIn(file);
+  for (const study of module.studies) {
+    for (const value of [study.title, study.summary]) check(`study ${study.id}`, value);
+    for (const section of study.sections) {
+      const values = [section.title, ...section.paragraphs, ...(section.points ?? []), section.decision ?? '', ...tableProse(section.table), ...figureProse(section.figure)];
+      for (const value of values) check(`study ${study.id}, section ${section.id}`, value);
+    }
+  }
+}
+
+/**
+ * Returns the prose of a table from the site's data: its caption and every cell.
+ *
+ * @param table - a table from the site's data, or undefined
+ */
+function tableProse(table) {
+  if (!table) return [];
+  return [table.caption ?? '', ...table.rows.flat()];
+}
+
+/**
+ * Returns the prose of a figure from the site's data: its caption, and its step and row labels.
+ *
+ * @param figure - a figure from the site's data, or undefined
+ */
+function figureProse(figure) {
+  if (!figure) return [];
+  const labels = figure.kind === 'flow' ? figure.lanes.flatMap((lane) => [lane.note ?? '', ...lane.steps]) : figure.kind === 'intervals' ? figure.rows.map((row) => row.label) : [];
+  return [figure.caption, ...labels];
 }
 
 /**

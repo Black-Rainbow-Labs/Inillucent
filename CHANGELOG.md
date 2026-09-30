@@ -10,6 +10,24 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**Two fixes found by keeping a mailbox's search table current.**
+
+- **A facet compared with an integer outside a search matched nothing.** A `FACET` column stores
+  its value as text. Inside a search `email_id = 3` matched, but in a plain `SELECT`, `UPDATE` or
+  `DELETE` the engine compared the stored `'3'` with the integer 3 and matched no row, so
+  `DELETE FROM email_search WHERE email_id = 3` reported `0 rows changed` and left the chunks
+  searchable. A facet column now has text affinity, and the engine applies a comparison's affinity
+  when it tests a constraint a virtual table did not apply itself, as SQLite does. A virtual table
+  column with no declared type compares as before.
+- **A write that changed no rows left its transaction in the log for good.** `DELETE FROM t WHERE
+  x = 5` with no such row committed a transaction that the connection did not fold into the file
+  when it closed, so every later open printed `replayed the log: 1 committed transactions`. A
+  connection now folds on close whenever it wrote to the log.
+
+The docs now show how a program keeps an `inillucent_search` table current: embed each document in
+the statement that stores it, delete and insert a changed document's chunks, and use `inillucent
+embed` for the first import. See [Keep the search table current](docs/rag-explained.md#keep-the-search-table-current).
+
 **Retrieval for a language model, out of the box.** A retrieval study on a mailbox of 67,369 emails
 found which techniques put the right text in front of a language model. This release turns the
 winning setup into features. See [Retrieval for RAG, explained from the start](docs/rag-explained.md).
@@ -204,6 +222,19 @@ table after a sync that changed it. The command line example fills its FTS5 tabl
 pinned SQLite build, the gate fixtures and `tests/prerequisites.local.toml` from the main checkout,
 and sets `INILLUCENT_NETWORK_TESTS`. Without them the 1.0.30 release was refused twice while every
 test passed.
+
+**What an unloaded model leaves on a graphics card is measured and documented.** A model dropped
+from a CUDA session leaves about 500 MiB on the card until the process exits. That is the CUDA
+context. ONNX Runtime releases its memory arena and the weights when the session is dropped, and it
+has no call that releases the context. `inillucent-bench embed-residency --memory` reads the card
+after each load, embed and drop, and [Embeddings](docs/embeddings.md#what-stays-on-a-graphics-card-after-the-model-is-dropped)
+prints the run.
+
+**Two changes for a Rust caller of `inillucent-core`.** `Branches::runs_vector()` and
+`Branches::runs_lexical()` are public, so a caller of `Index::search_branches` can report the same
+path `hybrid_search_grouped` does. `ModelManifest::read` and `ModelManifest::write` return
+`anyhow::Result` in place of `Result<_, String>`, so `.with_context` and `?` work on them. A caller
+that matched on the `String` error needs to change.
 
 ## 1.0.30 — 2026-09-25
 

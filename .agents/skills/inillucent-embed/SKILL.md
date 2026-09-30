@@ -27,7 +27,7 @@ release archive, has the full contract.
 | C and C++ | the C library | calls the C library |
 | Python | `pip install inillucent` | the `Database` class calls the C library. `run()` and `query()` start the `inillucent` program |
 | Node | `npm install inillucent` | starts `inillucent --output json` and parses the JSON |
-| Go | `go get github.com/Black-Rainbow-Labs/Inillucent/packages/go` | starts `inillucent --output json` and parses the JSON |
+| Go | `go get github.com/Black-Rainbow-Labs/Inillucent/packages/go/v2` | starts `inillucent --output json` and parses the JSON |
 | PHP | `composer require black-rainbow-labs/inillucent` | starts `inillucent --output json` and parses the JSON |
 
 All four language packages are published at version 1.0.32. The Python wheel holds the C library

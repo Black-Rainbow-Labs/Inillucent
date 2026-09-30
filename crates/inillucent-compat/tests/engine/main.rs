@@ -63,6 +63,7 @@ mod reindex_without_rowid;
 mod rowid_after_tail_delete;
 mod schema_function_policy;
 mod search;
+mod search_facet_compare;
 mod search_fusion;
 mod search_recall;
 mod search_rerank;

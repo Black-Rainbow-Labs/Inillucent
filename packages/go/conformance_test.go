@@ -33,7 +33,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	inillucent "github.com/Black-Rainbow-Labs/Inillucent/packages/go"
+	inillucent "github.com/Black-Rainbow-Labs/Inillucent/packages/go/v2"
 )
 
 // language is how the suite's `skipped_by` names this runner.

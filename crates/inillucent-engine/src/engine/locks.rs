@@ -618,9 +618,23 @@ impl ImportedDatabase {
         // above is protecting: a journal is only ever written by a *dirty*
         // page's writeback, so a session that read and evicted clean frames has
         // none and still releases without taking the file exclusively.
+        //
+        // **And of the log this connection wrote, which a statement that changed
+        // no rows leaves behind with nothing dirty.** `DELETE FROM t WHERE x = 5`
+        // on a table with no such row still commits a transaction to the log,
+        // and its records reach no dirty frame, so the question above answered
+        // "nothing held" and the connection closed without folding. The file then
+        // stayed behind its log for good: every later open replayed that
+        // transaction, printed `replayed the log: 1 committed transactions` and
+        // closed without folding it either, because a reader appends nothing.
+        // `since_checkpoint` counts only what this connection appended, so a
+        // read-only session still releases without taking the file exclusively.
         let holding = self.holds_what_the_file_does_not(&self.storage.database)
+            || self.storage.wal.since_checkpoint() > 0
             || self.session_state.attached.iter().any(|held| {
-                held.path.is_some() && self.holds_what_the_file_does_not(&held.database)
+                held.path.is_some()
+                    && (self.holds_what_the_file_does_not(&held.database)
+                        || held.wal.since_checkpoint() > 0)
             });
         if !holding {
             return Ok(());

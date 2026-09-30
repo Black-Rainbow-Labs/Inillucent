@@ -3,7 +3,7 @@
 This folder holds the reference pages for inillucent. Each page can be read on its own.
 
 To learn inillucent step by step, read the documentation book at
-[inillucent.com/docs](https://inillucent.com/docs). The book is a tutorial in 25 chapters. The pages
+[inillucent.com/docs](https://inillucent.com/docs). The book is a tutorial in 26 chapters. The pages
 here are for looking things up.
 
 The tables below list the pages in reading order for a programmer who has used a database but has
@@ -37,7 +37,7 @@ this index.
 | 8 | [SQL support](sql.md) | The SQL that runs, the cases that differ from SQLite, and the statements the engine refuses |
 | 9 | [Pragmas](pragmas.md) | Every pragma the engine recognises. A program writes this page from the engine's own list |
 | 10 | [Search explained from the start](search-explained.md) | Keyword search, search by meaning and hybrid search for a reader who has never built a search, with every term defined and examples to run |
-| 11 | [Retrieval for RAG, explained from the start](rag-explained.md) | What a RAG system is, which search techniques found the right text in a measured study, and how to set them up in inillucent: chunking, a reranker, reciprocal rank fusion and bulk embedding |
+| 11 | [Retrieval for RAG, explained from the start](rag-explained.md) | What a RAG system is, each step and the choices at each step, and how to set it up in inillucent: chunking, a reranker, reciprocal rank fusion and bulk embedding |
 | 12 | [Vector search](vector-search.md) | `VECTOR(N)` columns, HNSW indexes, the `inillucent_search` table, and how hybrid search ranks results |
 | 13 | [Embeddings](embeddings.md) | Running the embedding model inside your process, installing it, and choosing a model |
 | 14 | [Migrating](migrating.md) | Copying a SQLite file, a PostgreSQL database or a MySQL database into inillucent |
@@ -58,15 +58,25 @@ every interval, every p-value and every diagnostic. `inillucent-bench grade` wri
 [Retrieval quality](retrieval-quality.md) and `inillucent-scorecard.md` describe the same run, taken
 on 2026-09-20.
 
+## Research
+
+Each study measures one question about how inillucent should work, and says what was built because
+of each result. The same studies are at [inillucent.com/research](https://inillucent.com/research).
+
+| | Page | What it covers |
+|---|---|---|
+| 20 | [Research](research/README.md) | The list of studies, newest first |
+| 21 | [Which retrieval techniques find the right text for RAG](research/rag-retrieval-study.md) | Chunking, headings, embedding models, fusion, rerankers and language model helpers, measured on 67,369 emails, and the features each result led to |
+
 ## Working on it
 
 | | Page | What it covers |
 |---|---|---|
-| 20 | [Repository and building](repository.md) | The crates and what each one does, building, running the tests, and the test coverage table |
-| 21 | [Dependency policy](dependency-policy.md) | Which crates a production crate may use, and why the allowed list is short |
-| 22 | [Writing style](writing-style.md) | How to write and check a page in this folder or a chapter on inillucent.com |
-| 23 | [Roadmap](roadmap.md) | What is not built yet, in the order it is being worked on |
-| 24 | [Closed items](closed-items.md) | What came off the roadmap, and the measurement that closed each item |
+| 22 | [Repository and building](repository.md) | The crates and what each one does, building, running the tests, and the test coverage table |
+| 23 | [Dependency policy](dependency-policy.md) | Which crates a production crate may use, and why the allowed list is short |
+| 24 | [Writing style](writing-style.md) | How to write and check a page in this folder or a chapter on inillucent.com |
+| 25 | [Roadmap](roadmap.md) | What is not built yet, in the order it is being worked on |
+| 26 | [Closed items](closed-items.md) | What came off the roadmap, and the measurement that closed each item |
 | | [`AGENTS.md`](../AGENTS.md) | The starting page for an AI agent that uses or changes this repository |
 | | [`agent-skills/`](../agent-skills/README.md) | One page for each common job, readable by any AI agent |
 

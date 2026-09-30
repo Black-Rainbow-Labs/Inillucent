@@ -2147,6 +2147,14 @@ covers = ["inillucent-search", "inillucent-core", "inillucent-engine"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "search_facet_compare"
+tier = "engine"
+covers = ["inillucent-search", "inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "search_fusion"
 tier = "engine"
 covers = ["inillucent-search", "inillucent-core", "inillucent-engine"]

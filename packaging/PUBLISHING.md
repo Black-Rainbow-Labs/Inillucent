@@ -20,7 +20,7 @@ Checked on 2026-09-24 with requests that carried no credential. Every destinatio
 | crates.io | `inillucent-cli` and the other publishable crates | yes |
 | npm | `inillucent`, with five `@blackrainbowlabs/cli-*` platform packages | yes |
 | PyPI | `inillucent` | yes |
-| Go | `github.com/Black-Rainbow-Labs/Inillucent/packages/go` | yes, through `proxy.golang.org` |
+| Go | `github.com/Black-Rainbow-Labs/Inillucent/packages/go/v2` | yes, through `proxy.golang.org` |
 | Packagist | `black-rainbow-labs/inillucent` | yes |
 | Homebrew | `brew install black-rainbow-labs/inillucent/inillucent` | yes |
 

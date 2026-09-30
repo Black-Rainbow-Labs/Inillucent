@@ -1182,11 +1182,17 @@ pub enum Branches {
 }
 
 impl Branches {
-    fn runs_lexical(self) -> bool {
+    /// Whether this selection runs the lexical retriever.
+    ///
+    /// Public so a caller of `search_branches` can report the same `path` that
+    /// `hybrid_search_grouped` reports without copying the match itself.
+    pub fn runs_lexical(self) -> bool {
         matches!(self, Branches::Both | Branches::Lexical)
     }
 
-    fn runs_vector(self) -> bool {
+    /// Whether this selection runs the vector retriever. A search that does not
+    /// is the one `hybrid_search_grouped` reports with the path `lexical`.
+    pub fn runs_vector(self) -> bool {
         matches!(self, Branches::Both | Branches::Vector)
     }
 }

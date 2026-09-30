@@ -198,6 +198,24 @@ function Get-NextVersion {
     }
 }
 
+function Get-GoMajorSuffix {
+    <#
+    .SYNOPSIS
+        The end of the Go module path for a version: `/v<major>` from 2.0.0 on, nothing before.
+
+    .DESCRIPTION
+        Go's rule for a module at major version 2 or higher: its path ends in the major version, and
+        proxy.golang.org refuses the version otherwise. Versions 0.x and 1.x have no suffix.
+
+    .PARAMETER Version
+        The version being released.
+    #>
+    param([string] $Version)
+    $major = [int] ($Version.Split('.')[0])
+    if ($major -ge 2) { return "/v$major" }
+    return ''
+}
+
 # ---------------------------------------------------------------------------
 # Phase 2: the version, in every file that carries it.
 # ---------------------------------------------------------------------------
@@ -763,7 +781,8 @@ function Get-Routes {
             # The unescaped path is a different module that does not exist, so this reported "does
             # not name 0.1.7 yet" for a tag that had been pushed correctly - a verifier that fails
             # on a healthy release teaches people to ignore it.
-            Verify = { Test-Registry -Url 'https://proxy.golang.org/github.com/!black-!rainbow-!labs/!inillucent/packages/go/@latest' -Version $Version }
+            # The module path ends in `/v<major>` from 2.0.0 on, so the question is asked of that path.
+            Verify = { Test-Registry -Url "https://proxy.golang.org/github.com/!black-!rainbow-!labs/!inillucent/packages/go$(Get-GoMajorSuffix -Version $Version)/@latest" -Version $Version }
         },
         @{
             Name   = 'packagist'
@@ -1204,6 +1223,14 @@ function Publish-GoModule {
         The version being released.
     #>
     param([string] $Version)
+    # **A 2.x module path must end in `/v2` (the 2.0.1 release).** proxy.golang.org refuses any other
+    # path at that version with "module path must match major version", after the tag has been
+    # pushed and too late to fix inside the release. So the tag is refused here first.
+    $suffix = Get-GoMajorSuffix -Version $Version
+    $goMod = Get-Content -Raw -LiteralPath (Join-Path $root 'packages/go/go.mod')
+    if ($goMod -notmatch "(?m)^module github\.com/Black-Rainbow-Labs/Inillucent/packages/go$([regex]::Escape($suffix))\s*$") {
+        throw "packages/go/go.mod must declare module github.com/Black-Rainbow-Labs/Inillucent/packages/go$suffix for version $Version. Go refuses a module at major version 2 or higher whose path does not end in /v<major>."
+    }
     $tag = "packages/go/v$Version"
     # **On the mirror, at the mirror's own release commit (task-1995).** The module path is
     # `github.com/Black-Rainbow-Labs/Inillucent/packages/go`, so proxy.golang.org reads this tag off

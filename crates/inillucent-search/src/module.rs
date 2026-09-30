@@ -140,11 +140,32 @@ fn readable_here(
 }
 
 /// Returns the columns a declaration produces, visible ones first.
+///
+/// A facet column is declared `TEXT` because its value is always stored as
+/// text. Without that affinity `WHERE email_id = 3` compared the stored `'3'`
+/// with the integer 3 and matched nothing in a plain `SELECT` or `DELETE`,
+/// while the same constraint inside a search matched, because the cursor reads
+/// a claimed facet value as text. With it, SQL applies text affinity to the
+/// literal, and a join against an integer column applies numeric affinity to
+/// the facet, so both forms select the same rows. The engine's recheck of a
+/// constraint the module did not claim applies that affinity too - see
+/// `comparison_affinity` in `inillucent-engine/src/vtab.rs`.
+///
+/// @param options - the table's parsed declaration
+/// @param table - the table's own name, which becomes the hidden query column
 fn declaration_of(options: &Options, table: &[u8]) -> Declaration {
     let mut columns: Vec<DeclaredColumn> = options
         .columns
         .iter()
-        .map(|name| DeclaredColumn::visible(&String::from_utf8_lossy(name)))
+        .enumerate()
+        .map(|(position, name)| {
+            let column = DeclaredColumn::visible(&String::from_utf8_lossy(name));
+            if options.is_facet(position) {
+                column.typed("TEXT")
+            } else {
+                column
+            }
+        })
         .collect();
     columns.push(DeclaredColumn::hidden(&String::from_utf8_lossy(table)));
     columns.push(DeclaredColumn::hidden("k").typed("INTEGER"));

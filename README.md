@@ -67,7 +67,7 @@ directory, and need no administrator rights.
 | Homebrew | `brew install black-rainbow-labs/inillucent/inillucent` |
 | npm | `npm install -g inillucent` |
 | pip | `pip install inillucent` |
-| Go | `go install github.com/Black-Rainbow-Labs/Inillucent/packages/go/cmd/inillucent-install@latest && inillucent-install` |
+| Go | `go install github.com/Black-Rainbow-Labs/Inillucent/packages/go/v2/cmd/inillucent-install@latest && inillucent-install` |
 | Composer | `composer require black-rainbow-labs/inillucent && vendor/bin/inillucent-install` |
 | cargo | `cargo install inillucent-cli inillucent-migrate`. For the `embed()` function, run `cargo install inillucent-cli --features embed` |
 

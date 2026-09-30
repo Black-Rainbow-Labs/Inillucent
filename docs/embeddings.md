@@ -219,6 +219,28 @@ is given, so the SQL adds the prefix.
 
 `embed(NULL)` returns `NULL`.
 
+`embed(TEXT)` runs only in a statement your program sends. It is refused inside a trigger, a view,
+a generated column, a `DEFAULT`, a `CHECK` and an index expression, with
+`embed may only be used from top-level SQL`, because a database file must not be able to make the
+program that opens it load the model. A trigger can copy a vector that the program's own statement
+computed. [Vector search](vector-search.md#keeping-an-fts5-table-in-step-with-a-table) shows that
+pattern.
+
+### Embed each document when you write it
+
+Most programs add documents a few at a time: an email arrives, a page is edited. Compute the vector
+in the same statement that stores the row, and the table never holds a row without one:
+
+```sql
+INSERT INTO note_search (rowid, body, vector) VALUES (?1, ?2, embed('search_document: ' || ?2));
+```
+
+One embedding takes 12 to 36 ms on the processor once the model is loaded, and the first call in a
+process loads it, which takes 0.7 to 1.2 seconds. A search embeds only the question. Nothing is
+embedded again unless its text changes. [Retrieval for RAG](rag-explained.md#keep-the-search-table-current)
+shows the whole cycle for a mailbox: a new email, a changed email and a deleted email.
+`inillucent embed`, [below](#embedding-a-whole-table), is for the first import of a whole collection.
+
 ### A question is embedded once for the whole statement
 
 In the `ORDER BY` above, `embed('search_query: ' || ?1)` has the same argument for every row.
@@ -310,6 +332,10 @@ cost.
 
 The default is `idle` with a timer of 5 minutes, shown as `idle:300s`.
 
+On a graphics card, a dropped model still leaves about 500 MiB on the card, under `on-demand` and
+after an `idle` timer ends. That 500 MiB is the CUDA context, which stays until the process exits. See [What stays on a graphics card after the model is
+dropped](#what-stays-on-a-graphics-card-after-the-model-is-dropped).
+
 ```sh
 inillucent setup-embeddings --residency idle:5m        # recorded for this machine
 INILLUCENT_EMBED_RESIDENCY=on-demand inillucent ...     # for one process
@@ -368,6 +394,59 @@ What the run found:
   int8 is not the default.
 - **The first CUDA session in a process takes about 1.6 s** instead of 774 ms, because the graphics
   driver starts up at the same time.
+
+### What stays on a graphics card after the model is dropped
+
+On a processor, dropping the model gives its memory back. On a graphics card, about 500 MiB stays on
+the card until the process exits, whichever residency profile is set. That 500 MiB is the CUDA
+context, which the process creates when it opens its first CUDA session. ONNX Runtime does not own
+the CUDA context and has no call that releases it. Everything ONNX Runtime does own, which is the
+weights and the CUDA execution provider's memory arena, comes back when the session is dropped.
+
+`inillucent-bench embed-residency --memory` measures this. It loads `nomic-embed-text-v1.5` on a
+card, embeds 64 documents of about 2,300 characters, drops the model, and reads the card with
+`nvidia-smi` after each step. The run below was taken on 30 September 2026 at commit `31f100a3`, on
+Windows with an RTX 5090 (card 0) and nothing else starting or stopping on that card.
+
+```sh
+inillucent-bench embed-residency --memory --devices cuda:0 --repeats 5 --documents 64 \
+  --model-dir ~/.cache/inillucent-models/nomic-embed-text-v1.5
+```
+
+| Moment | Card memory against the start |
+|---|---:|
+| session open | +1,102 MiB |
+| 64 documents embedded | +3,264 MiB |
+| session dropped | +500 MiB |
+| cycles 2 to 5, session dropped | +499 to +504 MiB |
+
+A small Python script that loads only the CUDA runtime and creates a context, with no ONNX Runtime
+in the process, measured the same card:
+
+| Step | Card memory against the start |
+|---|---:|
+| CUDA context created | +495 MiB |
+| cuBLAS and cuDNN handles created, then destroyed | +497 MiB |
+| `cudaDeviceReset` | +0 MiB |
+
+What the two runs show:
+
+- **The memory arena comes back.** It grows by about 2.2 GB while the 64 documents are embedded, and
+  all of it is released when the session is dropped.
+- **Nothing leaks from one session to the next.** The residue is the same after the fifth cycle as
+  after the first.
+- **The residue is the CUDA context.** A process that creates a context and does nothing else holds
+  495 MiB, and inillucent's residue is 500 MiB. Only `cudaDeviceReset` or the end of the process
+  gives it back.
+- **Lazy module loading keeps the context small, and it is on by default.** With
+  `CUDA_MODULE_LOADING=EAGER`, creating a cuBLAS handle added another 208 MiB of kernels to the
+  context. CUDA 12.2 and later load kernels lazily unless that variable says otherwise.
+
+inillucent does not call `cudaDeviceReset`. It destroys the context for the whole process, so any
+other code in the same process that is using that card, including a second inillucent session,
+would fail on its next call. So the residency profiles release everything except the CUDA context.
+A program that needs the whole card back while it keeps running should embed in a child process
+that exits when the work is done, or run the model on the processor.
 
 `Optimization::All` sets ONNX Runtime's `ORT_ENABLE_ALL`, which is the value 99. The `ort` crate's
 `Level3` is the value 3, `ORT_ENABLE_LAYOUT`, which ONNX Runtime added in 1.23. ONNX Runtime 1.22.0
@@ -488,9 +567,10 @@ It never runs on the processor without saying so.
 
 ## Embedding a whole table
 
-`embed()` in SQL embeds one row at a time. `inillucent embed` embeds every row of a table whose vector
-column is `NULL`, sorts the texts by length, groups them under a memory ceiling, and writes the
-vectors in transactions:
+`embed()` in SQL embeds one row at a time, which is right for documents that arrive a few at a time.
+For the first import of a whole collection, or to fill vectors after changing the model,
+`inillucent embed` embeds every row of a table whose vector column is `NULL`, sorts the texts by
+length, groups them under a memory ceiling, and writes the vectors in transactions:
 
 ```sh
 inillucent --db app.rdb embed --table chunk --text body --vector v \

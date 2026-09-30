@@ -209,7 +209,9 @@ row corpus measured for [Vector search](../../docs/vector-search.md), the two me
 of the top ten. Filtering afterwards also returns fewer rows than `k`.
 
 A facet is also an ordinary column. It comes back from a `SELECT`, and `WHERE live = '0'` works on a
-query that is not a search. A table that declares a facet is stored in format 2, and a build older
+query that is not a search. A facet is stored as text and has text affinity, so `email_id = 3` and
+`email_id = '3'` select the same rows in a search, a `SELECT`, an `UPDATE` and a `DELETE`. Release 2.0.1
+and earlier matched nothing for the integer outside a search; there, compare with a text value. A table that declares a facet is stored in format 2, and a build older
 than the one that added facets refuses to open it, with a message that says so.
 
 ## Making vectors with `embed()`
@@ -238,8 +240,15 @@ SELECT id FROM note ORDER BY vector_distance_cos(v, embed('search_query: flight 
   those locations.
 - **`embed()` runs once for a statement when its argument does not change between rows.** `embed`
   is registered as deterministic, so the planner can compute it once.
-- **`embed()` cannot be used in a `CHECK` constraint or an index expression.** Loading the model
-  there would happen once per row.
+- **`embed()` runs only in a statement the program sends.** It is refused in a trigger, a view, a
+  generated column, a `DEFAULT`, a `CHECK` and an index expression, with
+  `embed may only be used from top-level SQL`, because a database file must not be able to make
+  the program that opens it load a model. A trigger can copy a vector the program's own statement computed.
+- **Embed a document when it is written, and only then.** Put `embed('search_document: ' || ...)` in
+  the `INSERT` that stores each new document, and delete and insert a changed document's chunks. A
+  search embeds only the question. `inillucent embed --table ...` is for the first import of a whole
+  collection. [Retrieval for RAG](../../docs/rag-explained.md#keep-the-search-table-current) has the
+  whole cycle for a mailbox.
 - **Add the prefix the model expects.** `nomic-embed-text-v1.5` expects `search_query: ` before a
   question and `search_document: ` before a stored passage.
 
@@ -252,6 +261,10 @@ stays in memory:
 | `resident` | a bulk import, or a server that searches all the time |
 | `on-demand` | a process that answers one question and exits |
 | `idle:<time>`, default `idle:300s` | a person asking a few questions in a row |
+
+On a graphics card, unloading the model leaves about 500 MiB on the card until the process exits.
+That is the CUDA context, and no residency profile releases it. A program that needs the whole card
+back should embed in a child process that exits afterwards.
 
 [Embeddings](../../docs/embeddings.md) has the details.
 
@@ -312,8 +325,9 @@ questions over 67,369 emails found this setup worked best. Every step is a featu
    `rerank_depth` lower on a machine with no graphics card.
 
 Pass the question to `question` and to the reranker with no `search_query: ` label. That label is
-for `nomic-embed-text-v1.5` only. See [Retrieval for a language model,
-explained](../../docs/rag-explained.md) for the measurements.
+for `nomic-embed-text-v1.5` only. See [Retrieval for RAG, explained from the
+start](../../docs/rag-explained.md) for each step, and [the retrieval
+study](../../docs/research/rag-retrieval-study.md) for the measurements behind each default.
 
 ## Before you design around a feature
 

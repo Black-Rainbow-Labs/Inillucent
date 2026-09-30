@@ -34,7 +34,7 @@
 --
 -- ## What is not here
 --
--- 162 statements are carried. 17 literals are not, because they are `format!`
+-- 163 statements are carried. 17 literals are not, because they are `format!`
 -- templates rather than statements: Nikaya interpolates a column list, a table
 -- name or a key into them, and what reaches the engine is whatever the
 -- interpolation produced. Running the literal would assert that the engine
@@ -453,24 +453,28 @@ SELECT name FROM schema_migration WHERE name = ?1;
 -- params: ["row-0001", 1]
 INSERT INTO schema_migration (name, applied_at) VALUES (?1, ?2);
 
--- statement: db.rs:753
+-- statement: db.rs:755
 -- params: ["row-0001"]
 SELECT id FROM chunk WHERE id > ?1 AND embedding_attempts < 3
 ORDER BY id LIMIT 5000;
 
--- statement: db.rs:772
+-- statement: db.rs:774
 -- params: ["row-0001", "row-0001"]
 SELECT chunk_id FROM chunk_embedding
 WHERE chunk_id = ?1 AND embedding_model = ?2;
 
--- statement: db.rs:781
+-- statement: db.rs:783
 -- params: ["row-0001", 1]
 INSERT INTO embedding_queue (chunk_id, queued_at) VALUES (?1, ?2)
 ON CONFLICT (chunk_id) DO NOTHING;
 
--- statement: main.rs:288
+-- statement: main.rs:295
 -- params: []
 SELECT count(*) AS total FROM document;
+
+-- statement: main.rs:817
+-- params: []
+UPDATE chunk SET embedding_attempts = 0, embedding_error = NULL WHERE embedding_attempts > 0;
 
 -- statement: repositories/accounts.rs:33
 -- params: ["row-0001"]
@@ -1010,72 +1014,72 @@ SELECT snippet FROM email_message WHERE document_id = ?1;
 SELECT document_id, address FROM email_participant
 WHERE document_id = ?1 AND kind IN ('to', 'cc') ORDER BY kind, ordinal;
 
--- statement: repositories/status.rs:46
+-- statement: repositories/status.rs:49
 -- params: []
 SELECT provider_account, authorization_state FROM source_account
 WHERE source_type = 'gmail' LIMIT 1;
 
--- statement: repositories/status.rs:56
+-- statement: repositories/status.rs:59
 -- params: []
 SELECT messages_total_remote, last_history_id, full_sync_started_at,
        full_sync_completed_at, last_incremental_at
 FROM gmail_sync_state LIMIT 1;
 
--- statement: repositories/status.rs:77
+-- statement: repositories/status.rs:80
 -- params: []
 SELECT count(*) AS total FROM document WHERE kind = 'email' AND deleted_at IS NULL;
 
--- statement: repositories/status.rs:78
+-- statement: repositories/status.rs:81
 -- params: []
 SELECT count(*) AS total FROM document WHERE kind = 'email' AND deleted_at IS NOT NULL;
 
--- statement: repositories/status.rs:79
+-- statement: repositories/status.rs:82
 -- params: []
 SELECT count(*) AS total FROM document WHERE kind = 'attachment';
 
--- statement: repositories/status.rs:80
+-- statement: repositories/status.rs:83
 -- params: []
 SELECT count(*) AS total FROM attachment;
 
--- statement: repositories/status.rs:81
+-- statement: repositories/status.rs:84
 -- params: []
 SELECT count(*) AS total FROM attachment_download_queue WHERE status = 'queued';
 
--- statement: repositories/status.rs:82
+-- statement: repositories/status.rs:85
 -- params: []
 SELECT count(*) AS total FROM attachment WHERE extraction_status = 'pending';
 
--- statement: repositories/status.rs:83
+-- statement: repositories/status.rs:86
 -- params: []
 SELECT count(*) AS total FROM attachment WHERE extraction_status = 'failed';
 
--- statement: repositories/status.rs:84
+-- statement: repositories/status.rs:87
 -- params: []
 SELECT count(*) AS total FROM attachment_download_queue WHERE status = 'failed';
 
--- statement: repositories/status.rs:85
+-- statement: repositories/status.rs:88
 -- params: []
 SELECT count(*) AS total FROM chunk;
 
--- statement: repositories/status.rs:108
+-- statement: repositories/status.rs:115
 -- params: ["row-0001"]
 SELECT count(*) AS total FROM chunk_embedding WHERE embedding_model = ?1;
 
--- statement: repositories/status.rs:219
+-- statement: repositories/status.rs:226
 -- params: []
 SELECT count(*) AS total FROM document WHERE indexed_at IS NULL AND deleted_at IS NULL;
 
--- statement: repositories/status.rs:306
+-- statement: repositories/status.rs:313
 -- params: []
 SELECT id, job_type, status, counters, error_summary, started_at, finished_at
 FROM sync_job WHERE status = 'running' ORDER BY id DESC LIMIT 1;
 
--- statement: repositories/status.rs:320
+-- statement: repositories/status.rs:327
 -- params: []
 SELECT id, job_type, status, counters, error_summary, started_at, finished_at
 FROM sync_job ORDER BY id DESC LIMIT 10;
 
--- statement: repositories/status.rs:340
+-- statement: repositories/status.rs:347
 -- params: []
 SELECT labels FROM document_meta WHERE kind = 'email';
 
@@ -1279,23 +1283,23 @@ SELECT (SELECT count(*) FROM document WHERE kind='email' AND deleted_at IS NULL)
 (SELECT count(*) FROM chunk_embedding WHERE embedding_model = ?1) AS d,
 (SELECT count(*) FROM attachment WHERE extraction_status='pending') AS e;
 
--- statement: services/gates.rs:764
+-- statement: services/gates.rs:772
 -- params: []
 SELECT from_name AS value FROM document_meta
 WHERE from_name IS NOT NULL AND from_name <> ''
 GROUP BY from_name ORDER BY count(*) DESC LIMIT 1;
 
--- statement: services/gates.rs:777
+-- statement: services/gates.rs:785
 -- params: []
 SELECT thread_id AS value FROM document_meta WHERE thread_id IS NOT NULL
 GROUP BY thread_id ORDER BY count(*) DESC LIMIT 1;
 
--- statement: services/gates.rs:786
+-- statement: services/gates.rs:794
 -- params: []
 SELECT address AS value FROM email_participant
 GROUP BY address ORDER BY count(*) DESC LIMIT 1;
 
--- statement: services/gates.rs:867
+-- statement: services/gates.rs:875
 -- params: ["row-0001"]
 SELECT d.id AS id, d.kind AS kind, d.provider_id AS provider_id,
        m.from_address AS from_address, m.from_name AS from_name, m.labels AS labels,
@@ -1304,12 +1308,12 @@ FROM document d
 JOIN document_meta m ON m.document_id = d.id
 WHERE d.id = ?1 AND d.deleted_at IS NULL;
 
--- statement: services/gates.rs:945
+-- statement: services/gates.rs:953
 -- params: ["row-0001"]
 SELECT ma.document_id AS document_id FROM message_attachment ma
 WHERE ma.attachment_id = ?1 LIMIT 1;
 
--- statement: services/gates.rs:956
+-- statement: services/gates.rs:964
 -- params: ["row-0001"]
 SELECT address, display_name FROM email_participant WHERE document_id = ?1;
 
@@ -1332,34 +1336,34 @@ LIMIT 1;
 SELECT address FROM email_participant
 WHERE document_id = ?1 AND kind IN ('to','cc') ORDER BY ordinal LIMIT 12;
 
--- statement: services/ingestion.rs:707
+-- statement: services/ingestion.rs:664
 -- params: ["row-0001", 1]
 INSERT INTO sync_job (job_type, status, started_at, created_at, updated_at)
 VALUES (?1, 'running', ?2, ?2, ?2) RETURNING id;
 
--- statement: services/ingestion.rs:720
+-- statement: services/ingestion.rs:677
 -- params: [1, "row-0001", 1]
 UPDATE sync_job SET counters = ?2, updated_at = ?3 WHERE id = ?1;
 
--- statement: services/ingestion.rs:737
+-- statement: services/ingestion.rs:694
 -- params: [1, "row-0001", "row-0001", 1]
 UPDATE sync_job SET status = ?2, error_summary = ?3, finished_at = ?4, updated_at = ?4
 WHERE id = ?1;
 
--- statement: services/ingestion.rs:760
+-- statement: services/ingestion.rs:717
 -- params: ["row-0001", 1]
 UPDATE sync_job SET status = 'failed', error_summary = ?1, finished_at = ?2, updated_at = ?2
 WHERE status = 'running';
 
--- statement: services/ingestion.rs:770
+-- statement: services/ingestion.rs:727
 -- params: []
 SELECT count(*) AS total FROM sync_job WHERE status = 'running';
 
--- statement: services/ingestion.rs:814
+-- statement: services/ingestion.rs:771
 -- params: [1]
 SELECT status, error_summary FROM sync_job WHERE id = ?1;
 
--- statement: services/ingestion.rs:821
+-- statement: services/ingestion.rs:778
 -- params: [1]
 SELECT status FROM sync_job WHERE id = ?1;
 

@@ -355,6 +355,35 @@ The same works for an `inillucent_search` table. inillucent makes a trigger's wr
 table after the statement's writes to ordinary tables and before the commit. A statement that fails
 undoes both.
 
+A trigger can copy a vector, but it cannot compute one. `embed(TEXT)` is refused inside a trigger,
+a view, a generated column, a `DEFAULT`, a `CHECK` and an index expression, with
+`embed may only be used from top-level SQL`. A schema is data, and a database file must not be able
+to make the program that opens it load the embedding model on every insert. So the statement your
+program runs computes the vector, and the trigger copies `NEW.v`:
+
+```sql
+CREATE TABLE page (id INTEGER PRIMARY KEY, title TEXT, body TEXT, v VECTOR(768));
+CREATE VIRTUAL TABLE page_search USING inillucent_search(title, body, dims = 768);
+
+CREATE TRIGGER page_search_insert AFTER INSERT ON page BEGIN
+  INSERT INTO page_search (rowid, title, body, vector) VALUES (NEW.id, NEW.title, NEW.body, NEW.v);
+END;
+CREATE TRIGGER page_search_delete AFTER DELETE ON page BEGIN
+  DELETE FROM page_search WHERE rowid = OLD.id;
+END;
+CREATE TRIGGER page_search_update AFTER UPDATE ON page BEGIN
+  UPDATE page_search SET title = NEW.title, body = NEW.body, vector = NEW.v WHERE rowid = NEW.id;
+END;
+
+-- your program's statement: the vector is computed here, once
+INSERT INTO page (title, body, v) VALUES (?1, ?2, embed('search_document: ' || ?1 || char(10) || ?2));
+```
+
+`page_search` keeps its own copy of the text and the vector, so each row is stored twice. There is no
+`content =` option that makes an `inillucent_search` table read another table. When the search
+table can be the only copy, write to it directly, as in
+[Retrieval for RAG](rag-explained.md#keep-the-search-table-current).
+
 ## Hybrid search
 
 An `inillucent_search` table holds text and vectors together. It is a virtual table: it looks like
@@ -536,7 +565,12 @@ return fewer rows than `k`.
 Rules for facet columns:
 
 - Several facet constraints joined by `AND` must all hold.
-- A facet value is compared as text, so `region = 1` and `region = '1'` select the same rows.
+- A facet value is stored as text, and a facet column has text affinity. `region = 1` and
+  `region = '1'` select the same rows, inside a search and in a plain `SELECT`, `UPDATE` or
+  `DELETE`. A join against an integer column, `ON e.id = docs.email_id`, matches too. Before
+  release 2.0.2 a facet column had no affinity, so outside a search `email_id = 3` matched nothing
+  and `DELETE FROM docs WHERE email_id = 3` deleted nothing without an error. On those releases
+  write `email_id = '3'`.
 - Write a value for every row. A facet left NULL reads back as the empty string, so no ordinary
   filter matches it.
 - `FACET` must be the last word of the column's declaration. `"live facet"` in quotes is one column

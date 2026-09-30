@@ -902,7 +902,7 @@ fn install_model(root: &Path, spec: &ModelSpec, force: bool) -> Result<Installed
     manifest.source = Some(spec.source.to_string());
     manifest
         .write(&directory)
-        .map_err(|reason| Failed::misuse(format!("the model manifest: {reason}")))?;
+        .map_err(|reason| Failed::misuse(format!("the model manifest: {reason:#}")))?;
 
     Ok(InstalledModel {
         id: spec.id.to_string(),

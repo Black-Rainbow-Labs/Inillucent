@@ -12,10 +12,10 @@ inillucent is written in Rust, so `go install` cannot build the database itself.
 first, then add the package to your module.
 
 ```sh
-go install github.com/Black-Rainbow-Labs/Inillucent/packages/go/cmd/inillucent-install@latest
+go install github.com/Black-Rainbow-Labs/Inillucent/packages/go/v2/cmd/inillucent-install@latest
 inillucent-install
 
-go get github.com/Black-Rainbow-Labs/Inillucent/packages/go@latest
+go get github.com/Black-Rainbow-Labs/Inillucent/packages/go/v2@latest
 ```
 
 `inillucent-install` downloads the release archive for your machine from
@@ -47,7 +47,7 @@ import (
     "context"
     "fmt"
 
-    inillucent "github.com/Black-Rainbow-Labs/Inillucent/packages/go"
+    inillucent "github.com/Black-Rainbow-Labs/Inillucent/packages/go/v2"
 )
 
 func main() {
@@ -170,7 +170,7 @@ that its git tags carry the folder name, so a release tag looks like `packages/g
 still ask for the plain version:
 
 ```sh
-go get github.com/Black-Rainbow-Labs/Inillucent/packages/go@latest
+go get github.com/Black-Rainbow-Labs/Inillucent/packages/go/v2@latest
 ```
 
 `go get ...@packages/go/v<version>` fails with `invalid version`. Do not install `v0.1.0`. Its installer

@@ -49,6 +49,7 @@ mod arm;
 mod corpus;
 mod embedcheck;
 mod engine;
+mod gpumemory;
 mod gradeembed;
 mod http;
 mod llamacpp;
@@ -443,6 +444,10 @@ enum Command {
     /// The number this exists for is the one that decides whether an
     /// application can load the model per query and drop it again, or has to
     /// keep it resident. `docs/embeddings.md` prints what it found.
+    ///
+    /// With `--memory` it measures something else: what loading, embedding and
+    /// dropping the model leaves on each card named in `--devices`, read with
+    /// `nvidia-smi` after every step.
     EmbedResidency {
         /// The model directory, which must hold a manifest.
         #[arg(long, default_value = DEFAULT_MODEL_DIR)]
@@ -465,6 +470,17 @@ enum Command {
         /// second copy of the weights on disk.
         #[arg(long, default_value_t = false)]
         skip_optimized: bool,
+        /// Measure card memory across load, embed and drop cycles instead of
+        /// load times. Every device in `--devices` must be a card.
+        #[arg(long, default_value_t = false)]
+        memory: bool,
+        /// Documents embedded per cycle under `--memory`, which is what grows
+        /// the execution provider's memory arena.
+        #[arg(long, default_value_t = 64)]
+        documents: usize,
+        /// Seconds to wait before each card reading under `--memory`.
+        #[arg(long, default_value_t = 2.0)]
+        settle: f64,
     },
     /// Measure what scoring a number of passages with the reranker costs.
     ///
@@ -1152,14 +1168,23 @@ fn main() -> Result<()> {
             repeats,
             steady,
             skip_optimized,
-        } => embed_residency(
-            &model_dir,
-            optimized_dir,
-            &devices,
-            repeats,
-            steady,
-            skip_optimized,
-        ),
+            memory,
+            documents,
+            settle,
+        } => {
+            if memory {
+                embed_residency_memory(&model_dir, &devices, repeats, documents, settle)
+            } else {
+                embed_residency(
+                    &model_dir,
+                    optimized_dir,
+                    &devices,
+                    repeats,
+                    steady,
+                    skip_optimized,
+                )
+            }
+        }
         Command::RerankCost {
             model_dir,
             devices,
@@ -1795,6 +1820,49 @@ fn embed_residency(
         }
     }
     residency::report(&measurements);
+    Ok(())
+}
+
+/// Measures what loading, embedding and dropping the model leaves on each card.
+///
+/// @param model_dir - the model directory, `~` not yet expanded
+/// @param devices - the cards to measure, comma separated as given
+/// @param cycles - how many times to load, embed and drop the model
+/// @param documents - documents embedded per cycle
+/// @param settle - seconds to wait before each reading
+fn embed_residency_memory(
+    model_dir: &str,
+    devices: &str,
+    cycles: usize,
+    documents: usize,
+    settle: f64,
+) -> Result<()> {
+    let dir = expand_home(model_dir)?;
+    let dir = std::path::Path::new(&dir);
+    let model = models::resolve_dir(dir, "model.onnx")?;
+    for device in parse_devices(devices)? {
+        let Device::Cuda(card) = device else {
+            anyhow::bail!(
+                "--memory measures a card, and {} is not one",
+                device.label()
+            );
+        };
+        println!(
+            "### cuda:{card}, {} cycles of {documents} documents",
+            cycles
+        );
+        println!();
+        let phases = gpumemory::measure(&gpumemory::MemoryStudy {
+            dir,
+            manifest: &model.manifest,
+            card,
+            cycles,
+            documents,
+            settle: std::time::Duration::from_secs_f64(settle.max(0.0)),
+        })?;
+        gpumemory::report(&phases);
+        println!();
+    }
     Ok(())
 }
 

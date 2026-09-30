@@ -997,9 +997,36 @@ fn rechecks_of(
             constraint.spec.op,
             recheck_value(constraint, position, supplied, params, catalog)?,
             collation,
+            comparison_affinity(&constraint.predicate),
         ));
     }
     Ok(rechecks)
+}
+
+/// Returns the affinity a comparison predicate was bound with.
+///
+/// **A recheck compared the raw values and ignored the column's affinity.**
+/// The binder decides by SQLite's rules which affinity `s.email_id = 3`
+/// compares under - the TEXT affinity of an `inillucent_search` facet column
+/// turns the 3 into `'3'` - and writes it on the node. The recheck compared
+/// the stored `'3'` with the integer 3 instead, so the row failed, and
+/// `DELETE FROM s WHERE email_id = 3` deleted nothing and reported no error.
+/// A module column with no declared type has no affinity, so its comparisons
+/// are unchanged: `pragma_table_info('t') WHERE cid = '1'` still finds no
+/// row, which is what SQLite 3.53.4 answers too.
+///
+/// `None` for a predicate that is not a comparison, such as `LIKE`, which
+/// reads both sides as text anyway.
+///
+/// @param predicate - the whole predicate the constraint was taken from
+fn comparison_affinity(
+    predicate: &inillucent_sql::bind::BoundExpr,
+) -> Option<inillucent_value::affinity::Affinity> {
+    match predicate {
+        inillucent_sql::bind::BoundExpr::Compare { affinity, .. }
+        | inillucent_sql::bind::BoundExpr::Is { affinity, .. } => *affinity,
+        _ => None,
+    }
 }
 
 /// Returns the collation a comparison predicate was bound with.
@@ -1026,12 +1053,14 @@ fn comparison_collation(
 }
 
 /// One constraint the engine has to test for itself: which column, which
-/// operator, against what, under which collation.
+/// operator, against what, under which collation, and with which affinity
+/// applied to both sides first.
 type Recheck = (
     usize,
     inillucent_sql::vtab::ConstraintOp,
     OwnedDatum,
     inillucent_value::collation::Collation,
+    Option<inillucent_value::affinity::Affinity>,
 );
 
 /// Returns the positions of a table's hidden columns.
@@ -1093,18 +1122,18 @@ fn recheck_value(
 /// Reports whether a produced row satisfies the constraints the module left.
 ///
 /// @param row - the row the cursor produced
-/// @param rechecks - the column, operator, value and collation of each
+/// @param rechecks - the column, operator, value, collation and affinity of each
 /// @param case_sensitive - `PRAGMA case_sensitive_like`, for a `LIKE` recheck
 fn passes_rechecks(
     row: &[OwnedDatum],
     rechecks: &[Recheck],
     case_sensitive: bool,
 ) -> DbResult<bool> {
-    for (column, op, wanted, collation) in rechecks {
+    for (column, op, wanted, collation, affinity) in rechecks {
         let Some(held) = row.get(*column) else {
             return Ok(false);
         };
-        if !satisfies(held, *op, wanted, *collation, case_sensitive)? {
+        if !satisfies(held, *op, wanted, *collation, *affinity, case_sensitive)? {
             return Ok(false);
         }
     }
@@ -1304,6 +1333,7 @@ impl ImportedDatabase {
                 constraint.spec.op,
                 inillucent_exec::physical::literal_value(&constraint.value, params)?,
                 inillucent_value::collation::Collation::Binary,
+                comparison_affinity(&constraint.predicate),
             ));
         }
         let mut batch: Vec<Vec<OwnedDatum>> =
@@ -1437,18 +1467,36 @@ impl ImportedDatabase {}
 /// @param op - the operator the constraint carries
 /// @param wanted - the value on the other side
 /// @param collation - the column's collation
+/// @param affinity - the comparison's affinity, applied to both sides before an
+///   ordering comparison, as the pipeline's own comparison does
 /// @param case_sensitive - `PRAGMA case_sensitive_like`
 fn satisfies(
     held: &OwnedDatum,
     op: inillucent_sql::vtab::ConstraintOp,
     wanted: &OwnedDatum,
     collation: inillucent_value::Collation,
+    affinity: Option<inillucent_value::affinity::Affinity>,
     case_sensitive: bool,
 ) -> DbResult<bool> {
     use inillucent_sql::vtab::ConstraintOp;
     use std::cmp::Ordering;
     let left = Value::from(&held.borrow()).into_owned()?;
     let right = Value::from(&wanted.borrow()).into_owned()?;
+    let (left, right) = match affinity {
+        Some(affinity) => (
+            inillucent_value::affinity::apply_affinity(
+                left,
+                affinity,
+                inillucent_value::TextEncoding::Utf8,
+            )?,
+            inillucent_value::affinity::apply_affinity(
+                right,
+                affinity,
+                inillucent_value::TextEncoding::Utf8,
+            )?,
+        ),
+        None => (left, right),
+    };
     if matches!(left, Value::Null) || matches!(right, Value::Null) {
         // A comparison against NULL is unknown, which excludes the row.
         return Ok(false);

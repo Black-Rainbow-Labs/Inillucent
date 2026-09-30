@@ -29,6 +29,19 @@
 //! | [`Residency::Idle`] | a person asking questions: the load is paid once for a burst, and the memory comes back afterwards |
 //!
 //! `Idle` is the default for the reason the third row gives.
+//!
+//! ## What does not come back on a graphics card
+//!
+//! Dropping a CUDA session releases the weights and the CUDA execution
+//! provider's memory arena, and nothing else. About 500 MiB stays on the card
+//! for the life of the process: that is the CUDA context the first session
+//! created, which ONNX Runtime does not own and cannot release.
+//! `inillucent-bench embed-residency --memory` measured it on an RTX 5090 as
+//! +500 MiB after every one of five load, embed and drop cycles, against
+//! +495 MiB for a process that only creates a context. Only `cudaDeviceReset`
+//! frees it, and that would break any other session in the process still using
+//! the card, so the manager does not call it. `docs/embeddings.md` has the
+//! whole measurement.
 
 use std::time::Duration;
 

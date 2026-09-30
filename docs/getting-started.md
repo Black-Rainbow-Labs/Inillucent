@@ -38,7 +38,7 @@ install a specific release and `--uninstall` (`-Uninstall`) to remove it.
 | npm | `npm install -g inillucent`, or `npx inillucent help` to try it with nothing installed |
 | pip | `pip install inillucent` |
 | Homebrew | `brew install black-rainbow-labs/inillucent/inillucent` |
-| Go | `go install github.com/Black-Rainbow-Labs/Inillucent/packages/go/cmd/inillucent-install@latest`, then run `inillucent-install` |
+| Go | `go install github.com/Black-Rainbow-Labs/Inillucent/packages/go/v2/cmd/inillucent-install@latest`, then run `inillucent-install` |
 | Composer | `composer require black-rainbow-labs/inillucent`, then run `vendor/bin/inillucent-install` |
 | cargo | `cargo install inillucent-cli` |
 

@@ -329,22 +329,29 @@ impl ModelManifest {
     /// prefixes and pooling, which decide what the vectors mean rather than how
     /// fast they arrive.
     ///
+    /// Returns `anyhow::Result` like every other fallible call a caller of this
+    /// crate makes, so a caller can add `.with_context` and use `?`. It returned
+    /// `Result<_, String>` through 2.0.1, which made every caller write a `map_err`.
+    ///
     /// @param dir - the model directory
-    pub fn read(dir: &std::path::Path) -> Result<ModelManifest, String> {
+    pub fn read(dir: &std::path::Path) -> anyhow::Result<ModelManifest> {
+        use anyhow::Context;
         let path = dir.join(Self::FILE);
         let text = std::fs::read_to_string(&path)
-            .map_err(|error| format!("reading {}: {error}", path.display()))?;
-        serde_json::from_str(&text).map_err(|error| format!("parsing {}: {error}", path.display()))
+            .with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 
     /// Writes this manifest into a model directory.
     ///
+    /// Returns `anyhow::Result` for the same reason `read` does.
+    ///
     /// @param dir - the model directory
-    pub fn write(&self, dir: &std::path::Path) -> Result<(), String> {
+    pub fn write(&self, dir: &std::path::Path) -> anyhow::Result<()> {
+        use anyhow::Context;
         let path = dir.join(Self::FILE);
-        let text = serde_json::to_string_pretty(self)
-            .map_err(|error| format!("serializing the manifest: {error}"))?;
-        std::fs::write(&path, text).map_err(|error| format!("writing {}: {error}", path.display()))
+        let text = serde_json::to_string_pretty(self).context("serializing the manifest")?;
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
     }
 
     /// Apply the document prefix.
@@ -457,6 +464,31 @@ mod tests {
         let text = serde_json::to_string_pretty(&m).unwrap();
         let back: ModelManifest = serde_json::from_str(&text).unwrap();
         assert_eq!(m, back);
+    }
+
+    /// `read` and `write` return `anyhow::Result`, so a caller's
+    /// `.with_context` compiles and the chain names both the caller's step and
+    /// the file. A manifest written and read back is the same manifest.
+    #[test]
+    fn read_and_write_take_a_callers_context_and_round_trip() {
+        use anyhow::Context;
+        let dir = std::env::temp_dir().join(format!("inillucent-manifest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let missing = ModelManifest::read(&dir.join("absent")).context("opening the embedder");
+        let chain = format!("{:#}", missing.unwrap_err());
+        assert!(
+            chain.starts_with("opening the embedder: reading "),
+            "{chain}"
+        );
+        assert!(chain.contains(ModelManifest::FILE), "{chain}");
+
+        let written = ModelManifest::nomic_v1_5();
+        written.write(&dir).context("installing").unwrap();
+        let back = ModelManifest::read(&dir).context("opening").unwrap();
+        assert_eq!(written, back);
+        std::fs::remove_file(dir.join(ModelManifest::FILE)).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]

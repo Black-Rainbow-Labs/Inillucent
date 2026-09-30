@@ -37,6 +37,12 @@ reason = "task-1973 turned on the four lints and missing_docs for this crate (#!
 sha256 = "fb0792c4483c9ef452769c933eb5f3dcfc9bab32c8b3753840fb35d9e7b294a3"
 
 [[amendment]]
+path = "crates/inillucent-bench/src/gpumemory.rs"
+ticket = "task-2161"
+reason = "task-2161: new file. Measures what loading, embedding and dropping the model leaves on a card."
+sha256 = "27557ced0f24df8d887b329b2a92e408aaaafc856fcdeaa4dac3b7306e91c253"
+
+[[amendment]]
 path = "crates/inillucent-bench/src/gradeembed.rs"
 ticket = "task-2110"
 reason = "Bug 5: a manifest can say runnable false, for a model whose vectors come from outside (the Qwen3 teachers), and an installed arm that fails to open fails the arm tests rather than skipping"
@@ -62,9 +68,9 @@ sha256 = "ab368ee7cdb99c2bb13b3c15299ac1ef2f29784b20f38137f2368703054b2777"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/main.rs"
-ticket = "task-2158"
-reason = "task-2158: the rerank-cost subcommand."
-sha256 = "18a4a8c8c482cfa47e54c585952294cbc4c32a5837eec44725c4a58669139e0c"
+ticket = "task-2161"
+reason = "task-2161: embed-residency --memory, which reads card memory after each load, embed and drop."
+sha256 = "6eeaa1f7deb6c85daa8793115bf1d215648a10a9ef6645008a4f92d8e71a1d01"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/metrics.rs"
@@ -206,9 +212,9 @@ sha256 = "a783de8198752d17fa1d349e043f47fd41d71fb25dffd0b91d7dc8527be8774c"
 
 [[amendment]]
 path = "crates/inillucent-core/src/index.rs"
-ticket = "task-2068"
-reason = "make_text_resident, for a caller that reads every chunk once - inillucent-migrate digests a whole corpus and should not pay a positional read each."
-sha256 = "2da11e58aeb70de253f1f22fc2d67094574d53654d839341f9104e73e2ea061e"
+ticket = "task-2161"
+reason = "task-2161: Branches::runs_vector and runs_lexical are public, so a caller of search_branches can report the path hybrid_search_grouped reports. No change to what a search does."
+sha256 = "64e9af2b0bc257476d21b4b67084aa482f85b579ac86449849fde689a0c6a45a"
 
 [[amendment]]
 path = "crates/inillucent-core/src/install.rs"
@@ -224,9 +230,9 @@ sha256 = "6d922f0be1b5a645179a7bb6035adf0b1ee7f01dd190e6c6bf74ead2ba7f2e2c"
 
 [[amendment]]
 path = "crates/inillucent-core/src/model.rs"
-ticket = "task-2158"
-reason = "task-2158: a model kind field, absent for a bi encoder and left out of its digest, and the reranker manifest. A test pins the digest of the baseline manifest."
-sha256 = "333a769c457507a76373cc19e3f8c652318c8575c08dd19f64b18d54fb50d65d"
+ticket = "task-2161"
+reason = "task-2161: ModelManifest::read and write return anyhow::Result instead of Result<_, String>, and a test checks a caller's context reaches the error. No change to what a manifest holds."
+sha256 = "99e6623fdd7f1026b6829b901ebc2b8107b7ddd3c6abc37cd4518de3fdfaa9ba"
 
 [[amendment]]
 path = "crates/inillucent-core/src/persist.rs"
@@ -254,9 +260,9 @@ sha256 = "76bcdcd2c409c80813dab9404864af9906eb43c70860745f8405440640e71a85"
 
 [[amendment]]
 path = "crates/inillucent-core/src/residency.rs"
-ticket = "task-2158"
-reason = "task-2158: the residency manager is generic over the session type so the reranker uses the same profiles and reaper as the embedder. ManagedEmbedder is an alias and its behaviour is unchanged."
-sha256 = "6d585b2345b499ac5d0a34d465bbc84b3f488d370c5077e291469d0fef02fc41"
+ticket = "task-2161"
+reason = "task-2161: the module doc says the CUDA context, about 500 MiB, stays on a card after a session is dropped. Comment only."
+sha256 = "d619bcccdf61631269803df5b6610a4b06359cf4adcf274885c87bb257b7ae6b"
 
 [[amendment]]
 path = "crates/inillucent-core/src/store.rs"

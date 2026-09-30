@@ -1,9 +1,16 @@
 # Retrieval for RAG, explained from the start
 
 This page explains how an application finds the right text to give a language model, which is the
-first half of what is called RAG. It defines every term, describes each technique that was tested,
-and reports what each technique measured on a real collection of 67,369 emails. The last section
-shows how to use the techniques that won in inillucent.
+first half of what is called RAG. It defines every term, walks through each step and the choices at
+each step, and says what each choice measured on a real collection of 67,369 emails. The last
+section shows how to set it up in inillucent, with every command and its output.
+
+The study behind the numbers has its own page,
+[Which retrieval techniques find the right text for RAG](research/rag-retrieval-study.md). It covers
+how the questions were written and graded, every comparison with its interval, the round by round
+tuning, and why each feature was built the way it was. The same material is chapter 18 of the book
+at [inillucent.com/docs](https://inillucent.com/docs#rag) and the study at
+[inillucent.com/research](https://inillucent.com/research#rag-retrieval).
 
 You need to know what a table and a `SELECT` are. You do not need any mathematics beyond adding and
 dividing. [Search explained from the start](search-explained.md) covers keyword search and search by
@@ -37,7 +44,7 @@ where the page first uses it.
 | **HyDE** | hypothetical document embeddings. A language model writes an imagined answer, and the search looks for chunks close to that imagined answer |
 | **GPU** | a graphics card. Models run on it many times faster than on the main processor, the CPU |
 
-The measurement terms are defined in [How the techniques were measured](#how-the-techniques-were-measured).
+The measurement terms are defined in [How the study measured this](#how-the-study-measured-this).
 
 ## What retrieval does
 
@@ -82,7 +89,18 @@ runs for every question.
    by the reranker, and reordered by that score.
 4. **Return** the best 5 or 10 chunks to the language model.
 
-Every one of those steps has choices. The study tried the common ones.
+Every one of those steps has choices. The study tried the common ones. This table is the short
+answer, and the sections after it explain each choice.
+
+| Step | The choices | What the study found | Start with |
+|---|---|---|---|
+| Chunking | 450, 900, 2,000 or 6,000 characters | No measurable difference | 900 characters with an overlap of 100 |
+| Heading | a heading on each chunk, or none | Removing it cost 0.043 to 0.111 nDCG@10 | Always a heading |
+| Embedding | the model inside inillucent, or a newer one in a separate program | No measurable difference | `nomic-embed-text-v1.5` through `inillucent embed` |
+| First search | keyword, vector or hybrid | Hybrid beat keyword alone by 0.038 | Hybrid |
+| Fusion | adaptive weight, fixed weight or RRF | RRF won on the emails, the adaptive weight on another collection | Measure both |
+| Reranking | none, or a reranker over the top 30, 60 or 100 | +0.10 to +0.13, the largest gain | A reranker over the top 60 on a graphics card |
+| Help from a language model | query rewriting, HyDE, document summaries | No gain once a reranker ran | None |
 
 ## The techniques that were tested
 
@@ -179,116 +197,36 @@ Finally, the study gave a local language model two tools, `search_email` and `re
 asked it every question. The model decided what to search for, how many times, and which documents
 to read. This measured whether better search produces better answers, which is what a user sees.
 
-## How the techniques were measured
+## How the study measured this
 
-A retrieval measurement needs three things: questions, the correct answers to each question, and a
-score that compares a search's results with the correct answers.
+119 questions were written from real emails and split into a **dev** half, used for every decision,
+and a **test** half, only reported. A language model graded 11,138 question and document pairs from
+0 to 2, and was checked against known answers. Each search was scored with **nDCG@10**, which is 1
+when the best documents come first and 0 when nothing useful is found. Every difference has a 95%
+interval, and a difference whose interval crosses zero is **inside the noise**: the study could not
+tell the two techniques apart.
 
-**Questions.** 119 questions were written from real emails in the collection, in three styles: a few
-keywords, a full question, and a vague recollection ("that thing someone sent about the move"). They
-were split into two halves of 60 and 59. Every decision was made on the first half, the **dev**
-half. The second half, the **test** half, was only reported. A technique that helps on the dev half
-and not on the test half was tuned to those particular questions and does not generalize.
+The main results, as changes in nDCG@10:
 
-**Correct answers.** For every question, the top 10 documents from every technique were collected
-into one pool, and a strong language model graded every question and document pair: 2 if the
-document answers the question, 1 if it is related, 0 if it is not. 11,138 pairs were graded. The
-grader was checked three ways. It graded the email each question was written from as 2 every time.
-It graded randomly chosen emails as 0 every time. Asked again, it gave the same grade 96.8% of the
-time. A person did not check the grades.
-
-**Scores.** Each score looks at the top 10 or top 5 results of one search:
-
-| Score | What it measures | Range |
+| Technique | Change | 95% interval |
 |---|---|---|
-| **nDCG@10** | the main score. It adds up the grades of the top 10 results, counting results near the top more than results near the bottom, and divides by the best possible total for that question | 0 to 1. 1 means the best documents in the best order |
-| **recall@10** | the share of all documents graded 2 that appear in the top 10 | 0 to 1 |
-| **MRR** | mean reciprocal rank. 1 divided by the position of the first good result: 1 if it is first, 0.5 if it is second | 0 to 1 |
-| **Success@5** | the share of questions with at least one good result in the top 5 | 0 to 1 |
-| **pass rate** | for the agent: the share of answers the grader judged correct, complete and supported by the documents the agent read | 0 to 1 |
+| A reranker over the top 60, against hybrid search | **+0.106** | +0.070 to +0.147 |
+| Heading removed, with a reranker | **-0.111** | -0.148 to -0.073 |
+| RRF, against the adaptive weight | **+0.035** | +0.006 to +0.066 |
+| Hybrid search, against keyword search alone | **+0.038** | +0.021 to +0.058 |
+| `nomic-embed-text-v1.5` inside inillucent, against Nomic v2 | -0.002 | -0.017 to +0.014 |
+| 6,000 character chunks, against 900 | -0.003 | -0.031 to +0.026 |
+| HyDE, against hybrid search | +0.005 | -0.034 to +0.046 |
 
-**Is a difference real?** With 119 questions, two techniques can score differently by chance. Every
-comparison on this page gives a **95% interval**. It was computed by drawing the 119 questions again
-at random 2,000 times, with repeats allowed, and measuring the difference each time. If the whole
-interval is above zero, the technique helped. If the interval crosses zero, the study could not tell
-the two apart, and this page says the difference is **inside the noise**.
+On the whole mailbox, hybrid search scored 0.635 and reranking over RRF scored 0.758. A reranker
+over 60 candidates took 0.14 to 0.23 seconds on a graphics card and 10.6 to 22.8 seconds on 8
+processor threads. Embedding all 558,429 chunks took 22 minutes on a graphics card and would take
+about 12 hours through `embed()` on the processor. The agent that answered from the search gave
+0.780 correct answers on the test half against 0.771 before, which is inside the noise, and made
+0.49 fewer tool calls per answer.
 
-**Two collections.** Most comparisons used a sample of 15,000 emails, because each index takes time
-to build. The important ones were checked again on all 67,369 emails, which is 558,429 chunks.
-
-## What was measured
-
-The study ran on 29 September 2026. The change in nDCG@10 is the technique minus the setup it is
-compared with. A change in **bold** has an interval that does not cross zero.
-
-### Every comparison
-
-| Technique | Compared with | Change in nDCG@10 | 95% interval |
-|---|---|---|---|
-| Reranker `bge-reranker-v2-m3` over the top 60 | hybrid search | **+0.106** | +0.070 to +0.147 |
-| Reranker `gte-reranker-modernbert-base` over the top 60 | hybrid search | **+0.101** | +0.066 to +0.141 |
-| The two rerankers against each other | | +0.004 | -0.017 to +0.026 |
-| Heading removed, with a reranker | heading kept | **-0.111** | -0.148 to -0.073 |
-| Heading removed, hybrid search | heading kept | **-0.043** | -0.083 to -0.002 |
-| Fixed weight 0.5 | adaptive weight | **+0.040** | +0.012 to +0.068 |
-| RRF | adaptive weight | **+0.035** | +0.006 to +0.066 |
-| Hybrid search | keyword search alone | **+0.038** | +0.021 to +0.058 |
-| Hybrid search | vector search alone | +0.005 | -0.042 to +0.057 |
-| Document summary on every chunk, hybrid search | no summary | **+0.063** | +0.024 to +0.104 |
-| Document summary on every chunk, with a reranker | no summary | +0.023 | -0.006 to +0.055 |
-| `nomic-embed-text-v1.5` inside inillucent | Nomic v2, hybrid search | -0.002 | -0.017 to +0.014 |
-| 450 character chunks | 900 | -0.014 | -0.045 to +0.014 |
-| 2,000 character chunks | 900 | -0.009 | -0.033 to +0.015 |
-| 6,000 character chunks | 900 | -0.003 | -0.031 to +0.026 |
-| 6,000 character chunks, with a reranker | 900, with a reranker | +0.019 | -0.010 to +0.052 |
-| Query rewriting | hybrid search | +0.002 | -0.031 to +0.034 |
-| HyDE | hybrid search | +0.005 | -0.034 to +0.046 |
-
-### On the whole collection of 67,369 emails
-
-| Setup | nDCG@10 | recall@10 | MRR | Success@5 | Median search time |
-|---|---|---|---|---|---|
-| Keyword search alone | 0.591 | 0.657 | 0.576 | 0.689 | 24 ms |
-| Hybrid search, adaptive weight | 0.635 | 0.730 | 0.616 | 0.748 | 89 ms |
-| Hybrid search, RRF | 0.667 | 0.752 | 0.656 | 0.798 | 104 ms |
-| Hybrid search, fixed weight 0.5 | 0.672 | 0.771 | 0.657 | 0.798 | 95 ms |
-| RRF, then `bge-reranker-v2-m3` over the top 60 | **0.758** | **0.809** | **0.787** | 0.857 | 296 ms |
-| Adaptive weight, then `bge-reranker-v2-m3` over the top 60 | 0.749 | 0.794 | **0.788** | **0.866** | 305 ms |
-| Adaptive weight, then `gte-reranker-modernbert-base` over the top 60 | 0.755 | 0.808 | 0.775 | **0.866** | 229 ms |
-
-All rows use `nomic-embed-text-v1.5`. The reranker times are on an RTX 5090 graphics card. The same
-table with Nomic v2 gave 0.631 for hybrid search and 0.749 for RRF with the reranker, so the
-embedding model made no measurable difference on the whole collection either.
-
-### What the reranker costs
-
-Time to rerank a set of candidates, median of many searches:
-
-| Reranker | 20 candidates, GPU | 60 candidates, GPU | 20 candidates, CPU | 60 candidates, CPU |
-|---|---|---|---|---|
-| `gte-reranker-modernbert-base` | 0.05 s | 0.14 s | 3.1 s | 10.6 s |
-| `bge-reranker-v2-m3` | 0.06 s | 0.23 s | 6.5 s | 22.8 s |
-
-The CPU runs used 8 threads. On the CPU a reranker over 60 candidates is too slow for a person
-waiting on a search. A smaller or quantized reranker over fewer candidates might be fast enough on a
-CPU, and it has not been measured yet.
-
-### What embedding costs
-
-Embedding all 558,429 chunks took **22 minutes** on the graphics card and would take about **12
-hours** through `embed()` on the CPU, which embeds about 13 chunks a second. The vectors from the
-graphics card matched `embed()` to a cosine similarity of 0.9999994, which means they are the same
-vectors.
-
-### The agent
-
-The agent's pass rate on the test half was 0.771 with the original setup and 0.780 with the best
-setup (the reranker, `nomic-embed-text-v1.5` and a better instruction prompt). The change, +0.008, is
-inside the noise: the interval runs from -0.068 to +0.085. The agent made 0.49 fewer tool calls per
-answer with the better setup.
-
-A capable agent partly makes up for weaker search by searching again and reading more documents. So
-better retrieval showed up as less work for the agent. It did not show up as more correct answers.
+[Which retrieval techniques find the right text for RAG](research/rag-retrieval-study.md) has every
+comparison, the method, the grading checks and the limits of the study.
 
 ## What the results mean
 
@@ -319,15 +257,6 @@ better retrieval showed up as less work for the agent. It did not show up as mor
    collection costs hours of language model time.
 8. **Embed a large collection on a graphics card.** 22 minutes against 12 hours.
 
-## Where the study came from
-
-The study searched one person's private mailbox, so the questions and the emails are not
-published. What can be checked is the method: the questions, grades, scripts and every number came
-from one run, and each number on this page is copied from its output. The same study on a different
-collection may find different sizes of effect. The two effects that were largest here, the reranker
-and the heading, agree with published work on other collections. The effects that were small here,
-such as chunk size, are the ones most likely to differ elsewhere.
-
 ## Doing this in inillucent
 
 Every command and every result below was run on 29 September 2026 at commit `ed70d251`, on the 80
@@ -336,7 +265,8 @@ Wikipedia articles of `examples/rag-agent/corpus`. The chunks were embedded on a
 minutes instead of seconds.
 
 The recipe follows the order of the study: chunk with a heading, embed in bulk, search with both
-lists, and rerank.
+lists, and rerank. The last part shows how a program keeps the search table current as documents are
+added, changed and deleted, using a mailbox.
 
 ```mermaid
 flowchart LR
@@ -421,7 +351,9 @@ inillucent --db app.rdb embed --table chunk --text body --vector v --prefix "sea
 embedded 3233 rows in 5.1 s, 640 rows a second, on cuda:0 with 1 session. 0 skipped because the text was NULL or empty. 0 cut at the model's token limit
 ```
 
-`inillucent embed` reads the rows whose `v` is `NULL`, so a run that stops continues where it ended.
+This is the first import of a whole collection. Documents that arrive later are embedded one at a time
+in the statement that stores them, as [Keep the search table current](#keep-the-search-table-current)
+shows. `inillucent embed` reads the rows whose `v` is `NULL`, so a run that stops continues where it ended.
 The prefix `search_document: ` belongs to `nomic-embed-text-v1.5`. `--sessions 2` runs two sessions on the
 card. [Embeddings](embeddings.md#embedding-a-whole-table) has the measured speeds, including 11
 rows a second for `embed()` in SQL and 813 for two sessions on a card.
@@ -504,6 +436,119 @@ The study found the reranker raised nDCG@10 by 0.10 to 0.13 on every collection.
 here it made a smaller difference. [Vector search](vector-search.md#reranking-a-search) prints the
 comparison. A reranker helps most where many chunks look like good answers and only a few are, which is
 what a mailbox of similar emails is. Check it on your own questions.
+
+### Keep the search table current
+
+The steps above build a table from a collection that already exists. After that, documents arrive a
+few at a time. Each one is embedded once, in the statement that stores it, and a search embeds only
+the question. Nothing is embedded again unless its text changes.
+
+This example is a mailbox. `email` holds each message. `email_search` holds the chunks, and each chunk
+carries its email's id and sender as `FACET` columns, so a search can filter on them and a program can
+delete or join by them. The `inillucent_search` table stores its own copy of each chunk's text and
+vector in the database file, so it is built once and survives a restart.
+
+```sql
+CREATE TABLE email (id INTEGER PRIMARY KEY, sender TEXT, subject TEXT, sent_at TEXT, body TEXT);
+
+CREATE VIRTUAL TABLE email_search USING inillucent_search(text, email_id FACET, sender FACET, dims = 768);
+```
+
+**A new email arrives.** Store it, then cut it into chunks and embed each chunk in one statement.
+Run both in one transaction, so a failure leaves neither:
+
+```sql
+BEGIN;
+INSERT INTO email (id, sender, subject, sent_at, body) VALUES (?1, ?2, ?3, ?4, ?5);
+
+INSERT INTO email_search (text, email_id, sender, vector)
+SELECT c.chunk, e.id, e.sender, embed('search_document: ' || c.chunk)
+FROM email AS e,
+     chunk_text(e.body, 900, 100,
+       'Subject: ' || e.subject || char(10) || 'From: ' || e.sender || char(10) || 'Date: ' || e.sent_at) AS c
+WHERE e.id = ?1;
+COMMIT;
+```
+
+The heading gives every chunk its email's subject, sender and date. Each chunk costs one call to the
+model, 12 to 36 ms on the processor, and the first call in a process loads the model. Three short
+emails, each one chunk, took 2.1 seconds on the processor including that load.
+
+**Search.** Join the hits back to `email` by the facet:
+
+```sql
+SELECT e.id, e.subject,
+       round(confidence(email_search), 3) AS confidence,
+       origin(email_search) AS origin
+FROM email_search
+JOIN email AS e ON e.id = email_search.email_id
+WHERE email_search MATCH 'job OR offer'
+  AND vector = embed('search_query: did anyone offer me a job')
+  AND k = 3
+ORDER BY rank;
+```
+
+```
+id  subject                 confidence  origin
+--  ----------------------  ----------  ------
+2   Offer letter            0.497       both
+1   Invoice 4471 for March  0.171       vector
+3   Dinner Sunday           0.148       vector
+```
+
+The offer letter says "we would like to extend you a position", and the search by meaning found it
+beside the keyword `offer`. Add `AND sender = 'hr@globex.com'` to search one sender's mail.
+
+**An email changes.** The number of chunks can change with the text, so delete the email's chunks and
+insert them again. Only that email is embedded again:
+
+```sql
+BEGIN;
+UPDATE email SET body = ?2 WHERE id = ?1;
+DELETE FROM email_search WHERE email_id = ?1;
+-- then the INSERT ... SELECT ... chunk_text ... embed from above, for WHERE e.id = ?1
+COMMIT;
+```
+
+**An email is deleted.**
+
+```sql
+BEGIN;
+DELETE FROM email_search WHERE email_id = ?1;
+DELETE FROM email WHERE id = ?1;
+COMMIT;
+```
+
+A facet is stored as text and has text affinity, so `email_id = 1` and `email_id = '1'` select the
+same chunks. Release 2.0.1 and earlier compared a facet with an integer under no affinity outside a
+search, so `DELETE FROM email_search WHERE email_id = 1` deleted nothing and gave no error. On those
+releases write `email_id = CAST(?1 AS TEXT)`.
+
+**A whole mailbox the first time.** Insert the chunks without a vector, then fill every vector in one
+run, on a graphics card if there is one:
+
+```sql
+INSERT INTO email_search (text, email_id, sender)
+SELECT c.chunk, e.id, e.sender
+FROM email AS e,
+     chunk_text(e.body, 900, 100,
+       'Subject: ' || e.subject || char(10) || 'From: ' || e.sender || char(10) || 'Date: ' || e.sent_at) AS c;
+```
+
+```sh
+inillucent --db mail.rdb embed --table email_search --text text --vector vector --prefix "search_document: " --device cuda:0
+```
+
+That is the same command as [Embed the whole table](#embed-the-whole-table), pointed at the search
+table's own `vector` column. After the first import, go back to embedding each new email as it
+arrives.
+
+**Why a trigger cannot do the embedding.** `embed(TEXT)` is refused inside a trigger, a view, a
+generated column, a `DEFAULT` and a `CHECK`, with `embed may only be used from top-level SQL`. A
+database file must not be able to make the program that opens it load a model on every insert. A
+trigger can copy a vector your statement computed, as
+[Vector search](vector-search.md#keeping-an-fts5-table-in-step-with-a-table) shows, at the cost of
+storing each vector twice.
 
 ### From the command line, and what to measure next
 

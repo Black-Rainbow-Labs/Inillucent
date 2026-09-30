@@ -52,6 +52,14 @@ if (-not (Test-Path -LiteralPath $nfpm)) {
     throw 'nfpm is missing. Run: pwsh tools/cross/fetch-toolchain.ps1'
 }
 $gpg = 'C:\Program Files\Git\usr\bin\gpg.exe'
+# **Git's own `usr\bin` goes on PATH for this script.** The keyring on this machine uses keyboxd,
+# and Git's gpg starts it as `/usr/lib/gnupg/keyboxd`, a path the MSYS runtime resolves only when
+# its `usr\bin` is on PATH. From Git Bash it is. From PowerShell it is not, and gpg fails with
+# "error running '/usr/lib/gnupg/keyboxd': probably not installed", so the 2.0.1 release first
+# shipped with no .deb and no .rpm. Measured on 2026-09-29: the same `--list-secret-keys` fails
+# from PowerShell and lists the signing key once this directory is prepended.
+$gitUsrBin = Split-Path -Parent $gpg
+if (-not (($env:Path -split ';') -contains $gitUsrBin)) { $env:Path = "$gitUsrBin;$env:Path" }
 
 if (-not $Version) { $Version = Get-WorkspaceVersion -Root $root }
 $dist = Join-Path $root 'dist'

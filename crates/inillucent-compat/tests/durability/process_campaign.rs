@@ -247,8 +247,21 @@ fn afterwards(shell: &Path, database: &Path) -> Afterwards {
             .and_then(|line| line.parse::<u64>().ok())
             .unwrap_or(0)
     };
+    // **A reader that printed nothing is reported with what it said instead.**
+    // Under the release's 24 way parallel run one cut answered an empty
+    // integrity check and the message could not say why: the reader's standard
+    // error, which is where a refused open goes, was dropped. It passed alone
+    // five times in five.
+    let check = match lines.first() {
+        Some(line) => (*line).to_string(),
+        None => format!(
+            "nothing, exit code {}, standard error: {}",
+            said.code,
+            said.stderr.trim()
+        ),
+    };
     Afterwards {
-        check: lines.first().copied().unwrap_or("").to_string(),
+        check,
         rows: number(1),
         highest: number(2),
     }
