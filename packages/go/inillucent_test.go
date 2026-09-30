@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Black-Rainbow-Labs/Inillucent/packages/go"
+	"github.com/Black-Rainbow-Labs/Inillucent/packages/go/v2"
 )
 
 // skipWithoutBinary skips a test when inillucent is not installed, and says how
