@@ -215,6 +215,14 @@ def _declare(lib: ctypes.CDLL) -> None:
 
     lib.inillucent_open.argtypes = [c_char_p, c_uint32, POINTER(c_void_p), POINTER(c_void_p)]
     lib.inillucent_open.restype = c_int32
+    lib.inillucent_open_with_key.argtypes = [
+        c_char_p,
+        c_uint32,
+        c_char_p,
+        POINTER(c_void_p),
+        POINTER(c_void_p),
+    ]
+    lib.inillucent_open_with_key.restype = c_int32
     for name in ("inillucent_close", "inillucent_checkpoint", "inillucent_integrity_check"):
         getattr(lib, name).argtypes = [c_void_p, POINTER(c_void_p)]
         getattr(lib, name).restype = c_int32
@@ -738,7 +746,13 @@ class Statement:
 
 
 class Database:
-    """One open database file."""
+    """One open database file.
+
+    ``key`` opens a database encrypted at rest, and creates one encrypted when
+    the path holds nothing. ``"x'<64 hex digits>'"`` is a raw 32 byte key and
+    any other text is a passphrase. A wrong key, a key for a plaintext file and
+    no key for an encrypted file all raise with the status ``CORRUPT``.
+    """
 
     def __init__(
         self,
@@ -746,6 +760,7 @@ class Database:
         create: bool = True,
         read_only: bool = False,
         diagnostics: bool = False,
+        key: "str | None" = None,
     ) -> None:
         flags = 0
         if create:
@@ -756,9 +771,18 @@ class Database:
             flags |= OPEN_DIAGNOSTICS
         handle = c_void_p()
         error = c_void_p()
-        status = _LIB.inillucent_open(
-            path.encode("utf-8"), flags, ctypes.byref(handle), ctypes.byref(error)
-        )
+        if key is None:
+            status = _LIB.inillucent_open(
+                path.encode("utf-8"), flags, ctypes.byref(handle), ctypes.byref(error)
+            )
+        else:
+            status = _LIB.inillucent_open_with_key(
+                path.encode("utf-8"),
+                flags,
+                key.encode("utf-8"),
+                ctypes.byref(handle),
+                ctypes.byref(error),
+            )
         _check(status, error)
         self._handle = handle
         self._connections: "list[Connection]" = []

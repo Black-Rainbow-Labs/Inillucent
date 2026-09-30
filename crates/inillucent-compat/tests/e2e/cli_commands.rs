@@ -1139,6 +1139,292 @@ fn backup_writes_a_copy_that_holds_the_same_rows() {
     );
 }
 
+// --- encryption at rest ------------------------------------------------------
+
+/// Writes a key file beside a case's database and returns its path.
+///
+/// A raw key, so no case pays for PBKDF2 in a debug build.
+///
+/// @param beside - the case's database
+/// @param name - the key file's name
+/// @param byte - the byte the 32 byte key repeats
+fn key_file(beside: &Path, name: &str, byte: u8) -> String {
+    let path = beside.with_file_name(name);
+    let hex: String = std::iter::repeat_n(format!("{byte:02x}"), 32).collect();
+    std::fs::write(&path, format!("x'{hex}'\n")).expect("the key file is written");
+    path.to_string_lossy().into_owned()
+}
+
+/// Returns the files in a directory, among those whose name starts with
+/// `prefix`, that hold `needle` in plaintext.
+///
+/// @param directory - where to look
+/// @param needle - the bytes to look for
+/// @param prefix - only files whose name starts with this
+fn plaintext_in(directory: &Path, needle: &[u8], prefix: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(directory)
+        .expect("the directory lists")
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path()).unwrap_or_default();
+        if bytes.windows(needle.len()).any(|window| window == needle) {
+            found.push(name);
+        }
+    }
+    found
+}
+
+/// Encrypts the `populated` fixture with a key and returns the copy and the
+/// key file.
+///
+/// @param binary - the built `inillucent`
+/// @param case - the case's directory name
+fn encrypted_copy(binary: &Path, case: &str) -> (PathBuf, String) {
+    let database = populated(binary, case);
+    let key = key_file(&database, "key.txt", 0x5a);
+    let copy = database.with_file_name("sealed.rdb");
+    let ran = run(
+        binary,
+        &[
+            "--db",
+            &database.to_string_lossy(),
+            "--key-file",
+            &key,
+            "encrypt",
+            &copy.to_string_lossy(),
+            "--output",
+            "json",
+        ],
+    );
+    succeeded("encrypt", &ran);
+    assert_eq!(
+        text_field(&ran.stdout, "encryption"),
+        "xchacha20-poly1305",
+        "{}",
+        ran.stdout
+    );
+    (copy, key)
+}
+
+/// `encrypt` writes a copy only its key opens, with no row on the disk in
+/// plaintext, and the same rows through every index.
+#[test]
+fn encrypt_writes_a_copy_only_its_key_opens() {
+    let binary = program("inillucent");
+    let (copy, key) = encrypted_copy(&binary, "encrypt");
+    let directory = copy.parent().expect("a directory").to_path_buf();
+    assert_eq!(
+        plaintext_in(&directory, b"goodbye", "sealed"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        plaintext_in(&directory, b"quick brown", "sealed"),
+        Vec::<String>::new()
+    );
+    assert!(
+        !plaintext_in(&directory, b"goodbye", "app").is_empty(),
+        "the fixture was meant to be plaintext, so the search above could not fail"
+    );
+    let counted = run(
+        &binary,
+        &[
+            "--db",
+            &copy.to_string_lossy(),
+            "--key-file",
+            &key,
+            "query",
+            "SELECT (SELECT count(*) FROM note WHERE body = 'goodbye'), \
+             (SELECT count(*) FROM doc WHERE doc MATCH 'fox')",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(
+        rows(&counted.stdout),
+        vec![vec!["1".to_string(), "1".to_string()]],
+        "{}",
+        counted.said()
+    );
+    let refused = run(
+        &binary,
+        &[
+            "--db",
+            &copy.to_string_lossy(),
+            "query",
+            "SELECT 1",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(refused.code, 1, "{}", refused.said());
+    assert!(refused.stdout.contains("corrupt"), "{}", refused.stdout);
+    let wrong = key_file(&copy, "wrong.txt", 0x5b);
+    let refused = run(
+        &binary,
+        &[
+            "--db",
+            &copy.to_string_lossy(),
+            "--key-file",
+            &wrong,
+            "query",
+            "SELECT 1",
+        ],
+    );
+    assert_eq!(refused.code, 1, "{}", refused.said());
+    assert!(
+        refused.stderr.contains("the key is wrong"),
+        "{}",
+        refused.said()
+    );
+}
+
+/// `decrypt` writes a plaintext copy the program opens with no key.
+#[test]
+fn decrypt_writes_a_plaintext_copy() {
+    let binary = program("inillucent");
+    let (sealed, key) = encrypted_copy(&binary, "decrypt");
+    let opened = sealed.with_file_name("opened.rdb");
+    let ran = run(
+        &binary,
+        &[
+            "--db",
+            &sealed.to_string_lossy(),
+            "--key-file",
+            &key,
+            "decrypt",
+            &opened.to_string_lossy(),
+            "--output",
+            "json",
+        ],
+    );
+    succeeded("decrypt", &ran);
+    assert_eq!(
+        text_field(&ran.stdout, "encryption"),
+        "none",
+        "{}",
+        ran.stdout
+    );
+    let counted = run(
+        &binary,
+        &[
+            "--db",
+            &opened.to_string_lossy(),
+            "query",
+            "SELECT count(*) FROM note",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(
+        rows(&counted.stdout),
+        vec![vec!["2".to_string()]],
+        "{}",
+        counted.said()
+    );
+}
+
+/// `rekey` moves the database to the key in `--new-key-file`: the old key
+/// stops opening it and the new one opens it.
+#[test]
+fn rekey_moves_the_database_to_the_new_key() {
+    let binary = program("inillucent");
+    let (sealed, key) = encrypted_copy(&binary, "rekey");
+    let new_key = key_file(&sealed, "new.txt", 0x77);
+    let ran = run(
+        &binary,
+        &[
+            "--db",
+            &sealed.to_string_lossy(),
+            "--key-file",
+            &key,
+            "rekey",
+            "--new-key-file",
+            &new_key,
+        ],
+    );
+    succeeded("rekey", &ran);
+    let stale = run(
+        &binary,
+        &[
+            "--db",
+            &sealed.to_string_lossy(),
+            "--key-file",
+            &key,
+            "query",
+            "SELECT 1",
+        ],
+    );
+    assert_eq!(
+        stale.code,
+        1,
+        "the old key still opens it: {}",
+        stale.said()
+    );
+    let counted = run(
+        &binary,
+        &[
+            "--db",
+            &sealed.to_string_lossy(),
+            "--key-file",
+            &new_key,
+            "query",
+            "SELECT count(*) FROM note",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(
+        rows(&counted.stdout),
+        vec![vec!["2".to_string()]],
+        "{}",
+        counted.said()
+    );
+}
+
+/// The shell opens an encrypted database with `-key-file`, and a commit it
+/// made survives the process being killed before any checkpoint, with
+/// nothing on the disk in plaintext.
+#[test]
+fn encryption_survives_a_killed_shell() {
+    let binary = program("inillucent");
+    let shell = program("inillucent-shell");
+    let (sealed, key) = encrypted_copy(&binary, "encrypted-crash");
+    let printed = inillucent_compat::cliproc::write_and_crash_with(
+        &shell,
+        &["-key-file", &key],
+        &sealed,
+        "INSERT INTO note (body) VALUES ('written before the kill');",
+    );
+    assert!(
+        printed.contains("written"),
+        "the shell did not run the insert: {printed}"
+    );
+    let directory = sealed.parent().expect("a directory").to_path_buf();
+    assert_eq!(
+        plaintext_in(&directory, b"before the kill", "sealed"),
+        Vec::<String>::new()
+    );
+    let counted = run_with_input(
+        &shell,
+        &[
+            "-key-file",
+            &key,
+            &sealed.to_string_lossy().replace('\\', "/"),
+        ],
+        "SELECT count(*) FROM note;\n",
+    );
+    assert!(
+        counted.stdout.trim().ends_with('3'),
+        "the commit was lost: {}",
+        counted.said()
+    );
+}
+
 /// `restore` refuses a backup that is not there, and reopens one that is.
 ///
 /// **What `restore` does is open the named file for the rest of the session,
@@ -2032,6 +2318,41 @@ fn setup_embeddings_reports_what_is_installed() {
         "`setup-embeddings` did not report where it installs:\n{}",
         ran.stdout
     );
+}
+
+/// `embed` refuses a table that is not there, by name, and never opens a model to do it.
+///
+/// A build with embedding support checks the table and the columns first, so a misspelled name is
+/// an error at once on a machine that has no model. A build without it answers `unsupported` with
+/// exit code 3, and the message says the build lacks embedding support. Either way the exit code is
+/// not zero and nothing is written.
+#[test]
+fn embed_refuses_a_missing_table_by_name_or_says_the_build_lacks_embedding() {
+    let binary = program("inillucent");
+    let root = inillucent_compat::workspace_root().join("_agent_output/cli-embed");
+    let _ = std::fs::create_dir_all(&root);
+    let database = root.join(format!("{}.rdb", std::process::id()));
+    inillucent_base::testing::remove_database(&database);
+    let path = database.to_string_lossy().into_owned();
+    let created = run(&binary, &["create", &path]);
+    succeeded("create", &created);
+    let ran = run(
+        &binary,
+        &[
+            "--db", &path, "embed", "--table", "nothing", "--text", "body", "--vector", "v",
+        ],
+    );
+    assert_ne!(ran.code, 0, "a missing table must fail: {}", ran.said());
+    let said = ran.said();
+    if ran.code == 3 {
+        assert!(said.contains("no embedding support compiled in"), "{said}");
+    } else {
+        assert_eq!(ran.code, 1, "{said}");
+        assert!(
+            said.contains("nothing"),
+            "the refusal must name the table: {said}"
+        );
+    }
 }
 
 // --- the two verbs that hand the process over ---------------------------------

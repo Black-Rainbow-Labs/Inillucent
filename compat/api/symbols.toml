@@ -5,7 +5,7 @@
 # `inillucent-compat::obligations::the_registers_match_the_engine` fails if
 # this file and the engine disagree.
 
-count = 53
+count = 54
 profile = "default"
 
 [[symbol]]
@@ -115,6 +115,10 @@ signature = "inillucent_last_insert_rowid(conn: *mut inillucent_conn) -> i64"
 [[symbol]]
 name = "inillucent_open"
 signature = "inillucent_open( path: *const c_char, flags: u32, out: *mut *mut inillucent_db, error: *mut *mut inillucent_error, ) -> i32"
+
+[[symbol]]
+name = "inillucent_open_with_key"
+signature = "inillucent_open_with_key( path: *const c_char, flags: u32, key: *const c_char, out: *mut *mut inillucent_db, error: *mut *mut inillucent_error, ) -> i32"
 
 [[symbol]]
 name = "inillucent_path"

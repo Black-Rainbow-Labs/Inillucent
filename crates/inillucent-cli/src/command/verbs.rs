@@ -1085,6 +1085,88 @@ pub fn backup(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
     Ok(Outcome::said("backup", format!("wrote {named}")).with("wrote", json::text(&named)))
 }
 
+/// `encrypt`: writes an encrypted copy of a plaintext database.
+///
+/// The key is the one this process was given - `--key-file` or
+/// `INILLUCENT_KEY` - and the source is opened without it, which the
+/// dispatcher arranges through `crate::keys::opens_source_without_key`.
+pub fn encrypt(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
+    let Some(key) = crate::keys::configured() else {
+        return Err(Failed::said(
+            Status::InvalidState,
+            "encrypt needs a key for the copy: pass --key-file or set INILLUCENT_KEY",
+        ));
+    };
+    let named = copy_target(context, arguments)?;
+    context
+        .shell()
+        .export_to(&named, Some(key))
+        .map_err(|error| Failed::from_engine(&error))?;
+    Ok(
+        Outcome::said("encrypt", format!("wrote {named}, encrypted"))
+            .with("wrote", json::text(&named))
+            .with("encryption", json::text(inillucent_driver::CIPHER_NAME)),
+    )
+}
+
+/// `decrypt`: writes a plaintext copy of an encrypted database.
+pub fn decrypt(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
+    if !context.shell().is_encrypted() {
+        return Err(Failed::said(
+            Status::InvalidState,
+            "this database is not encrypted, so there is nothing to decrypt",
+        ));
+    }
+    let named = copy_target(context, arguments)?;
+    context
+        .shell()
+        .export_to(&named, None)
+        .map_err(|error| Failed::from_engine(&error))?;
+    Ok(
+        Outcome::said("decrypt", format!("wrote {named}, not encrypted"))
+            .with("wrote", json::text(&named))
+            .with("encryption", json::text("none")),
+    )
+}
+
+/// `rekey`: changes the key of an encrypted database.
+///
+/// The new key comes from `--new-key-file` or `INILLUCENT_NEW_KEY`, never
+/// from a word on the command line; see `crate::keys` for why.
+pub fn rekey(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
+    let key = match arguments.text("new-key-file") {
+        Some(path) => {
+            let confined = context.confine(path)?;
+            crate::keys::read_key_file(&confined.to_string_lossy())
+                .map_err(|message| Failed::said(Status::InvalidState, message))?
+        }
+        None => match std::env::var(crate::keys::NEW_KEY_VARIABLE) {
+            Ok(text) if !text.is_empty() => inillucent_driver::EncryptionKey::parse(&text),
+            _ => {
+                return Err(Failed::said(
+                    Status::InvalidState,
+                    "rekey needs the new key: pass --new-key-file or set INILLUCENT_NEW_KEY",
+                ))
+            }
+        },
+    };
+    context
+        .shell()
+        .rekey(key)
+        .map_err(|error| Failed::from_engine(&error))?;
+    Ok(Outcome::said("rekey", "the key was changed".to_string()))
+}
+
+/// Reads and confines the output path `encrypt` and `decrypt` write to.
+///
+/// @param context - the session, for its root
+/// @param arguments - the command's arguments
+fn copy_target(context: &Context, arguments: &Arguments) -> Result<String, Failed> {
+    let file = arguments.required_text("file")?.to_string();
+    let confined = context.confine(&file)?;
+    Ok(confined.to_string_lossy().into_owned())
+}
+
 /// `restore`: replaces this database's contents from a file.
 pub fn restore(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
     let file = arguments.required_text("file")?.to_string();
@@ -1241,8 +1323,14 @@ pub fn search(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
     let query_text = arguments.required_text("query")?.to_string();
     let name = arguments.required_text("table")?.to_string();
     let k = neighbours_asked_for(arguments)?;
+    // `--rerank` names the query text as the question, which turns reranking on for the search
+    // and asks for `k` rows so the reranker's candidates are counted from the same number.
+    let reranked = match arguments.flag("rerank") {
+        true => format!(" AND question = {} AND k = {k}", quoted_text(&query_text)),
+        false => String::new(),
+    };
     let sql = format!(
-        "SELECT rowid, * FROM {0} WHERE {0} MATCH {1} ORDER BY rank LIMIT {k}",
+        "SELECT rowid, * FROM {0} WHERE {0} MATCH {1}{reranked} ORDER BY rank LIMIT {k}",
         quoted(&name),
         quoted_text(&query_text)
     );

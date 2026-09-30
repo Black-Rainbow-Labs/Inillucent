@@ -442,10 +442,11 @@ models already return vectors of length 1. `l2_normalize(v)` scales any other ve
 | `vector` | `vector = ?1`, or `vector = embed('search_query: ' \|\| ?1)` | the query vector |
 | `k` | `k = 20` | how many hits the search collects. Defaults to 10 |
 | `recall` | `recall = 0.9` | in approximate mode, widens the graph walk to reach this recall. Exact mode ignores it |
+| `question` | `question = 'plain words'` | the question in plain words. Naming it reranks the search with a cross encoder. See [Reranking a search](#reranking-a-search) |
 | `rank` | `ORDER BY rank` | the combined ranking. Ascending order is best first, as in FTS5 |
 
-The same arguments also work as a table function, in the order query text, `k`, vector, recall:
-`SELECT rowid, title FROM docs('release', 2)`.
+The same arguments also work as a table function, in the order query text, `k`, vector, recall,
+question: `SELECT rowid, title FROM docs('release', 2)`.
 
 `k` and `LIMIT` are different. `k` decides how many hits the search collects. `LIMIT` trims the
 rows the query returns.
@@ -465,6 +466,8 @@ Three functions describe each hit:
 | `dims = N` | the vector width. Without it the table is keyword only and refuses a vector | none |
 | `mode` | `'exact'` compares every vector. `'approximate'` walks the HNSW graph | `'exact'` |
 | `vector_weight` | a fixed weight from 0 to 1 for the vector list in a search with both parts. See [How the two rankings are combined](#how-the-two-rankings-are-combined) | chosen for each query |
+| `fusion` | how the keyword list and the vector list are combined: `'adaptive'`, `'rrf'` or `'weighted'`. See [How the two rankings are combined](#how-the-two-rankings-are-combined) | `'adaptive'` |
+| `rerank_depth` | how many rows of the combined list the reranker scores, from 1 to 1,000. See [Reranking a search](#reranking-a-search) | 60 |
 | `metric` (or `distance`) | `'cosine'` or `'l2'`. Any other value is refused | `'cosine'` |
 | `m`, `ef_construction`, `ef_search` | the HNSW graph settings, as in [Index settings](#index-settings) | 16, 64, 64 |
 | `tokenize` | the tokenizer. `porter` is the only one | `porter` |
@@ -579,9 +582,105 @@ in the top 5.
 | 0.8 | 18 of 20 | 0.789 | 0.528 | 0.466 |
 
 A search of a plain `VECTOR(768)` column holding the same vectors found 18 of 20 with a mean
-reciprocal rank of 0.798. Measure a weight on your own questions before you set one. The option was
+reciprocal rank of 0.798. The same search with a reranker, by naming `question`, found 18 of 20
+with a mean reciprocal rank of 0.813. See [Reranking a search](#reranking-a-search). Measure a
+weight on your own questions before you set one. The option was
 added in release 1.0.30, and release 1.0.29 or earlier cannot open a database with a table that
 declares it.
+
+### The fusion option
+
+`fusion` chooses how the two lists become one:
+
+| Value | What it does |
+|---|---|
+| `'adaptive'` | the default. Min max scaling with a vector weight of 0.35 that is adjusted for each query |
+| `'rrf'` | reciprocal rank fusion with k = 60. Each list gives a row `1 / (60 + position)`, and the two numbers are added. Only positions count, and no weight applies |
+| `'weighted'` | min max scaling with the fixed `vector_weight`. It needs `vector_weight` |
+
+```sql
+CREATE VIRTUAL TABLE chunk_search USING inillucent_search(title, body, dims = 768, fusion = 'rrf');
+```
+
+A declaration with no `fusion` and no `vector_weight` is `'adaptive'`, and `vector_weight` alone is
+`'weighted'`, as it always was. `fusion = 'rrf'` with `vector_weight` is refused when the table is
+created, because reciprocal rank fusion has no weight. `fusion = 'weighted'` without `vector_weight`
+is refused too. The default did not change. The retrieval study on a mailbox preferred reciprocal rank
+fusion by 0.035 nDCG@10, and the graded corpus in this repository preferred the adaptive weight by
+0.065 on document identity. Two corpora disagreed, and a change of default would change the results
+of every existing table. [Retrieval for RAG, explained from the start](rag-explained.md) says how to
+measure the choice on your own questions.
+
+**The score of an `'rrf'` search is small.** A row that is first in both lists scores
+`1/61 + 1/61`, about 0.033, and no row can score more than `2/61`. Do not set a threshold on `score`
+expecting a number from 0 to 1. `confidence` is computed the same way whatever fusion runs.
+
+A release before this option existed ignores the `fusion` key. It searches a table declared with
+`fusion = 'rrf'` with the adaptive weight.
+
+### Reranking a search
+
+A reranker is a cross encoder. It reads the question and each candidate row together and scores how
+well the row answers the question. A search that names `question` runs one over its own results:
+
+```sql
+CREATE VIRTUAL TABLE chunk_search USING inillucent_search(title, body, dims = 768, rerank_depth = 60);
+
+SELECT rowid, title, score(chunk_search) AS relevance
+FROM chunk_search
+WHERE chunk_search MATCH ?1
+  AND vector = embed('search_query: ' || ?1)
+  AND question = ?1
+  AND k = 10
+ORDER BY rank;
+```
+
+A query that names `question` is reranked, and a query that does not is not. `rerank_depth` says how
+deep. The search collects the top `rerank_depth` rows of the combined list with the table's own
+fusion. The passage of each row is its text columns in declaration order, joined by a newline, so a
+table declared as `(title, body)` gives the reranker `title`, a newline and `body`. Facet columns are
+left out. The reranker scores every passage in one call, and the rows come back highest score first,
+ties keeping the combined order. A `k` larger than `rerank_depth` returns `rerank_depth` rows, because only
+those were scored.
+
+Pass the question in plain words. The `search_query: ` label belongs to `nomic-embed-text-v1.5` and a
+cross encoder was not trained with it. `score(chunk_search)` is the reranker's score from 0 to 1 and
+`rank` is its negative. `confidence()` and `origin()` are the combined search's, unchanged.
+
+The search is refused in these cases:
+
+| What the query does | What happens |
+|---|---|
+| names `question` with neither `MATCH` nor `vector` | status `invalid_state`: the reranker needs candidates from a search |
+| names `question` in a build without the `embed` feature | status `unsupported`, exit code 3 |
+| names `question` and no reranker is installed | status `invalid_state`, naming `inillucent setup-embeddings reranker` |
+| a table is created with `rerank_depth` outside 1 to 1,000, or not a whole number | refused at `CREATE` |
+
+On the processor, 60 candidates take about 5 to 8 seconds, and on a graphics card about 0.07
+seconds. [Embeddings](embeddings.md#reranking) has the measurements. A machine with no card can lower
+`rerank_depth` to trade depth for time.
+
+**Quality on a public corpus.** On the 3,696 chunks of `examples/rag-agent` and its 20 answerable
+questions, the hybrid search of the table above, with `vector_weight = 0.5` and each question's words
+joined by `OR`, was run with and without `question`. A question counts as found when a chunk of the
+right article is in the top 5, and the mean reciprocal rank is over the top 10 rows. The measurements
+were taken on 29 September 2026 at commit `ed70d251`, with the reranker on `cuda:0`.
+
+| Search | Found in the top 5 | Mean reciprocal rank |
+|---|---:|---:|
+| hybrid, `vector_weight = 0.5` | 19 of 20 | 0.789 |
+| the same, with `question` | 18 of 20 | 0.813 |
+
+On this corpus the reranker did not help by a clear margin. It found one article fewer in the top 5
+and raised the mean reciprocal rank by 0.024. It moved three questions to first place: "pleasure as the absence of pain", "the school that met
+at the Lyceum" and "the Neoplatonist who wrote the Enneads". It moved "what did the Stoics believe
+about death" from first to sixth, "the apeiron, the boundless origin of all things" from first to
+second, and "asking questions to expose contradictions in a belief" from second to fourth. The questions are short, the articles are long and cover several subjects, and the
+keyword and vector lists already put the right article first for 14 of 20 questions. The study found
+its gain of 0.10 to 0.13 nDCG@10 on a mailbox of 67,369 emails, where a question has many near
+matches to tell apart. Measure it on your own questions before you rely on it.
+
+A release before this option existed refuses a query that names `question` with `no such column`.
 
 ### Confidence is a separate number from score
 

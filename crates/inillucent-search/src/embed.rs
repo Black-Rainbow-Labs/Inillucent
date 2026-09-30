@@ -45,13 +45,13 @@
 use std::sync::{Arc, OnceLock};
 
 use inillucent_base::{error, DbResult};
-use inillucent_core::embed_onnx::OnnxOptions;
+use inillucent_core::embed_onnx::{OnnxOptions, TokenCounter};
 use inillucent_core::install;
 use inillucent_core::model::ModelManifest;
 use inillucent_core::residency::{ManagedEmbedder, Residency};
 use inillucent_value::Value;
 
-use crate::embed_refusal::{model_would_not_run, no_model, MODEL};
+use crate::embed_refusal::{cuda_would_not_start, model_would_not_run, no_model, MODEL};
 
 /// The managed embedder, and whether building one was even possible.
 ///
@@ -59,7 +59,24 @@ use crate::embed_refusal::{model_would_not_run, no_model, MODEL};
 /// two statements embedding at once should not both do it. The manager itself
 /// is what decides when the weights are in memory, so this holding a value does
 /// not mean the model is loaded.
-static EMBEDDER: OnceLock<Option<ManagedEmbedder>> = OnceLock::new();
+static EMBEDDER: OnceLock<Result<Built, BuildFailure>> = OnceLock::new();
+
+/// A managed embedder and the processor it was opened for.
+///
+/// The processor is kept so a failure can be reported as a CUDA failure, which names a different
+/// installer command from a failure on the processor.
+struct Built {
+    embedder: ManagedEmbedder,
+    cuda: bool,
+}
+
+/// Why no embedder could be built.
+enum BuildFailure {
+    /// No model is installed on this machine.
+    NoModel,
+    /// A thread count or device setting could not be used. The text says which.
+    Settings(String),
+}
 
 /// Builds the managed embedder, when this machine has a model to build it over.
 ///
@@ -69,16 +86,35 @@ static EMBEDDER: OnceLock<Option<ManagedEmbedder>> = OnceLock::new();
 /// the baseline is the one model whose contract this repository knows by heart,
 /// and any other model without a manifest would be run on somebody else's
 /// prefixes.
-fn build() -> Option<ManagedEmbedder> {
-    let dir = install::model_dir(MODEL)?;
+fn build() -> Result<Built, BuildFailure> {
+    let dir = install::model_dir(MODEL).ok_or(BuildFailure::NoModel)?;
     let manifest = ModelManifest::read(&dir).unwrap_or_else(|_| ModelManifest::nomic_v1_5());
-    let options = OnnxOptions::for_model(&manifest);
-    Some(ManagedEmbedder::new(
-        &dir,
-        manifest.model_file.clone(),
-        options,
-        Residency::configured(),
-    ))
+    // The thread count and the device come from `INILLUCENT_EMBED_THREADS` and
+    // `INILLUCENT_EMBED_DEVICE`, then from what `setup-embeddings` recorded. A device of
+    // `cuda` that will not start fails the first call. It is never run on the processor.
+    let options = OnnxOptions::for_model(&manifest)
+        .with_configured_machine()
+        .map_err(|reason| BuildFailure::Settings(format!("{reason:#}")))?;
+    let cuda = matches!(options.device, inillucent_core::embed_onnx::Device::Cuda(_));
+    Ok(Built {
+        embedder: ManagedEmbedder::new(
+            &dir,
+            manifest.model_file.clone(),
+            options,
+            Residency::configured(),
+        ),
+        cuda,
+    })
+}
+
+/// Turns a build failure into the refusal the caller reads.
+///
+/// @param failure - why no embedder exists
+fn refusal_for(failure: &BuildFailure) -> error::DbError {
+    match failure {
+        BuildFailure::NoModel => no_model(),
+        BuildFailure::Settings(reason) => model_would_not_run(reason),
+    }
 }
 
 /// Returns one text's embedding as the bytes a `VECTOR(n)` column holds.
@@ -99,12 +135,17 @@ fn embed(arguments: &[Value<'static>]) -> DbResult<Value<'static>> {
         Some(Value::Integer(number)) => number.to_string(),
         Some(Value::Real(number)) => number.to_string(),
     };
-    let Some(embedder) = EMBEDDER.get_or_init(build) else {
-        return Err(no_model());
+    let built = match EMBEDDER.get_or_init(build) {
+        Ok(built) => built,
+        Err(failure) => return Err(refusal_for(failure)),
     };
-    let vectors = embedder
+    let vectors = built
+        .embedder
         .embed_prefixed(&[text])
-        .map_err(|reason| model_would_not_run(&format!("{reason:#}")))?;
+        .map_err(|reason| match built.cuda {
+            true => cuda_would_not_start("embed", &format!("{reason:#}")),
+            false => model_would_not_run(&format!("{reason:#}")),
+        })?;
     let Some(vector) = vectors.first() else {
         return Err(error::refusal("embed: the model returned no vector"));
     };
@@ -113,6 +154,43 @@ fn embed(arguments: &[Value<'static>]) -> DbResult<Value<'static>> {
         bytes.extend_from_slice(&value.to_bits().to_le_bytes());
     }
     Value::owned_blob(&bytes)
+}
+
+/// The tokenizer `embed_tokens` counts with, loaded the first time it is asked.
+///
+/// A separate lock from [`EMBEDDER`] because the tokenizer is 700 KB and the session is 1.9 GB, and a
+/// query that only counts tokens must not load the model.
+static COUNTER: OnceLock<Result<TokenCounter, BuildFailure>> = OnceLock::new();
+
+/// Builds the token counter from the model directory, when there is one.
+fn build_counter() -> Result<TokenCounter, BuildFailure> {
+    let dir = install::model_dir(MODEL).ok_or(BuildFailure::NoModel)?;
+    TokenCounter::open(dir).map_err(|reason| BuildFailure::Settings(format!("{reason:#}")))
+}
+
+/// Returns how many tokens the embedding model sees for one text, before its limit is applied.
+///
+/// `NULL` in gives `NULL` out. It needs only the tokenizer, so it does not load the model.
+/// `SELECT id FROM chunk WHERE embed_tokens('search_document: ' || body) > 1900` finds the rows
+/// `embed` would cut.
+///
+/// @param arguments - the one text to count
+fn embed_tokens(arguments: &[Value<'static>]) -> DbResult<Value<'static>> {
+    let text = match arguments.first() {
+        None | Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Text(text)) => String::from_utf8_lossy(text.raw()).into_owned(),
+        Some(Value::Blob(blob)) => String::from_utf8_lossy(blob.raw()).into_owned(),
+        Some(Value::Integer(number)) => number.to_string(),
+        Some(Value::Real(number)) => number.to_string(),
+    };
+    let counter = match COUNTER.get_or_init(build_counter) {
+        Ok(counter) => counter,
+        Err(failure) => return Err(refusal_for(failure)),
+    };
+    let count = counter
+        .count(&text)
+        .map_err(|reason| model_would_not_run(&format!("{reason:#}")))?;
+    Ok(Value::Integer(count as i64))
 }
 
 /// Adds `embed` to a registry.
@@ -146,6 +224,17 @@ fn embed(arguments: &[Value<'static>]) -> DbResult<Value<'static>> {
 ///
 /// @param registry - what a connection reaches functions through
 pub fn register(registry: &mut inillucent_ext::registry::Registry) {
+    registry.register_function(inillucent_ext::registry::UserFunction {
+        flags: inillucent_ext::registry::FunctionFlags {
+            deterministic: true,
+            ..inillucent_ext::registry::FunctionFlags::external()
+        },
+        ..inillucent_ext::registry::UserFunction::external(
+            "embed_tokens",
+            1,
+            inillucent_ext::registry::UserBody::Scalar(Arc::new(embed_tokens)),
+        )
+    });
     registry.register_function(inillucent_ext::registry::UserFunction {
         flags: inillucent_ext::registry::FunctionFlags {
             deterministic: true,

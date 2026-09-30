@@ -89,6 +89,7 @@ mod tests {
             mrl_widths: vec![8],
             prefixes: inillucent_core::model::Prefixes::none(),
             pooling: inillucent_core::model::Pooling::Mean,
+            kind: inillucent_core::model::ModelKind::BiEncoder,
             max_tokens,
             layer_norm: false,
             model_file: "model.gguf".into(),

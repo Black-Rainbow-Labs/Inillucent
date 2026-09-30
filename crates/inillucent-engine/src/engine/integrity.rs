@@ -81,12 +81,26 @@ impl crate::ImportedDatabase {
                 .ok_or_else(|| refusal("a tree names a database that is not attached"))?
                 .refuse_a_page_count_that_cannot_be_addressed()?;
         }
-        for (root, tree) in &self.schema.trees {
+        // **In handle order, and each failure names its tree** (task-2150). The
+        // trees are a hash map, so the walk used to visit them in a different
+        // order in every process: two checks of one damaged file reported two
+        // different first problems, and neither said which table or index it
+        // was about.
+        let mut roots: Vec<&u32> = self.schema.trees.keys().collect();
+        roots.sort_unstable();
+        for root in roots {
+            let Some(tree) = self.schema.trees.get(root) else {
+                continue;
+            };
             let pool = self
                 .schema_file(self.session_state.schema_of(*root))
                 .ok_or_else(|| refusal("a tree names a database that is not attached"))?
                 .pool();
-            tree.check(pool)?;
+            tree.check(pool).map_err(|error| {
+                let said = error.detail().unwrap_or_default().to_string();
+                let named = self.name_of_tree(*root, tree);
+                error.with_detail(format!("{named}: {said}"))
+            })?;
         }
         // **And then whether the trees agree about who owns a page.** Every
         // check above is about one tree in isolation - its key order, its

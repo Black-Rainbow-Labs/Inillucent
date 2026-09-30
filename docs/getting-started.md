@@ -80,9 +80,9 @@ flowchart LR
 
 | Program | What it is for |
 |---|---|
-| `inillucent` | The command line. It has 30 commands, such as `query`, `exec`, `describe`, `import`, `export`, `search`, `explain`, `backup`, `migrate` and `setup-embeddings`. Every command takes `--output json`. |
-| `inillucent-shell` | An interactive shell that works like `sqlite3`. It answers 63 of its 65 dot commands. It knows all 48 of `sqlite3`'s command line options: it acts on 30 and refuses 18 by name, because the engine has nothing they could control. |
-| `inillucent-mcp` | 28 of the same commands served to an AI agent over MCP, on standard input and output. |
+| `inillucent` | The command line. It has 34 commands, such as `query`, `exec`, `describe`, `import`, `export`, `search`, `explain`, `backup`, `migrate` and `setup-embeddings`. Every command takes `--output json`. |
+| `inillucent-shell` | An interactive shell that works like `sqlite3`. It answers 63 of its 65 dot commands. It knows all 49 of its command line options: the 48 that `sqlite3` has, and `-key-file` for an encrypted database. It acts on 31 and refuses 18 by name, because the engine has nothing they could control. |
+| `inillucent-mcp` | 29 of the same commands served to an AI agent over MCP, on standard input and output. |
 | `inillucent-migrate` | Builds a database from a SQLite file, a running PostgreSQL or MySQL server, or a retrieval index saved by an older version. `inillucent migrate` does the same job from the command line. |
 
 `inillucent shell` starts the shell, and `inillucent mcp` starts the MCP server, so the
@@ -236,7 +236,7 @@ Any other word is taken as a mistyped command, and nothing is opened or created:
 ```text
 inillucent: 'qeury' is not a command, and it does not name a database file.
   Did you mean: query?
-  Run 'inillucent help' for the 30 commands there are.
+  Run 'inillucent help' for the 34 commands there are.
   To open a file of that name as a database, write it as a path: inillucent ./qeury
 ```
 

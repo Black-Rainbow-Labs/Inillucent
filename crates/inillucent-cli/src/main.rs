@@ -70,6 +70,8 @@ struct Invocation {
     refused: Vec<(String, &'static str)>,
     /// The words that are shaped like an option and are not one of them.
     unknown: Vec<String>,
+    /// The file `-key-file` named, holding the key databases are opened with.
+    key_file: Option<String>,
 }
 
 /// The options that name a SQLite internal this engine does not have.
@@ -207,6 +209,7 @@ fn parse(arguments: impl Iterator<Item = String>) -> Invocation {
         no_follow: false,
         refused: Vec::new(),
         unknown: Vec::new(),
+        key_file: None,
     };
     let mut named = false;
     let mut only_positional = false;
@@ -248,6 +251,7 @@ fn parse(arguments: impl Iterator<Item = String>) -> Invocation {
             "-stats" | "--stats" => invocation.commands.push(".stats on".to_string()),
             "-batch" | "--batch" | "-noinit" | "--noinit" => {}
             "-readonly" | "--readonly" => invocation.readonly = true,
+            "-key-file" | "--key-file" => invocation.key_file = arguments.next(),
             "-safe" | "--safe" => invocation.safe = true,
             "-ifexists" | "--ifexists" => invocation.if_exists = true,
             "-nofollow" | "--nofollow" => invocation.no_follow = true,
@@ -381,6 +385,12 @@ fn run() {
         eprintln!("{message}");
         std::process::exit(1);
     }
+    // Before the database is opened, so it is opened with the key. See
+    // `inillucent_cli::keys`.
+    if let Err(message) = inillucent_cli::keys::install_from(invocation.key_file.as_deref()) {
+        eprintln!("Error: {message}");
+        std::process::exit(1);
+    }
     let mut shell = match Shell::open(&invocation.path) {
         Ok(shell) => shell,
         Err(message) => {
@@ -456,6 +466,8 @@ fn usage() {
         "   -nullvalue TEXT      set text string for NULL values",
         "   -quote               set output mode to 'quote'",
         "   -readonly            refuse every statement that changes the database",
+        "   -key-file FILE       open databases encrypted, with the key in FILE",
+        "                        (or $INILLUCENT_KEY)",
         "   -safe                refuse .cd, .load, .shell, .system, .excel and .www",
         "   -separator SEP       set output column separator",
         "   -stats               print memory and page-cache statistics",

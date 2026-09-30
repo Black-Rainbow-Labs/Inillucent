@@ -52,7 +52,7 @@ statement ok
 ATTACH '%SCRATCH%/other.db' AS other
 
 case syntax-attach-stmt-p2
-capability attach_with_key
+capability attach_computed_path
 
 statement ok
 ATTACH ? AS other KEY 'secret'

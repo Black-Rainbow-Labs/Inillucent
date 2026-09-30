@@ -607,13 +607,25 @@ const UNREACHABLE: &[(&str, &str)] = &[
 /// A name here is still printed in the report. It must be a name whose answer
 /// depends on something outside the build and the case, such as a file on the
 /// machine.
-const OUTSIDE_THE_MATRIX: &[(&str, &str)] = &[(
-    "embed",
-    "registered only when `inillucent-search` is built with its `embed` feature, which a broad \
-     build turns on through feature unification, and it answers from a model installed on the \
-     machine, so one case would pass on one machine and fail on another; the suites \
-     `engine::embed_direct_only` and `retrieval::rag_verify` call it",
-)];
+const OUTSIDE_THE_MATRIX: &[(&str, &str)] = &[
+    (
+        "embed",
+        "registered only when `inillucent-search` is built with its `embed` feature, which a broad \
+         build turns on through feature unification, and it answers from a model installed on the \
+         machine, so one case would pass on one machine and fail on another; the suites \
+         `engine::embed_direct_only` and `retrieval::rag_verify` call it",
+    ),
+    (
+        "embed_tokens",
+        "registered with `embed` and answering from the tokenizer installed on the machine; the \
+         suite `retrieval::embed_settings` calls it",
+    ),
+    (
+        "rerank",
+        "registered with `embed` and answering from the reranker installed on the machine; the \
+         suites `retrieval::rerank` and `retrieval::rerank_absent` call it",
+    ),
+];
 
 /// Every name the inventory checks, with the first case that reached it.
 #[derive(Clone, Debug, Default)]

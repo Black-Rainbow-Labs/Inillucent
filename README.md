@@ -22,6 +22,7 @@ search and keyword search built in. Everything lives in one file.
 - A write ahead log and crash recovery, tested by cutting the power at every step of a commit.
 - Vector columns, HNSW indexes and an embedding model that runs inside your process.
 - One database file that several processes can use at the same time.
+- Encryption at rest with XChaCha20-Poly1305, for the database file, its log and its journals.
 
 ## Documentation
 
@@ -37,6 +38,7 @@ repository are listed in [docs/README.md](docs/README.md). Good places to start:
 | [Vector search](docs/vector-search.md) | vector columns, HNSW indexes, keyword search and hybrid ranking |
 | [Embeddings](docs/embeddings.md) | running the embedding model inside your process |
 | [Migrating](docs/migrating.md) | moving in from SQLite, PostgreSQL or MySQL |
+| [Encryption at rest](docs/encryption.md) | keys, what is encrypted, and what it costs |
 | [Performance](docs/performance.md) | speed, processor time and memory against SQLite |
 | [Retrieval quality](docs/retrieval-quality.md) | search quality and speed against PostgreSQL with pgvector |
 | [AGENTS.md](AGENTS.md) | the starting point for an AI agent that uses or changes this repository |
@@ -136,6 +138,14 @@ Tables, vector indexes and keyword indexes all live in one `.rdb` file, and they
 together. Several processes can open the file at the same time. One process writes at a time, and
 the others wait for up to `PRAGMA busy_timeout`, which is 5 seconds by default.
 [Architecture in one page](docs/architecture-overview.md)
+
+### Encrypted on disk
+
+Open a database with a key and every file it writes is encrypted: the database file, the log and
+the journals. A changed byte is found on the next read. The key comes from a file or from the
+`INILLUCENT_KEY` environment variable, and `inillucent encrypt` writes an encrypted copy of a
+database you already have.
+[Encryption at rest](docs/encryption.md)
 
 ### Bring your data with you
 

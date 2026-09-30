@@ -614,14 +614,17 @@ nor the file. The profile then decides whether the model stays.
 | Chunks of a few hundred tokens, split on sentence boundaries | [RAG Chunking Strategies: A 2026 Retrieval Playbook](https://www.digitalapplied.com/blog/rag-chunking-strategies-2026-retrieval-quality-playbook) | about 250 tokens of whole sentences |
 | Overlap of 10% to 20% is the usual default. A January 2026 study measured no benefit from it, so measure it on your own data | the same playbook | about 20%, and `--overlap-chars 0` to compare |
 | Return the chunks around a hit, so the model sees more than the matched piece | the "small to big" pattern in the same playbook | `get_passage` |
-| Rerank the top 20 to 50 hits with a cross encoder. With contextual chunks and hybrid search, this cut missing answers by 67% | Anthropic, Introducing Contextual Retrieval | not built: see below |
+| Rerank the top 20 to 50 hits with a cross encoder. With contextual chunks and hybrid search, this cut missing answers by 67% | Anthropic, Introducing Contextual Retrieval | not built here. inillucent ships a reranker: see below |
 | Rebuild the index when the chunker or the model changes | common practice | the settings are in every fingerprint |
 
 ## What this example does not do
 
 - **Rerank.** A cross encoder reads the question and each hit together and scores them again. It is
-  the largest single gain in the table above. inillucent ships one embedding model and no reranker.
-  One would go in `src/search.rs`, after the search and before the hits are returned.
+  the largest single gain in the table above. inillucent ships a reranker, `gte-reranker-modernbert-base`,
+  installed with `inillucent setup-embeddings reranker`. A search table reranks its own results when the
+  query names `question`, and `rerank(question, passage)` scores one pair in SQL. This example does not
+  use it. Adding it means adding `AND question = ?` to the `hybrid` query in `src/search.rs`. See
+  [Reranking a search](../../../docs/vector-search.md#reranking-a-search).
 - **Build an HNSW index.** 3,696 chunks take a few milliseconds to compare exhaustively.
   [Vector search](../../../docs/vector-search.md) says when an index is worth building, and
   `CREATE INDEX chunk_v ON chunk USING inillucent_hnsw (v)` builds one. Nothing else in this

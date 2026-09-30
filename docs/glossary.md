@@ -62,6 +62,9 @@ If a word on another page is not here and should be, add it.
 | **Snapshot** | The state of the database at one moment. A reader that uses a snapshot sees the same data for the whole of its transaction. |
 | **`synchronous`** | The pragma that decides how often a commit calls fsync. `FULL` waits for the disk on every commit, and `OFF` never waits. |
 | **Transaction** | A group of statements that all take effect or none do. `BEGIN` starts one, `COMMIT` keeps its changes and `ROLLBACK` discards them. In the Rust driver a [`Transaction`](../drivers/README.md) is a value, and dropping it rolls the transaction back. |
+| **Encryption at rest** | Storing a database so that its files are unreadable without a key. inillucent encrypts the database file, the log and the journals with XChaCha20-Poly1305 when a database is opened with a key. See [Encryption at rest](encryption.md). |
+| **Key** | What an encrypted database is opened with: a passphrase, or 32 raw bytes written as `x'` followed by 64 hex digits and `'`. |
+| **Rekey** | Changing the key an encrypted database is encrypted with. `PRAGMA rekey` and `inillucent rekey` do it, and rewrite one header per file. |
 | **Undo** | Putting back the old contents of what a transaction changed, when the transaction rolls back. |
 | **WAL** | Write ahead log. A file the engine appends a record to before it changes the database file. The record reaches the disk before the page does, so a crash can always be repaired from the log. inillucent's log files sit beside the database and are named `<database>-wal.NNNNNNNNNN`. |
 
@@ -99,8 +102,10 @@ If a word on another page is not here and should be, add it.
 | **Abstention** | Returning no result when nothing in the data answers the query. inillucent decides to abstain by comparing each hit's confidence with a threshold. |
 | **Approximate search** | Finding nearest neighbors by checking only part of the data, through an index such as HNSW. It is much faster than exact search and can miss a correct answer. |
 | **BM25** | The standard formula for scoring how well a piece of text matches a set of query words. It rewards rare words and words that appear often in a short text. |
-| **Chunk** | A piece of a document, about a paragraph long, that is indexed and returned as one search result. |
+| **Candidate depth** | How many rows of a first search a reranker scores. inillucent's `rerank_depth` option sets it, and the default is 60. |
+| **Chunk** | A piece of a document, about a paragraph long, that is indexed and returned as one search result. `chunk_text` cuts a document into chunks. |
 | **Confidence** | A number that each search hit carries beside its score. The score decides the order of the hits. The confidence says how likely the hit is to answer the query, and it is the number a search compares with its abstention threshold. |
+| **Cross encoder** | A model that reads a question and a passage together and returns one relevance score. A reranker is a cross encoder. A bi encoder, which is what an embedding model is, reads one text and returns a vector. |
 | **Cosine distance** | A measure of how far apart two vectors point, ignoring their length. 0 means the same direction. `vector_distance_cos` computes it. |
 | **Embedding** | A vector that a trained model produces from a piece of text. Texts with similar meaning get vectors that are close together, even when they share no words. inillucent's default model produces 768 numbers per text. |
 | **Exact search** | Finding nearest neighbors by comparing the query with every vector. It is always correct, and it is slow on large tables. |
@@ -115,7 +120,8 @@ If a word on another page is not here and should be, add it.
 | **Posting** | One entry in an inverted index: a chunk that contains a word, and where the word appears in it. |
 | **Quantization** | Storing each number of a vector with fewer bits to save memory. inillucent stores one byte per number (int8) and checks the top candidates again against the full vectors. |
 | **Recall** | The share of the true nearest neighbors that an approximate search returned. A recall of 1.0 means it found all of them. |
-| **Reciprocal rank fusion** | A way to combine two ranked lists by adding one divided by each hit's rank in each list. inillucent offers it as an option. The default fusion adds the two scores after scaling each list to the same range. |
+| **Reciprocal rank fusion** | A way to combine two ranked lists by adding one divided by each hit's rank in each list. inillucent offers it as an option. The default fusion adds the two scores after scaling each list to the same range. Also called **RRF**. |
+| **Reranker** | A cross encoder that reads the rows a first search found, each together with the question, and puts them in a new order. `rerank(question, passage)` and the `question` column of `inillucent_search` use one. See [Retrieval for RAG, explained from the start](rag-explained.md). |
 | **Semantic search** | Finding the chunks whose embeddings are close to the query's embedding, which matches meaning instead of words. Also called **vector search**. |
 | **Vector** | A list of numbers. In a `VECTOR(N)` column every value is a list of N 32 bit floats. |
 

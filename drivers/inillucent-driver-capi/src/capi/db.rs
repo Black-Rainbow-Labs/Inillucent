@@ -145,38 +145,100 @@ pub unsafe extern "C" fn inillucent_open(
     error: *mut *mut inillucent_error,
 ) -> i32 {
     guarded("inillucent_open", error, || {
-        let Some(path) = borrowed(path) else {
-            return misused("inillucent_open", error);
-        };
-        if out.is_null() {
-            return misused("inillucent_open", error);
-        }
-        let diagnostics = flags & INILLUCENT_OPEN_DIAGNOSTICS != 0;
-        let options = OpenOptions {
-            create: flags & INILLUCENT_OPEN_CREATE != 0,
-            read_only: flags & INILLUCENT_OPEN_READONLY != 0,
-            diagnostics,
-            ..OpenOptions::default()
-        };
-        match Database::open_with(path, options) {
-            Ok(database) => {
-                let held = Box::new(inillucent_db {
-                    live: Live::new(inillucent_db::MAGIC),
-                    path: c_string(&database.path().display().to_string()),
-                    cancel: database.cancel_handle(),
-                    database,
-                    connections: Cell::new(0),
-                });
-                *out = publish(held);
-                INILLUCENT_OK
-            }
-            Err(why) => {
-                let status = why.status as i32;
-                report(error, &why, diagnostics);
-                status
-            }
-        }
+        open_database("inillucent_open", path, flags, None, out, error)
     })
+}
+
+/// Opens a database encrypted with a key.
+///
+/// The key is text: SQLCipher's `x'<64 hex digits>'` is a raw 32 byte key and
+/// anything else is a passphrase. A null key is `inillucent_open`. A plaintext
+/// file opened with a key, an encrypted one opened without, and a wrong key
+/// all fail with `INILLUCENT_CORRUPT`, as SQLite fails a file it cannot read
+/// as a database.
+///
+/// @param path - the file, UTF-8
+/// @param flags - the `INILLUCENT_OPEN_*` bits
+/// @param key - the key, UTF-8, or null for none
+/// @param out - where the handle goes
+/// @param error - where a failure goes, or null
+///
+/// # Safety
+///
+/// `path` must be a NUL-terminated string, `key` null or a NUL-terminated
+/// string, and `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn inillucent_open_with_key(
+    path: *const c_char,
+    flags: u32,
+    key: *const c_char,
+    out: *mut *mut inillucent_db,
+    error: *mut *mut inillucent_error,
+) -> i32 {
+    guarded("inillucent_open_with_key", error, || {
+        let key = match key.is_null() {
+            true => None,
+            false => match borrowed(key) {
+                Some(text) => Some(inillucent_driver::EncryptionKey::parse(text)),
+                None => return misused("inillucent_open_with_key", error),
+            },
+        };
+        open_database("inillucent_open_with_key", path, flags, key, out, error)
+    })
+}
+
+/// The open both entry points share.
+///
+/// @param name - the entry point, for a misuse report
+/// @param path - the file
+/// @param flags - the `INILLUCENT_OPEN_*` bits
+/// @param key - the key, if the file is encrypted
+/// @param out - where the handle goes
+/// @param error - where a failure goes, or null
+///
+/// # Safety
+///
+/// As [`inillucent_open`].
+unsafe fn open_database(
+    name: &'static str,
+    path: *const c_char,
+    flags: u32,
+    key: Option<inillucent_driver::EncryptionKey>,
+    out: *mut *mut inillucent_db,
+    error: *mut *mut inillucent_error,
+) -> i32 {
+    let Some(path) = borrowed(path) else {
+        return misused(name, error);
+    };
+    if out.is_null() {
+        return misused(name, error);
+    }
+    let diagnostics = flags & INILLUCENT_OPEN_DIAGNOSTICS != 0;
+    let options = OpenOptions {
+        create: flags & INILLUCENT_OPEN_CREATE != 0,
+        read_only: flags & INILLUCENT_OPEN_READONLY != 0,
+        diagnostics,
+        key,
+        ..OpenOptions::default()
+    };
+    match Database::open_with(path, options) {
+        Ok(database) => {
+            let held = Box::new(inillucent_db {
+                live: Live::new(inillucent_db::MAGIC),
+                path: c_string(&database.path().display().to_string()),
+                cancel: database.cancel_handle(),
+                database,
+                connections: Cell::new(0),
+            });
+            *out = publish(held);
+            INILLUCENT_OK
+        }
+        Err(why) => {
+            let status = why.status as i32;
+            report(error, &why, diagnostics);
+            status
+        }
+    }
 }
 /// Checkpoints and closes a database.
 ///

@@ -108,6 +108,7 @@ pub fn on_a_sized_stack<R: Send + 'static>(body: fn() -> R) -> R {
 }
 
 pub mod archive;
+pub mod bulk_embed;
 pub mod command;
 pub mod commands;
 pub mod dbconfig;
@@ -121,6 +122,7 @@ pub mod import;
 #[allow(unsafe_code)]
 pub mod interrupt;
 pub mod json;
+pub mod keys;
 pub mod mcp;
 pub mod render;
 pub mod setup;

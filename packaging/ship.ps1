@@ -1133,7 +1133,12 @@ function Invoke-ReleaseTests {
         if (Test-Path -LiteralPath $nikaya) { $env:NIKAYA_ROOT = $nikaya }
     }
     Write-Host "   $runner $($arguments -join ' ')"
-    & $runner @arguments
+    # **To the host, not to the pipeline (task-2148).** Unredirected, every line the runner prints
+    # is part of what this function returns, so $script:TestNote became the whole test run - over
+    # a thousand lines - and ship.log showed none of it. The notes are passed to `gh release
+    # create --notes`, so the 1.0.33 GitHub release failed with "The filename or extension is too
+    # long" after the tag, the mirror and every registry had already published.
+    & $runner @arguments | Out-Host
     $code = $LASTEXITCODE
     switch ($code) {
         0 { Write-Host '   the changes since the nightly ran and passed.' -ForegroundColor Green; return $plan.Note }

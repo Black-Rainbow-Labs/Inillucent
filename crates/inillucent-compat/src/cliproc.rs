@@ -240,8 +240,25 @@ pub fn run_with_input(program: &Path, arguments: &[&str], input: &str) -> Ran {
 /// @param sql - the statements, each ending in a semicolon
 /// @returns what the shell printed before it was killed
 pub fn write_and_crash(shell: &Path, database: &Path, sql: &str) -> String {
+    write_and_crash_with(shell, &[], database, sql)
+}
+
+/// [`write_and_crash`], with options placed before the database name.
+///
+/// **For the options a crash case needs and the plain form does not pass**,
+/// such as `-key-file` for an encrypted database. An option, not an
+/// environment variable: a variable set in a test process is inherited by
+/// every child any other test in the same process starts meanwhile.
+///
+/// @param shell - the `inillucent-shell` binary
+/// @param options - the options before the database name
+/// @param database - the file to open
+/// @param sql - the statements, each ending in a semicolon
+/// @returns what the shell printed before it was killed
+pub fn write_and_crash_with(shell: &Path, options: &[&str], database: &Path, sql: &str) -> String {
     use std::io::{Read, Write};
     let mut child = Command::new(shell)
+        .args(options)
         .arg(database.to_string_lossy().replace('\\', "/"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -42,6 +42,7 @@ pub mod budget;
 pub mod buffer;
 pub mod bytes;
 pub mod checksum;
+pub mod crypt;
 pub mod deflate;
 pub mod error;
 pub mod hash;

@@ -222,6 +222,98 @@ const IMPORT_PARAMS: &[Param] = &[
     DB,
 ];
 
+/// The parameters `embed` takes.
+const EMBED_PARAMS: &[Param] = &[
+    Param {
+        name: "table",
+        kind: Kind::Text,
+        required: true,
+        positional: false,
+        description:
+            "The table to fill. An ordinary table with a VECTOR(768) or BLOB column, or an \
+                      inillucent_search table, whose vector column can be updated by rowid.",
+    },
+    Param {
+        name: "text",
+        kind: Kind::Text,
+        required: true,
+        positional: false,
+        description: "The column holding the text to embed. A row whose text is NULL or empty is \
+                      skipped and counted.",
+    },
+    Param {
+        name: "vector",
+        kind: Kind::Text,
+        required: true,
+        positional: false,
+        description:
+            "The column to write the vectors into. Only rows where it IS NULL are embedded, \
+                      so a stopped run continues where it ended.",
+    },
+    Param {
+        name: "prefix",
+        kind: Kind::Text,
+        required: false,
+        positional: false,
+        description: "Text put in front of every value before it is embedded, exactly as \
+                      embed('search_document: ' || body) does. For nomic-embed-text-v1.5 use \
+                      'search_document: '. The default is no prefix.",
+    },
+    Param {
+        name: "device",
+        kind: Kind::Text,
+        required: false,
+        positional: false,
+        description:
+            "The processor: 'cpu', 'cuda' or 'cuda:N' for card N. Without it the machine's \
+                      setting applies (INILLUCENT_EMBED_DEVICE, then what setup-embeddings \
+                      recorded, then the processor). A cuda device that will not start is an error \
+                      naming 'inillucent setup-embeddings runtime --gpu', and never runs on the \
+                      processor.",
+    },
+    Param {
+        name: "threads",
+        kind: Kind::Integer,
+        required: false,
+        positional: false,
+        description: "Threads ONNX Runtime uses inside one operator, per session. Without it the \
+                      machine's setting applies.",
+    },
+    Param {
+        name: "sessions",
+        kind: Kind::Integer,
+        required: false,
+        positional: false,
+        description: "How many model sessions to open on the device and run at once. The default \
+                      is 1. Two sessions on one card were measured 2.1 times faster than one.",
+    },
+    Param {
+        name: "batch-size",
+        kind: Kind::Integer,
+        required: false,
+        positional: false,
+        description: "Most texts in one call to the model. The default is 16. A batch is also \
+                      limited by a memory ceiling that shrinks it when the texts are long.",
+    },
+    Param {
+        name: "commit-every",
+        kind: Kind::Integer,
+        required: false,
+        positional: false,
+        description: "How many rows to embed and write in one transaction. The default is 1024. A \
+                      crash loses at most one transaction.",
+    },
+    Param {
+        name: "all",
+        kind: Kind::Boolean,
+        required: false,
+        positional: false,
+        description: "Embed every row again, including rows that already have a vector.",
+    },
+    DB,
+    FORMAT,
+];
+
 /// The parameters `export` takes.
 const EXPORT_PARAMS: &[Param] = &[
     Param {
@@ -283,6 +375,30 @@ const BACKUP_PARAMS: &[Param] = &[
         required: true,
         positional: true,
         description: "Where to write the copy.",
+    },
+    DB,
+];
+
+/// The parameters `encrypt` and `decrypt` take.
+const COPY_PARAMS: &[Param] = &[
+    Param {
+        name: "file",
+        kind: Kind::Text,
+        required: true,
+        positional: true,
+        description: "Where to write the copy. A file already there is refused, not replaced.",
+    },
+    DB,
+];
+
+/// The parameters `rekey` takes.
+const REKEY_PARAMS: &[Param] = &[
+    Param {
+        name: "new-key-file",
+        kind: Kind::Text,
+        required: false,
+        positional: false,
+        description: "A file holding the new key. Without it the new key is read from the                       INILLUCENT_NEW_KEY environment variable. A key is never taken as a word                       on the command line, where every user of the machine can read it.",
     },
     DB,
 ];
@@ -388,6 +504,17 @@ const SEARCH_PARAMS: &[Param] = &[
         positional: false,
         description: "How many results to return, best first. Defaults to 10.",
     },
+    Param {
+        name: "rerank",
+        kind: Kind::Boolean,
+        required: false,
+        positional: false,
+        description: "Reorder the rows the search found with the reranker, which reads the query \
+                      and each row together. The query text is passed as the question, so write \
+                      it as plain words. Needs an inillucent_search table and the reranker, \
+                      installed with 'inillucent setup-embeddings reranker'. On the processor \
+                      60 rows take about 10 seconds; on a graphics card about a tenth of one.",
+    },
     DB,
     FORMAT,
 ];
@@ -467,8 +594,10 @@ const SETUP_PARAMS: &[Param] = &[
         required: false,
         positional: true,
         description: "What to install: 'all' for both halves, 'runtime' for the ONNX Runtime \
-                      shared library on its own, or 'model' for the weights on their own. Omit \
-                      it to report what is installed and download nothing.",
+                      shared library on its own, 'model' for the embedding weights on their own, or \
+                      'reranker' for the cross encoder that rerank() and a search naming question \
+                      use (about 600 MB, and not part of 'all'). Omit it to report what is \
+                      installed and download nothing.",
     },
     Param {
         name: "status",
@@ -487,6 +616,27 @@ const SETUP_PARAMS: &[Param] = &[
                       'on-demand' loads it per call and drops it, 'idle' or 'idle:90s' loads it on \
                       use and drops it after a quiet period. Recorded for this machine; \
                       INILLUCENT_EMBED_RESIDENCY overrides it for one process.",
+    },
+    Param {
+        name: "threads",
+        kind: Kind::Integer,
+        required: false,
+        positional: false,
+        description: "How many threads ONNX Runtime uses inside one operator, for embed(), \
+                      rerank() and a reranked search. Recorded for this machine; \
+                      INILLUCENT_EMBED_THREADS overrides it for one process. Without it ONNX \
+                      Runtime picks its own count. Four was the fastest single process setting \
+                      measured for the embedding model.",
+    },
+    Param {
+        name: "device",
+        kind: Kind::Text,
+        required: false,
+        positional: false,
+        description: "The processor the sessions run on: 'cpu', 'cuda' or 'cuda:N' for card N. \
+                      Recorded for this machine; INILLUCENT_EMBED_DEVICE overrides it for one \
+                      process. A cuda device that will not start is an error and never runs on \
+                      the processor. It needs the runtime installed with '--gpu'.",
     },
     Param {
         name: "gpu",
@@ -661,6 +811,24 @@ pub static COMMANDS: &[Command] = &[
         run: verbs::import,
     },
     Command {
+        name: "embed",
+        summary: "Fill a vector column with embeddings, on the processor or a graphics card.",
+        detail: "Reads every row of --table whose --vector column IS NULL, embeds the --text column \
+                 with the nomic-embed-text-v1.5 model, and writes the vectors in the layout embed() \
+                 returns. It sorts the texts by length, groups them under a memory ceiling, and \
+                 commits every --commit-every rows, so a stopped run continues where it ended. A \
+                 corpus of 558,429 chunks took 22 minutes on a graphics card, where embed() in SQL, \
+                 one row at a time on the processor, would take about 12 hours. It prints how many \
+                 rows were embedded, how many were skipped because the text was NULL or empty, and \
+                 how many were cut at the model's token limit, with the rowid of up to 20 of them. \
+                 Needs the model: run 'inillucent setup-embeddings all' first, and \
+                 'inillucent setup-embeddings runtime --gpu' for a card.",
+        params: EMBED_PARAMS,
+        cli_only: None,
+        writes: Writes::Yes,
+        run: crate::bulk_embed::embed_table,
+    },
+    Command {
         name: "export",
         summary: "Write a table or a query's rows out as CSV, JSON or one of six other formats.",
         detail: "With 'out' the rows go to a file and the result says so; without it they come \
@@ -689,6 +857,39 @@ pub static COMMANDS: &[Command] = &[
         cli_only: None,
         writes: Writes::No,
         run: verbs::backup,
+    },
+    Command {
+        name: "encrypt",
+        summary: "Write an encrypted copy of a plaintext database.",
+        detail: "The copy is encrypted with the key from --key-file or INILLUCENT_KEY, and                  holds every row, index, view and trigger of the database --db names, which is                  read without the key. The source is left as it was: replace it with the copy                  once you have checked the copy opens.",
+        params: COPY_PARAMS,
+        cli_only: Some(
+            "it takes its key from the program's own --key-file or environment, and an MCP              client has neither. Encrypt a database before serving it.",
+        ),
+        writes: Writes::No,
+        run: verbs::encrypt,
+    },
+    Command {
+        name: "decrypt",
+        summary: "Write a plaintext copy of an encrypted database.",
+        detail: "Opens the database --db names with the key from --key-file or INILLUCENT_KEY                  and writes every row, index, view and trigger to a file that is not                  encrypted. The encrypted database is left as it was.",
+        params: COPY_PARAMS,
+        cli_only: Some(
+            "it writes every row of an encrypted database to disk unprotected, which is a              decision for the person who holds the key and not for an agent the database              is served to.",
+        ),
+        writes: Writes::No,
+        run: verbs::decrypt,
+    },
+    Command {
+        name: "rekey",
+        summary: "Change the key an encrypted database is encrypted with.",
+        detail: "Opens the database with the key from --key-file or INILLUCENT_KEY and moves it                  to the new key from --new-key-file or INILLUCENT_NEW_KEY. Only the header of                  each file is rewritten, so it takes the same time whatever the database's                  size, and the old key stops opening the database when it returns. PRAGMA                  rekey does the same from SQL.",
+        params: REKEY_PARAMS,
+        cli_only: Some(
+            "an agent that could change the key could lock the database's owner out of it.",
+        ),
+        writes: Writes::Yes,
+        run: verbs::rekey,
     },
     Command {
         name: "restore",

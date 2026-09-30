@@ -91,6 +91,8 @@ pub mod attach;
 mod checkpoint;
 pub mod connect;
 pub mod ddl;
+pub mod encryption;
+pub use encryption::EncryptionKey;
 mod engine;
 
 // The six groups `ImportedDatabase`'s fields are made of, and the methods

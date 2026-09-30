@@ -135,6 +135,12 @@ impl ImportedDatabase {
             b"encoding" => self.pragma_fixed_word(argument, "encoding", b"UTF-8"),
             b"locking_mode" => self.pragma_locking_mode(argument),
             b"wal_checkpoint" => self.pragma_wal_checkpoint(),
+            // Encryption at rest. None of the three is on SQLite's own list;
+            // `key` and `rekey` are SQLCipher's names, so a script written for
+            // it gets an answer that says where the key goes here.
+            b"encryption" => self.pragma_encryption(argument),
+            b"rekey" => self.pragma_rekey(argument, at),
+            b"key" => self.pragma_key(),
             b"page_size" => Ok(named_integer("page_size", self.storage.page_size as i64)),
             b"page_count" => Ok(named_integer(
                 "page_count",

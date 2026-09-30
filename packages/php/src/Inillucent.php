@@ -37,12 +37,14 @@ final class Inillucent
      * @param string|null $binary the inillucent program to run; found automatically when null
      * @param bool $readOnly refuse every statement that changes something
      * @param string|null $root refuse every path outside this directory
+     * @param string|null $key the key of an encrypted database, sent in INILLUCENT_KEY and never on the command line
      */
     public function __construct(
         private string $path,
         private ?string $binary = null,
         private bool $readOnly = false,
         private ?string $root = null,
+        private ?string $key = null,
     ) {
         $this->binary ??= Locator::find();
     }
@@ -160,7 +162,8 @@ final class Inillucent
                 : (string) $value;
         }
 
-        $output = Process::run($argv, $stdin);
+        $environment = $this->key === null ? [] : ['INILLUCENT_KEY' => $this->key];
+        $output = Process::run($argv, $stdin, $environment);
         $trimmed = trim($output['stdout']);
         // A refusal exits non-zero *and* prints the result object, because JSON
         // was asked for. So the document is what is read, and only an

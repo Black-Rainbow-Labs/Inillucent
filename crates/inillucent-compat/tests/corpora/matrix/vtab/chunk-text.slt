@@ -1,0 +1,31 @@
+# chunk_text, inillucent's own table function that cuts a document into windows of characters. The
+# pinned SQLite has none, so each answer was worked out by hand from the rules: a window ends at a
+# paragraph break or a sentence end in its last 30%, else at the last space, else at the size; the
+# next window starts where the last ended, less the overlap; and a heading and a blank line begin
+# every chunk.
+
+oracle none
+
+case chunk-text-windows
+query III rowsort
+SELECT count(*), sum(length), max(start) FROM chunk_text('aaaa bbbb cccc dddd', 9, 0)
+----
+3
+19
+10
+
+case chunk-text-heading
+query T rowsort
+SELECT replace(chunk, char(10), '|') FROM chunk_text('ab cd', 5, 0, 'H')
+----
+H||ab cd
+
+case chunk-text-nothing
+query I rowsort
+SELECT count(*) FROM chunk_text(NULL, 5)
+----
+0
+
+case chunk-text-refuses-a-bad-size
+statement error
+SELECT * FROM chunk_text('abc', 0)

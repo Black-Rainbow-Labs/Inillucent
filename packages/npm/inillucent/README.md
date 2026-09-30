@@ -39,9 +39,9 @@ package by name, for example `npm install @blackrainbowlabs/cli-linux-x64`.
 
 | Program | What it is |
 |---|---|
-| `inillucent` | the command line: 30 commands, such as `query`, `exec`, `describe`, `import`, `export` and `search` |
+| `inillucent` | the command line: 34 commands, such as `query`, `exec`, `describe`, `import`, `export` and `search` |
 | `inillucent-shell` | an interactive shell that works like `sqlite3`, with 63 of its 65 dot commands |
-| `inillucent-mcp` | an MCP server: 28 of the same commands served to an AI agent |
+| `inillucent-mcp` | an MCP server: 29 of the same commands served to an AI agent |
 | `inillucent-migrate` | builds a database from a legacy retrieval index. `inillucent migrate` copies a SQLite file or a PostgreSQL or MySQL database |
 
 ## From a shell
@@ -106,6 +106,24 @@ spans two calls. To run several statements as one transaction, use the `batch` c
 `query()` returns a BLOB column as a `Uint8Array`, so bytes read by one query can be bound into the
 next.
 
+## Encrypted databases
+
+Pass `key` beside `db`:
+
+```js
+const key = `x'${'5a'.repeat(32)}'`;
+await inillucent('exec', { db: 'app.rdb', key, sql: 'CREATE TABLE note (body TEXT)' });
+const rows = await query('SELECT body FROM note', { db: 'app.rdb', key });
+```
+
+The key travels to the program in the `INILLUCENT_KEY` environment variable. It is never put on the command line, because a command line is visible in the process list. When you pass no key, the environment the program inherits is left alone.
+
+A key written `x'` followed by 64 hexadecimal digits and `'` is a raw 32 byte key. Any other text is a passphrase, which is stretched with 600,000 rounds of PBKDF2 on every open, so a raw key opens faster.
+
+A database created with a key is encrypted. Opening it without the key, or with a wrong key, fails with status `corrupt`. Opening a plaintext database with a key fails the same way.
+
+A call without `key` on an encrypted database returns `{ ok: false, status: 'corrupt' }`.
+
 ## Errors
 
 ```js
@@ -146,7 +164,7 @@ client's configuration:
 }
 ```
 
-`inillucent-mcp` serves 28 of the command line's commands as MCP tools. The tools are generated from
+`inillucent-mcp` serves 29 of the command line's commands as MCP tools. The tools are generated from
 the same command table as the command line. `--readonly` refuses every statement that changes data.
 `--root DIR` refuses every path outside `DIR`.
 

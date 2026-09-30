@@ -218,6 +218,11 @@ A server with a certificate from a private authority needs `sslrootcert=<file>` 
 
 The report file and the `transport` field in `--output json` say `verified-tls` or `plaintext`.
 
+This is about the connection. The `.rdb` a migration writes is not encrypted, even when the command
+line has a key. For an encrypted result, run
+`inillucent --db new.rdb --key-file app.key encrypt new-encrypted.rdb` afterwards and remove the
+plaintext file.
+
 ### MySQL 8 accounts that use `caching_sha2_password`
 
 inillucent cannot complete the full `caching_sha2_password` login. That login needs an RSA key

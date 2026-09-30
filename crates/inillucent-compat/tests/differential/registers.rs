@@ -64,6 +64,7 @@ const OURS_ONLY_FUNCTIONS: &[&str] = &[
     "binary_quantize",
     "cosine_distance",
     "embed",
+    "embed_tokens",
     "geopoly_area",
     "geopoly_bbox",
     "geopoly_blob",
@@ -91,6 +92,7 @@ const OURS_ONLY_FUNCTIONS: &[&str] = &[
     "percentile_cont",
     "percentile_disc",
     "regexp",
+    "rerank",
     "sqlar_compress",
     "sqlar_uncompress",
     "sqlite_offset",
@@ -134,6 +136,7 @@ const STILL_ABSENT: &[&str] = &["fts5", "fts5_get_locale", "fts5_insttoken", "ft
 /// can do.
 const OURS_ONLY_MODULES: &[&str] = &[
     "bytecode",
+    "chunk_text",
     "completion",
     "fsdir",
     "fts3",

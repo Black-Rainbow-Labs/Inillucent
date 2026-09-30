@@ -186,15 +186,97 @@ const NOMIC_FILES: &[ModelFile] = &[
     },
 ];
 
+/// Where the reranker's files come from.
+///
+/// **A commit and not `main`**, so a later push to the repository cannot change what a fresh
+/// install downloads, and the digests below stay true. The commit, `f7481e60...`, is the
+/// repository's head on 29 September 2026, from
+/// `https://huggingface.co/api/models/Alibaba-NLP/gte-reranker-modernbert-base`. The model's
+/// licence, read from its README at that commit, is Apache 2.0.
+const RERANKER_BASE: &str = "https://huggingface.co/Alibaba-NLP/gte-reranker-modernbert-base/resolve/f7481e6055501a30fb19d090657df9ec1f79ab2c";
+
+/// The five files `gte-reranker-modernbert-base` needs to run, each pinned by digest.
+///
+/// `onnx/model.onnx` is the fp32 export, 599 MB. The repository also publishes fp16, int8 and
+/// four other quantized exports. The study measured the fp32 one, and installing another by
+/// accident would change the scores without any message.
+const RERANKER_FILES: &[ModelFile] = &[
+    ModelFile {
+        remote: "onnx/model.onnx",
+        local: "model.onnx",
+        sha256: "c6d3226502addbcd4d2cf273802957ebf8a2a6bf94037dcb9b1d95bfc01e5d93",
+        bytes: 598_803_940,
+    },
+    ModelFile {
+        remote: "tokenizer.json",
+        local: "tokenizer.json",
+        sha256: "2aea6ff4701d063e7e029b6be695a1659f2caaa2ae4fb0e8b18285818271becd",
+        bytes: 3_583_499,
+    },
+    ModelFile {
+        remote: "tokenizer_config.json",
+        local: "tokenizer_config.json",
+        sha256: "626c86908d7c711f93b0feffd8657b782cc2727b391f9be190240e8cafb626d5",
+        bytes: 21_031,
+    },
+    ModelFile {
+        remote: "special_tokens_map.json",
+        local: "special_tokens_map.json",
+        sha256: "ea97ecdbcc73713039d8d64dbb05e3689495c96657fbd9a18f5bed381be81049",
+        bytes: 694,
+    },
+    ModelFile {
+        remote: "config.json",
+        local: "config.json",
+        sha256: "c9316ff715158502dad782f35454eee18de984160618dc30afe7508feb46b7ce",
+        bytes: 1_333,
+    },
+];
+
+/// One model this command can install: where it comes from, which files it needs, and the manifest
+/// it is sealed with.
+struct ModelSpec {
+    /// The model id, which is its directory name.
+    id: &'static str,
+    /// The URL every file is fetched from, with the file's remote path added.
+    base: &'static str,
+    /// The model's page, recorded in the manifest and the install state.
+    source: &'static str,
+    /// Every file, with its digest.
+    files: &'static [ModelFile],
+    /// The manifest that describes the model.
+    manifest: fn() -> ModelManifest,
+}
+
+/// The embedding model: `nomic-embed-text-v1.5`.
+const EMBEDDER: ModelSpec = ModelSpec {
+    id: install::DEFAULT_MODEL,
+    base: MODEL_BASE,
+    source: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5",
+    files: NOMIC_FILES,
+    manifest: ModelManifest::nomic_v1_5,
+};
+
+/// The reranker: `gte-reranker-modernbert-base`, from a pinned commit.
+const RERANKER: ModelSpec = ModelSpec {
+    id: install::RERANKER_MODEL,
+    base: RERANKER_BASE,
+    source: "https://huggingface.co/Alibaba-NLP/gte-reranker-modernbert-base",
+    files: RERANKER_FILES,
+    manifest: ModelManifest::gte_reranker_modernbert_base,
+};
+
 /// Which parts of the install to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Component {
-    /// Both.
+    /// The runtime and the embedding model. Not the reranker, so nobody gets an unexpected 600 MB.
     All,
     /// The ONNX Runtime shared library.
     Runtime,
     /// The weights.
     Model,
+    /// The reranker, a cross encoder of about 600 MB.
+    Reranker,
 }
 
 impl Component {
@@ -206,8 +288,9 @@ impl Component {
             "" | "all" | "both" => Ok(Component::All),
             "runtime" | "onnxruntime" | "onnx" => Ok(Component::Runtime),
             "model" | "weights" | "embeddings" => Ok(Component::Model),
+            "reranker" | "rerank" | "cross-encoder" => Ok(Component::Reranker),
             other => Err(Failed::misuse(format!(
-                "'{other}' is not a component. Use all, runtime or model."
+                "'{other}' is not a component. Use all, runtime, model or reranker."
             ))),
         }
     }
@@ -242,13 +325,18 @@ pub fn setup_embeddings(context: &mut Context, arguments: &Arguments) -> Result<
         None => None,
     };
 
+    let machine = machine_settings(arguments)?;
+
     if arguments.flag("status") || named.is_empty() {
-        // Changing when the model is in memory is not a reason to fetch it
-        // again, so a profile given without a component is recorded here and
-        // nothing is downloaded.
-        if let Some(residency) = residency {
+        // Changing when the model is in memory, how many threads it uses or which
+        // processor it runs on is not a reason to fetch it again, so a setting
+        // given without a component is recorded here and nothing is downloaded.
+        if residency.is_some() || machine.any() {
             let mut state = install::read_state(&root).unwrap_or_default();
-            state.residency = Some(residency.label());
+            if let Some(residency) = residency {
+                state.residency = Some(residency.label());
+            }
+            machine.record(&mut state);
             install::write_state(&root, &state).map_err(|error| {
                 Failed::misuse(format!("the install state could not be written: {error}"))
             })?;
@@ -305,9 +393,16 @@ pub fn setup_embeddings(context: &mut Context, arguments: &Arguments) -> Result<
     }
 
     if matches!(component, Component::All | Component::Model) {
-        let installed = install_model(&root, force)?;
+        let installed = install_model(&root, &EMBEDDER, force)?;
         lines.push(format!("{} -> {}", installed.id, installed.dir));
         fields.push(("model".to_string(), model_json(&installed)));
+        state.put_model(installed);
+    }
+
+    if component == Component::Reranker {
+        let installed = install_model(&root, &RERANKER, force)?;
+        lines.push(format!("{} -> {}", installed.id, installed.dir));
+        fields.push(("reranker".to_string(), model_json(&installed)));
         state.put_model(installed);
     }
 
@@ -315,6 +410,8 @@ pub fn setup_embeddings(context: &mut Context, arguments: &Arguments) -> Result<
         state.residency = Some(residency.label());
         lines.push(format!("residency profile: {}", residency.label()));
     }
+    machine.record(&mut state);
+    lines.extend(machine.lines());
     let effective = state
         .residency
         .as_deref()
@@ -344,6 +441,71 @@ pub fn setup_embeddings(context: &mut Context, arguments: &Arguments) -> Result<
         outcome = outcome.with(&name, value);
     }
     Ok(outcome)
+}
+
+/// The thread count and the device `setup-embeddings` was asked to record.
+struct MachineSettings {
+    threads: Option<usize>,
+    device: Option<String>,
+}
+
+impl MachineSettings {
+    /// Reports whether either setting was given.
+    fn any(&self) -> bool {
+        self.threads.is_some() || self.device.is_some()
+    }
+
+    /// Writes the settings that were given into the install state, and leaves the others as they were.
+    ///
+    /// @param state - the install state about to be written
+    fn record(&self, state: &mut install::State) {
+        if let Some(threads) = self.threads {
+            state.threads = Some(threads);
+        }
+        if let Some(device) = self.device.as_ref() {
+            state.device = Some(device.clone());
+        }
+    }
+
+    /// Returns the lines that tell the caller what was recorded.
+    fn lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(threads) = self.threads {
+            lines.push(format!("threads: {threads}"));
+        }
+        if let Some(device) = self.device.as_ref() {
+            lines.push(format!("device: {device}"));
+        }
+        lines
+    }
+}
+
+/// Reads `--threads` and `--device`, refusing a value that cannot be used before anything is fetched.
+///
+/// @param arguments - what was asked for
+fn machine_settings(arguments: &Arguments) -> Result<MachineSettings, Failed> {
+    let threads = match arguments.integer("threads") {
+        Some(count) => Some(install::parse_threads(&count.to_string()).map_err(Failed::misuse)?),
+        None => None,
+    };
+    let device = match arguments.text("device") {
+        Some(text) => Some(install::parse_device(text).map_err(Failed::misuse)?),
+        None => None,
+    };
+    Ok(MachineSettings { threads, device })
+}
+
+/// Describes one machine setting for `--status`: its value, then where the value came from.
+///
+/// @param name - the setting's name
+/// @param value - the value in force
+/// @param source - where it came from
+/// @param variable - the environment variable that overrides it
+fn setting_line(name: &str, value: &str, source: install::SettingSource, variable: &str) -> String {
+    format!(
+        "{name}: {value} ({}). {variable} overrides it for one process",
+        source.label()
+    )
 }
 
 /// What `--status` prints.
@@ -405,12 +567,49 @@ fn status(root: &Path) -> Outcome {
         ),
     });
 
+    let threads = install::configured_threads();
+    let device = install::configured_device();
+    let threads_text = threads
+        .value
+        .map_or("ONNX Runtime's own choice".to_string(), |count| {
+            count.to_string()
+        });
+    lines.push(setting_line(
+        "Threads",
+        &threads_text,
+        threads.source,
+        install::THREADS_VAR,
+    ));
+    lines.push(setting_line(
+        "Device",
+        &device.value,
+        device.source,
+        install::DEVICE_VAR,
+    ));
+
+    match install::model_dir(install::RERANKER_MODEL) {
+        Some(dir) => lines.push(format!("{}: {}", install::RERANKER_MODEL, dir.display())),
+        None => lines.push(format!(
+            "{}: not installed. Run: inillucent setup-embeddings reranker (about 600 MB, needed \
+             only for rerank() and a search that names question)",
+            install::RERANKER_MODEL
+        )),
+    }
+
     let ready = install::runtime_library().is_some()
         && install::model_dir(install::DEFAULT_MODEL).is_some();
     Outcome::said("setup-embeddings", lines.join("\n"))
         .with("root", json::text(root.display().to_string()))
         .with("ready", Json::Bool(ready))
         .with("residency", json::text(effective.label()))
+        .with(
+            "threads",
+            setting_json(threads.value.map(|count| count.to_string()), threads.source),
+        )
+        .with(
+            "device",
+            setting_json(Some(device.value.clone()), device.source),
+        )
         .with(
             "runtime",
             match state.runtime.as_ref() {
@@ -425,6 +624,28 @@ fn status(root: &Path) -> Outcome {
                 None => Json::Null,
             },
         )
+        .with(
+            "reranker_installed",
+            Json::Bool(install::model_dir(install::RERANKER_MODEL).is_some()),
+        )
+        .with(
+            "reranker",
+            match state.model(install::RERANKER_MODEL) {
+                Some(model) => model_json(model),
+                None => Json::Null,
+            },
+        )
+}
+
+/// One machine setting as JSON: its value, or null for the default, and where it came from.
+///
+/// @param value - the value in force, when there is one
+/// @param source - where it came from
+fn setting_json(value: Option<String>, source: install::SettingSource) -> Json {
+    json::object(vec![
+        ("value", value.map_or(Json::Null, json::text)),
+        ("source", json::text(source.label())),
+    ])
 }
 
 /// Downloads and installs the ONNX Runtime shared library.
@@ -636,12 +857,13 @@ fn unversioned(name: &str) -> String {
     name.to_string()
 }
 
-/// Downloads and installs the weights, and seals a manifest over what landed.
+/// Downloads and installs one model's weights, and seals a manifest over what landed.
 ///
 /// @param root - the install root
+/// @param spec - which model, where it comes from and what its files must hash to
 /// @param force - fetch again even when the files are already there
-fn install_model(root: &Path, force: bool) -> Result<InstalledModel, Failed> {
-    let directory = install::models_root(root).join(install::DEFAULT_MODEL);
+fn install_model(root: &Path, spec: &ModelSpec, force: bool) -> Result<InstalledModel, Failed> {
+    let directory = install::models_root(root).join(spec.id);
     std::fs::create_dir_all(&directory).map_err(|error| {
         Failed::misuse(format!(
             "{} could not be created: {error}",
@@ -649,12 +871,12 @@ fn install_model(root: &Path, force: bool) -> Result<InstalledModel, Failed> {
         ))
     })?;
 
-    for file in NOMIC_FILES {
+    for file in spec.files {
         let destination = directory.join(file.local);
         if destination.exists() && !force && already_correct(&destination, file) {
             continue;
         }
-        let url = format!("{MODEL_BASE}/{}", file.remote);
+        let url = format!("{}/{}", spec.base, file.remote);
         let mut progress = bar();
         http::download(&url, &destination, Some(file.sha256), &mut progress)
             .map_err(|error| Failed::misuse(format!("{error}")))?;
@@ -664,26 +886,28 @@ fn install_model(root: &Path, force: bool) -> Result<InstalledModel, Failed> {
     // so it is written here. Its digests come from the files that actually
     // landed, which is what makes it impossible for a manifest to describe
     // weights that are not there.
-    let mut manifest = ModelManifest::nomic_v1_5();
-    manifest.weights_sha256 = NOMIC_FILES
+    let mut manifest = (spec.manifest)();
+    manifest.weights_sha256 = spec
+        .files
         .iter()
         .find(|f| f.local == "model.onnx")
         .map(|f| f.sha256.to_string())
         .unwrap_or_default();
-    manifest.tokenizer_sha256 = NOMIC_FILES
+    manifest.tokenizer_sha256 = spec
+        .files
         .iter()
         .find(|f| f.local == "tokenizer.json")
         .map(|f| f.sha256.to_string())
         .unwrap_or_default();
-    manifest.source = Some(MODEL_BASE.trim_end_matches("/resolve/main").to_string());
+    manifest.source = Some(spec.source.to_string());
     manifest
         .write(&directory)
         .map_err(|reason| Failed::misuse(format!("the model manifest: {reason}")))?;
 
     Ok(InstalledModel {
-        id: install::DEFAULT_MODEL.to_string(),
+        id: spec.id.to_string(),
         dir: directory.display().to_string(),
-        source: MODEL_BASE.trim_end_matches("/resolve/main").to_string(),
+        source: spec.source.to_string(),
         verified: true,
     })
 }

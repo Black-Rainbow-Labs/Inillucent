@@ -183,6 +183,7 @@ impl Registry {
         registry.register_module(Arc::new(JsonWalkModule::each()));
         registry.register_module(Arc::new(JsonWalkModule::tree()));
         registry.register_module(Arc::new(SeriesModule));
+        registry.register_module(Arc::new(crate::vtab::chunk::ChunkTextModule));
         registry.register_module(Arc::new(RTreeModule::float()));
         registry.register_module(Arc::new(RTreeModule::integer()));
         registry.register_module(Arc::new(RTreeModule::geopoly()));

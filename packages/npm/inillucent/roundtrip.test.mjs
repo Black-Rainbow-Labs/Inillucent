@@ -17,7 +17,7 @@
 // has never built the workspace.
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -169,4 +169,31 @@ withDatabase('a VECTOR column survives the wrapper', async (db) => {
     found.columns.some((column) => column.name === 'distance'),
     'vector-search answered without a distance column',
   );
+});
+
+withDatabase('an encrypted database opens with its key and not without it', async (db) => {
+  // The key travels in INILLUCENT_KEY. It is a raw 32 byte key here because a
+  // passphrase costs 600,000 PBKDF2 iterations on every open.
+  const key = `x'${'5a'.repeat(32)}'`;
+  const secret = 'plaintext-marker-for-the-file-scan';
+  const made = await inillucent('batch', {
+    db,
+    key,
+    sql: `CREATE TABLE note (id INTEGER PRIMARY KEY, body TEXT);
+      INSERT INTO note (body) VALUES ('${secret}')`,
+  });
+  assert.equal(made.ok, true, made.message);
+
+  const rows = await query('SELECT body FROM note', { db, key });
+  assert.equal(rows[0].body, secret, 'the row did not come back with the key');
+
+  const mode = await query('PRAGMA encryption', { db, key });
+  assert.equal(Object.values(mode[0])[0], 'xchacha20-poly1305');
+
+  const without = await inillucent('query', { db, sql: 'SELECT body FROM note' });
+  assert.equal(without.ok, false);
+  assert.equal(without.status, 'corrupt', `no key came back as ${without.status}`);
+
+  const bytes = readFileSync(db);
+  assert.equal(bytes.includes(Buffer.from(secret)), false, 'the row text is in the file');
 });

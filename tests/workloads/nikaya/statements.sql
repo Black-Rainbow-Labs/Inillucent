@@ -34,7 +34,7 @@
 --
 -- ## What is not here
 --
--- 159 statements are carried. 17 literals are not, because they are `format!`
+-- 162 statements are carried. 17 literals are not, because they are `format!`
 -- templates rather than statements: Nikaya interpolates a column list, a table
 -- name or a key into them, and what reaches the engine is whatever the
 -- interpolation produced. Running the literal would assert that the engine
@@ -438,37 +438,37 @@ CREATE TABLE IF NOT EXISTS embedding_queue (
 
 -- section: statements
 
--- statement: db.rs:677
+-- statement: db.rs:687
 -- params: []
 CREATE TABLE IF NOT EXISTS schema_migration (
     name       TEXT PRIMARY KEY,
     applied_at INTEGER NOT NULL
 );
 
--- statement: db.rs:688
+-- statement: db.rs:698
 -- params: ["row-0001"]
 SELECT name FROM schema_migration WHERE name = ?1;
 
--- statement: db.rs:702
+-- statement: db.rs:712
 -- params: ["row-0001", 1]
 INSERT INTO schema_migration (name, applied_at) VALUES (?1, ?2);
 
--- statement: db.rs:743
+-- statement: db.rs:753
 -- params: ["row-0001"]
 SELECT id FROM chunk WHERE id > ?1 AND embedding_attempts < 3
 ORDER BY id LIMIT 5000;
 
--- statement: db.rs:762
+-- statement: db.rs:772
 -- params: ["row-0001", "row-0001"]
 SELECT chunk_id FROM chunk_embedding
 WHERE chunk_id = ?1 AND embedding_model = ?2;
 
--- statement: db.rs:771
+-- statement: db.rs:781
 -- params: ["row-0001", 1]
 INSERT INTO embedding_queue (chunk_id, queued_at) VALUES (?1, ?2)
 ON CONFLICT (chunk_id) DO NOTHING;
 
--- statement: main.rs:284
+-- statement: main.rs:288
 -- params: []
 SELECT count(*) AS total FROM document;
 
@@ -1341,14 +1341,27 @@ VALUES (?1, 'running', ?2, ?2, ?2) RETURNING id;
 -- params: [1, "row-0001", 1]
 UPDATE sync_job SET counters = ?2, updated_at = ?3 WHERE id = ?1;
 
--- statement: services/ingestion.rs:730
+-- statement: services/ingestion.rs:737
 -- params: [1, "row-0001", "row-0001", 1]
 UPDATE sync_job SET status = ?2, error_summary = ?3, finished_at = ?4, updated_at = ?4
 WHERE id = ?1;
 
--- statement: services/ingestion.rs:741
+-- statement: services/ingestion.rs:760
+-- params: ["row-0001", 1]
+UPDATE sync_job SET status = 'failed', error_summary = ?1, finished_at = ?2, updated_at = ?2
+WHERE status = 'running';
+
+-- statement: services/ingestion.rs:770
 -- params: []
 SELECT count(*) AS total FROM sync_job WHERE status = 'running';
+
+-- statement: services/ingestion.rs:814
+-- params: [1]
+SELECT status, error_summary FROM sync_job WHERE id = ?1;
+
+-- statement: services/ingestion.rs:821
+-- params: [1]
+SELECT status FROM sync_job WHERE id = ?1;
 
 -- statement: services/verify.rs:106
 -- params: []

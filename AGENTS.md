@@ -28,7 +28,7 @@ An install gives you four programs:
 
 | Program | What it is |
 |---|---|
-| `inillucent` | the command line: 30 commands, each with `--output json` |
+| `inillucent` | the command line: 34 commands, each with `--output json` |
 | `inillucent-shell` | an interactive shell that works like `sqlite3`, with 63 of its 65 dot commands |
 | `inillucent-mcp` | the same commands served to an AI agent over MCP |
 | `inillucent-migrate` | builds a database from a legacy retrieval index; `inillucent migrate` covers SQLite files and PostgreSQL or MySQL servers |

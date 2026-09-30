@@ -297,10 +297,16 @@ impl Shell {
         // **The detail, not only the code.** An open that fails with "bad
         // parameter or other API misuse" and nothing else is an error nobody
         // can act on; the detail says which part of the file could not be read.
-        let database = match read_only {
-            true => Database::open_read_only(path, inillucent_driver::DEFAULT_FRAMES),
-            false => Database::open(path),
-        }?;
+        // **With the process's key, when it has one.** See `crate::keys`: the
+        // key comes from `--key-file` or the environment, and every database
+        // this shell opens is opened with it.
+        let database = Database::open_keyed(
+            path,
+            inillucent_driver::PAGE_SIZE,
+            inillucent_driver::DEFAULT_FRAMES,
+            read_only,
+            crate::keys::for_opening(),
+        )?;
         // **The shell adds `fsdir`, and the library does not.** A table-valued
         // function over the file system belongs to a program that asked for
         // one; the reference draws the same line, with `fsdir` in `shell.c`.
@@ -497,6 +503,33 @@ impl Shell {
             .database
             .backup_to(path)
             .map_err(|error| error.message().to_string())
+    }
+
+    /// Writes a copy of the database, encrypted with `key` or in plaintext.
+    ///
+    /// @param path - where the copy goes
+    /// @param key - the key the copy is encrypted with, if any
+    pub fn export_to(
+        &self,
+        path: &str,
+        key: Option<inillucent_driver::EncryptionKey>,
+    ) -> Result<(), inillucent_base::DbError> {
+        self.open_slot().database.export_to(path, key)
+    }
+
+    /// Reports whether the database is encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        self.open_slot().database.is_encrypted()
+    }
+
+    /// Changes the key the database is encrypted with.
+    ///
+    /// @param key - the new key
+    pub fn rekey(
+        &self,
+        key: inillucent_driver::EncryptionKey,
+    ) -> Result<(), inillucent_base::DbError> {
+        self.open_slot().database.rekey(key)
     }
 
     /// Returns where the database was opened from.

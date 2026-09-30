@@ -45,14 +45,26 @@ fn example() -> PathBuf {
 /// `[[`, and a POSIX `sh` runs them wrongly rather than refusing them - which
 /// would be a failure that is about the shell and reads as a failure of the
 /// index.
+///
+/// **A shell that cannot read a Windows path is not a shell for this suite.** The runner starts from
+/// PowerShell, where `bash` is found in `System32` and is the Windows Subsystem for Linux launcher,
+/// which answers `--version` and then cannot open `C:/...`. Each candidate is asked to read the
+/// script the suite is about to run, and Git for Windows' own `bash` is tried by its usual path.
 fn shell() -> Option<String> {
-    for name in ["bash", "sh"] {
-        let answered = Command::new(name).arg("--version").output();
-        if answered.is_ok_and(|output| output.status.success()) {
-            return Some(name.to_string());
-        }
-    }
-    None
+    let probe = example().join("scripts/verify.sh");
+    let script = probe.to_string_lossy().replace('\\', "/");
+    let candidates = [
+        "bash".to_string(),
+        "sh".to_string(),
+        "C:/Program Files/Git/bin/bash.exe".to_string(),
+    ];
+    candidates.into_iter().find(|name| {
+        Command::new(name)
+            .arg("-c")
+            .arg(format!("test -f '{script}'"))
+            .output()
+            .is_ok_and(|output| output.status.success())
+    })
 }
 
 /// Reports whether this build can answer `embed(TEXT)`.

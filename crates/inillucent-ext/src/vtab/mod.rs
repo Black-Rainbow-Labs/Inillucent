@@ -18,6 +18,7 @@
 //! the module says `omit` - and `omit` is the module promising, not the engine
 //! assuming.
 
+pub mod chunk;
 pub mod fsdir;
 pub mod fts5;
 pub mod ivfflat;

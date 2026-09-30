@@ -40,6 +40,8 @@ pub mod model;
 pub mod persist;
 pub mod quantize;
 pub mod rank;
+#[cfg(feature = "onnx")]
+pub mod rerank_onnx;
 pub mod residency;
 pub mod store;
 pub mod tokenize;

@@ -10,6 +10,7 @@
 //!   grade-embedding  compare two or more embedding models over the same corpus
 //!   models       write or reseal a model manifest
 //!   embed-residency  what loading the embedding model costs, and what moves it
+//!   rerank-cost  what scoring a number of passages with the reranker costs, per device
 
 // The harness connects to live databases and scores the numbers
 // `docs/performance.md` and `docs/retrieval-quality.md` publish, so a bad
@@ -55,6 +56,7 @@ mod metrics;
 mod models;
 mod queryset;
 mod report;
+mod rerankcost;
 mod residency;
 mod runs;
 mod scenarios;
@@ -463,6 +465,28 @@ enum Command {
         /// second copy of the weights on disk.
         #[arg(long, default_value_t = false)]
         skip_optimized: bool,
+    },
+    /// Measure what scoring a number of passages with the reranker costs.
+    ///
+    /// Prints the median and the 95th percentile of `OnnxReranker::score` over each passage
+    /// count, on each device and, on the processor, each thread count. `docs/embeddings.md`
+    /// prints what it found on this machine, so a later change can measure the cost again.
+    RerankCost {
+        /// The reranker's model folder. Defaults to the installed one.
+        #[arg(long)]
+        model_dir: Option<String>,
+        /// Devices to run on, comma separated: `cpu`, `cuda`, `cuda:0`.
+        #[arg(long, default_value = "cpu")]
+        devices: String,
+        /// Thread counts to try on the processor, comma separated. A card ignores them.
+        #[arg(long, default_value = "4,8")]
+        threads: String,
+        /// How many passages one call scores, comma separated.
+        #[arg(long, default_value = "20,60")]
+        passages: String,
+        /// Timed calls for each row. The 95th percentile of 20 is the second largest.
+        #[arg(long, default_value_t = 20)]
+        repeats: usize,
     },
     /// Write or reseal a model's manifest, filling in the weights and tokenizer
     /// digests from the files on disk.
@@ -1136,8 +1160,54 @@ fn main() -> Result<()> {
             steady,
             skip_optimized,
         ),
+        Command::RerankCost {
+            model_dir,
+            devices,
+            threads,
+            passages,
+            repeats,
+        } => rerank_cost(model_dir, &devices, &threads, &passages, repeats),
         Command::Models { dir } => seal_model(&dir),
     }
+}
+
+/// Measures what scoring passages with the reranker costs, and prints a table.
+///
+/// @param model_dir - the reranker's model folder, or the installed one
+/// @param devices - the devices, comma separated as given
+/// @param threads - the processor thread counts, comma separated as given
+/// @param passages - the passage counts, comma separated as given
+/// @param repeats - the timed calls for each row
+fn rerank_cost(
+    model_dir: Option<String>,
+    devices: &str,
+    threads: &str,
+    passages: &str,
+    repeats: usize,
+) -> Result<()> {
+    let dir = match model_dir {
+        Some(named) => PathBuf::from(expand_home(&named)?),
+        None => inillucent_core::install::model_dir(inillucent_core::install::RERANKER_MODEL)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no reranker is installed. Run `inillucent setup-embeddings reranker` or pass --model-dir"
+                )
+            })?,
+    };
+    let numbers = |text: &str| -> Result<Vec<usize>> {
+        text.split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(|part| part.parse::<usize>().map_err(anyhow::Error::from))
+            .collect()
+    };
+    rerankcost::run(
+        &dir,
+        &parse_devices(devices)?,
+        &numbers(threads)?,
+        &numbers(passages)?,
+        repeats.max(1),
+    )
 }
 
 /// Assembles the graded corpus from the downloaded public material.

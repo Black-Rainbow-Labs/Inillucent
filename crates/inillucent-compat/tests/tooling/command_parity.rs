@@ -103,7 +103,7 @@ fn every_exclusion_is_argued_for() {
         .collect();
     assert_eq!(
         excluded,
-        vec!["shell", "mcp"],
+        vec!["encrypt", "decrypt", "rekey", "shell", "mcp"],
         "a command was hidden from MCP. If that is right, this list is what says so."
     );
     for command in command::COMMANDS {

@@ -64,8 +64,9 @@ pragmas, modules, collations and dot commands, and asks inillucent for the same 
 | Collations | 5 | 5 | none |
 | Shell dot commands | 65 | 63 | `.expert`, `.session` |
 
-The register holds the 68 pragmas this engine recognises. That is SQLite's 67 plus `defensive`.
-SQLite sets `defensive` through `sqlite3_db_config`, and inillucent also answers it as a pragma.
+The register holds the 71 pragmas this engine recognises. That is SQLite's 67 plus `defensive`,
+`encryption`, `key` and `rekey`. SQLite sets `defensive` through `sqlite3_db_config`, and
+inillucent also answers it as a pragma. The other three are for [encryption at rest](encryption.md).
 `tools/doc-facts/check.mjs` fails when a page names a different count.
 
 ### Where the function counts come from
@@ -94,6 +95,18 @@ node tools/feature-probe/registers.js    # compares both registers name by name
 through `create_scalar_function` or `create_aggregate_function`, and `embed(TEXT)` in a build with
 the `embed` feature. Those rows have `builtin = 0`. The release build checked for this page has no
 `embed` feature, so `embed('hello')` returns exit code 3.
+
+A build with the `embed` feature registers three functions that run a model:
+
+| Function | What it returns |
+|---|---|
+| `embed(TEXT)` | the text's embedding, 768 numbers as 3,072 bytes |
+| `embed_tokens(TEXT)` | how many tokens the embedding model sees in the text, before its 1,900 token limit is applied. `SELECT id FROM chunk WHERE embed_tokens('search_document: ' || body) > 1900` finds the rows `embed()` would cut |
+| `rerank(QUESTION, PASSAGE)` | how relevant the passage is to the question, from 0 to 1, from a reranker. It scores one pair per call, so a search table that names `question` is faster for many rows |
+
+All three return `NULL` for a `NULL` argument, and all three are `direct_only`. A build without the
+`embed` feature answers each with the status `unsupported` and exit code 3. See
+[Embeddings](embeddings.md) and [Vector search](vector-search.md).
 
 ### Where a registered function may be called
 
@@ -140,7 +153,7 @@ otherwise.
 | Several databases | `ATTACH` and `DETACH`, joins across files, and one transaction that commits to two files or to neither. Temporary tables, views and triggers |
 | Schema and maintenance | `sqlite_schema` and `sqlite_master`, `VACUUM`, `VACUUM INTO`, `integrity_check` and `quick_check` |
 | Plans | `EXPLAIN QUERY PLAN` in SQLite's format. Plain `EXPLAIN` runs and prints a different program, see [below](#five-follow-from-how-inillucent-is-built) |
-| Table valued functions | `generate_series`, `json_each`, `json_tree`, a `pragma_*` function for every pragma that returns a value except `foreign_key_check`, such as `pragma_table_info('t')` and `pragma_user_version`, and any module an application registers |
+| Table valued functions | `generate_series`, `chunk_text(text, size, overlap, heading)`, which cuts a document into windows of characters for embedding, `json_each`, `json_tree`, a `pragma_*` function for every pragma that returns a value except `foreign_key_check`, such as `pragma_table_info('t')` and `pragma_user_version`, and any module an application registers |
 
 ### Rules a reader asks about
 
@@ -256,7 +269,7 @@ exit code 3.
 
 | Construct | Example | What to write instead |
 |---|---|---|
-| `ATTACH ... KEY` | `ATTACH 'x.db' AS k KEY 'secret'` | `ATTACH` without `KEY`. inillucent has no encryption |
+| `ATTACH` with a file name that is not a literal | `ATTACH ? AS k` | the file name as a string literal |
 | a row value `IN` a subquery | `(a, b) IN (SELECT x, y FROM s)` | `EXISTS (SELECT 1 FROM s WHERE x = a AND y = b)` |
 | a full text `MATCH` under an `OR` whose pattern reads another table's row | `f MATCH q.w OR rowid = 3` | a constant or bound pattern, or two queries joined with `UNION` |
 | a partial index as an `ON CONFLICT` target | `ON CONFLICT(b) WHERE b > 0` | a full unique index |

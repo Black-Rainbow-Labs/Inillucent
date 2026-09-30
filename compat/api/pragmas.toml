@@ -5,7 +5,7 @@
 # `inillucent-compat::obligations::the_registers_match_the_engine` fails if
 # this file and the engine disagree.
 
-count = 68
+count = 71
 
 [[pragma]]
 name = "analysis_limit"
@@ -113,6 +113,11 @@ columns = ["encoding"]
 takes_argument = true
 
 [[pragma]]
+name = "encryption"
+columns = ["encryption"]
+takes_argument = false
+
+[[pragma]]
 name = "foreign_key_check"
 columns = ["table", "rowid", "parent", "fkid"]
 takes_argument = true
@@ -193,6 +198,11 @@ columns = []
 takes_argument = true
 
 [[pragma]]
+name = "key"
+columns = []
+takes_argument = true
+
+[[pragma]]
 name = "legacy_alter_table"
 columns = []
 takes_argument = true
@@ -254,6 +264,11 @@ takes_argument = true
 
 [[pragma]]
 name = "recursive_triggers"
+columns = []
+takes_argument = true
+
+[[pragma]]
+name = "rekey"
 columns = []
 takes_argument = true
 

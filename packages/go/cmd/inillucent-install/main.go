@@ -58,7 +58,7 @@ const downloads = "https://inillucent.com/downloads"
 //
 // `-version latest` still asks the server, for somebody who wants the newest on
 // purpose.
-const nativeVersion = "1.0.33"
+const nativeVersion = "2.0.1"
 
 // programs are the four the release ships.
 var programs = []string{"inillucent", "inillucent-shell", "inillucent-mcp", "inillucent-migrate"}

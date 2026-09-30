@@ -111,6 +111,24 @@ $db = new Inillucent('app.rdb', binary: '/usr/local/bin/inillucent', readOnly: t
 `query()` returns a BLOB column as a PHP string of bytes, so bytes read by one query can be bound
 into the next.
 
+## Encrypted databases
+
+Pass the key as the fifth constructor argument:
+
+```php
+$key = "x'" . str_repeat('5a', 32) . "'";
+$db = new Inillucent('app.rdb', null, false, null, $key);
+$db->exec('CREATE TABLE note (body TEXT)');
+```
+
+The key travels to the program in the `INILLUCENT_KEY` environment variable. It is never put on the command line, because a command line is visible in the process list. When you pass no key, the environment the program inherits is left alone.
+
+A key written `x'` followed by 64 hexadecimal digits and `'` is a raw 32 byte key. Any other text is a passphrase, which is stretched with 600,000 rounds of PBKDF2 on every open, so a raw key opens faster.
+
+A database created with a key is encrypted. Opening it without the key, or with a wrong key, fails with status `corrupt`. Opening a plaintext database with a key fails the same way.
+
+Without the key, `query`, `exec` and the other methods throw an `Inillucent\Error` whose status is `corrupt`, and `run` returns a result with `status` set to `corrupt`.
+
 ## Errors
 
 ```php

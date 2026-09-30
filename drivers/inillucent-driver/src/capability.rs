@@ -100,6 +100,17 @@ pub enum Probe {
         /// What its first cell must be, rendered.
         expect: &'static str,
     },
+    /// Supported means the query answers this on a database opened with a
+    /// key.
+    ///
+    /// A separate kind because every other probe opens a plaintext database,
+    /// and the one thing a plaintext database cannot show is encryption.
+    Keyed {
+        /// The query under test.
+        sql: &'static str,
+        /// What its first cell must be, rendered.
+        expect: &'static str,
+    },
     /// There is nothing to run, because the driver exposes no entry point for
     /// it. The note has to say why.
     Nothing,
@@ -432,14 +443,32 @@ pub static CAPABILITIES: &[Capability] = &[
             sql: "SELECT abs(DISTINCT a) FROM t",
         },
     },
-    // —— what it does not do ——————————————————————————————————————
+    Capability {
+        name: "encryption",
+        support: Support::Yes,
+        note: "A database opened with a key is encrypted at rest with XChaCha20-Poly1305: the database file, its log, its journals and its temporary files. A passphrase is stretched with PBKDF2-HMAC-SHA256 at 600,000 iterations. PRAGMA encryption names the cipher, and PRAGMA rekey changes the key.",
+        probe: Probe::Keyed {
+            sql: "PRAGMA encryption",
+            expect: "xchacha20-poly1305",
+        },
+    },
     Capability {
         name: "attach_with_key",
-        support: Support::No,
-        note: "ATTACH takes a path and a name: the KEY clause, which SQLite's own build answers only with the encryption extension, is refused.",
+        support: Support::Yes,
+        note: "ATTACH ... KEY opens an encrypted file with its own key, and KEY '' opens a plaintext one. With no KEY clause an attachment is opened with the connection's own key, which is SQLCipher's rule.",
         probe: Probe::Runs {
             setup: &[],
-            sql: "ATTACH DATABASE 'other.rdb' AS o KEY 'k'",
+            sql: "ATTACH DATABASE ':memory:' AS o KEY \"x'1111111111111111111111111111111111111111111111111111111111111111'\"",
+        },
+    },
+    // —— what it does not do ——————————————————————————————————————
+    Capability {
+        name: "attach_computed_path",
+        support: Support::No,
+        note: "ATTACH takes its file name as a string literal. A bound parameter or an expression in that place is refused, where SQLite evaluates it.",
+        probe: Probe::Runs {
+            setup: &[],
+            sql: "ATTACH ? AS other",
         },
     },
     Capability {
@@ -600,6 +629,15 @@ pub static CAPABILITIES: &[Capability] = &[
         probe: Probe::Runs {
             setup: &["CREATE TABLE t (a INTEGER)"],
             sql: "EXPLAIN EXPLAIN SELECT a FROM t",
+        },
+    },
+    Capability {
+        name: "rerank",
+        support: Support::Yes,
+        note: "`rerank(query, passage)` scores a passage against a question with a cross encoder, from 0 to 1, and a search table's `question` column reorders a search's rows with the same model. Both need a build with embedding support, and at run time the reranker that `inillucent setup-embeddings reranker` installs. A build without embedding support answers unsupported, exit code 3. The probe passes NULL, which returns NULL without loading a model, so it runs on a machine with no reranker installed.",
+        probe: Probe::Runs {
+            setup: &[],
+            sql: "SELECT rerank(NULL, NULL)",
         },
     },
     Capability {

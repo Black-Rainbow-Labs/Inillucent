@@ -254,7 +254,7 @@ const NOT_BUILT: &str = "SELECT (SELECT 1, 2)";
 ///
 /// The paths are placeholders replaced per run: `{dir}` is this run's scratch
 /// directory and `{copy}` is a backup this session writes before it reads.
-const CALLS: [(&str, &str, &str); 28] = [
+const CALLS: [(&str, &str, &str); 29] = [
     // The order matters, and it is not alphabetical. **Three tools change which
     // database the session is on**: `create` opens the file it makes,
     // `restore` opens the file it is given, and `migrate` writes a new one.
@@ -317,6 +317,13 @@ const CALLS: [(&str, &str, &str); 28] = [
     ("inillucent_capabilities", "{}", "ddl"),
     ("inillucent_functions", "{}", "substr"),
     ("inillucent_setup_embeddings", "{}", "nomic-embed-text-v1.5"),
+    // A table that is not there is refused by name before any model is opened, so this answers on
+    // a machine with no model. The row in `tests/selection.toml` builds the program with `embed`.
+    (
+        "inillucent_embed",
+        r#"{"table":"nothing","text":"body","vector":"v"}"#,
+        "no such table: nothing",
+    ),
     // The workspace version this test was built at, which every crate shares.
     // It was the literal "0.1.", and the 1.0.29 release made that answer red.
     (

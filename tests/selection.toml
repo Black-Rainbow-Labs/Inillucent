@@ -1246,6 +1246,14 @@ covers = ["inillucent-engine", "inillucent-exec"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "chunk_text"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-ext"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "reindex_without_rowid"
 tier = "engine"
 covers = ["inillucent-engine"]
@@ -1501,6 +1509,14 @@ package = "inillucent-compat"
 kind = "test"
 name = "engine"
 module = "torn_page_with_image"
+tier = "engine"
+
+# Encryption at rest: the encrypting `Vfs` over memory and over the real file
+# system, checked against a plain byte model and against the bytes it stores.
+[[target]]
+package = "inillucent-vfs"
+kind = "test"
+name = "crypt"
 tier = "engine"
 
 [[target]]
@@ -1930,6 +1946,16 @@ module = "corruption"
 tier = "durability"
 covers = ["inillucent-storage", "inillucent-vfs"]
 
+# Crash campaigns over the encrypting file system: every cut point of a
+# commit and of a checkpoint, in delete and wal mode.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "encrypted_crash"
+tier = "durability"
+covers = ["inillucent-vfs", "inillucent-base", "inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-sim"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"
@@ -2021,6 +2047,16 @@ module = "reindex_crash"
 tier = "durability"
 covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim"]
 
+# Encryption at rest through the connection: no plaintext on disk, key
+# refusals, rekey, ATTACH KEY, VACUUM, backup and export.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "encryption_at_rest"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-vfs", "inillucent-base"]
+
 # A statement never moves the connection onto a different file system.
 [[target]]
 package = "inillucent-compat"
@@ -2106,6 +2142,22 @@ name = "engine"
 module = "search_recall"
 tier = "engine"
 covers = ["inillucent-search", "inillucent-core", "inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "search_fusion"
+tier = "engine"
+covers = ["inillucent-search", "inillucent-core", "inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "search_rerank"
+tier = "engine"
+covers = ["inillucent-search", "inillucent-sql", "inillucent-engine"]
 
 [[target]]
 package = "inillucent-compat"
@@ -2317,6 +2369,10 @@ package = "inillucent-driver"
 kind = "test"
 name = "capability"
 tier = "e2e"
+# The `rerank` row is a function of the `embed` feature, so the runner builds this suite with it.
+# Without the feature the row skips, which is what `requires` declares.
+features = ["inillucent-driver/embed"]
+requires = ["embed"]
 
 [[target]]
 package = "inillucent-driver"
@@ -2385,8 +2441,12 @@ module = "mcp_wire"
 tier = "e2e"
 covers = ["inillucent-cli"]
 # One `initialize` handshake over real pipes and one `tools/call` of each of
-# the 28 MCP tools. `command_parity` keeps the tool set equal to the registry;
+# the 29 MCP tools. `command_parity` keeps the tool set equal to the registry;
 # nothing called a tool by name over the wire.
+# `inillucent_embed` is called with a table that is not there, which a build with embedding
+# support refuses by name and a build without it refuses as unsupported, so the row builds the
+# program with the feature and the case can name the table.
+features = ["inillucent-cli/embed"]
 
 [[target]]
 package = "inillucent-compat"
@@ -2443,6 +2503,17 @@ covers = ["inillucent-engine", "inillucent-sql"]
 # The two lists a read only connection decides a pragma by have to cover the
 # pragma register exactly: one in neither is decided by whichever branch the
 # filter falls through to (task-1979, section 5.2).
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "rowid_after_tail_delete"
+tier = "engine"
+covers = ["inillucent-exec", "inillucent-tree", "inillucent-engine"]
+# An insert after the newest rows were deleted takes the largest rowid left
+# plus one. It took rowid 1 when the rightmost leaf held no live row, and
+# failed with a UNIQUE constraint on the rowid (task-2150).
 
 # One writer, four readers and a checkpoint under them (task-2036). Nothing in
 # the tree ran a reader *while* a writer was working, and a checkpoint under a
@@ -2525,6 +2596,75 @@ covers = ["inillucent-search"]
 # skills point an agent at the example, and neither script was called by
 # anything.
 requires = ["onnx", "shell"]
+# The example's questions are semantic, so the `inillucent` program has to answer `embed()`. The
+# runner builds it with `embed` from the row's `features`, and a suite run alone is then not a skip.
+features = ["inillucent-cli/embed"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "retrieval"
+module = "bulk_embed"
+tier = "retrieval"
+covers = ["inillucent-search", "inillucent-core", "inillucent-cli"]
+# `inillucent embed` on the processor: byte for byte against `embed()`, resume, truncation report,
+# an `inillucent_search` table as the target, and a card that is not there. Driven through the
+# `inillucent` program, which the runner builds with `embed` from the `features` row below. The
+# graphics card cases are in `bulk_embed_cuda`, so a machine with no card still runs these.
+features = ["inillucent-cli/embed"]
+requires = ["embed"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "retrieval"
+module = "bulk_embed_cuda"
+tier = "retrieval"
+covers = ["inillucent-search", "inillucent-core", "inillucent-cli"]
+# `inillucent embed` on card 0 against `embed()` on the processor, to a cosine similarity of
+# 0.99999. A machine with no card declares `cuda` absent in `tests/prerequisites.local.toml`. Only
+# card 0 is used, because card 1 holds the local language model.
+features = ["inillucent-cli/embed"]
+requires = ["embed", "cuda"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "retrieval"
+module = "rerank"
+tier = "retrieval"
+covers = ["inillucent-search", "inillucent-core", "inillucent-cli"]
+# `rerank()`, a search that names `question`, and `inillucent search --rerank`, through the
+# `inillucent` program, which the runner builds with `embed` from the `features` row below. The
+# reranker is a separate 600 MB install: `inillucent setup-embeddings reranker`.
+features = ["inillucent-cli/embed"]
+requires = ["embed", "reranker"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "retrieval"
+module = "rerank_absent"
+tier = "retrieval"
+covers = ["inillucent-search", "inillucent-core", "inillucent-cli"]
+# What a machine with no reranker sees. Every folder the program searches for a model is pointed at
+# an empty one, so the case is the same on a machine that has the reranker. It needs only a build
+# with the `embed` function.
+features = ["inillucent-cli/embed"]
+requires = ["embed"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "retrieval"
+module = "embed_settings"
+tier = "retrieval"
+covers = ["inillucent-search", "inillucent-core", "inillucent-cli"]
+# The thread and device settings of `embed()` and `embed_tokens(text)`, driven through the
+# `inillucent` program with the settings in its environment. The program is built with
+# `embed` from the `features` row below, and the suite skips when the machine has no model.
+features = ["inillucent-cli/embed"]
+requires = ["embed"]
 
 [[target]]
 package = "inillucent-driver"
@@ -2586,7 +2726,9 @@ requires = ["onnx"]
 package = "inillucent-core"
 kind = "lib"
 tier = "retrieval"
-requires = ["onnx"]
+requires = ["onnx", "reranker"]
+# The reranker cases in `rerank_onnx.rs` skip when `gte-reranker-modernbert-base` is not installed:
+# `inillucent setup-embeddings reranker`.
 # 27 of this crate's tests are behind `onnx`, which the default build does
 # not turn on - so they were in the source and in no binary (task-1913).
 features = ["inillucent-core/onnx"]

@@ -130,6 +130,32 @@ pub enum Output {
     SentenceEmbedding,
 }
 
+/// What a model reads and what it returns.
+///
+/// A bi encoder reads one text and returns a vector. A cross encoder reads a
+/// question and a passage together and returns one relevance score. A reranker
+/// is a cross encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelKind {
+    /// One text in, one vector out. Every model this crate shipped before rerankers.
+    #[default]
+    BiEncoder,
+    /// A question and a passage in, one score out.
+    CrossEncoder,
+}
+
+/// Whether a kind is the default, so a manifest that does not set it is written without it.
+///
+/// **A manifest with no `kind` is a bi encoder.** Every `model.json` written before cross encoders
+/// existed reads as one, and a bi encoder is written back without the field, so the file and the
+/// digest of an existing model do not change.
+///
+/// @param kind - the manifest's kind
+fn is_bi_encoder(kind: &ModelKind) -> bool {
+    *kind == ModelKind::BiEncoder
+}
+
 /// Everything the harness needs in order to run a model the way its author
 /// intended, plus enough provenance to say which model a number came from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -146,6 +172,12 @@ pub struct ModelManifest {
     pub prefixes: Prefixes,
     /// How the token vectors become one vector.
     pub pooling: Pooling,
+    /// What the model reads and returns. Absent means a bi encoder.
+    ///
+    /// Left out of the digest when it is `bi_encoder`, so the digest of every existing manifest
+    /// is what it was.
+    #[serde(default, skip_serializing_if = "is_bi_encoder")]
+    pub kind: ModelKind,
     /// Longest sequence handed to the model. Chunks above it are truncated, and
     /// the card prints how many were, so a model that quietly saw less text than
     /// its rivals is visible rather than merely faster.
@@ -240,6 +272,7 @@ impl ModelManifest {
             mrl_widths: vec![64, 128, 256, 512, 768],
             prefixes: Prefixes::nomic(),
             pooling: Pooling::Mean,
+            kind: ModelKind::BiEncoder,
             max_tokens: 1900,
             layer_norm: false,
             model_file: default_model_file(),
@@ -252,6 +285,37 @@ impl ModelManifest {
             weights_sha256: String::new(),
             recipe_git_sha: None,
             source: Some("https://huggingface.co/nomic-ai/nomic-embed-text-v1.5".to_string()),
+        }
+    }
+
+    /// The reranker `inillucent setup-embeddings reranker` installs: `gte-reranker-modernbert-base`.
+    ///
+    /// A cross encoder, so `dims`, the prefixes and the pooling do not apply and are set to
+    /// values that say so. `max_tokens` is 1,024, the value the retrieval study used: the model
+    /// accepts 8,192 and a longer input costs time with the square of its length. ModernBERT
+    /// declares no `token_type_ids` input.
+    pub fn gte_reranker_modernbert_base() -> ModelManifest {
+        ModelManifest {
+            id: "gte-reranker-modernbert-base".to_string(),
+            dims: 1,
+            mrl_widths: vec![1],
+            prefixes: Prefixes::none(),
+            pooling: Pooling::Cls,
+            kind: ModelKind::CrossEncoder,
+            max_tokens: 1024,
+            layer_norm: false,
+            model_file: default_model_file(),
+            token_type_ids: false,
+            backend: Backend::Onnx,
+            runnable: true,
+            output: Output::TokenEmbeddings,
+            output_name: String::new(),
+            tokenizer_sha256: String::new(),
+            weights_sha256: String::new(),
+            recipe_git_sha: None,
+            source: Some(
+                "https://huggingface.co/Alibaba-NLP/gte-reranker-modernbert-base".to_string(),
+            ),
         }
     }
 
@@ -361,6 +425,11 @@ impl ModelManifest {
             field(&self.tokenizer_sha256);
             field(&self.weights_sha256);
             field(self.recipe_git_sha.as_deref().unwrap_or(""));
+            // Only a cross encoder writes its kind, so the digest of a bi encoder is the digest it
+            // had before the field existed.
+            if self.kind == ModelKind::CrossEncoder {
+                field("cross_encoder");
+            }
         }
         out
     }
@@ -419,6 +488,51 @@ mod tests {
             serde_json::from_str(&text.replacen('{', "{\"runnable\":false,", 1)).unwrap();
         assert!(!refused.runnable);
         assert_eq!(base.canonical_bytes(), refused.canonical_bytes());
+    }
+
+    /// SHA-256 of `ModelManifest::nomic_v1_5().canonical_bytes()`, taken before the `kind` field existed.
+    const BASELINE_MANIFEST_SHA256: &str =
+        "64ef9ad3c06b3dfbf9a7b1e8f28a83a71f863d763165342c143abd74e32ecf14";
+
+    /// A manifest with no `kind` is a bi encoder, is written back without one, and has the digest it
+    /// had before the field existed.
+    ///
+    /// The digest is compared with a constant taken from the manifest as it was written before
+    /// this change, so a change to the bytes fails here and not in a cache somebody built last month.
+    #[test]
+    fn a_bi_encoder_manifest_is_unchanged_by_the_kind_field() {
+        let base = ModelManifest::nomic_v1_5();
+        assert_eq!(base.kind, ModelKind::BiEncoder);
+        let text = serde_json::to_string(&base).unwrap();
+        assert!(
+            !text.contains("kind"),
+            "a bi encoder is written without a kind: {text}"
+        );
+        let old: ModelManifest = serde_json::from_str(&text).unwrap();
+        assert_eq!(old.kind, ModelKind::BiEncoder);
+        let mut digest = inillucent_base::hash::Sha256::new();
+        digest.update(&base.canonical_bytes());
+        assert_eq!(
+            inillucent_base::hash::to_hex(&digest.finish()),
+            BASELINE_MANIFEST_SHA256,
+            "the digest of the baseline manifest moved: every cache header that names it is now unreadable"
+        );
+    }
+
+    /// A cross encoder writes its kind and its digest differs from a bi encoder with the same fields.
+    #[test]
+    fn a_cross_encoder_says_so_and_has_its_own_digest() {
+        let reranker = ModelManifest::gte_reranker_modernbert_base();
+        assert_eq!(reranker.kind, ModelKind::CrossEncoder);
+        let text = serde_json::to_string(&reranker).unwrap();
+        assert!(text.contains("\"kind\":\"cross_encoder\""), "{text}");
+        let back: ModelManifest = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, reranker);
+        let mut as_bi = reranker.clone();
+        as_bi.kind = ModelKind::BiEncoder;
+        assert_ne!(reranker.canonical_bytes(), as_bi.canonical_bytes());
+        assert_eq!(reranker.max_tokens, 1024);
+        assert!(!reranker.token_type_ids);
     }
 
     #[test]

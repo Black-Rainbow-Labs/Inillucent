@@ -10,6 +10,65 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**Retrieval for a language model, out of the box.** A retrieval study on a mailbox of 67,369 emails
+found which techniques put the right text in front of a language model. This release turns the
+winning setup into features. See [Retrieval for RAG, explained from the start](docs/rag-explained.md).
+
+- **A reranker.** `inillucent setup-embeddings reranker` installs `gte-reranker-modernbert-base`, a
+  cross encoder of about 600 MB, from a pinned Hugging Face commit with a pinned SHA-256 for every
+  file. `rerank(question, passage)` returns a score from 0 to 1. A search table reranks its own
+  results when a query names `question`, and `rerank_depth` says how many rows the reranker scores
+  (default 60). `inillucent search --rerank` does the same from the command line. `setup-embeddings
+  all` does not install the reranker.
+- **A `fusion` option on `inillucent_search`.** `fusion = 'rrf'` combines the keyword list and the
+  vector list with reciprocal rank fusion. `'adaptive'` is the default and is unchanged, and
+  `'weighted'` is what `vector_weight` alone has always meant. An RRF score is at most 2/61.
+- **`inillucent embed`.** Fills a vector column for every row whose vector is `NULL`, on the processor
+  or on a graphics card, in transactions of `--commit-every` rows, so a stopped run continues where it
+  ended. It reports the rows embedded, the rows skipped and the rows cut at the token limit.
+- **`chunk_text(text, size, overlap, heading)`.** A table function that cuts a document into
+  windows, ending each at a paragraph break, a sentence end or a space, with the heading written at
+  the start of every chunk.
+- **`INILLUCENT_EMBED_THREADS` and `INILLUCENT_EMBED_DEVICE`**, and `setup-embeddings --threads` and
+  `--device`, for `embed()`, `rerank()` and reranked searches. The defaults are unchanged. A device of
+  `cuda` that will not start is an error that names `inillucent setup-embeddings runtime --gpu`.
+- **`embed_tokens(text)`** counts the tokens the embedding model sees before its limit is applied.
+- The test runner passes a row's `inillucent-cli/...` features to the build of the programs.
+
+Two things an older release does differently. A reader from before this change ignores the
+`fusion` and `rerank_depth` keys of a table, so a table declared with `fusion = 'rrf'` searches with
+the adaptive weight there. It refuses a query that names `question` with `no such column`, because
+the hidden column `question` is new. The hidden column `rank` of an `inillucent_search` table moved
+from the fifth position to the sixth, behind `question`.
+
+**Encryption at rest.** A database opened with a key is encrypted with XChaCha20-Poly1305: the
+database file, its log segments, its rollback journal and its sort and spill files. A byte changed
+without the key is found on the next read. The key is a passphrase, stretched with
+PBKDF2-HMAC-SHA256 at 600,000 iterations, or a raw 32 byte key written `x'<64 hex digits>'`. The
+command line, the shell and the MCP server take it from `--key-file` or `INILLUCENT_KEY`, never as a
+word on the command line. The Rust driver has `OpenOptions::key`, the C library has
+`inillucent_open_with_key`, and the npm, Go, PHP and Python packages have a `key` option. New
+commands `inillucent encrypt`, `inillucent decrypt` and `inillucent rekey` write an encrypted copy,
+write a plaintext copy and change the key. `PRAGMA encryption`, `PRAGMA rekey` and `ATTACH ... KEY`
+work, with SQLCipher's rules. A wrong key, a missing key and a key for a plaintext file all fail
+with the status `corrupt`. An encrypted file is 1.6% larger at the default page size, and opening
+one with a passphrase costs about 200 ms. The cryptography is written in this repository and checked
+against the published test vectors. The C ABI version is 1.1.0. See
+[Encryption at rest](docs/encryption.md).
+
+**A connection with a full buffer pool keeps working after another process writes the file.**
+When another process writes, a connection throws its cache away and replays the log before its
+next statement. Every frame it let go was left off the free list, so a connection whose pool had
+filled up had nothing to read into afterwards, and every statement failed with `every frame in the
+buffer pool is pinned` until the process restarted. A server holding one connection over a file
+larger than its pool is always in that state. An insert into a table whose rowid is generated,
+after the table's newest rows were deleted, took rowid 1 when the rightmost leaf held no live row
+and failed with `UNIQUE constraint failed: <table>.rowid`; it now takes the largest rowid left plus
+one. `integrity-check` lists every page the free map calls allocated and no tree reaches, one
+`Page N: never used` line each up to a hundred, where it stopped at the first. It now names the table or index a
+tree check failed on and the leaf pages involved, and checks the trees in the same order every
+time.
+
 **The statement matrix's first run found 67 ways inillucent answered differently from SQLite
 3.53.4, and 66 of them are fixed.** Fixing them and running the matrix's random layer found seven
 more, and six of those are fixed. The matrix runs every case against the pinned SQLite and

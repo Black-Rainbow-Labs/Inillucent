@@ -977,3 +977,341 @@ fn a_finished_checkpoints_journal_is_not_put_back_over_it() {
         "nothing was there to put back, yet the replay reported that it had"
     );
 }
+
+/// Reads every file in a directory into memory, by name.
+///
+/// What a second process's open is compared against: the database, every log
+/// segment and the rollback journal, byte for byte. An open that changed any of
+/// them wrote into a file another process was holding.
+///
+/// @param directory - the case's directory
+fn every_file_in(directory: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let listing = std::fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("the case's directory did not list: {error}"));
+    let mut held = std::collections::BTreeMap::new();
+    for entry in listing.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|error| panic!("{} did not read: {error}", path.display()));
+            held.insert(entry.file_name().to_string_lossy().to_string(), bytes);
+        }
+    }
+    held
+}
+
+/// Names the files two snapshots of one directory disagree about.
+///
+/// @param before - the directory before the second process opened the database
+/// @param after - the directory after it
+fn files_that_changed(
+    before: &std::collections::BTreeMap<String, Vec<u8>>,
+    after: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Vec<String> {
+    let mut names: std::collections::BTreeSet<&String> = before.keys().collect();
+    names.extend(after.keys());
+    names
+        .into_iter()
+        .filter(|name| before.get(*name) != after.get(*name))
+        .map(|name| {
+            let size = |held: Option<&Vec<u8>>| {
+                held.map_or_else(
+                    || "absent".to_string(),
+                    |bytes| format!("{} bytes", bytes.len()),
+                )
+            };
+            format!(
+                "{name}: {} before, {} after",
+                size(before.get(name)),
+                size(after.get(name))
+            )
+        })
+        .collect()
+}
+
+/// Returns how many rows one table holds, read by a fresh process.
+///
+/// @param binary - the built `inillucent`
+/// @param database - the file to read
+/// @param table - the table to count
+fn present_in(binary: &Path, database: &Path, table: &str) -> usize {
+    let ran = run(
+        binary,
+        &[
+            "--db",
+            &database.to_string_lossy(),
+            "query",
+            &format!("SELECT count(*) FROM {table}"),
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(ran.code, 0, "counting the rows failed:\n{}", ran.said());
+    rows(&ran.stdout)
+        .first()
+        .and_then(|row| row.first())
+        .and_then(|cell| cell.parse::<usize>().ok())
+        .unwrap_or_else(|| panic!("the count is not a number:\n{}", ran.stdout))
+}
+
+/// A second process opening a file another process holds writes nothing to
+/// it, and the holder reads back every page it wrote (task-2150).
+///
+/// **What happened to Nikaya's database.** Its server held the file for ten
+/// days in rollback journal mode with no checkpoint, so the journal beside the
+/// file held the pre-image of every page the server had evicted: zeros, for
+/// pages recovery had rebuilt from the log. Every agent session on the machine
+/// started `nikaya-server mcp`, which opened the same file in a process of its
+/// own. The build both ran was from 2026-09-09, and its `replay_hot_journal`
+/// ran before the open took any lock and asked nothing about who owned the
+/// journal. It wrote the server's live pre-images over the file and deleted
+/// the journal, and only then did the open's SHARED lock refuse it as busy.
+/// The server's next read of page 211542 came from the file, got a page of
+/// zeros, and every status and sync request failed its checksum.
+///
+/// Measured with that build: this case's own sequence, a holder that rewrote
+/// three hundred rows and added a hundred under a cache of eight pages, and a
+/// second process refused with `a writer holds PENDING`. The journal was gone
+/// afterwards, and the holder read back 300 rows where it had written 400, 195
+/// of them carrying its new value. `replay_hot_journal` has taken the lock
+/// chain first since task-1987, so a journal whose owner is alive stays where
+/// it is. This case keeps it that way.
+///
+/// **The assertion is on bytes.** The second process may be refused, and it
+/// is: the holder keeps EXCLUSIVE for its whole life. What it may not do is
+/// change the database, a log segment or the journal on its way to being
+/// refused, and the holder must then read back exactly the rows it wrote.
+#[test]
+fn a_second_process_opening_a_held_file_writes_nothing_to_it() {
+    const ROWS: usize = 300;
+    const ADDED: usize = 100;
+    let binary = program("inillucent");
+    let shell = program("inillucent-shell");
+    let directory = area("second-open-writes-nothing");
+    let database = directory.join("held.rdb");
+    let path = database.to_string_lossy().to_string();
+    // Folded rows, so the holder's rewrite has real pre-images to save.
+    let seed = format!(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {ROWS}) \
+         INSERT INTO big (id, b) SELECT i, replace(hex(zeroblob(1000)), '0', 'a') FROM n"
+    );
+    for arguments in [
+        vec!["create", path.as_str()],
+        vec![
+            "--db",
+            path.as_str(),
+            "exec",
+            "CREATE TABLE big (id INTEGER PRIMARY KEY, b TEXT NOT NULL)",
+        ],
+        vec!["--db", path.as_str(), "exec", seed.as_str()],
+    ] {
+        let ran = run(&binary, &arguments);
+        assert_eq!(
+            ran.code,
+            0,
+            "seeding the file failed at {arguments:?}:\n{}",
+            ran.said()
+        );
+    }
+
+    // The holder: exclusive for its whole life, a rollback journal, a cache far
+    // smaller than the table, every row rewritten and a hundred more added, and
+    // nothing folded.
+    let script = format!(
+        "PRAGMA locking_mode = exclusive;\n\
+         PRAGMA journal_mode = delete;\n\
+         PRAGMA cache_size = 8;\n\
+         UPDATE big SET b = replace(hex(zeroblob(1000)), '0', 'z');\n\
+         WITH RECURSIVE n(i) AS (SELECT {first} UNION ALL SELECT i + 1 FROM n WHERE i < {last}) \
+         INSERT INTO big (id, b) SELECT i, replace(hex(zeroblob(1000)), '0', 'z') FROM n;\n",
+        first = ROWS + 1,
+        last = ROWS + ADDED,
+    );
+    // Started here rather than through `held_after`, because this case reads
+    // the holder's answers after the second open, and `held_after` gives the
+    // holder's output to a reader that closes it at the marker.
+    let mut holder = Command::new(&shell)
+        .arg(database.to_string_lossy().replace('\\', "/"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("the holder did not start: {error}"));
+    {
+        let pipe = holder.stdin.as_mut().expect("the holder takes input");
+        pipe.write_all(format!("{script}SELECT 'holder-has-written';\n").as_bytes())
+            .expect("the script reaches the holder");
+        pipe.flush().expect("the script is flushed");
+    }
+    let mut said = Vec::new();
+    if let Some(out) = holder.stdout.as_mut() {
+        use std::io::Read;
+        let mut byte = [0u8; 1];
+        while !String::from_utf8_lossy(&said).contains("holder-has-written") {
+            match out.read(&mut byte) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => said.push(byte[0]),
+            }
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&said).contains("holder-has-written"),
+        "the holder never acknowledged its script; it said {:?}",
+        String::from_utf8_lossy(&said)
+    );
+    let journal = DbPath::new(&path).journal();
+    assert!(
+        OsVfs::new()
+            .access(&journal, AccessMode::Exists)
+            .unwrap_or(false),
+        "the holder evicted nothing under its journal, so there is no journal for a second \
+         process to put back and this case tests less than it says"
+    );
+
+    let before = every_file_in(&directory);
+    let second = run(
+        &binary,
+        &[
+            "--db",
+            path.as_str(),
+            "query",
+            "SELECT count(*) FROM big",
+            "--output",
+            "json",
+        ],
+    );
+    let after = every_file_in(&directory);
+    let changed = files_that_changed(&before, &after);
+
+    // The holder reads every row back, then lets the file go.
+    let asked = "SELECT count(*), sum(b = replace(hex(zeroblob(1000)), '0', 'z')) FROM big;\n\
+                 SELECT 'holder-has-read';\n";
+    let mut pipe = holder.stdin.take().expect("the holder takes input");
+    pipe.write_all(asked.as_bytes())
+        .expect("the question reaches the holder");
+    drop(pipe);
+    let finished = holder.wait_with_output().expect("the holder finished");
+    let answered = String::from_utf8_lossy(&finished.stdout).replace("\r\n", "\n");
+    let complained = String::from_utf8_lossy(&finished.stderr).to_string();
+
+    assert!(
+        changed.is_empty(),
+        "a second process's open changed files a live process held EXCLUSIVE:\n{}\n\
+         the second process said:\n{}",
+        changed.join("\n"),
+        second.said()
+    );
+    let expected = format!("{}|{}", ROWS + ADDED, ROWS + ADDED);
+    assert!(
+        answered.contains(&expected),
+        "the holder did not read back the {expected} rows it wrote after a second process \
+         opened the file; it answered:\n{answered}\nand complained:\n{complained}"
+    );
+    assert_eq!(
+        present_in(&binary, &database, "big"),
+        ROWS + ADDED,
+        "a fresh process does not count every row after the holder closed"
+    );
+    let checked = run(&binary, &["--db", path.as_str(), "integrity-check"]);
+    assert_eq!(
+        checked.code,
+        0,
+        "the file is not intact afterwards:\n{}",
+        checked.said()
+    );
+}
+
+/// A long-lived connection whose buffer pool is full keeps reading after
+/// another process writes the file (task-2150).
+///
+/// **The shape of a server.** Nikaya keeps one connection open for the life of
+/// its process, with a pool far smaller than its file, so the pool is always
+/// full. When another process writes, the connection throws its cache away
+/// and replays the log before its next statement. `Pool::discard_all` dropped
+/// every frame it emptied without putting it back on the free list, so a full
+/// pool came back from that with no frame to read into, and every statement
+/// after it failed with "every frame in the buffer pool is pinned". Measured
+/// on this case's own shape before the fix: the count after the other
+/// process's insert, and every statement after it, failed that way.
+///
+/// The connection is this test process's own, opened with 64 frames over a
+/// table of about 125 pages, and the write is a separate `inillucent`
+/// process, which is how the other process reaches the file in production.
+#[test]
+fn a_full_pool_reads_again_after_another_process_writes() {
+    const ROWS: i64 = 2000;
+    let binary = program("inillucent");
+    let directory = area("full-pool-after-another-write");
+    let database = directory.join("served.rdb");
+    let path = database.to_string_lossy().to_string();
+    let seed = format!(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {ROWS}) \
+         INSERT INTO big (id, b) SELECT i, replace(hex(zeroblob(1000)), '0', 'a') FROM n"
+    );
+    for arguments in [
+        vec!["create", path.as_str()],
+        vec![
+            "--db",
+            path.as_str(),
+            "exec",
+            "CREATE TABLE big (id INTEGER PRIMARY KEY, b TEXT NOT NULL)",
+        ],
+        vec!["--db", path.as_str(), "exec", seed.as_str()],
+    ] {
+        let ran = run(&binary, &arguments);
+        assert_eq!(
+            ran.code,
+            0,
+            "seeding the file failed at {arguments:?}:\n{}",
+            ran.said()
+        );
+    }
+
+    let served = inillucent_engine::connect::Database::open_with(&database, 64)
+        .unwrap_or_else(|error| panic!("the long-lived connection did not open: {error}"));
+    let session = served.session();
+    let count = |sql: &str| -> Result<i64, String> {
+        let mut statement = session.prepare(sql).map_err(|error| error.to_string())?;
+        let mut found = None;
+        while statement.step().map_err(|error| error.to_string())? {
+            found = match statement.row().first() {
+                Some(inillucent_tree::datum::OwnedDatum::Int(value)) => Some(*value),
+                _ => None,
+            };
+        }
+        found.ok_or_else(|| format!("{sql} returned no number"))
+    };
+    // Read every page, so the pool is full when the other process writes.
+    assert_eq!(
+        count("SELECT sum(length(b)) FROM big"),
+        Ok(ROWS * 2000),
+        "the first full read"
+    );
+
+    let wrote = run(
+        &binary,
+        &[
+            "--db",
+            path.as_str(),
+            "exec",
+            "INSERT INTO big (id, b) VALUES (999999, 'written by another process')",
+        ],
+    );
+    assert_eq!(
+        wrote.code,
+        0,
+        "the other process could not write:\n{}",
+        wrote.said()
+    );
+
+    assert_eq!(
+        count("SELECT count(*) FROM big"),
+        Ok(ROWS + 1),
+        "the long-lived connection could not read after another process wrote"
+    );
+    assert_eq!(
+        count("SELECT sum(length(b)) FROM big"),
+        Ok(ROWS * 2000 + 26),
+        "a second full read after the write"
+    );
+}

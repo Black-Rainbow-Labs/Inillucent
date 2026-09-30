@@ -1324,15 +1324,23 @@ fn build(root: &Path, rows: &[&Row]) -> Result<(), String> {
         println!("no selected suite starts a program, so inillucent-cli is not built");
         return Ok(());
     }
-    let status = Command::new(cargo())
-        .current_dir(root)
-        .args([
-            "build",
-            "-p",
-            "inillucent-cli",
-            "-p",
-            "inillucent-driver-capi",
-        ])
+    // A suite that drives a program with a feature on, such as `embed`, names the feature on its
+    // row as `inillucent-cli/embed`. The test build above unified it into the test binaries only,
+    // so it is passed to this second build as well. Other rows' features are not: see
+    // `testplan::program_features`.
+    let program_features = testplan::program_features(rows);
+    let mut program_build = Command::new(cargo());
+    program_build.current_dir(root).args([
+        "build",
+        "-p",
+        "inillucent-cli",
+        "-p",
+        "inillucent-driver-capi",
+    ]);
+    if !program_features.is_empty() {
+        program_build.args(["--features", &program_features.join(",")]);
+    }
+    let status = program_build
         .status()
         .map_err(|error| format!("cannot run cargo: {error}"))?;
     if !status.success() {

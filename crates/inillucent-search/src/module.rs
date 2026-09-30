@@ -30,6 +30,7 @@
 //! | `k` | `k = 20` | `docs('text', 20)` |
 //! | `vector` | `vector = :embedding` | `docs('text', 20, :embedding)` |
 //! | `recall` | `recall = 0.9` | `docs('text', 20, :embedding, 0.9)` |
+//! | `question` | `question = 'plain words'` | `docs('text', 20, :embedding, 0.9, 'plain words')` |
 //! | `rank` | `ORDER BY rank` | - |
 //!
 //! `rank` is negated, so `ORDER BY rank` ascending is best-first. That is
@@ -67,6 +68,8 @@ const ROLE_LIMIT: char = 'k';
 const ROLE_VECTOR: char = 'v';
 /// The recall target.
 const ROLE_RECALL: char = 'r';
+/// The question a reranker reads the candidates against.
+const ROLE_QUESTION: char = 'u';
 /// The rowid, for a point lookup.
 const ROLE_ROWID: char = 'i';
 
@@ -147,6 +150,7 @@ fn declaration_of(options: &Options, table: &[u8]) -> Declaration {
     columns.push(DeclaredColumn::hidden("k").typed("INTEGER"));
     columns.push(DeclaredColumn::hidden("vector").typed("BLOB"));
     columns.push(DeclaredColumn::hidden("recall").typed("REAL"));
+    columns.push(DeclaredColumn::hidden("question").typed("TEXT"));
     columns.push(DeclaredColumn::hidden("rank").typed("REAL"));
     Declaration {
         columns,
@@ -201,9 +205,14 @@ impl SearchTable {
         self.query_column().saturating_add(3)
     }
 
+    /// Returns which declared column carries the question a reranker reads candidates against.
+    fn question_column(&self) -> i32 {
+        self.query_column().saturating_add(4)
+    }
+
     /// Returns which declared column carries the score.
     fn rank_column(&self) -> i32 {
-        self.query_column().saturating_add(4)
+        self.query_column().saturating_add(5)
     }
 
     /// Returns the commit sequence this transaction publishes under.
@@ -996,6 +1005,12 @@ impl VirtualTable for SearchTable {
             } else if spec.column == self.recall_column() {
                 query.use_constraint(index, true);
                 roles.push(ROLE_RECALL);
+            } else if spec.column == self.question_column() {
+                // Claimed on its own too, so `question = ?1` with no search reaches the cursor,
+                // which refuses it by name instead of the engine comparing the question with a
+                // column that has no value.
+                query.use_constraint(index, true);
+                roles.push(ROLE_QUESTION);
             }
         }
         if !searching {
@@ -1072,6 +1087,7 @@ impl VirtualTable for SearchTable {
             limit_column: self.limit_column(),
             vector_column: self.vector_column(),
             recall_column: self.recall_column(),
+            question_column: self.question_column(),
             rank_column: self.rank_column(),
             rows: Vec::new(),
             at: 0,
@@ -1318,6 +1334,7 @@ struct SearchCursor {
     limit_column: i32,
     vector_column: i32,
     recall_column: i32,
+    question_column: i32,
     rank_column: i32,
     /// The rows this cursor will produce, with their scores when it searched.
     rows: Vec<(i64, Option<Hit>)>,
@@ -1327,6 +1344,37 @@ struct SearchCursor {
 }
 
 impl SearchCursor {
+    /// Runs the search the statement asked for, and reranks it when the statement named `question`.
+    ///
+    /// A reranked search collects at least `rerank_depth` rows with the table's own fusion, so the
+    /// reranker has candidates to choose from, and hands back the first `k` after reordering them.
+    /// `k` as the statement's `k` column reports is the number that was asked for, not the number
+    /// collected.
+    ///
+    /// @param context - the running statement
+    fn search_hits(&mut self, context: &mut Context<'_>) -> DbResult<Vec<Hit>> {
+        let Some(question) = self.request.question.clone() else {
+            return self
+                .cache
+                .search(context, &self.store, &self.options, &self.request);
+        };
+        crate::rerank_search::available()?;
+        let asked = self.request.limit;
+        self.request.limit = asked.max(self.options.rerank_depth());
+        let found = self
+            .cache
+            .search(context, &self.store, &self.options, &self.request);
+        self.request.limit = asked;
+        crate::rerank_search::rerank_hits(
+            context,
+            &self.store,
+            &self.options,
+            &question,
+            found?,
+            asked,
+        )
+    }
+
     /// Returns the row the cursor is on, reading it once.
     fn row(&mut self, context: &mut Context<'_>) -> DbResult<Row> {
         if let Some(row) = self.current.clone() {
@@ -1373,6 +1421,7 @@ impl VirtualCursor for SearchCursor {
                         .map(|real| real as f32)
                         .or_else(|| value.as_integer().map(|whole| whole as f32));
                 }
+                ROLE_QUESTION => self.request.question = text_of(Some(value)),
                 ROLE_ROWID => wanted_rowid = value.as_integer(),
                 // A facet, whose role character carries its column's position.
                 // The value is read as text because a facet's stored value is
@@ -1395,15 +1444,16 @@ impl VirtualCursor for SearchCursor {
             }
             return Ok(());
         }
+        if self.request.question.is_some() && plan.index_number & PLAN_SEARCH == 0 {
+            return Err(crate::embed_refusal::nothing_to_rerank());
+        }
         if plan.index_number & PLAN_SEARCH != 0 {
             if !self.options.has_vectors() && !self.request.vector.is_empty() {
                 return Err(failure(
                     "inillucent_search: this table was declared without a vector width",
                 ));
             }
-            let hits = self
-                .cache
-                .search(context, &self.store, &self.options, &self.request)?;
+            let hits = self.search_hits(context)?;
             self.rows = hits.into_iter().map(|hit| (hit.id, Some(hit))).collect();
             return Ok(());
         }
@@ -1442,6 +1492,12 @@ impl VirtualCursor for SearchCursor {
                 Some(recall) => Value::Real(f64::from(recall)),
                 None => Value::Null,
             });
+        }
+        if position == self.question_column {
+            return match self.request.question.as_ref() {
+                Some(question) => Value::owned_text(question.as_bytes()),
+                None => Ok(Value::Null),
+            };
         }
         if position == self.rank_column {
             // Negated, so `ORDER BY rank` ascending is best-first. FTS5's own
@@ -1539,7 +1595,10 @@ mod tests {
             .iter()
             .map(|column| String::from_utf8_lossy(&column.name).into_owned())
             .collect();
-        assert_eq!(names, vec!["body", "docs", "k", "vector", "recall", "rank"]);
+        assert_eq!(
+            names,
+            vec!["body", "docs", "k", "vector", "recall", "question", "rank"]
+        );
         assert!(!declaration.columns.first().expect("body").hidden);
         assert!(declaration.columns.get(1).expect("docs").hidden);
     }

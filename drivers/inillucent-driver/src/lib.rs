@@ -152,6 +152,14 @@ pub use inillucent_engine::base::limits::Limit;
 /// (task-1979, section 5.2).
 pub use inillucent_engine::readonly;
 
+/// The page size a new database is created with, which is also the unit an
+/// encrypted database file is encrypted in.
+pub use inillucent_engine::connect::PAGE_SIZE;
+/// What `PRAGMA encryption` answers for an encrypted database.
+pub use inillucent_engine::encryption::CIPHER_NAME;
+/// The key an encrypted database is opened with: a passphrase, or 32 raw
+/// bytes. See [`OpenOptions::key`].
+pub use inillucent_engine::EncryptionKey;
 /// How many frames a buffer pool holds when nobody says otherwise.
 pub use inillucent_engine::DEFAULT_FRAMES;
 
@@ -242,6 +250,17 @@ pub struct OpenOptions {
     /// Default `inillucent_engine::DEFAULT_STATEMENT_CACHE`, which is a
     /// thousand. Zero compiles every statement fresh.
     pub statement_cache: usize,
+    /// The key the database is encrypted with. Default `None`: a plaintext
+    /// database.
+    ///
+    /// With a key, the database file, its log and its journals are encrypted
+    /// with XChaCha20-Poly1305, and a file that does not exist is created
+    /// encrypted. A plaintext file opened with a key, an encrypted file opened
+    /// without one, and a wrong key are all refused with [`Status::Corrupt`],
+    /// the status SQLite gives a file it cannot read as a database.
+    /// `EncryptionKey::parse` reads SQLCipher's `x'<64 hex digits>'` as a raw
+    /// key and anything else as a passphrase. `Debug` never prints it.
+    pub key: Option<EncryptionKey>,
 }
 
 impl Default for OpenOptions {
@@ -254,6 +273,7 @@ impl Default for OpenOptions {
             diagnostics: false,
             limits: Limits::unbounded(),
             statement_cache: inillucent_engine::DEFAULT_STATEMENT_CACHE,
+            key: None,
         }
     }
 }
@@ -405,10 +425,13 @@ impl Database {
         // only connection took a writer's locks, waited out the busy budget
         // against a live writer and reported the writer's lock. A read only
         // open takes SHARED only and its handle refuses a write.
-        let engine = match options.read_only {
-            true => EngineDatabase::open_read_only(&path, options.cache_frames),
-            false => EngineDatabase::open_with(&path, options.cache_frames),
-        }
+        let engine = EngineDatabase::open_keyed(
+            &path,
+            inillucent_engine::connect::PAGE_SIZE,
+            options.cache_frames,
+            options.read_only,
+            options.key.clone(),
+        )
         .map_err(|error| Error::from_engine(&error, options.diagnostics))?;
         engine.set_statement_cache_limit(options.statement_cache);
         Ok(Database {
@@ -620,6 +643,26 @@ impl Database {
     pub fn backup_to(&self, path: impl AsRef<Path>) -> Result<()> {
         self.engine
             .backup_to(path.as_ref())
+            .map_err(|error| self.classify(&error))
+    }
+
+    /// Reports whether this database is encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        self.engine.is_encrypted()
+    }
+
+    /// Writes a copy of this database to a new file: encrypted with `key`, or
+    /// in plaintext when `key` is `None`.
+    ///
+    /// This is how a plaintext database becomes an encrypted one and back. It
+    /// rebuilds the way `VACUUM INTO` does, so the copy has every row, index,
+    /// view and trigger, and it refuses a path that already holds a file.
+    ///
+    /// @param path - where the copy goes
+    /// @param key - the key the copy is encrypted with, if any
+    pub fn export_to(&self, path: impl AsRef<Path>, key: Option<EncryptionKey>) -> Result<()> {
+        self.engine
+            .export_to(path.as_ref(), key)
             .map_err(|error| self.classify(&error))
     }
 

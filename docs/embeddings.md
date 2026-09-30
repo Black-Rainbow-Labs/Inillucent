@@ -6,7 +6,8 @@ columns and searches them, as [Vector search](vector-search.md) explains.
 
 You can make the vectors anywhere and insert them. inillucent can also make them itself, inside your
 own process, with the SQL function `embed(TEXT)`. There is no embedding server and no network call.
-This page covers `embed(TEXT)`, how to install the model it runs, and how the model was measured.
+This page covers `embed(TEXT)`, how to install the model it runs, how to embed a whole table with
+`inillucent embed`, the reranker that `rerank()` runs, and how each was measured.
 
 ## Terms used on this page
 
@@ -18,6 +19,8 @@ This page covers `embed(TEXT)`, how to install the model it runs, and how the mo
 | session | the model loaded into memory by ONNX Runtime, ready to answer |
 | residency | when the model is held in memory and when it is dropped |
 | execution provider | the part of ONNX Runtime that runs the model on one kind of processor, such as a CUDA graphics card |
+| token | a piece of a word that the model reads as one unit. `embed_tokens(TEXT)` counts them |
+| cross encoder | a model that reads a question and a passage together and returns one relevance score. A reranker is a cross encoder |
 | cosine similarity | a score from minus one to one of how close two vectors point. 1.0 means the same direction |
 
 Other terms are in [the glossary](glossary.md).
@@ -48,6 +51,9 @@ inillucent setup-embeddings all
 
 - ONNX Runtime 1.22.0, the shared library that runs the model;
 - the `nomic-embed-text-v1.5` weights and tokenizer, from Hugging Face.
+
+The reranker is a separate download of about 600 MB, so `all` does not include it. See
+[Reranking](#reranking).
 
 The download is about 620 MB the first time. A later run finds the files and downloads nothing.
 Every file is checked against a SHA-256 digest written into the inillucent source. A file with the
@@ -80,9 +86,12 @@ the command to install what is missing.
 | `inillucent setup-embeddings all` | installs ONNX Runtime and the weights |
 | `inillucent setup-embeddings runtime` | installs ONNX Runtime only |
 | `inillucent setup-embeddings model` | installs the weights only |
+| `inillucent setup-embeddings reranker` | installs the reranker, `gte-reranker-modernbert-base`, about 600 MB. See [Reranking](#reranking) |
 | `inillucent setup-embeddings` | reports what is installed and downloads nothing |
 | `--status` | reports what is installed, where, and the residency profile, and downloads nothing |
 | `--residency <profile>` | records when the model is held in memory: `resident`, `on-demand`, `idle` or `idle:<time>` such as `idle:90s`. See [When the model is in memory](#when-the-model-is-in-memory) |
+| `--threads <N>` | records how many threads ONNX Runtime uses inside one operator. See [Threads and device](#threads-and-device) |
+| `--device <cpu\|cuda\|cuda:N>` | records which processor `embed()`, `rerank()` and reranked searches run on. See [Threads and device](#threads-and-device) |
 | `--gpu` | installs the ONNX Runtime build that has the CUDA execution provider. It exists for Windows and Linux on x86-64 only. See [Graphics cards](#graphics-cards) |
 | `--force` | downloads and installs again even when the files are present and their digests match |
 | `--onnxruntime-version <version>` | installs another ONNX Runtime version. A version with no digest in the source is installed and reported as unverified |
@@ -102,6 +111,7 @@ Set `INILLUCENT_HOME` to use another folder for every command. Inside the folder
 ```
 runtime/onnxruntime-1.22.0/lib/    the ONNX Runtime shared library
 models/nomic-embed-text-v1.5/      model.onnx, tokenizer.json, model.json, config.json and two tokenizer files
+models/gte-reranker-modernbert-base/   the reranker, when it is installed
 embeddings.json                    what is installed, and the residency profile
 ```
 
@@ -114,6 +124,8 @@ embeddings.json                    what is installed, and the residency profile
 | `INILLUCENT_MODEL_ROOTS` | more folders to search for model folders, separated by `;` on Windows and `:` elsewhere |
 | `ORT_DYLIB_PATH` | the ONNX Runtime library to load. When `ORT_DYLIB_PATH` is set, the installed runtime is ignored |
 | `INILLUCENT_EMBED_RESIDENCY` | the residency profile for one process |
+| `INILLUCENT_EMBED_THREADS` | how many threads ONNX Runtime uses inside one operator, for one process |
+| `INILLUCENT_EMBED_DEVICE` | `cpu`, `cuda` or `cuda:N`, for one process |
 
 inillucent looks for the model folder in this order: `INILLUCENT_ONNX_DIR`, the install folder, the
 folders in `INILLUCENT_MODEL_ROOTS`, then `~/.cache/inillucent-models`. A folder counts only when it
@@ -253,6 +265,37 @@ a second message: `embed: an embedding model is installed but did not run`. That
 `inillucent setup-embeddings runtime` as the usual fix. What ONNX Runtime said is kept in the
 diagnostic detail, which a caller reads by opening the database with diagnostics on.
 
+## Text longer than the model reads
+
+`nomic-embed-text-v1.5` reads at most 1,900 tokens of a text. A longer text is embedded from its
+first 1,900 tokens and the rest is ignored. No message says so. The retrieval study behind
+[Retrieval for RAG, explained from the start](rag-explained.md) found that 19.5% of its 6,000
+character chunks were longer than the limit.
+
+`embed_tokens(TEXT)` returns how many tokens the model sees in a text, before the limit is applied.
+It reads only `tokenizer.json`, so it does not load the model:
+
+```sql
+SELECT embed_tokens('hello world') AS plain, embed_tokens('search_document: hello world') AS labelled;
+```
+
+```
+plain  labelled
+-----  --------
+4      8
+```
+
+The count includes the two special tokens the model adds. Count the text exactly as `embed()` will
+see it, label included. To find the rows that `embed()` would cut:
+
+```sql
+SELECT id FROM chunk WHERE embed_tokens('search_document: ' || body) > 1900;
+```
+
+`inillucent embed` counts these rows and names them, as [Embedding a whole
+table](#embedding-a-whole-table) describes. The fix for a text that is too long is a shorter chunk.
+`chunk_text(text, size, overlap, heading)` cuts a document into chunks of a size you choose.
+
 ## When the model is in memory
 
 Loading the model into memory takes 650 to 800 ms. After it is loaded, one embedding takes 12 to 36
@@ -332,10 +375,11 @@ refuses the value 3 with `graph_optimization_level is not valid` and the session
 
 ## Graphics cards
 
-`embed(TEXT)` in SQL runs on the processor. The embedder that `embed(TEXT)` uses opens its session on
-the processor, and no setting changes that.
+`embed(TEXT)` in SQL runs on the processor unless a device is set. `INILLUCENT_EMBED_DEVICE=cuda:0`, or
+`inillucent setup-embeddings --device cuda:0`, runs `embed()`, `rerank()` and reranked searches on card 0.
+See [Threads and device](#threads-and-device).
 
-A graphics card is used by `inillucent-bench`, the tool that embeds a whole corpus. It takes
+`inillucent embed` takes `--device`, and `inillucent-bench`, the tool that embeds a whole corpus, takes
 `--devices` with `cpu`, `cuda`, `cuda:1`, or several separated by commas.
 
 `inillucent setup-embeddings --gpu` installs the ONNX Runtime build that includes the CUDA execution
@@ -348,7 +392,8 @@ installed separately. On any other platform `--gpu` fails with
 | `INILLUCENT_CUDA_BIN` | a folder to load the CUDA libraries from, in place of searching `PATH` |
 | `INILLUCENT_CUDNN_BIN` | a folder to load the cuDNN libraries from, in place of searching `PATH` |
 
-When the CUDA execution provider cannot start, the session fails with an error. The `ort` crate's
+When the CUDA execution provider cannot start, the session fails with an error that names
+`inillucent setup-embeddings runtime --gpu`. The `ort` crate's
 default is to log the failure and run on the processor, which makes a one hour job take a day with
 no message. inillucent turns that default off with `error_on_failure`.
 
@@ -415,6 +460,167 @@ model, `--max-batch-cells 8000000` brings the largest batch to 1.1 GB.
 `--max-batch-cells` is a flag and has no field in the model manifest. The limit depends on the card.
 A manifest field would change the manifest digest every time somebody tuned it, and every cache
 written before would stop matching.
+
+## Threads and device
+
+Two settings decide how ONNX Runtime runs a model for `embed()`, `rerank()` and a reranked search. Each
+is read in this order: an environment variable, then the value `inillucent setup-embeddings` recorded
+in `embeddings.json`, then the default.
+
+| Setting | Environment variable | Recorded by | Default |
+|---|---|---|---|
+| thread count | `INILLUCENT_EMBED_THREADS` | `setup-embeddings --threads N` | ONNX Runtime's own choice |
+| device | `INILLUCENT_EMBED_DEVICE` | `setup-embeddings --device cpu\|cuda\|cuda:N` | `cpu` |
+
+`inillucent setup-embeddings --status` prints both and says where each came from:
+
+```
+Threads: ONNX Runtime's own choice (default). INILLUCENT_EMBED_THREADS overrides it for one process
+Device: cpu (default). INILLUCENT_EMBED_DEVICE overrides it for one process
+```
+
+Four threads was the fastest setting for one embedding on this machine: 21.4 ms against 36.4 ms at
+the default, in [What loading costs](#what-loading-costs). That is the value to try first for
+`embed()` and for a question embedded in a search. It is not the fastest setting for embedding a whole
+table: [Embedding a whole table](#embedding-a-whole-table) measured 4 threads at 7.2 rows a second
+and the default at 13.9. A device of `cuda` on a machine with no CUDA runtime fails the first call.
+It never runs on the processor without saying so.
+
+## Embedding a whole table
+
+`embed()` in SQL embeds one row at a time. `inillucent embed` embeds every row of a table whose vector
+column is `NULL`, sorts the texts by length, groups them under a memory ceiling, and writes the
+vectors in transactions:
+
+```sh
+inillucent --db app.rdb embed --table chunk --text body --vector v \
+  --prefix "search_document: " --device cuda:0
+```
+
+| Flag | What it does |
+|---|---|
+| `--table`, `--text`, `--vector` | the table, the column that holds the text and the column that receives the vector. The table can be an ordinary table with a `VECTOR(768)` or `BLOB` column, or an `inillucent_search` table, whose `vector` column can be updated by rowid |
+| `--prefix` | text put in front of every value, exactly as `embed('search_document: ' \|\| body)` does. The default is no prefix |
+| `--device` | `cpu`, `cuda` or `cuda:N`. Without it the machine's device setting applies. A card that will not start is an error that names `inillucent setup-embeddings runtime --gpu`. It never runs on the processor |
+| `--threads` | threads ONNX Runtime uses inside one operator, for each session |
+| `--sessions` | how many model sessions to open on the device and run at once. The default is 1 |
+| `--batch-size` | most texts in one call to the model. The default is 16 |
+| `--commit-every` | rows embedded and written in one transaction. The default is 1,024. A crash loses at most one transaction |
+| `--all` | embed every row again, including rows that already have a vector |
+
+A rerun continues where a stopped run ended, because only rows whose vector is `NULL` are read. The
+command prints how many rows it embedded, how many it skipped because the text was `NULL` or empty,
+how many it cut at the token limit, and the `rowid` of up to 20 of the cut rows. `--output json` returns
+the same numbers as fields.
+
+On the processor, a vector the command writes equals `embed(prefix || text)` byte for byte. On a
+card it agrees to a cosine similarity of at least 0.99999.
+
+**What it measured.** The corpus is the 3,696 chunks of `examples/rag-agent`, each embedded as
+`search_document: ` followed by the article title, a blank line and the chunk. The measurements were
+taken on 29 September 2026 at commit `ed70d251` on Windows with an RTX 5090 (card 0) and the
+weights on a local disk. Each row was run twice, and the second run is printed. Model loading, which
+takes 0.7 to 1.2 seconds, is not counted.
+
+| How it was embedded | Time | Rows a second | Compared with `embed()` |
+|---|---:|---:|---:|
+| `embed()` one row at a time on the processor (the example's `sync`) | 327.7 s | 11.3 | 1.0 times |
+| `inillucent embed`, processor, default threads | 265.2 s | 13.9 | 1.2 times |
+| `inillucent embed`, processor, 4 threads | 511.9 s | 7.2 | 0.6 times |
+| `inillucent embed`, `cuda:0`, one session | 5.3 s | 691 | 61 times |
+| `inillucent embed`, `cuda:0`, two sessions | 4.5 s | 813 | 72 times |
+
+The `embed()` row is one run, of the whole `sync`. Two sessions on one card are 1.2 times faster than one here. The
+corpus is small enough that opening the second session costs half a second of the 5.3. The 3,696
+vectors from the processor run equal the ones `embed()` wrote in `sync` in every byte. The worst
+cosine similarity between a vector from the card and the same row from the processor was 0.9999995.
+A batch of 32 was slower than a batch of 16 on the card, at 758 rows a second.
+
+The study's 558,429 chunks took 22 minutes on a card. `embed()` in SQL at 11 rows a second would take
+14 hours.
+
+## Reranking
+
+A reranker is a cross encoder. An embedding model reads the question and each passage separately,
+and a search compares the two vectors. A cross encoder reads the question and one passage together,
+so it can tell a passage that answers the question from one that only shares its words, and it
+returns one relevance score. In the retrieval study behind [Retrieval for a language model,
+explained](rag-explained.md), adding one raised nDCG@10 by 0.10 to 0.13 on every collection and every
+embedding model, the largest gain that study measured.
+
+```sh
+inillucent setup-embeddings reranker          # about 600 MB, once
+```
+
+`inillucent setup-embeddings all` does not install it, so nobody gets an unexpected 600 MB. The
+command installs `gte-reranker-modernbert-base` into `models/gte-reranker-modernbert-base/` in the
+install folder. `inillucent setup-embeddings --status` reports it.
+
+| Model | Parameters | File | Licence |
+|---|---|---|---|
+| `gte-reranker-modernbert-base`, from `Alibaba-NLP/gte-reranker-modernbert-base` | 149 million | `onnx/model.onnx`, 599 MB, the full precision export | Apache 2.0 |
+
+The files are downloaded from Hugging Face commit `f7481e6055501a30fb19d090657df9ec1f79ab2c`, and
+the SHA-256 of every file is written into the inillucent source, so a later push to the repository
+cannot change what an install downloads. `onnx/model.onnx` must hash to
+`c6d3226502addbcd4d2cf273802957ebf8a2a6bf94037dcb9b1d95bfc01e5d93`. The study also measured
+`bge-reranker-v2-m3`, a model of 568 million parameters. The two scored the same, and `gte` is a
+quarter of the size, is one file, and was faster on both processors, so `gte` is the one inillucent
+ships.
+
+As a function, for any query:
+
+```sql
+SELECT id, body, rerank(?1, body) AS relevance
+FROM chunk
+WHERE id IN (SELECT rowid FROM chunk_search WHERE chunk_search MATCH ?1 AND k = 60)
+ORDER BY relevance DESC
+LIMIT 10;
+```
+
+`rerank(query, passage)` returns a number from 0 to 1, and `NULL` when either argument is `NULL`. It runs
+the model once for each call, so the function above runs it 60 times. Inside a search table the
+reranker scores all the candidates in one call and groups them by length, which is faster. See
+[Reranking a search](vector-search.md#reranking-a-search). Pass the question with no label. The
+`search_query: ` label belongs to `nomic-embed-text-v1.5`.
+
+Without the reranker installed, `rerank()` fails with the status `invalid_state` and exit code 1, and
+the message names `inillucent setup-embeddings reranker`. A build without the `embed` feature answers
+`unsupported` with exit code 3. The reranker loads under the same residency profile as the embedding
+model, and `INILLUCENT_EMBED_THREADS` and `INILLUCENT_EMBED_DEVICE` apply to it.
+
+**What scoring costs.** `inillucent-bench rerank-cost` measures `OnnxReranker::score` over passages of
+about 900 characters, with 20 timed calls for each row after one call that is not counted. The
+numbers were taken on 29 September 2026 at commit `ed70d251` on Windows with an RTX 5090 (card 0).
+Each configuration was measured twice, the two runs agreed within 10%, and the second is printed.
+
+```sh
+inillucent-bench rerank-cost --devices cpu,cuda:0 --threads 4,8 --passages 20,60 --repeats 20
+```
+
+| Device | Threads | Passages | Median | 95th percentile |
+|---|---:|---:|---:|---:|
+| processor | 4 | 20 | 2.43 s | 2.56 s |
+| processor | 4 | 60 | 7.52 s | 7.93 s |
+| processor | 8 | 20 | 1.72 s | 1.76 s |
+| processor | 8 | 60 | 5.19 s | 5.36 s |
+| `cuda:0` | | 20 | 28 ms | 32 ms |
+| `cuda:0` | | 60 | 72 ms | 74 ms |
+
+A reranked search on a machine with no graphics card therefore takes 5 to 8 seconds at the default
+depth of 60. A user can think that is a hang. `rerank_depth` trades depth for time: 20 candidates take
+about a third as long. A card makes it 70 times faster, and `INILLUCENT_EMBED_DEVICE=cuda:0` turns the
+card on.
+
+**Agreement with the study's scores.** `tools/rag-lab/rerank.py` in the study scored the same 20
+question and passage pairs on the processor, one pair per call. The Rust reranker's scores, after
+the sigmoid, differ from the Python scores by at most **1.8e-6**. The pairs, the Python logits and
+the scores are in `crates/inillucent-core/fixtures/rerank_reference.json`, and
+`OnnxReranker` is tested against them to 1e-4. The Python run used ONNX Runtime 1.30.0 and the Rust
+run used 1.22.0.
+
+**Quality on a public corpus.** [Vector search](vector-search.md#reranking-a-search) has the
+comparison on `examples/rag-agent`.
 
 ## Checking that a cache matches its text
 

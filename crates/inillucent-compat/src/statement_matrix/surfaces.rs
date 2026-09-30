@@ -36,6 +36,7 @@ pub const CASES: &[&str] = &[
     "surface-user-collation",
     "surface-cancel",
     "surface-readonly-open",
+    "surface-encrypted-open",
 ];
 
 /// The surfaces a Layer 1 case runs through, by the name a failure carries.
@@ -540,6 +541,7 @@ pub fn run_api_case(id: &str, directory: &Path) -> Result<Option<String>, String
         "surface-user-collation" => user_collation(&path),
         "surface-cancel" => cancel(&path),
         "surface-readonly-open" => readonly_open(&path),
+        "surface-encrypted-open" => encrypted_open(&path),
         _ => Err(format!("{id} is not a surface case")),
     }
 }
@@ -696,6 +698,44 @@ fn readonly_open(path: &Path) -> Result<Option<String>, String> {
         Err(error) if error.status == Status::ReadOnly => None,
         Err(error) => Some(format!(
             "the INSERT failed with {:?} rather than ReadOnly",
+            error.status
+        )),
+    })
+}
+
+/// A database opened with a key reports its cipher, reads back what it
+/// wrote, and refuses to open without the key, which is what the
+/// `encryption` row promises.
+///
+/// @param path - the database file
+fn encrypted_open(path: &Path) -> Result<Option<String>, String> {
+    let _ = std::fs::remove_file(path);
+    let keyed = || OpenOptions {
+        key: Some(inillucent_driver::EncryptionKey::raw([0x2a; 32])),
+        ..OpenOptions::default()
+    };
+    {
+        let database = Database::open_with(path, keyed()).map_err(|error| error.message)?;
+        database
+            .session()
+            .execute_batch("CREATE TABLE t(a); INSERT INTO t VALUES (7)")
+            .map_err(|error| error.message)?;
+    }
+    let database = Database::open_with(path, keyed()).map_err(|error| error.message)?;
+    let connection = database.session();
+    if let Some(problem) = expect_value(&connection, "PRAGMA encryption", "'xchacha20-poly1305'") {
+        return Ok(Some(problem));
+    }
+    if let Some(problem) = expect_value(&connection, "SELECT a FROM t", "7") {
+        return Ok(Some(problem));
+    }
+    drop(connection);
+    drop(database);
+    Ok(match Database::open(path) {
+        Ok(_) => Some("an encrypted database opened without its key".to_string()),
+        Err(error) if error.status == Status::Corrupt => None,
+        Err(error) => Some(format!(
+            "an open without the key failed with {:?} rather than Corrupt",
             error.status
         )),
     })

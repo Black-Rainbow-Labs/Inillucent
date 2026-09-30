@@ -288,6 +288,33 @@ time:
 inillucent runs inside the calling process, so it pays no network cost. pgvector pays a round trip
 to its server.
 
+## The recommended recipe for retrieval augmented generation
+
+A RAG store gives a language model the passages that answer a question. A study of 119 graded
+questions over 67,369 emails found this setup worked best. Every step is a feature of inillucent:
+
+1. **Cut each document into chunks with its heading on every chunk.** `chunk_text(text, size,
+   overlap, heading)` is a table function:
+   `SELECT d.id, c.seq, c.chunk FROM doc AS d, chunk_text(d.body, 900, 100, 'Subject: ' || d.subject) AS c`.
+   Chunks without their heading lost 0.043 to 0.111 nDCG@10.
+2. **Find the chunks the embedding model would cut.**
+   `SELECT id FROM chunk WHERE embed_tokens('search_document: ' || body) > 1900`.
+3. **Embed the table in bulk.** `inillucent --db app.rdb embed --table chunk --text body --vector v
+   --prefix "search_document: " --device cuda:0`. A rerun continues where a stopped run ended.
+   Leave out `--device` to use the processor.
+4. **Search with keywords and vectors together.** `CREATE VIRTUAL TABLE chunk_search USING
+   inillucent_search(title, body, dims = 768)`. Add `fusion = 'rrf'` to try reciprocal rank fusion
+   and measure it against the default on your own questions. Two corpora disagreed about which is
+   better, so the default stays `adaptive`.
+5. **Rerank.** Install the reranker once with `inillucent setup-embeddings reranker` (about 600 MB),
+   then name the question in plain words: `... AND question = ?1 AND k = 10`. It raised nDCG@10 by
+   0.10 to 0.13 in the study, and takes about 10 seconds for 60 candidates on a processor. Set
+   `rerank_depth` lower on a machine with no graphics card.
+
+Pass the question to `question` and to the reranker with no `search_query: ` label. That label is
+for `nomic-embed-text-v1.5` only. See [Retrieval for a language model,
+explained](../../docs/rag-explained.md) for the measurements.
+
 ## Before you design around a feature
 
 ```sh

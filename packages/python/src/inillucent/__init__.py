@@ -47,7 +47,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-__version__ = "1.0.33"
+__version__ = "2.0.1"
 
 _HERE = Path(__file__).resolve().parent
 
@@ -126,6 +126,7 @@ def binary(program: str = "inillucent") -> Path:
 def run(
     command: str,
     db: str | os.PathLike[str] | None = None,
+    key: str | None = None,
     **arguments: Any,
 ) -> dict[str, Any]:
     """Run one ``inillucent`` command and return its result object.
@@ -141,6 +142,9 @@ def run(
 
     :param command: the verb, such as ``query`` or ``describe``
     :param db: the database file
+    :param key: the key of an encrypted database. It reaches the program in the
+        ``INILLUCENT_KEY`` environment variable and never on the command line,
+        because a command line is visible in the process list
     :param arguments: the named arguments that verb takes
     """
     argv: list[str] = [str(binary()), command, "--output", "json"]
@@ -158,7 +162,8 @@ def run(
             argv += [flag, json.dumps(list(value))]
         else:
             argv += [flag, str(value)]
-    finished = subprocess.run(argv, capture_output=True, text=True)
+    environment = None if key is None else {**os.environ, "INILLUCENT_KEY": key}
+    finished = subprocess.run(argv, capture_output=True, text=True, env=environment)
     output = finished.stdout.strip()
     if output.startswith("{"):
         return json.loads(output)
@@ -173,6 +178,7 @@ def query(
     db: str | os.PathLike[str] | None = None,
     params: Sequence[Any] | None = None,
     limit: int | None = None,
+    key: str | None = None,
 ) -> list[Mapping[str, Any]]:
     """Run a query through the command line and return rows as dictionaries.
 
@@ -183,8 +189,9 @@ def query(
     :param db: the database file
     :param params: the values for ``?1``, ``?2``, ...
     :param limit: how many rows to hand back
+    :param key: the key of an encrypted database, sent in ``INILLUCENT_KEY``
     """
-    result = run("query", db=db, sql=sql, params=params, limit=limit)
+    result = run("query", db=db, key=key, sql=sql, params=params, limit=limit)
     if not result.get("ok"):
         raise _refusal(result)
     names = [column["name"] for column in result["columns"]]

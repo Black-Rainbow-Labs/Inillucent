@@ -440,8 +440,8 @@ impl ImportedDatabase {
             // numbering, the planner's tree handles, the write path's choice of
             // log - was already written for more than one; what was missing was
             // a second file to point them at.
-            Directive::Attach { file, schema } => {
-                self.attach(&file, &schema)?;
+            Directive::Attach { file, schema, key } => {
+                self.attach(&file, &schema, key.as_deref())?;
                 Ok(Outcome::empty())
             }
             Directive::Detach { schema } => {

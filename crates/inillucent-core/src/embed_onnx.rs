@@ -77,6 +77,16 @@ impl Device {
     }
 }
 
+/// What a failed CUDA start says to do about it.
+///
+/// A request for a card never falls back to the processor, so the message that
+/// ends the request has to name the command that installs the runtime build that
+/// carries the CUDA execution provider.
+pub const CUDA_HELP: &str = "The CUDA device was asked for and did not start. Run `inillucent \
+    setup-embeddings runtime --gpu` to install the ONNX Runtime build that carries CUDA, and \
+    check that the CUDA toolkit and cuDNN are installed. The request was not run on the \
+    processor instead";
+
 /// How much work ONNX Runtime does on the graph while a session loads.
 ///
 /// It is a knob rather than a constant because the two things it trades against
@@ -261,6 +271,21 @@ impl OnnxOptions {
         }
     }
 
+    /// Applies the thread count and the device the environment or the install recorded.
+    ///
+    /// `INILLUCENT_EMBED_THREADS` and `INILLUCENT_EMBED_DEVICE` first, then what
+    /// `inillucent setup-embeddings --threads` and `--device` wrote into
+    /// `embeddings.json`, then the defaults: ONNX Runtime's own thread count and
+    /// the processor. `embed()`, `rerank()` and a reranked search call this, so
+    /// the two settings reach every session the SQL functions open.
+    pub fn with_configured_machine(mut self) -> Result<OnnxOptions> {
+        let threads = crate::install::configured_threads().value;
+        self.intra_threads = threads.or(self.intra_threads);
+        let device = crate::install::configured_device().value;
+        self.device = Device::parse(&device)?;
+        Ok(self)
+    }
+
     /// The same, with the machine settings a caller has already chosen.
     /// @param manifest - the model being run
     /// @param batch_size - texts per inference call
@@ -293,6 +318,18 @@ pub struct OnnxEmbedder {
     seen: std::sync::atomic::AtomicUsize,
     truncated: std::sync::atomic::AtomicUsize,
     tokens: std::sync::atomic::AtomicUsize,
+}
+
+/// The vectors for a set of texts, and how long each text was before the model's limit was applied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Embedded {
+    /// One vector per text, in the order the texts were given.
+    pub vectors: Vec<Vec<f32>>,
+    /// The token count of each text before `max_tokens` was applied, in the same order.
+    ///
+    /// A count above `max_tokens` means the model saw only the first `max_tokens` tokens of that
+    /// text. `inillucent embed` reports those rows.
+    pub tokens: Vec<usize>,
 }
 
 /// How much text a model actually saw, over the run so far.
@@ -417,52 +454,7 @@ impl OnnxEmbedder {
         let dir: PathBuf = dir.as_ref().to_path_buf();
         let model_path = dir.join(model_file);
         let tokenizer_path = dir.join("tokenizer.json");
-
-        use_installed_runtime();
-
-        let mut builder = Session::builder().context("creating an ONNX session builder")?;
-        builder = builder
-            .with_optimization_level(options.optimization.level())
-            .map_err(|e| anyhow::anyhow!("setting the ONNX graph optimization level: {e}"))?;
-        if let Some(path) = options.optimized_model_path.as_ref() {
-            builder = builder.with_optimized_model_path(path).map_err(|e| {
-                anyhow::anyhow!("asking for the optimized graph at {}: {e}", path.display())
-            })?;
-        }
-        if let Some(threads) = options.intra_threads {
-            // ort's builder returns its error carrying the builder itself, which is
-            // not a plain error type, so the message is rebuilt rather than wrapped.
-            builder = builder.with_intra_threads(threads).map_err(|e| {
-                anyhow::anyhow!("setting the ONNX intra operator thread count: {e}")
-            })?;
-        }
-        if let Device::Cuda(device_id) = options.device {
-            preload_cuda_dylibs();
-            // error_on_failure, deliberately. ort's default is to log the failure and
-            // fall back to the processor, which is the worst outcome available here: an
-            // embedding run meant to take an hour silently becomes one that takes a day,
-            // and nothing in the output says why.
-            builder = builder
-                .with_execution_providers([ort::ep::CUDA::default()
-                    .with_device_id(device_id)
-                    // Extend the arena by exactly what was asked for. The default
-                    // rounds up to the next power of two, which on a card holding
-                    // two sessions means the first one reserves memory it never
-                    // uses and the second one fails on an allocation that would
-                    // have fitted.
-                    .with_arena_extend_strategy(ort::ep::ArenaExtendStrategy::SameAsRequested)
-                    .with_memory_limit(options.device_memory_limit.unwrap_or(usize::MAX))
-                    .build()
-                    .error_on_failure()])
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "registering the CUDA execution provider on card {device_id}: {e}"
-                    )
-                })?;
-        }
-        let session = builder
-            .commit_from_file(&model_path)
-            .with_context(|| format!("loading {}", model_path.display()))?;
+        let session = build_session(&model_path, &options)?;
 
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("loading {}: {e}", tokenizer_path.display()))?;
@@ -486,8 +478,21 @@ impl OnnxEmbedder {
     /// Embed already prefixed texts. Callers that want the task prefixes applied
     /// should use `embed_documents` or `embed_query`.
     pub fn embed_prefixed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        Ok(self.embed_prefixed_counted(texts)?.vectors)
+    }
+
+    /// Embeds already prefixed texts and reports how many tokens each one had before the limit.
+    ///
+    /// The same work as [`OnnxEmbedder::embed_prefixed`], and the token counts are what that call
+    /// already computed to plan its batches, so knowing which texts were cut costs nothing extra.
+    ///
+    /// @param texts - the texts, with any task prefix already on them
+    pub fn embed_prefixed_counted(&self, texts: &[String]) -> Result<Embedded> {
         if texts.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Embedded {
+                vectors: Vec::new(),
+                tokens: Vec::new(),
+            });
         }
         // Tokenized once, up front, for two reasons. Every sequence in a batch is
         // padded to the longest one in it, so mixing a 6 character chunk with a
@@ -503,6 +508,7 @@ impl OnnxEmbedder {
             .iter()
             .map(|e| e.get_ids().len().min(self.options.max_tokens).max(1))
             .collect();
+        let tokens: Vec<usize> = encodings.iter().map(|e| e.get_ids().len()).collect();
 
         {
             use std::sync::atomic::Ordering::Relaxed;
@@ -524,7 +530,10 @@ impl OnnxEmbedder {
         ) {
             self.run_group(&batch, &encodings, &mut out)?;
         }
-        Ok(out)
+        Ok(Embedded {
+            vectors: out,
+            tokens,
+        })
     }
 
     /// Runs one batch of already tokenized texts and writes each vector back into
@@ -753,6 +762,103 @@ impl OnnxEmbedder {
     }
 }
 
+/// Counts the tokens a model's tokenizer produces for a text, without loading the model.
+///
+/// It reads `tokenizer.json` and nothing else, so `embed_tokens(text)` answers on a machine
+/// that has the tokenizer and has never opened a session. The count is taken before any
+/// limit is applied, so a caller compares it with the model's `max_tokens` to find the texts
+/// the model would cut. The special tokens the model adds are counted, because the model is
+/// charged for them.
+pub struct TokenCounter {
+    tokenizer: Tokenizer,
+}
+
+impl TokenCounter {
+    /// Loads the tokenizer from a model directory.
+    ///
+    /// @param dir - the model directory, holding `tokenizer.json`
+    pub fn open(dir: impl AsRef<Path>) -> Result<TokenCounter> {
+        let path = dir.as_ref().join("tokenizer.json");
+        let mut tokenizer = Tokenizer::from_file(&path)
+            .map_err(|e| anyhow::anyhow!("loading {}: {e}", path.display()))?;
+        disarm_tokenizer(&mut tokenizer);
+        Ok(TokenCounter { tokenizer })
+    }
+
+    /// Returns how many tokens the model sees for one text, with no limit applied.
+    ///
+    /// @param text - the text exactly as it would be embedded, prefix included
+    pub fn count(&self, text: &str) -> Result<usize> {
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!("tokenizing: {e}"))?;
+        Ok(encoding.get_ids().len())
+    }
+}
+
+/// Opens an ONNX Runtime session over one exported graph, on the device and with the thread
+/// count the options name.
+///
+/// **The one place a session is built, for the embedder and the reranker.** Runtime loading, the
+/// optimization level, the intra operator thread count and the CUDA execution provider are the same
+/// for both, and a second copy would be a second place for a CUDA failure to fall back to the
+/// processor quietly.
+///
+/// @param model_path - the `.onnx` file
+/// @param options - the device, the thread count and the optimization level
+pub(crate) fn build_session(model_path: &Path, options: &OnnxOptions) -> Result<Session> {
+    use_installed_runtime();
+
+    let mut builder = Session::builder().context("creating an ONNX session builder")?;
+    builder = builder
+        .with_optimization_level(options.optimization.level())
+        .map_err(|e| anyhow::anyhow!("setting the ONNX graph optimization level: {e}"))?;
+    if let Some(path) = options.optimized_model_path.as_ref() {
+        builder = builder.with_optimized_model_path(path).map_err(|e| {
+            anyhow::anyhow!("asking for the optimized graph at {}: {e}", path.display())
+        })?;
+    }
+    if let Some(threads) = options.intra_threads {
+        // ort's builder returns its error carrying the builder itself, which is
+        // not a plain error type, so the message is rebuilt rather than wrapped.
+        builder = builder
+            .with_intra_threads(threads)
+            .map_err(|e| anyhow::anyhow!("setting the ONNX intra operator thread count: {e}"))?;
+    }
+    if let Device::Cuda(device_id) = options.device {
+        preload_cuda_dylibs();
+        // error_on_failure, deliberately. ort's default is to log the failure and
+        // fall back to the processor, which is the worst outcome available here: an
+        // embedding run meant to take an hour silently becomes one that takes a day,
+        // and nothing in the output says why.
+        builder = builder
+            .with_execution_providers([ort::ep::CUDA::default()
+                .with_device_id(device_id)
+                // Extend the arena by exactly what was asked for. The default
+                // rounds up to the next power of two, which on a card holding
+                // two sessions means the first one reserves memory it never
+                // uses and the second one fails on an allocation that would
+                // have fitted.
+                .with_arena_extend_strategy(ort::ep::ArenaExtendStrategy::SameAsRequested)
+                .with_memory_limit(options.device_memory_limit.unwrap_or(usize::MAX))
+                .build()
+                .error_on_failure()])
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "registering the CUDA execution provider on card {device_id}: {e}. {CUDA_HELP}"
+                )
+            })?;
+    }
+    let cuda_help = match options.device {
+        Device::Cuda(_) => format!(". {CUDA_HELP}"),
+        Device::Cpu => String::new(),
+    };
+    builder
+        .commit_from_file(model_path)
+        .with_context(|| format!("loading {}{cuda_help}", model_path.display()))
+}
+
 /// How much of a set of texts a model would truncate, without running it.
 ///
 /// The tokenizer alone answers this, and answering it without a session is what
@@ -822,7 +928,7 @@ pub fn count_truncation(
 /// decision and it is taken from the manifest, where it is recorded, digested
 /// into the cache header, and printed on the card.
 /// @param tokenizer - the loaded tokenizer, modified in place
-fn disarm_tokenizer(tokenizer: &mut Tokenizer) {
+pub(crate) fn disarm_tokenizer(tokenizer: &mut Tokenizer) {
     tokenizer.with_padding(None);
     if let Err(e) = tokenizer.with_truncation(None) {
         // `with_truncation(None)` cannot fail in this version, and if a later one
@@ -852,7 +958,7 @@ fn disarm_tokenizer(tokenizer: &mut Tokenizer) {
 /// @param ids - token ids, row major
 /// @param mask - attention mask, row major
 /// @param types - token type ids, row major, all zero
-fn build_inputs<'a>(
+pub(crate) fn build_inputs<'a>(
     session: &Session,
     batch: usize,
     width: usize,
@@ -978,7 +1084,11 @@ fn empty_cache_tensor(input: &ort::value::Outlet, batch: usize) -> Result<Value>
 /// @param lengths - token count per text, already truncated to the model bound
 /// @param batch_size - most texts in one batch
 /// @param max_cells - ceiling on `texts in the batch x longest, squared`
-fn plan_batches(lengths: &[usize], batch_size: usize, max_cells: usize) -> Vec<Vec<usize>> {
+pub(crate) fn plan_batches(
+    lengths: &[usize],
+    batch_size: usize,
+    max_cells: usize,
+) -> Vec<Vec<usize>> {
     let mut order: Vec<usize> = (0..lengths.len()).collect();
     order.sort_by_key(|&i| lengths.get(i).copied().unwrap_or(0));
 

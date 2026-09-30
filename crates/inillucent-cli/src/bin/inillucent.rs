@@ -70,6 +70,8 @@ struct Invocation {
     limit: usize,
     /// What to print where a value is null.
     null: String,
+    /// The file `--key-file` named, holding the key databases are opened with.
+    key_file: Option<String>,
 }
 
 /// Runs whatever the command line named.
@@ -103,6 +105,13 @@ fn run() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // **The key is installed before anything is opened.** See
+    // `inillucent_cli::keys` for where it comes from and why a key is never a
+    // word on the command line.
+    if let Err(message) = inillucent_cli::keys::install_from(invocation.key_file.as_deref()) {
+        eprintln!("{message}");
+        return ExitCode::from(2);
+    }
     let Some(verb) = invocation.verb.clone() else {
         print_overview();
         return ExitCode::from(2);
@@ -302,6 +311,7 @@ fn dispatch_help(topic: &str) -> ExitCode {
         root: None,
         limit: 200,
         null: String::new(),
+        key_file: None,
     };
     let Some(help) = command::find("help") else {
         return ExitCode::from(2);
@@ -327,6 +337,7 @@ fn split(arguments: &[String]) -> Result<Invocation, String> {
         root: None,
         limit: 200,
         null: String::new(),
+        key_file: None,
     };
     let mut walk = arguments.iter();
     while let Some(argument) = walk.next() {
@@ -340,6 +351,13 @@ fn split(arguments: &[String]) -> Result<Invocation, String> {
             }
             "--json" => invocation.json = true,
             "--readonly" => invocation.readonly = true,
+            "--key-file" => {
+                invocation.key_file = Some(
+                    walk.next()
+                        .cloned()
+                        .ok_or_else(|| "--key-file needs a path.".to_string())?,
+                );
+            }
             "--root" => {
                 let named = walk
                     .next()
@@ -406,12 +424,21 @@ fn dispatch(command: &'static Command, invocation: &Invocation) -> ExitCode {
     } else {
         &invocation.database
     };
-    let mut context = match Context::open_for(
-        database,
-        OpenMode::of(invocation.readonly),
-        invocation.root.clone(),
-        command.writes.may_create(),
-    ) {
+    let open = || {
+        Context::open_for(
+            database,
+            OpenMode::of(invocation.readonly),
+            invocation.root.clone(),
+            command.writes.may_create(),
+        )
+    };
+    // `encrypt` reads a plaintext database, so its source is opened without
+    // the key the copy is written with.
+    let opened = match inillucent_cli::keys::opens_source_without_key(command.name) {
+        true => inillucent_cli::keys::opening_without_key(open),
+        false => open(),
+    };
+    let mut context = match opened {
         Ok(context) => context,
         Err(failure) => return report(&failure, invocation.json, command.name),
     };
@@ -619,6 +646,8 @@ fn print_overview() {
         "      --json         print the whole result object instead of a table",
         "      --output WHICH text or json (--json means --output json)",
         "      --readonly     refuse every statement that would change something",
+        "      --key-file F   open the database encrypted, with the key in file F",
+        "                     (or $INILLUCENT_KEY; see docs/encryption.md)",
         "      --root DIR     refuse every path that resolves outside DIR (links followed)",
         "      --limit N      how many rows to hand back (default 200; 0 for all)",
         "      --null TEXT    what to print where a value is null",

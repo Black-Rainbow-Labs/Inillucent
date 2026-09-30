@@ -260,7 +260,43 @@ def main():
         "a capability nobody declared must answer UNKNOWN rather than NO - they mean "
         "different things, and one of them is a checked absence"
     )
+    check_encryption()
     return 0
+
+
+def check_encryption():
+    """An encrypted database through this binding: written with a key, not
+    readable without it or with another one, and holding no plaintext row.
+
+    Outside the suite because the suite opens every case's database the same
+    way, and the one thing it cannot show is what happens with a key.
+    """
+    key = "x'" + "44" * 32 + "'"
+    path = scratch("encrypted")
+    secret = "the vault code is 7461"
+    try:
+        database = inillucent.Database(path, key=key)
+        connection = database.connect()
+        connection.execute("CREATE TABLE vault (code TEXT)")
+        connection.execute("INSERT INTO vault VALUES (?1)", [secret])
+        database.close()
+        for candidate in [path] + glob.glob(glob.escape(path) + "-wal.*"):
+            with open(candidate, "rb") as handle:
+                assert secret.encode("utf-8") not in handle.read(), f"{candidate} holds the row"
+        for attempt in [None, "x'" + "45" * 32 + "'"]:
+            try:
+                inillucent.Database(path, key=attempt).close()
+            except inillucent.DriverError as why:
+                assert why.status == inillucent.CORRUPT, f"key {attempt!r} gave status {why.status}"
+            else:
+                raise AssertionError(f"the database opened with key {attempt!r}")
+        database = inillucent.Database(path, key=key)
+        rows = database.connect().execute("SELECT code FROM vault")
+        assert list(rows)[0][0] == secret, "the row did not come back"
+        database.close()
+        print("  ok    an encrypted database opens only with its key")
+    finally:
+        remove_database(path)
 
 
 if __name__ == "__main__":

@@ -25,10 +25,20 @@
 /// `inillucent-search`'s `no_model` answers `invalid_state` and names
 /// `inillucent setup-embeddings`, because the component is installable and
 /// exit 3 would say the opposite.
-const NEEDS_A_COMPONENT: &[(&[u8], &str)] = &[(
-    b"embed",
-    "embed(TEXT): this build has no embedding support compiled in",
-)];
+const NEEDS_A_COMPONENT: &[(&[u8], &str)] = &[
+    (
+        b"embed",
+        "embed(TEXT): this build has no embedding support compiled in",
+    ),
+    (
+        b"embed_tokens",
+        "embed_tokens(TEXT): this build has no embedding support compiled in",
+    ),
+    (
+        b"rerank",
+        "rerank(TEXT, TEXT): this build has no embedding support compiled in",
+    ),
+];
 
 /// Returns what a name needs, when the name is one this build left out.
 ///
@@ -1153,6 +1163,24 @@ pub fn minmax_aggregate(folded: &[u8]) -> Option<AggregateFunc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three functions that run a model answer `unsupported` in a build with no embedding
+    /// support, and a name nobody has is still just a name nobody has.
+    ///
+    /// The engine reaches this list when a call does not resolve, so a build without the feature
+    /// tells the caller the statement is fine and the build lacks the feature, with exit code 3,
+    /// instead of "no such function".
+    #[test]
+    fn the_model_functions_need_a_component() {
+        for name in [&b"embed"[..], b"embed_tokens", b"rerank"] {
+            let said = needs_a_component(name).expect("the function needs a component");
+            assert!(said.contains("no embedding support compiled in"), "{said}");
+        }
+        assert!(
+            needs_a_component(b"rerank").is_some_and(|said| said.starts_with("rerank(TEXT, TEXT)"))
+        );
+        assert_eq!(needs_a_component(b"nope"), None);
+    }
 
     /// Names are matched folded, and an unknown name is not a function.
     #[test]

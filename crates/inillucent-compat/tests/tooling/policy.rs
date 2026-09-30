@@ -2270,7 +2270,7 @@ fn no_shell_file_reaches_past_the_driver_more_than_it_is_recorded_at() {
     // `inillucent_engine`, and how many lines of it do. Measured at
     // task-1932; a row at zero is a file that has moved and whose row should
     // be deleted.
-    const REACHES: [(&str, usize); 8] = [
+    const REACHES: [(&str, usize); 9] = [
         // The shell itself. Down from ten to one in task-1962 (roadmap item
         // 7): the virtual table modules, the authorizer, the cache statistics,
         // the statement budget and `leading_trivia` are all on the driver's
@@ -2301,6 +2301,11 @@ fn no_shell_file_reaches_past_the_driver_more_than_it_is_recorded_at() {
         // One function signature taking an engine connection, which follows
         // `shell.rs`.
         ("crates/inillucent-cli/src/import.rs", 1),
+        // `inillucent embed` (task-2158). It reads rows and writes vectors with a prepared
+        // statement inside a transaction, which the driver's `Connection` does not offer
+        // over the shell's own connection, so it names the engine's connection type as
+        // `import.rs` does: one `use` for the connection and one for the value type.
+        ("crates/inillucent-cli/src/bulk_embed.rs", 2),
         // Down from one to zero in task-1946 (M11). It was never a
         // dependency at all - the one hit was a sentence in a module comment
         // naming the crate by path, counted because the check reads lines

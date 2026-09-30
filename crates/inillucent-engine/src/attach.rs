@@ -32,7 +32,6 @@ use inillucent_base::error::{refusal, statement_refusal};
 use inillucent_base::DbResult;
 use inillucent_pool::{Database, Options};
 use inillucent_vfs::memory::MemoryVfs;
-use inillucent_vfs::os::OsVfs;
 use inillucent_vfs::{DbPath, Vfs};
 
 use super::recovery::{open_file, OpenedFile};
@@ -70,9 +69,16 @@ impl ImportedDatabase {
     /// The file is created when it is not there, which is what `ATTACH` does:
     /// naming a database that does not exist yet is how one is made.
     ///
+    /// **`KEY` chooses the file system the attachment is opened on.** A key
+    /// opens it through an encrypting one, `KEY ''` through the operating
+    /// system's, and no `KEY` clause through whichever `main` uses, with
+    /// `main`'s key - which is SQLCipher's rule, so a script that attaches a
+    /// second encrypted database under one passphrase needs no change.
+    ///
     /// @param file - the path, as the statement's literal
     /// @param name - the name it will be known by
-    pub(crate) fn attach(&mut self, file: &[u8], name: &[u8]) -> DbResult<()> {
+    /// @param key - the `KEY` clause's text, if there was one
+    pub(crate) fn attach(&mut self, file: &[u8], name: &[u8], key: Option<&[u8]>) -> DbResult<()> {
         if name.eq_ignore_ascii_case(b"main") || name.eq_ignore_ascii_case(TEMP) {
             return Err(refusal(format!(
                 "database {} is already in use",
@@ -97,6 +103,7 @@ impl ImportedDatabase {
                 "too many attached databases - max {MAX_ATTACHED}"
             )));
         }
+        let mut keyed = false;
         let (vfs, path, held) = if file == IN_MEMORY || file.is_empty() {
             let vfs: Arc<dyn Vfs> = Arc::new(MemoryVfs::new());
             (
@@ -106,7 +113,7 @@ impl ImportedDatabase {
             )
         } else {
             let text = String::from_utf8_lossy(file).into_owned();
-            let vfs: Arc<dyn Vfs> = Arc::new(OsVfs::new());
+            let key = self.attachment_key(key)?;
             // **A confined process refuses the path here, by name.** The VFS
             // refuses it too, and that is the guarantee - but the VFS has only
             // an extended result code to answer with, and an agent told
@@ -122,9 +129,26 @@ impl ImportedDatabase {
                 },
             };
             let held = path.as_path().to_path_buf();
+            keyed = key.is_some();
+            crate::encryption::check_the_file_matches_the_key(&held, keyed)?;
+            let vfs = crate::encryption::file_system(key, self.storage.page_size)?;
             (vfs, path, Some(held))
         };
         self.attach_file(vfs, path, held, name.to_vec(), None)
+            .map_err(|error| crate::encryption::explain_a_wrong_key(error, keyed))
+    }
+
+    /// Decides the key an attachment is opened with.
+    ///
+    /// @param clause - the `KEY` clause's text, if there was one
+    fn attachment_key(&self, clause: Option<&[u8]>) -> DbResult<Option<crate::EncryptionKey>> {
+        match clause {
+            Some([]) => Ok(None),
+            Some(text) => Ok(Some(crate::EncryptionKey::parse(&String::from_utf8_lossy(
+                text,
+            )))),
+            None => self.encryption_key(),
+        }
     }
 
     /// Opens or creates one file and registers it as a schema of this

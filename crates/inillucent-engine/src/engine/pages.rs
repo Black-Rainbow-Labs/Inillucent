@@ -267,7 +267,7 @@ impl crate::ImportedDatabase {
     ///
     /// @param handle - the handle this connection reads the tree through
     /// @param tree - the tree itself, for its root page
-    fn name_of_tree(&self, handle: u32, tree: &PagedTree) -> String {
+    pub(crate) fn name_of_tree(&self, handle: u32, tree: &PagedTree) -> String {
         for table in &self.schema.tables {
             if table.root == handle {
                 return format!("table {}", String::from_utf8_lossy(&table.name));
@@ -300,6 +300,14 @@ fn compare_against_the_free_map(
     names: &BTreeMap<u32, String>,
     complete: bool,
 ) -> DbResult<()> {
+    // **Every leaked page, not the first** (task-2150). A leak loses no row,
+    // so there is no reason to stop at one, and the count is what says whether
+    // a repair is one page or a file's worth: Nikaya's database reported
+    // `Page 211841: never used` and nothing could say whether that was the only
+    // one. One line per page, as the pinned SQLite writes them, and the same
+    // cap of a hundred it puts on its own list.
+    let mut leaked: Vec<u64> = Vec::new();
+    let mut more = 0u64;
     for number in inillucent_pool::meta::FIRST_DATA_PAGE.0..file.pool().page_count() {
         let page = PageId(number);
         match (held.get(&page), file.page_is_allocated(page)) {
@@ -319,12 +327,30 @@ fn compare_against_the_free_map(
             // An application matching on this answer is matching on the text,
             // so it is the text the reference this repository grades against
             // produces today.
-            (None, true) if complete => return Err(damaged(format!("Page {number}: never used"))),
+            (None, true) if complete => match leaked.len() < MOST_LEAKS_LISTED {
+                true => leaked.push(number),
+                false => more = more.saturating_add(1),
+            },
             _ => {}
         }
     }
-    Ok(())
+    if leaked.is_empty() {
+        return Ok(());
+    }
+    let mut said: Vec<String> = leaked
+        .iter()
+        .map(|number| format!("Page {number}: never used"))
+        .collect();
+    if more > 0 {
+        said.push(format!("and {more} more pages never used"));
+    }
+    Err(damaged(said.join("\n")))
 }
+
+/// How many leaked pages one check names before it counts the rest.
+///
+/// The cap the pinned SQLite puts on the errors one `integrity_check` returns.
+const MOST_LEAKS_LISTED: usize = 100;
 
 /// Records a page's holder, refusing a page that already has one.
 ///

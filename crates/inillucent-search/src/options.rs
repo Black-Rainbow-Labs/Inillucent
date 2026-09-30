@@ -81,6 +81,16 @@ pub const MAX_DIMS: usize = 16_384;
 /// The default number of hits a search returns when the caller names none.
 pub const DEFAULT_K: i64 = 10;
 
+/// How many rows of the fused list the reranker scores, when the declaration names none.
+///
+/// 60 is the depth the retrieval study measured: on the graphics card 60 candidates take about a
+/// tenth of a second and on the processor about ten seconds, so a table on a machine with no card
+/// can lower it to trade depth for time.
+pub const DEFAULT_RERANK_DEPTH: usize = 60;
+
+/// The most rows the reranker may be asked to score in one search.
+pub const MAX_RERANK_DEPTH: usize = 1_000;
+
 /// How long a delta log grows before a commit flushes it into a segment.
 ///
 /// **A constant, and it stopped being a share of the corpus in task-1911.**
@@ -219,6 +229,51 @@ impl Metric {
     }
 }
 
+/// How the keyword list and the vector list of a hybrid search are combined.
+///
+/// **The default is `Adaptive` and it did not change when `Rrf` was added.** Two
+/// corpora disagree about which is better. The retrieval study on a mailbox of
+/// 67,369 emails found reciprocal rank fusion ahead of the adaptive weight by
+/// 0.035 nDCG@10. The score card corpus in this repository found the adaptive
+/// weight ahead of reciprocal rank fusion by 0.065 on document identity
+/// (`IndexConfig::default` records the measurement). A change of default would
+/// change the results of every existing table, so the choice is the table's to
+/// declare.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FusionChoice {
+    /// Min-max scaling with a vector weight that starts at 0.35 and is adjusted for each query.
+    Adaptive,
+    /// Reciprocal rank fusion with k = 60. It has no weight.
+    Rrf,
+    /// Min-max scaling with the fixed `vector_weight` the declaration names.
+    Weighted,
+}
+
+impl FusionChoice {
+    /// Returns the choice's name, as `%_config` stores it and the option spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            FusionChoice::Adaptive => "adaptive",
+            FusionChoice::Rrf => "rrf",
+            FusionChoice::Weighted => "weighted",
+        }
+    }
+
+    /// Reads a choice back from its name.
+    ///
+    /// @param text - the value of the `fusion` option
+    pub fn parse(text: &str) -> DbResult<FusionChoice> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "adaptive" => Ok(FusionChoice::Adaptive),
+            "rrf" => Ok(FusionChoice::Rrf),
+            "weighted" => Ok(FusionChoice::Weighted),
+            other => Err(inillucent_base::error::statement_refusal(format!(
+                "inillucent_search: fusion must be adaptive, rrf or weighted, not {other}"
+            ))),
+        }
+    }
+}
+
 /// Everything the `CREATE VIRTUAL TABLE` statement declared.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
@@ -283,6 +338,14 @@ pub struct Options {
     /// Thousandths rather than an `f32`, so the declaration stays `Eq` and the
     /// stored value reads back exactly as it was written.
     pub vector_weight: Option<u16>,
+    /// How the keyword list and the vector list are combined.
+    ///
+    /// `Weighted` exactly when `vector_weight` is set, `Rrf` when the declaration
+    /// said `fusion = 'rrf'`, and `Adaptive` otherwise.
+    pub fusion: FusionChoice,
+    /// How many rows of the fused list a search that names `question` hands to the reranker, when
+    /// the declaration said. `None` means [`DEFAULT_RERANK_DEPTH`].
+    pub rerank_depth: Option<usize>,
     /// How many delta rows may accumulate before a commit folds them in, or
     /// zero to compact only when asked.
     pub compact: Option<u64>,
@@ -319,6 +382,11 @@ impl Options {
     pub fn vector_weight(&self) -> Option<f32> {
         self.vector_weight
             .map(|thousandths| f32::from(thousandths) / 1000.0)
+    }
+
+    /// Returns how many rows of the fused list the reranker scores for a search that names `question`.
+    pub fn rerank_depth(&self) -> usize {
+        self.rerank_depth.unwrap_or(DEFAULT_RERANK_DEPTH)
     }
 
     /// Returns whether this table has a vector branch at all.
@@ -478,6 +546,13 @@ impl Options {
                     .map(|thousandths| format!("{}", f32::from(thousandths) / 1000.0))
                     .unwrap_or_default(),
             ),
+            ("fusion".to_string(), self.fusion.name().to_string()),
+            (
+                "rerank_depth".to_string(),
+                self.rerank_depth
+                    .map(|depth| depth.to_string())
+                    .unwrap_or_default(),
+            ),
             ("tokenize".to_string(), TOKENIZER.to_string()),
             (
                 "compact".to_string(),
@@ -535,6 +610,8 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
     let mut ef_search: Option<usize> = None;
     let mut mode = Mode::Exact;
     let mut vector_weight: Option<u16> = None;
+    let mut fusion_named: Option<FusionChoice> = None;
+    let mut rerank_depth: Option<usize> = None;
     let mut compact: Option<u64> = None;
     let mut segment_merge: Option<usize> = None;
     let mut merge_budget: Option<u64> = None;
@@ -590,6 +667,10 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
             "ef_search" => ef_search = Some(positive(&value, "ef_search")?),
             "mode" => mode = Mode::parse(&value)?,
             "vector_weight" => vector_weight = Some(weight(&value)?),
+            // No `fusion` and no `vector_weight` is `adaptive`, and the default
+            // stays that way: see `FusionChoice` for the two corpora that disagree.
+            "fusion" => fusion_named = Some(FusionChoice::parse(&value)?),
+            "rerank_depth" => rerank_depth = Some(depth(&value)?),
             "tokenize" | "tokenizer" => {
                 if !value.eq_ignore_ascii_case(TOKENIZER) {
                     return Err(failure(format!(
@@ -630,6 +711,7 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
              because a facet is not indexed and a table of facets alone answers nothing",
         ));
     }
+    let fusion = resolve_fusion(fusion_named, vector_weight)?;
     Ok(Options {
         columns,
         facets,
@@ -640,6 +722,8 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
         ef_search,
         mode,
         vector_weight,
+        fusion,
+        rerank_depth,
         compact,
         segment_merge,
         merge_budget,
@@ -647,6 +731,52 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
         source_column,
         threads,
     })
+}
+
+/// Reads a rerank depth, refusing one that is not a whole number from 1 to 1,000.
+///
+/// @param value - the text the option was given
+fn depth(value: &str) -> DbResult<usize> {
+    let held = value
+        .parse::<usize>()
+        .ok()
+        .filter(|held| (1..=MAX_RERANK_DEPTH).contains(held));
+    held.ok_or_else(|| {
+        failure(format!(
+            "inillucent_search: rerank_depth must be a whole number from 1 to {MAX_RERANK_DEPTH}, \
+             not {value}"
+        ))
+    })
+}
+
+/// Decides which fusion a declaration means, and refuses the combinations that contradict.
+///
+/// `vector_weight` alone means `weighted`, as it always has. `fusion = 'rrf'` and
+/// `fusion = 'adaptive'` have no weight to give, so naming one beside
+/// `vector_weight` is a contradiction and is refused instead of one of the two
+/// being ignored. `fusion = 'weighted'` with no `vector_weight` has nothing to
+/// weight by and is refused for the same reason.
+///
+/// @param named - the value of the `fusion` option, when the declaration gave one
+/// @param vector_weight - the declared fixed weight, when the declaration gave one
+fn resolve_fusion(
+    named: Option<FusionChoice>,
+    vector_weight: Option<u16>,
+) -> DbResult<FusionChoice> {
+    match (named, vector_weight) {
+        (None, None) => Ok(FusionChoice::Adaptive),
+        (None, Some(_)) | (Some(FusionChoice::Weighted), Some(_)) => Ok(FusionChoice::Weighted),
+        (Some(FusionChoice::Weighted), None) => Err(failure(
+            "inillucent_search: fusion = 'weighted' needs vector_weight, the fixed share from 0 to 1 \
+             that the vector list counts for. Add vector_weight = 0.5, or use fusion = 'adaptive'",
+        )),
+        (Some(other), Some(_)) => Err(failure(format!(
+            "inillucent_search: fusion = '{}' has no weight, so vector_weight cannot be set with it. \
+             Remove vector_weight, or use fusion = 'weighted'",
+            other.name()
+        ))),
+        (Some(choice), None) => Ok(choice),
+    }
 }
 
 /// Reads a vector weight between 0 and 1, as thousandths.
@@ -849,6 +979,16 @@ pub fn from_config(rows: &[(String, String)], fallback: &Options) -> DbResult<Op
     // An empty stored value is "the build's own default", which is what a store
     // created before these three existed says - see the `%_config` rows above.
     let graph = |key: &str| find(key).and_then(|value| value.parse::<usize>().ok());
+    let vector_weight = find("vector_weight")
+        .and_then(|value| weight(&value).ok())
+        .or(fallback.vector_weight);
+    // A table written before the option existed has no `fusion` row and reads
+    // as it always did: `weighted` when it stored a weight, `adaptive` otherwise.
+    let fusion = match find("fusion").filter(|value| !value.is_empty()) {
+        Some(name) => FusionChoice::parse(&name)?,
+        None if vector_weight.is_some() => FusionChoice::Weighted,
+        None => FusionChoice::Adaptive,
+    };
     Ok(Options {
         columns,
         facets,
@@ -860,9 +1000,13 @@ pub fn from_config(rows: &[(String, String)], fallback: &Options) -> DbResult<Op
         mode,
         // An empty stored value is "the adaptive default", which is what every
         // table written before the option existed says by having no row.
-        vector_weight: find("vector_weight")
-            .and_then(|value| weight(&value).ok())
-            .or(fallback.vector_weight),
+        vector_weight,
+        fusion,
+        // An empty or unreadable stored value is the default depth, which is what a table written
+        // before the option existed says by having no row.
+        rerank_depth: find("rerank_depth")
+            .and_then(|value| depth(&value).ok())
+            .or(fallback.rerank_depth),
         compact: compact.or(fallback.compact),
         segment_merge: segment_merge.or(fallback.segment_merge),
         merge_budget: merge_budget.or(fallback.merge_budget),

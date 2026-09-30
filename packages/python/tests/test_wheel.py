@@ -92,6 +92,35 @@ def test_a_statement_round_trips_through_the_driver() -> None:
             assert rows.rows[0][1] == "Ada", f"the row came back as {rows.rows[0]!r}"
 
 
+def test_an_encrypted_database_needs_its_key() -> None:
+    """A database made with a key opens with it, refuses to open without it, and is opaque on disk.
+
+    The key travels in ``INILLUCENT_KEY``. It is a raw 32 byte key because a
+    passphrase costs 600,000 PBKDF2 iterations on every open.
+    """
+    from inillucent import query, run  # noqa: PLC0415 - after sys.path is set
+
+    key = "x'" + "5a" * 32 + "'"
+    secret = "plaintext-marker-for-the-file-scan"
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "probe.rdb"
+        made = run(
+            "batch",
+            db=path,
+            key=key,
+            sql=f"CREATE TABLE note (id INTEGER PRIMARY KEY, body TEXT); "
+            f"INSERT INTO note (body) VALUES ('{secret}')",
+        )
+        assert made["ok"], made
+        rows = query("SELECT body FROM note", db=path, key=key)
+        assert rows[0]["body"] == secret, f"the row came back as {rows!r}"
+        mode = query("PRAGMA encryption", db=path, key=key)
+        assert list(mode[0].values())[0] == "xchacha20-poly1305", mode
+        without = run("query", db=path, sql="SELECT body FROM note")
+        assert without["ok"] is False and without["status"] == "corrupt", without
+        assert secret.encode() not in path.read_bytes(), "the row text is in the file"
+
+
 def staged() -> bool:
     """Whether ``build.py`` has staged the wheel's native half.
 

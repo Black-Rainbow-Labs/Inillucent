@@ -1,0 +1,169 @@
+{
+ "produced_by": "tools/rag-lab/rerank.py, CrossEncoder('gte', device_id=None), one pair per call, on the processor",
+ "onnxruntime": "1.30.0",
+ "model": "gte-reranker-modernbert-base, onnx/model.onnx sha256 c6d3226502addbcd4d2cf273802957ebf8a2a6bf94037dcb9b1d95bfc01e5d93",
+ "max_tokens": 1024,
+ "score": "the sigmoid of the logit, computed in 64 bit floats",
+ "pairs": [
+  {
+   "query": "who was Seneca",
+   "passage": "Lucius Annaeus Seneca the Younger (/ˈsɛnɪkə/ SEN-ik-ə; c. 4 BC – AD 65), usually known mononymously as Seneca, was a Stoic philosopher of Ancient Rome, a statesman, a dramatist, and in one work, a satirist, from the post-Augustan age of Latin literature. Seneca was born in Colonia Patricia Corduba in Hispania, and was trained in rhetoric and philosophy in Rome. His father was Seneca the Elder, his elder brother was Lucius Junius Gallio Annaeanus, and his nephew was the poet Lucan. In AD 41, Seneca was exiled to the island of Corsica under emperor Claudius, but was allowed to return in 49 to become a tutor to Nero. When Nero became emperor in 54, Seneca became his advisor and, together with the praetorian prefect Sextus Afranius Burrus, provided competent government for the first five years of Nero's reign.",
+   "kind": "relevant",
+   "article": "Seneca the Younger",
+   "logit": 3.057619571685791,
+   "score": 0.9551103476019794
+  },
+  {
+   "query": "who was Seneca",
+   "passage": "Thales of Miletus (/ˈθeɪliːz/ THAY-leez; Ancient Greek: Θαλῆς; c. 626/623  – c. 548/545 BC) was an Ancient Greek pre-Socratic philosopher from Miletus in Ionia, Asia Minor. Thales was one of the Seven Sages, founding figures of Ancient Greece. Beginning in eighteenth-century historiography, many came to regard him as the first philosopher in the Greek tradition, breaking from the prior use of mythology to explain the world and instead using natural philosophy. He is thus otherwise referred to as the first to have engaged in mathematics, science, and deductive reasoning. Thales's view that all of nature is based on the existence of a single ultimate substance, which he theorized to be water, was widely influential among the philosophers of his time. Thales thought the Earth floated on water.",
+   "kind": "unrelated",
+   "article": "Thales of Miletus",
+   "logit": 0.9954825043678284,
+   "score": 0.7301694585234244
+  },
+  {
+   "query": "what did the Stoics believe about death",
+   "passage": "Stoicism was a school of Hellenistic philosophy. It was founded in Athens by Zeno of Citium in the early third century BC. It concerns the active relationship between cosmic determinism and human freedom. This philosophy claims that it is virtuous to maintain a will (a determination, prohairesis) which is according to the participants \"in accord with nature\". The Stoics believed that the universe was ruled by reason, which they thought of as God being present in nature itself. Stoic doctrine was popular in Greece and the Roman Empire from its founding until all the schools of philosophy were ordered closed in 529 AD by the Emperor Justinian I, who thought their pagan character was at odds with his Christian faith.",
+   "kind": "relevant",
+   "article": "Stoicism",
+   "logit": 1.4412444829940796,
+   "score": 0.8086472927851366
+  },
+  {
+   "query": "what did the Stoics believe about death",
+   "passage": "Epicurus (/ˌɛpɪˈkjʊərəs/, EH-pih-KURE-əs; Ancient Greek: Ἐπίκουρος Epikouros; 341–270 BC) was an ancient Greek philosopher who founded Epicureanism, a highly influential school of philosophy; it asserted that philosophy's purpose is to attain as well as to help others attain tranquil lives, characterized by freedom from fear and the absence of pain. Epicurus advocated that people were best able to pursue philosophy by living a self-sufficient life surrounded by friends; he and his followers were known for eating simple meals and discussing a wide range of philosophical subjects at \"The Garden\", the school he established in Athens. Epicurus taught that although the gods exist, they have no involvement in human affairs.",
+   "kind": "unrelated",
+   "article": "Epicurus",
+   "logit": 0.7181001901626587,
+   "score": 0.6721885288843342
+  },
+  {
+   "query": "the prisoners watching shadows on a cave wall",
+   "passage": " wall of the cave. They observe the shadows projected onto the outer wall by objects carried behind the inner wall by people who are invisible to the chained “prisoners” and who walk along the inner wall with a fire behind them, creating the shadows on the inner wall in front of the prisoners. The \"sign bearers\" pronounce the names of the objects, the sounds of which are reflected near the shadows and are understood by the prisoners as if they were coming from the shadows themselves. Only the shadows and sounds are the prisoners' reality, which are not accurate representations of the real world. The shadows represent distorted and blurred copies of reality we can perceive through our senses, while the objects under the Sun represent the true forms of objects that we can only perceive through reason.",
+   "kind": "relevant",
+   "article": "Allegory of the cave",
+   "logit": 3.7084336280822754,
+   "score": 0.9760707526757137
+  },
+  {
+   "query": "the prisoners watching shadows on a cave wall",
+   "passage": "Marcus Aurelius Antoninus (/ɔːˈriːliəs/ or-EE-lee-əs, Latin: [ˈmaːrkʊs au̯ˈreːli.us antoːˈniːnʊs]; 26 April 121 – 17 March 180) was Roman emperor from 161 to 180 and a Stoic philosopher. He was a member of the Nerva–Antonine dynasty, the last of the rulers later known as the Five Good Emperors and the last emperor of the Pax Romana, an age of relative peace, calm, and stability for the Roman Empire lasting from 27 BC to 180 AD. He served as Roman consul in 140, 145, and 161. Marcus Aurelius was the son of the praetor Marcus Annius Verus and his wife, Domitia Calvilla. He was related through marriage to the emperors Trajan and Hadrian. Marcus was three when his father died, and was raised by his mother and paternal grandfather. After Hadrian's adoptive son, Aelius Caesar, died in 138, Hadrian adopted Marcus's uncle Antoninus Pius as his new heir.",
+   "kind": "unrelated",
+   "article": "Marcus Aurelius",
+   "logit": 0.374692440032959,
+   "score": 0.5925923488945074
+  },
+  {
+   "query": "which philosopher said everything is water",
+   "passage": "Thales of Miletus (/ˈθeɪliːz/ THAY-leez; Ancient Greek: Θαλῆς; c. 626/623  – c. 548/545 BC) was an Ancient Greek pre-Socratic philosopher from Miletus in Ionia, Asia Minor. Thales was one of the Seven Sages, founding figures of Ancient Greece. Beginning in eighteenth-century historiography, many came to regard him as the first philosopher in the Greek tradition, breaking from the prior use of mythology to explain the world and instead using natural philosophy. He is thus otherwise referred to as the first to have engaged in mathematics, science, and deductive reasoning. Thales's view that all of nature is based on the existence of a single ultimate substance, which he theorized to be water, was widely influential among the philosophers of his time. Thales thought the Earth floated on water.",
+   "kind": "relevant",
+   "article": "Thales of Miletus",
+   "logit": 2.1401522159576416,
+   "score": 0.8947449464939194
+  },
+  {
+   "query": "which philosopher said everything is water",
+   "passage": "Heraclitus (/ˌhɛrəˈklaɪtəs/; Ancient Greek: Ἡράκλειτος, romanized: Hērákleitos; fl. c. 500 BC) as an ancient Greek pre-Socratic philosopher from the city of Ephesus, which was then part of the Persian Empire. He exerts a wide influence on Western philosophy, both ancient and modern, through the works of such authors as Plato, Aristotle, Georg Wilhelm Friedrich Hegel, Friedrich Nietzsche, and Martin Heidegger. Little is known of Heraclitus's life. He wrote a single work, of which only fragments survive. Even in ancient times, his paradoxical philosophy, appreciation for wordplay, and cryptic, oracular epigrams earned him the epithets \"the dark\" and \"the obscure\". He was considered arrogant and depressed, a misanthrope who was subject to melancholia.",
+   "kind": "unrelated",
+   "article": "Heraclitus",
+   "logit": 1.119552731513977,
+   "score": 0.7539057433129205
+  },
+  {
+   "query": "pleasure as the absence of pain",
+   "passage": "rized by freedom from fear and the absence of pain. Epicurus advocated that people were best able to pursue philosophy by living a self-sufficient life surrounded by friends; he and his followers were known for eating simple meals and discussing a wide range of philosophical subjects at \"The Garden\", the school he established in Athens. Epicurus taught that although the gods exist, they have no involvement in human affairs. Like the earlier philosopher Democritus, Epicurus claimed that all occurrences in the natural world are ultimately the result of tiny, invisible particles known as atoms moving and interacting in empty space, though Epicurus also deviated from Democritus by proposing the idea of atomic \"swerve\", which holds that atoms may deviate from their expected course, thus permitting humans to possess free will in an otherwise deterministic universe.",
+   "kind": "relevant",
+   "article": "Epicurus",
+   "logit": 1.9043631553649902,
+   "score": 0.8703845522175253
+  },
+  {
+   "query": "pleasure as the absence of pain",
+   "passage": "Hypatia (born c. 350–370 – March 415 AD) was a Neoplatonist philosopher, astronomer, and mathematician who lived in Alexandria, at that time in the province of Egypt and a major city of the Eastern Roman Empire. In Alexandria, Hypatia was a prominent thinker who taught subjects including philosophy and astronomy, and in her lifetime was renowned as a great teacher and a wise counselor. Not the only fourth century Alexandrian female mathematician, Hypatia was preceded by Pandrosion. However, Hypatia is the first female mathematician whose life is reasonably well recorded. She wrote a commentary on Diophantus's thirteen-volume Arithmetica, which may survive in part, having been interpolated into Diophantus's original text, and another commentary on Apollonius of Perga's treatise on conic sections, which has not survived.",
+   "kind": "unrelated",
+   "article": "Hypatia",
+   "logit": -0.04837244749069214,
+   "score": 0.4879092456253655
+  },
+  {
+   "query": "a Roman emperor who wrote a private notebook",
+   "passage": "rriage to the emperors Trajan and Hadrian. Marcus was three when his father died, and was raised by his mother and paternal grandfather. After Hadrian's adoptive son, Aelius Caesar, died in 138, Hadrian adopted Marcus's uncle Antoninus Pius as his new heir. In turn, Antoninus adopted Marcus and Lucius, the son of Aelius. Hadrian died that year, and Antoninus became emperor. Now heir to the throne, Marcus studied Greek and Latin under tutors such as Herodes Atticus and Marcus Cornelius Fronto. He married Antoninus's daughter Faustina in 145. After Antoninus died in 161, Marcus acceded to the throne alongside his adoptive brother, who took the regnal name Lucius Aurelius Verus. Under the reign of Marcus Aurelius, the Roman Empire witnessed much military conflict.",
+   "kind": "relevant",
+   "article": "Marcus Aurelius",
+   "logit": 0.9134581089019775,
+   "score": 0.7137072772457641
+  },
+  {
+   "query": "a Roman emperor who wrote a private notebook",
+   "passage": "Protagoras (/proʊˈtæɡərəs, -æs/ proh-TAG-ər-əs, -⁠ass; Greek: Πρωταγόρας; c. 490 BC – c. 420 BC) was a pre-Socratic Greek philosopher and rhetorical theorist. He is numbered as one of the sophists by Plato. In his dialogue Protagoras, Plato credits him with inventing the role of the professional sophist. Protagoras is also believed to have created a major controversy during ancient times through his statement that \"Of all things the measure is Man, of the things that are, that they are, and of the things that are not, that they are not\" which was usually rendered simply as \"Man is the measure of all things,\" interpreted (possibly wrongly, since he disagreed[clarification needed]) by Plato to mean that there is no objective truth; Protagoras seems to have meant that each person's own personal history, experiences and expectations, developed over their lifetime, determine their judgments, ",
+   "kind": "unrelated",
+   "article": "Protagoras",
+   "logit": 1.0941591262817383,
+   "score": 0.7491641028374698
+  },
+  {
+   "query": "you cannot step into the same river twice",
+   "passage": "Heraclitus (/ˌhɛrəˈklaɪtəs/; Ancient Greek: Ἡράκλειτος, romanized: Hērákleitos; fl. c. 500 BC) as an ancient Greek pre-Socratic philosopher from the city of Ephesus, which was then part of the Persian Empire. He exerts a wide influence on Western philosophy, both ancient and modern, through the works of such authors as Plato, Aristotle, Georg Wilhelm Friedrich Hegel, Friedrich Nietzsche, and Martin Heidegger. Little is known of Heraclitus's life. He wrote a single work, of which only fragments survive. Even in ancient times, his paradoxical philosophy, appreciation for wordplay, and cryptic, oracular epigrams earned him the epithets \"the dark\" and \"the obscure\". He was considered arrogant and depressed, a misanthrope who was subject to melancholia.",
+   "kind": "relevant",
+   "article": "Heraclitus",
+   "logit": 0.2812022566795349,
+   "score": 0.5698409485034333
+  },
+  {
+   "query": "you cannot step into the same river twice",
+   "passage": "Aristotle (Attic Greek: Ἀριστοτέλης, romanized: Aristotélēs; 384–322 BC) was an ancient Greek philosopher and polymath. His writings cover a broad range of subjects spanning the natural sciences, philosophy, linguistics, economics, politics, psychology, and the arts. As the founder of the Peripatetic school of philosophy in the Lyceum in Athens, he began the wider Aristotelian tradition that followed, which set the groundwork for the development of modern science. Little is known about Aristotle's life. He was born in the city of Stagira in northern Greece during the Classical period. His father, Nicomachus, died when Aristotle was a child, and he was brought up by a guardian. At around eighteen years old, he joined Plato's Academy in Athens and remained there until the age of thirty seven (c. 347 BC).",
+   "kind": "unrelated",
+   "article": "Aristotle",
+   "logit": 0.0491965115070343,
+   "score": 0.5122966478487339
+  },
+  {
+   "query": "the woman mathematician murdered in Alexandria",
+   "passage": "and astronomy, and in her lifetime was renowned as a great teacher and a wise counselor. Not the only fourth century Alexandrian female mathematician, Hypatia was preceded by Pandrosion. However, Hypatia is the first female mathematician whose life is reasonably well recorded. She wrote a commentary on Diophantus's thirteen-volume Arithmetica, which may survive in part, having been interpolated into Diophantus's original text, and another commentary on Apollonius of Perga's treatise on conic sections, which has not survived. Many modern scholars also believe that Hypatia may have edited the surviving text of Ptolemy's Almagest, based on the title of her father Theon's commentary on Book III of the Almagest. Hypatia constructed astrolabes and hydrometers, but did not invent either of these, which were both in use long before she was born.",
+   "kind": "relevant",
+   "article": "Hypatia",
+   "logit": 1.9452968835830688,
+   "score": 0.8749329086617755
+  },
+  {
+   "query": "the woman mathematician murdered in Alexandria",
+   "passage": "Lucius Annaeus Seneca the Younger (/ˈsɛnɪkə/ SEN-ik-ə; c. 4 BC – AD 65), usually known mononymously as Seneca, was a Stoic philosopher of Ancient Rome, a statesman, a dramatist, and in one work, a satirist, from the post-Augustan age of Latin literature. Seneca was born in Colonia Patricia Corduba in Hispania, and was trained in rhetoric and philosophy in Rome. His father was Seneca the Elder, his elder brother was Lucius Junius Gallio Annaeanus, and his nephew was the poet Lucan. In AD 41, Seneca was exiled to the island of Corsica under emperor Claudius, but was allowed to return in 49 to become a tutor to Nero. When Nero became emperor in 54, Seneca became his advisor and, together with the praetorian prefect Sextus Afranius Burrus, provided competent government for the first five years of Nero's reign.",
+   "kind": "unrelated",
+   "article": "Seneca the Younger",
+   "logit": -0.2770135700702667,
+   "score": 0.4311860906992173
+  },
+  {
+   "query": "man is the measure of all things",
+   "passage": "of all things,\" interpreted (possibly wrongly, since he disagreed[clarification needed]) by Plato to mean that there is no objective truth; Protagoras seems to have meant that each person's own personal history, experiences and expectations, developed over their lifetime, determine their judgments, opinions, and statements regarding \"truth\" (which is the title of the book in which Protagoras made this statement). When a person makes a judgment about a certain thing—good or bad or beautiful or unjust—that person will differ from other people's judgments because their experience has been different. This concept of individual relativity was intended to be provocative; naturally, it was criticized by Plato and other philosophers, contrasting with both popular opinion and other philosophical doctrine that reality and its truth must have an objective grounding.",
+   "kind": "relevant",
+   "article": "Protagoras",
+   "logit": 1.3938887119293213,
+   "score": 0.8012123282490404
+  },
+  {
+   "query": "man is the measure of all things",
+   "passage": "Stoicism was a school of Hellenistic philosophy. It was founded in Athens by Zeno of Citium in the early third century BC. It concerns the active relationship between cosmic determinism and human freedom. This philosophy claims that it is virtuous to maintain a will (a determination, prohairesis) which is according to the participants \"in accord with nature\". The Stoics believed that the universe was ruled by reason, which they thought of as God being present in nature itself. Stoic doctrine was popular in Greece and the Roman Empire from its founding until all the schools of philosophy were ordered closed in 529 AD by the Emperor Justinian I, who thought their pagan character was at odds with his Christian faith.",
+   "kind": "unrelated",
+   "article": "Stoicism",
+   "logit": 0.9292768239974976,
+   "score": 0.7169285457308645
+  },
+  {
+   "query": "the school that met at the Lyceum",
+   "passage": "Aristotle (Attic Greek: Ἀριστοτέλης, romanized: Aristotélēs; 384–322 BC) was an ancient Greek philosopher and polymath. His writings cover a broad range of subjects spanning the natural sciences, philosophy, linguistics, economics, politics, psychology, and the arts. As the founder of the Peripatetic school of philosophy in the Lyceum in Athens, he began the wider Aristotelian tradition that followed, which set the groundwork for the development of modern science. Little is known about Aristotle's life. He was born in the city of Stagira in northern Greece during the Classical period. His father, Nicomachus, died when Aristotle was a child, and he was brought up by a guardian. At around eighteen years old, he joined Plato's Academy in Athens and remained there until the age of thirty seven (c. 347 BC).",
+   "kind": "relevant",
+   "article": "Aristotle",
+   "logit": 1.9870672225952148,
+   "score": 0.8794325181935013
+  },
+  {
+   "query": "the school that met at the Lyceum",
+   "passage": "The allegory of the cave is an allegory presented by the Greek philosopher Plato in his work Republic (514a–520a, Book VII) to compare \"the effect of education (παιδεία) and the lack of it on our nature\". It is written as a dialogue between Plato's brother Glaucon and his mentor Socrates and is narrated by the latter. The allegory is presented after the analogy of the Sun (508b–509c) and the analogy of the divided line (509d–511e). In the allegory, Plato describes people who have spent their entire lives chained by their necks and ankles in front of an inner wall with a view of the empty outer wall of the cave. They observe the shadows projected onto the outer wall by objects carried behind the inner wall by people who are invisible to the chained “prisoners” and who walk along the inner wall with a fire behind them, creating the shadows on the inner wall in front of the prisoners.",
+   "kind": "unrelated",
+   "article": "Allegory of the cave",
+   "logit": -0.5852953791618347,
+   "score": 0.35771503935434584
+  }
+ ]
+}

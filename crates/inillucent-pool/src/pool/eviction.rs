@@ -407,7 +407,21 @@ impl Pool {
             }
             self.cool()?;
             match self.evict_one()? {
-                Some(_) => gone = gone.saturating_add(1),
+                // **Back on the free list, because nobody else will put it
+                // there** (task-2150). `evict_one` hands the frame it emptied to
+                // its caller, and `take_frame` uses it at once; this caller has
+                // no page to put in it. Dropping the index lost the frame: it
+                // was neither resident nor free, so a connection whose pool was
+                // full when another process wrote the file came back from the
+                // resynchronisation with no frame to read anything into, and
+                // every statement after that failed with "every frame in the
+                // buffer pool is pinned". Nikaya's server, a 32,768 frame pool
+                // over a 6.9 GB file, was stuck that way after one write from
+                // another process.
+                Some(frame) => {
+                    self.state.borrow_mut().free.push(frame);
+                    gone = gone.saturating_add(1);
+                }
                 None => break,
             }
         }

@@ -269,6 +269,10 @@ TLS comes from the operating system: SChannel on Windows, and the system OpenSSL
 A machine with neither gets an error that names what to install.
 [Dependency policy](dependency-policy.md) explains why inillucent uses the operating system's TLS.
 
+This section is about the connection. The database a migration writes is not encrypted, whatever
+key the command line was given. To end with an encrypted database, run `inillucent encrypt` on the
+result and remove the plaintext file. [Encryption at rest](encryption.md) describes it.
+
 <a id="mysql-caching_sha2_password"></a>
 
 ## MySQL `caching_sha2_password`

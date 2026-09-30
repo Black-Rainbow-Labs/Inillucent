@@ -108,6 +108,28 @@ when `embed(TEXT)` is first called, from the folder `inillucent setup-embeddings
 | `read_only` | `false` |
 | `cache_frames` | 4,096 frames, which is 128 MiB at the engine's 32 KiB page |
 | `limits` | unbounded |
+| `key` | `None`. With a key the database is encrypted at rest; see below |
+
+### An encrypted database
+
+```rust
+use inillucent_driver::{Database, EncryptionKey, OpenOptions};
+
+let options = OpenOptions {
+    key: Some(EncryptionKey::parse("correct horse battery staple")),
+    ..OpenOptions::default()
+};
+let database = Database::open_with("app.rdb", options)?;
+```
+
+The database file, its log and its journals are encrypted with XChaCha20-Poly1305.
+`EncryptionKey::parse` reads `x'<64 hex digits>'` as a raw 32 byte key and anything else as a
+passphrase, which costs about 200 ms of PBKDF2 per open. A wrong key, no key for an encrypted file
+and a key for a plaintext file all fail with `Status::Corrupt`. `Database::export_to(path, key)`
+writes an encrypted or a plaintext copy, and `PRAGMA rekey = '...'` changes the key. The C library
+has `inillucent_open_with_key`, and the npm, Go, PHP and Python packages have a `key` option that
+reaches the command line through `INILLUCENT_KEY`. Keep the key out of source code and out of a
+command line: read it from a secret store or from the environment.
 
 ## Six behaviors to design around
 
@@ -158,5 +180,5 @@ sees:
 inillucent --db app.rdb query "SELECT * FROM note" --output json
 ```
 
-`inillucent` has all 30 commands, and `inillucent-mcp` serves 28 of those commands over MCP. See
+`inillucent` has all 34 commands, and `inillucent-mcp` serves 29 of those commands over MCP. See
 [`inillucent-mcp`](../inillucent-mcp/SKILL.md).

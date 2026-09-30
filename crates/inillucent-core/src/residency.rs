@@ -51,6 +51,8 @@ use std::time::Instant;
 use crate::embed::Embedder;
 #[cfg(feature = "onnx")]
 use crate::embed_onnx::{OnnxEmbedder, OnnxOptions};
+#[cfg(feature = "onnx")]
+use crate::rerank_onnx::OnnxReranker;
 
 /// How long an `idle` profile keeps the model with nothing asking for it.
 pub const DEFAULT_IDLE: Duration = Duration::from_secs(300);
@@ -178,9 +180,42 @@ pub struct Stats {
     pub embed_ms: u64,
 }
 
+/// A model session that a [`Managed`] holder can open, keep and drop.
+///
+/// The residency policy, the counters and the idle reaper do not depend on what the session
+/// computes, so the embedder and the reranker share them through this one trait instead of
+/// carrying a copy each.
+#[cfg(feature = "onnx")]
+pub trait Session: Send + 'static {
+    /// Opens the session from a model folder.
+    ///
+    /// @param dir - the model folder
+    /// @param model_file - the weights file inside it
+    /// @param options - how the session is opened
+    fn open(dir: &Path, model_file: &str, options: OnnxOptions) -> Result<Self>
+    where
+        Self: Sized;
+}
+
+#[cfg(feature = "onnx")]
+impl Session for OnnxEmbedder {
+    /// Opens the embedder.
+    fn open(dir: &Path, model_file: &str, options: OnnxOptions) -> Result<Self> {
+        OnnxEmbedder::open_model(dir, model_file, options)
+    }
+}
+
+#[cfg(feature = "onnx")]
+impl Session for OnnxReranker {
+    /// Opens the reranker.
+    fn open(dir: &Path, model_file: &str, options: OnnxOptions) -> Result<Self> {
+        OnnxReranker::open_file(dir, model_file, options)
+    }
+}
+
 /// The parts a reaper thread has to reach without keeping the model alive.
 #[cfg(feature = "onnx")]
-struct Shared {
+struct Shared<S: Session> {
     dir: PathBuf,
     model_file: String,
     options: OnnxOptions,
@@ -191,7 +226,7 @@ struct Shared {
     /// touched" are read together by the reaper and written together by a call,
     /// and two locks over the two halves is how a reaper evicts a session that a
     /// call had just claimed.
-    state: Mutex<Loaded>,
+    state: Mutex<Loaded<S>>,
     /// Woken when a call finishes, so a reaper that is parked until a deadline
     /// that has just moved does not have to sleep through the old one.
     idle: Condvar,
@@ -204,26 +239,43 @@ struct Shared {
 
 /// The session, when there is one, and when it was last used.
 #[cfg(feature = "onnx")]
-struct Loaded {
-    embedder: Option<OnnxEmbedder>,
+struct Loaded<S: Session> {
+    embedder: Option<S>,
     last_used: Instant,
     /// Whether a reaper thread is already parked on this state.
     reaping: bool,
 }
 
-/// An embedder that loads and unloads according to a policy.
+/// A model session that loads and unloads according to a policy.
 ///
 /// Cheap to clone: every clone names the same session and the same counters, so
 /// a server can hand one to each of its request paths without any of them
 /// loading a second copy of the weights.
 #[cfg(feature = "onnx")]
-#[derive(Clone)]
-pub struct ManagedEmbedder {
-    shared: Arc<Shared>,
+pub struct Managed<S: Session> {
+    shared: Arc<Shared<S>>,
 }
 
 #[cfg(feature = "onnx")]
-impl ManagedEmbedder {
+impl<S: Session> Clone for Managed<S> {
+    /// Names the same session and the same counters.
+    fn clone(&self) -> Self {
+        Managed {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+/// An embedder that loads and unloads according to a policy.
+#[cfg(feature = "onnx")]
+pub type ManagedEmbedder = Managed<OnnxEmbedder>;
+
+/// A reranker that loads and unloads according to the same policy as the embedder.
+#[cfg(feature = "onnx")]
+pub type ManagedReranker = Managed<OnnxReranker>;
+
+#[cfg(feature = "onnx")]
+impl<S: Session> Managed<S> {
     /// Builds one over a model directory. Nothing is loaded until the first call.
     ///
     /// Deliberately lazy even for [`Residency::Resident`]: a process that builds
@@ -240,8 +292,8 @@ impl ManagedEmbedder {
         model_file: impl Into<String>,
         options: OnnxOptions,
         residency: Residency,
-    ) -> ManagedEmbedder {
-        ManagedEmbedder {
+    ) -> Managed<S> {
+        Managed {
             shared: Arc::new(Shared {
                 dir: dir.as_ref().to_path_buf(),
                 model_file: model_file.into(),
@@ -300,31 +352,6 @@ impl ManagedEmbedder {
         }
     }
 
-    /// Embeds texts as documents, applying the model's document prefix.
-    ///
-    /// @param texts - the texts
-    pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        self.with_session(texts.len() as u64, |embedder| {
-            embedder.embed_documents(texts)
-        })
-    }
-
-    /// Embeds one text as a query, applying the model's query prefix.
-    ///
-    /// @param text - the query
-    pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
-        self.with_session(1, |embedder| embedder.embed_query(text))
-    }
-
-    /// Embeds texts that already carry whatever prefix they need.
-    ///
-    /// @param texts - the prefixed texts
-    pub fn embed_prefixed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        self.with_session(texts.len() as u64, |embedder| {
-            embedder.embed_prefixed(texts)
-        })
-    }
-
     /// Runs one operation against a loaded session, loading and unloading as the
     /// policy requires.
     ///
@@ -335,11 +362,7 @@ impl ManagedEmbedder {
     ///
     /// @param texts - how many texts this call is embedding, for the counters
     /// @param run - what to do with the session
-    fn with_session<T>(
-        &self,
-        texts: u64,
-        run: impl FnOnce(&OnnxEmbedder) -> Result<T>,
-    ) -> Result<T> {
+    fn with_session<T>(&self, texts: u64, run: impl FnOnce(&S) -> Result<T>) -> Result<T> {
         let shared = &self.shared;
         let mut state = shared
             .state
@@ -348,9 +371,8 @@ impl ManagedEmbedder {
 
         if state.embedder.is_none() {
             let started = Instant::now();
-            let embedder =
-                OnnxEmbedder::open_model(&shared.dir, &shared.model_file, shared.options.clone())
-                    .with_context(|| {
+            let embedder = S::open(&shared.dir, &shared.model_file, shared.options.clone())
+                .with_context(|| {
                     format!(
                         "loading {} from {} for the {} profile",
                         shared.model_file,
@@ -402,6 +424,47 @@ impl ManagedEmbedder {
     }
 }
 
+#[cfg(feature = "onnx")]
+impl ManagedEmbedder {
+    /// Embeds texts as documents, applying the model's document prefix.
+    ///
+    /// @param texts - the texts
+    pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.with_session(texts.len() as u64, |embedder| {
+            embedder.embed_documents(texts)
+        })
+    }
+
+    /// Embeds one text as a query, applying the model's query prefix.
+    ///
+    /// @param text - the query
+    pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.with_session(1, |embedder| embedder.embed_query(text))
+    }
+
+    /// Embeds texts that already carry whatever prefix they need.
+    ///
+    /// @param texts - the prefixed texts
+    pub fn embed_prefixed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.with_session(texts.len() as u64, |embedder| {
+            embedder.embed_prefixed(texts)
+        })
+    }
+}
+
+#[cfg(feature = "onnx")]
+impl ManagedReranker {
+    /// Scores each passage against the question, loading the reranker if the policy says it is not in memory.
+    ///
+    /// @param query - the question, in plain words
+    /// @param passages - the passages to score
+    pub fn score(&self, query: &str, passages: &[&str]) -> Result<Vec<f32>> {
+        self.with_session(passages.len() as u64, |reranker| {
+            reranker.score(query, passages)
+        })
+    }
+}
+
 /// Milliseconds since an instant, saturating rather than wrapping.
 ///
 /// @param started - when the span began
@@ -421,7 +484,7 @@ fn elapsed_ms(started: Instant) -> u64 {
 /// @param shared - a weak handle to the state
 /// @param after - how long with no call before the session is dropped
 #[cfg(feature = "onnx")]
-fn spawn_reaper(shared: Weak<Shared>, after: Duration) {
+fn spawn_reaper<S: Session>(shared: Weak<Shared<S>>, after: Duration) {
     let handed = shared.clone();
     let spawned = std::thread::Builder::new()
         .name("inillucent-embed-reaper".to_string())
@@ -445,7 +508,7 @@ fn spawn_reaper(shared: Weak<Shared>, after: Duration) {
 /// @param shared - a weak handle to the state
 /// @param after - the idle period
 #[cfg(feature = "onnx")]
-fn reap(shared: Weak<Shared>, after: Duration) {
+fn reap<S: Session>(shared: Weak<Shared<S>>, after: Duration) {
     loop {
         let Some(shared) = shared.upgrade() else {
             return;

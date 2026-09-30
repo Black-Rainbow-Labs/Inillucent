@@ -80,10 +80,10 @@ The Python conformance runner prints the size of the table when it finishes:
 
 ```
 $ python drivers/bindings/python/run_conformance.py
-50 capabilities reported
+53 capabilities reported
 ```
 
-The 50 rows are 32 `yes`, 2 `partial` and 16 `no`. The two `partial` rows are:
+The 52 rows are 34 `yes`, 2 `partial` and 16 `no`. The two `partial` rows are:
 
 | Capability | Why it is `partial` |
 |---|---|
@@ -173,6 +173,40 @@ integers and back.
 | `diagnostics` | `false` |
 | `limits` | unbounded |
 | `statement_cache` | 1,000 compiled statements per connection |
+
+## Encrypted databases
+
+A database opened with a key is encrypted at rest with XChaCha20-Poly1305: the database file, its
+log and its journals. `docs/encryption.md` in the repository describes what is encrypted and what
+it costs.
+
+| Language | How the key is given |
+|---|---|
+| Rust | `OpenOptions { key: Some(EncryptionKey::parse("...")), ..OpenOptions::default() }` |
+| C | `inillucent_open_with_key(path, flags, key, &db, &error)`, with the key as a UTF-8 string. A null key is `inillucent_open` |
+| Python over the C library | `inillucent.Database(path, key="...")` |
+| npm, Go, PHP and the Python package | a `key` option. The package passes it to the command line in the `INILLUCENT_KEY` environment variable |
+
+`x'<64 hex digits>'` is a raw 32 byte key and any other text is a passphrase. A wrong key, a key for
+a plaintext file and no key for an encrypted file all fail with the status `corrupt`
+(`INILLUCENT_CORRUPT`), which is what SQLite answers for a file it cannot read as a database.
+
+```rust
+use inillucent_driver::{Database, EncryptionKey, OpenOptions};
+
+let options = OpenOptions {
+    key: Some(EncryptionKey::parse("correct horse battery staple")),
+    ..OpenOptions::default()
+};
+let database = Database::open_with("app.rdb", options)?;
+database.session().execute("CREATE TABLE note (body TEXT)", &[])?;
+assert!(database.is_encrypted());
+database.export_to("plain-copy.rdb", None)?; // a plaintext copy
+```
+
+`Database::export_to(path, key)` writes a copy encrypted with `key`, or in plaintext when `key` is
+`None`. It is how a plaintext database becomes an encrypted one and back. `PRAGMA rekey = '...'`
+changes the key of an encrypted database.
 
 ## The capability table
 
@@ -340,7 +374,7 @@ tests this. It is the one case that sets `"connection": "per_call"`.
 
 ## ABI stability
 
-`abi.toml` gives each of the 53 symbols in the header a stability and a `since` version.
+`abi.toml` gives each of the 54 symbols in the header a stability and a `since` version.
 `inillucent-driver-capi/tests/abi.rs` checks that the header, `abi.toml` and the Rust code name the
 same symbols. It also checks that every numeric constant in the header equals the driver's own enum
 value. A status renumbered in Rust without the header changing would make every binding read every
@@ -351,7 +385,8 @@ error wrongly, and both sides would still compile.
 | stable | The signature will not change, and the symbol will not be removed. |
 | provisional | The symbol exists and may change in a minor version. `inillucent_cancel` is the only provisional symbol. It asks a running statement to stop, and the statement then fails with `INILLUCENT_INTERRUPTED`. |
 
-The ABI version is 1.0.0, and `inillucent_abi_version()` returns 1000000.
+The ABI version is 1.1.0, and `inillucent_abi_version()` returns 1001000. Version 1.1.0 added
+`inillucent_open_with_key`. A binding written against 1.0.0 finds every symbol it calls.
 
 ## Building the C library
 

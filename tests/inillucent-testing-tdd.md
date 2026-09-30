@@ -161,13 +161,13 @@ check a run against.
 | tier | targets | tests | cadence | what it is for |
 |---|---:|---:|---|---|
 | `smoke` | 1 | 10 | `change` | the ten-second answer: a real file opened, written, reopened, read |
-| `unit` | 31 | 1,446 | `change` | every crate's own `#[cfg(test)]` modules |
-| `engine` | 71 | 466 | `change` | SQL and storage behaviour over real database files |
+| `unit` | 31 | 1,471 | `change` | every crate's own `#[cfg(test)]` modules |
+| `engine` | 77 | 484 | `change` | SQL and storage behaviour over real database files |
 | `differential` | 34 | 349 | `change` | graded against the pinned SQLite 3.53.4 |
-| `durability` | 34 | 234 | `merge` | crashes, injected faults, corruption and concurrency |
-| `e2e` | 36 | 432 | `change` | the public surfaces an application binds to, end to end |
+| `durability` | 35 | 239 | `merge` | crashes, injected faults, corruption and concurrency |
+| `e2e` | 36 | 437 | `change` | the public surfaces an application binds to, end to end |
 | `perf` | 1 | 8 | `merge` | the cost guards — **runs alone**, see §5 |
-| `retrieval` | 7 | 570 | `change` | the embedding and retrieval engine, and its graded harness |
+| `retrieval` | 12 | 570 | `change` | the embedding and retrieval engine, and its graded harness |
 | `tooling` | 17 | 150 | `change` | the checks that keep the repository's own rules true |
 | `matrix` | 24 | 187 | `change` | the SQL statement matrix: every statement form with every pair of contexts, graded against the pinned SQLite |
 | `matrix_deep` | 24 | 54 | `merge` | the statement matrix at every configuration arm, every triple of contexts, and the driver's other surfaces |

@@ -217,19 +217,21 @@ prerequisite in `tests/selection.toml` is missing from this table or has a diffe
 |---|---:|---|
 | `oracle` | 79 | the pinned SQLite 3.53.4 comparison process: `pwsh tools/sqlite-reference.ps1` or `bash tools/sqlite-reference.sh` |
 | `shell` | 9 | the pinned `sqlite3` 3.53.4 shell, built by the same two scripts |
+| `embed` | 7 | a build with `inillucent-engine/embed` turned on. The runner builds it from the target's `features` row, and passes a row's `inillucent-cli/embed` to the build of the programs too. `tools/coverage.mjs` does not, because the feature needs `inillucent-core/onnx` and `inillucent-core` is left out of the coverage run |
 | `tracked-fixtures` | 5 | the files under `compat/fixtures/`, which are committed. A new clone has them. The row is for a checkout that has lost them |
 | `onnx` | 3 | ONNX Runtime and the embedding weights: `inillucent setup-embeddings all` |
 | `python` | 3 | Python with the `ssl` module, for the TLS server, the `ctypes` conformance runner and the workload extractor |
 | `fixtures` | 2 | the gate fixtures, 1.2 MB and 120 MB, which are not committed: `bash tools/build-gate-fixtures.sh _agent_output/fixtures` |
+| `reranker` | 2 | the reranker, `gte-reranker-modernbert-base`: `inillucent setup-embeddings reranker` |
 | `directory-link` | 2 | permission to create a directory link. Windows gives it to an elevated shell or a machine in developer mode |
 | `node` | 1 | Node.js, for the npm package's conformance runner: https://nodejs.org/ |
 | `go` | 1 | a Go toolchain, for the Go package's conformance runner: https://go.dev/dl/ |
 | `php` | 1 | PHP, for the PHP package's conformance runner: https://www.php.net/downloads |
 | `asan` | 1 | an address sanitizer in the C toolchain: MSVC with its `clang_rt.asan` runtime on Windows, or `cc -fsanitize=address` on Linux x86-64 or aarch64. The Rust side uses the pinned compiler with `RUSTC_BOOTSTRAP=1`, so no nightly is needed. `INILLUCENT_CAPI_ASAN=1` makes its absence a failure |
-| `embed` | 1 | a build with `inillucent-engine/embed` turned on. The runner builds it from the target's `features` row. `tools/coverage.mjs` does not, because the feature needs `inillucent-core/onnx` and `inillucent-core` is left out of the coverage run |
 | `baseline` | 1 | a recorded performance baseline: `cargo run -p inillucent-compat --bin inillucent-baseline -- capture` |
 | `btree-corpus` | 1 | the saved sequences under `compat/corpus/btree/`, which are committed |
 | `cc` | 1 | a C compiler on `PATH`, for the program that links the C ABI |
+| `cuda` | 1 | a graphics card that ONNX Runtime can run the model on, and the CUDA build of the runtime: `inillucent setup-embeddings runtime --gpu`. Only card 0 is used |
 | `local-timezone` | 1 | a local time zone set in the operating system: `localtime_r` on Unix, `SystemTimeToTzSpecificLocalTime` on Windows |
 | `mysql` | 1 | a running MySQL server, named by `INILLUCENT_TEST_MYSQL_URL` |
 | `narrow-slots` | 1 | the narrow integer slots compiled in, set by a constant in `crates/inillucent-tree/src/leaf.rs` |
@@ -249,8 +251,8 @@ a prerequisite and its suite cannot skip. Those two checks keep this table equal
 
 ## What the tests cover
 
-The workspace has 4,008 tests across 285 test targets, counted tier by tier on 26 September 2026 in
-the tier table of `tests/inillucent-testing-tdd.md`. There are 285 rows in `tests/selection.toml`,
+The workspace has 4,008 tests across 297 test targets, counted tier by tier on 26 September 2026 in
+the tier table of `tests/inillucent-testing-tdd.md`. There are 297 rows in `tests/selection.toml`,
 and each row is one `[[target]]` that the runner runs. `tools/doc-facts/check.mjs` fails when this
 page gives a different count from `tests/selection.toml`.
 

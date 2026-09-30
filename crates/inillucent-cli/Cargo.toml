@@ -34,7 +34,7 @@ path = "src/bin/inillucent-mcp.rs"
 default = []
 # Passes the retrieval engine's in-process embedder through, so
 # `embed(TEXT)` answers. Off by default: see `inillucent-search`.
-embed = ["inillucent-engine/embed"]
+embed = ["inillucent-engine/embed", "inillucent-core/onnx"]
 
 [dependencies]
 inillucent-alloc = { workspace = true }

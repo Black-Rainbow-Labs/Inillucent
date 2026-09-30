@@ -21,10 +21,11 @@ final class Process
      *
      * @param list<string> $argv the program and its arguments
      * @param string|null $stdin what to write to its standard input
+     * @param array<string,string> $environment variables added to this process's own environment for the child
      * @return array{stdout:string,stderr:string,code:int}
      * @throws Error when the program could not be started at all
      */
-    public static function run(array $argv, ?string $stdin = null): array
+    public static function run(array $argv, ?string $stdin = null, array $environment = []): array
     {
         $descriptors = [
             0 => ['pipe', 'r'],
@@ -32,7 +33,10 @@ final class Process
             2 => ['pipe', 'w'],
         ];
         $pipes = [];
-        $handle = @proc_open($argv, $descriptors, $pipes);
+        // A null environment makes the child inherit this process's own, so it is
+        // only built when a caller asked for a variable to be added.
+        $env = $environment === [] ? null : array_merge(getenv(), $environment);
+        $handle = @proc_open($argv, $descriptors, $pipes, null, $env);
         if ($handle === false) {
             throw new Error(
                 sprintf('could not run %s. Is it installed and on PATH?', $argv[0] ?? 'inillucent'),

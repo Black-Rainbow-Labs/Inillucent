@@ -162,10 +162,11 @@ quoting bugs, and every language binding works the same way.
 
 | Command | What it does |
 |---|---|
-| `inillucent help` | lists all 30 commands |
+| `inillucent help` | lists all 34 commands |
 | `inillucent help <command>` | explains one command and every parameter it takes |
 | `inillucent-shell app.rdb` | an interactive shell that works like `sqlite3`, with 63 of its 65 dot commands |
 | `inillucent-mcp --db app.rdb` | serves the commands to an AI agent; see the `inillucent-mcp` skill |
+| `inillucent --key-file app.key create app.rdb` | creates an encrypted database. Every later command on it needs `--key-file app.key` or `INILLUCENT_KEY` |
 
 ## Next
 

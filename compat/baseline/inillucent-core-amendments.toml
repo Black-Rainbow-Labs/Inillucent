@@ -26,9 +26,9 @@ sha256 = "51481630369add08d37508f8ddbac2ae5dd552feda58bc44f3914ee0e7ed1510"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/embedcheck.rs"
-ticket = "task-2110"
-reason = "Bug 5: a manifest can say runnable false, for a model whose vectors come from outside (the Qwen3 teachers), and an installed arm that fails to open fails the arm tests rather than skipping"
-sha256 = "f738cddf653d90e174034d99401d1c6f92f6c6fd8b45662958041aea0bcc4da7"
+ticket = "task-2158"
+reason = "task-2158: the test manifest names its kind, a bi encoder, because ModelManifest gained the kind field. No change to what the test checks."
+sha256 = "5fabf9326cc46ceec6b61793c6c788fd0f71574c0cafb732800ffa94f4deabc2"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/engine.rs"
@@ -62,9 +62,9 @@ sha256 = "ab368ee7cdb99c2bb13b3c15299ac1ef2f29784b20f38137f2368703054b2777"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/main.rs"
-ticket = "task-1973"
-reason = "task-1973 turned on the four lints and missing_docs for this crate (one attribute per lint, the form every governed crate uses). 191 sites answered across the crate; every one in this file now propagates a caught error or reads through .get(). main was 576 lines and is 127: one function per subcommand. The three widest subcommands carry an Args struct (TuneArgs, GradeArgs, GradeEmbeddingArgs) so their functions take one parameter rather than twenty; the command line surface is unchanged, checked with --help. synth_embed takes a SynthEmbedRequest and its allow(clippy::too_many_arguments) is gone, which is what task-1970's no_function_takes_more_than_eight_parameters exempted."
-sha256 = "e962ba3317b4dff84c5f61d10caaa724cdf0c81f1b757f0ab690e73a5d89462d"
+ticket = "task-2158"
+reason = "task-2158: the rerank-cost subcommand."
+sha256 = "18a4a8c8c482cfa47e54c585952294cbc4c32a5837eec44725c4a58669139e0c"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/metrics.rs"
@@ -74,9 +74,9 @@ sha256 = "641c0bafaaaa7821837056b1f26a50d8211e10693074d87df99ab9868754bf9e"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/models.rs"
-ticket = "task-2110"
-reason = "Bug 5: a manifest can say runnable false, for a model whose vectors come from outside (the Qwen3 teachers), and an installed arm that fails to open fails the arm tests rather than skipping"
-sha256 = "1108adb3d0aef55f0671952663087e2551c58c7724095d9f28292945c86d3c12"
+ticket = "task-2158"
+reason = "task-2158: the test manifest names its kind, a bi encoder, because ModelManifest gained the kind field. No change to what the test checks."
+sha256 = "3d2dbe24ef0c37622e70284d8157e49473da890cce172a33c29d9756f0b39fdb"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/queryset.rs"
@@ -89,6 +89,12 @@ path = "crates/inillucent-bench/src/report.rs"
 ticket = "task-1973"
 reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. render was 262 lines and is 22, over nine push_* helpers, one per section of the card. Doc comment on print_summary."
 sha256 = "4da5736e689d05002bb007c06e2263250060646174574c9af20e09b3c9a2a287"
+
+[[amendment]]
+path = "crates/inillucent-bench/src/rerankcost.rs"
+ticket = "task-2158"
+reason = "task-2158: new file. Times OnnxReranker score per device."
+sha256 = "17507bc18076e49e90f8e694ce7d8aebf346cc5c4cc74b500ce48d6b08fc79cd"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/residency.rs"
@@ -134,9 +140,9 @@ sha256 = "fa7a8835c1902cb0416076044c595c8bd41be314ae9a51061b19727e03f31dc2"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/truncation.rs"
-ticket = "task-2110"
-reason = "Bug 5: a manifest can say runnable false, for a model whose vectors come from outside (the Qwen3 teachers), and an installed arm that fails to open fails the arm tests rather than skipping"
-sha256 = "15f02de728473198d3e9c9115379d1039f1ce126ddc966039ed28dadec6027bb"
+ticket = "task-2158"
+reason = "task-2158: the test manifest names its kind, a bi encoder, because ModelManifest gained the kind field. No change to what the test checks."
+sha256 = "23cc5f3da17c99e162acbfca9b39325ce9e0417e56439239355eaf5ac8b67dc0"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/tune.rs"
@@ -176,9 +182,9 @@ sha256 = "3f8c9918845848bba6c58be46c3b9c47a97f72ad4847bdfb707c1091cae10ccb"
 
 [[amendment]]
 path = "crates/inillucent-core/src/embed_onnx.rs"
-ticket = "task-1970"
-reason = "six eprintln skips became inillucent_base::testing::skipping, which panics under INILLUCENT_STRICT so the strict runner can see them (task-1969, 4.6)"
-sha256 = "80e692f01f2f2e142813c733db563036ca2a7152d293d69d6594454bebfc9885"
+ticket = "task-2158"
+reason = "task-2158: session building moved into build_session so the embedder and the reranker share it, the CUDA failure message names the runtime install command, with_configured_machine reads the thread and device settings, embed_prefixed_counted reports each text token count, and TokenCounter counts tokens without a session. No change to what any vector is."
+sha256 = "88ace895fe9bbcd91e500b68513a5310a261e512473d484d14d4e508c27053cb"
 
 [[amendment]]
 path = "crates/inillucent-core/src/filter.rs"
@@ -206,21 +212,21 @@ sha256 = "2da11e58aeb70de253f1f22fc2d67094574d53654d839341f9104e73e2ea061e"
 
 [[amendment]]
 path = "crates/inillucent-core/src/install.rs"
-ticket = "task-1953"
-reason = "task-1946 H7: LEGACY_MODEL_ROOTS held a drive letter from the machine the engine was written on, which is machine configuration published as source. Extra roots come from a new INILLUCENT_MODEL_ROOTS variable; the search order is otherwise unchanged."
-sha256 = "b2059aa50d1b4b5e83c687845f0f43699ab26679153810f90ea2533c538bd6ef"
+ticket = "task-2158"
+reason = "task-2158: the thread count and device settings and where each came from, the reranker model id, and two fields in the install state. Path and setting arithmetic only."
+sha256 = "3c41295aeae315b1241cf416776ce2493c7c7d263f7ef9ef69dbc62ff8de0d68"
 
 [[amendment]]
 path = "crates/inillucent-core/src/lib.rs"
-ticket = "task-1932"
-reason = "H9: inillucent-core joins GOVERNED. The four panic lints and deny(missing_docs) are now on the crate, every module states its invariant, 167 doc comments were written and every indexing, slicing, unwrap and expect site the lints report is rewritten."
-sha256 = "684d92dc2622ba9bd7c5032c224a3848c81d5d1531846ab355560c9de4e4896d"
+ticket = "task-2158"
+reason = "task-2158: declares the rerank_onnx module behind the onnx feature."
+sha256 = "6d922f0be1b5a645179a7bb6035adf0b1ee7f01dd190e6c6bf74ead2ba7f2e2c"
 
 [[amendment]]
 path = "crates/inillucent-core/src/model.rs"
-ticket = "task-2110"
-reason = "Bug 5: a manifest can say runnable false, for a model whose vectors come from outside (the Qwen3 teachers), and an installed arm that fails to open fails the arm tests rather than skipping"
-sha256 = "44b7781a6d3147e79b283e9f518b65a33d41c43ff5f3983bb31630df5e53e689"
+ticket = "task-2158"
+reason = "task-2158: a model kind field, absent for a bi encoder and left out of its digest, and the reranker manifest. A test pins the digest of the baseline manifest."
+sha256 = "333a769c457507a76373cc19e3f8c652318c8575c08dd19f64b18d54fb50d65d"
 
 [[amendment]]
 path = "crates/inillucent-core/src/persist.rs"
@@ -241,10 +247,16 @@ reason = "M4: the 33rd flag name is an error rather than an abort, so add_chunks
 sha256 = "022f1fe51faf8019de7517920c0d00798c2121dd873b2f9a18f7b8dbec44e7c4"
 
 [[amendment]]
+path = "crates/inillucent-core/src/rerank_onnx.rs"
+ticket = "task-2158"
+reason = "task-2158: new file. A cross encoder reranker run in process, with tests against the study Python scores."
+sha256 = "76bcdcd2c409c80813dab9404864af9906eb43c70860745f8405440640e71a85"
+
+[[amendment]]
 path = "crates/inillucent-core/src/residency.rs"
-ticket = "task-2068"
-reason = "The skip site in managed_or_skip announced with a bare eprintln! carrying the marker and then returned None. A print does not panic under INILLUCENT_STRICT, and the policy guard could not read the message because the literal starts on the line after the eprintln!( - so all four ONNX residency cases reported green on a machine with no weights. The site now calls inillucent_base::testing::skipping, which is what task-1946 intended when it replaced a silent ? with a message. No behaviour changes on a machine that has the weights: the function returns None in exactly the same case, and the only difference is that a strict run now says so. task-2066 section 4.4.11."
-sha256 = "17e49794567b07924cf7ac27d97d8cea6b3e5725de7cec2ab2cf4489ced3f47f"
+ticket = "task-2158"
+reason = "task-2158: the residency manager is generic over the session type so the reranker uses the same profiles and reaper as the embedder. ManagedEmbedder is an alias and its behaviour is unchanged."
+sha256 = "6d585b2345b499ac5d0a34d465bbc84b3f488d370c5077e291469d0fef02fc41"
 
 [[amendment]]
 path = "crates/inillucent-core/src/store.rs"

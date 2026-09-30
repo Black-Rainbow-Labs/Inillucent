@@ -615,6 +615,26 @@ One way to choose it: run questions that do have an answer, take the confidence 
 each, and use a value just below the lowest of them. [Vector search](vector-search.md#confidence-is-a-separate-number-from-score)
 has measured thresholds and one case where a threshold alone is not enough.
 
+## Part 7: putting the best answers first with a reranker
+
+Hybrid search finds candidates. A reranker then reads the question and each candidate together and
+scores how well the candidate answers the question. A search that names `question` does this over
+its own results:
+
+```sql
+SELECT rowid, title, score(docs) AS relevance
+FROM docs
+WHERE docs MATCH 'release' AND vector = embed('search_query: when is the next release')
+  AND question = 'when is the next release' AND k = 5
+ORDER BY rank;
+```
+
+In the retrieval study behind [Retrieval for RAG, explained from the start](rag-explained.md), adding
+a reranker raised nDCG@10 by 0.10 to 0.13 on every collection and every embedding model, the
+largest gain the study measured. The reranker is a separate download, installed with
+`inillucent setup-embeddings reranker`. It takes 5 to 8 seconds for 60 candidates on a processor and
+about a tenth of a second on a graphics card. [Vector search](vector-search.md#reranking-a-search) has the details.
+
 ## Choosing what to build
 
 ```mermaid

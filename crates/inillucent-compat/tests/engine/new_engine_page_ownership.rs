@@ -226,6 +226,41 @@ fn the_leak_report_names_a_page_no_tree_reaches() {
     assert_eq!(answer(&mut reopened, "SELECT count(*) FROM t"), "3");
 }
 
+/// Every leaked page is named, one line each, rather than the first
+/// (task-2150).
+///
+/// A leak loses no row, so the check has no reason to stop at one, and the
+/// count is what decides whether the repair is one page or a `VACUUM`. Nikaya's
+/// database reported `Page 211841: never used` and nothing could say whether it
+/// was the only one.
+#[test]
+fn the_leak_report_names_every_leaked_page() {
+    let directory = scratch("never-used-twice");
+    let path = directory.join("leaked.db");
+    let mut engine =
+        ImportedDatabase::create(path.clone(), PAGE_SIZE, FRAMES).expect("a fresh database");
+    run(
+        &mut engine,
+        &[
+            "CREATE TABLE t (a TEXT, b INTEGER)",
+            "INSERT INTO t VALUES ('p',1),('q',2),('r',3)",
+        ],
+    );
+    let first = engine
+        .strand_a_page_unchecked()
+        .expect("a page is taken out of the free map");
+    let second = engine
+        .strand_a_page_unchecked()
+        .expect("a second page is taken out of the free map");
+    let expected = format!("Page {first}: never used\nPage {second}: never used");
+    assert_eq!(leaks(&engine), expected, "both leaked pages are named");
+    assert_eq!(
+        integrity(&mut engine),
+        expected,
+        "the pragma names both as well"
+    );
+}
+
 /// `DROP TABLE` gives back the pages its out-of-line values sat on.
 ///
 /// **The leak task-2052 measured and task-2065 closed, now asserted the other

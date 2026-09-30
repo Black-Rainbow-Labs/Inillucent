@@ -230,6 +230,7 @@ mod tests {
             mrl_widths: vec![1024],
             prefixes: Prefixes::query_only("query: "),
             pooling: Pooling::Cls,
+            kind: inillucent_core::model::ModelKind::BiEncoder,
             max_tokens: 512,
             layer_norm: false,
             model_file: "model_fp32.onnx".into(),

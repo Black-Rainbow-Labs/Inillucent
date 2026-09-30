@@ -67,6 +67,19 @@ fn binary() -> PathBuf {
 /// @param root - the install root
 /// @param arguments - what to pass after the verb
 fn run(root: &PathBuf, arguments: &[&str]) -> (bool, String, String) {
+    run_with(root, arguments, &[])
+}
+
+/// Runs the command with extra environment variables set, and returns its output.
+///
+/// @param root - the install root
+/// @param arguments - what to pass after the verb
+/// @param variables - environment variables to set for this one process
+fn run_with(
+    root: &PathBuf,
+    arguments: &[&str],
+    variables: &[(&str, &str)],
+) -> (bool, String, String) {
     let binary = binary();
     let output = Command::new(binary)
         .current_dir(workspace_root())
@@ -76,6 +89,9 @@ fn run(root: &PathBuf, arguments: &[&str]) -> (bool, String, String) {
         .env_remove("INILLUCENT_ONNX_DIR")
         .env_remove("ORT_DYLIB_PATH")
         .env_remove("INILLUCENT_EMBED_RESIDENCY")
+        .env_remove("INILLUCENT_EMBED_THREADS")
+        .env_remove("INILLUCENT_EMBED_DEVICE")
+        .envs(variables.iter().copied())
         .output()
         .unwrap_or_else(|error| panic!("inillucent did not start: {error}"));
     (
@@ -166,7 +182,7 @@ fn an_unknown_component_is_refused_before_anything_is_fetched() {
     assert!(!ok, "an unknown component fails: {stdout}");
     let said = format!("{stdout}{stderr}");
     assert!(said.contains("everything"), "the refusal names it: {said}");
-    assert!(said.contains("all, runtime or model"), "{said}");
+    assert!(said.contains("all, runtime, model or reranker"), "{said}");
     assert_eq!(bytes_under(&root), 0);
 }
 
@@ -215,4 +231,81 @@ fn setting_only_the_profile_records_it_and_downloads_nothing() {
         "a profile change writes the state file and nothing else, and this wrote {} bytes",
         bytes_under(&root)
     );
+}
+
+/// `--threads` and `--device` alone are recorded, downloaded nothing for, and read back by `--status` with their source.
+///
+/// The default is reported as a default, so a reader can tell a value somebody chose from one nobody did.
+#[test]
+fn the_thread_count_and_the_device_are_recorded_and_reported_with_their_source() {
+    let root = area("machine-settings");
+    let (_, before, _) = run(&root, &["--status"]);
+    assert!(
+        before.contains("Threads: ONNX Runtime's own choice (default)"),
+        "{before}"
+    );
+    assert!(before.contains("Device: cpu (default)"), "{before}");
+
+    let (ok, stdout, _) = run(&root, &["--threads", "4", "--device", "CUDA:1"]);
+    assert!(ok, "{stdout}");
+    let (_, after, _) = run(&root, &["--status"]);
+    assert!(
+        after.contains("Threads: 4 (recorded by setup-embeddings)"),
+        "{after}"
+    );
+    assert!(
+        after.contains("Device: cuda:1 (recorded by setup-embeddings)"),
+        "{after}"
+    );
+    assert!(bytes_under(&root) < 4096, "only the state file was written");
+
+    let (_, json, _) = run(&root, &["--status", "--output", "json"]);
+    assert!(
+        json.contains("\"source\": \"recorded by setup-embeddings\""),
+        "{json}"
+    );
+}
+
+/// An environment variable overrides what was recorded, and the status says so.
+#[test]
+fn an_environment_variable_overrides_the_recorded_settings() {
+    let root = area("machine-settings-env");
+    let (ok, stdout, _) = run(&root, &["--threads", "4", "--device", "cpu"]);
+    assert!(ok, "{stdout}");
+    let (_, status, _) = run_with(
+        &root,
+        &["--status"],
+        &[
+            ("INILLUCENT_EMBED_THREADS", "8"),
+            ("INILLUCENT_EMBED_DEVICE", "cuda:0"),
+        ],
+    );
+    assert!(
+        status.contains("Threads: 8 (environment variable)"),
+        "{status}"
+    );
+    assert!(
+        status.contains("Device: cuda:0 (environment variable)"),
+        "{status}"
+    );
+}
+
+/// A thread count or a device that cannot be used is refused before anything is written.
+#[test]
+fn a_bad_thread_count_or_device_is_refused_and_writes_nothing() {
+    let root = area("machine-settings-bad");
+    for arguments in [
+        vec!["--threads", "0"],
+        vec!["--device", "tpu"],
+        vec!["--device", "cuda:x"],
+    ] {
+        let (ok, stdout, stderr) = run(&root, &arguments);
+        assert!(!ok, "{arguments:?} should be refused: {stdout}");
+        let said = format!("{stdout}{stderr}");
+        assert!(
+            said.contains("thread count") || said.contains("device must be"),
+            "{arguments:?}: {said}"
+        );
+    }
+    assert_eq!(bytes_under(&root), 0);
 }

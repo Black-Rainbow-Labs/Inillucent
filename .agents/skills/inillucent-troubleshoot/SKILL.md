@@ -224,6 +224,26 @@ inillucent --db app.rdb integrity-check
 free map lists as free while a table uses it, an index entry with no row, or `Page N: never used`.
 A file that cannot be opened at all also fails with `corrupt`.
 
+An encrypted database fails with `corrupt` in three more ways, and the message says which:
+
+| Message | What to do |
+|---|---|
+| `this database is encrypted. Open it with its key` | pass `--key-file`, set `INILLUCENT_KEY`, or use a driver's key option |
+| `this database is not encrypted, so it cannot be opened with a key` | open it without a key, or write an encrypted copy with `inillucent encrypt` |
+| `file is not a database, or the key is wrong` | the key is wrong. A passphrase is the whole text, and a raw key is `x'` followed by 64 hex digits and `'` |
+
+`PRAGMA encryption` answers `xchacha20-poly1305` on an encrypted database and `none` otherwise.
+See `docs/encryption.md` in the repository.
+
+A tree whose keys are out of order is named in the message, with the leaf pages involved:
+`index <name>: a key does not increase across the leaf chain: leaf 211739 holds a key at or below
+the one before it, which leaf 95106 holds`. An index can be rebuilt from its table with `REINDEX`,
+and `integrity-check` afterwards says whether that was enough.
+
+`Page N: never used` is a leak: the free map counts the page as in use and no table or index
+reaches it. No row is lost. Every leaked page is listed, one line each, up to a hundred, and
+`VACUUM` gives them back.
+
 | Pragma | What it checks |
 |---|---|
 | `PRAGMA quick_check` | every tree's structure, and which tree owns each page |

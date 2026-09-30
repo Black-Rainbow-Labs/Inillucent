@@ -395,6 +395,16 @@ pub trait Vfs: Send + Sync + Debug {
     /// Sleeps for at least `micros` microseconds, or returns immediately in a
     /// simulated VFS where time is a counter rather than a wait.
     fn sleep(&self, micros: u64) -> VfsResult<()>;
+
+    /// Returns the encrypting file system this is, when it is one.
+    ///
+    /// **So the engine can ask its own `Vfs` whether the database is
+    /// encrypted**, which `PRAGMA rekey`, `backup` and `ATTACH` without `KEY`
+    /// need, without carrying a second handle that a reopen could forget.
+    /// Every file system but `CryptVfs` answers `None`.
+    fn encryption(&self) -> Option<&crate::crypt::CryptVfs> {
+        None
+    }
 }
 
 #[cfg(test)]

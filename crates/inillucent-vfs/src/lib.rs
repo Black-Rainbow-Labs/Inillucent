@@ -31,6 +31,7 @@
 pub mod confine;
 pub mod conformance;
 pub mod contract;
+pub mod crypt;
 pub mod error;
 pub mod locks;
 pub mod memory;
@@ -44,6 +45,7 @@ pub use contract::{
     AccessMode, DeviceCharacteristics, FileIdentity, FileKind, FileLock, OpenOptions, SharedMemory,
     ShmLockRequest, ShmRegion, SyncMode, Vfs, VfsFile, SHM_LOCK_COUNT,
 };
+pub use crypt::{CryptVfs, EncryptionKey};
 pub use error::{VfsError, VfsOperation, VfsResult};
 pub use memory::MemoryVfs;
 pub use os::OsVfs;

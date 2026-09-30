@@ -75,7 +75,7 @@ about = "the shared conformance suite through the Go wrapper"
 [[test]]
 language = "go"
 path = "packages/go/inillucent_test.go"
-command = "go test -C packages/go -run 'TestRoundTrip|TestBinding|TestStatus|TestDescribe|TestReadOnly' ./..."
+command = "go test -C packages/go -run 'TestRoundTrip|TestBinding|TestStatus|TestDescribe|TestReadOnly|TestEncrypted' ./..."
 requires = ["go", "programs"]
 about = "the Go wrapper's own round trip, which predates the conformance runner"
 

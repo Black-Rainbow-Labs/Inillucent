@@ -1027,6 +1027,10 @@ impl PagedTree {
     pub fn check(&self, pool: &Pool) -> DbResult<()> {
         let mut previous: Option<Vec<OwnedDatum>> = None;
         let mut chain = 0u64;
+        // The message names both leaves (task-2150); the visitor is not told its
+        // page, so the walk is followed here by the sibling links it takes.
+        let mut at = self.first_leaf;
+        let mut previous_leaf = PageId::NONE;
         self.visit_leaves(pool, &mut |leaf| {
             leaf.integrity()?;
             chain = chain.saturating_add(1);
@@ -1042,11 +1046,17 @@ impl PagedTree {
                         &self.directions,
                     ) != std::cmp::Ordering::Less
                     {
-                        return Err(corrupt("a key does not increase across the leaf chain"));
+                        return Err(corrupt(format!(
+                            "a key does not increase across the leaf chain: leaf {} holds a key \
+                             at or below the one before it, which leaf {} holds",
+                            at.0, previous_leaf.0
+                        )));
                     }
                 }
                 previous = Some(head.iter().map(OwnedDatum::from_datum).collect());
+                previous_leaf = at;
             }
+            at = leaf.right_sibling();
             Ok(true)
         })?;
         // **Against the interior levels, which is what invariant 4 says.** It

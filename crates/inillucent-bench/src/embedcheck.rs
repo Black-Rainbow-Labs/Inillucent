@@ -575,6 +575,7 @@ mod tests {
             mrl_widths: vec![8],
             prefixes: Prefixes::none(),
             pooling: Pooling::Mean,
+            kind: inillucent_core::model::ModelKind::BiEncoder,
             max_tokens: 512,
             layer_norm: false,
             model_file: "model.onnx".into(),

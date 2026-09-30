@@ -108,6 +108,14 @@ the varint codec, the deterministic random generator, the TOML reader and the JS
 is part of something inillucent publishes, such as a file format or a checksum. A dependency upgrade
 must not be able to change any of them.
 
+The cryptography behind [encryption at rest](encryption.md) is first party for the same reason: an
+encrypted database is a file format. `crates/inillucent-base/src/crypt/` holds ChaCha20, Poly1305,
+XChaCha20-Poly1305, HMAC-SHA256 and PBKDF2-HMAC-SHA256. Each is checked against the test vectors
+its standard publishes: RFC 8439, the XChaCha20 draft, RFC 4231 and RFC 7914. ChaCha20 was chosen
+over AES because it takes the same time whatever the key in plain Rust, with no lookup table and no
+processor instruction. A first party AES without the processor's AES instructions would either leak
+the key through the time its lookup tables take or need a much larger implementation.
+
 ## Adding a dependency
 
 1. Add an `[[external]]` row to `docs/invariants/layering.toml`. Name the crate, its category, and

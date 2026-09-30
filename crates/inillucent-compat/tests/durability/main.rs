@@ -22,6 +22,7 @@ mod busy_timeout;
 mod concurrency;
 mod corruption;
 mod durability;
+mod encrypted_crash;
 mod fault_shapes;
 mod fault_sweep;
 mod faults;

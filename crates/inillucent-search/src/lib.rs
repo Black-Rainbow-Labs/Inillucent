@@ -70,6 +70,9 @@ pub mod embed_refusal;
 pub mod merge;
 pub mod module;
 pub mod options;
+#[cfg(feature = "embed")]
+pub mod rerank;
+pub mod rerank_search;
 pub mod store;
 
 /// The implementation phase that filled this crate in, as named by the TDD.
@@ -94,6 +97,10 @@ pub fn register(registry: &mut inillucent_ext::registry::Registry) {
     // asked would be paying for it on every open. See `embed`.
     #[cfg(feature = "embed")]
     embed::register(registry);
+    // **And `rerank`**, which is behind the same feature for the same reason: it runs a model in
+    // this process, so a database that did not ask for one does not link the runtime.
+    #[cfg(feature = "embed")]
+    rerank::register(registry);
 }
 
 #[cfg(test)]

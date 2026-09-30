@@ -239,6 +239,12 @@ type DB struct {
 	ReadOnly bool
 	// Root, when set, refuses every path outside that directory.
 	Root string
+	// Key opens an encrypted database. It is passed to the program in the
+	// INILLUCENT_KEY environment variable and never on the command line, because
+	// a command line is visible in the process list. Empty leaves the inherited
+	// environment alone. A key of the form x'<64 hex digits>' is a raw 32 byte
+	// key; any other text is a passphrase.
+	Key string
 }
 
 // Open returns a DB for a database file. It does no I/O: the file is opened by
@@ -279,6 +285,7 @@ func (db *DB) Run(ctx context.Context, command string, arguments Args) (Result, 
 	argv = append(argv, arguments.flags()...)
 
 	run := exec.CommandContext(ctx, db.binary(), argv...)
+	run.Env = db.environment()
 	output, runErr := run.Output()
 	// A refusal exits non-zero *and* prints the result object, because the
 	// caller asked for JSON. So the exit status is not the thing to read - the
@@ -310,6 +317,16 @@ func (db *DB) Run(ctx context.Context, command string, arguments Args) (Result, 
 		}
 	}
 	return result, nil
+}
+
+// environment returns the environment the program runs with: this process's own,
+// plus INILLUCENT_KEY when the DB has a key. Nil means "inherit", which is what
+// exec.Cmd does with a nil Env.
+func (db *DB) environment() []string {
+	if db.Key == "" {
+		return nil
+	}
+	return append(os.Environ(), "INILLUCENT_KEY="+db.Key)
 }
 
 // asExitError is errors.As, spelled out so this package imports nothing beyond

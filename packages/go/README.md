@@ -98,6 +98,24 @@ The `DB` struct has four fields you can set.
 | `ReadOnly` | adds `--readonly`, so every statement that changes data is refused |
 | `Root` | adds `--root`, so every path outside that directory is refused |
 
+## Encrypted databases
+
+Set `Key` on the `DB`:
+
+```go
+key := "x'" + strings.Repeat("5a", 32) + "'"
+db := &inillucent.DB{Path: "app.rdb", Key: key}
+_, err := db.Exec(ctx, "CREATE TABLE note (body TEXT)")
+```
+
+The key travels to the program in the `INILLUCENT_KEY` environment variable. It is never put on the command line, because a command line is visible in the process list. When you pass no key, the environment the program inherits is left alone.
+
+A key written `x'` followed by 64 hexadecimal digits and `'` is a raw 32 byte key. Any other text is a passphrase, which is stretched with 600,000 rounds of PBKDF2 on every open, so a raw key opens faster.
+
+A database created with a key is encrypted. Opening it without the key, or with a wrong key, fails with status `corrupt`. Opening a plaintext database with a key fails the same way.
+
+Without the key the call returns an `*inillucent.Error` whose `Status` is `inillucent.StatusCorrupt`.
+
 ## Errors
 
 ```go

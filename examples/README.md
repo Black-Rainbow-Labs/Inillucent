@@ -14,6 +14,7 @@ so you can copy any folder out of the repository and it still works.
 | [`rag-agent/rust-example/`](rag-agent/rust-example/README.md) | an MCP server written in Rust. It cuts the articles into overlapping chunks, embeds them, keeps the database in step with the source on a timer, and offers four kinds of search as MCP tools | the `inillucent` crate from crates.io |
 | [`rag-agent/corpus/`](rag-agent/corpus/ATTRIBUTION.md) | 80 Wikipedia articles, one per line of `greek-philosophy.jsonl`, with their licence and sources | read by both examples |
 | [`coffee-shop/`](coffee-shop/README.md) | a coffee shop's till and back office, written in Rust. Orders with sizes and modifiers, promotion codes, loyalty points, split payments, refunds, deliveries, waste, stock counts, a tip pool and closing the day, with the stock and a double entry ledger kept by triggers. The README shows each use case's SQL and its answer | the `inillucent` crate from crates.io |
+| [`encrypted-notes/`](encrypted-notes/README.md) | a notes database encrypted at rest: a key file, the refusal without it, a plaintext copy, an encrypted copy and a changed key, with the files searched for the row | the `inillucent` command line |
 | [`todo-mvc/`](todo-mvc/README.md) | a todo service with a REST API, written in Rust. Lists, todos with subtasks to any depth, tags, comments, a history written by triggers, keyword search and reports, with the SQL for each explained | the `inillucent` crate from crates.io |
 
 ## Which one to start with
@@ -25,6 +26,7 @@ so you can copy any folder out of the repository and it still works.
 | compare vector search with inillucent's combined keyword and vector search | `rag-agent/rust-example/`, section "Vector column or inillucent_search table" |
 | see how to keep a search index up to date as documents change | `rag-agent/rust-example/`, section "Keeping the index in step with the source" |
 | build an ordinary web service on inillucent, with joins, foreign keys, triggers, recursive CTEs and window functions | `todo-mvc/` |
+| keep a database encrypted on the disk, and see what the key protects | `encrypted-notes/` |
 | keep money, stock and books that must agree to the cent, with triggers, generated columns, `UPSERT`, `UPDATE ... FROM` and reports built from window functions | `coffee-shop/` |
 
 ## What every example needs

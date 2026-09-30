@@ -294,6 +294,65 @@ fn backs_up_and_checks_itself(session: &mut Session, directory: &Path) {
     );
 }
 
+/// A server started with `--key-file` serves an encrypted database, and a
+/// server started without one refuses it with the status `corrupt`.
+///
+/// An agent never sees the key: it is a file the operator named on the
+/// server's command line, and no tool takes one.
+#[test]
+fn a_server_given_a_key_file_serves_an_encrypted_database() {
+    let (server, binary) = (program("inillucent-mcp"), program("inillucent"));
+    let directory = area("encrypted");
+    let key = directory.join("key.txt");
+    std::fs::write(&key, format!("x'{}'\n", "3c".repeat(32))).expect("the key is written");
+    let key = key.to_string_lossy().into_owned();
+    let database = directory.join("sealed.rdb");
+    let made = run(
+        &binary,
+        &["--key-file", &key, "create", &database.to_string_lossy()],
+    );
+    assert_eq!(made.code, 0, "`create` failed:\n{}", made.said());
+
+    let mut session = Session::start_with(&server, &database, &["--key-file", &key]);
+    let wrote = session.tool(
+        "inillucent_batch",
+        "{\"sql\":\"CREATE TABLE vault (code TEXT); INSERT INTO vault VALUES ('7461-swordfish');\"}",
+    );
+    assert!(!is_an_error(&wrote), "the batch was refused:\n{wrote}");
+    let read = session.tool("inillucent_query", "{\"sql\":\"SELECT code FROM vault\"}");
+    assert!(
+        read.contains("7461-swordfish"),
+        "the row did not come back:\n{read}"
+    );
+    let cipher = session.tool("inillucent_query", "{\"sql\":\"PRAGMA encryption\"}");
+    assert!(cipher.contains("xchacha20-poly1305"), "{cipher}");
+    drop(session);
+
+    for entry in std::fs::read_dir(&directory).expect("lists").flatten() {
+        let bytes = std::fs::read(entry.path()).unwrap_or_default();
+        assert!(
+            !bytes.windows(9).any(|window| window == b"swordfish"),
+            "{} holds the row in plaintext",
+            entry.path().display()
+        );
+    }
+
+    // A server that cannot open its database does not start, and says why on
+    // standard error, which is where every diagnostic of this program goes.
+    let keyless = run(&server, &["--db", &database.to_string_lossy()]);
+    assert_eq!(
+        keyless.code,
+        1,
+        "a server with no key started:\n{}",
+        keyless.said()
+    );
+    assert!(
+        keyless.stderr.contains("this database is encrypted"),
+        "{}",
+        keyless.said()
+    );
+}
+
 /// A `tools/call` before `initialize` is refused, and the server carries on.
 #[test]
 fn a_call_before_the_handshake_is_refused() {

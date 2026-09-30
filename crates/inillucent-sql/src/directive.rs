@@ -361,6 +361,10 @@ pub enum Directive {
         file: Vec<u8>,
         /// The name it will be known by.
         schema: Vec<u8>,
+        /// The `KEY` clause's text: the file's encryption key, or empty for a
+        /// plaintext file. `None` when there was no `KEY` clause, which means
+        /// the connection's own key.
+        key: Option<Vec<u8>>,
     },
     /// `DETACH`, which removes one.
     Detach {
@@ -1537,7 +1541,9 @@ impl<'a> Binder<'a> {
         into: Option<ast::ExprId>,
     ) -> Result<Directive, ParseError> {
         let target = match into {
-            Some(expr) => Some(self.literal_path(expr)?),
+            Some(expr) => {
+                Some(self.literal_path(expr, "VACUUM INTO with a file name that is not a literal")?)
+            }
             None => None,
         };
         let index = self.resolve_database(database)?;
@@ -1550,7 +1556,7 @@ impl<'a> Binder<'a> {
 
     /// Binds an `ATTACH`.
     ///
-    /// Both operands are literals. SQLite evaluates them, and every other
+    /// Every operand is a literal, the `KEY` included. SQLite evaluates them, and every other
     /// value they could produce is a file name computed at run time - a
     /// statement that decides which database to open from arithmetic is not a
     /// shape worth supporting before it is asked for, and it is one an
@@ -1561,12 +1567,28 @@ impl<'a> Binder<'a> {
         schema: ast::ExprId,
         key: Option<ast::ExprId>,
     ) -> Result<Directive, ParseError> {
-        if key.is_some() {
-            return Err(unsupported("ATTACH ... KEY", Span::default()));
-        }
+        // SQLCipher's documentation writes a raw key as `KEY "x'...'"`, which
+        // the grammar reads as a double quoted name, so a name is read as its
+        // text the way `literal_or_name` reads a schema name.
+        let key = match key.map(|expr| self.ast.expr(expr)) {
+            None => None,
+            Some(Some(ast::Expr::Literal(ast::Literal::String(text)))) => Some(text.clone()),
+            Some(Some(ast::Expr::Column {
+                table: None,
+                column,
+                ..
+            })) => Some(self.ast.text(*column).to_vec()),
+            Some(_) => {
+                return Err(unsupported(
+                    "an ATTACH KEY that is not a string literal",
+                    Span::default(),
+                ))
+            }
+        };
         Ok(Directive::Attach {
-            file: self.literal_path(file)?,
+            file: self.literal_path(file, "ATTACH with a file name that is not a literal")?,
             schema: self.literal_or_name(schema)?,
+            key,
         })
     }
 
@@ -1598,19 +1620,24 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Reads the file name a `VACUUM INTO` was given.
+    /// Reads the file name a `VACUUM INTO` or an `ATTACH` was given.
     ///
     /// A literal only. SQLite evaluates the expression, but every other value
     /// it could produce is a file name computed at run time, and a statement
-    /// that decides where to write a copy of the database from arithmetic is
-    /// not a shape worth supporting before it is asked for.
-    fn literal_path(&mut self, expr: ast::ExprId) -> Result<Vec<u8>, ParseError> {
+    /// that decides which file to open or where to write a copy of the
+    /// database from arithmetic is not a shape worth supporting before it is
+    /// asked for.
+    ///
+    /// @param expr - the file name operand
+    /// @param refused - the construct the refusal names when it is not one
+    fn literal_path(
+        &mut self,
+        expr: ast::ExprId,
+        refused: &'static str,
+    ) -> Result<Vec<u8>, ParseError> {
         match self.ast.expr(expr) {
             Some(ast::Expr::Literal(ast::Literal::String(text))) => Ok(text.clone()),
-            _ => Err(unsupported(
-                "VACUUM INTO with a name that is not a literal",
-                Span::default(),
-            )),
+            _ => Err(unsupported(refused, Span::default())),
         }
     }
 

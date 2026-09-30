@@ -70,11 +70,11 @@ use std::sync::Mutex;
 use inillucent_base::DbResult;
 use inillucent_core::filter::{AttributeFilter, Filter};
 use inillucent_core::index::{Index, IndexConfig};
-use inillucent_core::rank::{AdaptiveWeights, Fusion, HitOrigin};
+use inillucent_core::rank::{AdaptiveWeights, Fusion, HitOrigin, RRF_K};
 use inillucent_core::store::ChunkInput;
 use inillucent_ext::vtab::{failure, Context};
 
-use crate::options::{Metric, Mode, Options};
+use crate::options::{FusionChoice, Metric, Mode, Options};
 use crate::store::{state, Delta, Op, Row, SegmentMeta, Store};
 
 /// The source name every row of a search table is filed under.
@@ -117,6 +117,9 @@ pub struct Request {
     pub limit: usize,
     /// The recall target, between zero and one, or nothing for the default.
     pub recall: Option<f32>,
+    /// The question in plain words, when the statement named `question` and so asked for the
+    /// rows to be reranked. It is not part of what the keyword and vector branches search for.
+    pub question: Option<String>,
     /// The facet constraints the statement carried, as the facet's column
     /// position and the value that column must hold.
     ///
@@ -299,13 +302,31 @@ pub fn configuration(options: &Options) -> IndexConfig {
     // ever inserted, not only the search call at the end. `IndexConfig::metric`
     // is the field that carries it there.
     config.metric = core_metric(options.metric);
-    if let Some(weight) = options.vector_weight() {
-        config.fusion = Fusion::NormalizedScore {
-            vector_weight: weight,
-        };
+    if let Some(fixed) = fixed_fusion(options) {
+        config.fusion = fixed;
         config.adaptive_fusion = false;
     }
     config
+}
+
+/// Returns the fusion a declaration fixes, or `None` when the adaptive default applies.
+///
+/// `rrf` gives reciprocal rank fusion with the damping constant the retrieval
+/// engine ships, and a declared `vector_weight` gives min-max scaling at that
+/// weight. Neither is adaptive, so the caller turns adaptive weighting off
+/// whenever this returns a fusion.
+///
+/// @param options - the table's declaration
+fn fixed_fusion(options: &Options) -> Option<Fusion> {
+    match options.fusion {
+        FusionChoice::Adaptive => None,
+        FusionChoice::Rrf => Some(Fusion::ReciprocalRank { k: RRF_K }),
+        FusionChoice::Weighted => options
+            .vector_weight()
+            .map(|weight| Fusion::NormalizedScore {
+                vector_weight: weight,
+            }),
+    }
 }
 
 /// Applies a declared fixed vector weight to an index read back from a segment.
@@ -318,10 +339,8 @@ pub fn configuration(options: &Options) -> IndexConfig {
 /// @param index - the index a search is about to use
 /// @param options - the table's declaration
 fn apply_ranking(index: &mut Index, options: &Options) {
-    if let Some(weight) = options.vector_weight() {
-        index.set_fusion(Fusion::NormalizedScore {
-            vector_weight: weight,
-        });
+    if let Some(fixed) = fixed_fusion(options) {
+        index.set_fusion(fixed);
         index.set_adaptive_fusion(false, AdaptiveWeights::default());
     }
 }

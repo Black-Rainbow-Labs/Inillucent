@@ -10,9 +10,12 @@
 //! against a fresh pass. A hash that quietly changed between releases would
 //! turn every retained manifest into a false alarm.
 //!
-//! It is not used for anything secret and nothing here needs to resist a
-//! deliberate collision - the inputs are this engine's own files - so a plain,
-//! readable implementation is the right one.
+//! It is also the hash inside HMAC-SHA256 and PBKDF2 in [`crate::crypt::kdf`],
+//! which turn a passphrase into the key that protects an encrypted database.
+//! That use needs no resistance to a deliberate collision either, and the
+//! compression has no table indexed by data and no branch on it, so it takes
+//! the same time whatever the passphrase. [`compress`] and [`INITIAL`] are
+//! visible to the crate so PBKDF2 can run its inner loop on saved states.
 
 /// The SHA-256 round constants.
 const K: [u32; 64] = [
@@ -28,7 +31,7 @@ const K: [u32; 64] = [
 
 /// The initial state, which is the fractional part of the square roots of the
 /// first eight primes.
-const INITIAL: [u32; 8] = [
+pub(crate) const INITIAL: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
@@ -144,7 +147,7 @@ pub fn to_hex(bytes: &[u8]) -> String {
 }
 
 /// Runs one compression round over a 64-byte block.
-fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+pub(crate) fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut schedule = [0u32; 64];
     for index in 0usize..16 {
         let start = index.saturating_mul(4);

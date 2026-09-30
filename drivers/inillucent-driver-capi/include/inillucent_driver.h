@@ -179,6 +179,16 @@ int32_t inillucent_supports(const char *name);
 int32_t inillucent_open(const char *path, uint32_t flags, inillucent_db **out,
                         inillucent_error **error);
 
+/* Opens (and by default creates) a database encrypted with `key`: the file,
+ * its log and its journals are encrypted with XChaCha20-Poly1305. `key` is
+ * UTF-8 text: "x'<64 hex digits>'" is a raw 32 byte key and anything else is
+ * a passphrase, stretched with PBKDF2-HMAC-SHA256. A NULL key is
+ * inillucent_open. A wrong key, a key for a plaintext file and no key for an
+ * encrypted file all fail with INILLUCENT_CORRUPT. */
+int32_t inillucent_open_with_key(const char *path, uint32_t flags,
+                                 const char *key, inillucent_db **out,
+                                 inillucent_error **error);
+
 /* Checkpoints and closes. Refuses with INILLUCENT_INVALID_STATE while any
  * connection on it is still open, rather than leaving them dangling. */
 int32_t inillucent_close(inillucent_db *db, inillucent_error **error);

@@ -275,7 +275,7 @@ pub const CASE_CAPABILITIES: &[(&str, &str)] = &[
     ("lim-004", "computed_limit"),
     ("lim-005", "computed_limit"),
     ("sub-010", "row_value_in_subquery"),
-    ("syntax-attach-stmt-p2", "attach_with_key"),
+    ("syntax-attach-stmt-p2", "attach_computed_path"),
 ];
 
 /// The capability rows [`CASE_CAPABILITIES`] names for one case.
@@ -590,7 +590,7 @@ pub fn capability_cases(
         let (setup, sql) = match capability.probe {
             Probe::Runs { setup, sql } | Probe::Refuses { setup, sql } => (setup, sql),
             Probe::Answers { setup, sql, .. } => (setup, sql),
-            Probe::Registers { .. } | Probe::Nothing => continue,
+            Probe::Registers { .. } | Probe::Keyed { .. } | Probe::Nothing => continue,
         };
         let family = family_by_content(&sql);
         let case = capability_case(oracle, scratch, capability.name, family, setup, &sql)?;

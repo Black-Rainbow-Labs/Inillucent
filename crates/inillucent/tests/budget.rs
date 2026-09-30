@@ -313,7 +313,11 @@ const POINT_COMPILE_ALLOCATIONS: u64 = 93;
 /// build most people run, which is the argument
 /// [`TRIVIAL_COMPILE_ALLOCATIONS`] already makes against a margin. So the guard
 /// asks the engine which build it is in and stays exact in both.
-const EMBEDDER_COMPILE_ALLOCATIONS: u64 = 3;
+///
+/// **Five since `embed_tokens` and `rerank` were registered beside `embed` (task-2158).** Each
+/// function the feature registers is one more allocation in a compile, whatever the statement is:
+/// `SELECT 1` measured 21 with the three functions against a bound of 19 written for one.
+const EMBEDDER_COMPILE_ALLOCATIONS: u64 = 5;
 
 /// Reports whether this build has the in-process embedder compiled in.
 ///

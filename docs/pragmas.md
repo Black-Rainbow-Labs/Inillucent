@@ -9,7 +9,7 @@ writes it from `inillucent_sql::pragma_register::REGISTER`, and
 `cargo test -p inillucent-compat --test tooling harness::` fails when the page and the
 register differ. Do not edit it by hand.
 
-There are **68 pragmas**. 62 of them take an argument in parentheses.
+There are **71 pragmas**. 64 of them take an argument in parentheses.
 
 A pragma that is not in this table is not recognised. It returns no rows and no
 error, which is also what SQLite does. So running a pragma does not tell you
@@ -42,6 +42,7 @@ pragmas do.
 | `defer_foreign_keys` | yes | one unnamed column |
 | `empty_result_callbacks` | yes | one unnamed column |
 | `encoding` | yes | `encoding` |
+| `encryption` | no | `encryption` |
 | `foreign_key_check` | yes | `table`, `rowid`, `parent`, `fkid` |
 | `foreign_key_list` | yes | `id`, `seq`, `table`, `from`, `to`, `on_update`, `on_delete`, `match` |
 | `foreign_keys` | yes | one unnamed column |
@@ -58,6 +59,7 @@ pragmas do.
 | `integrity_check` | yes | `integrity_check` |
 | `journal_mode` | yes | `journal_mode` |
 | `journal_size_limit` | yes | one unnamed column |
+| `key` | yes | one unnamed column |
 | `legacy_alter_table` | yes | one unnamed column |
 | `locking_mode` | yes | `locking_mode` |
 | `max_page_count` | yes | one unnamed column |
@@ -71,6 +73,7 @@ pragmas do.
 | `quick_check` | yes | `quick_check` |
 | `read_uncommitted` | yes | one unnamed column |
 | `recursive_triggers` | yes | one unnamed column |
+| `rekey` | yes | one unnamed column |
 | `reverse_unordered_selects` | yes | one unnamed column |
 | `schema_version` | yes | one unnamed column |
 | `secure_delete` | yes | one unnamed column |

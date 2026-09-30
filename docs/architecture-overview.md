@@ -328,6 +328,7 @@ crate and the layer rules between them.
 | The `inillucent_search` virtual table | `inillucent-search` |
 | The retrieval engine: HNSW, BM25 and the combined ranking | `inillucent-core` |
 | File access on Windows, POSIX and in memory | `inillucent-vfs` |
+| Encryption at rest: the encrypting file system, and the ciphers under it | `inillucent-vfs` (`src/crypt`), `inillucent-base` (`src/crypt`) |
 | The driver an application uses, and its C interface | `inillucent-driver`, `inillucent-driver-capi` |
 | The command line, the shell and the MCP server | `inillucent-cli` |
 

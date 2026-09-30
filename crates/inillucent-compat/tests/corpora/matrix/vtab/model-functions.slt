@@ -1,0 +1,13 @@
+# The functions that run a model, `embed`, `embed_tokens` and `rerank`, exist only in a build with
+# embedding support and answer from weights installed on the machine, so no case can grade what
+# they return. What every build agrees on is that a call with the wrong number of arguments is
+# refused: a build with the feature says so, and a build without it says the feature is not built.
+# The `rerank` capability row is exercised by that refusal.
+
+oracle none
+
+case capability-rerank
+capability rerank
+
+statement error
+SELECT rerank('only one argument')

@@ -766,6 +766,34 @@ fn largest_key(tree: &PagedTree, pool: &Pool) -> DbResult<i64> {
     let leaf = LeafRef::parse(&guard)?
         .with_collations(tree.collations())
         .with_directions(tree.directions());
+    if let Some(largest) = largest_in_leaf(&leaf)? {
+        return Ok(largest);
+    }
+    drop(guard);
+    // **The rightmost leaf holds no live row, so the answer is further left**
+    // (task-2150). Deleting the newest rows of a table empties the leaf its
+    // largest keys lived in, and this answered zero for it: the next insert
+    // took rowid 1, which the table already held, and failed with
+    // `UNIQUE constraint failed: chunk_embedding.rowid`. That is what stopped
+    // Nikaya's embedding pass after a sync tombstoned the newest messages. The
+    // walk is only taken in that case, so an insert still reads one leaf.
+    let mut largest: Option<i64> = None;
+    tree.visit_reverse(pool, None, &mut |leaf| {
+        largest = largest_in_leaf(leaf)?;
+        Ok(largest.is_none())
+    })?;
+    Ok(largest.unwrap_or(0))
+}
+
+/// Returns the largest integer key a leaf holds live, or `None` when it holds
+/// no live row.
+///
+/// `visit_live` merges the sorted region and the delta area and reads only the
+/// key column; the rows it visits are not in key order, so this takes the
+/// maximum rather than the last. See [`largest_key`] for why only the key.
+///
+/// @param leaf - the leaf
+fn largest_in_leaf(leaf: &LeafRef<'_>) -> DbResult<Option<i64>> {
     let mut largest: Option<i64> = None;
     leaf.visit_live(&[0], &mut |values| {
         if let Some(Datum::Int(number)) = values.first() {
@@ -776,7 +804,7 @@ fn largest_key(tree: &PagedTree, pool: &Pool) -> DbResult<i64> {
         }
         Ok(())
     })?;
-    Ok(largest.unwrap_or(0))
+    Ok(largest)
 }
 
 /// What every row a statement writes is written under.

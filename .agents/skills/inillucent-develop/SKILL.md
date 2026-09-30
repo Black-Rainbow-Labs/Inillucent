@@ -163,7 +163,7 @@ flowchart LR
 ```
 
 `command_parity.rs` fails the build when any of the four stops agreeing with `COMMANDS`. Today the
-table has 30 rows. `inillucent-mcp` serves 28 of the CLI's commands as MCP tools. The other two,
+table has 31 rows. `inillucent-mcp` serves 29 of the CLI's commands as MCP tools. The other two,
 `shell` and `mcp`, have `cli_only` set.
 
 To add a command:

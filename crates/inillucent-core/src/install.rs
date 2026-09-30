@@ -56,8 +56,19 @@ pub const RUNTIME_VAR: &str = "ORT_DYLIB_PATH";
 /// process.
 pub const RESIDENCY_VAR: &str = "INILLUCENT_EMBED_RESIDENCY";
 
+/// The environment variable that sets how many threads ONNX Runtime uses inside one operator, for
+/// `embed()`, `rerank()` and a reranked search.
+pub const THREADS_VAR: &str = "INILLUCENT_EMBED_THREADS";
+
+/// The environment variable that names the processor the embedding and reranking sessions run on:
+/// `cpu`, `cuda` or `cuda:N`.
+pub const DEVICE_VAR: &str = "INILLUCENT_EMBED_DEVICE";
+
 /// The model the setup command installs when it is not told otherwise.
 pub const DEFAULT_MODEL: &str = "nomic-embed-text-v1.5";
+
+/// The reranker the setup command installs with `setup-embeddings reranker`.
+pub const RERANKER_MODEL: &str = "gte-reranker-modernbert-base";
 
 /// The file inside the home directory that records what was installed.
 pub const STATE_FILE: &str = "embeddings.json";
@@ -421,6 +432,12 @@ pub struct State {
     /// number.
     #[serde(default)]
     pub residency: Option<String>,
+    /// The intra operator thread count `setup-embeddings --threads` recorded.
+    #[serde(default)]
+    pub threads: Option<usize>,
+    /// The device `setup-embeddings --device` recorded, as `cpu`, `cuda` or `cuda:N`.
+    #[serde(default)]
+    pub device: Option<String>,
 }
 
 impl State {
@@ -437,6 +454,126 @@ impl State {
     pub fn put_model(&mut self, model: InstalledModel) {
         self.models.retain(|existing| existing.id != model.id);
         self.models.push(model);
+    }
+}
+
+/// Where a setting came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingSource {
+    /// An environment variable set for this process.
+    Environment,
+    /// The value `setup-embeddings` recorded in `embeddings.json`.
+    Recorded,
+    /// Neither was set, so the built in default applies.
+    Default,
+}
+
+impl SettingSource {
+    /// Returns the words `setup-embeddings --status` prints for the source.
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingSource::Environment => "environment variable",
+            SettingSource::Recorded => "recorded by setup-embeddings",
+            SettingSource::Default => "default",
+        }
+    }
+}
+
+/// A setting and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Setting<T> {
+    /// The value in force.
+    pub value: T,
+    /// Where it came from.
+    pub source: SettingSource,
+}
+
+/// Checks a thread count as it is written on a command line or in a variable.
+///
+/// @param text - a whole number of at least 1
+pub fn parse_threads(text: &str) -> Result<usize, String> {
+    match text.trim().parse::<usize>() {
+        Ok(count) if count >= 1 => Ok(count),
+        _ => Err(format!(
+            "the thread count must be a whole number of at least 1, not '{}'",
+            text.trim()
+        )),
+    }
+}
+
+/// Checks a device name and returns it in its canonical lower case form.
+///
+/// @param text - `cpu`, `cuda` or `cuda:N` where N is the card number
+pub fn parse_device(text: &str) -> Result<String, String> {
+    let text = text.trim().to_ascii_lowercase();
+    let card_ok = text
+        .strip_prefix("cuda:")
+        .is_some_and(|card| !card.is_empty() && card.chars().all(|c| c.is_ascii_digit()));
+    if text == "cpu" || text == "cuda" || card_ok {
+        return Ok(text);
+    }
+    Err(format!(
+        "the device must be cpu, cuda or cuda:N where N is a card number, not '{text}'"
+    ))
+}
+
+/// The thread count this process should give ONNX Runtime, and where it came from.
+///
+/// The environment first, then what the install recorded, then ONNX Runtime's own choice, which
+/// is `None`. A value that does not parse is reported on standard error and ignored, for the
+/// reason `Residency::configured` gives: a typo in a variable should not take a database down, and
+/// a silent fallback is how a machine runs for a month on a setting nobody chose.
+pub fn configured_threads() -> Setting<Option<usize>> {
+    if let Some(named) = non_empty_var(THREADS_VAR) {
+        match parse_threads(&named) {
+            Ok(count) => {
+                return Setting {
+                    value: Some(count),
+                    source: SettingSource::Environment,
+                }
+            }
+            Err(reason) => eprintln!("inillucent: ignoring {THREADS_VAR}: {reason}"),
+        }
+    }
+    match read_state(&home()).and_then(|state| state.threads) {
+        Some(count) if count >= 1 => Setting {
+            value: Some(count),
+            source: SettingSource::Recorded,
+        },
+        _ => Setting {
+            value: None,
+            source: SettingSource::Default,
+        },
+    }
+}
+
+/// The device this process should run its sessions on, and where it came from.
+///
+/// The same order as [`configured_threads`], with `cpu` as the default.
+pub fn configured_device() -> Setting<String> {
+    if let Some(named) = non_empty_var(DEVICE_VAR) {
+        match parse_device(&named) {
+            Ok(device) => {
+                return Setting {
+                    value: device,
+                    source: SettingSource::Environment,
+                }
+            }
+            Err(reason) => eprintln!("inillucent: ignoring {DEVICE_VAR}: {reason}"),
+        }
+    }
+    match read_state(&home())
+        .and_then(|state| state.device)
+        .and_then(|text| parse_device(&text).ok())
+    {
+        Some(device) => Setting {
+            value: device,
+            source: SettingSource::Recorded,
+        },
+        None => Setting {
+            value: "cpu".to_string(),
+            source: SettingSource::Default,
+        },
     }
 }
 

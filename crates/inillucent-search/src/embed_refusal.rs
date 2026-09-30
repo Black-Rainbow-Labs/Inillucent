@@ -79,6 +79,89 @@ pub fn model_would_not_run(reason: &dyn std::fmt::Display) -> DbError {
     .with_detail(format!("embed: {reason}"))
 }
 
+/// The reranker `rerank()` and a reranked search score with, named in the refusal so a person can
+/// see which weights the command is about to download.
+pub const RERANKER: &str = install::RERANKER_MODEL;
+
+/// The refusal a machine with no reranker installed gets.
+///
+/// It names the command that installs the reranker and how large the download is, because the
+/// reranker is a separate 600 MB download that `setup-embeddings all` does not fetch. It is marked
+/// as a missing component, so the driver answers `invalid_state`, exit code 1: the statement is
+/// fine, the function is built, and this machine has not got the weights yet.
+pub fn no_reranker() -> DbError {
+    error::unmet_requirement(
+        "a reranker model",
+        format!(
+            "rerank: no reranker is installed. Run `inillucent setup-embeddings reranker` to \
+             download {RERANKER} (about 600 MB), or set {} to a directory that already holds it",
+            install::MODEL_DIR_VAR
+        ),
+    )
+}
+
+/// The refusal a reranker that is installed and would not run gets.
+///
+/// @param reason - what the reranker said, for the diagnostic detail
+pub fn reranker_would_not_run(reason: &dyn std::fmt::Display) -> DbError {
+    error::unmet_requirement(
+        "a working ONNX Runtime",
+        "rerank: a reranker is installed but did not run. The usual cause is a missing ONNX \
+         Runtime, which `inillucent setup-embeddings runtime` installs; open the database with \
+         diagnostics on to read what it said",
+    )
+    .with_detail(format!("rerank: {reason}"))
+}
+
+/// The refusal a build without embedding support gives for a function or a column that needs it.
+///
+/// Marked `unsupported`, so the driver answers `unsupported` and the command line exits with 3: the
+/// statement is spelled correctly and this build has not got the feature, which is a different
+/// answer from a machine that has the feature and not the weights.
+///
+/// @param what - the function or column, such as `rerank(TEXT, TEXT)`
+pub fn not_built(what: &str) -> DbError {
+    error::refusal(format!(
+        "{what}: this build has no embedding support compiled in"
+    ))
+    .with_unsupported(what)
+}
+
+/// The refusal a search that names `question` and no candidates gets.
+///
+/// A reranker reorders the rows a search found, so a search with neither a `MATCH` nor a `vector`
+/// constraint has nothing to reorder.
+pub fn nothing_to_rerank() -> DbError {
+    error::unmet_requirement(
+        "a search to rerank",
+        "inillucent_search: question needs candidates to rerank. Add a MATCH constraint, a vector \
+         constraint, or both, so the search finds rows for the reranker to reorder",
+    )
+}
+
+/// The refusal a call gets when the CUDA device was asked for and did not start.
+///
+/// **It never becomes a run on the processor.** A bulk embedding meant to take
+/// twenty minutes on a card takes about twelve hours on the processor, and nothing
+/// in the output would say why. The message names the command that installs the
+/// runtime build that carries CUDA, which is the usual missing piece.
+///
+/// @param function - the SQL function or command that was called, such as `embed`
+/// @param reason - what the runtime said, for the diagnostic detail
+pub fn cuda_would_not_start(function: &str, reason: &dyn std::fmt::Display) -> DbError {
+    error::unmet_requirement(
+        "a working CUDA runtime",
+        format!(
+            "{function}: the CUDA device was asked for and did not start. Run `inillucent \
+             setup-embeddings runtime --gpu` to install the ONNX Runtime build that carries \
+             CUDA, and check that the CUDA toolkit and cuDNN are installed. The call was not run \
+             on the processor instead. Set {} to cpu to use the processor",
+            install::DEVICE_VAR
+        ),
+    )
+    .with_detail(format!("{function}: {reason}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +220,46 @@ mod tests {
             "the runtime's own words are kept for a diagnostic reader"
         );
         assert_eq!(refused.requirement(), Some("a working ONNX Runtime"));
+    }
+
+    /// A CUDA start that failed names the command that installs the CUDA runtime, and says it did
+    /// not fall back to the processor.
+    #[test]
+    fn a_cuda_refusal_names_the_gpu_runtime_and_the_absence_of_a_fallback() {
+        let refused = cuda_would_not_start("embed", &"no provider");
+        let message = format!("{refused}");
+        assert!(
+            message.contains("setup-embeddings runtime --gpu"),
+            "{message}"
+        );
+        assert!(message.contains("not run on the processor"), "{message}");
+        assert_eq!(refused.requirement(), Some("a working CUDA runtime"));
+    }
+
+    /// The reranker refusals name what to run, and are marked so the driver reports them correctly.
+    #[test]
+    fn the_reranker_refusals_name_their_fix_and_carry_the_right_marker() {
+        let missing = no_reranker();
+        let message = format!("{missing}");
+        assert!(
+            message.contains("inillucent setup-embeddings reranker"),
+            "{message}"
+        );
+        assert!(message.contains(RERANKER), "{message}");
+        assert_eq!(missing.requirement(), Some("a reranker model"));
+        assert_eq!(missing.unsupported(), None);
+
+        let unbuilt = not_built("rerank(TEXT, TEXT)");
+        assert_eq!(unbuilt.unsupported(), Some("rerank(TEXT, TEXT)"));
+        assert!(format!("{unbuilt}").contains("no embedding support compiled in"));
+
+        let nothing = nothing_to_rerank();
+        assert!(format!("{nothing}").contains("MATCH"));
+        assert_eq!(nothing.requirement(), Some("a search to rerank"));
+
+        let broken = reranker_would_not_run(&"boom");
+        assert!(format!("{broken}").contains("setup-embeddings runtime"));
+        assert!(!format!("{broken}").contains("boom"));
     }
 
     /// Neither refusal is the other, so a caller told to install the runtime is

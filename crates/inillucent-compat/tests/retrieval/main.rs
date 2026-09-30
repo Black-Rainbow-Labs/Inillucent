@@ -16,4 +16,9 @@
 //! `tests/selection.toml`. `selection::discover` finds a module file with no
 //! row, so `no_test_hides_outside_the_map` names one that was forgotten.
 
+mod bulk_embed;
+mod bulk_embed_cuda;
+mod embed_settings;
 mod rag_verify;
+mod rerank;
+mod rerank_absent;

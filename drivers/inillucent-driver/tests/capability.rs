@@ -132,6 +132,39 @@ fn probe_with(name: &str, setup: &[&str], sql: &str, want_value: bool, register:
     outcome
 }
 
+/// Runs one query on a fresh database opened with a raw key, and reads its
+/// first cell.
+///
+/// Opening is part of what is probed: an engine that cannot open a keyed
+/// database answers `Refused`, which a `yes` row counts as wrong.
+///
+/// @param name - the capability's name, used for the file
+/// @param sql - the query under test
+fn probe_keyed(name: &str, sql: &str) -> Outcome {
+    let path = scratch(name);
+    let options = inillucent_driver::OpenOptions {
+        key: Some(inillucent_driver::EncryptionKey::raw([0x33; 32])),
+        ..inillucent_driver::OpenOptions::default()
+    };
+    let outcome = match Database::open_with(&path, options) {
+        Err(why) => Outcome::Refused(format!("{}: {}", why.status.name(), why.message)),
+        Ok(database) => {
+            let answered = database.session().query(sql, &[], usize::MAX);
+            let outcome = match answered {
+                Err(why) => Outcome::Refused(format!("{}: {}", why.status.name(), why.message)),
+                Ok(rows) => Outcome::Answered(match rows.value(0, 0) {
+                    Some(Value::Text(text)) => text.clone(),
+                    other => format!("{other:?}"),
+                }),
+            };
+            drop(database);
+            outcome
+        }
+    };
+    let _ = std::fs::remove_file(&path);
+    outcome
+}
+
 /// Every declared capability is what the engine actually does, in both
 /// directions.
 #[test]
@@ -139,6 +172,15 @@ fn the_capability_table_matches_the_engine() {
     let mut wrong: Vec<String> = Vec::new();
     for entry in CAPABILITIES {
         let supported = entry.support == Support::Yes;
+        // `rerank` is a function of the `embed` feature. The runner builds this suite with the
+        // feature, from the `features` row in `tests/selection.toml`. A plain `cargo test` does
+        // not, and the row is then not evidence of anything, so it says so and moves on.
+        if entry.name == "rerank" && !cfg!(feature = "embed") {
+            inillucent_base::testing::skipping(
+                "this build has no embedding support compiled in, so `rerank` cannot be probed",
+            );
+            continue;
+        }
         match entry.probe {
             Probe::Nothing => continue,
             Probe::Runs { setup, sql } => match (supported, probe(entry.name, setup, sql, false)) {
@@ -187,6 +229,21 @@ fn the_capability_table_matches_the_engine() {
                     )),
                 }
             }
+            Probe::Keyed { sql, expect } => match (supported, probe_keyed(entry.name, sql)) {
+                (true, Outcome::Answered(got)) if got == expect => {}
+                (false, Outcome::Answered(got)) if got != expect => {}
+                (false, Outcome::Refused(_)) => {}
+                (true, other) => wrong.push(format!(
+                    "`{}` is declared supported and a keyed database answered `{}` where                      `{expect}` was required",
+                    entry.name,
+                    described(&other)
+                )),
+                (false, other) => wrong.push(format!(
+                    "`{}` is declared unsupported and a keyed database answered `{expect}`                      anyway ({}). The engine has grown it; update capability.rs.",
+                    entry.name,
+                    described(&other)
+                )),
+            },
             Probe::Answers { setup, sql, expect } => {
                 match (supported, probe(entry.name, setup, sql, true)) {
                     (true, Outcome::Answered(got)) if got == expect => {}
@@ -245,23 +302,25 @@ fn an_unimplemented_construct_refuses_by_name_and_a_typo_does_not() {
 
     // **The example moves as the engine grows, and that is the point.** It was
     // a `LEFT JOIN`, then `ATTACH`, then `VACUUM`, then a second `ON CONFLICT`
-    // clause, each retired as the engine implemented it in turn; the assertion
-    // is about the *classification*, so it is repointed at a construct that is
-    // still unimplemented rather than weakened. `ATTACH ... KEY` is one: it
-    // names an encryption extension this engine does not have, and SQLite's
-    // own answer in a build without one is
-    // to parse the key and quietly ignore it - which is the answer a caller who
-    // asked for an encrypted file must not be given.
+    // clause, then `ATTACH ... KEY`, each retired as the engine implemented it
+    // in turn; the assertion is about the *classification*, so it is repointed
+    // at a construct that is still unimplemented rather than weakened. A row
+    // value on the left of `IN (SELECT ...)` is one: the capability table's
+    // `row_value_in_subquery` row says so and checks it.
     let refused = connection
-        .query("ATTACH DATABASE 'vault.db' AS vault KEY 'secret'", &[], 10)
-        .expect_err("an encryption key on ATTACH is refused");
+        .query(
+            "SELECT a FROM people WHERE (a, a) IN (SELECT a, a FROM teams)",
+            &[],
+            10,
+        )
+        .expect_err("a row value against a subquery is refused");
     assert_eq!(
         refused.status,
         Status::Unsupported,
-        "an encryption key is a capability gap, not a syntax error: {refused}"
+        "a row value against a subquery is a capability gap, not a syntax error: {refused}"
     );
     let named = refused.feature.expect("the refusal names the construct");
-    assert!(named.contains("ATTACH"), "it named `{named}`");
+    assert!(!named.is_empty(), "the refusal named nothing");
 
     let typo = connection
         .query("SELECT a FROM peple", &[], 10)

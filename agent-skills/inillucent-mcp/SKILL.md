@@ -5,7 +5,7 @@ description: Serve an inillucent database to an AI agent over MCP with inillucen
 
 # Giving an agent a database over MCP
 
-`inillucent-mcp` serves 28 of the CLI's commands as MCP tools over standard input and output. The
+`inillucent-mcp` serves 29 of the CLI's commands as MCP tools over standard input and output. The
 tools are generated from the same command table as the `inillucent` command line. A test,
 `command_parity.rs`, fails the build if the two ever disagree. Each tool's description is the text
 `inillucent help <command>` prints.
@@ -97,6 +97,17 @@ Temporary files are made inside `DIR`.
 `--root` also refuses a migration from a PostgreSQL or MySQL server, because such a migration
 connects to a host and a port. The refusal says so by name, with the status `invalid_state`. Run a
 server migration from a command line without `--root`.
+
+### `--key-file FILE`
+
+`--key-file FILE` serves an encrypted database. The file holds the key: a passphrase, or a raw key
+written `x'<64 hex digits>'`. `INILLUCENT_KEY` in the server's environment does the same. The agent
+never sees the key. No tool takes one, and `encrypt`, `decrypt` and `rekey` are not served. A server
+started without the key of an encrypted database does not start, and says why on standard error.
+
+```json
+{"command": ["inillucent-mcp", "--db", "vault.rdb", "--key-file", "vault.key", "--readonly"]}
+```
 
 `--readonly` and `--root` do not replace file system permissions. They let you give an agent the
 reporting database without giving it every file the user can read.

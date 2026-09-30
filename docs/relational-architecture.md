@@ -115,7 +115,10 @@ Three rules follow from this table.
 
 - **`inillucent-vfs` is the only crate that touches a file.** A test can therefore replace the disk
   with a simulated one, and the crash tests use that to fail a chosen write or sync. `--root` is
-  enforced in `inillucent-vfs` for the same reason (section 8).
+  enforced in `inillucent-vfs` for the same reason (section 8). Encryption at rest is a file system
+  that wraps the operating system's one for the same reason: every file the engine opens goes
+  through it, and no crate above it knows whether the database is encrypted. See
+  [Encryption at rest](encryption.md).
 - **The log does not depend on the buffer pool.** A log record stores a page number as a plain
   `u64`. The pool is told the highest LSN that is safe on disk, and it refuses to write a page whose
   LSN is at or above that number. The log therefore reaches the disk before any page it describes.

@@ -259,6 +259,44 @@ impl Database {
         Database::open_as(path, PAGE_SIZE, frames, true)
     }
 
+    /// Opens an encrypted database, creating it, encrypted, when the path
+    /// holds nothing.
+    ///
+    /// @param path - the database file
+    /// @param key - the key it is encrypted with
+    pub fn open_encrypted(path: impl AsRef<Path>, key: crate::EncryptionKey) -> DbResult<Database> {
+        Database::open_keyed(path, PAGE_SIZE, DEFAULT_FRAMES, false, Some(key))
+    }
+
+    /// Opens a database with every choice stated, the key included.
+    ///
+    /// **Every other open is this one with arguments written in.** With a key
+    /// the database, its log and its journals are opened through an
+    /// encrypting file system; without one, through the operating system's.
+    /// The file is looked at first, so a key given for a plaintext file, or no
+    /// key for an encrypted one, is refused with a sentence that says so
+    /// rather than with "file is not a database". A wrong key is refused as
+    /// `file is not a database, or the key is wrong`, with the status
+    /// `SQLITE_NOTADB`.
+    ///
+    /// A `:memory:` database has no file to protect, and a key given for one
+    /// is not used.
+    ///
+    /// @param path - the database file
+    /// @param page_size - the page size to build at, or the one the file has
+    /// @param frames - how many frames the buffer pool holds
+    /// @param read_only - whether this connection may write the file
+    /// @param key - the key the file is encrypted with, if it is
+    pub fn open_keyed(
+        path: impl AsRef<Path>,
+        page_size: usize,
+        frames: usize,
+        read_only: bool,
+        key: Option<crate::EncryptionKey>,
+    ) -> DbResult<Database> {
+        Database::open_on_key(path.as_ref(), page_size, frames, read_only, key)
+    }
+
     /// [`Database::open_with`], with the caller saying whether this connection
     /// may write.
     ///
@@ -272,7 +310,24 @@ impl Database {
         frames: usize,
         read_only: bool,
     ) -> DbResult<Database> {
-        let path = path.as_ref().to_path_buf();
+        Database::open_on_key(path.as_ref(), page_size, frames, read_only, None)
+    }
+
+    /// [`Database::open_keyed`], behind the generic path argument.
+    ///
+    /// @param path - the database file
+    /// @param page_size - the page size to build at, or the one the file has
+    /// @param frames - how many frames the buffer pool holds
+    /// @param read_only - whether this connection may write the file
+    /// @param key - the key the file is encrypted with, if it is
+    fn open_on_key(
+        path: &Path,
+        page_size: usize,
+        frames: usize,
+        read_only: bool,
+        key: Option<crate::EncryptionKey>,
+    ) -> DbResult<Database> {
+        let path = path.to_path_buf();
         // **`:memory:` is a database, not a filename.** The operating system
         // refuses it as a path - on Windows with `the filename, directory name,
         // or volume label syntax is incorrect` - so a shell started with no
@@ -297,9 +352,19 @@ impl Database {
                 next_session: std::cell::Cell::new(1),
             });
         }
-        let engine = match (there_is_a_database_at(&path)?, read_only) {
-            (true, false) => ImportedDatabase::open(path.clone(), page_size, frames)?,
-            (true, true) => ImportedDatabase::open_read_only(path.clone(), page_size, frames)?,
+        let exists = there_is_a_database_at(&path)?;
+        let keyed = key.is_some();
+        if exists {
+            crate::encryption::check_the_file_matches_the_key(&path, keyed)?;
+        }
+        let vfs = crate::encryption::file_system(key, page_size)?;
+        let explain = |error| crate::encryption::explain_a_wrong_key(error, keyed);
+        let engine = match (exists, read_only) {
+            (true, false) => {
+                ImportedDatabase::open_on(vfs, path.clone(), page_size, frames).map_err(explain)?
+            }
+            (true, true) => ImportedDatabase::open_as(vfs, path.clone(), page_size, frames, true)
+                .map_err(explain)?,
             // **A read only connection does not create the file it was given.**
             // Creating one would answer a caller who asked to read an existing
             // database with an empty one, and would write - see task-1979's E2,
@@ -310,7 +375,7 @@ impl Database {
                      create one",
                 ))
             }
-            (false, false) => ImportedDatabase::create(path.clone(), page_size, frames)?,
+            (false, false) => ImportedDatabase::create_on(vfs, path.clone(), page_size, frames)?,
         };
         Ok(Database {
             writer: std::rc::Rc::clone(&engine.writing),
@@ -632,8 +697,44 @@ impl Database {
                 path.display()
             ))
         })?;
-        let copy = Database::open(path)?;
+        // **The copy is opened with the key this database was.** It is the
+        // same bytes, so it is encrypted the same way, and the check below
+        // has to be able to read it.
+        let key = self.engine.borrow().encryption_key()?;
+        let copy = Database::open_keyed(path, PAGE_SIZE, DEFAULT_FRAMES, false, key)?;
         copy.check()
+    }
+
+    /// Reports whether this database is encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        self.engine.borrow().is_encrypted()
+    }
+
+    /// Changes the key this encrypted database is encrypted with. See
+    /// `ImportedDatabase::rekey`; `PRAGMA rekey` does the same.
+    ///
+    /// @param key - the new key
+    pub fn rekey(&self, key: crate::EncryptionKey) -> DbResult<()> {
+        self.engine.borrow_mut().rekey(key)
+    }
+
+    /// Writes a copy of this database to a new file, encrypted with `key`,
+    /// or in plaintext when `key` is `None`.
+    ///
+    /// **What `inillucent encrypt` and `inillucent decrypt` run.** It is the
+    /// rebuild `VACUUM INTO` does, onto a file system of the caller's
+    /// choosing, so the copy holds every row, index, view and trigger, and
+    /// nothing of the source's free space. A file already at `path` is
+    /// refused, as `VACUUM INTO` refuses one.
+    ///
+    /// @param path - where the copy goes
+    /// @param key - the key the copy is encrypted with, if any
+    pub fn export_to(
+        &self,
+        path: impl AsRef<Path>,
+        key: Option<crate::EncryptionKey>,
+    ) -> DbResult<()> {
+        self.engine.borrow_mut().export_to(path.as_ref(), key)
     }
 }
 

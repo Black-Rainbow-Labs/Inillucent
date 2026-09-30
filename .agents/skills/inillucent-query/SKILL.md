@@ -10,6 +10,10 @@ against that table. Guessing at column names first wastes calls.
 
 ## 1. See what the file holds
 
+An encrypted database needs its key on every command: `--key-file <file>`, or the key in
+`INILLUCENT_KEY`. Without it every command fails with the status `corrupt` and a message that says
+the database is encrypted.
+
 ```sh
 inillucent --db app.rdb tables            # tables and views
 inillucent --db app.rdb schema            # every CREATE statement

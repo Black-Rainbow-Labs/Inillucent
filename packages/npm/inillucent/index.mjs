@@ -77,14 +77,15 @@ export { resolveBinary, PROGRAMS, platformPackage };
  * @param binary - the program to run
  * @param args - its command line
  * @param stdin - what to write to its standard input, or null
+ * @param env - the environment the program runs with
  */
-async function spawnWith(binary, args, stdin) {
+async function spawnWith(binary, args, stdin, env) {
   if (stdin === null) {
-    return run(binary, args, { maxBuffer: 256 * 1024 * 1024 });
+    return run(binary, args, { maxBuffer: 256 * 1024 * 1024, env });
   }
   const { spawn } = await import('node:child_process');
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(binary, args, { stdio: ['pipe', 'pipe', 'pipe'], env });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk) => {
@@ -111,6 +112,22 @@ async function spawnWith(binary, args, stdin) {
 }
 
 /**
+ * Builds the environment a child program runs with.
+ *
+ * The key of an encrypted database travels in `INILLUCENT_KEY` and never on the
+ * command line, because a command line is visible in the process list. With no
+ * key the inherited environment is passed on untouched.
+ *
+ * @param key - the key text of an encrypted database, or undefined
+ */
+function childEnvironment(key) {
+  if (key === undefined || key === null) {
+    return process.env;
+  }
+  return { ...process.env, INILLUCENT_KEY: String(key) };
+}
+
+/**
  * Runs one inillucent command and returns its result object.
  *
  * The command line's `--output json` contract: `{ ok, command, columns, rows,
@@ -124,10 +141,11 @@ async function spawnWith(binary, args, stdin) {
  * broken invocation throws.
  *
  * @param command - the verb, such as "query" or "describe"
- * @param options - the named arguments the verb takes, plus `db`
+ * @param options - the named arguments the verb takes, plus `db` and `key`
+ *   (the key of an encrypted database, sent in `INILLUCENT_KEY`)
  */
 export async function inillucent(command, options = {}) {
-  const { db, ...rest } = options;
+  const { db, key, ...rest } = options;
   const args = [command, '--output', 'json'];
   let stdin = null;
   if (db) {
@@ -160,7 +178,7 @@ export async function inillucent(command, options = {}) {
   }
   const binary = resolveBinary('inillucent');
   try {
-    const { stdout } = await spawnWith(binary, args, stdin);
+    const { stdout } = await spawnWith(binary, args, stdin, childEnvironment(key));
     return JSON.parse(stdout);
   } catch (why) {
     // A non-zero exit still prints the result object on standard output when
@@ -182,7 +200,7 @@ export async function inillucent(command, options = {}) {
  * that need the counts, the timing or the failure class.
  *
  * @param sql - the statement
- * @param options - `db`, `params`, `limit`
+ * @param options - `db`, `key`, `params`, `limit`
  */
 export async function query(sql, options = {}) {
   const result = await inillucent('query', { sql, ...options });

@@ -125,7 +125,10 @@ impl PagedTree {
                 }
             }
             seen = seen.saturating_add(1);
-            if seen > self.leaf_count.saturating_add(1) {
+            // Bounded by the file, as the forward walk is: `leaf_count` is the
+            // last checkpoint's statistic and a tree grows past it between
+            // checkpoints (task-2150).
+            if seen > pool.page_count().max(1) {
                 return Err(corrupt("a reverse walk visited more leaves than exist"));
             }
             match self.step_left(pool, &mut descent)? {

@@ -38,14 +38,19 @@ problems come from those two inputs.
   are in scope: a downgrade the caller did not ask for, a certificate that is not checked, and a
   password that appears in a log, a manifest, a report or an MCP result.
 - **The C ABI.** A lifetime or ownership mistake that correct use of the published header can reach.
+- **Encryption at rest.** A way to read rows from an encrypted database without its key, to make
+  the engine accept a unit or a header changed without the key as genuine, or to find the key or
+  the data key in a file. [Encryption at rest](docs/encryption.md) lists what the encryption does
+  not protect, such as putting back an older copy of the whole file, and those are not in scope.
 
 ## What is not in scope
 
 - **A slow query you wrote yourself.** An embedded database runs in your process and does what you
   ask. A `CROSS JOIN` of three large tables is slow because the query asked for it. Use the
   connection's limits and budget to cap the work.
-- **Anything that needs write access to the database file.** A caller who can write the file can
-  put anything in it. No engine defends against that.
+- **Anything that needs write access to a plaintext database file.** A caller who can write the
+  file can put anything in it. No engine defends against that. An encrypted database is different:
+  a change made without the key is detected, and a way round that is in scope.
 - **The dot commands that `inillucent-shell -safe` refuses**, such as `.shell`, `.system` and
   `.load`. Without `-safe`, `inillucent-shell` runs them, the same as `sqlite3` does.
 - **A missing feature.** Exit code 3 means the engine has not built that feature. Exit code 1 means

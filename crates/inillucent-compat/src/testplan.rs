@@ -237,6 +237,26 @@ pub fn needs_programs(rows: &[&Row]) -> bool {
     })
 }
 
+/// Returns the features that belong to the programs the runner builds, and to nothing else.
+///
+/// **Only the two program packages, so a feature does not change what every other suite runs.**
+/// The features of the test build are unified into that one cargo invocation. The programs are
+/// built by a second invocation, and a suite that drives `inillucent` with a feature on (for
+/// example `embed`) needs that feature in the program too. Passing every row's features to the
+/// second build would turn `inillucent-engine/embed` on for programs that other suites expect to
+/// answer `unsupported`, so only a feature named `inillucent-cli/...` or
+/// `inillucent-driver-capi/...` is passed.
+///
+/// @param rows - the rows to build
+pub fn program_features(rows: &[&Row]) -> Vec<String> {
+    wanted_features(rows)
+        .into_iter()
+        .filter(|feature| {
+            feature.starts_with("inillucent-cli/") || feature.starts_with("inillucent-driver-capi/")
+        })
+        .collect()
+}
+
 /// How long an `--exact` name list may get before it is split across more than
 /// one run of the same binary.
 ///
@@ -451,6 +471,20 @@ mod tests {
             ]
             .map(String::from)
             .to_vec()
+        );
+    }
+
+    /// Only a feature of a program package reaches the build of the programs.
+    #[test]
+    fn only_program_features_reach_the_program_build() {
+        let map = map(
+            "[[target]]\npackage = \"a\"\nkind = \"lib\"\ntier = \"unit\"\n\
+             features = [\"inillucent-engine/embed\", \"inillucent-cli/embed\"]\n",
+        );
+        let rows: Vec<&Row> = map.rows.iter().collect();
+        assert_eq!(
+            program_features(&rows),
+            vec!["inillucent-cli/embed".to_string()]
         );
     }
 

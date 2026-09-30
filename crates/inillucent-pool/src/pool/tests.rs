@@ -428,3 +428,33 @@ fn the_watermark_reports_a_full_pool() {
     }
     assert!(pool.under_watermark());
 }
+
+/// A full pool that is discarded can read again, and every frame is free
+/// afterwards (task-2150).
+///
+/// `discard_all` is what a connection runs when another process has written
+/// the file. It emptied each frame through `evict_one` and dropped the frame
+/// number that call returned, so the frame was neither resident nor on the
+/// free list. On a pool that had filled up, that left nothing to read into:
+/// the next fetch failed with "every frame in the buffer pool is pinned",
+/// and so did every fetch after it.
+#[test]
+fn a_full_pool_reads_again_after_it_is_discarded() {
+    let pool = pool_over(512, 4, 12);
+    for page in 2..10u64 {
+        let _ = pool.fetch(PageId(page)).unwrap();
+    }
+    assert_eq!(pool.resident(), 4, "every frame holds a page");
+
+    assert_eq!(pool.discard_all().unwrap(), 4, "every frame was let go");
+    assert_eq!(pool.resident(), 0);
+    assert_eq!(
+        pool.state.borrow().free.len(),
+        4,
+        "a discarded frame went back on the free list"
+    );
+    for page in 2..10u64 {
+        let guard = pool.fetch(PageId(page)).unwrap();
+        assert_eq!(page::read_u64(&guard, 32).unwrap(), page);
+    }
+}

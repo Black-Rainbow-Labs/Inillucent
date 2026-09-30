@@ -71,6 +71,14 @@ pub const REGISTER: &[PragmaSpec] = &[
         columns: &["encoding"],
         takes_argument: true,
     },
+    // Encryption at rest. `encryption` reports the cipher, `key` refuses and
+    // says where a key goes, and `rekey` changes the key. `key` and `rekey`
+    // are SQLCipher's names; none of the three is on SQLite's own list.
+    PragmaSpec {
+        name: "encryption",
+        columns: &["encryption"],
+        takes_argument: false,
+    },
     PragmaSpec {
         name: "foreign_key_check",
         columns: &["table", "rowid", "parent", "fkid"],
@@ -128,6 +136,7 @@ pub const REGISTER: &[PragmaSpec] = &[
         takes_argument: true,
     },
     boolean("journal_size_limit"),
+    boolean("key"),
     boolean("legacy_alter_table"),
     PragmaSpec {
         name: "locking_mode",
@@ -157,6 +166,7 @@ pub const REGISTER: &[PragmaSpec] = &[
     },
     boolean("read_uncommitted"),
     boolean("recursive_triggers"),
+    boolean("rekey"),
     boolean("reverse_unordered_selects"),
     boolean("schema_version"),
     boolean("secure_delete"),

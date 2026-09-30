@@ -971,13 +971,13 @@ The 26 that answer differently with no arguments:
 
 ## Constructs the probe does not reach
 
-`inillucent capabilities` lists 50 capabilities reported by the engine. 16 of them are `no`: the
+`inillucent capabilities` lists 53 capabilities reported by the engine. 16 of them are `no`: the
 engine refuses the construct with exit code 3. None of these is one of the 416 cases. Most of them
 run in SQLite. One, writing to a view, is refused by SQLite too.
 
 | Capability | What is refused |
 |---|---|
-| `attach_with_key` | `ATTACH ... KEY`, which SQLite runs only with its encryption extension |
+| `attach_computed_path` | `ATTACH ? AS other`: a file name that is not a string literal |
 | `row_value_in_subquery` | `(a, b) IN (SELECT x, y FROM s)` |
 | `match_in_an_or_reading_a_row` | a full text `MATCH` under an `OR` whose pattern reads another table's row, such as `f MATCH q.w OR rowid = 3` |
 | `load_extension` | `load_extension()`. There is no C extension interface |
@@ -1011,12 +1011,12 @@ These cannot be tested with a SQL script. Each row comes from the source code or
 | journal modes | `DELETE`, `TRUNCATE`, `PERSIST`, `MEMORY`, `WAL`, `OFF` | all six, and `delete` by default. `ROLLBACK` works under every mode, including `OFF` |
 | page size | 512 bytes to 64 KiB, 4 KiB by default | 32 KiB from SQL. The Rust engine API `Database::open_at` also accepts 8, 16 and 64 KiB |
 | page cache | `PRAGMA cache_size` is `-2000`, which is 2 MiB | `PRAGMA cache_size` is `-131072`, which is 128 MiB |
-| C API | `sqlite3.h`, about 290 functions | `inillucent_driver.h`, 53 functions, listed in `drivers/abi.toml` |
+| C API | `sqlite3.h`, about 290 functions | `inillucent_driver.h`, 54 functions, listed in `drivers/abi.toml` |
 | language bindings | many | Python, Node, Go, PHP and C, all over the one C library. See [`drivers/README.md`](../drivers/README.md) |
 | backup | `sqlite3_backup_*` | `inillucent_backup_to` in the C API, `.backup` in the shell |
 | authorizer and cancel | `sqlite3_set_authorizer`, `sqlite3_interrupt` | an authorizer in the Rust driver, and `inillucent_cancel` in the C API |
 | not provided | | serialize and deserialize, incremental blob I/O, update, commit, rollback and preupdate hooks, tracing, `unlock_notify`, snapshots, a custom VFS |
-| encryption at rest | SEE, a paid extension | none. `ATTACH ... KEY` is refused by name |
+| encryption at rest | SEE, a paid extension | XChaCha20-Poly1305 for the database file, the log and the journals, `ATTACH ... KEY` and `PRAGMA rekey`. See [Encryption at rest](encryption.md) |
 | functions and collations written by the application | yes | yes, scalar and aggregate functions and collations, through the driver |
 | virtual table modules written by the application | `sqlite3_create_module` | `Database::register_module` in the Rust driver |
 
@@ -1164,10 +1164,9 @@ the page cache and one `CREATE INDEX`. [Performance](performance.md#memory) brea
 | Memory is 11.5% more than SQLite's | open. See [Performance](performance.md#memory) |
 | `open.prepare` and `schema` miss their speed bars | open. Both are faster than SQLite |
 | A correlated `IN` subquery over many outer rows is slower than SQLite | open. 807% slower over 400 outer rows. Write it as a join. See [Performance](performance.md#the-workloads-that-are-slower) |
-| The C API has 53 functions where SQLite has about 290 | open. The list of what is missing is in [Architecture and operations](#architecture-and-operations) |
+| The C API has 54 functions where SQLite has about 290 | open. The list of what is missing is in [Architecture and operations](#architecture-and-operations) |
 | One thread per database | open |
 | A SQLite file cannot be opened directly | by design. `inillucent migrate` copies it |
-| No encryption at rest | the same as a SQLite build without its encryption extension |
 | `fts4aux`, `fts3tokenize`, `.expert`, `.session` and four FTS5 functions | open. See [Is the list of cases complete?](#is-the-list-of-cases-complete) |
 | The retrieval index uses 1,216 MiB of memory for 185,078 chunks | open. Nothing has been done yet to reduce it |
 

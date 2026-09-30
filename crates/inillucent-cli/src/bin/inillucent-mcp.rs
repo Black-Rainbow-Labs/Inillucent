@@ -99,6 +99,7 @@ fn parse(arguments: &[String]) -> Result<Settings, String> {
         ..Settings::default()
     };
     let mut walk = arguments.iter();
+    let mut key_file_given = false;
     while let Some(argument) = walk.next() {
         match argument.as_str() {
             "--db" | "-d" => {
@@ -108,6 +109,13 @@ fn parse(arguments: &[String]) -> Result<Settings, String> {
                     .ok_or_else(|| "--db needs a path.".to_string())?;
             }
             "--readonly" => settings.readonly = true,
+            "--key-file" => {
+                let named = walk
+                    .next()
+                    .ok_or_else(|| "--key-file needs a path.".to_string())?;
+                inillucent_cli::keys::install_from(Some(named))?;
+                key_file_given = true;
+            }
             "--root" => {
                 let named = walk
                     .next()
@@ -127,6 +135,11 @@ fn parse(arguments: &[String]) -> Result<Settings, String> {
             other => return Err(format!("'{other}' is not an option this server takes.")),
         }
     }
+    // The environment's key, when the command line named no file. See
+    // `inillucent_cli::keys`.
+    if !key_file_given {
+        inillucent_cli::keys::install_from(None)?;
+    }
     Ok(settings)
 }
 
@@ -139,6 +152,8 @@ fn usage() {
     for line in [
         "  -d, --db PATH   the database to serve (or $INILLUCENT_DB; :memory: by default)",
         "      --readonly  refuse every statement that would change something",
+        "      --key-file F  open the database encrypted, with the key in file F",
+        "                    (or $INILLUCENT_KEY; see docs/encryption.md)",
         "      --root DIR  refuse every path that resolves outside DIR (links followed)",
         "      --limit N   how many rows a call gets back when it does not say (default 200)",
         "  -V, --version   print the version and stop",

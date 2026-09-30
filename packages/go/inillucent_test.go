@@ -1,10 +1,12 @@
 package inillucent_test
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Black-Rainbow-Labs/Inillucent/packages/go"
@@ -153,5 +155,52 @@ func TestReadOnlyRefusesAWrite(t *testing.T) {
 	// And a read still works, which is what makes it read-only rather than shut.
 	if _, err := locked.Query(ctx, "SELECT count(*) FROM t"); err != nil {
 		t.Fatalf("a read-only database refused a read: %v", err)
+	}
+}
+
+// An encrypted database opens with its key and not without it, and its file
+// holds none of the text that was written to it.
+func TestEncryptedDatabaseNeedsItsKey(t *testing.T) {
+	skipWithoutBinary(t)
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "probe.rdb")
+	// A raw key, because a passphrase costs 600,000 PBKDF2 iterations per open.
+	key := "x'" + strings.Repeat("5a", 32) + "'"
+	secret := "plaintext-marker-for-the-file-scan"
+	keyed := &inillucent.DB{Path: path, Key: key}
+
+	if err := keyed.Batch(ctx, "CREATE TABLE note (id INTEGER PRIMARY KEY, body TEXT)"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := keyed.Exec(ctx, "INSERT INTO note (body) VALUES (?1)", secret); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	result, err := keyed.Query(ctx, "SELECT body FROM note")
+	if err != nil {
+		t.Fatalf("query with the key: %v", err)
+	}
+	if rows := result.Maps(); len(rows) != 1 || rows[0]["body"] != secret {
+		t.Fatalf("the row did not come back with the key: %v", rows)
+	}
+	mode, err := keyed.Query(ctx, "PRAGMA encryption")
+	if err != nil {
+		t.Fatalf("pragma: %v", err)
+	}
+	if len(mode.Rows) != 1 || mode.Rows[0][0] != "xchacha20-poly1305" {
+		t.Fatalf("expected xchacha20-poly1305, got %v", mode.Rows)
+	}
+
+	_, err = inillucent.Open(path).Query(ctx, "SELECT body FROM note")
+	held, ok := err.(*inillucent.Error)
+	if !ok || held.Status != inillucent.StatusCorrupt {
+		t.Fatalf("a read without the key should be corrupt, got %v", err)
+	}
+
+	bytesOnDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read the file: %v", err)
+	}
+	if bytes.Contains(bytesOnDisk, []byte(secret)) {
+		t.Fatal("the row text is in the database file")
 	}
 }

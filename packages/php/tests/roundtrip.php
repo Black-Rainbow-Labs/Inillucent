@@ -210,6 +210,24 @@ holds(
     in_array('distance', array_column($found['columns'], 'name'), true)
 );
 
+// --- an encrypted database needs its key -----------------------------------
+// A raw 32 byte key, because a passphrase costs 600,000 PBKDF2 iterations on
+// every open. The key travels in INILLUCENT_KEY.
+$key = "x'" . str_repeat('5a', 32) . "'";
+$secret = 'plaintext-marker-for-the-file-scan';
+$sealed = $directory . DIRECTORY_SEPARATOR . 'sealed.rdb';
+$keyed = new Inillucent($sealed, $binary, false, null, $key);
+$keyed->batch('CREATE TABLE note (id INTEGER PRIMARY KEY, body TEXT)');
+$keyed->exec('INSERT INTO note (body) VALUES (?1)', [$secret]);
+same('the row came back with the key', array_column($keyed->query('SELECT body FROM note'), 'body'), [$secret]);
+$mode = $keyed->query('PRAGMA encryption');
+same('the database reports its cipher', array_values($mode[0])[0], 'xchacha20-poly1305');
+
+$keyless = (new Inillucent($sealed, $binary))->run('query', ['sql' => 'SELECT body FROM note']);
+same('a read without the key is not ok', $keyless['ok'], false);
+same('a read without the key is corrupt', $keyless['status'], 'corrupt');
+holds('the row text is not in the file', !str_contains((string) file_get_contents($sealed), $secret));
+
 clean($directory);
 
 if ($failures === []) {
