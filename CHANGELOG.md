@@ -10,6 +10,30 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**Three fixes for one file shared by two processes.** A 3.5 GB database was damaged twice in one
+day while one process wrote large batches and another had the file open. One copy had four pages
+of zeros near its end. The other had a table whose leaf chain reached three leaves its interior
+levels did not.
+
+- **A second process could undo a writer's committed pages.** A statement whose dirty pages outgrow
+  the buffer pool writes some of them to the file early, and saves their old images in
+  `<database>-journal` first. The journal stayed on the disk after the statement committed and the
+  lock was released. A process that opened the file in that window took it for a journal left by a
+  crash and wrote the old images back. The writer did not notice and kept building on the old
+  pages. A test with a 64 frame pool lost 505 of 4,800 committed updates, and in another run the
+  file could no longer be opened. A connection now folds before it releases the lock whenever its
+  journal holds old images.
+- **A reader could not catch up on a log larger than its pool.** Every statement failed with
+  `writing it would put the data file ahead of the log` until the writer folded. The replay now
+  writes the pages it has to evict. Before it writes the file it raises its lock to exclusive, so a
+  connection holding the shared lock never writes the file, the journal or the log.
+- **A connection that was already open ignored a journal left by a process that died.** It replayed
+  the log over the file as it stood, while an open puts the old pages back first. It now puts them
+  back first too.
+
+The new durability suite `process_journal_handoff` runs three shells on one file and fails on 2.0.2
+in all three ways. A file damaged by an earlier release is not repaired by upgrading.
+
 **Two fixes found by keeping a mailbox's search table current.**
 
 - **A facet compared with an integer outside a search matched nothing.** A `FACET` column stores

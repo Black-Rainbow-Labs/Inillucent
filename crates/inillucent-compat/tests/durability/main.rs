@@ -36,6 +36,7 @@ mod phase2_campaigns;
 mod process_campaign;
 mod process_concurrency;
 mod process_crash;
+mod process_journal_handoff;
 mod process_readers;
 mod reindex_crash;
 mod search_crash;

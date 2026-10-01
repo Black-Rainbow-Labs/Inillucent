@@ -608,6 +608,10 @@ pub struct Pool {
     /// So [`Pool::checkpoint`] keeps the journal while this is set and the
     /// writer is still open, and [`Pool::finish_journal`] clears it.
     stolen: Cell<bool>,
+    /// The connection's `busy_timeout`, for [`Pool::hold_for_writing`].
+    write_lock_millis: Cell<u64>,
+    /// Whether the file handle may write; a read only open says no.
+    writable: Cell<bool>,
 }
 
 /// The pool's counters, one cell each.
@@ -737,6 +741,8 @@ impl Pool {
             // Nothing is uncommitted until a transaction says so.
             uncommitted_lsn: Arc::new(AtomicU64::new(u64::MAX)),
             stolen: Cell::new(false),
+            write_lock_millis: Cell::new(DEFAULT_BUSY_MILLIS),
+            writable: Cell::new(true),
         })
     }
 
@@ -796,30 +802,6 @@ impl Pool {
     #[allow(clippy::type_complexity)]
     pub fn on_log_behind(&self, advance: std::rc::Rc<dyn Fn() -> DbResult<u64>>) {
         *self.advance_log.borrow_mut() = Some(advance);
-    }
-
-    /// Returns the write-ahead watermark, or `u64::MAX` when there is no log.
-    pub fn durable_lsn(&self) -> u64 {
-        self.durable_lsn.get()
-    }
-
-    /// Returns the highest LSN this pool has written into the data file.
-    ///
-    /// Zero when it has written no stamped page, which is what the meta record
-    /// means by "unset" - see [`crate::meta::Meta::high_water_lsn`].
-    pub fn high_water_lsn(&self) -> u64 {
-        self.high_water_lsn.get()
-    }
-
-    /// Raises the high water to at least `lsn`.
-    ///
-    /// Used by a caller that has read a stamp the pool did not write - an open
-    /// that folds the meta page's recorded high water back in, so a run which
-    /// writes nothing does not report a lower number than the run before it.
-    ///
-    /// @param lsn - a stamp the file is known to carry
-    pub fn note_high_water_lsn(&self, lsn: u64) {
-        self.high_water_lsn.set(self.high_water_lsn.get().max(lsn));
     }
 
     /// Returns the page size in bytes.
@@ -1140,6 +1122,10 @@ impl Pool {
         // checkpointer's flush, an eviction, a manual flush - so a page cannot
         // reach the data file by a route that skips it.
         self.refuse_if_ahead_of_the_log(frame, page)?;
+        // Under EXCLUSIVE, and never from a read only handle (task-2166).
+        if !self.may_write_back()? {
+            return Ok(false);
+        }
         // No-steal: a page an open transaction has changed does not go to the
         // file. It stays dirty, so a later checkpoint - after the transaction
         // ends either way - writes it then.

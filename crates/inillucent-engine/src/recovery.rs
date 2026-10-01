@@ -533,6 +533,18 @@ pub(crate) fn resync_file(
             doubtful: doubtful.clone(),
         }
     };
+    // **Every record this replays is already in the log on the disk, so a page
+    // it produces is never ahead of the log** (task-2166). The pool still held
+    // the watermark of this connection's *previous* log, and the closure that
+    // asks that log to catch up, so the first replayed page a full pool had to
+    // evict was refused: `page 86 carries lsn 112842376, the log was asked to
+    // catch up and reached 112684168: writing it would put the data file ahead
+    // of the log`. A reader with a pool smaller than what another process had
+    // logged since the last fold could not read at all, and every statement it
+    // sent failed the same way until the writer folded. `open_file` replays
+    // with no watermark for the same reason; the new log's own point is set
+    // below, once the replay is done.
+    database.pool().set_durable_lsn(u64::MAX);
     let mut repaired = false;
     let checkpointed = match read_checkpointed_catalog(database) {
         Ok(checkpointed) => checkpointed,

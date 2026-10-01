@@ -206,6 +206,9 @@ impl Pool {
         if offset.saturating_add(self.page_size as u64) > length {
             return Ok(false);
         }
+        // The journal is one file every connection names the same way, so
+        // writing it is a write like any other - see `Pool::hold_for_writing`.
+        self.hold_for_writing()?;
         let mut before = vec![0u8; self.page_size];
         self.file
             .read_exact_at(offset, &mut before)
@@ -263,7 +266,10 @@ impl Pool {
     /// evicted every dirty page it had holds nothing dirty and still leaves a
     /// journal the next open replays - which moves the file back past writes
     /// that were acknowledged. `ImportedDatabase::fold_on_close` asks this
-    /// beside the dirty count and folds when either says yes.
+    /// beside the dirty count and folds when either says yes, and so does
+    /// `ImportedDatabase::release_if_idle` every time the lock is let go
+    /// (task-2166): the next open can be another process's, while this
+    /// connection is still using the pages the journal would put back.
     pub fn journal_is_hot(&self) -> bool {
         self.journal
             .borrow()
@@ -293,5 +299,29 @@ impl Pool {
             self.stolen.set(false);
         }
         outcome
+    }
+
+    /// Returns the write-ahead watermark, or `u64::MAX` when there is no log.
+    pub fn durable_lsn(&self) -> u64 {
+        self.durable_lsn.get()
+    }
+
+    /// Returns the highest LSN this pool has written into the data file.
+    ///
+    /// Zero when it has written no stamped page, which is what the meta record
+    /// means by "unset" - see [`crate::meta::Meta::high_water_lsn`].
+    pub fn high_water_lsn(&self) -> u64 {
+        self.high_water_lsn.get()
+    }
+
+    /// Raises the high water to at least `lsn`.
+    ///
+    /// Used by a caller that has read a stamp the pool did not write - an open
+    /// that folds the meta page's recorded high water back in, so a run which
+    /// writes nothing does not report a lower number than the run before it.
+    ///
+    /// @param lsn - a stamp the file is known to carry
+    pub fn note_high_water_lsn(&self, lsn: u64) {
+        self.high_water_lsn.set(self.high_water_lsn.get().max(lsn));
     }
 }

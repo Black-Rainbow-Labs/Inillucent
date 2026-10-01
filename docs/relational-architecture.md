@@ -164,6 +164,15 @@ pages than the pool holds. The pool then writes some of that transaction's pages
 That early write is protected by a rollback journal, so a crash before the commit can put the old
 page back. In `wal` mode the journal file is still created for this case.
 
+The journal never outlives the file lock. Under `locking_mode = normal`, a connection whose journal
+holds old page images folds the log into the file before it releases the lock, and the fold removes
+the journal. So a journal that another process finds beside an unlocked file always belongs to a
+process that died while it held the lock. Before version 2.0.3 the journal stayed until the next
+fold. A second process that opened the file in that window wrote the old images back over pages
+the first connection had committed, and the first connection kept working from pages it believed
+were current. That lost committed rows, and it produced pages of zeros and B+tree levels that did
+not reach every leaf.
+
 ---
 
 ## 4. Transactions and isolation
@@ -185,7 +194,15 @@ reader of another process read a snapshot while a writer works.
 
 When a connection takes the lock, it checks whether another process changed the file or the log
 since it last looked. If either moved, it drops its cached pages and replays the log from the file's
-last checkpoint before it reads anything.
+last checkpoint before it reads anything. If a rollback journal is beside the file at that moment,
+a process died while it held the lock, and the connection puts the journal's old pages back before
+it replays, as an open does.
+
+A connection holding the shared lock never writes the file. A replay can change more pages than
+the pool holds, and the pool then has to write some of them to the file. Before it writes one, the
+connection raises its lock to exclusive. If another connection already holds the reserved lock,
+the statement fails at once with `busy` instead of waiting, because each would wait for the other.
+A connection that raised its lock this way folds before it releases it.
 
 `ROLLBACK` is done from the log. It works the same way in every journal mode, including `off`.
 

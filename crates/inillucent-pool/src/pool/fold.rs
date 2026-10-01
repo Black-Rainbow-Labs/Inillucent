@@ -163,6 +163,10 @@ impl Pool {
         // to forbid held anyway. It is kept because anything a caller saved
         // before reaching a checkpoint is still owed a sync, and it costs
         // nothing when there is none.
+        //
+        // **And the file is held exclusively first** (task-2166): a checkpoint
+        // writes the meta record, which every reader holding SHARED reads.
+        self.hold_for_writing()?;
         self.seal_journal()?;
         self.flush()?;
         // Every page this checkpoint wrote has now raised the high water, so
@@ -383,6 +387,7 @@ impl Pool {
         if page != META_PAGE && page != SHADOW_PAGE {
             return Err(misuse(format!("page {} is not a meta page", page.0)));
         }
+        self.hold_for_writing()?;
         self.file
             .write_all_at(page.0.saturating_mul(self.page_size as u64), image)
             .map_err(|error| error.into_db_error())?;
@@ -475,6 +480,7 @@ impl Pool {
             self.note_high_water_lsn(lsn);
         }
         page::checksum_page(image)?;
+        self.hold_for_writing()?;
         self.file
             .write_all_at(page.0.saturating_mul(self.page_size as u64), image)
             .map_err(|error| error.into_db_error())?;

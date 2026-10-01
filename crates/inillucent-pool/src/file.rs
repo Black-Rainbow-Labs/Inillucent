@@ -379,6 +379,7 @@ impl Database {
     /// @param frames - how many frames the pool holds
     pub fn open_read_only(vfs: &dyn Vfs, path: &DbPath, frames: usize) -> DbResult<Database> {
         let (pool, meta) = Self::open_bootstrap_with(vfs, path, frames, true)?;
+        pool.forbid_writing();
         let free = FreeMap::new(pool.page_size());
         Ok(Database {
             pool,
@@ -594,6 +595,9 @@ impl Database {
         if there <= wanted {
             return Ok(());
         }
+        // Shortening the file is a write, and another reader holding SHARED may
+        // be reading the pages past `wanted` - see `Pool::hold_for_writing`.
+        self.pool.hold_for_writing()?;
         self.pool
             .file()
             .truncate(wanted)
@@ -1114,6 +1118,7 @@ impl Database {
     /// @param millis - the budget in milliseconds
     pub fn set_busy_millis(&mut self, millis: u64) {
         self.busy_millis = millis;
+        self.pool.set_write_lock_millis(millis);
     }
 
     /// Returns the record the file held the last time this connection looked.

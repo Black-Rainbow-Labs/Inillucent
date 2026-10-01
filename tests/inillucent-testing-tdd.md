@@ -164,7 +164,7 @@ check a run against.
 | `unit` | 31 | 1,471 | `change` | every crate's own `#[cfg(test)]` modules |
 | `engine` | 78 | 488 | `change` | SQL and storage behaviour over real database files |
 | `differential` | 34 | 349 | `change` | graded against the pinned SQLite 3.53.4 |
-| `durability` | 35 | 239 | `merge` | crashes, injected faults, corruption and concurrency |
+| `durability` | 36 | 243 | `merge` | crashes, injected faults, corruption and concurrency |
 | `e2e` | 36 | 437 | `change` | the public surfaces an application binds to, end to end |
 | `perf` | 1 | 8 | `merge` | the cost guards — **runs alone**, see §5 |
 | `retrieval` | 12 | 570 | `change` | the embedding and retrieval engine, and its graded harness |

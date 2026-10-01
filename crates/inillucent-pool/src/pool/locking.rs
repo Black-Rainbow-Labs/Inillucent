@@ -13,6 +13,15 @@
 
 use super::*;
 
+/// How long [`Pool::hold_for_writing`] waits for RESERVED, in milliseconds.
+///
+/// Long enough to outlast a writer that took RESERVED to start a statement and
+/// is about to let it go because a reader is in its way, which is a matter of a
+/// millisecond or two. Short enough that a reader beside a transaction holding
+/// RESERVED gives way before either of them has waited for anything that
+/// matters - see that function.
+const RESERVED_PATIENCE_MILLIS: u64 = 100;
+
 impl Pool {
     /// Raises the lock on the database file.
     ///
@@ -56,6 +65,105 @@ impl Pool {
     /// Returns the level currently held.
     pub fn lock_level(&self) -> FileLock {
         self.file.lock_level()
+    }
+
+    /// Raises a shared lock to the exclusive one, before this pool writes the
+    /// database file or its journal.
+    ///
+    /// **A connection that holds only SHARED writes pages too, and it used to
+    /// do it under SHARED** (task-2166). A reader that finds another process
+    /// has committed replays the log into its own pool, and a replay that
+    /// dirties more pages than the pool holds evicts them - which writes each
+    /// one to the file and its old image to `<database>-journal`. Every other
+    /// reader holds SHARED at the same moment, so two of them could write the
+    /// same journal, and one could read a page while the other was halfway
+    /// through writing it. The journal was then left beside the file after the
+    /// reader let go, where the next process to open the file put the old
+    /// images back over pages the reader believed were current.
+    ///
+    /// Raising here rather than in the engine is what reaches every such write:
+    /// an eviction inside a replay, inside an open, inside a read. A connection
+    /// that raised keeps EXCLUSIVE until it lets the file go, and the engine
+    /// folds before it does so the journal does not outlive the lock - see
+    /// `ImportedDatabase::release_if_idle`.
+    ///
+    /// **RESERVED is waited for only briefly.** A connection that holds SHARED
+    /// and is refused RESERVED is beside another one that has it. If that one
+    /// is a transaction, it is waiting for every SHARED holder to leave before
+    /// it can take EXCLUSIVE, and waiting here would be each waiting for the
+    /// other until a budget ran out - so this one gives way and reports busy,
+    /// which is what SQLite does in the same place. The brief wait is for the
+    /// other case: a writer starting a statement takes RESERVED and lets it go
+    /// again within a millisecond when a reader is in its way, and failing a
+    /// read over that would be failing it for nothing. EXCLUSIVE is then
+    /// waited for: what stands in the way of it is readers finishing a
+    /// statement.
+    ///
+    /// A pool holding no lock at all is left alone. That is a file nobody else
+    /// can reach - one being created, or one a test opened without the
+    /// protocol - and a pool holding EXCLUSIVE has nothing to raise.
+    pub fn hold_for_writing(&self) -> DbResult<()> {
+        let level = self.file.lock_level();
+        if level == FileLock::None || level == FileLock::Exclusive || !self.writable.get() {
+            return Ok(());
+        }
+        if level < FileLock::Reserved {
+            lock_with_wait(
+                self.file.as_ref(),
+                FileLock::Reserved,
+                RESERVED_PATIENCE_MILLIS.min(self.write_lock_millis.get()),
+            )
+            .map_err(|error| {
+                error.with_detail(
+                    "this connection had to write pages it replayed from the log, and another \
+                     connection holds the file for writing; run the statement again",
+                )
+            })?;
+        }
+        lock_with_wait(
+            self.file.as_ref(),
+            FileLock::Exclusive,
+            self.write_lock_millis.get(),
+        )
+    }
+
+    /// Reports whether `writeback` may write a dirty page, raising the lock
+    /// first when it may.
+    ///
+    /// **A read only handle keeps the page rather than failing the write**
+    /// (task-2166). Its dirty pages are ones a replay produced, and the file
+    /// cannot take them. Held back, the frame stays resident and the pool
+    /// uses a frame it has spare instead, which is what `take_frame` does
+    /// past the budget - so a read only connection whose replay is larger
+    /// than `cache_size` still reads, up to the frames the pool owns.
+    ///
+    /// Every other pool writes under EXCLUSIVE or not at all: a reader that
+    /// replays past its pool reaches `writeback` holding SHARED - see
+    /// [`Pool::hold_for_writing`].
+    pub(super) fn may_write_back(&self) -> DbResult<bool> {
+        if !self.writable.get() {
+            Counters::add(&self.counters.held_back, 1);
+            return Ok(false);
+        }
+        self.hold_for_writing()?;
+        Ok(true)
+    }
+
+    /// Sets how long [`Pool::hold_for_writing`] waits for readers to leave.
+    ///
+    /// The connection's `busy_timeout`, pushed down by `Database::set_busy_millis`
+    /// so a raise made on the connection's behalf waits as long as the
+    /// connection said it would.
+    ///
+    /// @param millis - the budget
+    pub fn set_write_lock_millis(&self, millis: u64) {
+        self.write_lock_millis.set(millis);
+    }
+
+    /// Records that this pool's file handle may not write, so a raise would
+    /// only hold other processes out for a write that the handle refuses.
+    pub fn forbid_writing(&self) {
+        self.writable.set(false);
     }
 
     /// Returns the file itself, for a caller that has to ask it about its own

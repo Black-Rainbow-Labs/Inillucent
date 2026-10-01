@@ -2534,6 +2534,18 @@ module = "process_readers"
 tier = "durability"
 covers = ["inillucent-cli", "inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-vfs"]
 
+# A rollback journal left beside the file between two statements of a live
+# writer, replayed by a second process's open over pages the writer had
+# committed. Three shells kept open, because the window exists only between the
+# statements of a connection that stays open.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "process_journal_handoff"
+tier = "durability"
+covers = ["inillucent-cli", "inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-vfs"]
+
 # A kill campaign across forty seeded cut points, at two page sizes (task-2036).
 # `process_crash` beside it kills at twenty evenly spaced points at one page
 # size; the shape that found task-1987's loss of one insert in six hundred was

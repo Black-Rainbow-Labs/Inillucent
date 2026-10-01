@@ -861,3 +861,11 @@ they are touching do not collide; two that have not, do.
   right.** Three lanes removed lines whose own cases still disagreed for a different reason. To see
   what a listed case differs on, run it from a `.slt` under a new case id (`case x-<id>`), which
   the list does not hide. (task-2136)
+- **A test of two processes on one file has to keep the second process open.** A process that opens
+  the file and then closes folds what it replayed on the way out. The fold moves the meta record, the
+  writer reloads, and a defect in the hand off disappears. `process_journal_handoff.rs` keeps every
+  shell open until the end for this reason, and its first version still passed on the broken build
+  until the table was large enough for a journal to be on the disk when the second process looked.
+  To prove a durability case fails before a fix, make a second worktree at `HEAD` with
+  `git worktree add --detach`, copy the new test into it, and run it there with its own
+  `--target-dir`. (task-2166)

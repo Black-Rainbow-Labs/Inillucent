@@ -132,6 +132,7 @@ impl ImportedDatabase {
         let moved =
             reloaded || (taking && !inside && (self.the_meta_moved()? || self.the_log_moved()?));
         if moved && !inside {
+            self.settle_a_journal_left_by_the_dead(writing)?;
             self.resync_from_file()?;
         }
         if taking && !inside {
@@ -198,6 +199,7 @@ impl ImportedDatabase {
                     && !inside
                     && (self.attached_meta_moved(index)? || self.attached_log_moved(index)?));
             if moved && !inside {
+                self.settle_attached_journal_left_by_the_dead(index, &path, writing)?;
                 self.resync_attached(index, &path)?;
                 any = true;
             }
@@ -255,6 +257,46 @@ impl ImportedDatabase {
         }
         let tail = held.wal.tail_of_open_segment()?;
         Ok(tail.sequence != held.wal.sequence() || tail.next_lsn != held.wal.written_end())
+    }
+
+    /// Puts back the pages a dead process left in one attached file.
+    ///
+    /// The attached half of
+    /// [`ImportedDatabase::settle_a_journal_left_by_the_dead`], and there for
+    /// the same reason: a file is a file whichever name a statement gives it.
+    ///
+    /// @param index - which attachment
+    /// @param path - that attachment's file
+    /// @param writing - whether the statement changes the database
+    fn settle_attached_journal_left_by_the_dead(
+        &mut self,
+        index: usize,
+        path: &std::path::Path,
+        writing: bool,
+    ) -> DbResult<()> {
+        let db_path = DbPath::new(path.to_string_lossy().as_ref());
+        let Some(held) = self.session_state.attached.get_mut(index) else {
+            return Ok(());
+        };
+        if !inillucent_pool::journal::a_hot_journal_is_beside(held.vfs.as_ref(), &db_path) {
+            return Ok(());
+        }
+        if held.database.read_only() {
+            return Err(refusal(
+                "another process stopped in the middle of writing an attached database and \
+                 left a rollback journal, and a read only connection cannot replay it; open it \
+                 for writing once to recover it",
+            ));
+        }
+        held.database.end_access()?;
+        let replayed = inillucent_pool::journal::replay_hot_journal(held.vfs.as_ref(), &db_path);
+        let retaken = match writing {
+            true => held.database.begin_write_within(true),
+            false => held.database.begin_read(),
+        };
+        replayed?;
+        retaken?;
+        Ok(())
     }
 
     /// Rebuilds one attached file's pages, free map and log position from the
@@ -378,6 +420,58 @@ impl ImportedDatabase {
             || tail.next_lsn != self.storage.wal.written_end())
     }
 
+    /// Puts back the pages a process that died holding the file left in it,
+    /// before this connection reads them.
+    ///
+    /// **Open did this and a connection that was already open did not**
+    /// (task-2166). A writer that is killed, or that aborts, in the middle of a
+    /// statement whose pages outgrew its pool has written some of them to the
+    /// file early, with their old images in `<database>-journal`. Some of those
+    /// pages belong to a transaction that never committed. A new process opens
+    /// the file, finds the journal and puts the old images back first. A reader
+    /// that was open all along took the lock, saw that the log had moved,
+    /// replayed it on top of the file as it stood - uncommitted pages included,
+    /// because replay only ever applies records and never takes a page back -
+    /// and could then fold that into the file for good.
+    ///
+    /// Asked only when the file or the log moved, so a statement after which
+    /// nobody else wrote pays nothing: a process that wrote a page early had to
+    /// make its log durable to that page first, so its log moved.
+    ///
+    /// The lock is let go for the replay, because the replay takes EXCLUSIVE on
+    /// a handle of its own and this connection's SHARED would stand in its way.
+    /// Nothing is lost by letting go here: this connection has read nothing yet
+    /// under this lock, and it is about to throw its cache away regardless.
+    ///
+    /// @param writing - whether the statement changes the database, which
+    ///   decides the lock taken back afterwards
+    fn settle_a_journal_left_by_the_dead(&mut self, writing: bool) -> DbResult<()> {
+        if self.storage.path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let db_path = DbPath::new(self.storage.path.to_string_lossy().as_ref());
+        if !inillucent_pool::journal::a_hot_journal_is_beside(self.storage.vfs.as_ref(), &db_path) {
+            return Ok(());
+        }
+        if self.storage.read_only {
+            return Err(refusal(
+                "another process stopped in the middle of writing this database and left a \
+                 rollback journal, and a read only connection cannot replay it; open it for \
+                 writing once to recover it",
+            ));
+        }
+        self.storage.database.end_access()?;
+        let replayed =
+            inillucent_pool::journal::replay_hot_journal(self.storage.vfs.as_ref(), &db_path);
+        let retaken = match writing {
+            true => self.storage.database.begin_write_within(true),
+            false => self.storage.database.begin_read(),
+        };
+        replayed?;
+        retaken?;
+        Ok(())
+    }
+
     /// Rebuilds this connection's pages, free map and log position from the
     /// files, with the lock held.
     ///
@@ -485,10 +579,12 @@ impl ImportedDatabase {
         // acknowledged inserts through `ATTACH` under load.
         let wrote = self.storage.database.lock_level() > inillucent_vfs::FileLock::Shared
             || self.storage.database.pool().dirty_pages() > 0
+            || self.storage.database.pool().journal_is_hot()
             || self.session_state.attached.iter().any(|held| {
                 held.path.is_some()
                     && (held.database.lock_level() > inillucent_vfs::FileLock::Shared
-                        || held.database.pool().dirty_pages() > 0)
+                        || held.database.pool().dirty_pages() > 0
+                        || held.database.pool().journal_is_hot())
             });
         if wrote && self.storage.database.pool().lock_level() != inillucent_vfs::FileLock::None {
             // **The log, once.** `Wal::commit` already syncs under `synchronous =
@@ -537,13 +633,9 @@ impl ImportedDatabase {
             if self.any_attached_is_dirty() {
                 self.checkpoint_attached_only()?;
             }
-            // **And `main`'s fold only once its log has grown past the bar** - see
-            // `crate::checkpoint::RECLAIM_BYTES` for why four mebibytes and why
-            // bytes rather than pages. At the 32 KiB default page size an
-            // autocommit statement writes about 34 KiB of log, so this is one fold
-            // every hundred and twenty statements, and a hot leaf is imaged once
-            // per fold however many statements touched it.
-            if self.a_fold_is_due() {
+            // **And `main` folds when a fold is owed before the lock goes** - see
+            // `fold_owed_at_release`.
+            if self.fold_owed_at_release() {
                 // `false`: a statement letting the file go is not somebody asking for
                 // a checkpoint - see `checkpoint_of` for what the difference costs.
                 self.checkpoint_of(false)?;
@@ -645,6 +737,47 @@ impl ImportedDatabase {
         folded.and(left)
     }
 
+    /// Reports whether `main` has to fold before this connection lets the file go.
+    ///
+    /// **Once its log has grown past the bar** - see
+    /// `crate::checkpoint::RECLAIM_BYTES` for why four mebibytes and why
+    /// bytes rather than pages. At the 32 KiB default page size an
+    /// autocommit statement writes about 34 KiB of log, so this is one fold
+    /// every hundred and twenty statements, and a hot leaf is imaged once
+    /// per fold however many statements touched it.
+    ///
+    /// **And whenever a rollback journal would outlive the lock**
+    /// (task-2166). A statement whose dirty pages outgrew the pool wrote
+    /// some of them to the file early and saved their old images to
+    /// `<database>-journal` first. That journal used to stay beside the
+    /// file after the lock was let go, until the next fold removed it.
+    /// Any process that opened the file in between found a journal
+    /// beside an unlocked file, took it for one a crashed process had
+    /// left, and wrote the old images back over pages this connection
+    /// had committed. Nothing told this connection: the meta record and
+    /// the log had not moved, so its next statement read the old pages
+    /// and built on them. Two damaged files came out of it, one with a
+    /// leaf chain reaching three leaves its interior levels did not, one
+    /// with four pages of zeros near its end, and a test
+    /// (`process_journal_handoff`) measured 505 of 4,800 acknowledged
+    /// updates lost with `integrity-check` answering `ok`.
+    /// `fold_on_close` already folded for a hot journal (task-2055); a
+    /// release is the same moment for every other process.
+    ///
+    /// **Only under EXCLUSIVE.** A connection that holds SHARED and has
+    /// dirty pages replayed another process's log into its pool; those
+    /// pages are already in the log, so leaving them unfolded loses
+    /// nothing. Folding them under SHARED wrote the log, the pages and
+    /// the meta record while every other reader could be reading them.
+    /// A connection whose pool had to write a page raised to EXCLUSIVE
+    /// to do it (`Pool::hold_for_writing`), so a hot journal always
+    /// comes with the lock this needs.
+    fn fold_owed_at_release(&self) -> bool {
+        let exclusive = self.storage.database.lock_level() == inillucent_vfs::FileLock::Exclusive;
+        let journal_hot = self.storage.database.pool().journal_is_hot();
+        exclusive && (journal_hot || self.a_fold_is_due())
+    }
+
     /// Reports whether one file holds something the data file does not.
     ///
     /// Two things count, and a fold on the way out is owed for either: a dirty
@@ -712,10 +845,14 @@ impl ImportedDatabase {
     /// wrote `main` alone raises the attachment's lock too and folding it then would
     /// make reading a database change it.
     fn any_attached_is_dirty(&self) -> bool {
+        // A hot journal counts as dirty for the reason `release_if_idle` gives
+        // for `main` (task-2166): a connection that evicted every page it
+        // changed has nothing dirty left and still has a journal another
+        // process would replay over it.
         self.session_state.attached.iter().any(|held| {
             held.path.is_some()
                 && held.database.lock_level() > inillucent_vfs::FileLock::Shared
-                && held.database.pool().dirty_pages() > 0
+                && (held.database.pool().dirty_pages() > 0 || held.database.pool().journal_is_hot())
         })
     }
 

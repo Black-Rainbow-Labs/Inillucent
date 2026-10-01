@@ -104,9 +104,14 @@ brew_check() {
 }
 
 # --- Go: the proxy serves this version ----------------------------------------------------
+# A module at major version 2 or later has a path that ends in /vN, and the proxy lists its
+# versions only under that path. The 2.x releases are .../packages/go/v2, so asking the path
+# without the suffix listed every 0.x and 1.x version and reported 2.0.2 as missing.
 go_check() {
-  local out
-  out=$(curl -s "https://proxy.golang.org/github.com/!black-!rainbow-!labs/!inillucent/packages/go/@v/list" | tr -d '\r')
+  local out major suffix=""
+  major="${VERSION%%.*}"
+  if [ "$major" -ge 2 ]; then suffix="/v$major"; fi
+  out=$(curl -s "https://proxy.golang.org/github.com/!black-!rainbow-!labs/!inillucent/packages/go$suffix/@v/list" | tr -d '\r')
   if echo "$out" | grep -qx "v$VERSION"; then ok "go module" "proxy lists v$VERSION"
   else bad "go module" "proxy lists: $(echo "$out" | tr '\n' ' ')"; fi
 }

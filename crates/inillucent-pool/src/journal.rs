@@ -40,12 +40,23 @@
 //! by the first page this connection writes back, which is a checkpoint or an
 //! eviction, and it is removed by [`Journal::finish`], which only a checkpoint
 //! reaches. So a transaction whose dirty pages outgrow the buffer pool evicts,
-//! which creates the journal, and the file then sits beside the database until
-//! the next checkpoint - under `PRAGMA locking_mode = exclusive`, which is the
-//! default, a connection that never checkpoints again never removes it. The
-//! file is harmless: it holds pre-images of pages the commit has since made
-//! current, and `replay_hot_journal` puts them back over a database its meta
-//! record still describes, which is the state that commit left. It is named
+//! which creates the journal. Under `PRAGMA locking_mode = exclusive` the file
+//! then sits beside the database until the next checkpoint, and nobody else can
+//! open the database to find it. Under `normal` a connection folds before it
+//! lets the lock go whenever its journal holds pre-images, so the journal never
+//! outlives the lock (task-2166).
+//!
+//! **This paragraph used to call the leftover journal harmless, and it was
+//! not.** The argument was that it holds pre-images of pages the commit has
+//! since made current, and that `replay_hot_journal` puts them back over a
+//! database its meta record still describes, which redo then brings forward
+//! again. That is true for the process doing the replay. It is false for the
+//! connection that wrote the journal and is still open: its cache says those
+//! pages are current, nothing it checks on the way into a statement had moved,
+//! and it went on building on pages that were older than it believed. One of
+//! those files came back with four pages of zeros; another with a leaf chain
+//! reaching leaves its interior levels did not; a test measured 505 of 4,800
+//! acknowledged updates lost. See `process_journal_handoff.rs`. It is named
 //! here because "one file" is a claim this makes about itself.
 //!
 //! `PRAGMA journal_mode` used to accept either name without changing what
@@ -614,6 +625,38 @@ fn write_header(file: &dyn VfsFile, page_size: usize, count: usize, nonce: u64) 
     }
     file.write_all_at(0, &header)
         .map_err(|error| error.into_db_error())
+}
+
+/// Reports whether a journal with pre-images in it is beside a database.
+///
+/// **Asked by a connection that already holds the database's lock and has just
+/// found that another process wrote** (task-2166). A journal is written and
+/// disposed of under EXCLUSIVE, and a connection lets the lock go only once its
+/// journal is finished, so one that is on the disk while this connection holds
+/// any lock was left by a process that died holding EXCLUSIVE. Its pre-images
+/// have to go back before this connection reads a page, exactly as they do at
+/// open - and a connection that stays open used to read straight past them,
+/// including any page of an unfinished transaction an eviction had put in the
+/// file.
+///
+/// The magic is read rather than only the name looked up, because `truncate`
+/// and `persist` leave a finished journal on the disk: an empty file, or one
+/// whose header is zeroed. Neither has anything to put back, and calling either
+/// hot would make every statement after another process's write release and
+/// retake the lock for nothing.
+///
+/// @param vfs - where the files live
+/// @param database - the database file's path
+pub fn a_hot_journal_is_beside(vfs: &dyn Vfs, database: &DbPath) -> bool {
+    let path = database.journal();
+    if !vfs.access(&path, AccessMode::Exists).unwrap_or(false) {
+        return false;
+    }
+    let Ok(journal) = vfs.open(&path, OpenOptions::of_kind(FileKind::MainJournal)) else {
+        return false;
+    };
+    let mut magic = [0u8; 8];
+    journal.read_exact_at(0, &mut magic).is_ok() && magic == MAGIC
 }
 
 /// Takes the whole lock chain on a database, reporting whether it got it.

@@ -252,6 +252,19 @@ reaches it. No row is lost. Every leaked page is listed, one line each, up to a 
 A file whose free map chain returns to a page it already read is refused when it is opened, with a
 message that names the chain.
 
+Releases up to 2.0.2 could damage a file that one process wrote while another process opened it.
+The writer had to be changing more pages than its buffer pool holds. The damage looks like one of
+these:
+
+- `page N checksum 00000000 is not the computed ...`, with pages of zeros near the end of the file;
+- `the sibling chain visits N leaves and the interior levels reach M`;
+- `replaying InsertRow at ... found no room in leaf N`, when the file is opened;
+- rows whose committed changes are gone, with `integrity-check` answering `ok`.
+
+2.0.3 fixes it. Upgrade every program that opens the file, including drivers and the MCP server.
+An upgrade does not repair a file that is already damaged. Copy the tables that still read into a
+new file, or build the file again from its source.
+
 ## "The test suite passes and I do not believe it"
 
 Some suites need a prerequisite the workspace cannot build: the pinned SQLite, a fixture corpus, a
