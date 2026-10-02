@@ -1,4 +1,4 @@
-# 32 cuts: 1 old, 31 new, 0 damaged and detected
+# 27 cuts: 1 old, 26 new, 0 damaged and detected
 cut	state	committed
 1	new	true
 2	new	true
@@ -21,14 +21,9 @@ cut	state	committed
 19	new	true
 20	new	true
 21	new	true
-22	new	true
+22	old	true
 23	new	true
 24	new	true
 25	new	true
 26	new	true
-27	old	true
-28	new	true
-29	new	true
-30	new	true
-31	new	true
-32	new	true
+27	new	true

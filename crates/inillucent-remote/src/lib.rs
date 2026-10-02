@@ -79,6 +79,7 @@
 
 pub mod archive;
 pub mod auth;
+pub mod curl;
 pub mod http;
 pub mod migrate;
 pub mod mysql;

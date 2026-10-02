@@ -96,13 +96,19 @@ $zigDir = Join-Path $crossBin 'zig'
 # under. codesign on a Mac derives the identifier from the file name, so these
 # are the names it would have chosen; matching them keeps an artifact built here
 # interchangeable with one built there.
+# Program = $true marks an executable. Each one is signed with entitlements.plist,
+# whose one entitlement lets the program load ONNX Runtime, a library signed by
+# another team, under the hardened runtime. 2.0.3 shipped without it and embed()
+# failed in every program on macOS. The library does not take it: what a process
+# may load is decided by the program that loads the library.
 $signables = @(
-    @{ File = 'inillucent'; Id = 'inillucent' },
-    @{ File = 'inillucent-shell'; Id = 'inillucent-shell' },
-    @{ File = 'inillucent-mcp'; Id = 'inillucent-mcp' },
-    @{ File = 'inillucent-migrate'; Id = 'inillucent-migrate' },
-    @{ File = 'libinillucent_driver_capi.dylib'; Id = 'libinillucent_driver_capi' }
+    @{ File = 'inillucent'; Id = 'inillucent'; Program = $true },
+    @{ File = 'inillucent-shell'; Id = 'inillucent-shell'; Program = $true },
+    @{ File = 'inillucent-mcp'; Id = 'inillucent-mcp'; Program = $true },
+    @{ File = 'inillucent-migrate'; Id = 'inillucent-migrate'; Program = $true },
+    @{ File = 'libinillucent_driver_capi.dylib'; Id = 'libinillucent_driver_capi'; Program = $false }
 )
+$entitlements = Join-Path $PSScriptRoot 'entitlements.plist'
 
 # The oldest macOS these binaries run on, which is zig's default and not a
 # choice anybody made here.
@@ -319,12 +325,23 @@ function Assert-Signature {
 
     .PARAMETER Path
         The binary to read.
+
+    .PARAMETER Program
+        Whether the file is an executable, which must also carry the entitlement
+        that lets it load ONNX Runtime.
     #>
-    param([string] $Path)
+    param([string] $Path, [bool] $Program = $false)
     $info = & $rcodesign print-signature-info $Path 2>&1
     if ($LASTEXITCODE -ne 0) { throw "$Path has no readable signature" }
     $runtime = ($info | Select-String -Pattern 'CodeSignatureFlags\(RUNTIME\)').Count
     if ($runtime -lt 2) { throw "$Path has $runtime slices with the hardened runtime flag; both slices need it" }
+    if ($Program) {
+        # rcodesign prints the entitlements twice per slice, as XML and as DER.
+        $validation = ($info | Select-String -Pattern 'com\.apple\.security\.cs\.disable-library-validation').Count
+        if ($validation -lt 4) {
+            throw "$Path names com.apple.security.cs.disable-library-validation $validation times; both slices need it, or embed() cannot load ONNX Runtime"
+        }
+    }
     if (-not ($info | Select-String -Pattern 'time_stamp_token')) {
         throw "$Path carries no trusted timestamp, so its signature stops verifying when the certificate expires"
     }
@@ -347,11 +364,12 @@ function Set-AppleSignatures {
         $path = Join-Path $Universal $entry.File
         Assert-UniversalBinary -Path $path
         Assert-MinimumOs -Path $path
+        $entitlementArguments = @()
+        if ($entry.Program) { $entitlementArguments = @('--entitlements-xml-file', $entitlements) }
         Invoke-Rcodesign -Quiet -Arguments (@('sign') + $IdentityArguments + @(
                 '--binary-identifier', $entry.Id,
-                '--code-signature-flags', 'runtime',
-                $path))
-        Assert-Signature -Path $path
+                '--code-signature-flags', 'runtime') + $entitlementArguments + @($path))
+        Assert-Signature -Path $path -Program $entry.Program
         Write-Host "   signed $($entry.File)"
     }
 }

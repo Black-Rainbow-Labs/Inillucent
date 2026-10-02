@@ -248,6 +248,10 @@ struct Shared<S: Session> {
     embeddings: AtomicU64,
     load_ms: AtomicU64,
     embed_ms: AtomicU64,
+    /// Whether this holder has asked `exit_hook` to drop its session at exit.
+    /// Set once, the first time a session opens, which is after ONNX Runtime
+    /// was loaded and so early enough for the exit handler to run first.
+    exit_registered: std::sync::atomic::AtomicBool,
 }
 
 /// The session, when there is one, and when it was last used.
@@ -323,6 +327,7 @@ impl<S: Session> Managed<S> {
                 embeddings: AtomicU64::new(0),
                 load_ms: AtomicU64::new(0),
                 embed_ms: AtomicU64::new(0),
+                exit_registered: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -398,6 +403,9 @@ impl<S: Session> Managed<S> {
                 .fetch_add(elapsed_ms(started), Ordering::Relaxed);
             shared.loads.fetch_add(1, Ordering::Relaxed);
             state.embedder = Some(embedder);
+            if !shared.exit_registered.swap(true, Ordering::Relaxed) {
+                register_exit_unload(Arc::downgrade(shared));
+            }
         }
 
         let started = Instant::now();
@@ -476,6 +484,26 @@ impl ManagedReranker {
             reranker.score(query, passages)
         })
     }
+}
+
+/// Asks for one holder's session to be dropped when the process exits.
+///
+/// Without it, a process that embedded under `idle` or `resident` aborted at
+/// exit on macOS with code 134; `crate::exit_hook` says why. The handle is weak,
+/// so a holder dropped earlier is not kept alive, and the lock is only tried,
+/// so a call still running on another thread at exit is left alone rather than
+/// waited for.
+/// @param shared - a weak handle to the holder's state
+#[cfg(feature = "onnx")]
+fn register_exit_unload<S: Session>(shared: Weak<Shared<S>>) {
+    crate::exit_hook::register(Box::new(move || {
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        if let Ok(mut state) = shared.state.try_lock() {
+            state.embedder = None;
+        };
+    }));
 }
 
 /// Milliseconds since an instant, saturating rather than wrapping.

@@ -188,9 +188,15 @@ sha256 = "3f8c9918845848bba6c58be46c3b9c47a97f72ad4847bdfb707c1091cae10ccb"
 
 [[amendment]]
 path = "crates/inillucent-core/src/embed_onnx.rs"
-ticket = "task-2158"
-reason = "task-2158: session building moved into build_session so the embedder and the reranker share it, the CUDA failure message names the runtime install command, with_configured_machine reads the thread and device settings, embed_prefixed_counted reports each text token count, and TokenCounter counts tokens without a session. No change to what any vector is."
-sha256 = "88ace895fe9bbcd91e500b68513a5310a261e512473d484d14d4e508c27053cb"
+ticket = "task-2167"
+reason = "An ONNX Runtime that is installed and will not load is an error naming the file and the reason, and a panic inside ort while it loads the library is caught and returned as an error. 2.0.3 printed a warning, fell back to the system loader, and on macOS panicked with exit code 134. No change to what a loaded session computes."
+sha256 = "accbd68a1ee48da9b0ca4c1855b3ac991f672f9e258cd0376ca45e5b4c6449aa"
+
+[[amendment]]
+path = "crates/inillucent-core/src/exit_hook.rs"
+ticket = "task-2167"
+reason = "New: drops every loaded model session from an atexit handler registered after the first session opens, and keeps one ONNX Runtime environment reference for the life of the process on Linux and Windows, so a process that embedded exits with its own exit code. 2.0.3 aborted at exit on macOS under idle and resident, crashed on Linux under on-demand, and crashed on Windows in 10 of 30 on-demand runs. No change to any embedding."
+sha256 = "a4286e498b18669e62e120c623a68a426231bdc851e43256e1c4b15c1ab21f1f"
 
 [[amendment]]
 path = "crates/inillucent-core/src/filter.rs"
@@ -212,9 +218,9 @@ sha256 = "a783de8198752d17fa1d349e043f47fd41d71fb25dffd0b91d7dc8527be8774c"
 
 [[amendment]]
 path = "crates/inillucent-core/src/index.rs"
-ticket = "task-2161"
-reason = "task-2161: Branches::runs_vector and runs_lexical are public, so a caller of search_branches can report the path hybrid_search_grouped reports. No change to what a search does."
-sha256 = "64e9af2b0bc257476d21b4b67084aa482f85b579ac86449849fde689a0c6a45a"
+ticket = "task-2167"
+reason = "Index::set_document_attributes, so inillucent-search can put back the facet values a merge in 2.0.3 wrote without. Attributes are only read by a filter; nothing derived from them changes."
+sha256 = "b68c3bc018acc91545e0d49475dc66a4755c647cdf0cb007d8adef8b84086c08"
 
 [[amendment]]
 path = "crates/inillucent-core/src/install.rs"
@@ -224,9 +230,9 @@ sha256 = "3c41295aeae315b1241cf416776ce2493c7c7d263f7ef9ef69dbc62ff8de0d68"
 
 [[amendment]]
 path = "crates/inillucent-core/src/lib.rs"
-ticket = "task-2158"
-reason = "task-2158: declares the rerank_onnx module behind the onnx feature."
-sha256 = "6d922f0be1b5a645179a7bb6035adf0b1ee7f01dd190e6c6bf74ead2ba7f2e2c"
+ticket = "task-2167"
+reason = "Declares the exit_hook module, under the onnx feature."
+sha256 = "6468137bcda4ecbe2c13b3706e2fe9e58a5922ab4fea625d036c41e09565af6d"
 
 [[amendment]]
 path = "crates/inillucent-core/src/model.rs"
@@ -260,15 +266,15 @@ sha256 = "76bcdcd2c409c80813dab9404864af9906eb43c70860745f8405440640e71a85"
 
 [[amendment]]
 path = "crates/inillucent-core/src/residency.rs"
-ticket = "task-2161"
-reason = "task-2161: the module doc says the CUDA context, about 500 MiB, stays on a card after a session is dropped. Comment only."
-sha256 = "d619bcccdf61631269803df5b6610a4b06359cf4adcf274885c87bb257b7ae6b"
+ticket = "task-2167"
+reason = "A holder registers with exit_hook the first time its session opens, so the session is dropped before ONNX Runtime's own exit code runs. The residency policy and its counters are unchanged."
+sha256 = "6efe79dd4b4eba7c665aa583ef9c9efcd2aef465c9a7429befb4136e6c661efb"
 
 [[amendment]]
 path = "crates/inillucent-core/src/store.rs"
-ticket = "task-2117"
-reason = "clippy cleanup for the CI lint step, in two tests only: a reversed range is written as a Range struct, and a Store is built with struct update syntax instead of assigned after Default. No behaviour change."
-sha256 = "051dbfce493d210cd6a784bc5a75377610ab4df2beba0e63c5d7023ad0519ec9"
+ticket = "task-2167"
+reason = "Store::set_attributes replaces one document's attributes by appending them and pointing its range at them. Used only to repair facet values a 2.0.3 merge dropped."
+sha256 = "29b36c2453b8c32cf89021eec7711d7c03c9c8a5ded6f0085a40908f45efbb6a"
 
 [[amendment]]
 path = "crates/inillucent-core/src/tokenize.rs"

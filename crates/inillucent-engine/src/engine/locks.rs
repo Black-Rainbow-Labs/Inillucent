@@ -101,11 +101,27 @@ impl ImportedDatabase {
         // has nothing to re-derive, which is what keeps the check off the path
         // `locking_mode = exclusive` takes (task-1979, section 4.4 item 1).
         let taking = !self.storage.database.trusted();
+        // **A write holds RESERVED, so readers in other processes keep reading
+        // through it**, for `main` under `locking_mode = normal` with no file
+        // attached. See `Database::set_reserved_writes`. A transaction across
+        // attached files and an exclusive connection keep EXCLUSIVE: the first
+        // has a cross file commit built on it, and the second was asked for.
+        let reserved = !self.pragmas.locking_exclusive()
+            && self
+                .session_state
+                .attached
+                .iter()
+                .all(|held| held.path.is_none());
+        self.storage.database.set_reserved_writes(reserved);
+        let held_before = self.storage.database.lock_level();
         let reloaded = if writing {
             self.storage.database.begin_write_within(!inside)?
         } else {
             self.storage.database.begin_read()?
         };
+        if writing && inside && held_before == inillucent_vfs::FileLock::Shared && reserved {
+            self.refuse_a_write_on_a_stale_read()?;
+        }
         // **Two questions, because the log's tail alone does not answer it.**
         // This asked only whether the log had moved, and that is not sound: the
         // other process's own `leave` checkpoints, a checkpoint rolls a new
@@ -129,13 +145,22 @@ impl ImportedDatabase {
         // already discarded them, which `attach.rs` reads as a row that
         // survived a rollback. Two page reads and a `file_size` per lock are
         // the price of not doing that.
+        //
+        // **A transaction that held no lock yet is re-derived too.** `batch`
+        // opens its transaction before its first statement, so that statement
+        // ran as `inside` and skipped this, and trusted what its open had read.
+        // With writes holding RESERVED, an open can read the log while another
+        // process appends to it, so what it read can be behind. A transaction
+        // that has held no lock has read and written nothing under one, so there
+        // is nothing of its own for a resynchronisation to throw away.
+        let settles = !inside || held_before == inillucent_vfs::FileLock::None;
         let moved =
-            reloaded || (taking && !inside && (self.the_meta_moved()? || self.the_log_moved()?));
-        if moved && !inside {
+            reloaded || (taking && settles && (self.the_meta_moved()? || self.the_log_moved()?));
+        if moved && settles {
             self.settle_a_journal_left_by_the_dead(writing)?;
             self.resync_from_file()?;
         }
-        if taking && !inside {
+        if taking && settles {
             self.storage.database.mark_trusted();
         }
         // **Every attached file takes its own lock, for the same reason `main`
@@ -144,6 +169,7 @@ impl ImportedDatabase {
         // databases attaching one shared `.rdb` lost one side entirely, with
         // nothing excluding them. A file is a file; which name a statement
         // qualifies it with does not change what another process can do to it.
+        let main_moved = moved;
         let moved = self.enter_attached(writing, inside)? || moved;
         // **The pages are not the whole cache.** The resynchronisation above
         // throws away the pool when another process has committed; the *schema*
@@ -151,7 +177,7 @@ impl ImportedDatabase {
         // kept it would write its own catalog tree over the one the other
         // process just built - which is a lost table rather than a stale read.
         // `reload_catalog` is the same reread `ATTACH` does.
-        if moved && !inside {
+        if (moved && !inside) || (main_moved && settles) {
             self.reload_catalog()?;
             self.reattach_every_tree()?;
             // **And the modules hear that somebody else committed
@@ -162,6 +188,36 @@ impl ImportedDatabase {
             self.committed_elsewhere_modules();
         }
         Ok(())
+    }
+
+    /// Refuses the first write of a transaction that read before another
+    /// process committed.
+    ///
+    /// **The one case RESERVED writes open up.** A statement that reads holds
+    /// SHARED, and another process can now take RESERVED beside it and commit.
+    /// A `BEGIN` takes the write lock, so this is not a transaction that read
+    /// first; it is a write nested inside a statement that started as a read,
+    /// such as a module that writes its own tables during a query. When that
+    /// write comes, the pages it read are
+    /// older than the file plus the log, and writing from them would put back
+    /// what the other process changed. SQLite answers the same case in WAL mode
+    /// with `SQLITE_BUSY_SNAPSHOT`; this answers `busy` and gives the slot back,
+    /// and the caller rolls the transaction back and runs it again. A
+    /// transaction that took the write lock at `BEGIN IMMEDIATE`, or whose first
+    /// statement wrote, never reaches this.
+    fn refuse_a_write_on_a_stale_read(&mut self) -> DbResult<()> {
+        if !(self.the_meta_moved()? || self.the_log_moved()?) {
+            return Ok(());
+        }
+        let _ = self
+            .storage
+            .database
+            .pool()
+            .unlock(inillucent_vfs::FileLock::Shared);
+        Err(inillucent_base::error::DbError::primary(inillucent_base::error::PrimaryCode::Busy)
+            .with_message(
+                "another process committed after this transaction began reading, so it cannot                  write; roll it back and run it again, or start it with BEGIN IMMEDIATE",
+            ))
     }
 
     /// Takes the lock every attached file needs and re-derives the ones that
@@ -635,7 +691,17 @@ impl ImportedDatabase {
             }
             // **And `main` folds when a fold is owed before the lock goes** - see
             // `fold_owed_at_release`.
-            if self.fold_owed_at_release() {
+            // **Only when readers let it go soon.** Under RESERVED writes a
+            // reader can hold SHARED here, and the fold needs EXCLUSIVE; its pages
+            // are in the log already, so a fold readers are in the way of waits
+            // for a later statement or for close rather than making this one wait
+            // out the busy budget. Under EXCLUSIVE writes this returns at once.
+            if self.fold_owed_at_release()
+                && self
+                    .storage
+                    .database
+                    .try_hold_for_writing(crate::checkpoint::FOLD_PATIENCE_MILLIS)
+            {
                 // `false`: a statement letting the file go is not somebody asking for
                 // a checkpoint - see `checkpoint_of` for what the difference costs.
                 self.checkpoint_of(false)?;
@@ -773,9 +839,11 @@ impl ImportedDatabase {
     /// to do it (`Pool::hold_for_writing`), so a hot journal always
     /// comes with the lock this needs.
     fn fold_owed_at_release(&self) -> bool {
-        let exclusive = self.storage.database.lock_level() == inillucent_vfs::FileLock::Exclusive;
+        // RESERVED counts: under RESERVED writes it is what a writer holds, and
+        // the caller raises to EXCLUSIVE before it folds.
+        let writer = self.storage.database.lock_level() >= inillucent_vfs::FileLock::Reserved;
         let journal_hot = self.storage.database.pool().journal_is_hot();
-        exclusive && (journal_hot || self.a_fold_is_due())
+        writer && (journal_hot || self.a_fold_is_due())
     }
 
     /// Reports whether one file holds something the data file does not.

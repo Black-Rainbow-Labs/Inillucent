@@ -510,6 +510,18 @@ impl Index {
         &self.store
     }
 
+    /// Replaces one document's attributes, leaving its chunks, text and vectors
+    /// where they are.
+    ///
+    /// Attributes are only read by a filter, so nothing derived from them has
+    /// to be rebuilt. `inillucent-search` uses this to put back the facet
+    /// values that a merge in 2.0.3 and earlier wrote without.
+    /// @param doc - the document's ordinal
+    /// @param attributes - every attribute set and its values
+    pub fn set_document_attributes(&mut self, doc: u32, attributes: &[(String, Vec<String>)]) {
+        self.store.set_attributes(doc, attributes);
+    }
+
     /// Reads the whole chunk text into memory.
     ///
     /// **For a caller that reads every chunk once** (task-2066 §4.3.8). A load

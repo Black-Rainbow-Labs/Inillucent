@@ -62,7 +62,7 @@ const CHUNK: usize = 256 * 1024;
 ///
 /// Named rather than blank because both hosts this fetches from log it, and a
 /// download that misbehaves should be attributable to the program that made it.
-const USER_AGENT: &str = concat!("inillucent/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("inillucent/", env!("CARGO_PKG_VERSION"));
 
 /// One URL, split into what a request needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +241,29 @@ pub fn download(
     expect_sha256: Option<&str>,
     progress: &mut dyn Progress,
 ) -> DbResult<Fetched> {
+    download_on(
+        url,
+        destination,
+        expect_sha256,
+        progress,
+        crate::curl::selected(),
+    )
+}
+
+/// [`download`], on the transport the caller names.
+///
+/// @param url - what to fetch
+/// @param destination - where the finished file goes
+/// @param expect_sha256 - the digest the bytes must have, when one is known
+/// @param progress - told how it is going
+/// @param through_curl - whether the `curl` program fetches the bytes
+fn download_on(
+    url: &str,
+    destination: &Path,
+    expect_sha256: Option<&str>,
+    progress: &mut dyn Progress,
+    through_curl: bool,
+) -> DbResult<Fetched> {
     let parsed = Url::parse(url)?;
     let partial = partial_path(destination);
     if let Some(parent) = destination.parent() {
@@ -258,18 +281,15 @@ pub fn download(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| parsed.path.clone());
 
-    let mut response = open(&parsed, already)?;
-    // A server that ignores the range and sends the whole file again has to be
-    // obeyed rather than trusted: appending its body to what is already there
-    // would produce a file of the right length made of the wrong bytes, and the
-    // digest would be the only thing that noticed.
-    let restarted = already > 0 && response.status != 206;
+    let opened = open_body(url, &parsed, already, through_curl)?;
+    let mut response = opened.body;
+    let restarted = opened.restarted;
     let resumed = if restarted { 0 } else { already };
     if restarted {
         let _ = std::fs::remove_file(&partial);
     }
 
-    let total = response.body_total(resumed);
+    let total = opened.total;
     progress.started(&name, total, resumed);
 
     let mut digest = Sha256::new();
@@ -306,7 +326,13 @@ pub fn download(
     let mut done = resumed;
     let mut buffer = vec![0u8; CHUNK];
     loop {
-        let read = response.read_body(&mut buffer)?;
+        let read = match response.read_body(&mut buffer) {
+            Ok(read) => read,
+            Err(error) => {
+                response.abandon();
+                return Err(error);
+            }
+        };
         if read == 0 {
             break;
         }
@@ -328,7 +354,7 @@ pub fn download(
         ))
     })?;
     drop(file);
-    response.stream.close();
+    response.finish()?;
 
     if let Some(expected) = total {
         if done != expected {
@@ -380,17 +406,32 @@ pub fn download(
 /// @param url - what to fetch
 /// @param limit - the most this will hold
 pub fn get(url: &str, limit: usize) -> DbResult<Vec<u8>> {
+    get_on(url, limit, crate::curl::selected())
+}
+
+/// [`get`], on the transport the caller names.
+///
+/// @param url - what to fetch
+/// @param limit - the most this will hold
+/// @param through_curl - whether the `curl` program fetches the bytes
+fn get_on(url: &str, limit: usize, through_curl: bool) -> DbResult<Vec<u8>> {
     let parsed = Url::parse(url)?;
-    let mut response = open(&parsed, 0)?;
+    let mut response = open_body(url, &parsed, 0, through_curl)?.body;
     let mut out = Vec::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
-        let read = response.read_body(&mut buffer)?;
+        let read = match response.read_body(&mut buffer) {
+            Ok(read) => read,
+            Err(error) => {
+                response.abandon();
+                return Err(error);
+            }
+        };
         if read == 0 {
             break;
         }
         if out.len().saturating_add(read) > limit {
-            response.stream.close();
+            response.abandon();
             return Err(refusal(format!(
                 "{} is larger than the {limit} bytes this call will hold",
                 parsed.display()
@@ -398,8 +439,94 @@ pub fn get(url: &str, limit: usize) -> DbResult<Vec<u8>> {
         }
         out.extend_from_slice(buffer.get(..read).unwrap_or(&[]));
     }
-    response.stream.close();
+    response.finish()?;
     Ok(out)
+}
+
+/// A response body from either transport.
+///
+/// The built in client reads the socket itself. On macOS, and wherever
+/// `INILLUCENT_HTTP=curl` is set, the body comes from the `curl` program
+/// instead; `crate::curl` says why. Everything a download checks is checked
+/// the same way for both.
+enum Body {
+    /// The built in client's response.
+    Socket(Response),
+    /// The body curl is writing.
+    Curl(crate::curl::Body),
+}
+
+impl Body {
+    /// Reads the next bytes of the body. Zero means the body has ended.
+    ///
+    /// @param out - where the bytes go
+    fn read_body(&mut self, out: &mut [u8]) -> DbResult<usize> {
+        match self {
+            Body::Socket(response) => response.read_body(out),
+            Body::Curl(body) => body.read_body(out),
+        }
+    }
+
+    /// Ends a body read to its end, reporting a transfer curl gave up on.
+    fn finish(self) -> DbResult<()> {
+        match self {
+            Body::Socket(mut response) => {
+                response.stream.close();
+                Ok(())
+            }
+            Body::Curl(body) => body.finish(),
+        }
+    }
+
+    /// Ends a body without reading the rest of it.
+    fn abandon(self) {
+        match self {
+            Body::Socket(mut response) => response.stream.close(),
+            Body::Curl(body) => body.abandon(),
+        }
+    }
+}
+
+/// A body, with what the download needs to know before reading it.
+struct Opened {
+    body: Body,
+    /// Whether the bytes already on disk have to be thrown away.
+    restarted: bool,
+    /// The size of the finished file, when it is known.
+    total: Option<u64>,
+}
+
+/// Opens a body on whichever transport this system uses.
+///
+/// The built in client asks for a range and resumes. A server that ignores the
+/// range and sends the whole file again has to be obeyed rather than trusted:
+/// appending its body to what is already there would produce a file of the
+/// right length made of the wrong bytes, and the digest would be the only thing
+/// that noticed. The curl path always fetches the whole file, so a partial file
+/// from an earlier run is restarted.
+/// @param url - the URL as the caller wrote it
+/// @param parsed - the same URL, parsed
+/// @param already - bytes of a partial file already on disk
+/// @param through_curl - whether the `curl` program fetches the bytes
+fn open_body(url: &str, parsed: &Url, already: u64, through_curl: bool) -> DbResult<Opened> {
+    if through_curl {
+        let total = crate::curl::length(url);
+        let body = crate::curl::open(url)?;
+        return Ok(Opened {
+            body: Body::Curl(body),
+            restarted: already > 0,
+            total,
+        });
+    }
+    let response = open(parsed, already)?;
+    let restarted = already > 0 && response.status != 206;
+    let resumed = if restarted { 0 } else { already };
+    let total = response.body_total(resumed);
+    Ok(Opened {
+        body: Body::Socket(response),
+        restarted,
+        total,
+    })
 }
 
 /// The name of the partial file a download writes into.
@@ -893,6 +1020,98 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&body).trim(), "1.22.0");
 
         std::fs::remove_dir_all(&into).expect("the scratch directory is removed");
+    }
+
+    /// Serves `body` over plain HTTP on a loopback port, to any number of
+    /// requests, and returns the URL. A `HEAD` gets the headers alone.
+    ///
+    /// @param body - what every `GET` answers with
+    fn serve(body: &'static [u8]) -> String {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let address = listener.local_addr().expect("the bound address");
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                let Ok(mut connection) = connection else {
+                    return;
+                };
+                let mut reader = BufReader::new(connection.try_clone().expect("a second handle"));
+                let mut request = String::new();
+                let _ = reader.read_line(&mut request);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = connection.write_all(head.as_bytes());
+                if !request.starts_with("HEAD") {
+                    let _ = connection.write_all(body);
+                }
+            }
+        });
+        format!("http://{address}/weights.bin")
+    }
+
+    /// The curl transport, which macOS uses for every download, installs a
+    /// file only when its digest matches, and refuses one that does not.
+    ///
+    /// Runs on any system with a `curl` program, which Windows 10 and later,
+    /// macOS and the Linux images this is tested on all have. A machine without
+    /// one skips, saying so.
+    #[test]
+    fn the_curl_transport_digests_and_installs_like_the_built_in_client() {
+        if std::process::Command::new("curl")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            skipping("no curl program on this machine");
+            return;
+        }
+        let body: &'static [u8] = b"the bytes of a model file";
+        let url = serve(body);
+        let into = std::env::temp_dir().join(format!("inillucent-curl-{}", std::process::id()));
+        let destination = into.join("weights.bin");
+        let digest = {
+            let mut hash = Sha256::new();
+            hash.update(body);
+            to_hex(&hash.finish())
+        };
+        let fetched = download_on(&url, &destination, Some(&digest), &mut Silent, true)
+            .expect("the file fetches through curl");
+        assert_eq!(fetched.bytes, body.len() as u64);
+        assert_eq!(fetched.sha256, digest);
+        assert_eq!(std::fs::read(&destination).expect("it was installed"), body);
+        assert!(!partial_path(&destination).exists());
+
+        let wrong = into.join("wrong.bin");
+        let refusal = download_on(&url, &wrong, Some(&"0".repeat(64)), &mut Silent, true)
+            .expect_err("a digest that does not match is refused");
+        assert!(
+            refusal.to_string().contains("does not have the digest"),
+            "{refusal}"
+        );
+        assert!(!wrong.exists() && !partial_path(&wrong).exists());
+
+        assert_eq!(get_on(&url, 1024, true).expect("a small fetch"), body);
+        let too_small = get_on(&url, 4, true).expect_err("the limit holds");
+        assert!(too_small.to_string().contains("larger than"), "{too_small}");
+
+        let missing = download_on(
+            "http://127.0.0.1:1/nothing",
+            &into.join("missing.bin"),
+            None,
+            &mut Silent,
+            true,
+        )
+        .expect_err("a connection that fails is an error");
+        assert!(missing.to_string().contains("curl ended with"), "{missing}");
+        let _ = std::fs::remove_dir_all(&into);
     }
 
     /// A socket that is connected to nothing, for a test that never reads it.

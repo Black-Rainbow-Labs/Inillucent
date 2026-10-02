@@ -31,6 +31,8 @@ pub mod distance;
 pub mod embed;
 #[cfg(feature = "onnx")]
 pub mod embed_onnx;
+#[cfg(feature = "onnx")]
+pub mod exit_hook;
 pub mod filter;
 pub mod flat;
 pub mod hnsw;

@@ -692,7 +692,7 @@ fn hold_the_database(target: &dyn VfsFile) -> bool {
     if crate::pool::lock_with_wait(
         target,
         FileLock::Exclusive,
-        crate::pool::DEFAULT_BUSY_MILLIS,
+        crate::file::default_busy_millis(),
     )
     .is_err()
     {

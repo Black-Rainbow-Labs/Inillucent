@@ -315,16 +315,25 @@ These differences change how an application runs, and they do not show up in a p
 | Page cache | 4,096 frames of 32 KiB, 128 MiB, fixed when the file is opened. `PRAGMA cache_size` reports `-131072`. A frame's memory is allocated the first time the frame is used | `cache_size`, 2 MiB by default |
 | Journal modes | all six. `delete` is the default. `PRAGMA journal_mode = wal` selects the write ahead log, and the file reopens in WAL mode | all six, `delete` by default |
 | Writers | one at a time. A second writer waits up to `PRAGMA busy_timeout` (5000 ms by default) and then fails with `busy` | one at a time |
-| Readers during a write | a reader waits for the writer, and fails with `busy` after `PRAGMA busy_timeout` | in WAL mode, a reader does not wait |
+| Readers during a write | a reader in another process reads the last committed state and does not wait. It waits only while the writer folds the log into the file, and under `PRAGMA locking_mode = exclusive` or with a database attached | in WAL mode, a reader does not wait |
 | Processes on one file | several, with `PRAGMA locking_mode = normal`, the default | several |
 | Threads | one. The engine is single threaded | serialised or multithreaded |
 | A transaction larger than the page cache | allowed under `delete`, `truncate` and `persist`. Under `wal`, `memory` and `off`, the transaction fails when it changes more pages than the cache holds | spills to the journal |
 | A `SELECT` result | computed when the first row is stepped. Later steps return rows already computed | computed one row per step |
+| `$1`, `$2` placeholders | `$N` binds the Nth value, as `?N` does and as PostgreSQL does. `SET a = $2 WHERE id = $1` takes `a` from the second value | `$1` is a name, numbered by the order names first appear, so the same statement takes `a` from the first value |
 
 **Multiple processes.** Two processes can write the same file, one at a time. The number of rows in
 the file equals the number of commits acknowledged. `crates/inillucent-compat/tests/durability/process_concurrency.rs`
-checks this with two real writer processes. [Roadmap](roadmap.md) describes the change that would let a
-reader run while a writer works.
+checks this with two real writer processes.
+
+**A reader during a write.** A write transaction holds the RESERVED lock, which readers share, so a
+query in another process reads the last committed state while the transaction runs.
+`crates/inillucent-compat/tests/durability/process_readers.rs` checks that every answer such a
+reader gives is a state some commit produced. The writer takes the EXCLUSIVE lock only to write the
+database file: when its changes outgrow its page cache, and when it folds the log into the file. A
+fold on the way out of a statement waits 50 milliseconds for readers and is otherwise left to a
+later statement or to close. A connection under `PRAGMA locking_mode = exclusive`, or one with a
+database attached, still takes EXCLUSIVE for the whole transaction.
 
 **`PRAGMA locking_mode = exclusive`.** `normal` is the default, as in SQLite. With `exclusive`, the
 engine keeps the file locked between statements, so a second process waits for the first to close.

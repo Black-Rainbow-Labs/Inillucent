@@ -66,36 +66,46 @@ enum Shape {
 /// floor on it would be a floor on zero - which is what
 /// `the_allocation_report_says_why_it_is_empty` asserts instead, and what
 /// §4.4.12 files as work rather than as a number to guard.
+///
+/// **Ten floors were lowered by the change that let readers read beside a
+/// write.** An open, and a reader catching up with the log, used to cut a torn
+/// tail off the log as soon as they had replayed it: an open of the segment, a
+/// truncate, a sync and a look for later segments, at every open a campaign
+/// makes. Both now hold only SHARED there, beside a writer that may be
+/// appending, so they leave the cut to the next connection that replays while
+/// holding the writer's lock (`Database::with_writer_slot`). Those calls are
+/// the cut points that went: five to eight per campaign, all of them before the
+/// commit, with every state and every recovered answer unchanged.
 const FLOORS: [Floor; 19] = [
     Floor {
         name: "delete-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 94,
+        least: 86,
     },
     Floor {
         name: "delete-full-disk-full.txt",
         shape: Shape::CutPoints,
-        least: 94,
+        least: 86,
     },
     Floor {
         name: "delete-full-io-error.txt",
         shape: Shape::CutPoints,
-        least: 94,
+        least: 86,
     },
     Floor {
         name: "delete-full-short-write.txt",
         shape: Shape::CutPoints,
-        least: 94,
+        least: 86,
     },
     Floor {
         name: "truncate-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 166,
+        least: 159,
     },
     Floor {
         name: "persist-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 166,
+        least: 159,
     },
     Floor {
         name: "delete-full-checkpoint-crash.txt",
@@ -125,22 +135,22 @@ const FLOORS: [Floor; 19] = [
     Floor {
         name: "wal-commit.tsv",
         shape: Shape::HashCuts,
-        least: 32,
+        least: 27,
     },
     Floor {
         name: "wal-io-error.tsv",
         shape: Shape::HashCuts,
-        least: 32,
+        least: 27,
     },
     Floor {
         name: "wal-short-write.tsv",
         shape: Shape::HashCuts,
-        least: 32,
+        least: 27,
     },
     Floor {
         name: "wal-checkpoint.tsv",
         shape: Shape::HashCuts,
-        least: 62,
+        least: 57,
     },
     Floor {
         name: "multi-database-commit.tsv",

@@ -120,6 +120,7 @@ if ($Only) { $Only = @($Only -split ',' | ForEach-Object { $_.Trim() } | Where-O
 if ($Skip) { $Skip = @($Skip -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
 . (Join-Path $PSScriptRoot 'stage-layout.ps1')
 . (Join-Path $PSScriptRoot 'nightly-evidence.ps1')
+. (Join-Path $PSScriptRoot 'site/install-page.ps1')
 . (Join-Path $PSScriptRoot 'github-token.ps1')
 # The DPAPI sealing helpers live in apple-credentials.ps1 because that is where sealing was first
 # needed. Nothing about `Protect-AppleSecret` is Apple-specific: it is `ConvertFrom-SecureString`,
@@ -587,7 +588,16 @@ function Get-Routes {
                 }
                 $null
             }
-            Run   = { & (Join-Path $script:Packaging 'linux/package-linux.ps1') -Version $Version }
+            # **PATH is put back afterwards.** `package-linux.ps1` puts Git's `usr\bin` at the front
+            # of PATH so gpg can start keyboxd, and the change outlived the script: Git's
+            # `usr\bin` holds a `link.exe`, so the `crates` route's verify build linked with it
+            # instead of the MSVC linker and failed with `/usr/bin/link: missing operand`. That is
+            # how 2.0.3 first reached every registry but crates.io.
+            Run   = {
+                $pathBefore = $env:Path
+                try { & (Join-Path $script:Packaging 'linux/package-linux.ps1') -Version $Version }
+                finally { $env:Path = $pathBefore }
+            }
         },
         @{
             Name  = 'signature'
@@ -1343,6 +1353,17 @@ function Test-SiteVersion {
     if ($unlinked.Count -gt 0) {
         return "the download page offers no $(($unlinked | ForEach-Object { $_.Platform }) -join ', ')"
     }
+
+    # The install page the documentation sends people and agents to. It named 1.0.29 while the site
+    # served 2.0.3, and its step 3 told a reader with a correct install that the install failed.
+    try {
+        $install = (Invoke-WebRequest -Uri 'https://inillucent.com/install.md' -UseBasicParsing -TimeoutSec 30).Content
+        if ($install -is [byte[]]) { $install = [System.Text.Encoding]::UTF8.GetString($install) }
+    } catch {
+        return "inillucent.com/install.md could not be read: $($_.Exception.Message)"
+    }
+    $installProblem = Test-InstallPage -Text $install -Version $Version
+    if ($installProblem) { return $installProblem }
 
     try {
         $sums = (Invoke-WebRequest -Uri "$base/SHA256SUMS" -UseBasicParsing -TimeoutSec 30).Content

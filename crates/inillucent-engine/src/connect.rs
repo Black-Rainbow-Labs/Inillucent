@@ -201,6 +201,20 @@ fn there_is_a_database_at(path: &Path) -> DbResult<bool> {
     }
 }
 
+/// Runs an open that waits up to `millis` for a lock another process holds.
+///
+/// Every open function here reads the file under a lock before a connection
+/// exists, so `PRAGMA busy_timeout` cannot reach that wait. Opens run inside
+/// this wait up to `millis` instead of five seconds, and the database they open
+/// starts with `millis` as its `busy_timeout`. See
+/// `inillucent_pool::file::default_busy_millis` for the order the budget is
+/// chosen in.
+/// @param millis - how long the open may wait, in milliseconds
+/// @param open - the open to run, such as `|| Database::open(path)`
+pub fn with_open_busy_timeout<T>(millis: u64, open: impl FnOnce() -> T) -> T {
+    inillucent_pool::file::with_open_busy_millis(millis, open)
+}
+
 impl Database {
     /// Opens a database, creating it when the path holds nothing.
     ///

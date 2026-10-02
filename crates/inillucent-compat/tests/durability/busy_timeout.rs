@@ -316,6 +316,10 @@ fn read_while_held(shell: &Path, database: &Path, timeout_ms: u64) -> String {
     reader.until("reader-is-open");
 
     let mut holder = Fed::start(shell, database);
+    // **Exclusive, so the holder keeps readers out.** An ordinary write holds
+    // RESERVED and readers read through it; `locking_mode = exclusive` keeps
+    // the EXCLUSIVE a write took before, which is what a reader waits for.
+    holder.send("PRAGMA locking_mode = exclusive;");
     holder.send("BEGIN IMMEDIATE;");
     holder.send("INSERT INTO note (who) VALUES ('holder');");
     holder.send("SELECT 'holder-has-it';");
@@ -495,4 +499,184 @@ fn a_timeout_shorter_than_the_hold_gives_up_and_names_its_budget() {
         0,
         "the writer whose budget elapsed wrote its row anyway"
     );
+}
+
+/// Starts a shell that takes the write lock and keeps it until told to commit.
+///
+/// @param shell - the built `inillucent-shell`
+/// @param database - the file
+fn holding(shell: &Path, database: &Path) -> Fed {
+    let mut holder = Fed::start(shell, database);
+    // **Exclusive, so the holder keeps readers out.** An ordinary write holds
+    // RESERVED and readers read through it; `locking_mode = exclusive` keeps
+    // the EXCLUSIVE a write took before, which is what a reader waits for.
+    holder.send("PRAGMA locking_mode = exclusive;");
+    holder.send("BEGIN IMMEDIATE;");
+    holder.send("INSERT INTO note (who) VALUES ('holder');");
+    holder.send("SELECT 'holder-has-it';");
+    holder.until("holder-has-it");
+    std::thread::sleep(SETTLING);
+    holder
+}
+
+/// Lets a holder commit and end.
+///
+/// @param holder - the shell [`holding`] started
+fn release(mut holder: Fed) {
+    holder.send("COMMIT;");
+    holder.finish();
+}
+
+/// **An open waits as long as its caller says, before any connection exists.**
+///
+/// In 2.0.3 a process that opened a file while another held a write failed
+/// after five seconds, and nothing it could set changed that: the open reads
+/// the file under a lock, and `PRAGMA busy_timeout` belongs to a connection
+/// that does not exist until the open has finished. A service restarted during
+/// a long compaction could not start. Three ways to set the open's wait are
+/// checked here, each by a value: a refusal that names the budget it was given,
+/// or a row that is only there because the open waited for the holder to commit.
+#[test]
+fn an_open_waits_as_long_as_its_caller_says() {
+    let (binary, shell) = (program("inillucent"), program("inillucent-shell"));
+    let directory = area("open-waits");
+    let database = prepared(&binary, &directory);
+    let path = database.to_string_lossy().to_string();
+
+    // The environment variable reaches the command line's open. 200 ms is far
+    // below the five second default, so a refusal naming 200 is the variable.
+    let holder = holding(&shell, &database);
+    let refused = Command::new(&binary)
+        .env("INILLUCENT_BUSY_TIMEOUT", "200")
+        .args([
+            "--db",
+            path.as_str(),
+            "query",
+            "SELECT count(*) AS n FROM note",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("the command line starts");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        !refused.status.success(),
+        "the open was not refused:\n{said}"
+    );
+    assert!(
+        said.contains("of the 200 ms"),
+        "the refusal does not name the variable's budget:\n{said}"
+    );
+    release(holder);
+
+    // The driver's option, short: refused, naming its own budget.
+    let holder = holding(&shell, &database);
+    let short = inillucent_driver::OpenOptions {
+        busy_timeout: Some(Duration::from_millis(150)),
+        ..inillucent_driver::OpenOptions::default()
+    };
+    let refusal = match inillucent_driver::Database::open_with(&database, short) {
+        Ok(_) => panic!("an open with a 150 ms budget did not wait for the holder"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        refusal.contains("of the 150 ms"),
+        "the refusal does not name the option's budget:\n{refusal}"
+    );
+
+    // The driver's option, long: the open waits for the commit and then sees it.
+    let committed = std::thread::spawn(move || {
+        std::thread::sleep(HELD);
+        release(holder);
+    });
+    let long = inillucent_driver::OpenOptions {
+        busy_timeout: Some(Duration::from_secs(60)),
+        ..inillucent_driver::OpenOptions::default()
+    };
+    let opened = inillucent_driver::Database::open_with(&database, long)
+        .unwrap_or_else(|error| panic!("an open with a 60 s budget gave up: {error}"));
+    let connection = opened.session();
+    let rows = connection
+        .query_all("SELECT count(*) FROM note WHERE who = 'holder'", &[])
+        .expect("the count runs");
+    assert_eq!(
+        first_integer(&rows),
+        Some(2),
+        "the open did not wait for the holder's commit"
+    );
+    let timeout = connection
+        .query_all("PRAGMA busy_timeout", &[])
+        .expect("the pragma reads");
+    assert_eq!(
+        first_integer(&timeout),
+        Some(60_000),
+        "the database did not start with the open's budget as its busy_timeout"
+    );
+    committed.join().expect("the holder ends");
+}
+
+/// The first column of the first row, when it is an integer.
+///
+/// @param rows - what a query returned
+fn first_integer(rows: &inillucent_driver::Rows) -> Option<i64> {
+    match rows.rows.first().and_then(|row| row.first()) {
+        Some(inillucent_driver::Value::Integer(number)) => Some(*number),
+        _ => None,
+    }
+}
+
+/// **A reader reads the last committed state while another process holds a
+/// write transaction, without waiting.**
+///
+/// In 2.0.3 a write took EXCLUSIVE from its first statement to its commit, so
+/// every reader in another process waited for the whole transaction: a search
+/// that took 50 ms waited up to 15.6 s beside a process rewriting rows. A write
+/// now holds RESERVED, and a reader replays the log only up to the last commit.
+/// The reader here has a budget of zero, so any wait at all is a refusal, and
+/// the counts it prints are the values asserted: nothing of the open
+/// transaction, then the row once it commits.
+#[test]
+fn a_reader_reads_the_committed_state_while_another_process_writes() {
+    let (binary, shell) = (program("inillucent"), program("inillucent-shell"));
+    let directory = area("reader-reads-through");
+    let database = prepared(&binary, &directory);
+
+    let mut holder = Fed::start(&shell, &database);
+    holder.send("BEGIN IMMEDIATE;");
+    holder.send("INSERT INTO note (who) VALUES ('holder');");
+    holder.send("SELECT 'holder-has-it';");
+    holder.until("holder-has-it");
+
+    let mut reader = Fed::start(&shell, &database);
+    reader.send("PRAGMA busy_timeout = 0;");
+    reader.send("SELECT 'during=' || count(*) FROM note;");
+    let during = reader.until("during=");
+    assert!(
+        during.contains("during=0"),
+        "the reader saw an uncommitted row or no count:\n{during}\n{}",
+        reader.errors()
+    );
+
+    holder.send("COMMIT;");
+    holder.send("SELECT 'committed';");
+    holder.until("committed");
+    reader.send("SELECT 'after=' || count(*) FROM note;");
+    let after = reader.until("after=");
+    assert!(
+        after.contains("after=1"),
+        "the reader did not see the commit:\n{after}\n{}",
+        reader.errors()
+    );
+    let complained = reader.errors();
+    assert!(
+        !complained.to_ascii_lowercase().contains("busy")
+            && !complained.contains("another process"),
+        "the reader waited or was refused:\n{complained}"
+    );
+    reader.finish();
+    holder.finish();
+    assert_eq!(rows_by(&binary, &database, "holder"), 1);
 }

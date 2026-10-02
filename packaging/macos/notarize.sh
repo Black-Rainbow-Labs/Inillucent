@@ -75,7 +75,11 @@ do
   # --options runtime is the hardened runtime, and notarisation refuses a
   # binary without it. --timestamp gets a trusted timestamp so the signature
   # outlives the certificate.
-  codesign --force --sign "$identity" --options runtime --timestamp "$file"
+  # A program also takes entitlements.plist, so it can load ONNX Runtime.
+  case "$file" in
+    *.dylib) codesign --force --sign "$identity" --options runtime --timestamp "$file" ;;
+    *) codesign --force --sign "$identity" --options runtime --timestamp --entitlements "$(dirname "$0")/entitlements.plist" "$file" ;;
+  esac
   codesign --verify --verbose=2 "$file"
 done
 

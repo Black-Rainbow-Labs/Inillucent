@@ -332,15 +332,6 @@ impl State {
     }
 }
 
-/// How long a lock request waits before it reports the file as busy.
-///
-/// SQLite's own default is zero - it reports `SQLITE_BUSY` at once and leaves
-/// the waiting to a busy handler the application installs. This waits by
-/// default because an application that has not thought about concurrency is
-/// better served by taking turns than by an error it does not handle, and
-/// `PRAGMA busy_timeout` moves it either way.
-pub(crate) const DEFAULT_BUSY_MILLIS: u64 = 5_000;
-
 /// Raises a lock on a file, waiting up to a budget for the holder to let go.
 ///
 /// **Waiting is the whole of what a busy timeout is.** A lock another process
@@ -741,7 +732,7 @@ impl Pool {
             // Nothing is uncommitted until a transaction says so.
             uncommitted_lsn: Arc::new(AtomicU64::new(u64::MAX)),
             stolen: Cell::new(false),
-            write_lock_millis: Cell::new(DEFAULT_BUSY_MILLIS),
+            write_lock_millis: Cell::new(crate::file::default_busy_millis()),
             writable: Cell::new(true),
         })
     }

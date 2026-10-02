@@ -128,8 +128,10 @@ damaged.
 
 ## "The database is busy"
 
-One process writes at a time. A second process waits up to `PRAGMA busy_timeout`, which is 5000
-milliseconds by default, and then fails with the status `busy`. On the 1.0.32 build, while one
+One process writes at a time. A second writer waits up to `PRAGMA busy_timeout`, which is 5000
+milliseconds by default, and then fails with the status `busy`. A reader does not wait for a write
+transaction from 2.0.4 on; it waits only while a writer folds the log into the file, or for a writer
+under `PRAGMA locking_mode = exclusive`. On the 1.0.32 build, while one
 process held a write transaction open, a second process could not open the file at all. It waited
 5013 ms and failed:
 
@@ -139,6 +141,11 @@ Error [busy]: could not open "<path>": another process holds the file for writin
 
 Find the process that holds a write transaction open, and make it commit or roll back. To wait
 longer, run `PRAGMA busy_timeout = <milliseconds>` on the connection that waits.
+
+When the message starts `could not open`, the wait was the open's, and `PRAGMA busy_timeout` cannot
+reach it. Set `INILLUCENT_BUSY_TIMEOUT=<milliseconds>` in the environment of the process that
+opens, or pass the wait to the open: `OpenOptions::busy_timeout` in Rust,
+`inillucent_open_with_timeout` in C, `busy_timeout_ms` in Python.
 
 Inside one Rust program, a `Database` from `inillucent-driver` is neither `Send` nor `Sync`, so it
 cannot move between threads. To use one database from several threads, open a `SharedDatabase`.

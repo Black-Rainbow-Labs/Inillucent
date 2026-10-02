@@ -596,6 +596,35 @@ impl Store {
             .unwrap_or(&[])
     }
 
+    /// Replaces one document's attributes with `attributes`.
+    ///
+    /// The new pairs are appended to the arena and the document's range is
+    /// pointed at them. The old pairs stay in the arena, unreferenced, until the
+    /// store is next rebuilt; that costs a few bytes per document and saves
+    /// moving every later document's range.
+    /// @param doc - the document's ordinal
+    /// @param attributes - every attribute set and its values, as `ChunkInput` carries them
+    pub fn set_attributes(&mut self, doc: u32, attributes: &[(String, Vec<String>)]) {
+        let start = self.attribute_arena.len() as u32;
+        for (name, values) in attributes {
+            let name_id = self.attribute_names.intern(name);
+            while self.attribute_values.len() <= name_id as usize {
+                self.attribute_values.push(Dictionary::default());
+            }
+            for value in values {
+                let Some(dictionary) = self.attribute_values.get_mut(name_id as usize) else {
+                    continue;
+                };
+                let value_id = dictionary.intern(value);
+                self.attribute_arena.push((name_id, value_id));
+            }
+        }
+        let end = self.attribute_arena.len() as u32;
+        if let Some(document) = self.documents.get_mut(doc as usize) {
+            document.attributes = start..end;
+        }
+    }
+
     /// The dictionary of values interned for one named attribute set.
     /// @param name - the attribute name, such as participant
     pub fn attribute_dictionary(&self, name: &str) -> Option<&Dictionary> {

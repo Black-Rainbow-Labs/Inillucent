@@ -1663,6 +1663,110 @@
           ]
         }
       ]
+    },
+    {
+      "name": "numbered_dollar_parameters_bind_by_number",
+      "group": "core",
+      "about": "`$2` is the second value, as it is in PostgreSQL, whatever order the placeholders appear in. 2.0.3 numbered `$N` by the order it first appeared, which is SQLite's rule for a name, so `UPDATE ... SET a = $2 WHERE id = $1` matched no row and reported no error. Every step here gives a different answer under that rule.",
+      "setup": [
+        "CREATE TABLE dollar (id INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+        "INSERT INTO dollar VALUES (1, 'old', 'old')"
+      ],
+      "steps": [
+        {
+          "sql": "SELECT $2 AS second, $1 AS first",
+          "params": [
+            {
+              "text": "first"
+            },
+            {
+              "text": "second"
+            }
+          ],
+          "rows": [
+            [
+              {
+                "text": "second"
+              },
+              {
+                "text": "first"
+              }
+            ]
+          ]
+        },
+        {
+          "sql": "UPDATE dollar SET a = $2 WHERE id = $1",
+          "params": [
+            {
+              "int": 1
+            },
+            {
+              "text": "new"
+            }
+          ],
+          "affected": 1
+        },
+        {
+          "sql": "INSERT INTO dollar (b, a, id) VALUES ($3, $2, $1)",
+          "params": [
+            {
+              "int": 2
+            },
+            {
+              "text": "for a"
+            },
+            {
+              "text": "for b"
+            }
+          ],
+          "affected": 1
+        },
+        {
+          "sql": "SELECT id, a, b FROM dollar ORDER BY id",
+          "rows": [
+            [
+              {
+                "int": 1
+              },
+              {
+                "text": "new"
+              },
+              {
+                "text": "old"
+              }
+            ],
+            [
+              {
+                "int": 2
+              },
+              {
+                "text": "for a"
+              },
+              {
+                "text": "for b"
+              }
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT a FROM dollar WHERE id = $1 AND a = ?2",
+          "params": [
+            {
+              "int": 2
+            },
+            {
+              "text": "for a"
+            }
+          ],
+          "rows": [
+            [
+              {
+                "text": "for a"
+              }
+            ]
+          ]
+        }
+      ]
     }
   ],
   "groups": {

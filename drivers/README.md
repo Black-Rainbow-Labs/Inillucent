@@ -374,7 +374,7 @@ tests this. It is the one case that sets `"connection": "per_call"`.
 
 ## ABI stability
 
-`abi.toml` gives each of the 54 symbols in the header a stability and a `since` version.
+`abi.toml` gives each of the 55 symbols in the header a stability and a `since` version.
 `inillucent-driver-capi/tests/abi.rs` checks that the header, `abi.toml` and the Rust code name the
 same symbols. It also checks that every numeric constant in the header equals the driver's own enum
 value. A status renumbered in Rust without the header changing would make every binding read every
@@ -385,8 +385,9 @@ error wrongly, and both sides would still compile.
 | stable | The signature will not change, and the symbol will not be removed. |
 | provisional | The symbol exists and may change in a minor version. `inillucent_cancel` is the only provisional symbol. It asks a running statement to stop, and the statement then fails with `INILLUCENT_INTERRUPTED`. |
 
-The ABI version is 1.1.0, and `inillucent_abi_version()` returns 1001000. Version 1.1.0 added
-`inillucent_open_with_key`. A binding written against 1.0.0 finds every symbol it calls.
+The ABI version is 1.2.0, and `inillucent_abi_version()` returns 1002000. Version 1.1.0 added
+`inillucent_open_with_key`, and version 1.2.0 added `inillucent_open_with_timeout`. A binding
+written against 1.0.0 finds every symbol it calls.
 
 ## Building the C library
 

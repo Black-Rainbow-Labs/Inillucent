@@ -24,7 +24,7 @@
 # decision somebody made rather than a line somebody edited.
 
 schema_version = 1
-abi_version = "1.1.0"
+abi_version = "1.2.0"
 
 [[symbol]]
 name = "inillucent_abi_version"
@@ -172,6 +172,11 @@ since = "1.0.0"
 name = "inillucent_open_with_key"
 stability = "stable"
 since = "1.1.0"
+
+[[symbol]]
+name = "inillucent_open_with_timeout"
+stability = "stable"
+since = "1.2.0"
 
 [[symbol]]
 name = "inillucent_path"

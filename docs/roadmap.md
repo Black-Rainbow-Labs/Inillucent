@@ -145,8 +145,9 @@ decision has not been made.
 ## 4. PostgreSQL parity
 
 **What it is.** A set of features that would let inillucent stand in for a PostgreSQL server. None of
-them is built. inillucent has no network listener, no replica, no reader that runs while a writer
-holds the file, no roles and no passwords. A PostgreSQL client has nothing to connect to.
+them is built. inillucent has no network listener, no replica, no roles and no passwords. A reader in
+another process already reads the last committed state while a write transaction runs; item 3
+below is a snapshot a reader keeps for a whole transaction, inside a server. A PostgreSQL client has nothing to connect to.
 
 **Why a user wants it.** Existing tools such as `psql` and `pg_dump` would work against inillucent,
 several machines could share one database, and a second machine could hold a current copy.

@@ -110,7 +110,7 @@ const UNSAFE_CRATES: [&str; 1] = ["inillucent-driver-capi"];
 // are FFI. Each call installs a handler and reads nothing back; each handler
 // stores `true` into an already-allocated `AtomicBool` and returns, which is
 // the whole of what a handler is allowed to do.
-const UNSAFE_ALLOWED: [&str; 19] = [
+const UNSAFE_ALLOWED: [&str; 20] = [
     // **The AVX2 dot product, added by task-2000's design 9.** It is the one place
     // in the engine where safe Rust cannot express the thing that has to happen: a
     // 256-bit fused multiply-add is an intrinsic, every intrinsic in
@@ -128,6 +128,15 @@ const UNSAFE_ALLOWED: [&str; 19] = [
     // arithmetic instruction it contains. Nothing in it allocates, frees, or holds a
     // reference past the statement it was made in.
     "crates/inillucent-core/src/distance.rs",
+    // **The exit handler that drops a loaded model before ONNX Runtime's own
+    // destructors run.** On macOS a process that had embedded under the `idle`
+    // or `resident` profile aborted at exit with code 134, because ONNX
+    // Runtime's C++ statics were destroyed while the session's threads still
+    // used them. Rust has no way to run code at `exit` before the C runtime runs
+    // its destructors other than registering with `atexit`, which is FFI. The
+    // file holds one declaration and one call, the call carries its SAFETY note,
+    // and the handler catches every panic so none can unwind into the C runtime.
+    "crates/inillucent-core/src/exit_hook.rs",
     "crates/inillucent-cli/src/interrupt.rs",
     // The allocator's own concurrency suite, added in task-1932 (H9). It
     // allocates on one thread and frees on another through `GlobalAlloc`, which

@@ -159,6 +159,15 @@ use crate::ImportedDatabase;
 /// would make what a suite sees depend on how long it took to get there.
 pub(crate) const RECLAIM_BYTES: u64 = 4 << 20;
 
+/// How long a fold on the way out of a statement waits for readers to leave.
+///
+/// A writer holding RESERVED folds only when it can take EXCLUSIVE, and readers
+/// in other processes may be mid statement. Fifty milliseconds covers a reader
+/// finishing an ordinary query; a reader holding SHARED longer, inside a read
+/// transaction, puts the fold off to a later statement or to close, which loses
+/// nothing because the log holds every page the fold would write.
+pub(crate) const FOLD_PATIENCE_MILLIS: u64 = 50;
+
 /// Records the checkpoint in the log and deletes the segments it has made
 /// redundant.
 ///
@@ -371,6 +380,11 @@ impl ImportedDatabase {
         // the whole of it, and one a statement took on its way out does the log's
         // housekeeping only once the log has grown past [`RECLAIM_BYTES`].
         let reclaiming = asked || self.storage.wal.since_checkpoint() >= RECLAIM_BYTES;
+        // **EXCLUSIVE before anything below runs.** A writer may hold only
+        // RESERVED (`Database::set_reserved_writes`), and a fold rolls and retires
+        // log segments and rewrites the meta record that readers read. Taking it
+        // here, once, means no step of the fold runs beside a reader.
+        self.storage.database.pool().hold_for_writing()?;
         // **The catalog's statistics are made honest first, and inside the
         // transaction the checkpoint is about to make durable - but only on a
         // checkpoint that is doing the rest of the housekeeping too.** A tree's

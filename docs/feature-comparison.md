@@ -1006,7 +1006,7 @@ These cannot be tested with a SQL script. Each row comes from the source code or
 | copy from SQLite | | `inillucent migrate app.db --destination app.rdb` |
 | copy to SQLite | | `.dump` in `inillucent-shell` prints SQL that `sqlite3` can run |
 | processes per file | many | many. A second writer waits for `PRAGMA busy_timeout` and then gets `busy` |
-| writers | one at a time. In WAL mode a reader does not wait for a writer | one at a time. A reader also waits for a writer |
+| writers | one at a time. In WAL mode a reader does not wait for a writer | one at a time. A reader reads the last committed state and does not wait for a write transaction |
 | threads | three threading modes | one thread per database. Confine a connection to one thread, or serialise the calls |
 | journal modes | `DELETE`, `TRUNCATE`, `PERSIST`, `MEMORY`, `WAL`, `OFF` | all six, and `delete` by default. `ROLLBACK` works under every mode, including `OFF` |
 | page size | 512 bytes to 64 KiB, 4 KiB by default | 32 KiB from SQL. The Rust engine API `Database::open_at` also accepts 8, 16 and 64 KiB |

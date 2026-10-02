@@ -203,6 +203,13 @@ if ($Link) {
     & node (Join-Path $PSScriptRoot 'site/update-downloads.mjs') $contentFile $json $Version
     if ($LASTEXITCODE -ne 0) { throw 'the download section could not be rewritten' }
 
+    # The install page an agent follows. Nothing rewrote it, and it named 1.0.29 while the site
+    # served 2.0.3, so a correct install failed its own step 3.
+    $installPage = Join-Path $SitePath 'public/install.md'
+    if (-not (Test-Path -LiteralPath $installPage)) { throw "$installPage does not exist" }
+    & node (Join-Path $PSScriptRoot 'site/update-install-page.mjs') $installPage $json $Version
+    if ($LASTEXITCODE -ne 0) { throw 'the install page could not be rewritten' }
+
     Write-Host ''
     Write-Host "linked $($entries.Count) download(s) in $contentFile"
     Write-Host 'now rebuild and deploy the site so the change is live.'

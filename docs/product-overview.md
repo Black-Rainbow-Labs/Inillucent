@@ -133,8 +133,8 @@ the process serving it holds 1,216 MiB of memory. The pgvector database for the 
 
 - **One writer at a time.** Several processes share the file, but they take turns to write. A
   second writer waits up to `PRAGMA busy_timeout`, which is 5,000 milliseconds by default, and is
-  then refused with `busy`. A reader in another process also waits for the writer, because
-  inillucent has no shared memory index that would let the reader find the log.
+  then refused with `busy`. A reader in another process does not wait for a write transaction: it
+  reads the last committed state from the file and the log.
 - **Statements do not run in parallel inside one process.** `SharedDatabase` lets any number of
   threads use one database, and it runs one statement at a time.
 - **inillucent has its own file format.** `inillucent migrate` imports a SQLite file once. inillucent

@@ -189,6 +189,17 @@ int32_t inillucent_open_with_key(const char *path, uint32_t flags,
                                  const char *key, inillucent_db **out,
                                  inillucent_error **error);
 
+/* Opens (and by default creates) a database, waiting up to busy_timeout_ms
+ * for a lock another process holds. inillucent_open waits 5000 ms, or what
+ * the INILLUCENT_BUSY_TIMEOUT environment variable says, and PRAGMA
+ * busy_timeout cannot reach that wait because no connection exists yet. The
+ * database also starts with busy_timeout_ms as its PRAGMA busy_timeout.
+ * Since ABI 1.2.0. */
+int32_t inillucent_open_with_timeout(const char *path, uint32_t flags,
+                                     uint32_t busy_timeout_ms,
+                                     inillucent_db **out,
+                                     inillucent_error **error);
+
 /* Checkpoints and closes. Refuses with INILLUCENT_INVALID_STATE while any
  * connection on it is still open, rather than leaving them dangling. */
 int32_t inillucent_close(inillucent_db *db, inillucent_error **error);

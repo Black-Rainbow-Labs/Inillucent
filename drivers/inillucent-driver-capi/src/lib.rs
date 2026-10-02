@@ -79,9 +79,10 @@ pub use capi::value::*;
 /// The encoding is ADBC's, because a binding author who has met one of these
 /// before has met that one.
 ///
-/// 1.1.0 added `inillucent_open_with_key`. A new symbol is a minor version: a
-/// binding written against 1.0.0 still finds every symbol it calls.
-pub const ABI_VERSION: u32 = 1_001_000;
+/// 1.1.0 added `inillucent_open_with_key`, and 1.2.0 added
+/// `inillucent_open_with_timeout`. A new symbol is a minor version: a binding
+/// written against 1.0.0 still finds every symbol it calls.
+pub const ABI_VERSION: u32 = 1_002_000;
 
 // —— status codes, which the header freezes ————————————————————————
 

@@ -16,6 +16,27 @@ use inillucent_sql::plan::{plan_select_with, Levers, PhysicalPlan};
 
 use crate::*;
 
+/// The pragmas whose value belongs to the connection rather than to the file,
+/// so reading or setting one takes the read lock only. See
+/// [`takes_no_write_lock`].
+const CONNECTION_PRAGMAS: [&str; 15] = [
+    "busy_timeout",
+    "timeout",
+    "foreign_keys",
+    "defer_foreign_keys",
+    "recursive_triggers",
+    "case_sensitive_like",
+    "query_only",
+    "cache_size",
+    "cache_spill",
+    "synchronous",
+    "temp_store",
+    "automatic_index",
+    "reverse_unordered_selects",
+    "ignore_check_constraints",
+    "trusted_schema",
+];
+
 impl crate::ImportedDatabase {
     /// Runs one already-compiled statement.
     ///
@@ -42,7 +63,8 @@ impl crate::ImportedDatabase {
         // default, both calls compare two integers. Under `normal` this is what
         // lets a second process have the file between statements, and what makes
         // this connection notice when one has written to it.
-        self.enter(Self::writes_of(cached))?;
+        let writing = Self::writes_of(cached) && !takes_no_write_lock(cached);
+        self.enter(writing)?;
         let reads = self.session_state.nesting.get() == 0 && opens_a_transaction(cached);
         self.session_state
             .nesting
@@ -1485,5 +1507,42 @@ fn push_value_columns<'v>(
                 origin: None,
                 declared_type: Vec::new(),
             });
+    }
+}
+
+/// Reports whether a directive needs only the read lock, though it is not a
+/// query.
+///
+/// **Every directive took the write lock**, a `PRAGMA busy_timeout`
+/// included, so a reader that set its own timeout waited for every writer
+/// in another process. Since a write holds RESERVED and readers read
+/// through it, that would be the only reason left for a reader to wait. A
+/// `PRAGMA` that sets or reads a setting of this connection only, such as
+/// `busy_timeout` or `foreign_keys`, needs no write lock.
+///
+/// **A plain `BEGIN` keeps taking the write lock.** Running it under the
+/// read lock was tried: `two_writer_processes_lose_nothing_one_statement_each`
+/// then lost up to seventeen of 120 acknowledged inserts, and the cause was not
+/// traced, so the change was taken back. A `BEGIN` takes RESERVED now, so readers
+/// in other processes still read beside it.
+///
+/// @param cached - the compiled statement
+fn takes_no_write_lock(cached: &Cached) -> bool {
+    let Cached::Ddl(sql) = cached else {
+        return false;
+    };
+    let text = sql.trim_start().to_ascii_lowercase();
+    let mut words = text.split(|c: char| c.is_whitespace() || c == ';');
+    match words.next() {
+        Some("pragma") => {
+            let rest = text.get("pragma".len()..).unwrap_or_default().trim_start();
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+                .collect();
+            let name = name.rsplit('.').next().unwrap_or_default();
+            CONNECTION_PRAGMAS.contains(&name)
+        }
+        _ => false,
     }
 }

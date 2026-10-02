@@ -591,7 +591,12 @@ pub(crate) fn resync_file(
             false => database.release(change.page, 1)?,
         }
     }
-    inillucent_wal::truncate_after(vfs.as_ref(), db_path, &outcome)?;
+    // **Only with the writer's slot held.** A writer holds RESERVED while its
+    // transaction runs, so this replay can end in the middle of its records,
+    // and cutting the log there would remove them. See
+    // `Database::with_writer_slot`.
+    database
+        .with_writer_slot(|| inillucent_wal::truncate_after(vfs.as_ref(), db_path, &outcome))?;
     let (next_lsn, sequence) = resume_above_every_stamp(database, &outcome)?;
     let wal = std::rc::Rc::new(Wal::open(
         std::sync::Arc::clone(vfs),
@@ -756,9 +761,9 @@ pub(crate) fn open_file_as(
     // live, and the next allocation handed it to a second owner. See
     // `Applier::free_map_changes`.
     apply_free_map_changes(&mut database, &free_map)?;
-    if !read_only {
-        inillucent_wal::truncate_after(vfs.as_ref(), db_path, &outcome)?;
-    }
+    // An open replays under SHARED, so it cuts no torn tail; see `with_writer_slot`.
+    let cut = || inillucent_wal::truncate_after(vfs.as_ref(), db_path, &outcome);
+    database.with_writer_slot(cut)?;
     // **And the file's own header is made to describe the file.** A
     // transaction that grew the file and then did not become durable leaves a
     // file longer than the meta record claims: the pool grows the file when it

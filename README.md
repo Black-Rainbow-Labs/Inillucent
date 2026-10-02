@@ -136,7 +136,8 @@ works in any SQL statement. There is no embedding server to deploy or keep runni
 
 Tables, vector indexes and keyword indexes all live in one `.rdb` file, and they commit and roll back
 together. Several processes can open the file at the same time. One process writes at a time, and
-the others wait for up to `PRAGMA busy_timeout`, which is 5 seconds by default.
+another writer waits for up to `PRAGMA busy_timeout`, which is 5 seconds by default. Readers do not
+wait for a write transaction; they read the last committed state.
 [Architecture in one page](docs/architecture-overview.md)
 
 ### Encrypted on disk

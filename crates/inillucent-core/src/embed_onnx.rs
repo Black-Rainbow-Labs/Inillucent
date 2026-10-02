@@ -808,8 +808,30 @@ impl TokenCounter {
 /// @param model_path - the `.onnx` file
 /// @param options - the device, the thread count and the optimization level
 pub(crate) fn build_session(model_path: &Path, options: &OnnxOptions) -> Result<Session> {
-    use_installed_runtime();
+    use_installed_runtime().map_err(|reason| anyhow::anyhow!(reason))?;
+    // **A panic inside `ort` becomes an error here.** Under `load-dynamic`,
+    // `ort` loads the library the first time its API is used, and when the
+    // library will not load it panics instead of returning an error. 2.0.3's
+    // command line on macOS ended there with exit code 134 and a message about
+    // `OrtGetApiBase` and `dlsym(0x0, ...)`, which named neither the file nor
+    // the reason. The installed runtime is checked first, above, so this only
+    // catches a library found some other way that does not load.
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        open_session(model_path, options)
+    }));
+    match opened {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "ONNX Runtime could not be loaded. Run `inillucent setup-embeddings runtime`, or set ORT_DYLIB_PATH to the full path of a libonnxruntime 1.22 library"
+        )),
+    }
+}
 
+/// Builds the session once ONNX Runtime is known to be loadable.
+///
+/// @param model_path - the `.onnx` file
+/// @param options - the device, the thread count and the optimization level
+fn open_session(model_path: &Path, options: &OnnxOptions) -> Result<Session> {
     let mut builder = Session::builder().context("creating an ONNX session builder")?;
     builder = builder
         .with_optimization_level(options.optimization.level())
@@ -1138,25 +1160,50 @@ pub(crate) fn plan_batches(
 /// has pinned a specific library keeps it; and a failure to load the installed
 /// one is left to the session to report, because the loader's own message names
 /// the file and a message from here would only name the attempt.
-fn use_installed_runtime() {
+fn use_installed_runtime() -> std::result::Result<(), String> {
     use std::sync::OnceLock;
-    static ONCE: OnceLock<()> = OnceLock::new();
+    static ONCE: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     ONCE.get_or_init(|| {
         if std::env::var("ORT_DYLIB_PATH").is_ok_and(|value| !value.trim().is_empty()) {
-            return;
+            return Ok(());
         }
-        let Some(library) = crate::install::runtime_library() else { return };
+        let Some(library) = crate::install::runtime_library() else {
+            return Ok(());
+        };
+        // **A library that is installed and will not load is an error, not a
+        // fallback.** 2.0.3 printed a warning here and went on to the system
+        // loader, which on a machine with no other copy handed `ort` a null
+        // handle, and `ort` panicked. The installed copy is the one the person
+        // set up, so its failure is the thing to report.
         match ort::init_from(&library) {
             Ok(builder) => {
                 builder.commit();
+                Ok(())
             }
-            Err(error) => eprintln!(
-                "warning: the ONNX Runtime at {} would not load ({error}); falling back to the system loader",
-                library.display()
-            ),
+            Err(error) => Err(format!(
+                "the ONNX Runtime at {} would not load: {error}.{}",
+                library.display(),
+                RUNTIME_LOAD_HELP
+            )),
         }
-    });
+    })
+    .clone()
 }
+
+/// What to say after an installed ONNX Runtime fails to load.
+///
+/// On macOS the usual cause is a program signed with the hardened runtime and
+/// without the `com.apple.security.cs.disable-library-validation` entitlement,
+/// which refuses a library Microsoft signed. Every program a release ships has
+/// the entitlement, so seeing this there means a program built or signed some
+/// other way.
+#[cfg(target_os = "macos")]
+const RUNTIME_LOAD_HELP: &str = " A program signed with the hardened runtime needs the com.apple.security.cs.disable-library-validation entitlement to load it; `codesign -d --entitlements - <program>` shows whether it has it. Reinstalling with `inillucent setup-embeddings runtime --force` replaces a damaged copy";
+
+/// What to say after an installed ONNX Runtime fails to load.
+#[cfg(not(target_os = "macos"))]
+const RUNTIME_LOAD_HELP: &str =
+    " Reinstalling with `inillucent setup-embeddings runtime --force` replaces a damaged copy";
 
 fn preload_cuda_dylibs() {
     use std::sync::OnceLock;

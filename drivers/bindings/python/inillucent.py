@@ -223,6 +223,17 @@ def _declare(lib: ctypes.CDLL) -> None:
         POINTER(c_void_p),
     ]
     lib.inillucent_open_with_key.restype = c_int32
+    # ABI 1.2.0. A library older than that has no such symbol, and a caller
+    # that does not ask for a timeout never needs it.
+    if hasattr(lib, "inillucent_open_with_timeout"):
+        lib.inillucent_open_with_timeout.argtypes = [
+            c_char_p,
+            c_uint32,
+            c_uint32,
+            POINTER(c_void_p),
+            POINTER(c_void_p),
+        ]
+        lib.inillucent_open_with_timeout.restype = c_int32
     for name in ("inillucent_close", "inillucent_checkpoint", "inillucent_integrity_check"):
         getattr(lib, name).argtypes = [c_void_p, POINTER(c_void_p)]
         getattr(lib, name).restype = c_int32
@@ -752,6 +763,11 @@ class Database:
     the path holds nothing. ``"x'<64 hex digits>'"`` is a raw 32 byte key and
     any other text is a passphrase. A wrong key, a key for a plaintext file and
     no key for an encrypted file all raise with the status ``CORRUPT``.
+
+    ``busy_timeout_ms`` is how long the open waits for a lock another process
+    holds, and the database's starting ``PRAGMA busy_timeout``. Without it the
+    open waits five seconds, or what ``INILLUCENT_BUSY_TIMEOUT`` says. It cannot
+    be combined with ``key``; set ``INILLUCENT_BUSY_TIMEOUT`` for that.
     """
 
     def __init__(
@@ -761,6 +777,7 @@ class Database:
         read_only: bool = False,
         diagnostics: bool = False,
         key: "str | None" = None,
+        busy_timeout_ms: "int | None" = None,
     ) -> None:
         flags = 0
         if create:
@@ -771,7 +788,25 @@ class Database:
             flags |= OPEN_DIAGNOSTICS
         handle = c_void_p()
         error = c_void_p()
-        if key is None:
+        if busy_timeout_ms is not None:
+            if key is not None:
+                raise ValueError(
+                    "busy_timeout_ms and key cannot be combined; set INILLUCENT_BUSY_TIMEOUT instead"
+                )
+            if not hasattr(_LIB, "inillucent_open_with_timeout"):
+                raise Unsupported(
+                    UNSUPPORTED,
+                    "this C library predates ABI 1.2.0 and has no inillucent_open_with_timeout",
+                    "inillucent_open_with_timeout",
+                )
+            status = _LIB.inillucent_open_with_timeout(
+                path.encode("utf-8"),
+                flags,
+                max(0, min(int(busy_timeout_ms), 0xFFFFFFFF)),
+                ctypes.byref(handle),
+                ctypes.byref(error),
+            )
+        elif key is None:
             status = _LIB.inillucent_open(
                 path.encode("utf-8"), flags, ctypes.byref(handle), ctypes.byref(error)
             )

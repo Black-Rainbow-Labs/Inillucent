@@ -261,6 +261,16 @@ pub struct OpenOptions {
     /// `EncryptionKey::parse` reads SQLCipher's `x'<64 hex digits>'` as a raw
     /// key and anything else as a passphrase. `Debug` never prints it.
     pub key: Option<EncryptionKey>,
+    /// How long the open waits for a lock another process holds, and the
+    /// `busy_timeout` the database starts with.
+    ///
+    /// Default `None`: the `INILLUCENT_BUSY_TIMEOUT` environment variable in
+    /// milliseconds when it is set, and five seconds when it is not. The open
+    /// reads the file under a lock before any connection exists, so
+    /// `PRAGMA busy_timeout` cannot reach it. In 2.0.3 a process that opened a
+    /// file while another held a long write failed after five seconds with no
+    /// way to wait longer; this is the way.
+    pub busy_timeout: Option<std::time::Duration>,
 }
 
 impl Default for OpenOptions {
@@ -274,6 +284,7 @@ impl Default for OpenOptions {
             limits: Limits::unbounded(),
             statement_cache: inillucent_engine::DEFAULT_STATEMENT_CACHE,
             key: None,
+            busy_timeout: None,
         }
     }
 }
@@ -425,14 +436,23 @@ impl Database {
         // only connection took a writer's locks, waited out the busy budget
         // against a live writer and reported the writer's lock. A read only
         // open takes SHARED only and its handle refuses a write.
-        let engine = EngineDatabase::open_keyed(
-            &path,
-            inillucent_engine::connect::PAGE_SIZE,
-            options.cache_frames,
-            options.read_only,
-            options.key.clone(),
-        )
-        .map_err(|error| Error::from_engine(&error, options.diagnostics))?;
+        let open = || {
+            EngineDatabase::open_keyed(
+                &path,
+                inillucent_engine::connect::PAGE_SIZE,
+                options.cache_frames,
+                options.read_only,
+                options.key.clone(),
+            )
+        };
+        let opened = match options.busy_timeout {
+            Some(wait) => inillucent_engine::connect::with_open_busy_timeout(
+                u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                open,
+            ),
+            None => open(),
+        };
+        let engine = opened.map_err(|error| Error::from_engine(&error, options.diagnostics))?;
         engine.set_statement_cache_limit(options.statement_cache);
         Ok(Database {
             engine,

@@ -10,6 +10,41 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**Nine problems a user of 2.0.3 on macOS reported, fixed.**
+
+- **`$1` and `$2` bind by their number.** `SET a = $2 WHERE id = $1` used to bind the first value to
+  `$2`, because `$N` was numbered by the order it appeared, which is SQLite's rule for a name. It
+  matched no row and reported no error. `$N` now binds the Nth value, as `?N` does and as PostgreSQL
+  does. The driver conformance suite has a case for it, so every language binding checks it.
+- **A facet filter with `=` dropped rows after many small commits.** Merging a search table's
+  segments rebuilt each row without its facet values, so `src = 'slack'` missed the merged rows
+  while `src IN ('slack')` found them. Merges now keep the values, and a table written by an earlier
+  release has the missing values read back from its rows when a segment loads, without a `compact`.
+- **A process that used `embed()` crashed as it exited.** On macOS it aborted with exit code 134
+  under the `idle` and `resident` profiles; on Linux it crashed under `on-demand`. Both came from
+  ONNX Runtime being torn down in the wrong order. A loaded model is now dropped before ONNX
+  Runtime's own exit code runs.
+- **`embed()` failed from the command line on macOS.** The programs are signed with the
+  `com.apple.security.cs.disable-library-validation` entitlement, so they can load ONNX Runtime,
+  and the release refuses a program without it. A runtime that will not load is now an error that
+  names the file, not a panic.
+- **`inillucent setup-embeddings` aborted on macOS before downloading anything.** It loaded the
+  system's private OpenSSL, which macOS refuses. Downloads on macOS now go through `/usr/bin/curl`,
+  and the digest of every file is still checked before it is installed.
+- **An open can wait as long as the caller says.** `INILLUCENT_BUSY_TIMEOUT` in milliseconds,
+  `OpenOptions::busy_timeout` in Rust, `inillucent_open_with_timeout` in C (ABI 1.2.0) and
+  `busy_timeout_ms` in Python set how long an open waits for a file another process is writing.
+  The open used to fail after five seconds with nothing to set.
+- **A reader no longer waits for a write transaction in another process.** A write holds the
+  RESERVED lock, which readers share, and a reader reads the last committed state. The writer takes
+  the EXCLUSIVE lock only to write the database file. A reader waited up to 15.6 seconds before.
+  `PRAGMA busy_timeout` and the other settings of a connection no longer take the write lock.
+- **inillucent.com/install.md named 1.0.29.** The release now rewrites it, and refuses to finish
+  when the live page names another version.
+- **The client libraries' tests asserted version 1.0.** They check the format now, and the
+  TypeScript client, published to npm as `inillucent-client`, finds the library where the engine's
+  installers put it.
+
 **Three fixes for one file shared by two processes.** A 3.5 GB database was damaged twice in one
 day while one process wrote large batches and another had the file open. One copy had four pages
 of zeros near its end. The other had a table whose leaf chain reached three leaves its interior

@@ -145,7 +145,7 @@ pub unsafe extern "C" fn inillucent_open(
     error: *mut *mut inillucent_error,
 ) -> i32 {
     guarded("inillucent_open", error, || {
-        open_database("inillucent_open", path, flags, None, out, error)
+        open_database("inillucent_open", path, flags, None, None, out, error)
     })
 }
 
@@ -183,7 +183,56 @@ pub unsafe extern "C" fn inillucent_open_with_key(
                 None => return misused("inillucent_open_with_key", error),
             },
         };
-        open_database("inillucent_open_with_key", path, flags, key, out, error)
+        open_database(
+            "inillucent_open_with_key",
+            path,
+            flags,
+            key,
+            None,
+            out,
+            error,
+        )
+    })
+}
+
+/// Opens a database, waiting up to `busy_timeout_ms` for a lock another
+/// process holds.
+///
+/// The open reads the file under a lock before a connection exists, so
+/// `PRAGMA busy_timeout` cannot reach that wait, and `inillucent_open` waits
+/// five seconds, or what `INILLUCENT_BUSY_TIMEOUT` says. In 2.0.3 a program
+/// started while another process held a long write failed after those five
+/// seconds with no way to wait longer. The database this opens also starts with
+/// `busy_timeout_ms` as its `PRAGMA busy_timeout`.
+///
+/// @param path - the file, UTF-8
+/// @param flags - the `INILLUCENT_OPEN_*` bits
+/// @param busy_timeout_ms - how long to wait for a lock, in milliseconds
+/// @param out - where the handle goes
+/// @param error - where a failure goes, or null
+///
+/// # Safety
+///
+/// `path` must be a NUL-terminated string, and `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn inillucent_open_with_timeout(
+    path: *const c_char,
+    flags: u32,
+    busy_timeout_ms: u32,
+    out: *mut *mut inillucent_db,
+    error: *mut *mut inillucent_error,
+) -> i32 {
+    guarded("inillucent_open_with_timeout", error, || {
+        let wait = std::time::Duration::from_millis(u64::from(busy_timeout_ms));
+        open_database(
+            "inillucent_open_with_timeout",
+            path,
+            flags,
+            None,
+            Some(wait),
+            out,
+            error,
+        )
     })
 }
 
@@ -193,6 +242,7 @@ pub unsafe extern "C" fn inillucent_open_with_key(
 /// @param path - the file
 /// @param flags - the `INILLUCENT_OPEN_*` bits
 /// @param key - the key, if the file is encrypted
+/// @param busy_timeout - how long the open waits for a lock, when the caller said
 /// @param out - where the handle goes
 /// @param error - where a failure goes, or null
 ///
@@ -204,6 +254,7 @@ unsafe fn open_database(
     path: *const c_char,
     flags: u32,
     key: Option<inillucent_driver::EncryptionKey>,
+    busy_timeout: Option<std::time::Duration>,
     out: *mut *mut inillucent_db,
     error: *mut *mut inillucent_error,
 ) -> i32 {
@@ -219,6 +270,7 @@ unsafe fn open_database(
         read_only: flags & INILLUCENT_OPEN_READONLY != 0,
         diagnostics,
         key,
+        busy_timeout,
         ..OpenOptions::default()
     };
     match Database::open_with(path, options) {

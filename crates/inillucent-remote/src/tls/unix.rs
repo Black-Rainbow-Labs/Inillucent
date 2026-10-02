@@ -39,13 +39,25 @@ use inillucent_base::DbResult;
 /// A version suffix rather than the bare `libssl.so`, because the bare name is
 /// part of the *development* package and is missing on a machine that has the
 /// library and not the headers - which is most machines.
-const CANDIDATES: [&str; 6] = [
-    "libssl.so.3",
-    "libssl.so.1.1",
-    "libssl.3.dylib",
-    "libssl.1.1.dylib",
-    "libssl.dylib",
-    "libssl.so",
+#[cfg(not(target_os = "macos"))]
+const CANDIDATES: [&str; 3] = ["libssl.so.3", "libssl.so.1.1", "libssl.so"];
+
+/// The names OpenSSL goes by on macOS: Homebrew's copies, by full path.
+///
+/// **Never a bare name.** macOS has no public OpenSSL. A bare `libssl.dylib`
+/// falls back to `/usr/lib/libssl.dylib`, the system's private copy, and macOS
+/// aborts a program that loads it that way with
+/// `... is loading libcrypto in an unsafe way`. 2.0.3 tried that name last and
+/// so ended every TLS connection on a Mac without OpenSSL from Homebrew with
+/// exit code 134 instead of an error. Downloads no longer come here on macOS
+/// (`crate::curl`); a migration over TLS still does, and without Homebrew's
+/// OpenSSL it is refused with a message naming what to install.
+#[cfg(target_os = "macos")]
+const CANDIDATES: [&str; 4] = [
+    "/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib",
+    "/usr/local/opt/openssl@3/lib/libssl.3.dylib",
+    "/opt/homebrew/opt/openssl@1.1/lib/libssl.1.1.dylib",
+    "/usr/local/opt/openssl@1.1/lib/libssl.1.1.dylib",
 ];
 
 /// `SSL_VERIFY_PEER`, which makes a failed chain a failed handshake.
@@ -298,8 +310,15 @@ impl Drop for Session {
 /// @param root - an extra certificate authority file, when the URL named one
 pub fn connect(socket: TcpStream, host: &str, root: Option<&str>) -> DbResult<Session> {
     let Some(library) = library() else {
+        // On macOS the platform library is Homebrew's OpenSSL, so the message
+        // names the command that installs it.
+        let install = if cfg!(target_os = "macos") {
+            " (on macOS: brew install openssl@3)"
+        } else {
+            ""
+        };
         return Err(super::unavailable(format!(
-            "none of {} could be loaded",
+            "none of {} could be loaded{install}",
             CANDIDATES.join(", ")
         )));
     };

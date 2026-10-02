@@ -129,7 +129,13 @@ echo
 echo "== signing"
 signable="$stage/bin/inillucent $stage/bin/inillucent-shell $stage/bin/inillucent-mcp $stage/bin/inillucent-migrate $stage/lib/libinillucent_driver_capi.dylib"
 for file in $signable; do
-  codesign --force --sign "$identity" --options runtime --timestamp "$file"
+  # A program also takes entitlements.plist, which lets it load ONNX Runtime,
+  # a library another team signed, under the hardened runtime. The library
+  # does not: the program that loads it decides what may be loaded.
+  case "$file" in
+    *.dylib) codesign --force --sign "$identity" --options runtime --timestamp "$file" ;;
+    *) codesign --force --sign "$identity" --options runtime --timestamp --entitlements "$root/packaging/macos/entitlements.plist" "$file" ;;
+  esac
   codesign --verify --strict --verbose=2 "$file"
 done
 

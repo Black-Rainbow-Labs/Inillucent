@@ -169,3 +169,136 @@ fn a_write_that_changed_nothing_is_folded_at_close() {
         assert_eq!(column(&connection, "SELECT x FROM o"), vec!["1"]);
     }
 }
+
+/// Adds `count` rows to `s` in one commit, every seventh one tagged `slack`.
+///
+/// @param connection - the database
+/// @param next - the next rowid, advanced past the rows written
+/// @param count - how many rows the commit holds
+/// @returns how many of the rows were tagged `slack`
+fn add_tagged_rows(connection: &Connection<'_>, next: &mut i64, count: usize) -> usize {
+    exec(connection, "BEGIN");
+    let mut slack = 0;
+    for _ in 0..count {
+        let id = *next;
+        let source = if id % 7 == 0 { "slack" } else { "confluence" };
+        slack += usize::from(source == "slack");
+        let angle = id as f64 * 0.37;
+        exec(
+            connection,
+            &format!(
+                "INSERT INTO s (rowid, body, src, vector) VALUES ({id}, 'apple {id}', '{source}', \
+                 '[{:.4}, {:.4}, {:.4}, 0.5]')",
+                angle.sin(),
+                angle.cos(),
+                (angle * 0.5).sin()
+            ),
+        );
+        *next += 1;
+    }
+    exec(connection, "COMMIT");
+    slack
+}
+
+/// Counts the rows a search for `apple` returns under one facet predicate.
+///
+/// @param connection - the database
+/// @param predicate - the facet constraint, such as `src = 'slack'`
+fn found(connection: &Connection<'_>, predicate: &str) -> usize {
+    column(
+        connection,
+        &format!("SELECT rowid FROM s WHERE s MATCH 'apple' AND {predicate} AND k = 100000 ORDER BY rank"),
+    )
+    .len()
+}
+
+/// A facet `=` finds every matching row after many small commits were merged.
+///
+/// 2.0.3 lost rows here. A table filled by one large commit and then by many
+/// small ones answered `src = 'slack'` with only the rows of the large commit
+/// and a few of the others, while `src IN ('slack')`, which the module does
+/// not claim and the engine checks itself, found all of them. A compaction
+/// brought the missing rows back. `compact = 1` merges after every commit, the
+/// fastest way to reach the merged state the default reaches after about a
+/// hundred commits.
+#[test]
+fn a_facet_equality_finds_rows_merged_from_small_commits() {
+    for compact in ["compact = 1", "compact = 8"] {
+        let connection = start_inillucent(AREA, &format!("merged-{}", compact.len()));
+        exec(
+            &connection,
+            &format!("CREATE VIRTUAL TABLE s USING inillucent_search(body, src FACET, dims = 4, {compact})"),
+        );
+        let mut next = 1;
+        let mut slack = add_tagged_rows(&connection, &mut next, 700);
+        for _ in 0..40 {
+            slack += add_tagged_rows(&connection, &mut next, 20);
+        }
+        let by_in = found(&connection, "src IN ('slack')");
+        assert_eq!(by_in, slack, "{compact}: IN is the engine's own check");
+        let by_equal = found(&connection, "src = 'slack'");
+        assert_eq!(
+            by_equal, slack,
+            "{compact}: src = 'slack' lost rows after merges"
+        );
+        let other = found(&connection, "src = 'confluence'");
+        assert_eq!(
+            other,
+            next as usize - 1 - slack,
+            "{compact}: the other value lost rows"
+        );
+        exec(&connection, "INSERT INTO s (s) VALUES ('compact')");
+        assert_eq!(
+            found(&connection, "src = 'slack'"),
+            slack,
+            "{compact}: after compact"
+        );
+    }
+}
+
+/// A file whose merges dropped its facet values answers every row anyway.
+///
+/// `tests/fixtures/facets-merged-by-2.0.3/app.rdb` was written by the
+/// published 2.0.3 binary, which found 2 of its 60 `slack` rows with `=`. The
+/// current build reads the missing values back from the rows when it loads a
+/// damaged segment, so an application upgrading the engine does not have to
+/// know to run `compact`. The second half checks the repair survives a commit
+/// that merges the damaged segment and writes it again.
+#[test]
+fn a_file_whose_merges_dropped_facets_answers_every_row() {
+    let fixture = inillucent_compat::workspace_root()
+        .join("crates/inillucent-compat/tests/fixtures/facets-merged-by-2.0.3");
+    let path = scratch(AREA, "damaged-by-2.0.3", "inillucent");
+    std::fs::copy(fixture.join("app.rdb"), &path).expect("the fixture is staged");
+    let mut wal = path.clone().into_os_string();
+    wal.push("-wal.0000000003");
+    std::fs::copy(fixture.join("app.rdb-wal.0000000003"), &wal).expect("its log is staged");
+    let database: &'static Database = Box::leak(Box::new(
+        Database::open(&path).expect("the 2.0.3 file opens"),
+    ));
+    let connection = database.session();
+    assert_eq!(
+        found(&connection, "src IN ('slack')"),
+        60,
+        "the fixture holds 60 slack rows"
+    );
+    assert_eq!(
+        found(&connection, "src = 'slack'"),
+        60,
+        "the damaged segments were not repaired"
+    );
+    assert_eq!(found(&connection, "src = 'confluence'"), 120);
+    let mut next = 181;
+    let slack = add_tagged_rows(&connection, &mut next, 6);
+    assert_eq!(
+        found(&connection, "src = 'slack'"),
+        60 + slack,
+        "after a commit that merges"
+    );
+    exec(&connection, "INSERT INTO s (s) VALUES ('compact')");
+    assert_eq!(
+        found(&connection, "src = 'slack'"),
+        60 + slack,
+        "after a compaction"
+    );
+}

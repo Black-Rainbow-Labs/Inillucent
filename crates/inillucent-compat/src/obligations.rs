@@ -162,6 +162,20 @@ pub fn pragma_page() -> String {
         "`busy_timeout` to 0 to make the statement fail at once. `busy_timeout` applies to\n",
     );
     out.push_str("waits between processes and to waits inside one process.\n\n");
+    // The open's wait, which the pragma cannot reach, and the three ways to set it.
+    out.push_str(
+        "Opening a file also waits when another process holds it for writing, because the\n\
+         open reads the file under a lock. `PRAGMA busy_timeout` cannot set that wait: no\n\
+         connection exists until the open has finished. Three things set it, and the\n\
+         database then starts with the same value as its `busy_timeout`:\n\n\
+         | Where | How |\n\
+         |---|---|\n\
+         | any program, any language | the environment variable `INILLUCENT_BUSY_TIMEOUT`, in milliseconds |\n\
+         | the Rust driver | `OpenOptions { busy_timeout: Some(Duration::from_secs(60)), .. }` |\n\
+         | the C library | `inillucent_open_with_timeout(path, flags, 60000, &db, &error)` |\n\
+         | the Python binding | `Database(path, busy_timeout_ms=60000)` |\n\n\
+         With none of them, the open waits 5000 milliseconds.\n\n",
+    );
     out.push_str(
         "`locking_mode` starts at **normal**, which is also SQLite's default. In normal\n",
     );

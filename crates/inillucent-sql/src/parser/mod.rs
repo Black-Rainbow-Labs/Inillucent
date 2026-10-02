@@ -535,10 +535,26 @@ impl<'a> Parser<'a> {
     /// SQLite's rule is that a bare `?` takes one past the highest index used
     /// so far, an explicit `?NNN` takes exactly NNN and raises the high-water
     /// mark, and a repeated `:name` reuses the index the first occurrence got.
+    ///
+    /// `$N`, a `$` followed only by digits, is the one place this engine
+    /// departs from SQLite. SQLite treats `$1` as a name and numbers it by the
+    /// order names first appear, so `SET a = $2 WHERE id = $1` binds the first
+    /// value to `$2`. Code written for PostgreSQL means `$N` as the Nth value,
+    /// and under SQLite's rule it ran without an error and changed the wrong
+    /// rows. So `$N` takes index N, exactly as `?N` does, and keeps its name so
+    /// a caller that looks `$1` up by name still finds index 1.
     fn assign_parameter(&mut self, token: Token) -> Result<(u32, Option<NameId>), ParseError> {
         let text = token.text(self.source);
         let sigil = text.first().copied().unwrap_or(b'?');
         let limit = self.limits.get(Limit::VariableNumber).max(0) as u32;
+        let numbered_dollar = sigil == b'$'
+            && text.len() > 1
+            && text
+                .get(1..)
+                .is_some_and(|rest| rest.iter().all(u8::is_ascii_digit));
+        if numbered_dollar {
+            return self.assign_numbered_dollar(token, text, limit);
+        }
         if sigil == b'?' && text.len() > 1 {
             let digits = text.get(1..).unwrap_or(&[]);
             let mut index: u32 = 0;
@@ -583,6 +599,39 @@ impl<'a> Parser<'a> {
         }
         self.parameters.count = index;
         self.parameters.names.push((text.to_vec(), index));
+        let id = self.ast.intern_bytes(text, QuoteForm::Bare, token.span);
+        Ok((index, Some(id)))
+    }
+
+    /// Records a `$N` parameter at index N, the PostgreSQL meaning.
+    ///
+    /// The name is recorded once with its own number, so a lookup of `$2` by
+    /// name answers 2 whether or not `$1` appeared first.
+    /// @param token - the `$N` token
+    /// @param text - the token's text, `$` and the digits
+    /// @param limit - the highest index the connection allows
+    fn assign_numbered_dollar(
+        &mut self,
+        token: Token,
+        text: &[u8],
+        limit: u32,
+    ) -> Result<(u32, Option<NameId>), ParseError> {
+        let mut index: u32 = 0;
+        for byte in text.get(1..).unwrap_or(&[]) {
+            index = index
+                .saturating_mul(10)
+                .saturating_add(u32::from(byte.saturating_sub(b'0')));
+        }
+        if index == 0 || index > limit {
+            return Err(ParseError::new(
+                ParseErrorKind::LimitExceeded("variable number"),
+                token.span,
+            ));
+        }
+        self.parameters.count = self.parameters.count.max(index);
+        if self.parameters.index_of(text).is_none() {
+            self.parameters.names.push((text.to_vec(), index));
+        }
         let id = self.ast.intern_bytes(text, QuoteForm::Bare, token.span);
         Ok((index, Some(id)))
     }

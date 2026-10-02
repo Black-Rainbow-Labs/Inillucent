@@ -100,6 +100,20 @@ file, a statement waits up to this long and then fails with `busy`. Set
 `busy_timeout` to 0 to make the statement fail at once. `busy_timeout` applies to
 waits between processes and to waits inside one process.
 
+Opening a file also waits when another process holds it for writing, because the
+open reads the file under a lock. `PRAGMA busy_timeout` cannot set that wait: no
+connection exists until the open has finished. Three things set it, and the
+database then starts with the same value as its `busy_timeout`:
+
+| Where | How |
+|---|---|
+| any program, any language | the environment variable `INILLUCENT_BUSY_TIMEOUT`, in milliseconds |
+| the Rust driver | `OpenOptions { busy_timeout: Some(Duration::from_secs(60)), .. }` |
+| the C library | `inillucent_open_with_timeout(path, flags, 60000, &db, &error)` |
+| the Python binding | `Database(path, busy_timeout_ms=60000)` |
+
+With none of them, the open waits 5000 milliseconds.
+
 `locking_mode` starts at **normal**, which is also SQLite's default. In normal
 mode the file lock is released between statements, so a second process can open
 the database. In `exclusive` mode the connection keeps the lock until it closes.

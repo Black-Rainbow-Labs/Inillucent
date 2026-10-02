@@ -842,7 +842,7 @@ fn live_documents_of(index: &Index) -> Vec<(i64, ChunkInput, Vec<f32>)> {
                 updated_at: None,
                 external_chunk_id: Some(id.to_string()),
                 labels: Vec::new(),
-                attributes: Vec::new(),
+                attributes: attributes_of_document(store, record.doc),
                 flags: Vec::new(),
                 deleted: false,
             },
@@ -850,6 +850,48 @@ fn live_documents_of(index: &Index) -> Vec<(i64, ChunkInput, Vec<f32>)> {
         ));
     }
     out
+}
+
+/// Returns one document's facet values, grouped by facet name, as a
+/// [`ChunkInput`] carries them.
+///
+/// **Why a merge needs this.** [`live_documents_of`] rebuilds each row from the
+/// segment's store so it can be replayed onto the merge's accumulator. It used
+/// to leave the attributes empty, so every row that went through a merge lost
+/// its facet values. A search with `src = 'slack'` hands the facet to the
+/// retrieval engine as an attribute filter, and a row with no attributes fails
+/// it, so after enough small commits the search silently missed most of the
+/// rows they wrote. `src IN ('slack')` still found them because the module does
+/// not claim `IN`, and the engine checks the stored column itself.
+/// `a_facet_equality_finds_rows_merged_from_small_commits` in
+/// `inillucent-compat/tests/engine/search_facet_compare.rs` fails without it.
+/// @param store - the segment's store
+/// @param doc - the document's ordinal in that store
+fn attributes_of_document(
+    store: &inillucent_core::store::Store,
+    doc: u32,
+) -> Vec<(String, Vec<String>)> {
+    let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+    for (name, value) in store.attributes_of(doc) {
+        let Some(name_text) = store.attribute_names.value(*name) else {
+            continue;
+        };
+        let Some(value_text) = store
+            .attribute_values
+            .get(*name as usize)
+            .and_then(|values| values.value(*value))
+        else {
+            continue;
+        };
+        match grouped
+            .iter_mut()
+            .find(|(existing, _)| existing == name_text)
+        {
+            Some((_, values)) => values.push(value_text.to_string()),
+            None => grouped.push((name_text.to_string(), vec![value_text.to_string()])),
+        }
+    }
+    grouped
 }
 
 /// Loads one segment's bytes back into a queryable index, refusing a segment
@@ -872,8 +914,9 @@ pub fn load_segment(
     options: &Options,
     id: i64,
 ) -> DbResult<Index> {
-    let index = load_segment_by_id(context, store, options, id, true)?;
+    let mut index = load_segment_by_id(context, store, options, id, true)?;
     check_generation_metric(&index, options)?;
+    restore_dropped_facets(context, store, options, &mut index)?;
     Ok(index)
 }
 
@@ -899,9 +942,61 @@ pub fn load_segment_resumable(
     options: &Options,
     id: i64,
 ) -> DbResult<Index> {
-    let index = load_segment_by_id(context, store, options, id, false)?;
+    let mut index = load_segment_by_id(context, store, options, id, false)?;
     check_generation_metric(&index, options)?;
+    restore_dropped_facets(context, store, options, &mut index)?;
     Ok(index)
+}
+
+/// Puts back the facet values a merge in 2.0.3 and earlier wrote without.
+///
+/// Those merges rebuilt every row with no attributes (see
+/// [`attributes_of_document`]), and the segments they wrote are still in
+/// files made by those releases. Every row of a table with facets gets one
+/// attribute per facet when it is built, even an empty one, so a live document
+/// with none was damaged by such a merge. Its values are read back from the
+/// row itself, which is authoritative. A table without that damage pays one
+/// pass over its documents per load and reads nothing. The repair is in memory
+/// only, and the next merge or compaction writes the repaired segment.
+/// @param context - the module's reach into the database
+/// @param store - the shadow tables, to read the rows from
+/// @param options - the table's declaration, which says which columns are facets
+/// @param index - the segment just loaded
+fn restore_dropped_facets(
+    context: &mut Context<'_>,
+    store: &Store,
+    options: &Options,
+    index: &mut Index,
+) -> DbResult<()> {
+    if options.facets.is_empty() {
+        return Ok(());
+    }
+    let mut damaged: Vec<(u32, i64)> = Vec::new();
+    {
+        let segment = index.store();
+        for chunk in 0..segment.n_chunks() {
+            let chunk = chunk as u32;
+            let Some(record) = segment.chunks.get(chunk as usize) else {
+                continue;
+            };
+            let Some(document) = segment.documents.get(record.doc as usize) else {
+                continue;
+            };
+            if document.deleted || document.attributes.start != document.attributes.end {
+                continue;
+            }
+            if let Ok(id) = segment.chunk_external_id(chunk).parse::<i64>() {
+                damaged.push((record.doc, id));
+            }
+        }
+    }
+    for (doc, id) in damaged {
+        if let Some(row) = store.read_row(context, id)? {
+            let attributes = chunk_of(id, &row, options).attributes;
+            index.set_document_attributes(doc, &attributes);
+        }
+    }
+    Ok(())
 }
 
 /// Loads one `%_gen` id's bytes, resolving a segment delta's base chain as

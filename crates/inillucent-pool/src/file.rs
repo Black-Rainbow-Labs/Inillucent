@@ -269,6 +269,24 @@ pub struct Database {
     /// go, because the same is then true of everything cached since
     /// (task-1979, section 4.4 item 1).
     trusted: bool,
+    /// Whether a write holds RESERVED, and raises to EXCLUSIVE only to write
+    /// the file.
+    ///
+    /// **A reader waited out every write transaction another process held**
+    /// (the 2.0.3 report: a search that took 50 ms waited up to 15.6 s). A
+    /// write took EXCLUSIVE at its first statement and kept it to the commit,
+    /// so SHARED was refused for the whole transaction. Nothing in a
+    /// transaction's body needs that: its changes go to the log, which a reader
+    /// already replays only up to the last `Commit` record, and every write to
+    /// this file, its journal or its meta record raises to EXCLUSIVE first
+    /// through `Pool::hold_for_writing`. With this set a writer takes RESERVED,
+    /// which readers share, and a reader sees the last committed state.
+    ///
+    /// False by default, and the engine sets it only for a database it does not
+    /// attach others to and holds under `locking_mode = normal`: a transaction
+    /// across attached files and an exclusive connection keep the stronger lock
+    /// they were built on.
+    reserved_writes: bool,
 }
 
 impl Database {
@@ -312,10 +330,11 @@ impl Database {
             slots: LastReadSlots::default(),
             free: FreeMap::new(options.page_size),
             shared_extent: None,
-            busy_millis: DEFAULT_BUSY_MILLIS,
+            busy_millis: default_busy_millis(),
             read_only: false,
             replayed_by_its_owner: false,
             trusted: false,
+            reserved_writes: false,
         };
         let mut next = FIRST_DATA_PAGE.0;
         let created = database.free.ensure(FIRST_DATA_PAGE.0, &mut next)?;
@@ -356,10 +375,11 @@ impl Database {
             slots: LastReadSlots::default(),
             free,
             shared_extent: None,
-            busy_millis: DEFAULT_BUSY_MILLIS,
+            busy_millis: default_busy_millis(),
             read_only: false,
             replayed_by_its_owner: false,
             trusted: false,
+            reserved_writes: false,
         })
     }
 
@@ -388,10 +408,11 @@ impl Database {
             slots: LastReadSlots::default(),
             free,
             shared_extent: None,
-            busy_millis: DEFAULT_BUSY_MILLIS,
+            busy_millis: default_busy_millis(),
             read_only: true,
             replayed_by_its_owner: false,
             trusted: false,
+            reserved_writes: false,
         })
     }
 
@@ -432,10 +453,11 @@ impl Database {
             slots: LastReadSlots::default(),
             free,
             shared_extent: None,
-            busy_millis: DEFAULT_BUSY_MILLIS,
+            busy_millis: default_busy_millis(),
             read_only: false,
             replayed_by_its_owner: false,
             trusted: false,
+            reserved_writes: false,
         })
     }
 
@@ -524,6 +546,7 @@ impl Database {
             .with_unsupported("opening a SQLite database in place"));
         }
         let mut waited = 0u64;
+        let budget = default_busy_millis();
         let page_size = loop {
             if let Some(size) = declared_page_size(file.as_ref()) {
                 break size;
@@ -531,7 +554,7 @@ impl Database {
             if let Some(size) = discover_page_size(file.as_ref()) {
                 break size;
             }
-            if waited >= DEFAULT_BUSY_MILLIS {
+            if waited >= budget {
                 return Err(corrupt("neither meta page is readable"));
             }
             // Released while waiting, because the process finishing the
@@ -938,12 +961,15 @@ impl Database {
 
     /// Raises the lock to the one a write needs.
     ///
-    /// `Exclusive` rather than `Reserved`: this engine writes pages in place
-    /// under a rollback journal and appends to a log under a write-ahead one,
-    /// and neither is safe to interleave with another process's reads without
-    /// the shared-memory index that would let a reader find the log. Taking the
-    /// stronger lock is the honest version of that - writers serialise with
-    /// readers, and nobody is told otherwise.
+    /// `Exclusive`, unless [`Database::set_reserved_writes`] said `Reserved`.
+    /// This was `Exclusive` always, on the argument that pages written in place
+    /// and a log appended to cannot be read by another process at the same time
+    /// without an index that lets a reader find the log. A reader here does find
+    /// it: it replays the log up to the last `Commit` record each time it takes
+    /// the lock, and every write to the file itself raises to `Exclusive` in
+    /// `Pool::hold_for_writing` before it happens. So under `Reserved` the log
+    /// is the only file a transaction's body changes, and readers keep reading
+    /// the last committed state while it runs.
     pub fn begin_write(&mut self) -> DbResult<bool> {
         self.begin_write_within(true)
     }
@@ -974,8 +1000,8 @@ impl Database {
             .with_detail("this connection is read only and cannot write the database"));
         }
         // The same short circuit `begin_read` makes, for the same reason: a
-        // writer that already holds the file exclusively has nothing to raise.
-        if self.pool.lock_level() == FileLock::Exclusive {
+        // writer that already holds the lock a write needs has nothing to raise.
+        if self.pool.lock_level() >= self.write_lock() {
             return Ok(false);
         }
         if !may_release {
@@ -990,6 +1016,9 @@ impl Database {
             // This connection's own `busy_timeout`, and this module's own
             // wait, for the two reasons `begin_read` gives above it.
             for level in [FileLock::Shared, FileLock::Reserved, FileLock::Exclusive] {
+                if level > self.write_lock() {
+                    break;
+                }
                 wait_for_lock_within(self.pool.file(), level, self.busy_millis)?;
             }
             if held {
@@ -1016,7 +1045,7 @@ impl Database {
         // and wrong when there was nothing to raise: a writer holding the file
         // would drop it, reread the meta record and take it again, once per
         // statement.
-        if self.pool.lock_level() == FileLock::Exclusive {
+        if self.pool.lock_level() >= self.write_lock() {
             return Ok(false);
         }
         let mut waited = 0u64;
@@ -1028,7 +1057,7 @@ impl Database {
                 Err(_) if waited >= self.busy_millis => {
                     let refusal = file_is_busy(
                         self.pool.file(),
-                        FileLock::Exclusive,
+                        self.write_lock(),
                         waited,
                         self.busy_millis,
                     );
@@ -1059,7 +1088,9 @@ impl Database {
         self.pool.unlock(FileLock::None)?;
         self.pool.lock_within(FileLock::Shared, 0)?;
         self.pool.lock_within(FileLock::Reserved, 0)?;
-        self.pool.lock_within(FileLock::Exclusive, 0)?;
+        if self.write_lock() == FileLock::Exclusive {
+            self.pool.lock_within(FileLock::Exclusive, 0)?;
+        }
         // **Read after the lock that excludes a writer, not before it**
         // (task-1979, section 4; measured again in task-1980). This asked the
         // file what had changed while it held SHARED, which two processes hold
@@ -1076,6 +1107,83 @@ impl Database {
         // when the write happens. `begin_read` needs no such move: SHARED is
         // the lock a read needs, and a writer cannot write while it is held.
         self.reload_if_moved()
+    }
+
+    /// The lock a write takes: `Reserved` under [`Database::set_reserved_writes`],
+    /// and `Exclusive` otherwise.
+    fn write_lock(&self) -> FileLock {
+        match self.reserved_writes {
+            true => FileLock::Reserved,
+            false => FileLock::Exclusive,
+        }
+    }
+
+    /// Chooses whether a write holds `Reserved` and raises to `Exclusive` only
+    /// to write the file. See the field for why, and for when the engine asks.
+    ///
+    /// @param reserved - true for `Reserved`, false for the `Exclusive` a write
+    ///   took before
+    pub fn set_reserved_writes(&mut self, reserved: bool) {
+        self.reserved_writes = reserved;
+    }
+
+    /// Reports whether a write holds `Reserved` rather than `Exclusive`.
+    pub fn reserved_writes(&self) -> bool {
+        self.reserved_writes
+    }
+
+    /// Runs `change` only when this connection held the writer's slot,
+    /// `Reserved` or stronger, through the read that `change` depends on, and
+    /// reports whether it ran.
+    ///
+    /// **For cutting a torn tail off the log after a replay**, which is only
+    /// safe when nobody can have appended since the replay read the log. Since a
+    /// writer holds only `Reserved` under [`Database::set_reserved_writes`], a
+    /// connection holding `Shared` replays the log while another process appends
+    /// and commits. The first version of this took the slot for the cut once the
+    /// other process let it go, and cut the log back to where its own replay had
+    /// ended - removing every transaction the other process committed in between.
+    /// `process_readers` measured it: readers saw rows go missing, and the count
+    /// fall back to the last checkpoint. So a connection that read under `Shared`
+    /// never cuts; the next connection that takes the slot finds the log longer
+    /// than it last saw, replays it holding the slot, and cuts it then.
+    ///
+    /// @param change - the change to make
+    pub fn with_writer_slot(&self, change: impl FnOnce() -> DbResult<()>) -> DbResult<bool> {
+        // A read only handle changes nothing, the log included.
+        if self.read_only {
+            return Ok(false);
+        }
+        let held = self.pool.lock_level();
+        if held >= FileLock::Reserved || held == FileLock::None {
+            change()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Takes `Exclusive` for a change to the file that may also be put off, and
+    /// reports whether it was taken.
+    ///
+    /// A fold on the way out of a statement is owed eventually, not now: its
+    /// pages are already in the log. Under [`Database::set_reserved_writes`] a
+    /// reader can be holding `Shared` when it comes due, and waiting the whole
+    /// busy budget for it at every statement would make the writer pay for the
+    /// reader. So this waits `patience_millis` and reports false when readers are
+    /// still there; the caller leaves the fold to a later statement or to close.
+    ///
+    /// @param patience_millis - how long to wait for readers to leave
+    pub fn try_hold_for_writing(&self, patience_millis: u64) -> bool {
+        let held = self.pool.lock_level();
+        if held == FileLock::Exclusive || held == FileLock::None {
+            return true;
+        }
+        if held < FileLock::Reserved && self.pool.lock_within(FileLock::Reserved, 0).is_err() {
+            return false;
+        }
+        self.pool
+            .lock_within(FileLock::Exclusive, patience_millis)
+            .is_ok()
     }
 
     /// Releases the file lock, which is what `locking_mode = normal` does.
@@ -1435,6 +1543,59 @@ impl Database {
 /// directly, because an open runs before there is a connection to have set it.
 pub const DEFAULT_BUSY_MILLIS: u64 = 5_000;
 
+/// The environment variable that sets the busy wait for every open in a
+/// process, in milliseconds.
+pub const BUSY_TIMEOUT_VARIABLE: &str = "INILLUCENT_BUSY_TIMEOUT";
+
+thread_local! {
+    /// The budget an open on this thread waits for a lock, while
+    /// [`with_open_busy_millis`] is running. `None` outside it.
+    static OPEN_BUSY_MILLIS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// How long an open waits for a lock another process holds, and the
+/// `busy_timeout` the opened database starts with.
+///
+/// **An open could not be told to wait longer** (the 2.0.3 report). The open
+/// reads the file under a lock before any connection exists, so
+/// `PRAGMA busy_timeout` could not reach it, and a process that started while
+/// another held a long write failed after [`DEFAULT_BUSY_MILLIS`] with nothing
+/// it could set. In order, the answer is: the value a caller passed to
+/// [`with_open_busy_millis`] for this open, then [`BUSY_TIMEOUT_VARIABLE`],
+/// then [`DEFAULT_BUSY_MILLIS`]. A variable that is not a number is ignored,
+/// because a typo in the environment should not stop a database from opening.
+pub fn default_busy_millis() -> u64 {
+    if let Some(millis) = OPEN_BUSY_MILLIS.with(|cell| cell.get()) {
+        return millis;
+    }
+    std::env::var(BUSY_TIMEOUT_VARIABLE)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_BUSY_MILLIS)
+}
+
+/// Runs `open` with [`default_busy_millis`] answering `millis` on this thread.
+///
+/// The engine's open functions take no budget, and a dozen of them call down
+/// through several crates to the few places that wait. Setting the budget for
+/// the length of one call reaches all of them without changing each signature.
+/// The previous value is put back afterwards, including when `open` panics.
+/// @param millis - how long the open may wait for a lock
+/// @param open - the open to run
+pub fn with_open_busy_millis<T>(millis: u64, open: impl FnOnce() -> T) -> T {
+    /// Puts the previous budget back when it is dropped.
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        /// Restores the budget that was in force before.
+        fn drop(&mut self) {
+            let previous = self.0;
+            OPEN_BUSY_MILLIS.with(|cell| cell.set(previous));
+        }
+    }
+    let _restore = Restore(OPEN_BUSY_MILLIS.with(|cell| cell.replace(Some(millis))));
+    open()
+}
+
 /// Walks a free map's page chain and assembles it.
 ///
 /// Shared by [`Database::open`], [`Database::load_free_map`] and
@@ -1493,7 +1654,7 @@ fn read_free_map(pool: &Pool, head: PageId) -> DbResult<FreeMap> {
 /// @param file - the database file
 /// @param level - the level to reach
 fn wait_for_lock(file: &dyn inillucent_vfs::VfsFile, level: FileLock) -> DbResult<()> {
-    wait_for_lock_within(file, level, DEFAULT_BUSY_MILLIS)
+    wait_for_lock_within(file, level, default_busy_millis())
 }
 
 /// Takes a lock on a file, waiting up to a budget the caller states.

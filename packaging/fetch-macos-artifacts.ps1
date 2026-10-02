@@ -170,16 +170,19 @@ if (Test-Path -LiteralPath $rcodesign) {
         $file = Join-Path $unpacked "$name/bin/$program"
         $info = & $rcodesign print-signature-info $file 2>&1 | Out-String
 
-        # Four separate claims, each of which has its own way of being wrong: an
+        # Separate claims, each of which has its own way of being wrong: an
         # unsigned binary, a self-signed one, one without the hardened runtime,
-        # and one whose signature dies with the certificate because nobody
-        # timestamped it.
+        # one whose signature dies with the certificate because nobody
+        # timestamped it, and one that cannot load ONNX Runtime.
         $checks = @{
             'chains to an Apple root' = ($info -match 'chains_to_apple_root_ca:\s*true')
             'is a Developer ID certificate' = ($info -match 'apple_certificate_profile:\s*developer-id-application')
             'has the hardened runtime' = ($info -match 'CodeSignatureFlags\(RUNTIME\)')
             'carries a timestamp' = ($info -match 'time_stamp_token')
             'is universal' = (($info -match 'macho-index:0') -and ($info -match 'macho-index:1'))
+            # Without it the hardened runtime refuses ONNX Runtime, which
+            # Microsoft signed, and embed() fails. 2.0.3 shipped that way.
+            'may load ONNX Runtime' = ($info -match 'com\.apple\.security\.cs\.disable-library-validation')
         }
         foreach ($claim in $checks.Keys | Sort-Object) {
             if ($checks[$claim]) {

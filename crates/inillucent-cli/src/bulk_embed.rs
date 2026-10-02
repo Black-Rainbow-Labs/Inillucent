@@ -206,6 +206,18 @@ mod real {
     /// @param key - the settings the sessions were opened with
     /// @param embedders - the sessions to keep
     fn park(key: &str, embedders: Vec<OnnxEmbedder>) {
+        // A parked session lives in a static until the process exits, and a
+        // session still loaded when ONNX Runtime's own destructors run aborts
+        // the process on macOS. `exit_hook` drops them first. Registered here,
+        // after a session opened, so the handler runs before those destructors.
+        static EXIT_REGISTERED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        EXIT_REGISTERED.get_or_init(|| {
+            inillucent_core::exit_hook::register(Box::new(|| {
+                if let Ok(mut parked) = PARKED.try_lock() {
+                    parked.clear();
+                }
+            }));
+        });
         match PARKED.lock() {
             Ok(mut parked) => parked.extend(
                 embedders

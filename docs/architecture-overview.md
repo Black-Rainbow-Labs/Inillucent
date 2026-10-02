@@ -194,7 +194,9 @@ records the [LSN](glossary.md#transactions-and-the-log) of the last log record i
 skips the records a page already has.
 
 Several processes can use one database file. One process writes at a time. A second writer waits up
-to `PRAGMA busy_timeout` (5000 milliseconds by default) and then fails with the status `busy`.
+to `PRAGMA busy_timeout` (5000 milliseconds by default) and then fails with the status `busy`. A
+reader does not wait for a write transaction: it reads the last committed state, and waits only
+while a writer folds the log into the database file.
 `crates/inillucent-compat/tests/durability/process_concurrency.rs` runs two real writer processes and checks
 that the number of rows in the file equals the number of commits the engine acknowledged.
 

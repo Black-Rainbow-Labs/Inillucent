@@ -1,0 +1,120 @@
+# Install Inillucent
+
+You are installing **Inillucent 1.0.29**, MIT licensed: an embedded SQL database with vector
+and keyword search in one file. It installs `inillucent` (the command line, 30 verbs, `--output
+json` on every one), `inillucent-shell` (shaped like `sqlite3`), `inillucent-mcp` (an MCP server,
+28 tools), `inillucent-migrate` (SQLite, PostgreSQL or MySQL in, one verified database out), and the
+C library with its header. Nothing is written outside the home directory and nothing needs
+administrator rights.
+
+## 1. Install, for this operating system
+
+Check `uname -s` (`Darwin`, `Linux`) or for Windows, then follow one section.
+
+### Windows
+
+```powershell
+irm https://inillucent.com/downloads/install.ps1 | iex
+```
+
+Unpacks into `%LOCALAPPDATA%\Programs\inillucent` and adds its `bin` to the user PATH.
+
+### Linux, x86-64 or ARM
+
+```sh
+curl -fsSL https://inillucent.com/downloads/install.sh | sh
+```
+
+The script reads `uname -m` and picks `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu`
+itself. It unpacks into `~/.local/share/inillucent` and links the four programs into
+`~/.local/bin`. glibc 2.28 or newer.
+
+### macOS
+
+```sh
+curl -fsSL https://inillucent.com/downloads/install.sh | sh
+```
+
+The same script as Linux. It picks the universal archive, which runs on Apple silicon and Intel,
+and installs it the same way. There is also a signed installer package at
+https://inillucent.com/downloads/inillucent-1.0.29.pkg.
+
+## 2. PATH, if the script did not set it
+
+Windows sets the user PATH itself, so open a new terminal; if the command is still not found, add
+`%LOCALAPPDATA%\Programs\inillucent\bin`. On Linux and macOS add the bin directory, usually with
+`export PATH="$HOME/.local/bin:$PATH"` in `~/.bashrc` or `~/.zshrc`.
+
+## 3. Check it worked
+
+```sh
+inillucent --version
+```
+
+It must print `inillucent 1.0.29`. Not found means PATH, not the install: open a new terminal.
+
+## 4. Make the first database
+
+```sh
+inillucent create app.rdb
+inillucent --db app.rdb exec "CREATE TABLE note (id INTEGER PRIMARY KEY, body TEXT)"
+inillucent --db app.rdb query "SELECT * FROM note"
+```
+
+Exit code 3 means "this engine has not built that", a different code from 1 on purpose: it is not a
+syntax error, so do not start rewording the SQL.
+
+## 5. Register the MCP server
+
+Point `--root` at the directory the agent works in, so the server refuses every path resolving
+outside it. `--readonly` refuses every statement that would change something; leave it off if the
+agent should be able to write.
+
+In **Claude Code** and in **Codex** the server command goes after a `--`:
+
+```sh
+claude mcp add inillucent -- inillucent-mcp --db app.rdb --root .
+codex  mcp add inillucent -- inillucent-mcp --db app.rdb --root .
+```
+
+**Any other client**, in its own config:
+
+```json
+{
+  "mcpServers": {
+    "inillucent": {
+      "command": "inillucent-mcp",
+      "args": ["--db", "app.rdb", "--root", ".", "--readonly"]
+    }
+  }
+}
+```
+
+Confirm it registered with `claude mcp list` or `codex mcp list`.
+
+## The archives, and their checksums
+
+- **Windows** — `inillucent-1.0.29-x86_64-pc-windows-msvc.zip` (x86-64 · 20.3 MB), SHA-256 `027bb14bcc2511d4f8228dd291f26cc6cf6f3654f0ce530247fed78de695065b`
+- **macOS** — `inillucent-1.0.29.pkg` (Apple silicon and Intel, signed and notarised · 41.1 MB), SHA-256 `bf5c24140245ca9b84f947a6c2d55301edf242d56d4e5337faa0132a29d4baf7`
+- **macOS archive** — `inillucent-1.0.29-universal-apple-darwin.tar.gz` (Apple silicon and Intel · 42.8 MB), SHA-256 `963595f502d181827fc72c6fe9f244cdacca32299ff59755e6c2e30d3f2198d3`
+- **Linux** — `inillucent-1.0.29-x86_64-unknown-linux-gnu.tar.gz` (x86-64, glibc 2.28 or newer · 21.3 MB), SHA-256 `44a5c77750a07afe3726f8af23fa6f83517ecf7f5b2604471aca932b38cb08f3`
+- **Linux ARM** — `inillucent-1.0.29-aarch64-unknown-linux-gnu.tar.gz` (aarch64, glibc 2.28 or newer · 20 MB), SHA-256 `0675572c6efc28b6f4acdb678ae0c942df7c4b940b33a38972afe33c4b7285ad`
+- **Debian and Ubuntu** — `inillucent_1.0.29_amd64.deb` (x86-64 · 21 MB), SHA-256 `70c0ec34842d8be98fb0cfdcc2f1910f7f77f06221aa69e35553da7988b54f0a`
+- **Fedora and RHEL** — `inillucent-1.0.29.x86_64.rpm` (x86-64 · 20.9 MB), SHA-256 `0836fe3177d50d7dc5995724758491d09d75096cd6e576ae686de103ed6493d7`
+- **Debian and Ubuntu ARM** — `inillucent_1.0.29_arm64.deb` (aarch64 · 19.9 MB), SHA-256 `3d740b01d5e3a603de58acba2503e1a606758e50b65c5d61aee9f94c9c62a0bd`
+- **Fedora and RHEL ARM** — `inillucent-1.0.29.aarch64.rpm` (aarch64 · 19.6 MB), SHA-256 `6b59eedf8115b6c38571a4627946a0c32a3bb74f3616c804c0cd3690c00b2d36`
+
+Both install scripts check the archive against <https://inillucent.com/downloads/SHA256SUMS> before
+unpacking. The documentation is 26 chapters, each with the exact input and the output to expect:
+<https://inillucent.com/docs>
+
+## The prompt that sent you here
+
+```
+Download and install Inillucent on this machine. It is an embedded SQL database with vector and keyword search, in one file, with an MCP server.
+
+1. Fetch https://inillucent.com/install.md and follow the steps for my operating system.
+2. Confirm it worked by running `inillucent --version`.
+3. Register the MCP server with this agent using the MCP section of that page.
+4. Then tell me the version you installed, where the four programs are, and the command that creates my first database.
+```

@@ -458,7 +458,7 @@ impl Pragmas {
         Pragmas {
             limits: std::cell::RefCell::new(Limits::default()),
             levers: std::cell::Cell::new(Levers::default()),
-            busy_timeout_ms: std::cell::Cell::new(inillucent_pool::file::DEFAULT_BUSY_MILLIS),
+            busy_timeout_ms: std::cell::Cell::new(inillucent_pool::file::default_busy_millis()),
             foreign_keys: std::cell::Cell::new(false),
             defer_foreign_keys: std::cell::Cell::new(false),
             locking_exclusive: std::cell::Cell::new(false),

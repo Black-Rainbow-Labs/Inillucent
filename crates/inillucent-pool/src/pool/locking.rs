@@ -33,7 +33,7 @@ impl Pool {
     ///
     /// @param level - the level to raise to
     pub fn lock(&self, level: FileLock) -> DbResult<()> {
-        self.lock_within(level, DEFAULT_BUSY_MILLIS)
+        self.lock_within(level, crate::file::default_busy_millis())
     }
 
     /// Raises the lock, waiting up to a budget for the holder to let go.
@@ -142,6 +142,17 @@ impl Pool {
     /// [`Pool::hold_for_writing`].
     pub(super) fn may_write_back(&self) -> DbResult<bool> {
         if !self.writable.get() {
+            Counters::add(&self.counters.held_back, 1);
+            return Ok(false);
+        }
+        // **A reader beside a writer keeps the page too.** A writer that holds
+        // only RESERVED (`Database::set_reserved_writes`) leaves readers
+        // reading through its whole transaction, and a reader whose replay
+        // outgrows its pool would otherwise ask for RESERVED, be refused and
+        // fail its statement. Its dirty pages are ones the replay made and the
+        // log holds, so keeping them resident loses nothing.
+        let level = self.file.lock_level();
+        if level == FileLock::Shared && self.file.check_reserved_lock().unwrap_or(false) {
             Counters::add(&self.counters.held_back, 1);
             return Ok(false);
         }
