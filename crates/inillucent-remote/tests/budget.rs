@@ -188,8 +188,14 @@ fn a_migration_past_its_deadline_stops_and_publishes_nothing() {
         said.contains("time it was allowed"),
         "the migration stopped for something other than its deadline: {said}"
     );
+    // **Half the full copy, not a quarter.** A copy that ignored the deadline
+    // takes at least `ROWS * PER_ROW`, ten seconds, and longer on Windows,
+    // whose sleep rounds up to its timer. A quarter was 2.5 s, and on
+    // 2026-10-02 a stopped migration took 3.57 s on a busy GitHub Windows
+    // runner, though it refused with the deadline message and published
+    // nothing. Half still fails every migration that runs to the end.
     assert!(
-        elapsed < PER_ROW.saturating_mul(ROWS as u32 / 4),
+        elapsed < PER_ROW.saturating_mul(ROWS as u32 / 2),
         "the migration took {elapsed:?}, which is most of the way through {ROWS} rows: it \
          stopped at the end rather than at its deadline"
     );
