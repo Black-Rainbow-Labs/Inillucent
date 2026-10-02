@@ -45,17 +45,28 @@
 # and ran on every push until the cadence existed. It now runs once a day in
 # `nightly.yml`.
 #
-# A push runs the whole merge cadence. A pull request runs
-# `--changed origin/<base> --cadence merge`: what the change can break, by the
-# dependency closure, including the crash suites below the crates it touched.
-# That is the rule an agent runs locally with `--changed`, widened to the
-# `merge` tiers, and the push that merges the pull request runs everything.
+# ## Once a night, and only on the public repository
+#
+# The suite runs on a schedule and when started by hand, never on a push. It
+# runs only in Black-Rainbow-Labs/Inillucent, the public mirror, where GitHub
+# gives every job four cores at no charge. In jasonmcaffee/inillucent, which is
+# private, each push cost about seven runner hours on two cores, and on
+# 2026-10-02 the account's Actions spending stopped every job there. The
+# workflows are disabled in that repository, and the `if:` on the job below
+# keeps them from running there even if somebody turns them back on.
+#
+# `ship.ps1` starts this workflow by hand on the mirror after a release, through
+# `packaging/ci-status.ps1`, and the release is not finished until it passes.
+# The mirror changes only at a release, so the nightly run grades the code that
+# was last published.
 
 name: tests
 
 on:
-  push:
-  pull_request:
+  schedule:
+    # 03:00 UTC, beside nightly.yml.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
 
 # A second push to the same branch cancels the first. The suite takes tens of
 # minutes, so without this a branch pushed to three times holds three runners.
@@ -78,13 +89,24 @@ env:
 
 jobs:
   suite:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.os }}, share ${{ matrix.shard }}
+    if: github.repository == 'Black-Rainbow-Labs/Inillucent'
     runs-on: ${{ matrix.os }}
-    # The oracle build, the fixtures and every change and merge tier target.
-    # The first Windows run to reach the suite took 98 minutes end to end, 77 of
-    # them in the suite, and that included the nightly tier, which now runs in
-    # nightly.yml. The default 360 would hide a suite that started taking twice
-    # as long.
+    # The oracle build, the fixtures and a share of the change and merge tier
+    # targets. The default 360 would hide a suite that started taking twice as
+    # long.
+    #
+    # ## Why the suite is split into shares
+    #
+    # On 2026-10-02 one job per system ran out its 150 minutes: Linux had run
+    # 143 of 356 targets and Windows 45. The statement matrix tiers, added after
+    # the last run that finished, are most of the difference. The private
+    # repository's runners have two cores, and measured against
+    # `tests/timings.toml` the suite needs about 145 minutes of them on Linux and
+    # 225 on Windows. `inillucent-testrun --shard <k>/<n>` gives each job a share
+    # balanced by those times, so Linux runs three jobs and Windows four, each
+    # about 50 to 60 minutes of suite. fmt, clippy and the contract tests do not
+    # depend on the share, so only the first share of each system runs them.
     timeout-minutes: 150
     strategy:
       # Both operating systems always run. `fail-fast` would cancel Linux the
@@ -96,9 +118,14 @@ jobs:
       # own heading and does not fail the job; a suite that skips for anything
       # else still does. Each name is here for a reason:
       #
-      #   onnx              the embedding models are hundreds of megabytes and
+      #   onnx, embed       the embedding models are hundreds of megabytes and
       #                     are fetched by `inillucent setup-embeddings`, which
-      #                     no step here runs
+      #                     no step here runs. `embed` is the same model, asked
+      #                     for by the suites that drive the `inillucent`
+      #                     program built with its `embed` feature
+      #   reranker          the 600 MB reranker, fetched by `inillucent
+      #                     setup-embeddings reranker`, which no step here runs
+      #   cuda              a hosted runner has no graphics card
       #   nikaya            the Nikaya checkout is a private repository
       #   previous-release  the released binaries `build-interop-fixture.ps1`
       #                     downloads are not fetched here
@@ -107,9 +134,33 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            absent: --absent onnx --absent nikaya --absent previous-release --absent postgres --absent mysql
+            shard: 1/4
+            first: true
+            absent: --absent onnx --absent embed --absent reranker --absent cuda --absent nikaya --absent previous-release --absent postgres --absent mysql
+          - os: windows-latest
+            shard: 2/4
+            first: false
+            absent: --absent onnx --absent embed --absent reranker --absent cuda --absent nikaya --absent previous-release --absent postgres --absent mysql
+          - os: windows-latest
+            shard: 3/4
+            first: false
+            absent: --absent onnx --absent embed --absent reranker --absent cuda --absent nikaya --absent previous-release --absent postgres --absent mysql
+          - os: windows-latest
+            shard: 4/4
+            first: false
+            absent: --absent onnx --absent embed --absent reranker --absent cuda --absent nikaya --absent previous-release --absent postgres --absent mysql
           - os: ubuntu-latest
-            absent: --absent onnx --absent nikaya --absent previous-release
+            shard: 1/3
+            first: true
+            absent: --absent onnx --absent embed --absent reranker --absent cuda --absent nikaya --absent previous-release
+          - os: ubuntu-latest
+            shard: 2/3
+            first: false
+            absent: --absent onnx --absent embed --absent reranker --absent cuda --absent nikaya --absent previous-release
+          - os: ubuntu-latest
+            shard: 3/3
+            first: false
+            absent: --absent onnx --absent embed --absent reranker --absent cuda --absent nikaya --absent previous-release
 
     steps:
       # A Linux runner starts with about 20 GB free, and the suite needs more
@@ -207,6 +258,7 @@ jobs:
           echo "INILLUCENT_TEST_MYSQL_URL=mysql://root@127.0.0.1:3306/inillucent_migrate_test" >> "$GITHUB_ENV"
 
       - name: cargo fmt
+        if: matrix.first
         run: cargo fmt --all --check
 
       # `--all-targets --all-features`, because a lint that only runs on the
@@ -216,6 +268,7 @@ jobs:
       # enforced by this compile rather than by a list here - `tools/validate`
       # was the only thing that ever evaluated them.
       - name: cargo clippy
+        if: matrix.first
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       # Only the runner. It is behind `required-features = ["testrun"]`, so a
@@ -229,9 +282,14 @@ jobs:
       # fails on a thing the rest of the run would fail on confusingly: a
       # dependency that may not be linked, a crate depending on one it may not,
       # a test target with no row in the map, a command in the table and not in
-      # MCP.
+      # MCP, a workflow that is not YAML or a prerequisite CI does not answer.
+      #
+      # The command is quoted because `policy:: selection::` unquoted is a YAML
+      # mapping, not a string. That line stopped this file parsing from
+      # 2026-09-24, and every push run failed with no job until it was quoted.
       - name: the contracts
-        run: cargo test -p inillucent-compat --test tooling -- policy:: selection:: command_parity:: documentation::
+        if: matrix.first
+        run: 'cargo test -p inillucent-compat --test tooling -- policy:: selection:: command_parity:: documentation:: ci_workflows::'
 
       # The merge cadence: every tier but `nightly` on a push, and what the
       # change can break on a pull request. The runner's own exit code is read
@@ -247,9 +305,9 @@ jobs:
             RUNNER=target/debug/inillucent-testrun
           fi
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            "$RUNNER" --changed "origin/${{ github.base_ref }}" --cadence merge --strict ${{ matrix.absent }}
+            "$RUNNER" --changed "origin/${{ github.base_ref }}" --cadence merge --strict --shard ${{ matrix.shard }} ${{ matrix.absent }}
           else
-            "$RUNNER" --cadence merge --strict ${{ matrix.absent }}
+            "$RUNNER" --cadence merge --strict --shard ${{ matrix.shard }} ${{ matrix.absent }}
           fi
           code=$?
           echo "inillucent-testrun exited $code"

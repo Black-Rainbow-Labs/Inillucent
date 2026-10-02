@@ -3018,6 +3018,18 @@ module = "policy"
 tier = "tooling"
 covers = ["inillucent-compat"]
 
+# The GitHub workflows are YAML GitHub will run, and answer every `requires`
+# name in this file. `tests.yml` stopped parsing on 2026-09-24 and every push
+# run failed with no job for a week; and three names the embed suites added
+# were declared absent nowhere, which fails a strict run on every runner.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "tooling"
+module = "ci_workflows"
+tier = "tooling"
+covers = ["inillucent-compat"]
+
 # The Nikaya workload's freshness (task-2036). It runs
 # `tools/extract-nikaya-workload.py --check`, so there is one extractor rather
 # than two that agree on the day they are written. Nikaya is not part of this
@@ -3083,6 +3095,8 @@ requires = ["node", "go", "php"]
 # first GitHub Windows run failed with "these runners have produced no record"
 # for both. Running this one target after the rest makes the order certain.
 alone = true
+# And in the same share as both, when `--shard` splits a run across CI jobs.
+share_with = ["inillucent-driver::conformance", "inillucent-driver-capi::python_conformance"]
 
 # The escape ledger's guard (task-2036). It resolves every `held_by` entry in
 # `tests/escapes.toml` against the tree, so a row that claims a test holds a

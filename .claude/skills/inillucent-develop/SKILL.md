@@ -71,7 +71,7 @@ flowchart LR
   tier.
 - Each tier has a cadence. A `change` tier target runs by the closure above. A `durability`,
   `perf` or `matrix_deep` target (cadence `merge`) runs only when a crate you changed is in its
-  `covers`; CI runs them all on every push. A `nightly` target never runs on a change: the nightly job runs it, or
+  `covers`; CI runs them all every night. A `nightly` target never runs on a change: the nightly job runs it, or
   `--tier nightly` by name.
 - The build names only the selected targets, so a run that selects no `inillucent-bench` row does
   not compile ONNX Runtime, the tokenizers or oniguruma.
@@ -120,11 +120,26 @@ A new git worktree is missing two gitignored folders:
 
 ### CI and the nightly
 
-`.github/workflows/tests.yml` runs the merge cadence, on Windows and on Linux, on every push and
-every pull request. `.github/workflows/nightly.yml` runs the nightly cadence once a day, on Linux
-only, and uploads its summary as a workflow artifact. `packaging/nightly.ps1` runs the nightly
-cadence a second time, once a night on the Windows development machine, then builds that night's
-release and its performance gates, and appends a row per target to `tests/nightly-history.tsv`.
+CI runs only on the public mirror, Black-Rainbow-Labs/Inillucent, at 03:00 UTC and when started by
+hand, never on a push; both workflows are disabled in the private jasonmcaffee/inillucent. So run the
+suite locally before you push. `.github/workflows/tests.yml` runs the merge cadence, on Windows and
+on Linux, as four jobs on Windows and three on Linux that each run one
+`inillucent-testrun --shard <k>/<n>` share. `.github/workflows/nightly.yml` runs the nightly cadence once a day, on Linux
+only, as four jobs that each run `inillucent-testrun --shard <k>/4`, and uploads each summary as a
+workflow artifact. `packaging/nightly.ps1` runs the nightly cadence a second time, once a night on
+the Windows development machine, then builds that night's release and its performance gates, and
+appends a row per target to `tests/nightly-history.tsv`.
+
+`tooling::ci_workflows` checks both workflow files. It fails on a plain YAML value holding `: `,
+which makes GitHub refuse the whole file, and on a `requires` name in `tests/selection.toml` that
+CI neither provides nor passes to `--absent`. Give a new prerequisite name an answer in both
+workflows in the same change.
+
+**A deploy is finished when GitHub's tests runs are green.** After a release, a push to the mirror
+or a site publish, run `pwsh packaging/ci-status.ps1`. It starts the `tests` workflow on the
+mirror's `main` when that commit has no run, waits for it, and exits 0 only when it passed.
+`ship.ps1` runs the same check as its last route, `ci`. From 2026-09-24
+`tests.yml` did not parse and every run failed with no job, and eight releases were cut over it.
 
 ## Adding a dependency
 

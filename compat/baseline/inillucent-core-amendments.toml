@@ -194,9 +194,9 @@ sha256 = "accbd68a1ee48da9b0ca4c1855b3ac991f672f9e258cd0376ca45e5b4c6449aa"
 
 [[amendment]]
 path = "crates/inillucent-core/src/exit_hook.rs"
-ticket = "task-2167"
-reason = "New: drops every loaded model session from an atexit handler registered after the first session opens, and keeps one ONNX Runtime environment reference for the life of the process on Linux and Windows, so a process that embedded exits with its own exit code. 2.0.3 aborted at exit on macOS under idle and resident, crashed on Linux under on-demand, and crashed on Windows in 10 of 30 on-demand runs. No change to any embedding."
-sha256 = "a4286e498b18669e62e120c623a68a426231bdc851e43256e1c4b15c1ab21f1f"
+ticket = "task-2168"
+reason = "task-2167 added this file: it drops every loaded model session from an atexit handler and keeps one ONNX Runtime environment reference, so a process that embedded exits with its own exit code. task-2168 passes the unloader to catch_unwind directly instead of through a closure, which clippy on Linux refused as a redundant closure. No change to any embedding."
+sha256 = "80ecbf5612bce08ee18b8f4a7c0d64116a4ced774190e3cedccf7d304e4587de"
 
 [[amendment]]
 path = "crates/inillucent-core/src/filter.rs"
@@ -212,9 +212,9 @@ sha256 = "ef2b935a4f7ec6a35b8755f758e11eb863dc37fb28f7abeda781f3b9154c2e0d"
 
 [[amendment]]
 path = "crates/inillucent-core/src/hnsw.rs"
-ticket = "task-2068"
-reason = "the neighbour list is read through binio::read_pod_vec rather than reserved from a raw u32 off disk; a fuzz target found 14 GB asked for from a 21 byte input."
-sha256 = "a783de8198752d17fa1d349e043f47fd41d71fb25dffd0b91d7dc8527be8774c"
+ticket = "task-2168"
+reason = "task-2068 read the neighbour list through binio::read_pod_vec rather than reserving from a raw u32 off disk, after a fuzz target found 14 GB asked for from a 21 byte input. task-2168 builds the graph of the filtered recall test with one thread, so the test grades the same graph on every machine; the jira recall was 0.895 on a two processor GitHub runner. No change outside the tests."
+sha256 = "3b630c90a0a224ab39decdf4f77193358d3f9bd62cdd217a2ec388a13c53371e"
 
 [[amendment]]
 path = "crates/inillucent-core/src/index.rs"

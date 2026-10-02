@@ -4,6 +4,12 @@
 # in its name, and its reason says which bug. A rule here is a defect, never a
 # deliberate difference: those go in deliberate.toml.
 
-# Every rule that was here named a bug the statement matrix found, and each of
-# those bugs is fixed, so the list is empty: a random case that differs from
-# SQLite fails until it is fixed or a rule for its new bug is added here.
+# A random case that differs from SQLite fails until it is fixed or a rule for its
+# new bug is added here.
+
+[[rule]]
+name = "bug-83-a-failing-term-is-tested-before-the-join-equality"
+contains = ["JOIN", "abs("]
+detail = "integer overflow"
+kinds = ["outcome"]
+reason = "Bug 83 on task-2136. `abs()` of the smallest integer fails with integer overflow. SQLite reaches the WHERE term only for rows its join equality matched, through an automatic index, so a row the equality rejects never evaluates it; inillucent's nested loop tests the WHERE term on every pair first and fails. Found by the nightly random matrix on seed 20261006, case random-da72cd29323c."

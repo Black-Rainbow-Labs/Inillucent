@@ -87,6 +87,17 @@ pub(super) fn pattern_range(
     if *source != id || *candidate != column {
         return None;
     }
+    // **Only over a column with TEXT affinity**, which is SQLite's other
+    // condition (`isLikeOrGlob` in `whereexpr.c`). A column with no declared
+    // type keeps an integer as an integer, the index orders it before every
+    // text key, and a seek over the text range `'1'` to `'2'` never reaches
+    // it - while `1 GLOB '1*'` is true, because the pattern reads the integer
+    // as text. `CREATE INDEX t0_i ON t0(a)` over an untyped `a` holding 1
+    // answered no row for `a GLOB '1*'`; the nightly random matrix found it on
+    // seed 20261006.
+    if operand.affinity() != Some(inillucent_value::Affinity::Text) {
+        return None;
+    }
     let BoundExpr::Text(text) = pattern.as_ref() else {
         return None;
     };

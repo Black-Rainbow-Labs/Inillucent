@@ -411,7 +411,13 @@ macro_rules! matrix_family {
                     $crate::statement_matrix::group::Cadence::$cadence,
                     index,
                     GROUP_NAMES.len(),
-                    &std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("matrix"),
+                    // One directory per cadence, because `matrix::pragma` and
+                    // `matrix_deep::pragma` run at once and both have a group 0:
+                    // sharing `matrix/s0/pragma-0-default` made each delete the
+                    // other's fixtures mid case, which read as "unable to open
+                    // database file" and "disk I/O error" against SQLite.
+                    &std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+                        .join(concat!("matrix-", stringify!($cadence))),
                     oracle_missing,
                 );
             }

@@ -144,8 +144,28 @@ function Invoke-Rcodesign {
 
     .PARAMETER Quiet
         Discard its output; used for the calls whose result is read afterwards.
+
+    .PARAMETER WorkingDirectory
+        Where rcodesign runs, so a file in that folder can be named without a path.
+        rcodesign reads the text before the first colon of some arguments as a
+        scope, so a Windows path like J:\... cannot be passed to them.
     #>
-    param([string[]] $Arguments, [switch] $Quiet)
+    param([string[]] $Arguments, [switch] $Quiet, [string] $WorkingDirectory)
+    if ($WorkingDirectory) {
+        $out = [System.IO.Path]::GetTempFileName()
+        $err = [System.IO.Path]::GetTempFileName()
+        try {
+            $process = Start-Process -FilePath $rcodesign -ArgumentList $Arguments -WorkingDirectory $WorkingDirectory `
+                -Wait -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+            if (-not $Quiet) { Get-Content -LiteralPath $out, $err | Write-Host }
+            if ($process.ExitCode -ne 0) {
+                throw "rcodesign $($Arguments[0]) failed with $($process.ExitCode): $(Get-Content -LiteralPath $err -Raw)"
+            }
+        } finally {
+            Remove-Item -LiteralPath $out, $err -Force -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        return
+    }
     if ($Quiet) {
         & $rcodesign @Arguments *> $null
     } else {
@@ -365,8 +385,13 @@ function Set-AppleSignatures {
         Assert-UniversalBinary -Path $path
         Assert-MinimumOs -Path $path
         $entitlementArguments = @()
-        if ($entry.Program) { $entitlementArguments = @('--entitlements-xml-file', $entitlements) }
-        Invoke-Rcodesign -Quiet -Arguments (@('sign') + $IdentityArguments + @(
+        # **The file's bare name, from its own folder.** rcodesign reads the text before the
+        # first colon of --entitlements-xml-file as a scope (`main`, `@0`, a bundle path), so
+        # a Windows path's drive letter was taken for one and the first 2.0.4 build was signed
+        # with no entitlements at all; Assert-Signature refused it. A `main:` prefix does not
+        # apply to a single Mach-O either, measured, so rcodesign runs in packaging/macos.
+        if ($entry.Program) { $entitlementArguments = @('--entitlements-xml-file', (Split-Path -Leaf $entitlements)) }
+        Invoke-Rcodesign -Quiet -WorkingDirectory (Split-Path -Parent $entitlements) -Arguments (@('sign') + $IdentityArguments + @(
                 '--binary-identifier', $entry.Id,
                 '--code-signature-flags', 'runtime') + $entitlementArguments + @($path))
         Assert-Signature -Path $path -Program $entry.Program

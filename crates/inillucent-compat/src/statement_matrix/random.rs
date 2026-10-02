@@ -38,7 +38,7 @@ impl Rng {
     }
 
     /// The next 64 bits.
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -53,7 +53,7 @@ impl Rng {
         if n == 0 {
             return 0;
         }
-        (self.next() % n as u64) as usize
+        (self.next_u64() % n as u64) as usize
     }
 
     /// True with the given chance in a hundred.
@@ -689,7 +689,7 @@ pub fn run_group(
     let directory = scratch
         .join(format!("s{}", grouping::shard().0))
         .join(format!("random-{group}"));
-    let mut runner = Runner::new(arm.clone(), &directory);
+    let mut runner = Runner::new(arm, &directory);
     let oracle_missing = !runner.has_oracle();
     let borrowed: Vec<&Case> = cases.iter().collect();
     let verdicts = runner.run_all(&borrowed);
@@ -714,7 +714,7 @@ pub fn run_group(
         match known::judge(&case.id, failures, &ran, &empty, &rules) {
             known::Judged::Fail(left) => {
                 let shrunk = if report.problems.len() < MOST_SHRUNK {
-                    let mut shrinker = Runner::new(arm.clone(), &directory.join("shrink"));
+                    let mut shrinker = Runner::new(arm, &directory.join("shrink"));
                     let found = crate::statement_matrix::shrink::shrink(&mut shrinker, case);
                     shrinker.finish();
                     found.map(|(small, _)| small)

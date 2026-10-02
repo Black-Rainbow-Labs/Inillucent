@@ -190,8 +190,6 @@ fn a_connection_reads_its_own_counters_after_another_connection_writes() {
         "the SQL scalars read another connection's counters"
     );
 
-    drop(first);
-    drop(second);
     drop(database);
     let _ = std::fs::remove_file(&path);
 }

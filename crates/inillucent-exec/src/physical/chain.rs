@@ -1681,6 +1681,17 @@ pub(crate) fn source_for_run<'t>(
     prepared: &Prepared,
     limit: Option<usize>,
 ) -> DbResult<Source<'t>> {
+    // **`LIMIT 0` reads nothing, so it evaluates nothing.** SQLite tests the
+    // limit before its loop starts and jumps past the whole statement when it
+    // is zero, so an expression that would fail on a row - `abs()` of the
+    // smallest integer, which is "integer overflow" - is never reached. This
+    // pushed every row through the filter and failed. The nightly random
+    // matrix found it on seeds 20261005 and 20261007. An empty source still
+    // runs everything above it, so an aggregate answers its one row and the
+    // limit above it drops that row, as SQLite answers no row.
+    if constant_limit(&plan.select, params)? == Some(0) {
+        return Ok(Source::Rows(Vec::new()));
+    }
     match prepared.stages.first() {
         // A materialised subquery: the inner pipeline runs to completion into a
         // buffer, and the buffer drives the outer one. It is built here rather

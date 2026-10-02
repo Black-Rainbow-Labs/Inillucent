@@ -79,6 +79,13 @@ corpus.jsonl
 !/tests/interop/*/app.rdb
 !/tests/interop/*/app.rdb-wal.*
 
+# And one file written by the published 2.0.3 binary, whose search table lost its facet values in
+# merges. `search_facet_compare` opens a copy to prove the current build repairs it. The change
+# that added the test never committed the file, because the `*.rdb` rule above hid it, and the test
+# failed on every checkout but the one it was written in.
+!/crates/inillucent-compat/tests/fixtures/facets-merged-by-2.0.3/app.rdb
+!/crates/inillucent-compat/tests/fixtures/facets-merged-by-2.0.3/app.rdb-wal.*
+
 # The same for `.db`, but only inside a crate, because `.db` is also SQLite's
 # own extension and `compat/fixtures/` holds a hundred tracked files that are
 # genuinely source - the files a reader is meant to open with SQLite to check a

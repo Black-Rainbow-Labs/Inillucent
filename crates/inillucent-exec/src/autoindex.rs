@@ -113,6 +113,7 @@ fn converted(expr: Expr, affinity: Option<inillucent_value::Affinity>) -> Expr {
         Some(affinity) => Expr::Affinity {
             operand: Box::new(expr),
             affinity,
+            widen: false,
         },
     }
 }

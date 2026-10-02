@@ -86,12 +86,12 @@ fn ddl_table() -> Family {
         ],
         allowed: |pick| {
             // A table made by AS SELECT has no constraints to declare.
-            !(pick.get("form") == Some("as_select") && pick.get("constraint").is_some_and(|c| c != "none"))
+            !((pick.get("form") == Some("as_select") && pick.get("constraint").is_some_and(|c| c != "none"))
                 // A WITHOUT ROWID table's key cannot also be the column under test's.
-                && !pick.forbids("form", "constraint", &[("without_rowid", "primary_key")])
+                || pick.forbids("form", "constraint", &[("without_rowid", "primary_key")])
                 // A column a generated column reads cannot be dropped.
-                && !(pick.get("alter") == Some("drop_column")
-                    && pick.get("constraint").is_some_and(|c| c.starts_with("generated")))
+                || (pick.get("alter") == Some("drop_column")
+                    && pick.get("constraint").is_some_and(|c| c.starts_with("generated"))))
         },
         build: build_table,
     }

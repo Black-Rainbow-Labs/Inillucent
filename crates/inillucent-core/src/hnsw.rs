@@ -1885,11 +1885,19 @@ mod tests {
         }
     }
 
+    /// Filtered recall stays above 0.90 for every source.
+    ///
+    /// **One build thread, so the graph is the same on every machine.** The
+    /// default builds with one thread per processor, and a parallel build
+    /// inserts in a different order on a different machine. The jira recall
+    /// was above 0.90 on the 24 processor development machine and 0.895 on a
+    /// two processor GitHub Windows runner on 2026-10-02.
     #[test]
     fn filtered_recall_is_high_against_exhaustive_search_within_the_filter() {
         let (vs, store) = fixture(20000, 32);
         let mut g = Hnsw::new(HnswParams {
             exhaustive_below: 0,
+            build_threads: 1,
             ..Default::default()
         });
         g.force_graph_traversal();

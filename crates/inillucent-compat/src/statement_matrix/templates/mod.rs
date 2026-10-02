@@ -145,10 +145,13 @@ pub struct Generated {
     pub required: usize,
 }
 
+/// The generated families, by family name, strength and whether the values in
+/// [`MERGE_ONLY`] were left out.
+type Memo = BTreeMap<(String, usize, bool), Result<Generated, String>>;
+
 /// The memo of generated families.
-fn memo() -> &'static Mutex<BTreeMap<(String, usize, bool), Result<Generated, String>>> {
-    static MEMO: OnceLock<Mutex<BTreeMap<(String, usize, bool), Result<Generated, String>>>> =
-        OnceLock::new();
+fn memo() -> &'static Mutex<Memo> {
+    static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
     MEMO.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 

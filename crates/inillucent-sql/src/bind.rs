@@ -2607,7 +2607,18 @@ impl<'a> Binder<'a> {
                 span,
             ));
         }
-        let Some(column) = block.columns.first() else {
+        // **A compound takes its rules from its last arm.** SQLite's parser
+        // links a compound's arms through `pPrior`, so the `Select` an `IN`
+        // holds is the rightmost one, and the affinity and the collation are
+        // read off its first column. Measured against 3.53.4,
+        // `'7' IN (SELECT r FROM t UNION ALL SELECT 'x')` with a REAL `r`
+        // holding 7 answers 0 and the arms swapped answer 1; reading the first
+        // arm here gave the opposite of both.
+        let last = block
+            .compounds
+            .last()
+            .map_or(&block.columns, |(_, arm)| &arm.columns);
+        let Some(column) = last.first() else {
             return Err(unsupported("a subquery with no result column", span));
         };
         let (affinity, collation) = comparison_rules(&operand, &column.expr);
@@ -4489,9 +4500,15 @@ impl<'a> Binder<'a> {
         for argument in &list {
             bound.push(self.bind_expr(*argument)?);
         }
+        // **The first argument that has a collation, not the first argument.**
+        // SQLite asks each argument in turn and stops at the first with one; a
+        // `CASE`, a literal or a call without `COLLATE` has none and is passed
+        // over. `min(CASE ... ELSE a END, b)` with `b` declared `COLLATE
+        // NOCASE` compares with NOCASE in 3.53.4 and answered with BINARY
+        // here. The nightly random matrix found it on seed 20261002.
         let collation = bound
-            .first()
-            .and_then(BoundExpr::collation)
+            .iter()
+            .find_map(BoundExpr::collation)
             .unwrap_or(Collation::Binary);
         Ok(BoundExpr::Function {
             func,

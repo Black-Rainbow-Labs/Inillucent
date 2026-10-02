@@ -832,7 +832,7 @@ mod tests {
     fn an_unmarked_blob_with_a_jsonb_header_is_read_as_jsonb() {
         let null = Value::owned_blob(&[0x00]).expect("a blob");
         assert_eq!(
-            rendered(&run(JsonFunc::Quote, &[null.clone()]).expect("succeeds")),
+            rendered(&run(JsonFunc::Quote, std::slice::from_ref(&null)).expect("succeeds")),
             "null"
         );
         assert_eq!(

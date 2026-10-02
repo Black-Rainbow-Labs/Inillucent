@@ -10,6 +10,39 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**The GitHub tests ran again, and a release now waits for them.** From 2026-09-24 the tests
+workflow was not valid YAML, so GitHub ran no job on either repository, and 1.0.30 to 2.0.4 were
+released without a CI result. The workflow parses again, and what the week without CI let through is
+fixed:
+
+- **`x IN (SELECT ...)` against a REAL column matched as SQLite does.** SQLite tests membership in
+  an index that stores an integer as a real, so `9223372036854775806 IN (SELECT a FROM t)` is true
+  when the REAL column `a` holds 9223372036854775807. inillucent compared the integer exactly and
+  answered false. The correlated form had the same difference.
+- **A compound `IN` took its rules from the wrong arm.** `'7' IN (SELECT r FROM t UNION ALL SELECT
+  'x')` used the REAL affinity of the first arm. SQLite uses the last arm, and so does inillucent
+  now, for the collation as well.
+- **`PRAGMA data_store_directory` on Linux and macOS answers no column**, as SQLite does there. The
+  pragma exists only in SQLite's Windows build.
+- **`LIKE`, `GLOB` and `quote()` end text at its first zero byte**, as SQLite does, which reads
+  them as C strings. `('1' || x'00ff') LIKE '_'` is 1 now.
+- **A function takes its collation from the first argument that has one.** `min(CASE ... END, b)`
+  with `b` declared `COLLATE NOCASE` compared with BINARY before.
+- **`a GLOB '1*'` over an index on a column with no declared type finds an integer 1.** A pattern
+  becomes an index range only over a column with TEXT affinity, as in SQLite.
+- **`LIMIT 0` evaluates nothing.** A WHERE clause that would fail on a row, such as `abs()` of the
+  smallest integer, failed the statement before.
+- **A connection that was already open removes an empty journal a killed writer left.** On Linux
+  the writer can die after it creates `<database>-journal` and before it writes the header, and the
+  empty file stayed until the next process opened the database.
+- **A release is not finished until GitHub's tests run of it passes.** `ship.ps1`'s new last route,
+  `ci`, starts the tests workflow on the public mirror once the release is there and waits for it.
+  `packaging/ci-status.ps1` runs that check on its own.
+- **CI runs only on the public mirror, at night.** Both workflows run at 03:00 UTC and by hand, in
+  Black-Rainbow-Labs/Inillucent only, and split the suite across jobs with the new
+  `inillucent-testrun --shard <k>/<n>`: four on Windows and three on Linux for the tests, four for
+  the nightly.
+
 **Nine problems a user of 2.0.3 on macOS reported, fixed.**
 
 - **`$1` and `$2` bind by their number.** `SET a = $2 WHERE id = $1` used to bind the first value to

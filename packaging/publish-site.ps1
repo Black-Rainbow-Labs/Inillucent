@@ -115,10 +115,26 @@ if ($Stage) {
     New-Item -ItemType Directory -Force -Path $downloads | Out-Null
     Write-Host "staging inillucent $Version into $downloads"
 
+    # **Only what SHA256SUMS names is published.** The macOS build of 2.0.4 was signed and then
+    # refused by Apple's notary service, so its step stopped before it added the macOS lines to
+    # SHA256SUMS. The .pkg and the tarball were still in dist/, and this copied them: the site then
+    # offered a package Apple had not notarised and a tarball install.sh could not verify, so a Mac
+    # could not install the release at all. SHA256SUMS is written by the steps that finished, so it
+    # is the list of what may go out.
+    $named = @()
+    $sumsPath = Join-Path $dist 'SHA256SUMS'
+    if (Test-Path -LiteralPath $sumsPath) {
+        $named = @(Get-Content -LiteralPath $sumsPath | ForEach-Object { ($_ -split '\s+', 2)[1] } | Where-Object { $_ } | ForEach-Object { $_.Trim() })
+    }
     $missing = @()
     foreach ($artifact in $artifacts) {
         $from = Join-Path $dist $artifact.File
         if (-not (Test-Path -LiteralPath $from)) { $missing += $artifact.File; continue }
+        if ($named -notcontains $artifact.File) {
+            Write-Warning "$($artifact.File) is in dist/ and SHA256SUMS does not name it, so it is not published"
+            $missing += $artifact.File
+            continue
+        }
         Copy-Item -LiteralPath $from -Destination $downloads -Force
         Write-Host "  $($artifact.File)"
     }
@@ -186,10 +202,18 @@ if ($Link) {
     $contentFile = Join-Path $SitePath 'src/data/content.ts'
     if (-not (Test-Path -LiteralPath $contentFile)) { throw "$contentFile does not exist" }
 
+    # Linked only when SHA256SUMS names it, for the reason the staging loop gives: a file a
+    # failed step left in downloads/ from an earlier staging is not part of this release.
+    $linkable = @()
+    $sumsPath = Join-Path $dist 'SHA256SUMS'
+    if (Test-Path -LiteralPath $sumsPath) {
+        $linkable = @(Get-Content -LiteralPath $sumsPath | ForEach-Object { ($_ -split '\s+', 2)[1] } | Where-Object { $_ } | ForEach-Object { $_.Trim() })
+    }
     $entries = @()
     foreach ($artifact in $artifacts) {
         $staged = Join-Path $downloads $artifact.File
         if (-not (Test-Path -LiteralPath $staged)) { continue }
+        if ($linkable -notcontains $artifact.File) { continue }
         $entries += [pscustomobject]@{
             platform = $artifact.Platform
             detail   = "$($artifact.Detail) · $([math]::Round((Get-Item -LiteralPath $staged).Length / 1MB, 1)) MB"

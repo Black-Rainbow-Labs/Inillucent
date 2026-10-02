@@ -766,11 +766,9 @@ impl Walk<'_> {
                     self.column_def(column);
                 }
             }
-            Statement::Begin { behaviour } => {
-                if let Some(behaviour) = behaviour {
-                    self.form(behaviour_name(behaviour));
-                }
-            }
+            Statement::Begin {
+                behaviour: Some(behaviour),
+            } => self.form(behaviour_name(behaviour)),
             Statement::Rollback { savepoint } => self.flag(savepoint.is_some(), "Rollback::to"),
             Statement::Pragma {
                 database,
@@ -955,7 +953,7 @@ impl Walk<'_> {
                 self.flag(*all, "Select::all");
                 self.result_columns(columns);
                 for term in from {
-                    self.from_term(*term);
+                    self.walk_from_term(*term);
                 }
                 self.maybe_expr(*filter);
                 self.flag(!group_by.is_empty(), "Select::group_by");
@@ -1004,7 +1002,7 @@ impl Walk<'_> {
     /// Walks one FROM term.
     ///
     /// @param id - the term
-    fn from_term(&mut self, id: FromTermId) {
+    fn walk_from_term(&mut self, id: FromTermId) {
         let Some(term) = self.ast.from_term(id).cloned() else {
             return;
         };
@@ -1035,7 +1033,7 @@ impl Walk<'_> {
             FromSource::Subquery(select) => self.select(*select),
             FromSource::Join(terms) => {
                 for term in terms {
-                    self.from_term(*term);
+                    self.walk_from_term(*term);
                 }
             }
         }
@@ -1312,14 +1310,14 @@ impl Walk<'_> {
         self.with(&update.with);
         self.flag(update.on_conflict.is_some(), "Update::or");
         self.conflict(update.on_conflict.as_ref());
-        self.from_term(update.target);
+        self.walk_from_term(update.target);
         for (names, value) in &update.assignments {
             self.flag(names.len() > 1, "Update::row_value_assignment");
             self.expr(*value);
         }
         self.flag(!update.from.is_empty(), "Update::from");
         for term in &update.from {
-            self.from_term(*term);
+            self.walk_from_term(*term);
         }
         self.maybe_expr(update.filter);
         self.flag(!update.returning.is_empty(), "Update::returning");
@@ -1336,7 +1334,7 @@ impl Walk<'_> {
     fn delete(&mut self, delete: &inillucent_sql::ast::Delete) {
         self.flag(!delete.with.ctes.is_empty(), "Delete::with");
         self.with(&delete.with);
-        self.from_term(delete.target);
+        self.walk_from_term(delete.target);
         self.maybe_expr(delete.filter);
         self.flag(!delete.returning.is_empty(), "Delete::returning");
         self.result_columns(&delete.returning);

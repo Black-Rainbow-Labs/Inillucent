@@ -15,5 +15,10 @@ commit and after a compaction.
 
 | File | sha256 |
 |---|---|
-| `app.rdb` | `e3bc2f557ecc8e6f9e72a7a2091baa771620e5a09fe1882ede329dbcd1e5c80e` |
-| `app.rdb-wal.0000000003` | `57e025de2a0c8dd9ffc51a4cd1833b3dbeb8e9a50eccaed244d8fbfeb1c8e2a9` |
+| `app.rdb` | `fc8eacdb7a8711d97a286dccfcccd1da09daa21330763cf89c3aa30a57785b39` |
+| `app.rdb-wal.0000000003` | `98b666d48d8ce2bc1874a9aa90adab2445aef19ac5ddefaec076094872284f37` |
+
+The first copy of these two files was never committed, so they were built again on 2026-10-01 from
+the published `inillucent-2.0.3-x86_64-pc-windows-msvc.zip`, whose sha256 matched the release's
+`SHA256SUMS`. That binary answered `SELECT rowid FROM s WHERE s MATCH 'apple' AND src = 'slack' AND
+k = 100000` with 2 rows and the same search with `src IN ('slack')` with 60, on a copy of the checkpointed file.

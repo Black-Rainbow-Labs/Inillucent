@@ -671,9 +671,9 @@ fn view_column_type(
         for arm in arms.iter().skip(at.saturating_add(1)) {
             kinds |= arm.map_or(0, value_kinds);
         }
-        if affinity == Affinity::Text && kinds & 0x01 != 0 {
-            affinity = Affinity::Blob;
-        } else if is_numeric(affinity) && kinds & 0x02 != 0 {
+        if (affinity == Affinity::Text && kinds & 0x01 != 0)
+            || (is_numeric(affinity) && kinds & 0x02 != 0)
+        {
             affinity = Affinity::Blob;
         }
         if is_numeric(affinity)

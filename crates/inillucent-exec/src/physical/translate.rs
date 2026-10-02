@@ -794,26 +794,64 @@ fn translate_call(
                 // An `IN` over a folded block is an `IN` over a list of
                 // literals, which already carries SQLite's three-valued NULL
                 // rule and the affinity and collation the binder attached.
-                SubqueryKind::In => Expr::InList {
-                    negated: *negated,
-                    operand: Box::new(match operand {
+                SubqueryKind::In => {
+                    let held = match operand {
                         Some(held) => translate(held, space, params, frame)?,
                         None => return unsupported("an IN with no left operand"),
-                    }),
-                    list: value
-                        .column
-                        .iter()
-                        .cloned()
-                        .map(Expr::Literal)
-                        .collect::<Vec<Expr>>(),
-                    affinity: *affinity,
-                    collation: *collation,
-                },
+                    };
+                    let (operand, list) = membership_sides(held, &value.column, *affinity);
+                    Expr::InList {
+                        negated: *negated,
+                        operand: Box::new(operand),
+                        list,
+                        affinity: *affinity,
+                        collation: *collation,
+                    }
+                }
             }
         }
         other => return unsupported(&format!("the expression {}", name_of(other))),
     };
     Ok(Some(found))
+}
+
+/// Prepares both sides of `x IN (SELECT ...)` the way SQLite's ephemeral index
+/// holds them.
+///
+/// SQLite answers the membership test by writing the block's values into an
+/// ephemeral index under the comparison's affinity and looking the operand up
+/// in it. Under a REAL affinity that index stores an integer as a real, so the
+/// integer loses whatever precision a double cannot hold, on both sides. An
+/// ordinary `=` keeps the integer exact, which is why this is done here and not
+/// in the comparison: `9223372036854775806 IN (SELECT a FROM t)` is true when
+/// `a` is a REAL column holding 9223372036854775807, and `a =
+/// 9223372036854775806` is false. Every other affinity stores the values the
+/// comparison already sees, so the sides are returned as they came.
+///
+/// @param operand - the translated left operand
+/// @param column - the values the folded block produced
+/// @param affinity - the comparison's affinity
+fn membership_sides(
+    operand: Expr,
+    column: &[OwnedDatum],
+    affinity: Option<inillucent_value::Affinity>,
+) -> (Expr, Vec<Expr>) {
+    if affinity != Some(inillucent_value::Affinity::Real) {
+        return (operand, column.iter().cloned().map(Expr::Literal).collect());
+    }
+    let list = column
+        .iter()
+        .map(|datum| match datum {
+            OwnedDatum::Int(integer) => Expr::Literal(OwnedDatum::Real(*integer as f64)),
+            other => Expr::Literal(other.clone()),
+        })
+        .collect();
+    let operand = Expr::Affinity {
+        operand: Box::new(operand),
+        affinity: inillucent_value::Affinity::Real,
+        widen: true,
+    };
+    (operand, list)
 }
 
 /// Translates a bound expression in the space after aggregation.

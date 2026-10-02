@@ -678,15 +678,12 @@ fn depth_map(bytes: &[u8]) -> Vec<u32> {
     let mut depth = 0u32;
     let mut quote: Option<u8> = None;
     for byte in bytes {
-        match quote {
-            Some(open) => {
-                depths.push(1);
-                if *byte == open || (open == b'[' && *byte == b']') {
-                    quote = None;
-                }
-                continue;
+        if let Some(open) = quote {
+            depths.push(1);
+            if *byte == open || (open == b'[' && *byte == b']') {
+                quote = None;
             }
-            None => {}
+            continue;
         }
         match byte {
             b'\'' | b'"' | b'`' | b'[' => {

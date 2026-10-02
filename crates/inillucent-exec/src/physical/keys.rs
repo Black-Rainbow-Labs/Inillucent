@@ -596,6 +596,7 @@ fn with_affinity(expr: Expr, affinity: Option<Affinity>) -> Expr {
         Some(affinity) => Expr::Affinity {
             operand: Box::new(expr),
             affinity,
+            widen: false,
         },
     }
 }
@@ -620,7 +621,9 @@ mod tests {
         );
         let converted = with_affinity(Expr::Column(0), Some(Affinity::Integer));
         match converted {
-            Expr::Affinity { affinity, operand } => {
+            Expr::Affinity {
+                affinity, operand, ..
+            } => {
                 assert_eq!(affinity, Affinity::Integer);
                 assert!(matches!(*operand, Expr::Column(0)));
             }

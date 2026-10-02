@@ -689,6 +689,9 @@ struct ApplyAffinity {
     operand: Box<dyn Eval>,
     /// The conversion.
     affinity: Affinity,
+    /// Whether an integer is widened to a real afterwards. See
+    /// [`Expr::Affinity`].
+    widen: bool,
 }
 
 impl Eval for ApplyAffinity {
@@ -701,7 +704,7 @@ impl Eval for ApplyAffinity {
         // an integer key probing an INTEGER index, which is every probe
         // `join.range` makes. `leaves_unchanged` is `apply_affinity`'s own
         // rules for the cases it returns its input, so the answer is the same.
-        if leaves_unchanged(&value.get(), self.affinity) {
+        if !self.widen && leaves_unchanged(&value.get(), self.affinity) {
             return Ok(value);
         }
         let converted = inillucent_value::affinity::apply_affinity(
@@ -710,6 +713,11 @@ impl Eval for ApplyAffinity {
             inillucent_value::TextEncoding::Utf8,
         )
         .unwrap_or(inillucent_value::Value::Null);
+        let converted = if self.widen {
+            inillucent_value::affinity::realify(converted)
+        } else {
+            converted
+        };
         Ok(Computed::Owned(OwnedDatum::from(converted)))
     }
 }

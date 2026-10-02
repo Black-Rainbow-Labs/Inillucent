@@ -150,8 +150,9 @@ fn no_test_hides_outside_the_map() {
 /// and is quoted with its line number.
 #[test]
 fn every_line_of_the_map_is_one_the_parser_reads() {
-    const KEYS: [&str; 17] = [
+    const KEYS: [&str; 18] = [
         "builds",
+        "share_with",
         "module",
         "package",
         "kind",
@@ -1105,5 +1106,33 @@ fn only_the_listed_packages_start_the_built_programs() {
          Add the package to `testplan::PROGRAM_PACKAGES`, or declare `requires = [\"shell\"]` on \
          its row.",
         outside.join("\n  ")
+    );
+}
+
+/// Every label a `share_with` names is a row of the map.
+///
+/// `--shard` keeps a target in the same share as the targets it names, and a
+/// label that matches nothing keeps nothing together. `bindings` would then be
+/// graded in one CI job against records written in another, which is the
+/// failure the field was added for.
+#[test]
+fn every_share_with_names_a_row() {
+    let map = map();
+    let labels: BTreeSet<String> = map.rows.iter().map(|row| row.target.label()).collect();
+    let mut named = 0usize;
+    let mut unknown = Vec::new();
+    for row in &map.rows {
+        for label in &row.share_with {
+            named += 1;
+            if !labels.contains(label) {
+                unknown.push(format!("{} names `{label}`", row.target.label()));
+            }
+        }
+    }
+    assert!(named >= 2, "only {named} share_with labels were read");
+    assert!(
+        unknown.is_empty(),
+        "these share_with labels name no row:\n  {}",
+        unknown.join("\n  ")
     );
 }

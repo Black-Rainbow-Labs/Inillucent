@@ -729,7 +729,6 @@ fn encrypted_open(path: &Path) -> Result<Option<String>, String> {
     if let Some(problem) = expect_value(&connection, "SELECT a FROM t", "7") {
         return Ok(Some(problem));
     }
-    drop(connection);
     drop(database);
     Ok(match Database::open(path) {
         Ok(_) => Some("an encrypted database opened without its key".to_string()),

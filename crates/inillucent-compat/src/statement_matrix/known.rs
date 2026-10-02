@@ -106,9 +106,9 @@ impl Deliberate {
                 .contains
                 .iter()
                 .all(|needle| upper.contains(&needle.to_ascii_uppercase()))
-            && (self.kinds.is_empty() || self.kinds.iter().any(|wanted| *wanted == kind))
+            && (self.kinds.is_empty() || self.kinds.contains(&kind))
             && (self.detail.is_empty() || failure.detail.contains(&self.detail))
-            && (self.cases.is_empty() || self.cases.iter().any(|id| *id == failure.case))
+            && (self.cases.is_empty() || self.cases.contains(&failure.case))
     }
 }
 

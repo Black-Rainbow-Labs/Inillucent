@@ -1,0 +1,70 @@
+# `x IN (SELECT ...)` under a REAL affinity. SQLite writes the block's values into an
+# ephemeral index under the comparison's affinity, and a REAL affinity stores an integer
+# as a real there, on both sides. So the membership test loses the precision a double
+# cannot hold, while `=` on the same values keeps the integer exact. The nightly random
+# matrix found the difference on seed 20261001, case 2713.
+
+setup
+
+statement ok
+CREATE TABLE t1(a REAL, b NUMERIC, c VARCHAR(10), d NUMERIC)
+
+statement ok
+INSERT INTO t1 VALUES (9223372036854775807, ' 7', 0, 'abc'), (7, NULL, 'a', 9223372036854775807)
+
+statement ok
+CREATE TABLE t2(r REAL)
+
+statement ok
+INSERT INTO t2 VALUES (9007199254740992)
+
+case real-affinity-in-random-2713
+
+query T rowsort
+SELECT CAST(t1.b AS TEXT) AS c1, (t1.b COLLATE NOCASE) AS c2, t1.c AS c3 FROM t1 WHERE (t1.b IS NULL) AND (9223372036854775807 IN (SELECT q1.a FROM t1 AS q1))
+
+case real-affinity-in-widens-the-operand
+
+query I rowsort
+SELECT 9223372036854775807 IN (SELECT a FROM t1), 9223372036854775806 IN (SELECT a FROM t1), 9223372036854775806 NOT IN (SELECT a FROM t1)
+
+case real-affinity-in-below-two-to-the-53
+
+query I rowsort
+SELECT 9007199254740993 IN (SELECT r FROM t2), 9007199254740993 IN (SELECT CAST(9007199254740992 AS REAL))
+
+case real-affinity-in-widens-the-block
+
+query I rowsort
+SELECT count(*) FROM t1 WHERE a IN (SELECT 9223372036854775807)
+
+case real-affinity-equal-stays-exact
+
+query I rowsort
+SELECT (SELECT count(*) FROM t1 WHERE a = 9223372036854775806), (SELECT count(*) FROM t2 WHERE r = 9007199254740993), (SELECT count(*) FROM t2 WHERE r IN (9007199254740993, 1, 2))
+
+case real-affinity-numeric-column-stays-exact
+
+query I rowsort
+SELECT 9223372036854775806 IN (SELECT d FROM t1)
+
+case real-affinity-in-correlated
+
+query I rowsort
+SELECT count(*) FROM t1 AS o WHERE 9223372036854775806 IN (SELECT q.a FROM t1 AS q WHERE q.c <> o.c)
+
+case real-affinity-in-compound
+
+query I rowsort
+SELECT 9007199254740993 IN (SELECT r FROM t2 UNION ALL SELECT 1)
+
+case compound-in-takes-the-last-arms-rules
+
+statement ok
+CREATE TABLE t3(r REAL)
+
+statement ok
+INSERT INTO t3 VALUES (7)
+
+query I rowsort
+SELECT 'a' IN (SELECT 'A' COLLATE NOCASE UNION ALL SELECT 'b'), 'a' IN (SELECT 'b' UNION ALL SELECT 'A' COLLATE NOCASE), '7' IN (SELECT r FROM t3 UNION ALL SELECT 'x'), '7' IN (SELECT 'x' UNION ALL SELECT r FROM t3), '7' IN (SELECT r FROM t3 UNION SELECT 'x'), '7' IN (SELECT 'x' UNION SELECT r FROM t3), '7' IN (SELECT 'x' UNION ALL SELECT r FROM t3 UNION ALL SELECT 'y')

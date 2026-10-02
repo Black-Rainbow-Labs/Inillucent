@@ -506,7 +506,29 @@ impl ImportedDatabase {
             return Ok(());
         }
         let db_path = DbPath::new(self.storage.path.to_string_lossy().as_ref());
-        if !inillucent_pool::journal::a_hot_journal_is_beside(self.storage.vfs.as_ref(), &db_path) {
+        // **Any journal file, not only one with a header.** A writer killed in
+        // the instant after it created `<database>-journal` and before it wrote
+        // the header leaves an empty file. No page was written early behind
+        // it, so there is nothing to put back, but the file has to go: the
+        // next open deletes it under EXCLUSIVE, and until then every check that
+        // asks whether a journal is beside the file says yes. Asking only
+        // about a valid header left the empty file here. It showed only on
+        // Linux, where the kill lands before the header far more often, and
+        // `process_journal_handoff` failed there on the first CI run that
+        // reached it. `replay_hot_journal` decides under the lock what the
+        // file is, and deletes one with no header.
+        let journal = db_path.journal();
+        if !self
+            .storage
+            .vfs
+            .access(&journal, inillucent_vfs::AccessMode::Exists)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let hot =
+            inillucent_pool::journal::a_hot_journal_is_beside(self.storage.vfs.as_ref(), &db_path);
+        if self.storage.read_only && !hot {
             return Ok(());
         }
         if self.storage.read_only {

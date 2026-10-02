@@ -18,6 +18,7 @@
 
 mod affinity;
 mod bindings;
+mod ci_workflows;
 mod cli_import;
 mod command_parity;
 mod coverage_floor;

@@ -208,7 +208,16 @@ impl ImportedDatabase {
             // them matched the rows and not the column names, which the matrix
             // case `pragma-temp-store-directory` found. `shrink_memory` has no
             // result column in SQLite either.
-            b"data_store_directory" | b"temp_store_directory" if argument.is_none() => {
+            //
+            // `data_store_directory` has its column only where SQLite compiles
+            // it, which is Windows. A Linux SQLite does not know the name and
+            // answers with no column at all, and the first Linux nightly with
+            // an oracle reported exactly that difference in the matrix case
+            // `pragma-data-store-directory`. See `WINDOWS_ONLY_PRAGMAS`.
+            b"temp_store_directory" if argument.is_none() => {
+                Ok(list_of::<&str>(&String::from_utf8_lossy(name), &[]))
+            }
+            b"data_store_directory" if argument.is_none() && cfg!(windows) => {
                 Ok(list_of::<&str>(&String::from_utf8_lossy(name), &[]))
             }
             b"shrink_memory" | b"data_store_directory" | b"temp_store_directory" => {

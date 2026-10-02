@@ -59,13 +59,13 @@ pub fn family() -> Family {
             Axis::new("data", &["empty", "one", "duplicates", "mixed", "nocase"]),
         ],
         allowed: |pick| {
-            !(pick.get("table") == Some("fts5") && pick.get("index").is_some_and(|index| index != "none"))
-                && !(pick.get("table") == Some("fts5") && pick.get("data") == Some("mixed"))
-                && !(matches!(pick.get("operation"), Some("analyze_index") | Some("reindex_index"))
+            !((pick.get("table") == Some("fts5") && pick.get("index").is_some_and(|index| index != "none"))
+                || (pick.get("table") == Some("fts5") && pick.get("data") == Some("mixed"))
+                || (matches!(pick.get("operation"), Some("analyze_index") | Some("reindex_index"))
                     && pick.get("index") == Some("none"))
-                && !(pick.get("index") == Some("unique") && pick.get("data") == Some("duplicates"))
+                || (pick.get("index") == Some("unique") && pick.get("data") == Some("duplicates"))
                 // An index operation needs an index, and an FTS5 table has none.
-                && !pick.forbids("operation", "table", &[("analyze_index", "fts5"), ("reindex_index", "fts5")])
+                || pick.forbids("operation", "table", &[("analyze_index", "fts5"), ("reindex_index", "fts5")]))
         },
         build,
     }

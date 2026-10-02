@@ -1,0 +1,39 @@
+# Three differences the nightly random matrix found on seed 20261002.
+#
+# SQLite reads text as a C string in LIKE, GLOB and quote(), so a value holding a zero
+# byte ends there. And a function's collation comes from the first argument that has
+# one: a CASE or a literal has none and is passed over.
+
+setup
+
+statement ok
+CREATE TABLE t1(a INTEGER PRIMARY KEY, b, c NUMERIC)
+
+statement ok
+INSERT INTO t1 VALUES (1, x'00ff', x'00ff')
+
+statement ok
+CREATE TABLE t2(a VARCHAR(10), b TEXT COLLATE NOCASE)
+
+statement ok
+INSERT INTO t2 VALUES (-1.75, 'abc')
+
+case nul-text-like-random-1920
+
+query I rowsort
+SELECT (t1.a % t1.a) AS c1 FROM t1 WHERE (((t1.a || x'00ff') COLLATE NOCASE) NOT LIKE '_')
+
+case nul-text-like-and-glob
+
+query I rowsort
+SELECT ('1' || x'00ff') LIKE '_', ('1' || x'00ff') LIKE '___', ('1' || x'00ff') GLOB '?', ('1' || x'00ff') GLOB '???', 'ab' LIKE ('a_' || x'00' || 'zz'), 'a' LIKE ('a' || x'00' || 'zz')
+
+case nul-text-quote
+
+query T rowsort
+SELECT quote(x'00ff' || -1.75), quote('a' || x'00' || 'b'), quote('it''s')
+
+case call-collation-skips-a-case
+
+query T rowsort
+SELECT hex(min((CASE WHEN 1 THEN 'B' ELSE t2.a END), t2.b)), hex(max('B', t2.b)), hex(min(t2.a, t2.b)) FROM t2

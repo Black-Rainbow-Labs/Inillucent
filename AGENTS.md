@@ -138,13 +138,13 @@ revision selects nothing and exits 0. Pass `--changed origin/main`.
 | Cadence | Tiers | Where it runs |
 |---|---|---|
 | `change` | smoke, unit, engine, differential, e2e, retrieval, tooling, matrix | `--changed`, by the dependency closure of what you edited |
-| `merge` | durability, perf, matrix_deep | `--changed` only when a crate you edited is in the target's `covers`; every push in CI |
+| `merge` | durability, perf, matrix_deep | `--changed` only when a crate you edited is in the target's `covers`; every night in CI |
 | `nightly` | nightly | never on a change; the nightly job, or `--tier nightly` by name |
 
 So a parser change does not run the crash suites or the nightly stories, and a change to the write
 ahead log does run `wal_crash`. A durability row's `covers` names every storage crate the suite
 exercises for this reason. `--cadence merge` with `--changed` selects the merge tiers by the closure
-as well, which is what CI does on a pull request.
+as well.
 
 **The build names only what was selected.** The runner builds with `-p`, `--lib`, `--test` and
 `--bin` for the selected targets instead of `--workspace`. A run that selects no `inillucent-bench`
@@ -195,12 +195,30 @@ quietly. CI passes `--absent` for what a runner cannot have, per operating syste
 `.github/workflows/tests.yml`. `--summary <file>` writes the verdict, the failures and the declared
 absences as JSON.
 
-**Two workflows, two cadences.** `.github/workflows/tests.yml` runs the merge cadence, on Windows and
-on Linux, on every push and every pull request: what the change can break on a pull request, and
-every tier but `nightly` on a push. `.github/workflows/nightly.yml` runs the nightly cadence once a
-day, on Linux only, at 03:00 UTC, and uploads its summary as a workflow artifact. It commits nothing.
+**Two workflows, two cadences, both only at night and only on the public mirror.** Neither
+workflow runs on a push. Both run at 03:00 UTC and when started by hand, and only in
+Black-Rainbow-Labs/Inillucent: the job's `if:` checks the repository, and both workflows are
+disabled in jasonmcaffee/inillucent, which is private and whose Actions spending stopped every job
+there on 2026-10-02. The mirror changes only at a release, so a night grades the code that was last
+published, and `ship.ps1` starts a run there for each release. Run the suite locally before you push.
+
+`.github/workflows/tests.yml` runs the merge cadence, every tier but `nightly`, on Windows and on
+Linux. It runs as four jobs on Windows and three on Linux, each a share of the targets from
+`inillucent-testrun --shard <k>/<n>`, because the suite needed about 225 minutes of a two core
+Windows runner and 145 of a Linux one, and a job may run 150. `.github/workflows/nightly.yml` runs
+the nightly cadence on Linux and uploads its summary as a workflow artifact. It commits nothing.
+It runs as four jobs, each with `inillucent-testrun --shard <k>/4`, because one job ran out its 240
+minutes on a two core runner. `--shard` splits the selected targets by
+their times in `tests/timings.toml`, and the four shares together run every target once. A row's
+`share_with` names targets that must land in its share: `bindings` grades records that two other
+suites write in the same run.
 `packaging/nightly.ps1` runs the nightly cadence a second time, once a night on the Windows
 development machine, and section 3 below covers what else that run does.
+
+**The workflows are checked like code.** `tooling::ci_workflows` fails when a workflow holds a plain
+YAML value with `: ` in it, which GitHub reads as a mapping and refuses the whole file for, and when a
+`requires` name in `tests/selection.toml` is neither provided in CI nor passed to `--absent` there.
+A new prerequisite name needs an answer in both workflows in the same change.
 
 **When the runner stops a target.** The runner stops a target only when both of these are true:
 
@@ -311,6 +329,8 @@ Read three neighbouring files before you write a new one. Then follow these rule
      published at https://inillucent.com/docs.
 7. `node tools/doc-style/check.mjs` reports no problems, and
    `cargo test -p inillucent-compat --test tooling documentation::` passes.
+8. If the change was deployed in any way (a release, a push to the mirror, a site publish),
+   `pwsh packaging/ci-status.ps1` exits 0. Section 3 says why.
 
 ---
 
@@ -343,11 +363,12 @@ what happened on the first attempt at 0.1.8.
 worktree belongs to, so a worktree on another drive needs no arguments. `-SitePath` and `-TapPath`
 override them.
 
-### The five phases
+### The six phases
 
 | Phase | What it does |
 |---|---|
 | **preflight** | reads every credential, decides which routes can run, prints the plan, and changes nothing |
+| **tests** | reads the nightly's evidence, and runs the merge cadence over what changed since it |
 | **version** | writes the new version into every file that carries it and refreshes `Cargo.lock` |
 | **build** | compiles, signs and notarises. Nothing has left the machine yet |
 | **publish** | tags, pushes, and sends the release to every destination |
@@ -391,7 +412,7 @@ packaging/tests`.
 
 ### The routes
 
-`ship.ps1` publishes through fourteen routes, named as the plan prints them:
+`ship.ps1` publishes through fifteen routes, named as the plan prints them:
 
 | Route | What it publishes |
 |---|---|
@@ -409,6 +430,7 @@ packaging/tests`.
 | `go` | the Go module tag |
 | `packagist` | Composer, which reads the tags again |
 | `homebrew` | the Homebrew formula in the tap |
+| `ci` | nothing: it starts the tests workflow on the mirror's `main`, which is now the release, waits for it, and fails the release unless it passed |
 
 A route with no credential is skipped, and the skip message says how to fix it. The script does not
 fail for a missing credential, because a script that needs all of them would never be run.
@@ -458,6 +480,23 @@ Installer.app or a macOS binary. If that matters, say so in those words after th
 - **The Windows build needs the MSVC environment.** `onig_sys` compiles C code with `cl.exe`, and an
   agent terminal has no `INCLUDE`, so the build fails on `stddef.h`. `Import-MsvcEnvironment` runs
   `vcvars64.bat` when it is needed.
+
+### A deploy is finished when GitHub's tests runs are green
+
+```powershell
+pwsh packaging/ci-status.ps1
+```
+
+It reads the head of `main` on the public mirror, starts the `tests` workflow there when that commit
+has no run yet, waits for it, and exits 0 only when it passed. `ship.ps1` runs the same check as its
+`ci` route. Run it yourself after any other deploy to the mirror, before you report the work as
+finished. A run still in progress is waited for, up to three hours. A red, cancelled or missing run
+is a failure: fix it, release again, and run the check again. The private development repository
+has no CI, so `-Remote origin` reports nothing new.
+
+From 2026-09-24 `tests.yml` did not parse, so every run on both repositories failed with no
+job. Eight releases, 1.0.30 to 2.0.4, were cut and reported finished over those runs, because
+nothing in the release or in an agent's checklist read GitHub.
 
 ### Check what was published
 

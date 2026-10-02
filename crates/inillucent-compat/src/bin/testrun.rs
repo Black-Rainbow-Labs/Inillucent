@@ -152,6 +152,17 @@ struct Options {
     summary: Option<PathBuf>,
     /// Pass a filter through to each test binary.
     filter: Option<String>,
+    /// Which share of the selection to run, from `--shard <k>/<n>`: the
+    /// share counted from zero, and the number of shares.
+    ///
+    /// **One hosted runner cannot finish the nightly cadence.** On the private
+    /// repository's runner, which has two cores, the nightly job ran for its
+    /// whole 240 minutes and was cancelled on 2026-10-01 with 48 of its 382
+    /// targets finished. A share is chosen after the build and after module
+    /// shards are split out, by the times in `tests/timings.toml`, so several
+    /// jobs each run about the same amount of work and together run every
+    /// selected target once.
+    shard: Option<(usize, usize)>,
     /// What `--timeout` asked for, in seconds.
     ///
     /// `None` works each target's budget out from its own recorded time, which
@@ -183,6 +194,7 @@ impl Options {
             artifacts: other.artifacts.clone(),
             summary: other.summary.clone(),
             filter: other.filter.clone(),
+            shard: other.shard,
             timeout: other.timeout,
         }
     }
@@ -214,6 +226,7 @@ impl Default for Options {
             artifacts: None,
             summary: None,
             filter: None,
+            shard: None,
             timeout: None,
         }
     }
@@ -248,6 +261,7 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
                     .map_err(|_| format!("`--test-threads` wants a number, not `{value}`"))?;
             }
             "--filter" => options.filter = Some(take("--filter")?),
+            "--shard" => options.shard = Some(parse_shard(&take("--shard")?)?),
             "--timeout" => {
                 let value = take("--timeout")?;
                 options.timeout = Some(
@@ -297,6 +311,83 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
     Ok(options)
 }
 
+/// Reads a `--shard` value: `k/n`, where `k` counts from 1.
+///
+/// @param value - the text after `--shard`
+/// @returns the share counted from zero, and the number of shares
+fn parse_shard(value: &str) -> Result<(usize, usize), String> {
+    let wrong = || format!("`--shard` wants k/n with 1 <= k <= n, not `{value}`");
+    let (share, count) = value.split_once('/').ok_or_else(wrong)?;
+    let share: usize = share.trim().parse().map_err(|_| wrong())?;
+    let count: usize = count.trim().parse().map_err(|_| wrong())?;
+    if share == 0 || count == 0 || share > count {
+        return Err(wrong());
+    }
+    Ok((share.saturating_sub(1), count))
+}
+
+/// Keeps one share of the targets, when `--shard` asked for one.
+///
+/// Longest first, each group of targets goes to the share with the least
+/// recorded time so far, ties to the lowest share. A group is one target and
+/// whatever its row names in `share_with`, which have to run in the same job:
+/// `bindings` grades records two other targets write. Every job computes the
+/// same split from the same ledger, map and selection, so the shares never
+/// overlap and never leave a target out. A target the ledger has never seen
+/// counts as `UNKNOWN_MILLISECONDS`, as it does for the run order.
+///
+/// @param built - every target the run selected
+/// @param ledger - the recorded times
+/// @param map - the selection map, which holds each row's `share_with`
+/// @param shard - the share counted from zero, and the number of shares
+fn keep_shard(
+    built: Vec<Built>,
+    ledger: &BTreeMap<String, u64>,
+    map: &Map,
+    shard: Option<(usize, usize)>,
+) -> Vec<Built> {
+    let Some((mine, count)) = shard else {
+        return built;
+    };
+    let mut owner: BTreeMap<String, String> = BTreeMap::new();
+    for row in &map.rows {
+        for named in &row.share_with {
+            owner.insert(named.clone(), row.target.label());
+        }
+    }
+    let mut groups: BTreeMap<String, (u64, Vec<Built>)> = BTreeMap::new();
+    for one in built {
+        let label = one.target.label();
+        let time = ledger.get(&label).copied().unwrap_or(UNKNOWN_MILLISECONDS);
+        let key = owner.get(&label).cloned().unwrap_or(label);
+        let group = groups.entry(key).or_default();
+        group.0 = group.0.saturating_add(time);
+        group.1.push(one);
+    }
+    let mut ordered: Vec<(String, (u64, Vec<Built>))> = groups.into_iter().collect();
+    ordered.sort_by(|left, right| {
+        right
+            .1
+             .0
+            .cmp(&left.1 .0)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let mut loads = vec![0u64; count];
+    let mut kept = Vec::new();
+    for (_, (time, members)) in ordered {
+        let least = (0..count)
+            .min_by_key(|index| (loads.get(*index).copied().unwrap_or(u64::MAX), *index))
+            .unwrap_or(0);
+        if let Some(load) = loads.get_mut(least) {
+            *load = load.saturating_add(time);
+        }
+        if least == mine {
+            kept.extend(members);
+        }
+    }
+    kept
+}
+
 /// The help text.
 fn usage() -> String {
     "inillucent-testrun - run the workspace's tests in parallel\n\
@@ -309,7 +400,9 @@ fn usage() -> String {
        default is merge: everything but the nightly tier\n  \
        --tier <name>       run one tier; repeatable\n  \
        --target <label>    run one target as `package::name`; repeatable\n  \
-       --filter <text>     pass a name filter to each test binary\n\
+       --filter <text>     pass a name filter to each test binary\n  \
+       --shard <k>/<n>     run the k-th of n shares of the selection, balanced\n                      \
+       by tests/timings.toml; n jobs with k = 1..n run it all once\n\
      \n\
      Execution:\n  \
        --jobs <n>          test binaries at once (default: the machine's cores)\n  \
@@ -433,11 +526,19 @@ const PROCESS_MEMORY: u64 = 8 * 1024 * 1024 * 1024;
 /// Caps what every process this run starts may commit together at a quarter of the
 /// machine's memory, so a run at one process per processor cannot take the
 /// rest of the machine even when each process stays under its own cap.
+///
+/// **Never below one process's own cap.** A GitHub Windows runner has 16 GB, so
+/// a quarter is 4 GB for both processes the runner runs at once, half of what
+/// one is allowed. On 2026-10-02 `hostile`'s doubling case, which allocates values of
+/// 256 MB and more on the way to the value bound it asserts, failed there with "memory
+/// allocation of 268435456 bytes failed" while its neighbour held the rest.
+/// The development machine's quarter is far above the floor, so its cap does
+/// not change.
 fn cap_memory() {
     let Some(physical) = inillucent_compat::supervise::physical_memory() else {
         return;
     };
-    let total = physical / 4;
+    let total = (physical / 4).max(PROCESS_MEMORY);
     if !inillucent_compat::supervise::cap_everything_started(total) {
         eprintln!("inillucent-testrun: could not cap the memory of the processes it starts");
     }
@@ -487,8 +588,13 @@ fn run(options: &Options) -> Result<bool, String> {
         return Ok(true);
     }
 
-    let built = executables_for(&root, &map, &selected, options)?;
     let ledger = read_ledger(&root.join("tests/timings.toml"));
+    let built = keep_shard(
+        executables_for(&root, &map, &selected, options)?,
+        &ledger,
+        &map,
+        options.shard,
+    );
     // Kept by target so the retry pass can start one again. The workers take
     // their own clone, so nothing here is a second opinion about what was built.
     let executables: BTreeMap<Target, Built> = built

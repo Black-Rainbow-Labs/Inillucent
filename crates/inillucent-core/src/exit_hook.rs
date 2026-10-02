@@ -127,6 +127,6 @@ extern "C" fn run_unloaders() {
         Err(_) => return,
     };
     for unload in taken {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unload()));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(unload));
     }
 }

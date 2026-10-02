@@ -378,6 +378,19 @@ pub enum Expr {
         operand: Box<Expr>,
         /// The affinity the comparison applies.
         affinity: Affinity,
+        /// Whether an integer is then widened to a real, as a REAL column
+        /// stores it.
+        ///
+        /// **Only `x IN (SELECT ...)` sets it.** SQLite tests membership by
+        /// writing both sides into an ephemeral index under the comparison's
+        /// affinity, and a REAL affinity there stores an integer as a real.
+        /// So `9223372036854775806 IN (SELECT a FROM t)` is true when `a` is a
+        /// REAL column holding 9223372036854775807, while `a =
+        /// 9223372036854775806` is false: the comparison keeps the integer
+        /// exact. The nightly random matrix found the difference on seed
+        /// 20261001. A probe into an index must not widen, or it would match
+        /// rows `=` does not.
+        widen: bool,
     },
     /// `IS` / `IS NOT`.
     Is {
@@ -659,10 +672,11 @@ pub fn compile(expr: &Expr, types: &[StaticType]) -> DbResult<Box<dyn Eval>> {
             op: *op,
             operand: compile(operand, types)?,
         }),
-        Expr::Affinity { operand, affinity } => Box::new(ApplyAffinity {
-            operand: compile(operand, types)?,
-            affinity: *affinity,
-        }),
+        Expr::Affinity {
+            operand,
+            affinity,
+            widen,
+        } => affinity_node(operand, *affinity, *widen, types)?,
         Expr::Cast { operand, affinity } => Box::new(crate::scalar::Cast {
             operand: compile(operand, types)?,
             affinity: *affinity,
@@ -800,6 +814,29 @@ fn general_arith(
         op,
         left: compile(left, types)?,
         right: compile(right, types)?,
+    }))
+}
+
+/// Compiles a comparison's affinity conversion.
+///
+/// Its own function for the reason `general_arith` above is: `compile` has a
+/// recorded length, and the change that taught `x IN (SELECT ...)` to widen an
+/// integer under a REAL affinity gave this arm a field.
+///
+/// @param operand - what to convert
+/// @param affinity - the conversion
+/// @param widen - whether an integer is then widened to a real
+/// @param types - the static types of the columns in scope
+fn affinity_node(
+    operand: &Expr,
+    affinity: Affinity,
+    widen: bool,
+    types: &[StaticType],
+) -> DbResult<Box<dyn Eval>> {
+    Ok(Box::new(ApplyAffinity {
+        operand: compile(operand, types)?,
+        affinity,
+        widen,
     }))
 }
 

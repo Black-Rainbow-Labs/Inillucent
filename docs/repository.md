@@ -171,10 +171,13 @@ target failed. Exit code 2 means the run did not happen, for example because the
 
 Each tier has a cadence. `change` tiers run on every change that can reach them. The `durability`,
 `perf` and `matrix_deep` tiers are `merge`: a change run selects one of their targets only when a
-crate that actually changed is in its `covers`. `.github/workflows/tests.yml` runs the merge cadence
-on Windows and on Linux, on every push and every pull request. The `nightly` tier never runs on a
-change or a push. `.github/workflows/nightly.yml` runs it once a day on Linux, at 03:00 UTC, and
-uploads its summary as a workflow artifact. `packaging/nightly.ps1` runs the nightly tier a second
+crate that actually changed is in its `covers`. CI runs only on the public mirror,
+Black-Rainbow-Labs/Inillucent, at night and when started by hand, never on a push.
+`.github/workflows/tests.yml` runs the merge cadence on Windows and on Linux, as four jobs on Windows
+and three on Linux that each run a share of the targets with `inillucent-testrun --shard`. The
+`nightly` tier never runs on a change. `.github/workflows/nightly.yml` runs it once a day on Linux, at 03:00 UTC, as four
+jobs that each run a quarter of the targets with `inillucent-testrun --shard`, and uploads each
+summary as a workflow artifact. `packaging/nightly.ps1` runs the nightly tier a second
 time, once a night on the Windows development machine, and also builds that night's release and runs
 the performance gates. The runner builds only the targets it selected.
 
@@ -251,8 +254,8 @@ a prerequisite and its suite cannot skip. Those two checks keep this table equal
 
 ## What the tests cover
 
-The workspace has 4,008 tests across 299 test targets, counted tier by tier on 26 September 2026 in
-the tier table of `tests/inillucent-testing-tdd.md`. There are 299 rows in `tests/selection.toml`,
+The workspace has 4,008 tests across 300 test targets, counted tier by tier on 26 September 2026 in
+the tier table of `tests/inillucent-testing-tdd.md`. There are 300 rows in `tests/selection.toml`,
 and each row is one `[[target]]` that the runner runs. `tools/doc-facts/check.mjs` fails when this
 page gives a different count from `tests/selection.toml`.
 

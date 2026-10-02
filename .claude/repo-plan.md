@@ -869,3 +869,12 @@ they are touching do not collide; two that have not, do.
   To prove a durability case fails before a fix, make a second worktree at `HEAD` with
   `git worktree add --detach`, copy the new test into it, and run it there with its own
   `--target-dir`. (task-2166)
+- **A green local run is not a green CI run.** From 2026-09-24 `.github/workflows/tests.yml` did not
+  parse, every push run on both GitHub repositories failed with no job, and eight releases went out
+  over it. Nothing local reads the workflow, and the nightly does not run clippy or Linux. After any
+  deploy, `pwsh packaging/ci-status.ps1` must exit 0, and `ship.ps1` now refuses a commit whose run
+  did not pass. Read the runs with the token git already has; `gh` is not logged in here. (task-2168)
+- **`matrix::<family>` and `matrix_deep::<family>` run at once.** They wrote the same
+  `tmp/matrix/s0/<family>-0-default` scratch and deleted each other's fixtures, which showed as
+  "unable to open database file" and "disk I/O error" against SQLite only when both ran. Each
+  cadence has its own directory now. (task-2168)

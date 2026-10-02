@@ -111,7 +111,7 @@ impl Stats {
         if self.slowest.len() < KEEP || self.slowest.last().is_some_and(|(least, _)| time > *least)
         {
             self.slowest.push((time, id.to_string()));
-            self.slowest.sort_by(|left, right| right.0.cmp(&left.0));
+            self.slowest.sort_by_key(|entry| std::cmp::Reverse(entry.0));
             self.slowest.truncate(KEEP);
         }
     }
@@ -435,7 +435,6 @@ impl Runner {
                 check_properties(&connection, context);
                 return Ok(());
             }
-            drop(connection);
             drop(database);
             if context.graded {
                 self.reopen_oracle(&sqlite)?;

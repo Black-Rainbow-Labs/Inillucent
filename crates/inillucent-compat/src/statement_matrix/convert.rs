@@ -592,8 +592,8 @@ pub fn capability_cases(
             Probe::Answers { setup, sql, .. } => (setup, sql),
             Probe::Registers { .. } | Probe::Keyed { .. } | Probe::Nothing => continue,
         };
-        let family = family_by_content(&sql);
-        let case = capability_case(oracle, scratch, capability.name, family, setup, &sql)?;
+        let family = family_by_content(sql);
+        let case = capability_case(oracle, scratch, capability.name, family, setup, sql)?;
         by_family.entry(family).or_default().push(case);
     }
     let header = [

@@ -55,7 +55,7 @@ fn open(path: &Path, key: &str) -> Database {
 /// @param sql - the statements
 fn run(database: &Database, sql: &str) {
     database
-        .connect()
+        .session()
         .execute_batch(sql)
         .unwrap_or_else(|error| panic!("{sql}: {error}"));
 }
@@ -66,7 +66,7 @@ fn run(database: &Database, sql: &str) {
 /// @param sql - the query
 fn rows(database: &Database, sql: &str) -> Vec<Vec<OwnedDatum>> {
     database
-        .connect()
+        .session()
         .query(sql)
         .unwrap_or_else(|error| panic!("{sql}: {error}"))
 }
@@ -262,20 +262,18 @@ fn rekey_changes_the_key_and_keeps_the_rows() {
     let database = open(&path, KEY_B);
     assert_eq!(count(&database).0, 201);
     let refused = database
-        .connect()
+        .session()
         .execute_batch("PRAGMA rekey = ''")
-        .err()
-        .expect("refused");
+        .expect_err("refused");
     assert!(
         refused.message().contains("inillucent decrypt"),
         "{}",
         refused.message()
     );
     let refused = database
-        .connect()
+        .session()
         .execute_batch("PRAGMA key = 'x'")
-        .err()
-        .expect("refused");
+        .expect_err("refused");
     assert!(
         refused.message().contains("when the database is opened"),
         "{}",
@@ -284,10 +282,9 @@ fn rekey_changes_the_key_and_keeps_the_rows() {
     drop(database);
     let plain = Database::open(dir.join("plain.rdb")).expect("opens");
     let refused = plain
-        .connect()
+        .session()
         .execute_batch(&format!("PRAGMA rekey = \"{KEY_A}\""))
-        .err()
-        .expect("refused");
+        .expect_err("refused");
     assert!(
         refused.message().contains("not encrypted"),
         "{}",
@@ -352,13 +349,12 @@ fn attach_takes_a_key() {
         ),
     );
     let refused = database
-        .connect()
+        .session()
         .execute_batch(&format!(
             "ATTACH '{}' AS w KEY \"{KEY_A}\"",
             other.display()
         ))
-        .err()
-        .expect("a wrong key is refused");
+        .expect_err("a wrong key is refused");
     assert_eq!(refused.code(), PrimaryCode::NotADb);
     drop(database);
     assert!(
@@ -412,8 +408,7 @@ fn export_converts_in_both_directions() {
         .expect("the plaintext copy is written");
     let refused = sealed
         .export_to(dir.join("opened.rdb"), None)
-        .err()
-        .expect("refused");
+        .expect_err("refused");
     assert!(refused.message().contains("already exists"));
     drop(sealed);
     let sealed_bytes = std::fs::read(dir.join("sealed.rdb")).expect("reads");
@@ -446,8 +441,8 @@ fn a_changed_byte_is_reported_as_damage() {
     std::fs::write(&path, &bytes).expect("writes");
     let outcome =
         Database::open_encrypted(&path, EncryptionKey::parse(KEY_A)).and_then(|database| {
-            let answer = database.connect().query("PRAGMA integrity_check")?;
-            let counted = database.connect().query(&format!(
+            let answer = database.session().query("PRAGMA integrity_check")?;
+            let counted = database.session().query(&format!(
                 "SELECT count(*) FROM note WHERE body LIKE '{SECRET}%'"
             ));
             Ok((answer, counted.is_ok()))

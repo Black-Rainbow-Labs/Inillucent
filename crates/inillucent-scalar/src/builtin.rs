@@ -814,9 +814,13 @@ fn quote(value: &Value<'_>, encoding: TextEncoding) -> Value<'static> {
             out.push(b'\'');
             out
         }
+        // **Text ends at its first zero byte**, because SQLite formats it with
+        // `%Q`, which reads a C string: `quote(x'00ff' || 'a')` is `''`. This
+        // copied every byte, NUL included. The nightly random matrix found it
+        // on seed 20261002.
         Value::Text(text) => {
             let mut out = vec![b'\''];
-            for byte in text.utf8_bytes().iter() {
+            for byte in text.utf8_bytes().iter().take_while(|byte| **byte != 0) {
                 if *byte == b'\'' {
                     out.push(b'\'');
                 }

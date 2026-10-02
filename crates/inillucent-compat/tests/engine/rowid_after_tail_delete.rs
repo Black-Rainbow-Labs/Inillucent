@@ -110,7 +110,6 @@ fn an_insert_after_a_reopen_takes_the_next_rowid() {
         let database = Database::open(&path).unwrap_or_else(|error| panic!("open: {error}"));
         let session = database.session();
         table_with_its_tail_deleted(&session);
-        drop(session);
         database
             .checkpoint()
             .unwrap_or_else(|error| panic!("checkpoint: {error}"));

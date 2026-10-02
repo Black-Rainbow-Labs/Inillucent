@@ -555,7 +555,7 @@ impl ImportedDatabase {
             .collect();
         // Read under an immutable borrow, then patch: the rows come back owned,
         // which is what lets both happen in one method.
-        let mut read: Vec<(usize, Vec<(Vec<u8>, Option<Vec<u8>>, Vec<u8>)>)> = Vec::new();
+        let mut read: Vec<(usize, Vec<StatisticsRow>)> = Vec::new();
         for (at, root) in sources {
             let rows = match (self.schema.trees.get(&root), self.pool_of(root)) {
                 (Some(tree), Ok(pool)) => statistics_rows(pool, tree),
@@ -627,6 +627,10 @@ pub(crate) fn attach_statistics(
     apply_statistics(tables, &rows);
 }
 
+/// One `sqlite_stat1` row: the table name, the index name when it has one, and
+/// the statistics text.
+pub(crate) type StatisticsRow = (Vec<u8>, Option<Vec<u8>>, Vec<u8>);
+
 /// Reads the three-column rows out of a `sqlite_stat1` tree.
 ///
 /// Separate from attaching them so a caller holding `&mut self` can read under
@@ -634,10 +638,7 @@ pub(crate) fn attach_statistics(
 ///
 /// @param pool - the buffer pool the tree lives in
 /// @param tree - the statistics tree
-pub(crate) fn statistics_rows(
-    pool: &Pool,
-    tree: &PagedTree,
-) -> Vec<(Vec<u8>, Option<Vec<u8>>, Vec<u8>)> {
+pub(crate) fn statistics_rows(pool: &Pool, tree: &PagedTree) -> Vec<StatisticsRow> {
     let mut rows: Vec<(Vec<u8>, Option<Vec<u8>>, Vec<u8>)> = Vec::new();
     let _ = tree.visit_leaves(pool, &mut |leaf| {
         for row in leaf.live()? {

@@ -348,9 +348,7 @@ impl crate::ImportedDatabase {
             // tells the modules as well, so their buffered rows go too.
             if module_rolls_back(statement, &error) {
                 self.counters.last_changes.set(0);
-                if let Err(undo) = self.rollback() {
-                    return Err(undo);
-                }
+                self.rollback()?;
             }
             return Err(error);
         }

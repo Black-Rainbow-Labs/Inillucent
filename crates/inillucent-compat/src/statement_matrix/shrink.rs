@@ -306,7 +306,7 @@ mod tests {
         let rows = values_rows(sql).expect("it has rows");
         assert_eq!(rows.len(), 3);
         let mut record = Record::ok(sql);
-        replace_values(&mut record, &rows[..1].to_vec());
+        replace_values(&mut record, &rows[..1]);
         assert_eq!(
             record.sql(),
             Some("INSERT INTO t VALUES (1, 'a') ON CONFLICT DO NOTHING")

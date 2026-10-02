@@ -243,6 +243,15 @@ pub struct Row {
     /// have to be built by the outer run whether or not it selected them.
     /// `testplan::build_set` adds them to the build and not to the run.
     pub builds: Vec<String>,
+    /// Other targets, by label, that `--shard` must put in this target's share.
+    ///
+    /// `bindings` grades records that `inillucent-driver::conformance` and
+    /// `inillucent-driver-capi::python_conformance` write in the same run. When
+    /// CI first split the suite into shares, the Python record was written in
+    /// one job and graded in another, and the Linux share holding `bindings`
+    /// failed with "these runners have produced no record". `alone` orders the
+    /// targets inside one run; this keeps them in the same run.
+    pub share_with: Vec<String>,
     /// How many processes the runner splits this target across.
     ///
     /// **One family of the statement matrix can hold more cases than one
@@ -254,6 +263,20 @@ pub struct Row {
     /// labelled `<target>#i/N`, so longest first scheduling sees it. One, the
     /// default, is no split.
     pub shards: u32,
+}
+
+/// Reads a list of strings from a row, or nothing when the key is absent.
+///
+/// Four keys of a target row are lists read the same way, and writing the read
+/// out four times put `Map::parse` past the length `policy.rs` allows.
+///
+/// @param row - one `[[target]]` table
+/// @param key - the key to read
+fn list_field(row: &toml_lite::Table, key: &str) -> Vec<String> {
+    row.get(key)
+        .and_then(Value::as_list)
+        .map(<[String]>::to_vec)
+        .unwrap_or_default()
 }
 
 /// The separator between a target's label and its shard, as `#i/N`.
@@ -439,22 +462,11 @@ impl Map {
                     only.insert(package.clone());
                     only
                 });
-            let requires = row
-                .get("requires")
-                .and_then(Value::as_list)
-                .map(<[String]>::to_vec)
-                .unwrap_or_default();
-            let features = row
-                .get("features")
-                .and_then(Value::as_list)
-                .map(<[String]>::to_vec)
-                .unwrap_or_default();
+            let requires = list_field(row, "requires");
+            let features = list_field(row, "features");
             let alone = row.get("alone").and_then(Value::as_bool).unwrap_or(false);
-            let builds = row
-                .get("builds")
-                .and_then(Value::as_list)
-                .map(<[String]>::to_vec)
-                .unwrap_or_default();
+            let builds = list_field(row, "builds");
+            let share_with = list_field(row, "share_with");
             let module = row
                 .get("module")
                 .and_then(Value::as_str)
@@ -487,6 +499,7 @@ impl Map {
                 features,
                 alone,
                 builds,
+                share_with,
                 shards,
             });
         }

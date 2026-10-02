@@ -12,7 +12,7 @@ detail for each destination. [`macos/README.md`](macos/README.md) covers the mac
 
 | Term | Meaning |
 |---|---|
-| route | One destination a release publishes to, such as npm or inillucent.com. `ship.ps1` runs fourteen of them in a fixed order. |
+| route | One destination a release publishes to, such as npm or inillucent.com. `ship.ps1` runs fifteen of them in a fixed order. |
 | preflight | The first phase. It reads every credential and prints which routes will run. It changes nothing. |
 | DPAPI | The Windows data protection API. It encrypts a file so that only the same Windows account on the same machine can decrypt it. Every release credential is stored this way. |
 | RAM disk | A drive held in memory, `R:\` on the release machine. A credential is decrypted onto it for the length of a run and deleted afterwards. |
@@ -68,17 +68,17 @@ flowchart LR
     A["preflight: read credentials, print the plan"] --> B["tests: read the nightly evidence"]
     B --> C["version: write the new version into every file"]
     C --> D["build: compile, sign, package, notarise"]
-    D --> E["publish: tag, mirror, GitHub, site, registries"]
+    D --> E["publish: tag, mirror, GitHub, site, registries, ci"]
     E --> F["report: each route published, skipped or failed"]
 ```
 
 | Phase | What happens | Why it is in this place |
 |---|---|---|
 | preflight | Decrypts the credentials, checks each route's needs, and prints `[run ]` or `[skip]` for every route with the reason. For npm and GitHub it prints the account it will publish as. | A tag cannot be taken back quietly, so the plan is known before anything is written. |
-| tests | Reads `_agent_output/nightly/latest.json` in the main checkout. Green for this commit: no suite runs, and the notes name the nightly run. Green for an older commit: runs `inillucent-testrun --changed <that commit> --cadence merge --strict`. Red or missing: refuses. Exit code 1 or 2 from that run stops the release. | A red suite stops the release before the version phase has changed any file. |
+| tests | Reads `_agent_output/nightly/latest.json` in the main checkout. Green for this commit: no suite runs, and the notes name the nightly run. Green for an older commit: runs `inillucent-testrun --changed <that commit> --cadence merge --strict`. Red or missing: refuses. Exit code 1 or 2 from that run stops the release. | A red suite stops the release before the version phase has changed any file. The development repository has no CI, so GitHub is read after publishing, by the `ci` route. |
 | version | Writes the new version into every file that carries it and refreshes `Cargo.lock`. Warns about any other tracked file that still names the old version. | Every later route reads the version this phase writes. |
 | build | The `build`, `linux-packages` and `signature` routes. Nothing has left the machine yet. | A build failure leaves nothing published. |
-| publish | The routes from `tag` to `homebrew`, in the order in the table below. After each route, `ship.ps1` asks the destination whether the release arrived. | Some destinations read what an earlier route wrote. |
+| publish | The routes from `tag` to `ci`, in the order in the table below. After each route, `ship.ps1` asks the destination whether the release arrived. | Some destinations read what an earlier route wrote. |
 | report | Prints one line per route: `published`, `skipped` or `failed`, with the reason. | A route counts as published only when its check of the destination passes. `ship.ps1` exits 1 when any route failed. |
 
 A route with no credential is skipped. The skip carries the sentence that fixes it. `ship.ps1`
@@ -104,11 +104,16 @@ The routes run in this order.
 | `go` | The tag `packages/go/v<version>` on the mirror. | nothing | `proxy.golang.org` names the version |
 | `packagist` | Asks Packagist to read the mirror's tags again. | a Packagist token | Packagist names the version |
 | `homebrew` | `Formula/inillucent.rb` in the tap, committed and pushed. | the tap checkout | The formula on GitHub names the version |
+| `ci` | Nothing. It starts the tests workflow on the mirror's `main`, which the `mirror` route set to the release, and waits up to four hours for it. | nothing | The run passed. A red, cancelled or missing run fails the release |
 
 Each registry check retries for three minutes, because npm, PyPI and crates.io show a new version a
 little after the upload returns.
 
 ### Why the order matters
+
+- **`ci` runs after `mirror`.** CI runs only on the public mirror, at night and by hand, so the
+  release commit has no run until `ci` starts one on the mirror's `main`. It is the last route
+  because it takes the longest. `pwsh packaging/ci-status.ps1` is the same check on its own.
 
 - **`mirror` runs before `github`.** The GitHub release is created on the mirror. When
   `gh release create` names a tag that does not exist, GitHub creates the tag at the repository's

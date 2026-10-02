@@ -208,8 +208,8 @@ fn lowered(about: &Lowering, block: &BoundSelect, next: &mut usize) -> BoundExpr
         block,
         Some(BoundExpr::Compare {
             op: BinaryOp::Equal,
-            left: Box::new(about.listed.clone()),
-            right: Box::new(about.operand.clone()),
+            left: Box::new(widened(about.listed.clone(), about.affinity)),
+            right: Box::new(widened(about.operand.clone(), about.affinity)),
             affinity: about.affinity,
             collation: about.collation,
         }),
@@ -247,6 +247,48 @@ fn lowered(about: &Lowering, block: &BoundSelect, next: &mut usize) -> BoundExpr
             (any_null, BoundExpr::Null),
         ],
         otherwise: Some(Box::new(missing)),
+        comparisons: Vec::new(),
+    }
+}
+
+/// Widens an integer to a real when the `IN` compares under a REAL affinity.
+///
+/// SQLite tests `IN` membership through an ephemeral index that stores both
+/// sides under the comparison's affinity, and a REAL affinity stores an integer
+/// as a real. So `9223372036854775806 IN (SELECT a ...)` matches a REAL column
+/// holding 9223372036854775807, while the `=` this lowering otherwise writes
+/// keeps the integer exact and does not. The uncorrelated `IN` makes the same
+/// conversion in `inillucent-exec`'s `membership_sides`; this is the same rule
+/// for the lowered form, written as
+/// `CASE WHEN typeof(x) = 'integer' THEN CAST(x AS REAL) ELSE x END`.
+///
+/// @param expr - one side of the equality
+/// @param affinity - the affinity `IN` applies to both sides
+fn widened(expr: BoundExpr, affinity: Option<Affinity>) -> BoundExpr {
+    if affinity != Some(Affinity::Real) {
+        return expr;
+    }
+    let is_integer = BoundExpr::Compare {
+        op: BinaryOp::Equal,
+        left: Box::new(BoundExpr::Function {
+            func: crate::function::ScalarFunc::TypeOf,
+            arguments: vec![expr.clone()],
+            collation: Collation::Binary,
+        }),
+        right: Box::new(BoundExpr::Text(b"integer".to_vec())),
+        affinity: None,
+        collation: Collation::Binary,
+    };
+    BoundExpr::Case {
+        operand: None,
+        branches: vec![(
+            is_integer,
+            BoundExpr::Cast {
+                operand: Box::new(expr.clone()),
+                affinity: Affinity::Real,
+            },
+        )],
+        otherwise: Some(Box::new(expr)),
         comparisons: Vec::new(),
     }
 }

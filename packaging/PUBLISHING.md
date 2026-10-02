@@ -24,9 +24,10 @@ Checked on 2026-09-24 with requests that carried no credential. Every destinatio
 | Packagist | `black-rainbow-labs/inillucent` | yes |
 | Homebrew | `brew install black-rainbow-labs/inillucent/inillucent` | yes |
 
-Both GitHub repositories are public: the development repository (the `origin` remote) and the
-mirror `Black-Rainbow-Labs/Inillucent` (the `brl` remote). Every published package links to the
-mirror.
+The development repository (the `origin` remote) is private. The mirror
+`Black-Rainbow-Labs/Inillucent` (the `brl` remote) is public, and every published package links to
+it. GitHub gives a private repository's workflow runs two cores and a public one's four, which is
+why both workflows split their targets across several jobs.
 
 ## Repairing a release
 
@@ -305,6 +306,33 @@ machine that installs the formula.
 `ship.ps1` checks the formula on GitHub at
 `https://raw.githubusercontent.com/Black-Rainbow-Labs/homebrew-inillucent/main/Formula/inillucent.rb`,
 because that copy is the one `brew` reads.
+
+## The tests workflow on the mirror
+
+`ship.ps1` route: `ci`.
+
+```powershell
+pwsh packaging/ci-status.ps1                     # the mirror's main; starts a run when it has none
+pwsh packaging/ci-status.ps1 -TimeoutMinutes 0   # read once, start nothing, do not wait
+```
+
+CI runs only on the public mirror. `.github/workflows/tests.yml` and `nightly.yml` run there at 03:00
+UTC and when started by hand, never on a push. Both are disabled in the development repository,
+where the private Actions spending stopped every job on 2026-10-02, and each job's `if:` names the
+mirror so a workflow turned back on there still runs nothing. The `ci` route starts the tests
+workflow on the mirror's `main`, which the `mirror` route has just set to the release, and waits
+for it. `ci-status.ps1` runs the same check alone, and a deploy made any other way is finished when
+it exits 0.
+
+A run that GitHub could not start, because the workflow file is not YAML, is reported as a failure
+with no jobs. From 2026-09-24 every run on both repositories was one of those, and every release
+from 1.0.30 to 2.0.4 was cut over them. `ci_workflows` in the `tooling` tier now fails on the YAML
+mistake that caused it, and on a prerequisite name the workflow does not answer for.
+
+A failed run in which no job started is set aside when another run of the same commit passed. A
+repository whose Actions minutes or payment have run out produces exactly that run, and so does an
+unparseable workflow, which can never sit beside a passing run of the same commit. With no passing
+run beside it, the check stays red.
 
 ## Checking a release after it is out
 

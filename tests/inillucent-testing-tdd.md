@@ -168,7 +168,7 @@ check a run against.
 | `e2e` | 36 | 437 | `change` | the public surfaces an application binds to, end to end |
 | `perf` | 1 | 8 | `merge` | the cost guards — **runs alone**, see §5 |
 | `retrieval` | 12 | 570 | `change` | the embedding and retrieval engine, and its graded harness |
-| `tooling` | 17 | 150 | `change` | the checks that keep the repository's own rules true |
+| `tooling` | 18 | 153 | `change` | the checks that keep the repository's own rules true |
 | `matrix` | 24 | 187 | `change` | the SQL statement matrix: every statement form with every pair of contexts, graded against the pinned SQLite |
 | `matrix_deep` | 24 | 54 | `merge` | the statement matrix at every configuration arm, every triple of contexts, and the driver's other surfaces |
 | `nightly` | 5 | 102 | `nightly` | the long forms, run on a schedule rather than on a change |
@@ -181,7 +181,7 @@ map.** `inillucent-testrun --changed` runs a `change` tier's targets when the
 change reaches anything they cover, runs a `merge` tier's targets only when a
 crate that actually changed is in their `covers`, and never runs the `nightly`
 tier. A run with no `--changed` runs `change` and `merge`. CI runs
-`--cadence merge` on every push, and the nightly runs `--cadence nightly`,
+`--cadence merge` every night, and the nightly runs `--cadence nightly`,
 which is every tier. So a crash suite runs for the ticket that edits the log
 and on every merge, and not for the ticket that edits the parser. A `durability`
 row's `covers` therefore names every storage crate the suite exercises, not
@@ -394,8 +394,8 @@ is in decides *when* it runs, through the tier's cadence:
 | `nightly` | nightly | never; it runs in the nightly job, or by name |
 
 A run with no `--changed` runs `change` and `merge`. `--cadence merge` with
-`--changed` selects the merge tiers by the closure too, which is what CI runs on
-a pull request, and `--cadence nightly` is every tier. This is the one place
+`--changed` selects the merge tiers by the closure too, and `--cadence nightly`
+is every tier. This is the one place
 selection is narrower than the closure, and it is deliberate: a four file change
 in `inillucent-engine` and `inillucent-sql` selected 178 of 231 targets, one of
 them a 3,991 s nightly story, and 23 crash suites that named

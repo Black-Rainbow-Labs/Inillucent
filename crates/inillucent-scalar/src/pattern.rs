@@ -46,6 +46,16 @@ pub fn glob(pattern: &[u8], subject: &[u8]) -> bool {
     matches(pattern, subject, None, false, false)
 }
 
+/// The bytes before the first zero byte, or all of them when there is none.
+///
+/// @param bytes - a pattern or a subject
+fn before_nul(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().position(|byte| *byte == 0) {
+        Some(at) => bytes.get(..at).unwrap_or(bytes),
+        None => bytes,
+    }
+}
+
 /// The shared matcher, with one backtrack point.
 fn matches(
     pattern: &[u8],
@@ -54,6 +64,14 @@ fn matches(
     is_like: bool,
     fold_case: bool,
 ) -> bool {
+    // **Both end at the first NUL, as SQLite's do.** SQLite matches the C
+    // strings `sqlite3_value_text` returns, so a text value holding a zero
+    // byte is matched only up to it: `('1' || x'00ff') LIKE '_'` is 1 and
+    // `LIKE '___'` is 0, which is also what `length` says. This matcher read
+    // every byte and answered the opposite of both. The nightly random matrix
+    // found it on seed 20261002.
+    let pattern = before_nul(pattern);
+    let subject = before_nul(subject);
     let (any, one) = if is_like { (b'%', b'_') } else { (b'*', b'?') };
     let mut p = 0usize;
     let mut s = 0usize;

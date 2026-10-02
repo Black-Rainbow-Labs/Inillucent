@@ -52,7 +52,7 @@ pub fn build(
     strength: usize,
     allowed: &dyn Fn(&Partial) -> bool,
 ) -> Result<Array, String> {
-    if sizes.iter().any(|size| *size == 0) {
+    if sizes.contains(&0) {
         return Err("an axis has no values".to_string());
     }
     let strength = strength.clamp(1, sizes.len().max(1));
@@ -274,7 +274,7 @@ fn grow_vertically(
         let mut placed = false;
         for row in rows.iter_mut().skip(first_new) {
             let fits = combination.iter().all(|(at, value)| {
-                matches!(row.get(*at).copied().flatten(), None)
+                row.get(*at).copied().flatten().is_none()
                     || row.get(*at).copied().flatten() == Some(*value)
             });
             if !fits {

@@ -265,7 +265,7 @@ pub fn observe_detailed(
     (observation, error)
 }
 
-//// Compares one observation, saying whether the cumulative counters count.
+/// Compares one observation, saying whether the cumulative counters count.
 ///
 /// Panics with the first difference [`observation_differences`] finds, which
 /// is what every hand written differential suite wants: stop at the statement

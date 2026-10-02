@@ -309,6 +309,18 @@ if ($wantLinux) {
     }
 }
 
+# **SHA256SUMS describes what was just built before the macOS half can fail.** The sums were written
+# only at the end, so when Apple's notary service refused 2.0.4 the macOS step threw, and a re-run of
+# the build route had rebuilt the Windows and Linux archives with different bytes while SHA256SUMS
+# still held the first run's hashes. The site and the GitHub release then served archives that
+# failed install.sh's checksum. The macOS files are left out here, because until that half finishes
+# they are not publishable, and the line after it writes the complete file.
+if ($wantMacos) {
+    $early = Update-Sha256Sums -Dist $dist -Version $Version
+    $kept = Get-Content -LiteralPath $early | Where-Object { $_ -notmatch 'apple-darwin|\.pkg$' }
+    [System.IO.File]::WriteAllText($early, (($kept -join "`n") + "`n"))
+}
+
 if ($wantMacos) {
     # The macOS half builds its own two targets, because it sets a deployment
     # target per architecture that the Linux and Windows builds have no use for.

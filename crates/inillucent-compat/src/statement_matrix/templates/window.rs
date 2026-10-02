@@ -90,8 +90,8 @@ pub fn family() -> Family {
     Family {
         name: "window",
         axes,
-        allowed: allowed,
-        build: build,
+        allowed,
+        build,
     }
 }
 
@@ -106,10 +106,11 @@ fn allowed(pick: &Pick) -> bool {
     let function = pick.get("function");
     // A RANGE frame with an offset orders by one term, so only an aggregate's
     // answer is independent of how peers are ordered.
-    if unit == Some("RANGE") && offset {
-        if function.is_some_and(|f| !aggregate(f) || f == "group_concat") {
-            return false;
-        }
+    if unit == Some("RANGE")
+        && offset
+        && function.is_some_and(|f| !aggregate(f) || f == "group_concat")
+    {
+        return false;
     }
     if unit == Some("none") && pick.get("exclude").is_some_and(|e| e != "none") {
         return false;

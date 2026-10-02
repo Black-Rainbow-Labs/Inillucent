@@ -19,7 +19,9 @@
         3. version     write the new version into every file that carries it, in one step, and
                        refuse to continue if a seventh file is found holding the old one.
         4. build       compile, sign, package, notarise. Local; nothing has left the machine.
-        5. publish     tag, push, GitHub, the mirror, the site, the registries.
+        5. publish     tag, push, GitHub, the mirror, the site, the registries, and last the
+                       `ci` route, which starts the tests workflow on the public mirror's main,
+                       now the release, and fails the release when it does not pass.
         6. report      route by route: published, skipped or failed, and why.
 
     Preflight is first and separate because a tag is the one step that cannot be taken back quietly.
@@ -41,6 +43,17 @@
     It reads the runner's three exit codes and says which it got. `2` is not a test failure - it
     means the run did not happen, so nothing was graded - and reporting it as a red suite is the
     confusion task-2047 removed from the runner and would put back here.
+
+    GITHUB'S RUN OF THE RELEASE IS PART OF THE RELEASE
+
+    From 2026-09-24 `.github/workflows/tests.yml` was not valid YAML, so every run on both
+    repositories failed with no job, and every release from 1.0.30 to 2.0.4 was cut over those red
+    runs. The nightly cannot see that: it runs on this machine, on Windows, without clippy and
+    without the workflow file. CI now runs only on the public mirror, at night and by hand, because
+    the development repository is private and its Actions spending stopped every job there on
+    2026-10-02. So the `ci` route starts the tests workflow on the mirror once the `mirror` route has
+    pushed the release, waits for it, and fails the release unless it passes.
+    packaging/ci-evidence.ps1 has the rules.
 
     `-Only` selects routes, and the tests are not a route, so `-Only site` still runs them. The one
     way past is `-SkipTests`, which prints a sentence saying the release is untested and writes that
@@ -122,6 +135,7 @@ if ($Skip) { $Skip = @($Skip -split ',' | ForEach-Object { $_.Trim() } | Where-O
 . (Join-Path $PSScriptRoot 'nightly-evidence.ps1')
 . (Join-Path $PSScriptRoot 'site/install-page.ps1')
 . (Join-Path $PSScriptRoot 'github-token.ps1')
+. (Join-Path $PSScriptRoot 'ci-evidence.ps1')
 # The DPAPI sealing helpers live in apple-credentials.ps1 because that is where sealing was first
 # needed. Nothing about `Protect-AppleSecret` is Apple-specific: it is `ConvertFrom-SecureString`,
 # which encrypts under one Windows account, and the project's minisign and OpenPGP keys want exactly
@@ -851,6 +865,17 @@ function Get-Routes {
                 $url = 'https://raw.githubusercontent.com/Black-Rainbow-Labs/homebrew-inillucent/main/Formula/inillucent.rb'
                 Test-Registry -Url $url -Version $Version
             }
+        },
+        # **After `mirror`, and last because it takes the longest.** CI runs only on the public
+        # mirror and never on a push, so this starts the tests workflow on the mirror's `main`,
+        # which the `mirror` route set to the release, waits for it, and fails the release when it
+        # does not pass. A release whose own CI is red is not finished.
+        @{
+            Name   = 'ci'
+            What   = "GitHub's tests run of the release, on the public mirror"
+            Needs  = { $null }
+            Run    = { Write-Host '   starting and waiting for the tests run on the mirror; it takes about an hour.' }
+            Verify = { Test-PublishedCi }
         }
     )
 }
@@ -900,6 +925,31 @@ function Publish-Tag {
     if ($LASTEXITCODE -ne 0) { throw "pushing HEAD to origin/$branch failed" }
     & git -C $root push origin "v$Version"
     if ($LASTEXITCODE -ne 0) { throw "pushing v$Version failed" }
+}
+
+function Test-PublishedCi {
+    <#
+    .SYNOPSIS
+        Starts the tests workflow on the public mirror's `main`, which the mirror route has just set
+        to the release, waits for it, and returns $null when it passed or the reason when it did not.
+
+    .DESCRIPTION
+        Only the mirror: the development repository is private, its workflows are disabled, and its
+        Actions spending stopped every job there on 2026-10-02.
+    #>
+    $problems = @()
+    foreach ($remote in @('brl')) {
+        try {
+            $repo = Get-RepoFromRemote -Root $script:Root -Remote $remote
+            $sha = Get-BranchHead -Repo $repo -Branch 'main'
+            $verdict = Wait-CiVerdict -Repo $repo -Sha $sha -TimeoutMinutes 240 -StartOn 'main'
+            if ($verdict.State -ne 'green') { $problems += "$repo $($sha.Substring(0, 12)): $($verdict.Reason)" }
+        } catch {
+            $problems += "$remote could not be read: $($_.Exception.Message)"
+        }
+    }
+    if ($problems.Count -gt 0) { return ($problems -join '; ') }
+    return $null
 }
 
 function Publish-InteropFixture {

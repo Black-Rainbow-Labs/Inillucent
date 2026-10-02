@@ -51,11 +51,11 @@ pub fn family() -> Family {
             Axis::new("data", &["empty", "one", "duplicates", "mixed"]),
         ],
         allowed: |pick| {
-            !pick.forbids("target", "data", &[("fts5", "mixed")])
-                && !pick.forbids("target", "write", &[("fts5", "create_index")])
+            !(pick.forbids("target", "data", &[("fts5", "mixed")])
+                || pick.forbids("target", "write", &[("fts5", "create_index")])
                 // ROLLBACK TO and RELEASE name a savepoint the case opened.
-                && !(matches!(pick.get("end"), Some("rollback_to") | Some("release") | Some("nested_rollback"))
-                    && pick.get("begin").is_some_and(|begin| begin != "savepoint"))
+                || (matches!(pick.get("end"), Some("rollback_to") | Some("release") | Some("nested_rollback"))
+                    && pick.get("begin").is_some_and(|begin| begin != "savepoint")))
         },
         build,
     }

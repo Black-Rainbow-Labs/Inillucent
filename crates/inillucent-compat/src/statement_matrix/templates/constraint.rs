@@ -47,11 +47,11 @@ pub fn family() -> Family {
         allowed: |pick| {
             let foreign = pick.get("kind").is_some_and(|kind| kind.starts_with("fk"));
             // Deleting a parent row only means something for a foreign key.
-            !(pick.get("operation") == Some("delete_parent")
+            !((pick.get("operation") == Some("delete_parent")
                 && pick.get("kind").is_some_and(|kind| !kind.starts_with("fk")))
-                && !(pick.get("foreign_keys") == Some("deferred_pragma")
+                || (pick.get("foreign_keys") == Some("deferred_pragma")
                     && pick.get("kind").is_some()
-                    && !foreign)
+                    && !foreign))
         },
         build,
     }
