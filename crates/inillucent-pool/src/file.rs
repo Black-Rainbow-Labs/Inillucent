@@ -323,12 +323,13 @@ impl Database {
         for slot in [META_PAGE, SHADOW_PAGE] {
             pool.write_meta_slot(slot, &image)?;
         }
+        let free = pool.new_free_map();
         let mut database = Database {
             pool,
             meta,
             disk_meta: meta,
             slots: LastReadSlots::default(),
-            free: FreeMap::new(options.page_size),
+            free,
             shared_extent: None,
             busy_millis: default_busy_millis(),
             read_only: false,
@@ -400,7 +401,7 @@ impl Database {
     pub fn open_read_only(vfs: &dyn Vfs, path: &DbPath, frames: usize) -> DbResult<Database> {
         let (pool, meta) = Self::open_bootstrap_with(vfs, path, frames, true)?;
         pool.forbid_writing();
-        let free = FreeMap::new(pool.page_size());
+        let free = pool.new_free_map();
         Ok(Database {
             pool,
             meta,
@@ -445,7 +446,7 @@ impl Database {
     /// @param frames - how many frames the pool holds
     pub fn open_before_recovery(vfs: &dyn Vfs, path: &DbPath, frames: usize) -> DbResult<Database> {
         let (pool, meta) = Self::open_bootstrap(vfs, path, frames)?;
-        let free = FreeMap::new(pool.page_size());
+        let free = pool.new_free_map();
         Ok(Database {
             pool,
             meta,
@@ -688,6 +689,14 @@ impl Database {
     /// @param page - the page to ask about
     pub fn page_is_allocated(&self, page: PageId) -> bool {
         self.free.is_allocated(page)
+    }
+
+    /// Reports whether a page is never handed out because the lock bytes are in
+    /// it. See `FreeMap::reserving`.
+    ///
+    /// @param page - the page to test
+    pub fn page_is_reserved(&self, page: PageId) -> bool {
+        self.free.is_reserved(page)
     }
 
     /// Returns the buffer pool, so a caller that owns the file can grow it.
@@ -1357,7 +1366,7 @@ impl Database {
         self.meta = found;
         // Adopted from the file, so it is also the last record seen there.
         self.disk_meta = found;
-        self.free = FreeMap::new(self.pool.page_size());
+        self.free = self.pool.new_free_map();
         self.shared_extent = None;
         Ok(())
     }
@@ -1621,7 +1630,7 @@ pub fn with_open_busy_millis<T>(millis: u64, open: impl FnOnce() -> T) -> T {
 /// @param pool - the buffer pool the file is open through
 /// @param head - the free map's first page, from the meta record
 fn read_free_map(pool: &Pool, head: PageId) -> DbResult<FreeMap> {
-    let mut free = FreeMap::new(pool.page_size());
+    let mut free = pool.new_free_map();
     let mut next = head;
     let mut seen: std::collections::BTreeSet<PageId> = std::collections::BTreeSet::new();
     while !next.is_none() {

@@ -144,6 +144,13 @@ Every page carries a checksum and the LSN of the last log record applied to it. 
 checksum fails is reported as damage. Recovery also treats a page whose checksum fails as a page
 with no LSN, so every log record for that page is applied again.
 
+The page that holds byte 1 GiB of the file is never given to data. The locking protocol locks bytes
+from that offset, as SQLite does, and on Windows a byte range lock stops every other handle from
+reading or writing the bytes it covers. SQLite never allocates that page. Before version 2.0.7 the
+free map handed it out like any other page, so on Windows a file larger than 1 GiB that two
+processes had open failed reads and folds with `disk I/O error`, and a fold that failed part way
+left the file damaged. A file an older release wrote keeps whatever it already stores in that page.
+
 ### The buffer pool
 
 The buffer pool holds pages in frames. A frame's memory is taken the first time the frame is used,
@@ -160,9 +167,25 @@ so a large `cache_size` costs little until pages are read into it.
 8 GiB.
 
 A changed page stays in its frame until a checkpoint writes it out. A transaction can change more
-pages than the pool holds. The pool then writes some of that transaction's pages to the file early.
-That early write is protected by a rollback journal, so a crash before the commit can put the old
-page back. In `wal` mode the journal file is still created for this case.
+pages than the pool holds, and the pool then has to make room. A connection that holds the file
+without the exclusive lock, which is every write under `locking_mode = normal` on a connection with
+no database attached, writes such a page to a spill file of its own and reads it back from there
+when it needs the page again. The spill file is a temporary file that the operating system deletes
+when it is closed and when the process ends, and an encrypted database's spill file is encrypted
+with a key of its own. Nothing in it has to survive a crash, because every change it holds is in the
+log. A fold writes the spilled pages into the database file, under the exclusive lock, with the rest
+of the changed pages.
+
+So a reader in another process keeps reading the last committed state through the whole of a large
+transaction. Before version 2.0.7 the pool wrote such a page into the database file early, which
+needs the exclusive lock, and the writer kept that lock until it committed: every reader in another
+process waited for the rest of the transaction and then failed with `busy`. An `UPDATE` of 20,000
+rows of 3 KB values was enough, with the default page cache of 128 MiB.
+
+A connection that holds the exclusive lock already, under `locking_mode = exclusive` or with a
+database attached, still writes such a page to the file early. That early write is protected by a
+rollback journal, so a crash before the commit can put the old page back. In `wal` mode the journal
+file is still created for this case.
 
 The journal never outlives the file lock. Under `locking_mode = normal`, a connection whose journal
 holds old page images folds the log into the file before it releases the lock, and the fold removes
@@ -199,12 +222,21 @@ a process died while it held the lock, and the connection puts the journal's old
 it replays, as an open does.
 
 A connection holding the shared lock never writes the file. A replay can change more pages than
-the pool holds, and the pool then has to write some of them to the file. Before it writes one, the
-connection raises its lock to exclusive. If another connection already holds the reserved lock,
-the statement fails at once with `busy` instead of waiting, because each would wait for the other.
-A connection that raised its lock this way folds before it releases it.
+the pool holds, and the pool then spills them, as a writer's pool does (section 3), so the replay
+needs no lock beyond the shared one. A replay that fails part way drops every page it produced, so
+that no later fold on that connection, and not its close, writes a half applied log into the file.
 
 `ROLLBACK` is done from the log. It works the same way in every journal mode, including `off`.
+
+A rollback puts the rows back through the B+trees, so the page splits and new pages the transaction
+made stay in the trees, holding the rows as they were. The undo is logged under the same transaction
+as the changes, and a finished rollback ends with a commit record, so a replay applies the
+transaction and its undo together and arrives at the pages the connection holds. A statement that
+fails in autocommit mode and is undone, for example with `busy`, ends the same way. Before version
+2.0.7 no commit record followed a rollback, so a replay skipped the transaction and its undo, and the
+records of the next committed transaction named pages the replay did not know: the next open after
+a crash failed with `read 0 of 32768 bytes at` the file's own size, or applied rows to an older copy
+of a page, and a fold then wrote the result into the file.
 
 Two statements are refused inside an open transaction:
 
@@ -682,6 +714,24 @@ Segmented generations then made the default fold limit a constant 1,024 entries.
 100,000 documents, one row per commit, the median commit went from 0.152 ms to 0.032 ms and the
 99th percentile from 0.923 ms to 0.097 ms. That run was recorded on this page on 13 September 2026.
 
+Version 2.0.7 changed three things about a commit that merges segments, and one about the first
+query after another process writes:
+
+- **A segment is read by rowid.** `%_state` holds `gen_rows`, a map of where each segment's rows are
+  in `%_gen`. Without it, loading one segment read every row of `%_gen`, each a blob of up to
+  512 KiB: on a table of 120,000 rows of 768 numbers that was about 1 GB a load. A table an older
+  release wrote has no map, and the first write that adds a segment builds it.
+- **A fold is one batch on every core.** Folding a segment into a merge, and applying the delta rows
+  a query has not seen, used to insert one document at a time into the graph on one core.
+- **A merge stays within `merge_budget`.** A second fold in one commit happens only when it fits
+  what is left of the budget.
+- **A reader catches up in one batch.** After another process deleted and inserted 2,000 rows, a
+  connection's next search took 3.26 s and now takes 0.52 s.
+
+Measured with 2,000 rows of 768 numbers a commit and the default options, on a 24 core Windows
+machine: the commits that merge took 13.7, 17.7 and 21.3 s at 40,000, 80,000 and 120,000 rows, and
+take 2.1, 2.8 and 3.3 s.
+
 ### What an application can read back
 
 `%_state` is an ordinary table:
@@ -694,6 +744,7 @@ Segmented generations then made the default fold limit a constant 1,024 entries.
 | `folds` | folds since the last `compact` or `rebuild` |
 | `generation` | which generation is current |
 | `covered` | the highest delta sequence the current generation contains |
+| `gen_rows` | where each segment's rows are in `%_gen`, as three integers a segment: its id, its first rowid and its number of rows |
 
 `chunks` minus `rows` is how many chunks the graph holds that no live row points at. An update marks
 the old chunk deleted and adds a new one, and only `compact` or `rebuild` removes the old one. When
@@ -705,6 +756,12 @@ Publishing a generation is a set of ordinary writes inside the caller's transact
 a publish leaves the old generation current and the delta log unchanged. The replaced generation's
 rows stay in the file until `drop-old-generations` runs, because a snapshot opened before the switch
 may still read them.
+
+A merge that takes more than one commit leaves a segment stored as a chain: the segment's id names
+its last link, and each link names the one before it. `drop-old-generations` keeps every link of
+every live segment. Before version 2.0.7 it kept only the id the manifest names and deleted the
+earlier links, and the table could no longer be read (`segment 42 is unreadable`). `rebuild`
+repairs a table that lost links that way.
 
 If a generation cannot be read back, the query fails with an error, and `rebuild` repairs it.
 `%_content` holds every row, so the index can always be built again from the database alone.

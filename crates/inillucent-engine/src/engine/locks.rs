@@ -361,6 +361,22 @@ impl ImportedDatabase {
     /// @param index - which attachment
     /// @param path - that attachment's file
     fn resync_attached(&mut self, index: usize, path: &std::path::Path) -> DbResult<()> {
+        let resynced = self.resync_attached_within(index, path);
+        if resynced.is_err() {
+            // The same rule `resync_from_file` keeps for `main`: a replay that
+            // failed part way leaves no page behind for a fold to write.
+            if let Some(held) = self.session_state.attached.get(index) {
+                let _ = held.database.pool().abandon_all();
+            }
+        }
+        resynced
+    }
+
+    /// The body of [`ImportedDatabase::resync_attached`].
+    ///
+    /// @param index - which attachment
+    /// @param path - that attachment's file
+    fn resync_attached_within(&mut self, index: usize, path: &std::path::Path) -> DbResult<()> {
         let db_path = DbPath::new(path.to_string_lossy().as_ref());
         let doubtful = crate::multi::doubtful_transactions(path)?;
         let Some(held) = self.session_state.attached.get_mut(index) else {
@@ -555,7 +571,24 @@ impl ImportedDatabase {
     ///
     /// See `crate::recovery::resync_file` for why every part of it is
     /// re-derived rather than patched.
+    ///
+    /// **A replay that fails leaves nothing behind to fold.** It fails part way
+    /// through, with some of the log applied to this connection's pages and the
+    /// rest not, and those pages are dirty. The next fold, on this connection's
+    /// next write or on its close, used to write them into the file and move the
+    /// recovery point past the records it never applied, which made the damage
+    /// permanent. So a failed replay drops every page it produced: the log still
+    /// holds all of it, and the next statement replays again from the file.
     fn resync_from_file(&mut self) -> DbResult<()> {
+        let resynced = self.resync_from_file_within();
+        if resynced.is_err() {
+            let _ = self.storage.database.pool().abandon_all();
+        }
+        resynced
+    }
+
+    /// The body of [`ImportedDatabase::resync_from_file`].
+    fn resync_from_file_within(&mut self) -> DbResult<()> {
         if self.storage.path.as_os_str().is_empty() {
             return Ok(());
         }

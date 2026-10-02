@@ -117,8 +117,7 @@ impl Pool {
     /// @param frame - the frame about to be written
     /// @param page - the page it holds, for the message
     pub(super) fn refuse_if_ahead_of_the_log(&self, frame: u32, page: PageId) -> DbResult<()> {
-        let durable = self.durable_lsn.get();
-        if durable == u64::MAX {
+        if self.durable_lsn.get() == u64::MAX {
             return Ok(());
         }
         let lsn = {
@@ -130,6 +129,23 @@ impl Pool {
                 .map_err(|_| misuse("a frame chosen for writeback was mutably borrowed"))?;
             page::read_u64(&bytes, page::header::LSN)?
         };
+        self.refuse_an_image_ahead_of_the_log(lsn, page)
+    }
+
+    /// Refuses to write a page image whose stamp the log has not made durable,
+    /// asking the log to catch up first.
+    ///
+    /// The body of [`Pool::refuse_if_ahead_of_the_log`], taking the stamp rather
+    /// than a frame, so a page written from the spill file is held to the same
+    /// rule as one written from a frame.
+    ///
+    /// @param lsn - the stamp in the page's header
+    /// @param page - the page, for the message
+    pub(super) fn refuse_an_image_ahead_of_the_log(&self, lsn: u64, page: PageId) -> DbResult<()> {
+        let durable = self.durable_lsn.get();
+        if durable == u64::MAX {
+            return Ok(());
+        }
         if lsn <= durable {
             return Ok(());
         }

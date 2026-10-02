@@ -599,6 +599,14 @@ pub struct Pool {
     /// So [`Pool::checkpoint`] keeps the journal while this is set and the
     /// writer is still open, and [`Pool::finish_journal`] clears it.
     stolen: Cell<bool>,
+    /// Dirty pages evicted while this connection did not hold EXCLUSIVE.
+    ///
+    /// See `pool/spill.rs`. `None` until the first such eviction opens the file.
+    spill: RefCell<Option<spill::Spill>>,
+    /// What opens the spill file, registered by the engine through
+    /// [`Pool::on_spill`]. `None` keeps the old behaviour: an eviction writes the
+    /// database file under EXCLUSIVE.
+    spill_opener: RefCell<Option<spill::SpillOpener>>,
     /// The connection's `busy_timeout`, for [`Pool::hold_for_writing`].
     write_lock_millis: Cell<u64>,
     /// Whether the file handle may write; a read only open says no.
@@ -654,7 +662,10 @@ mod eviction;
 mod fold;
 mod journal_gate;
 mod locking;
+mod spill;
 mod swizzle;
+
+pub use spill::SpillOpener;
 
 impl Pool {
     /// Returns a pool over an open file.
@@ -732,6 +743,8 @@ impl Pool {
             // Nothing is uncommitted until a transaction says so.
             uncommitted_lsn: Arc::new(AtomicU64::new(u64::MAX)),
             stolen: Cell::new(false),
+            spill: RefCell::new(None),
+            spill_opener: RefCell::new(None),
             write_lock_millis: Cell::new(crate::file::default_busy_millis()),
             writable: Cell::new(true),
         })
@@ -1025,32 +1038,43 @@ impl Pool {
         // descent holding an observation of this frame is reading a page that
         // is no longer there, and the bump is what tells it so.
         let held = self.latch(frame).map(|latch| latch.try_exclusive());
-        let filled = self.fill_frame(frame, page);
-        if let Err(error) = filled {
-            // **The frame goes back.** A read can fail three ways - the buffer
-            // is borrowed, the file is short or unreadable, the checksum does
-            // not match - and every one of them used to return the error while
-            // keeping the frame, so a pool that saw sixteen failed reads had
-            // sixteen fewer frames and then reported "every frame is pinned",
-            // which is not even the right diagnosis.
-            //
-            // Found by a Phase 3 recovery campaign fetching pages a truncated
-            // file does not hold, which is the ordinary shape of a fault
-            // campaign and of any reader probing for a page. The exclusive
-            // latch leaked with it.
-            if held == Some(true) {
-                if let Some(latch) = self.latch(frame) {
-                    latch.release_exclusive();
+        // **A spilled page is read back from the spill file, never from the
+        // database file**, which holds an older copy or none at all. It comes
+        // back dirty, from the point it was dirty from when it left.
+        let filled = match self.fill_from_spill(frame, page) {
+            Ok(Some(slot)) => Ok(Some(slot)),
+            Ok(None) => self.fill_frame(frame, page).map(|()| None),
+            Err(error) => Err(error),
+        };
+        let spilled = match filled {
+            Ok(spilled) => spilled,
+            Err(error) => {
+                // **The frame goes back.** A read can fail three ways - the buffer
+                // is borrowed, the file is short or unreadable, the checksum does
+                // not match - and every one of them used to return the error while
+                // keeping the frame, so a pool that saw sixteen failed reads had
+                // sixteen fewer frames and then reported "every frame is pinned",
+                // which is not even the right diagnosis.
+                //
+                // Found by a Phase 3 recovery campaign fetching pages a truncated
+                // file does not hold, which is the ordinary shape of a fault
+                // campaign and of any reader probing for a page. The exclusive
+                // latch leaked with it.
+                if held == Some(true) {
+                    if let Some(latch) = self.latch(frame) {
+                        latch.release_exclusive();
+                    }
                 }
+                self.state.borrow_mut().free.push(frame);
+                return Err(error);
             }
-            self.state.borrow_mut().free.push(frame);
-            return Err(error);
-        }
+        };
         let mut state = self.state.borrow_mut();
         state.amend(frame, |meta| {
             meta.page = page;
             meta.state = FrameState::Hot;
-            meta.dirty = false;
+            meta.dirty = spilled.is_some();
+            meta.rec_lsn = spilled.map_or(u64::MAX, |slot| slot.rec_lsn());
             meta.parent = None;
         });
         if let Some(slot) = self.pins.get(frame as usize) {
@@ -1106,6 +1130,16 @@ impl Pool {
     /// @param page - the page it holds
     /// @param why - a checkpoint's flush, or an eviction
     fn writeback(&self, frame: u32, page: PageId, why: Writing) -> DbResult<bool> {
+        // **An eviction by a connection that does not hold EXCLUSIVE goes to its
+        // spill file, not to the database file.** Writing the database file needs
+        // EXCLUSIVE, and a writer that took it here kept it until its commit, so
+        // every reader in another process waited for the rest of the transaction.
+        // See `pool/spill.rs`. The write ahead rule does not apply to a spill: the
+        // spill file is this connection's own and does not survive a crash.
+        if why == Writing::Eviction && self.should_spill() {
+            self.spill_frame(frame, page)?;
+            return Ok(true);
+        }
         // The write-ahead rule, and the only place in the engine it is
         // enforced. Phase 2 said this seam was here and that Phase 3 would add
         // "a condition rather than a caller"; this is that condition. Every
@@ -1279,6 +1313,8 @@ impl Pool {
         let frame = match self.lookup(page) {
             Some(frame) => frame,
             None => {
+                // The image replaces whatever was spilled for this page.
+                self.forget_spilled(page);
                 let frame = self.claim_frame()?;
                 let mut state = self.state.borrow_mut();
                 if let Some(meta) = state.frames.get_mut(frame as usize) {
@@ -1415,19 +1451,24 @@ impl Pool {
             // and none of them bound what recovery still needs.
             return u64::MAX;
         }
-        let state = self.state.borrow();
-        state
-            .frames
-            .iter()
-            .enumerate()
-            .filter(|(_, meta)| meta.dirty && meta.state != FrameState::Free)
-            .filter(|(frame, _)| {
-                self.lsn_of(*frame as u32)
-                    .is_ok_and(|stamp| stamp >= uncommitted)
-            })
-            .map(|(_, meta)| meta.rec_lsn)
-            .min()
-            .unwrap_or(u64::MAX)
+        let resident = {
+            let state = self.state.borrow();
+            state
+                .frames
+                .iter()
+                .enumerate()
+                .filter(|(_, meta)| meta.dirty && meta.state != FrameState::Free)
+                .filter(|(frame, _)| {
+                    self.lsn_of(*frame as u32)
+                        .is_ok_and(|stamp| stamp >= uncommitted)
+                })
+                .map(|(_, meta)| meta.rec_lsn)
+                .min()
+                .unwrap_or(u64::MAX)
+        };
+        // A spilled page a fold holds back bounds recovery exactly as a resident
+        // one does.
+        resident.min(self.oldest_spilled_uncommitted_lsn())
     }
 
     /// Applies a change to a resident page and marks the frame dirty.
@@ -1486,43 +1527,6 @@ impl Pool {
         self.file
             .read_exact_at(page.0.saturating_mul(self.page_size as u64), output)
             .map_err(|error| error.into_db_error())
-    }
-
-    /// Rewrites every swizzled swip in a page image as the page id it names.
-    ///
-    /// This is TDD invariant 6, and it is the one place it can be enforced: the
-    /// frame-to-page mapping lives in the pool, so nothing above it could do
-    /// the translation even if it wanted to. Only interior pages carry swips,
-    /// which is checked rather than assumed - a leaf whose bytes happened to
-    /// resemble a slot array would otherwise be silently rewritten.
-    ///
-    /// @param image - the page image about to be written
-    pub(super) fn translate_swips(&self, image: &mut [u8]) -> DbResult<usize> {
-        if page::kind_of(image)? != PageKind::Interior {
-            return Ok(0);
-        }
-        let offsets = crate::interior::swip_offsets_of(image)?;
-        let state = self.state.borrow();
-        let mut translated = 0usize;
-        for offset in offsets {
-            let swip = Swip::from_raw(page::read_u64(image, offset)?);
-            let Some(frame) = swip.frame() else {
-                continue;
-            };
-            let page = state
-                .frames
-                .get(frame as usize)
-                .map(|meta| meta.page)
-                .ok_or_else(|| corrupt(format!("a swip names frame {frame}, which is not one")))?;
-            if page.is_none() {
-                return Err(corrupt(format!(
-                    "a swip names frame {frame}, which holds no page"
-                )));
-            }
-            page::write_u64(image, offset, Swip::unswizzled(page).raw())?;
-            translated = translated.saturating_add(1);
-        }
-        Ok(translated)
     }
 
     /// Returns one frame's version latch.

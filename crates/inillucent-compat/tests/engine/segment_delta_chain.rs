@@ -333,3 +333,109 @@ fn drop_old_generations_protects_a_whole_in_flight_chain() {
         "no row was lost across the reclaim and the resumed merge"
     );
 }
+
+/// **`drop-old-generations` keeps every link of a finished merge.** A merge
+/// that took more than one commit leaves a segment that is a chain of links,
+/// each naming the one before it. The command kept only the id the manifest
+/// names, so it deleted the earlier links and the table could no longer be
+/// read: `segment 42 is unreadable` after one `drop-old-generations` on a
+/// table of 40 rows.
+#[test]
+fn drop_old_generations_keeps_every_link_of_a_finished_merge() {
+    const DIMS: usize = 4;
+    const N: i64 = 40;
+
+    let connection = start_inillucent(AREA, "keeps-finished-chains");
+    exec(
+        &connection,
+        &format!(
+            "CREATE VIRTUAL TABLE docs USING inillucent_search(title, body, dims = {DIMS}, \
+             mode = 'exact', compact = 1, segment_merge = 2, merge_budget = 1)"
+        ),
+    );
+    for id in 1..=N {
+        insert_row(&connection, id, DIMS);
+    }
+    let before = stored_segment_count(&connection, "docs");
+    exec(
+        &connection,
+        "INSERT INTO docs(docs) VALUES ('drop-old-generations')",
+    );
+    assert!(
+        stored_segment_count(&connection, "docs") < before,
+        "the reclaim removed something"
+    );
+    exec(
+        &connection,
+        "INSERT INTO docs(docs) VALUES ('integrity-check')",
+    );
+    let query = hex(&vector_for(7, DIMS));
+    let found = column(
+        &connection,
+        &format!("SELECT rowid FROM docs WHERE vector = x'{query}' AND k = {N} ORDER BY rank"),
+    );
+    assert_eq!(found.len(), N as usize, "every row is still searchable");
+}
+
+/// **A segment reads back whether or not the table has its row map.** A
+/// segment's rows are read by rowid from the map in `%_state` that says where
+/// they are, because finding them by reading the whole of `%_gen` read every
+/// blob in it: about 1 GB per segment load on a table of 120,000 rows. A table
+/// an older release wrote has no map, and a map can name rows that changed;
+/// both read the whole table instead and answer the same.
+#[test]
+fn a_segment_reads_back_without_its_row_map() {
+    const DIMS: usize = 4;
+    const N: i64 = 12;
+
+    let connection = start_inillucent(AREA, "row-map");
+    exec(
+        &connection,
+        &format!(
+            "CREATE VIRTUAL TABLE docs USING inillucent_search(title, body, dims = {DIMS}, \
+             mode = 'exact', compact = 1, segment_merge = 2, merge_budget = 1)"
+        ),
+    );
+    for id in 1..=N {
+        insert_row(&connection, id, DIMS);
+    }
+    assert_eq!(
+        column(
+            &connection,
+            "SELECT count(*) FROM docs_state WHERE k = 'gen_rows'"
+        ),
+        vec!["1".to_string()],
+        "a table this release writes keeps the map"
+    );
+    let all = column(&connection, "SELECT rowid FROM docs ORDER BY rowid");
+    let query = hex(&vector_for(3, DIMS));
+    let search =
+        format!("SELECT rowid FROM docs WHERE vector = x'{query}' AND k = 5 ORDER BY rank");
+    let ranked = column(&connection, &search);
+
+    exec(&connection, "DELETE FROM docs_state WHERE k = 'gen_rows'");
+    exec(
+        &connection,
+        "INSERT INTO docs(docs) VALUES ('integrity-check')",
+    );
+    assert_eq!(
+        column(&connection, &search),
+        ranked,
+        "the same answer with no map"
+    );
+    insert_row(&connection, N + 1, DIMS);
+    assert_eq!(
+        column(
+            &connection,
+            "SELECT count(*) FROM docs_state WHERE k = 'gen_rows'"
+        ),
+        vec!["1".to_string()],
+        "the next write builds the map again"
+    );
+    let mut expected = all.clone();
+    expected.push((N + 1).to_string());
+    assert_eq!(
+        column(&connection, "SELECT rowid FROM docs ORDER BY rowid"),
+        expected
+    );
+}

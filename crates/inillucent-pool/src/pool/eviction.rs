@@ -352,7 +352,10 @@ impl Pool {
             "the dirty frame count and the frames disagree, so a site changed a frame's \
              bookkeeping without going through State::amend"
         );
-        state.dirty
+        // **A spilled page is a page the file does not have**, the same as a
+        // dirty frame, so it counts: it is what makes a connection fold before it
+        // closes, and what refuses a discard that would lose it.
+        state.dirty.saturating_add(self.spilled_pages())
     }
 
     /// Drops every cached page without writing any of it back.
@@ -382,6 +385,9 @@ impl Pool {
             // rather than by seven decrements.
             state.dirty = 0;
         }
+        // The spilled pages go with the frames, for the same reason: the log
+        // the caller replays next holds every change they hold.
+        self.forget_every_spilled_page();
         self.discard_all()
     }
 
@@ -397,6 +403,10 @@ impl Pool {
     ///
     /// Returns how many frames went.
     pub fn discard_all(&self) -> DbResult<usize> {
+        // **The spill file describes the same cache, so it goes too.** Every
+        // caller has already refused when [`Pool::dirty_pages`], which counts
+        // spilled pages, was not zero, so nothing here is a change the file lacks.
+        self.forget_every_spilled_page();
         let mut gone = 0usize;
         // Bounded by the frame count: a pinned frame cannot be evicted, and a
         // caller that still holds a guard gets fewer frames dropped rather than

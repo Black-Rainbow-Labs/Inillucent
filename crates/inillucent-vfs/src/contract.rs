@@ -325,6 +325,27 @@ pub trait VfsFile: Send + Sync + Debug {
     /// Returns a value that is equal for two handles on the same file and
     /// different for handles on different files, even when the paths differ.
     fn file_identity(&self) -> VfsResult<FileIdentity>;
+
+    /// Returns the pages, at `page_size` bytes a page, whose bytes include the
+    /// bytes the locking protocol locks.
+    ///
+    /// **Such a page must never hold data.** The lock bytes start at the one
+    /// gigabyte mark, as SQLite's do, and on Windows a byte range lock is
+    /// mandatory: while another process holds a lock on those bytes, a read of
+    /// them fails with "another process has locked a portion of the file" and so
+    /// does a write. SQLite never allocates that page. inillucent did, so on
+    /// Windows a file larger than 1 GiB opened by two processes failed reads and
+    /// folds with `disk I/O error`, and a fold that failed part way through left
+    /// the file damaged.
+    ///
+    /// The default is the plain layout, where page `n` starts at `n * page_size`.
+    /// A file system that places pages elsewhere, such as the encrypting one,
+    /// answers for its own layout.
+    ///
+    /// @param page_size - the page size the caller lays pages out at
+    fn pages_under_the_lock_bytes(&self, page_size: u64) -> Vec<u64> {
+        crate::os::pages_under_the_lock_bytes(0, page_size.max(1))
+    }
 }
 
 /// A file's identity, used to recognise two names for the same file.

@@ -30,8 +30,8 @@ pub use hint::unanswerable_index_hint;
 use hint::{forced_path, index_usable, outer_terms, statement_terms};
 use partial::implies;
 use terms::{
-    collation_of, compares_unconverted, comparison_against_column, comparison_against_rowid,
-    comparison_collation, indexable_comparison,
+    collation_of, compares_unconverted, comparison_against_rowid, comparison_collation,
+    constant_in_list, indexable_comparison, virtual_constraint,
 };
 mod seek_union;
 
@@ -334,6 +334,20 @@ pub struct VirtualConstraint {
     pub value: BoundExpr,
     /// The whole predicate, for the compiler to re-test when it must.
     pub predicate: BoundExpr,
+    /// The values of `column IN (a, b, c)`, when that is what this constraint
+    /// came from, and empty otherwise.
+    ///
+    /// **An `IN` list is offered as `=`, and the engine runs the module's
+    /// `filter` once for each distinct value**, which is what SQLite does for a
+    /// virtual table. Before it was offered at all, `DELETE FROM docs WHERE rowid
+    /// IN (...)` on an `inillucent_search` table read every row of the table and
+    /// tested each one against the whole list: 4.94 s to delete 2,000 rows of
+    /// 120,000, where deleting them one statement at a time took a fraction of a
+    /// second. `value` holds the first item, so a module asked about the
+    /// constraint sees an ordinary `=`. The term stays among the statement's own
+    /// filters, so a module that ignores the constraint, or one the engine cannot
+    /// drive this way, still returns the right rows.
+    pub in_list: Vec<BoundExpr>,
 }
 
 impl AccessPath {
@@ -2102,6 +2116,7 @@ fn virtual_path(
             spec: crate::vtab::ConstraintSpec { column, op, usable },
             value,
             predicate: term.clone(),
+            in_list: Vec::new(),
         });
         // **Only a usable constraint is this term's to answer.** In `FROM
         // json_each(...) s, json_each(s.value) r`, `s` took `s.value = r.json`
@@ -2109,6 +2124,28 @@ fn virtual_path(
         // such a constraint as not usable and tests it at the later loop.
         if let Some(slot) = consumed.get_mut(index).filter(|_| usable) {
             *slot = true;
+        }
+    }
+    // **One `IN` list of constant values, offered as `=` and not consumed.** See
+    // `VirtualConstraint::in_list`. Only one, because the engine drives the
+    // module once per value of one list; two lists would need every pair.
+    if let Some((column, list, term)) = terms
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !consumed.get(*index).copied().unwrap_or(false))
+        .find_map(|(_, term)| constant_in_list(id, term).map(|(column, list)| (column, list, term)))
+    {
+        if let Some(first) = list.first().cloned() {
+            offer.push(VirtualConstraint {
+                spec: crate::vtab::ConstraintSpec {
+                    column,
+                    op: crate::vtab::ConstraintOp::Eq,
+                    usable: true,
+                },
+                value: first,
+                predicate: term.clone(),
+                in_list: list,
+            });
         }
     }
     let order_by = order_offer(id, position, select);
@@ -2150,61 +2187,6 @@ pub fn conjunction(filter: &BoundExpr) -> Vec<BoundExpr> {
     let mut terms = Vec::new();
     split_conjunction(filter, &mut terms);
     terms
-}
-
-/// Returns the column, operator and value when a term constrains this term.
-fn virtual_constraint(
-    id: usize,
-    table: &TableInfo,
-    term: &BoundExpr,
-) -> Option<(i32, crate::vtab::ConstraintOp, BoundExpr)> {
-    use crate::vtab::{ConstraintOp, ROWID_COLUMN};
-    // `x MATCH 'y'`, `x LIKE 'y'`, `x GLOB 'y'` and `x REGEXP 'y'` are the
-    // operators a module exists to give meaning to, so they are offered first.
-    if let BoundExpr::Pattern {
-        negated: false,
-        op,
-        operand,
-        pattern,
-        escape: None,
-    } = term
-    {
-        if let BoundExpr::Column { source, column, .. } = operand.as_ref() {
-            if *source == id {
-                let op = match op {
-                    crate::ast::PatternOp::Match => ConstraintOp::Match,
-                    crate::ast::PatternOp::Like => ConstraintOp::Like,
-                    crate::ast::PatternOp::Glob => ConstraintOp::Glob,
-                    crate::ast::PatternOp::Regexp => ConstraintOp::Regexp,
-                };
-                return Some((i32::from(*column), op, pattern.as_ref().clone()));
-            }
-        }
-    }
-    if let Some((op, value)) = comparison_against_rowid(id, term) {
-        return binary_constraint(op).map(|op| (ROWID_COLUMN, op, value));
-    }
-    for column in 0..table.columns.len() {
-        let column = column as u16;
-        if let Some((op, value)) = comparison_against_column(id, column, term) {
-            return binary_constraint(op).map(|op| (i32::from(column), op, value));
-        }
-    }
-    None
-}
-
-/// Returns the constraint operator one comparison offers, if any.
-fn binary_constraint(op: BinaryOp) -> Option<crate::vtab::ConstraintOp> {
-    use crate::vtab::ConstraintOp;
-    Some(match op {
-        BinaryOp::Equal => ConstraintOp::Eq,
-        BinaryOp::NotEqual => ConstraintOp::Ne,
-        BinaryOp::Less => ConstraintOp::Lt,
-        BinaryOp::LessEqual => ConstraintOp::Le,
-        BinaryOp::Greater => ConstraintOp::Gt,
-        BinaryOp::GreaterEqual => ConstraintOp::Ge,
-        _ => return None,
-    })
 }
 
 /// Returns how an UPDATE or a DELETE should find the rows it touches, with some

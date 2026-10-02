@@ -211,6 +211,99 @@ fn compares_with_null(left: &BoundExpr, right: &BoundExpr) -> bool {
     matches!(left, BoundExpr::Null) || matches!(right, BoundExpr::Null)
 }
 
+/// Returns the column, operator and value when a term constrains this term.
+pub(super) fn virtual_constraint(
+    id: usize,
+    table: &TableInfo,
+    term: &BoundExpr,
+) -> Option<(i32, crate::vtab::ConstraintOp, BoundExpr)> {
+    use crate::vtab::{ConstraintOp, ROWID_COLUMN};
+    // `x MATCH 'y'`, `x LIKE 'y'`, `x GLOB 'y'` and `x REGEXP 'y'` are the
+    // operators a module exists to give meaning to, so they are offered first.
+    if let BoundExpr::Pattern {
+        negated: false,
+        op,
+        operand,
+        pattern,
+        escape: None,
+    } = term
+    {
+        if let BoundExpr::Column { source, column, .. } = operand.as_ref() {
+            if *source == id {
+                let op = match op {
+                    crate::ast::PatternOp::Match => ConstraintOp::Match,
+                    crate::ast::PatternOp::Like => ConstraintOp::Like,
+                    crate::ast::PatternOp::Glob => ConstraintOp::Glob,
+                    crate::ast::PatternOp::Regexp => ConstraintOp::Regexp,
+                };
+                return Some((i32::from(*column), op, pattern.as_ref().clone()));
+            }
+        }
+    }
+    if let Some((op, value)) = comparison_against_rowid(id, term) {
+        return binary_constraint(op).map(|op| (ROWID_COLUMN, op, value));
+    }
+    for column in 0..table.columns.len() {
+        let column = column as u16;
+        if let Some((op, value)) = comparison_against_column(id, column, term) {
+            return binary_constraint(op).map(|op| (i32::from(column), op, value));
+        }
+    }
+    None
+}
+
+/// Returns the column and the values when a term is `rowid IN (values)` on
+/// this term, with every value known before the scan starts.
+///
+/// A value that reads any column is refused, so the list never depends on where
+/// the term sits in a join. `NOT IN` is refused because it is not an equality.
+/// Only the rowid, because a rowid compares as an integer and nothing else, so
+/// running the module once per value finds exactly the rows the list names;
+/// a declared column brings its own affinity and collation into the comparison.
+///
+/// @param id - the FROM term
+/// @param term - one conjunct of the WHERE clause
+pub(super) fn constant_in_list(id: usize, term: &BoundExpr) -> Option<(i32, Vec<BoundExpr>)> {
+    let BoundExpr::InList {
+        negated: false,
+        operand,
+        list,
+        ..
+    } = term
+    else {
+        return None;
+    };
+    if list.is_empty() {
+        return None;
+    }
+    let constant = |value: &BoundExpr| {
+        let mut used = Vec::new();
+        value.sources_used(&mut used);
+        used.is_empty()
+    };
+    if !list.iter().all(constant) {
+        return None;
+    }
+    if !matches!(operand.as_ref(), BoundExpr::Rowid { source } if *source == id) {
+        return None;
+    }
+    Some((crate::vtab::ROWID_COLUMN, list.clone()))
+}
+
+/// Returns the constraint operator one comparison offers, if any.
+pub(super) fn binary_constraint(op: BinaryOp) -> Option<crate::vtab::ConstraintOp> {
+    use crate::vtab::ConstraintOp;
+    Some(match op {
+        BinaryOp::Equal => ConstraintOp::Eq,
+        BinaryOp::NotEqual => ConstraintOp::Ne,
+        BinaryOp::Less => ConstraintOp::Lt,
+        BinaryOp::LessEqual => ConstraintOp::Le,
+        BinaryOp::Greater => ConstraintOp::Gt,
+        BinaryOp::GreaterEqual => ConstraintOp::Ge,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

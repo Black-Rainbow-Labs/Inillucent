@@ -177,4 +177,41 @@ impl Pool {
         page::write_u64(&mut bytes, at, Swip::unswizzled(page).raw())?;
         Ok(true)
     }
+
+    /// Rewrites every swizzled swip in a page image as the page id it names.
+    ///
+    /// This is TDD invariant 6, and it is the one place it can be enforced: the
+    /// frame-to-page mapping lives in the pool, so nothing above it could do
+    /// the translation even if it wanted to. Only interior pages carry swips,
+    /// which is checked rather than assumed - a leaf whose bytes happened to
+    /// resemble a slot array would otherwise be silently rewritten.
+    ///
+    /// @param image - the page image about to be written
+    pub(super) fn translate_swips(&self, image: &mut [u8]) -> DbResult<usize> {
+        if page::kind_of(image)? != PageKind::Interior {
+            return Ok(0);
+        }
+        let offsets = crate::interior::swip_offsets_of(image)?;
+        let state = self.state.borrow();
+        let mut translated = 0usize;
+        for offset in offsets {
+            let swip = Swip::from_raw(page::read_u64(image, offset)?);
+            let Some(frame) = swip.frame() else {
+                continue;
+            };
+            let page = state
+                .frames
+                .get(frame as usize)
+                .map(|meta| meta.page)
+                .ok_or_else(|| corrupt(format!("a swip names frame {frame}, which is not one")))?;
+            if page.is_none() {
+                return Err(corrupt(format!(
+                    "a swip names frame {frame}, which holds no page"
+                )));
+            }
+            page::write_u64(image, offset, Swip::unswizzled(page).raw())?;
+            translated = translated.saturating_add(1);
+        }
+        Ok(translated)
+    }
 }

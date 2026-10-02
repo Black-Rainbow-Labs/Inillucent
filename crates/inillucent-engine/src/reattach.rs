@@ -24,8 +24,8 @@ use inillucent_vfs::DbPath;
 use inillucent_wal::{Wal, WalOptions, FIRST_LSN};
 
 use crate::{
-    attach_catalog, let_the_pool_ask_the_log, read_catalog, ImportedDatabase, Recorded, MAIN,
-    SCHEMA_VIEW_ROOT,
+    attach_catalog, let_the_pool_ask_the_log, let_the_pool_spill, read_catalog, ImportedDatabase,
+    Recorded, MAIN, SCHEMA_VIEW_ROOT,
 };
 
 impl ImportedDatabase {
@@ -210,6 +210,7 @@ impl ImportedDatabase {
             .pool()
             .set_durable_lsn(self.storage.wal.write_ahead_point());
         let_the_pool_ask_the_log(self.storage.database.pool(), &self.storage.wal);
+        let_the_pool_spill(self.storage.database.pool(), &self.storage.vfs);
         self.rebuild_tables()?;
         self.refresh_catalog();
         Ok(())

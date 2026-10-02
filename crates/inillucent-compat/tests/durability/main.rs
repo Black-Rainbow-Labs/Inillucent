@@ -28,6 +28,7 @@ mod fault_sweep;
 mod faults;
 mod fold_protocol;
 mod free_map_checkpoint_crash;
+mod large_transactions;
 mod multi_database_crash;
 mod new_engine_free_map_recovery;
 mod new_engine_recovery_shapes;

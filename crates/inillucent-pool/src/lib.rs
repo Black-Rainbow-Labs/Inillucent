@@ -74,7 +74,7 @@ pub use interior::{InteriorBuilder, InteriorRef};
 pub use latch::{LatchState, VersionLatch, OPTIMISTIC_RETRIES};
 pub use meta::Meta;
 pub use page::{PageId, PageKind, PageSize, COMMON_HEADER};
-pub use pool::{FrameState, PageGuard, Pool, PoolStats};
+pub use pool::{FrameState, PageGuard, Pool, PoolStats, SpillOpener};
 pub use swip::Swip;
 
 /// The implementation phase that filled this crate in, as named by the TDD.

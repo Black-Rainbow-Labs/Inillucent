@@ -158,6 +158,7 @@ impl crate::ImportedDatabase {
         )?);
         database.pool().set_durable_lsn(wal.write_ahead_point());
         let_the_pool_ask_the_log(database.pool(), &wal);
+        let_the_pool_spill(database.pool(), &vfs);
 
         // Smallest tree first, so the physical pass takes the cheapest
         // structure that covers the query. Sorting by bytes rather than by
@@ -772,6 +773,33 @@ pub(crate) fn let_the_pool_ask_the_log(pool: &Pool, wal: &std::rc::Rc<Wal>) {
     pool.on_log_behind(std::rc::Rc::new(move || {
         held.sync()?;
         Ok(held.write_ahead_point())
+    }));
+}
+
+/// Tells a pool how to open the file it spills evicted dirty pages to.
+///
+/// **Registered wherever the log hook is**, because both are what a pool needs
+/// before a statement can dirty more pages than it holds. With it, a connection
+/// that holds the file without EXCLUSIVE writes such a page to a transient file
+/// of its own rather than to the database file, so a reader in another process
+/// keeps reading through a large transaction. See `inillucent_pool`'s
+/// `pool/spill.rs`.
+///
+/// The file is opened on the database's own file system, so an encrypted
+/// database's spill file is encrypted, and as a transient file, so it is deleted
+/// when it is closed and when the process ends.
+///
+/// @param pool - the pool that will spill
+/// @param vfs - the file system the database was opened on
+pub(crate) fn let_the_pool_spill(pool: &Pool, vfs: &std::sync::Arc<dyn inillucent_vfs::Vfs>) {
+    let vfs = std::sync::Arc::clone(vfs);
+    pool.on_spill(std::rc::Rc::new(move || {
+        let path = vfs.temp_path("spill").map_err(|why| why.into_db_error())?;
+        vfs.open(
+            &path,
+            inillucent_vfs::OpenOptions::of_kind(inillucent_vfs::FileKind::Transient),
+        )
+        .map_err(|why| why.into_db_error())
     }));
 }
 

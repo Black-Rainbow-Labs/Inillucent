@@ -508,6 +508,15 @@ impl VfsFile for CryptFile {
     }
 
     /// Passes the lock through; locks are on the file, not its contents.
+    /// Answers for this file's own layout, where a page is a unit and its trailer.
+    fn pages_under_the_lock_bytes(&self, page_size: u64) -> Vec<u64> {
+        // A page here is a unit, and a unit sits at `base + index * stride` with
+        // its trailer, so the lock bytes fall in whichever units span them. The
+        // caller's page size is the unit size for a database file.
+        let _ = page_size;
+        crate::os::pages_under_the_lock_bytes(self.base, self.layout.stride())
+    }
+
     fn lock(&self, level: FileLock) -> VfsResult<()> {
         self.inner.lock(level)
     }

@@ -671,6 +671,18 @@ const SETUP_PARAMS: &[Param] = &[
         description: "Install somewhere other than the per-user directory. INILLUCENT_HOME does the \
                       same thing for every command at once.",
     },
+    Param {
+        name: "from",
+        kind: Kind::Text,
+        required: false,
+        positional: false,
+        description: "Install the model or the reranker from a folder already on this machine \
+                      instead of downloading it, for a network that cannot reach Hugging Face. \
+                      Each file is found by its installed name or by its path in the Hugging \
+                      Face repository, such as onnx/model.onnx, and is checked against the \
+                      SHA-256 this build pins before anything is copied. One file missing or \
+                      different and nothing is installed. The runtime still downloads.",
+    },
     FORMAT,
 ];
 

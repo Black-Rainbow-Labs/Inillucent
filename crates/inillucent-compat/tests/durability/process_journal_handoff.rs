@@ -461,10 +461,10 @@ fn a_reader_that_replays_more_than_its_pool_leaves_nothing_to_undo() {
 /// early, and a reader that had the file open the whole time.
 ///
 /// Two small statements leave pages dirty in the writer's pool without filling
-/// it, so nothing is written early and no fold runs. A third statement touches
-/// every row: it fills the pool, writes the dirty pages of the first two to the
-/// file early and saves their old images to the journal. The writer is killed
-/// the moment the journal appears.
+/// it, so nothing is written early and no fold runs. A third statement, run
+/// under `locking_mode = exclusive`, touches every row: it fills the pool,
+/// writes the dirty pages of the first two to the file early and saves their old
+/// images to the journal. The writer is killed the moment the journal appears.
 ///
 /// A process that opens the file afterwards puts those images back before it
 /// reads anything, which is what `open` has always done. A reader that was
@@ -488,6 +488,15 @@ fn a_reader_that_was_open_settles_what_a_killed_writer_left() {
         "two small statements already left a journal; the case needs dirty pages that have \
          not been written yet"
     );
+    // **Exclusive, because that is the one way a statement still writes pages
+    // early.** A writer under `locking_mode = normal` holds the file without
+    // EXCLUSIVE, and the pages it cannot keep go to its own spill file, so the
+    // journal appears only when the fold after the commit writes the file. A
+    // kill at that moment leaves the third statement committed, which is the
+    // right answer for a different case. Under `exclusive` the statement holds
+    // EXCLUSIVE and writes its pages to the file early with their old images in
+    // the journal, which is the state this case settles.
+    writer.ask("PRAGMA locking_mode = exclusive;");
     writer.send("UPDATE t SET pad = randomblob(3072), v = v + 1000;");
     let started = std::time::Instant::now();
     while !journal.exists() {

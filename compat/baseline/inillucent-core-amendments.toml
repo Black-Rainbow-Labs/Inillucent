@@ -212,9 +212,9 @@ sha256 = "ef2b935a4f7ec6a35b8755f758e11eb863dc37fb28f7abeda781f3b9154c2e0d"
 
 [[amendment]]
 path = "crates/inillucent-core/src/hnsw.rs"
-ticket = "task-2168"
-reason = "task-2068 read the neighbour list through binio::read_pod_vec rather than reserving from a raw u32 off disk, after a fuzz target found 14 GB asked for from a 21 byte input. task-2168 builds the graph of the filtered recall test with one thread, so the test grades the same graph on every machine; the jira recall was 0.895 on a two processor GitHub runner. No change outside the tests."
-sha256 = "3b630c90a0a224ab39decdf4f77193358d3f9bd62cdd217a2ec388a13c53371e"
+ticket = "task-2169"
+reason = "task-2068 read the neighbour list through binio::read_pod_vec rather than reserving from a raw u32 off disk, after a fuzz target found 14 GB asked for from a 21 byte input. task-2168 builds the graph of the filtered recall test with one thread, so the test grades the same graph on every machine; the jira recall was 0.895 on a two processor GitHub runner. task-2169 keeps recording on the parallel path of Hnsw::insert_batch: publish_neighbours and link_locked report whether a list changed, and insert_range_locked collects the touched lists and adds them to the recording. The recording used to force the sequential loop, which made a search table merge one graph insert at a time on one core once the merge folded a whole segment in one batch; a merge commit of 8,000 chunks of 768 numbers took 13 to 21 s. A caller that does not record gets the same parallel path as before. inillucent-core's 286 tests pass unchanged."
+sha256 = "4f7f5de8ef8a032a4b1c63ae71a3dee623c315263f3ac51ffde5ef4b59abfc26"
 
 [[amendment]]
 path = "crates/inillucent-core/src/index.rs"

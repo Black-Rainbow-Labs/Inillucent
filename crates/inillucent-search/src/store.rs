@@ -150,6 +150,10 @@ pub mod state {
     /// comment describes - except during a crisis merge, which is allowed to
     /// spend past it on purpose.
     pub const MERGE_WORK: &str = "merge_work";
+    /// Where each generation's rows are in `%_gen`: its id, the rowid of its
+    /// first row and how many rows it took, so a segment is read by rowid
+    /// rather than by reading the whole table. See `Store::read_generation`.
+    pub const GEN_ROWS: &str = "gen_rows";
 }
 
 /// One immutable segment of a search index's built structure.
@@ -595,7 +599,8 @@ impl Store {
         generation: i64,
         bytes: &[u8],
     ) -> DbResult<()> {
-        let mut next = self.tables.max_rowid(context, b"gen")?.saturating_add(1);
+        let first = self.tables.max_rowid(context, b"gen")?.saturating_add(1);
+        let mut next = first;
         for (ordinal, chunk) in bytes.chunks(CHUNK).enumerate() {
             self.tables.write_row(
                 context,
@@ -610,11 +615,159 @@ impl Store {
             )?;
             next = next.saturating_add(1);
         }
-        Ok(())
+        // Where the rows went, so reading them back is a read by rowid rather
+        // than a read of the whole table. See `read_generation`.
+        self.note_generation_rows(context, generation, first, next.saturating_sub(first))
     }
 
     /// Reads one generation's bytes back, or nothing when it is not there.
+    ///
+    /// **Read by rowid, from where [`state::GEN_ROWS`] says the rows are.** This
+    /// read every row of `%_gen` to find one generation's, and each row is a blob
+    /// of up to 512 KiB, so loading one segment read the whole table: on a table
+    /// of 120,000 rows of 768 numbers `%_gen` held 1,953 rows, about 1 GB, and
+    /// any scan of it took a second where reading one row by rowid takes under
+    /// one millisecond. A merge loads several segments a commit and a first
+    /// search loads every live one, which is what made some commits take 30 to
+    /// 40 s and a first search on a table with many segments take minutes.
+    ///
+    /// Every row read back is checked: its generation and its ordinal have to be
+    /// the ones the map promised. A table an older release wrote has no map, and
+    /// a map an older release left behind can name rows that have since changed;
+    /// either way this reads the whole table instead, as it always did.
+    /// @param context - the module's reach into the database
+    /// @param generation - the generation to read
     pub fn read_generation(
+        &self,
+        context: &mut Context<'_>,
+        generation: i64,
+    ) -> DbResult<Option<Vec<u8>>> {
+        if let Some(bytes) = self.read_generation_by_rowid(context, generation)? {
+            return Ok(Some(bytes));
+        }
+        self.read_generation_by_scan(context, generation)
+    }
+
+    /// Reads one generation's rows by rowid, from the map, and returns their
+    /// bytes when every row is the one the map named.
+    ///
+    /// `None` means the map could not vouch for the rows, never that the
+    /// generation is absent; the caller then reads the whole table.
+    /// @param context - the module's reach into the database
+    /// @param generation - the generation to read
+    fn read_generation_by_rowid(
+        &self,
+        context: &mut Context<'_>,
+        generation: i64,
+    ) -> DbResult<Option<Vec<u8>>> {
+        let Some(map) = self.generation_rows(context)? else {
+            return Ok(None);
+        };
+        let Some(&(_, first, parts)) = map.iter().find(|(held, _, _)| *held == generation) else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        for ordinal in 0..parts {
+            let Some(values) =
+                self.tables
+                    .read_row(context, b"gen", first.saturating_add(ordinal))?
+            else {
+                return Ok(None);
+            };
+            let same_generation = values.get(1).and_then(Value::as_integer) == Some(generation);
+            let same_ordinal = values.get(2).and_then(Value::as_integer) == Some(ordinal);
+            let Some(blob) = values.get(3).and_then(Value::as_blob) else {
+                return Ok(None);
+            };
+            if !same_generation || !same_ordinal {
+                return Ok(None);
+            }
+            bytes.extend_from_slice(blob.raw());
+        }
+        Ok(Some(bytes))
+    }
+
+    /// Reads the map of where each generation's rows are, or `None` when the
+    /// table has none.
+    /// @param context - the module's reach into the database
+    fn generation_rows(&self, context: &mut Context<'_>) -> DbResult<Option<Vec<(i64, i64, i64)>>> {
+        let Some(bytes) = self.state_blob(context, state::GEN_ROWS)? else {
+            return Ok(None);
+        };
+        Ok(Some(decode_generation_rows(&bytes)))
+    }
+
+    /// Records where one generation's rows went, building the map from the
+    /// table first when an older release left none.
+    /// @param context - the module's reach into the database
+    /// @param generation - the generation just written
+    /// @param first - the rowid of its first row
+    /// @param parts - how many rows it took
+    fn note_generation_rows(
+        &self,
+        context: &mut Context<'_>,
+        generation: i64,
+        first: i64,
+        parts: i64,
+    ) -> DbResult<()> {
+        let mut map = match self.generation_rows(context)? {
+            Some(map) => map,
+            None => self.generation_rows_by_scan(context, generation)?,
+        };
+        map.retain(|(held, _, _)| *held != generation);
+        map.push((generation, first, parts));
+        self.set_state_blob(context, state::GEN_ROWS, &encode_generation_rows(&map))
+    }
+
+    /// Builds the map of where each generation's rows are by reading the whole
+    /// table, once, for a table an older release wrote.
+    ///
+    /// Only a generation whose rows are one run of consecutive rowids with
+    /// ordinals counting from zero is put in the map. Anything else is left out,
+    /// and [`Self::read_generation`] reads it the slow way.
+    /// @param context - the module's reach into the database
+    /// @param skip - a generation to leave out, because the caller is writing it
+    fn generation_rows_by_scan(
+        &self,
+        context: &mut Context<'_>,
+        skip: i64,
+    ) -> DbResult<Vec<(i64, i64, i64)>> {
+        let mut rows: Vec<(i64, i64, i64)> = Vec::new();
+        self.tables.scan(context, b"gen", |rowid, values| {
+            let generation = values.get(1).and_then(Value::as_integer);
+            let ordinal = values.get(2).and_then(Value::as_integer);
+            if let (Some(generation), Some(ordinal)) = (generation, ordinal) {
+                rows.push((generation, rowid, ordinal));
+            }
+            Ok(true)
+        })?;
+        rows.sort_unstable();
+        let mut map: Vec<(i64, i64, i64)> = Vec::new();
+        let mut at = 0usize;
+        while let Some(&(generation, first, _)) = rows.get(at) {
+            let run: Vec<&(i64, i64, i64)> = rows
+                .iter()
+                .skip(at)
+                .take_while(|(held, _, _)| *held == generation)
+                .collect();
+            let whole = run.iter().enumerate().all(|(offset, (_, rowid, ordinal))| {
+                *ordinal == offset as i64 && *rowid == first.saturating_add(offset as i64)
+            });
+            if whole && generation != skip {
+                map.push((generation, first, run.len() as i64));
+            }
+            at = at.saturating_add(run.len().max(1));
+        }
+        Ok(map)
+    }
+
+    /// Reads one generation's bytes by reading every row of `%_gen`.
+    ///
+    /// The fallback for [`Self::read_generation`], for a table whose rows the
+    /// seek cannot vouch for.
+    /// @param context - the module's reach into the database
+    /// @param generation - the generation to read
+    fn read_generation_by_scan(
         &self,
         context: &mut Context<'_>,
         generation: i64,
@@ -691,6 +844,11 @@ impl Store {
         let removed = doomed.len();
         for rowid in doomed {
             self.tables.delete_row(context, b"gen", rowid)?;
+        }
+        // The map keeps only what is still there.
+        if let Some(mut map) = self.generation_rows(context)? {
+            map.retain(|(generation, _, _)| keep.contains(generation));
+            self.set_state_blob(context, state::GEN_ROWS, &encode_generation_rows(&map))?;
         }
         Ok(removed)
     }
@@ -799,6 +957,41 @@ impl Store {
             &[Value::owned_text(state::MERGE.as_bytes())?],
         )
     }
+}
+
+/// Returns the bytes the map of where each generation's rows are is stored as:
+/// three little endian integers per generation.
+/// @param map - generation, first rowid, rows, for each generation
+fn encode_generation_rows(map: &[(i64, i64, i64)]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(map.len().saturating_mul(24));
+    for (generation, first, parts) in map {
+        bytes.extend_from_slice(&generation.to_le_bytes());
+        bytes.extend_from_slice(&first.to_le_bytes());
+        bytes.extend_from_slice(&parts.to_le_bytes());
+    }
+    bytes
+}
+
+/// Reads the map [`encode_generation_rows`] writes. A short tail is ignored,
+/// which leaves out a generation rather than inventing one; reading it falls
+/// back to the whole table.
+/// @param bytes - the stored map
+fn decode_generation_rows(bytes: &[u8]) -> Vec<(i64, i64, i64)> {
+    let number = |at: &[u8]| -> i64 {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(at);
+        i64::from_le_bytes(word)
+    };
+    bytes
+        .chunks_exact(24)
+        .map(|entry| {
+            (
+                number(entry.get(0..8).unwrap_or(&[0; 8])),
+                number(entry.get(8..16).unwrap_or(&[0; 8])),
+                number(entry.get(16..24).unwrap_or(&[0; 8])),
+            )
+        })
+        .collect()
 }
 
 /// Encodes the segment manifest as a fixed-width blob.

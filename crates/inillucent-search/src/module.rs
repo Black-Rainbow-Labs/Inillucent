@@ -343,7 +343,17 @@ impl SearchTable {
             "rebuild" => self.rebuild(context),
             "drop-old-generations" => {
                 let live = merge::live_segments(context, &self.store)?;
-                let mut ids: Vec<i64> = live.iter().map(|segment| segment.id).collect();
+                // **Every link of every live segment, not only its own id.** A
+                // merge that took more than one commit leaves a segment that is
+                // a chain: its id names the last link, and each link names the
+                // one before it, back to the merge's first input. Keeping only
+                // the ids the manifest names deleted every earlier link, and the
+                // table could not be read again: `segment 42 is unreadable` on a
+                // table of 40 rows after one `drop-old-generations`.
+                let mut ids: Vec<i64> = Vec::new();
+                for segment in &live {
+                    ids.extend(merge::chain_ids(context, &self.store, segment.id)?);
+                }
                 // Every in-flight merge's checkpoint is a real segment that
                 // is not yet named by the manifest - dropping one here would
                 // strand its `state::MERGE` entry pointing at a `%_gen` id no
@@ -595,6 +605,15 @@ impl SearchTable {
             if !crisis && budget == 0 {
                 break;
             }
+            // **A commit that has already merged something starts another merge
+            // only when its first fold fits what is left.** A merge folds at
+            // least one input whatever the budget, so that it always moves; two
+            // merges each doing that in one commit was a level zero merge of
+            // 6,000 chunks and a level one fold of 8,000 in the same commit,
+            // against a budget of 8,192.
+            if !crisis && spent > 0 && first_fold_cost(&segments, level, &claimed) > budget {
+                break;
+            }
             let mut state = self.begin_merge(context, level, &claimed)?;
             if self.continue_merge(context, &mut state, &mut budget, &mut spent, crisis)? {
                 self.finish_merge(context, state)?;
@@ -713,9 +732,6 @@ impl SearchTable {
         let mut batches: Vec<inillucent_core::persist::DeltaBatch> = Vec::new();
         let mut folded_any = false;
         while state.folded < state.inputs.len() {
-            if folded_any && !crisis && *budget == 0 {
-                break;
-            }
             // The loop's own condition proves the index is in range; `get`
             // says it in the form the compiler keeps true (task-1932, H9 -
             // reported once `inillucent-ext` was made to deny the four lints,
@@ -723,6 +739,13 @@ impl SearchTable {
             let Some(input) = state.inputs.get(state.folded).cloned() else {
                 break;
             };
+            // **A fold after the first has to fit what is left of the budget.**
+            // This stopped only once the budget reached exactly zero, so with
+            // 192 chunks left a merge folded another input of 8,000: one commit
+            // folded 16,000 chunks against a budget of 8,192 and took 13 s.
+            if folded_any && !crisis && input.chunks.max(0) as u64 > *budget {
+                break;
+            }
             let segment = merge::load_segment(context, &self.store, &self.options, input.id)?;
             let (_inserted, recorded) =
                 merge::fold_segment_recording(&mut accumulator, &segment, &input.tombstoned)?;
@@ -944,6 +967,24 @@ impl SearchTable {
         self.cache.forget();
         Ok(())
     }
+}
+
+/// Returns how many chunks the first fold of a new merge at a level would
+/// cost: the second oldest unclaimed segment there, because the oldest becomes
+/// the accumulator for nothing.
+/// @param segments - the live segments
+/// @param level - the level a merge would collapse
+/// @param claimed - segment ids a merge in progress already owns
+fn first_fold_cost(segments: &[SegmentMeta], level: i32, claimed: &BTreeSet<i64>) -> u64 {
+    let mut unclaimed: Vec<&SegmentMeta> = segments
+        .iter()
+        .filter(|segment| segment.level == level && !claimed.contains(&segment.id))
+        .collect();
+    unclaimed.sort_by_key(|segment| segment.covers_from);
+    unclaimed
+        .get(1)
+        .map(|segment| segment.chunks.max(0) as u64)
+        .unwrap_or(0)
 }
 
 /// Returns how many segments a manifest holds at one level.

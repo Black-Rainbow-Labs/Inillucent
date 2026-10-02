@@ -202,7 +202,7 @@ impl crate::ImportedDatabase {
         // precisely because the transaction does not commit. Doing it before
         // `reload_entries` runs is what stops the walk it does reaching a tree
         // that is on its way out.
-        self.release_built_trees(built_floor)?;
+        self.release_built_trees(built_floor, txn)?;
         let held = self.writing.undo().borrow().len();
         self.writing
             .marks()
@@ -530,7 +530,15 @@ impl crate::ImportedDatabase {
         // was always put back correctly, and the module's own buffer was not.
         self.session_state.modules_begun.set(false);
         let told = self.rollback_modules(None);
+        let txn = self.current_txn();
         let undone = self.undo_to(None);
+        // **A finished rollback is committed, as a change that changes no row.**
+        // See `commit_the_undo`. Skipped when the undo failed part way, because
+        // committing half an undo would make half a transaction durable.
+        let committed = match undone {
+            Ok(()) => self.commit_the_undo(txn, self.writing.touched()),
+            Err(_) => Ok(()),
+        };
         self.writing.marks().borrow_mut().clear();
         // `undo_to(None)` has already cut it to zero; clearing it again is what
         // makes that true even when the undo above failed part-way. An
@@ -560,8 +568,44 @@ impl crate::ImportedDatabase {
         self.pragmas.set_defer_foreign_keys(false);
         self.refresh_catalog();
         undone?;
+        committed?;
         told?;
         Ok(())
+    }
+
+    /// Writes a commit record for a transaction whose undo has just finished.
+    ///
+    /// **Recovery replays only a transaction whose commit record it finds, and
+    /// a rollback used to leave none.** The undo puts rows back through the tree,
+    /// so a page split or a new page the transaction made stays in the tree with
+    /// different rows in it, and the next transaction this connection commits
+    /// writes into those pages. The undo is logged under the rolled back
+    /// transaction, so with no commit record a replay skipped the transaction and
+    /// its undo together and never learned those pages exist. A replay of the
+    /// next commit then read a page the file did not have (`read 0 of 32768 bytes
+    /// at <the file's size>`) or changed an older copy of it (`row N missing from
+    /// index`), and a fold wrote that into the file. Measured on 2.0.4: an
+    /// `UPDATE` of 20,000 indexed rows committed, the same rolled back, the same
+    /// committed, then the process ended without closing, and the file would not
+    /// open again (`page 7565 checksum 00000000`). The replay that goes wrong is
+    /// the next open after a crash, or another process catching up on the log.
+    ///
+    /// With the commit record a replay applies the transaction's records and then
+    /// their undo, in log order, and arrives at the pages this connection has. The
+    /// rows end where they began, so nothing the transaction wrote becomes
+    /// visible. A crash before the record lands still loses the transaction and
+    /// its undo together, which is also correct: the pages they made died with
+    /// the process.
+    ///
+    /// A transaction that wrote nothing has nothing to commit.
+    ///
+    /// @param txn - the transaction that was rolled back
+    /// @param participants - the schemas it wrote
+    pub(crate) fn commit_the_undo(&mut self, txn: u64, participants: u16) -> DbResult<()> {
+        if participants == 0 {
+            return Ok(());
+        }
+        self.commit_across(txn, participants)
     }
 
     /// Names a point the transaction can be rolled back to.
@@ -665,7 +709,7 @@ impl crate::ImportedDatabase {
     /// there to walk.
     ///
     /// @param floor - how long the list was when the abandoned part began
-    fn release_built_trees(&mut self, floor: usize) -> DbResult<()> {
+    fn release_built_trees(&mut self, floor: usize, txn: u64) -> DbResult<()> {
         let abandoned: Vec<crate::engine::state::BuiltTree> = {
             let mut built = self.writing.built().borrow_mut();
             if built.len() <= floor {
@@ -702,7 +746,17 @@ impl crate::ImportedDatabase {
                 self.session_state.owner.remove(&tree.root);
             }
             for reference in released.values {
-                self.free_built_value(at, reference)?;
+                self.free_built_value(at, reference, txn)?;
+            }
+            // **Logged, because a finished rollback is now committed** (see
+            // `commit_the_undo`). The build's own records claim these pages, so a
+            // replay of the committed undo has to free them again or the file
+            // comes back with pages allocated that nothing reaches.
+            let wal = self
+                .log_of(at)
+                .ok_or_else(|| refusal("a rollback names a database that is not attached"))?;
+            for page in &released.pages {
+                wal.append(txn, inillucent_wal::record::Body::FreePage { page: page.0 })?;
             }
             let session = self.session_state.session.get();
             let database = file_of(
@@ -735,6 +789,7 @@ impl crate::ImportedDatabase {
         &mut self,
         at: usize,
         reference: inillucent_pool::extent::ExtentRef,
+        txn: u64,
     ) -> DbResult<()> {
         let wal = self
             .log_of(at)
@@ -743,8 +798,9 @@ impl crate::ImportedDatabase {
         let mut log = WalLog {
             wal,
             // The records this writes belong to the transaction being
-            // abandoned, so nothing replays them - see `release_built_trees`.
-            txn: self.current_txn(),
+            // abandoned, whose finished undo is committed - see
+            // `commit_the_undo`.
+            txn,
             schema: at,
             wrote: false,
             undo: None,

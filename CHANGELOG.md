@@ -10,6 +10,71 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**Six problems a user of 2.0.4 reported, fixed, and five more found while fixing them.** Each was
+reproduced first, with the user's own scripts where there were scripts, and every number below was
+measured with the same script before and after.
+
+- **A file could be damaged after a process was stopped, when another process had it open.** A
+  `ROLLBACK`, or a statement undone after it failed, puts rows back through the B+trees, so the page
+  splits the transaction made stay in place, and the next transaction writes into those pages. No
+  commit record followed the undo, so a replay of the log skipped the transaction and its undo and
+  did not know those pages existed. The replay that goes wrong is the next open after a crash, or
+  another process catching up on the log; both happen when a writer is stopped while a reader keeps
+  it from folding. The next open failed with `read 0 of 32768 bytes at` the file's size, or applied
+  rows to an older copy of a page (`row 7766 missing from index`), and a fold then wrote that into
+  the file. Reproduced in one process with no signal at all: commit, roll back, commit, exit without
+  closing, and 2.0.4 cannot open the file. A finished rollback now ends with a commit record, so the
+  replay applies the transaction and its undo together. Killing a background job and a search
+  service at random moments, in the shape of the user's workload, left a file that would not open in
+  5 of 19 rounds on 2.0.4 and in none of 12 rounds now.
+- **A connection whose replay of the log failed part way could fold what it had replayed.** It now
+  drops every page the failed replay produced, so the file never takes a half applied log.
+- **A reader waited for a write transaction larger than about 50 MiB, and then failed with `busy`.**
+  A transaction whose changed pages outgrew the writer's page cache wrote them into the database
+  file early, which needs the EXCLUSIVE lock, and kept that lock until it committed. Such a page now
+  goes to a spill file the writer owns: a temporary file deleted when it is closed or when the
+  process ends, encrypted with a key of its own when the database is encrypted. The database file is
+  written only by a fold. With the user's script, a reader beside transactions of 10,000 to 60,000
+  rows of 3 KB values reads in 0.04 to 0.23 s where it failed after its three second timeout from
+  20,000 rows on.
+- **Deleting rows from a search table by rowid was slow.** `rowid IN (...)` on a virtual table read
+  every row and tested it against the whole list. The list is now offered to the module as `=` and
+  the module runs once per value. Deleting 2,000 rowids of 120,000 took 4.94 s and takes 0.12 s.
+- **`id IN (...)` with more than 512 values scanned the table**, on any table. The union of seeks
+  that answers a list was built for at most 512 values, and a longer list tested every row against
+  all of them: 2,000 ids on a table of 120,000 rows took 3.85 s and take 0.066 s. A list of up to
+  100,000 values is now sought by key. This is most of the time the user's `INSERT INTO ...
+  SELECT ... WHERE c.id IN (...)` took, which went from 4.29 s to 0.114 s on the same shape.
+- **A reader's first search after another process wrote the search table was slow.** The reader
+  applied each changed row to its cached index one at a time, one graph insert at a time on one
+  core. The changes now go in as one batch on every core: 3.26 s became 0.52 s after 2,000 changed
+  rows, and 0.94 s became 0.15 s after 500.
+- **With default options, some commits to a search table took 30 to 40 seconds.** Three causes.
+  Loading one segment read every row of `%_gen`, each a blob of up to 512 KiB, about 1 GB on a table
+  of 120,000 rows of 768 numbers; a segment is now read by rowid from a map the table keeps in
+  `%_state`. Folding a segment into a merge inserted one document at a time on one core; it is one
+  batch on every core now. And one commit could fold twice its `merge_budget`; a second fold now has
+  to fit what is left. With the user's script the commits that merge took 13.7, 17.7 and 21.3 s on
+  this machine and take 2.1, 2.8 and 3.3 s. The first search in a new process over a table of
+  120,000 rows held in many segments took 420.6 s and takes 24.2 s.
+- **`drop-old-generations` made a search table unreadable.** A merge that takes more than one
+  commit leaves a segment stored as a chain of links, and the command kept only the last link: every
+  later query failed with `segment N is unreadable`. It keeps every link of every live segment now.
+  `rebuild` repairs a table an earlier version damaged this way.
+- **On Windows, a file larger than 1 GiB that two processes had open failed reads with `disk I/O
+  error`.** The locking protocol locks bytes at 1 GiB, as SQLite does, and Windows stops every other
+  handle from reading or writing locked bytes. SQLite never puts data in that page. inillucent did;
+  the free map now never hands that page out. A file an older release wrote keeps what it already
+  stores there.
+- **`inillucent setup-embeddings model --from <folder>`**, and the same for `reranker`, installs
+  from a folder already on the machine, for a network that cannot reach Hugging Face. Each file is
+  found by its installed name or by its path in the repository, such as `onnx/model.onnx`, and is
+  checked against the size and SHA-256 this release pins before anything is copied. One file missing
+  or different and nothing is installed.
+
+The new durability suite `large_transactions` runs a reader beside a transaction larger than the
+page cache, and kills a writer after a rollback and a commit. Both fail on 2.0.4.
+
 **The GitHub tests ran again, and a release now waits for them.** From 2026-09-24 the tests
 workflow was not valid YAML, so GitHub ran no job on either repository, and 1.0.30 to 2.0.4 were
 released without a CI result. The workflow parses again, and what the week without CI let through is

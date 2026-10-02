@@ -44,6 +44,9 @@ pub struct FreeMap {
     pages: Vec<(PageId, Vec<u8>)>,
     /// Where the next allocation scan begins, as a global page index.
     hint: u64,
+    /// Pages that may never be handed out, because the locking protocol locks
+    /// bytes inside them. See `VfsFile::pages_under_the_lock_bytes`.
+    reserved: Vec<u64>,
 }
 
 impl FreeMap {
@@ -55,7 +58,30 @@ impl FreeMap {
             page_size,
             pages: Vec::new(),
             hint: 0,
+            reserved: Vec::new(),
         }
+    }
+
+    /// Returns the same map, never handing out `pages`.
+    ///
+    /// **The pages under the lock bytes** (see
+    /// `VfsFile::pages_under_the_lock_bytes`). They read as allocated whatever
+    /// their bit says, so no allocation and no run ever includes one, and the
+    /// file grows past them. A file an older release wrote may already hold data
+    /// in one; that page keeps its data, and once it is freed it is never
+    /// handed out again.
+    ///
+    /// @param pages - the page numbers to hold back
+    pub fn reserving(mut self, pages: Vec<u64>) -> FreeMap {
+        self.reserved = pages;
+        self
+    }
+
+    /// Reports whether a page is held back because the lock bytes are in it.
+    ///
+    /// @param page - the page to test
+    pub fn is_reserved(&self, page: PageId) -> bool {
+        self.reserved.contains(&page.0)
     }
 
     /// Returns how many map pages the chain holds.
@@ -117,6 +143,9 @@ impl FreeMap {
     ///
     /// @param page - the page to test
     pub fn is_allocated(&self, page: PageId) -> bool {
+        if self.is_reserved(page) {
+            return true;
+        }
         let (map, byte, mask) = self.locate(page);
         match self.pages.get(map).and_then(|(_, bytes)| bytes.get(byte)) {
             Some(value) => value & mask != 0,
@@ -173,7 +202,11 @@ impl FreeMap {
         let per = pages_per_map(self.page_size).max(1) as u64;
         let mut created = Vec::new();
         while (self.pages.len() as u64).saturating_mul(per) < pages.max(*next_page) {
-            // The map page is itself a page of the file, taken from the end.
+            // The map page is itself a page of the file, taken from the end -
+            // but never a page the lock bytes are in.
+            while self.reserved.contains(next_page) {
+                *next_page = next_page.saturating_add(1);
+            }
             let id = PageId(*next_page);
             *next_page = next_page.saturating_add(1);
             let mut bytes = vec![0u8; self.page_size];
@@ -267,6 +300,60 @@ mod tests {
         let mut next = crate::meta::FIRST_DATA_PAGE.0;
         map.ensure(pages, &mut next).unwrap();
         (map, next)
+    }
+
+    /// **A page under the lock bytes is never handed out**, alone or inside a
+    /// run, and freeing it does not make it available. On Windows a byte range
+    /// lock blocks other handles from reading or writing those bytes, so a page
+    /// holding data there fails reads with `disk I/O error` while another
+    /// process has the file open.
+    #[test]
+    fn a_page_under_the_lock_bytes_is_never_handed_out() {
+        let mut map = FreeMap::new(512).reserving(vec![40]);
+        let mut next = crate::meta::FIRST_DATA_PAGE.0;
+        map.ensure(200, &mut next).unwrap();
+        let mut handed = Vec::new();
+        while let Some(page) = map.allocate_run(1).unwrap() {
+            handed.push(page.0);
+            if handed.len() > 400 {
+                break;
+            }
+        }
+        assert!(!handed.contains(&40), "page 40 was handed out: {handed:?}");
+        assert!(map.is_reserved(PageId(40)));
+        map.free(PageId(40)).unwrap();
+        assert!(
+            map.is_allocated(PageId(40)),
+            "a freed reserved page still reads as taken"
+        );
+
+        let mut runs = FreeMap::new(512).reserving(vec![40]);
+        let mut next = crate::meta::FIRST_DATA_PAGE.0;
+        runs.ensure(200, &mut next).unwrap();
+        while let Some(first) = runs.allocate_run(7).unwrap() {
+            assert!(
+                !(first.0..first.0 + 7).contains(&40),
+                "a run starting at {} spans the reserved page",
+                first.0
+            );
+            if first.0 > 300 {
+                break;
+            }
+        }
+    }
+
+    /// A map page is never placed on a page under the lock bytes either.
+    #[test]
+    fn a_map_page_skips_the_page_under_the_lock_bytes() {
+        let mut map = FreeMap::new(512).reserving(vec![2]);
+        let mut next = crate::meta::FIRST_DATA_PAGE.0;
+        map.ensure(100, &mut next).unwrap();
+        assert_eq!(
+            map.first(),
+            PageId(3),
+            "the map page moved past the reserved page"
+        );
+        assert!(map.is_allocated(PageId(2)));
     }
 
     /// One map page describes the whole page minus the header, eight pages per

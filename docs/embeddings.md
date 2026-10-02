@@ -96,7 +96,25 @@ the command to install what is missing.
 | `--force` | downloads and installs again even when the files are present and their digests match |
 | `--onnxruntime-version <version>` | installs another ONNX Runtime version. A version with no digest in the source is installed and reported as unverified |
 | `--dir <path>` | installs somewhere other than the folder in your user profile |
+| `--from <folder>` | installs the model or the reranker from a folder already on this machine instead of downloading it. See [Installing without Hugging Face](#installing-without-hugging-face) |
 | `--output json` | prints the result as JSON |
+
+### Installing without Hugging Face
+
+A network that blocks `huggingface.co` cannot download the model. Copy the model's files to the
+machine some other way, then point `--from` at the folder:
+
+```sh
+inillucent setup-embeddings model --from /path/to/nomic-embed-text-v1.5
+inillucent setup-embeddings reranker --from /path/to/gte-reranker-modernbert-base
+```
+
+Each file is found under the name it is installed as, such as `model.onnx`, or under its path in the
+Hugging Face repository, such as `onnx/model.onnx`, so a folder of installed files and a clone of
+the repository both work. Every file is checked against the size and SHA-256 this release pins
+before any file is copied. One file missing or different, and the command names it, prints both
+digests, and installs nothing. ONNX Runtime comes from GitHub and is still downloaded:
+`setup-embeddings all --from <folder>` downloads the runtime and copies the model.
 
 ### Where the files go
 

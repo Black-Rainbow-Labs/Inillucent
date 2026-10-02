@@ -124,6 +124,7 @@ pub(super) fn rowid_union_keys(
     params: &Params,
 ) -> DbResult<Vec<Vec<OwnedDatum>>> {
     let mut seen: Vec<Vec<OwnedDatum>> = Vec::with_capacity(keys.len());
+    let mut identities = std::collections::HashSet::with_capacity(keys.len());
     for expr in keys {
         let value = vec![constant_value(
             expr,
@@ -131,11 +132,48 @@ pub(super) fn rowid_union_keys(
             params,
             Some(Affinity::Integer),
         )?];
-        if !seen.contains(&value) {
+        if identities.insert(key_identity(&value)) {
             seen.push(value);
         }
     }
     Ok(seen)
+}
+
+/// Returns bytes that are equal for two keys exactly when the keys are equal.
+///
+/// **What lets a long `IN` list be folded in linear time.** The keys were
+/// folded by comparing each with every key kept so far, which is quadratic,
+/// and a list of tens of thousands of ids made that the slowest part of the
+/// statement. Equal here means what `OwnedDatum`'s `==` means: the same kind
+/// and the same value, with `0.0` and `-0.0` one value.
+///
+/// @param key - the key's values, one per column it compares
+fn key_identity(key: &[OwnedDatum]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(key.len().saturating_mul(9));
+    for value in key {
+        match value {
+            OwnedDatum::Null => bytes.push(0),
+            OwnedDatum::Int(number) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&number.to_le_bytes());
+            }
+            OwnedDatum::Real(number) => {
+                bytes.push(2);
+                let number = if *number == 0.0 { 0.0f64 } else { *number };
+                bytes.extend_from_slice(&number.to_bits().to_le_bytes());
+            }
+            OwnedDatum::Text(text) | OwnedDatum::Blob(text) => {
+                bytes.push(if matches!(value, OwnedDatum::Text(_)) {
+                    3
+                } else {
+                    4
+                });
+                bytes.extend_from_slice(&(text.len() as u64).to_le_bytes());
+                bytes.extend_from_slice(text);
+            }
+        }
+    }
+    bytes
 }
 
 /// Returns the keys an index seek union's equality branches probe, evaluated
@@ -159,6 +197,7 @@ pub(super) fn index_union_keys(
     params: &Params,
 ) -> DbResult<Vec<Vec<OwnedDatum>>> {
     let mut seen: Vec<Vec<OwnedDatum>> = Vec::with_capacity(branches.len());
+    let mut identities = std::collections::HashSet::with_capacity(branches.len());
     for branch in branches {
         let mut key = Vec::with_capacity(branch.equalities.len());
         for (position, expr) in branch.equalities.iter().enumerate() {
@@ -178,7 +217,7 @@ pub(super) fn index_union_keys(
         if key.contains(&OwnedDatum::Null) {
             continue;
         }
-        if !seen.contains(&key) {
+        if identities.insert(key_identity(&key)) {
             seen.push(key);
         }
     }

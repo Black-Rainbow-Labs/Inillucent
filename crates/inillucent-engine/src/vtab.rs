@@ -481,7 +481,15 @@ impl ImportedDatabase {
         let AccessPath::VirtualScan { offer, .. } = path else {
             return Ok(false);
         };
-        if let Some(answered) = self.eponymous_rows(table, offer, params, downstream)? {
+        // **An `IN` list is the statement's own filter to test here**, not an
+        // argument: these tables read their argument from an `=` on a hidden
+        // column, and an `IN` offered as `=` would be read as its first value.
+        let offer: Vec<inillucent_sql::plan::VirtualConstraint> = offer
+            .iter()
+            .filter(|held| held.in_list.is_empty())
+            .cloned()
+            .collect();
+        if let Some(answered) = self.eponymous_rows(table, &offer, params, downstream)? {
             return Ok(answered);
         }
         let reach = ScanReach {
@@ -573,11 +581,23 @@ pub(crate) fn scan_module(
                 &held
             }
         };
-        let specs: Vec<inillucent_sql::vtab::ConstraintSpec> =
+        let mut specs: Vec<inillucent_sql::vtab::ConstraintSpec> =
             offer.iter().map(|held| held.spec).collect();
-        let mut query = IndexQuery::new(specs, order_by.clone());
+        let mut query = IndexQuery::new(specs.clone(), order_by.clone());
         connected.table.best_index(&mut query)?;
-        let plan = FilterPlan {
+        let driving = in_list_to_drive(&query, offer, params, supplied, reach.folding)?;
+        if driving.is_none() {
+            // An `IN` the module claimed and this scan cannot run once per value
+            // is taken back, and the statement's own filter tests it.
+            if let Some(at) = claimed_in_list(&query, offer) {
+                if let Some(spec) = specs.get_mut(at) {
+                    spec.usable = false;
+                }
+                query = IndexQuery::new(specs, order_by.clone());
+                connected.table.best_index(&mut query)?;
+            }
+        }
+        let mut plan = FilterPlan {
             index_number: query.index_number,
             index_string: query.index_string.clone(),
             arguments: filter_arguments(&query, offer, params, supplied, reach.folding)?,
@@ -606,17 +626,107 @@ pub(crate) fn scan_module(
             limits: &reach.limits.borrow(),
             catalog: Some(reach.catalog),
         };
-        drive_cursor(
-            cursor.as_mut(),
-            &mut context,
-            &plan,
-            &shape,
-            params,
-            reach.case_sensitive_like,
-            downstream,
-        )?;
+        let Some((slot, values)) = driving else {
+            drive_cursor(
+                cursor.as_mut(),
+                &mut context,
+                &plan,
+                &shape,
+                params,
+                reach.case_sensitive_like,
+                downstream,
+            )?;
+            return Ok(true);
+        };
+        // **One `filter` per distinct value of the `IN` list.** See
+        // `VirtualConstraint::in_list`.
+        for value in values {
+            if let Some(argument) = plan.arguments.get_mut(slot) {
+                *argument = Value::Integer(value);
+            }
+            let flow = drive_cursor(
+                cursor.as_mut(),
+                &mut context,
+                &plan,
+                &shape,
+                params,
+                reach.case_sensitive_like,
+                downstream,
+            )?;
+            if flow == inillucent_exec::ops::Flow::Stop {
+                break;
+            }
+        }
         Ok(true)
     }
+}
+
+/// Returns the offer position of an `IN` list the module claimed, if any.
+///
+/// @param query - what `best_index` answered
+/// @param offer - the constraints the planner offered
+fn claimed_in_list(
+    query: &IndexQuery,
+    offer: &[inillucent_sql::plan::VirtualConstraint],
+) -> Option<usize> {
+    offer.iter().enumerate().find_map(|(at, held)| {
+        let claimed = query.usage.get(at).is_some_and(|usage| usage.argument > 0);
+        (claimed && !held.in_list.is_empty()).then_some(at)
+    })
+}
+
+/// Returns where the claimed `IN` list's value goes among `filter`'s
+/// arguments, and its distinct values, when the scan can run once per value.
+///
+/// `None` when no `IN` list was claimed, and also when one was and the scan
+/// cannot be split: the module promised an order, which holds within one
+/// `filter` and not across several; a lateral join supplies its own values; or
+/// a value is not an integer, which a rowid never equals. In every one of those
+/// cases the statement's own filter still tests the list.
+///
+/// @param query - what `best_index` answered
+/// @param offer - the constraints the planner offered
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param supplied - a lateral join's values
+/// @param catalog - where a value's function calls are folded
+fn in_list_to_drive(
+    query: &IndexQuery,
+    offer: &[inillucent_sql::plan::VirtualConstraint],
+    params: &inillucent_exec::physical::Params,
+    supplied: &[OwnedDatum],
+    catalog: &dyn inillucent_exec::physical::TreeCatalog,
+) -> DbResult<Option<(usize, Vec<i64>)>> {
+    let Some(at) = claimed_in_list(query, offer) else {
+        return Ok(None);
+    };
+    if query.ordered || !supplied.is_empty() {
+        return Ok(None);
+    }
+    let Some(held) = offer.get(at) else {
+        return Ok(None);
+    };
+    let Some(slot) = query
+        .argument_order()
+        .iter()
+        .position(|position| *position == at)
+    else {
+        return Ok(None);
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut values = Vec::with_capacity(held.in_list.len());
+    for item in &held.in_list {
+        match inillucent_exec::physical::literal_value_in(item, params, Some(catalog))? {
+            OwnedDatum::Int(value) => {
+                if seen.insert(value) {
+                    values.push(value);
+                }
+            }
+            // NULL equals nothing, so it adds no row and needs no filter.
+            OwnedDatum::Null => {}
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some((slot, values)))
 }
 
 impl ImportedDatabase {
@@ -701,6 +811,9 @@ impl ImportedDatabase {
 /// A free function rather than a method of the connection, so a write's view
 /// of the trees can run it too; see [`ScanReach`].
 ///
+/// Returns whether the pipeline said stop, so a scan that runs `filter` once
+/// for each value of an `IN` list stops there too.
+///
 /// @param cursor - the module's cursor, not yet filtered
 /// @param context - what the module reaches its storage through
 /// @param plan - what `best_index` chose, and the argument values
@@ -716,7 +829,7 @@ fn drive_cursor(
     params: &inillucent_exec::physical::Params,
     case_sensitive_like: bool,
     downstream: &mut dyn inillucent_exec::ops::Sink,
-) -> DbResult<()> {
+) -> DbResult<inillucent_exec::ops::Flow> {
     {
         let mut rows: Vec<Vec<OwnedDatum>> = Vec::with_capacity(inillucent_exec::batch::BATCH_ROWS);
         cursor.filter(context, plan)?;
@@ -731,16 +844,16 @@ fn drive_cursor(
                 if inillucent_exec::ops::emit_rows(&rows, downstream)?
                     == inillucent_exec::ops::Flow::Stop
                 {
-                    return Ok(());
+                    return Ok(inillucent_exec::ops::Flow::Stop);
                 }
                 rows.clear();
             }
             cursor.next(context)?;
         }
         if !rows.is_empty() {
-            inillucent_exec::ops::emit_rows(&rows, downstream)?;
+            return inillucent_exec::ops::emit_rows(&rows, downstream);
         }
-        Ok(())
+        Ok(inillucent_exec::ops::Flow::Continue)
     }
 }
 
@@ -976,6 +1089,11 @@ fn rechecks_of(
         // later. The planner leaves it among the statement's filters, which
         // test it where its value exists, so it is not tested here as well.
         if promised(query, position) || !constraint.spec.usable {
+            continue;
+        }
+        // An `IN` list stays among the statement's own filters, which test the
+        // whole list; testing its first value here would drop the rest.
+        if !constraint.in_list.is_empty() {
             continue;
         }
         // A negative column is the rowid. It is not one of the module's

@@ -329,8 +329,9 @@ checks this with two real writer processes.
 **A reader during a write.** A write transaction holds the RESERVED lock, which readers share, so a
 query in another process reads the last committed state while the transaction runs.
 `crates/inillucent-compat/tests/durability/process_readers.rs` checks that every answer such a
-reader gives is a state some commit produced. The writer takes the EXCLUSIVE lock only to write the
-database file: when its changes outgrow its page cache, and when it folds the log into the file. A
+reader gives is a state some commit produced. The writer takes the EXCLUSIVE lock only to fold the
+log into the database file. Pages a transaction changes beyond what its page cache holds go to a
+spill file of the writer's own, so a large transaction does not stop readers either. A
 fold on the way out of a statement waits 50 milliseconds for readers and is otherwise left to a
 later statement or to close. A connection under `PRAGMA locking_mode = exclusive`, or one with a
 database attached, still takes EXCLUSIVE for the whole transaction.

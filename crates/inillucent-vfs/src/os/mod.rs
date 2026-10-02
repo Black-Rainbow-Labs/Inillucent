@@ -24,6 +24,29 @@ mod platform;
 
 pub use platform::system_randomness;
 
+/// Returns the units, laid out `stride` bytes apart from `base`, that hold any
+/// byte the locking protocol locks.
+///
+/// See `VfsFile::pages_under_the_lock_bytes`. The lock bytes are
+/// `ranges::PENDING_BYTE` through the end of the shared range, 512 bytes, so this
+/// is one unit unless a unit boundary falls inside them.
+///
+/// @param base - where unit zero starts in the file
+/// @param stride - how many bytes each unit takes in the file
+pub fn pages_under_the_lock_bytes(base: u64, stride: u64) -> Vec<u64> {
+    let stride = stride.max(1);
+    let first_byte = ranges::PENDING_BYTE;
+    let last_byte = ranges::SHARED_FIRST
+        .saturating_add(ranges::SHARED_SIZE)
+        .saturating_sub(1);
+    if last_byte < base {
+        return Vec::new();
+    }
+    let first = first_byte.saturating_sub(base) / stride;
+    let last = last_byte.saturating_sub(base) / stride;
+    (first..=last).collect()
+}
+
 use std::fs::{File, OpenOptions as FsOpenOptions};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -481,5 +504,28 @@ impl Drop for OsFile {
         if self.options.delete_on_close {
             let _ = std::fs::remove_file(self.path.as_path());
         }
+    }
+}
+
+#[cfg(test)]
+mod lock_page_tests {
+    use super::pages_under_the_lock_bytes;
+
+    /// The lock bytes start at 1 GiB, so in the plain layout they fall in the
+    /// one page that starts there, whatever the page size.
+    #[test]
+    fn the_lock_bytes_fall_in_the_page_at_one_gigabyte() {
+        assert_eq!(pages_under_the_lock_bytes(0, 32_768), vec![32_768]);
+        assert_eq!(pages_under_the_lock_bytes(0, 4_096), vec![262_144]);
+        assert_eq!(pages_under_the_lock_bytes(0, 65_536), vec![16_384]);
+    }
+
+    /// A layout whose units do not start at zero, as an encrypted file's do, can
+    /// put a unit boundary inside the lock bytes, and then both units are named.
+    #[test]
+    fn a_unit_boundary_inside_the_lock_bytes_names_both_units() {
+        let stride = 0x1000_0000;
+        assert_eq!(pages_under_the_lock_bytes(0x100, stride), vec![3, 4]);
+        assert_eq!(pages_under_the_lock_bytes(0, stride), vec![4]);
     }
 }

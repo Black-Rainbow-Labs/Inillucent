@@ -215,3 +215,36 @@ fn plain_explain_lists_the_chain_in_the_references_columns() {
     };
     assert!(comment.starts_with("SCAN t"), "the comment was {comment:?}");
 }
+
+/// **A list of more than 512 rowids is searched by key, not scanned.** The
+/// planner built a union of seeks for at most 512 values, and past that it
+/// scanned the table and tested every row against the whole list: 3.8 s for
+/// 2,000 ids on a table of 120,000 rows, where the seeks take milliseconds.
+#[test]
+fn a_long_rowid_list_is_searched_by_key() {
+    let database = fixture("long-rowid-list");
+    let connection = database.session();
+    connection
+        .execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 2 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) \
+             INSERT INTO t(id, a, b) SELECT i, 'y', i FROM n",
+        )
+        .expect("the rows load");
+    let list: Vec<String> = (1..=2000).map(|i| (i * 2).to_string()).collect();
+    let sql = format!(
+        "SELECT count(*) FROM t WHERE id IN ({}, 2, 4)",
+        list.join(", ")
+    );
+    assert_eq!(
+        details(&connection, &format!("EXPLAIN QUERY PLAN {sql}")),
+        vec!["SEARCH t USING INTEGER PRIMARY KEY (rowid=?)".to_string()]
+    );
+    let counted = connection
+        .query(&sql)
+        .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    assert_eq!(
+        counted.first().and_then(|row| row.first()).cloned(),
+        Some(OwnedDatum::Int(2000)),
+        "every listed row once, a repeated value included once"
+    );
+}

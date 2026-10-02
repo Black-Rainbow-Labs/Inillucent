@@ -13,13 +13,23 @@ use super::*;
 
 /// The most branches a seek union will offer as a candidate.
 ///
-/// Past this a plan with one branch per value is a plan with thousands of
-/// tree descents, and the cost model already prefers a scan once the total
-/// passes a scan's own cost - this just stops the planner building and
-/// pricing a candidate that size in the first place. Chosen generously
-/// against the shape this exists for: "a page of ids read from an index" is
-/// dozens of values, not thousands.
-const MAX_SEEK_UNION_BRANCHES: usize = 512;
+/// **It was 512, and a longer list read the whole table.** A list of 2,000
+/// rowids is an ordinary batch for a program that keeps a search table in step
+/// with the rows it indexes, and past the old limit `WHERE id IN (...)` scanned
+/// every row and tested each one against the whole list: 3.8 s for 2,000 ids
+/// on a table of 120,000 rows, where 2,000 seeks take a few milliseconds. The
+/// cost model prices a union as one descent per value, so a list long enough to
+/// cost more than a scan is still priced as one; the limit only bounds how big
+/// a candidate the planner builds.
+const MAX_SEEK_UNION_BRANCHES: usize = 100_000;
+
+/// The longest list whose duplicate values the planner folds itself.
+///
+/// Folding compares every value with every value kept so far, which is free
+/// for a short list and quadratic for a long one. A longer list keeps its
+/// duplicates here, and the executor folds them by hashing the values it
+/// actually seeks to - see `rowid_union_keys`.
+const FOLDED_AT_PLAN_TIME: usize = 512;
 
 /// Returns a union of rowid seeks, when a term is `rowid IN (list)`.
 ///
@@ -73,7 +83,7 @@ pub(super) fn rowid_in_list_path(
         }
         let mut keys: Vec<BoundExpr> = Vec::with_capacity(list.len());
         for value in list {
-            if !keys.contains(value) {
+            if list.len() > FOLDED_AT_PLAN_TIME || !keys.contains(value) {
                 keys.push(value.clone());
             }
         }
@@ -394,10 +404,12 @@ fn in_list_branches(
         if matches!(value, BoundExpr::Null) {
             continue;
         }
-        if seen.contains(&value) {
-            continue;
+        if list.len() <= FOLDED_AT_PLAN_TIME {
+            if seen.contains(&value) {
+                continue;
+            }
+            seen.push(value);
         }
-        seen.push(value);
         let mut equalities = prefix.to_vec();
         equalities.push(value.clone());
         // A member of an `IN` list is converted to the column's affinity,

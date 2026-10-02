@@ -1338,20 +1338,15 @@ impl Hnsw {
     /// @param last - one past the last new node
     pub fn insert_batch(&mut self, vectors: &VectorSet, first: u32, last: u32) {
         let batch = last.saturating_sub(first);
-        // Recording is only wired up for the sequential path below - `link_locked`
-        // and `publish_neighbours` never call `mark_touched` - so a caller that
-        // has turned recording on always gets the sequential loop, regardless of
-        // how wide the batch is or how many threads are configured. Every
-        // caller that records is folding one document at a time anyway
-        // (`inillucent_search::merge::fold_segment_recording`), well under
-        // `PARALLEL_INSERT_FLOOR`, so this never costs anything there; it only
-        // guards a future caller from silently losing touches to the untracked
-        // parallel path.
-        if self.touched.is_some()
-            || self.params.build_threads <= 1
-            || batch < PARALLEL_INSERT_FLOOR
-            || self.entry.is_none()
-        {
+        // **Recording works on the parallel path too.** It used to force the
+        // sequential loop, which was harmless while every recording caller
+        // folded one document at a time. A merge now folds a whole segment in
+        // one batch (`inillucent_search::merge::fold_segment_recording`), and
+        // the sequential loop made each merge step one insert at a time on one
+        // core: a commit that advanced a merge by 8,000 chunks of 768 numbers
+        // took 13 to 21 s on a 24 core machine. `insert_range_locked` collects
+        // what each insert changed and adds it to the recording.
+        if self.params.build_threads <= 1 || batch < PARALLEL_INSERT_FLOOR || self.entry.is_none() {
             for node in first..last {
                 self.insert(vectors, node);
             }
@@ -1424,10 +1419,17 @@ impl Hnsw {
             .into_iter()
             .map(|layer| layer.into_iter().map(std::sync::RwLock::new).collect())
             .collect();
+        // Every `(layer, node)` whose list an insert changed, when a caller is
+        // recording - see `Hnsw::start_recording`. Each insert collects its own
+        // and adds them under the lock once, so the lock is taken once a node
+        // rather than once an edge.
+        let recording = self.touched.is_some();
+        let changed: std::sync::Mutex<Vec<(u8, u32)>> = std::sync::Mutex::new(Vec::new());
         let insert_one = |node: u32| {
             if node == entry {
                 return;
             }
+            let mut mine: Vec<(u8, u32)> = Vec::new();
             let query = vectors.copy_of(node);
             let level = levels.get((node - first) as usize).copied().unwrap_or(0);
             let mut current = entry;
@@ -1449,12 +1451,21 @@ impl Hnsw {
                     self.params.ef_construction,
                 );
                 let selected = self.select_neighbours(vectors, &candidates, self.max_degree(layer));
-                self.publish_neighbours(lists, vectors, node, &selected, layer);
+                if self.publish_neighbours(lists, vectors, node, &selected, layer) && recording {
+                    mine.push((layer as u8, node));
+                }
                 for neighbour in &selected {
-                    self.link_locked(lists, vectors, *neighbour, node, layer);
+                    if self.link_locked(lists, vectors, *neighbour, node, layer) && recording {
+                        mine.push((layer as u8, *neighbour));
+                    }
                 }
                 if let Some(best) = selected.first() {
                     current = *best;
+                }
+            }
+            if !mine.is_empty() {
+                if let Ok(mut all) = changed.lock() {
+                    all.extend(mine);
                 }
             }
         };
@@ -1479,9 +1490,14 @@ impl Hnsw {
                     .collect()
             })
             .collect();
+        if let (Some(touched), Ok(changed)) = (self.touched.as_mut(), changed.into_inner()) {
+            touched.extend(changed);
+        }
     }
 
     /// `link`, against the locked representation used during a parallel build.
+    ///
+    /// Returns whether `from`'s list changed, which a recording caller notes.
     ///
     /// The same rule as `link`: add the edge, and if that overflows the degree cap
     /// prune with the diversity heuristic rather than by plain distance, because
@@ -1501,25 +1517,26 @@ impl Hnsw {
         from: u32,
         to: u32,
         layer: usize,
-    ) {
+    ) -> bool {
         let cap = self.max_degree(layer);
         // A node the layer does not hold has no list to link into, which is
         // the same outcome an index would have reached by panicking
         // (task-1932, H9).
         let Some(cell) = layer_lists.get(from as usize) else {
-            return;
+            return false;
         };
         let Ok(mut list) = cell.write() else {
-            return;
+            return false;
         };
         if list.contains(&to) {
-            return;
+            return false;
         }
         list.push(to);
         if list.len() <= cap {
-            return;
+            return true;
         }
         *list = self.prune_to_cap(vectors, from, &list, cap);
+        true
     }
 
     /// Publishes a node's own neighbour list, merging rather than replacing.
@@ -1534,6 +1551,8 @@ impl Hnsw {
     /// @param node - the node whose list this is
     /// @param selected - what this node's own search chose
     /// @param layer - which layer, which sets the degree cap
+    ///
+    /// Returns whether the list changed, which a recording caller notes.
     fn publish_neighbours(
         &self,
         layer_lists: &LockedLayer,
@@ -1541,22 +1560,26 @@ impl Hnsw {
         node: u32,
         selected: &[u32],
         layer: usize,
-    ) {
+    ) -> bool {
         let cap = self.max_degree(layer);
         let Some(cell) = layer_lists.get(node as usize) else {
-            return;
+            return false;
         };
         let Ok(mut list) = cell.write() else {
-            return;
+            return false;
         };
+        let mut changed = false;
         for candidate in selected {
             if !list.contains(candidate) {
                 list.push(*candidate);
+                changed = true;
             }
         }
         if list.len() > cap {
             *list = self.prune_to_cap(vectors, node, &list, cap);
+            changed = true;
         }
+        changed
     }
 
     /// Reduces one neighbour list to the degree cap with the diversity heuristic.

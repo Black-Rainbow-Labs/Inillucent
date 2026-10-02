@@ -1383,11 +1383,18 @@ impl crate::ImportedDatabase {
                     return failure;
                 }
             } else {
-                // Undone, so there is nothing to commit and nothing to name as
-                // a participant. The restores are logged like any other write
-                // and no `Commit` follows them, so a recovery replays neither
-                // the statement nor its undo.
-                //
+                // **Undone, and the undo is committed** when it finished. The
+                // restores are logged like any other write, and a statement that
+                // failed part way can leave page splits behind it that the next
+                // statement writes into - so the statement and its undo have to
+                // replay together. See `commit_the_undo`, which says what leaving
+                // them uncommitted cost. A busy refusal is the common way to get
+                // here: a statement that could not take the lock it needed.
+                if undone.is_ok() {
+                    if let Err(failure) = self.commit_the_undo(txn, wrote) {
+                        return failure;
+                    }
+                }
                 // And no-steal has nothing left to hold back either: in
                 // autocommit this statement was the whole transaction, so
                 // `wrote` is every schema it armed a watermark on.

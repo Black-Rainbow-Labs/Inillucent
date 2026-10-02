@@ -17,7 +17,7 @@ use inillucent_tree::PagedTree;
 use inillucent_vfs::DbPath;
 use inillucent_wal::{Wal, WalOptions, FIRST_LSN};
 
-use crate::{attach_catalog, let_the_pool_ask_the_log, read_catalog};
+use crate::{attach_catalog, let_the_pool_ask_the_log, let_the_pool_spill, read_catalog};
 use crate::{index_shape, keyed_table_shape, schema_layout, table_from_create_sql, table_shape};
 use inillucent_base::error::refusal;
 use inillucent_catalog::paged::ObjectKind;
@@ -611,6 +611,7 @@ pub(crate) fn resync_file(
         .pool()
         .set_retained_lsn(database.meta().checkpoint_lsn);
     let_the_pool_ask_the_log(database.pool(), &wal);
+    let_the_pool_spill(database.pool(), vfs);
     // **The highest transaction number the log holds, so the caller can raise
     // its own counter past it** (task-2000, design 1b). Until the fold became
     // lazy this did not matter: a connection folded on its way out of every
@@ -824,6 +825,7 @@ pub(crate) fn open_file_as(
         .pool()
         .set_retained_lsn(database.meta().checkpoint_lsn);
     let_the_pool_ask_the_log(database.pool(), &wal);
+    let_the_pool_spill(database.pool(), vfs);
 
     // The catalog is read again, because recovery may have changed it: a
     // `CREATE TABLE` after the checkpoint is a row in this very tree.

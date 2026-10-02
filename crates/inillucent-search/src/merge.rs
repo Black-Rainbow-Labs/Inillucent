@@ -722,20 +722,33 @@ pub fn fold_segment_recording(
     // Every segment of one table is built under the same `configuration`, so
     // a chunk's vector is already the accumulator's own width - there is
     // nothing here to pad or reconcile, only to copy across.
-    let mut inserted = 0usize;
+    //
+    // **Every older version is tombstoned first and the segment goes in with
+    // one append**, which is the same as replacing one document at a time,
+    // because a segment holds one live document per id. One append is one
+    // graph insert batch on every core the table builds with; one document at
+    // a time was one insert at a time on one core, which made a merge step of
+    // 8,000 chunks take 13 to 21 s and a first search over a table with many
+    // segments take minutes.
     let mut recorded = RecordedBatch::default();
-    for (id, chunk, vector) in live_documents_of(segment) {
-        let stats = accumulator
-            .replace_document(
-                SOURCE,
-                &id.to_string(),
-                vec![chunk.clone()],
-                std::slice::from_ref(&vector),
-            )
-            .map_err(|why| failure(why.to_string()))?;
-        inserted = inserted.saturating_add(stats.chunks_added);
-        recorded.puts.push((chunk, vector));
+    let documents = live_documents_of(segment);
+    let mut chunks = Vec::with_capacity(documents.len());
+    let mut vectors = Vec::with_capacity(documents.len());
+    for (id, chunk, vector) in documents {
+        accumulator.tombstone(SOURCE, &id.to_string());
+        recorded.puts.push((chunk.clone(), vector.clone()));
+        chunks.push(chunk);
+        vectors.push(vector);
     }
+    let inserted = match chunks.is_empty() {
+        true => 0,
+        false => {
+            accumulator
+                .append(chunks, &vectors)
+                .map_err(|why| failure(why.to_string()))?
+                .chunks_added
+        }
+    };
     for id in tombstoned {
         accumulator.tombstone(SOURCE, &id.to_string());
         recorded
@@ -1250,10 +1263,21 @@ fn legacy_manifest(generation: i64, covered: i64, chunks: i64) -> Option<Segment
 
 /// Applies a run of delta entries to a loaded index.
 ///
-/// A put and an update are the same call, because `replace_document` tombstones
-/// whatever was there and appends the new version - which is what an
-/// append-only index does with an edit, and what the live sync path already
-/// does.
+/// A put and an update are the same thing, because an append only index
+/// tombstones whatever was there and appends the new version.
+///
+/// **Every changed row is tombstoned first and every new version goes in with
+/// one append.** This applied one row at a time, and one row at a time is one
+/// graph insert at a time on one core: a connection that had searched the table
+/// paid 3.26 s on its next search after another process deleted and inserted
+/// 2,000 rows of 768 numbers, against 0.02 s for the search after. One append
+/// of the whole batch goes into the graph on every core the table builds with
+/// (`HnswParams::build_threads`), which is how a fresh segment is already built.
+///
+/// Only the last entry for a row matters, because a put reads the row as the
+/// row store holds it now rather than as the entry wrote it: a row deleted and
+/// written again is written once, and a row written and then deleted is not
+/// written at all.
 fn apply(
     index: &mut Index,
     context: &mut Context<'_>,
@@ -1262,32 +1286,38 @@ fn apply(
     entries: &[Delta],
 ) -> DbResult<usize> {
     let dims = options.dims.max(1);
-    let mut inserted = 0usize;
+    let mut last: std::collections::HashMap<i64, Op> =
+        std::collections::HashMap::with_capacity(entries.len());
+    let mut order: Vec<i64> = Vec::with_capacity(entries.len());
     for entry in entries {
-        match entry.op {
-            Op::Delete => {
-                index.tombstone(SOURCE, &entry.id.to_string());
-            }
-            Op::Put => {
-                let Some(row) = store.read_row(context, entry.id)? else {
-                    // The log says the row was written and it is not there. The
-                    // row store is authoritative, so this is a delete: it can
-                    // only happen if the two were written by different
-                    // transactions, which the module never does, or if
-                    // something outside the module edited a shadow table.
-                    index.tombstone(SOURCE, &entry.id.to_string());
-                    continue;
-                };
-                let chunk = chunk_of(entry.id, &row, options);
-                let vector = embedding_of(&row, dims)?;
-                let stats = index
-                    .replace_document(SOURCE, &entry.id.to_string(), vec![chunk], &[vector])
-                    .map_err(|why| failure(why.to_string()))?;
-                inserted = inserted.saturating_add(stats.chunks_added);
-            }
+        if last.insert(entry.id, entry.op).is_none() {
+            order.push(entry.id);
         }
     }
-    Ok(inserted)
+    let mut chunks = Vec::new();
+    let mut vectors = Vec::new();
+    for id in order {
+        index.tombstone(SOURCE, &id.to_string());
+        if last.get(&id) != Some(&Op::Put) {
+            continue;
+        }
+        // The log says the row was written. If it is not there, the row store
+        // is authoritative and the row stays deleted: that can only happen if
+        // the two were written by different transactions, which the module
+        // never does, or if something outside the module edited a shadow table.
+        let Some(row) = store.read_row(context, id)? else {
+            continue;
+        };
+        chunks.push(chunk_of(id, &row, options));
+        vectors.push(embedding_of(&row, dims)?);
+    }
+    if chunks.is_empty() {
+        return Ok(0);
+    }
+    let stats = index
+        .append(chunks, &vectors)
+        .map_err(|why| failure(why.to_string()))?;
+    Ok(stats.chunks_added)
 }
 
 /// Returns how many live chunks an index holds.

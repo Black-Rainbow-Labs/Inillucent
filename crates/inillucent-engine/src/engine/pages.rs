@@ -327,6 +327,10 @@ fn compare_against_the_free_map(
             // An application matching on this answer is matching on the text,
             // so it is the text the reference this repository grades against
             // produces today.
+            // **A page the lock bytes are in is allocated and reached by
+            // nothing, by design**, so it is not a leak. See
+            // `FreeMap::reserving`.
+            (None, true) if complete && file.page_is_reserved(page) => {}
             (None, true) if complete => match leaked.len() < MOST_LEAKS_LISTED {
                 true => leaked.push(number),
                 false => more = more.saturating_add(1),

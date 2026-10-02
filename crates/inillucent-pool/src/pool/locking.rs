@@ -188,4 +188,14 @@ impl Pool {
     pub fn file(&self) -> &dyn VfsFile {
         self.file.as_ref()
     }
+
+    /// Returns an empty free map that never hands out the pages under this
+    /// file's lock bytes.
+    ///
+    /// Every free map a database builds comes from here, so none of them can
+    /// forget the reservation. See `VfsFile::pages_under_the_lock_bytes`.
+    pub fn new_free_map(&self) -> crate::freemap::FreeMap {
+        crate::freemap::FreeMap::new(self.page_size)
+            .reserving(self.file.pages_under_the_lock_bytes(self.page_size as u64))
+    }
 }

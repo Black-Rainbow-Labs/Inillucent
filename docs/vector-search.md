@@ -760,7 +760,7 @@ INSERT INTO docs(docs) VALUES('compact');
 |---|---|
 | `compact` | builds one clean index from every row in one pass, and drops deleted rows from the graph |
 | `rebuild` | rebuilds the whole index from the stored rows and discards every older version. Use it when an index segment cannot be read |
-| `drop-old-generations` | frees the space held by index versions no reader needs |
+| `drop-old-generations` | frees the space held by index versions no reader needs. Before version 2.0.7 it also deleted parts of segments a merge had built over several commits, and the table could no longer be read; `rebuild` repairs such a table |
 | `integrity-check` | checks the index against the rows and fails with the problem it found |
 
 An `inillucent_hnsw` index takes the same commands through its own name:

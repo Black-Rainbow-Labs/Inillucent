@@ -358,6 +358,7 @@ pub fn setup_embeddings(context: &mut Context, arguments: &Arguments) -> Result<
         .to_string();
     let gpu = arguments.flag("gpu");
     let force = arguments.flag("force");
+    let from = folder_to_copy_from(context, arguments, component)?;
 
     let mut state = install::read_state(&root).unwrap_or_default();
     let mut lines: Vec<String> = Vec::new();
@@ -393,14 +394,14 @@ pub fn setup_embeddings(context: &mut Context, arguments: &Arguments) -> Result<
     }
 
     if matches!(component, Component::All | Component::Model) {
-        let installed = install_model(&root, &EMBEDDER, force)?;
+        let installed = install_model(&root, &EMBEDDER, force, from.as_deref())?;
         lines.push(format!("{} -> {}", installed.id, installed.dir));
         fields.push(("model".to_string(), model_json(&installed)));
         state.put_model(installed);
     }
 
     if component == Component::Reranker {
-        let installed = install_model(&root, &RERANKER, force)?;
+        let installed = install_model(&root, &RERANKER, force, from.as_deref())?;
         lines.push(format!("{} -> {}", installed.id, installed.dir));
         fields.push(("reranker".to_string(), model_json(&installed)));
         state.put_model(installed);
@@ -441,6 +442,28 @@ pub fn setup_embeddings(context: &mut Context, arguments: &Arguments) -> Result<
         outcome = outcome.with(&name, value);
     }
     Ok(outcome)
+}
+
+/// Returns the folder `--from` names, refusing it for the runtime, which is always downloaded.
+///
+/// @param context - the surface, which may be confined
+/// @param arguments - what was asked for
+/// @param component - what is being installed
+fn folder_to_copy_from(
+    context: &mut Context,
+    arguments: &Arguments,
+    component: Component,
+) -> Result<Option<std::path::PathBuf>, Failed> {
+    let Some(named) = arguments.text("from") else {
+        return Ok(None);
+    };
+    if component == Component::Runtime {
+        return Err(Failed::misuse(
+            "--from installs the model or the reranker from a folder; the runtime is downloaded. \
+             Use 'setup-embeddings model --from <folder>', or leave out --from.",
+        ));
+    }
+    Ok(Some(context.confine(named)?))
 }
 
 /// The thread count and the device `setup-embeddings` was asked to record.
@@ -862,7 +885,13 @@ fn unversioned(name: &str) -> String {
 /// @param root - the install root
 /// @param spec - which model, where it comes from and what its files must hash to
 /// @param force - fetch again even when the files are already there
-fn install_model(root: &Path, spec: &ModelSpec, force: bool) -> Result<InstalledModel, Failed> {
+/// @param from - a folder holding the files already, to copy them from instead of downloading
+fn install_model(
+    root: &Path,
+    spec: &ModelSpec,
+    force: bool,
+    from: Option<&Path>,
+) -> Result<InstalledModel, Failed> {
     let directory = install::models_root(root).join(spec.id);
     std::fs::create_dir_all(&directory).map_err(|error| {
         Failed::misuse(format!(
@@ -871,15 +900,20 @@ fn install_model(root: &Path, spec: &ModelSpec, force: bool) -> Result<Installed
         ))
     })?;
 
-    for file in spec.files {
-        let destination = directory.join(file.local);
-        if destination.exists() && !force && already_correct(&destination, file) {
-            continue;
+    match from {
+        Some(folder) => copy_model_files(folder, &directory, spec, force)?,
+        None => {
+            for file in spec.files {
+                let destination = directory.join(file.local);
+                if destination.exists() && !force && already_correct(&destination, file) {
+                    continue;
+                }
+                let url = format!("{}/{}", spec.base, file.remote);
+                let mut progress = bar();
+                http::download(&url, &destination, Some(file.sha256), &mut progress)
+                    .map_err(|error| Failed::misuse(format!("{error}")))?;
+            }
         }
-        let url = format!("{}/{}", spec.base, file.remote);
-        let mut progress = bar();
-        http::download(&url, &destination, Some(file.sha256), &mut progress)
-            .map_err(|error| Failed::misuse(format!("{error}")))?;
     }
 
     // The manifest is this repository's contract rather than the model author's,
@@ -910,6 +944,94 @@ fn install_model(root: &Path, spec: &ModelSpec, force: bool) -> Result<Installed
         source: spec.source.to_string(),
         verified: true,
     })
+}
+
+/// Installs a model's files from a folder already on this machine.
+///
+/// **Every file is found and checked before any is copied**, so a folder with
+/// one file missing or different installs nothing, the same promise a failed
+/// download makes. A file is found under its installed name or under its path in
+/// the Hugging Face repository, so both a folder of the installed files and a
+/// clone of the repository work. Each is checked against the size and the
+/// SHA-256 this build pins, which is the same check a download gets.
+///
+/// @param folder - where the files are
+/// @param directory - the model's install directory
+/// @param spec - which files, and what they must hash to
+/// @param force - copy again even when the installed file is already correct
+fn copy_model_files(
+    folder: &Path,
+    directory: &Path,
+    spec: &ModelSpec,
+    force: bool,
+) -> Result<(), Failed> {
+    let mut found = Vec::with_capacity(spec.files.len());
+    for file in spec.files {
+        let candidates = [folder.join(file.local), folder.join(file.remote)];
+        let Some(source) = candidates.iter().find(|path| path.is_file()) else {
+            return Err(Failed::misuse(format!(
+                "{} is not in {} (looked for {} and {}). Nothing was installed",
+                file.local,
+                folder.display(),
+                file.local,
+                file.remote
+            )));
+        };
+        let actual = sha256_of(source).ok_or_else(|| {
+            Failed::misuse(format!(
+                "{} could not be read. Nothing was installed",
+                source.display()
+            ))
+        })?;
+        if !actual.eq_ignore_ascii_case(file.sha256) {
+            return Err(Failed::misuse(format!(
+                "{} is not the file this build installs: its SHA-256 is {actual}, and {} \
+                 needs {}. Nothing was installed",
+                source.display(),
+                spec.id,
+                file.sha256
+            )));
+        }
+        found.push((file, source.clone()));
+    }
+    for (file, source) in found {
+        let destination = directory.join(file.local);
+        if destination.exists() && !force && already_correct(&destination, file) {
+            continue;
+        }
+        // Copied under a temporary name and renamed, so an interrupted copy
+        // never leaves a file of the right name and the wrong content.
+        let partial = directory.join(format!("{}.partial", file.local));
+        std::fs::copy(&source, &partial)
+            .and_then(|_| std::fs::rename(&partial, &destination))
+            .map_err(|error| {
+                let _ = std::fs::remove_file(&partial);
+                Failed::misuse(format!(
+                    "{} could not be copied to {}: {error}",
+                    source.display(),
+                    destination.display()
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+/// Returns a file's SHA-256 in lowercase hex, or `None` when it cannot be read.
+///
+/// @param path - the file
+fn sha256_of(path: &Path) -> Option<String> {
+    let mut handle = std::fs::File::open(path).ok()?;
+    let mut digest = inillucent_base::hash::Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        use std::io::Read;
+        match handle.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => digest.update(buffer.get(..read).unwrap_or(&[])),
+            Err(_) => return None,
+        }
+    }
+    Some(inillucent_base::hash::to_hex(&digest.finish()))
 }
 
 /// Whether a file on disk is already the one that would be downloaded.
@@ -1078,6 +1200,86 @@ impl Progress for Bar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two small files with known digests, standing in for a model's files: one
+    /// found by its installed name and one by its path in the repository.
+    const FAKE_FILES: &[ModelFile] = &[
+        ModelFile {
+            remote: "a.txt",
+            local: "a.txt",
+            sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            bytes: 5,
+        },
+        ModelFile {
+            remote: "onnx/b.bin",
+            local: "b.bin",
+            sha256: "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7",
+            bytes: 5,
+        },
+    ];
+
+    /// The fake model the two files make up.
+    const FAKE_MODEL: ModelSpec = ModelSpec {
+        id: "fake-model",
+        base: "",
+        source: "",
+        files: FAKE_FILES,
+        manifest: EMBEDDER.manifest,
+    };
+
+    /// Returns an empty scratch directory for one case.
+    ///
+    /// @param name - the case
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("inillucent-setup-from-{}", std::process::id()))
+            .join(name);
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// **`--from` installs a model from a folder, and only when every file is
+    /// the pinned one.** A file is found by its installed name or by its path in
+    /// the repository. One file missing, or one whose digest differs, and
+    /// nothing is copied.
+    #[test]
+    fn a_model_is_installed_from_a_folder_only_when_every_file_matches() {
+        let folder = scratch("good");
+        std::fs::write(folder.join("a.txt"), b"hello").unwrap();
+        std::fs::create_dir_all(folder.join("onnx")).unwrap();
+        std::fs::write(folder.join("onnx").join("b.bin"), b"world").unwrap();
+        let installed = scratch("installed");
+        copy_model_files(&folder, &installed, &FAKE_MODEL, false).unwrap();
+        assert_eq!(std::fs::read(installed.join("a.txt")).unwrap(), b"hello");
+        assert_eq!(std::fs::read(installed.join("b.bin")).unwrap(), b"world");
+
+        let wrong = scratch("wrong");
+        std::fs::write(wrong.join("a.txt"), b"hullo").unwrap();
+        std::fs::write(wrong.join("b.bin"), b"world").unwrap();
+        let untouched = scratch("untouched");
+        let refused = copy_model_files(&wrong, &untouched, &FAKE_MODEL, false);
+        let said = format!("{:?}", refused.err());
+        assert!(said.contains("Nothing was installed"), "{said}");
+        assert!(
+            said.contains("2cf24dba"),
+            "the refusal names the pinned digest: {said}"
+        );
+        assert!(
+            !untouched.join("b.bin").exists(),
+            "a good file was copied beside a bad one"
+        );
+
+        let missing = scratch("missing");
+        std::fs::write(missing.join("a.txt"), b"hello").unwrap();
+        let refused = copy_model_files(&missing, &untouched, &FAKE_MODEL, false);
+        let said = format!("{:?}", refused.err());
+        assert!(said.contains("b.bin is not in"), "{said}");
+        assert!(
+            !untouched.join("a.txt").exists(),
+            "a file was copied while another was missing"
+        );
+    }
 
     /// Every platform this ships on has an archive, and every pinned digest is
     /// a SHA-256.

@@ -92,6 +92,14 @@ impl Pool {
             each(page, &image)?;
             handed = handed.saturating_add(1);
         }
+        // **And every spilled page the flush will write.** Its image in the
+        // spill file is already translated and is the exact bytes the file will
+        // get.
+        for (page, slot) in self.spilled_for_fold() {
+            self.read_spilled(&slot, &mut image)?;
+            each(page, &image)?;
+            handed = handed.saturating_add(1);
+        }
         Ok(handed)
     }
 
@@ -125,10 +133,17 @@ impl Pool {
                 .collect()
         };
         dirty.sort_unstable();
+        // **The spilled pages are dirty pages too** (`pool/spill.rs`), and a fold
+        // is the only thing that puts them in the file. A page of a transaction
+        // still open stays spilled, as a resident one stays dirty.
+        let spilled = self.spilled_for_fold();
         // **No pre images when the redo log carries the after images**
         // (task-2000, design 1a). See `Pool::fold_protected_by_log`.
         if self.journal.borrow().is_some() && !self.fold_protected_by_log.get() {
             for (page, _) in &dirty {
+                self.journal_page(*page)?;
+            }
+            for (page, _) in &spilled {
                 self.journal_page(*page)?;
             }
             self.seal_journal()?;
@@ -136,7 +151,10 @@ impl Pool {
         for (page, frame) in &dirty {
             self.writeback(*frame, *page, Writing::Checkpoint)?;
         }
-        Ok(dirty.len())
+        for (page, slot) in &spilled {
+            self.write_spilled(*page, slot)?;
+        }
+        Ok(dirty.len().saturating_add(spilled.len()))
     }
 
     /// Writes every dirty frame, then the meta page and its shadow, then syncs.
@@ -485,6 +503,9 @@ impl Pool {
             .write_all_at(page.0.saturating_mul(self.page_size as u64), image)
             .map_err(|error| error.into_db_error())?;
         Counters::add(&self.counters.writes, 1);
+        // A spilled copy of this page number is the page's previous life, and a
+        // fetch would read it back in place of what was just written.
+        self.forget_spilled(page);
         if page.0 >= self.page_count.get() {
             self.page_count.set(page.0.saturating_add(1));
         }
