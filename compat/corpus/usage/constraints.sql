@@ -1,0 +1,172 @@
+-- case: fk/basic-enforcement-and-messages
+PRAGMA foreign_keys = ON;
+CREATE TABLE p(id INTEGER PRIMARY KEY, code TEXT UNIQUE);
+CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id), pcode REFERENCES p(code));
+INSERT INTO p VALUES(1, 'a');
+INSERT INTO c VALUES(1, 1, 'a');
+INSERT INTO c VALUES(2, 2, NULL);
+INSERT INTO c VALUES(3, NULL, 'zz');
+INSERT INTO c VALUES(4, NULL, NULL);
+DELETE FROM p;
+UPDATE p SET id = 5;
+UPDATE p SET code = 'b';
+SELECT * FROM c;
+-- case: fk/actions-cascade-setnull-setdefault
+PRAGMA foreign_keys = ON;
+CREATE TABLE p(id INTEGER PRIMARY KEY);
+CREATE TABLE c1(pid REFERENCES p ON DELETE CASCADE ON UPDATE CASCADE);
+CREATE TABLE c2(pid REFERENCES p ON DELETE SET NULL ON UPDATE SET NULL);
+CREATE TABLE c3(pid DEFAULT 0 REFERENCES p ON DELETE SET DEFAULT);
+CREATE TABLE c4(pid REFERENCES p ON DELETE RESTRICT);
+INSERT INTO p VALUES(0), (1), (2), (3);
+INSERT INTO c1 VALUES(1), (2); INSERT INTO c2 VALUES(1), (2); INSERT INTO c3 VALUES(1), (2); INSERT INTO c4 VALUES(3);
+UPDATE p SET id = 10 WHERE id = 1;
+SELECT * FROM c1; SELECT * FROM c2;
+DELETE FROM p WHERE id = 2;
+SELECT * FROM c1; SELECT * FROM c2; SELECT * FROM c3;
+DELETE FROM p WHERE id = 3;
+DELETE FROM p WHERE id = 0;
+SELECT * FROM p;
+-- case: fk/deferred-constraints
+PRAGMA foreign_keys = ON;
+CREATE TABLE p(id INTEGER PRIMARY KEY);
+CREATE TABLE c(pid REFERENCES p DEFERRABLE INITIALLY DEFERRED);
+BEGIN;
+INSERT INTO c VALUES(7);
+SELECT count(*) FROM c;
+COMMIT;
+SELECT count(*) FROM c;
+INSERT INTO p VALUES(7);
+COMMIT;
+BEGIN;
+INSERT INTO c VALUES(7);
+DELETE FROM p;
+INSERT INTO p VALUES(7);
+COMMIT;
+SELECT * FROM c;
+-- case: fk/defer-foreign-keys-pragma
+PRAGMA foreign_keys = ON;
+CREATE TABLE p(id INTEGER PRIMARY KEY);
+CREATE TABLE c(pid REFERENCES p);
+BEGIN;
+PRAGMA defer_foreign_keys = ON;
+INSERT INTO c VALUES(1);
+INSERT INTO p VALUES(1);
+COMMIT;
+PRAGMA defer_foreign_keys;
+SELECT * FROM c;
+-- case: fk/foreign-key-check
+CREATE TABLE p(id INTEGER PRIMARY KEY);
+CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+CREATE TABLE d(x, y, FOREIGN KEY(x, y) REFERENCES nosuch(a, b));
+INSERT INTO p VALUES(1);
+INSERT INTO c VALUES(1, 1), (2, 5), (3, 6);
+INSERT INTO d VALUES(1, 2);
+PRAGMA foreign_key_check;
+PRAGMA foreign_key_check(c);
+SELECT * FROM pragma_foreign_key_check('c');
+-- case: fk/self-referencing-and-composite
+PRAGMA foreign_keys = ON;
+CREATE TABLE node(id INTEGER PRIMARY KEY, parent REFERENCES node(id) ON DELETE CASCADE);
+INSERT INTO node VALUES(1, NULL), (2, 1), (3, 2), (4, 1);
+DELETE FROM node WHERE id = 2;
+SELECT * FROM node;
+CREATE TABLE pk2(a, b, PRIMARY KEY(a, b));
+CREATE TABLE ck2(x, y, FOREIGN KEY(x, y) REFERENCES pk2(a, b));
+INSERT INTO pk2 VALUES(1, 2);
+INSERT INTO ck2 VALUES(1, 2);
+INSERT INTO ck2 VALUES(1, 3);
+INSERT INTO ck2 VALUES(1, NULL);
+SELECT * FROM ck2;
+-- case: fk/parent-without-unique-index
+PRAGMA foreign_keys = ON;
+CREATE TABLE p(a);
+CREATE TABLE c(x REFERENCES p(a));
+INSERT INTO c VALUES(1);
+CREATE TABLE c2(x REFERENCES nosuch(a));
+INSERT INTO c2 VALUES(1);
+-- case: fk/drop-parent-table
+PRAGMA foreign_keys = ON;
+CREATE TABLE p(id INTEGER PRIMARY KEY);
+CREATE TABLE c(pid REFERENCES p);
+INSERT INTO p VALUES(1);
+INSERT INTO c VALUES(1);
+DROP TABLE p;
+SELECT count(*) FROM c;
+DELETE FROM c;
+DROP TABLE p;
+SELECT name FROM sqlite_master;
+-- case: fk/replace-triggers-delete-action
+PRAGMA foreign_keys = ON;
+CREATE TABLE p(id INTEGER PRIMARY KEY, u UNIQUE);
+CREATE TABLE c(pid REFERENCES p(id) ON DELETE CASCADE);
+INSERT INTO p VALUES(1, 'a');
+INSERT INTO c VALUES(1);
+INSERT OR REPLACE INTO p VALUES(1, 'b');
+SELECT count(*) FROM c;
+PRAGMA recursive_triggers = ON;
+INSERT INTO c VALUES(1);
+INSERT OR REPLACE INTO p VALUES(1, 'c');
+SELECT count(*) FROM c;
+-- case: trigger/before-after-order-and-new-old
+CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+CREATE TABLE log(seq INTEGER PRIMARY KEY, msg);
+CREATE TRIGGER b_ins BEFORE INSERT ON t BEGIN INSERT INTO log(msg) VALUES('before ' || new.a || ' id=' || quote(new.id)); END;
+CREATE TRIGGER a_ins AFTER INSERT ON t BEGIN INSERT INTO log(msg) VALUES('after ' || new.a || ' id=' || new.id); END;
+CREATE TRIGGER a_upd AFTER UPDATE OF a ON t WHEN old.a <> new.a BEGIN INSERT INTO log(msg) VALUES('upd ' || old.a || '->' || new.a); END;
+CREATE TRIGGER a_del AFTER DELETE ON t BEGIN INSERT INTO log(msg) VALUES('del ' || old.a); END;
+INSERT INTO t(a) VALUES('x'), ('y');
+UPDATE t SET a = 'x' WHERE a = 'x';
+UPDATE t SET a = 'z' WHERE a = 'x';
+DELETE FROM t WHERE a = 'y';
+SELECT msg FROM log ORDER BY seq;
+SELECT changes(), total_changes();
+-- case: trigger/raise-forms
+CREATE TABLE t(a);
+CREATE TRIGGER ab BEFORE INSERT ON t WHEN new.a < 0 BEGIN SELECT RAISE(ABORT, 'negative not allowed'); END;
+CREATE TRIGGER ig BEFORE INSERT ON t WHEN new.a = 0 BEGIN SELECT RAISE(IGNORE); END;
+CREATE TRIGGER fl BEFORE INSERT ON t WHEN new.a = 99 BEGIN SELECT RAISE(FAIL, 'ninety nine'); END;
+INSERT INTO t VALUES(1);
+INSERT INTO t VALUES(-1);
+INSERT INTO t VALUES(0);
+INSERT INTO t VALUES(5), (99), (6);
+SELECT * FROM t;
+SELECT RAISE(ABORT, 'outside');
+-- case: trigger/recursive-and-depth
+CREATE TABLE t(n);
+CREATE TRIGGER r AFTER INSERT ON t WHEN new.n < 5 BEGIN INSERT INTO t VALUES(new.n + 1); END;
+INSERT INTO t VALUES(1);
+SELECT * FROM t;
+PRAGMA recursive_triggers = ON;
+DELETE FROM t;
+INSERT INTO t VALUES(1);
+SELECT * FROM t;
+-- case: trigger/update-of-columns-and-when
+CREATE TABLE t(a, b, c);
+CREATE TABLE log(x);
+CREATE TRIGGER tb AFTER UPDATE OF b, c ON t BEGIN INSERT INTO log VALUES('bc:' || new.b || new.c); END;
+INSERT INTO t VALUES(1, 2, 3);
+UPDATE t SET a = 10;
+UPDATE t SET b = 20;
+UPDATE t SET a = 1, c = 30;
+SELECT * FROM log;
+-- case: trigger/temp-trigger-on-main-table
+CREATE TABLE t(a);
+CREATE TEMP TRIGGER tt AFTER INSERT ON t BEGIN UPDATE t SET a = a + 1 WHERE rowid = new.rowid; END;
+INSERT INTO t VALUES(1);
+SELECT * FROM t;
+SELECT type, name, tbl_name FROM sqlite_temp_master;
+-- case: trigger/drop-table-drops-triggers
+CREATE TABLE t(a);
+CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;
+DROP TABLE t;
+SELECT count(*) FROM sqlite_master;
+CREATE TRIGGER bad AFTER INSERT ON nosuch BEGIN SELECT 1; END;
+CREATE TABLE t(a);
+CREATE TRIGGER bad2 AFTER INSERT ON t BEGIN SELECT nosuchcol FROM t; END;
+INSERT INTO t VALUES(1);
+-- case: trigger/trigger-qualified-name-errors
+CREATE TABLE t(a);
+CREATE TRIGGER x AFTER INSERT ON t BEGIN INSERT INTO main.t VALUES(1); END;
+CREATE TRIGGER y AFTER INSERT ON t BEGIN UPDATE t SET a = 1 FROM t AS t2; END;
+SELECT name FROM sqlite_master WHERE type = 'trigger';

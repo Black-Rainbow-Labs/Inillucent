@@ -144,27 +144,23 @@ impl VirtualTable for JsonWalkTable {
     /// because `SELECT * FROM json_each` is a statement that prepares and then
     /// produces no rows - which is what the pinned release does.
     fn best_index(&self, info: &mut IndexQuery) -> DbResult<()> {
-        let mut used_json = false;
-        let mut used_root = false;
-        for index in 0..info.constraints.len() {
-            let Some(constraint) = info.constraints.get(index).copied() else {
-                continue;
-            };
-            if !constraint.usable || constraint.op != super::ConstraintOp::Eq {
-                continue;
-            }
-            match constraint.column as usize {
-                JSON if !used_json => {
-                    info.use_constraint(index, true);
-                    used_json = true;
-                }
-                ROOT if !used_root => {
-                    info.use_constraint(index, true);
-                    used_root = true;
-                }
-                _ => {}
+        let mut used = [false, false];
+        // The document is claimed first and the root second, whatever order the
+        // constraints were offered in, because that is the order `filter` reads
+        // its arguments.
+        for (slot, column) in [JSON, ROOT].into_iter().enumerate() {
+            let found = info.constraints.iter().position(|constraint| {
+                constraint.usable
+                    && constraint.op == super::ConstraintOp::Eq
+                    && constraint.column as usize == column
+            });
+            if let (Some(index), Some(flag)) = (found, used.get_mut(slot)) {
+                info.use_constraint(index, true);
+                *flag = true;
             }
         }
+        let used_json = used.first().copied().unwrap_or(false);
+        let used_root = used.get(1).copied().unwrap_or(false);
         // The argument order `filter` receives is the order they were claimed
         // in, and the document is always claimed first.
         info.index_number = i32::from(used_json) | (i32::from(used_root) << 1);
@@ -179,6 +175,8 @@ impl VirtualTable for JsonWalkTable {
             walk: self.walk,
             rows: Vec::new(),
             at: 0,
+            given_json: Value::Null,
+            given_root: Value::Null,
         }))
     }
 }
@@ -205,6 +203,12 @@ struct JsonWalkCursor {
     walk: Walk,
     rows: Vec<WalkRow>,
     at: usize,
+    /// The document the scan was given, which the hidden `json` column of
+    /// every row reports. A predicate on it is tested against this value.
+    given_json: Value<'static>,
+    /// The root path the scan was given, or `$` for the whole document, which
+    /// the hidden `root` column of every row reports.
+    given_root: Value<'static>,
 }
 
 impl VirtualCursor for JsonWalkCursor {
@@ -218,6 +222,8 @@ impl VirtualCursor for JsonWalkCursor {
     fn filter(&mut self, _context: &mut Context<'_>, plan: &FilterPlan) -> DbResult<()> {
         self.rows.clear();
         self.at = 0;
+        self.given_json = Value::Null;
+        self.given_root = Value::Null;
         let mut arguments = plan.arguments.iter();
         let document = (plan.index_number & 1 != 0)
             .then(|| arguments.next())
@@ -228,6 +234,11 @@ impl VirtualCursor for JsonWalkCursor {
         let Some(document) = document else {
             return Ok(());
         };
+        self.given_json = document.clone().into_owned()?;
+        self.given_root = match root {
+            Some(value) => value.clone().into_owned()?,
+            None => Value::owned_text(b"$")?,
+        };
         if document.is_null() {
             return Ok(());
         }
@@ -236,21 +247,21 @@ impl VirtualCursor for JsonWalkCursor {
         };
         // The offsets are into the encoding of the *whole* document, so a root
         // path is located inside it rather than encoded on its own.
-        let (start, start_id, prefix, root_key, parent_path) = match root {
-            None => (&tree, 0i64, "$".to_string(), None, "$".to_string()),
+        let (start, start_at, start_id, prefix, root_key, parent_path) = match root {
+            None => (&tree, 0i64, 0i64, "$".to_string(), None, "$".to_string()),
             Some(Value::Null) => return Ok(()),
             Some(value) => {
                 let text = text_of(value);
                 let steps = path::parse(&text)?;
-                let Some((found, offset)) = locate(&tree, 0, &steps) else {
+                let Some((found, value_at, reported)) = locate(&tree, 0, &steps)? else {
                     return Ok(());
                 };
                 let (key, parent) = root_position(&text, &steps);
-                (found, offset, text, key, parent)
+                (found, value_at, reported, text, key, parent)
             }
         };
         match self.walk {
-            Walk::Each => self.each(start, start_id, &prefix),
+            Walk::Each => self.each(start, start_at, start_id, &prefix),
             Walk::Tree => {
                 self.rows.push(WalkRow {
                     key: root_key,
@@ -260,7 +271,7 @@ impl VirtualCursor for JsonWalkCursor {
                     fullkey: prefix.clone(),
                     path: parent_path,
                 });
-                self.descend(start, start_id, start_id, &prefix);
+                self.descend(start, start_at, start_id, &prefix);
             }
         }
         Ok(())
@@ -300,6 +311,8 @@ impl VirtualCursor for JsonWalkCursor {
             PARENT => row.parent.map_or(Value::Null, Value::Integer),
             FULLKEY => Value::owned_text(row.fullkey.as_bytes())?,
             PATH => Value::owned_text(row.path.as_bytes())?,
+            JSON => self.given_json.clone(),
+            ROOT => self.given_root.clone(),
             _ => Value::Null,
         })
     }
@@ -312,8 +325,8 @@ impl VirtualCursor for JsonWalkCursor {
 
 impl JsonWalkCursor {
     /// Adds one row per direct child of a node.
-    fn each(&mut self, node: &Node, node_id: i64, prefix: &str) {
-        for child in children(node, node_id) {
+    fn each(&mut self, node: &Node, value_at: i64, node_id: i64, prefix: &str) {
+        for child in children(node, value_at) {
             self.rows.push(WalkRow {
                 key: child.key.clone(),
                 node: child.node.clone(),
@@ -431,10 +444,40 @@ fn children(node: &Node, node_id: i64) -> Vec<Child<'_>> {
     out
 }
 
-/// Resolves a path inside a document, returning the node and its offset.
-fn locate<'tree>(node: &'tree Node, at: i64, steps: &[path::Step]) -> Option<(&'tree Node, i64)> {
+/// Resolves a path inside a document, returning the node, where its own encoding begins and the
+/// offset the walk reports for it.
+///
+/// For an object member the reported offset is the label's, which is before the value begins.
+///
+/// A malformed step ends the walk the way `json_extract` ends it: an error where the
+/// walk is standing on something that step would be read against, and no rows
+/// where it is not.
+///
+/// @param node - the element the walk is on
+/// @param at - the offset of that element in the whole document
+/// @param steps - what is left of the path
+fn locate<'tree>(
+    node: &'tree Node,
+    at: i64,
+    steps: &[path::Step],
+) -> DbResult<Option<(&'tree Node, i64, i64)>> {
+    locate_from(node, at, at, steps)
+}
+
+/// Resolves the rest of a path, remembering the offset reported for the element reached so far.
+///
+/// @param node - the element the walk is on
+/// @param at - where that element's own encoding begins
+/// @param reported - the offset the walk reports for that element
+/// @param steps - what is left of the path
+fn locate_from<'tree>(
+    node: &'tree Node,
+    at: i64,
+    reported: i64,
+    steps: &[path::Step],
+) -> DbResult<Option<(&'tree Node, i64, i64)>> {
     let Some((step, rest)) = steps.split_first() else {
-        return Some((node, at));
+        return Ok(Some((node, at, reported)));
     };
     let members = children(node, at);
     let found = match step {
@@ -447,8 +490,17 @@ fn locate<'tree>(node: &'tree Node, at: i64, steps: &[path::Step]) -> Option<(&'
             .checked_sub(*back)
             .and_then(|index| members.get(index)),
         path::Step::Append => None,
-    }?;
-    locate(found.node, found.value_at, rest)
+        path::Step::Malformed { array_only, text } => {
+            return match !array_only || matches!(node, Node::Array(_)) {
+                true => Err(path::bad_path(text)),
+                false => Ok(None),
+            }
+        }
+    };
+    match found {
+        Some(found) => locate_from(found.node, found.value_at, found.id, rest),
+        None => Ok(None),
+    }
 }
 
 /// Returns how many bytes one node's whole encoding takes.
@@ -509,7 +561,7 @@ fn root_position(text: &str, steps: &[path::Step]) -> (Option<Value<'static>>, S
     let key = match last {
         path::Step::Key(name) => Value::owned_text(name.as_bytes()).ok(),
         path::Step::Index(index) => Some(Value::Integer(*index as i64)),
-        path::Step::FromEnd(_) | path::Step::Append => None,
+        path::Step::FromEnd(_) | path::Step::Append | path::Step::Malformed { .. } => None,
     };
     // The containing path is the written path with its last step removed, which
     // is a suffix trim rather than a re-render: the path was written by the
@@ -551,9 +603,11 @@ mod tests {
             walk: kind,
             rows: Vec::new(),
             at: 0,
+            given_json: Value::Null,
+            given_root: Value::Null,
         };
         match kind {
-            Walk::Each => cursor.each(&tree, 0, "$"),
+            Walk::Each => cursor.each(&tree, 0, 0, "$"),
             Walk::Tree => {
                 cursor.rows.push(WalkRow {
                     key: None,
@@ -609,7 +663,7 @@ mod tests {
     fn a_root_path_keeps_the_document_offsets() {
         let tree = parse::parse(r#"{"a":1,"b":[2,3]}"#).expect("parses").node;
         let steps = path::parse("$.b").expect("parses");
-        let (found, offset) = locate(&tree, 0, &steps).expect("found");
+        let (found, offset, _) = locate(&tree, 0, &steps).expect("walks").expect("found");
         assert_eq!(offset, 7);
         assert!(matches!(found, Node::Array(_)));
     }

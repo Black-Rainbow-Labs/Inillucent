@@ -17,6 +17,25 @@ use crate::keyword::Keyword;
 use crate::lexer::{Punctuator, Span};
 use inillucent_base::limits::Limit;
 
+/// The `ORDER BY` terms, `LIMIT` and `OFFSET` written after one arm.
+type SelectTail = (
+    Vec<crate::ast::OrderTerm>,
+    Option<crate::ast::ExprId>,
+    Option<crate::ast::ExprId>,
+);
+
+/// Returns the words SQLite uses for a compound operator in its refusals.
+///
+/// @param op - the operator
+fn compound_operator_name(op: CompoundOp) -> &'static str {
+    match op {
+        CompoundOp::Union => "UNION",
+        CompoundOp::UnionAll => "UNION ALL",
+        CompoundOp::Intersect => "INTERSECT",
+        CompoundOp::Except => "EXCEPT",
+    }
+}
+
 impl Parser<'_> {
     /// Parses a SELECT statement, including any `WITH` prefix.
     pub(super) fn parse_select_statement(&mut self) -> Result<Statement, ParseError> {
@@ -46,7 +65,23 @@ impl Parser<'_> {
         let mut last_is_values = self.at_keyword(Keyword::VALUES)?;
         let first = self.parse_select_core()?;
         let mut compounds = Vec::new();
-        while let Some(op) = self.parse_compound_operator()? {
+        let mut misplaced: Option<(&'static str, CompoundOp)> = None;
+        let (order_by, limit, offset) = loop {
+            let tail = self.parse_select_tail(last_is_values)?;
+            let Some(op) = self.parse_compound_operator()? else {
+                break tail;
+            };
+            // **An `ORDER BY` or a `LIMIT` before a compound operator is read
+            // and then refused by name.** SQLite's grammar gives every arm a
+            // tail and reports the rightmost arm that has one but is not last.
+            if !tail.0.is_empty() || tail.1.is_some() {
+                let clause = if tail.0.is_empty() {
+                    "LIMIT"
+                } else {
+                    "ORDER BY"
+                };
+                misplaced = Some((clause, op));
+            }
             if compounds.len() as i64 >= self.limits.get(Limit::CompoundSelect) {
                 return Err(ParseError::new(
                     ParseErrorKind::LimitExceeded("too many terms in compound SELECT"),
@@ -55,17 +90,41 @@ impl Parser<'_> {
             }
             last_is_values = self.at_keyword(Keyword::VALUES)?;
             compounds.push((op, self.parse_select_core()?));
+        };
+        if let Some((clause, op)) = misplaced {
+            return Err(ParseError::new(
+                ParseErrorKind::Refused(format!(
+                    "{clause} clause should come after {} not before",
+                    compound_operator_name(op)
+                )),
+                Span::default(),
+            ));
         }
-        // **`ORDER BY` and `LIMIT` belong to a `SELECT`, never to a
-        // `VALUES`.** In SQLite's grammar they are the tail of a `SELECT`
-        // core, and the compound's last core carries them for the whole
-        // compound; a `VALUES` core has no tail. So when the last arm is a
-        // `VALUES`, one row or several, the `ORDER` or `LIMIT` after it is
-        // a syntax error there - `SELECT 1, 2 INTERSECT VALUES (1, 1), (2, 2)
-        // ORDER BY 1, 2` included - and it was accepted here.
-        if last_is_values
-            && (self.at_keyword(Keyword::ORDER)? || self.at_keyword(Keyword::LIMIT)?)
-        {
+        let end = self.cursor();
+        Ok(self.ast.add_select(Select {
+            with,
+            first,
+            compounds,
+            order_by,
+            limit,
+            offset,
+            span: Span::new(start, end),
+            nested_from: false,
+        }))
+    }
+
+    /// Parses the `ORDER BY` and `LIMIT` that follow one arm of a `SELECT`.
+    ///
+    /// **`ORDER BY` and `LIMIT` belong to a `SELECT`, never to a `VALUES`.** In
+    /// SQLite's grammar they are the tail of a `SELECT` core, and the compound's
+    /// last core carries them for the whole compound; a `VALUES` core has no
+    /// tail. So when the arm is a `VALUES`, one row or several, the `ORDER` or
+    /// `LIMIT` after it is a syntax error there - `SELECT 1, 2 INTERSECT VALUES
+    /// (1, 1), (2, 2) ORDER BY 1, 2` included - and it was accepted here.
+    ///
+    /// @param is_values - whether the arm just read is a `VALUES` list
+    fn parse_select_tail(&mut self, is_values: bool) -> Result<SelectTail, ParseError> {
+        if is_values && (self.at_keyword(Keyword::ORDER)? || self.at_keyword(Keyword::LIMIT)?) {
             return Err(self.unexpected(&["the end of the statement"])?);
         }
         let order_by = if self.at_keyword(Keyword::ORDER)? {
@@ -76,16 +135,7 @@ impl Parser<'_> {
             Vec::new()
         };
         let (limit, offset) = self.parse_limit_clause()?;
-        let end = self.cursor();
-        Ok(self.ast.add_select(Select {
-            with,
-            first,
-            compounds,
-            order_by,
-            limit,
-            offset,
-            span: Span::new(start, end),
-        }))
+        Ok((order_by, limit, offset))
     }
 
     /// Parses `LIMIT expr [OFFSET expr | , expr]`.
@@ -191,13 +241,13 @@ impl Parser<'_> {
             let mut rows = Vec::new();
             loop {
                 self.expect(Punctuator::LeftParen)?;
+                // A row has at least one value: SQLite reads `VALUES()` as a syntax
+                // error at the `)`, so the first expression is required.
                 let mut row = Vec::new();
-                if !self.at(Punctuator::RightParen)? {
-                    loop {
-                        row.push(self.parse_expr()?);
-                        if !self.eat(Punctuator::Comma)? {
-                            break;
-                        }
+                loop {
+                    row.push(self.parse_expr()?);
+                    if !self.eat(Punctuator::Comma)? {
+                        break;
                     }
                 }
                 self.expect(Punctuator::RightParen)?;
@@ -309,6 +359,28 @@ impl Parser<'_> {
     pub(super) fn parse_from_clause(&mut self) -> Result<Vec<FromTermId>, ParseError> {
         let mut terms = Vec::new();
         let first = self.parse_from_term(JoinKind::Comma, false, JoinConstraint::None)?;
+        // **The first term takes an `ON` or `USING` in SQLite's grammar and
+        // refuses it afterwards.** That is the whole reason an upsert after an
+        // `INSERT ... SELECT ... FROM t` with no `WHERE` is a syntax error:
+        // `ON CONFLICT(k)` is read as a join condition, and the parser stops
+        // at the `DO` that follows it.
+        let at = self.cursor();
+        match self.parse_join_constraint()? {
+            JoinConstraint::None => {}
+            constraint => {
+                let word = if matches!(constraint, JoinConstraint::On(_)) {
+                    "ON"
+                } else {
+                    "USING"
+                };
+                return Err(ParseError::new(
+                    ParseErrorKind::Refused(format!("a JOIN clause is required before {word}")),
+                    Span::at(at),
+                ));
+            }
+        }
+        // The first term of a FROM clause is left flat unless it has an alias.
+        self.wrap_joined_group(first, true);
         terms.push(first);
         loop {
             let Some((join, natural)) = self.parse_join_operator()? else {
@@ -316,6 +388,7 @@ impl Parser<'_> {
             };
             let start = self.cursor();
             let term = self.parse_from_term(join, natural, JoinConstraint::None)?;
+            self.wrap_joined_group(term, false);
             let constraint = self.parse_join_constraint()?;
             if natural && constraint != JoinConstraint::None {
                 return Err(ParseError::new(
@@ -373,7 +446,13 @@ impl Parser<'_> {
     /// Parses `ON expr` or `USING (a, b)`.
     fn parse_join_constraint(&mut self) -> Result<JoinConstraint, ParseError> {
         if self.eat_keyword(Keyword::ON)? {
-            return Ok(JoinConstraint::On(self.parse_expr()?));
+            let condition = self.parse_expr()?;
+            // `DO` cannot follow a join condition, and is what follows
+            // `ON CONFLICT(k)` read as one; see `parse_from_clause`.
+            if self.at_keyword(Keyword::DO)? {
+                return Err(self.unexpected(&["end of the FROM clause"])?);
+            }
+            return Ok(JoinConstraint::On(condition));
         }
         if self.eat_keyword(Keyword::USING)? {
             self.expect(Punctuator::LeftParen)?;
@@ -455,6 +534,72 @@ impl Parser<'_> {
         }))
     }
 
+    /// Turns a parenthesised join of several terms into a subquery.
+    ///
+    /// **SQLite reads it as `(SELECT * FROM ...)`** unless it is the first term
+    /// of the FROM clause with no alias: its `USING` columns merge inside it,
+    /// the `ON` or `USING` written after it joins it as one term, and a column
+    /// name two of its terms share is renamed `a:1`. Flattening it into the
+    /// enclosing list lost the condition written after the closing parenthesis,
+    /// and the null extension a `LEFT JOIN` gives the group as a whole.
+    ///
+    /// @param term - the FROM term just parsed
+    /// @param first - whether it opens the FROM clause
+    fn wrap_joined_group(&mut self, term: FromTermId, first: bool) {
+        let Some(held) = self.ast.from_term(term) else {
+            return;
+        };
+        let FromSource::Join(inner) = &held.source else {
+            return;
+        };
+        if inner.len() < 2 || (first && held.alias.is_none()) {
+            return;
+        }
+        let (inner, span) = (inner.clone(), held.span);
+        let select = self.select_over_terms(inner, span);
+        if let Some(stored) = self.ast_from_term_mut(term) {
+            stored.source = FromSource::Subquery(select);
+        }
+    }
+
+    /// Builds `SELECT * FROM <terms>` for a parenthesised join.
+    ///
+    /// @param terms - the joined terms inside the parentheses
+    /// @param span - where the parenthesised join was written
+    fn select_over_terms(&mut self, terms: Vec<FromTermId>, span: Span) -> SelectId {
+        let star = self
+            .ast
+            .add_expr(crate::ast::Expr::Star { table: None }, span);
+        let core = self.ast.add_core(SelectCore {
+            body: SelectBody::Select {
+                distinct: false,
+                all: false,
+                columns: vec![ResultColumn {
+                    expr: star,
+                    alias: None,
+                    alias_was_explicit: false,
+                    span,
+                }],
+                from: terms,
+                filter: None,
+                group_by: Vec::new(),
+                having: None,
+                windows: Vec::new(),
+            },
+            span,
+        });
+        self.ast.add_select(Select {
+            with: With::default(),
+            first: core,
+            compounds: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            span,
+            nested_from: true,
+        })
+    }
+
     /// Parses `INDEXED BY name` or `NOT INDEXED`.
     fn parse_index_hint(&mut self) -> Result<IndexHint, ParseError> {
         if self.at_keyword(Keyword::INDEXED)? {
@@ -509,6 +654,7 @@ impl Parser<'_> {
                 end: None,
                 exclude: FrameExclude::NoOthers,
                 span,
+                bare_name: true,
             });
             return Ok((id, span));
         }
@@ -603,6 +749,7 @@ impl Parser<'_> {
             end: frame_end,
             exclude,
             span,
+            bare_name: false,
         });
         Ok((id, span))
     }

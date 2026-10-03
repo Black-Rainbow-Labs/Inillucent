@@ -67,6 +67,8 @@ const HAS_STOP: i32 = 2;
 const HAS_STEP: i32 = 4;
 /// The plan bit that says the scan runs backwards.
 const DESCENDING: i32 = 8;
+/// The plan bit that says the scan runs forwards whatever the step's sign.
+const ASCENDING: i32 = 16;
 
 /// One connected `generate_series`.
 struct SeriesTable {
@@ -86,31 +88,30 @@ impl VirtualTable for SeriesTable {
     /// sorter, and the plan says so.
     fn best_index(&self, info: &mut IndexQuery) -> DbResult<()> {
         let mut plan = 0i32;
-        for index in 0..info.constraints.len() {
-            let Some(constraint) = info.constraints.get(index).copied() else {
-                continue;
-            };
-            if !constraint.usable || constraint.op != ConstraintOp::Eq {
-                continue;
+        // **Claimed in the order `filter` reads its arguments**, which is start,
+        // then stop, then step, whatever order the constraints were offered in:
+        // `WHERE stop = 6 AND start IN (1, 5)` offers the stop first.
+        for (column, bit) in [(START, HAS_START), (STOP, HAS_STOP), (STEP, HAS_STEP)] {
+            let found = info.constraints.iter().position(|constraint| {
+                constraint.usable
+                    && constraint.op == ConstraintOp::Eq
+                    && constraint.column as usize == column
+            });
+            if let Some(index) = found {
+                plan |= bit;
+                info.use_constraint(index, true);
             }
-            let bit = match constraint.column as usize {
-                START => HAS_START,
-                STOP => HAS_STOP,
-                STEP => HAS_STEP,
-                _ => continue,
-            };
-            if plan & bit != 0 {
-                continue;
-            }
-            plan |= bit;
-            info.use_constraint(index, true);
         }
         if let Some(order) = info.order_by.first() {
             if info.order_by.len() == 1 && order.column as usize == VALUE {
                 info.ordered = true;
-                if order.descending {
-                    plan |= DESCENDING;
-                }
+                // Both directions are named: with a negative step the walk
+                // runs downwards unless the ordering asks for ascending.
+                plan |= if order.descending {
+                    DESCENDING
+                } else {
+                    ASCENDING
+                };
             }
         }
         info.index_number = plan;
@@ -130,6 +131,7 @@ impl VirtualTable for SeriesTable {
             descending: false,
             done: true,
             row: 0,
+            arguments: (0, 0xffff_ffff, 1),
         }))
     }
 }
@@ -142,11 +144,25 @@ struct SeriesCursor {
     descending: bool,
     done: bool,
     row: i64,
+    /// The start, stop and step as the statement gave them.
+    arguments: (i64, i64, i64),
 }
 
 impl VirtualCursor for SeriesCursor {
     /// Reads the three arguments and positions on the first value.
     fn filter(&mut self, _context: &mut Context<'_>, plan: &FilterPlan) -> DbResult<()> {
+        // SQLite's series is empty when any argument it was given is NULL.
+        // Reading NULL as zero, or as no argument at all, turned
+        // `generate_series(1, NULL)` into a walk to 4,294,967,295 that a
+        // `count(*)` over it never finished.
+        if plan
+            .arguments
+            .iter()
+            .any(|value| matches!(value, Value::Null))
+        {
+            self.done = true;
+            return Ok(());
+        }
         let mut arguments = plan.arguments.iter();
         let mut take = |bit: i32, fallback: i64| -> i64 {
             if plan.index_number & bit == 0 {
@@ -160,24 +176,46 @@ impl VirtualCursor for SeriesCursor {
         let start = take(HAS_START, 0);
         let stop = take(HAS_STOP, 0xffff_ffff);
         let step = take(HAS_STEP, 1);
+        self.arguments = (start, stop, step);
         // A zero step would never terminate, and SQLite treats it as one.
-        self.step = if step == 0 { 1 } else { step.abs() };
-        self.descending = plan.index_number & DESCENDING != 0;
+        self.step = if step == 0 { 1 } else { step.saturating_abs() };
+        // A negative step walks from `start` down to `stop`, so the low end of
+        // the series is `stop`. Unless an `ORDER BY value` says otherwise the
+        // walk then runs downwards.
+        let (low, high) = if step < 0 {
+            (stop, start)
+        } else {
+            (start, stop)
+        };
+        self.descending = if plan.index_number & DESCENDING != 0 {
+            true
+        } else if plan.index_number & ASCENDING != 0 {
+            false
+        } else {
+            step < 0
+        };
         self.row = 0;
-        if start > stop {
+        if low > high {
             self.done = true;
             return Ok(());
         }
         self.done = false;
-        if self.descending {
-            // The last value on the ascending series, which is where a
-            // descending walk begins.
-            let steps = (stop.saturating_sub(start)) / self.step;
-            self.value = start.saturating_add(steps.saturating_mul(self.step));
-            self.stop = start;
+        // The values are anchored at `start`: a positive step counts up from
+        // `low`, a negative one counts down from `high`. The far end of the
+        // series is the last value a whole number of steps reaches.
+        let span =
+            (i128::from(high) - i128::from(low)) / i128::from(self.step) * i128::from(self.step);
+        let (bottom, top) = if step < 0 {
+            (i64::try_from(i128::from(high) - span).unwrap_or(low), high)
         } else {
-            self.value = start;
-            self.stop = stop;
+            (low, i64::try_from(i128::from(low) + span).unwrap_or(high))
+        };
+        if self.descending {
+            self.value = top;
+            self.stop = bottom;
+        } else {
+            self.value = bottom;
+            self.stop = top;
         }
         Ok(())
     }
@@ -208,24 +246,18 @@ impl VirtualCursor for SeriesCursor {
     fn column(&mut self, _context: &mut Context<'_>, index: usize) -> DbResult<Value<'static>> {
         Ok(match index {
             VALUE => Value::Integer(self.value),
-            START => Value::Integer(if self.descending {
-                self.stop
-            } else {
-                self.value
-            }),
-            STOP => Value::Integer(if self.descending {
-                self.value
-            } else {
-                self.stop
-            }),
-            STEP => Value::Integer(self.step),
+            // The hidden columns echo the arguments as they were given, a
+            // negative step included.
+            START => Value::Integer(self.arguments.0),
+            STOP => Value::Integer(self.arguments.1),
+            STEP => Value::Integer(self.arguments.2),
             _ => Value::Null,
         })
     }
 
-    /// Returns the row's position in the series.
+    /// Returns the row's rowid, which SQLite makes equal to its value.
     fn rowid(&self) -> DbResult<i64> {
-        Ok(self.row.saturating_add(1))
+        Ok(self.value)
     }
 }
 

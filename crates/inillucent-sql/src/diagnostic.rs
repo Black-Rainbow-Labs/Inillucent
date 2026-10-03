@@ -38,6 +38,21 @@ pub enum ParseErrorKind {
     /// and the schema will not have it, which is what `foreign key mismatch`
     /// says.
     Refused(String),
+    /// SQLite's own sentence for a statement that SQLite refuses in this form but
+    /// accepts in another one this build cannot run.
+    ///
+    /// **The words are SQLite's and the status is `unsupported`.** A write to a view is
+    /// `cannot modify v because it is a view` when the view has no `INSTEAD OF`
+    /// trigger, and runs the trigger when it has one. A view that was reopened has lost
+    /// its triggers in this build, and the writes the triggers would have run are ones
+    /// the matrix in `tests/matrix` still marks as not built, so the sentence is
+    /// SQLite's and the caller is still told the construct is not built.
+    RefusedNotBuilt {
+        /// What the message says.
+        said: String,
+        /// The construct, for the `unsupported` status.
+        feature: &'static str,
+    },
     /// A hard limit was exceeded.
     LimitExceeded(&'static str),
 }
@@ -86,6 +101,15 @@ impl ParseError {
             }
             ParseErrorKind::Unsupported(what) => format!("unsupported: {what}"),
             ParseErrorKind::Refused(message) => message.clone(),
+            ParseErrorKind::RefusedNotBuilt { said, .. } => said.clone(),
+            // SQLite words these limits as the limit itself, with no `exceeded`:
+            // `too many terms in compound SELECT`, `too many columns in result set`
+            // and `string or blob too big`. The others keep their wording.
+            ParseErrorKind::LimitExceeded(
+                what @ ("too many terms in compound SELECT"
+                | "too many columns in result set"
+                | "string or blob too big"),
+            ) => (*what).to_string(),
             ParseErrorKind::LimitExceeded(what) => format!("{what} exceeded"),
         }
     }
@@ -112,6 +136,28 @@ impl From<LexError> for ParseError {
             span: Span::at(error.offset as usize),
         }
     }
+}
+
+/// Turns a lexing failure into the parse failure SQLite words it as.
+///
+/// SQLite says `unrecognized token: "<the bytes it consumed>"`, and an application
+/// that matches on that message needs the token in it. The lexer does not hold the
+/// SQL text in its error, so the caller that has the text supplies it here.
+///
+/// @param source - the SQL text that was being lexed
+/// @param error - what the lexer reported
+pub fn lex_failure(source: &[u8], error: LexError) -> ParseError {
+    if error.kind == LexErrorKind::UnterminatedComment {
+        return ParseError::from(error);
+    }
+    let text = crate::lexer::illegal_token_text(source, error);
+    ParseError::new(
+        ParseErrorKind::Refused(format!(
+            "unrecognized token: \"{}\"",
+            String::from_utf8_lossy(text)
+        )),
+        Span::at(error.offset as usize),
+    )
 }
 
 impl From<ParseError> for DbError {

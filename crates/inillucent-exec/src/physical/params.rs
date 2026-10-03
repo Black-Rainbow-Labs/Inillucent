@@ -205,6 +205,36 @@ pub struct Params {
     /// because it is read where a body statement is *run* - see
     /// `crate::trigger::run_body` - and not where one is translated.
     recursive_triggers: std::cell::Cell<bool>,
+    /// Whether an `INSERT` stores each value as its source produced it, without
+    /// applying the column's affinity.
+    ///
+    /// `CREATE TABLE ... AS SELECT` sets it for its fill: SQLite writes the
+    /// query's values into the new table as they are, so a REAL that is a whole
+    /// number stays REAL in a column whose derived affinity is NUMERIC.
+    keeps_types: std::cell::Cell<bool>,
+    /// The rows a common table expression produced, for the references to it
+    /// that share one evaluation.
+    ///
+    /// SQLite evaluates a CTE that is used twice once, so `random()` in it gives
+    /// both references the same value. Shared by every copy of this set, which
+    /// are the copies one execution makes of it.
+    ///
+    /// **Allocated by the first copy or the first write, not by `new`.** A
+    /// statement with no shared common table expression never needs the cell,
+    /// and `new` runs on every prepare, so allocating it there cost every
+    /// compile one allocation (the compile budget test counts them).
+    shared_rows: std::cell::OnceCell<std::rc::Rc<std::cell::RefCell<SharedRows>>>,
+}
+
+/// The rows of the common table expressions an execution has evaluated.
+#[derive(Debug, Default)]
+pub struct SharedRows {
+    /// The counters and seed of the execution the rows belong to. Rows kept from
+    /// another execution are dropped, because a set of parameters can be run
+    /// again.
+    context: Option<crate::scalar::Context>,
+    /// The rows, by the number the binder gave the CTE.
+    rows: Vec<(usize, Vec<Vec<OwnedDatum>>)>,
 }
 /// Scrambles a seed into the next one.
 ///
@@ -226,7 +256,9 @@ impl Clone for Params {
             reads: std::cell::Cell::new(self.reads.get()),
             context: self.context.clone(),
             recursive_triggers: self.recursive_triggers.clone(),
+            keeps_types: self.keeps_types.clone(),
             subqueries: self.subqueries.clone(),
+            shared_rows: self.copy_of_shared_rows(),
         }
     }
 }
@@ -239,7 +271,9 @@ impl Params {
             reads: std::cell::Cell::new(0),
             context: std::cell::Cell::new(crate::scalar::Context::default()),
             recursive_triggers: std::cell::Cell::new(false),
+            keeps_types: std::cell::Cell::new(false),
             subqueries: Vec::new(),
+            shared_rows: std::cell::OnceCell::new(),
         }
     }
 
@@ -253,7 +287,9 @@ impl Params {
             reads: std::cell::Cell::new(0),
             context: std::cell::Cell::new(crate::scalar::Context::default()),
             recursive_triggers: std::cell::Cell::new(false),
+            keeps_types: std::cell::Cell::new(false),
             subqueries: Vec::new(),
+            shared_rows: std::cell::OnceCell::new(),
         }
     }
 
@@ -270,7 +306,9 @@ impl Params {
             reads: std::cell::Cell::new(self.reads.get()),
             context: self.context.clone(),
             recursive_triggers: self.recursive_triggers.clone(),
+            keeps_types: self.keeps_types.clone(),
             subqueries,
+            shared_rows: self.copy_of_shared_rows(),
         }
     }
 
@@ -293,7 +331,9 @@ impl Params {
             reads: std::cell::Cell::new(self.reads.get()),
             context: self.context.clone(),
             recursive_triggers: self.recursive_triggers.clone(),
+            keeps_types: self.keeps_types.clone(),
             subqueries: Vec::new(),
+            shared_rows: self.copy_of_shared_rows(),
         }
     }
 
@@ -305,6 +345,77 @@ impl Params {
         if let Some(slot) = self.subqueries.get_mut(id) {
             *slot = Some(value);
         }
+    }
+
+    /// Returns the cell of kept rows as a field value for a copy of this set,
+    /// making the cell first when this set has none, so the copy and this set
+    /// share one.
+    fn copy_of_shared_rows(
+        &self,
+    ) -> std::cell::OnceCell<std::rc::Rc<std::cell::RefCell<SharedRows>>> {
+        let copy = std::cell::OnceCell::new();
+        let _ = copy.set(std::rc::Rc::clone(self.shared_cell()));
+        copy
+    }
+
+    /// Returns the cell of kept rows, making it on first use.
+    fn shared_cell(&self) -> &std::rc::Rc<std::cell::RefCell<SharedRows>> {
+        self.shared_rows.get_or_init(Default::default)
+    }
+
+    /// Makes an `INSERT` run with this set store its values without applying
+    /// the columns' affinity.
+    pub fn keep_supplied_types(&self) {
+        self.keeps_types.set(true);
+    }
+
+    /// Reports whether an `INSERT` run with this set stores its values without
+    /// applying the columns' affinity.
+    pub fn keeps_supplied_types(&self) -> bool {
+        self.keeps_types.get()
+    }
+
+    /// Returns the rows a shared common table expression already produced in
+    /// this execution.
+    ///
+    /// @param key - the number the binder gave the CTE
+    pub fn shared_rows(&self, key: usize) -> Option<Vec<Vec<OwnedDatum>>> {
+        let held = self.shared_rows.get()?.borrow();
+        if held.context != Some(self.context.get()) {
+            return None;
+        }
+        held.rows
+            .iter()
+            .find(|(held_key, _)| *held_key == key)
+            .map(|(_, rows)| rows.clone())
+    }
+
+    /// Forgets the rows kept for the shared common table expressions.
+    ///
+    /// Called when an execution begins, so a set of parameters run again reads
+    /// the table as it is then.
+    pub fn forget_shared_rows(&self) {
+        let Some(cell) = self.shared_rows.get() else {
+            return;
+        };
+        let mut held = cell.borrow_mut();
+        held.rows.clear();
+        held.context = None;
+    }
+
+    /// Keeps the rows a shared common table expression produced, for its other
+    /// references.
+    ///
+    /// @param key - the number the binder gave the CTE
+    /// @param rows - what it produced
+    pub fn keep_shared_rows(&self, key: usize, rows: &[Vec<OwnedDatum>]) {
+        let mut held = self.shared_cell().borrow_mut();
+        let now = Some(self.context.get());
+        if held.context != now {
+            held.rows.clear();
+            held.context = now;
+        }
+        held.rows.push((key, rows.to_vec()));
     }
 
     /// Returns whether this execution's subqueries have been folded already.
@@ -341,6 +452,22 @@ impl Params {
     /// @param context - the counters and the statement's random seed
     pub fn set_context(&self, context: crate::scalar::Context) {
         self.context.set(context);
+    }
+
+    /// Returns a copy of this set that says `last_insert_rowid()` is `rowid`.
+    ///
+    /// For the expressions of a `RETURNING` clause, which SQLite evaluates after
+    /// it has recorded the row it just wrote.
+    ///
+    /// @param rowid - the key of the row that was written
+    pub fn with_last_insert_rowid(&self, rowid: i64) -> Params {
+        let copy = self.clone();
+        let held = copy.context.get();
+        copy.context.set(crate::scalar::Context {
+            last_insert_rowid: rowid,
+            ..held
+        });
+        copy
     }
 
     /// Tells this set whether a trigger's own writes fire triggers.

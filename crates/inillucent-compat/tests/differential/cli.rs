@@ -253,6 +253,276 @@ fn errors_and_bail_match() {
     check("errors", "SELECT * FROM nope;\nSELECT 'after';\n");
 }
 
+/// The tables the failing statements below run against.
+const ERROR_SETUP: &str = "\
+CREATE TABLE a(x INTEGER PRIMARY KEY, y TEXT UNIQUE, z); CREATE TABLE b(x, z);
+CREATE VIEW vv AS SELECT x FROM a; CREATE INDEX ia ON a(z);
+INSERT INTO a VALUES(1,'p',3);
+";
+const ERROR_STATEMENTS: &[&str] = &[
+    r##"SELECT * FROM nosuch;"##,
+    r##"SELECT nosuch FROM a;"##,
+    r##"SELECT a.nosuch FROM a;"##,
+    r##"SELECT zz.x FROM a;"##,
+    r##"SELECT x FROM a, b;"##,
+    r##"SELECT 1 FROM a WHERE nosuchfn(x);"##,
+    r##"SELECT 1 FROM a WHERE count(*) > 1;"##,
+    r##"SELECT x, count(*) FROM a WHERE count(*)>1;"##,
+    r##"SELECT x FROM a ORDER BY 3;"##,
+    r##"SELECT x FROM a GROUP BY 3;"##,
+    r##"SELECT x FROM a UNION SELECT x,z FROM b;"##,
+    r##"SELECT x FROM a UNION SELECT x FROM b ORDER BY 2;"##,
+    r##"SELECT x FROM a UNION SELECT x FROM b ORDER BY q;"##,
+    r##"SELECT (SELECT x,z FROM a);"##,
+    r##"SELECT * ;"##,
+    r##"SELECT 1 +;"##,
+    r##"SELECT 1 1;"##,
+    r##"SELEC 1;"##,
+    r##"SELECT FROM a;"##,
+    r##"SELECT 1 FROM;"##,
+    r##"CREATE TABLE a(q);"##,
+    r##"CREATE TABLE IF NOT EXISTS a(q); CREATE TABLE a(q);"##,
+    r##"CREATE INDEX ia ON a(z);"##,
+    r##"CREATE INDEX ib ON a(nosuch);"##,
+    r##"CREATE INDEX ib ON nosuch(z);"##,
+    r##"CREATE VIEW vv AS SELECT 1;"##,
+    r##"CREATE TRIGGER tr AFTER INSERT ON nosuch BEGIN SELECT 1; END;"##,
+    r##"CREATE TABLE t(a UNKNOWNTYPE) STRICT;"##,
+    r##"CREATE TABLE t(a INT) STRICT, WITHOUT ROWID;"##,
+    r##"CREATE TABLE sqlite_x(a);"##,
+    r##"INSERT INTO a VALUES(1,'p',3);"##,
+    r##"INSERT INTO a VALUES(2,'p',3);"##,
+    r##"INSERT INTO a(x) VALUES(NULL), (NULL), (1);"##,
+    r##"INSERT INTO a VALUES(1);"##,
+    r##"INSERT INTO a(nosuch) VALUES(1);"##,
+    r##"INSERT INTO nosuch VALUES(1);"##,
+    r##"INSERT INTO a VALUES(nosuch);"##,
+    r##"INSERT INTO vv VALUES(1);"##,
+    r##"INSERT INTO a SELECT 1,2;"##,
+    r##"UPDATE a SET nosuch=1;"##,
+    r##"UPDATE a SET x=1 WHERE nosuch=1;"##,
+    r##"UPDATE nosuch SET x=1;"##,
+    r##"UPDATE a SET (x,y)=(1);"##,
+    r##"DELETE FROM nosuch;"##,
+    r##"DELETE FROM a WHERE nosuch;"##,
+    r##"DELETE FROM vv;"##,
+    r##"SELECT 'a' < 'b' COLLATE nope;"##,
+    r##"SELECT x FROM a ORDER BY y COLLATE nope;"##,
+    r##"SELECT (1,2) = 1;"##,
+    r##"SELECT 1 IN (SELECT x,z FROM a);"##,
+    r##"SELECT abs();"##,
+    r##"SELECT abs(1,2);"##,
+    r##"SELECT nosuchfn(1);"##,
+    r##"SELECT count(*, 1);"##,
+    r##"SELECT 1 LIMIT nosuch;"##,
+    r##"SELECT RAISE(ABORT,'x');"##,
+    r##"SELECT 1 FROM a JOIN b USING (nosuch);"##,
+    r##"SELECT 1 FROM a NATURAL JOIN nosuch;"##,
+    r##"SELECT q.x FROM a;"##,
+    r##"SELECT main.a.nosuch FROM a;"##,
+    r##"SELECT x FROM a WHERE x IN (SELECT nosuch FROM b);"##,
+    r##"SELECT x FROM (SELECT nosuch FROM b);"##,
+    r##"WITH c(q) AS (SELECT 1,2) SELECT * FROM c;"##,
+    r##"SELECT * FROM c;"##,
+    r##"DROP TABLE nosuch;"##,
+    r##"DROP TABLE sqlite_master;"##,
+    r##"DROP VIEW a;"##,
+    r##"DROP INDEX nosuch;"##,
+    r##"DROP TRIGGER nosuch;"##,
+    r##"ALTER TABLE nosuch RENAME TO q;"##,
+    r##"ALTER TABLE a RENAME TO b;"##,
+    r##"ALTER TABLE a ADD COLUMN y;"##,
+    r##"ATTACH ':memory:' AS main;"##,
+    r##"DETACH nosuch;"##,
+    r##"VACUUM nosuch;"##,
+    r##"REINDEX nosuch;"##,
+    r##"ANALYZE nosuch;"##,
+    r##"SAVEPOINT;"##,
+    r##"RELEASE nosuch;"##,
+    r##"ROLLBACK TO nosuch;"##,
+    r##"COMMIT;"##,
+    r##"ROLLBACK;"##,
+    r##"BEGIN; BEGIN;"##,
+    r##"SELECT json_extract('{','$');"##,
+    r##"SELECT * FROM json_each('{');"##,
+    r##"SELECT abs(-9223372036854775808);"##,
+    r##"SELECT zeroblob(2000000000);"##,
+    r##"SELECT substr();"##,
+    r##"SELECT nosuch.* FROM a;"##,
+    r##"SELECT a.* FROM a, nosuch;"##,
+    r##"SELECT 1 FROM a WHERE x = ;"##,
+    r##"SELECT 1 FROM a WHERE (x;"##,
+    r##"SELECT 1 FROM a WHERE x IN (;"##,
+    r##"SELECT CASE WHEN 1 THEN 2;"##,
+    r##"SELECT 1 FROM a LIMIT 1 OFFSET;"##,
+    r##"SELECT 'unterminated;"##,
+    r##"SELECT "unterminated;"##,
+    r##"SELECT x'zz';"##,
+    r##"SELECT 1 FROM a GROUP BY;"##,
+    r##"SELECT 1 FROM a HAVING;"##,
+    r##"INSERT INTO a VALUES(;"##,
+    r##"INSERT INTO a VALUES();"##,
+    r##"INSERT INTO a(x,) VALUES(1);"##,
+    r##"CREATE TABLE;"##,
+    r##"CREATE TABLE t(;"##,
+    r##"CREATE TABLE t(a,);"##,
+    r##"CREATE TABLE t();"##,
+    r##"CREATE INDEX;"##,
+    r##"DROP;"##,
+    r##"UPDATE a SET;"##,
+    r##"UPDATE a SET x=;"##,
+    r##"DELETE a;"##,
+    r##"DELETE FROM;"##,
+    r##"SELECT sum(x) OVER (ORDER BY nosuch) FROM a;"##,
+    r##"SELECT sum(x) OVER nosuchw FROM a;"##,
+    r##"SELECT row_number() FROM a;"##,
+    r##"SELECT total(x, 1) FROM a;"##,
+    r##"SELECT group_concat() FROM a;"##,
+    r##"SELECT x FROM a INDEXED BY nosuch;"##,
+    r##"SELECT x FROM a NOT INDEXED, b INDEXED BY nosuch;"##,
+    r##"SELECT unlikely();"##,
+    r##"SELECT iif(1);"##,
+    r##"SELECT coalesce(1);"##,
+    r##"SELECT nullif(1);"##,
+    r##"SELECT min();"##,
+    r##"SELECT 1 FROM a ORDER BY x COLLATE;"##,
+    r##"SELECT x FROM a AS;"##,
+    r##"SELECT 1 AS;"##,
+    r##"SELECT 1 AS 'a' 'b';"##,
+    r##"SELECT * FROM a JOIN b ON;"##,
+    r##"VALUES(1),(2,3);"##,
+    r##"VALUES();"##,
+    r##"SELECT (1,2) = (1,2,3);"##,
+    r##"SELECT (1,2) < (1,2,3);"##,
+    r##"SELECT (1,2) IS (1,2,3);"##,
+    r##"SELECT (1,2) IN ((1,2),(3,4,5));"##,
+    r##"SELECT 1 IN (SELECT 1,2);"##,
+    r##"SELECT (1,2) + 1;"##,
+    r##"SELECT (1,2) BETWEEN 1 AND 2;"##,
+    r##"SELECT (1,2) LIKE 'a';"##,
+    r##"SELECT -(1,2);"##,
+    r##"SELECT ((1,2));"##,
+    r##"SELECT abs((1,2));"##,
+    r##"SELECT (1,2) = (SELECT 1,2,3);"##,
+    r##"SELECT (1,2) = (SELECT 1);"##,
+    r##"SELECT * FROM (SELECT 1,2) WHERE (1,2) = a;"##,
+    r##"SELECT CASE (1,2) WHEN 1 THEN 2 END;"##,
+    r##"SELECT 1 WHERE (1,2);"##,
+    r##"SELECT ();"##,
+    r##"SELECT (1,2) ISNULL;"##,
+    r##"SELECT (1,2) NOT NULL;"##,
+    r##"SELECT 1 IN (1,(2,3));"##,
+    r##"SELECT (1,2) = NULL;"##,
+    r##"SELECT 1 FROM (VALUES(1),(2,3));"##,
+    r##"CREATE TABLE t(a COLLATE nope);"##,
+    r##"CREATE INDEX i ON t(a COLLATE nope);"##,
+    r##"SELECT 1 ORDER BY 1 COLLATE nope;"##,
+    r##"SELECT 'a' = 'b' COLLATE nope;"##,
+    r##"SELECT min('a' COLLATE nope);"##,
+    r##"SELECT 1 FROM sqlite_master WHERE type COLLATE nope = 'x';"##,
+    r##"CREATE TABLE a(x INTEGER PRIMARY KEY);"##,
+    r##"SELECT x FROM a INDEXED BY nope;"##,
+    r##"SELECT x FROM a INDEXED BY nope WHERE x = 1;"##,
+    r##"UPDATE a INDEXED BY nope SET x = 1;"##,
+    r##"DELETE FROM a INDEXED BY nope;"##,
+    r##"SELECT sum(x) OVER nope FROM a;"##,
+    r##"SELECT sum(x) OVER (nope) FROM a;"##,
+    r##"CREATE TABLE b(q, r);"##,
+    r##"UPDATE b SET (q, r) = (1);"##,
+    r##"UPDATE b SET (q, r) = (1, 2, 3);"##,
+    r##"UPDATE b SET (q, r) = (SELECT 1, 2);"##,
+    r##"UPDATE b SET q = 1, q = 2;"##,
+    r##"UPDATE b SET (q, q) = (1, 2);"##,
+    r##"UPDATE b SET nosuch = 1, q = 2;"##,
+    r##"PRAGMA nosuch.table_info(b);"##,
+    r##"ANALYZE nosuch.b;"##,
+    r##"REINDEX nosuch.b;"##,
+    r##"ATTACH 'x' AS temp;"##,
+    r##"CREATE TABLE nosuch.t(a);"##,
+    r##"CREATE TEMP TABLE main.t(a);"##,
+    r##"CREATE INDEX nosuch.i ON b(q);"##,
+    r##"DROP TABLE nosuch.b;"##,
+    r##"SELECT * FROM nosuch.b;"##,
+    r##"SELECT 1 FROM b WHERE nosuch.b.q = 1;"##,
+    r##"INSERT INTO nosuch.b VALUES(1,2);"##,
+];
+
+/// Each failing statement prints SQLite's message, and the excerpt and caret under it
+/// exactly when SQLite prints them.
+///
+/// **Where the caret is and whether there is one are both part of the output.** SQLite
+/// points at a token for a syntax error, a missing column, an unknown function and a
+/// table that already exists, and points at nothing for a missing table, an out of range
+/// `ORDER BY` term, a row value misused, a sub-select with two columns, a missing
+/// collation and the other failures found after the statement was read. Every statement
+/// here ran against both shells one at a time, and the lists were cut to the ones that
+/// match.
+#[test]
+fn error_messages_and_their_context_lines_match() {
+    for (index, statement) in ERROR_STATEMENTS.iter().enumerate() {
+        check(
+            &format!("error-context-{index}"),
+            &format!("{ERROR_SETUP}{statement}\n"),
+        );
+    }
+}
+
+/// Several statements on one line are one chunk of input.
+///
+/// A statement that fails to compile ends the line and its error is the one printed. A
+/// statement that fails while running does not end it, the next statement runs, and
+/// only the last of those errors is printed.
+#[test]
+fn several_statements_on_one_line_follow_the_chunk_rule() {
+    check(
+        "one-line-chunks",
+        "CREATE TABLE t(a INT CHECK(a>0), b, CHECK(a<b)); INSERT INTO t VALUES(-1,1); INSERT INTO t VALUES(5,2);\n\
+         SELECT \"zz\" FROM t; SELECT \"a\" FROM t;\n\
+         INSERT INTO t VALUES(1,2); SELECT nosuch FROM t; INSERT INTO t VALUES(3,4);\n\
+         INSERT INTO t VALUES(7,8); INSERT INTO t VALUES(9,0); INSERT INTO t VALUES(10,11);\n\
+         SELECT * FROM t;\n\
+         SELECT 3; SELECT 4 FROM nosuch; SELECT 5; SELECT 6 +;\n\
+         SELECT 7; SELECT 8\n;\nSELECT 9;\n",
+    );
+    check(
+        "one-line-runtime-errors",
+        "CREATE TABLE u(a UNIQUE); BEGIN; INSERT INTO u VALUES(1); INSERT INTO u VALUES(1); INSERT INTO u VALUES(2); COMMIT; SELECT a FROM u ORDER BY a;\n\
+         SELECT abs(-9223372036854775808); SELECT 'after';\n",
+    );
+}
+
+/// `.mode quote` writes a text with a control character as `unistr(...)`.
+#[test]
+fn quote_mode_writes_control_characters_as_unistr() {
+    check(
+        "quote-unistr",
+        ".mode quote\n\
+         SELECT 'a'||char(10)||'b';\n\
+         SELECT 'a'||char(9)||'b', 'it''s'||char(13);\n\
+         SELECT 'a\\'||char(10)||'b';\n\
+         SELECT 'a\\b', 'plain', '', char(127), char(160);\n\
+         SELECT char(10,10), 'é'||char(1);\n\
+         .headers on\n\
+         SELECT 1 AS \"a\nb\", 'x' AS y;\n\
+         .mode insert t\n\
+         SELECT 'a'||char(10)||'b' AS v;\n",
+    );
+}
+
+/// `.parameter set` evaluates its word as an SQL expression before it keeps it as text.
+#[test]
+fn parameter_values_are_expressions_first() {
+    check(
+        "parameter-values",
+        ".parameter set :n NULL\n\
+         .parameter set :e 1+1\n\
+         .parameter set :t hello\n\
+         .parameter set :d 42\n\
+         .parameter set :s 'two words'\n\
+         SELECT :n, :e, :t, :d, :s, typeof(:n), typeof(:e), typeof(:t), typeof(:d);\n\
+         .parameter list\n",
+    );
+}
 /// A statement spanning several lines is run when it is complete.
 #[test]
 fn a_multi_line_statement_matches() {

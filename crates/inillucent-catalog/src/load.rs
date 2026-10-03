@@ -606,7 +606,7 @@ fn column_info(source: &[u8], ast: &Ast, column: &inillucent_sql::ast::ColumnDef
                 info.primary_key_position = Some(1);
                 info.primary_key_conflict = *on_conflict;
             }
-            ColumnConstraint::Generated { expr, stored } => {
+            ColumnConstraint::Generated { expr, stored, .. } => {
                 info.generated = true;
                 // A VIRTUAL generated column is not stored in the record, and a
                 // STORED one is. Neither is hidden from `SELECT *`.
@@ -847,9 +847,47 @@ fn declares_autoincrement(
 
 /// Returns the folded name of an indexed column when it is a bare column.
 fn bare_column_name(ast: &Ast, key: &IndexedColumn) -> Option<Vec<u8>> {
-    match ast.expr(key.expr) {
+    match key_expression(ast, key).0 {
         Some(Expr::Column { column, .. }) => Some(ast.folded(*column).to_vec()),
         _ => None,
+    }
+}
+
+/// Splits an indexed column into its expression and the collation written on it.
+///
+/// **`UNIQUE (a COLLATE NOCASE)` is still a key on the bare column `a`.** The
+/// parser reads the expression first and takes a trailing `COLLATE` as part of
+/// it, so the key arrives as a `Collate` node around the column. Reading that
+/// as an expression made the constraint's index an expression index with no
+/// column, and the collation was lost with it.
+///
+/// @param ast - the statement's syntax tree
+/// @param key - the indexed column
+fn key_expression<'a>(
+    ast: &'a Ast,
+    key: &IndexedColumn,
+) -> (Option<&'a Expr>, Option<inillucent_sql::ast::NameId>) {
+    match ast.expr(key.expr) {
+        Some(Expr::Collate { operand, collation }) => (ast.expr(*operand), Some(*collation)),
+        other => (other, key.collation),
+    }
+}
+
+/// Returns the folded name of a table level key's column, looking through a `COLLATE`.
+///
+/// SQLite skips a `COLLATE` around the key when it decides whether the key is
+/// the rowid alias, so `PRIMARY KEY(a COLLATE nocase)` over an INTEGER column
+/// is still the alias.
+///
+/// @param ast - the parsed statement
+/// @param key - the key term
+fn alias_key_name(ast: &Ast, key: &IndexedColumn) -> Option<Vec<u8>> {
+    match ast.expr(key.expr) {
+        Some(Expr::Collate { operand, .. }) => match ast.expr(*operand) {
+            Some(Expr::Column { column, .. }) => Some(ast.folded(*column).to_vec()),
+            _ => None,
+        },
+        _ => bare_column_name(ast, key),
     }
 }
 
@@ -909,7 +947,7 @@ fn rowid_alias(
         if keys.len() != 1 {
             continue;
         }
-        let Some(name) = keys.first().and_then(|key| bare_column_name(ast, key)) else {
+        let Some(name) = keys.first().and_then(|key| alias_key_name(ast, key)) else {
             continue;
         };
         let Some(index) = info.column_position(&name) else {
@@ -967,7 +1005,7 @@ fn automatic_indexes(
                 unique,
                 columns: vec![IndexColumnInfo {
                     column: Some(position as u16),
-                    expr_sql: None,
+                    expr_sql: virtual_key_sql(info, Some(position as u16)),
                     collation,
                     descending: false,
                     declared_descending: false,
@@ -992,7 +1030,7 @@ fn automatic_indexes(
                 let single_rowid = columns.len() == 1
                     && columns
                         .first()
-                        .and_then(|key| bare_column_name(ast, key))
+                        .and_then(|key| alias_key_name(ast, key))
                         .and_then(|name| info.column_position(&name))
                         .is_some_and(|index| info.rowid_alias == Some(index));
                 if single_rowid {
@@ -1017,7 +1055,7 @@ fn automatic_indexes(
         let mut key_columns = Vec::with_capacity(keys.len());
         for key in keys {
             let column = bare_column_name(ast, key).and_then(|name| info.column_position(&name));
-            let collation = match key.collation {
+            let collation = match key_expression(ast, key).1 {
                 Some(name) => ast.folded(name).to_vec(),
                 None => column
                     .and_then(|index| info.column(index))
@@ -1026,9 +1064,14 @@ fn automatic_indexes(
             };
             key_columns.push(IndexColumnInfo {
                 column,
-                expr_sql: None,
+                expr_sql: virtual_key_sql(info, column),
                 collation,
-                descending: key.order == inillucent_sql::ast::SortOrder::Descending,
+                // The primary key of a WITHOUT ROWID table is the table's own tree, which this
+                // build stores in ascending key order whatever `DESC` says, so the planner has to
+                // seek and order it as ascending. `declared_descending` still reports the
+                // declaration, as `PRAGMA index_xinfo` does.
+                descending: key.order == inillucent_sql::ast::SortOrder::Descending
+                    && !(info.without_rowid && origin == IndexOrigin::PrimaryKey),
                 declared_descending: key.order == inillucent_sql::ast::SortOrder::Descending,
             });
         }
@@ -1048,6 +1091,23 @@ fn automatic_indexes(
         });
     }
     (indexes, rowid_key_conflict)
+}
+
+/// Returns the expression an index key computes, when the key is a `VIRTUAL`
+/// generated column.
+///
+/// A virtual column is in no record, so an index over it holds the column's
+/// expression evaluated per row. `CREATE INDEX` already did this; the index a
+/// `UNIQUE` constraint makes was built with no expression, so it was never
+/// written to and the constraint was never enforced.
+///
+/// @param info - the table
+/// @param column - the key's column, when the key is a bare column
+fn virtual_key_sql(info: &TableInfo, column: Option<u16>) -> Option<Vec<u8>> {
+    column
+        .and_then(|declared| info.column(declared))
+        .filter(|held| held.generated && !held.stored)
+        .and_then(|held| held.generated_sql.clone())
 }
 
 /// Returns the name SQLite gives an automatic index.
@@ -1420,17 +1480,34 @@ mod tests {
     #[test]
     fn an_unimplemented_construct_in_schema_sql_keeps_its_marker() {
         let error = trigger_from_create_sql(
-            b"CREATE TRIGGER r AFTER INSERT ON t BEGIN INSERT INTO u VALUES (1) RETURNING 1; END",
+            b"CREATE TRIGGER r AFTER INSERT ON t BEGIN INSERT INTO u SELECT 1 FROM t NATURAL JOIN u ON 1; END",
         )
-        .expect_err("RETURNING is refused inside a trigger");
+        .expect_err("a NATURAL join with ON is refused");
         assert_eq!(
             error.unsupported(),
-            Some("RETURNING is not available in triggers"),
+            Some("a NATURAL join may not have ON or USING"),
             "{error:?}"
         );
         assert_eq!(error.code(), inillucent_base::PrimaryCode::Error);
         assert!(
             error.message().contains("cannot parse the CREATE TRIGGER"),
+            "{error:?}"
+        );
+    }
+
+    /// `RETURNING` in a trigger body is a plain refusal in SQLite's words, not a feature this
+    /// engine lacks, so it carries no unsupported marker.
+    #[test]
+    fn returning_in_a_trigger_body_is_refused_in_sqlites_words() {
+        let error = trigger_from_create_sql(
+            b"CREATE TRIGGER r AFTER INSERT ON t BEGIN INSERT INTO u VALUES (1) RETURNING 1; END",
+        )
+        .expect_err("RETURNING is refused inside a trigger");
+        assert_eq!(error.unsupported(), None, "{error:?}");
+        assert!(
+            error
+                .message()
+                .contains("cannot use RETURNING in a trigger"),
             "{error:?}"
         );
     }

@@ -40,11 +40,11 @@ pub fn call(func: MathFunc, arguments: &[Value<'static>]) -> Value<'static> {
         MathFunc::Acos => domain(first, -1.0, 1.0, f64::acos),
         MathFunc::Asin => domain(first, -1.0, 1.0, f64::asin),
         MathFunc::Atan => Some(first.atan()),
-        MathFunc::Acosh => (first >= 1.0).then(|| first.acosh()),
-        MathFunc::Asinh => Some(first.asinh()),
+        MathFunc::Acosh => (first >= 1.0).then(|| reference_acosh(first)),
+        MathFunc::Asinh => Some(reference_asinh(first)),
         // The interval is closed, and the ends are the infinities rather than
         // an error: `atanh(1)` is +Inf in the pinned build.
-        MathFunc::Atanh => domain(first, -1.0, 1.0, f64::atanh),
+        MathFunc::Atanh => domain(first, -1.0, 1.0, odd_atanh),
         MathFunc::Atan2 => second.map(|second| first.atan2(second)),
         MathFunc::Ceil => Some(first.ceil()),
         MathFunc::Cos => Some(first.cos()),
@@ -84,6 +84,59 @@ pub fn call(func: MathFunc, arguments: &[Value<'static>]) -> Value<'static> {
         Some(value) if !value.is_nan() => Value::Real(value),
         _ => Value::Null,
     }
+}
+
+/// `atanh` computed on the magnitude, with the sign put back afterwards.
+///
+/// The C library the pinned SQLite uses computes `atanh(-x)` as `-atanh(x)`,
+/// while Rust's `f64::atanh` runs its formula on the signed value, which loses
+/// digits for a negative argument: `atanh(tanh(-1.0))` is -0.9999999999999999 in
+/// SQLite and -1.0 with the Rust function.
+///
+/// @param value - the argument, between -1 and 1 inclusive
+fn odd_atanh(value: f64) -> f64 {
+    value.abs().atanh().copysign(value)
+}
+
+/// Beyond this magnitude `x * x` is about to overflow, and both `asinh` and
+/// `acosh` are `ln(x) + ln 2`. Below it the formulas below run unchanged, which
+/// matched the reference at 2.8e8 and 1e12 where the usual switch at 2^28 did not.
+const LARGE_ARGUMENT: f64 = 1.0e150;
+
+/// `asinh` the way the pinned SQLite's C library computes it.
+///
+/// Rust's `f64::asinh` takes a different path, and for 34 of 400 sampled
+/// arguments it differs from the reference in the last digit. Using `ln_1p` of
+/// `a + a*a / (1 + sqrt(1 + a*a))` on the magnitude matched all 400, and the
+/// sign is put back afterwards so `asinh(-x)` is `-asinh(x)`.
+///
+/// @param value - the argument
+fn reference_asinh(value: f64) -> f64 {
+    let magnitude = value.abs();
+    if magnitude < 3.725_290_298_461_914e-9 || !magnitude.is_finite() {
+        return value;
+    }
+    let result = if magnitude > LARGE_ARGUMENT {
+        magnitude.ln() + core::f64::consts::LN_2
+    } else {
+        let square = magnitude * magnitude;
+        (magnitude + square / (1.0 + (1.0 + square).sqrt())).ln_1p()
+    };
+    result.copysign(value)
+}
+
+/// `acosh` the way the pinned SQLite's C library computes it.
+///
+/// `ln_1p(t + sqrt(t * (t + 2)))` with `t = x - 1` matched the reference for
+/// all 400 sampled arguments, where `f64::acosh` differed for 64 of them.
+///
+/// @param value - the argument, at least 1
+fn reference_acosh(value: f64) -> f64 {
+    if value > LARGE_ARGUMENT {
+        return value.ln() + core::f64::consts::LN_2;
+    }
+    let offset = value - 1.0;
+    (offset + (offset * (offset + 2.0)).sqrt()).ln_1p()
 }
 
 /// An argument that is a number, and whether it was an exact integer.

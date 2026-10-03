@@ -179,6 +179,11 @@ use inillucent_pool::{Database, Options, PageId, Pool};
 /// forbid. The same shape as `ext` and `vfs` above.
 pub use inillucent_sql::bind::{AuthAction, Authorization, Authorizer};
 use inillucent_sql::catalog_view::{StaticCatalog, TableInfo};
+/// Whether a word is one of SQLite's keywords, re-exported for the same reason.
+///
+/// The shell quotes a column name in `.mode insert` exactly when SQLite's
+/// `quoteChar` would, and that rule asks `sqlite3_keyword_check`.
+pub use inillucent_sql::keyword::lookup as keyword_lookup;
 use inillucent_sql::parser::parse_next_statement;
 use inillucent_sql::plan::Levers;
 use inillucent_sqlite_reader::SqliteFile;
@@ -1166,6 +1171,26 @@ impl ImportedDatabase {
             std::sync::Arc::clone(&self.storage.vfs),
             self,
             destination,
+            self.storage.page_size,
+            self.storage.frames,
+        )
+    }
+
+    /// Rebuilds this database into a database held in memory, and discards it.
+    ///
+    /// **What `VACUUM INTO ':memory:'` and `VACUUM INTO ''` do.** SQLite opens
+    /// the target as a private in memory or temporary database, copies into it,
+    /// and closes it, so the statement succeeds and leaves nothing behind. It is
+    /// still a full rebuild, which is what makes it a check that the schema and
+    /// every row can be replayed.
+    pub(crate) fn rebuild_into_memory(&mut self) -> DbResult<()> {
+        self.checkpoint()?;
+        let vfs: std::sync::Arc<dyn inillucent_vfs::Vfs> =
+            std::sync::Arc::new(inillucent_vfs::memory::MemoryVfs::new());
+        crate::rebuild::rebuild_into(
+            vfs,
+            self,
+            std::path::Path::new("vacuum-into-memory.rdb"),
             self.storage.page_size,
             self.storage.frames,
         )

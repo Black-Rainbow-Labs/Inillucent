@@ -1563,7 +1563,7 @@
           "status": "constraint"
         },
         {
-          "sql": "SELECT a FROM s WHERE (a, b) IN (SELECT a, b FROM s)",
+          "sql": "ATTACH ? AS other",
           "status": "unsupported"
         }
       ]

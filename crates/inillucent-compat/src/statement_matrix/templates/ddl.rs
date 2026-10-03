@@ -79,6 +79,10 @@ fn ddl_table() -> Family {
                     "rename_column",
                     "rename_table",
                     "drop_column",
+                    "set_not_null",
+                    "drop_not_null",
+                    "add_check",
+                    "drop_constraint",
                 ],
             ),
             Axis::new("data", DATA),
@@ -179,6 +183,13 @@ fn build_table(pick: &Pick) -> Option<Case> {
         "rename_column" => (Some("ALTER TABLE t RENAME COLUMN b TO bb"), "t"),
         "rename_table" => (Some("ALTER TABLE t RENAME TO t_new"), "t_new"),
         "drop_column" => (Some("ALTER TABLE t DROP COLUMN b"), "t"),
+        "set_not_null" => (Some("ALTER TABLE t ALTER COLUMN b SET NOT NULL"), "t"),
+        "drop_not_null" => (Some("ALTER TABLE t ALTER COLUMN a DROP NOT NULL"), "t"),
+        "add_check" => (
+            Some("ALTER TABLE t ADD CONSTRAINT ck CHECK (k IS NOT 99)"),
+            "t",
+        ),
+        "drop_constraint" => (Some("ALTER TABLE t DROP CONSTRAINT ck"), "t"),
         _ => (None, "t"),
     };
     if let Some(sql) = statement {

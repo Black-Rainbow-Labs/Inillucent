@@ -17,54 +17,121 @@ use inillucent_value::{cast, fpdecode, numeric, TextEncoding, Value};
 /// Formats a call to `printf`/`format`.
 ///
 /// The first argument is the format; the rest are consumed left to right.
+///
+/// **An unknown conversion makes the whole answer NULL, as it does in SQLite**:
+/// `printf('%y', 1)`, `printf('%5')`, `printf('%1$d', 1)` and `printf('%hd', 1)`
+/// are all NULL. A lone `%` at the very end of the format is a literal one.
 pub fn format(arguments: &[Value<'static>], encoding: TextEncoding) -> Value<'static> {
-    let Some(Value::Text(text)) = arguments.first() else {
-        // A NULL or non-text format is NULL, and a call with no arguments at
-        // all is NULL too.
+    let Some(first) = arguments
+        .first()
+        .filter(|value| !matches!(value, Value::Null))
+    else {
+        // A NULL format is NULL, and a call with no arguments at all is NULL too.
         return Value::Null;
     };
-    let template = text.utf8_bytes().to_vec();
+    let template = text_of(Some(first), encoding);
     let mut out: Vec<u8> = Vec::new();
     let mut next = 1usize;
     let mut index = 0usize;
-    while index < template.len() {
-        let byte = template.get(index).copied().unwrap_or(0);
+    while let Some(byte) = template.get(index).copied() {
         index = index.saturating_add(1);
         if byte != b'%' {
             out.push(byte);
             continue;
         }
-        let Some((spec, after)) = parse_spec(&template, index) else {
+        if index >= template.len() {
             out.push(b'%');
-            continue;
+            break;
+        }
+        let Some((mut spec, after)) = parse_spec(&template, index) else {
+            return Value::Null;
         };
         index = after;
-        if spec.conversion == b'%' {
-            out.push(b'%');
-            continue;
-        }
-        let mut spec = spec;
-        if spec.width_from_argument {
-            let width = integer_of(arguments.get(next));
-            next = next.saturating_add(1);
-            if width < 0 {
-                spec.left = true;
-                spec.width = width.unsigned_abs() as usize;
-            } else {
-                spec.width = width as usize;
+        take_widths(&mut spec, arguments, &mut next);
+        // `%n` writes nothing and `%%` takes no argument.
+        let argument = match spec.conversion {
+            b'n' => continue,
+            b'%' => None,
+            _ => {
+                next = next.saturating_add(1);
+                arguments.get(next.saturating_sub(1))
             }
-        }
-        if spec.precision_from_argument {
-            let precision = integer_of(arguments.get(next));
-            next = next.saturating_add(1);
-            spec.precision = (precision >= 0).then_some(precision as usize);
-        }
-        let argument = arguments.get(next);
-        next = next.saturating_add(1);
+        };
+        // A character conversion measures its width in characters.
+        spec.characters |= spec.conversion == b'c';
         let rendered = render(&spec, argument, encoding);
         pad(&mut out, &rendered, &spec);
     }
     Value::owned_text(&out).unwrap_or(Value::Null)
+}
+
+/// Reads a `*` width and a `*` precision from the arguments.
+///
+/// SQLite reads each as a C `int`, so a value past 32 bits wraps: a width of
+/// 2147483648 is read as -2147483648, which asks for left justification and a
+/// width of zero. A negative width left justifies, and a negative precision is
+/// its absolute value (-1, meaning none, when it is -2147483648).
+///
+/// @param spec - the specification, with its `*` fields still to fill
+/// @param arguments - the call's arguments
+/// @param next - the next argument to read, advanced past the ones used
+fn take_widths(spec: &mut Spec, arguments: &[Value<'static>], next: &mut usize) {
+    if spec.width_from_argument {
+        let width = integer_of(arguments.get(*next)) as i32;
+        *next = next.saturating_add(1);
+        if width < 0 {
+            spec.left = true;
+        }
+        spec.width = if width >= -2_147_483_647 {
+            width.unsigned_abs() as usize
+        } else {
+            0
+        };
+    }
+    if spec.precision_from_argument {
+        let precision = integer_of(arguments.get(*next)) as i32;
+        *next = next.saturating_add(1);
+        spec.precision = match precision {
+            0.. => Some(precision as usize),
+            -2_147_483_647..=-1 => Some(precision.unsigned_abs() as usize),
+            _ => None,
+        };
+    }
+}
+
+/// Returns the longest field a call asks for, before anything is written.
+///
+/// The width and the precision are in the format string or in the arguments, so
+/// the size of the answer is known up front, and a refusal made here costs
+/// nothing where one made after the answer exists has already paid for it.
+///
+/// @param arguments - the call's arguments, the format first
+pub fn widest_request(arguments: &[Value<'static>]) -> Option<u64> {
+    let first = arguments
+        .first()
+        .filter(|value| !matches!(value, Value::Null))?;
+    let template = text_of(Some(first), TextEncoding::Utf8);
+    let (mut widest, mut next, mut index) = (0u64, 1usize, 0usize);
+    while let Some(byte) = template.get(index).copied() {
+        index = index.saturating_add(1);
+        if byte != b'%' {
+            continue;
+        }
+        let Some((mut spec, after)) = parse_spec(&template, index) else {
+            return Some(widest).filter(|value| *value > 0);
+        };
+        index = after;
+        take_widths(&mut spec, arguments, &mut next);
+        if !matches!(spec.conversion, b'%' | b'n') {
+            next = next.saturating_add(1);
+        }
+        let precision = match spec.conversion {
+            b's' | b'z' | b'q' | b'Q' | b'w' | b'%' | b'n' => 0,
+            _ => spec.precision.unwrap_or(0),
+        };
+        widest = widest.max(spec.width as u64).max(precision as u64);
+    }
+    (widest > 0).then_some(widest)
 }
 
 /// One conversion specification.
@@ -148,22 +215,29 @@ fn parse_spec(template: &[u8], start: usize) -> Option<(Spec, usize)> {
             spec.precision_from_argument = true;
             index = index.saturating_add(1);
         } else {
-            let mut precision = 0usize;
+            // `%.c` is a precision of zero, not no precision.
+            let mut precision = 0u32;
             while template.get(index).is_some_and(u8::is_ascii_digit) {
                 let digit = template.get(index).copied().unwrap_or(b'0');
                 precision = precision
-                    .saturating_mul(10)
-                    .saturating_add(usize::from(digit.saturating_sub(b'0')));
+                    .wrapping_mul(10)
+                    .wrapping_add(u32::from(digit.saturating_sub(b'0')));
                 index = index.saturating_add(1);
             }
-            spec.precision = Some(precision);
+            spec.precision = Some((precision & 0x7fff_ffff) as usize);
         }
     }
-    // Length modifiers are accepted and ignored: every integer here is 64-bit.
-    while matches!(template.get(index), Some(b'l') | Some(b'h')) {
-        index = index.saturating_add(1);
+    // `l` and `ll` are accepted and ignored: every integer here is 64-bit. Any
+    // other modifier, `h` included, is not a conversion at all.
+    for _ in 0..2 {
+        if template.get(index) == Some(&b'l') {
+            index = index.saturating_add(1);
+        }
     }
     let conversion = template.get(index).copied()?;
+    if !b"diuxXopcsrzqQwfeEgGn%".contains(&conversion) {
+        return None;
+    }
     spec.conversion = conversion;
     Some((spec, index.saturating_add(1)))
 }
@@ -177,45 +251,16 @@ fn integer_of(value: Option<&Value<'static>>) -> i64 {
 fn render(spec: &Spec, argument: Option<&Value<'static>>, encoding: TextEncoding) -> Vec<u8> {
     match spec.conversion {
         b'd' | b'i' | b'u' => integer(spec, integer_of(argument)),
-        b'x' => based(spec, integer_of(argument), 16, false),
+        b'x' | b'p' => based(spec, integer_of(argument), 16, false),
         b'X' => based(spec, integer_of(argument), 16, true),
         b'o' => based(spec, integer_of(argument), 8, false),
+        b'r' => ordinal(spec, integer_of(argument)),
         b'f' | b'e' | b'E' | b'g' | b'G' => real(spec, argument),
-        b'c' => {
-            // `%c` is the *first character of the argument as text*, not a
-            // character code: the pinned build renders `printf('%c', 65)` as
-            // "6", because 65 becomes the text "65" and the first character of
-            // that is a six.
-            let text = text_of(argument, encoding);
-            let mut characters = String::from_utf8_lossy(&text).into_owned();
-            characters.truncate(
-                characters
-                    .char_indices()
-                    .nth(1)
-                    .map_or(characters.len(), |(at, _)| at),
-            );
-            characters.into_bytes()
-        }
-        b's' | b'z' => {
-            let mut text = text_of(argument, encoding);
-            if let Some(precision) = spec.precision {
-                // **`!` counts characters, and without it the count is bytes
-                // (task-1932, M8).** `printf('%.3s', 'éab')` is `éa` - three
-                // bytes - and `printf('%!.3s', 'éab')` is `éab`. Truncating on
-                // a byte index that is not a character boundary would split a
-                // character in half, so the byte path cuts at the last boundary
-                // at or before the count, which is what the reference's own
-                // UTF-8 aware truncation does.
-                let cut = match spec.characters {
-                    true => char_boundary_after(&text, precision),
-                    false => char_boundary_at_or_before(&text, precision),
-                };
-                text.truncate(cut);
-            }
-            text
-        }
-        b'q' => quoted(argument, encoding, false),
-        b'Q' => quoted(argument, encoding, true),
+        b'c' => repeated_character(spec, argument, encoding),
+        b'%' => b"%".to_vec(),
+        b's' | b'z' => limited(text_of(argument, encoding), spec),
+        b'q' => quoted(spec, argument, encoding, false),
+        b'Q' => quoted(spec, argument, encoding, true),
         b'w' => {
             // `%w` quotes an identifier: a double quote is doubled and the
             // whole is *not* wrapped, which is what makes it usable inside a
@@ -224,7 +269,7 @@ fn render(spec: &Spec, argument: Option<&Value<'static>>, encoding: TextEncoding
             if matches!(argument, None | Some(Value::Null)) {
                 return b"(NULL)".to_vec();
             }
-            let text = text_of(argument, encoding);
+            let text = limited(text_of(argument, encoding), spec);
             let mut out = Vec::new();
             for byte in text {
                 if byte == b'"' {
@@ -236,6 +281,84 @@ fn render(spec: &Spec, argument: Option<&Value<'static>>, encoding: TextEncoding
         }
         _ => Vec::new(),
     }
+}
+
+/// Renders `%c`: the first character of the argument as text, repeated
+/// `precision` times.
+///
+/// **It is the first character of the argument as text, not a character code:**
+/// the pinned build renders `printf('%c', 65)` as "6", because 65 becomes the
+/// text "65". A NULL or empty argument is one NUL byte, which is what SQLite
+/// writes. The precision is a repeat count, so `printf('%.3c', 'x')` is `xxx`,
+/// and a precision of zero or one is one character. The field width counts the
+/// repeats as characters, whatever the flags say.
+///
+/// @param spec - the conversion as it was written
+/// @param argument - the value to take the character from
+/// @param encoding - the database encoding
+fn repeated_character(
+    spec: &Spec,
+    argument: Option<&Value<'static>>,
+    encoding: TextEncoding,
+) -> Vec<u8> {
+    let text = text_of(argument, encoding);
+    let lead = text.first().copied().unwrap_or(0);
+    let mut length = 1usize;
+    if lead & 0xc0 == 0xc0 {
+        while length < 4 && text.get(length).is_some_and(|byte| byte & 0xc0 == 0x80) {
+            length = length.saturating_add(1);
+        }
+    }
+    let character = match text.get(..length) {
+        Some(bytes) if !text.is_empty() => bytes.to_vec(),
+        _ => vec![0u8],
+    };
+    let times = spec.precision.unwrap_or(1).max(1);
+    let mut out = Vec::with_capacity(character.len().saturating_mul(times));
+    for _ in 0..times {
+        out.extend_from_slice(&character);
+    }
+    out
+}
+
+/// Cuts a string to the precision, in bytes or, under `!`, in characters.
+///
+/// **A byte cut may split a character**, and SQLite lets it: the answer for
+/// `printf('%.1s', 'éa')` is the single byte `C3`. Only `!` counts whole
+/// characters (task-1932, M8): `printf('%!.3s', 'éab')` is `éab`.
+///
+/// @param text - the rendered argument
+/// @param spec - the conversion as it was written
+fn limited(mut text: Vec<u8>, spec: &Spec) -> Vec<u8> {
+    if let Some(precision) = spec.precision {
+        let cut = match spec.characters {
+            true => char_boundary_after(&text, precision),
+            false => precision.min(text.len()),
+        };
+        text.truncate(cut);
+    }
+    text
+}
+
+/// Renders `%r`: a number followed by its English ordinal suffix.
+///
+/// @param spec - the conversion as it was written
+/// @param value - the number
+fn ordinal(spec: &Spec, value: i64) -> Vec<u8> {
+    let mut out = integer(spec, value);
+    let tens = value % 100;
+    let suffix: &[u8] = if (10..=19).contains(&tens) {
+        b"th"
+    } else {
+        match value % 10 {
+            1 => b"st",
+            2 => b"nd",
+            3 => b"rd",
+            _ => b"th",
+        }
+    };
+    out.extend_from_slice(suffix);
+    out
 }
 
 /// Renders an integer conversion.
@@ -407,16 +530,34 @@ fn text_of(argument: Option<&Value<'static>>, encoding: TextEncoding) -> Vec<u8>
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Integer(integer)) => numeric::integer_to_text(*integer),
         Some(Value::Real(real)) => numeric::real_to_text(*real),
-        Some(Value::Text(text)) => text.utf8_bytes().to_vec(),
-        Some(Value::Blob(blob)) => blob.raw().to_vec(),
+        // `%s` reads its argument as a C string, so text and a blob end at
+        // the first NUL: `printf('%s|%s', 'a' || char(0) || 'b', 'c')` is `a|c`.
+        Some(Value::Text(text)) => until_nul(&text.utf8_bytes()),
+        Some(Value::Blob(blob)) => until_nul(blob.raw()),
     }
+}
+
+/// Returns the bytes before the first NUL, as an owned vector.
+///
+/// @param bytes - the argument's bytes
+fn until_nul(bytes: &[u8]) -> Vec<u8> {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    bytes.get(..end).unwrap_or(bytes).to_vec()
 }
 
 /// Renders `%q` or `%Q`: a string with its single quotes doubled.
 ///
 /// `%Q` also wraps it in quotes and writes a bare `NULL` for a NULL, which is
 /// what makes it safe to paste into generated SQL where `%q` is not.
-fn quoted(argument: Option<&Value<'static>>, encoding: TextEncoding, wrap: bool) -> Vec<u8> {
+fn quoted(
+    spec: &Spec,
+    argument: Option<&Value<'static>>,
+    encoding: TextEncoding,
+    wrap: bool,
+) -> Vec<u8> {
     // A NULL is `NULL` unquoted for `%Q` and the literal text `(NULL)` for
     // `%q`, which is the marker SQLite writes wherever a string was expected
     // and none was given.
@@ -427,7 +568,7 @@ fn quoted(argument: Option<&Value<'static>>, encoding: TextEncoding, wrap: bool)
             b"(NULL)".to_vec()
         };
     }
-    let text = text_of(argument, encoding);
+    let text = limited(text_of(argument, encoding), spec);
     let mut out = Vec::new();
     if wrap {
         out.push(b'\'');
@@ -460,18 +601,6 @@ fn char_boundary_after(text: &[u8], count: usize) -> usize {
         }
     }
     text.len()
-}
-
-/// Returns the largest character boundary at or before a byte index.
-///
-/// @param text - the rendered text
-/// @param at - the byte index the precision names
-fn char_boundary_at_or_before(text: &[u8], at: usize) -> usize {
-    let mut cut = at.min(text.len());
-    while cut > 0 && text.get(cut).is_some_and(|byte| byte & 0xC0 == 0x80) {
-        cut = cut.saturating_sub(1);
-    }
-    cut
 }
 
 /// Returns how many characters a rendered conversion occupies.

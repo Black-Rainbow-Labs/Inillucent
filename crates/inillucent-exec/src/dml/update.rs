@@ -12,7 +12,7 @@ use inillucent_sql::dml::BoundUpdate;
 use inillucent_tree::datum::OwnedDatum;
 
 use super::*;
-use crate::declared::{IndexExprs, WriteDeclarations};
+use crate::declared::{BoundDeclarations, IndexExprs, WriteDeclarations};
 use crate::expr::Eval;
 use crate::physical::{Params, SourceLayout, TreeCatalog};
 use crate::trigger::{self, Depth};
@@ -45,8 +45,15 @@ pub fn update_cached(
     keys: &[Row],
     cache: &UpdateCache,
 ) -> DbResult<Changes> {
-    update_at_cached(statement, target, params, keys, Depth::default(), cache)
-        .map_err(|error| outer_unwind(error, statement.on_conflict))
+    update_at_cached(
+        statement,
+        target,
+        params,
+        keys,
+        Depth::outermost(statement.on_conflict),
+        cache,
+    )
+    .map_err(|error| outer_unwind(error, statement.on_conflict))
 }
 /// Applies an `UPDATE` that is already some triggers deep.
 ///
@@ -91,8 +98,11 @@ pub struct UpdateSetup {
     layout: std::rc::Rc<SourceLayout>,
     /// The row images the statement can read.
     space: RowSpace,
-    /// The correlated blocks its assignments hold, prepared once.
+    /// The subqueries its assignments and its `RETURNING` clause hold, prepared
+    /// once, the assignments' first.
     correlated: Vec<crate::correlate::Correlation>,
+    /// How many of `correlated` belong to the assignments.
+    assigned_count: usize,
     /// Each assignment's record slot and compiled value.
     assignments: Vec<(usize, Box<dyn Eval>)>,
     /// Each `STORED` generated column's record slot and compiled value.
@@ -151,6 +161,7 @@ pub fn update_at_cached(
     let UpdateSetup {
         space,
         correlated,
+        assigned_count,
         assignments,
         generated,
         projected_slots,
@@ -160,6 +171,11 @@ pub fn update_at_cached(
         ..
     } = &*held;
 
+    // The setup outlives the statement, and a subquery that keeps its first
+    // answer must not keep it into the next statement.
+    for held in correlated {
+        held.forget();
+    }
     let mut changes = Changes::default();
     let captured = target.captures(table.root);
     for row in keys {
@@ -171,7 +187,8 @@ pub fn update_at_cached(
         let Some(before) = read_row(table, target, key)? else {
             continue;
         };
-        let answers = answer_correlations(correlated, target, params, &before)?;
+        let answers =
+            super::answers::assigned_answers(correlated, *assigned_count, target, params, &before)?;
         let mut after = before.clone();
         if *joined {
             // The values sit after the key columns of the row the keys query
@@ -196,61 +213,7 @@ pub fn update_at_cached(
             }
         }
         convert_after(space, generated, declarations, &answers, &mut after)?;
-        // **Every uniqueness the row moved onto, not just the table's own key.**
-        //
-        // Moving a key moves the row, so the new key has to be free; that much
-        // was always checked. What was not is that an `UPDATE` leaving the
-        // rowid alone can still collide with *another* row on a secondary
-        // `UNIQUE` index - `UPDATE t SET a = 'x'` where some other row already
-        // holds `'x'` - and the engine used to perform it, leaving two entries
-        // under one key and a table disagreeing with its own constraint.
-        // `conflicting_row` knows which row is asking, so it reports neither
-        // this row's own key nor an index whose entry did not move.
-        //
-        // `OR REPLACE` asks again after each deletion, because one image can
-        // collide with a *different* row on each of two unique indexes and
-        // SQLite deletes both. It terminates: every turn removes a row.
-        let mut skipped = false;
-        while let Some(clash) = conflicting_row(
-            table,
-            &layout,
-            target,
-            &after,
-            Some(&before),
-            IndexExprs::new(declarations, space),
-            &[],
-        )? {
-            // The constraint's own clause, when the statement wrote none -
-            // `a TEXT UNIQUE ON CONFLICT REPLACE` replaces under a plain
-            // `UPDATE` too.
-            match resolution_of(statement.on_conflict.or(clash.conflict)) {
-                Resolution::Skip => {
-                    skipped = true;
-                    break;
-                }
-                Resolution::Replace => {
-                    let Some(held) = read_row(table, target, &clash.key)? else {
-                        skipped = true;
-                        break;
-                    };
-                    remove_row(
-                        table,
-                        &layout,
-                        target,
-                        &clash.key,
-                        &held,
-                        IndexExprs::new(declarations, space),
-                    )?;
-                }
-                _ => {
-                    let unwind = unwind_of(statement.on_conflict.or(clash.conflict));
-                    return Err(clash.error.or_unwind(unwind));
-                }
-            }
-        }
-        if skipped {
-            continue;
-        }
+        check_key_is_integer(&layout, &mut after)?;
         if trigger::fire(
             &statement.triggers,
             TriggerTime::Before,
@@ -269,22 +232,13 @@ pub fn update_at_cached(
         {
             continue;
         }
-        // **Read again only if something could have moved it.** A `BEFORE` body
-        // may write the same table, and applying the stale image would put back
-        // a row another statement had already changed - so when there are
-        // triggers the row is read rather than assumed. When there are none,
-        // nothing has run between the first read and here, and the second read
-        // was a whole row copied out of the tree and thrown away: `txn.large`
-        // is two thousand updates in one transaction and paid for two thousand
-        // of them.
-        let resolution = resolution_of(statement.on_conflict);
-        if !declarations_are_met(table, &layout, declarations, space, &mut after, resolution)? {
-            continue;
-        }
-        declarations.types_are_met(table, &after)?;
-        if !declarations.checks_are_met(space, &after, resolution == Resolution::Skip)? {
-            continue;
-        }
+        // **Read again if a `BEFORE` body could have changed the row.** It may
+        // write this same table, and SQLite loads the columns the statement
+        // does not assign again after the triggers ran, so a change the body
+        // made survives and the indexes are maintained from the row as it now
+        // is. Without triggers nothing ran since the first read, and a second
+        // read was a whole row copied out of the tree and thrown away:
+        // `txn.large` is two thousand updates in one transaction.
         let reread = if statement.triggers.is_empty() {
             None
         } else {
@@ -293,7 +247,36 @@ pub fn update_at_cached(
                 None => continue,
             }
         };
+        if let Some(current) = &reread {
+            let written = |slot: usize| match *joined {
+                true => projected_slots.contains(&Some(slot)),
+                false => assignments.iter().any(|(held, _)| *held == slot),
+            };
+            take_unassigned_columns(&layout, &written, current, &mut after);
+            convert_after(space, generated, declarations, &answers, &mut after)?;
+        }
         let current = reread.as_ref().unwrap_or(&before);
+        // **Constraints are checked on the row as the triggers left it**, in
+        // SQLite's order: `NOT NULL`, `STRICT` types and `CHECK`, then the
+        // uniqueness of the keys.
+        let resolution = resolution_of(statement.on_conflict);
+        if !declarations_are_met(table, &layout, declarations, space, &mut after, resolution)? {
+            continue;
+        }
+        declarations.types_are_met(table, space, &after)?;
+        if !declarations.checks_are_met(space, &after, resolution == Resolution::Skip)? {
+            continue;
+        }
+        let request = WriteRequest {
+            layout: &layout,
+            params,
+            depth,
+            indexes: IndexExprs::new(declarations, space),
+            declarations,
+        };
+        if !resolve_key_conflicts(statement, target, &after, current, request)? {
+            continue;
+        }
         replace_row(
             table,
             &layout,
@@ -307,6 +290,16 @@ pub fn update_at_cached(
             changes.removed.push(before.clone());
             changes.written.push(after.clone());
         }
+        // **`RETURNING` is evaluated for the row straight after it is written**,
+        // against the table as it is then, before the `AFTER` triggers run.
+        let returned = super::answers::returned_for_update(
+            space,
+            projected,
+            (correlated, *assigned_count),
+            target,
+            params,
+            &after,
+        )?;
         if trigger::fire(
             &statement.triggers,
             TriggerTime::After,
@@ -325,11 +318,7 @@ pub fn update_at_cached(
         {
             continue;
         }
-        if !projected.is_empty() {
-            let mut out = Vec::with_capacity(projected.len());
-            for eval in projected {
-                out.push(space.evaluate_with(eval.as_ref(), &[after.as_slice()], &answers)?);
-            }
+        if let Some(out) = returned {
             changes.returned.push(out);
         }
     }
@@ -422,7 +411,7 @@ fn build_update_setup(
     // `crate::correlate` - the same operator a `SELECT` uses, so there is one
     // implementation of what a correlated block means rather than a second in
     // the write path.
-    let correlated = update_correlations(statement, layout, catalog)?;
+    let (correlated, assigned_count) = update_correlations(statement, layout, catalog)?;
     let space = RowSpace::new(&sources_for(statement.source, &statement.triggers), layout)
         .with_correlations(
             &correlated
@@ -480,9 +469,12 @@ fn build_update_setup(
     let declarations = WriteDeclarations::compile(
         &statement.table,
         layout,
-        &statement.checks,
-        &statement.not_null_defaults,
-        &statement.index_exprs,
+        BoundDeclarations {
+            checks: &statement.checks,
+            defaults: &statement.not_null_defaults,
+            virtual_columns: &statement.virtual_columns,
+            index_exprs: &statement.index_exprs,
+        },
         &space,
         params,
         catalog,
@@ -491,6 +483,7 @@ fn build_update_setup(
         layout: std::rc::Rc::clone(layout),
         space,
         correlated,
+        assigned_count,
         assignments,
         generated,
         projected_slots,
@@ -502,37 +495,162 @@ fn build_update_setup(
         settings: params.settings(),
     })
 }
+/// Prepares the subqueries an `UPDATE` evaluates for each row.
+///
+/// The assignments' come first and the `RETURNING` clause's after them, which
+/// is the order their answers sit in; the count of the first group is returned. A `RETURNING` subquery is prepared whether
+/// or not it reads the row, because SQLite runs it for each row returned.
+///
+/// @param statement - the bound update
+/// @param layout - the table tree's layout
+/// @param catalog - where the subqueries' trees are read
 fn update_correlations(
     statement: &BoundUpdate,
     layout: &SourceLayout,
     catalog: &dyn TreeCatalog,
-) -> DbResult<Vec<crate::correlate::Correlation>> {
-    let mut exprs: Vec<&BoundExpr> = statement
+) -> DbResult<(Vec<crate::correlate::Correlation>, usize)> {
+    let assigned: Vec<&BoundExpr> = statement
         .assignments
         .iter()
         .map(|assignment| &assignment.value)
         .collect();
-    exprs.extend(statement.returning.iter().map(|column| &column.expr));
-    crate::correlate::correlations_in(&exprs, catalog, &row_resolver(statement.source, layout))
+    let mut found = crate::correlate::correlations_in(
+        &assigned,
+        catalog,
+        &image_resolver(statement.source, false, layout),
+    )?;
+    let returned: Vec<&BoundExpr> = statement
+        .returning
+        .iter()
+        .map(|column| &column.expr)
+        .collect();
+    let assigned_count = found.len();
+    found.extend(returning_correlations(
+        &returned,
+        statement.source,
+        layout,
+        statement.table.root,
+        catalog,
+    )?);
+    Ok((found, assigned_count))
 }
-/// Returns how an outer reference maps onto one row image's tree columns.
+/// Copies the columns the statement did not assign from the row as it is now.
 ///
-/// The write path's row space is one image of the target table, so a `NEW.x` or
-/// an `a.x` in a correlated block is the tree column the layout puts `x` in.
+/// SQLite loads these again after the `BEFORE` triggers ran, so a trigger that
+/// changed another column of the row keeps its change, while the columns the
+/// statement assigned keep the statement's values. The key is never copied: a
+/// trigger cannot move the row this statement is writing.
 ///
-/// @param source - the statement-wide number of the target's FROM term
 /// @param layout - the table tree's layout
-fn row_resolver(source: usize, layout: &SourceLayout) -> impl Fn(&BoundExpr) -> Option<usize> + '_ {
-    move |expr: &BoundExpr| match expr {
-        BoundExpr::Column {
-            source: held,
-            column,
-            ..
-        } if *held == source => layout.slots.get(usize::from(*column)).copied().flatten(),
-        BoundExpr::Rowid { source: held } if *held == source => layout.rowid,
-        _ => None,
+/// @param written - whether the statement assigns a record slot
+/// @param current - the row as the triggers left it
+/// @param after - the row image to complete in place
+pub(crate) fn take_unassigned_columns(
+    layout: &SourceLayout,
+    written: &dyn Fn(usize) -> bool,
+    current: &[OwnedDatum],
+    after: &mut [OwnedDatum],
+) {
+    for (slot, cell) in after.iter_mut().enumerate() {
+        if written(slot) || layout.rowid == Some(slot) {
+            continue;
+        }
+        if let Some(value) = current.get(slot) {
+            *cell = value.clone();
+        }
     }
 }
+
+/// Gives the rowid of an updated row its integer, or refuses the update.
+///
+/// **`datatype mismatch`, as SQLite reports it.** The rowid takes integer
+/// affinity first, so `SET id = '5'` moves the row to 5, and `SET id = 7.0`
+/// to 7. What is still not an integer then is refused: an integer that
+/// overflows in `SET id = id - 1` becomes a real, and a real, text or `NULL`
+/// in the rowid column is a row the tree can no longer find by its key.
+///
+/// @param layout - the table tree's layout
+/// @param after - the row as it will be written, with the key made an integer
+fn check_key_is_integer(layout: &SourceLayout, after: &mut [OwnedDatum]) -> DbResult<()> {
+    let Some(cell) = layout.rowid.and_then(|slot| after.get_mut(slot)) else {
+        return Ok(());
+    };
+    let converted = crate::declared::to_key_affinity(std::mem::replace(cell, OwnedDatum::Null));
+    let integer = matches!(converted, OwnedDatum::Int(_));
+    *cell = converted;
+    match integer {
+        true => Ok(()),
+        false => Err(inillucent_base::DbError::new(inillucent_base::ExtendedCode(
+            inillucent_sql::dml::codes::MISMATCH,
+        ))
+        .with_message("datatype mismatch")),
+    }
+}
+
+/// Resolves every key the updated row collides with, as its `OR` clause says.
+///
+/// **Every uniqueness the row moved onto, not just the table's own key.**
+/// Moving a key moves the row, so the new key has to be free. An `UPDATE`
+/// leaving the rowid alone can still collide with another row on a secondary
+/// `UNIQUE` index, and `conflicting_row` knows which row is asking, so it
+/// reports neither this row's own key nor an index whose entry did not move.
+///
+/// `OR REPLACE` asks again after each deletion, because one image can collide
+/// with a different row on each of two unique indexes and SQLite deletes both.
+/// It terminates: every turn removes a row. A removed row runs its foreign key
+/// actions, and its declared delete triggers under `recursive_triggers`.
+///
+/// Returns false when the row is skipped.
+///
+/// @param statement - the bound update
+/// @param target - the file and its trees
+/// @param after - the row as it will be written
+/// @param current - the row as it is stored now
+/// @param request - the layout, parameters and depth of the write
+fn resolve_key_conflicts(
+    statement: &BoundUpdate,
+    target: &mut dyn WriteTarget,
+    after: &[OwnedDatum],
+    current: &[OwnedDatum],
+    request: WriteRequest<'_>,
+) -> DbResult<bool> {
+    let table = &statement.table;
+    while let Some(clash) = conflicting_row(
+        table,
+        request.layout,
+        target,
+        after,
+        Some(current),
+        request.indexes,
+        &[],
+    )? {
+        // The constraint's own clause, when the statement wrote none -
+        // `a TEXT UNIQUE ON CONFLICT REPLACE` replaces under a plain `UPDATE`
+        // too.
+        match resolution_of(statement.on_conflict.or(clash.conflict)) {
+            Resolution::Skip => return Ok(false),
+            Resolution::Replace => {
+                let Some(held) = read_row(table, target, &clash.key)? else {
+                    return Ok(false);
+                };
+                let triggers = &statement.replace_triggers;
+                // A trigger's `RAISE(IGNORE)` keeps the row, and then the key is
+                // still taken, which is the constraint failing.
+                if !remove_with_triggers(table, target, &clash.key, &held, triggers, request, true)?
+                {
+                    let unwind = unwind_of(statement.on_conflict.or(clash.conflict));
+                    return Err(clash.error.or_unwind(unwind));
+                }
+            }
+            _ => {
+                let unwind = unwind_of(statement.on_conflict.or(clash.conflict));
+                return Err(clash.error.or_unwind(unwind));
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// Computes the stored generated columns of an updated row and applies the
 /// table's affinity to it.
 ///
@@ -579,35 +697,6 @@ fn convert_after(
     Ok(())
 }
 
-/// Answers every prepared correlated block against one row image.
-///
-/// @param correlated - the prepared blocks
-/// @param target - the file and its trees
-/// @param params - the bound parameters
-/// @param row - the row image, in tree-column order
-fn answer_correlations(
-    correlated: &[crate::correlate::Correlation],
-    target: &dyn WriteTarget,
-    params: &Params,
-    row: &[OwnedDatum],
-) -> DbResult<Vec<OwnedDatum>> {
-    if correlated.is_empty() {
-        return Ok(Vec::new());
-    }
-    let catalog = target.catalog();
-    // **One set for every block of this row, written into rather than cloned
-    // per block** (task-2066 §4.3.1). `without_subqueries` copies the whole
-    // parameter vector, and a correlation's own numbers start at 100,000 - so
-    // a statement with two correlated blocks used to copy two hundred thousand
-    // slots to write two of them. Each block writes only its own numbers and
-    // they are past anything a statement can write, so one set is safe.
-    let mut bare = params.without_subqueries();
-    let mut answers = Vec::with_capacity(correlated.len());
-    for correlation in correlated {
-        answers.push(correlation.answer(catalog, &mut bare, row)?);
-    }
-    Ok(answers)
-}
 /// What differs between the row as it was and the row as it will be.
 ///
 /// **Three answers rather than two, because the caller does three different
@@ -669,7 +758,7 @@ fn update_view(
     let space = RowSpace::new(&sources_for(statement.source, &statement.triggers), &layout);
     let catalog = target.catalog();
     let mut assignments = Vec::with_capacity(statement.assignments.len());
-    for assignment in &statement.assignments {
+    for (nth, assignment) in statement.assignments.iter().enumerate() {
         let Some(slot) = layout
             .slots
             .get(usize::from(assignment.column))
@@ -678,15 +767,44 @@ fn update_view(
         else {
             continue;
         };
-        assignments.push((slot, space.compile(&assignment.value, params, catalog)?));
+        // Not compiled for an `UPDATE ... FROM`: its value may read a joined
+        // term this row space does not hold, and the row carries the value.
+        let eval = match statement.from.is_empty() {
+            true => Some(space.compile(&assignment.value, params, catalog)?),
+            false => None,
+        };
+        assignments.push((nth, slot, eval));
     }
+    let mut projected = Vec::with_capacity(statement.returning.len());
+    for column in &statement.returning {
+        projected.push(space.compile(&column.expr, params, catalog)?);
+    }
+    // An `UPDATE ... FROM` hands over the view's columns and then one computed
+    // value per assignment, because the joined terms are not in the row space
+    // the assignments would be evaluated in here.
+    let joined = !statement.from.is_empty();
+    let width = table.columns.len();
     let mut changes = Changes::default();
-    for before in rows {
+    for row in rows {
+        let before = row.get(..width).unwrap_or(row.as_slice()).to_vec();
         let mut after = before.clone();
-        for (slot, eval) in &assignments {
-            let value = space.evaluate(eval.as_ref(), &[before.as_slice()])?;
+        for (nth, slot, eval) in &assignments {
+            let value = match eval {
+                Some(eval) if !joined => space.evaluate(eval.as_ref(), &[before.as_slice()])?,
+                _ => row
+                    .get(width.saturating_add(*nth))
+                    .cloned()
+                    .unwrap_or(OwnedDatum::Null),
+            };
             if let Some(cell) = after.get_mut(*slot) {
                 *cell = value;
+                // SQLite gives an assigned column of a view the affinity of
+                // the column the view reads, so `SET a = 2` over a `TEXT`
+                // column hands the trigger and `RETURNING` the text `'2'`. An
+                // `INSERT` through a view does not.
+                if let Some(column) = table.columns.get(*slot) {
+                    crate::declared::apply_cell_affinity(cell, column.affinity);
+                }
             }
         }
         if trigger::fire(
@@ -708,6 +826,14 @@ fn update_view(
             continue;
         }
         count_view_row(&mut changes);
+        if !projected.is_empty() {
+            let mut out = Vec::with_capacity(projected.len());
+            for eval in &projected {
+                out.push(space.evaluate(eval.as_ref(), &[after.as_slice()])?);
+            }
+            super::target::widen_real_returning(&statement.returning, &mut out);
+            changes.returned.push(out);
+        }
     }
     Ok(changes)
 }

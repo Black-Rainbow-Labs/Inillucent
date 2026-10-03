@@ -37,6 +37,25 @@ use crate::expr::Eval;
 use crate::ops::{emit_rows, Flow, Sink};
 use crate::physical::{Params, TreeCatalog};
 
+/// What a lateral join evaluates against each outer row.
+pub struct OuterRowTests {
+    /// One expression per offered constraint, over the outer row.
+    pub arguments: Vec<Box<dyn Eval>>,
+    /// Conditions on the outer row that must hold before the module is called.
+    ///
+    /// **Without them the module is called for rows the `WHERE` removes.**
+    /// `FROM sqlite_master m, pragma_foreign_key_check(m.name) WHERE m.type =
+    /// 'table'` called the function for index rows too, and it fails for a
+    /// name that is not a table.
+    pub gate: Vec<Box<dyn Eval>>,
+    /// Whether the join is a `LEFT JOIN`, so an outer row that no module row
+    /// matches is still produced, extended with NULLs.
+    pub left: bool,
+    /// The `ON` condition of a `LEFT JOIN`, over the outer row followed by the
+    /// module's row. A module row that fails it does not match.
+    pub on: Option<Box<dyn Eval>>,
+}
+
 /// Joins each outer row to the rows a module answers for it.
 pub struct LateralModule<'t> {
     /// The module's instance, which names what to run.
@@ -49,6 +68,12 @@ pub struct LateralModule<'t> {
     needed: ColumnUse,
     /// One expression per offered constraint, over the outer row.
     arguments: Vec<Box<dyn Eval>>,
+    /// Conditions on the outer row that must hold before the module is called.
+    gate: Vec<Box<dyn Eval>>,
+    /// Whether an outer row with no matching module row is still produced.
+    left: bool,
+    /// The `ON` condition of a `LEFT JOIN`.
+    on: Option<Box<dyn Eval>>,
     /// Where the module's rows come from.
     catalog: &'t dyn TreeCatalog,
     /// How wide the module's rows are, so a call answering nothing still pads.
@@ -64,7 +89,7 @@ impl<'t> LateralModule<'t> {
     /// @param path - the access path the planner chose
     /// @param params - the values bound to `?1`, `?2`, ...
     /// @param needed - which of the term's columns the query reads
-    /// @param arguments - one expression per offered constraint, over the outer row
+    /// @param tests - the arguments and the outer row conditions to evaluate for each outer row
     /// @param catalog - where the module's rows come from
     /// @param width - how many columns the module declares
     /// @param downstream - what to push joined rows into
@@ -73,7 +98,7 @@ impl<'t> LateralModule<'t> {
         path: AccessPath,
         params: Params,
         needed: ColumnUse,
-        arguments: Vec<Box<dyn Eval>>,
+        tests: OuterRowTests,
         catalog: &'t dyn TreeCatalog,
         width: usize,
         downstream: Box<dyn Sink + 't>,
@@ -83,7 +108,10 @@ impl<'t> LateralModule<'t> {
             path,
             params,
             needed,
-            arguments,
+            arguments: tests.arguments,
+            gate: tests.gate,
+            left: tests.left,
+            on: tests.on,
             catalog,
             width,
             downstream,
@@ -91,10 +119,54 @@ impl<'t> LateralModule<'t> {
     }
 }
 
+impl LateralModule<'_> {
+    /// Reports whether an outer row satisfies every condition on the outer terms.
+    ///
+    /// A condition that is NULL rejects the row, as it does in a `WHERE`.
+    ///
+    /// @param batch - the outer rows
+    /// @param nth - which live row of the batch to test
+    fn outer_row_passes(&self, batch: &Batch<'_>, nth: usize) -> DbResult<bool> {
+        for condition in &self.gate {
+            let verdict = condition.value(batch, nth)?;
+            if crate::expr::truth(&verdict.get()) != Some(true) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl LateralModule<'_> {
+    /// Reports whether a joined row meets the `ON` condition of a `LEFT JOIN`.
+    ///
+    /// A join with no condition keeps every row. A NULL condition rejects the
+    /// row, as it does in a `WHERE`.
+    ///
+    /// @param joined - the outer row followed by the module's row
+    fn on_holds(&self, joined: &[OwnedDatum]) -> DbResult<bool> {
+        let Some(condition) = &self.on else {
+            return Ok(true);
+        };
+        let borrowed: Vec<inillucent_tree::datum::Datum<'_>> =
+            joined.iter().map(OwnedDatum::borrow).collect();
+        let columns: Vec<crate::batch::Vector<'_>> = borrowed
+            .iter()
+            .map(|value| crate::batch::Vector::Const(*value))
+            .collect();
+        let batch = Batch::new(1, columns);
+        let verdict = condition.value(&batch, 0)?;
+        Ok(crate::expr::truth(&verdict.get()) == Some(true))
+    }
+}
+
 impl Sink for LateralModule<'_> {
     fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
         let outer_width = batch.columns.len();
         for nth in 0..batch.live() {
+            if !self.outer_row_passes(batch, nth)? {
+                continue;
+            }
             let mut supplied = Vec::with_capacity(self.arguments.len());
             for expression in &self.arguments {
                 supplied.push(OwnedDatum::from_datum(&expression.value(batch, nth)?.get()));
@@ -109,7 +181,7 @@ impl Sink for LateralModule<'_> {
             else {
                 return Err(misuse("a virtual table the caller does not have"));
             };
-            if rows.is_empty() {
+            if rows.is_empty() && !self.left {
                 continue;
             }
             // The outer row is copied once and reused for every row the module
@@ -123,7 +195,17 @@ impl Sink for LateralModule<'_> {
                 let mut joined = outer.clone();
                 joined.extend(row);
                 joined.resize(outer_width.saturating_add(self.width), OwnedDatum::Null);
-                produced.push(joined);
+                if self.on_holds(&joined)? {
+                    produced.push(joined);
+                }
+            }
+            if produced.is_empty() && self.left {
+                let mut padded = outer;
+                padded.resize(outer_width.saturating_add(self.width), OwnedDatum::Null);
+                produced.push(padded);
+            }
+            if produced.is_empty() {
+                continue;
             }
             if emit_rows(&produced, self.downstream.as_mut())? == Flow::Stop {
                 return Ok(Flow::Stop);

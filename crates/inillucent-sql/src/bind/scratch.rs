@@ -109,9 +109,13 @@ pub(super) struct BlockFrame {
     aggregates: Vec<BoundAggregate>,
     result_aliases: Vec<(Vec<u8>, BoundExpr)>,
     allow_aggregates: bool,
+    allow_windows: bool,
+    in_group_by: bool,
+    in_plain_order_by: bool,
     inside_aggregate: bool,
     correlations: Vec<usize>,
     tail_may_name_an_alias: bool,
+    deferred: Option<(Vec<u8>, crate::lexer::Span)>,
 }
 
 impl<'a> Binder<'a> {
@@ -175,9 +179,13 @@ impl<'a> Binder<'a> {
             aggregates: core::mem::take(&mut self.aggregates),
             result_aliases: core::mem::take(&mut self.result_aliases),
             allow_aggregates: core::mem::replace(&mut self.allow_aggregates, false),
+            allow_windows: core::mem::replace(&mut self.allow_windows, false),
+            in_group_by: core::mem::replace(&mut self.in_group_by, false),
+            in_plain_order_by: core::mem::replace(&mut self.in_plain_order_by, false),
             inside_aggregate: core::mem::replace(&mut self.inside_aggregate, false),
             correlations: core::mem::take(&mut self.correlations),
             tail_may_name_an_alias: self.tail_may_name_an_alias,
+            deferred: self.outer.deferred.take(),
         }
     }
 
@@ -203,8 +211,12 @@ impl<'a> Binder<'a> {
         self.aggregates = frame.aggregates;
         self.result_aliases = frame.result_aliases;
         self.allow_aggregates = frame.allow_aggregates;
+        self.allow_windows = frame.allow_windows;
+        self.in_group_by = frame.in_group_by;
+        self.in_plain_order_by = frame.in_plain_order_by;
         self.inside_aggregate = frame.inside_aggregate;
         self.tail_may_name_an_alias = frame.tail_may_name_an_alias;
+        self.outer.deferred = frame.deferred;
         ids
     }
 }

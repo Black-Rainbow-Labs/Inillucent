@@ -369,6 +369,11 @@ impl Parser<'_> {
         if self.at(Punctuator::Star)? && self.peek_at(1)?.is(Punctuator::RightParen) {
             self.bump()?;
             arguments = None;
+        } else if self.at(Punctuator::Star)? {
+            // `count(*, 1)`: SQLite takes the `*` as the whole argument list and
+            // rejects whatever comes after it, so the error names that token.
+            self.bump()?;
+            return Err(self.unexpected(&["`)`"])?);
         } else if !self.at(Punctuator::RightParen)? {
             distinct = self.eat_keyword(Keyword::DISTINCT)?;
             if !distinct {
@@ -544,7 +549,7 @@ impl Parser<'_> {
     /// two positions take different classes.
     pub(super) fn parse_type_name(&mut self) -> Result<crate::ast::NameId, ParseError> {
         let first = self.peek()?;
-        if !Parser::token_is_plain_name(first) {
+        if !Parser::token_is_type_word(first) {
             return Err(self.unexpected(&["a type name"])?);
         }
         let mut end = first.span;
@@ -554,16 +559,20 @@ impl Parser<'_> {
         // ALWAYS AS (...)` had the declared type `BLOB GENERATED ALWAYS` -
         // which `PRAGMA table_xinfo` then reported and which decides the
         // column's affinity.
-        while self.at_plain_name()? && !self.at_constraint_keyword()? {
+        while Parser::token_is_type_word(self.peek()?) && !self.at_constraint_keyword()? {
             end = self.bump()?.span;
         }
         if self.at(Punctuator::LeftParen)? {
             self.bump()?;
+            // One number or two: `VARCHAR(10)` and `DECIMAL(10, 2)`. A third is
+            // a syntax error at the second comma, as in SQLite's grammar.
+            let mut numbers = 0;
             loop {
                 let token = self.peek()?;
                 match token.kind {
                     TokenKind::Integer | TokenKind::Float => {
                         self.bump()?;
+                        numbers += 1;
                     }
                     TokenKind::Punctuator(Punctuator::Plus)
                     | TokenKind::Punctuator(Punctuator::Minus) => {
@@ -572,7 +581,7 @@ impl Parser<'_> {
                     }
                     _ => return Err(self.unexpected(&["a number"])?),
                 }
-                if !self.eat(Punctuator::Comma)? {
+                if numbers >= 2 || !self.eat(Punctuator::Comma)? {
                     break;
                 }
             }
@@ -830,6 +839,7 @@ impl Parser<'_> {
             limit: None,
             offset: None,
             span,
+            nested_from: false,
         }))
     }
 

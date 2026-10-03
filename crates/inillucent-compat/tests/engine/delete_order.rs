@@ -184,10 +184,12 @@ fn a_delete_in_index_order_reads_each_leaf_about_once() {
     // stopped choosing the covering index would hand the delete its keys in
     // table order, and this test would pass without testing anything.
     let delete = "DELETE FROM big WHERE a % 2 = 0";
+    // EXPLAIN QUERY PLAN words a write's index search as `USING INDEX`, as SQLite does, although
+    // the keys are gathered from the index alone.
     let chosen = plan(&connection, delete);
     assert!(
-        chosen.contains("COVERING INDEX big_d"),
-        "the keys of `{delete}` are no longer gathered from the covering index (`{chosen}`), \
+        chosen.contains("INDEX big_d"),
+        "the keys of `{delete}` are no longer gathered from the index (`{chosen}`), \
          so this test no longer puts them out of table order"
     );
     let pages = integers(&connection, "PRAGMA page_count")

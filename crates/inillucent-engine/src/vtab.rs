@@ -486,8 +486,14 @@ impl ImportedDatabase {
         // column, and an `IN` offered as `=` would be read as its first value.
         let offer: Vec<inillucent_sql::plan::VirtualConstraint> = offer
             .iter()
-            .filter(|held| held.in_list.is_empty())
-            .cloned()
+            .enumerate()
+            .filter(|(_, held)| held.in_list.is_empty())
+            // A constraint the loop order has put out of this term's reach
+            // compares one of its columns to a column of a later term. It is
+            // the statement's own filter to test, and folding its value here
+            // fails because that column is not in scope.
+            .filter(|(_, held)| held.spec.usable)
+            .map(|(at, held)| with_supplied_value(held, supplied.get(at)))
             .collect();
         if let Some(answered) = self.eponymous_rows(table, &offer, params, downstream)? {
             return Ok(answered);
@@ -504,6 +510,36 @@ impl ImportedDatabase {
         };
         scan_module(&reach, table, path, params, needed, supplied, downstream)
     }
+}
+
+/// Returns a constraint whose value is the one a lateral join already computed.
+///
+/// **An eponymous answer reads its arguments out of the constraints, and a
+/// correlated argument is a column of the outer row.** `pragma_index_info(il.name)`
+/// offers `arg = il.name`, which cannot be folded here because `il` is not in
+/// scope; the lateral join evaluated it against the outer row and passed the
+/// result in `supplied`. Replacing the constraint's value with that literal lets
+/// every later step (the argument lookup, the recheck of the other predicates)
+/// read it the way it reads a constant.
+///
+/// @param held - the constraint the planner offered
+/// @param supplied - the value the lateral join computed for it, if there is one
+fn with_supplied_value(
+    held: &inillucent_sql::plan::VirtualConstraint,
+    supplied: Option<&OwnedDatum>,
+) -> inillucent_sql::plan::VirtualConstraint {
+    let mut constraint = held.clone();
+    let Some(value) = supplied else {
+        return constraint;
+    };
+    constraint.value = match value {
+        OwnedDatum::Null => inillucent_sql::bind::BoundExpr::Null,
+        OwnedDatum::Int(number) => inillucent_sql::bind::BoundExpr::Integer(*number),
+        OwnedDatum::Real(number) => inillucent_sql::bind::BoundExpr::Real(*number),
+        OwnedDatum::Text(bytes) => inillucent_sql::bind::BoundExpr::Text(bytes.clone()),
+        OwnedDatum::Blob(bytes) => inillucent_sql::bind::BoundExpr::Blob(bytes.clone()),
+    };
+    constraint
 }
 
 /// What a module's scan reads, whoever is holding the connection.
@@ -583,17 +619,29 @@ pub(crate) fn scan_module(
         };
         let mut specs: Vec<inillucent_sql::vtab::ConstraintSpec> =
             offer.iter().map(|held| held.spec).collect();
-        let mut query = IndexQuery::new(specs.clone(), order_by.clone());
+        let mut ordering = order_by.clone();
+        let mut query = IndexQuery::new(specs.clone(), ordering.clone());
         connected.table.best_index(&mut query)?;
-        let driving = in_list_to_drive(&query, offer, params, supplied, reach.folding)?;
+        // **An order the module promised does not hold across several runs of
+        // `filter`.** With an `IN` list to drive, the module is asked again
+        // without the ordering, and the statement sorts the rows itself.
+        if query.ordered && supplied.is_empty() && !claimed_in_lists(&query, offer).is_empty() {
+            ordering.clear();
+            query = IndexQuery::new(specs.clone(), ordering.clone());
+            connected.table.best_index(&mut query)?;
+        }
+        let driving = in_lists_to_drive(&query, offer, params, supplied, reach.folding)?;
         if driving.is_none() {
             // An `IN` the module claimed and this scan cannot run once per value
             // is taken back, and the statement's own filter tests it.
-            if let Some(at) = claimed_in_list(&query, offer) {
-                if let Some(spec) = specs.get_mut(at) {
-                    spec.usable = false;
+            let claimed = claimed_in_lists(&query, offer);
+            if !claimed.is_empty() {
+                for at in claimed {
+                    if let Some(spec) = specs.get_mut(at) {
+                        spec.usable = false;
+                    }
                 }
-                query = IndexQuery::new(specs, order_by.clone());
+                query = IndexQuery::new(specs, ordering);
                 connected.table.best_index(&mut query)?;
             }
         }
@@ -626,7 +674,7 @@ pub(crate) fn scan_module(
             limits: &reach.limits.borrow(),
             catalog: Some(reach.catalog),
         };
-        let Some((slot, values)) = driving else {
+        let Some(lists) = driving else {
             drive_cursor(
                 cursor.as_mut(),
                 &mut context,
@@ -638,11 +686,20 @@ pub(crate) fn scan_module(
             )?;
             return Ok(true);
         };
-        // **One `filter` per distinct value of the `IN` list.** See
-        // `VirtualConstraint::in_list`.
-        for value in values {
-            if let Some(argument) = plan.arguments.get_mut(slot) {
-                *argument = Value::Integer(value);
+        // **One `filter` per combination of values of the `IN` lists.** See
+        // `VirtualConstraint::in_list`. A list with no value left (all NULL)
+        // matches nothing, so the module is not asked at all.
+        if lists.iter().any(|list| list.values.is_empty()) {
+            return Ok(true);
+        }
+        let mut counters = vec![0usize; lists.len()];
+        loop {
+            for (list, at) in lists.iter().zip(&counters) {
+                if let (Some(argument), Some(value)) =
+                    (plan.arguments.get_mut(list.slot), list.values.get(*at))
+                {
+                    *argument = value.clone();
+                }
             }
             let flow = drive_cursor(
                 cursor.as_mut(),
@@ -653,7 +710,8 @@ pub(crate) fn scan_module(
                 reach.case_sensitive_like,
                 downstream,
             )?;
-            if flow == inillucent_exec::ops::Flow::Stop {
+            if flow == inillucent_exec::ops::Flow::Stop || !advance_counters(&lists, &mut counters)
+            {
                 break;
             }
         }
@@ -661,18 +719,49 @@ pub(crate) fn scan_module(
     }
 }
 
-/// Returns the offer position of an `IN` list the module claimed, if any.
+/// One `IN` list the scan runs `filter` for once per value.
+struct DrivenList {
+    /// Where the list's value goes among `filter`'s arguments.
+    slot: usize,
+    /// The distinct values that can match, NULL left out.
+    values: Vec<Value<'static>>,
+}
+
+/// Steps a mixed radix counter over the lists to the next combination.
+///
+/// Returns `false` once every combination has been visited. The last list
+/// changes fastest.
+///
+/// @param lists - the lists being driven
+/// @param counters - the position in each list; updated
+fn advance_counters(lists: &[DrivenList], counters: &mut [usize]) -> bool {
+    for (list, counter) in lists.iter().zip(counters.iter_mut()).rev() {
+        *counter = counter.saturating_add(1);
+        if *counter < list.values.len() {
+            return true;
+        }
+        *counter = 0;
+    }
+    false
+}
+
+/// Returns the offer positions of the `IN` lists the module claimed.
 ///
 /// @param query - what `best_index` answered
 /// @param offer - the constraints the planner offered
-fn claimed_in_list(
+fn claimed_in_lists(
     query: &IndexQuery,
     offer: &[inillucent_sql::plan::VirtualConstraint],
-) -> Option<usize> {
-    offer.iter().enumerate().find_map(|(at, held)| {
-        let claimed = query.usage.get(at).is_some_and(|usage| usage.argument > 0);
-        (claimed && !held.in_list.is_empty()).then_some(at)
-    })
+) -> Vec<usize> {
+    offer
+        .iter()
+        .enumerate()
+        .filter(|(at, held)| {
+            let claimed = query.usage.get(*at).is_some_and(|usage| usage.argument > 0);
+            claimed && !held.in_list.is_empty()
+        })
+        .map(|(at, _)| at)
+        .collect()
 }
 
 /// Returns where the claimed `IN` list's value goes among `filter`'s
@@ -689,44 +778,90 @@ fn claimed_in_list(
 /// @param params - the values bound to `?1`, `?2`, ...
 /// @param supplied - a lateral join's values
 /// @param catalog - where a value's function calls are folded
-fn in_list_to_drive(
+fn in_lists_to_drive(
     query: &IndexQuery,
     offer: &[inillucent_sql::plan::VirtualConstraint],
     params: &inillucent_exec::physical::Params,
     supplied: &[OwnedDatum],
     catalog: &dyn inillucent_exec::physical::TreeCatalog,
-) -> DbResult<Option<(usize, Vec<i64>)>> {
-    let Some(at) = claimed_in_list(query, offer) else {
-        return Ok(None);
-    };
-    if query.ordered || !supplied.is_empty() {
+) -> DbResult<Option<Vec<DrivenList>>> {
+    let claimed = claimed_in_lists(query, offer);
+    if claimed.is_empty() || query.ordered || !supplied.is_empty() {
         return Ok(None);
     }
-    let Some(held) = offer.get(at) else {
-        return Ok(None);
-    };
-    let Some(slot) = query
-        .argument_order()
-        .iter()
-        .position(|position| *position == at)
-    else {
-        return Ok(None);
-    };
-    let mut seen = std::collections::HashSet::new();
-    let mut values = Vec::with_capacity(held.in_list.len());
+    let mut lists = Vec::with_capacity(claimed.len());
+    for at in claimed {
+        let Some(held) = offer.get(at) else {
+            return Ok(None);
+        };
+        let Some(slot) = query
+            .argument_order()
+            .iter()
+            .position(|position| *position == at)
+        else {
+            return Ok(None);
+        };
+        let Some(values) = list_values(held, params, catalog)? else {
+            return Ok(None);
+        };
+        lists.push(DrivenList { slot, values });
+    }
+    Ok(Some(lists))
+}
+
+/// Returns the distinct, non NULL values of one `IN` list as `filter` arguments.
+///
+/// `None` when a value of a rowid list is not an integer, which a rowid never
+/// equals. Any other column is handed whatever the list holds: a hidden column
+/// of `generate_series` or `json_each` takes its argument from an equality, and
+/// SQLite runs the module once per value of an `IN` on it.
+///
+/// @param held - the constraint carrying the list
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param catalog - where a value's function calls are folded
+fn list_values(
+    held: &inillucent_sql::plan::VirtualConstraint,
+    params: &inillucent_exec::physical::Params,
+    catalog: &dyn inillucent_exec::physical::TreeCatalog,
+) -> DbResult<Option<Vec<Value<'static>>>> {
+    let mut candidates: Vec<OwnedDatum> = Vec::with_capacity(held.in_list.len());
     for item in &held.in_list {
-        match inillucent_exec::physical::literal_value_in(item, params, Some(catalog))? {
-            OwnedDatum::Int(value) => {
-                if seen.insert(value) {
-                    values.push(value);
-                }
-            }
+        match item {
+            // `IN (SELECT ...)`: the rows the statement already folded.
+            inillucent_sql::bind::BoundExpr::Subquery { id, .. } => match params.subquery(*id) {
+                Some(answer) => candidates.extend(answer.column.iter().cloned()),
+                None => return Ok(None),
+            },
+            _ => candidates.push(inillucent_exec::physical::literal_value_in(
+                item,
+                params,
+                Some(catalog),
+            )?),
+        }
+    }
+    let mut seen: Vec<OwnedDatum> = Vec::with_capacity(candidates.len());
+    for value in candidates {
+        match value {
             // NULL equals nothing, so it adds no row and needs no filter.
             OwnedDatum::Null => {}
+            OwnedDatum::Int(_) => {
+                if !seen.contains(&value) {
+                    seen.push(value);
+                }
+            }
+            other if held.spec.column >= 0 => {
+                if !seen.contains(&other) {
+                    seen.push(other);
+                }
+            }
             _ => return Ok(None),
         }
     }
-    Ok(Some((slot, values)))
+    let mut values = Vec::with_capacity(seen.len());
+    for datum in &seen {
+        values.push(owned_value(datum)?);
+    }
+    Ok(Some(values))
 }
 
 impl ImportedDatabase {
@@ -1364,7 +1499,7 @@ impl ImportedDatabase {
                 let name = pragma_argument_text(named);
                 Some(self.schema_named(&name).ok_or_else(|| {
                     inillucent_base::error::refusal(format!(
-                        "unknown database {}",
+                        "unknown database '{}'",
                         String::from_utf8_lossy(&name)
                     ))
                 })?)

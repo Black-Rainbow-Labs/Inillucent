@@ -164,6 +164,10 @@ pub(crate) struct Pragmas {
     /// `PRAGMA recursive_triggers`.
     recursive_triggers: std::cell::Cell<bool>,
 
+    /// Whether `ALTER TABLE ... RENAME TO` follows SQLite's pre 3.25 rules,
+    /// set by `PRAGMA legacy_alter_table`.
+    legacy_alter_table: std::cell::Cell<bool>,
+
     /// The ceiling `PRAGMA max_page_count` set, in pages.
     max_page_count: std::cell::Cell<i64>,
 
@@ -173,6 +177,11 @@ pub(crate) struct Pragmas {
     /// engine keeps temporary tables in memory whatever the number says, and
     /// the one value it cannot be - `FILE` - is refused rather than recorded.
     temp_store: std::cell::Cell<i64>,
+
+    /// What the settings in `pragma::remembered` were last set to, by name.
+    ///
+    /// A setting that was never set is absent, and reads its default.
+    remembered: std::cell::RefCell<std::collections::BTreeMap<&'static str, i64>>,
 }
 
 // The accessors, and why the fields below them are private.
@@ -392,6 +401,18 @@ impl Pragmas {
         self.recursive_triggers.set(value);
     }
 
+    /// Returns whether `PRAGMA legacy_alter_table` is on.
+    pub(crate) fn legacy_alter_table(&self) -> bool {
+        self.legacy_alter_table.get()
+    }
+
+    /// Sets `PRAGMA legacy_alter_table`.
+    ///
+    /// @param value - what to set it to
+    pub(crate) fn set_legacy_alter_table(&self, value: bool) {
+        self.legacy_alter_table.set(value);
+    }
+
     /// Returns secure delete.
     pub(crate) fn secure_delete(&self) -> u8 {
         self.secure_delete.get()
@@ -414,6 +435,33 @@ impl Pragmas {
     /// @param value - what to set it to
     pub(crate) fn set_temp_store(&self, value: i64) {
         self.temp_store.set(value);
+    }
+
+    /// Returns what a remembered setting was last set to, when it was set.
+    ///
+    /// @param name - the pragma's folded name
+    pub(crate) fn remembered(&self, name: &str) -> Option<i64> {
+        self.remembered.borrow().get(name).copied()
+    }
+
+    /// Records what a remembered setting was set to.
+    ///
+    /// @param name - the pragma's folded name
+    /// @param value - what it reads from now on
+    pub(crate) fn remember(&self, name: &'static str, value: i64) {
+        self.remembered.borrow_mut().insert(name, value);
+    }
+
+    /// Returns every remembered setting, for a `VACUUM` to carry across.
+    pub(crate) fn remembered_all(&self) -> std::collections::BTreeMap<&'static str, i64> {
+        self.remembered.borrow().clone()
+    }
+
+    /// Puts back the settings `remembered_all` returned.
+    ///
+    /// @param held - the settings to restore
+    pub(crate) fn restore_remembered(&self, held: std::collections::BTreeMap<&'static str, i64>) {
+        *self.remembered.borrow_mut() = held;
     }
 
     /// Returns writable schema.
@@ -449,6 +497,23 @@ impl Pragmas {
         }));
     }
 
+    /// Turns the reversal of unordered scans on or off, which
+    /// `PRAGMA reverse_unordered_selects` does.
+    ///
+    /// The read back value lives with the other remembered settings; this
+    /// moves the lever the planner reads, which is turned off while the pragma
+    /// is on (see `Levers::FORWARD_UNORDERED`).
+    ///
+    /// @param on - whether scans with no `ORDER BY` run backwards
+    pub(crate) fn set_reverse_unordered(&self, on: bool) {
+        let mask = self.levers.get().disabled();
+        self.levers.set(Levers::without(if on {
+            mask | Levers::FORWARD_UNORDERED
+        } else {
+            mask & !Levers::FORWARD_UNORDERED
+        }));
+    }
+
     /// Returns the settings a connection starts with.
     ///
     /// The values are SQLite's own defaults for a fresh connection, and both
@@ -474,8 +539,10 @@ impl Pragmas {
             defensive: std::cell::Cell::new(false),
             query_only: std::cell::Cell::new(false),
             recursive_triggers: std::cell::Cell::new(false),
+            legacy_alter_table: std::cell::Cell::new(false),
             max_page_count: std::cell::Cell::new(crate::pragma::DEFAULT_MAX_PAGE_COUNT),
             temp_store: std::cell::Cell::new(0),
+            remembered: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         }
     }
 }
@@ -1201,6 +1268,65 @@ impl Schema {
             }
         }
         Ok(queries)
+    }
+
+    /// Returns the queries `PRAGMA foreign_key_check` runs, one per foreign key.
+    ///
+    /// **Unlike [`Schema::violation_queries`], a key whose parent table does not
+    /// exist is checked.** SQLite reports every child row whose key columns are
+    /// all non NULL when the parent table is missing, because no parent row can
+    /// exist for it. The commit time check must not do that: with the parent
+    /// missing, a write to the child fails before the commit is reached.
+    ///
+    /// The parent is named as the key spells it, which is what SQLite prints,
+    /// and `key` is the number `PRAGMA foreign_key_list` gives the key, where
+    /// the last key declared is 0.
+    ///
+    /// @param only - the folded name of the one table to check, or none for all
+    /// @param database - the schema to check, by number
+    /// @param database_name - the name the queries write that schema as
+    pub(crate) fn foreign_key_checks(
+        &self,
+        only: Option<&str>,
+        database: usize,
+        database_name: &[u8],
+    ) -> Vec<ViolationQuery> {
+        let mut queries = Vec::new();
+        for child in &self.tables {
+            if child.kind != inillucent_sql::catalog_view::TableKind::Table
+                || child.folded.starts_with(b"sqlite_")
+                || child.database != database
+                || only.is_some_and(|name| child.folded != name.as_bytes())
+            {
+                continue;
+            }
+            for (position, key) in child.foreign_keys.iter().enumerate() {
+                let parent = self.tables.iter().find(|candidate| {
+                    candidate.folded == key.parent_folded && candidate.database == database
+                });
+                let sql = match parent {
+                    Some(parent) => inillucent_sql::foreign_key::violation_query(
+                        child,
+                        parent,
+                        key,
+                        database_name,
+                    ),
+                    None => inillucent_sql::foreign_key::orphan_query(child, key, database_name),
+                };
+                let Some(sql) = sql else {
+                    continue;
+                };
+                let reported = child.foreign_keys.len().saturating_sub(position + 1);
+                queries.push(ViolationQuery {
+                    sql,
+                    child: child.name.clone(),
+                    parent: key.parent.clone(),
+                    key: u16::try_from(reported).unwrap_or_default(),
+                    deferred: key.is_deferred(),
+                });
+            }
+        }
+        queries
     }
 }
 

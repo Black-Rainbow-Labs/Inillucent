@@ -708,6 +708,14 @@ pub struct NestedLoopJoin<'s> {
     /// One buffer rather than one allocation per candidate pair; see the note
     /// in `push` (task-1932, M7).
     scratch: Vec<OwnedDatum>,
+    /// The subqueries of the join condition that read a column of the row being
+    /// tested, answered for each candidate pair and read by the condition from
+    /// the cells after the pair.
+    correlated: Vec<crate::correlate::Correlation>,
+    /// Where those subqueries read their tables.
+    catalog: Option<&'s dyn crate::physical::TreeCatalog>,
+    /// The values those subqueries run with.
+    answering: crate::physical::Params,
 }
 impl<'s> NestedLoopJoin<'s> {
     /// Returns a nested loop join over an already-materialised inner side.
@@ -735,7 +743,32 @@ impl<'s> NestedLoopJoin<'s> {
             condition,
             downstream,
             scratch: Vec::new(),
+            correlated: Vec::new(),
+            catalog: None,
+            answering: crate::physical::Params::new(),
         }
+    }
+
+    /// Returns the join with the subqueries of its condition to answer for each
+    /// candidate pair.
+    ///
+    /// An `ON` that holds `EXISTS (SELECT 1 FROM s WHERE s.k = t1.a)` reads a
+    /// column of the pair it is tested on, so no value of it exists before the
+    /// join runs. The answers are appended to the pair for the condition to read.
+    ///
+    /// @param correlated - the prepared subqueries
+    /// @param catalog - where they read their tables
+    /// @param params - the statement's bound values
+    pub fn with_correlations(
+        mut self,
+        correlated: Vec<crate::correlate::Correlation>,
+        catalog: &'s dyn crate::physical::TreeCatalog,
+        params: &crate::physical::Params,
+    ) -> NestedLoopJoin<'s> {
+        self.correlated = correlated;
+        self.catalog = Some(catalog);
+        self.answering = params.without_subqueries();
+        self
     }
 
     /// Returns the join with the width of each side taken from the plan.
@@ -779,9 +812,21 @@ impl Sink for NestedLoopJoin<'_> {
                 self.scratch.clear();
                 self.scratch.extend(outer.iter().cloned());
                 self.scratch.extend(inner.iter().cloned());
+                let joined = self.scratch.len();
+                if let Some(catalog) = self.catalog {
+                    for correlation in &self.correlated {
+                        let answer = correlation.answer(
+                            catalog,
+                            &mut self.answering,
+                            self.scratch.get(..joined).unwrap_or(&[]),
+                        )?;
+                        self.scratch.push(answer);
+                    }
+                }
                 if !keeps(self.condition.as_deref(), &self.scratch)? {
                     continue;
                 }
+                self.scratch.truncate(joined);
                 matched = matched.saturating_add(1);
                 if let Some(mark) = self.matched.get_mut(position) {
                     *mark = true;

@@ -88,6 +88,29 @@ impl Parser<'_> {
         self.bytes.get(self.at.saturating_add(offset)).copied()
     }
 
+    /// Returns the byte length of the three byte Unicode space at the cursor, or zero.
+    ///
+    /// These are the separators the pinned release reads as JSON5 whitespace beyond the
+    /// no-break space: U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F, U+3000
+    /// and the byte-order mark U+FEFF.
+    fn unicode_space_len(&self) -> usize {
+        let (Some(a), Some(b), Some(c)) = (self.peek(), self.peek_at(1), self.peek_at(2)) else {
+            return 0;
+        };
+        let is_space = match (a, b, c) {
+            (0xe1, 0x9a, 0x80) | (0xe2, 0x81, 0x9f) | (0xe3, 0x80, 0x80) | (0xef, 0xbb, 0xbf) => {
+                true
+            }
+            (0xe2, 0x80, 0x80..=0x8a | 0xa8 | 0xa9 | 0xaf) => true,
+            _ => false,
+        };
+        if is_space {
+            3
+        } else {
+            0
+        }
+    }
+
     /// Skips whitespace and, in JSON5, comments.
     fn skip_space(&mut self) {
         loop {
@@ -112,16 +135,14 @@ impl Parser<'_> {
                         self.at += 2;
                     }
                 }
-                // JSON5 counts the Unicode space separators as whitespace. The
-                // ones that matter in practice are the no-break space and the
-                // byte-order mark, both of which arrive in real documents.
+                // JSON5 counts the Unicode space separators as whitespace.
                 Some(0xc2) if self.peek_at(1) == Some(0xa0) => {
                     self.used_json5 = true;
                     self.at += 2;
                 }
-                Some(0xef) if self.peek_at(1) == Some(0xbb) && self.peek_at(2) == Some(0xbf) => {
+                Some(0xe1 | 0xe2 | 0xe3 | 0xef) if self.unicode_space_len() > 0 => {
                     self.used_json5 = true;
-                    self.at += 3;
+                    self.at += self.unicode_space_len();
                 }
                 _ => return,
             }
@@ -508,6 +529,19 @@ mod tests {
             panic!("an array");
         };
         assert_eq!(items.len(), 3);
+    }
+
+    /// The Unicode space separators JSON5 allows are whitespace, and each makes the document JSON5.
+    #[test]
+    fn unicode_spaces_are_whitespace() {
+        for space in [
+            "\u{a0}", "\u{1680}", "\u{2000}", "\u{200a}", "\u{2028}", "\u{2029}", "\u{202f}",
+            "\u{205f}", "\u{3000}", "\u{feff}",
+        ] {
+            let parsed = ok(&format!("{space}[1,{space}2]"));
+            assert!(parsed.used_json5, "{space:?}");
+        }
+        assert!(parse("\u{200b}1").is_err());
     }
 
     /// An escape makes a string `TEXTJ`, and no escape leaves it `TEXT`.

@@ -136,6 +136,13 @@ pub use inillucent_engine::connect::CacheStats;
 /// shows a person is the statement rather than the space before it.
 pub use inillucent_engine::connect::leading_trivia;
 
+/// Returns the SQLite keyword an ASCII word names, if it names one.
+///
+/// A front end that writes SQL for a person to paste back quotes an identifier
+/// that is a keyword. The shell's `.mode insert` asks this, as SQLite's shell
+/// asks `sqlite3_keyword_check`.
+pub use inillucent_engine::keyword_lookup;
+
 /// The run-time limits `sqlite3_limit` reads and writes.
 ///
 /// Re-exported for the same reason [`StatementLimits`] is: a caller naming one

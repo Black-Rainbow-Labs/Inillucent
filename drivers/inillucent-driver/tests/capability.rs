@@ -305,19 +305,16 @@ fn an_unimplemented_construct_refuses_by_name_and_a_typo_does_not() {
     // clause, then `ATTACH ... KEY`, each retired as the engine implemented it
     // in turn; the assertion is about the *classification*, so it is repointed
     // at a construct that is still unimplemented rather than weakened. A row
-    // value on the left of `IN (SELECT ...)` is one: the capability table's
-    // `row_value_in_subquery` row says so and checks it.
+    // value on the left of `IN (SELECT ...)` was one, and is built now. An
+    // `ATTACH` whose file name is a parameter is one: the capability table's
+    // `attach_computed_path` row says so and checks it.
     let refused = connection
-        .query(
-            "SELECT a FROM people WHERE (a, a) IN (SELECT a, a FROM teams)",
-            &[],
-            10,
-        )
-        .expect_err("a row value against a subquery is refused");
+        .query("ATTACH ? AS other", &[], 10)
+        .expect_err("a computed ATTACH file name is refused");
     assert_eq!(
         refused.status,
         Status::Unsupported,
-        "a row value against a subquery is a capability gap, not a syntax error: {refused}"
+        "a computed ATTACH file name is a capability gap, not a syntax error: {refused}"
     );
     let named = refused.feature.expect("the refusal names the construct");
     assert!(!named.is_empty(), "the refusal named nothing");

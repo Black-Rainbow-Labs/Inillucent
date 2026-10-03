@@ -186,3 +186,72 @@ fn an_automatic_index_answers_a_query_after_a_tidy_close() {
         "the primary key's index did not answer after a reopen"
     );
 }
+
+/// Returns a query's first column of every row, as integers.
+///
+/// @param path - the database file, opened fresh
+/// @param sql - the query
+fn integers_after_reopen(path: &Path, sql: &str) -> Vec<i64> {
+    read_back(path, sql)
+        .iter()
+        .filter_map(|row| row.first())
+        .filter_map(Value::as_integer)
+        .collect()
+}
+
+/// An `INSTEAD OF` trigger on a view still fires after the file is closed and
+/// opened again.
+///
+/// The load pass that attaches a trigger to its table skipped every trigger
+/// whose table it had no entry for, and a view has no entry there because it has
+/// no tree. The trigger's catalog row was then missing from the rows the
+/// connection keeps, so `INSERT`, `UPDATE` and `DELETE` on the view failed with
+/// "cannot modify v0 because it is a view" in the second session while they
+/// worked in the session that created the trigger. The usage corpus runs one
+/// session per case and cannot see this, so it needs a reopen.
+#[test]
+fn an_instead_of_trigger_on_a_view_fires_after_a_reopen() {
+    let directory = scratch("view-trigger");
+    let path = directory.join("view.db");
+    {
+        let database = Database::open(&path).expect("the database opens");
+        let connection = database.session().expect("the connection opens");
+        connection
+            .execute_batch(
+                "CREATE TABLE t0(k INTEGER, a, b TEXT);
+                 CREATE INDEX ie ON t0(coalesce(a, 0));
+                 CREATE VIEW v0 AS SELECT k, a, b FROM t0;
+                 CREATE TRIGGER vi INSTEAD OF INSERT ON v0 BEGIN
+                   INSERT INTO t0(k, a, b) VALUES (NEW.k, NEW.a, NEW.b);
+                 END;
+                 CREATE TRIGGER vu INSTEAD OF UPDATE ON v0 BEGIN
+                   UPDATE t0 SET a = NEW.a WHERE k = OLD.k;
+                 END;
+                 CREATE TRIGGER vd INSTEAD OF DELETE ON v0 BEGIN
+                   DELETE FROM t0 WHERE k = OLD.k;
+                 END;
+                 INSERT INTO v0 VALUES (1, 2, 'x');",
+            )
+            .expect("the first session runs");
+    }
+    {
+        let database = Database::open(&path).expect("the database reopens");
+        let connection = database.session().expect("the connection opens");
+        connection
+            .execute_batch(
+                "INSERT INTO v0 VALUES (3, 4, 'y');
+                 INSERT INTO v0 VALUES (5, 6, 'z');
+                 UPDATE v0 SET a = 40 WHERE k = 3;
+                 DELETE FROM v0 WHERE k = 5;",
+            )
+            .expect("the second session writes through the triggers");
+    }
+    assert_eq!(
+        integers_after_reopen(&path, "SELECT k FROM t0 ORDER BY k"),
+        vec![1, 3]
+    );
+    assert_eq!(
+        integers_after_reopen(&path, "SELECT a FROM t0 ORDER BY k"),
+        vec![2, 40]
+    );
+}

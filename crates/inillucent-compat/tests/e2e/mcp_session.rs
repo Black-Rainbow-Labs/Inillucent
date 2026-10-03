@@ -137,15 +137,12 @@ fn tells_a_syntax_error_from_an_unsupported_construct(session: &mut Session) {
         "a syntax error answered as though it were fine:\n{wrong}"
     );
 
-    // **A row value on the left of `IN (subquery)`**, which is one of the five
-    // the differential corpus's own allow list still names. It is deliberately
-    // not a window function: those were the obvious choice and they answer now,
-    // so a case written against them would have asserted `unsupported` about
-    // something that works.
-    let not_built = session.tool(
-        "inillucent_query",
-        "{\"sql\":\"SELECT id FROM note WHERE (id, body) IN (SELECT id, body FROM note)\"}",
-    );
+    // **`ATTACH` with a file name that is not a literal**, which the capability
+    // table's `attach_computed_path` row declares unbuilt. It is deliberately not
+    // a window function or a row value against a subquery: those were the obvious
+    // choices and they answer now, so a case written against them would have
+    // asserted `unsupported` about something that works.
+    let not_built = session.tool("inillucent_query", "{\"sql\":\"ATTACH ? AS other\"}");
     assert!(
         not_built.contains("unsupported"),
         "a construct the engine has not built answered without saying so. An agent that cannot \

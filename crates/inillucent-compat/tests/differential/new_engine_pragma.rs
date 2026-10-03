@@ -342,13 +342,22 @@ fn an_unknown_pragma_is_silent_on_the_new_engine() {
             "{sql}"
         );
     }
-    // And the one that refuses a value this engine cannot be, rather than
-    // accepting it and dropping it.
+    // **`temp_store = FILE` is accepted and read back as 1**, because SQLite
+    // stores the setting and reports it, and an application that sets it on
+    // every connection must not fail. Nothing here writes a temporary table to
+    // a file, so the setting changes nothing else.
     assert!(
         engine
             .execute_any("PRAGMA temp_store = FILE", &Params::new())
-            .is_err(),
-        "PRAGMA temp_store = FILE should have refused"
+            .is_ok(),
+        "PRAGMA temp_store = FILE should have been accepted"
+    );
+    assert_eq!(
+        ask(&mut engine, "PRAGMA temp_store")
+            .first()
+            .and_then(|row| row.first())
+            .map(String::as_str),
+        Some("1")
     );
     // **`auto_vacuum` is settable now, and is silently ignored on a database
     // that already has tables** - which is not this engine being lax, it is

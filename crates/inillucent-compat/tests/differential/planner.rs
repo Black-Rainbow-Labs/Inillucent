@@ -981,7 +981,7 @@ fn indexed_by_forces_the_named_index() {
 /// anywhere. The bound is now left as a residual over a whole walk, so the two
 /// join arms are **known plan differences with the same rows**: the pinned
 /// shell says `SEARCH h USING COVERING INDEX h_part (c>?)` for both, and
-/// `LEFT-JOIN` after the second.
+/// `LEFT-JOIN` after the second. The second plan line carries `LEFT-JOIN` here too.
 #[test]
 fn indexed_by_refuses_what_the_named_index_cannot_answer() {
     let (_database, connection) = build_hinted("indexed-by-refused");
@@ -1009,7 +1009,7 @@ fn indexed_by_refuses_what_the_named_index_cannot_answer() {
             ),
             (
                 "SELECT count(*) FROM s LEFT JOIN h INDEXED BY h_part ON h.c > 3",
-                &["SCAN s", "SCAN h USING COVERING INDEX h_part"],
+                &["SCAN s", "SCAN h USING COVERING INDEX h_part LEFT-JOIN"],
             ),
         ],
     );

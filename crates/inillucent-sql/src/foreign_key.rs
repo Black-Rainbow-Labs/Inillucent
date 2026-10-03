@@ -124,6 +124,48 @@ fn children_of(child: &[Vec<u8>], parent: &[Vec<u8>], row: &str) -> String {
     conjunction(&parts)
 }
 
+/// Returns `"c1" = OLD."p1" COLLATE ... AND ...`, which finds the children of
+/// one parent by the parent key's collation.
+///
+/// **SQLite compares a foreign key with the parent column's collation**, not
+/// the child's. The row's values reach the generated body as literals, which
+/// carry no collation of their own, so the parent's is written out.
+///
+/// @param child - the child's key column names
+/// @param parent - the parent's key column names
+/// @param collations - the collation of each parent column
+/// @param row - `OLD` or `NEW`
+fn children_matching(
+    child: &[Vec<u8>],
+    parent: &[Vec<u8>],
+    collations: &[Vec<u8>],
+    row: &str,
+) -> String {
+    let mut parts = Vec::with_capacity(child.len());
+    for ((near, far), collation) in child.iter().zip(parent.iter()).zip(collations.iter()) {
+        parts.push(format!(
+            "{} = {row}.{} COLLATE {}",
+            quote(near),
+            quote(far),
+            quote(collation)
+        ));
+    }
+    conjunction(&parts)
+}
+
+/// Returns the collation of one column of a table, `binary` when it has none.
+///
+/// @param table - the table the column belongs to
+/// @param column - the column's name
+fn collation_of(table: &TableInfo, column: &[u8]) -> Vec<u8> {
+    table
+        .column_position(&column.to_ascii_lowercase())
+        .and_then(|position| table.column(position))
+        .map(|held| held.collation.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| b"binary".to_vec())
+}
+
 /// Returns the name a synthesised trigger is known by.
 ///
 /// It has to be unique and it has to be stable: the binder's recursion guard is
@@ -241,6 +283,27 @@ fn child_check(
         "NOT EXISTS (SELECT 1 FROM {} WHERE {lookup})",
         qualified(database, &parent.name)
     ));
+    // **A row may be its own parent.** SQLite accepts a row of a table that
+    // references itself when the row's key columns equal its own referenced
+    // columns, which `NOT EXISTS` cannot see because the row is not written
+    // yet. SQLite compares the two values as stored, with no affinity and the
+    // binary collation, so an integer parent key does not accept the text
+    // `'1'` as itself.
+    if parent.folded == child.folded {
+        let same: Vec<String> = near
+            .iter()
+            .zip(far.iter())
+            .map(|(child_column, parent_column)| {
+                // The unary plus strips the columns' affinities.
+                format!(
+                    "+NEW.{} IS +NEW.{}",
+                    quote(parent_column),
+                    quote(child_column)
+                )
+            })
+            .collect();
+        guards.push(format!("NOT ({})", conjunction(&same)));
+    }
     let fires = match event {
         ForeignKeyEvent::ChildUpdate => format!("BEFORE UPDATE OF {} ON", column_list(near)),
         _ => "BEFORE INSERT ON".to_string(),
@@ -268,7 +331,8 @@ fn parent_action(
         ForeignKeyEvent::ParentDelete => key.on_delete,
         _ => key.on_update,
     };
-    let matching = children_of(near, far, "OLD");
+    let collations: Vec<Vec<u8>> = far.iter().map(|name| collation_of(parent, name)).collect();
+    let matching = children_matching(near, far, &collations, "OLD");
     let target = qualified(database, &child.name);
     let body = match action {
         ReferentialAction::NoAction | ReferentialAction::Restrict => {
@@ -654,7 +718,12 @@ pub fn parent_key_is_unique(parent: &TableInfo, key: &ForeignKeyInfo) -> bool {
         }
     }
     let primary = parent.primary_key();
-    if !primary.is_empty() && primary.len() == folded.len() {
+    let primary_collates = parent
+        .indexes
+        .iter()
+        .filter(|index| index.origin == crate::catalog_view::IndexOrigin::PrimaryKey)
+        .all(|index| index_uses_column_collations(parent, index));
+    if !primary.is_empty() && primary.len() == folded.len() && primary_collates {
         let names: Vec<Vec<u8>> = primary
             .iter()
             .filter_map(|position| parent.columns.get(usize::from(*position)))
@@ -665,16 +734,40 @@ pub fn parent_key_is_unique(parent: &TableInfo, key: &ForeignKeyInfo) -> bool {
         }
     }
     parent.indexes.iter().any(|index| {
-        index.unique && index.columns.len() == folded.len() && {
-            let names: Vec<Vec<u8>> = index
-                .columns
-                .iter()
-                .filter_map(|key| key.column)
-                .filter_map(|position| parent.columns.get(usize::from(position)))
-                .map(|column| column.folded.clone())
-                .collect();
-            same_set(&names, &folded)
-        }
+        index.unique
+            && index.columns.len() == folded.len()
+            && index_uses_column_collations(parent, index)
+            && {
+                let names: Vec<Vec<u8>> = index
+                    .columns
+                    .iter()
+                    .filter_map(|key| key.column)
+                    .filter_map(|position| parent.columns.get(usize::from(position)))
+                    .map(|column| column.folded.clone())
+                    .collect();
+                same_set(&names, &folded)
+            }
+    })
+}
+
+/// Reports whether an index orders each key column by that column's own collation.
+///
+/// **SQLite does not take an index as the parent key when it orders a column
+/// differently from the column's declaration.** `UNIQUE (code COLLATE NOCASE)`
+/// over a `code TEXT` column compares keys the way the column does not, so a
+/// foreign key onto `code` is a `foreign key mismatch`.
+///
+/// @param parent - the parent table
+/// @param index - the index being considered as the parent key
+fn index_uses_column_collations(
+    parent: &TableInfo,
+    index: &crate::catalog_view::IndexInfo,
+) -> bool {
+    index.columns.iter().all(|key| {
+        let Some(column) = key.column.and_then(|position| parent.column(position)) else {
+            return true;
+        };
+        key.collation.eq_ignore_ascii_case(&column.collation)
     })
 }
 
@@ -684,6 +777,37 @@ pub fn parent_key_is_unique(parent: &TableInfo, key: &ForeignKeyInfo) -> bool {
 /// unique index on `(b, a)`, because either one makes the pair unique.
 fn same_set(left: &[Vec<u8>], right: &[Vec<u8>]) -> bool {
     left.len() == right.len() && right.iter().all(|name| left.contains(name))
+}
+
+/// Returns the `SELECT` that finds every row of a child table whose key names a
+/// parent table that does not exist.
+///
+/// SQLite's `PRAGMA foreign_key_check` skips only the rows with a NULL in one
+/// of the key columns; every other row has no parent because there is no
+/// parent table to hold one.
+///
+/// @param child - the table that declares the key
+/// @param key - the key
+/// @param database - the schema the child is in
+pub fn orphan_query(child: &TableInfo, key: &ForeignKeyInfo, database: &[u8]) -> Option<String> {
+    let near = child_columns(key, child)?;
+    if near.is_empty() {
+        return None;
+    }
+    let guards: Vec<String> = near
+        .iter()
+        .map(|column| format!("c.{} IS NOT NULL", quote(column)))
+        .collect();
+    let identity = if child.without_rowid {
+        "NULL"
+    } else {
+        "c.rowid"
+    };
+    Some(format!(
+        "SELECT {identity} FROM {} AS c WHERE {}",
+        qualified(database, &child.name),
+        conjunction(&guards)
+    ))
 }
 
 /// Returns the `SELECT` that finds every row of a child table whose key has no

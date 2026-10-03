@@ -1890,6 +1890,18 @@ tier = "differential"
 covers = ["inillucent-cli"]
 requires = ["shell"]
 
+# Application usage scripts (driver PRAGMAs, ORM introspection, migrations,
+# CRUD shapes, error messages) compared byte for byte with the pinned shell.
+# Cases expected to differ are listed in compat/corpus/usage/known.toml.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "differential"
+module = "usage_corpus"
+tier = "differential"
+covers = ["inillucent-cli"]
+requires = ["shell"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"

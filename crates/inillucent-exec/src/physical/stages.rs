@@ -476,6 +476,19 @@ pub fn prepare(
     if single_scan && !forced.table_scan && !order_sensitive(&plan.select) {
         let table_root = stages.first().map(|stage| stage.root).unwrap_or(0);
         for candidate in catalog.covering_candidates(table_root) {
+            // SQLite walks an index in place of the table only when its
+            // entries are narrower than the table's rows.
+            let table = plan.sources.first().map(|source| &source.table);
+            let wider = table.is_some_and(|table| {
+                table
+                    .indexes
+                    .iter()
+                    .find(|index| index.root == candidate)
+                    .is_some_and(|index| !inillucent_sql::cost::index_is_narrower(table, index))
+            });
+            if wider {
+                continue;
+            }
             let trial = plan_stages(plan, catalog, Some(candidate))?;
             let attempt = Prepared {
                 stages: trial,
@@ -749,6 +762,14 @@ fn walk_stages(
                 // FROM people CROSS JOIN teams` - and refusing a shape the
                 // engine can answer is a gap rather than a policy.
                 AccessKind::Nested
+            };
+            // `PRAGMA reverse_unordered_selects` walks the outer table from its
+            // last row. The planner only sets the flag on a plan that reads
+            // nothing else of the table's order.
+            let kind = if kind == AccessKind::Full && term.plan.reverse {
+                AccessKind::Reverse
+            } else {
+                kind
             };
             push_stage(stages, term.catalog, term.reads(root, kind), offset)?;
         }

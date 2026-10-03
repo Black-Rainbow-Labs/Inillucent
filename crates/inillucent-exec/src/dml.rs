@@ -52,13 +52,14 @@ mod index;
 
 use inillucent_tree::datum::OwnedDatum;
 
-use crate::declared::IndexExprs;
+use crate::declared::{IndexExprs, WriteDeclarations};
 use crate::physical::SourceLayout;
 // **The six modules this file is made of (task-1962, A7).** It was 3,003 lines
 // holding the write target, the key search and the four statements, and the
 // order they are declared in is the order a reader meets them: where a row
 // goes, how the rows to change are found, then each statement. Everything is
 // re-exported under the path it had.
+mod answers;
 mod conflict;
 mod delete;
 mod insert;
@@ -66,10 +67,10 @@ mod keys;
 mod target;
 mod update;
 
-pub(crate) use conflict::CompiledUpsert;
+pub(crate) use answers::{answer_correlations, image_resolver, placed, returning_correlations};
 pub(crate) use conflict::{
     conflicting_row, matching_arm, resolution_for, resolution_for_arm, resolution_of,
-    rowid_conflict, unwind_of, upsert_row, Resolution,
+    rowid_conflict, unwind_of, upsert_row, CompiledUpsert, Resolution,
 };
 pub use delete::{delete, delete_at};
 pub(crate) use delete::{remove_row, remove_with_triggers};
@@ -81,7 +82,7 @@ pub(crate) use target::{
     row_exists, sources_for, Borrowed, Stored, Upsert, WriteRequest,
 };
 pub use target::{module_layout, view_layout, Changes, ModuleWrite, RowSpace, Trees, WriteTarget};
-pub(crate) use update::{difference, same_key, Difference};
+pub(crate) use update::{difference, same_key, take_unassigned_columns, Difference};
 pub use update::{update, update_at, update_at_cached, update_cached, UpdateSetup};
 
 /// One row in a tree's own column order.

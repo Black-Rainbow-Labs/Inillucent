@@ -5,7 +5,7 @@
 //! foreign key bodies the binder synthesises use; anything else is bound over
 //! the trigger's row and evaluated when the `RAISE` fires.
 
-use super::{unsupported, Binder, BoundExpr};
+use super::{schema_refused, Binder, BoundExpr};
 use crate::ast::{ExprId, RaiseAction};
 use crate::diagnostic::ParseError;
 use crate::lexer::Span;
@@ -30,7 +30,12 @@ impl Binder<'_> {
         // Outside a trigger body there is nothing for it to abandon, so
         // SQLite refuses it there rather than treating it as a no-op.
         if self.row_aliases.is_none() {
-            return Err(unsupported("RAISE outside a trigger", span));
+            // SQLite prints no position for this failure.
+            let _ = span;
+            return Err(schema_refused(
+                "RAISE() may only be used within a trigger-program",
+                Span::default(),
+            ));
         }
         let bound = match message {
             Some(id) => Some(self.bind_expr(id)?),

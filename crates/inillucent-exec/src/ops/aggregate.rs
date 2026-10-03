@@ -300,6 +300,9 @@ pub struct HashAggregate {
     collations: Vec<Collation>,
     specs: Vec<AggregateSpec>,
     pub(crate) groups: HashMap<Vec<u8>, (Vec<OwnedDatum>, Vec<Accumulator>)>,
+    /// For each key, whether the groups are emitted in descending order of it.
+    /// Empty when every key is ascending, which is nearly every statement.
+    descending: Vec<bool>,
     downstream: Box<dyn Sink>,
 }
 impl HashAggregate {
@@ -320,8 +323,52 @@ impl HashAggregate {
             collations,
             specs,
             groups: HashMap::new(),
+            descending: Vec::new(),
             downstream,
         }
+    }
+
+    /// Returns this operator emitting the groups in descending order of the
+    /// keys flagged.
+    ///
+    /// **SQLite copies the direction of each `ORDER BY` term onto the `GROUP BY`
+    /// term in the same position when the two lists are the same length**, so
+    /// `GROUP BY k ORDER BY sum(v) DESC` visits the groups with the largest `k`
+    /// first and groups that tie on `sum(v)` come out in that order: 4, 3, 2, 1
+    /// where this engine gave 1, 2, 3, 4. The `ORDER BY` after this operator
+    /// keeps the order of rows that compare equal, so the order the groups are
+    /// emitted in is the order ties are answered in.
+    ///
+    /// @param flags - for each key, whether it is emitted descending
+    pub fn with_descending(mut self, flags: Vec<bool>) -> HashAggregate {
+        self.descending = if flags.iter().any(|flag| *flag) {
+            flags
+        } else {
+            Vec::new()
+        };
+        self
+    }
+
+    /// Orders two groups' keys, each key in its own direction.
+    ///
+    /// @param left - one group's key
+    /// @param right - another group's key
+    fn compare_keys(&self, left: &[OwnedDatum], right: &[OwnedDatum]) -> Ordering {
+        for (index, (a, b)) in left.iter().zip(right.iter()).enumerate() {
+            let collation = self
+                .collations
+                .get(index)
+                .copied()
+                .unwrap_or(Collation::Binary);
+            let found = compare_under(&a.borrow(), &b.borrow(), collation);
+            if found != Ordering::Equal {
+                return match self.descending.get(index) {
+                    Some(true) => found.reverse(),
+                    _ => found,
+                };
+            }
+        }
+        Ordering::Equal
     }
 }
 impl Sink for HashAggregate {
@@ -387,6 +434,14 @@ impl Sink for HashAggregate {
         // planner does not yet prove the property - but it sorts sorted input.
         let mut keys: Vec<&Vec<u8>> = self.groups.keys().collect();
         keys.sort_unstable();
+        if !self.descending.is_empty() {
+            keys.sort_by(
+                |left, right| match (self.groups.get(*left), self.groups.get(*right)) {
+                    (Some(a), Some(b)) => self.compare_keys(&a.0, &b.0),
+                    _ => Ordering::Equal,
+                },
+            );
+        }
         let mut rows: Vec<Vec<OwnedDatum>> = Vec::with_capacity(keys.len());
         for encoded in keys {
             let Some((group, accumulators)) = self.groups.get(encoded) else {

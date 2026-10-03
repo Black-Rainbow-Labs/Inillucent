@@ -804,6 +804,15 @@ fn nibble(byte: u8) -> Option<u8> {
 fn quote(value: &Value<'_>, encoding: TextEncoding) -> Value<'static> {
     let rendered = match value {
         Value::Null => b"NULL".to_vec(),
+        // SQLite's `quote()` writes an infinite real as `9.0e+999` so the text
+        // reads back as the same value; plain printing says `Inf`.
+        Value::Real(real) if real.is_infinite() => {
+            if *real < 0.0 {
+                b"-9.0e+999".to_vec()
+            } else {
+                b"9.0e+999".to_vec()
+            }
+        }
         Value::Integer(_) | Value::Real(_) => eval::text_bytes(value, encoding),
         Value::Blob(blob) => {
             let mut out = b"X'".to_vec();
@@ -835,13 +844,19 @@ fn quote(value: &Value<'_>, encoding: TextEncoding) -> Value<'static> {
 
 /// `char(...)`, which builds text from Unicode code points.
 fn char_of(arguments: &[Value<'static>]) -> Value<'static> {
-    let mut out = String::new();
+    let mut out = Vec::new();
     for argument in arguments {
         let code = cast::integer_value(argument);
-        let code = u32::try_from(code).unwrap_or(0xfffd);
-        out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+        // A surrogate is written as the three bytes SQLite writes for it
+        // (`char(55296)` is `ED A0 80`); only a value outside 0 to 0x10FFFF
+        // becomes U+FFFD.
+        let code = match u32::try_from(code) {
+            Ok(code) if code <= 0x10_ffff => code,
+            _ => 0xfffd,
+        };
+        inillucent_value::encoding::push_utf8(&mut out, code);
     }
-    Value::owned_text(out.as_bytes()).unwrap_or(Value::Null)
+    Value::owned_text(&out).unwrap_or(Value::Null)
 }
 
 /// `unicode(x)`, which returns the first code point.
@@ -857,9 +872,8 @@ fn unicode(value: &Value<'_>, encoding: TextEncoding) -> Value<'static> {
     if bytes.first() == Some(&0) {
         return Value::Null;
     }
-    let text = String::from_utf8_lossy(&bytes);
-    match text.chars().next() {
-        Some(character) => Value::Integer(u32::from(character) as i64),
+    match inillucent_value::encoding::read_utf8_sqlite(&bytes) {
+        Some(code) => Value::Integer(i64::from(code)),
         None => Value::Null,
     }
 }
@@ -993,6 +1007,14 @@ fn substring(arguments: &[Value<'static>], encoding: TextEncoding) -> Value<'sta
     }
     let is_blob = matches!(subject, Value::Blob(_));
     let bytes = eval::text_bytes(subject, encoding);
+    // Text is read as a C string, so everything from the first NUL on is
+    // outside the subject: `substr('a' || char(0) || 'b', 3)` is empty. A
+    // blob keeps every byte.
+    let bytes = if is_blob {
+        bytes
+    } else {
+        before_nul(&bytes, encoding).to_vec()
+    };
     // SQLite reads a blob subject with `sqlite3_value_blob`, which gives no
     // pointer at all for an empty blob, and answers NULL for that whatever the
     // start and length are. An empty text subject is still the empty text.
@@ -1110,9 +1132,13 @@ fn characters(bytes: &[u8]) -> Vec<&[u8]> {
     let mut at = 0usize;
     while at < bytes.len() {
         let mut end = at.saturating_add(1);
-        while bytes
-            .get(end)
-            .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
+        // Only a leader of 0xC0 or more takes continuation bytes with it
+        // (`SQLITE_SKIP_UTF8`); a stray 0x80 is a character of its own.
+        let leader = bytes.get(at).copied().unwrap_or(0) >= 0xc0;
+        while leader
+            && bytes
+                .get(end)
+                .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
         {
             end = end.saturating_add(1);
         }
@@ -1140,7 +1166,12 @@ fn trim(
     // Held rather than inlined because `characters` borrows from them.
     let cutset_bytes = match arguments.get(1) {
         Some(value) if value.is_null() => return Value::Null,
-        Some(value) => eval::text_bytes(value, encoding),
+        // The characters to remove are read as a C string, so they end at
+        // the first NUL: `ltrim(char(0) || 'a', char(0))` removes nothing.
+        Some(value) => {
+            let bytes = eval::text_bytes(value, encoding);
+            before_nul(&bytes, encoding).to_vec()
+        }
         None => b" ".to_vec(),
     };
     let subject_bytes = eval::text_bytes(subject, encoding);
@@ -1396,6 +1427,24 @@ fn vector_pair(arguments: &[Value<'static>], measure: fn(&[f32], &[f32]) -> f64)
     Value::Real(answer)
 }
 
+/// The longest `LIKE` or `GLOB` pattern, in bytes, before it is refused.
+///
+/// SQLite's default for `SQLITE_LIMIT_LIKE_PATTERN_LENGTH`.
+pub const LIKE_PATTERN_LENGTH_LIMIT: usize = 50_000;
+
+/// What SQLite says about a pattern longer than the limit.
+pub const LIKE_PATTERN_TOO_COMPLEX: &str = "LIKE or GLOB pattern too complex";
+
+/// Reports whether the first argument, the pattern, is longer than the limit.
+///
+/// @param arguments - the arguments of `like()` or `glob()`
+fn pattern_is_too_long(arguments: &[Value<'static>]) -> bool {
+    arguments.first().is_some_and(|pattern| {
+        !pattern.is_null()
+            && eval::text_bytes(pattern, TextEncoding::Utf8).len() > LIKE_PATTERN_LENGTH_LIMIT
+    })
+}
+
 /// Returns the escape's bytes, or the sentence SQLite refuses it with.
 ///
 /// One *character*, which is one to four bytes of UTF-8. SQLite's wording is
@@ -1444,6 +1493,9 @@ pub fn refusal_for(func: ScalarFunc, arguments: &[Value<'static>]) -> Option<Str
         // silently meant "no escape" for an empty string - so
         // `'a%b' LIKE 'a%b' ESCAPE ''` answered 1 where SQLite raises, and
         // `ESCAPE 'ab'` quietly escaped on `a`.
+        ScalarFunc::Like | ScalarFunc::Glob if pattern_is_too_long(arguments) => {
+            return Some(LIKE_PATTERN_TOO_COMPLEX.to_string());
+        }
         ScalarFunc::Like => {
             let asked = arguments.get(2)?;
             if asked.is_null() {

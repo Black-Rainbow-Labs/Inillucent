@@ -125,6 +125,33 @@ pub(crate) fn count_row(changes: &mut Changes, target: &dyn WriteTarget, depth: 
 pub(crate) fn count_view_row(changes: &mut Changes) {
     changes.rows = changes.rows.saturating_add(1);
 }
+/// Widens the integers a `RETURNING` of a view reads from a `REAL` column.
+///
+/// **SQLite converts on output, not on store.** The row a view write returns is
+/// the `NEW` image, which was never stored in a `REAL` column, so an integer
+/// `20` is still an integer in it. A result column that is a bare reference to a
+/// column of `REAL` affinity is read through `OP_RealAffinity`, which turns it
+/// into `20.0` while `typeof()` over the same image still says `integer`.
+///
+/// @param returning - the statement's bound `RETURNING` columns
+/// @param out - the values computed for one row, in the same order
+pub(crate) fn widen_real_returning(
+    returning: &[inillucent_sql::bind::BoundResultColumn],
+    out: &mut [OwnedDatum],
+) {
+    for (column, cell) in returning.iter().zip(out.iter_mut()) {
+        let BoundExpr::Column {
+            affinity: inillucent_value::Affinity::Real,
+            ..
+        } = &column.expr
+        else {
+            continue;
+        };
+        if let OwnedDatum::Int(whole) = cell {
+            *cell = OwnedDatum::Real(*whole as f64);
+        }
+    }
+}
 /// A map from root page to tree, whichever map the caller happens to hold.
 ///
 /// The write path needs a mutable tree and a mutable [`Database`] at the same
@@ -824,6 +851,9 @@ pub(crate) struct WriteRequest<'a> {
     pub(crate) depth: Depth,
     /// The compiled expressions of any expression index on the table.
     pub(crate) indexes: IndexExprs<'a>,
+    /// The table's compiled declarations, which an upsert's `DO UPDATE` meets
+    /// the way an `UPDATE` does.
+    pub(crate) declarations: &'a WriteDeclarations,
 }
 
 /// What an upsert found, and which arm answers it.

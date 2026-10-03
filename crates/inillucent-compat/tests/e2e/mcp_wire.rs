@@ -238,12 +238,17 @@ fn populated_at(binary: &Path, case: &str) -> PathBuf {
 /// sides of the claim - exit code 3 from the binary, `unsupported` in a
 /// JSON-RPC result - are about one statement rather than two.
 ///
-/// It names no table, because it is asked last and the three tools above that
-/// move the session have by then left it on a database it made itself. A
-/// statement that needed a table would come back `not_found`, which is a
-/// different status and would have made this case look like it was checking
-/// something it was not.
-const NOT_BUILT: &str = "SELECT (SELECT 1, 2)";
+/// It needs no table to exist, because it is asked last and the three tools above that
+/// move the session have by then left it on a database it made itself. The engine
+/// refuses the `USING btree` clause, an extension of this dialect that only the vector
+/// index types fill, before it looks for the table, so a statement that named a table
+/// that is not there still comes back `unsupported` and not `not_found`.
+///
+/// **It was `SELECT (SELECT 1, 2)` until the engine started answering that with
+/// SQLite's own error.** SQLite refuses a sub-select with two columns, so the engine
+/// now says `sub-select returns 2 columns - expected 1` with the `syntax` status, and the
+/// example had to move to something SQLite does not have.
+const NOT_BUILT: &str = "CREATE INDEX unbuilt_i ON unbuilt_t USING btree (a)";
 
 /// Every tool, the arguments to call it with, and a word its answer must carry.
 ///

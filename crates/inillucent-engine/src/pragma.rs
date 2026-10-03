@@ -64,7 +64,6 @@ use std::collections::BTreeMap;
 
 use inillucent_base::error::refusal;
 use inillucent_base::DbResult;
-use inillucent_sql::declare::argument_text;
 use inillucent_sql::directive::PragmaArgument;
 use inillucent_tree::datum::OwnedDatum;
 
@@ -75,6 +74,7 @@ use super::{ImportedDatabase, Outcome, MAIN};
 // the name-to-handler table, which is the thing a reader looking for one
 // pragma actually wants, and the three subjects it dispatches to.
 mod integrity;
+mod remembered;
 mod schema;
 mod tuning;
 pub(crate) use tuning::setting_function_column;
@@ -130,17 +130,20 @@ impl ImportedDatabase {
             b"foreign_keys" => self.pragma_flag(argument),
             b"trusted_schema" => self.pragma_trusted_schema(argument),
             b"defer_foreign_keys" => self.pragma_defer(argument),
-            b"foreign_key_check" => self.pragma_foreign_key_check(argument),
             b"journal_mode" => self.pragma_journal_mode(argument),
             b"encoding" => self.pragma_fixed_word(argument, "encoding", b"UTF-8"),
             b"locking_mode" => self.pragma_locking_mode(argument),
-            b"wal_checkpoint" => self.pragma_wal_checkpoint(),
+            b"wal_checkpoint" => self.pragma_wal_checkpoint(argument),
             // Encryption at rest. None of the three is on SQLite's own list;
             // `key` and `rekey` are SQLCipher's names, so a script written for
             // it gets an answer that says where the key goes here.
             b"encryption" => self.pragma_encryption(argument),
             b"rekey" => self.pragma_rekey(argument, at),
             b"key" => self.pragma_key(),
+            // A setting is silent in SQLite, which answers no row. This build keeps its own page
+            // size, so the value is ignored (see docs/sql.md), but the statement still answers
+            // nothing the way SQLite's does.
+            b"page_size" if argument.is_some() => Ok(Outcome::empty()),
             b"page_size" => Ok(named_integer("page_size", self.storage.page_size as i64)),
             b"page_count" => Ok(named_integer(
                 "page_count",
@@ -183,7 +186,8 @@ impl ImportedDatabase {
             b"writable_schema" => self.pragma_writable_schema(argument),
             b"query_only" => self.pragma_query_only(argument),
             b"recursive_triggers" => self.pragma_recursive_triggers(argument),
-            b"auto_vacuum" => self.pragma_auto_vacuum(argument),
+            b"legacy_alter_table" => self.pragma_legacy_alter_table(argument),
+            b"auto_vacuum" => self.pragma_auto_vacuum(argument, at),
             b"secure_delete" => self.pragma_secure_delete(argument),
             b"ignore_check_constraints" => self.pragma_ignore_check_constraints(argument),
             b"automatic_index" => self.pragma_automatic_index(argument),
@@ -223,12 +227,13 @@ impl ImportedDatabase {
             b"shrink_memory" | b"data_store_directory" | b"temp_store_directory" => {
                 Ok(Outcome::empty())
             }
-            // Reported: a number this engine has exactly one of. Read it and
-            // get the truth; set it to that value and nothing happens; set it
-            // to anything else and it refuses rather than pretending.
-            name if reported_value(name).is_some() => {
-                let (value, spellings) = reported_value(name).unwrap_or((0, &[]));
-                pragma_fixed_number(argument, &String::from_utf8_lossy(name), value, spellings)
+            // Remembered: SQLite stores these and so does this engine, which
+            // has nothing to apply them to. See `remembered` for each one.
+            name if remembered::remembered_setting(name).is_some() => {
+                match remembered::remembered_setting(name) {
+                    Some(setting) => self.pragma_remembered(setting, argument),
+                    None => Ok(Outcome::empty()),
+                }
             }
             // On SQLite's list and not implemented here: refused by name, so a
             // caller can tell "no" from "nothing".
@@ -339,6 +344,7 @@ impl ImportedDatabase {
             )?,
             b"optimize" => list_of::<&str>("optimize", &[]),
             b"foreign_key_list" => self.pragma_foreign_key_list(argument, at)?,
+            b"foreign_key_check" => self.pragma_foreign_key_check(argument, at)?,
             b"table_info" => self.pragma_table_info(argument, false, at)?,
             b"table_xinfo" => self.pragma_table_info(argument, true, at)?,
             b"index_list" => self.pragma_index_list(argument, at)?,
@@ -371,9 +377,8 @@ impl ImportedDatabase {
     /// two integrity checks, `optimize`, and every setting that reads back a
     /// value, which is SQLite's rule (`pragma.h` flags each of them `Result0`
     /// or `Result1`, and `sqlite3PragmaVtabRegister` registers a function for
-    /// exactly those). `foreign_key_check` is the one SQLite has and this list
-    /// has not: it runs queries, which needs the connection mutably, and a
-    /// table-valued function is read under `&self`.
+    /// exactly those). `foreign_key_check` runs queries, which it does under
+    /// `&self` through `ImportedDatabase::run`, so it has a function too.
     pub(super) fn pragma_function_names() -> &'static [&'static str] {
         &[
             "pragma_analysis_limit",
@@ -391,6 +396,7 @@ impl ImportedDatabase {
             "pragma_defer_foreign_keys",
             "pragma_empty_result_callbacks",
             "pragma_encoding",
+            "pragma_foreign_key_check",
             "pragma_foreign_keys",
             "pragma_freelist_count",
             "pragma_full_column_names",
@@ -508,34 +514,6 @@ fn is_sqlite_pragma(name: &[u8]) -> bool {
     SQLITE_PRAGMAS
         .iter()
         .any(|held| held.as_bytes().eq_ignore_ascii_case(name))
-}
-
-/// Answers a pragma this engine has exactly one value for.
-///
-/// Reading it gives that value; setting it to what it already is succeeds and
-/// setting it to anything else refuses. That is the rule `journal_mode = DELETE`
-/// has always followed, said once for the pragmas that now need it.
-///
-/// @param argument - the value it was given, when it was given one
-/// @param name - the pragma's name, for the refusal
-/// @param value - the number it reports
-/// @param accepted - the spellings that mean that number
-fn pragma_fixed_number(
-    argument: Option<&PragmaArgument>,
-    name: &str,
-    value: i64,
-    accepted: &[&str],
-) -> DbResult<Outcome> {
-    let Some(argument) = argument else {
-        return Ok(named_integer(name, value));
-    };
-    let text = argument_text(argument).trim().to_ascii_lowercase();
-    if accepted.iter().any(|held| *held == text) {
-        return Ok(Outcome::empty());
-    }
-    Err(refusal(format!(
-        "this engine's {name} is {value} and cannot be set to {text}"
-    )))
 }
 
 /// Returns a one-column answer over a list of names.
@@ -830,65 +808,3 @@ const ENGINE_MODULES: &[&str] = &[
     "sqlite_stmt",
     "tables_used",
 ];
-
-/// The spellings that mean "off" for a pragma this engine reports as zero.
-const OFF: &[&str] = &["0", "off", "false", "no"];
-
-/// The spellings that mean "on", for a pragma this engine reports as one.
-const ON: &[&str] = &["1", "on", "true", "yes"];
-
-/// Returns the one value this engine has for a pragma, and how to spell it.
-///
-/// **The third disposition, as a table.** Each of these is a setting whose
-/// subject exists here and has exactly one state: this engine runs on one
-/// thread, maps no pages, limits no heap, spills no cache and has no legacy
-/// callback API for `count_changes` to change the shape of. Reading one is
-/// answering a question truthfully; setting it to what it already is costs
-/// nothing; setting it to anything else is refused, because accepting a
-/// setting that will not be honoured is the failure this whole part is about.
-///
-/// Four of them are values SQLite reports differently, and each difference is
-/// this engine telling the truth about itself: `automatic_index` is 0 because
-/// it never builds one where SQLite reports 1; `cache_spill` is 0 because the
-/// pool evicts by clock rather than at a threshold; `wal_autocheckpoint` is 0
-/// because the log is folded in at an explicit checkpoint rather than every
-/// thousand frames; `default_cache_size` follows the pool this file was opened
-/// with. They are named in `docs/feature-comparison.md` for that reason.
-///
-/// @param name - the pragma's folded name
-fn reported_value(name: &[u8]) -> Option<(i64, &'static [&'static str])> {
-    Some(match name {
-        // The pool evicts by clock rather than at a spill threshold.
-        b"cache_spill" => (0, OFF),
-        // Not a page format with cells to size-check.
-        b"cell_size_check" => (0, OFF),
-        b"checkpoint_fullfsync" => (0, OFF),
-        b"fullfsync" => (0, OFF),
-        // The legacy callback API these three shape does not exist here.
-        b"count_changes" => (0, OFF),
-        b"empty_result_callbacks" => (0, OFF),
-        b"full_column_names" => (0, OFF),
-        // Which SQLite also reports as 1.
-        b"short_column_names" => (1, ON),
-        // No heap limit of either kind.
-        b"hard_heap_limit" => (0, OFF),
-        b"soft_heap_limit" => (0, OFF),
-
-        // The log is rolled at a checkpoint rather than trimmed to a size.
-        b"journal_size_limit" => (-1, &["-1"]),
-        // `ALTER TABLE RENAME` here always rewrites the references, which is
-        // what SQLite's non-legacy behaviour is.
-        b"legacy_alter_table" => (0, OFF),
-        // Pages are read, never mapped.
-        b"mmap_size" => (0, OFF),
-        // One writer, one pool, no shared cache to read uncommitted from.
-        b"read_uncommitted" => (0, OFF),
-        b"reverse_unordered_selects" => (0, OFF),
-        // Single threaded by design; the sorter and the tree builder are too.
-        b"threads" => (0, OFF),
-        // The log is folded in at an explicit checkpoint rather than every N
-        // frames, so there is no frame count to set.
-        b"wal_autocheckpoint" => (0, OFF),
-        _ => return None,
-    })
-}

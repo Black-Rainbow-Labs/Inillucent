@@ -383,6 +383,22 @@ impl DbError {
         self
     }
 
+    /// Fixes the unwind at the statement, for the update half of an upsert.
+    ///
+    /// **An `ON CONFLICT DO UPDATE` arm resolves `ABORT` whatever the `OR`
+    /// clause of its statement says.** SQLite runs the arm as an update with
+    /// that algorithm, so a constraint failing inside it undoes the statement
+    /// and leaves the transaction open even under `INSERT OR ROLLBACK`. A
+    /// `RAISE` already written out in a trigger of the arm is kept.
+    pub fn with_statement_unwind(mut self) -> DbError {
+        let context = self.context_mut();
+        if !context.unwind_explicit {
+            context.unwind = Some(Unwind::Statement);
+            context.unwind_explicit = true;
+        }
+        self
+    }
+
     /// Records the unwind of the statement a trigger's statements are nested
     /// in, which beats theirs and beats a constraint's own clause.
     ///

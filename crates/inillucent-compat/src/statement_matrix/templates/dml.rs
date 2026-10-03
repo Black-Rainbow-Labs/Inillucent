@@ -123,7 +123,14 @@ fn write_allowed(pick: &Pick) -> bool {
     // The pinned SQLite has no `ORDER BY ... LIMIT` on a write, and the rowid
     // subquery `limited.rs` sends it instead cannot name a `WITHOUT ROWID`
     // table's rows. The pair is left out rather than graded against nothing.
-    if pick.forbids("form", "target", &[("order_limit", "without_rowid")]) {
+    // A view has no rowid either (`no such column: rowid`), while a build with
+    // the option materialises the view under the limit and fires the trigger for
+    // each row it keeps. `limited_writes.rs` holds that behaviour.
+    if pick.forbids(
+        "form",
+        "target",
+        &[("order_limit", "without_rowid"), ("order_limit", "view")],
+    ) {
         return false;
     }
     if pick.forbids(

@@ -191,7 +191,9 @@ pub fn schema_layout() -> Vec<ColumnSpec> {
 /// declaration SQLite documents, word for word, so a query written against one
 /// engine's catalog reads the other's.
 pub fn schema_create_sql() -> &'static [u8] {
-    b"CREATE TABLE sqlite_schema(type TEXT, name TEXT, tbl_name TEXT, rootpage INTEGER, sql TEXT)"
+    // `rootpage INT` is how SQLite declares it, and `PRAGMA table_info` reports
+    // the declared type. The affinity is the same as INTEGER's.
+    b"CREATE TABLE sqlite_schema(type TEXT, name TEXT, tbl_name TEXT, rootpage INT, sql TEXT)"
 }
 
 /// Writes the catalog tree and returns it.

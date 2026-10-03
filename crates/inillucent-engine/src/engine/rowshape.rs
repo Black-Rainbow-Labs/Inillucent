@@ -306,6 +306,33 @@ pub(crate) fn import_keyed_table(
     ))
 }
 
+/// Returns the collation a `WITHOUT ROWID` table's primary key orders one
+/// column by, when the key term wrote one.
+///
+/// **`PRIMARY KEY (a COLLATE NOCASE)` orders and de-duplicates the key by
+/// `NOCASE` whatever the column itself is declared with**, so the tree takes the
+/// key term's collation. Only a key column has one to take.
+///
+/// @param info - the table's declaration
+/// @param position - the column's position in the record, in key order first
+/// @param key_columns - how many leading columns are the key
+fn primary_key_term_collation(
+    info: &TableInfo,
+    position: usize,
+    key_columns: usize,
+) -> Option<Collation> {
+    if position >= key_columns {
+        return None;
+    }
+    let key = info
+        .indexes
+        .iter()
+        .find(|index| index.origin == inillucent_sql::catalog_view::IndexOrigin::PrimaryKey)?;
+    key.columns
+        .get(position)
+        .map(|held| collation_of(&held.collation))
+}
+
 /// Returns the column directory, key width and layout of a `WITHOUT ROWID`
 /// table's tree.
 ///
@@ -354,10 +381,12 @@ pub(crate) fn keyed_table_shape(
             Some(column) => physical_of(column),
             None => (PhysicalType::Any, StaticType::Unknown),
         };
-        let collation = info
-            .columns
-            .get(*declared)
-            .map(|column| collation_of(&column.collation))
+        let collation = primary_key_term_collation(info, position, key_columns)
+            .or_else(|| {
+                info.columns
+                    .get(*declared)
+                    .map(|column| collation_of(&column.collation))
+            })
             .unwrap_or(Collation::Binary);
         let spec = if position < key_columns {
             ColumnSpec::key(physical)
@@ -1209,6 +1238,14 @@ impl<'a> Loading<'a> {
             let folded = entry.table.to_ascii_lowercase();
             let held = inillucent_catalog::load::trigger_from_create_sql(&entry.sql).ok();
             match (self.infos.get_mut(&folded), held) {
+                // **A trigger on a view is kept, though no `infos` entry holds
+                // the view.** A view has no tree, so `tables_from` never makes
+                // one for it; `rebuild_tables` derives the view from `entries`
+                // and attaches the trigger there. Skipping the row here left it
+                // out of `entries`, so after a close and reopen an `INSTEAD OF`
+                // trigger was gone and a write to the view was refused with
+                // "cannot modify ... because it is a view".
+                (None, Some(_)) if names_a_view(stored, &folded) => {}
                 (None, _) => {
                     self.skip(entry);
                     continue;
@@ -1302,6 +1339,16 @@ impl<'a> Loading<'a> {
             highest_identifier: self.highest_identifier,
         })
     }
+}
+
+/// Returns whether a catalog row declares a view with the given folded name.
+///
+/// @param stored - the catalog rows
+/// @param folded - the lowercased name to look for
+fn names_a_view(stored: &[SchemaEntry], folded: &[u8]) -> bool {
+    stored
+        .iter()
+        .any(|entry| entry.kind == ObjectKind::View && entry.name.to_ascii_lowercase() == folded)
 }
 
 /// Reads one file's catalog tree and derives everything needed to plan on it.

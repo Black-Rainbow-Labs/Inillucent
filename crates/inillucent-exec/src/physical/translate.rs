@@ -429,6 +429,20 @@ fn translate_logical(
                 Expr::IsNull(inner)
             }
         }
+        // SQLite drops the other operand of `AND` when one is the literal 0, and
+        // of `OR` when one is a non zero literal, without evaluating it.
+        BoundExpr::And(left, right)
+            if matches!(**left, BoundExpr::Integer(0))
+                || matches!(**right, BoundExpr::Integer(0)) =>
+        {
+            Expr::Literal(OwnedDatum::Int(0))
+        }
+        BoundExpr::Or(left, right)
+            if matches!(**left, BoundExpr::Integer(held) if held != 0)
+                || matches!(**right, BoundExpr::Integer(held) if held != 0) =>
+        {
+            Expr::Literal(OwnedDatum::Int(1))
+        }
         BoundExpr::And(left, right) => Expr::And(
             Box::new(translate(left, space, params, frame)?),
             Box::new(translate(right, space, params, frame)?),
@@ -516,6 +530,7 @@ fn translate_comparison(
             affinity: *affinity,
         },
         BoundExpr::Collate { operand, .. } => translate(operand, space, params, frame)?,
+        BoundExpr::Generated { .. } => translate_generated(expr, space, params, frame)?,
         BoundExpr::Is {
             negated,
             left,
@@ -634,10 +649,18 @@ fn translate_pattern(
                 // under a `NOT`, a `CASE` or a function, where SQLite answers
                 // "unable to use function MATCH in the requested context" with
                 // code 1. It was reported as a feature not built yet.
+                //
+                // It is raised when a row reaches the expression, not when the
+                // statement is prepared: SQLite's default `match()` function is
+                // what reports it, so a table with no rows answers an empty
+                // result and the shell labels the failure `Error`, not `Parse error`.
                 PatternOp::Match => {
-                    return Err(inillucent_base::error::statement_refusal(
-                        "unable to use function MATCH in the requested context",
-                    ))
+                    return Ok(Some(Expr::Raise {
+                        code: 1,
+                        message: b"unable to use function MATCH in the requested context".to_vec(),
+                        computed: None,
+                        unwind: inillucent_base::error::Unwind::Statement,
+                    }))
                 }
                 other => return unsupported(&format!("the {other:?} operator")),
             };
@@ -773,12 +796,9 @@ fn translate_call(
             // already applied, because the operator is the only thing that
             // knows whether the block produced anything.
             if let Some(column) = space.correlated(*id) {
-                return Ok(Some(match kind {
-                    SubqueryKind::Exists | SubqueryKind::Scalar => Expr::Column(column),
-                    SubqueryKind::In => {
-                        return unsupported("a correlated IN subquery");
-                    }
-                }));
+                // An `IN` is answered as a whole too: the operator ran the test,
+                // negation and NULL rule included, and left 1, 0 or NULL.
+                return Ok(Some(Expr::Column(column)));
             }
             // Folded before the chain was built, by `subquery::fold`. A slot
             // that is empty is a correlated subquery whose column this pass was
@@ -1008,22 +1028,20 @@ fn bare_columns(select: &BoundSelect) -> Vec<BoundExpr> {
     }
     found
 }
-/// Returns the witness a bare column follows, when the query has exactly one.
+/// Returns the witness a bare column follows: the last `min` or `max` call.
 ///
-/// SQLite's rule: with one `min` or one `max` in the query, a bare column comes
-/// from the row that produced it. With none, or with more than one, the row is
-/// arbitrary and this answers `None` - which the accumulator reads as "keep the
-/// last".
+/// SQLite's rule, measured against the pinned 3.53.4: every `min` or `max`
+/// step overwrites the "this row improved the extreme" flag, so only the last
+/// call in the query decides which row the bare columns come from.
+/// `max(c), min(c)` follows `min(c)` and `min(c), max(c)` follows `max(c)`.
+/// With no `min` or `max` this answers `None`, and the bare column keeps the
+/// first row of the group.
 ///
 /// @param select - the bound statement
 fn bare_witness(select: &BoundSelect) -> Option<(BoundExpr, std::cmp::Ordering)> {
-    let mut extremes = select.aggregates.iter().filter(|call| {
+    let only = select.aggregates.iter().rev().find(|call| {
         matches!(call.func, AggregateFunc::Min | AggregateFunc::Max) && !call.arguments.is_empty()
-    });
-    let only = extremes.next()?;
-    if extremes.next().is_some() {
-        return None;
-    }
+    })?;
     let wanted = if only.func == AggregateFunc::Min {
         std::cmp::Ordering::Less
     } else {
@@ -1483,5 +1501,60 @@ mod tests {
                 .is_empty(),
             "a statement that selects nothing reads nothing"
         );
+    }
+}
+
+/// Translates a `VIRTUAL` generated column's value.
+///
+/// @param expr - the bound [`BoundExpr::Generated`]
+/// @param space - the joined column space
+/// @param params - the statement's bound values
+/// @param frame - which pass is translating
+fn translate_generated(
+    expr: &BoundExpr,
+    space: &Space<'_>,
+    params: &Params,
+    frame: Frame<'_>,
+) -> DbResult<Expr> {
+    let BoundExpr::Generated {
+        operand,
+        present,
+        affinity,
+        ..
+    } = expr
+    else {
+        return unsupported("a generated column value that is not one");
+    };
+    let value = translate(operand, space, params, frame)?;
+    let present = translate(present, space, params, frame)?;
+    Ok(generated_value(value, present, *affinity))
+}
+
+/// Builds the evaluation of a `VIRTUAL` generated column's value.
+///
+/// The column's expression is converted with the column's declared affinity,
+/// because SQLite stores and compares a generated value as it would a value
+/// written to that column. The result is NULL when the FROM term has no row,
+/// which is what an outer join gives for every column of the row it left out.
+/// Without that test, an expression that reads no column (`AS (1)`) would still
+/// produce a value for the row that does not exist.
+///
+/// @param value - the translated generated expression
+/// @param present - the translated expression that is NULL only for a missing row
+/// @param affinity - the column's declared affinity
+fn generated_value(value: Expr, present: Expr, affinity: inillucent_value::Affinity) -> Expr {
+    let converted = match affinity {
+        inillucent_value::Affinity::Blob => value,
+        other => Expr::Affinity {
+            operand: Box::new(value),
+            affinity: other,
+            widen: other == inillucent_value::Affinity::Real,
+        },
+    };
+    Expr::Case {
+        operand: None,
+        branches: vec![(Expr::IsNotNull(Box::new(present)), converted)],
+        otherwise: None,
+        comparisons: Vec::new(),
     }
 }

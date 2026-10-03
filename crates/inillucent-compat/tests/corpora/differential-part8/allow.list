@@ -21,4 +21,3 @@
 # that option do (task-2120). It stays here for as long as the engine accepts it.
 
 ms-007	accepted on purpose: `DELETE ... ORDER BY ... LIMIT`, which the pinned build is compiled without
-sub-010	an exit 3 gap: `(a, b) IN (SELECT ...)`, a row value against a subquery

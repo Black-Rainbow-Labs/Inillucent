@@ -14,6 +14,9 @@
 
 use super::*;
 use crate::ast::BinaryOp;
+use crate::bind::aggregate::explicit_argument_collation;
+use crate::bind::comparison_rules;
+use inillucent_value::Affinity;
 
 /// A text literal.
 ///

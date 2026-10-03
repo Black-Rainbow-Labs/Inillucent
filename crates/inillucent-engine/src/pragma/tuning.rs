@@ -7,7 +7,9 @@
 
 use inillucent_base::error::refusal;
 use inillucent_base::DbResult;
-use inillucent_sql::declare::{argument_boolean, argument_integer, argument_text};
+use inillucent_sql::declare::{
+    argument_boolean, argument_integer, argument_text, sqlite_atoi, sqlite_safety_level,
+};
 use inillucent_sql::directive::PragmaArgument;
 use inillucent_tree::datum::OwnedDatum;
 use inillucent_wal::Synchronous;
@@ -57,7 +59,11 @@ impl crate::ImportedDatabase {
         // SQLite's units: a negative number is kibibytes and a positive one is
         // pages, and it reads back what was written rather than what it derived
         // from it. So the sign is kept and the page count is worked out here.
-        let asked = argument_integer(argument);
+        //
+        // **A number that does not fit 32 bits is read as 0.** SQLite parses this argument with
+        // `sqlite3Atoi`, which answers 0 for anything outside the range of a C `int`, so
+        // `PRAGMA cache_size = 5022422913188235998` stores 0 and reads back 0.
+        let asked = i32::try_from(argument_integer(argument)).map_or(0, i64::from);
         let pages = if asked < 0 {
             (asked.saturating_neg().saturating_mul(1024) / page_size as i64).max(1)
         } else {
@@ -127,29 +133,43 @@ impl crate::ImportedDatabase {
         argument: Option<&PragmaArgument>,
     ) -> DbResult<Outcome> {
         let Some(argument) = argument else {
-            return Ok(named_integer(
-                "synchronous",
-                match self.storage.wal.synchronous() {
-                    Synchronous::Off => 0,
-                    Synchronous::Normal => 1,
-                    Synchronous::Full => 2,
-                },
+            return Ok(named_integer("synchronous", self.synchronous_level()));
+        };
+        // **SQLite's rules for the argument, including the odd ones.** `normal`
+        // is not a word it knows, so `PRAGMA synchronous = normal` is 1 only
+        // because 1 is what any unknown word means; a number is read as a
+        // number and kept to three bits, so `5` reads back 5 and `8` reads back
+        // 0; and a negative number is an unknown word. Changing it inside a
+        // transaction is an error.
+        if !self.autocommit() {
+            return Err(refusal(
+                "Safety level may not be changed inside a transaction",
             ));
-        };
-        let text = argument_text(argument).trim().to_ascii_lowercase();
-        let policy = match text.as_str() {
-            "0" | "off" => Synchronous::Off,
-            "1" | "normal" => Synchronous::Normal,
-            "2" | "full" => Synchronous::Full,
-            // SQLite's EXTRA syncs the directory as well as the file. There is
-            // no directory entry to sync here, so it is FULL - and it is mapped
-            // rather than refused, because refusing would break a caller that
-            // asked for *more* durability than the engine can distinguish.
-            "3" | "extra" => Synchronous::Full,
-            other => return Err(refusal(format!("no such synchronous setting: {other}"))),
-        };
-        self.set_synchronous(policy);
+        }
+        let asked = sqlite_safety_level(&argument_text(argument), false, 1);
+        let level = i64::from((u16::from(asked) + 1) & 7);
+        let held = if level == 0 { 0 } else { level - 1 };
+        self.pragmas.remember("synchronous", held);
+        // EXTRA syncs the directory as well as the file. There is no directory
+        // entry to sync here, so every level from 2 up is FULL. The level
+        // itself is remembered, so a script that sets 3 reads 3.
+        self.set_synchronous(synchronous_policy(held));
         Ok(Outcome::empty())
+    }
+    /// Returns the level `PRAGMA synchronous` reports.
+    ///
+    /// The level last set, as long as the log's policy is still the one that
+    /// level means; a policy changed some other way is reported as it is.
+    pub(crate) fn synchronous_level(&self) -> i64 {
+        let policy = self.storage.wal.synchronous();
+        match self.pragmas.remembered("synchronous") {
+            Some(level) if synchronous_policy(level) == policy => level,
+            _ => match policy {
+                Synchronous::Off => 0,
+                Synchronous::Normal => 1,
+                Synchronous::Full => 2,
+            },
+        }
     }
     /// Reads or sets how long a writer waits for the writer slot.
     ///
@@ -167,7 +187,9 @@ impl crate::ImportedDatabase {
                 self.pragmas.busy_timeout_ms() as i64,
             )),
             Some(argument) => {
-                let millis = argument_integer(argument).max(0) as u64;
+                // `sqlite3Atoi` again: a number past 32 bits is 0, and a
+                // negative one clears the timeout.
+                let millis = i64::from(sqlite_atoi(&argument_text(argument))).max(0) as u64;
                 self.pragmas.set_busy_timeout_ms(millis);
                 // **And the file hears about it.** Recording the number
                 // without giving it to the thing that waits is what C7 found:
@@ -189,6 +211,17 @@ impl crate::ImportedDatabase {
                 i64::from(self.pragmas.foreign_keys()),
             )),
             Some(argument) => {
+                // **Inside a transaction the setting is not changed, and
+                // nothing says so.** SQLite documents `PRAGMA foreign_keys` as
+                // "a no-op within a transaction", because turning enforcement
+                // on or off between two statements of one transaction would
+                // leave the earlier statements checked under the other rule.
+                // Django relies on it: it issues `PRAGMA foreign_keys = OFF`
+                // inside `atomic()` and expects the connection to keep
+                // enforcing, and reads the setting back to find out.
+                if !self.autocommit() {
+                    return Ok(Outcome::empty());
+                }
                 let asked = argument_boolean(argument);
                 // **The compiled statements go with it.** Whether keys are
                 // enforced is decided by the binder, once, when a statement is
@@ -321,7 +354,10 @@ impl crate::ImportedDatabase {
                 i64::from(self.file_of(at)?.user_version()),
             ));
         };
-        let value = argument_integer(argument) as i32;
+        // SQLite reads the argument with `sqlite3Atoi`, which gives 0 for a
+        // number that does not fit in 32 bits: `4294967295` is stored as 0
+        // and not as -1, and `abc` as 0.
+        let value = sqlite_atoi(&argument_text(argument));
         self.file_of_mut(at)?.set_user_version(value);
         // **Checkpointed, because the meta page is not in the log.** Every
         // other write here is replayed from the WAL on the next open; a meta
@@ -347,7 +383,9 @@ impl crate::ImportedDatabase {
                 i64::from(self.file_of(at)?.application_id()),
             ));
         };
-        let value = argument_integer(argument) as i32;
+        // The same reading as `user_version`: `sqlite3Atoi`, so a number that
+        // does not fit in 32 bits is stored as 0.
+        let value = sqlite_atoi(&argument_text(argument));
         self.file_of_mut(at)?.set_application_id(value);
         self.checkpoint()?;
         Ok(Outcome::empty())
@@ -503,10 +541,15 @@ impl crate::ImportedDatabase {
     /// tells the truth about which mode is actually in force.
     ///
     /// @param argument - the mode, when one was given
+    /// @param at - the attached database the pragma was qualified with
     pub(crate) fn pragma_auto_vacuum(
         &mut self,
         argument: Option<&PragmaArgument>,
+        at: Option<usize>,
     ) -> DbResult<Outcome> {
+        if at.is_some_and(|number| number != MAIN) {
+            return self.pragma_attached_auto_vacuum(argument, at);
+        }
         let Some(argument) = argument else {
             return Ok(named_integer(
                 "auto_vacuum",
@@ -536,6 +579,42 @@ impl crate::ImportedDatabase {
                     self.checkpoint()?;
                 }
             }
+        }
+        Ok(Outcome::empty())
+    }
+    /// Reads or sets `auto_vacuum` of an attached or temporary database.
+    ///
+    /// Each database file has its own mode, so `PRAGMA aux.auto_vacuum = FULL`
+    /// must leave `main` as it was. The same rule applies as for `main`: the
+    /// mode changes only while the database holds no table.
+    ///
+    /// @param argument - the mode, when one was given
+    /// @param at - the database the pragma was qualified with
+    fn pragma_attached_auto_vacuum(
+        &mut self,
+        argument: Option<&PragmaArgument>,
+        at: Option<usize>,
+    ) -> DbResult<Outcome> {
+        let Some(argument) = argument else {
+            return Ok(named_integer(
+                "auto_vacuum",
+                i64::from(self.file_of(at)?.auto_vacuum()),
+            ));
+        };
+        let asked = match argument_text(argument).trim().to_ascii_lowercase().as_str() {
+            "0" | "none" => Some(0u8),
+            "1" | "full" => Some(1),
+            "2" | "incremental" => Some(2),
+            _ => None,
+        };
+        let number = at.unwrap_or(MAIN);
+        let empty = self
+            .schema
+            .tables
+            .iter()
+            .all(|table| table.database != number || table.folded.starts_with(b"sqlite_"));
+        if let (Some(mode), true) = (asked, empty) {
+            self.file_of_mut(at)?.set_auto_vacuum(mode);
         }
         Ok(Outcome::empty())
     }
@@ -711,13 +790,35 @@ impl crate::ImportedDatabase {
         self.pragmas.set_recursive_triggers(asked);
         Ok(Outcome::empty())
     }
+    /// Reads or sets whether `ALTER TABLE ... RENAME TO` follows the legacy rules.
+    ///
+    /// With it on, a rename leaves views and trigger bodies alone and rewrites
+    /// the `REFERENCES` clauses of other tables only when `foreign_keys` is on.
+    /// The rename reads it when the statement runs, so no compiled statement
+    /// depends on it.
+    ///
+    /// @param argument - the value it was given, when it was given one
+    pub(crate) fn pragma_legacy_alter_table(
+        &mut self,
+        argument: Option<&PragmaArgument>,
+    ) -> DbResult<Outcome> {
+        let Some(argument) = argument else {
+            return Ok(named_integer(
+                "legacy_alter_table",
+                i64::from(self.pragmas.legacy_alter_table()),
+            ));
+        };
+        self.pragmas
+            .set_legacy_alter_table(argument_boolean(argument));
+        Ok(Outcome::empty())
+    }
     /// Reads or sets where temporary tables live.
     ///
-    /// This engine keeps them in memory, so `DEFAULT` and `MEMORY` are both
-    /// what it already does and are accepted; `FILE` is the one value it cannot
-    /// be, and is refused rather than accepted and ignored. SQLite reports the
-    /// *setting* rather than the state, so a caller that wrote `MEMORY` reads
-    /// `2` back and one that wrote nothing reads `0`.
+    /// This engine keeps temporary tables in memory whatever the setting says.
+    /// `FILE` is accepted and recorded, and has no effect: nothing here writes a
+    /// temporary table to a file. SQLite reports the setting and not where the
+    /// tables are, so a caller that wrote `MEMORY` reads `2` back, one that
+    /// wrote `FILE` reads `1`, and one that wrote nothing reads `0`.
     ///
     /// @param argument - the value it was given, when it was given one
     pub(crate) fn pragma_temp_store(
@@ -727,16 +828,16 @@ impl crate::ImportedDatabase {
         let Some(argument) = argument else {
             return Ok(named_integer("temp_store", self.pragmas.temp_store()));
         };
-        let text = argument_text(argument).trim().to_ascii_lowercase();
-        self.pragmas.set_temp_store(match text.as_str() {
-            "0" | "default" => 0,
-            "2" | "memory" => 2,
-            other => {
-                return Err(refusal(format!(
-                    "temp_store {other} is not available here; temporary tables live in memory"
-                )))
-            }
-        });
+        // SQLite's `getTempStore`: a first character of 0, 1 or 2 is that
+        // number, `file` is 1, `memory` is 2, and anything else is 0.
+        let text = argument_text(argument);
+        let setting = match text.as_bytes().first() {
+            Some(digit @ b'0'..=b'2') => i64::from(digit.saturating_sub(b'0')),
+            _ if text.eq_ignore_ascii_case("file") => 1,
+            _ if text.eq_ignore_ascii_case("memory") => 2,
+            _ => 0,
+        };
+        self.pragmas.set_temp_store(setting);
         Ok(Outcome::empty())
     }
 }
@@ -772,6 +873,11 @@ impl crate::ImportedDatabase {
             b"application_id" => Some(named_integer(
                 "application_id",
                 i64::from(self.file_of(at)?.application_id()),
+            )),
+            // Each database file has its own mode; `main`'s is the connection's.
+            b"auto_vacuum" if at.is_some_and(|number| number != MAIN) => Some(named_integer(
+                "auto_vacuum",
+                i64::from(self.file_of(at)?.auto_vacuum()),
             )),
             b"auto_vacuum" => Some(named_integer(
                 "auto_vacuum",
@@ -816,6 +922,7 @@ impl crate::ImportedDatabase {
             )),
             b"page_size" => Some(named_integer("page_size", self.storage.page_size as i64)),
             b"query_only" => flag("query_only", self.pragmas.query_only()),
+            b"legacy_alter_table" => flag("legacy_alter_table", self.pragmas.legacy_alter_table()),
             b"recursive_triggers" => flag("recursive_triggers", self.pragmas.recursive_triggers()),
             b"schema_version" => Some(named_integer(
                 "schema_version",
@@ -825,14 +932,7 @@ impl crate::ImportedDatabase {
                 "secure_delete",
                 i64::from(self.pragmas.secure_delete()),
             )),
-            b"synchronous" => Some(named_integer(
-                "synchronous",
-                match self.storage.wal.synchronous() {
-                    Synchronous::Off => 0,
-                    Synchronous::Normal => 1,
-                    Synchronous::Full => 2,
-                },
-            )),
+            b"synchronous" => Some(named_integer("synchronous", self.synchronous_level())),
             b"temp_store" => Some(named_integer("temp_store", self.pragmas.temp_store())),
             b"trusted_schema" => flag(
                 "trusted_schema",
@@ -843,9 +943,20 @@ impl crate::ImportedDatabase {
                 i64::from(self.file_of(at)?.user_version()),
             )),
             b"writable_schema" => flag("writable_schema", self.pragmas.writable_schema()),
-            other => reported_value(other)
-                .map(|(value, _)| named_integer(&String::from_utf8_lossy(other), value)),
+            other => remembered::remembered_setting(other)
+                .map(|setting| named_integer(setting.name, self.remembered_value(setting))),
         })
+    }
+}
+
+/// Returns the log policy a `PRAGMA synchronous` level asks for.
+///
+/// @param level - the level as the pragma reports it: 0 off, 1 normal, 2 full, 3 extra
+fn synchronous_policy(level: i64) -> Synchronous {
+    match level {
+        0 => Synchronous::Off,
+        1 => Synchronous::Normal,
+        _ => Synchronous::Full,
     }
 }
 

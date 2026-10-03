@@ -21,19 +21,81 @@ use super::*;
 /// cannot reach different verdicts about the same statement.
 /// @param select - the bound statement
 pub(super) fn statement_terms(select: &BoundSelect) -> Vec<BoundExpr> {
+    statement_terms_with_owners(select).0
+}
+
+/// Returns [`statement_terms`] together with, for each term, the position in the
+/// FROM list of the join whose `ON` it came from, or `None` for a term of the
+/// `WHERE`.
+///
+/// **The owners are empty unless a `RIGHT` or `FULL` join is present**, because
+/// [`terms_held_before_a_right_join`] is their only reader and it answers `None`
+/// for every term without one. Building a vector nobody reads cost every compile
+/// an allocation, and the compile budget test counts them. The terms are split
+/// straight into one vector for the same reason: a temporary vector per
+/// conjunction was two more.
+///
+/// @param select - the bound statement
+pub(super) fn statement_terms_with_owners(
+    select: &BoundSelect,
+) -> (Vec<BoundExpr>, Vec<Option<usize>>) {
+    let track = select
+        .sources
+        .iter()
+        .any(|source| matches!(source.join, JoinKind::Right | JoinKind::Full));
     let mut terms = Vec::new();
+    let mut owners = Vec::new();
     if let Some(filter) = &select.filter {
         split_conjunction(filter, &mut terms);
     }
-    for source in &select.sources {
+    for (position, source) in select.sources.iter().enumerate() {
         if is_outer(source.join) {
             continue;
         }
         if let Some(constraint) = &source.constraint {
+            if track {
+                owners.resize(terms.len(), None);
+            }
             split_conjunction(constraint, &mut terms);
+            if track {
+                owners.resize(terms.len(), Some(position));
+            }
         }
     }
-    terms
+    (terms, owners)
+}
+
+/// Returns, for each statement term, the FROM position of the `RIGHT` or `FULL`
+/// join it has to be tested before.
+///
+/// **An inner join's `ON` is a condition on the rows that join produces, and a
+/// later `RIGHT` or `FULL` join can null extend those rows.** Tested after that
+/// join, as the `WHERE` is, `a JOIN b ON a.x = b.x RIGHT JOIN c ON c.x = b.x`
+/// dropped every row of `c` that matched nothing, because the null extended
+/// `a.x = b.x` is NULL. The term belongs to the first `RIGHT` or `FULL` join
+/// after the join it was written on.
+///
+/// @param select - the bound statement
+/// @param owners - the position each term was written on, `None` for the `WHERE`
+pub(super) fn terms_held_before_a_right_join(
+    select: &BoundSelect,
+    owners: &[Option<usize>],
+) -> Vec<Option<usize>> {
+    if owners.is_empty() {
+        return Vec::new();
+    }
+    owners
+        .iter()
+        .map(|owner| {
+            let from = (*owner)?;
+            (from.saturating_add(1)..select.sources.len()).find(|later| {
+                select
+                    .sources
+                    .get(*later)
+                    .is_some_and(|source| matches!(source.join, JoinKind::Right | JoinKind::Full))
+            })
+        })
+        .collect()
 }
 
 /// Returns the conjuncts of an outer join term's own `ON`, which are the only
@@ -64,6 +126,11 @@ pub(super) fn outer_terms(source: &BoundSource) -> Vec<BoundExpr> {
 /// and a virtual table has no index this clause can name.
 /// @param select - one bound block, with its sources attached
 pub fn unanswerable_index_hint(select: &BoundSelect) -> Option<Vec<u8>> {
+    // `SELECT count(*) FROM t INDEXED BY a_partial_index` counts the table's
+    // rows without a scan, so SQLite never asks the index to answer anything.
+    if is_a_plain_count(select) {
+        return None;
+    }
     let mut shared: Option<Vec<BoundExpr>> = None;
     for (position, source) in select.sources.iter().enumerate() {
         let crate::bind::IndexChoice::Only(wanted) = &source.index_hint else {
@@ -100,6 +167,27 @@ pub fn unanswerable_index_hint(select: &BoundSelect) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// Reports whether a block is `SELECT count(*) FROM one_table` and nothing more.
+///
+/// That is the shape SQLite answers from the size of the table's tree.
+///
+/// @param select - one bound block, with its sources attached
+fn is_a_plain_count(select: &BoundSelect) -> bool {
+    select.sources.len() == 1
+        && select.filter.is_none()
+        && select.group_by.is_empty()
+        && select.having.is_none()
+        && select.compounds.is_empty()
+        && select.windows.is_empty()
+        && !select.distinct
+        && select.columns.len() == 1
+        && select.aggregates.len() == 1
+        && select
+            .aggregates
+            .iter()
+            .all(|aggregate| aggregate.star && aggregate.filter.is_none() && !aggregate.distinct)
 }
 
 /// Reports whether one b-tree index may be read for a term at all.

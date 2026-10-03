@@ -18,7 +18,7 @@ use inillucent_sql::dml::BoundDelete;
 use inillucent_tree::datum::{Datum, OwnedDatum};
 
 use super::*;
-use crate::declared::{IndexExprs, WriteDeclarations};
+use crate::declared::{BoundDeclarations, IndexExprs, WriteDeclarations};
 use crate::physical::{Params, SourceLayout};
 use crate::trigger::{self, Depth};
 
@@ -55,8 +55,21 @@ pub fn delete_at(
         return delete_view(statement, target, params, keys, depth);
     }
     let layout = layout_of(target, table)?;
-    let space = RowSpace::new(&sources_for(statement.source, &statement.triggers), &layout);
     let catalog = target.catalog();
+    let returned: Vec<&inillucent_sql::bind::BoundExpr> = statement
+        .returning
+        .iter()
+        .map(|column| &column.expr)
+        .collect();
+    let correlated =
+        returning_correlations(&returned, statement.source, &layout, table.root, catalog)?;
+    let space = RowSpace::new(&sources_for(statement.source, &statement.triggers), &layout)
+        .with_correlations(
+            &correlated
+                .iter()
+                .map(|held| held.id)
+                .collect::<Vec<usize>>(),
+        );
     // A delete declares no `CHECK` to meet, but it does have to know which of
     // the table's indexes hold the row it is removing: an entry only comes out
     // of a partial index if the predicate accepted the row, and an index key the
@@ -64,10 +77,14 @@ pub fn delete_at(
     let declarations = WriteDeclarations::compile(
         table,
         &layout,
-        &[],
-        // A `DELETE` writes no value, so no default can stand in for one.
-        &[],
-        &statement.index_exprs,
+        // A `DELETE` writes no value, so no `CHECK` applies, no default can
+        // stand in for one, and no virtual column has a value to check.
+        BoundDeclarations {
+            checks: &[],
+            defaults: &[],
+            virtual_columns: &[],
+            index_exprs: &statement.index_exprs,
+        },
         &space,
         params,
         catalog,
@@ -87,19 +104,15 @@ pub fn delete_at(
         let Some(row) = read_row(table, target, key)? else {
             continue;
         };
-        // `RETURNING` on a delete names the row that is going away, so it is
-        // read before the row stops existing.
-        if !projected.is_empty() {
-            let mut out = Vec::with_capacity(projected.len());
-            for eval in &projected {
-                out.push(space.evaluate(eval.as_ref(), &[row.as_slice()])?);
-            }
-            changes.returned.push(out);
-        }
         // The row was read a moment ago for `RETURNING` and for the index
         // entries; reading it again inside the removal was a second descent per
         // delete, on the workload the gate measures two thousand of.
-        if remove_with_triggers(
+        // **`RETURNING` names the row that went, and is evaluated after it has
+        // gone**, before the `AFTER` triggers. A subquery in it sees the table
+        // without this row and without the rows before it, as SQLite's does; a
+        // row a `BEFORE` trigger skipped is not returned.
+        let mut returned: Option<Vec<OwnedDatum>> = None;
+        if remove_then(
             table,
             target,
             key,
@@ -110,9 +123,26 @@ pub fn delete_at(
                 params,
                 depth,
                 indexes: IndexExprs::new(&declarations, &space),
+                declarations: &declarations,
+            },
+            false,
+            &mut |gone| {
+                if projected.is_empty() {
+                    return Ok(());
+                }
+                let answers = answer_correlations(&correlated, gone, params, &row)?;
+                let mut out = Vec::with_capacity(projected.len());
+                for eval in &projected {
+                    out.push(space.evaluate_with(eval.as_ref(), &[row.as_slice()], &answers)?);
+                }
+                returned = Some(out);
+                Ok(())
             },
         )? {
             count_row(&mut changes, target, depth);
+            if let Some(out) = returned {
+                changes.returned.push(out);
+            }
             if captured {
                 changes.removed.push(row);
             }
@@ -289,8 +319,9 @@ fn delete_unwatched(
 /// @param key - the row's key
 /// @param row - the row as it is
 /// @param triggers - the triggers this delete fires
-/// @param params - the bound parameters
-/// @param depth - how many triggers deep this write already is
+/// @param request - the layout, parameters and depth of the write
+/// @param replacing - whether a conflict is removing the row, which fires only
+///   the foreign key actions unless `recursive_triggers` is on
 pub(crate) fn remove_with_triggers(
     table: &TableInfo,
     target: &mut dyn WriteTarget,
@@ -298,14 +329,56 @@ pub(crate) fn remove_with_triggers(
     row: &[OwnedDatum],
     triggers: &[inillucent_sql::dml::BoundTrigger],
     request: WriteRequest<'_>,
+    replacing: bool,
+) -> DbResult<bool> {
+    remove_then(
+        table,
+        target,
+        key,
+        row,
+        triggers,
+        request,
+        replacing,
+        &mut |_| Ok(()),
+    )
+}
+/// Removes one row like [`remove_with_triggers`], running a step between the
+/// removal and the `AFTER` triggers.
+///
+/// `RETURNING` is evaluated there: after the row is gone and before anything the
+/// triggers write.
+///
+/// @param table - the table being written
+/// @param target - the file and its trees
+/// @param key - the row's key
+/// @param row - the row as it is
+/// @param triggers - the triggers this delete fires
+/// @param request - the layout, parameters and depth of the write
+/// @param replacing - whether a conflict is removing the row
+/// @param between - what to do once the row has been removed
+fn remove_then(
+    table: &TableInfo,
+    target: &mut dyn WriteTarget,
+    key: &[OwnedDatum],
+    row: &[OwnedDatum],
+    triggers: &[inillucent_sql::dml::BoundTrigger],
+    request: WriteRequest<'_>,
+    replacing: bool,
+    between: &mut dyn FnMut(&mut dyn WriteTarget) -> DbResult<()>,
 ) -> DbResult<bool> {
     let WriteRequest {
         layout,
         params,
         depth,
         indexes,
+        ..
     } = request;
-    if trigger::fire(
+    let fire = if replacing {
+        trigger::fire_replaced
+    } else {
+        trigger::fire
+    };
+    if fire(
         triggers,
         TriggerTime::Before,
         target,
@@ -330,7 +403,8 @@ pub(crate) fn remove_with_triggers(
         return Ok(false);
     }
     remove_row(table, layout, target, key, row, indexes)?;
-    trigger::fire(
+    between(target)?;
+    fire(
         triggers,
         TriggerTime::After,
         target,
@@ -392,6 +466,12 @@ fn delete_view(
     depth: Depth,
 ) -> DbResult<Changes> {
     let layout = view_layout(&statement.table);
+    let space = RowSpace::new(&sources_for(statement.source, &statement.triggers), &layout);
+    let catalog = target.catalog();
+    let mut projected = Vec::with_capacity(statement.returning.len());
+    for column in &statement.returning {
+        projected.push(space.compile(&column.expr, params, catalog)?);
+    }
     let mut changes = Changes::default();
     for before in rows {
         if trigger::fire(
@@ -413,6 +493,13 @@ fn delete_view(
             continue;
         }
         count_view_row(&mut changes);
+        if !projected.is_empty() {
+            let mut out = Vec::with_capacity(projected.len());
+            for eval in &projected {
+                out.push(space.evaluate(eval.as_ref(), &[before.as_slice()])?);
+            }
+            changes.returned.push(out);
+        }
     }
     Ok(changes)
 }

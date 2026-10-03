@@ -172,7 +172,9 @@ same('a missing table is not_found', $missing['status'], 'not_found');
 
 // `unsupported` is its own status and its own exit code, which is the thing
 // AGENTS.md asks a caller to branch on rather than reword their SQL over.
-$unbuilt = $db->run('query', ['sql' => 'SELECT (SELECT 1, 2)']);
+// The `USING btree` clause is an extension of this dialect that only the vector index
+// types fill; the engine refuses it before it looks for the table.
+$unbuilt = $db->run('exec', ['sql' => 'CREATE INDEX unbuilt_i ON people USING btree (age)']);
 same('an unbuilt construct is not ok', $unbuilt['ok'], false);
 same('an unbuilt construct is unsupported', $unbuilt['status'], 'unsupported');
 

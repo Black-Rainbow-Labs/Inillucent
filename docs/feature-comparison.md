@@ -971,23 +971,20 @@ The 26 that answer differently with no arguments:
 
 ## Constructs the probe does not reach
 
-`inillucent capabilities` lists 53 capabilities reported by the engine. 16 of them are `no`: the
-engine refuses the construct with exit code 3. None of these is one of the 416 cases. Most of them
-run in SQLite. One, writing to a view, is refused by SQLite too.
+`inillucent capabilities` lists 53 capabilities reported by the engine. 12 of them are `no`: the
+engine refuses the construct, and all but one of them with exit code 3. None of these is one of the
+416 cases. Most of them run in SQLite. One, writing to a view, is refused by SQLite too, with the
+same message and exit code 1.
 
 | Capability | What is refused |
 |---|---|
 | `attach_computed_path` | `ATTACH ? AS other`: a file name that is not a string literal |
-| `row_value_in_subquery` | `(a, b) IN (SELECT x, y FROM s)` |
 | `match_in_an_or_reading_a_row` | a full text `MATCH` under an `OR` whose pattern reads another table's row, such as `f MATCH q.w OR rowid = 3` |
 | `load_extension` | `load_extension()`. There is no C extension interface |
 | `compound_ordered_by_expression` | a compound select ordered by an expression |
 | `multi_column_vector_index` | a vector index over more than one column |
-| `writing_to_a_view` | `INSERT`, `UPDATE` or `DELETE` on a view with no `INSTEAD OF` trigger. SQLite refuses it too |
+| `writing_to_a_view` | `INSERT`, `UPDATE` or `DELETE` on a view with no `INSTEAD OF` trigger for that statement. SQLite refuses it too, with `cannot modify v because it is a view` |
 | `nested_explain` | `EXPLAIN EXPLAIN ...` |
-| `on_conflict_partial_index` | an `ON CONFLICT` target with a `WHERE` clause |
-| `on_conflict_expression_index` | an `ON CONFLICT` target with an expression |
-| `correlated_in_over_a_grouped_block` | a correlated `IN` subquery that groups, limits or is a compound select |
 | `returning_inside_a_trigger` | `RETURNING` inside a trigger body |
 | `fts5_unavailable_tokenizer` | an FTS5 tokenizer other than `ascii`, `unicode61` and `porter` |
 | `fts5_detail_option` | FTS5 `detail='none'` or `detail='column'` |

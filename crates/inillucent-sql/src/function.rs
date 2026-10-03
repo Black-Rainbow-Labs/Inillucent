@@ -790,40 +790,36 @@ impl JsonFunc {
             }
             JsonFunc::ArrayLength | JsonFunc::Type | JsonFunc::Valid | JsonFunc::Pretty => (1, 2),
             JsonFunc::Patch | JsonFunc::PatchB | JsonFunc::Arrow | JsonFunc::ArrowShift => (2, 2),
-            JsonFunc::Extract | JsonFunc::ExtractB | JsonFunc::Remove | JsonFunc::RemoveB => {
-                (2, usize::MAX)
-            }
-            JsonFunc::Insert
+            // **SQLite registers these with any argument count and checks it when the
+            // function runs.** `json_extract()` and `json_extract(X)` answer NULL, an
+            // editing function with an even count fails with `json_set() needs an odd
+            // number of arguments`, and `json_object('a')` fails with `json_object()
+            // requires an even number of arguments`. Refusing the count while binding
+            // answered a parse error with `wrong number of arguments to function`
+            // where SQLite answers a runtime error with its own sentence.
+            JsonFunc::Extract
+            | JsonFunc::ExtractB
+            | JsonFunc::Remove
+            | JsonFunc::RemoveB
+            | JsonFunc::Insert
             | JsonFunc::InsertB
             | JsonFunc::Replace
             | JsonFunc::ReplaceB
             | JsonFunc::Set
             | JsonFunc::SetB
             | JsonFunc::ArrayInsert
-            | JsonFunc::ArrayInsertB => (3, usize::MAX),
+            | JsonFunc::ArrayInsertB => (0, usize::MAX),
         }
     }
 
     /// Returns whether an argument count is legal for this function.
+    ///
+    /// The counts that depend on parity, `json_object` and the editing functions,
+    /// are checked when the function runs, because that is where SQLite checks them
+    /// and the error it gives is a runtime one.
     pub fn arity_ok(self, count: usize) -> bool {
         let (least, most) = self.arity();
-        if count < least || count > most {
-            return false;
-        }
-        match self {
-            // A path and a value go together, so the count past the document
-            // has to be even and the whole count therefore odd.
-            JsonFunc::Insert
-            | JsonFunc::InsertB
-            | JsonFunc::Replace
-            | JsonFunc::ReplaceB
-            | JsonFunc::Set
-            | JsonFunc::SetB
-            | JsonFunc::ArrayInsert
-            | JsonFunc::ArrayInsertB => count % 2 == 1,
-            JsonFunc::Object | JsonFunc::ObjectB => count.is_multiple_of(2),
-            _ => true,
-        }
+        count >= least && count <= most
     }
 
     /// Returns whether the function answers the binary format.
@@ -1151,6 +1147,28 @@ pub fn is_aggregate_call(folded: &[u8], count: usize, star: bool) -> bool {
     lookup_aggregate(folded).is_some()
 }
 
+/// Reports whether a built-in function's answer depends on more than its
+/// arguments, which is what SQLite will not allow in a generated column or an
+/// index.
+///
+/// @param folded - the function's folded name
+pub fn is_volatile(folded: &[u8]) -> bool {
+    // SQLite registers the version and compile option functions without the
+    // deterministic flag, so an index or a generated column may not call them.
+    const NOT_DETERMINISTIC: [&[u8]; 4] = [
+        b"sqlite_version",
+        b"sqlite_source_id",
+        b"sqlite_compileoption_used",
+        b"sqlite_compileoption_get",
+    ];
+    NOT_DETERMINISTIC
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(folded))
+        || VOLATILE
+            .iter()
+            .any(|(name, _)| name.as_bytes().eq_ignore_ascii_case(folded))
+}
+
 /// Returns the aggregate a `min`/`max` call resolves to at one argument.
 pub fn minmax_aggregate(folded: &[u8]) -> Option<AggregateFunc> {
     match folded {
@@ -1225,7 +1243,8 @@ mod tests {
 pub struct FunctionEntry {
     /// The name as it is written.
     pub name: &'static str,
-    /// `s` for a scalar, `w` for a window function, `a` for an aggregate.
+    /// `s` for a scalar, `w` for an aggregate or window function that can run
+    /// over a window, `a` for an aggregate that cannot.
     pub kind: &'static str,
     /// How many arguments, or -1 for any number.
     pub arity: i64,
@@ -1294,10 +1313,14 @@ pub fn every_function() -> Vec<FunctionEntry> {
             flags: VOLATILE_FLAGS,
         });
     }
+    // **Every built-in aggregate is reported as `w`.** SQLite's `type` column
+    // says `w` for an aggregate that can also run over a window, which is every
+    // one of its own (`max`, `sum`, `count`, `group_concat`, ...); `a` is for an
+    // aggregate that cannot, and none of these is one.
     for (name, arity) in AGGREGATES {
         out.push(FunctionEntry {
             name,
-            kind: "a",
+            kind: "w",
             arity: *arity,
             flags: BUILTIN_FLAGS,
         });

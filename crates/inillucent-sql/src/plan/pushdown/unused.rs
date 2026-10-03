@@ -68,6 +68,15 @@ pub(super) fn drop_unread_columns(select: &mut BoundSelect) {
 ///
 /// @param block - the derived table's query
 fn may_drop_columns(block: &BoundSelect) -> bool {
+    // The references of a shared common table expression read one set of rows.
+    // A derived table that only has a number to keep its rows under is read by
+    // one term, so the columns that term does not read can still be left out.
+    if block
+        .shared
+        .is_some_and(|key| key < crate::bind::FIRST_ANONYMOUS_SHARED)
+    {
+        return false;
+    }
     let arms = core::iter::once(block).chain(block.compounds.iter().map(|(_, arm)| arm));
     let plain = |arm: &BoundSelect| {
         !arm.distinct

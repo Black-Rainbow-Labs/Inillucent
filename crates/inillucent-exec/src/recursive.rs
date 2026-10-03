@@ -12,12 +12,37 @@
 //! here changed in the move.
 
 use inillucent_base::DbResult;
-use inillucent_sql::plan::PhysicalPlan;
+use inillucent_sql::ast::{NullOrder, SortOrder};
+use inillucent_sql::bind::BoundExpr;
+use inillucent_sql::plan::{PhysicalPlan, RecursiveQueue};
 use inillucent_tree::datum::OwnedDatum;
 use inillucent_value::collation::Collation;
 
-use crate::physical::{run_any, Params, TreeCatalog, WithQueue};
+use crate::ops::{compare_by, SortKey};
+use crate::physical::{constant_count, run_any, Negative, Params, TreeCatalog, WithQueue};
 use crate::setop::SetKeys;
+
+/// What a recursive CTE is filled from.
+///
+/// A struct because the loop needs eight things and every function that takes
+/// part in it needs the same ones.
+#[derive(Clone, Copy)]
+pub(crate) struct Recursion<'a> {
+    /// The FROM term whose queue this is.
+    pub(crate) cte: usize,
+    /// The arms that do not reference the CTE.
+    pub(crate) seeds: &'a [(inillucent_sql::ast::CompoundOp, PhysicalPlan)],
+    /// The arms that do.
+    pub(crate) steps: &'a [(inillucent_sql::ast::CompoundOp, PhysicalPlan)],
+    /// How many columns a row holds.
+    pub(crate) width: usize,
+    /// The CTE's own `ORDER BY`, `LIMIT` and `OFFSET`.
+    pub(crate) queue: &'a RecursiveQueue,
+    /// Where the trees and layouts come from.
+    pub(crate) catalog: &'a dyn TreeCatalog,
+    /// The bound parameters.
+    pub(crate) params: &'a Params,
+}
 
 /// Fills a recursive CTE and returns every row it produced.
 ///
@@ -30,22 +55,54 @@ use crate::setop::SetKeys;
 /// does not, which is also the difference between a graph walk that terminates
 /// on a cycle and one that does not.
 ///
-/// @param cte - the FROM term whose queue this is
-/// @param seeds - the arms that do not reference the CTE
-/// @param steps - the arms that do
-/// @param width - how many columns a row holds
-/// @param catalog - where the trees and layouts come from
-/// @param params - the bound parameters
+/// @param recursion - what the CTE is filled from
 /// @param limit - the rows the statement above will keep, when it says
 pub(crate) fn run_recursive(
-    cte: usize,
-    seeds: &[(inillucent_sql::ast::CompoundOp, PhysicalPlan)],
-    steps: &[(inillucent_sql::ast::CompoundOp, PhysicalPlan)],
-    width: usize,
-    catalog: &dyn TreeCatalog,
-    params: &Params,
+    recursion: &Recursion<'_>,
     limit: Option<usize>,
 ) -> DbResult<Vec<Vec<OwnedDatum>>> {
+    let Recursion { queue, params, .. } = *recursion;
+    let own_limit = constant_count(queue.limit.as_ref(), params, Negative::NoLimit)?;
+    let own_offset = constant_count(queue.offset.as_ref(), params, Negative::Zero)?.unwrap_or(0);
+    // The rows the loop has to produce before nothing more is needed: what the
+    // query's own LIMIT keeps after its OFFSET, or what the statement above
+    // keeps, whichever is fewer.
+    let wanted = [
+        own_limit.map(|own| own.saturating_add(own_offset)),
+        limit.map(|above| above.saturating_add(own_offset)),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    let produced = if queue.order_by.is_empty() {
+        fill_in_passes(recursion, wanted)?
+    } else {
+        fill_in_order(recursion, wanted)?
+    };
+    let kept = produced.into_iter().skip(own_offset);
+    Ok(match own_limit {
+        Some(own) => kept.take(own).collect(),
+        None => kept.collect(),
+    })
+}
+
+/// Fills a recursive CTE whose queue is taken in the order rows were added.
+///
+/// @param recursion - what the CTE is filled from
+/// @param limit - how many rows are needed, counting any offset, when known
+fn fill_in_passes(
+    recursion: &Recursion<'_>,
+    limit: Option<usize>,
+) -> DbResult<Vec<Vec<OwnedDatum>>> {
+    let Recursion {
+        cte,
+        seeds,
+        steps,
+        width,
+        catalog,
+        params,
+        ..
+    } = *recursion;
     let distinct = seeds
         .iter()
         .chain(steps.iter())
@@ -124,6 +181,134 @@ pub(crate) fn run_recursive(
         }
         working = fresh;
     }
+}
+
+/// Fills a recursive CTE whose queue is ordered by the query's own `ORDER BY`.
+///
+/// **One row at a time, because the order is decided between rows.** SQLite
+/// takes the first row of the ordered queue, produces it, runs the recursive
+/// arms over that one row and queues what they return, so a row that sorts
+/// first jumps ahead of rows queued earlier: `ORDER BY depth DESC` walks a tree
+/// depth first and `ORDER BY depth` breadth first. Rows that compare equal
+/// leave in the order they were queued. The loop stops as soon as `wanted` rows
+/// have been produced, without running the arms over the last one.
+///
+/// @param recursion - what the CTE is filled from
+/// @param wanted - how many rows are needed, counting any offset, when known
+fn fill_in_order(
+    recursion: &Recursion<'_>,
+    wanted: Option<usize>,
+) -> DbResult<Vec<Vec<OwnedDatum>>> {
+    let Recursion {
+        cte,
+        seeds,
+        steps,
+        width,
+        queue,
+        catalog,
+        params,
+    } = *recursion;
+    let keys = queue_keys(&queue.order_by)?;
+    let distinct = seeds
+        .iter()
+        .chain(steps.iter())
+        .any(|(op, _)| *op == inillucent_sql::ast::CompoundOp::Union);
+    let mut seen = SetKeys::new(vec![Collation::Binary; width.max(1)]);
+    let mut waiting: Vec<Vec<OwnedDatum>> = Vec::new();
+    for (_, arm) in seeds {
+        let (rows, _) = run_any(arm, catalog, params)?;
+        queue_new_rows(rows, distinct, &mut seen, &mut waiting)?;
+    }
+    let mut answer: Vec<Vec<OwnedDatum>> = Vec::new();
+    let reached = |answer: &Vec<Vec<OwnedDatum>>| wanted.is_some_and(|want| answer.len() >= want);
+    while !reached(&answer) {
+        inillucent_base::budget::check()?;
+        let Some(next) = first_in_order(&waiting, &keys) else {
+            break;
+        };
+        let row = waiting.remove(next);
+        answer.push(row.clone());
+        if reached(&answer) {
+            break;
+        }
+        let current = vec![row];
+        let queued = WithQueue {
+            inner: catalog,
+            cte,
+            rows: &current,
+        };
+        for (_, arm) in steps {
+            let (rows, _) = run_any(arm, &queued, params)?;
+            queue_new_rows(rows, distinct, &mut seen, &mut waiting)?;
+        }
+    }
+    Ok(answer)
+}
+
+/// Adds the rows a pass produced to the queue, dropping the ones a `UNION` has
+/// seen before.
+///
+/// @param rows - the rows produced
+/// @param distinct - whether a row already queued once is dropped
+/// @param seen - every row queued so far
+/// @param waiting - the queue
+fn queue_new_rows(
+    rows: Vec<Vec<OwnedDatum>>,
+    distinct: bool,
+    seen: &mut SetKeys,
+    waiting: &mut Vec<Vec<OwnedDatum>>,
+) -> DbResult<()> {
+    for row in rows {
+        if distinct && !seen.remember(&row) {
+            continue;
+        }
+        inillucent_base::budget::materialise(crate::ops::owned_row_bytes(&row))?;
+        waiting.push(row);
+    }
+    Ok(())
+}
+
+/// Returns the position of the row that leaves the queue next.
+///
+/// The first of the smallest, so rows that compare equal leave in the order
+/// they arrived.
+///
+/// @param waiting - the queue, oldest first
+/// @param keys - the ordering
+fn first_in_order(waiting: &[Vec<OwnedDatum>], keys: &[SortKey]) -> Option<usize> {
+    waiting
+        .iter()
+        .enumerate()
+        .reduce(|best, candidate| {
+            if compare_by(candidate.1, best.1, keys) == std::cmp::Ordering::Less {
+                candidate
+            } else {
+                best
+            }
+        })
+        .map(|(position, _)| position)
+}
+
+/// Turns the bound `ORDER BY` terms of a recursive query into sort keys.
+///
+/// @param terms - the terms, each naming a result column
+fn queue_keys(terms: &[inillucent_sql::bind::BoundOrderTerm]) -> DbResult<Vec<SortKey>> {
+    terms
+        .iter()
+        .map(|term| {
+            let BoundExpr::SorterColumn { column } = &term.expr else {
+                return Err(inillucent_base::error::misuse(
+                    "a recursive query ordered by an expression",
+                ));
+            };
+            Ok(SortKey {
+                column: usize::from(*column),
+                descending: term.order == SortOrder::Descending,
+                collation: term.collation,
+                nulls_first: term.nulls == NullOrder::First,
+            })
+        })
+        .collect()
 }
 
 /// Returns the rows that are neither duplicates of each other nor already seen.

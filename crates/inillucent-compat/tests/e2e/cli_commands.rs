@@ -322,7 +322,7 @@ fn run_reports_an_unbuilt_construct_as_unsupported() {
     let binary = program("inillucent");
     let database = populated(&binary, "run-unsupported");
     let path = database.to_string_lossy().to_string();
-    let unbuilt = "SELECT 1 FROM note WHERE (id, body) IN (SELECT id, body FROM note)";
+    let unbuilt = "ATTACH ? AS other";
     let refused = run(
         &binary,
         &[
@@ -2421,8 +2421,9 @@ const NOT_BUILT: [&str; 3] = [
     // The first is the one `crates/inillucent-compat/tests/e2e/mcp_wire.rs` drives
     // the server with, so the two sides of the claim - exit code 3 out of the
     // binary, `unsupported` out of a JSON-RPC result - are about one statement.
-    // It names no table on purpose, so neither suite has to build one first.
-    "SELECT (SELECT 1, 2)",
+    // It names a table that is not there on purpose, so neither suite has to build
+    // one first: the `USING btree` clause is refused before the table is looked up.
+    "CREATE INDEX unbuilt_i ON unbuilt_t USING btree (a)",
     "SELECT * FROM sqlite_schema WHERE (name, type) IN (SELECT name, type FROM sqlite_schema)",
     "SELECT 1 FROM sqlite_schema WHERE name IN (SELECT name, type FROM sqlite_schema)",
 ];

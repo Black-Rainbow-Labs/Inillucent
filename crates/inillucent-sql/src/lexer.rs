@@ -567,10 +567,18 @@ impl<'a> Lexer<'a> {
     fn scan_hex_number(&mut self, start: usize) -> Result<Token, LexError> {
         let mut cursor = start + 2;
         let digits = cursor;
-        while self
-            .byte(cursor)
-            .is_some_and(|byte| byte.is_ascii_hexdigit())
-        {
+        loop {
+            let Some(byte) = self.byte(cursor) else { break };
+            // SQLite 3.46 and later accept a `_` between two hex digits.
+            let separator = byte == b'_'
+                && cursor > digits
+                && self
+                    .byte(cursor.wrapping_sub(1))
+                    .is_some_and(|b| b.is_ascii_hexdigit())
+                && self.byte(cursor + 1).is_some_and(|b| b.is_ascii_hexdigit());
+            if !(byte.is_ascii_hexdigit() || separator) {
+                break;
+            }
             cursor += 1;
         }
         if cursor == digits || self.byte(cursor).is_some_and(is_identifier_part) {
@@ -726,6 +734,100 @@ pub fn is_identifier_start(byte: u8) -> bool {
 /// Returns whether the byte may continue a bare identifier.
 pub fn is_identifier_part(byte: u8) -> bool {
     is_identifier_start(byte) || byte.is_ascii_digit() || byte == b'$'
+}
+
+/// Returns the text SQLite quotes in `unrecognized token: "..."` for a lexing failure.
+///
+/// SQLite names the bytes its tokenizer consumed before it gave up, and that length is
+/// not the same for every kind. An unterminated quote runs to the end of the input,
+/// because the tokenizer looks for the closing quote until it runs out of text. A
+/// malformed blob runs to the closing quote. A malformed number runs to the end of the
+/// identifier characters that follow it, so `123abc` and `0b11` are named whole. A bare
+/// `@`, `:` or `$`, and a byte that begins no token, are named alone. Measured against
+/// the pinned shell for each of these.
+///
+/// @param source - the SQL text the lexer was given
+/// @param error - the failure the lexer reported
+pub fn illegal_token_text(source: &[u8], error: LexError) -> &[u8] {
+    let start = (error.offset as usize).min(source.len());
+    let end = match error.kind {
+        LexErrorKind::UnterminatedQuote | LexErrorKind::UnterminatedComment => source.len(),
+        LexErrorKind::MalformedBlob => blob_token_end(source, start),
+        LexErrorKind::MalformedNumber => number_token_end(source, start),
+        LexErrorKind::MalformedParameter | LexErrorKind::UnrecognisedByte => start + 1,
+    };
+    source.get(start..end.min(source.len())).unwrap_or(&[])
+}
+
+/// Returns where SQLite's tokenizer stops on a blob literal whose body is not valid.
+///
+/// @param source - the SQL text
+/// @param start - the offset of the `x` that opens the literal
+fn blob_token_end(source: &[u8], start: usize) -> usize {
+    let mut cursor = start + 2;
+    while source.get(cursor).is_some_and(u8::is_ascii_hexdigit) {
+        cursor += 1;
+    }
+    while source.get(cursor).is_some_and(|byte| *byte != b'\'') {
+        cursor += 1;
+    }
+    (cursor + 1).min(source.len())
+}
+
+/// Returns where SQLite's tokenizer stops on a numeric literal that runs into a word.
+///
+/// The digits, fraction and exponent are read the way a valid number is, and then every
+/// identifier character after them is part of the same bad token.
+///
+/// @param source - the SQL text
+/// @param start - the offset of the first digit, or of the `.` of `.5x`
+fn number_token_end(source: &[u8], start: usize) -> usize {
+    let at = |index: usize| source.get(index).copied();
+    let mut cursor = start;
+    let hex = at(start) == Some(b'0')
+        && at(start + 1).is_some_and(|byte| byte.eq_ignore_ascii_case(&b'x'))
+        && at(start + 2).is_some_and(|byte| byte.is_ascii_hexdigit());
+    if hex {
+        cursor += 2;
+        while at(cursor).is_some_and(|byte| byte.is_ascii_hexdigit()) {
+            cursor += 1;
+        }
+    } else {
+        cursor = skip_digits_and_separators(source, cursor);
+        if at(cursor) == Some(b'.') {
+            cursor = skip_digits_and_separators(source, cursor + 1);
+        }
+        let sign = usize::from(matches!(at(cursor + 1), Some(b'+') | Some(b'-')));
+        let exponent = at(cursor).is_some_and(|byte| byte.eq_ignore_ascii_case(&b'e'))
+            && at(cursor + 1 + sign).is_some_and(|byte| byte.is_ascii_digit());
+        if exponent {
+            cursor = skip_digits_and_separators(source, cursor + 1 + sign);
+        }
+    }
+    while at(cursor).is_some_and(is_identifier_part) {
+        cursor += 1;
+    }
+    cursor
+}
+
+/// Advances over decimal digits, allowing a `_` that sits between two digits.
+///
+/// @param source - the SQL text
+/// @param from - where to start
+fn skip_digits_and_separators(source: &[u8], from: usize) -> usize {
+    let mut cursor = from;
+    loop {
+        let byte = source.get(cursor).copied();
+        let between = byte == Some(b'_')
+            && cursor > from
+            && source.get(cursor + 1).is_some_and(u8::is_ascii_digit)
+            && source.get(cursor - 1).is_some_and(u8::is_ascii_digit);
+        if byte.is_some_and(|byte| byte.is_ascii_digit()) || between {
+            cursor += 1;
+        } else {
+            return cursor;
+        }
+    }
 }
 
 /// Returns the unquoted text of an identifier token, undoubling escapes.

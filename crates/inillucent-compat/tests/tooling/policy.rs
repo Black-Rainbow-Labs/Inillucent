@@ -1304,7 +1304,11 @@ const CEILINGS: [(&str, usize); 17] = [
     // aggregate reference is made and where it picks up its arguments'
     // explicit collation. Without the move the aggregate and window references
     // carrying a collation took this file to 4,824.
-    ("crates/inillucent-sql/src/bind.rs", 4_728),
+    //
+    // **Lowered to 4,513 when the built-in aggregate call moved to
+    // `bind/aggregate.rs` and the aggregates of an enclosing query went to
+    // `bind/outer_aggregate.rs`.**
+    ("crates/inillucent-sql/src/bind.rs", 4_501),
     // Its own row from the day it was split out of `bind.rs` (task-2088).
     // Lowered to 158 in task-2094, when its tests moved to
     // `bind/collation/tests.rs`; the aggregate and window rules and a test
@@ -2279,7 +2283,7 @@ fn no_shell_file_reaches_past_the_driver_more_than_it_is_recorded_at() {
     // `inillucent_engine`, and how many lines of it do. Measured at
     // task-1932; a row at zero is a file that has moved and whose row should
     // be deleted.
-    const REACHES: [(&str, usize); 9] = [
+    const REACHES: [(&str, usize); 10] = [
         // The shell itself. Down from ten to one in task-1962 (roadmap item
         // 7): the virtual table modules, the authorizer, the cache statistics,
         // the statement budget and `leading_trivia` are all on the driver's
@@ -2324,6 +2328,10 @@ fn no_shell_file_reaches_past_the_driver_more_than_it_is_recorded_at() {
         // The MCP server. Down from one to zero in task-1932: the budget types
         // it needed are re-exported by the driver now.
         ("crates/inillucent-cli/src/mcp.rs", 0),
+        // `.mode insert` quotes a column name the way the reference's `quoteChar` does,
+        // and one of its tests is whether the name is an SQL keyword, which only the
+        // engine's keyword table answers. One line, in `insert_column`.
+        ("crates/inillucent-cli/src/render.rs", 1),
     ];
 
     let root = workspace_root();

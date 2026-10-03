@@ -122,7 +122,7 @@ pub fn document(argument: &Argument<'_>) -> DbResult<Option<Node>> {
         Value::Null => Ok(None),
         Value::Integer(value) => Ok(Some(Node::Int(value.to_string()))),
         Value::Real(value) => Ok(Some(real_node(*value))),
-        Value::Blob(blob) => binary::from_blob(blob.raw()).map(Some),
+        Value::Blob(blob) => blob_document(blob.raw()).map(Some),
         Value::Text(text) => {
             let bytes = text.utf8_bytes();
             let source = std::str::from_utf8(&bytes).map_err(|_| malformed())?;
@@ -131,6 +131,23 @@ pub fn document(argument: &Argument<'_>) -> DbResult<Option<Node>> {
                 .map_err(|_| malformed())
         }
     }
+}
+
+/// Reads a blob as a document: JSONB when it decodes as JSONB, otherwise as JSON text.
+///
+/// The pinned release tries the JSONB reading first and, when the bytes are not valid JSONB,
+/// casts the blob to text and parses that. `json(x'7B2261223A317D')` is therefore `{"a":1}`
+/// and `json_valid(x'7B7D')` is 1, while a blob that is neither is malformed.
+///
+/// @param bytes - the blob's bytes
+fn blob_document(bytes: &[u8]) -> DbResult<Node> {
+    if let Ok(node) = binary::from_blob(bytes) {
+        return Ok(node);
+    }
+    let source = std::str::from_utf8(bytes).map_err(|_| malformed())?;
+    parse::parse(source)
+        .map(|parsed| parsed.node)
+        .map_err(|_| malformed())
 }
 
 /// Returns the node a real number becomes.
@@ -150,6 +167,23 @@ fn real_node(value: f64) -> Node {
     Node::Float(text)
 }
 
+/// Returns the node an infinite or ordinary real becomes when it is stored into
+/// a document by `json_array`, `json_object`, `json_quote` and the like.
+///
+/// An infinite SQL value is written `9.0e+999` there, the way `quote()` writes
+/// it. `json(x)` reads its argument as a document instead and keeps `9e999`
+/// (see [`real_node`]), which is what the pinned SQLite does for each.
+fn stored_real_node(value: f64) -> Node {
+    if value.is_infinite() {
+        return Node::Float(if value < 0.0 {
+            "-9.0e+999".to_string()
+        } else {
+            "9.0e+999".to_string()
+        });
+    }
+    real_node(value)
+}
+
 /// Reads one argument as a value to be stored into a document.
 ///
 /// This is the other half of the subtype rule. Unmarked text becomes a JSON
@@ -161,7 +195,10 @@ fn stored(argument: &Argument<'_>, raw: bool) -> DbResult<Node> {
     match argument.value {
         Value::Null => Ok(Node::Null),
         Value::Integer(value) => Ok(Node::Int(value.to_string())),
-        Value::Real(value) => Ok(real_node(*value)),
+        // `raw` is the editing functions (`json_set` and its kin), which
+        // keep `9e999` where the constructors write `9.0e+999`.
+        Value::Real(value) if raw => Ok(real_node(*value)),
+        Value::Real(value) => Ok(stored_real_node(*value)),
         Value::Blob(blob) => {
             if !argument.json {
                 return unmarked_blob(blob.raw());
@@ -268,7 +305,7 @@ fn array_length(arguments: &[Argument<'_>]) -> DbResult<Answer> {
             if argument.value.is_null() {
                 return Ok(Answer::null());
             }
-            path::lookup(&node, &path_of(argument)?)
+            path::lookup(&node, &path_of(argument)?)?
         }
     };
     Ok(match target {
@@ -314,7 +351,7 @@ fn error_position(arguments: &[Argument<'_>]) -> DbResult<Answer> {
 /// @param steps - the path, already parsed
 /// @param binary - true for `jsonb_extract`, false for `json_extract`
 pub fn extract_parsed(node: &Node, steps: &[path::Step], binary: bool) -> DbResult<Answer> {
-    let Some(found) = path::lookup(node, steps) else {
+    let Some(found) = path::lookup(node, steps)? else {
         return Ok(Answer::null());
     };
     if binary {
@@ -368,7 +405,7 @@ fn as_sql(node: &Node) -> DbResult<Answer> {
         Node::Float(text) => Answer::plain(Value::Real(parse_real(text))),
         Node::Float5(text) => Answer::plain(Value::Real(parse_real(&render::float5_to_json(text)))),
         Node::Text(_) | Node::TextJ(_) | Node::Text5(_) | Node::TextRaw(_) => {
-            Answer::plain(Value::owned_text(render::unescape(node).as_bytes())?)
+            Answer::plain(Value::owned_text(&render::unescape_bytes(node))?)
         }
         Node::Array(_) | Node::Object(_) => {
             Answer::marked(Value::owned_text(render::to_text(node).as_bytes())?)
@@ -394,6 +431,11 @@ fn parse_real(text: &str) -> f64 {
 /// string and JSON text for a container, which is the asymmetry `->>` exists
 /// to remove.
 fn extract(arguments: &[Argument<'_>], binary: bool) -> DbResult<Answer> {
+    // SQLite answers NULL for `json_extract()` and `json_extract(X)` without reading
+    // the document, so a malformed X is not reported either.
+    if arguments.len() < 2 {
+        return Ok(Answer::null());
+    }
     let Some(first) = arguments.first() else {
         return Ok(Answer::null());
     };
@@ -401,9 +443,6 @@ fn extract(arguments: &[Argument<'_>], binary: bool) -> DbResult<Answer> {
         return Ok(Answer::null());
     };
     let paths = arguments.get(1..).unwrap_or_default();
-    if paths.is_empty() {
-        return Err(failure("json_extract() needs at least two arguments"));
-    }
     if paths.len() == 1 {
         let Some(argument) = paths.first() else {
             return Ok(Answer::null());
@@ -412,7 +451,7 @@ fn extract(arguments: &[Argument<'_>], binary: bool) -> DbResult<Answer> {
             return Ok(Answer::null());
         }
         let steps = path_of(argument)?;
-        let Some(found) = path::lookup(&node, &steps) else {
+        let Some(found) = path::lookup(&node, &steps)? else {
             return Ok(Answer::null());
         };
         if binary {
@@ -423,7 +462,7 @@ fn extract(arguments: &[Argument<'_>], binary: bool) -> DbResult<Answer> {
     let mut items = Vec::with_capacity(paths.len());
     for argument in paths {
         let steps = path_of(argument)?;
-        items.push(path::lookup(&node, &steps).cloned().unwrap_or(Node::Null));
+        items.push(path::lookup(&node, &steps)?.cloned().unwrap_or(Node::Null));
     }
     answer(&Node::Array(items), binary)
 }
@@ -454,13 +493,16 @@ fn arrow(arguments: &[Argument<'_>], sql: bool) -> DbResult<Answer> {
             let source = std::str::from_utf8(&bytes).map_err(|_| malformed())?;
             if source.starts_with('$') {
                 path::parse(source)?
+            } else if source.is_empty() {
+                // An empty right operand is neither a path nor a label.
+                return Err(path::bad_path(source));
             } else {
                 vec![path::Step::Key(source.to_string())]
             }
         }
         _ => return Err(path::bad_path("?")),
     };
-    let Some(found) = path::lookup(&node, &steps) else {
+    let Some(found) = path::lookup(&node, &steps)? else {
         return Ok(Answer::null());
     };
     if sql {
@@ -476,7 +518,16 @@ fn edit(arguments: &[Argument<'_>], edit: path::Edit, binary: bool) -> DbResult<
     };
     let rest = arguments.get(1..).unwrap_or_default();
     if rest.len() % 2 != 0 {
-        return Err(failure("json_insert() needs an odd number of arguments"));
+        // SQLite words it with the function's own name, `set`, `insert` or
+        // `replace`, and for the binary spellings too: `jsonb_set()` says `json_set()`.
+        let name = match edit {
+            path::Edit::Insert => "insert",
+            path::Edit::Replace => "replace",
+            path::Edit::Set => "set",
+        };
+        return Err(failure(format!(
+            "json_{name}() needs an odd number of arguments"
+        )));
     }
     let Some(mut node) = document(first)? else {
         return Ok(Answer::null());
@@ -485,6 +536,10 @@ fn edit(arguments: &[Argument<'_>], edit: path::Edit, binary: bool) -> DbResult<
         let (Some(target), Some(value)) = (pair.first(), pair.get(1)) else {
             continue;
         };
+        // A NULL path edits nothing, and the document comes back as it was.
+        if target.value.is_null() {
+            continue;
+        }
         let steps = path_of(target)?;
         path::apply(&mut node, &steps, stored(value, true)?, edit)?;
     }
@@ -541,7 +596,7 @@ fn remove(arguments: &[Argument<'_>], binary: bool) -> DbResult<Answer> {
         if steps.is_empty() {
             return Ok(Answer::null());
         }
-        path::remove(&mut node, &steps);
+        path::remove(&mut node, &steps)?;
     }
     answer(&node, binary)
 }
@@ -592,7 +647,7 @@ fn type_of(arguments: &[Argument<'_>]) -> DbResult<Answer> {
             if argument.value.is_null() {
                 return Ok(Answer::null());
             }
-            path::lookup(&node, &path_of(argument)?)
+            path::lookup(&node, &path_of(argument)?)?
         }
     };
     Ok(match target {
@@ -611,46 +666,97 @@ fn valid(arguments: &[Argument<'_>]) -> DbResult<Answer> {
     let Some(first) = arguments.first() else {
         return Ok(Answer::null());
     };
+    // The flags are checked before the document, so a NULL document with a bad flag
+    // is an error and not NULL.
+    let flags = valid_flags(arguments.get(1))?;
+    let Some(flags) = flags else {
+        return Ok(Answer::null());
+    };
     if first.value.is_null() {
         return Ok(Answer::null());
     }
-    let flags = match arguments.get(1) {
-        None => 1,
-        Some(argument) => match argument.value {
-            Value::Null => return Ok(Answer::null()),
-            Value::Integer(value) => *value,
-            Value::Real(value) => *value as i64,
-            _ => 1,
-        },
-    };
     let answer = match first.value {
-        Value::Blob(blob) => {
-            let bytes = blob.raw();
-            let strict = flags & 8 != 0 && binary::is_valid(bytes);
-            let shallow = flags & 4 != 0 && binary::read_header(bytes, 0).is_ok();
-            strict || shallow
-        }
-        Value::Text(text) => {
-            let bytes = text.utf8_bytes();
-            match std::str::from_utf8(&bytes) {
-                Err(_) => false,
-                Ok(source) => match parse::parse(source) {
-                    Err(_) => false,
-                    Ok(parsed) => {
-                        if parsed.used_json5 {
-                            flags & 2 != 0
-                        } else {
-                            flags & 3 != 0
-                        }
-                    }
-                },
-            }
-        }
+        // A blob that is not JSONB is read again as text, which is how
+        // `json_valid(x'7b7d')` is true.
+        Value::Blob(blob) => valid_blob(blob.raw(), flags),
+        Value::Text(text) => valid_text(&text.utf8_bytes(), flags),
         // A number is a document in either dialect.
+        // An infinite real is converted to the text `Inf`, which no dialect
+        // accepts: `json_valid(1e999)` is 0 in SQLite.
+        Value::Real(real) if real.is_infinite() => false,
         Value::Integer(_) | Value::Real(_) => flags & 3 != 0,
         Value::Null => false,
     };
     Ok(Answer::plain(Value::Integer(i64::from(answer))))
+}
+
+/// Reads the second argument of `json_valid`, which must be between 1 and 15.
+///
+/// `Ok(None)` is a NULL flags argument, which makes the answer NULL.
+///
+/// @param argument - the flags argument, when the call has one
+fn valid_flags(argument: Option<&Argument<'_>>) -> DbResult<Option<i64>> {
+    let Some(argument) = argument else {
+        return Ok(Some(1));
+    };
+    let requested = match argument.value {
+        Value::Null => return Ok(None),
+        Value::Integer(value) => *value,
+        Value::Real(value) => *value as i64,
+        Value::Text(text) => leading_integer(&text.utf8_bytes()),
+        Value::Blob(blob) => leading_integer(blob.raw()),
+    };
+    if !(1..=15).contains(&requested) {
+        return Err(failure(
+            "FLAGS parameter to json_valid() must be between 1 and 15",
+        ));
+    }
+    Ok(Some(requested))
+}
+
+/// Returns the integer a text starts with, or 0, as SQLite converts a string to a number.
+///
+/// @param bytes - the text
+fn leading_integer(bytes: &[u8]) -> i64 {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim_start();
+    let end = trimmed
+        .char_indices()
+        .take_while(|(at, character)| {
+            character.is_ascii_digit() || (*at == 0 && matches!(character, '-' | '+'))
+        })
+        .map(|(at, character)| at + character.len_utf8())
+        .last()
+        .unwrap_or(0);
+    trimmed
+        .get(..end)
+        .and_then(|digits| digits.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// Answers `json_valid` for a text under a set of flags.
+///
+/// @param bytes - the text
+/// @param flags - the validity flags, 1 to 15
+fn valid_text(bytes: &[u8], flags: i64) -> bool {
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    match parse::parse(source) {
+        Err(_) => false,
+        Ok(parsed) if parsed.used_json5 => flags & 2 != 0,
+        Ok(_) => flags & 3 != 0,
+    }
+}
+
+/// Answers `json_valid` for a blob under a set of flags.
+///
+/// @param bytes - the blob
+/// @param flags - the validity flags, 1 to 15
+fn valid_blob(bytes: &[u8], flags: i64) -> bool {
+    let strict = flags & 8 != 0 && binary::is_valid(bytes);
+    let shallow = flags & 4 != 0 && binary::read_header(bytes, 0).is_ok();
+    strict || shallow || valid_text(bytes, flags)
 }
 
 /// `json_quote(X)`.
@@ -671,7 +777,7 @@ fn quote(arguments: &[Argument<'_>]) -> DbResult<Answer> {
     let node = match first.value {
         Value::Null => Node::Null,
         Value::Integer(value) => Node::Int(value.to_string()),
-        Value::Real(value) => real_node(*value),
+        Value::Real(value) => stored_real_node(*value),
         Value::Blob(blob) => unmarked_blob(blob.raw())?,
         Value::Text(text) => {
             let bytes = text.utf8_bytes();

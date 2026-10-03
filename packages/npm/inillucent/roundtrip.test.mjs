@@ -127,7 +127,12 @@ withDatabase('a failure comes back classified rather than thrown', async (db) =>
 
   // `unsupported` is its own status and its own exit code, which is the thing
   // AGENTS.md asks a caller to branch on rather than reword their SQL over.
-  const unbuilt = await inillucent('query', { db, sql: 'SELECT (SELECT 1, 2)' });
+  // The `USING btree` clause is an extension of this dialect that only the vector index
+  // types fill; the engine refuses it before it looks for the table.
+  const unbuilt = await inillucent('exec', {
+    db,
+    sql: 'CREATE INDEX unbuilt_i ON people USING btree (id)',
+  });
   assert.equal(unbuilt.ok, false);
   assert.equal(
     unbuilt.status,

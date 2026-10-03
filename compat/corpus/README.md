@@ -8,6 +8,7 @@ whether or not the generator's seed happens to produce the same input again.
 |---|---|---|
 | `btree/` | minimal operation sequences that once diverged from `ModelBTree`, shrunk to the smallest failing case | `inillucent-compat::durability::btree_model` |
 | `syntax/` | statements the parser and the pinned release once disagreed about accepting | `inillucent-compat::syntax::differential_parser_fuzzing_finds_no_divergence` |
+| `usage/` | scripts that look like application traffic: connection pragmas, ORM catalog queries, migrations, CRUD code and error messages, with `known.toml` listing the cases that still differ | `inillucent-compat::differential::usage_corpus` |
 | `select/` | the foundational SELECT corpus: a schema and one query per line | `inillucent-slt`, which records SQLite's answers into `tests/conformance/` |
 
 A retained file holds the **input**, never the annotation. That distinction is

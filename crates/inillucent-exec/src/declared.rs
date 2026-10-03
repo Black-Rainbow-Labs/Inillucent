@@ -31,7 +31,7 @@
 
 use inillucent_base::{DbError, DbResult, ExtendedCode};
 use inillucent_sql::catalog_view::TableInfo;
-use inillucent_sql::dml::{codes, BoundCheck, BoundDefault, BoundIndexExprs};
+use inillucent_sql::dml::{codes, BoundCheck, BoundDefault, BoundIndexExprs, BoundVirtualColumn};
 use inillucent_tree::datum::OwnedDatum;
 use inillucent_value::affinity::{self, Affinity};
 use inillucent_value::encoding::TextEncoding;
@@ -94,7 +94,7 @@ impl StrictClass {
 fn class_name(value: &OwnedDatum) -> &'static str {
     match value {
         OwnedDatum::Null => "NULL",
-        OwnedDatum::Int(_) => "INTEGER",
+        OwnedDatum::Int(_) => "INT",
         OwnedDatum::Real(_) => "REAL",
         OwnedDatum::Text(_) => "TEXT",
         OwnedDatum::Blob(_) => "BLOB",
@@ -111,6 +111,9 @@ struct TypedColumn {
     declared: Vec<u8>,
     /// The column name, for the message.
     name: Vec<u8>,
+    /// Whether the column is a `STORED` generated one, which SQLite checks
+    /// after the virtual generated columns and not in column order.
+    generated: bool,
 }
 
 /// One `CHECK` predicate, compiled, with the text SQLite names it by.
@@ -123,6 +126,14 @@ struct CompiledCheck {
     /// made once here rather than at every failure.
     label: Vec<u8>,
     /// The predicate.
+    expr: Box<dyn Eval>,
+}
+
+/// One virtual generated column a row has to satisfy, compiled.
+struct CompiledVirtual {
+    /// The column, by declared position.
+    position: u16,
+    /// The column's value as it is read, computed from the row.
     expr: Box<dyn Eval>,
 }
 
@@ -252,6 +263,9 @@ pub struct WriteDeclarations {
     /// Only the `NOT NULL` columns that declare one, so an ordinary table
     /// leaves this empty and nothing on the write path looks at it.
     defaults: Vec<CompiledDefault>,
+    /// The virtual generated columns that are `NOT NULL` or in a `STRICT`
+    /// table. They have no slot in the row, so their values are computed.
+    virtuals: Vec<CompiledVirtual>,
 }
 
 /// One `NOT NULL` column's `DEFAULT`, compiled.
@@ -262,27 +276,44 @@ struct CompiledDefault {
     expr: Box<dyn Eval>,
 }
 
+/// The bound expressions a statement hands to [`WriteDeclarations::compile`].
+///
+/// Grouped because the list grew past what a call can show at a glance.
+#[derive(Clone, Copy)]
+pub struct BoundDeclarations<'a> {
+    /// The statement's bound `CHECK` predicates.
+    pub checks: &'a [BoundCheck],
+    /// The bound `DEFAULT`s a `REPLACE` may substitute.
+    pub defaults: &'a [BoundDefault],
+    /// The virtual generated columns a row must satisfy.
+    pub virtual_columns: &'a [BoundVirtualColumn],
+    /// The statement's bound index expressions.
+    pub index_exprs: &'a [BoundIndexExprs],
+}
+
 impl WriteDeclarations {
     /// Compiles a table's declarations against the statement's row space.
     ///
     /// @param table - the table being written
     /// @param layout - the table tree's layout
-    /// @param checks - the statement's bound `CHECK` predicates
-    /// @param defaults - the bound `DEFAULT`s a `REPLACE` may substitute
-    /// @param index_exprs - the statement's bound index expressions
+    /// @param bound - the statement's bound expressions
     /// @param space - the statement's row space
     /// @param params - the bound parameters
     /// @param catalog - where a registered function's body is looked up
     pub fn compile(
         table: &TableInfo,
         layout: &SourceLayout,
-        checks: &[BoundCheck],
-        defaults: &[BoundDefault],
-        index_exprs: &[BoundIndexExprs],
+        bound: BoundDeclarations<'_>,
         space: &RowSpace,
         params: &Params,
         catalog: &dyn TreeCatalog,
     ) -> DbResult<WriteDeclarations> {
+        let BoundDeclarations {
+            checks,
+            defaults,
+            virtual_columns,
+            index_exprs,
+        } = bound;
         let mut affinities = Vec::new();
         let mut typed = Vec::new();
         for (position, column) in table.columns.iter().enumerate() {
@@ -303,6 +334,7 @@ impl WriteDeclarations {
                         class,
                         declared: column.declared_type.clone(),
                         name: column.name.clone(),
+                        generated: column.generated,
                     });
                 }
             }
@@ -351,13 +383,41 @@ impl WriteDeclarations {
                 expr: space.compile(&default.expr, params, catalog)?,
             });
         }
+        let mut virtuals = Vec::with_capacity(virtual_columns.len());
+        for held in virtual_columns {
+            virtuals.push(CompiledVirtual {
+                position: held.column,
+                expr: space.compile(&held.expr, params, catalog)?,
+            });
+        }
         Ok(WriteDeclarations {
             affinities,
             typed,
             checks: compiled,
             index_exprs: indexed,
             defaults: standins,
+            virtuals,
         })
+    }
+
+    /// Computes a virtual generated column's value for a row about to be stored.
+    ///
+    /// `None` when the column is not one the statement has to look at. The value
+    /// is the one a read would return, so it has the column's affinity applied.
+    ///
+    /// @param space - the statement's row space
+    /// @param row - the image about to be written
+    /// @param position - the column, by declared position
+    pub fn virtual_value(
+        &self,
+        space: &RowSpace,
+        row: &[OwnedDatum],
+        position: u16,
+    ) -> DbResult<Option<OwnedDatum>> {
+        let Some(held) = self.virtuals.iter().find(|held| held.position == position) else {
+            return Ok(None);
+        };
+        Ok(Some(space.evaluate(held.expr.as_ref(), &[row])?))
     }
 
     /// Puts a `NOT NULL` column's `DEFAULT` in place of a NULL, when it has one.
@@ -401,7 +461,17 @@ impl WriteDeclarations {
     /// Lets a caller skip the whole apparatus for a table of untyped columns
     /// with no constraints, which is what several of the gate's fixtures are.
     pub fn is_empty(&self) -> bool {
-        self.affinities.is_empty() && self.typed.is_empty() && self.checks.is_empty()
+        self.affinities.is_empty()
+            && self.typed.is_empty()
+            && self.checks.is_empty()
+            && self.virtuals.is_empty()
+    }
+
+    /// Returns these declarations without the affinities that convert a value,
+    /// for a write that stores each value as its source produced it.
+    pub fn without_affinities(mut self) -> WriteDeclarations {
+        self.affinities.clear();
+        self
     }
 
     /// Applies each column's affinity to the row about to be stored.
@@ -436,24 +506,51 @@ impl WriteDeclarations {
     /// column reports the missing value rather than the wrong class.
     ///
     /// @param table - the table being written
+    /// @param space - the statement's row space, which computes a virtual column
     /// @param row - the image about to be written
-    pub fn types_are_met(&self, table: &TableInfo, row: &[OwnedDatum]) -> DbResult<()> {
-        for column in &self.typed {
+    pub fn types_are_met(
+        &self,
+        table: &TableInfo,
+        space: &RowSpace,
+        row: &[OwnedDatum],
+    ) -> DbResult<()> {
+        // SQLite checks the ordinary columns first, then the virtual generated
+        // ones, then the stored generated ones. Which message a row with two
+        // wrong values gets is the only thing the order decides.
+        self.typed_columns_are_met(table, row, false)?;
+        if !table.strict {
+            return Ok(());
+        }
+        for held in &self.virtuals {
+            let Some(column) = table.column(held.position) else {
+                continue;
+            };
+            let Some(class) = StrictClass::of(&column.declared_type) else {
+                continue;
+            };
+            let value = space.evaluate(held.expr.as_ref(), &[row])?;
+            wrong_class(table, &column.name, &column.declared_type, class, &value)?;
+        }
+        self.typed_columns_are_met(table, row, true)
+    }
+
+    /// Checks the `STRICT` columns the row holds, either the ones that are
+    /// stored generated columns or the ones that are not.
+    ///
+    /// @param table - the table being written
+    /// @param row - the image about to be written
+    /// @param generated - true for the stored generated columns, false for the rest
+    fn typed_columns_are_met(
+        &self,
+        table: &TableInfo,
+        row: &[OwnedDatum],
+        generated: bool,
+    ) -> DbResult<()> {
+        for column in self.typed.iter().filter(|held| held.generated == generated) {
             let Some(value) = row.get(column.slot) else {
                 continue;
             };
-            if column.class.admits(value) {
-                continue;
-            }
-            return Err(
-                DbError::new(ExtendedCode(codes::DATATYPE)).with_message(format!(
-                    "cannot store {} value in {} column {}.{}",
-                    class_name(value),
-                    String::from_utf8_lossy(&column.declared),
-                    String::from_utf8_lossy(&table.name),
-                    String::from_utf8_lossy(&column.name)
-                )),
-            );
+            wrong_class(table, &column.name, &column.declared, column.class, value)?;
         }
         Ok(())
     }
@@ -493,6 +590,34 @@ impl WriteDeclarations {
         }
         Ok(true)
     }
+}
+
+/// Refuses a value that a `STRICT` column's type does not admit.
+///
+/// @param table - the table being written
+/// @param name - the column's name
+/// @param declared - the column's declared type, as written
+/// @param class - the storage class the declared type admits
+/// @param value - the value about to be stored
+fn wrong_class(
+    table: &TableInfo,
+    name: &[u8],
+    declared: &[u8],
+    class: StrictClass,
+    value: &OwnedDatum,
+) -> DbResult<()> {
+    if class.admits(value) {
+        return Ok(());
+    }
+    Err(
+        DbError::new(ExtendedCode(codes::DATATYPE)).with_message(format!(
+            "cannot store {} value in {} column {}.{}",
+            class_name(value),
+            String::from_utf8_lossy(declared),
+            String::from_utf8_lossy(&table.name),
+            String::from_utf8_lossy(name)
+        )),
+    )
 }
 
 /// Reports whether a value evaluates to SQL false.
@@ -546,6 +671,34 @@ fn already_stored_as(value: &OwnedDatum, affinity: Affinity) -> bool {
             OwnedDatum::Real(number) => !(*number == 0.0 && number.is_sign_negative()),
             _ => false,
         },
+    }
+}
+
+/// Applies a column's affinity to one cell of a row image, in place.
+///
+/// For a caller that holds an affinity and not a `WriteDeclarations`: the
+/// `NEW` row of a view's `INSTEAD OF UPDATE`, whose columns take the affinity of
+/// the table columns the view reads.
+///
+/// @param cell - the value to convert
+/// @param affinity - the column's affinity
+pub(crate) fn apply_cell_affinity(cell: &mut OwnedDatum, affinity: Affinity) {
+    if already_stored_as(cell, affinity) {
+        return;
+    }
+    let taken = std::mem::replace(cell, OwnedDatum::Null);
+    *cell = convert(taken, affinity);
+}
+
+/// Converts a value to the affinity a derived table's column is stored with.
+///
+/// @param value - the value
+/// @param affinity - the column's affinity, where Blob is none
+pub(crate) fn stored_as(value: OwnedDatum, affinity: Affinity) -> OwnedDatum {
+    if already_stored_as(&value, affinity) {
+        value
+    } else {
+        convert(value, affinity)
     }
 }
 

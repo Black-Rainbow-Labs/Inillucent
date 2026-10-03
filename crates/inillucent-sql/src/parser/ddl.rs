@@ -10,13 +10,68 @@ use inillucent_base::limits::Limit;
 
 use super::Parser;
 use crate::ast::{
-    AlterAction, ColumnConstraint, ColumnDef, CreateTableBody, ForeignKeyAction, ForeignKeyClause,
-    IndexedColumn, NameId, ObjectKind, ReferentialAction, SortOrder, Statement, TableConstraint,
-    TriggerEvent, TriggerTime,
+    AlterAction, ColumnConstraint, ColumnDef, CreateTableBody, Expr, ForeignKeyAction,
+    ForeignKeyClause, IndexedColumn, Literal, NameId, ObjectKind, ReferentialAction, SortOrder,
+    Statement, TableConstraint, TriggerEvent, TriggerTime,
 };
 use crate::diagnostic::{ParseError, ParseErrorKind};
 use crate::keyword::Keyword;
-use crate::lexer::{Punctuator, Span, TokenKind};
+use crate::lexer::{self, Punctuator, Span, TokenKind};
+
+/// Returns the declared type of a column as `PRAGMA table_info` reports it.
+///
+/// **SQLite stores the type with its quoting taken off, and names the six
+/// standard types in capitals.** `d "My Type"` has the type `My Type`, and
+/// `a Int`, `a "Integer"` and `a [text]` have `INT`, `INTEGER` and `TEXT`. The
+/// type text is dequoted the way `sqlite3Dequote` does it, which stops at the
+/// first closing quote, and a result equal to `INT`, `INTEGER`, `REAL`, `TEXT`,
+/// `BLOB` or `ANY` in any case is replaced by the capitals. Anything longer,
+/// such as `integer(5)` or `int unsigned`, is kept as written. The text kept in
+/// `sqlite_schema` is the statement as it was written and is not touched.
+///
+/// A quoted `"INTEGER"` on a `PRIMARY KEY` column therefore makes a rowid alias,
+/// as it does in SQLite.
+///
+/// @param written - the type's tokens, as the statement spelled them
+fn declared_type_text(written: &[u8]) -> Vec<u8> {
+    let dequoted = dequote_type(written);
+    for standard in [&b"INT"[..], b"INTEGER", b"REAL", b"TEXT", b"BLOB", b"ANY"] {
+        if dequoted.eq_ignore_ascii_case(standard) {
+            return standard.to_vec();
+        }
+    }
+    dequoted
+}
+
+/// Takes the quotes off a type name that starts with one.
+///
+/// @param written - the type's tokens, as the statement spelled them
+fn dequote_type(written: &[u8]) -> Vec<u8> {
+    let Some((&first, rest)) = written.split_first() else {
+        return Vec::new();
+    };
+    let closing = match first {
+        b'"' | b'\'' | b'`' => first,
+        b'[' => b']',
+        _ => return written.to_vec(),
+    };
+    let mut out = Vec::with_capacity(rest.len());
+    let mut at = 0usize;
+    while let Some(&byte) = rest.get(at) {
+        if byte == closing {
+            // A doubled quote is one quote of the name; `]` has no doubled form.
+            if closing != b']' && rest.get(at.saturating_add(1)) == Some(&closing) {
+                out.push(closing);
+                at = at.saturating_add(2);
+                continue;
+            }
+            break;
+        }
+        out.push(byte);
+        at = at.saturating_add(1);
+    }
+    out
+}
 
 impl Parser<'_> {
     /// Dispatches the five `CREATE` forms.
@@ -88,8 +143,12 @@ impl Parser<'_> {
                 // the right outcome for the wrong reason and says nothing a
                 // caller can act on.
                 if columns.len() as i64 > self.limits.get(Limit::Column) {
+                    // SQLite names the table: `too many columns on w`.
                     return Err(ParseError::new(
-                        ParseErrorKind::LimitExceeded("too many columns on table"),
+                        ParseErrorKind::Refused(format!(
+                            "too many columns on {}",
+                            String::from_utf8_lossy(self.ast.text(name))
+                        )),
                         Span::at(self.cursor()),
                     ));
                 }
@@ -175,9 +234,9 @@ impl Parser<'_> {
         // error - which is what the pinned release does. Asking the wide
         // question here would read the `left` of `a left` as a type and accept
         // a statement SQLite refuses.
-        let declared_type = if self.at_plain_name()? {
+        let declared_type = if Parser::token_is_type_word(self.peek()?) {
             let id = self.parse_type_name()?;
-            Some(self.ast.text(id).to_vec())
+            Some(declared_type_text(self.ast.text(id)))
         } else {
             None
         };
@@ -204,6 +263,7 @@ impl Parser<'_> {
             declared_type,
             constraints,
             span: Span::new(start, end),
+            deferred_failure: None,
         })
     }
 
@@ -275,6 +335,7 @@ impl Parser<'_> {
                 self.expect(Punctuator::LeftParen)?;
                 let expr = self.parse_expr()?;
                 self.expect(Punctuator::RightParen)?;
+                let mut bad_storage = false;
                 let stored = if self.at_name()? {
                     let word = self.peek()?;
                     let text = word.text(self.source());
@@ -284,13 +345,27 @@ impl Parser<'_> {
                     } else if text.eq_ignore_ascii_case(b"virtual") {
                         self.bump()?;
                         false
+                    } else if self.at_keyword(Keyword::GENERATED)? {
+                        // SQLite reads the word after the closing parenthesis as
+                        // the storage name, and `GENERATED` is a word it accepts
+                        // there, so a second `GENERATED ALWAYS AS` fails at `ALWAYS`.
+                        self.bump()?;
+                        false
                     } else {
+                        // Any other plain word is read as the storage name too and refused
+                        // afterwards with `error in generated column`.
+                        self.bump()?;
+                        bad_storage = true;
                         false
                     }
                 } else {
                     false
                 };
-                ColumnConstraint::Generated { expr, stored }
+                ColumnConstraint::Generated {
+                    expr,
+                    stored,
+                    bad_storage,
+                }
             }
             _ => return Ok(None),
         };
@@ -322,6 +397,32 @@ impl Parser<'_> {
     /// operator, which is the whole point - the next word after the default is
     /// the column's next constraint, not more of the default.
     fn parse_literal_default(&mut self) -> Result<crate::ast::ExprId, ParseError> {
+        // **A word followed by `(` is a function call, and the grammar does not
+        // allow one here.** SQLite reads `DEFAULT abs` as the word and then finds
+        // a `(` where a constraint or a comma should be: `DEFAULT abs(1)` is
+        // `near "(": syntax error`. A function needs the parentheses around the
+        // whole expression, as in `DEFAULT (abs(1))`.
+        let first = self.peek()?;
+        if matches!(first.kind, TokenKind::Identifier { .. })
+            && self.peek_at(1)?.is(Punctuator::LeftParen)
+            && !matches!(first.keyword(), Some(Keyword::NULL))
+        {
+            self.bump()?;
+            return Err(self.unexpected(&[",", ")"])?);
+        }
+        // **A bare word is a string.** SQLite's `ccons ::= DEFAULT scantok id`
+        // makes `DEFAULT hello` the text `hello`, and a double quoted word the
+        // same, because there is no column in scope for it to name. `TRUE` and
+        // `FALSE` are the two words that keep their meaning.
+        if Parser::token_is_plain_name(first) {
+            let word = lexer::identifier_text(self.source, first).into_owned();
+            if !word.eq_ignore_ascii_case(b"true") && !word.eq_ignore_ascii_case(b"false") {
+                self.bump()?;
+                return Ok(self
+                    .ast
+                    .add_expr(Expr::Literal(Literal::String(word)), first.span));
+            }
+        }
         self.parse_prefix()
     }
 
@@ -350,11 +451,11 @@ impl Parser<'_> {
     fn parse_table_constraint(&mut self) -> Result<TableConstraint, ParseError> {
         if self.eat_keyword(Keyword::PRIMARY)? {
             self.expect_keyword(Keyword::KEY)?;
-            let columns = self.parse_indexed_column_list()?;
-            // SQLite's grammar has no `AUTOINCREMENT` on a table-level PRIMARY
-            // KEY at all: `PRIMARY KEY(x, y) AUTOINCREMENT` is a syntax error
-            // there, not a constraint it refuses later. Accepting it would let
-            // inillucent store a CREATE TABLE the reference cannot parse.
+            // SQLite writes `AUTOINCREMENT` inside the parentheses, after the
+            // last key column: `PRIMARY KEY(a AUTOINCREMENT)`. After the closing
+            // parenthesis it is a syntax error, and the binder refuses it unless
+            // the key is a single INTEGER column.
+            let (columns, autoincrement) = self.parse_primary_key_columns()?;
             if self.at_keyword(Keyword::AUTOINCREMENT)? {
                 return Err(self.unexpected(&[")", ",", "ON"])?);
             }
@@ -362,7 +463,7 @@ impl Parser<'_> {
             return Ok(TableConstraint::PrimaryKey {
                 columns,
                 on_conflict,
-                autoincrement: false,
+                autoincrement,
             });
         }
         if self.eat_keyword(Keyword::UNIQUE)? {
@@ -402,6 +503,22 @@ impl Parser<'_> {
         Ok(TableConstraint::ForeignKey { columns, clause })
     }
 
+    /// Parses the parenthesised key of a table level `PRIMARY KEY`, with its
+    /// optional `AUTOINCREMENT` after the last column.
+    fn parse_primary_key_columns(&mut self) -> Result<(Vec<IndexedColumn>, bool), ParseError> {
+        self.expect(Punctuator::LeftParen)?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.parse_indexed_column()?);
+            if !self.eat(Punctuator::Comma)? {
+                break;
+            }
+        }
+        let autoincrement = self.eat_keyword(Keyword::AUTOINCREMENT)?;
+        self.expect(Punctuator::RightParen)?;
+        Ok((columns, autoincrement))
+    }
+
     /// Parses `( indexed-column, ... )`.
     fn parse_indexed_column_list(&mut self) -> Result<Vec<IndexedColumn>, ParseError> {
         self.expect(Punctuator::LeftParen)?;
@@ -426,10 +543,23 @@ impl Parser<'_> {
             None
         };
         let order = self.parse_sort_order()?;
+        // SQLite's grammar reads an index key like an ORDER BY term, so `NULLS FIRST` parses and is
+        // refused when the index is built.
+        let nulls = if self.eat_keyword(Keyword::NULLS)? {
+            if self.eat_keyword(Keyword::FIRST)? {
+                Some(crate::ast::NullOrder::First)
+            } else {
+                self.expect_keyword(Keyword::LAST)?;
+                Some(crate::ast::NullOrder::Last)
+            }
+        } else {
+            None
+        };
         Ok(IndexedColumn {
             expr,
             collation,
             order,
+            nulls,
         })
     }
 
@@ -701,9 +831,10 @@ impl Parser<'_> {
             _ => false,
         };
         if returning {
+            // SQLite points at nothing for this refusal.
             return Err(ParseError::new(
-                ParseErrorKind::Unsupported("RETURNING is not available in triggers"),
-                Span::at(self.cursor()),
+                ParseErrorKind::Refused("cannot use RETURNING in a trigger".to_string()),
+                Span::default(),
             ));
         }
         self.refuse_trigger_index_hint(&statement)?;
@@ -866,18 +997,89 @@ impl Parser<'_> {
                 }
             }
         } else if self.eat_keyword(Keyword::ADD)? {
-            self.eat_keyword(Keyword::COLUMN)?;
-            AlterAction::AddColumn(self.parse_column_def()?)
+            if self.at_keyword(Keyword::CONSTRAINT)? || self.at_keyword(Keyword::CHECK)? {
+                self.parse_alter_add_check()?
+            } else {
+                self.eat_keyword(Keyword::COLUMN)?;
+                self.parse_alter_add_column()?
+            }
         } else if self.eat_keyword(Keyword::DROP)? {
-            self.eat_keyword(Keyword::COLUMN)?;
-            AlterAction::DropColumn(self.parse_name()?)
+            if self.eat_keyword(Keyword::CONSTRAINT)? {
+                AlterAction::DropConstraint(self.parse_name()?)
+            } else {
+                self.eat_keyword(Keyword::COLUMN)?;
+                AlterAction::DropColumn(self.parse_name()?)
+            }
+        } else if self.eat_keyword(Keyword::ALTER)? {
+            self.parse_alter_column()?
         } else {
-            return Err(self.unexpected(&["RENAME", "ADD", "DROP"])?);
+            return Err(self.unexpected(&["RENAME", "ADD", "DROP", "ALTER"])?);
         };
         Ok(Statement::AlterTable {
             database,
             table,
             action,
+        })
+    }
+
+    /// Parses the column definition after `ADD [COLUMN]`.
+    ///
+    /// A subquery in the column's `CHECK` is not a compile error here, because
+    /// SQLite finds it only when it reads the schema back after the change.
+    fn parse_alter_add_column(&mut self) -> Result<AlterAction, ParseError> {
+        self.deferring_check_subquery = true;
+        self.deferred_check_subquery = false;
+        let parsed = self.parse_column_def();
+        self.deferring_check_subquery = false;
+        let mut definition = parsed?;
+        if std::mem::take(&mut self.deferred_check_subquery) {
+            definition.deferred_failure = Some("subqueries prohibited in CHECK constraints");
+        }
+        Ok(AlterAction::AddColumn(definition))
+    }
+
+    /// Parses `[CONSTRAINT name] CHECK (expr) [ON CONFLICT action]` after `ADD`.
+    ///
+    /// The span is kept because SQLite copies the constraint into the table's
+    /// stored text exactly as it was written, spacing and all.
+    fn parse_alter_add_check(&mut self) -> Result<AlterAction, ParseError> {
+        let start = self.cursor();
+        let name = self.parse_constraint_name()?;
+        self.expect_keyword(Keyword::CHECK)?;
+        self.expect(Punctuator::LeftParen)?;
+        let at = self.peek()?.span;
+        let before = self.selects;
+        let expr = self.parse_expr()?;
+        self.expect(Punctuator::RightParen)?;
+        self.no_subquery_in_check(before, at)?;
+        self.parse_on_conflict()?;
+        Ok(AlterAction::AddCheck {
+            name,
+            expr,
+            start: start as u32,
+            end: self.cursor() as u32,
+        })
+    }
+
+    /// Parses `[COLUMN] name SET NOT NULL [ON CONFLICT action]` or
+    /// `[COLUMN] name DROP NOT NULL` after `ALTER`.
+    fn parse_alter_column(&mut self) -> Result<AlterAction, ParseError> {
+        self.eat_keyword(Keyword::COLUMN)?;
+        let column = self.parse_name()?;
+        if self.eat_keyword(Keyword::DROP)? {
+            self.expect_keyword(Keyword::NOT)?;
+            self.expect_keyword(Keyword::NULL)?;
+            return Ok(AlterAction::DropNotNull(column));
+        }
+        self.expect_keyword(Keyword::SET)?;
+        let start = self.cursor();
+        self.expect_keyword(Keyword::NOT)?;
+        self.expect_keyword(Keyword::NULL)?;
+        self.parse_on_conflict()?;
+        Ok(AlterAction::SetNotNull {
+            column,
+            start: start as u32,
+            end: self.cursor() as u32,
         })
     }
 }

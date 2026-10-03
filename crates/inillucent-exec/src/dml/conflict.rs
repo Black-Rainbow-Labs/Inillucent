@@ -8,9 +8,9 @@ use index::{distinct_prefix, index_entry, key_of, maintained, unique_indexes};
 
 use inillucent_base::error::{misuse, Unwind};
 use inillucent_base::{DbError, DbResult, ExtendedCode};
-use inillucent_sql::ast::ConflictAction;
+use inillucent_sql::ast::{ConflictAction, TriggerTime};
 use inillucent_sql::catalog_view::{IndexInfo, IndexOrigin, TableInfo};
-use inillucent_sql::dml::{codes, rowid_message, unique_message, BoundInsert};
+use inillucent_sql::dml::{codes, rowid_message, unique_message, BoundInsert, UpsertConstraint};
 use inillucent_tree::datum::{Datum, OwnedDatum};
 
 use super::*;
@@ -18,6 +18,7 @@ use crate::declared::IndexExprs;
 use crate::expr::Eval;
 use crate::insert_plan::InsertPlan;
 use crate::physical::SourceLayout;
+use crate::trigger;
 
 /// What an insert does about a row that collides with one already there.
 ///
@@ -86,12 +87,12 @@ pub(crate) fn resolution_for_arm(
 /// `id` an error rather than an update.
 ///
 /// @param statement - the bound insert
-/// @param columns - the columns of the constraint that reported the conflict
-pub(crate) fn matching_arm(statement: &BoundInsert, columns: &[u16]) -> Option<usize> {
+/// @param which - the constraint that reported the conflict
+pub(crate) fn matching_arm(statement: &BoundInsert, which: UpsertConstraint) -> Option<usize> {
     statement
         .upsert
         .iter()
-        .position(|clause| clause.target.is_empty() || clause.target.as_slice() == columns)
+        .position(|clause| clause.constraint == UpsertConstraint::Any || clause.constraint == which)
 }
 /// Returns the arm an algorithm names.
 ///
@@ -136,14 +137,14 @@ pub(crate) struct Conflict {
     /// that is a separate defect with its own ticket, and this field is what it
     /// will read.
     pub(crate) conflict: Option<ConflictAction>,
-    /// The columns of the constraint that reported it, sorted.
+    /// The constraint that reported it.
     ///
     /// **What chooses between several `ON CONFLICT` arms.** An arm names a
-    /// conflict target - a set of columns - and runs only when the constraint
-    /// that fired is that one. Without this the engine could bind more than one
-    /// arm and would still have no way to pick, which is why the old refusal
-    /// was at bind time.
-    pub(crate) columns: Vec<u16>,
+    /// conflict target, which is the table's own key or one unique index, and
+    /// runs only when the constraint that fired is that one. Without this the
+    /// engine could bind more than one arm and would still have no way to
+    /// pick, which is why the old refusal was at bind time.
+    pub(crate) which: UpsertConstraint,
 }
 /// Returns what a failure resolved this way undoes.
 ///
@@ -219,7 +220,7 @@ pub(crate) fn rowid_conflict(table: &TableInfo) -> Option<ConflictAction> {
 /// too: otherwise `ON CONFLICT (k) DO NOTHING` would meet another constraint
 /// first and fail where SQLite does nothing.
 ///
-/// @param targets - the columns each upsert arm names, sorted; empty for a
+/// @param targets - the constraint each upsert arm names; empty for a
 ///   statement with no upsert
 pub(crate) fn conflicting_row(
     table: &TableInfo,
@@ -228,7 +229,7 @@ pub(crate) fn conflicting_row(
     row: &[OwnedDatum],
     replacing: Option<&[OwnedDatum]>,
     indexes: IndexExprs<'_>,
-    targets: &[&[u16]],
+    targets: &[UpsertConstraint],
 ) -> DbResult<Option<Conflict>> {
     let probe = Probe {
         table,
@@ -247,8 +248,7 @@ pub(crate) fn conflicting_row(
     }
     for named in [true, false] {
         for check in checks(table) {
-            let columns = check_columns(table, check);
-            if targets.contains(&columns.as_slice()) != named {
+            if targets.contains(&check.constraint()) != named {
                 continue;
             }
             if let Some(found) = probe.ask(check, target)? {
@@ -280,38 +280,14 @@ fn checks(table: &TableInfo) -> impl Iterator<Item = Check<'_>> {
         .chain((!key_first).then_some(Check::OwnKey))
 }
 
-/// Returns the sorted columns a constraint covers, as an upsert target names
-/// them.
-///
-/// @param table - the table being written
-/// @param check - the constraint
-fn check_columns(table: &TableInfo, check: Check<'_>) -> Vec<u16> {
-    let mut columns: Vec<u16> = match check {
-        Check::OwnKey => own_key_columns(table),
-        Check::Index(_, index) => index
-            .columns
-            .iter()
-            .filter_map(|column| column.column)
-            .collect(),
-    };
-    columns.sort_unstable();
-    columns
-}
-
-/// Returns the columns of the table's own key.
-///
-/// **The table's own key, whichever shape it has.** For a rowid table that is
-/// the `INTEGER PRIMARY KEY` when one was declared by name and nothing
-/// otherwise - an implicit rowid has no column an `ON CONFLICT` can name. For
-/// a `WITHOUT ROWID` table it is the whole primary key, which is what `ON
-/// CONFLICT(k)` names there.
-///
-/// @param table - the table being written
-fn own_key_columns(table: &TableInfo) -> Vec<u16> {
-    if table.without_rowid {
-        table.primary_key()
-    } else {
-        table.rowid_alias.into_iter().collect()
+impl Check<'_> {
+    /// Returns which constraint of the table this check asks, as an upsert
+    /// target names it.
+    fn constraint(&self) -> UpsertConstraint {
+        match self {
+            Check::OwnKey => UpsertConstraint::OwnKey,
+            Check::Index(position, _) => UpsertConstraint::Index(*position),
+        }
     }
 }
 
@@ -357,13 +333,11 @@ impl Probe<'_> {
             return Ok(None);
         }
         let (code, message) = rowid_message(table);
-        let mut columns = own_key_columns(table);
-        columns.sort_unstable();
         Ok(Some(Conflict {
             key,
             error: DbError::new(ExtendedCode(code)).with_message(message),
             conflict: rowid_conflict(table),
-            columns,
+            which: UpsertConstraint::OwnKey,
         }))
     }
 
@@ -436,7 +410,14 @@ impl Probe<'_> {
             }
         };
         if let Some(found) = found {
-            let key: Vec<OwnedDatum> = found.last().cloned().into_iter().collect();
+            // **The whole identity, not its last cell.** An entry ends with the
+            // rowid, or with every primary key column of a `WITHOUT ROWID`
+            // table. Taking only the last cell made a composite key one cell
+            // wide, so the row's own entry never compared equal to its key and
+            // `UPDATE b SET x = 9` was refused as a clash with itself.
+            let width = layout.identity.len().max(1);
+            let skip = found.len().saturating_sub(width);
+            let key: Vec<OwnedDatum> = found.iter().skip(skip).cloned().collect();
             // The row finding its own entry. It happens when the rowid moved
             // and the key columns did not, and when a collation makes a changed
             // value probe onto the value it replaced - `COLLATE NOCASE` and
@@ -454,17 +435,11 @@ impl Probe<'_> {
             } else {
                 codes::UNIQUE
             };
-            let mut columns: Vec<u16> = index
-                .columns
-                .iter()
-                .filter_map(|column| column.column)
-                .collect();
-            columns.sort_unstable();
             return Ok(Some(Conflict {
                 key,
                 error: DbError::new(ExtendedCode(code)).with_message(unique_message(table, index)),
                 conflict: index.conflict,
-                columns,
+                which: UpsertConstraint::Index(position),
             }));
         }
         Ok(None)
@@ -532,15 +507,18 @@ pub(crate) fn upsert_row(
     let Some(clause) = arm.and_then(|at| plan.upsert.get(at)) else {
         return Ok(None);
     };
+    // The subqueries of the arm read the row that was there and `excluded`.
+    let answers = plan.upsert_answers(target, request.params, &before, excluded)?;
     if let Some(filter) = &clause.filter {
-        let verdict = space.evaluate(filter.as_ref(), &[before.as_slice(), excluded])?;
+        let verdict =
+            space.evaluate_with(filter.as_ref(), &[before.as_slice(), excluded], &answers)?;
         if crate::expr::truth(&verdict.borrow()) != Some(true) {
             return Ok(None);
         }
     }
     let mut after = before.clone();
     for (slot, eval) in &clause.assignments {
-        let value = space.evaluate(eval.as_ref(), &[before.as_slice(), excluded])?;
+        let value = space.evaluate_with(eval.as_ref(), &[before.as_slice(), excluded], &answers)?;
         if let Some(cell) = after.get_mut(*slot) {
             *cell = value;
         }
@@ -548,6 +526,50 @@ pub(crate) fn upsert_row(
     // The stored generated columns, against the row the arm produced - see
     // `InsertPlan::apply_generated` (task-1913).
     plan.apply_generated(space, &mut after, excluded)?;
+    // **The column's affinity applies to what the arm assigns**, so `SET n =
+    // '7'` over an `INTEGER` column stores 7, before the uniqueness probe asks
+    // about the value that will really be stored.
+    request.declarations.apply_affinity(&mut after);
+    // **`replace_row` on both paths, because the arm can move the key.**
+    // `DO UPDATE SET a = 9` over an `INTEGER PRIMARY KEY` is a row that moves,
+    // and the unread path wrote the new one with `place_row` and left the old
+    // one behind - the table then held both. The stand-in image is
+    // enough for `replace_row`: it carries the key the row is moving *from*,
+    // which is all a removal needs, and that path has no index to maintain.
+    // **The arm's `UPDATE` triggers** fire around the write, with the row that
+    // was there as `OLD` and the row the arm produced as `NEW`.
+    let triggers = statement
+        .upsert
+        .get(arm.unwrap_or_default())
+        .map_or(&[][..], |clause| clause.triggers.as_slice());
+    let firing = update_firing(&request, &before, &after);
+    let before_update = trigger::fire(triggers, TriggerTime::Before, target, &firing);
+    if before_update? == trigger::Fired::SkipRow {
+        return Ok(None);
+    }
+    // **The row is read again when a `BEFORE` body could have changed it**, and
+    // the columns the arm does not assign are taken from it, as an `UPDATE`
+    // does. Writing back the image read before the trigger ran lost the
+    // trigger's change and left the indexes holding an entry for a value the
+    // row no longer has.
+    let before = match triggers.is_empty() {
+        true => before,
+        false => {
+            let Some(current) = read_row(table, target, &clash.key)? else {
+                return Ok(None);
+            };
+            let assigned: Vec<usize> = arm
+                .and_then(|at| plan.upsert.get(at))
+                .map_or_else(Vec::new, |clause| {
+                    clause.assignments.iter().map(|(slot, _)| *slot).collect()
+                });
+            let written = |slot: usize| assigned.contains(&slot);
+            take_unassigned_columns(layout, &written, &current, &mut after);
+            plan.apply_generated(space, &mut after, excluded)?;
+            request.declarations.apply_affinity(&mut after);
+            current
+        }
+    };
     // **The update arm is an update, and had the same hole `UPDATE` did.** The
     // row it writes can collide with a *third* row on another `UNIQUE` index -
     // `ON CONFLICT(a) DO UPDATE SET b = ...` onto a `b` somebody else holds -
@@ -561,14 +583,48 @@ pub(crate) fn upsert_row(
         let unwind = unwind_of(statement.on_conflict.or(clash.conflict));
         return Err(clash.error.or_unwind(unwind));
     }
-    // **`replace_row` on both paths, because the arm can move the key.**
-    // `DO UPDATE SET a = 9` over an `INTEGER PRIMARY KEY` is a row that moves,
-    // and the unread path wrote the new one with `place_row` and left the old
-    // one behind - the table then held both. The stand-in image is
-    // enough for `replace_row`: it carries the key the row is moving *from*,
-    // which is all a removal needs, and that path has no index to maintain.
+    // **The arm's row meets the table's declarations, as an `UPDATE`'s does**
+    // (the `NOT NULL`, `STRICT` and `CHECK` constraints), and a failure raises
+    // whatever the statement's own `OR` algorithm says: SQLite's `DO UPDATE`
+    // resolves `ABORT`. They were not checked at all, so `SET qty = -5` stored
+    // a row the table's own `CHECK` forbids.
+    let declarations = request.declarations;
+    declarations_are_met(
+        table,
+        layout,
+        declarations,
+        space,
+        &mut after,
+        Resolution::Raise,
+    )?;
+    declarations.types_are_met(table, space, &after)?;
+    declarations.checks_are_met(space, &after, false)?;
     replace_row(table, layout, target, &before, &after, indexes)?;
+    let firing = update_firing(&request, &before, &after);
+    trigger::fire(triggers, TriggerTime::After, target, &firing)?;
     Ok(Some(after))
+}
+
+/// Describes the row an upsert's `DO UPDATE` changed, for its `UPDATE` triggers.
+///
+/// @param request - the write's layout, parameters and depth
+/// @param old - the row that was there
+/// @param new - the row the arm produced
+fn update_firing<'a>(
+    request: &WriteRequest<'a>,
+    old: &'a [OwnedDatum],
+    new: &'a [OwnedDatum],
+) -> trigger::TriggerFiring<'a> {
+    trigger::TriggerFiring {
+        rows: trigger::TriggerRows {
+            old: Some(old),
+            new: Some(new),
+        },
+        slots: &request.layout.slots,
+        rowid: request.layout.rowid,
+        params: request.params,
+        depth: request.depth,
+    }
 }
 /// Reports whether an upsert has to read the row it is replacing.
 ///
@@ -590,7 +646,13 @@ fn needs_before(
     statement: &BoundInsert,
     plan: &InsertPlan,
 ) -> bool {
-    if maintained(table).next().is_some() {
+    // An `UPDATE` trigger reads `OLD`, which is the row as it was.
+    if maintained(table).next().is_some()
+        || statement
+            .upsert
+            .iter()
+            .any(|clause| !clause.triggers.is_empty())
+    {
         return true;
     }
     for column in 0..layout.width {

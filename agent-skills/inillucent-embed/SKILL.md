@@ -44,18 +44,17 @@ The engine returns the status `unsupported` for a statement it has not built. Th
 A mistyped statement gets a different status, such as `syntax`.
 
 ```sh
-inillucent query "SELECT 1 FROM t WHERE (a, b) IN (SELECT x, y FROM s)"
+inillucent --db app.rdb query "ATTACH ? AS other" --params '["other.rdb"]'
 ```
 
 ```
-Error [unsupported]: unsupported: a row value IN a query rather than a value list
-  not built yet: a row value IN a query rather than a value list
-  at byte 22 of the statement
+Error [unsupported]: unsupported: ATTACH with a file name that is not a literal
+  not built yet: ATTACH with a file name that is not a literal
 ```
 
 Keep `unsupported` separate from other errors in your code. An application can then tell its user
 "this engine cannot do that yet" instead of "check your SQL". No case in the 416 case probe against
-SQLite returns `unsupported`, and the capability table still lists 17 features as `no`, so write the
+SQLite returns `unsupported`, and the capability table still lists 12 features as `no`, so write the
 branch.
 
 **Ask the capability table before you write unusual SQL.** `inillucent capabilities` prints it, and

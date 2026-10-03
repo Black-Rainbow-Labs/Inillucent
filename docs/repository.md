@@ -190,6 +190,15 @@ are in `crates/inillucent-compat/tests/corpora/matrix/`, and `known.list` there 
 that fails because of a recorded defect. `tasks/task-2135-sql-statement-matrix-tdd.md` is the
 design.
 
+`differential::usage_corpus`, in the `differential` tier, runs 1,719 scripts that look like what
+applications send to SQLite: the pragmas a driver runs on connect, the catalog queries an ORM runs
+to read a schema, a migration's table rebuild, and ordinary create, read, update and delete code.
+It runs each script through `inillucent-shell` and the pinned `sqlite3` shell and compares the
+output byte for byte, error text included. The scripts are in `compat/corpus/usage/`, and
+`known.toml` there lists every case that still differs and says whether the difference is a defect or
+a deliberate deviation. `INILLUCENT_USAGE_REPORT=<file>` writes every difference to a JSON file.
+`tasks/task-2174-sqlite-usage-parity-tdd.md` is the design.
+
 `inillucent-testrun` caps the memory of every test process at 8 GiB, and of all of them together at
 a quarter of the machine's memory, so a test that grows without bound fails on its own.
 
@@ -219,7 +228,7 @@ prerequisite in `tests/selection.toml` is missing from this table or has a diffe
 | prerequisite | rows | what provides it |
 |---|---:|---|
 | `oracle` | 79 | the pinned SQLite 3.53.4 comparison process: `pwsh tools/sqlite-reference.ps1` or `bash tools/sqlite-reference.sh` |
-| `shell` | 9 | the pinned `sqlite3` 3.53.4 shell, built by the same two scripts |
+| `shell` | 10 | the pinned `sqlite3` 3.53.4 shell, built by the same two scripts |
 | `embed` | 7 | a build with `inillucent-engine/embed` turned on. The runner builds it from the target's `features` row, and passes a row's `inillucent-cli/embed` to the build of the programs too. `tools/coverage.mjs` does not, because the feature needs `inillucent-core/onnx` and `inillucent-core` is left out of the coverage run |
 | `tracked-fixtures` | 5 | the files under `compat/fixtures/`, which are committed. A new clone has them. The row is for a checkout that has lost them |
 | `onnx` | 3 | ONNX Runtime and the embedding weights: `inillucent setup-embeddings all` |
@@ -254,8 +263,8 @@ a prerequisite and its suite cannot skip. Those two checks keep this table equal
 
 ## What the tests cover
 
-The workspace has 4,097 tests across 306 test targets, counted tier by tier in the tier table of
-`tests/inillucent-testing-tdd.md`. There are 306 rows in `tests/selection.toml`,
+The workspace has 4,097 tests across 307 test targets, counted tier by tier in the tier table of
+`tests/inillucent-testing-tdd.md`. There are 307 rows in `tests/selection.toml`,
 and each row is one `[[target]]` that the runner runs. `tools/doc-facts/check.mjs` fails when this
 page gives a different count from `tests/selection.toml`.
 
@@ -263,7 +272,7 @@ The tests fall into these classes:
 
 | Class | What it checks |
 |---|---|
-| Differential tests | the same SQL runs through inillucent and the pinned SQLite 3.53.4, and the results are compared. `semantics.rs` holds 208 cases and the feature probe holds 416 |
+| Differential tests | the same SQL runs through inillucent and the pinned SQLite 3.53.4, and the results are compared. `semantics.rs` holds 208 cases, the feature probe holds 416, and `usage_corpus` holds 1,719 scripts of application traffic |
 | SQLLogicTest subset | expected results were recorded from the pinned SQLite, so the suite grades inillucent against SQLite on a machine with no SQLite installed. The generator never reads inillucent's output |
 | Model tests | a `BTreeMap` model runs the same operation traces as the engine, and the results must match |
 | Fault injection | a simulated file system under the page pool, the log and the transaction engine. It must lose an unsynced write sometimes and a synced write never, for every seed. A recorded schedule must replay the same trace, event for event |

@@ -467,8 +467,12 @@ pub(crate) struct ConnectionSettings {
     writable_schema: bool,
     query_only: bool,
     recursive_triggers: bool,
+    legacy_alter_table: bool,
     max_page_count: i64,
     temp_store: i64,
+    /// The settings `pragma::remembered` stores, which a `VACUUM` must not
+    /// reset: `PRAGMA mmap_size` would read its default again afterwards.
+    remembered: std::collections::BTreeMap<&'static str, i64>,
     busy_timeout_ms: u64,
     collations: Vec<(String, inillucent_value::collation::Collation)>,
     authorizer: Option<std::rc::Rc<dyn inillucent_sql::bind::Authorizer>>,
@@ -501,8 +505,10 @@ impl ConnectionSettings {
             writable_schema: database.pragmas.writable_schema(),
             query_only: database.pragmas.query_only(),
             recursive_triggers: database.pragmas.recursive_triggers(),
+            legacy_alter_table: database.pragmas.legacy_alter_table(),
             max_page_count: database.pragmas.max_page_count(),
             temp_store: database.pragmas.temp_store(),
+            remembered: database.pragmas.remembered_all(),
             busy_timeout_ms: database.pragmas.busy_timeout_ms(),
             collations: database.session_state.collations.clone(),
             authorizer: database.session_state.authorizer.clone(),
@@ -553,8 +559,12 @@ impl ConnectionSettings {
         database
             .pragmas
             .set_recursive_triggers(self.recursive_triggers);
+        database
+            .pragmas
+            .set_legacy_alter_table(self.legacy_alter_table);
         database.pragmas.set_max_page_count(self.max_page_count);
         database.pragmas.set_temp_store(self.temp_store);
+        database.pragmas.restore_remembered(self.remembered);
         database.pragmas.set_busy_timeout_ms(self.busy_timeout_ms);
         database.session_state.collations = self.collations;
         database.session_state.authorizer = self.authorizer;

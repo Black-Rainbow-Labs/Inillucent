@@ -89,7 +89,7 @@ innocuous = true
 
 [[function]]
 name = "avg"
-kind = "a"
+kind = "w"
 arity = 1
 flags = 526336
 deterministic = true
@@ -193,7 +193,7 @@ innocuous = true
 
 [[function]]
 name = "count"
-kind = "a"
+kind = "w"
 arity = 0
 flags = 526336
 deterministic = true
@@ -201,7 +201,7 @@ innocuous = true
 
 [[function]]
 name = "count"
-kind = "a"
+kind = "w"
 arity = 1
 flags = 526336
 deterministic = true
@@ -425,7 +425,7 @@ innocuous = true
 
 [[function]]
 name = "group_concat"
-kind = "a"
+kind = "w"
 arity = 1
 flags = 526336
 deterministic = true
@@ -433,7 +433,7 @@ innocuous = true
 
 [[function]]
 name = "group_concat"
-kind = "a"
+kind = "w"
 arity = 2
 flags = 526336
 deterministic = true
@@ -569,7 +569,7 @@ innocuous = true
 
 [[function]]
 name = "json_group_array"
-kind = "a"
+kind = "w"
 arity = 1
 flags = 526336
 deterministic = true
@@ -577,7 +577,7 @@ innocuous = true
 
 [[function]]
 name = "json_group_object"
-kind = "a"
+kind = "w"
 arity = 2
 flags = 526336
 deterministic = true
@@ -721,7 +721,7 @@ innocuous = true
 
 [[function]]
 name = "jsonb_group_array"
-kind = "a"
+kind = "w"
 arity = 1
 flags = 526336
 deterministic = true
@@ -729,7 +729,7 @@ innocuous = true
 
 [[function]]
 name = "jsonb_group_object"
-kind = "a"
+kind = "w"
 arity = 2
 flags = 526336
 deterministic = true
@@ -1033,7 +1033,7 @@ innocuous = true
 
 [[function]]
 name = "max"
-kind = "a"
+kind = "w"
 arity = 1
 flags = 526336
 deterministic = true
@@ -1057,7 +1057,7 @@ innocuous = true
 
 [[function]]
 name = "min"
-kind = "a"
+kind = "w"
 arity = 1
 flags = 526336
 deterministic = true
@@ -1417,7 +1417,7 @@ innocuous = true
 
 [[function]]
 name = "string_agg"
-kind = "a"
+kind = "w"
 arity = 2
 flags = 526336
 deterministic = true
@@ -1473,7 +1473,7 @@ innocuous = true
 
 [[function]]
 name = "sum"
-kind = "a"
+kind = "w"
 arity = 1
 flags = 526336
 deterministic = true
@@ -1513,7 +1513,7 @@ innocuous = true
 
 [[function]]
 name = "total"
-kind = "a"
+kind = "w"
 arity = 1
 flags = 526336
 deterministic = true

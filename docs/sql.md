@@ -49,7 +49,7 @@ The probe is `tools/feature-probe/`. Many of its cases are also checked in as te
 direction, fails the build.
 
 The 416 cases are a list somebody wrote. Some constructs are outside that list, and inillucent
-refuses 16 of them by name. They are listed in [What is refused](#what-is-refused).
+refuses 12 of them by name. They are listed in [What is refused](#what-is-refused).
 
 ### Counted against SQLite's own lists
 
@@ -138,22 +138,22 @@ otherwise.
 | Queries | `SELECT` with `WHERE`, `GROUP BY`, `HAVING`, `DISTINCT`, `ORDER BY` with `NULLS FIRST` and `NULLS LAST`, `LIMIT` and `OFFSET`. `VALUES` as a statement and in `FROM` |
 | Joins | inner, `LEFT`, `RIGHT` and `FULL OUTER`, `CROSS`, `NATURAL`, `USING`, self joins. The planner picks a hash join, an index nested loop or a scan |
 | Compound queries | `UNION`, `UNION ALL`, `EXCEPT`, `INTERSECT` |
-| Subqueries | in `WHERE`, `IN`, `EXISTS`, as a value, and as a table in `FROM`, correlated or not. Row values in comparisons and in `IN` with a value list |
+| Subqueries | in `WHERE`, `IN`, `EXISTS`, as a value, and as a table in `FROM`, correlated or not. Row values in comparisons and in `IN`, with a value list or a subquery, such as `(a, b) IN (SELECT x, y FROM s)`. Recursive CTEs with `ORDER BY`, `LIMIT` and `OFFSET` |
 | Common table expressions | `WITH`, `WITH RECURSIVE`, `MATERIALIZED` and `NOT MATERIALIZED`, and `WITH` on `INSERT`, `UPDATE` and `DELETE` |
 | Window functions | all eleven window functions, `PARTITION BY`, `ROWS`, `RANGE` and `GROUPS` frames, every `EXCLUDE` clause, `FILTER`, and named `WINDOW` clauses |
-| Writes | `INSERT`, `UPDATE`, `DELETE` and `REPLACE`, every `OR` conflict clause, `RETURNING`, `UPDATE ... FROM`, and `ON CONFLICT ... DO UPDATE` and `DO NOTHING` |
-| Tables | `CREATE TABLE`, `CREATE TABLE ... AS SELECT`, `WITHOUT ROWID`, `STRICT`, `VIRTUAL` and `STORED` generated columns, `AUTOINCREMENT` |
+| Writes | `INSERT`, `UPDATE`, `DELETE` and `REPLACE`, every `OR` conflict clause, `RETURNING`, `UPDATE ... FROM`, and `ON CONFLICT ... DO UPDATE` and `DO NOTHING`, with a target that is a column list, a partial index (the `WHERE` must match the index) or an expression such as `ON CONFLICT(lower(name))`. `DO UPDATE` runs the `CHECK`, `NOT NULL` and `STRICT` checks and fires the table's `UPDATE` triggers |
+| Tables | `CREATE TABLE`, `CREATE TABLE ... AS SELECT`, `WITHOUT ROWID`, `STRICT`, `VIRTUAL` and `STORED` generated columns, `AUTOINCREMENT`. A generated column has its declared affinity and collation, takes `STRICT`, `NOT NULL`, `UNIQUE` and `ON CONFLICT`, and can be a foreign key parent or child |
 | Indexes | unique, descending, partial, on an expression, with `COLLATE`, on a `WITHOUT ROWID` table. `REINDEX`, `INDEXED BY`, and `ANALYZE`, which writes `sqlite_stat1` in each database it measures, `ANALYZE aux` included |
-| Views and triggers | `CREATE VIEW`. `CREATE TRIGGER` with `BEFORE`, `AFTER` and `INSTEAD OF`, `UPDATE OF`, `WHEN`, `RAISE` with a message that is any expression, and recursive triggers |
-| `ALTER TABLE` | `RENAME TO`, `RENAME COLUMN`, `ADD COLUMN` and `DROP COLUMN`. `DROP COLUMN` is refused when a view reads the column |
-| Constraints | `NOT NULL`, `UNIQUE`, `PRIMARY KEY`, `CHECK`, `DEFAULT`, and foreign keys with all five actions, immediate or deferred, and `PRAGMA foreign_key_check` |
+| Views and triggers | `CREATE VIEW`, which stores the body and reports an error in it when the view is read. `CREATE TRIGGER` with `BEFORE`, `AFTER` and `INSTEAD OF`, `UPDATE OF`, `WHEN`, `RAISE` with a message that is any expression, and recursive triggers. `UPDATE` and `DELETE` on a view run its `INSTEAD OF UPDATE` and `INSTEAD OF DELETE` triggers, and the triggers are still there after the file is closed and opened again |
+| `ALTER TABLE` | `RENAME TO`, `RENAME COLUMN`, `ADD COLUMN`, `DROP COLUMN`, and the SQLite 3.53 forms `ALTER COLUMN c SET NOT NULL`, `ALTER COLUMN c DROP NOT NULL`, `ADD CONSTRAINT n CHECK (...)` and `DROP CONSTRAINT`. `RENAME` rewrites `REFERENCES` in other tables, view and trigger bodies, `UPDATE OF` lists, upsert targets and indexes, and fails with SQLite's `error in view v` message when a dependent view or trigger would break. `DROP COLUMN` follows SQLite's rules and is refused when a view reads the column. `PRAGMA legacy_alter_table` changes `RENAME` as in SQLite |
+| Constraints | `NOT NULL`, `UNIQUE`, `PRIMARY KEY`, `CHECK`, `DEFAULT`, and foreign keys with all five actions, immediate or deferred, and `PRAGMA foreign_key_check`. A foreign key compares with the parent column's collation, and a row may reference itself |
 | Values | type affinity on write, `CAST`, the `BINARY`, `NOCASE` and `RTRIM` collations, `LIKE`, `GLOB`, values larger than a page |
 | Functions | 190 built in function names, including 30 JSON functions, the maths functions and the date and time functions. Functions, aggregates and collations an application defines |
 | Transactions | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`. A `ROLLBACK` also undoes `CREATE` and `DROP TABLE` |
 | Several databases | `ATTACH` and `DETACH`, joins across files, and one transaction that commits to two files or to neither. Temporary tables, views and triggers |
 | Schema and maintenance | `sqlite_schema` and `sqlite_master`, `VACUUM`, `VACUUM INTO`, `integrity_check` and `quick_check` |
-| Plans | `EXPLAIN QUERY PLAN` in SQLite's format. Plain `EXPLAIN` runs and prints a different program, see [below](#five-follow-from-how-inillucent-is-built) |
-| Table valued functions | `generate_series`, `chunk_text(text, size, overlap, heading)`, which cuts a document into windows of characters for embedding, `json_each`, `json_tree`, a `pragma_*` function for every pragma that returns a value except `foreign_key_check`, such as `pragma_table_info('t')` and `pragma_user_version`, and any module an application registers |
+| Plans | `EXPLAIN QUERY PLAN` in SQLite's line format, with attached schema names, automatic index lines and `LEFT-JOIN` markers. The plan is a flat list, see [below](#how-inillucent-behaves-differently-from-sqlite). Plain `EXPLAIN` runs and prints a different program, see [below](#five-follow-from-how-inillucent-is-built) |
+| Table valued functions | `generate_series`, `chunk_text(text, size, overlap, heading)`, which cuts a document into windows of characters for embedding, `json_each`, `json_tree`, a `pragma_*` function for every pragma that returns a value, such as `pragma_table_info('t')`, `pragma_foreign_key_check` and `pragma_user_version`, which can take its argument from an earlier `FROM` term, as in `FROM sqlite_master m, pragma_index_list(m.name)`, and any module an application registers |
 
 ### Rules a reader asks about
 
@@ -161,6 +161,38 @@ otherwise.
 over the whole table. `SELECT count(*) AS n FROM t HAVING n > 0` filters that one group. A query
 with no `GROUP BY` and no aggregate is refused with `HAVING clause on a non-aggregate query`, which
 is SQLite's message.
+
+**Joins and subqueries follow SQLite's rules for what is evaluated and when.**
+
+- A `WHERE` term over a compound subquery is pushed into each arm, as SQLite does.
+- A `RIGHT` or `FULL` join after an inner join keeps its unmatched rows. Parenthesised joins work.
+  A subquery may appear in a join's `ON`, in `RETURNING`, and in the `SET` and `WHERE` of an upsert.
+- `INSERT ... VALUES ... UNION ALL VALUES` inserts every row. `LEFT JOIN json_each(NULL)` keeps the
+  left row.
+- `AND`, `OR`, `coalesce`, `ifnull` and `iif` skip the operands SQLite skips, so an operand that
+  would fail is not evaluated. The select list of an `EXISTS` subquery is never evaluated.
+- Rows produced before a run time error are returned before the error.
+- A CTE that calls a volatile function and is used twice is evaluated once. A subquery that calls
+  `random()` is evaluated for every row.
+- A subquery with several columns works as a row value. Anywhere a single value is needed it fails
+  with `sub-select returns N columns - expected 1`.
+- An aggregate whose arguments read only the outer query belongs to the outer query when it is used
+  inside a subquery. In `SELECT (SELECT max(t.a)) FROM t` the `max` runs over the rows of `t`.
+- A view in `main` does not read a temporary table that shadows its base table.
+- `INDEXED BY` may name a partial index where SQLite accepts it.
+- `RETURNING` is evaluated right after each row is written, before `AFTER` triggers run.
+
+**Messages and ordering.** `ORDER BY` or `LIMIT` before a compound operator is an error with
+SQLite's wording. A circular CTE fails with `circular reference: name`. `GROUP BY` takes the direction
+of an `ORDER BY` with the same number of terms, which decides the order of tied groups. `CREATE TABLE
+... AS` stores the query's values and does not apply the new column's affinity. `MATCH` on a plain
+column fails for each row it is evaluated on. An unknown function's error keeps the name as it was
+written. `NULLS FIRST` and `NULLS LAST` on an index key are refused, as in SQLite.
+
+**JSON and dates.** JSON5 input accepts Unicode whitespace, and an unpaired surrogate escape is read
+as SQLite reads it. A blob that is not JSONB is read as JSON text. `json_each` and `json_tree` give
+the same `id` values as SQLite when called with a path. A date function accepts a blob as the format or
+as a modifier, `subsec` as the time value, and `timediff` works in both directions.
 
 **A correlated `IN` subquery.** inillucent answers `a IN (SELECT ...)` with a correlated subquery by
 rewriting it as `EXISTS`. The rewrite keeps SQLite's `NULL` rules:
@@ -270,10 +302,7 @@ exit code 3.
 | Construct | Example | What to write instead |
 |---|---|---|
 | `ATTACH` with a file name that is not a literal | `ATTACH ? AS k` | the file name as a string literal |
-| a row value `IN` a subquery | `(a, b) IN (SELECT x, y FROM s)` | `EXISTS (SELECT 1 FROM s WHERE x = a AND y = b)` |
 | a full text `MATCH` under an `OR` whose pattern reads another table's row | `f MATCH q.w OR rowid = 3` | a constant or bound pattern, or two queries joined with `UNION` |
-| a partial index as an `ON CONFLICT` target | `ON CONFLICT(b) WHERE b > 0` | a full unique index |
-| an expression as an `ON CONFLICT` target | `ON CONFLICT(lower(a))` | a stored column with a unique index |
 | a correlated `IN` subquery with `GROUP BY`, `LIMIT` or a compound query | `a IN (SELECT a FROM t i WHERE i.id = o.id LIMIT 1)` | `EXISTS` with the condition written out |
 | an FTS5 tokenizer inillucent does not have | `tokenize='trigram'` | `ascii`, `unicode61` or `porter` |
 | FTS5 `detail='none'` or `detail='column'` | `fts5(body, detail='none')` | leave `detail` out. The index stores full positions |
@@ -287,7 +316,7 @@ them too.
 | Construct | inillucent's message |
 |---|---|
 | a compound query ordered by an expression | `ORDER BY term does not match any column in the result set` |
-| `INSERT`, `UPDATE` or `DELETE` on a view | `unsupported: writing to a view`. An `INSTEAD OF` trigger writes through a view |
+| `INSERT`, `UPDATE` or `DELETE` on a view that has no `INSTEAD OF` trigger for that statement | `cannot modify v because it is a view`, with exit code 1 as in SQLite. An `INSTEAD OF` trigger writes through a view. `INSERT ... ON CONFLICT` on a view fails with `cannot UPSERT a view` |
 | `EXPLAIN EXPLAIN` | `unsupported: nested EXPLAIN` |
 | `RETURNING` inside a trigger | `unsupported: RETURNING is not available in triggers` |
 | `UPDATE` or `DELETE` of a `sqlite_schema` row | `only an INSERT into sqlite_schema is built, not an UPDATE or a DELETE` |
@@ -320,6 +349,15 @@ These differences change how an application runs, and they do not show up in a p
 | Threads | one. The engine is single threaded | serialised or multithreaded |
 | A transaction larger than the page cache | allowed under `delete`, `truncate` and `persist`. Under `wal`, `memory` and `off`, the transaction fails when it changes more pages than the cache holds | spills to the journal |
 | A `SELECT` result | computed when the first row is stepped. Later steps return rows already computed | computed one row per step |
+| `DELETE ... LIMIT` and `UPDATE ... LIMIT` | accepted | accepted only in a build made with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`. The pinned `sqlite3` is built without it, and many distribution builds enable it |
+| `PRAGMA page_size` before the first write | ignored, because the page size is part of inillucent's file format. The default is 32768. `PRAGMA page_size = n` prints nothing, as in SQLite. `PRAGMA aux.page_size = n` is ignored too | sets the page size |
+| `PRAGMA page_count`, `freelist_count` and `max_page_count` | count pages of 32768 bytes, so the same data needs fewer pages, and a `max_page_count` limit is reached later | count pages of 4096 bytes |
+| `PRAGMA cache_size` default | `-131072`. A value outside 32 bits reads as 0 | `-2000` |
+| `PRAGMA busy_timeout` default | 5000 ms | 0 in the `sqlite3` shell |
+| `sqlite_schema.rootpage` | the first table has root page 4, because inillucent keeps its own catalog trees on the first pages. The other columns match | the first table has root page 2 |
+| a `WITHOUT ROWID` table whose primary key term is `DESC` | a query with no `ORDER BY` returns rows in ascending key order. Range predicates, seeks and `ORDER BY` on the key return the same rows as SQLite | the rows come back in descending key order |
+| `EXPLAIN QUERY PLAN` for a subquery, a CTE or a compound query | a flat list of lines. It has no `MATERIALIZE`, `CO-ROUTINE`, `MERGE` or `COMPOUND QUERY` blocks, and does not flatten a subquery in the plan text. The rows of the query match | a plan tree with those blocks |
+| `mmap_size`, `wal_autocheckpoint`, `journal_size_limit`, `temp_store = FILE`, `synchronous = EXTRA`, `threads`, the heap limits and `cache_spill` | stored and read back as SQLite reports them, and they do not change how inillucent runs. It maps no pages, has one thread, and folds the log at checkpoints | each changes how SQLite runs |
 | `$1`, `$2` placeholders | `$N` binds the Nth value, as `?N` does and as PostgreSQL does. `SET a = $2 WHERE id = $1` takes `a` from the second value | `$1` is a name, numbered by the order names first appear, so the same statement takes `a` from the first value |
 
 **Multiple processes.** Two processes can write the same file, one at a time. The number of rows in
@@ -364,6 +402,22 @@ the limit.
 
 A vector written to an `inillucent_search` table as JSON text, such as `'[1,0,0,0]'`, is accepted
 and stored as a blob.
+
+## The usage corpus
+
+The 416 probed cases cover one feature each. `differential::usage_corpus` covers how applications use
+SQLite. Its 1,719 cases are scripts under `compat/corpus/usage`. They contain the statements a
+driver sends when it connects, the catalog queries an ORM runs to read a schema, the table rebuild a
+migration tool runs, ordinary create, read, update and delete code, and the error messages those
+tools parse. Each script runs through `inillucent-shell` and through the pinned `sqlite3` shell with
+`.mode quote` and `.headers on`, and the two outputs are compared byte for byte. The comparison
+includes column names, storage classes and error text.
+
+`compat/corpus/usage/known.toml` lists the cases whose outputs still differ. A case that differs and
+is not listed fails the test. A listed case that now matches also fails, so an entry comes out when
+its case is fixed. Each entry has a `kind`. `deviation` marks a difference that stays on purpose and
+is described on this page. `defect` marks a difference that has not been fixed yet. Setting
+`INILLUCENT_USAGE_REPORT=<file>` writes every difference, with both outputs, to that file as JSON.
 
 ## Reproducing the probe
 

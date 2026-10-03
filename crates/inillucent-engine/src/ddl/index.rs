@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use inillucent_base::error::refusal;
 use inillucent_base::DbResult;
-use inillucent_catalog::ddl::canonical_sql;
+use inillucent_catalog::ddl::canonical_index_sql;
 use inillucent_catalog::load::index_from_create_sql;
 use inillucent_catalog::paged::{ObjectKind, SchemaEntry};
 use inillucent_sql::catalog_view::{IndexInfo, TableInfo};
@@ -60,7 +60,7 @@ impl crate::ImportedDatabase {
         } else {
             "CREATE INDEX"
         };
-        let sql = canonical_sql(keywords, source, name_offset, source.len() as u32);
+        let sql = canonical_index_sql(keywords, source, name_offset, source.len() as u32);
         let folded = table.to_ascii_lowercase();
         let position = self
             .schema
@@ -397,8 +397,8 @@ impl crate::ImportedDatabase {
     ) -> DbResult<EntrySet> {
         let mut projected: Vec<String> = Vec::with_capacity(width);
         for key in &index.columns {
-            match (&key.expr_sql, key.column) {
-                (Some(sql), _) => projected.push(String::from_utf8_lossy(sql).into_owned()),
+            match (key.computed_text(owner), key.column) {
+                (Some(sql), _) => projected.push(String::from_utf8_lossy(&sql).into_owned()),
                 (None, Some(declared)) => {
                     let column = owner
                         .column(declared)

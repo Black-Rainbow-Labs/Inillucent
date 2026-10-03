@@ -363,7 +363,11 @@ variants!(
         RenameTo,
         RenameColumn,
         AddColumn,
-        DropColumn
+        DropColumn,
+        SetNotNull,
+        DropNotNull,
+        AddCheck,
+        DropConstraint
     }
 );
 variants!(
@@ -1165,7 +1169,7 @@ impl Walk<'_> {
                 self.register(Register::Collation, &name);
             }
             ColumnConstraint::References(clause) => self.foreign_key(clause),
-            ColumnConstraint::Generated { expr, stored } => {
+            ColumnConstraint::Generated { expr, stored, .. } => {
                 self.form(if *stored {
                     "Generated::stored"
                 } else {

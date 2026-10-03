@@ -151,6 +151,9 @@ pub struct ScalarCall {
 
 impl Eval for ScalarCall {
     fn value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<Computed<'p>> {
+        if let Some(answer) = self.lazy_value(batch, nth)? {
+            return Ok(answer);
+        }
         let values = arguments_of(&self.arguments, batch, nth)?;
         let context = Context {
             seed: self.next_seed(),
@@ -243,55 +246,57 @@ fn size_asked_for(func: ScalarFunc, values: &[inillucent_value::Value<'static>])
         }
         // A format string's width fields are what make `printf` allocate, and
         // they are in the string before anything is written.
-        ScalarFunc::Printf => {
-            let format = values.first()?;
-            let text = match format {
-                inillucent_value::Value::Text(text) => text.raw(),
-                _ => return None,
-            };
-            widest_field(text)
-        }
+        ScalarFunc::Printf => inillucent_scalar::printf::widest_request(values),
         _ => None,
     }
 }
 
-/// Returns the largest width a `printf` format string asks for.
-///
-/// **The width, not the whole answer.** `%2000000000d` writes two billion
-/// spaces and one digit, and the number is in the format string - so the
-/// refusal can be made before a byte is written rather than after the process
-/// has grown by 5.7 GB.
-///
-/// @param format - the format string's bytes
-fn widest_field(format: &[u8]) -> Option<u64> {
-    let mut widest = 0u64;
-    let mut bytes = format.iter().copied().peekable();
-    while let Some(byte) = bytes.next() {
-        if byte != b'%' {
-            continue;
-        }
-        // Flags, then the width, then everything else the conversion carries.
-        let mut width = 0u64;
-        while let Some(next) = bytes.peek().copied() {
-            if matches!(next, b'-' | b'+' | b' ' | b'#' | b'0' | b'!' | b',') && width == 0 {
-                let _ = bytes.next();
-                continue;
-            }
-            if next.is_ascii_digit() {
-                width = width
-                    .saturating_mul(10)
-                    .saturating_add(u64::from(next - b'0'));
-                let _ = bytes.next();
-                continue;
-            }
-            break;
-        }
-        widest = widest.max(width);
-    }
-    (widest > 0).then_some(widest)
-}
-
 impl ScalarCall {
+    /// Answers `coalesce`, `ifnull` and `iif` without evaluating the arguments
+    /// the answer does not need.
+    ///
+    /// SQLite stops at the first argument that decides the answer, so
+    /// `coalesce(1, abs(-9223372036854775807 - 1))` is 1 and the overflow in the
+    /// second argument is never raised. `None` for every other function, which
+    /// reads all of its arguments.
+    ///
+    /// @param batch - the batch being evaluated
+    /// @param nth - the row's position among the live rows
+    fn lazy_value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<Option<Computed<'p>>> {
+        match self.func {
+            ScalarFunc::Coalesce | ScalarFunc::IfNull => {
+                for argument in &self.arguments {
+                    let value = argument.value(batch, nth)?;
+                    if !value.get().is_null() {
+                        return Ok(Some(value));
+                    }
+                }
+                Ok(Some(Computed::Owned(OwnedDatum::Null)))
+            }
+            ScalarFunc::Iif => {
+                let mut at = 0usize;
+                while at.saturating_add(1) < self.arguments.len() {
+                    let Some(condition) = self.arguments.get(at) else {
+                        break;
+                    };
+                    let verdict = condition.value(batch, nth)?;
+                    if crate::expr::truth(&verdict.get()) == Some(true) {
+                        return match self.arguments.get(at.saturating_add(1)) {
+                            Some(answer) => answer.value(batch, nth).map(Some),
+                            None => Ok(Some(Computed::Owned(OwnedDatum::Null))),
+                        };
+                    }
+                    at = at.saturating_add(2);
+                }
+                match self.arguments.get(at) {
+                    Some(otherwise) => otherwise.value(batch, nth).map(Some),
+                    None => Ok(Some(Computed::Owned(OwnedDatum::Null))),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Returns the next seed for the random built-ins, moving the stream on.
     ///
     /// `splitmix64`, which is the function library's own scrambler, so adjacent
@@ -990,6 +995,21 @@ impl Eval for Pattern {
     fn value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<Computed<'p>> {
         let operand = self.operand.value(batch, nth)?;
         let pattern = self.pattern.value(batch, nth)?;
+        // SQLite measures the pattern before it looks at the subject, so a
+        // pattern over the limit is an error even when the subject is NULL.
+        if !pattern.is_null() {
+            // A text pattern is measured where it is; only a number or a blob
+            // has to be turned into text first, and those are rare.
+            let measured = match pattern.get() {
+                Datum::Text(text) => text.len(),
+                other => eval::text_bytes(&Value::from(&other).into_owned()?, ENCODING).len(),
+            };
+            if measured > inillucent_scalar::builtin::LIKE_PATTERN_LENGTH_LIMIT {
+                return Err(inillucent_base::error::statement_refusal(
+                    inillucent_scalar::builtin::LIKE_PATTERN_TOO_COMPLEX,
+                ));
+            }
+        }
         if operand.is_null() || pattern.is_null() {
             return Ok(Computed::Borrowed(Datum::Null));
         }

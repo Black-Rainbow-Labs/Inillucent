@@ -35,7 +35,13 @@ impl crate::ImportedDatabase {
         // 3.53.4 on a connection that has made no temporary object, and SQLite
         // answers one row. Emitting `temp` unconditionally was tried here and
         // that differential caught it.
-        for (seq, at) in self.schema_numbers().into_iter().enumerate() {
+        // **`seq` is the database's slot, not its place in this list.** SQLite
+        // keeps `main` in slot 0, `temp` in slot 1 even while `temp` is not
+        // listed, and the first attachment in slot 2. A connection that has made
+        // nothing temporary lists `main` and then slot 2 - the numbers an
+        // application passes back to `sqlite3_db_filename` and its kin.
+        for at in self.schema_numbers() {
+            let seq = at;
             let (name, file) = match at {
                 crate::MAIN => (
                     b"main".to_vec(),
@@ -91,15 +97,20 @@ impl crate::ImportedDatabase {
             });
         };
         let mut rows = Vec::new();
-        for key in &table.foreign_keys {
-            let parent = self
-                .schema
-                .tables
-                .iter()
-                .find(|candidate| candidate.folded == key.parent_folded);
-            let targets = parent
-                .and_then(|parent| inillucent_sql::foreign_key::parent_columns(key, parent))
-                .unwrap_or_default();
+        // **SQLite numbers the keys from the last one declared**, because it
+        // adds each new key to the front of the table's list and reports the
+        // list from the front. A table with two keys reports the second one as
+        // `id` 0, and an application that matches a key by `id` across a
+        // dump and a reload needs the same numbers.
+        for (id, key) in table.foreign_keys.iter().rev().enumerate() {
+            // **`to` is NULL when the key names no parent column.**
+            // `REFERENCES p` means the parent's primary key, and SQLite reports
+            // that as NULL rather than looking the key's columns up.
+            let targets = if key.parent_columns.is_empty() {
+                Vec::new()
+            } else {
+                key.parent_columns.clone()
+            };
             for (position, column) in key.columns.iter().enumerate() {
                 let from = table
                     .columns
@@ -107,7 +118,7 @@ impl crate::ImportedDatabase {
                     .map(|info| info.name.clone())
                     .unwrap_or_default();
                 rows.push(vec![
-                    OwnedDatum::Int(i64::from(key.id)),
+                    OwnedDatum::Int(id as i64),
                     OwnedDatum::Int(position as i64),
                     OwnedDatum::Text(key.parent.clone()),
                     OwnedDatum::Text(from),
@@ -117,11 +128,9 @@ impl crate::ImportedDatabase {
                     },
                     OwnedDatum::Text(action_name(key.on_update).as_bytes().to_vec()),
                     OwnedDatum::Text(action_name(key.on_delete).as_bytes().to_vec()),
-                    OwnedDatum::Text(if key.match_clause.is_empty() {
-                        b"NONE".to_vec()
-                    } else {
-                        key.match_clause.clone()
-                    }),
+                    // SQLite parses `MATCH name` and ignores it, and reports the
+                    // fixed word whatever the key said.
+                    OwnedDatum::Text(b"NONE".to_vec()),
                 ]);
             }
         }
@@ -256,6 +265,7 @@ impl crate::ImportedDatabase {
                 .with_functions(&externals)
                 .with_collations(&self.session_state.collations)
                 .with_trusted_schema(self.session_state.registry.policy().trusted_schema)
+                .with_source(&table.create_sql)
                 .in_schema();
         Some(binder.bind_select(body.select))
     }
@@ -278,15 +288,24 @@ impl crate::ImportedDatabase {
             return Vec::new();
         };
         let declared = body.columns.clone();
-        bound
+        let written: Vec<Vec<u8>> = bound
             .columns
             .iter()
             .enumerate()
             .map(|(position, column)| {
-                let name = declared
+                declared
                     .get(position)
                     .cloned()
-                    .unwrap_or_else(|| column.name.clone());
+                    .unwrap_or_else(|| column.name.clone())
+            })
+            .collect();
+        let unique = inillucent_sql::bind::unique_column_names(&written);
+        bound
+            .columns
+            .iter()
+            .enumerate()
+            .zip(unique)
+            .map(|((position, _), name)| {
                 let (declared_type, affinity) = view_column_type(&bound, position);
                 inillucent_sql::catalog_view::ColumnInfo {
                     folded: name.to_ascii_lowercase(),
@@ -345,18 +364,22 @@ impl crate::ImportedDatabase {
             .rev()
             .enumerate()
             .map(|(seq, index)| {
-                let automatic = index.name.starts_with(b"sqlite_autoindex_");
                 // **`v` for an index a module owns, which SQLite has no value
                 // for because it has no such index (task-1979, R19).** It used
                 // to report `c`, the value for an index a `CREATE INDEX`
                 // statement made, and nothing else distinguished the two - so
                 // `inillucent indexes`, which reads `sqlite_master` and finds a
                 // vector index recorded there as a virtual table, had no second
-                // place to look. SQLite's three values keep their meanings.
+                // place to look. SQLite's three values keep their meanings:
+                // `c` for `CREATE INDEX`, `u` for a UNIQUE constraint and `pk`
+                // for a PRIMARY KEY constraint. A UNIQUE constraint's index is
+                // named `sqlite_autoindex_...` like a primary key's, so the
+                // name cannot tell the two apart; the index's origin does.
                 let origin = match index.origin {
                     inillucent_sql::catalog_view::IndexOrigin::Module => b"v".to_vec(),
-                    _ if automatic => b"pk".to_vec(),
-                    _ => b"c".to_vec(),
+                    inillucent_sql::catalog_view::IndexOrigin::PrimaryKey => b"pk".to_vec(),
+                    inillucent_sql::catalog_view::IndexOrigin::Unique => b"u".to_vec(),
+                    inillucent_sql::catalog_view::IndexOrigin::Created => b"c".to_vec(),
                 };
                 vec![
                     OwnedDatum::Int(seq as i64),
@@ -445,6 +468,26 @@ impl crate::ImportedDatabase {
             }
             rows.push(row);
         }
+        if extended && !table.has_rowid() {
+            // **A WITHOUT ROWID table's index entries end with the columns that
+            // find the row, and `index_xinfo` lists them with `key` 0.** Its own
+            // primary key index is the whole row, so every column the key does
+            // not name follows it in table order. A secondary index is followed
+            // by the primary key columns it does not already name, in key order.
+            for position in trailing_columns(table, index) {
+                let Some(column) = table.column(position) else {
+                    continue;
+                };
+                rows.push(vec![
+                    OwnedDatum::Int(rows.len() as i64),
+                    OwnedDatum::Int(i64::from(position)),
+                    OwnedDatum::Text(column.name.clone()),
+                    OwnedDatum::Int(0),
+                    OwnedDatum::Text(collation_name(&column.collation)),
+                    OwnedDatum::Int(0),
+                ]);
+            }
+        }
         if extended && table.has_rowid() {
             // **The row every index has and none of them declares.** An index
             // over a rowid table carries the rowid after its key columns, which
@@ -523,7 +566,7 @@ impl crate::ImportedDatabase {
                 table.columns.len() as i64
             };
             rows.push(vec![
-                OwnedDatum::Text(b"main".to_vec()),
+                OwnedDatum::Text(self.schema_label(table.database)),
                 OwnedDatum::Text(table.name.clone()),
                 OwnedDatum::Text(kind.to_vec()),
                 OwnedDatum::Int(ncol),
@@ -538,15 +581,26 @@ impl crate::ImportedDatabase {
                 OwnedDatum::Int(i64::from(table.strict)),
             ]);
         }
-        for (schema, name) in [
-            (b"main".as_slice(), b"sqlite_schema".as_slice()),
-            (b"temp".as_slice(), b"sqlite_temp_schema".as_slice()),
-        ] {
-            if !matches(name) {
+        // Each database has one table that lists its schema: `main` and every
+        // attachment have `sqlite_schema`, and `temp` has `sqlite_temp_schema`,
+        // which SQLite lists even while the connection has made nothing
+        // temporary.
+        let mut every_schema = self.schema_numbers();
+        if !every_schema.contains(&crate::TEMP) {
+            every_schema.insert(1, crate::TEMP);
+        }
+        for number in every_schema {
+            let schema = self.schema_label(number);
+            let name: &[u8] = if number == crate::TEMP {
+                b"sqlite_temp_schema"
+            } else {
+                b"sqlite_schema"
+            };
+            if !matches(name) || at.is_some_and(|named| named != number) {
                 continue;
             }
             rows.push(vec![
-                OwnedDatum::Text(schema.to_vec()),
+                OwnedDatum::Text(schema),
                 OwnedDatum::Text(name.to_vec()),
                 OwnedDatum::Text(b"table".to_vec()),
                 OwnedDatum::Int(5),
@@ -567,6 +621,20 @@ impl crate::ImportedDatabase {
             ]),
             changes: Default::default(),
         })
+    }
+    /// Returns the name a database is listed under.
+    ///
+    /// @param number - the database's slot: 0 for `main`, 1 for `temp`, then the attachments
+    pub(crate) fn schema_label(&self, number: usize) -> Vec<u8> {
+        match number {
+            crate::MAIN => b"main".to_vec(),
+            crate::TEMP => b"temp".to_vec(),
+            _ => self
+                .session_state
+                .schema_at(number)
+                .map(|held| held.name.clone())
+                .unwrap_or_else(|| b"main".to_vec()),
+        }
     }
     /// Lists the collations this connection can order by.
     ///
@@ -614,13 +682,44 @@ impl crate::ImportedDatabase {
             .iter()
             .find(|table| table.folded == wanted && at.is_none_or(|named| table.database == named))
             .or(
-                if wanted == b"sqlite_schema" || wanted == b"sqlite_master" {
+                if matches!(
+                    wanted.as_slice(),
+                    b"sqlite_schema"
+                        | b"sqlite_master"
+                        | b"sqlite_temp_schema"
+                        | b"sqlite_temp_master"
+                ) {
                     Some(&self.schema.schema_info)
                 } else {
                     None
                 },
             )
     }
+}
+
+/// Returns the table columns an index of a WITHOUT ROWID table carries after its
+/// own key columns, as column positions.
+///
+/// @param table - the WITHOUT ROWID table
+/// @param index - the index being described
+fn trailing_columns(
+    table: &inillucent_sql::catalog_view::TableInfo,
+    index: &inillucent_sql::catalog_view::IndexInfo,
+) -> Vec<u16> {
+    let named: Vec<u16> = index.columns.iter().filter_map(|key| key.column).collect();
+    let is_table_key = index.origin == inillucent_sql::catalog_view::IndexOrigin::PrimaryKey
+        && index.root == table.root;
+    let candidates: Vec<u16> = if is_table_key {
+        (0..table.columns.len())
+            .filter_map(|position| u16::try_from(position).ok())
+            .collect()
+    } else {
+        table.primary_key()
+    };
+    candidates
+        .into_iter()
+        .filter(|position| !named.contains(position))
+        .collect()
 }
 
 /// Returns the declared type and the affinity SQLite gives one column of a view.
@@ -733,13 +832,14 @@ fn value_kinds(expr: &inillucent_sql::bind::BoundExpr) -> u8 {
         | BoundExpr::External { .. }
         | BoundExpr::Function { .. }
         | BoundExpr::Aggregate { .. } => 0x07,
-        BoundExpr::Column { .. } | BoundExpr::Cast { .. } | BoundExpr::Subquery { .. } => {
-            match expr.affinity() {
-                Some(affinity) if is_numeric(affinity) => 0x05,
-                Some(inillucent_value::affinity::Affinity::Text) => 0x06,
-                _ => 0x07,
-            }
-        }
+        BoundExpr::Column { .. }
+        | BoundExpr::Generated { .. }
+        | BoundExpr::Cast { .. }
+        | BoundExpr::Subquery { .. } => match expr.affinity() {
+            Some(affinity) if is_numeric(affinity) => 0x05,
+            Some(inillucent_value::affinity::Affinity::Text) => 0x06,
+            _ => 0x07,
+        },
         BoundExpr::Case {
             branches,
             otherwise,

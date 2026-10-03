@@ -27,7 +27,7 @@ use inillucent_value::Collation;
 /// The arena has no walker of its own, and the only caller that needs one is
 /// the generated-column check, so it lives beside it rather than becoming a
 /// method every other reader would have to ignore.
-fn expression_children(ast: &crate::ast::Ast, expr: ast::ExprId) -> Vec<ast::ExprId> {
+pub(crate) fn expression_children(ast: &crate::ast::Ast, expr: ast::ExprId) -> Vec<ast::ExprId> {
     let mut out = Vec::new();
     let Some(node) = ast.expr(expr) else {
         return out;
@@ -98,39 +98,113 @@ fn expression_children(ast: &crate::ast::Ast, expr: ast::ExprId) -> Vec<ast::Exp
     out
 }
 
-/// Returns whether a stored expression names an identifier.
+/// Returns whether a column is declared `UNIQUE` in its own definition.
 ///
-/// It lexes rather than searches, so a column called `a` is not found inside
-/// `abc` or inside the text of a string literal.
-fn mentions_name(sql: &[u8], folded: &[u8]) -> bool {
-    let mut lexer = crate::lexer::Lexer::at(sql, 0);
-    loop {
-        let Ok(token) = lexer.next_token() else {
-            return false;
+/// SQLite sets its "unique" flag on a column only for `UNIQUE` written in the
+/// column's definition. A column named by a table level `UNIQUE (a, b)` or by
+/// `CREATE UNIQUE INDEX` does not get it, and `DROP COLUMN` treats the two
+/// differently: only the first is refused up front.
+///
+/// @param create_sql - the table's stored `CREATE TABLE` text
+/// @param position - the column's declared position
+fn declared_unique(create_sql: &[u8], position: usize) -> bool {
+    let limits = inillucent_base::limits::Limits::default();
+    let Ok(parsed) = crate::parser::parse_next_statement(create_sql, 0, &limits) else {
+        return false;
+    };
+    let ast::Statement::CreateTable {
+        body: ast::CreateTableBody::Columns { columns, .. },
+        ..
+    } = &parsed.statement
+    else {
+        return false;
+    };
+    columns.get(position).is_some_and(|column| {
+        column
+            .constraints
+            .iter()
+            .any(|(_, constraint)| matches!(constraint, ast::ColumnConstraint::Unique(_)))
+    })
+}
+
+/// Refuses `NULLS FIRST` and `NULLS LAST` on an index key.
+///
+/// SQLite's grammar accepts them there, because it reads an index key as an ORDER BY term, and
+/// then refuses them with a message that points at nothing.
+///
+/// @param columns - the key columns as written
+fn refuse_nulls_order(columns: &[ast::IndexedColumn]) -> Result<(), ParseError> {
+    for column in columns {
+        let word = match column.nulls {
+            Some(ast::NullOrder::First) => "FIRST",
+            Some(ast::NullOrder::Last) => "LAST",
+            None => continue,
         };
-        match token.kind {
-            crate::lexer::TokenKind::EndOfInput => return false,
-            crate::lexer::TokenKind::Identifier { keyword: None, .. }
-                if token.span.slice(sql).to_ascii_lowercase() == folded =>
-            {
-                return true;
-            }
-            _ => {}
+        return Err(refused(
+            format!("unsupported use of NULLS {word}"),
+            Span::default(),
+        ));
+    }
+    Ok(())
+}
+
+/// Returns the failure `RENAME COLUMN` and `DROP COLUMN` give for a column that
+/// is not there, which SQLite words with the name in double quotes.
+///
+/// @param name - the column as the statement wrote it
+fn no_such_quoted_column(name: &[u8]) -> ParseError {
+    refused(
+        format!("no such column: \"{}\"", String::from_utf8_lossy(name)),
+        Span::default(),
+    )
+}
+
+/// Returns the failure an `ALTER TABLE` gives for a name that is not a table.
+///
+/// SQLite words it differently for each kind of statement when the name is a
+/// view.
+///
+/// @param action - what the statement does
+/// @param target - the object that was named
+fn not_a_table_message(
+    action: &ast::AlterAction,
+    target: &crate::catalog_view::TableInfo,
+) -> String {
+    let name = String::from_utf8_lossy(&target.name).into_owned();
+    if target.kind != TableKind::View {
+        return format!("cannot alter {name}: not a table");
+    }
+    match action {
+        ast::AlterAction::RenameTo(_) => format!("view {name} may not be altered"),
+        ast::AlterAction::RenameColumn { .. } => {
+            format!("cannot rename columns of view \"{name}\"")
+        }
+        ast::AlterAction::AddColumn(_) => "Cannot add a column to a view".to_string(),
+        ast::AlterAction::DropColumn(_) => format!("cannot drop column from view \"{name}\""),
+        ast::AlterAction::SetNotNull { .. }
+        | ast::AlterAction::DropNotNull(_)
+        | ast::AlterAction::AddCheck { .. }
+        | ast::AlterAction::DropConstraint(_) => {
+            format!("cannot edit constraints of view \"{name}\"")
         }
     }
 }
 
 /// Returns the failure `REINDEX` gives for a name that is nothing it knows.
+///
+/// SQLite's message does not name the object, and it points at nothing, so the
+/// failure carries no position either. It used to be an `Unexpected` token failure,
+/// which printed `near "unable to identify ...": syntax error`.
+///
+/// @param name - the name that matched no table, index or collation
+/// @param span - where the name was written, which the failure does not report
 fn no_such_collation_sequence(name: &[u8], span: Span) -> ParseError {
+    let _ = (name, span);
     ParseError::new(
-        crate::diagnostic::ParseErrorKind::Unexpected {
-            found: format!(
-                "unable to identify the object to be reindexed: {}",
-                String::from_utf8_lossy(name)
-            ),
-            expected: Vec::new(),
-        },
-        span,
+        crate::diagnostic::ParseErrorKind::Refused(
+            "unable to identify the object to be reindexed".to_string(),
+        ),
+        Span::default(),
     )
 }
 
@@ -168,6 +242,11 @@ impl BeginKind {
 /// it saw and the executor, which knows the row count, decides.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AddedColumnRisk {
+    /// `REFERENCES` with a `DEFAULT` that is not `NULL`.
+    ///
+    /// Only a refusal while `PRAGMA foreign_keys` is on, which the binder does
+    /// not know, so [`AddedColumnRisk::refusal`] takes it as an argument.
+    pub references_with_default: bool,
     /// `NOT NULL` with nothing to fill the existing rows with.
     pub null_without_default: bool,
     /// A `DEFAULT` the existing rows cannot all be given one answer from.
@@ -180,9 +259,16 @@ impl AddedColumnRisk {
     /// Returns the refusal a table with rows in it owes, in SQLite's wording.
     ///
     /// The capitalisation is the reference's own and is inconsistent between
-    /// the three; it is reproduced rather than tidied, because a caller
-    /// matching on the message is matching on what SQLite prints.
-    pub fn refusal(&self) -> Option<&'static str> {
+    /// the four; it is reproduced rather than tidied, because a caller
+    /// matching on the message is matching on what SQLite prints. The order is
+    /// the order SQLite tests in, which decides the message when a column
+    /// breaks more than one rule.
+    ///
+    /// @param foreign_keys - whether `PRAGMA foreign_keys` is on
+    pub fn refusal(&self, foreign_keys: bool) -> Option<&'static str> {
+        if foreign_keys && self.references_with_default {
+            return Some("Cannot add a REFERENCES column with non-NULL default value");
+        }
         if self.null_without_default {
             return Some("Cannot add a NOT NULL column with default value NULL");
         }
@@ -210,6 +296,9 @@ pub enum AlterKind {
         from: Vec<u8>,
         /// Its new name, as written.
         to: Vec<u8>,
+        /// Whether the new name was written quoted, which makes every
+        /// occurrence in the schema quoted.
+        to_quoted: bool,
     },
     /// `ADD COLUMN`.
     AddColumn {
@@ -226,12 +315,53 @@ pub enum AlterKind {
         /// What it would do to rows that already exist.
         risk: AddedColumnRisk,
     },
+    /// An `ADD COLUMN` that SQLite refuses only after it has changed the schema.
+    AddColumnFailsAfter {
+        /// The full message, for example `error in table t after add column: ...`.
+        message: String,
+    },
     /// `DROP COLUMN`.
     DropColumn {
         /// The column's name, as stored.
         name: Vec<u8>,
         /// Its declared position, which is the record slot to remove.
         position: u16,
+    },
+    /// `ALTER COLUMN ... SET NOT NULL`.
+    SetNotNull {
+        /// The column's name, as stored.
+        name: Vec<u8>,
+        /// Its declared position.
+        position: u16,
+        /// Where `NOT NULL` starts in the statement's own source.
+        start: u32,
+        /// Where the clause ends.
+        end: u32,
+    },
+    /// `ALTER COLUMN ... DROP NOT NULL`.
+    DropNotNull {
+        /// The column's name, as stored.
+        name: Vec<u8>,
+        /// Its declared position.
+        position: u16,
+    },
+    /// `ADD [CONSTRAINT name] CHECK (...)`.
+    AddCheck {
+        /// The constraint's name, when it has one.
+        name: Option<Vec<u8>>,
+        /// Where the constraint starts in the statement's own source.
+        start: u32,
+        /// Where it ends.
+        end: u32,
+        /// Where the predicate starts in the statement's own source.
+        expr_start: u32,
+        /// Where the predicate ends.
+        expr_end: u32,
+    },
+    /// `DROP CONSTRAINT name`.
+    DropConstraint {
+        /// The constraint's name, as written.
+        name: Vec<u8>,
     },
 }
 
@@ -282,6 +412,13 @@ pub enum Directive {
         name_offset: u32,
         /// Whether the table already exists.
         exists: bool,
+        /// A failure the statement reports when it runs rather than when it is prepared.
+        ///
+        /// **A generated column loop is found by running a query.** SQLite finishes
+        /// `CREATE TABLE` by running `SELECT * FROM` the new table, and that query is
+        /// where `generated column loop on "c"` comes from, so the shell prints it as
+        /// `Error near line N`, not `Parse error`. Nothing is created when it is set.
+        refusal: Option<String>,
     },
     /// `CREATE TABLE ... AS SELECT`.
     ///
@@ -354,6 +491,10 @@ pub enum Directive {
         /// between the two forms and the reason the path is carried rather
         /// than resolved here.
         into: Option<Vec<u8>>,
+        /// The text of an `INTO` expression that is not a string literal, such
+        /// as `(SELECT n FROM p)` or `'a' || 'b'`, which the engine evaluates
+        /// when the statement runs. `into` is `None` when this is set.
+        into_sql: Option<String>,
     },
     /// `ATTACH`, which adds a database file to this connection.
     Attach {
@@ -702,10 +843,10 @@ impl<'a> Binder<'a> {
             .find_table(Some(database_name.as_slice()), &folded)
             .is_some();
         if exists && !if_not_exists {
-            return Err(refused(
-                format!("table {} already exists", String::from_utf8_lossy(&written)),
-                Span::default(),
-            ));
+            return Err(self.already_exists(&database_name, &folded, name));
+        }
+        if !exists {
+            self.refuse_index_namesake(&database_name, &folded, &written)?;
         }
         Ok(Directive::CreateVirtualTable {
             if_not_exists,
@@ -756,6 +897,18 @@ impl<'a> Binder<'a> {
                 strict,
             } => (columns, constraints, without_rowid, strict),
         };
+        // First, because SQLite meets `PRIMARY KEY(... AUTOINCREMENT)` before it
+        // looks at what the key names.
+        self.check_table_autoincrement(columns, constraints, *without_rowid)?;
+        for (_, constraint) in constraints {
+            match constraint {
+                ast::TableConstraint::PrimaryKey { columns, .. }
+                | ast::TableConstraint::Unique { columns, .. } => refuse_nulls_order(columns)?,
+                _ => {}
+            }
+        }
+        self.check_table_shape(self.ast.text(name), columns, constraints)?;
+        self.check_table_declarations(self.ast.text(name), columns, constraints)?;
         if *without_rowid && !self.declares_primary_key(columns, constraints) {
             return Err(schema_refused(
                 format!(
@@ -766,10 +919,12 @@ impl<'a> Binder<'a> {
             ));
         }
         self.check_autoincrement(columns, *without_rowid)?;
+        self.check_column_collations(columns)?;
         if *strict {
-            self.check_strict(columns)?;
+            self.check_strict(columns, name)?;
         }
-        self.check_generated(columns)?;
+        let refusal = self.check_generated(columns, constraints)?;
+        self.refuse_all_generated(columns)?;
         if columns.is_empty() {
             return Err(refused(
                 "a table must have at least one column",
@@ -797,10 +952,10 @@ impl<'a> Binder<'a> {
             .find_table(Some(database_name.as_slice()), &folded)
             .is_some();
         if exists && !if_not_exists {
-            return Err(refused(
-                format!("table {} already exists", String::from_utf8_lossy(&written)),
-                Span::default(),
-            ));
+            return Err(self.already_exists(&database_name, &folded, name));
+        }
+        if !exists {
+            self.refuse_index_namesake(&database_name, &folded, &written)?;
         }
         self.record_write_dependency(index);
         Ok(Directive::CreateTable {
@@ -809,6 +964,7 @@ impl<'a> Binder<'a> {
             name: written,
             name_offset: self.name_offset(name),
             exists,
+            refusal,
         })
     }
 
@@ -862,10 +1018,10 @@ impl<'a> Binder<'a> {
             .find_table(Some(database_name.as_slice()), &folded)
             .is_some();
         if exists && !if_not_exists {
-            return Err(refused(
-                format!("table {} already exists", String::from_utf8_lossy(&written)),
-                Span::default(),
-            ));
+            return Err(self.already_exists(&database_name, &folded, name));
+        }
+        if !exists {
+            self.refuse_index_namesake(&database_name, &folded, &written)?;
         }
         let span = self
             .ast
@@ -899,10 +1055,18 @@ impl<'a> Binder<'a> {
         // The line break is SQLite's own rule too, so the stored text matches
         // byte for byte: the name lengths are added up first, and a wide
         // declaration is written one column per line.
+        // Two columns that share a name are told apart the way a derived table
+        // tells them apart: `SELECT a, a` makes a table of `a` and `a:1`.
+        let written_names: Vec<Vec<u8>> = bound
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+        let names = crate::bind::unique_column_names(&written_names);
         let mut width = identifier_width(&written);
-        for column in &bound.columns {
+        for name in &names {
             width = width
-                .saturating_add(identifier_width(&column.name))
+                .saturating_add(identifier_width(name))
                 .saturating_add(5);
         }
         let (open, between, close): (&[u8], &[u8], &[u8]) = if width < 50 {
@@ -912,24 +1076,15 @@ impl<'a> Binder<'a> {
         };
         let mut create_sql = Vec::new();
         create_sql.extend_from_slice(b"CREATE TABLE ");
-        create_sql.extend_from_slice(&written);
+        // Quoted like a column name: a table name with a quote or a space in it
+        // must be written as a quoted identifier or the stored text cannot be read.
+        create_sql.extend_from_slice(&quoted_name(&written));
         create_sql.push(b'(');
-        let mut seen: Vec<Vec<u8>> = Vec::with_capacity(bound.columns.len());
-        for (position, column) in bound.columns.iter().enumerate() {
+        for (position, (column, name)) in bound.columns.iter().zip(&names).enumerate() {
             create_sql.extend_from_slice(if position > 0 { between } else { open });
-            let folded = column.name.to_ascii_lowercase();
-            if seen.contains(&folded) {
-                return Err(refused(
-                    format!(
-                        "duplicate column name: {}",
-                        String::from_utf8_lossy(&column.name)
-                    ),
-                    Span::default(),
-                ));
-            }
-            seen.push(folded);
-            create_sql.extend_from_slice(&quoted_name(&column.name));
-            create_sql.extend_from_slice(affinity_type(&column.declared_type));
+            create_sql.extend_from_slice(&quoted_name(name));
+            create_sql
+                .extend_from_slice(affinity_type(&column.declared_type, column.expr.affinity()));
         }
         create_sql.extend_from_slice(close);
         self.record_write_dependency(index);
@@ -967,40 +1122,20 @@ impl<'a> Binder<'a> {
     /// and may not refer to a column that does not exist or to itself. The
     /// cycle check is the one that matters: without it a `CREATE TABLE` that
     /// describes one is accepted and every later insert recurses.
-    fn check_generated(&self, columns: &[ast::ColumnDef]) -> Result<(), ParseError> {
+    fn check_generated(
+        &self,
+        columns: &[ast::ColumnDef],
+        constraints: &[(Option<ast::NameId>, ast::TableConstraint)],
+    ) -> Result<Option<String>, ParseError> {
         let names: Vec<Vec<u8>> = columns
             .iter()
             .map(|column| self.ast.folded(column.name).to_vec())
             .collect();
         let mut generated: Vec<(usize, Vec<usize>)> = Vec::new();
         for (position, column) in columns.iter().enumerate() {
-            let mut expr = None;
-            let mut has_default = false;
-            let mut in_primary_key = false;
-            for (_, constraint) in &column.constraints {
-                match constraint {
-                    ast::ColumnConstraint::Generated { expr: body, .. } => expr = Some(*body),
-                    ast::ColumnConstraint::Default(_) => has_default = true,
-                    ast::ColumnConstraint::PrimaryKey { .. } => in_primary_key = true,
-                    _ => {}
-                }
-            }
-            let Some(expr) = expr else {
+            let Some(expr) = self.check_generated_clauses(column)? else {
                 continue;
             };
-            let written = String::from_utf8_lossy(self.ast.text(column.name)).into_owned();
-            if has_default {
-                return Err(refused(
-                    format!("cannot use DEFAULT on a generated column: {written}"),
-                    Span::default(),
-                ));
-            }
-            if in_primary_key {
-                return Err(refused(
-                    format!("generated columns cannot be part of the PRIMARY KEY: {written}"),
-                    Span::default(),
-                ));
-            }
             let mut reads = Vec::new();
             self.expression_names(expr, &mut reads);
             let mut resolved = Vec::new();
@@ -1012,6 +1147,7 @@ impl<'a> Binder<'a> {
             }
             generated.push((position, resolved));
         }
+        self.check_key_has_no_generated(columns, constraints)?;
         // A cycle is anything that never becomes computable: repeat the "every
         // dependency is settled" pass until it stops making progress, and if
         // anything is left it depends on itself, directly or through others.
@@ -1034,15 +1170,109 @@ impl<'a> Binder<'a> {
                 break;
             }
         }
-        if let Some((position, _)) = pending.first() {
+        // SQLite computes the generated columns in passes and, when a pass makes no
+        // progress, names the last column in declaration order that is still waiting.
+        // That is the column `pending.last()` holds, because `pending` keeps declaration
+        // order. Measured against the pinned shell for loops of two and three columns.
+        if let Some((position, _)) = pending.last() {
             let written = columns
                 .get(*position)
                 .map(|column| String::from_utf8_lossy(self.ast.text(column.name)).into_owned())
                 .unwrap_or_default();
+            return Ok(Some(format!("generated column loop on \"{written}\"")));
+        }
+        Ok(None)
+    }
+
+    /// Checks the order of the `DEFAULT`, `AS` and `PRIMARY KEY` clauses of one column.
+    ///
+    /// SQLite meets the clauses in the order they are written. `AS` after a
+    /// `DEFAULT` or after another `AS` is `error in generated column "c"`,
+    /// `DEFAULT` after `AS` is `cannot use DEFAULT on a generated column`, and a
+    /// `PRIMARY KEY` on a generated column is refused whichever comes first.
+    /// Returns the generated expression, when the column has one.
+    ///
+    /// @param column - the column definition
+    pub(crate) fn check_generated_clauses(
+        &self,
+        column: &ast::ColumnDef,
+    ) -> Result<Option<ast::ExprId>, ParseError> {
+        let mut expr = None;
+        let mut has_default = false;
+        let mut in_primary_key = false;
+        for (_, constraint) in &column.constraints {
+            match constraint {
+                ast::ColumnConstraint::Generated {
+                    expr: body,
+                    bad_storage,
+                    ..
+                } => {
+                    if has_default || expr.is_some() || *bad_storage {
+                        return Err(refused(
+                            format!(
+                                "error in generated column \"{}\"",
+                                String::from_utf8_lossy(self.ast.text(column.name))
+                            ),
+                            Span::default(),
+                        ));
+                    }
+                    expr = Some(*body);
+                }
+                ast::ColumnConstraint::Default(_) => {
+                    if expr.is_some() {
+                        return Err(refused(
+                            "cannot use DEFAULT on a generated column",
+                            Span::default(),
+                        ));
+                    }
+                    has_default = true;
+                }
+                ast::ColumnConstraint::PrimaryKey { .. } => in_primary_key = true,
+                _ => {}
+            }
+        }
+        if expr.is_some() && in_primary_key {
             return Err(refused(
-                format!("generated column loop on {written}"),
+                "generated columns cannot be part of the PRIMARY KEY",
                 Span::default(),
             ));
+        }
+        Ok(expr)
+    }
+
+    /// Refuses a table level `PRIMARY KEY` that names a generated column.
+    ///
+    /// A `UNIQUE` constraint may name one.
+    ///
+    /// @param columns - the table's columns
+    /// @param constraints - the table's constraints
+    fn check_key_has_no_generated(
+        &self,
+        columns: &[ast::ColumnDef],
+        constraints: &[(Option<ast::NameId>, ast::TableConstraint)],
+    ) -> Result<(), ParseError> {
+        for (_, constraint) in constraints {
+            let ast::TableConstraint::PrimaryKey { columns: keys, .. } = constraint else {
+                continue;
+            };
+            for key in keys {
+                let Some(ast::Expr::Column { column: named, .. }) = self.ast.expr(key.expr) else {
+                    continue;
+                };
+                let folded = self.ast.folded(*named);
+                let generated = columns.iter().any(|column| {
+                    self.ast.folded(column.name) == folded
+                        && column.constraints.iter().any(|(_, constraint)| {
+                            matches!(constraint, ast::ColumnConstraint::Generated { .. })
+                        })
+                });
+                if generated {
+                    return Err(refused(
+                        "generated columns cannot be part of the PRIMARY KEY",
+                        Span::default(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -1063,18 +1293,52 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Refuses a column whose `COLLATE` names a collation sequence that does not exist.
+    ///
+    /// SQLite looks the name up when the table is created, so
+    /// `CREATE TABLE t(a COLLATE nosuch)` fails with `no such collation sequence:
+    /// nosuch` and creates nothing. It used to be accepted and fail later, on the
+    /// first statement that compared the column.
+    ///
+    /// @param columns - the column definitions
+    fn check_column_collations(&self, columns: &[ast::ColumnDef]) -> Result<(), ParseError> {
+        for column in columns {
+            for (_, constraint) in &column.constraints {
+                let ast::ColumnConstraint::Collate(name) = constraint else {
+                    continue;
+                };
+                let written = self.ast.text(*name);
+                if self.collation_named(written).is_none() {
+                    return Err(crate::bind::no_such_collation(written, Span::default()));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Checks the rules a `STRICT` table adds to its column list.
     ///
     /// Every column must name one of six types, and the check is on the
     /// declared text rather than on the affinity it maps to: `VARCHAR(10)` has
     /// TEXT affinity and is still refused, because STRICT is about what was
     /// written and not about what it means.
-    fn check_strict(&self, columns: &[ast::ColumnDef]) -> Result<(), ParseError> {
+    ///
+    /// SQLite names the column with its table, `missing datatype for t.a` and
+    /// `unknown datatype for t.a: "DATETIME"`, with both as written.
+    ///
+    /// @param columns - the column definitions
+    /// @param table - the table's name as written
+    fn check_strict(
+        &self,
+        columns: &[ast::ColumnDef],
+        table: ast::NameId,
+    ) -> Result<(), ParseError> {
+        let table = String::from_utf8_lossy(self.ast.text(table)).into_owned();
         for column in columns {
             let Some(declared) = column.declared_type.as_ref() else {
                 return Err(refused(
                     format!(
-                        "missing datatype for {}",
+                        "missing datatype for {table}.{}",
                         String::from_utf8_lossy(self.ast.text(column.name))
                     ),
                     Span::default(),
@@ -1088,7 +1352,7 @@ impl<'a> Binder<'a> {
             if !allowed {
                 return Err(refused(
                     format!(
-                        "unknown datatype for {}: \"{}\"",
+                        "unknown datatype for {table}.{}: \"{}\"",
                         String::from_utf8_lossy(self.ast.text(column.name)),
                         String::from_utf8_lossy(declared)
                     ),
@@ -1195,11 +1459,17 @@ impl<'a> Binder<'a> {
         let written = match database {
             // A qualifier still has to name a database that exists, and it
             // still restricts the search to that one.
-            Some(_) => Some(
-                self.catalog
-                    .database_name(self.resolve_database(database)?)
-                    .to_vec(),
-            ),
+            //
+            // **A database that does not exist reads as a table that does not
+            // exist.** SQLite answers `no such table: nosuch.t` for
+            // `ALTER TABLE nosuch.t ...`, and never says "unknown database".
+            Some(qualifier) => match self.resolve_database(database) {
+                Ok(found) => Some(self.catalog.database_name(found).to_vec()),
+                Err(_) => {
+                    let written = [self.ast.text(qualifier), b".", self.ast.text(table)].concat();
+                    return Err(no_such_table(&written, Span::default()));
+                }
+            },
             None => None,
         };
         let folded = self.ast.folded(table).to_vec();
@@ -1214,10 +1484,7 @@ impl<'a> Binder<'a> {
         let database_name = self.catalog.database_name(index).to_vec();
         if target.kind != crate::catalog_view::TableKind::Table {
             return Err(refused(
-                format!(
-                    "cannot alter {}: not a table",
-                    String::from_utf8_lossy(&target.name)
-                ),
+                not_a_table_message(action, &target),
                 Span::default(),
             ));
         }
@@ -1232,68 +1499,51 @@ impl<'a> Binder<'a> {
         }
         self.record_write_dependency(index);
         let kind = match action {
-            ast::AlterAction::RenameTo(name) => {
-                let to = self.ast.text(*name).to_vec();
-                let to_folded = self.ast.folded(*name).to_vec();
-                if self
-                    .catalog
-                    .find_table(Some(database_name.as_slice()), &to_folded)
-                    .is_some()
-                {
-                    return Err(refused(
-                        format!(
-                            "there is already another table or index with this name: {}",
-                            String::from_utf8_lossy(&to)
-                        ),
-                        Span::default(),
-                    ));
-                }
-                AlterKind::RenameTable { to }
-            }
+            ast::AlterAction::RenameTo(name) => self.bind_rename_to(*name, &database_name)?,
             ast::AlterAction::RenameColumn { from, to } => {
                 let from_folded = self.ast.folded(*from).to_vec();
                 let Some(position) = target.column_position(&from_folded) else {
-                    return Err(crate::bind::no_such_column(
-                        self.ast.text(*from),
-                        Span::default(),
-                    ));
+                    return Err(no_such_quoted_column(self.ast.text(*from)));
                 };
-                let to_folded = self.ast.folded(*to).to_vec();
-                if target.column_position(&to_folded).is_some() {
-                    return Err(refused(
-                        format!(
-                            "duplicate column name: {}",
-                            String::from_utf8_lossy(self.ast.text(*to))
-                        ),
-                        Span::default(),
-                    ));
-                }
+                // A new name that another column already has is refused after
+                // the rewrite, as `error in table t after rename: duplicate
+                // column name: b`, because that is where SQLite finds it.
                 let stored = target
                     .column(position)
                     .map(|column| column.name.clone())
                     .unwrap_or_default();
+                let to_quoted = self
+                    .ast
+                    .name(*to)
+                    .is_some_and(|name| name.quote != crate::lexer::QuoteForm::Bare);
                 AlterKind::RenameColumn {
                     from: stored,
                     to: self.ast.text(*to).to_vec(),
+                    to_quoted,
                 }
             }
             ast::AlterAction::AddColumn(definition) => {
                 let risk = self.check_added_column(&target, definition)?;
-                AlterKind::AddColumn {
-                    start: definition.span.start,
-                    end: definition.span.end,
-                    risk,
+                match definition.deferred_failure {
+                    Some(reason) => AlterKind::AddColumnFailsAfter {
+                        message: format!(
+                            "error in table {} after add column: {reason}",
+                            String::from_utf8_lossy(&target.name)
+                        ),
+                    },
+                    None => AlterKind::AddColumn {
+                        start: definition.span.start,
+                        end: definition.span.end,
+                        risk,
+                    },
                 }
             }
             ast::AlterAction::DropColumn(name) => {
                 let folded = self.ast.folded(*name).to_vec();
                 let Some(position) = target.column_position(&folded) else {
-                    return Err(crate::bind::no_such_column(
-                        self.ast.text(*name),
-                        Span::default(),
-                    ));
+                    return Err(no_such_quoted_column(self.ast.text(*name)));
                 };
-                self.check_dropped_column(&target, position)?;
+                self.check_dropped_column(&target, position, self.ast.text(*name))?;
                 let stored = target
                     .column(position)
                     .map(|column| column.name.clone())
@@ -1303,6 +1553,7 @@ impl<'a> Binder<'a> {
                     position,
                 }
             }
+            other => self.bind_constraint_alter(&target, other)?,
         };
         Ok(Directive::Alter {
             database: index,
@@ -1311,6 +1562,89 @@ impl<'a> Binder<'a> {
         })
     }
 
+    /// Binds `RENAME TO`, refusing the names SQLite refuses.
+    ///
+    /// A name that starts with `sqlite_` is reserved, and that check comes
+    /// before the one for a name already in use by a table or an index.
+    ///
+    /// @param name - the new name
+    /// @param database_name - the schema the table is in
+    fn bind_rename_to(
+        &self,
+        name: ast::NameId,
+        database_name: &[u8],
+    ) -> Result<AlterKind, ParseError> {
+        let to = self.ast.text(name).to_vec();
+        let to_folded = self.ast.folded(name).to_vec();
+        let written = String::from_utf8_lossy(&to).into_owned();
+        if to_folded.starts_with(b"sqlite_") {
+            return Err(refused(
+                format!("object name reserved for internal use: {written}"),
+                Span::default(),
+            ));
+        }
+        let taken = self
+            .catalog
+            .find_table(Some(database_name), &to_folded)
+            .is_some()
+            || self
+                .catalog
+                .find_index(Some(database_name), &to_folded)
+                .is_some();
+        if taken {
+            return Err(refused(
+                format!("there is already another table or index with this name: {written}"),
+                Span::default(),
+            ));
+        }
+        Ok(AlterKind::RenameTable { to })
+    }
+
+    /// Binds the four constraint forms of `ALTER TABLE`.
+    ///
+    /// @param target - the table
+    /// @param action - `SET NOT NULL`, `DROP NOT NULL`, `ADD CHECK` or `DROP CONSTRAINT`
+    fn bind_constraint_alter(
+        &self,
+        target: &crate::catalog_view::TableInfo,
+        action: &ast::AlterAction,
+    ) -> Result<AlterKind, ParseError> {
+        Ok(match action {
+            ast::AlterAction::SetNotNull { column, start, end } => {
+                let (name, position) = self.constrained_column(target, *column)?;
+                AlterKind::SetNotNull {
+                    name,
+                    position,
+                    start: *start,
+                    end: *end,
+                }
+            }
+            ast::AlterAction::DropNotNull(column) => {
+                let (name, position) = self.constrained_column(target, *column)?;
+                AlterKind::DropNotNull { name, position }
+            }
+            ast::AlterAction::AddCheck {
+                name,
+                expr,
+                start,
+                end,
+            } => {
+                self.check_names_resolve(target, *expr)?;
+                let span = self.ast.expr_span(*expr);
+                AlterKind::AddCheck {
+                    name: name.map(|id| self.ast.text(id).to_vec()),
+                    start: *start,
+                    end: *end,
+                    expr_start: span.start,
+                    expr_end: span.end,
+                }
+            }
+            ast::AlterAction::DropConstraint(name) => AlterKind::DropConstraint {
+                name: self.ast.text(*name).to_vec(),
+            },
+            _ => return Err(unsupported("that ALTER TABLE form", Span::default())),
+        })
+    }
     /// Checks what `ADD COLUMN` may not add.
     ///
     /// Every one of these is refused because the existing rows have no value
@@ -1333,10 +1667,16 @@ impl<'a> Binder<'a> {
                 Span::default(),
             ));
         }
+        // SQLite meets the collation and the default while it reads the column
+        // definition, so these come before every rule below.
+        self.check_column_constraints(definition)?;
+        self.check_generated_clauses(definition)?;
         let mut not_null = false;
         let mut has_default = false;
         let mut constant = true;
+        let mut generated = false;
         let mut generated_stored = false;
+        let mut references = false;
         for (_, constraint) in &definition.constraints {
             match constraint {
                 ast::ColumnConstraint::PrimaryKey { .. } => {
@@ -1353,92 +1693,174 @@ impl<'a> Binder<'a> {
                 }
                 ast::ColumnConstraint::NotNull(_) => not_null = true,
                 ast::ColumnConstraint::Default(expr) => {
-                    has_default = true;
+                    // A literal `DEFAULT NULL` is no default at all to SQLite:
+                    // `NOT NULL DEFAULT NULL` is refused like `NOT NULL`, and a
+                    // `REFERENCES` column with it is accepted.
+                    has_default = !self.is_null_literal(*expr);
                     if !self.constant_default(*expr) {
                         constant = false;
                     }
                 }
-                ast::ColumnConstraint::Generated { stored, .. } if *stored => {
-                    generated_stored = true;
+                ast::ColumnConstraint::References(_) => references = true,
+                ast::ColumnConstraint::Generated { stored, .. } => {
+                    generated = true;
+                    generated_stored = *stored;
                 }
                 _ => {}
             }
         }
+        // None of the three default rules applies to a generated column, which
+        // has no default.
         Ok(AddedColumnRisk {
-            null_without_default: not_null && !has_default,
-            non_constant_default: !constant,
+            references_with_default: !generated && references && has_default,
+            null_without_default: !generated && not_null && !has_default,
+            non_constant_default: !generated && !constant && has_default,
             generated_stored,
         })
     }
 
     /// Returns whether a `DEFAULT` is a constant an existing row can be given.
+    ///
+    /// SQLite can evaluate a literal, with a sign, while it compiles the
+    /// statement. It cannot evaluate `CURRENT_TIMESTAMP` and its two relatives,
+    /// a function, or an expression such as `1 + 1`, and refuses those.
     fn constant_default(&self, expr: ast::ExprId) -> bool {
         match self.ast.expr(expr) {
+            Some(ast::Expr::Literal(
+                ast::Literal::CurrentDate
+                | ast::Literal::CurrentTime
+                | ast::Literal::CurrentTimestamp,
+            )) => false,
             Some(ast::Expr::Literal(_)) => true,
-            Some(ast::Expr::Unary { operand, .. }) => self.constant_default(*operand),
+            // A bare word is a string in a default: `DEFAULT hello`, `DEFAULT "q"`.
+            Some(ast::Expr::Column {
+                database: None,
+                table: None,
+                ..
+            }) => true,
+            Some(ast::Expr::Unary {
+                op: ast::UnaryOp::Negate | ast::UnaryOp::Identity,
+                operand,
+            })
+            | Some(ast::Expr::Cast { operand, .. }) => self.constant_default(*operand),
             _ => false,
         }
     }
 
+    /// Resolves the column an `ALTER COLUMN` names.
+    ///
+    /// The message has no quotes around the name, unlike `DROP COLUMN`'s.
+    ///
+    /// @param table - the table
+    /// @param column - the column as written
+    fn constrained_column(
+        &self,
+        table: &crate::catalog_view::TableInfo,
+        column: ast::NameId,
+    ) -> Result<(Vec<u8>, u16), ParseError> {
+        let folded = self.ast.folded(column).to_vec();
+        let Some(position) = table.column_position(&folded) else {
+            return Err(crate::bind::no_such_column(
+                self.ast.text(column),
+                Span::default(),
+            ));
+        };
+        let stored = table
+            .column(position)
+            .map(|found| found.name.clone())
+            .unwrap_or_default();
+        Ok((stored, position))
+    }
+
+    /// Refuses a `CHECK` added by `ALTER TABLE` that names a column the table
+    /// does not have.
+    ///
+    /// @param table - the table
+    /// @param expr - the predicate
+    fn check_names_resolve(
+        &self,
+        table: &crate::catalog_view::TableInfo,
+        expr: ast::ExprId,
+    ) -> Result<(), ParseError> {
+        let mut pending = vec![expr];
+        while let Some(id) = pending.pop() {
+            pending.extend(expression_children(self.ast, id));
+            let Some(ast::Expr::Column {
+                table: qualifier,
+                column,
+                ..
+            }) = self.ast.expr(id)
+            else {
+                continue;
+            };
+            let folded = self.ast.folded(*column);
+            let own = qualifier.is_none_or(|name| self.ast.folded(name) == table.folded.as_slice());
+            let rowid = matches!(folded, b"rowid" | b"oid" | b"_rowid_");
+            if own && (rowid || table.column_position(folded).is_some()) {
+                continue;
+            }
+            let written = match qualifier {
+                Some(name) => [self.ast.text(*name), b".", self.ast.text(*column)].concat(),
+                None => self.ast.text(*column).to_vec(),
+            };
+            return Err(crate::bind::no_such_column(
+                &written,
+                self.ast.expr_span(id),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns whether an expression is the literal `NULL`.
+    fn is_null_literal(&self, expr: ast::ExprId) -> bool {
+        matches!(
+            self.ast.expr(expr),
+            Some(ast::Expr::Literal(ast::Literal::Null))
+        )
+    }
+
     /// Checks what `DROP COLUMN` may not drop.
+    ///
+    /// SQLite refuses three things before it changes anything: a column that is
+    /// part of the primary key, a column declared `UNIQUE` in its own
+    /// definition, and the only column of a table. Everything else that would
+    /// break (an index, a `CHECK`, a generated column, a view, a trigger) is
+    /// found after the change is made, by `ALTER TABLE` re-reading the schema.
+    ///
+    /// **Only a column level `UNIQUE` is refused here.** A column named by a
+    /// table level `UNIQUE (a, b)`, or by `CREATE UNIQUE INDEX`, is dropped as
+    /// far as this check goes, and the index or the table is what fails.
+    ///
+    /// @param table - the table
+    /// @param position - the declared position of the column
+    /// @param written - the column's name as the statement wrote it, which is
+    ///   the spelling SQLite puts in its message
     fn check_dropped_column(
         &self,
         table: &crate::catalog_view::TableInfo,
         position: u16,
+        written: &[u8],
     ) -> Result<(), ParseError> {
-        let named = table
-            .column(position)
-            .map(|column| String::from_utf8_lossy(&column.name).into_owned())
-            .unwrap_or_default();
+        let named = String::from_utf8_lossy(written).into_owned();
+        let in_primary_key = table.rowid_alias == Some(position)
+            || table
+                .column(position)
+                .is_some_and(|column| column.primary_key_position.is_some());
+        if in_primary_key {
+            return Err(refused(
+                format!("cannot drop PRIMARY KEY column: \"{named}\""),
+                Span::default(),
+            ));
+        }
+        if declared_unique(&table.create_sql, usize::from(position)) {
+            return Err(refused(
+                format!("cannot drop UNIQUE column: \"{named}\""),
+                Span::default(),
+            ));
+        }
         if table.columns.len() <= 1 {
             return Err(refused(
                 format!("cannot drop column \"{named}\": no other columns exist"),
-                Span::default(),
-            ));
-        }
-        if table.rowid_alias == Some(position)
-            || table
-                .column(position)
-                .is_some_and(|column| column.primary_key_position.is_some())
-        {
-            return Err(refused(
-                format!("cannot drop column \"{named}\": PRIMARY KEY"),
-                Span::default(),
-            ));
-        }
-        let indexed = table
-            .indexes
-            .iter()
-            .any(|index| index.columns.iter().any(|key| key.column == Some(position)));
-        if indexed {
-            return Err(refused(
-                format!("cannot drop column \"{named}\": indexed"),
-                Span::default(),
-            ));
-        }
-        // A CHECK or a generated column that reads it would be left naming a
-        // column that is gone, and the table would stop loading.
-        let folded = table
-            .column(position)
-            .map(|column| column.folded.clone())
-            .unwrap_or_default();
-        let referenced = table
-            .checks
-            .iter()
-            .any(|check| mentions_name(&check.expr_sql, &folded))
-            || table.columns.iter().enumerate().any(|(other, column)| {
-                other != usize::from(position)
-                    && column
-                        .generated_sql
-                        .as_ref()
-                        .is_some_and(|sql| mentions_name(sql, &folded))
-            });
-        if referenced {
-            return Err(refused(
-                format!(
-                    "error in table {}: cannot drop column \"{named}\"",
-                    String::from_utf8_lossy(&table.name)
-                ),
                 Span::default(),
             ));
         }
@@ -1540,17 +1962,29 @@ impl<'a> Binder<'a> {
         database: Option<ast::NameId>,
         into: Option<ast::ExprId>,
     ) -> Result<Directive, ParseError> {
-        let target = match into {
-            Some(expr) => {
-                Some(self.literal_path(expr, "VACUUM INTO with a file name that is not a literal")?)
+        let literal = into.and_then(|expr| match self.ast.expr(expr) {
+            Some(ast::Expr::Literal(ast::Literal::String(text))) => Some(text.clone()),
+            _ => None,
+        });
+        // Anything but a string literal is an expression SQLite evaluates when
+        // the statement runs, so its text travels with the directive.
+        let into_sql = match (into, &literal) {
+            (Some(expr), None) => {
+                let span = self.ast.expr_span(expr);
+                let written = self
+                    .source
+                    .get(span.start as usize..span.end as usize)
+                    .ok_or_else(|| refused("the file name could not be read", span))?;
+                Some(String::from_utf8_lossy(written).into_owned())
             }
-            None => None,
+            _ => None,
         };
         let index = self.resolve_database(database)?;
         self.record_write_dependency(index);
         Ok(Directive::Vacuum {
             database: index,
-            into: target,
+            into: literal,
+            into_sql,
         })
     }
 
@@ -1643,18 +2077,16 @@ impl<'a> Binder<'a> {
 
     /// Binds a `CREATE VIEW`.
     ///
-    /// The body is bound here, and thrown away, purely to refuse a view whose
-    /// query does not resolve. SQLite does the same: the definition is checked
-    /// when the view is created rather than when it is first read, so a typo
-    /// fails at `CREATE VIEW` rather than in whatever statement happens to
-    /// select from it next.
+    /// The body is not resolved here: SQLite checks only the syntax of a view
+    /// when it is created, and finds a missing table or column when the view is
+    /// read.
     fn bind_create_view(
         &mut self,
         temporary: bool,
         if_not_exists: bool,
         database: Option<ast::NameId>,
         name: ast::NameId,
-        columns: &[ast::NameId],
+        _columns: &[ast::NameId],
         select: ast::SelectId,
     ) -> Result<Directive, ParseError> {
         let temp = self.temporary_database(temporary, database, false)?;
@@ -1679,28 +2111,20 @@ impl<'a> Binder<'a> {
             .find_table(Some(database_name.as_slice()), &folded)
             .is_some();
         if exists && !if_not_exists {
-            return Err(refused(
-                format!("table {} already exists", String::from_utf8_lossy(&written)),
-                Span::default(),
-            ));
+            return Err(self.already_exists(&database_name, &folded, name));
         }
         if !exists {
-            let saved = core::mem::take(&mut self.scopes);
-            let bound = self.bind_select(select);
-            self.scopes = saved;
-            let bound = bound?;
-            if !columns.is_empty() && columns.len() != bound.columns.len() {
-                return Err(refused(
-                    format!(
-                        "expected {} columns for {} but got {}",
-                        columns.len(),
-                        String::from_utf8_lossy(&written),
-                        bound.columns.len()
-                    ),
-                    Span::default(),
-                ));
+            self.refuse_index_namesake(&database_name, &folded, &written)?;
+            // **The body is not resolved.** SQLite stores a view whose query
+            // names a table or a column that does not exist, or that reads the
+            // view itself, and reports it when the view is read; so does a
+            // column list of the wrong width. Only a parameter is refused here.
+            self.refuse_view_parameters()?;
+            if temp.is_none() && !database_name.eq_ignore_ascii_case(b"temp") {
+                self.refuse_view_in_another_database(&written, &database_name)?;
             }
         }
+        let _ = select;
         self.record_write_dependency(index);
         Ok(Directive::CreateView {
             if_not_exists,
@@ -1709,6 +2133,41 @@ impl<'a> Binder<'a> {
             name_offset: self.name_offset(name),
             exists,
         })
+    }
+
+    /// Refuses a view that is not temporary and names a table of another database.
+    ///
+    /// SQLite checks the names the view's query is written with: one qualified
+    /// with a database other than the view's own is `view v cannot reference
+    /// objects in database aux`. A temporary view may name any database.
+    ///
+    /// @param view - the view's name as written
+    /// @param home - the database the view is created in
+    fn refuse_view_in_another_database(&self, view: &[u8], home: &[u8]) -> Result<(), ParseError> {
+        for index in 0..self.ast.from_term_count() {
+            let Some(term) = self.ast.from_term(ast::FromTermId(index as u32)) else {
+                continue;
+            };
+            let ast::FromSource::Table {
+                database: Some(qualifier),
+                ..
+            } = &term.source
+            else {
+                continue;
+            };
+            if self.ast.text(*qualifier).eq_ignore_ascii_case(home) {
+                continue;
+            }
+            return Err(refused(
+                format!(
+                    "view {} cannot reference objects in database {}",
+                    String::from_utf8_lossy(view),
+                    String::from_utf8_lossy(self.ast.text(*qualifier))
+                ),
+                Span::default(),
+            ));
+        }
+        Ok(())
     }
 
     /// Refuses the two places `AUTOINCREMENT` may not be written.
@@ -1727,6 +2186,7 @@ impl<'a> Binder<'a> {
             for (_, constraint) in &column.constraints {
                 let ast::ColumnConstraint::PrimaryKey {
                     autoincrement: true,
+                    order,
                     ..
                 } = constraint
                 else {
@@ -1738,12 +2198,81 @@ impl<'a> Binder<'a> {
                         Span::default(),
                     ));
                 }
-                if !declared.eq_ignore_ascii_case(b"integer") {
+                // A `DESC` key is not the rowid alias, so it is not allowed
+                // either.
+                if !declared.eq_ignore_ascii_case(b"integer")
+                    || *order == ast::SortOrder::Descending
+                {
                     return Err(refused(
                         "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY",
                         Span::default(),
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses `AUTOINCREMENT` written inside a table level `PRIMARY KEY` unless
+    /// the key is one ascending INTEGER column of a rowid table.
+    ///
+    /// @param columns - the table's columns
+    /// @param constraints - the table's constraints
+    /// @param without_rowid - whether `WITHOUT ROWID` was written
+    fn check_table_autoincrement(
+        &self,
+        columns: &[ast::ColumnDef],
+        constraints: &[(Option<ast::NameId>, ast::TableConstraint)],
+        without_rowid: bool,
+    ) -> Result<(), ParseError> {
+        for (_, constraint) in constraints {
+            let ast::TableConstraint::PrimaryKey {
+                columns: keys,
+                autoincrement: true,
+                ..
+            } = constraint
+            else {
+                continue;
+            };
+            if without_rowid {
+                return Err(refused(
+                    "AUTOINCREMENT not allowed on WITHOUT ROWID tables",
+                    Span::default(),
+                ));
+            }
+            // SQLite looks through a `COLLATE` and ignores the term's `DESC`:
+            // `PRIMARY KEY(a DESC AUTOINCREMENT)` is still the rowid alias.
+            let single = match keys.as_slice() {
+                [key] => {
+                    let named = match self.ast.expr(key.expr) {
+                        Some(ast::Expr::Collate { operand, .. }) => self.ast.expr(*operand),
+                        other => other,
+                    };
+                    match named {
+                        Some(ast::Expr::Column {
+                            table: None,
+                            column,
+                            ..
+                        }) => Some(self.ast.folded(*column)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let integer = single.is_some_and(|folded| {
+                columns.iter().any(|column| {
+                    self.ast.folded(column.name) == folded
+                        && column
+                            .declared_type
+                            .as_deref()
+                            .is_some_and(|declared| declared.eq_ignore_ascii_case(b"integer"))
+                })
+            });
+            if !integer {
+                return Err(refused(
+                    "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY",
+                    Span::default(),
+                ));
             }
         }
         Ok(())
@@ -1771,15 +2300,6 @@ impl<'a> Binder<'a> {
             None => self.resolve_database(parts.database)?,
         };
         let written = self.ast.text(parts.name).to_vec();
-        if written.to_ascii_lowercase().starts_with(b"sqlite_") {
-            return Err(refused(
-                format!(
-                    "object name reserved for internal use: {}",
-                    String::from_utf8_lossy(&written)
-                ),
-                Span::default(),
-            ));
-        }
         let folded = self.ast.folded(parts.name).to_vec();
         let database_name = self.catalog.database_name(index).to_vec();
         let table_folded = self.ast.folded(parts.table).to_vec();
@@ -1811,11 +2331,25 @@ impl<'a> Binder<'a> {
             None => temp.map_or(Some(database_name.as_slice()), |_| None),
         };
         let Some(target) = self.catalog.find_table(scope, &table_folded).cloned() else {
-            return Err(crate::bind::no_such_table(
-                self.ast.text(parts.table),
+            // SQLite names the schema the table was looked for in, except for a
+            // temporary trigger, which looks in all of them.
+            let missing = match scope {
+                Some(schema) => [schema, b".", self.ast.text(parts.table)].concat(),
+                None => self.ast.text(parts.table).to_vec(),
+            };
+            return Err(crate::bind::no_such_table(&missing, Span::default()));
+        };
+        // After the table is found, as SQLite does: `CREATE TRIGGER sqlite_x ... ON missing` is
+        // a missing table and not a reserved name.
+        if written.to_ascii_lowercase().starts_with(b"sqlite_") {
+            return Err(refused(
+                format!(
+                    "object name reserved for internal use: {}",
+                    String::from_utf8_lossy(&written)
+                ),
                 Span::default(),
             ));
-        };
+        }
         let exists = self
             .catalog
             .find_trigger(Some(database_name.as_slice()), &folded)
@@ -1870,6 +2404,9 @@ impl<'a> Binder<'a> {
         // accepts both `UPDATE OF nosuchcolumn` and a body reading a column the
         // table has not got. Refusing either here would leave inillucent unable to
         // load a schema SQLite had written.
+        if temp.is_none() {
+            self.refuse_qualified_trigger_targets(parts.body)?;
+        }
         let _ = (parts.time, parts.when, parts.body);
         self.record_write_dependency(index);
         Ok(Directive::CreateTrigger {
@@ -1881,6 +2418,40 @@ impl<'a> Binder<'a> {
         })
     }
 
+    /// Finds the table a `CREATE INDEX` is on, and the schema the index goes in.
+    ///
+    /// **An unqualified index goes where its table is.** SQLite looks the
+    /// table up in the usual order, `temp` first, and creates the index in
+    /// the schema it found the table in. Taking an unqualified index to mean
+    /// `main` made `CREATE TEMP TABLE t(a); CREATE INDEX i ON t(a)` report
+    /// "no such table: t". A table that is not there is reported with the
+    /// schema it was looked for in, which is `main` when none was written.
+    ///
+    /// @param database - the schema the statement wrote, when it wrote one
+    /// @param table - the table's name
+    fn index_target(
+        &self,
+        database: Option<ast::NameId>,
+        table: ast::NameId,
+    ) -> Result<(usize, Vec<u8>, crate::catalog_view::TableInfo), ParseError> {
+        let table_folded = self.ast.folded(table).to_vec();
+        let index = match database {
+            Some(_) => self.resolve_database(database)?,
+            None => match self.catalog.find_table(None, &table_folded) {
+                Some(found) => found.database,
+                None => return Err(self.index_without_table(0, &table_folded, table)),
+            },
+        };
+        let database_name = self.catalog.database_name(index).to_vec();
+        let Some(target) = self
+            .catalog
+            .find_table(Some(database_name.as_slice()), &table_folded)
+            .cloned()
+        else {
+            return Err(self.index_without_table(index, &table_folded, table));
+        };
+        Ok((index, database_name, target))
+    }
     /// Binds a `CREATE INDEX`.
     ///
     /// @param spec - what the statement named
@@ -1894,6 +2465,7 @@ impl<'a> Binder<'a> {
             settings,
             ..
         } = *spec;
+        refuse_nulls_order(columns)?;
         let unique = spec.unique == Uniqueness::Unique;
         let if_not_exists = spec.if_not_exists == IfNotExists::Skip;
         // **A `WHERE` is carried in the statement text, not in this
@@ -1927,39 +2499,47 @@ impl<'a> Binder<'a> {
             }
         };
         let parsed_settings = index_settings(&using, settings)?;
-        let table_folded = self.ast.folded(table).to_vec();
-        // **An unqualified index goes where its table is.** SQLite looks the
-        // table up in the usual order, `temp` first, and creates the index in
-        // the schema it found the table in. Taking an unqualified index to mean
-        // `main` made `CREATE TEMP TABLE t(a); CREATE INDEX i ON t(a)` report
-        // "no such table: t".
-        let index = match database {
-            Some(_) => self.resolve_database(database)?,
-            None => match self.catalog.find_table(None, &table_folded) {
-                Some(found) => found.database,
-                None => return Err(no_such_table(self.ast.text(table), Span::default())),
-            },
-        };
-        let database_name = self.catalog.database_name(index).to_vec();
-        let Some(target) = self
-            .catalog
-            .find_table(Some(database_name.as_slice()), &table_folded)
-            .cloned()
-        else {
-            return Err(no_such_table(self.ast.text(table), Span::default()));
-        };
+        let (index, database_name, target) = self.index_target(database, table)?;
+        self.refuse_unindexable(&target)?;
         let written = self.ast.text(name).to_vec();
-        let folded = self.ast.folded(name).to_vec();
-        let exists = self
-            .catalog
-            .find_index(Some(database_name.as_slice()), &folded)
-            .is_some();
-        if exists && !if_not_exists {
+        if written.to_ascii_lowercase().starts_with(b"sqlite_") {
             return Err(refused(
-                format!("index {} already exists", String::from_utf8_lossy(&written)),
+                format!(
+                    "object name reserved for internal use: {}",
+                    String::from_utf8_lossy(&written)
+                ),
                 Span::default(),
             ));
         }
+        let folded = self.ast.folded(name).to_vec();
+        let exists = self.check_new_index_name(&database_name, &folded, &written, if_not_exists)?;
+        self.check_index_declarations(&target, columns, spec.filter)?;
+        let keys = self.index_key_columns(&target, columns)?;
+        self.record_write_dependency(index);
+        Ok(Directive::CreateIndex {
+            unique,
+            if_not_exists,
+            database: index,
+            name: written,
+            name_offset: self.name_offset(name),
+            table: target.name.clone(),
+            table_root: target.root,
+            using,
+            columns: keys,
+            settings: parsed_settings,
+            exists,
+        })
+    }
+
+    /// Describes each key of a `CREATE INDEX` for the engine.
+    ///
+    /// @param target - the table the index is over
+    /// @param columns - the indexed columns, in key order
+    fn index_key_columns(
+        &self,
+        target: &crate::catalog_view::TableInfo,
+        columns: &[ast::IndexedColumn],
+    ) -> Result<Vec<IndexKeyColumn>, ParseError> {
         let mut keys = Vec::with_capacity(columns.len());
         for column in columns {
             // `CREATE INDEX x ON t(b COLLATE NOCASE DESC)` parses the collation
@@ -2019,19 +2599,127 @@ impl<'a> Binder<'a> {
                 descending: column.order == ast::SortOrder::Descending,
             });
         }
-        self.record_write_dependency(index);
-        Ok(Directive::CreateIndex {
-            unique,
-            if_not_exists,
+        Ok(keys)
+    }
+
+    /// Refuses `DROP TABLE` and `DROP VIEW` on the schema table, in SQLite's words.
+    ///
+    /// SQLite answers `table sqlite_master may not be dropped` for either statement,
+    /// with or without `IF EXISTS`, and spells the temporary database's copy
+    /// `sqlite_temp_master`. All four spellings of the two names are the schema table.
+    ///
+    /// @param folded - the name the statement dropped, folded
+    /// @param database - the database it resolved to
+    fn refuse_dropping_the_schema_table(
+        &self,
+        folded: &[u8],
+        database: &[u8],
+    ) -> Result<(), ParseError> {
+        let main = matches!(folded, b"sqlite_master" | b"sqlite_schema");
+        let temp = matches!(folded, b"sqlite_temp_master" | b"sqlite_temp_schema");
+        if !main && !temp {
+            return Ok(());
+        }
+        let in_temp = temp || database.eq_ignore_ascii_case(b"temp");
+        let said = match in_temp {
+            true => "table sqlite_temp_master may not be dropped",
+            false => "table sqlite_master may not be dropped",
+        };
+        Err(refused(said, Span::default()))
+    }
+
+    /// Works out which database a `DROP` is about, and how a missing table is named.
+    ///
+    /// **An unqualified name is looked for in every database, `temp` first,** which is
+    /// SQLite's `sqlite3LocateTable` order. Taking it to mean `main` made `DROP TABLE s`
+    /// "no such table" for a temporary `s`, and dropped `main.s` where SQLite drops the
+    /// temporary `s` that shadows it.
+    ///
+    /// SQLite names a missing table with the schema the statement wrote, and calls an
+    /// unknown schema in front of a table a missing table: `DROP TABLE nosuch.t` is `no
+    /// such table: nosuch.t`.
+    ///
+    /// @param kind - what the statement drops
+    /// @param database - the schema as written, when there is one
+    /// @param written - the object's name as written
+    /// @param folded - the object's name folded
+    fn resolve_drop_database(
+        &self,
+        kind: ObjectKind,
+        database: Option<ast::NameId>,
+        written: &[u8],
+        folded: &[u8],
+    ) -> Result<(Vec<u8>, usize), ParseError> {
+        let qualified = match database {
+            Some(schema) => [self.ast.text(schema), b".".as_slice(), written].concat(),
+            None => written.to_vec(),
+        };
+        let index = match database {
+            Some(_) => match self.resolve_database(database) {
+                Err(_) if kind == ObjectKind::Table => {
+                    return Err(no_such_table(&qualified, Span::default()))
+                }
+                resolved => resolved?,
+            },
+            None => self.unqualified_home(kind, folded).unwrap_or(0),
+        };
+        Ok((qualified, index))
+    }
+
+    /// Binds `DROP TABLE`, which frees the table's tree and the trees of its indexes.
+    ///
+    /// @param if_exists - whether `IF EXISTS` was written
+    /// @param index - the database the table is in
+    /// @param database_name - that database's name
+    /// @param folded - the table's name folded
+    /// @param written - the table's name as written
+    /// @param qualified - the name as a failure should print it
+    fn bind_drop_table(
+        &self,
+        if_exists: bool,
+        index: usize,
+        database_name: &[u8],
+        folded: &[u8],
+        written: Vec<u8>,
+        qualified: &[u8],
+    ) -> Result<Directive, ParseError> {
+        let kind = ObjectKind::Table;
+        let found = self
+            .catalog
+            .find_table(Some(database_name), folded)
+            .cloned();
+        let Some(table) = found else {
+            if if_exists {
+                return Ok(Directive::Drop {
+                    kind,
+                    if_exists,
+                    database: index,
+                    name: written,
+                    root: 0,
+                    index_roots: Vec::new(),
+                    exists: false,
+                });
+            }
+            return Err(no_such_table(qualified, Span::default()));
+        };
+        self.refuse_dropping_own_table(&table, &written)?;
+        // A WITHOUT ROWID table's primary key *is* the table's own b-tree, so its entry
+        // names the same root. Freeing it twice frees a page that is already on the free
+        // list, which reads back as a malformed database.
+        let index_roots = table
+            .indexes
+            .iter()
+            .map(|held| held.root)
+            .filter(|root| *root != 0 && *root != table.root)
+            .collect();
+        Ok(Directive::Drop {
+            kind,
+            if_exists,
             database: index,
             name: written,
-            name_offset: self.name_offset(name),
-            table: target.name.clone(),
-            table_root: target.root,
-            using,
-            columns: keys,
-            settings: parsed_settings,
-            exists,
+            root: table.root,
+            index_roots,
+            exists: true,
         })
     }
 
@@ -2045,17 +2733,12 @@ impl<'a> Binder<'a> {
     ) -> Result<Directive, ParseError> {
         let written = self.ast.text(name).to_vec();
         let folded = self.ast.folded(name).to_vec();
-        // **An unqualified name is looked for in every database, `temp`
-        // first,** which is SQLite's `sqlite3LocateTable` order. Taking it to
-        // mean `main` made `DROP TABLE s` "no such table" for a temporary `s`,
-        // and dropped `main.s` where SQLite drops the temporary `s` that
-        // shadows it.
-        let index = match database {
-            Some(_) => self.resolve_database(database)?,
-            None => self.unqualified_home(kind, &folded).unwrap_or(0),
-        };
+        let (qualified, index) = self.resolve_drop_database(kind, database, &written, &folded)?;
         let database_name = self.catalog.database_name(index).to_vec();
         self.record_write_dependency(index);
+        if kind != ObjectKind::Trigger && kind != ObjectKind::Index {
+            self.refuse_dropping_the_schema_table(&folded, database_name.as_slice())?;
+        }
         if kind == ObjectKind::Trigger {
             // A trigger owns no B-tree either, so dropping one is its schema row
             // and nothing else.
@@ -2090,6 +2773,15 @@ impl<'a> Binder<'a> {
             let exists = found
                 .as_ref()
                 .is_some_and(|table| table.kind == crate::catalog_view::TableKind::View);
+            if found.is_some() && !exists {
+                return Err(refused(
+                    format!(
+                        "use DROP TABLE to delete table {}",
+                        String::from_utf8_lossy(&written)
+                    ),
+                    Span::default(),
+                ));
+            }
             if !exists && !if_exists {
                 return Err(refused(
                     format!("no such view: {}", String::from_utf8_lossy(&written)),
@@ -2107,53 +2799,16 @@ impl<'a> Binder<'a> {
             });
         }
         if kind == ObjectKind::Table {
-            let found = self
-                .catalog
-                .find_table(Some(database_name.as_slice()), &folded)
-                .cloned();
-            let Some(table) = found else {
-                if if_exists {
-                    return Ok(Directive::Drop {
-                        kind,
-                        if_exists,
-                        database: index,
-                        name: written,
-                        root: 0,
-                        index_roots: Vec::new(),
-                        exists: false,
-                    });
-                }
-                return Err(no_such_table(&written, Span::default()));
-            };
-            if table.kind == crate::catalog_view::TableKind::View {
-                return Err(refused(
-                    format!(
-                        "use DROP VIEW to delete view {}",
-                        String::from_utf8_lossy(&written)
-                    ),
-                    Span::default(),
-                ));
-            }
-            // A WITHOUT ROWID table's primary key *is* the table's own b-tree,
-            // so its entry names the same root. Freeing it twice frees a page
-            // that is already on the free list, which reads back as a malformed
-            // database.
-            let index_roots = table
-                .indexes
-                .iter()
-                .map(|index| index.root)
-                .filter(|root| *root != 0 && *root != table.root)
-                .collect();
-            return Ok(Directive::Drop {
-                kind,
+            return self.bind_drop_table(
                 if_exists,
-                database: index,
-                name: written,
-                root: table.root,
-                index_roots,
-                exists: true,
-            });
+                index,
+                &database_name,
+                &folded,
+                written,
+                &qualified,
+            );
         }
+        self.refuse_dropping_constraint_index(&database_name, &folded)?;
         let found = self.find_index_root(index, &folded);
         let Some(root) = found else {
             if if_exists {
@@ -2172,6 +2827,14 @@ impl<'a> Binder<'a> {
                 Span::default(),
             ));
         };
+        // The index a `UNIQUE` or `PRIMARY KEY` constraint made is part of the table,
+        // and SQLite refuses to drop it by name.
+        if folded.starts_with(b"sqlite_autoindex_") {
+            return Err(refused(
+                "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped",
+                Span::default(),
+            ));
+        }
         Ok(Directive::Drop {
             kind,
             if_exists,
@@ -2285,7 +2948,8 @@ impl<'a> Binder<'a> {
                     "unknown database {}",
                     String::from_utf8_lossy(self.ast.text(id))
                 ),
-                Span::default(),
+                // SQLite points at the schema name.
+                self.ast.name(id).map_or(Span::default(), |name| name.span),
             )
         })
     }
@@ -2317,11 +2981,14 @@ impl<'a> Binder<'a> {
 ///
 /// @param name - the column's name as the query reports it
 fn quoted_name(name: &[u8]) -> Vec<u8> {
+    // SQLite quotes a name that is a keyword as well as one that is not a plain
+    // word, so the stored text of `CREATE TABLE "select" AS ...` can be read back.
     let plain = !name.is_empty()
         && !name.first().is_some_and(u8::is_ascii_digit)
         && name
             .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        && crate::keyword::lookup(name).is_none();
     if plain {
         return name.to_vec();
     }
@@ -2343,9 +3010,21 @@ fn quoted_name(name: &[u8]) -> Vec<u8> {
 /// it: BLOB affinity - which is what a column with no declared type has -
 /// writes nothing at all, so the copy of an untyped column is untyped.
 ///
+/// A column that is not a bare column of a table has no declared type, and
+/// takes the affinity of its expression instead: `CAST(1 AS TEXT)` is a `TEXT`
+/// column, and `1 + 1` has no affinity and so no type.
+///
 /// @param declared - the source column's declared type, as written
-fn affinity_type(declared: &[u8]) -> &'static [u8] {
-    match inillucent_value::affinity::for_column(declared) {
+/// @param expression - the affinity of the expression the column is computed by
+fn affinity_type(
+    declared: &[u8],
+    expression: Option<inillucent_value::affinity::Affinity>,
+) -> &'static [u8] {
+    let affinity = match (declared.is_empty(), expression) {
+        (true, Some(held)) => held,
+        _ => inillucent_value::affinity::for_column(declared),
+    };
+    match affinity {
         inillucent_value::affinity::Affinity::Blob => b"",
         inillucent_value::affinity::Affinity::Text => b" TEXT",
         inillucent_value::affinity::Affinity::Integer => b" INT",

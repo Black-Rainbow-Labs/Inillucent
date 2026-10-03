@@ -590,7 +590,13 @@ impl Eval for Length {
                     Some(at) => bytes.get(..at).unwrap_or(bytes),
                     None => bytes,
                 };
-                Datum::Int(counted.iter().filter(|byte| (*byte & 0xC0) != 0x80).count() as i64)
+                // SQLite's rule, not a decoder's: only a byte of 0xC0 or more
+                // takes the continuation bytes after it, so a lone 0x80 is a
+                // character of its own.
+                Datum::Int(inillucent_value::numeric::character_count(
+                    counted,
+                    inillucent_value::TextEncoding::Utf8,
+                ) as i64)
             }
             Datum::Blob(bytes) => Datum::Int(bytes.len() as i64),
             Datum::Int(number) => Datum::Int(number.to_string().len() as i64),

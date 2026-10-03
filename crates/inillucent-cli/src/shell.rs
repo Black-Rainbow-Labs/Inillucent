@@ -73,6 +73,20 @@ pub struct Shell {
     active: usize,
     /// How results are laid out.
     pub layout: Layout,
+    /// What `.headers` last set, or `None` when it has not been used.
+    ///
+    /// SQLite's shell keeps the choice apart from the mode: until `.headers`
+    /// is used, `.mode` turns headers on for the tabular modes and off for
+    /// the others, and once it is used the choice survives every later
+    /// `.mode`. A single flag that `.mode box` set to on left headers on in
+    /// `list` and `insert` mode afterwards.
+    pub headers_chosen: Option<bool>,
+    /// Whether a result with no rows still prints its header line.
+    ///
+    /// Off for everything a person or a script types, because `sqlite3`
+    /// prints nothing for an empty result. `inillucent export` turns it on
+    /// for its one statement, so an exported file always names its columns.
+    pub header_when_empty: bool,
     /// Where output goes, when it is not standard output.
     output: Option<std::fs::File>,
     /// The name of that file, for `.show` to report.
@@ -136,6 +150,18 @@ pub struct Shell {
     pub done: bool,
     /// Whether anything has failed, which decides the exit code.
     pub failed: bool,
+    /// Whether a chunk of input is being run, so that the error of a statement that
+    /// fails while running is held until the chunk ends. See `run_chunk`.
+    pub holding: bool,
+    /// The lines of the last runtime error of the chunk being run.
+    pub held_error: Option<Vec<String>>,
+    /// Whether a statement of the chunk failed to compile, which ends the chunk.
+    pub chunk_stop: bool,
+    /// The text of the chunk from the start of the statement being run.
+    ///
+    /// The reference draws the excerpt under an error from the rest of the line, not from
+    /// the statement alone, so the statements that follow a failing one appear in it.
+    pub excerpt: Option<String>,
     /// The engine's error for the first statement that failed since `failed`
     /// was last cleared, when the failure came from the engine.
     ///
@@ -268,6 +294,9 @@ pub struct Failure {
     /// here and matching on the sentence there would be a second, worse
     /// classifier beside the driver's.
     pub error: Option<inillucent_base::DbError>,
+    /// The column names and rows a query produced before it failed, which the
+    /// reference shell prints ahead of the error.
+    pub partial: Option<(Vec<String>, Vec<Vec<Value<'static>>>)>,
 }
 
 impl Shell {
@@ -372,6 +401,8 @@ impl Shell {
             connections,
             active: 0,
             layout: Layout::default(),
+            headers_chosen: None,
+            header_when_empty: false,
             output: None,
             output_name: None,
             output_is_once: false,
@@ -398,6 +429,10 @@ impl Shell {
             defensive: true,
             done: false,
             failed: false,
+            holding: false,
+            held_error: None,
+            chunk_stop: false,
+            excerpt: None,
             first_error: None,
             log_to: None,
             progress_interval: 0,
@@ -806,6 +841,12 @@ impl Shell {
         }
         match outcome {
             Err(failure) => {
+                if let Some((columns, rows)) = &failure.partial {
+                    let layout = self.rendering_layout();
+                    for line in render(&layout, columns, rows) {
+                        self.say(&line);
+                    }
+                }
                 self.report(sql, &failure);
             }
             Ok((columns, rows)) => {
@@ -844,7 +885,17 @@ impl Shell {
                     return;
                 }
                 let layout = self.rendering_layout();
-                for line in render(&layout, &columns, &rows) {
+                // A statement that returned no rows prints nothing, headers
+                // included: SQLite's shell prints the header from its per-row
+                // callback. Printing it here put an empty line after every
+                // `CREATE` and `INSERT` once `.headers on` was set. `export`
+                // renders through the same function and keeps its header.
+                let lines = if rows.is_empty() && !self.header_when_empty {
+                    Vec::new()
+                } else {
+                    render(&layout, &columns, &rows)
+                };
+                for line in lines {
                     self.say(&line);
                 }
                 if self.show_changes {
@@ -883,11 +934,38 @@ impl Shell {
         } else {
             format!("Error near line {line}: {}", failure.message)
         };
-        self.complain(&heading);
-        let Some(offset) = failure.offset else {
+        let mut lines = vec![heading];
+        if let Some(offset) = failure.offset {
+            let shown = self.excerpt.as_deref().unwrap_or(sql);
+            lines.extend(error_context(shown.as_bytes(), offset as usize));
+        }
+        self.print_or_hold(lines, failure.compiling);
+    }
+
+    /// Prints the lines of an error, or holds them until the chunk of input ends.
+    ///
+    /// **A statement that fails while running does not stop its chunk, and only the last
+    /// of those errors is printed.** The reference runs every statement of a line, keeps
+    /// the message of each failure in one slot that the next failure overwrites, and prints
+    /// the slot when the line is done. A statement that fails to compile ends the line, and
+    /// its message replaces whatever was held. So
+    /// `INSERT ...(duplicate); INSERT ...(fine); SELECT ...;` on one line runs all three and
+    /// prints one error, and a typo in the second statement hides the first's error and
+    /// skips the third statement.
+    ///
+    /// @param lines - the heading and the statement excerpt lines
+    /// @param compiling - whether the statement failed to compile
+    fn print_or_hold(&mut self, lines: Vec<String>, compiling: bool) {
+        if self.holding && !compiling {
+            self.held_error = Some(lines);
+            self.failed = true;
             return;
-        };
-        for line in error_context(sql.as_bytes(), offset as usize) {
+        }
+        if self.holding {
+            self.held_error = None;
+            self.chunk_stop = true;
+        }
+        for line in lines {
             self.complain(&line);
         }
     }
@@ -926,6 +1004,7 @@ impl Shell {
             offset: error.sql_offset(),
             compiling: true,
             error: Some(error),
+            partial: None,
         })?;
         for (nth, value) in bound.iter().enumerate() {
             // The parser numbers markers from one, and a caller that passed
@@ -939,6 +1018,7 @@ impl Shell {
                     offset: None,
                     compiling: true,
                     error: Some(error),
+                    partial: None,
                 })?;
         }
         // **What `.parameter set` bound, applied by name.** A statement that
@@ -947,7 +1027,15 @@ impl Shell {
         // across a script.
         if !self.parameters.is_empty() {
             let names = connection.parameter_names(sql).unwrap_or_default();
+            // A parameter number has one name, the first the statement wrote for it. In
+            // `SELECT :a, ?1` both are number 1 and the name is `:a`, so a value set for `?1`
+            // is never looked up, as in the reference shell.
+            let mut named: Vec<u32> = Vec::new();
             for (name, index) in names {
+                if named.contains(&index) {
+                    continue;
+                }
+                named.push(index);
                 let key = String::from_utf8_lossy(&name).into_owned();
                 let Some(value) = self.parameters.get(&key) else {
                     continue;
@@ -959,12 +1047,16 @@ impl Shell {
         loop {
             match statement.step() {
                 Err(error) => {
+                    // The rows that came before the failure are printed ahead
+                    // of the error, as the reference shell does.
+                    let partial = (!rows.is_empty()).then(|| (statement.columns().to_vec(), rows));
                     return Err(Failure {
                         message: reason(&error),
                         offset: None,
                         compiling: false,
                         error: Some(error),
-                    })
+                        partial,
+                    });
                 }
                 Ok(false) => break,
                 Ok(true) => match owned_row_values(statement.row()) {
@@ -975,6 +1067,7 @@ impl Shell {
                             offset: None,
                             compiling: false,
                             error: Some(error),
+                            partial: None,
                         })
                     }
                 },
@@ -1084,6 +1177,13 @@ pub fn drive(shell: &mut Shell, input: impl Iterator<Item = String>) {
     let mut started = 1usize;
     for line in input {
         number += 1;
+        // The reference swallows a line that holds only whitespace or comments when no statement
+        // is half read, so such a line neither starts a statement nor moves the line number an
+        // error reports. `--what` on line 1 and a bad statement on line 2 is an error on line 2.
+        // With `.echo on` the line is still passed through, which keeps the echoed text unchanged.
+        if !shell.echo && pending.trim().is_empty() && only_whitespace_and_comments(&line) {
+            continue;
+        }
         if pending.trim().is_empty() {
             started = number;
         }
@@ -1101,15 +1201,10 @@ pub fn drive(shell: &mut Shell, input: impl Iterator<Item = String>) {
         }
         pending.push_str(&line);
         pending.push('\n');
-        while let Some(consumed) = complete_statement(shell, &pending) {
-            let statement = pending.get(..consumed).unwrap_or_default().to_string();
-            let rest = pending.split_off(consumed);
-            pending = rest;
-            if !statement.trim().is_empty() {
-                shell.run(statement.trim());
-                if shell.done || (shell.failed && shell.bail) {
-                    return;
-                }
+        if ends_in_complete_statement(shell, &pending) {
+            run_chunk(shell, &std::mem::take(&mut pending));
+            if shell.done || (shell.failed && shell.bail) {
+                return;
             }
         }
     }
@@ -1117,8 +1212,90 @@ pub fn drive(shell: &mut Shell, input: impl Iterator<Item = String>) {
         // Whatever is left was never terminated. Running it is what SQLite's
         // shell does at end of input, and it is what makes `echo "SELECT 1" |
         // inillucent-shell` work without a semicolon.
-        let statement = pending.trim().to_string();
-        shell.run(&statement);
+        run_chunk(shell, &pending);
+    }
+}
+
+/// Reports whether the text read so far ends at the end of a statement.
+///
+/// This is `sqlite3_complete` applied to everything the shell has accumulated, which is
+/// what decides when the reference's shell runs its input: when a line makes the whole
+/// text end in a `;` that is not inside a string, a comment or a trigger body.
+///
+/// @param shell - the shell
+/// @param text - the lines read since the last chunk ran
+fn ends_in_complete_statement(shell: &Shell, text: &str) -> bool {
+    let mut rest = text;
+    while let Some(consumed) = complete_statement(shell, rest) {
+        rest = rest.get(consumed..).unwrap_or_default();
+        if only_whitespace_and_comments(rest) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Reports whether text holds nothing but whitespace and comments.
+///
+/// @param text - the text after a statement's semicolon
+fn only_whitespace_and_comments(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes.get(at).copied() {
+            Some(byte) if byte.is_ascii_whitespace() => at += 1,
+            Some(b'-') if bytes.get(at + 1) == Some(&b'-') => at = skip_line_comment(bytes, at),
+            Some(b'/') if bytes.get(at + 1) == Some(&b'*') => match skip_block_comment(bytes, at) {
+                Some(end) => at = end,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Runs the statements of one chunk of input the way the reference runs a line.
+///
+/// **The unit is the chunk, not the statement.** The reference's shell hands everything
+/// it has accumulated to one call that prepares and runs statement after statement.
+/// A statement that fails to compile ends the call and its error is printed. A statement
+/// that fails while running does not end it: the next statement runs, and only the last
+/// runtime error is printed, after the line. See [`Shell::print_or_hold`].
+///
+/// @param shell - the shell
+/// @param chunk - the text, which may hold several statements
+fn run_chunk(shell: &mut Shell, chunk: &str) {
+    shell.holding = true;
+    shell.chunk_stop = false;
+    shell.held_error = None;
+    let mut rest = chunk.to_string();
+    loop {
+        let (statement, remainder) = match complete_statement(shell, &rest) {
+            Some(consumed) => {
+                let remainder = rest.split_off(consumed);
+                (std::mem::take(&mut rest), remainder)
+            }
+            None => (std::mem::take(&mut rest), String::new()),
+        };
+        if !statement.trim().is_empty() {
+            // The excerpt under an error runs on into the statements after this one.
+            let tail = format!("{}{remainder}", statement.trim_start());
+            shell.excerpt = Some(tail.trim_end().to_string());
+            shell.run(statement.trim());
+        }
+        rest = remainder;
+        if shell.done || shell.chunk_stop || (shell.failed && shell.bail) || rest.trim().is_empty()
+        {
+            break;
+        }
+    }
+    shell.holding = false;
+    shell.excerpt = None;
+    if let Some(lines) = shell.held_error.take() {
+        for line in lines {
+            shell.complain(&line);
+        }
     }
 }
 

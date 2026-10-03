@@ -16,6 +16,9 @@
 
 use super::*;
 
+/// How many tables one block may join.
+const MAX_JOINED_TABLES: usize = 64;
+
 impl Binder<'_> {
     /// Turns `ON`, `USING` and `NATURAL` into ordinary predicates.
     ///
@@ -32,6 +35,14 @@ impl Binder<'_> {
         &mut self,
         terms: &[ast::FromTermId],
     ) -> Result<(), ParseError> {
+        // The planner's table mask is one machine word, so SQLite refuses a
+        // block that joins more than 64 tables.
+        if self.scope().len() > MAX_JOINED_TABLES {
+            return Err(refused(
+                format!("at most {MAX_JOINED_TABLES} tables in a join"),
+                Span::default(),
+            ));
+        }
         let base = self
             .scope()
             .len()
@@ -58,6 +69,7 @@ impl Binder<'_> {
                 JoinConstraint::None => {}
                 JoinConstraint::On(expr) => {
                     let bound = self.bind_expr(expr)?;
+                    self.refuse_on_to_the_right(position, &bound)?;
                     self.set_constraint(position, Some(bound));
                 }
                 JoinConstraint::Using(names) => {
@@ -65,9 +77,18 @@ impl Binder<'_> {
                         .iter()
                         .map(|name| self.ast.folded(*name).to_vec())
                         .collect();
-                    for name in &folded {
-                        if self.find_column_in(position, name).is_none() {
-                            return Err(no_such_column(name, span));
+                    for (name, written) in folded.iter().zip(names.iter()) {
+                        let on_right = self.find_column_in(position, name).is_some();
+                        let on_left =
+                            (0..position).any(|index| self.find_column_in(index, name).is_some());
+                        if !on_right || !on_left {
+                            return Err(refused(
+                                format!(
+                                    "cannot join using column {} - column not present in both tables",
+                                    String::from_utf8_lossy(self.ast.text(*written))
+                                ),
+                                Span::default(),
+                            ));
                         }
                     }
                     let predicate = self.equality_over(position, &folded)?;
@@ -77,6 +98,43 @@ impl Binder<'_> {
                     self.set_constraint(position, predicate);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Refuses the `ON` clause of an outer join that reads a table written after it.
+    ///
+    /// An inner join's `ON` clause is a `WHERE` term, so it may name any table
+    /// of the block. The `ON` clause of a `LEFT`, `RIGHT` or `FULL` join decides
+    /// which rows are null extended, and SQLite refuses it when it reads a table
+    /// to its right.
+    ///
+    /// @param position - the joined term's position in the block
+    /// @param bound - the bound `ON` expression
+    fn refuse_on_to_the_right(&self, position: usize, bound: &BoundExpr) -> Result<(), ParseError> {
+        let outer = self.source_at(position).is_some_and(|source| {
+            matches!(
+                source.join,
+                JoinKind::Left | JoinKind::Right | JoinKind::Full
+            )
+        });
+        if !outer {
+            return Ok(());
+        }
+        let mut used = Vec::new();
+        bound.sources_used(&mut used);
+        let scope = self.scope();
+        let reads_right = used.iter().any(|id| {
+            scope
+                .iter()
+                .position(|candidate| candidate == id)
+                .is_some_and(|found| found > position)
+        });
+        if reads_right {
+            return Err(refused(
+                "ON clause references tables to its right",
+                Span::default(),
+            ));
         }
         Ok(())
     }

@@ -12,7 +12,7 @@
 //! about which values are equal. The cases that grade these rules are
 //! `crates/inillucent-compat/tests/corpora/differential-part8/task2089.cases`.
 
-use inillucent_value::{Affinity, Collation};
+use inillucent_value::Collation;
 
 use super::BoundExpr;
 use crate::ast::UnaryOp;
@@ -29,12 +29,22 @@ impl BoundExpr {
     /// where SQLite answers 1.
     pub fn collation(&self) -> Option<Collation> {
         match self {
-            BoundExpr::Column { collation, .. } => Some(*collation),
+            BoundExpr::Column { collation, .. } | BoundExpr::Generated { collation, .. } => {
+                Some(*collation)
+            }
             BoundExpr::Cast { operand, .. }
             | BoundExpr::Unary {
                 op: UnaryOp::Identity,
                 operand,
             } => operand.collation(),
+            // One column of a subquery used as a row value reads the collation
+            // of the column it stands for, as SQLite does for a `SELECT_COLUMN`.
+            // A scalar subquery written alone carries Binary here and none.
+            BoundExpr::Subquery {
+                kind: super::SubqueryKind::Scalar,
+                collation,
+                ..
+            } if *collation != Collation::Binary => Some(*collation),
             other => other.explicit_collation(),
         }
     }
@@ -58,10 +68,11 @@ impl BoundExpr {
     /// does not carry a `COLLATE` out of one either. An aggregate or window
     /// call has no children here either, because its arguments live in the
     /// block's lists, so its reference carries the answer for them: see
-    /// [`explicit_argument_collation`].
+    /// `explicit_argument_collation`, in `aggregate.rs`.
     pub fn explicit_collation(&self) -> Option<Collation> {
         match self {
             BoundExpr::Collate { collation, .. } => Some(*collation),
+            BoundExpr::Generated { .. } => None,
             BoundExpr::Aggregate { collation, .. } | BoundExpr::WindowRef { collation, .. } => {
                 *collation
             }
@@ -71,20 +82,6 @@ impl BoundExpr {
                 .find_map(BoundExpr::explicit_collation),
         }
     }
-}
-
-/// Returns the explicit collation a call's arguments carry, left first.
-///
-/// This is what an aggregate or a window reference answers for
-/// [`BoundExpr::explicit_collation`]. SQLite reads an aggregate call's
-/// collation from its first argument with `EP_Collate`, so
-/// `max(s COLLATE NOCASE) = 'C'` and `group_concat(s, ',' COLLATE NOCASE) =
-/// 'A,B,C,A,B,C'` both compare with NOCASE and 3.53.4 answers each with 1.
-/// Before task-2094 the reference hid its arguments and both answered 0.
-///
-/// @param arguments - the call's bound arguments, in the order written
-pub(super) fn explicit_argument_collation(arguments: &[BoundExpr]) -> Option<Collation> {
-    arguments.iter().find_map(BoundExpr::explicit_collation)
 }
 
 /// Returns the collation a result column compares with.
@@ -97,32 +94,6 @@ pub fn result_collation(expr: &BoundExpr) -> Collation {
     expr.explicit_collation()
         .or_else(|| expr.collation())
         .unwrap_or(Collation::Binary)
-}
-
-/// Returns the affinity and collation a comparison between two operands uses.
-///
-/// SQLite's rule, in order: if either side has a column affinity the comparison
-/// applies it, with the left side winning. The collation is an explicit one on
-/// the left operand, then an explicit one on the right, then the left
-/// operand's implicit one, then the right's, and otherwise BINARY. "On an
-/// operand" includes anywhere inside it: see [`BoundExpr::explicit_collation`].
-///
-/// @param left - the comparison's left operand
-/// @param right - the comparison's right operand
-pub fn comparison_rules(left: &BoundExpr, right: &BoundExpr) -> (Option<Affinity>, Collation) {
-    let affinity = match (left.affinity(), right.affinity()) {
-        (Some(left), Some(right)) => inillucent_value::compare::comparison_affinity(left, right),
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
-    };
-    let collation = left
-        .explicit_collation()
-        .or_else(|| right.explicit_collation())
-        .or_else(|| left.collation())
-        .or_else(|| right.collation())
-        .unwrap_or(Collation::Binary);
-    (affinity, collation)
 }
 
 /// Wraps an expression in the collation an explicit `COLLATE` names.

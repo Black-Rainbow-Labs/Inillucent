@@ -22,22 +22,44 @@ impl crate::ImportedDatabase {
     /// text a deferred constraint is tested with at commit - so the pragma and
     /// the commit cannot disagree about what a violation is.
     ///
+    /// **It reads under `&self`, so `pragma_foreign_key_check` can call it.** The
+    /// queries it runs only read, and the table valued form has no mutable
+    /// connection to hand them.
+    ///
+    /// **A table that has no foreign keys, or no such table at all, differ.**
+    /// SQLite answers no rows for the first and fails with `no such table` for
+    /// the second, whether the pragma is written as a statement or as a
+    /// function.
+    ///
+    /// **Rows come out in the order SQLite gives them**: the tables newest
+    /// first, and within a table by rowid, with a row that breaks two keys
+    /// reported once for each, the key SQLite numbers 0 first.
+    ///
     /// @param argument - one table to check, or none for every table
+    /// @param at - the attached database the pragma was qualified with
     pub(crate) fn pragma_foreign_key_check(
-        &mut self,
+        &self,
         argument: Option<&PragmaArgument>,
+        at: Option<usize>,
     ) -> DbResult<Outcome> {
         let only = argument.map(|argument| argument_text(argument).to_ascii_lowercase());
+        let database = self.database_to_check(only.as_deref(), at)?;
+        let queries =
+            self.schema
+                .foreign_key_checks(only.as_deref(), database, &self.schema_label(database));
         let mut rows = Vec::new();
-        for query in self.schema.violation_queries(only.as_deref())? {
-            for row in self.query_internally(&query.sql)? {
-                rows.push(vec![
-                    OwnedDatum::Text(query.child.clone()),
-                    row.first().cloned().unwrap_or(OwnedDatum::Null),
-                    OwnedDatum::Text(query.parent.clone()),
-                    OwnedDatum::Int(i64::from(query.key)),
-                ]);
+        let mut children: Vec<&[u8]> = Vec::new();
+        for query in queries.iter().rev() {
+            if !children.contains(&query.child.as_slice()) {
+                children.push(query.child.as_slice());
             }
+        }
+        for child in children {
+            let own: Vec<&crate::engine::keys::ViolationQuery> = queries
+                .iter()
+                .filter(|query| query.child.as_slice() == child)
+                .collect();
+            rows.extend(self.violations_of_table(&own)?);
         }
         Ok(Outcome {
             rows,
@@ -49,6 +71,97 @@ impl crate::ImportedDatabase {
             ]),
             changes: Default::default(),
         })
+    }
+    /// Refuses a pragma whose table argument does not exist, when the statement is prepared.
+    ///
+    /// SQLite looks the table up while compiling `PRAGMA foreign_key_check(missing)`, so the
+    /// shell reports `Parse error` and a prepared statement fails before any step. Checking
+    /// again at run time is still done by [`Self::pragma_foreign_key_check`].
+    ///
+    /// @param directive - the bound statement; only a `foreign_key_check` with a name is checked
+    pub(crate) fn check_pragma_at_prepare(
+        &self,
+        directive: &inillucent_sql::directive::Directive,
+    ) -> DbResult<()> {
+        let inillucent_sql::directive::Directive::Pragma {
+            database,
+            name,
+            argument: Some(argument),
+        } = directive
+        else {
+            return Ok(());
+        };
+        if name.as_slice() != b"foreign_key_check" {
+            return Ok(());
+        }
+        let only = argument_text(argument).to_ascii_lowercase();
+        self.database_to_check(Some(&only), *database).map(|_| ())
+    }
+
+    /// Returns the database a `foreign_key_check` looks in.
+    ///
+    /// **A name with no qualifier is looked for in every database, in the order
+    /// SQLite resolves one: `main`, `temp`, then the attachments.** With no
+    /// name and no qualifier the check is of `main`. A name that is not a table
+    /// of the database it is looked for in is SQLite's `no such table`, whether
+    /// the pragma is written as a statement or as a function.
+    ///
+    /// @param folded - the folded name of the table to check, when one was given
+    /// @param at - the database the pragma was qualified with, when it was
+    fn database_to_check(&self, folded: Option<&str>, at: Option<usize>) -> DbResult<usize> {
+        let Some(name) = folded else {
+            return Ok(at.unwrap_or(crate::MAIN));
+        };
+        let holds = |database: usize| {
+            self.schema
+                .tables
+                .iter()
+                .any(|table| table.folded == name.as_bytes() && table.database == database)
+        };
+        let found = match at {
+            Some(database) => Some(database).filter(|held| holds(*held)),
+            None => self.schema_numbers().into_iter().find(|held| holds(*held)),
+        };
+        found.ok_or_else(|| inillucent_base::error::refusal(format!("no such table: {name}")))
+    }
+
+    /// Returns the rows `PRAGMA foreign_key_check` reports for one table.
+    ///
+    /// SQLite scans the table once and tests each row against every key, so a
+    /// row is reported in rowid order and, when it breaks two keys, once for each
+    /// key from the one numbered 0. Running each key as its own query and sorting
+    /// the answers by rowid and key reproduces that. A table without a rowid
+    /// reports NULL for it, so its rows stay in the order the queries gave.
+    ///
+    /// @param own - the queries of the table's keys
+    fn violations_of_table(
+        &self,
+        own: &[&crate::engine::keys::ViolationQuery],
+    ) -> DbResult<Vec<Vec<OwnedDatum>>> {
+        let mut found: Vec<(OwnedDatum, &crate::engine::keys::ViolationQuery)> = Vec::new();
+        for query in own {
+            let (answer, _) = self.run(&query.sql)?;
+            for row in answer {
+                found.push((row.first().cloned().unwrap_or(OwnedDatum::Null), query));
+            }
+        }
+        found.sort_by(|(left, near), (right, far)| match (left, right) {
+            (OwnedDatum::Int(left), OwnedDatum::Int(right)) => {
+                left.cmp(right).then(near.key.cmp(&far.key))
+            }
+            _ => near.key.cmp(&far.key),
+        });
+        Ok(found
+            .into_iter()
+            .map(|(rowid, query)| {
+                vec![
+                    OwnedDatum::Text(query.child.clone()),
+                    rowid,
+                    OwnedDatum::Text(query.parent.clone()),
+                    OwnedDatum::Int(i64::from(query.key)),
+                ]
+            })
+            .collect())
     }
     /// Runs the integrity checker over every tree.
     ///
@@ -109,7 +222,21 @@ impl crate::ImportedDatabase {
     /// and this one holds a record per change, so a record count would be a
     /// bigger number meaning something else; the pages written is the same
     /// physical quantity SQLite's frame count is.
-    pub(crate) fn pragma_wal_checkpoint(&mut self) -> DbResult<Outcome> {
+    ///
+    /// **The mode decides what is reported afterwards, as in SQLite.** `PASSIVE`,
+    /// `FULL` and `RESTART` report the pages the checkpoint moved. `TRUNCATE`
+    /// empties the log, so it reports `0|0|0` whatever it moved: a log with no
+    /// frames in it, and none left to move. A word that is not a mode is
+    /// `PASSIVE`, as SQLite reads it.
+    ///
+    /// @param argument - the mode named in the pragma, when one was given
+    pub(crate) fn pragma_wal_checkpoint(
+        &mut self,
+        argument: Option<&PragmaArgument>,
+    ) -> DbResult<Outcome> {
+        let truncates = argument
+            .map(|argument| argument_text(argument).eq_ignore_ascii_case("truncate"))
+            .unwrap_or(false);
         // **Refused, not answered `1 | -1 | -1`, once the open transaction has
         // written anything.** The pinned reference checkpoints fine after a
         // bare `BEGIN` - no write lock is held yet - and answers `database
@@ -122,8 +249,9 @@ impl crate::ImportedDatabase {
         // would require - is exactly the no-steal argument `holds_uncommitted`
         // makes, so this is refused rather than made honest.
         if self.writing.batch().is_some() && self.writing.touched() != 0 {
-            return Err(DbError::primary(PrimaryCode::Locked)
-                .with_detail("cannot checkpoint: a transaction has written and not committed"));
+            return Err(
+                DbError::primary(PrimaryCode::Locked).with_detail("database table is locked")
+            );
         }
         // **Minus one twice when there is no log to check point.** SQLite
         // answers `0|-1|-1` under a rollback journal because the two counts are
@@ -143,15 +271,12 @@ impl crate::ImportedDatabase {
                 changes: Default::default(),
             });
         }
-        let before = self.storage.database.pool().stats().writes;
+        // **The pages the checkpoint is about to write are the log's frames.**
+        // Counting what the checkpoint wrote also counted the meta page it
+        // always rewrites, so a checkpoint with nothing to do reported 3.
+        let waiting = self.storage.database.pool().dirty_pages() as i64;
         self.checkpoint()?;
-        let moved = self
-            .storage
-            .database
-            .pool()
-            .stats()
-            .writes
-            .saturating_sub(before) as i64;
+        let moved = if truncates { 0 } else { waiting };
         Ok(Outcome {
             rows: vec![vec![
                 OwnedDatum::Int(0),

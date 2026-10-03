@@ -10,6 +10,194 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**A usage corpus of 1,719 application scripts, and the defects it found, fixed.** The new suite
+`differential::usage_corpus` runs the scripts in `compat/corpus/usage` through `inillucent-shell` and
+through the pinned `sqlite3` 3.53.4 shell and compares the output byte for byte, including column
+names, storage classes and error text. The scripts are the statements applications send: the pragmas
+a driver runs on connect, the catalog queries an ORM runs to read a schema, a migration's table
+rebuild, ordinary create, read, update and delete code, and the error messages those tools parse.
+`compat/corpus/usage/known.toml` lists the cases that still differ, each as a `defect` or a
+`deviation`, and the suite fails on a case that differs without an entry and on an entry whose case
+now matches. `INILLUCENT_USAGE_REPORT=<file>` writes every difference to a JSON file.
+
+The shell:
+
+- **With `.headers on`, a statement that returns no rows prints nothing.** It printed an empty line.
+- **`.mode insert` with headers on names the columns**, as in `INSERT INTO tab(a,b) VALUES(...)`, and
+  quotes a name only where SQLite's shell does.
+- **`.headers` is a choice that survives `.mode`.** Without one, the `column`, `table`, `box`,
+  `markdown` and `html` modes show headers and the other modes do not. With headers off, the drawn
+  modes size columns by their values and draw no header.
+- **`inillucent export` of an empty result still writes the header line.**
+- **`.mode quote` prints text that holds control characters as `unistr('...')`.**
+- **Input runs in chunks the way `sqlite3_complete` splits it.** A parse error abandons the rest of
+  that input line, and the excerpt and caret lines under an error match SQLite's.
+- **`.parameter set` evaluates its value as an expression**, so `NULL` is `NULL`, and
+  `.parameter set ?2 20` binds `?2`.
+
+Schema changes:
+
+- **`ALTER TABLE ... RENAME TO` rewrites `REFERENCES` in other tables, table qualifiers in views,
+  trigger bodies, and temporary triggers and views.** `RENAME COLUMN` rewrites trigger bodies
+  (`new.col`), `UPDATE OF` lists, upsert targets, partial and expression indexes and child
+  `REFERENCES t(col)`. Both check every dependent view and trigger first and fail with SQLite's
+  `error in view v: ...` messages. A name that starts with `sqlite_` is refused.
+- **`PRAGMA legacy_alter_table` can be set and changes `RENAME` as in SQLite.**
+- **`ALTER TABLE ADD COLUMN` refuses a default that is not constant, a `CURRENT_TIMESTAMP` default,
+  and a `REFERENCES` column with a default that is not `NULL` when the table has rows.** The new
+  column is written before the table constraints in the stored SQL.
+- **`ALTER TABLE DROP COLUMN` follows SQLite's rules and messages**, and cuts the stored SQL as
+  SQLite does.
+- **The SQLite 3.53 forms `ALTER COLUMN c SET NOT NULL`, `ALTER COLUMN c DROP NOT NULL`,
+  `ADD CONSTRAINT n CHECK (...)` and `DROP CONSTRAINT` run.**
+- **`CREATE VIEW` stores the body without resolving it.** An error in the body, including a column
+  list of the wrong width, appears when the view is read.
+- **`CREATE TABLE` refuses what SQLite refuses at create time**: an unknown collation, a
+  `DEFAULT (nosuch)`, a duplicate `WITH` name, a qualified table name in a trigger body, and two
+  primary keys. A persistent view cannot name another database.
+- **`DROP TABLE` and `DROP INDEX` remove the table's `sqlite_stat1` rows**, and SQLite's own tables
+  and constraint indexes cannot be dropped.
+- **`PRIMARY KEY(a AUTOINCREMENT)` at table level and quoted type names parse.**
+
+Writes:
+
+- **`UPDATE` and `DELETE` on a view run its `INSTEAD OF UPDATE` and `INSTEAD OF DELETE` triggers**,
+  including `UPDATE ... FROM`. `INSERT ... ON CONFLICT` on a view fails with `cannot UPSERT a view`.
+  Triggers on views are still there after the file is closed and opened again.
+- **`ON CONFLICT` may name a partial unique index or an expression index.** The `WHERE` must match
+  the index predicate. The capability rows `on_conflict_partial_index` and
+  `on_conflict_expression_index` changed from `no` to `yes`.
+- **Upsert `DO UPDATE` runs the `CHECK`, `NOT NULL` and `STRICT` checks and fires the table's
+  `UPDATE` triggers.**
+- **`REPLACE` and `UPDATE OR REPLACE` run the foreign key actions of every row they remove.** Delete
+  triggers fire for those rows only with `recursive_triggers` on.
+- **A `BEFORE UPDATE` trigger's change to the same row is kept**, and constraints are checked after
+  the `BEFORE` triggers. The rowid of a new row is chosen after the `BEFORE INSERT` triggers, and a
+  `BEFORE INSERT` trigger sees `-1` for an unassigned rowid.
+- **A trigger body inherits the conflict action of the statement that fired it.**
+- **`UPDATE t SET id = id + 1` visits rows in rowid order** and fails with the `UNIQUE` error where
+  SQLite does.
+- **A column assigned twice in `UPDATE` takes the last value**, and a column listed twice in `INSERT`
+  follows SQLite's rule.
+- **A foreign key compares with the parent column's collation**, and a row may reference itself.
+- **`INSERT ... AS alias` works for upsert**, `last_insert_rowid()` works inside `RETURNING`, and
+  the `sqlite_sequence` rows for `AUTOINCREMENT` follow SQLite.
+
+Generated columns:
+
+- **Virtual and stored generated columns follow SQLite**: their result names, the declared affinity
+  and collation, `STRICT` checks, `NOT NULL`, `UNIQUE` and `ON CONFLICT`, foreign keys as parent or
+  child, real values in `OLD`, `NEW` and `excluded`, and `NULL` for the missing row of an outer join.
+
+Queries:
+
+- **`ORDER BY` is applied when an `IN` list is answered from an index**, and `LIMIT -1 OFFSET n`
+  keeps the offset in every query shape.
+- **`x IS TRUE` is true for any number that is not zero.**
+- **A scalar subquery keeps its column affinity.** A compound subquery column has an affinity only
+  when its arms agree, and `WHERE` terms over a compound subquery are pushed into its arms as SQLite
+  does.
+- **Recursive CTEs accept `ORDER BY`, which orders the queue, and `LIMIT` and `OFFSET`.**
+- **A result column alias may be used in `WHERE`.**
+- **`(a, b) IN (SELECT ...)` runs.** The capability row `row_value_in_subquery` changed from `no` to
+  `yes`, and the example of an unbuilt construct in the docs is now `ATTACH ? AS other`.
+- **`SELECT *` on a rowid table walks the table in rowid order** unless a narrower covering index
+  exists.
+- **View and `CREATE TABLE ... AS SELECT` column names follow SQLite**: an expression such as
+  `a + b` is named by its text, and duplicate names get `:1` and `:2` suffixes.
+- **A constant false `WHERE` is tested once before any scan**, so `generate_series(1) WHERE 0`
+  returns at once. `generate_series` with a `NULL` argument returns no rows, and a negative step
+  works.
+- **`count()` with no argument is valid.** `sum`, `total` and `avg` of overflowing reals give `Inf`,
+  and bare columns next to `min` and `max` follow SQLite's rule.
+- **`IN` lists take affinity and collation from the left operand.** `COLLATE` on an `ORDER BY`
+  ordinal or alias works, and a compound takes its collation from the leftmost arm that has one.
+- **`printf` supports `*` for width and precision**, and an unknown conversion returns `NULL`.
+- **Infinity prints as `9.0e+999` in `quote()` and the JSON constructors**, and numeric literals
+  accept `_` separators.
+- **`PRAGMA reverse_unordered_selects` reverses the outer scan.**
+
+Pragmas and the catalog:
+
+- **A `pragma_*` table valued function can take its argument from an earlier `FROM` term**, as in
+  `FROM sqlite_master m, pragma_index_list(m.name)`. This is how EF Core and Rails read a schema.
+  `pragma_foreign_key_check` exists, and `PRAGMA foreign_key_check` reports rows whose parent table
+  does not exist.
+- **`PRAGMA foreign_keys` inside a transaction does nothing**, and `BEGIN IMMEDIATE` fails under
+  `query_only`.
+- **`mmap_size`, `wal_autocheckpoint`, `journal_size_limit`, `temp_store = FILE`,
+  `synchronous = EXTRA`, `threads`, the heap limits, `cache_spill` and the flag pragmas are stored
+  and read back as SQLite reports them.** They do not change how inillucent runs: it maps no pages,
+  has one thread, and folds the log at checkpoints.
+- **`index_list` reports the origin `u`, `pk` or `c`.** `foreign_key_list` numbers its rows and names
+  the implicit parent column as SQLite does, `table_list` and `database_list` report schema names,
+  `function_list` reports the type `w`, and standard type names are upper case.
+
+Messages and functions:
+
+- **Error messages and error classes match SQLite's text across the corpus.** That includes
+  `datatype mismatch`, which printed a Rust debug value, `misuse of aggregate function count()`,
+  `table t has 2 columns but 3 values were supplied`, `UNIQUE constraint failed: index 'i'` for an
+  expression index, and `no such table: main.x` where SQLite names the schema.
+- **Date and time functions follow SQLite's `date.c`**: negative years, the `+YYYY-MM-DD HH:MM:SS`
+  modifier, fractional months and `subsec`.
+- **JSON functions handle malformed paths and wrong argument counts as `json.c` does.**
+
+Joins and subqueries:
+
+- **`WHERE` terms are pushed into the arms of a compound subquery**, as SQLite does.
+- **`RIGHT` and `FULL` joins after an inner join keep unmatched rows**, and parenthesised joins work.
+- **Subqueries work in a join's `ON`, in `RETURNING` and in the `SET` and `WHERE` of an upsert.**
+- **`INSERT ... VALUES ... UNION ALL VALUES` inserts every row**, and `LEFT JOIN json_each(NULL)`
+  keeps the left row.
+- **Rows produced before a run time error are returned before the error.**
+- **`AND`, `OR`, `coalesce`, `ifnull` and `iif` skip the operands SQLite skips**, and an `EXISTS`
+  select list is never evaluated.
+- **A CTE used twice is evaluated once when it calls a volatile function**, and a subquery that calls
+  `random()` is evaluated for every row.
+- **A subquery with several columns works as a row value**, and fails with
+  `sub-select returns N columns - expected 1` where one value is needed.
+- **A view in `main` no longer reads a temporary table that shadows its base table.**
+- **`INDEXED BY` a partial index works where SQLite accepts it.**
+- **`RETURNING` is evaluated right after each row is written, before `AFTER` triggers.**
+- **An aggregate whose arguments read only the outer query belongs to the outer query when it is used
+  inside a subquery**, as in `SELECT (SELECT max(t.a)) FROM t`.
+
+Errors and ordering:
+
+- **`ORDER BY` or `LIMIT` before a compound operator is an error with SQLite's wording**, and a
+  circular CTE fails with `circular reference: name`.
+- **`GROUP BY` takes the direction of an `ORDER BY` with the same number of terms**, which sets the
+  order of tied groups.
+- **`CREATE TABLE ... AS` stores the query's values without applying the new column's affinity.**
+- **`MATCH` on a plain column fails for each row**, an unknown function's error keeps its name as
+  written, and `NULLS FIRST` and `NULLS LAST` on an index key are refused as in SQLite.
+- **A `WITHOUT ROWID` table with a `DESC` primary key term answers range predicates and `ORDER BY`
+  correctly.** They returned no rows before.
+- **`PRAGMA page_size = n` prints nothing**, and `PRAGMA cache_size` reads a value outside 32 bits
+  as 0.
+- **`EXPLAIN QUERY PLAN` prints attached schema names, automatic index lines and `LEFT-JOIN` markers**
+  as SQLite does. It still prints a flat list, with no `MATERIALIZE`, `CO-ROUTINE`, `MERGE` or
+  `COMPOUND QUERY` blocks.
+
+JSON and dates:
+
+- **JSON5 input accepts Unicode whitespace**, and an unpaired surrogate escape is read as SQLite
+  reads it.
+- **A blob that is not JSONB is read as JSON text**, and `json_each` and `json_tree` give SQLite's
+  `id` values at a path.
+- **A date function accepts a blob as the format or a modifier and `subsec` as the time value**, and
+  `timediff` works in both directions.
+
+Differences from SQLite that stay, each listed in `known.toml` as a `deviation`: `DELETE ... LIMIT`
+and `UPDATE ... LIMIT` are accepted, because the pinned `sqlite3` is built without
+`SQLITE_ENABLE_UPDATE_DELETE_LIMIT` and many distribution builds enable it. `page_size` defaults to
+32768 and `cache_size` to -131072, and `PRAGMA page_size` before the first write, and
+`PRAGMA aux.page_size`, are ignored, because the page size is part of inillucent's own file format.
+`page_count`, `freelist_count` and `max_page_count` count the larger pages, `busy_timeout` defaults to
+5000, `sqlite_schema.rootpage` numbers differ, and a `WITHOUT ROWID` table with a `DESC` primary key
+returns rows in ascending key order when a query has no `ORDER BY`.
+
 **Eleven defects found by new tests that run several real processes against one file, and fixed.**
 Four workers and two readers open one file, commit seeded transactions, and are killed at random
 moments; a checker rebuilds every acknowledged transaction from its seed and compares the file byte

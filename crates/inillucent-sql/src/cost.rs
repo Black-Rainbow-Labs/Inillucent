@@ -176,3 +176,72 @@ mod tests {
         assert!(search_cost(0.0, 0.0, true) > 0.0);
     }
 }
+
+/// Returns SQLite's estimate of how wide one column's values are.
+///
+/// SQLite's `szEst`: 1 for a column with no declared type and for every numeric
+/// affinity, 16 for a `TEXT` or `BLOB` declaration, and for `CHAR(n)`-style
+/// declarations `n / 4 + 1`, at most 255. Only the comparison between a table
+/// and an index matters, so the numbers are the ones SQLite compares.
+///
+/// @param column - the column as declared
+pub fn column_width(column: &crate::catalog_view::ColumnInfo) -> u32 {
+    use inillucent_value::Affinity;
+    if column.declared_type.is_empty() {
+        return 1;
+    }
+    if !matches!(column.affinity, Affinity::Text | Affinity::Blob) {
+        return 1;
+    }
+    let lowered = column.declared_type.to_ascii_lowercase();
+    let Some(start) = lowered.windows(4).position(|word| word == b"char") else {
+        return 16;
+    };
+    let digits: Vec<u8> = lowered
+        .iter()
+        .skip(start)
+        .skip_while(|byte| !byte.is_ascii_digit())
+        .take_while(|byte| byte.is_ascii_digit())
+        .copied()
+        .collect();
+    let length = String::from_utf8_lossy(&digits).parse::<u32>().unwrap_or(0);
+    (length / 4 + 1).clamp(1, 255)
+}
+
+/// Reports whether an index entry is narrower than a row of its table, which is
+/// the only reason SQLite walks an index in place of the table when nothing
+/// else decides.
+///
+/// **A covering index that is no narrower is not walked.** `SELECT * FROM t` on
+/// `t(id INTEGER PRIMARY KEY, u UNIQUE)` returns the rows in rowid order in
+/// SQLite, because the index entry (`u` and the rowid) is as wide as the row.
+/// Walking it anyway returned them in `u` order, and an application that reads
+/// a table without an `ORDER BY` gets rowid order.
+///
+/// @param table - the table
+/// @param index - an index over it that holds every column the query reads
+pub fn index_is_narrower(
+    table: &crate::catalog_view::TableInfo,
+    index: &crate::catalog_view::IndexInfo,
+) -> bool {
+    if table.without_rowid {
+        return true;
+    }
+    let row: u32 = table
+        .columns
+        .iter()
+        .map(column_width)
+        .sum::<u32>()
+        .saturating_add(u32::from(table.rowid_alias.is_none()));
+    let entry: u32 = index
+        .columns
+        .iter()
+        .map(|key| {
+            key.plain_column()
+                .and_then(|at| table.columns.get(usize::from(at)))
+                .map_or(1, column_width)
+        })
+        .sum::<u32>()
+        .saturating_add(1);
+    entry < row
+}

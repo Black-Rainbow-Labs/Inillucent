@@ -233,33 +233,64 @@ pub fn text5_to_json(content: &str) -> String {
 }
 
 /// Returns string content with every escape resolved, as SQL text.
+///
+/// An unpaired surrogate escape has no `String` spelling, so it becomes U+FFFD here. Use
+/// `unescape_bytes` where the exact bytes matter.
+///
+/// @param node - the text node
 pub fn unescape(node: &Node) -> String {
+    String::from_utf8_lossy(&unescape_bytes(node)).into_owned()
+}
+
+/// Appends a code point as the bytes SQLite writes for it, including the three byte form of an unpaired surrogate.
+///
+/// @param out - the bytes being built
+/// @param code - the code point, or an unpaired surrogate value
+fn push_code_point(out: &mut Vec<u8>, code: u32) {
+    match char::from_u32(code) {
+        Some(character) => out.extend_from_slice(character.encode_utf8(&mut [0u8; 4]).as_bytes()),
+        None if (0xd800..0xe000).contains(&code) => {
+            out.push(0xe0 | ((code >> 12) & 0x0f) as u8);
+            out.push(0x80 | ((code >> 6) & 0x3f) as u8);
+            out.push(0x80 | (code & 0x3f) as u8);
+        }
+        None => out.extend_from_slice("\u{fffd}".as_bytes()),
+    }
+}
+
+/// Returns string content with every escape resolved, as the bytes SQLite produces.
+///
+/// An unpaired surrogate escape such as `\ud800` becomes the three bytes `ED A0 80`, which is what
+/// the pinned release returns, so the result is bytes and not a `String`.
+///
+/// @param node - the text node
+pub fn unescape_bytes(node: &Node) -> Vec<u8> {
     let content = match node {
-        Node::Text(text) => return text.clone(),
-        Node::TextRaw(text) => return text.clone(),
+        Node::Text(text) => return text.clone().into_bytes(),
+        Node::TextRaw(text) => return text.clone().into_bytes(),
         Node::TextJ(text) | Node::Text5(text) => text,
-        _ => return String::new(),
+        _ => return Vec::new(),
     };
-    let mut out = String::with_capacity(content.len());
+    let mut out: Vec<u8> = Vec::with_capacity(content.len());
     let mut characters = content.chars().peekable();
     while let Some(character) = characters.next() {
         if character != '\\' {
-            out.push(character);
+            push_code_point(&mut out, character as u32);
             continue;
         }
         match characters.next() {
-            None => out.push('\\'),
-            Some('"') => out.push('"'),
-            Some('\\') => out.push('\\'),
-            Some('/') => out.push('/'),
-            Some('b') => out.push('\u{8}'),
-            Some('f') => out.push('\u{c}'),
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('v') => out.push('\u{b}'),
-            Some('0') => out.push('\0'),
-            Some('\'') => out.push('\''),
+            None => out.push(b'\\'),
+            Some('"') => out.push(b'"'),
+            Some('\\') => out.push(b'\\'),
+            Some('/') => out.push(b'/'),
+            Some('b') => out.push(8),
+            Some('f') => out.push(0x0c),
+            Some('n') => out.push(b'\n'),
+            Some('r') => out.push(b'\r'),
+            Some('t') => out.push(b'\t'),
+            Some('v') => out.push(0x0b),
+            Some('0') => out.push(0),
+            Some('\'') => out.push(b'\''),
             Some('x') => {
                 let mut value = 0u32;
                 for _ in 0..2 {
@@ -269,7 +300,7 @@ pub fn unescape(node: &Node) -> String {
                     characters.next();
                     value = value * 16 + digit;
                 }
-                out.push(char::from_u32(value).unwrap_or('\u{fffd}'));
+                push_code_point(&mut out, value);
             }
             Some('u') => {
                 let value = read_hex4(&mut characters);
@@ -282,12 +313,12 @@ pub fn unescape(node: &Node) -> String {
                         if (0xdc00..0xe000).contains(&low) {
                             characters = lookahead;
                             let combined = 0x1_0000 + ((value - 0xd800) << 10) + (low - 0xdc00);
-                            out.push(char::from_u32(combined).unwrap_or('\u{fffd}'));
+                            push_code_point(&mut out, combined);
                             continue;
                         }
                     }
                 }
-                out.push(char::from_u32(value).unwrap_or('\u{fffd}'));
+                push_code_point(&mut out, value);
             }
             Some('\n') => {}
             Some('\r') => {
@@ -295,7 +326,7 @@ pub fn unescape(node: &Node) -> String {
                     characters.next();
                 }
             }
-            Some(other) => out.push(other),
+            Some(other) => push_code_point(&mut out, other as u32),
         }
     }
     out
@@ -362,6 +393,20 @@ mod tests {
         );
         let empty = parse::parse("{\"a\":{}}").expect("parses").node;
         assert_eq!(to_pretty(&empty, "    "), "{\n    \"a\": {}\n}");
+    }
+
+    /// An unpaired surrogate escape becomes the three bytes SQLite writes for it.
+    #[test]
+    fn an_unpaired_surrogate_keeps_its_three_bytes() {
+        let high = Node::TextJ("a\\ud800b".to_string());
+        assert_eq!(unescape_bytes(&high), vec![0x61, 0xed, 0xa0, 0x80, 0x62]);
+        let low = Node::TextJ("\\udc00".to_string());
+        assert_eq!(unescape_bytes(&low), vec![0xed, 0xb0, 0x80]);
+        let swapped = Node::TextJ("\\ude00\\ud83d".to_string());
+        assert_eq!(
+            unescape_bytes(&swapped),
+            vec![0xed, 0xb8, 0x80, 0xed, 0xa0, 0xbd]
+        );
     }
 
     /// Escapes resolve to the characters they name when read as SQL text.

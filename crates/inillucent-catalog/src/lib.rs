@@ -39,11 +39,14 @@
     )
 )]
 
+pub mod alter_text;
 pub mod analyze;
 pub mod ddl;
 pub mod load;
 pub mod paged;
 pub mod rename;
+mod rename_column;
+mod rename_table;
 pub mod snapshot;
 
 pub use ddl::{

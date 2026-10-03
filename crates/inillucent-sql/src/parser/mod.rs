@@ -33,15 +33,57 @@ pub struct ParameterMap {
     pub count: u32,
     /// Named parameters and the index each was assigned.
     pub names: Vec<(Vec<u8>, u32)>,
+    /// Which of `?1` to `?64` the statement wrote, as bit `N - 1`.
+    ///
+    /// **A bitset because the name of `?N` is its own text, and copying that
+    /// text into `names` cost two allocations on every compile of a statement
+    /// that binds `?1`.** Compiling `SELECT id FROM t WHERE email = ?1` is the
+    /// statement the allocation budget measures. A number above 64 is rare and
+    /// goes into `names` as before.
+    pub numbered: u64,
 }
 
 impl ParameterMap {
     /// Returns the index a named parameter was assigned.
+    ///
+    /// @param name - the parameter as written, sigil included
     pub fn index_of(&self, name: &[u8]) -> Option<u32> {
+        if let Some(index) = self.numbered_index(name) {
+            return Some(index);
+        }
         self.names
             .iter()
             .find(|(candidate, _)| candidate == name)
             .map(|(_, index)| *index)
+    }
+
+    /// Returns N when `name` is `?N` for an N the bitset holds and the
+    /// statement wrote.
+    ///
+    /// @param name - the parameter as written
+    fn numbered_index(&self, name: &[u8]) -> Option<u32> {
+        let digits = name.strip_prefix(b"?")?;
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) || digits.len() > 2 {
+            return None;
+        }
+        let index = digits.iter().fold(0u32, |sum, byte| {
+            sum.saturating_mul(10)
+                .saturating_add(u32::from(byte.saturating_sub(b'0')))
+        });
+        let written = (1..=64).contains(&index) && self.numbered & (1u64 << (index - 1)) != 0;
+        written.then_some(index)
+    }
+
+    /// Returns every parameter that has a name, `?N` included, as the name and
+    /// the index it was assigned.
+    pub fn all_names(&self) -> Vec<(Vec<u8>, u32)> {
+        let mut all = self.names.clone();
+        for index in 1..=64u32 {
+            if self.numbered & (1u64 << (index - 1)) != 0 {
+                all.push((format!("?{index}").into_bytes(), index));
+            }
+        }
+        all
     }
 }
 
@@ -98,6 +140,15 @@ pub struct Parser<'a> {
     /// enumeration of every expression node, to be kept in step with the first
     /// for ever. See `no_subquery_in_check`.
     selects: u64,
+    /// Set while `ALTER TABLE ... ADD COLUMN` reads the column definition.
+    ///
+    /// SQLite reports a subquery in the added column's `CHECK` after it has made
+    /// the change, as a run time error, where `CREATE TABLE` reports it while
+    /// compiling. While this is set `no_subquery_in_check` records the fact in
+    /// `deferred_check_subquery` and lets the parse finish.
+    deferring_check_subquery: bool,
+    /// Whether a `CHECK` subquery was seen while `deferring_check_subquery` was set.
+    deferred_check_subquery: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -133,6 +184,8 @@ impl<'a> Parser<'a> {
             depth: 0,
             parameters: ParameterMap::default(),
             selects: 0,
+            deferring_check_subquery: false,
+            deferred_check_subquery: false,
         }
     }
 
@@ -149,7 +202,10 @@ impl<'a> Parser<'a> {
     /// Fills the lookahead buffer to at least `wanted` tokens.
     fn fill(&mut self, wanted: usize) -> Result<(), ParseError> {
         while self.buffer.len() < wanted {
-            let token = self.lexer.next_token()?;
+            let token = match self.lexer.next_token() {
+                Ok(token) => token,
+                Err(error) => return Err(crate::diagnostic::lex_failure(self.source, error)),
+            };
             let end = token.kind == TokenKind::EndOfInput;
             self.buffer.push(token);
             if end {
@@ -375,6 +431,16 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Returns whether a token may be one word of a declared type name.
+    ///
+    /// The grammar's `typename ::= ids` and `ids ::= ID|STRING`, so a type may be
+    /// written as a string: `CREATE TABLE u(a 'INTEGER' PRIMARY KEY)` is accepted.
+    ///
+    /// @param token - the token to test
+    fn token_is_type_word(token: Token) -> bool {
+        Parser::token_is_plain_name(token) || token.kind == TokenKind::String
+    }
+
     /// Reports whether a token is a word, keyword or not.
     ///
     /// It is deliberately weaker than [`Parser::token_is_name`], which asks
@@ -390,12 +456,6 @@ impl<'a> Parser<'a> {
         Ok(Parser::token_is_name(self.peek()?))
     }
 
-    /// Returns whether the next token may be read where the grammar writes
-    /// `ids` - a bare alias, or a declared type name.
-    fn at_plain_name(&mut self) -> Result<bool, ParseError> {
-        Ok(Parser::token_is_plain_name(self.peek()?))
-    }
-
     /// Refuses a subquery where SQLite refuses one.
     ///
     /// `CHECK (a IN (SELECT ...))` is `subqueries prohibited in CHECK
@@ -409,6 +469,10 @@ impl<'a> Parser<'a> {
     /// @param span - where the constraint was written
     fn no_subquery_in_check(&mut self, before: u64, span: Span) -> Result<(), ParseError> {
         if self.selects == before {
+            return Ok(());
+        }
+        if self.deferring_check_subquery {
+            self.deferred_check_subquery = true;
             return Ok(());
         }
         Err(ParseError::new(
@@ -523,7 +587,10 @@ impl<'a> Parser<'a> {
         if self.at_keyword(Keyword::WINDOW)? {
             return Ok((None, false));
         }
-        if Parser::token_is_plain_name(self.peek()?) {
+        // **A string literal is an alias too**: SQLite's `as ::= ids` and
+        // `ids ::= ID|STRING`, so `SELECT 'a' 'b'` names its column `b`.
+        let next = self.peek()?;
+        if Parser::token_is_plain_name(next) || next.kind == TokenKind::String {
             let name = self.parse_name()?;
             return Ok((Some(name), false));
         }
@@ -565,11 +632,21 @@ impl<'a> Parser<'a> {
             }
             if index == 0 || index > limit {
                 return Err(ParseError::new(
-                    ParseErrorKind::LimitExceeded("variable number"),
+                    ParseErrorKind::Refused(format!(
+                        "variable number must be between ?1 and ?{limit}"
+                    )),
                     token.span,
                 ));
             }
             self.parameters.count = self.parameters.count.max(index);
+            // **`?N` has a name, and the name is its own text.** SQLite's
+            // `sqlite3_bind_parameter_name` answers `?2` for it, which is how
+            // a caller that binds by name (`.parameter set ?2 20`) finds it.
+            if index <= 64 {
+                self.parameters.numbered |= 1u64 << (index - 1);
+            } else if self.parameters.index_of(text).is_none() {
+                self.parameters.names.push((text.to_vec(), index));
+            }
             return Ok((index, None));
         }
         if sigil == b'?' {
@@ -747,21 +824,32 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        self.eat_keyword(Keyword::TRANSACTION)?;
+        self.eat_transaction_suffix()?;
         Ok(Statement::Begin { behaviour })
     }
 
-    /// Parses `COMMIT|END [TRANSACTION]`.
+    /// Parses SQLite's `trans_opt`: nothing, `TRANSACTION`, or `TRANSACTION name`.
+    ///
+    /// The name is read and thrown away, as SQLite does. It is accepted on
+    /// `BEGIN`, `COMMIT`, `END` and `ROLLBACK` alike and has no effect.
+    fn eat_transaction_suffix(&mut self) -> Result<(), ParseError> {
+        if self.eat_keyword(Keyword::TRANSACTION)? && self.at_name()? {
+            self.parse_name()?;
+        }
+        Ok(())
+    }
+
+    /// Parses `COMMIT|END [TRANSACTION [name]]`.
     fn parse_commit(&mut self) -> Result<Statement, ParseError> {
         self.bump()?;
-        self.eat_keyword(Keyword::TRANSACTION)?;
+        self.eat_transaction_suffix()?;
         Ok(Statement::Commit)
     }
 
-    /// Parses `ROLLBACK [TRANSACTION] [TO [SAVEPOINT] name]`.
+    /// Parses `ROLLBACK [TRANSACTION [name]] [TO [SAVEPOINT] name]`.
     fn parse_rollback(&mut self) -> Result<Statement, ParseError> {
         self.expect_keyword(Keyword::ROLLBACK)?;
-        self.eat_keyword(Keyword::TRANSACTION)?;
+        self.eat_transaction_suffix()?;
         if self.eat_keyword(Keyword::TO)? {
             self.eat_keyword(Keyword::SAVEPOINT)?;
             let name = self.parse_name()?;

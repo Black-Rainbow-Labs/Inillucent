@@ -215,6 +215,7 @@ where a test goes. The common cases:
 |---|---|---|
 | one function or module | `#[cfg(test)]` in the crate | `unit` |
 | a construct SQLite also has | `inillucent-compat/tests/`, graded against the oracle | `differential` |
+| a sequence of statements an application sends, such as a driver's connection pragmas, an ORM's catalog queries or a migration's table rebuild | a case in `compat/corpus/usage/*.sql`, run by `differential::usage_corpus` | `differential` |
 | a statement form, in every context the matrix names | a case in `inillucent-compat/tests/corpora/matrix/<family>/`, or a template in `statement_matrix/templates/` | `matrix` |
 | SQL or storage with no SQLite equivalent | `inillucent-compat/tests/` | `engine` |
 | what an application does with the public API | `crates/inillucent/tests/` | `e2e` |
@@ -229,6 +230,50 @@ A new `tests/*.rs` file needs a row in `tests/selection.toml`. Without the row, 
 fails and names the target. In `inillucent-compat`, a suite is a module of its tier binary: a file
 in `tests/<tier>/`, a `mod` line in `tests/<tier>/main.rs`, and a row with `name = "<tier>"` and
 `module = "<file>"`. Its target is `inillucent-compat::<tier>::<file>`.
+
+### The usage corpus
+
+`differential::usage_corpus` runs every script in `compat/corpus/usage/*.sql` through
+`inillucent-shell` and through the pinned `sqlite3` shell, with `.mode quote` and `.headers on`
+added in front, and compares the two outputs byte for byte. The comparison includes column names,
+storage classes and error text. It has 1,719 cases.
+
+To add a case, append a block to the file for its area:
+
+```sql
+-- case: dml/upsert-partial-index-target
+CREATE TABLE t(a, b);
+CREATE UNIQUE INDEX t_a ON t(a) WHERE b > 0;
+INSERT INTO t VALUES(1, 1) ON CONFLICT(a) WHERE b > 0 DO NOTHING;
+SELECT * FROM t;
+```
+
+The text after `-- case:` is the case name. It must be unique across all the files. The script is
+everything up to the next `-- case:` line, and it may hold dot commands.
+
+If a case prints something different from SQLite, either fix the engine or add an entry to
+`compat/corpus/usage/known.toml`:
+
+```toml
+[[known]]
+case = "dml/delete-update-limit-refused"
+kind = "deviation"
+reason = "the pinned sqlite3 shell is built without SQLITE_ENABLE_UPDATE_DELETE_LIMIT"
+```
+
+Use `kind = "deviation"` for a difference that stays on purpose and is described in `docs/sql.md`.
+Use `kind = "defect"` for a difference that has not been fixed yet. The suite fails when a case
+differs and has no entry, and it fails when an entry's case now matches, so delete the entry in the
+commit that fixes the case.
+
+Set `INILLUCENT_USAGE_REPORT=<file>` to write every difference to a JSON file. The file has the
+total case count and, for each difference, the case name, its file, its SQL, and what `sqlite3` and
+`inillucent-shell` printed. Run the suite before and after a fix, and compare the two reports, to see
+what the fix changed across the whole corpus:
+
+```sh
+INILLUCENT_USAGE_REPORT=_agent_output/usage-report.json target/debug/inillucent-testrun --target inillucent-compat::differential::usage_corpus
+```
 
 When a suite needs a prerequisite the workspace cannot build:
 

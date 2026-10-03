@@ -12,8 +12,10 @@
 //! span forms that read a run of entries.
 
 use inillucent_base::error::misuse;
+use inillucent_value::Collation;
 
 use super::*;
+use crate::ops::{compare_by, SortKey};
 
 /// Returns the key expressions an inner stage probes with.
 ///
@@ -136,6 +138,16 @@ pub(super) fn rowid_union_keys(
             seen.push(value);
         }
     }
+    // SQLite loops over an `IN` list in ascending order whatever order it was
+    // written in, because it builds an ephemeral index of the list first. A
+    // statement with no `ORDER BY` returns its rows in that order too.
+    let ascending = [SortKey {
+        column: 0,
+        descending: false,
+        collation: Collation::Binary,
+        nulls_first: true,
+    }];
+    seen.sort_by(|left, right| compare_by(left, right, &ascending));
     Ok(seen)
 }
 
@@ -193,6 +205,8 @@ pub(super) fn index_union_keys(
     branches: &[IndexSeekBranch],
     table: &TableInfo,
     columns: &[Option<u16>],
+    collations: &[Collation],
+    descending: &[bool],
     space: &Space<'_>,
     params: &Params,
 ) -> DbResult<Vec<Vec<OwnedDatum>>> {
@@ -221,6 +235,10 @@ pub(super) fn index_union_keys(
             seen.push(key);
         }
     }
+    // In index order, which is the order SQLite visits an `IN` list in: it
+    // sorts the values into an ephemeral index first.
+    let order = index_key_order(collations, descending, seen.first().map_or(0, Vec::len));
+    seen.sort_by(|left, right| compare_by(left, right, &order));
     Ok(seen)
 }
 
@@ -265,6 +283,7 @@ pub(super) fn range_union_bounds<'t>(
         columns,
         without_rowid,
         key_entry_slots,
+        dedup,
         ..
     } = path
     else {
@@ -272,6 +291,7 @@ pub(super) fn range_union_bounds<'t>(
     };
     let (table_root, index_root, without_rowid) = (*table_root, *index_root, *without_rowid);
     let mut scans = Vec::with_capacity(branches.len());
+    let mut starts: Vec<Vec<OwnedDatum>> = Vec::with_capacity(branches.len());
     for branch in branches {
         let branch_path = AccessPath::IndexSeek {
             table_root,
@@ -293,6 +313,7 @@ pub(super) fn range_union_bounds<'t>(
         if bounds.matches_nothing {
             continue;
         }
+        starts.push(bounds.low.clone().unwrap_or_default());
         scans.push(SpanScan::new(
             tree,
             projection.clone(),
@@ -302,7 +323,32 @@ pub(super) fn range_union_bounds<'t>(
             bounds.high_inclusive,
         ));
     }
+    // An `IN` list is visited in index order whatever order it was written in:
+    // SQLite sorts the values into an ephemeral index first. A keyset page's
+    // branches are already in the order they have to run in.
+    if *dedup {
+        let order = index_key_order(collations, descending, starts.first().map_or(0, Vec::len));
+        let mut paired: Vec<_> = starts.into_iter().zip(scans).collect();
+        paired.sort_by(|(left, _), (right, _)| compare_by(left, right, &order));
+        scans = paired.into_iter().map(|(_, scan)| scan).collect();
+    }
     Ok(scans)
+}
+
+/// Returns the sort keys that put index entries' leading columns in index order.
+///
+/// @param collations - the collation of each index column
+/// @param descending - whether each index column is stored descending
+/// @param width - how many leading columns to order by
+fn index_key_order(collations: &[Collation], descending: &[bool], width: usize) -> Vec<SortKey> {
+    (0..width)
+        .map(|column| SortKey {
+            column,
+            descending: descending.get(column).copied().unwrap_or(false),
+            collation: collations.get(column).copied().unwrap_or(Collation::Binary),
+            nulls_first: true,
+        })
+        .collect()
 }
 
 /// The bounds of a range scan, with the inclusivity of each end.

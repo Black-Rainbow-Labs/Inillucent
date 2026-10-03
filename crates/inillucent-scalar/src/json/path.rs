@@ -1,10 +1,17 @@
 //! JSON path parsing, lookup, and the four editing operations.
 //!
-//! Invariant: a path is either well formed or it is an error, and a lookup that
-//! finds nothing is not an error. `json_extract(x, '$.missing')` is NULL and
+//! Invariant: a lookup that finds nothing is not an error, and a path that does not
+//! start with `$` is. `json_extract(x, '$.missing')` is NULL and
 //! `json_extract(x, 'missing')` fails with "bad JSON path"; the two look alike
 //! from a distance and applications rely on the difference, because the first
 //! is a question about the data and the second is a bug in the query.
+//!
+//! **A malformed step is an error only when the walk reaches it.** SQLite reads a
+//! path one step at a time while it walks the document, so
+//! `json_extract('{"a":1}', '$.a[')` is NULL: `a` is a number, there is no array to
+//! index, and the broken `[` is never read. `json_extract('{"a":[1]}', '$.a[')` is an
+//! error. A step written `.` is checked whatever the document holds, and a step
+//! written `[` is checked only against an array, which [`Step::Malformed`] records.
 //!
 //! The editing operations differ only in what they do when the path already
 //! exists and when it does not, so they are one walk parameterised by that
@@ -25,72 +32,104 @@ pub enum Step {
     FromEnd(usize),
     /// `[#]`, which names the position one past the end.
     Append,
+    /// A step that does not parse, which ends the path.
+    ///
+    /// It is an error only if the walk gets this far. `array_only` is true for a
+    /// broken `[...]`, which SQLite does not read unless the element it is applied
+    /// to is an array; a broken `.` or an unknown character is read wherever the
+    /// walk stands.
+    Malformed {
+        /// Whether the step is reported only against an array.
+        array_only: bool,
+        /// The whole path as written, for the error.
+        text: String,
+    },
 }
 
 /// Parses a path, which must begin with `$`.
+///
+/// A step that does not parse ends the list with [`Step::Malformed`] and is not
+/// reported here; see the module comment for when it is.
 pub fn parse(text: &str) -> DbResult<Vec<Step>> {
     let mut characters = text.chars().peekable();
     if characters.next() != Some('$') {
         return Err(bad_path(text));
     }
     let mut steps = Vec::new();
+    let malformed = |array_only: bool| Step::Malformed {
+        array_only,
+        text: text.to_string(),
+    };
     loop {
         match characters.next() {
             None => return Ok(steps),
-            Some('.') => {
-                let name = if characters.peek() == Some(&'"') {
-                    characters.next();
-                    let mut name = String::new();
-                    loop {
-                        match characters.next() {
-                            None => return Err(bad_path(text)),
-                            Some('"') => break,
-                            Some('\\') => match characters.next() {
-                                None => return Err(bad_path(text)),
-                                Some(escaped) => name.push(escaped),
-                            },
-                            Some(character) => name.push(character),
-                        }
-                    }
-                    name
-                } else {
-                    let mut name = String::new();
-                    while let Some(character) = characters.peek() {
-                        if *character == '.' || *character == '[' {
-                            break;
-                        }
-                        name.push(*character);
-                        characters.next();
-                    }
-                    if name.is_empty() {
-                        return Err(bad_path(text));
-                    }
-                    name
-                };
-                steps.push(Step::Key(name));
-            }
-            Some('[') => {
-                let step = if characters.peek() == Some(&'#') {
-                    characters.next();
-                    if characters.peek() == Some(&'-') {
-                        characters.next();
-                        let back = read_number(&mut characters).ok_or_else(|| bad_path(text))?;
-                        Step::FromEnd(back)
-                    } else {
-                        Step::Append
-                    }
-                } else {
-                    let index = read_number(&mut characters).ok_or_else(|| bad_path(text))?;
-                    Step::Index(index)
-                };
-                if characters.next() != Some(']') {
-                    return Err(bad_path(text));
+            Some('.') => match read_key(&mut characters) {
+                Some(name) => steps.push(Step::Key(name)),
+                None => {
+                    steps.push(malformed(false));
+                    return Ok(steps);
                 }
-                steps.push(step);
+            },
+            Some('[') => match read_index(&mut characters) {
+                Some(step) => steps.push(step),
+                None => {
+                    steps.push(malformed(true));
+                    return Ok(steps);
+                }
+            },
+            Some(_) => {
+                steps.push(malformed(false));
+                return Ok(steps);
             }
-            Some(_) => return Err(bad_path(text)),
         }
     }
+}
+
+/// Reads the key after a `.`, either a quoted name or a run up to the next `.` or `[`.
+///
+/// Returns `None` for an empty key and for a quote that is never closed.
+///
+/// @param characters - the path, positioned just after the `.`
+fn read_key(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+    let mut name = String::new();
+    if characters.peek() == Some(&'"') {
+        characters.next();
+        loop {
+            match characters.next()? {
+                '"' => return Some(name),
+                '\\' => name.push(characters.next()?),
+                character => name.push(character),
+            }
+        }
+    }
+    while let Some(character) = characters.peek() {
+        if *character == '.' || *character == '[' {
+            break;
+        }
+        name.push(*character);
+        characters.next();
+    }
+    (!name.is_empty()).then_some(name)
+}
+
+/// Reads the index after a `[`: a number, `#`, or `#-` and a number, then the `]`.
+///
+/// Returns `None` when the text is none of those.
+///
+/// @param characters - the path, positioned just after the `[`
+fn read_index(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<Step> {
+    let step = if characters.peek() == Some(&'#') {
+        characters.next();
+        if characters.peek() == Some(&'-') {
+            characters.next();
+            Step::FromEnd(read_number(characters)?)
+        } else {
+            Step::Append
+        }
+    } else {
+        Step::Index(read_number(characters)?)
+    };
+    (characters.next() == Some(']')).then_some(step)
 }
 
 /// Reads a run of decimal digits, refusing an empty one.
@@ -115,24 +154,51 @@ pub fn bad_path(text: &str) -> DbError {
 }
 
 /// Resolves a path against a document, returning the element it names.
-pub fn lookup<'tree>(node: &'tree Node, steps: &[Step]) -> Option<&'tree Node> {
+///
+/// `Ok(None)` is an element that is not there. An error is a malformed step the
+/// walk reached; see the module comment for which those are.
+///
+/// @param node - the document
+/// @param steps - the path
+pub fn lookup<'tree>(node: &'tree Node, steps: &[Step]) -> DbResult<Option<&'tree Node>> {
     let Some((step, rest)) = steps.split_first() else {
-        return Some(node);
+        return Ok(Some(node));
     };
     match (step, node) {
-        (Step::Key(name), Node::Object(members)) => members
-            .iter()
-            .find(|(label, _)| label_matches(label, name))
-            .and_then(|(_, value)| lookup(value, rest)),
-        (Step::Index(index), Node::Array(items)) => {
-            items.get(*index).and_then(|item| lookup(item, rest))
+        (Step::Malformed { array_only, text }, held) => reached_malformed(*array_only, text, held),
+        (Step::Key(name), Node::Object(members)) => {
+            match members.iter().find(|(label, _)| label_matches(label, name)) {
+                Some((_, value)) => lookup(value, rest),
+                None => Ok(None),
+            }
         }
-        (Step::FromEnd(back), Node::Array(items)) => items
-            .len()
-            .checked_sub(*back)
-            .and_then(|index| items.get(index))
-            .and_then(|item| lookup(item, rest)),
-        _ => None,
+        (Step::Index(index), Node::Array(items)) => match items.get(*index) {
+            Some(item) => lookup(item, rest),
+            None => Ok(None),
+        },
+        (Step::FromEnd(back), Node::Array(items)) => {
+            match items
+                .len()
+                .checked_sub(*back)
+                .and_then(|index| items.get(index))
+            {
+                Some(item) => lookup(item, rest),
+                None => Ok(None),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Decides what a malformed step means for the element the walk is standing on.
+///
+/// @param array_only - whether the step is a broken `[...]`
+/// @param text - the path as written
+/// @param held - the element the walk reached
+fn reached_malformed<T>(array_only: bool, text: &str, held: &Node) -> DbResult<Option<T>> {
+    match !array_only || matches!(held, Node::Array(_)) {
+        true => Err(bad_path(text)),
+        false => Ok(None),
     }
 }
 
@@ -177,6 +243,9 @@ pub fn apply(node: &mut Node, steps: &[Step], value: Node, edit: Edit) -> DbResu
         return Ok(());
     };
     match (step, node) {
+        (Step::Malformed { array_only, text }, held) => {
+            reached_malformed::<()>(*array_only, text, held).map(|_| ())
+        }
         (Step::Key(name), Node::Object(members)) => {
             if let Some(position) = members
                 .iter()
@@ -260,6 +329,10 @@ pub fn insert_into_array(
     let Some((last, init)) = steps.split_last() else {
         return Ok(());
     };
+    if matches!(last, Step::Malformed { .. }) {
+        lookup(node, steps)?;
+        return Ok(());
+    }
     if matches!(last, Step::Key(_)) {
         return Err(inillucent_base::error::misuse(format!(
             "not an array element: '{written}'"
@@ -278,7 +351,7 @@ pub fn insert_into_array(
             Some(index) => index,
             None => return Ok(()),
         },
-        Step::Key(_) => return Ok(()),
+        Step::Key(_) | Step::Malformed { .. } => return Ok(()),
     };
     if at > items.len() {
         return Ok(());
@@ -321,6 +394,12 @@ fn seed(rest: &[Step]) -> Option<Node> {
         None => Some(Node::Null),
         Some(Step::Key(_)) => Some(Node::Object(Vec::new())),
         Some(Step::Index(0) | Step::Append) => Some(Node::Array(Vec::new())),
+        // A broken step is read against whatever the new element is, and SQLite
+        // makes an array for a `[` and an object for anything else.
+        Some(Step::Malformed { array_only, .. }) => Some(match array_only {
+            true => Node::Array(Vec::new()),
+            false => Node::Object(Vec::new()),
+        }),
         // `$.a[3]` into a document with no `a` would have to create an array
         // with three holes, and JSON has no hole.
         Some(Step::Index(_) | Step::FromEnd(_)) => None,
@@ -328,51 +407,59 @@ fn seed(rest: &[Step]) -> Option<Node> {
 }
 
 /// Removes the element a path names, reporting whether one was there.
-pub fn remove(node: &mut Node, steps: &[Step]) -> bool {
+///
+/// An error is a malformed step the walk reached, as for [`lookup`].
+///
+/// @param node - the document, edited in place
+/// @param steps - the path
+pub fn remove(node: &mut Node, steps: &[Step]) -> DbResult<bool> {
     let Some((step, rest)) = steps.split_first() else {
-        return false;
+        return Ok(false);
     };
     match (step, node) {
+        (Step::Malformed { array_only, text }, held) => {
+            reached_malformed::<()>(*array_only, text, held).map(|_| false)
+        }
         (Step::Key(name), Node::Object(members)) => {
             let Some(position) = members
                 .iter()
                 .position(|(label, _)| label_matches(label, name))
             else {
-                return false;
+                return Ok(false);
             };
             if rest.is_empty() {
                 members.remove(position);
-                return true;
+                return Ok(true);
             }
-            members
-                .get_mut(position)
-                .is_some_and(|(_, value)| remove(value, rest))
+            match members.get_mut(position) {
+                Some((_, value)) => remove(value, rest),
+                None => Ok(false),
+            }
         }
-        (Step::Index(index), Node::Array(items)) => {
-            let index = *index;
-            if index >= items.len() {
-                return false;
-            }
-            if rest.is_empty() {
-                items.remove(index);
-                return true;
-            }
-            items.get_mut(index).is_some_and(|item| remove(item, rest))
-        }
+        (Step::Index(index), Node::Array(items)) => remove_from_array(items, Some(*index), rest),
         (Step::FromEnd(back), Node::Array(items)) => {
-            let Some(index) = items.len().checked_sub(*back) else {
-                return false;
-            };
-            if index >= items.len() {
-                return false;
-            }
-            if rest.is_empty() {
-                items.remove(index);
-                return true;
-            }
-            items.get_mut(index).is_some_and(|item| remove(item, rest))
+            remove_from_array(items, items.len().checked_sub(*back), rest)
         }
-        _ => false,
+        _ => Ok(false),
+    }
+}
+
+/// Removes an array element, or goes on into it when the path continues.
+///
+/// @param items - the array
+/// @param index - the element the step names, when it is inside the array
+/// @param rest - the steps after this one
+fn remove_from_array(items: &mut Vec<Node>, index: Option<usize>, rest: &[Step]) -> DbResult<bool> {
+    let Some(index) = index.filter(|index| *index < items.len()) else {
+        return Ok(false);
+    };
+    if rest.is_empty() {
+        items.remove(index);
+        return Ok(true);
+    }
+    match items.get_mut(index) {
+        Some(item) => remove(item, rest),
+        None => Ok(false),
     }
 }
 
@@ -438,7 +525,6 @@ mod tests {
     #[test]
     fn a_path_must_start_at_the_root() {
         assert!(parse("a").is_err());
-        assert!(parse("$a").is_err());
         assert_eq!(parse("$").expect("parses"), Vec::new());
     }
 
@@ -461,8 +547,30 @@ mod tests {
     #[test]
     fn a_missing_element_is_not_an_error() {
         let node = document(r#"{"a":1}"#);
-        assert!(lookup(&node, &parse("$.a.b").expect("parses")).is_none());
-        assert!(lookup(&node, &parse("$[0]").expect("parses")).is_none());
+        assert!(lookup(&node, &parse("$.a.b").expect("parses"))
+            .expect("looks up")
+            .is_none());
+        assert!(lookup(&node, &parse("$[0]").expect("parses"))
+            .expect("looks up")
+            .is_none());
+    }
+
+    /// A broken step is an error only when the walk reaches it.
+    #[test]
+    fn a_malformed_step_is_read_only_where_the_walk_gets_to_it() {
+        let number = document(r#"{"a":1}"#);
+        let array = document(r#"{"a":[1]}"#);
+        // A broken index after a number: the walk stops at the number.
+        assert!(lookup(&number, &parse("$.a[").expect("parses"))
+            .expect("not reached")
+            .is_none());
+        // The same broken index after an array is read, and is an error.
+        assert!(lookup(&array, &parse("$.a[").expect("parses")).is_err());
+        // An empty key is read wherever the walk stands.
+        assert!(lookup(&number, &parse("$.").expect("parses")).is_err());
+        assert!(lookup(&number, &parse("$x").expect("parses")).is_err());
+        // A path that does not start at the root fails before any walk.
+        assert!(parse("a").is_err());
     }
 
     /// The three edits differ only over an existing and a missing path.
@@ -520,10 +628,10 @@ mod tests {
     #[test]
     fn removal_reports_what_it_did() {
         let mut node = document("[1,2,3]");
-        assert!(remove(&mut node, &parse("$[0]").expect("parses")));
-        assert!(remove(&mut node, &parse("$[0]").expect("parses")));
+        assert!(remove(&mut node, &parse("$[0]").expect("parses")).expect("removes"));
+        assert!(remove(&mut node, &parse("$[0]").expect("parses")).expect("removes"));
         assert_eq!(rendered(&node), "[3]");
-        assert!(!remove(&mut node, &parse("$.zz").expect("parses")));
+        assert!(!remove(&mut node, &parse("$.zz").expect("parses")).expect("removes"));
     }
 
     /// A merge patch deletes on null and merges objects recursively.

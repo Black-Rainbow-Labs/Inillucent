@@ -12,11 +12,11 @@ use inillucent_base::{DbError, DbResult, ExtendedCode};
 use inillucent_sql::ast::{ConflictAction, TriggerTime};
 use inillucent_sql::bind::EXCLUDED_SOURCE;
 use inillucent_sql::catalog_view::{TableInfo, TableKind};
-use inillucent_sql::dml::{codes, rowid_message, BoundInsert, BoundInsertSource};
+use inillucent_sql::dml::{codes, rowid_message, BoundInsert, BoundInsertSource, UpsertConstraint};
 use inillucent_tree::datum::{Datum, OwnedDatum};
 
 use super::*;
-use crate::declared::{IndexExprs, WriteDeclarations};
+use crate::declared::{BoundDeclarations, IndexExprs, WriteDeclarations};
 use crate::insert_plan::InsertPlan;
 use crate::physical::{Params, SourceLayout};
 use crate::trigger::{self, Depth};
@@ -33,8 +33,14 @@ pub fn insert(
     params: &Params,
     supplied: &[Row],
 ) -> DbResult<Changes> {
-    insert_at(statement, target, params, supplied, Depth::default())
-        .map_err(|error| outer_unwind(error, statement.on_conflict))
+    insert_at(
+        statement,
+        target,
+        params,
+        supplied,
+        Depth::outermost(statement.on_conflict),
+    )
+    .map_err(|error| outer_unwind(error, statement.on_conflict))
 }
 /// Stamps the outermost statement's `OR` clause onto whatever it failed with.
 ///
@@ -107,13 +113,13 @@ pub fn insert_at(
     if !statement.upsert.is_empty() {
         sources.push(EXCLUDED_SOURCE);
     }
-    let space = RowSpace::new(&sources, &layout);
-    // **The catalog the write path's own registered-function lookups read.**
-    // `target` already exposes one for a trigger body's queries
-    // (`WriteTarget::catalog`) - see `docs/roadmap.md` item 13 for why a
-    // `VALUES` row calling `embed(?1)` needs the same view.
+    // The catalog the write path's registered function lookups read: the one
+    // `WriteTarget::catalog` gives a trigger body, because a `VALUES` row calling
+    // `embed(?1)` needs the same view (`docs/roadmap.md` item 13).
     let catalog = target.catalog();
-    let plan = InsertPlan::compile(statement, &layout, &space, params, catalog)?;
+    let subqueries = InsertPlan::subqueries(statement, &layout, catalog)?;
+    let space = super::answers::space_with_subqueries(&sources, &layout, &subqueries.0);
+    let plan = InsertPlan::compile(statement, &layout, &space, params, catalog, subqueries)?;
     // What the table's declarations require of every row, compiled once: the
     // affinities that convert a value on the way in, the `STRICT` type classes,
     // and the `CHECK` predicates. All three were collected by the catalog and
@@ -121,46 +127,49 @@ pub fn insert_at(
     let declarations = WriteDeclarations::compile(
         table,
         &layout,
-        &statement.checks,
-        &statement.not_null_defaults,
-        &statement.index_exprs,
+        BoundDeclarations {
+            checks: &statement.checks,
+            defaults: &statement.not_null_defaults,
+            virtual_columns: &statement.virtual_columns,
+            index_exprs: &statement.index_exprs,
+        },
         &space,
         params,
         catalog,
     )?;
+    let declarations = match params.keeps_supplied_types() {
+        true => declarations.without_affinities(),
+        false => declarations,
+    };
 
     let rows = rows_to_insert(statement, &space, params, catalog, supplied)?;
 
     // **Found on demand, not up front.** Reading the largest rowid costs a
     // descent, and a statement that supplies its own key needs none - which is
     // every `INSERT INTO t(id, ...) VALUES (?1, ...)`, the shape the gate's
-    // `write.insert.batch` measures. `None` here means "not asked yet".
-    let mut next_rowid: Option<i64> = None;
-    // **An `AUTOINCREMENT` table counts up from what it has ever held**, which
-    // is the whole of the difference between it and an ordinary rowid table.
-    // The mark is read once for the statement and written back once, in the
-    // same transaction as the rows, so a rollback takes it with them.
-    let sequence_mark = if table.autoincrement {
-        let floor = highest_rowid(target, table)?;
-        let mark = crate::sequence::read(target, statement.sequence_root, &table.name, floor)?;
-        next_rowid = Some(mark.seq);
-        Some(mark)
-    } else {
-        None
-    };
+    // `write.insert.batch` measures. `None` here means "not asked yet", except
+    // for an `AUTOINCREMENT` table, which starts from its mark.
+    let mut sequence_mark = open_sequence(statement, target)?;
+    let mut next_rowid: Option<i64> = sequence_mark.as_ref().map(|mark| mark.seq);
     let mut high_water = sequence_mark.as_ref().map_or(0, |mark| mark.seq);
     let mut changes = Changes::default();
     let captured = target.captures(table.root);
     for supplied_row in &rows {
         // See `give_back`: a skipped row hands its rowid back.
         let rowid_before = next_rowid;
-        let image = plan.build_row(
+        let mut image = plan.build_row(
             supplied_row,
             &space,
             &mut next_rowid,
             &mut TableKeys::over(target, table),
             table.autoincrement.then_some(table),
         )?;
+        // **`NEW` in a `BEFORE` trigger already has the column affinity
+        // applied.** SQLite converts the values before it fires the trigger,
+        // so `typeof(NEW.a)` over a `REAL` column reads `real` for a `42`.
+        if !statement.triggers.is_empty() {
+            declarations.apply_affinity(&mut image);
+        }
         // **`BEFORE` fires on the row as it will be written**, which is where
         // every foreign-key check on the child's side lives: the binder turns
         // `REFERENCES p(id)` into `BEFORE INSERT ... SELECT RAISE(ABORT, ...)
@@ -168,34 +177,56 @@ pub fn insert_at(
         // refused here, before anything is written and before the constraint
         // checks below.
         //
-        // SQLite leaves `NEW.rowid` undefined in a `BEFORE INSERT` body when
-        // the statement supplied no key. This engine hands the allocated one,
-        // because the row image is built before it is written and there is no
-        // second image to hand instead; a body that reads it therefore sees the
-        // number the row is about to get rather than a NULL.
-        if trigger::fire(
-            &statement.triggers,
-            TriggerTime::Before,
-            target,
-            &trigger::TriggerFiring {
-                rows: trigger::TriggerRows {
-                    old: None,
-                    new: Some(image.as_slice()),
-                },
-                slots: &layout.slots,
-                rowid: layout.rowid,
-                params,
-                depth,
+        // A key the statement left out is -1 in a `BEFORE INSERT` body, as in
+        // SQLite, which fires it before the key is allocated.
+        let unassigned =
+            !statement.triggers.is_empty() && plan.rowid_is_unassigned(supplied_row, &space)?;
+        let firing = trigger::TriggerFiring {
+            rows: trigger::TriggerRows {
+                old: None,
+                new: Some(image.as_slice()),
             },
-        )? == trigger::Fired::SkipRow
+            slots: &layout.slots,
+            rowid: layout.rowid,
+            params,
+            depth,
+        };
+        if trigger::fire_before_insert(&statement.triggers, target, &firing, unassigned)?
+            == trigger::Fired::SkipRow
         {
             give_back(table, &mut next_rowid, rowid_before);
             continue;
         }
+        // **The key is chosen after the `BEFORE` triggers ran.** SQLite
+        // allocates a rowid when the row is written, so a trigger that inserts
+        // into this same table takes the rows the outer one would have, and
+        // the outer row then takes the next free number.
+        if unassigned
+            && statement
+                .triggers
+                .iter()
+                .any(|trigger| !trigger.foreign_key)
+        {
+            reallocate_key(
+                statement,
+                &space,
+                target,
+                &mut next_rowid,
+                &mut sequence_mark,
+                &mut image,
+            )?;
+        }
+        // **The sequence advances when the key is chosen, not when the row is
+        // kept.** A row that `OR IGNORE`, a `CHECK` or a conflict then skips
+        // has still used its number in SQLite.
+        if let Some(Some(OwnedDatum::Int(chosen))) = layout.rowid.map(|slot| image.get(slot)) {
+            if sequence_mark.is_some() {
+                high_water = high_water.max(*chosen);
+            }
+        }
         // **Affinity first, then the constraints.** `NOT NULL`, `STRICT` and
         // `CHECK` all test the value that will actually be stored, and after
         // affinity `'42'` in an `INTEGER` column *is* the integer 42.
-        let mut image = image;
         plan.convert(&declarations, &space, &mut image)?;
         // **The statement's own `OR` algorithm, not the upsert's arm.** A
         // `NOT NULL` or a `CHECK` is not a key collision, and an
@@ -208,7 +239,7 @@ pub fn insert_at(
             give_back(table, &mut next_rowid, rowid_before);
             continue;
         }
-        declarations.types_are_met(table, &image)?;
+        declarations.types_are_met(table, &space, &image)?;
         if !declarations.checks_are_met(&space, &image, declared == Resolution::Skip)? {
             give_back(table, &mut next_rowid, rowid_before);
             continue;
@@ -224,59 +255,151 @@ pub fn insert_at(
                 params,
                 depth,
                 indexes: IndexExprs::new(&declarations, &space),
+                declarations: &declarations,
             },
         )?
         else {
             give_back(table, &mut next_rowid, rowid_before);
             continue;
         };
+        if matches!(stored, Stored::Updated(_)) {
+            // The row went into a key that was already there, so the number
+            // allocated for it is handed back; see `give_back`.
+            give_back(table, &mut next_rowid, rowid_before);
+        }
         if let Some(assigned) = record_rowid(&stored, &layout, &mut changes, target, depth) {
             // A key the statement supplied raises the mark too: `INSERT INTO t
             // VALUES (50, ...)` makes the next allocated key 51.
             high_water = high_water.max(assigned);
         }
-        if trigger::fire(
-            &statement.triggers,
-            TriggerTime::After,
-            target,
-            &trigger::TriggerFiring {
-                rows: trigger::TriggerRows {
-                    old: None,
-                    new: Some(stored.row()),
-                },
-                slots: &layout.slots,
-                rowid: layout.rowid,
-                params,
-                depth,
-            },
-        )? == trigger::Fired::SkipRow
-        {
+        // **`AFTER INSERT` does not fire for a row the upsert updated.** The
+        // arm fired the `UPDATE` triggers itself, in `upsert_row`.
+        let after_insert: &[inillucent_sql::dml::BoundTrigger] = match stored {
+            Stored::Updated(_) => &[],
+            Stored::Inserted(_) => &statement.triggers,
+        };
+        let returned =
+            returned_for_row(statement, &plan, &space, params, target, &stored, &layout)?;
+        if fire_after_insert(after_insert, target, stored.row(), &layout, params, depth)? {
             continue;
         }
         count_row(&mut changes, target, depth);
         if captured {
             changes.written.push(stored.row().to_vec());
         }
-        if !plan.returning.is_empty() {
-            let mut out = Vec::with_capacity(plan.returning.len());
-            for eval in &plan.returning {
-                out.push(space.evaluate(eval.as_ref(), &[stored.row()])?);
-            }
+        if let Some(out) = returned {
             changes.returned.push(out);
         }
     }
-    if let Some(mark) = &sequence_mark {
-        if high_water > mark.seq || mark.rowid.is_none() && changes.rows > 0 {
-            crate::sequence::write(
-                target,
-                statement.sequence_root,
-                &table.name,
-                mark,
-                high_water,
-            )?;
-        }
-    }
+    close_sequence(statement, target, sequence_mark.as_ref(), high_water)?;
     Ok(changes)
+}
+/// Evaluates `RETURNING` for a row straight after it is written.
+///
+/// It runs before the `AFTER` triggers, so a subquery in it keeps the answer
+/// from before they ran. A column calling `last_insert_rowid()` reads the row
+/// just inserted, which needs its own compile with that rowid.
+///
+/// @param statement - the bound insert
+/// @param plan - the compiled insert
+/// @param space - the row space the plan evaluates in
+/// @param params - the bound parameters
+/// @param target - the file and its trees
+/// @param stored - the row as it was written
+/// @param layout - the layout of the table being written
+fn returned_for_row(
+    statement: &BoundInsert,
+    plan: &InsertPlan,
+    space: &RowSpace,
+    params: &Params,
+    target: &dyn WriteTarget,
+    stored: &Stored,
+    layout: &SourceLayout,
+) -> DbResult<Option<Row>> {
+    if uses_last_rowid(statement) && !plan.returning.is_empty() {
+        return Ok(Some(returned_row(
+            statement, plan, space, params, target, stored, layout,
+        )?));
+    }
+    super::answers::returned_for_insert(plan, space, target, params, stored.row())
+}
+
+/// Fires the `AFTER INSERT` triggers for one row, and reports whether they
+/// skipped it.
+///
+/// @param triggers - the triggers to fire
+/// @param target - the file and its trees
+/// @param row - the row as it was written
+/// @param layout - the layout of the table being written
+/// @param params - the bound parameters
+/// @param depth - how deep in triggers this statement runs
+fn fire_after_insert(
+    triggers: &[inillucent_sql::dml::BoundTrigger],
+    target: &mut dyn WriteTarget,
+    row: &[OwnedDatum],
+    layout: &SourceLayout,
+    params: &Params,
+    depth: Depth,
+) -> DbResult<bool> {
+    let after = trigger::TriggerFiring {
+        rows: trigger::TriggerRows {
+            old: None,
+            new: Some(row),
+        },
+        slots: &layout.slots,
+        rowid: layout.rowid,
+        params,
+        depth,
+    };
+    Ok(trigger::fire(triggers, TriggerTime::After, target, &after)? == trigger::Fired::SkipRow)
+}
+
+/// Reads the high-water mark of an `AUTOINCREMENT` table, once for the statement.
+///
+/// **An `AUTOINCREMENT` table counts up from what it has ever held**, which is
+/// the whole of the difference between it and an ordinary rowid table. The mark
+/// is read once for the statement and written back once, in the same
+/// transaction as the rows, so a rollback takes it with them. `None` for every
+/// other table.
+///
+/// @param statement - the bound insert
+/// @param target - the file and its trees
+fn open_sequence(
+    statement: &BoundInsert,
+    target: &mut dyn WriteTarget,
+) -> DbResult<Option<crate::sequence::Mark>> {
+    let table = &statement.table;
+    if !table.autoincrement {
+        return Ok(None);
+    }
+    let floor = highest_rowid(target, table)?;
+    let mark = crate::sequence::read(target, statement.sequence_root, &table.name, floor)?;
+    Ok(Some(mark))
+}
+/// Writes an `AUTOINCREMENT` table's mark back when the statement moved it.
+///
+/// **The row for the table is written even by a statement that stores
+/// nothing**, as SQLite does: `INSERT ... SELECT` over no rows leaves
+/// `sqlite_sequence` holding the table with a `seq` of 0.
+///
+/// @param statement - the bound insert
+/// @param target - the file and its trees
+/// @param mark - the mark as it was read, when the table has one
+/// @param high_water - the largest key the statement chose
+fn close_sequence(
+    statement: &BoundInsert,
+    target: &mut dyn WriteTarget,
+    mark: Option<&crate::sequence::Mark>,
+    high_water: i64,
+) -> DbResult<()> {
+    let Some(mark) = mark else {
+        return Ok(());
+    };
+    if high_water > mark.seq || mark.rowid.is_none() {
+        let root = statement.sequence_root;
+        crate::sequence::write(target, root, &statement.table.name, mark, high_water)?;
+    }
+    Ok(())
 }
 /// Tells the target whether this insert is one that can write only one row.
 ///
@@ -383,6 +506,113 @@ fn give_back(table: &TableInfo, next_rowid: &mut Option<i64>, before: Option<i64
         *next_rowid = before;
     }
 }
+/// Evaluates the `RETURNING` columns for one stored row.
+///
+/// **`last_insert_rowid()` inside `RETURNING` answers the row just inserted.**
+/// The function reads the connection's counter as it stood when the statement
+/// began, which is right everywhere else in a statement and wrong here: SQLite
+/// has already recorded the new rowid when it produces the returned row. A
+/// statement that does not call it keeps the expressions compiled once.
+///
+/// @param statement - the bound insert
+/// @param plan - the compiled statement
+/// @param space - the statement's row space
+/// @param params - the bound parameters
+/// @param target - the file and its trees
+/// @param stored - what the write did
+/// @param layout - the table tree's layout
+fn returned_row(
+    statement: &BoundInsert,
+    plan: &InsertPlan,
+    space: &RowSpace,
+    params: &Params,
+    target: &dyn WriteTarget,
+    stored: &Stored,
+    layout: &SourceLayout,
+) -> DbResult<Row> {
+    let inserted = match stored {
+        Stored::Inserted(row) => layout.rowid.and_then(|slot| row.get(slot)),
+        Stored::Updated(_) => None,
+    };
+    let (Some(OwnedDatum::Int(rowid)), true) = (inserted, uses_last_rowid(statement)) else {
+        let mut out = Vec::with_capacity(plan.returning.len());
+        for eval in &plan.returning {
+            out.push(space.evaluate(eval.as_ref(), &[stored.row()])?);
+        }
+        return Ok(out);
+    };
+    let own = params.with_last_insert_rowid(*rowid);
+    let mut out = Vec::with_capacity(statement.returning.len());
+    for column in &statement.returning {
+        let eval = space.compile(&column.expr, &own, target.catalog())?;
+        out.push(space.evaluate(eval.as_ref(), &[stored.row()])?);
+    }
+    Ok(out)
+}
+
+/// Reports whether a `RETURNING` column calls `last_insert_rowid()`.
+///
+/// @param statement - the bound insert
+fn uses_last_rowid(statement: &BoundInsert) -> bool {
+    fn calls(expr: &inillucent_sql::bind::BoundExpr) -> bool {
+        use inillucent_sql::bind::BoundExpr;
+        use inillucent_sql::function::ScalarFunc;
+        matches!(
+            expr,
+            BoundExpr::Function {
+                func: ScalarFunc::LastInsertRowid,
+                ..
+            }
+        ) || expr.children().into_iter().any(calls)
+    }
+    statement.returning.iter().any(|column| calls(&column.expr))
+}
+
+/// Chooses the key of a row again, after its `BEFORE` triggers ran.
+///
+/// **A `BEFORE` body can insert into the table being written**, and then the key
+/// chosen before it ran belongs to the body's row. The largest key the table
+/// holds is read again, and the outer row takes the next one.
+///
+/// @param statement - the bound insert
+/// @param space - the statement's row space
+/// @param target - the file and its trees
+/// @param next_rowid - the largest rowid handed out so far, reset here
+/// @param sequence_mark - the table's `sqlite_sequence` row, when it has one
+/// @param image - the row image whose key is replaced
+fn reallocate_key(
+    statement: &BoundInsert,
+    space: &RowSpace,
+    target: &mut dyn WriteTarget,
+    next_rowid: &mut Option<i64>,
+    sequence_mark: &mut Option<crate::sequence::Mark>,
+    image: &mut [OwnedDatum],
+) -> DbResult<()> {
+    let table = &statement.table;
+    *next_rowid = None;
+    if let Some(mark) = sequence_mark.as_mut() {
+        // **The counter is the one read when the statement began**, as in
+        // SQLite, where every trigger program shares the statement's register.
+        // Only a row the body added to the table can move the next key, and
+        // only a `sqlite_sequence` row the body created changes where the
+        // counter is written back.
+        if mark.rowid.is_none() {
+            let fresh = crate::sequence::read(target, statement.sequence_root, &table.name, 0)?;
+            mark.rowid = fresh.rowid;
+        }
+        let floor = highest_rowid(target, table)?;
+        *next_rowid = Some(mark.seq.max(floor));
+    }
+    let allocated = crate::insert_plan::allocate_key(
+        next_rowid,
+        &mut TableKeys::over(target, table),
+        table.autoincrement.then_some(table),
+    )?;
+    if let Some(cell) = space.rowid.and_then(|slot| image.get_mut(slot)) {
+        *cell = OwnedDatum::Int(allocated);
+    }
+    Ok(())
+}
 /// Fires a view's `INSTEAD OF INSERT` triggers, storing nothing.
 ///
 /// The row image is the view's columns in declaration order, which is what a
@@ -405,7 +635,7 @@ fn insert_into_view(
     let layout = view_layout(table);
     let space = RowSpace::new(&[statement.target_source], &layout);
     let catalog = target.catalog();
-    let plan = InsertPlan::compile(statement, &layout, &space, params, catalog)?;
+    let plan = InsertPlan::compile(statement, &layout, &space, params, catalog, (Vec::new(), 0))?;
     let rows = rows_to_insert(statement, &space, params, catalog, supplied)?;
     let mut changes = Changes::default();
     let mut never = None;
@@ -437,6 +667,7 @@ fn insert_into_view(
             for eval in &plan.returning {
                 out.push(space.evaluate(eval.as_ref(), &[image.as_slice()])?);
             }
+            super::target::widen_real_returning(&statement.returning, &mut out);
             changes.returned.push(out);
         }
     }
@@ -511,14 +742,14 @@ fn write_one(
     // the insert path did not. It terminates: every turn removes a row.
     // The upsert arms' targets are asked first, as SQLite asks them. A
     // statement with no upsert collects nothing and allocates nothing.
-    let targets: Vec<&[u16]> = statement
+    let targets: Vec<UpsertConstraint> = statement
         .upsert
         .iter()
-        .filter(|arm| !arm.target.is_empty())
-        .map(|arm| arm.target.as_slice())
+        .map(|arm| arm.constraint)
+        .filter(|constraint| *constraint != UpsertConstraint::Any)
         .collect();
     while let Some(clash) = conflicting_row(table, layout, target, &row, None, indexes, &targets)? {
-        let arm = matching_arm(statement, &clash.columns);
+        let arm = matching_arm(statement, clash.which);
         match resolution_for_arm(statement, clash.conflict, arm) {
             Resolution::Skip => return Ok(None),
             Resolution::Replace => {
@@ -530,20 +761,32 @@ fn write_one(
                 // triggers are not fired - that is SQLite's rule with its
                 // default `recursive_triggers = off` - so the binder fills
                 // these separately and they are only the ones a key implies.
-                remove_with_triggers(
+                // A `RAISE(IGNORE)` in a delete trigger the pragma lets fire
+                // keeps the row, and then the key is still taken: the insert
+                // fails with the constraint, as it does in SQLite.
+                if !remove_with_triggers(
                     table,
                     target,
                     &clash.key,
                     &held,
                     &statement.replace_triggers,
                     request,
-                )?;
+                    true,
+                )? {
+                    let unwind = unwind_of(statement.on_conflict.or(clash.conflict));
+                    return Err(clash.error.or_unwind(unwind));
+                }
                 continue;
             }
             Resolution::Update => {
                 // `None` is the arm's `WHERE` declining, which leaves the row
                 // as it is and writes nothing - the same outcome as
                 // `DO NOTHING`, and not an error.
+                //
+                // **The arm is an `UPDATE` with `ABORT` semantics** whatever
+                // the statement's `OR` clause says, so `INSERT OR ROLLBACK ...
+                // DO UPDATE` that fails inside the arm undoes the statement
+                // and leaves the transaction open.
                 return Ok(upsert_row(
                     statement,
                     table,
@@ -556,7 +799,8 @@ fn write_one(
                         arm,
                     },
                     request,
-                )?
+                )
+                .map_err(DbError::with_statement_unwind)?
                 .map(Stored::Updated));
             }
             // `ABORT`, `FAIL` and `ROLLBACK` all raise here and differ only in
@@ -916,16 +1160,34 @@ pub(crate) fn declarations_are_met(
     row: &mut [OwnedDatum],
     resolution: Resolution,
 ) -> DbResult<bool> {
-    for (position, column) in table.columns.iter().enumerate() {
-        let Some(slot) = layout.slots.get(position).copied().flatten() else {
-            continue;
+    // **Two passes: the generated columns come after the ordinary ones.**
+    // SQLite tests `NOT NULL` on every ordinary column first and on the
+    // generated columns, stored or virtual, in a second pass, so a row that
+    // breaks two of them reports the ordinary column.
+    let passes = [false, true];
+    for (position, column) in passes.iter().flat_map(|second| {
+        table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(move |(_, held)| held.generated == *second)
+    }) {
+        let slot = layout.slots.get(position).copied().flatten();
+        // **A virtual generated column has no slot, and its value is computed.**
+        // `NOT NULL` on one was never tested, because the loop only looked at
+        // columns the row holds. The value tested is the one a read returns.
+        let value = match slot {
+            Some(slot) => row.get(slot).cloned(),
+            None => declarations.virtual_value(space, row, position as u16)?,
         };
-        let value = row.get(slot).cloned();
+        if slot.is_none() && value.is_none() {
+            continue;
+        }
         // A `VECTOR(N)` column holds N finite floats or nothing - see
         // `vector_column_is_met`. A JSON array of N numbers is accepted as a
         // spelling of one and converted here, which is where a column's
         // affinity is applied to a value on its way in.
-        if let Some(width) = column.vector_dimensions() {
+        if let (Some(slot), Some(width)) = (slot, column.vector_dimensions()) {
             if let Some(converted) = vector_from_json(value.as_ref(), width) {
                 if let Some(cell) = row.get_mut(slot) {
                     *cell = converted.clone();
@@ -956,10 +1218,10 @@ pub(crate) fn declarations_are_met(
         }
         // The default stands in, and the loop carries on to the next column -
         // `UPDATE OR REPLACE t SET c = NULL, e = NULL` fills both.
-        if matches!(action, Some(ConflictAction::Replace))
-            && declarations.stand_in_default(space, row, slot)?
-        {
-            continue;
+        if let (Some(slot), Some(ConflictAction::Replace)) = (slot, action) {
+            if declarations.stand_in_default(space, row, slot)? {
+                continue;
+            }
         }
         return Err(DbError::new(ExtendedCode(codes::NOT_NULL))
             .with_message(format!(

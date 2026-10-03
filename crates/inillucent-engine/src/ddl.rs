@@ -52,6 +52,8 @@ use inillucent_value::collation::Collation;
 // trees it builds, and the four statements. Every method moved whole and
 // nothing changed shape.
 mod alter;
+mod alter_checks;
+mod alter_rewrite;
 pub(crate) use alter::Already;
 mod catalog;
 mod index;
@@ -208,6 +210,27 @@ impl ImportedDatabase {
         Ok(outcome)
     }
 
+    /// Runs a `BEGIN`.
+    ///
+    /// **`BEGIN IMMEDIATE` and `BEGIN EXCLUSIVE` take the write lock, and a
+    /// connection under `PRAGMA query_only` may not.** SQLite fails them with
+    /// `attempt to write a readonly database` and starts no transaction, so the
+    /// `COMMIT` after one says `cannot commit - no transaction is active`.
+    /// `BEGIN DEFERRED` takes nothing until a statement needs it, and succeeds.
+    ///
+    /// @param kind - which lock the `BEGIN` asks for
+    fn begin_statement(&mut self, kind: inillucent_sql::directive::BeginKind) -> DbResult<Outcome> {
+        let wants_the_write_lock = kind != inillucent_sql::directive::BeginKind::Deferred;
+        if self.writing.batch().is_none() && self.pragmas.query_only() && wants_the_write_lock {
+            return Err(inillucent_base::error::DbError::primary(
+                inillucent_base::error::PrimaryCode::ReadOnly,
+            )
+            .with_message("attempt to write a readonly database")
+            .with_detail("attempt to write a readonly database"));
+        }
+        self.transaction_statement("begin")
+    }
+
     /// Runs `BEGIN`, `COMMIT` or `ROLLBACK` with no savepoint named.
     ///
     /// **The three transaction statements refuse what SQLite refuses.**
@@ -256,6 +279,10 @@ impl ImportedDatabase {
     fn run_directive(&mut self, directive: Directive, sql: &str) -> DbResult<Outcome> {
         let source = sql.as_bytes();
         match directive {
+            Directive::CreateTable {
+                refusal: Some(said),
+                ..
+            } => Err(inillucent_base::error::statement_refusal(said)),
             Directive::CreateTable {
                 if_not_exists,
                 name,
@@ -393,7 +420,7 @@ impl ImportedDatabase {
             Directive::Alter { table, action, .. } => self.alter_table(source, &table, &action),
             analyze @ Directive::Analyze { .. } => self.run_analyze(analyze),
             Directive::Reindex { indexes, .. } => self.reindex(&indexes),
-            Directive::Begin(_) => self.transaction_statement("begin"),
+            Directive::Begin(kind) => self.begin_statement(kind),
             Directive::Commit => self.transaction_statement("commit"),
             Directive::Pragma {
                 ref name,
@@ -469,6 +496,21 @@ impl ImportedDatabase {
             Directive::Vacuum { .. } if self.writing.batch().is_some() => {
                 Err(statement_refusal("cannot VACUUM from within a transaction"))
             }
+            Directive::Vacuum {
+                database,
+                into: None,
+                into_sql: Some(expression),
+            } => {
+                let path = self.vacuum_target(&expression)?;
+                self.run_directive(
+                    Directive::Vacuum {
+                        database,
+                        into: Some(path),
+                        into_sql: None,
+                    },
+                    sql,
+                )
+            }
             Directive::Vacuum { into: None, .. } => {
                 self.vacuum_in_place()?;
                 Ok(Outcome::empty())
@@ -477,8 +519,9 @@ impl ImportedDatabase {
                 into: Some(path), ..
             } => {
                 let path = String::from_utf8_lossy(&path).into_owned();
-                if path.is_empty() {
-                    return Err(refusal("VACUUM INTO needs a file to write"));
+                if path.is_empty() || path == ":memory:" {
+                    self.rebuild_into_memory()?;
+                    return Ok(Outcome::empty());
                 }
                 // The second statement that names a file of its own, and so
                 // the second one a confined process refuses by name rather
@@ -502,6 +545,22 @@ impl ImportedDatabase {
                 self.rebuild_into(std::path::Path::new(&path))?;
                 Ok(Outcome::empty())
             }
+        }
+    }
+}
+
+impl ImportedDatabase {
+    /// Evaluates the file name expression of `VACUUM INTO`.
+    ///
+    /// SQLite accepts any expression there, such as `(SELECT n FROM p)` or
+    /// `'a' || 'b'`, and refuses a value that is not text.
+    ///
+    /// @param expression - the expression as it was written
+    fn vacuum_target(&mut self, expression: &str) -> DbResult<Vec<u8>> {
+        let rows = self.query_internally(&format!("SELECT ({expression})"))?;
+        match rows.first().and_then(|row| row.first()) {
+            Some(inillucent_tree::datum::OwnedDatum::Text(bytes)) => Ok(bytes.clone()),
+            _ => Err(statement_refusal("non-text filename")),
         }
     }
 }

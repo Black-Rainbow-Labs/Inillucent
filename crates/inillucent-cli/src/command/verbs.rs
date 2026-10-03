@@ -1031,7 +1031,12 @@ pub fn export(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
             })?;
     }
     let script = format!(".mode {mode}\n.headers on\n{sql};");
+    // An export of nothing still writes its header, so a reader of the file
+    // learns the columns. The shell prints no header for an empty result,
+    // as `sqlite3` does, unless it is asked to here.
+    context.shell().header_when_empty = true;
     let printed = context.collect_output(&script);
+    context.shell().header_when_empty = false;
     let rows = context.shell().rows_since_redirect;
     // The `.once` releases itself after the statement, and this releases it
     // after a statement that never ran - an empty `sql`, or one the parser

@@ -456,7 +456,10 @@ impl ImportedDatabase {
         }
         match &mut *held {
             physical::Slot::Reusable(compiled) => {
-                compiled.run(plan, self, params)?;
+                if let Err(error) = compiled.run(plan, self, params) {
+                    physical::keep_partial_rows(compiled.take_rows());
+                    return Err(error);
+                }
                 return Ok(compiled.take_rows());
             }
             physical::Slot::Never => {}
@@ -471,7 +474,10 @@ impl ImportedDatabase {
             // cost a second time for the same first execution.
             physical::Slot::Untried => match physical::try_compile(plan, self, prepared, params)? {
                 Some(mut compiled) => {
-                    compiled.run(plan, self, params)?;
+                    if let Err(error) = compiled.run(plan, self, params) {
+                        physical::keep_partial_rows(compiled.take_rows());
+                        return Err(error);
+                    }
                     let rows = compiled.take_rows();
                     *held = if compiled.rebindable() {
                         physical::Slot::Reusable(Box::new(compiled))

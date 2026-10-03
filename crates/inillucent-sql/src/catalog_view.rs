@@ -147,6 +147,43 @@ impl IndexColumnInfo {
     pub fn plain_column(&self) -> Option<u16> {
         self.column.filter(|_| self.expr_sql.is_none())
     }
+
+    /// Returns the text a computed key is evaluated from, when the key is one.
+    ///
+    /// An expression key is its own text. A key on a `VIRTUAL` generated column
+    /// is the column's name instead of the column's expression: reading the
+    /// column through the binder converts the value with the column's
+    /// affinity, which is the value SQLite puts in the index, and the bare
+    /// expression is not that value (`k INT AS (a)` over `'1'` is the integer 1,
+    /// and the expression alone gives the text).
+    ///
+    /// @param table - the table the index is on
+    pub fn computed_text(&self, table: &TableInfo) -> Option<Vec<u8>> {
+        let sql = self.expr_sql.as_ref()?;
+        let Some(info) = self.column.and_then(|declared| table.column(declared)) else {
+            return Some(sql.clone());
+        };
+        Some(quoted_name(&info.name))
+    }
+}
+
+/// Returns an identifier in double quotes, with any quote inside it doubled.
+///
+/// For the places that build the text of an expression from a column name and
+/// bind it, so a name that is not a plain word still reads as one identifier.
+///
+/// @param name - the identifier as declared
+pub fn quoted_name(name: &[u8]) -> Vec<u8> {
+    let mut quoted = Vec::with_capacity(name.len().saturating_add(2));
+    quoted.push(b'"');
+    for byte in name {
+        if *byte == b'"' {
+            quoted.push(b'"');
+        }
+        quoted.push(*byte);
+    }
+    quoted.push(b'"');
+    quoted
 }
 
 /// An index over a table.

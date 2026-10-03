@@ -21,6 +21,10 @@ use crate::catalog_view::TableInfo;
 use crate::diagnostic::{ParseError, ParseErrorKind};
 use crate::lexer::Span;
 
+/// The first number a derived table inside a correlated subquery keeps its rows
+/// under, which is past any number a common table expression can have.
+pub const FIRST_ANONYMOUS_SHARED: usize = 1 << 20;
+
 /// One common table expression visible to a block.
 ///
 /// The definition is kept as an AST id rather than a bound block because two
@@ -40,6 +44,8 @@ pub struct CteBinding {
     pub select: SelectId,
     /// Whether the `WITH` said `RECURSIVE`.
     pub recursive: bool,
+    /// `Some(true)` for `MATERIALIZED`, `Some(false)` for `NOT MATERIALIZED`.
+    pub materialized: Option<bool>,
 }
 
 /// One recursive CTE whose definition is being bound.
@@ -63,6 +69,22 @@ impl Binder<'_> {
         }
         let mut bindings = Vec::with_capacity(with.ctes.len());
         for cte in &with.ctes {
+            // **A name may be defined once in one `WITH`.** SQLite refuses the
+            // second definition while it parses, in these words; an inner
+            // `WITH` is a different clause and may reuse the name.
+            let folded = self.ast.folded(cte.name);
+            if bindings
+                .iter()
+                .any(|held: &CteBinding| held.folded.as_slice() == folded)
+            {
+                return Err(super::refused(
+                    format!(
+                        "duplicate WITH table name: {}",
+                        String::from_utf8_lossy(self.ast.text(cte.name))
+                    ),
+                    crate::lexer::Span::default(),
+                ));
+            }
             bindings.push(CteBinding {
                 folded: self.ast.folded(cte.name).to_vec(),
                 name: self.ast.text(cte.name).to_vec(),
@@ -73,6 +95,7 @@ impl Binder<'_> {
                     .collect(),
                 select: cte.select,
                 recursive: with.recursive,
+                materialized: cte.materialized,
             });
         }
         self.ctes.push(bindings);
@@ -92,6 +115,106 @@ impl Binder<'_> {
             }
         }
         None
+    }
+
+    /// Reports whether the statement refers to a name in more than one FROM term.
+    ///
+    /// Counted over every FROM term the statement was parsed into, so an inner
+    /// `WITH` that reuses the name is counted too. That only ever shares a CTE
+    /// that did not need to be shared.
+    ///
+    /// @param folded - the folded name
+    pub(super) fn name_is_used_twice(&self, folded: &[u8]) -> bool {
+        let mut uses = 0usize;
+        for at in 0..self.ast.from_term_count() {
+            let Some(term) = self.ast.from_term(ast::FromTermId(at as u32)) else {
+                continue;
+            };
+            if let ast::FromSource::Table {
+                database: None,
+                name,
+                ..
+            } = &term.source
+            {
+                if self.ast.folded(*name) == folded {
+                    uses = uses.saturating_add(1);
+                }
+            }
+        }
+        uses > 1
+    }
+
+    /// Marks the block a CTE reference was just bound to as one that shares its
+    /// evaluation with the other references, when that can be seen.
+    ///
+    /// SQLite evaluates a CTE used more than once a single time unless it is
+    /// `NOT MATERIALIZED`. The difference can only be seen when the body is not
+    /// a function of its tables, so only a body that calls `random()` or a
+    /// function like it is marked, and one that reads a column of an enclosing
+    /// query is left alone because it has a different answer for every row.
+    ///
+    /// @param cte - the definition
+    pub(super) fn share_last_source(&mut self, cte: &CteBinding) {
+        if cte.materialized == Some(false) || !self.name_is_used_twice(&cte.folded) {
+            return;
+        }
+        let key = match self.shared_ctes.iter().position(|(arena, select)| {
+            *arena == self.ast as *const _ as usize && *select == cte.select
+        }) {
+            Some(key) => key,
+            None => {
+                self.shared_ctes
+                    .push((self.ast as *const _ as usize, cte.select));
+                self.shared_ctes.len().saturating_sub(1)
+            }
+        };
+        let Some(source) = self.sources.last_mut() else {
+            return;
+        };
+        let SourceRows::Subquery(block) = &mut source.rows else {
+            return;
+        };
+        if !block.correlations.is_empty() {
+            return;
+        }
+        let mut volatile = false;
+        let mut probe = (**block).clone();
+        crate::rewrite::rewrite_select(&mut probe, &mut |expr: &mut super::BoundExpr| {
+            if crate::plan::calls_a_volatile_function(expr) {
+                volatile = true;
+            }
+        });
+        if volatile {
+            block.shared = Some(key);
+        }
+    }
+
+    /// Makes the derived tables of a correlated subquery that read nothing of
+    /// the enclosing query keep their rows for the whole statement.
+    ///
+    /// **SQLite materialises such a derived table once** (`OP_Once`), however
+    /// many outer rows the subquery runs for. Read again for every row, a
+    /// `SELECT ... FROM (SELECT sum(v) OVER () ...)` inside an `UPDATE`'s `SET`
+    /// saw the rows the statement had already changed.
+    ///
+    /// @param block - a subquery that reads a column of an enclosing query
+    pub(super) fn share_uncorrelated_sources(&mut self, block: &mut super::BoundSelect) {
+        for source in &mut block.sources {
+            let SourceRows::Subquery(inner) = &mut source.rows else {
+                continue;
+            };
+            if inner.correlations.is_empty() {
+                if inner.shared.is_none() {
+                    inner.shared = Some(FIRST_ANONYMOUS_SHARED + self.shared_anonymous);
+                    self.shared_anonymous = self.shared_anonymous.saturating_add(1);
+                }
+            } else {
+                self.share_uncorrelated_sources(inner);
+            }
+        }
+        for (_, arm) in &mut block.compounds {
+            self.share_uncorrelated_sources(arm);
+        }
     }
 
     /// Reports whether a CTE's own query names it in a FROM clause.
@@ -188,6 +311,7 @@ impl Binder<'_> {
             constraint: None,
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
+            written_schema: None,
         });
         if let Some(scope) = self.scopes.last_mut() {
             scope.push(id);
@@ -227,14 +351,6 @@ impl Binder<'_> {
         let limit = select.limit;
         let offset = select.offset;
         let first = select.first;
-        if !order_by.is_empty() || limit.is_some() || offset.is_some() {
-            return Err(ParseError::new(
-                ParseErrorKind::Unsupported(
-                    "ORDER BY and LIMIT are not allowed on a recursive CTE",
-                ),
-                span,
-            ));
-        }
 
         let id = self.sources.len();
         // The store's FROM-term number is reserved before anything is bound, so
@@ -250,13 +366,16 @@ impl Binder<'_> {
             constraint: None,
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
+            written_schema: None,
         });
 
         let seed = self.bind_isolated_arm(first)?;
         let table = subquery_table(&alias, &cte.columns, &seed);
         if !cte.columns.is_empty() && cte.columns.len() != seed.columns.len() {
-            return Err(ParseError::new(
-                ParseErrorKind::Unsupported("the named column list does not match the query"),
+            return Err(super::refusal::named_column_count(
+                &alias,
+                seed.columns.len(),
+                cte.columns.len(),
                 span,
             ));
         }
@@ -299,17 +418,35 @@ impl Binder<'_> {
         }
         self.recursing.pop();
         outcome?;
-
+        // The ORDER BY, LIMIT and OFFSET belong to the whole recursive query:
+        // SQLite orders its queue by them and stops the recursion at the limit,
+        // so they are kept on the body rather than on the seed arm.
+        let seed_columns = seeds
+            .first()
+            .map_or_else(Vec::new, |(_, seed)| seed.columns.clone());
+        // An ORDER BY name may come from any arm, as in every other compound.
+        let other_arms: Vec<(ast::CompoundOp, crate::bind::BoundSelect)> =
+            seeds.iter().skip(1).chain(steps.iter()).cloned().collect();
+        let order_by = self.bind_compound_order_by(&order_by, &seed_columns, &other_arms)?;
+        let limit = limit.map(|expr| self.bind_expr(expr)).transpose()?;
+        let offset = offset.map(|expr| self.bind_expr(expr)).transpose()?;
         let mut source = BoundSource {
             index_hint: crate::bind::IndexChoice::Any,
             id,
-            rows: SourceRows::Recursive(Box::new(RecursiveBody { seeds, steps })),
+            rows: SourceRows::Recursive(Box::new(RecursiveBody {
+                seeds,
+                steps,
+                order_by,
+                limit,
+                offset,
+            })),
             table: std::rc::Rc::new(table),
             alias,
             join,
             constraint: None,
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
+            written_schema: None,
         };
         if let SourceRows::Recursive(body) = &mut source.rows {
             if body.steps.is_empty() {
@@ -321,6 +458,9 @@ impl Binder<'_> {
                 }
                 let mut head = arms.remove(0).1;
                 head.compounds = arms;
+                head.order_by = core::mem::take(&mut body.order_by);
+                head.limit = body.limit.take();
+                head.offset = body.offset.take();
                 source.rows = SourceRows::Subquery(Box::new(head));
             }
         }
@@ -331,5 +471,86 @@ impl Binder<'_> {
             scope.push(id);
         }
         Ok(())
+    }
+}
+
+impl<'a> Binder<'a> {
+    /// Binds a FROM term that names a common table expression.
+    ///
+    /// @param cte - the expression the name stands for
+    /// @param folded - the folded name, to tell a recursive reference from a plain one
+    /// @param alias - the alias written on the term, if any
+    /// @param join - how the term joins the ones before it
+    /// @param span - where the term is, for an error
+    pub(super) fn bind_cte_term(
+        &mut self,
+        cte: CteBinding,
+        folded: &[u8],
+        alias: Option<ast::NameId>,
+        join: JoinKind,
+        span: Span,
+    ) -> Result<(), ParseError> {
+        let alias = match alias {
+            Some(alias) => self.ast.text(alias).to_vec(),
+            None => cte.name.clone(),
+        };
+        // A definition already being bound cannot be bound again: that
+        // is a cycle, and following it does not end.
+        if self.binding_ctes.contains(&cte.select) {
+            // SQLite names the expression and points at nothing.
+            let _ = span;
+            return Err(ParseError::new(
+                ParseErrorKind::Refused(format!(
+                    "circular reference: {}",
+                    String::from_utf8_lossy(&cte.name)
+                )),
+                Span::default(),
+            ));
+        }
+        self.binding_ctes.push(cte.select);
+        // **`RECURSIVE` is a keyword SQLite does not require.** A CTE
+        // whose FROM names itself *is* the recursion, written or not,
+        // and reading the keyword as the only evidence sent this
+        // binder round the same definition until the stack ran out.
+        let outcome = if cte.recursive || self.select_names_itself(cte.select, folded) {
+            self.bind_recursive_cte(&cte, alias, join, span)
+        } else {
+            let bound =
+                self.bind_subquery_term(cte.select, Some(alias), cte.columns.clone(), join, span);
+            if bound.is_ok() {
+                self.share_last_source(&cte);
+            }
+            bound
+        };
+        self.binding_ctes.pop();
+        outcome
+    }
+
+    /// Finds the table a FROM term names, falling back to a table valued
+    /// function when the view's own database does not hold the name.
+    ///
+    /// A name that is not a table of the view's database may still be a table
+    /// valued function such as `json_each`, which belongs to no schema.
+    ///
+    /// @param database - the schema written on the term, if any
+    /// @param database_name - the schema to look in, folded
+    /// @param folded - the table name, folded
+    pub(super) fn find_term_table(
+        &self,
+        database: Option<ast::NameId>,
+        database_name: Option<Vec<u8>>,
+        folded: &[u8],
+    ) -> (Option<&'a TableInfo>, Option<Vec<u8>>) {
+        let found = self.catalog.find_table(database_name.as_deref(), folded);
+        if found.is_none() && database.is_none() && database_name.is_some() {
+            let eponymous = self
+                .catalog
+                .find_table(None, folded)
+                .filter(|table| table.kind == crate::catalog_view::TableKind::Virtual);
+            if eponymous.is_some() {
+                return (eponymous, None);
+            }
+        }
+        (found, database_name)
     }
 }

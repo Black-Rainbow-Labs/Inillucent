@@ -366,6 +366,7 @@ fn window_input_rows(
             name: b"w".to_vec(),
             origin: None,
             declared_type: Vec::new(),
+            written: None,
         })
         .collect();
     inner.windows.clear();

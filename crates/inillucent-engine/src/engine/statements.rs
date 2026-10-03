@@ -379,9 +379,7 @@ impl ImportedDatabase {
         // sqlite_master may not be modified" and code 1, and an application
         // that reads the code must not see an API misuse.
         if !self.pragmas.writable_schema() {
-            return Err(statement_refusal(
-                "writing to sqlite_schema needs PRAGMA writable_schema = ON",
-            ));
+            return Err(statement_refusal("table sqlite_master may not be modified"));
         }
         if !inserting {
             return Err(refusal(
@@ -673,7 +671,7 @@ impl ImportedDatabase {
     /// @param sql - the statement text
     pub fn parameter_names(&self, sql: &str) -> DbResult<Vec<(Vec<u8>, u32)>> {
         let parsed = self.parse_once(sql)?;
-        let names = parsed.parameters.names.clone();
+        let names = parsed.parameters.all_names();
         self.compiled.recycle(parsed);
         Ok(names)
     }
@@ -746,6 +744,14 @@ impl Statement {
     /// so `SELECT ?3` is three and `SELECT ?1, ?1` is one.
     pub fn parameter_count(&self) -> u32 {
         self.parameters
+    }
+
+    /// Returns the result column names when the statement is a plain query.
+    pub(crate) fn query_names(&self) -> Option<std::rc::Rc<Vec<String>>> {
+        match &**self.cached.borrow() {
+            Cached::Select(_, _, _, names) => Some(std::rc::Rc::clone(names)),
+            _ => None,
+        }
     }
 }
 
@@ -829,6 +835,9 @@ pub(crate) fn refused(
     match error.kind {
         inillucent_sql::diagnostic::ParseErrorKind::Unsupported(what) => {
             built.with_unsupported(what)
+        }
+        inillucent_sql::diagnostic::ParseErrorKind::RefusedNotBuilt { feature, .. } => {
+            built.with_unsupported(feature)
         }
         _ => built,
     }

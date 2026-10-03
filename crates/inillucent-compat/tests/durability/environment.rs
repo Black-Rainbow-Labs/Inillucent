@@ -367,4 +367,8 @@ fn unusual_paths_survive_a_killed_writer() {
             other => panic!("{text}: {other:?}"),
         }
     }
+    // **The long tree goes when the case passes.** `git worktree remove` cannot
+    // delete a path over 260 characters on Windows and stops with `Filename too
+    // long`, so a worktree that had run this case could not be retired.
+    let _ = std::fs::remove_dir_all(&directory);
 }

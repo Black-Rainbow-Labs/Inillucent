@@ -147,6 +147,10 @@ impl Default for Layout {
 /// It returns lines rather than writing, so the caller decides where they go -
 /// which is what `.output` and `.once` need, and what makes this testable
 /// without a file.
+///
+/// @param layout - the output settings
+/// @param columns - the result's column names
+/// @param rows - the result's rows
 pub fn render(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Vec<String> {
     match layout.mode {
         Mode::List | Mode::Tabs => separated(layout, columns, rows),
@@ -236,6 +240,57 @@ pub fn literal(value: &Value<'static>) -> String {
             out
         }
     }
+}
+
+/// Returns a value as `.mode quote` and `.mode insert` write it.
+///
+/// **A text with a control character is written as `unistr('...')`.** The reference's
+/// `output_quoted_string` counts the characters below U+0020, and when there is one
+/// it cannot print the text between plain quotes without a newline, a tab or an escape
+/// sequence landing in the output, so it writes a call to `unistr()` that rebuilds the
+/// text: a quote is doubled, a backslash is doubled, and each control character is a
+/// `\uXXXX` escape in lower case hex. Without a control character the text is written
+/// between plain quotes, backslash and all, and DEL and the C1 range are not controls.
+/// The text ends at its first NUL byte, because the reference reads it as a C string.
+/// Everything that is not text is written as `literal` writes it.
+///
+/// `.dump` and the other callers of `literal` are unchanged: the reference builds those
+/// with the SQL `quote()` function, which does not escape.
+///
+/// @param value - the value
+pub fn quote_literal(value: &Value<'static>) -> String {
+    let Value::Text(text) = value else {
+        return literal(value);
+    };
+    let bytes = text.raw();
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    let text = String::from_utf8_lossy(bytes.get(..end).unwrap_or(bytes));
+    if !text.chars().any(|character| u32::from(character) < 0x20) {
+        return format!("'{}'", text.replace('\'', "''"));
+    }
+    let mut out = String::from("unistr('");
+    for character in text.chars() {
+        match character {
+            '\'' => out.push_str("''"),
+            '\\' => out.push_str("\\\\"),
+            control if u32::from(control) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", u32::from(control)));
+            }
+            other => out.push(other),
+        }
+    }
+    out.push_str("')");
+    out
+}
+
+/// Returns a column name as `.mode quote` writes it in the header line.
+///
+/// @param name - the column name
+fn quote_name(name: &str) -> String {
+    quote_literal(&Value::owned_text(name.as_bytes()).unwrap_or(Value::Null))
 }
 
 /// `list` and `tabs`: values with a separator between them.
@@ -357,13 +412,13 @@ fn quoted(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> 
         out.push(
             columns
                 .iter()
-                .map(|name| format!("'{}'", name.replace('\'', "''")))
+                .map(|name| quote_name(name))
                 .collect::<Vec<String>>()
                 .join(&layout.separator),
         );
     }
     for row in rows {
-        let cells: Vec<String> = row.iter().map(literal).collect();
+        let cells: Vec<String> = row.iter().map(quote_literal).collect();
         out.push(cells.join(&layout.separator));
     }
     out
@@ -390,14 +445,45 @@ fn lines(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> V
 }
 
 /// `insert`: one statement per row, which is what a dump is made of.
+///
+/// With headers on, SQLite names the columns after the table, each quoted only
+/// when its `quoteChar` says so: a name that is not a plain word, or that is a
+/// keyword.
 fn inserts(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Vec<String> {
-    let _ = columns;
+    let target = if layout.headers {
+        let names: Vec<String> = columns.iter().map(|name| insert_column(name)).collect();
+        format!("{}({})", layout.table, names.join(","))
+    } else {
+        layout.table.clone()
+    };
     rows.iter()
         .map(|row| {
-            let cells: Vec<String> = row.iter().map(literal).collect();
-            format!("INSERT INTO {} VALUES({});", layout.table, cells.join(","))
+            let cells: Vec<String> = row.iter().map(quote_literal).collect();
+            format!("INSERT INTO {target} VALUES({});", cells.join(","))
         })
         .collect()
+}
+
+/// Returns a column name as SQLite's shell writes it in `.mode insert`.
+///
+/// The rule is `quoteChar` in the shell's source: quote when the first
+/// character is not a letter or an underscore, when any character is not a
+/// letter, digit or underscore, or when the word is a keyword.
+///
+/// @param name - the column name
+fn insert_column(name: &str) -> String {
+    let plain = name
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        && inillucent_driver::keyword_lookup(name.as_bytes()).is_none();
+    if plain {
+        return name.to_string();
+    }
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// `json`: an array of objects, one per row.
@@ -453,9 +539,20 @@ fn json_value(value: &Value<'static>) -> String {
     }
 }
 
-/// Returns each column's width: the widest of its values and its name.
+/// Returns each column's width: the widest of its values, and of its name
+/// when the name is printed. With headers off SQLite sizes a column by its
+/// values alone.
 fn widths(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Vec<usize> {
-    let mut widths: Vec<usize> = columns.iter().map(|name| name.chars().count()).collect();
+    let mut widths: Vec<usize> = columns
+        .iter()
+        .map(|name| {
+            if layout.headers {
+                name.chars().count()
+            } else {
+                0
+            }
+        })
+        .collect();
     for row in rows {
         for (index, value) in row.iter().enumerate() {
             let width = plain(layout, value).chars().count();
@@ -590,26 +687,9 @@ fn drawn(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> V
     if layout.mode != Mode::Markdown {
         out.push(rule.clone());
     }
-    let centred: Vec<String> = columns
-        .iter()
-        .enumerate()
-        .map(|(index, name)| centre(name, widths.get(index).copied().unwrap_or(0)))
-        .collect();
-    out.push(drawn_row(&frame, &centred, &widths, layout, true));
-    out.push(match layout.mode {
-        Mode::Markdown => markdown_rule(&widths),
-        Mode::Box => rule_line(
-            &Frame {
-                left: "\u{255e}",
-                middle: "\u{256a}",
-                right: "\u{2561}",
-                horizontal: "\u{2550}",
-                ..frame
-            },
-            &widths,
-        ),
-        _ => rule.clone(),
-    });
+    if layout.headers {
+        drawn_header(layout, &frame, columns, &widths, &rule, &mut out);
+    }
     for row in rows {
         let cells: Vec<String> = row
             .iter()
@@ -632,6 +712,47 @@ fn drawn(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> V
         out.push(rule);
     }
     out
+}
+
+/// Appends the header line of a drawn table and the rule under it.
+///
+/// With headers off SQLite draws neither, and a box or a table keeps only
+/// its top and bottom rules.
+///
+/// @param layout - the shell's output settings
+/// @param frame - the characters the mode draws with
+/// @param columns - the column names
+/// @param widths - each column's width
+/// @param rule - the mode's plain rule, which `table` repeats under the header
+/// @param out - the lines drawn so far
+fn drawn_header(
+    layout: &Layout,
+    frame: &Frame,
+    columns: &[String],
+    widths: &[usize],
+    rule: &str,
+    out: &mut Vec<String>,
+) {
+    let centred: Vec<String> = columns
+        .iter()
+        .enumerate()
+        .map(|(index, name)| centre(name, widths.get(index).copied().unwrap_or(0)))
+        .collect();
+    out.push(drawn_row(frame, &centred, widths, layout, true));
+    out.push(match layout.mode {
+        Mode::Markdown => markdown_rule(widths),
+        Mode::Box => rule_line(
+            &Frame {
+                left: "\u{255e}",
+                middle: "\u{256a}",
+                right: "\u{2561}",
+                horizontal: "\u{2550}",
+                ..*frame
+            },
+            widths,
+        ),
+        _ => rule.to_string(),
+    });
 }
 
 /// Returns one horizontal rule.

@@ -254,82 +254,82 @@ removed = 858
 family = "update"
 cadence = "change"
 strength = 2
-rows = 87
-cases = 87
-required = 1219
-removed = 11
+rows = 86
+cases = 86
+required = 1218
+removed = 12
 
 [[count]]
 family = "update"
 cadence = "merge"
 strength = 2
-rows = 87
-cases = 87
-required = 1219
-removed = 11
+rows = 86
+cases = 86
+required = 1218
+removed = 12
 
 [[count]]
 family = "update"
 cadence = "merge"
 strength = 3
-rows = 659
-cases = 659
-required = 15994
-removed = 386
+rows = 661
+cases = 661
+required = 15957
+removed = 423
 
 [[count]]
 family = "delete"
 cadence = "change"
 strength = 2
-rows = 72
-cases = 72
-required = 823
-removed = 8
+rows = 71
+cases = 71
+required = 822
+removed = 9
 
 [[count]]
 family = "delete"
 cadence = "merge"
 strength = 2
-rows = 72
-cases = 72
-required = 823
-removed = 8
+rows = 71
+cases = 71
+required = 822
+removed = 9
 
 [[count]]
 family = "delete"
 cadence = "merge"
 strength = 3
-rows = 514
-cases = 514
-required = 8557
-removed = 227
+rows = 518
+cases = 518
+required = 8526
+removed = 258
 
 [[count]]
 family = "ddl_table"
 cadence = "change"
 strength = 2
-rows = 97
-cases = 97
-required = 530
+rows = 113
+cases = 113
+required = 654
 removed = 12
 
 [[count]]
 family = "ddl_table"
 cadence = "merge"
 strength = 2
-rows = 97
-cases = 97
-required = 530
+rows = 113
+cases = 113
+required = 654
 removed = 12
 
 [[count]]
 family = "ddl_table"
 cadence = "merge"
 strength = 3
-rows = 675
-cases = 674
-required = 3682
-removed = 250
+rows = 891
+cases = 891
+required = 5066
+removed = 290
 
 [[count]]
 family = "ddl_index"

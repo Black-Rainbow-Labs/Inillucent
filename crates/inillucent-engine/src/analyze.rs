@@ -355,6 +355,44 @@ impl ImportedDatabase {
         tables: &[Vec<u8>],
         only_index: Option<&[u8]>,
     ) -> DbResult<()> {
+        self.clear_stat1_where(at, &|table, index| {
+            let named = tables.iter().any(|wanted| Some(wanted.as_slice()) == table);
+            let indexed = only_index
+                .is_none_or(|only| index.is_some_and(|name| name.eq_ignore_ascii_case(only)));
+            named && indexed
+        })
+    }
+
+    /// Removes the `sqlite_stat1` rows a dropped table or index leaves behind.
+    ///
+    /// SQLite deletes by table name for `DROP TABLE` and by index name for
+    /// `DROP INDEX`, so a recreated index does not start with the old statistics.
+    ///
+    /// @param at - the database whose `sqlite_stat1` it is
+    /// @param table - the dropped table's name, for `DROP TABLE`
+    /// @param index - the dropped index's name, for `DROP INDEX`
+    pub(crate) fn forget_stat1_of(
+        &mut self,
+        at: usize,
+        table: Option<&[u8]>,
+        index: Option<&[u8]>,
+    ) -> DbResult<()> {
+        self.clear_stat1_where(at, &|row_table, row_index| match (table, index) {
+            (Some(wanted), _) => row_table.is_some_and(|name| name.eq_ignore_ascii_case(wanted)),
+            (None, Some(wanted)) => row_index.is_some_and(|name| name.eq_ignore_ascii_case(wanted)),
+            (None, None) => false,
+        })
+    }
+
+    /// Removes the `sqlite_stat1` rows a test accepts.
+    ///
+    /// @param at - the database whose `sqlite_stat1` it is
+    /// @param doomed_row - given a row's table and index names, whether the row goes
+    fn clear_stat1_where(
+        &mut self,
+        at: usize,
+        doomed_row: &dyn Fn(Option<&[u8]>, Option<&[u8]>) -> bool,
+    ) -> DbResult<()> {
         let Some(root) = self.stat1_root(at) else {
             return Ok(());
         };
@@ -371,14 +409,15 @@ impl ImportedDatabase {
                     let Some(Datum::Int(rowid)) = row.first().copied() else {
                         continue;
                     };
-                    let named = matches!(row.get(1), Some(Datum::Text(name))
-                        if tables.iter().any(|wanted| wanted == name));
-                    let indexed = only_index.is_none_or(|only| {
-                        matches!(row.get(2), Some(Datum::Text(name))
-                            if name.eq_ignore_ascii_case(only))
-                    });
-                    let named = named && indexed;
-                    if named {
+                    let table = match row.get(1) {
+                        Some(Datum::Text(name)) => Some(*name),
+                        _ => None,
+                    };
+                    let index = match row.get(2) {
+                        Some(Datum::Text(name)) => Some(*name),
+                        _ => None,
+                    };
+                    if doomed_row(table, index) {
                         keys.push(rowid);
                     }
                 }
@@ -386,16 +425,21 @@ impl ImportedDatabase {
             })?;
             keys
         };
+        if doomed.is_empty() {
+            return Ok(());
+        }
         let txn = self.current_txn();
         let wal = self
             .log_of(at)
             .ok_or_else(|| refusal("a statement names a database that is not attached"))?;
+        // A before-image is kept so that a `ROLLBACK` of a `DROP` puts the
+        // statistics back with the table.
         let mut log = WalLog {
             wal,
             txn,
             schema: at,
             wrote: false,
-            undo: None,
+            undo: Some(self.writing.undo()),
             uncommitted: self.uncommitted_handle_of(at),
         };
         let tree = self

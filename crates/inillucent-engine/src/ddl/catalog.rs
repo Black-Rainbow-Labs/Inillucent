@@ -303,6 +303,17 @@ impl crate::ImportedDatabase {
                 (vec![pragma.to_string()], true, true)
             } else if pragma == "optimize" {
                 (vec![pragma.to_string()], true, false)
+            } else if pragma == "foreign_key_check" {
+                // Reading it to learn the columns would check every foreign key
+                // of the database at every open.
+                (
+                    ["table", "rowid", "parent", "fkid"]
+                        .iter()
+                        .map(|held| (*held).to_string())
+                        .collect(),
+                    true,
+                    true,
+                )
             } else {
                 let shape = self.pragma_rows(pragma.as_bytes(), None).ok()??;
                 (shape.names.to_vec(), true, true)

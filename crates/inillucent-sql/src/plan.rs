@@ -20,20 +20,29 @@ use crate::bind::{BoundExpr, BoundSelect, BoundSource, ColumnUse, SourceRows};
 use crate::catalog_view::{IndexInfo, TableInfo};
 use crate::cost;
 
+mod covering;
+mod describe;
 mod hint;
+mod outer_paths;
 mod partial;
 mod pattern;
 mod pushdown;
 mod range;
 mod terms;
+use covering::covering_slots;
+use describe::{index_seek_detail, range_detail};
 pub use hint::unanswerable_index_hint;
-use hint::{forced_path, index_usable, outer_terms, statement_terms};
+use hint::{forced_path, index_usable, outer_terms};
+use outer_paths::{choose_term_path, derived_affinities, hold_terms_before_right_joins, TermPath};
 use partial::implies;
+pub use pushdown::{calls_a_volatile_function, is_repeatable_condition};
 use terms::{
     collation_of, compares_unconverted, comparison_against_rowid, comparison_collation,
     constant_in_list, indexable_comparison, virtual_constraint,
 };
+mod queue;
 mod seek_union;
+pub use queue::RecursiveQueue;
 
 /// A comparison an access path can enforce.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,7 +152,9 @@ pub enum AccessPath {
         /// a value no column of the table carries, and the probe value takes no
         /// column affinity because there is no column to take it from - which
         /// is SQLite's rule and the reason this is an `Option` rather than a
-        /// position that would have to be invented.
+        /// position that would have to be invented. A key on a virtual generated
+        /// column is the exception: it is computed, and it names the column, so
+        /// the probe takes the column's affinity.
         columns: Vec<Option<u16>>,
         /// Whether the table has no rowid, so the index key holds the key.
         without_rowid: bool,
@@ -250,6 +261,13 @@ pub enum AccessPath {
         /// Whether the nested block reads a FROM term outside itself, and so
         /// has to be rebuilt for every row of the query that encloses it.
         correlated: bool,
+        /// The affinity each column of the rows is stored with.
+        ///
+        /// SQLite writes a derived table's rows into a table of its own, whose
+        /// columns take the affinity of the query's: a REAL column of the first
+        /// arm of a compound makes the integer 7 of the second arm 7.0. Blob
+        /// stands for no affinity.
+        affinities: Vec<inillucent_value::Affinity>,
     },
     /// Rows produced by a recursive CTE, filled by walking its own queue.
     Recursive {
@@ -259,6 +277,8 @@ pub enum AccessPath {
         steps: Vec<(CompoundOp, PhysicalPlan)>,
         /// How many columns a row holds.
         width: usize,
+        /// How the queue is ordered and where the recursion stops.
+        queue: RecursiveQueue,
     },
     /// The one row of a recursive CTE's queue the fill loop is on.
     RecursiveSelf {
@@ -374,8 +394,9 @@ impl AccessPath {
             AccessPath::RowidSeek { .. } => {
                 format!("SEARCH {table} USING INTEGER PRIMARY KEY (rowid=?)")
             }
-            AccessPath::RowidRange { .. } => {
-                format!("SEARCH {table} USING INTEGER PRIMARY KEY (rowid>?)")
+            AccessPath::RowidRange { low, high, .. } => {
+                let bounds = range_detail("rowid", low.is_some(), high.is_some());
+                format!("SEARCH {table} USING INTEGER PRIMARY KEY ({bounds})")
             }
             // Every branch is the same one-row lookup, so one line describes
             // all of them - which is also how a plain equality reads, and an
@@ -426,7 +447,7 @@ impl AccessPath {
                     index_name,
                     info,
                     equalities.len(),
-                    low.is_some() || high.is_some(),
+                    (low.is_some(), high.is_some()),
                 );
                 format!(
                     "SEARCH {table} USING {kind} {} ({detail})",
@@ -457,7 +478,7 @@ impl AccessPath {
                         index_name,
                         info,
                         branch.equalities.len(),
-                        branch.low.is_some() || branch.high.is_some(),
+                        (branch.low.is_some(), branch.high.is_some()),
                     );
                     let line = format!(
                         "SEARCH {table} USING {kind} {} ({detail})",
@@ -471,49 +492,6 @@ impl AccessPath {
             }
         }
     }
-}
-
-/// Returns the `(col=? AND col>?)` detail an index seek's description ends
-/// with, given how many leading columns of its equality prefix it pins and
-/// whether it also carries a range on the column after it.
-///
-/// Shared between [`AccessPath::IndexSeek`] and each branch of an
-/// [`AccessPath::IndexSeekUnion`], which differ only in how many branches
-/// there are - the naming of one branch's columns is exactly what a plain
-/// seek already does.
-fn index_seek_detail(
-    index_name: &[u8],
-    info: Option<&TableInfo>,
-    equalities: usize,
-    ranged: bool,
-) -> String {
-    let keyed = info.and_then(|held| {
-        held.indexes
-            .iter()
-            .find(|candidate| candidate.name == index_name)
-    });
-    let named = |position: usize| -> String {
-        keyed
-            .and_then(|index| index.columns.get(position))
-            .and_then(|key| key.column)
-            .and_then(|at| info.and_then(|held| held.column(at)))
-            .map(|column| String::from_utf8_lossy(&column.name).into_owned())
-            .unwrap_or_else(|| "?".to_string())
-    };
-    let mut detail = String::new();
-    for index in 0..equalities {
-        if index > 0 {
-            detail.push_str(" AND ");
-        }
-        detail.push_str(&format!("{}=?", named(index)));
-    }
-    if ranged {
-        if !detail.is_empty() {
-            detail.push_str(" AND ");
-        }
-        detail.push_str(&format!("{}>?", named(equalities)));
-    }
-    detail
 }
 
 /// One FROM term with the path chosen for it.
@@ -533,6 +511,8 @@ pub struct PlannedSource {
     pub table: TableInfo,
     /// The name the query calls it.
     pub alias: Vec<u8>,
+    /// The schema the query wrote before the name, which `EXPLAIN QUERY PLAN` repeats.
+    pub written_schema: Option<Vec<u8>>,
     /// How its rows are produced.
     pub path: AccessPath,
     /// The join that attached it to the term before it.
@@ -558,6 +538,13 @@ pub struct PlannedSource {
     /// statement's terms and re-tested as a residual, and false for an outer
     /// join whose condition says more than its key does.
     pub on_enforced: bool,
+    /// A condition the rows entering this `RIGHT` or `FULL` join must meet.
+    ///
+    /// It is the `ON` of the inner joins written before this join that no
+    /// access path enforced. It is tested on the rows of the terms before this
+    /// one, before they are joined, because after the join a null extended row
+    /// would fail it. `None` for every other join.
+    pub before: Option<BoundExpr>,
 }
 
 /// How the rows are grouped and aggregated.
@@ -662,43 +649,16 @@ impl PhysicalPlan {
         highest
     }
 
+    /// Returns the lines for the search that finds the rows an `UPDATE` or `DELETE` changes.
+    ///
+    /// SQLite never reports a covering index for a write, so `USING COVERING INDEX` reads `USING INDEX`.
+    pub fn describe_write(&self) -> Vec<String> {
+        describe::write_lines(self)
+    }
+
     /// Returns the `EXPLAIN QUERY PLAN` lines this plan renders as.
     pub fn describe(&self) -> Vec<String> {
-        let mut lines = Vec::new();
-        for source in &self.sources {
-            lines.push(
-                source
-                    .path
-                    .describe_over(&String::from_utf8_lossy(&source.alias), Some(&source.table)),
-            );
-        }
-        for (op, arm) in &self.compounds {
-            lines.push(format!("COMPOUND QUERY {}", compound_name(*op)));
-            lines.extend(arm.describe());
-        }
-        // A temp b-tree is only named when there is one. Grouping and
-        // de-duplicating that the walk already delivers build nothing, and a
-        // plan that said otherwise would be describing a different program.
-        if self.aggregation == AggregationMode::Grouped && !self.grouped_walk {
-            lines.push("USE TEMP B-TREE FOR GROUP BY".to_string());
-        }
-        if self.needs_sort {
-            lines.push("USE TEMP B-TREE FOR ORDER BY".to_string());
-        }
-        if self.select.distinct && !self.distinct_walk {
-            lines.push("USE TEMP B-TREE FOR DISTINCT".to_string());
-        }
-        lines
-    }
-}
-
-/// Returns the word `EXPLAIN QUERY PLAN` names a compound operator by.
-fn compound_name(op: CompoundOp) -> &'static str {
-    match op {
-        CompoundOp::Union => "UNION",
-        CompoundOp::UnionAll => "UNION ALL",
-        CompoundOp::Intersect => "INTERSECT",
-        CompoundOp::Except => "EXCEPT",
+        describe::plan_lines(self)
     }
 }
 
@@ -759,8 +719,16 @@ impl Levers {
     /// exactly this switch under exactly this name, so an application that
     /// turns it off there has somewhere to turn it off here.
     pub const AUTOMATIC_INDEX: u32 = 64;
+    /// Walk a scan with no `ORDER BY` from its first entry to its last.
+    ///
+    /// What `PRAGMA reverse_unordered_selects` switches, turned around so that
+    /// zero disabled levers is still the shipped engine: the pragma being ON
+    /// disables this one, and the outermost scan of a query with no `ORDER BY`
+    /// then runs backwards, as SQLite's does.
+    pub const FORWARD_UNORDERED: u32 = 128;
     /// Every lever this build has.
-    pub const EVERY: u32 = Levers::PLAN_CACHE
+    pub const EVERY: u32 = Levers::FORWARD_UNORDERED
+        | Levers::PLAN_CACHE
         | Levers::COVERING_INDEX
         | Levers::INDEXED_WRITE
         | Levers::ORDERED_WALK
@@ -826,7 +794,8 @@ pub fn plan_select_with(select: BoundSelect, levers: Levers) -> PhysicalPlan {
     let mut select = select;
     pushdown::push_into_derived_tables(&mut select);
     let compound_arms = core::mem::take(&mut select.compounds);
-    let terms = statement_terms(&select);
+    let (terms, owners) = hint::statement_terms_with_owners(&select);
+    let held_before = hint::terms_held_before_a_right_join(&select, &owners);
     // The order the terms are visited in is chosen before their paths are, and
     // then the paths are chosen in that order - because a path may use a value
     // from a term visited earlier, and which terms those are is exactly what the
@@ -870,42 +839,11 @@ pub fn plan_select_with(select: BoundSelect, levers: Levers) -> PhysicalPlan {
         // A subquery, a recursive CTE and a virtual table each still resolve to
         // what they are, because those are not access-path choices - they are
         // what the term *is*.
-        let mut on_enforced = false;
-        let path = if is_outer(source.join) && matches!(source.rows, SourceRows::Table) {
-            match source.table.module.clone() {
-                Some(_) => choose_path(level, &ids, source, &select, &terms, &mut consumed, levers),
-                None => {
-                    // **Only a `LEFT` term may seek on its `ON`.** A `RIGHT`
-                    // or `FULL` term keeps the rows of its own that matched
-                    // nothing, and only a side read whole can know which
-                    // those are: `list l RIGHT JOIN todo t ON t.list_id =
-                    // l.id` with an index on `list_id` probed `todo` per list
-                    // and never produced the todo whose list does not exist.
-                    let on_terms = if source.join == JoinKind::Left {
-                        outer_terms(source)
-                    } else {
-                        Vec::new()
-                    };
-                    let mut on_consumed = vec![false; on_terms.len()];
-                    let chosen = choose_path(
-                        level,
-                        &ids,
-                        source,
-                        &select,
-                        &on_terms,
-                        &mut on_consumed,
-                        levers,
-                    );
-                    // Every conjunct of the condition turned into part of the
-                    // key, so the probe answers the condition and an index
-                    // nested loop can null-extend on an empty probe.
-                    on_enforced = !on_terms.is_empty() && on_consumed.iter().all(|held| *held);
-                    chosen
-                }
-            }
-        } else {
-            choose_path(level, &ids, source, &select, &terms, &mut consumed, levers)
-        };
+        let TermPath {
+            path,
+            on_enforced,
+            remaining_on,
+        } = choose_term_path(level, &ids, source, &select, &terms, &mut consumed, levers);
         let (cost, rows) = path_cost(source, &path);
         sources.push(PlannedSource {
             cost,
@@ -913,14 +851,20 @@ pub fn plan_select_with(select: BoundSelect, levers: Levers) -> PhysicalPlan {
             id: source.id,
             table: (*source.table).clone(),
             alias: source.alias.clone(),
+            written_schema: source.written_schema.clone(),
             path,
             join: source.join,
-            on: is_outer(source.join)
-                .then(|| source.constraint.clone())
-                .flatten(),
+            on: match remaining_on {
+                Some(remaining) => remaining,
+                None => is_outer(source.join)
+                    .then(|| source.constraint.clone())
+                    .flatten(),
+            },
             on_enforced,
+            before: None,
         });
     }
+    hold_terms_before_right_joins(&select, &terms, &held_before, &mut consumed, &mut sources);
     let (residuals, constant_filter) = distribute_residuals(&terms, &consumed, &ids);
     let aggregation = if !select.group_by.is_empty() {
         AggregationMode::Grouped
@@ -982,7 +926,7 @@ pub fn plan_select_with(select: BoundSelect, levers: Levers) -> PhysicalPlan {
         None
     };
     let needs_sort = !select.order_by.is_empty() && provided.is_none();
-    let reverse = provided.unwrap_or(false);
+    let reverse = provided.unwrap_or(false) || reverses_unordered_scan(&select, &sources, levers);
     let compounds: Vec<(CompoundOp, PhysicalPlan)> = compound_arms
         .into_iter()
         .map(|(op, arm)| (op, plan_select_with(arm, levers)))
@@ -1007,6 +951,40 @@ pub fn plan_select_with(select: BoundSelect, levers: Levers) -> PhysicalPlan {
         subqueries,
         levers,
     }
+}
+
+/// Returns whether `PRAGMA reverse_unordered_selects` makes the outer scan run
+/// backwards.
+///
+/// SQLite reverses every scan whose direction nothing asks for. This reverses
+/// the outermost term of a query with no `ORDER BY`, no `GROUP BY` and no
+/// `DISTINCT` (a plain aggregate such as `group_concat(a)` is included, because
+/// the order the rows reach it in is visible), which is the order the rows leave in when the inner terms are
+/// seeks that find one row each. A statement that sorts anyway, or whose outer
+/// term is not a scan of a table or an index, is left alone.
+///
+/// @param select - the bound statement
+/// @param sources - the planned FROM terms
+/// @param levers - the optimizations that were on when the plan was chosen
+fn reverses_unordered_scan(
+    select: &BoundSelect,
+    sources: &[PlannedSource],
+    levers: Levers,
+) -> bool {
+    !levers.has(Levers::FORWARD_UNORDERED)
+        && select.order_by.is_empty()
+        && !select.distinct
+        && select.group_by.is_empty()
+        && select.windows.is_empty()
+        && select.compounds.is_empty()
+        && sources.first().is_some_and(|outer| {
+            matches!(
+                outer.path,
+                AccessPath::TableScan { .. }
+                    | AccessPath::RowidRange { .. }
+                    | AccessPath::IndexSeek { .. }
+            )
+        })
 }
 
 /// Returns whether a select holds a subquery used as a value.
@@ -1569,7 +1547,7 @@ fn vector_path(
     else {
         return None;
     };
-    if *held != id || reads_a_column(probe) {
+    if *held != id || terms::reads_a_column(probe) {
         return None;
     }
     let index = source.table.indexes.iter().find(|held| {
@@ -1586,22 +1564,6 @@ fn vector_path(
         probe: Box::new(probe.clone()),
         depth,
     })
-}
-
-/// Reports whether an expression reads any column or rowid.
-///
-/// A probe that did would be a different question per row, and the index
-/// answers one.
-///
-/// @param expr - the expression to look through
-fn reads_a_column(expr: &BoundExpr) -> bool {
-    if matches!(
-        expr,
-        BoundExpr::Column { .. } | BoundExpr::Rowid { .. } | BoundExpr::VirtualFunction { .. }
-    ) {
-        return true;
-    }
-    expr.children().into_iter().any(reads_a_column)
 }
 
 /// Returns what one term's path costs, and how many rows it produces.
@@ -1889,6 +1851,13 @@ fn distribute_residuals(
             .iter()
             .filter_map(|source| ids.iter().position(|id| id == source))
             .max();
+        // A term that reads no table but calls `random()` or another function
+        // whose answer changes between calls is tested for every row, as SQLite
+        // does. Treated as a constant it would be tested once for the statement.
+        let level = match level {
+            None if levels > 0 && pushdown::calls_a_volatile_function(term) => Some(levels - 1),
+            other => other,
+        };
         match level {
             Some(level) if level < levels => {
                 if let Some(slot) = residuals.get_mut(level) {
@@ -1925,10 +1894,12 @@ fn choose_path(
         SourceRows::Subquery(block) => {
             let width = block.columns.len();
             let correlated = !block.correlations.is_empty();
+            let affinities = derived_affinities(block);
             return AccessPath::Subquery {
                 plan: Box::new(plan_select_with((**block).clone(), levers)),
                 width,
                 correlated,
+                affinities,
             };
         }
         SourceRows::Recursive(body) => {
@@ -1945,6 +1916,11 @@ fn choose_path(
                     .map(|(op, arm)| (*op, plan_select_with(arm.clone(), levers)))
                     .collect(),
                 width,
+                queue: RecursiveQueue {
+                    order_by: body.order_by.clone(),
+                    limit: body.limit.clone(),
+                    offset: body.offset.clone(),
+                },
             };
         }
         SourceRows::RecursiveSelf { cte } => {
@@ -2129,13 +2105,23 @@ fn virtual_path(
     // **One `IN` list of constant values, offered as `=` and not consumed.** See
     // `VirtualConstraint::in_list`. Only one, because the engine drives the
     // module once per value of one list; two lists would need every pair.
-    if let Some((column, list, term)) = terms
+    let lists: Vec<(i32, Vec<BoundExpr>, &BoundExpr)> = terms
         .iter()
         .enumerate()
         .filter(|(index, _)| !consumed.get(*index).copied().unwrap_or(false))
-        .find_map(|(_, term)| constant_in_list(id, term).map(|(column, list)| (column, list, term)))
-    {
+        .filter_map(|(_, term)| {
+            constant_in_list(id, table, term).map(|(column, list)| (column, list, term))
+        })
+        .collect();
+    for (column, list, term) in lists {
         if let Some(first) = list.first().cloned() {
+            // A list written as a subquery has no first value to show the
+            // module; its values are read when the scan runs.
+            let first = if matches!(first, BoundExpr::Subquery { .. }) {
+                BoundExpr::Null
+            } else {
+                first
+            };
             offer.push(VirtualConstraint {
                 spec: crate::vtab::ConstraintSpec {
                     column,
@@ -2164,7 +2150,11 @@ fn virtual_path(
 /// within each of those restarts - which is not the statement's ordering and
 /// would let the sorter be skipped wrongly.
 fn order_offer(id: usize, position: usize, select: &BoundSelect) -> Vec<crate::vtab::OrderSpec> {
-    if position != 0 {
+    // An aggregate with no GROUP BY returns one row, so its ORDER BY orders
+    // nothing the module scans: `SELECT group_concat(value) FROM
+    // generate_series(10, 1, -3) ORDER BY value` walks the series in its own
+    // order, as SQLite does.
+    if position != 0 || (!select.aggregates.is_empty() && select.group_by.is_empty()) {
         return Vec::new();
     }
     let mut offer = Vec::new();
@@ -2228,6 +2218,7 @@ pub fn write_path_with(
         constraint: None,
         suppressed: Vec::new(),
         index_exprs: Vec::new(),
+        written_schema: None,
     };
     let mut consumed = vec![false; terms.len()];
     // A write reads the whole row it is about to change, so no index covers it.
@@ -2551,7 +2542,10 @@ fn index_candidate(
                 .and_then(|wanted| {
                     find_expr_equality(position, ids, &wanted, collation, terms, consumed, &used)
                 })
-                .map(|(term_index, value)| (term_index, value, None)),
+                // A key on a virtual generated column still names that column, and
+                // the probe takes the column's affinity: the entries hold the value
+                // after the column's affinity was applied.
+                .map(|(term_index, value)| (term_index, value, key_column.column)),
         };
         let Some((term_index, value, column)) = found else {
             break;
@@ -2585,10 +2579,24 @@ fn index_candidate(
         }
         None => (None, None),
     };
+    // A partial index whose predicate the query repeats does not need that predicate's columns.
+    let beyond = if usable {
+        partial::needed_beyond_predicate(id, needed, terms, computed)
+    } else {
+        None
+    };
+    let covering_need = beyond.as_ref().map_or(needed, |(reduced, _)| reduced);
     let covering = levers
         .has(Levers::COVERING_INDEX)
-        .then(|| covering_slots(table, index, needed, usable))
+        .then(|| covering_slots(table, index, covering_need, usable))
         .flatten();
+    if let Some((_, implied)) = &beyond {
+        for term in implied {
+            if !used.contains(term) {
+                used.push(*term);
+            }
+        }
+    }
     // **A partial index whose predicate the query implies is worth walking whole.**
     // It holds only the rows its predicate accepted, so reading
     // every entry of it reads exactly the rows the query asked for - even with
@@ -2653,44 +2661,6 @@ fn index_candidate(
 /// `usize` because no entry can have that many fields, and because a number
 /// that could also be a real slot would be a silent misread.
 pub const ROWID_ENTRY_SLOT: usize = usize::MAX;
-
-/// Returns where each column the query reads sits in one index's entries.
-///
-/// `None` when the index does not hold them all, which is the ordinary case and
-/// is why a covering path is worth naming when it happens. A `WITHOUT ROWID`
-/// table is excluded: its rows *are* index entries, so the question is already
-/// answered by whether the seek is on the table's own key, and mixing the two
-/// would be two answers to one question.
-/// @param table - the table being read
-/// @param index - the index being considered
-/// @param needed - what the query reads from this term
-fn covering_slots(
-    table: &TableInfo,
-    index: &IndexInfo,
-    needed: &ColumnUse,
-    usable: bool,
-) -> Option<Vec<(u16, usize)>> {
-    if needed.opaque || table.without_rowid || !usable {
-        return None;
-    }
-    let mut slots = Vec::with_capacity(needed.columns.len());
-    for slot in &needed.columns {
-        // The rowid alias is a column of the table and the *rowid* of the
-        // entry, so it is covered whatever the index holds - but it is read
-        // with `IdxRowid` rather than out of the entry's record, so it is not
-        // in the list.
-        if table.rowid_alias == Some(*slot) {
-            slots.push((*slot, ROWID_ENTRY_SLOT));
-            continue;
-        }
-        let position = index
-            .columns
-            .iter()
-            .position(|key| key.plain_column() == Some(*slot))?;
-        slots.push((*slot, position));
-    }
-    Some(slots)
-}
 
 /// Finds an equality predicate on one column with a matching collation.
 fn find_equality(

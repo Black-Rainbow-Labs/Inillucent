@@ -273,6 +273,20 @@ pub struct Accumulator {
     rows: Vec<Vec<inillucent_value::value::Value<'static>>>,
 }
 
+/// Returns a real result, or NULL when it is NaN.
+///
+/// SQLite's `sqlite3_result_double` stores NaN as NULL, so `sum` over `Inf`
+/// and `-Inf` is NULL and not NaN.
+///
+/// @param value - the computed total
+fn real_or_null(value: f64) -> OwnedDatum {
+    if value.is_nan() {
+        OwnedDatum::Null
+    } else {
+        OwnedDatum::Real(value)
+    }
+}
+
 impl Accumulator {
     /// Returns a fresh accumulator.
     ///
@@ -408,15 +422,20 @@ impl Accumulator {
             // A NULL never wins a `min` or a `max`, so a row whose witness is
             // NULL cannot be the row the bare column comes from - unless no row
             // has yet been chosen at all.
+            // A held NULL is replaced by the first value that is not NULL: the
+            // comparison alone would keep it for a `min`, because NULL sorts
+            // below every value, and the bare column would stay on the row
+            // that had no value at all.
             let replace = match &self.extreme {
                 None => true,
                 Some(held) => {
                     !seen.borrow().is_null()
-                        && inillucent_tree::types::compare_under(
-                            &seen.borrow(),
-                            &held.borrow(),
-                            self.ordering,
-                        ) == wanted
+                        && (held.borrow().is_null()
+                            || inillucent_tree::types::compare_under(
+                                &seen.borrow(),
+                                &held.borrow(),
+                                self.ordering,
+                            ) == wanted)
                 }
             };
             if replace {
@@ -945,6 +964,13 @@ impl Accumulator {
     /// they did on the first attempt, when only `sum` was corrected and the
     /// other two answered 3.5 where SQLite answered 124.25.
     fn compensated(&self) -> f64 {
+        // SQLite drops the compensation when it is NaN or infinite
+        // (`sqlite3IsOverflow`). Once the running total overflows, the term
+        // is infinity minus infinity, and adding it would turn a total of
+        // Inf into NaN where SQLite answers Inf.
+        if !self.compensation.is_finite() {
+            return self.real_sum;
+        }
         self.real_sum + self.compensation
     }
 
@@ -993,12 +1019,12 @@ impl Accumulator {
                         "integer overflow",
                     ));
                 } else if self.is_real {
-                    OwnedDatum::Real(self.compensated())
+                    real_or_null(self.compensated())
                 } else {
                     OwnedDatum::Int(self.integer_sum)
                 }
             }
-            AggregateKind::Total => OwnedDatum::Real(if self.is_real {
+            AggregateKind::Total => real_or_null(if self.is_real {
                 self.compensated()
             } else {
                 self.integer_sum as f64
@@ -1012,7 +1038,7 @@ impl Accumulator {
                     } else {
                         self.integer_sum as f64
                     };
-                    OwnedDatum::Real(total / self.count as f64)
+                    real_or_null(total / self.count as f64)
                 }
             }
             AggregateKind::JsonGroupArray(binary) => {

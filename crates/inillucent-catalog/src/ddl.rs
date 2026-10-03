@@ -248,6 +248,32 @@ pub fn canonical_sql(keywords: &str, source: &[u8], name_offset: u32, end: u32) 
     sql
 }
 
+/// Returns the `sqlite_schema` text SQLite stores for a `CREATE INDEX`.
+///
+/// SQLite stores the text up to its last token and removes a final `;` without
+/// removing the space before it, so `CREATE INDEX i ON t(a) ;` is stored with
+/// the trailing space. Whitespace after the last token is not part of the text.
+///
+/// @param keywords - the prefix the statement is stored with
+/// @param source - the statement text
+/// @param name_offset - where the index's name starts
+/// @param end - where the statement ends
+pub fn canonical_index_sql(keywords: &str, source: &[u8], name_offset: u32, end: u32) -> Vec<u8> {
+    let start = name_offset as usize;
+    let finish = (end as usize).min(source.len()).max(start);
+    let mut tail = source.get(start..finish).unwrap_or(&[]).to_vec();
+    while tail.last().is_some_and(u8::is_ascii_whitespace) {
+        tail.pop();
+    }
+    if tail.last() == Some(&b';') {
+        tail.pop();
+    }
+    let mut sql = keywords.as_bytes().to_vec();
+    sql.push(b' ');
+    sql.extend_from_slice(&tail);
+    sql
+}
+
 /// Returns the name SQLite gives the `n`th automatic index of a table.
 pub fn automatic_index_name(table: &[u8], ordinal: u32) -> Vec<u8> {
     let mut name = b"sqlite_autoindex_".to_vec();

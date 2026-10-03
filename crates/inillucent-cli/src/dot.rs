@@ -103,7 +103,11 @@ pub fn run(shell: &mut Shell, line: &str) {
         "indexes" | "indices" => indexes(shell, &arguments),
         "schema" => schema(shell, &arguments),
         "fullschema" => full_schema(shell),
-        "headers" => shell.layout.headers = truthy(arguments.first().copied()),
+        "headers" => {
+            let on = truthy(arguments.first().copied());
+            shell.headers_chosen = Some(on);
+            shell.layout.headers = on;
+        }
         "mode" => mode(shell, &arguments),
         "separator" => separator(shell, &arguments),
         "nullvalue" => match arguments.first() {
@@ -295,6 +299,37 @@ fn progress(shell: &mut Shell, arguments: &[&str]) {
     shell.progress_interval = interval;
 }
 
+/// Works out the value `.parameter set NAME VALUE` binds.
+///
+/// **The word is tried as an SQL expression first and kept as text only when it does
+/// not compile.** That is the reference's order: it runs `REPLACE INTO
+/// temp.sqlite_parameters(key,value) VALUES('NAME',VALUE)`, and when that does not
+/// prepare it stores the word itself as text. So `NULL` binds a NULL, `'42'` (whose
+/// quotes the word splitter already removed) binds the integer 42, `1+1` binds 2, and
+/// `hello`, which names no column, binds the text `hello`. This used to quote every
+/// word that was not a number, which made `.parameter set ?4 NULL` the four letters.
+///
+/// @param shell - the shell, which evaluates the expression
+/// @param word - the VALUE argument after the word splitter
+fn parameter_value(shell: &Shell, word: &str) -> Result<Value<'static>, String> {
+    let evaluated = match word.contains(';') {
+        true => None,
+        false => shell.collect(&format!("SELECT {word}")).ok(),
+    };
+    let rows = match evaluated {
+        Some((_, rows)) => rows,
+        None => {
+            let quoted = format!("SELECT '{}'", word.replace('\'', "''"));
+            shell.collect(&quoted).map_err(|failure| failure.message)?.1
+        }
+    };
+    Ok(rows
+        .first()
+        .and_then(|row| row.first())
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
 /// `.parameter init | list | set NAME VALUE | unset NAME | clear`.
 ///
 /// **The one dot command with no substitute.** A bound parameter could not be
@@ -343,24 +378,11 @@ fn parameter(shell: &mut Shell, arguments: &[&str]) {
                 shell.complain("Error: .parameter set needs a name and a value");
                 return;
             };
-            // Quoted text arrives here with its quotes already removed by
-            // `split`, so it is re-quoted before being evaluated - otherwise
-            // `.parameter set :s hello` would be a column reference.
-            let expression = if value.parse::<f64>().is_ok() {
-                (*value).to_string()
-            } else {
-                format!("'{}'", value.replace('\'', "''"))
-            };
-            match shell.collect(&format!("SELECT {expression}")) {
-                Ok((_, rows)) => {
-                    let held = rows
-                        .first()
-                        .and_then(|row| row.first())
-                        .cloned()
-                        .unwrap_or(Value::Null);
+            match parameter_value(shell, value) {
+                Ok(held) => {
                     shell.parameters.insert((*name).to_string(), held);
                 }
-                Err(failure) => shell.complain(&format!("Error: {}", failure.message)),
+                Err(message) => shell.complain(&format!("Error: {message}")),
             }
         }
         other => shell.complain(&format!(
@@ -723,19 +745,18 @@ fn mode(shell: &mut Shell, arguments: &[&str]) {
             } else {
                 "\n".to_string()
             };
-            // The tabular modes want headers, which is what SQLite's shell
-            // does when the mode changes: nobody asks for a box with no
-            // labels on it.
-            if matches!(
+            // The tabular modes default to headers and the others do not,
+            // unless `.headers` has been used, whose choice wins in every
+            // mode. That is SQLite's shell, asked of the pinned 3.53.4.
+            let tabular = matches!(
                 mode,
                 crate::render::Mode::Column
                     | crate::render::Mode::Markdown
                     | crate::render::Mode::Table
                     | crate::render::Mode::Box
                     | crate::render::Mode::Html
-            ) {
-                shell.layout.headers = true;
-            }
+            );
+            shell.layout.headers = shell.headers_chosen.unwrap_or(tabular);
             if let Some(table) = arguments.get(1) {
                 shell.layout.table = (*table).to_string();
             }

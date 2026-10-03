@@ -64,6 +64,26 @@ pub fn run_prepared(
     run_prepared_limited(plan, catalog, prepared, params, None)
 }
 
+thread_local! {
+    /// The rows the last pipeline to fail had already delivered.
+    static PARTIAL_ROWS: std::cell::RefCell<Vec<Vec<OwnedDatum>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Keeps the rows a failed pipeline had delivered, replacing any kept before.
+///
+/// The outermost pipeline fails last, so its rows are the ones left.
+///
+/// @param rows - what the failed pipeline's sink held
+pub fn keep_partial_rows(rows: Vec<Vec<OwnedDatum>>) {
+    PARTIAL_ROWS.with(|held| *held.borrow_mut() = rows);
+}
+
+/// Takes the rows the last failed pipeline had delivered before it failed.
+pub fn take_partial_rows() -> Vec<Vec<OwnedDatum>> {
+    PARTIAL_ROWS.with(|held| std::mem::take(&mut *held.borrow_mut()))
+}
+
 /// Runs a prepared pipeline, stopping after `limit` rows when one is given.
 ///
 /// **For a caller that needs one row and not the answer** (task-2066 §4.3.1).
@@ -95,7 +115,13 @@ pub fn run_prepared_limited(
         None => Box::new(CollectInto::new(std::rc::Rc::clone(&rows))),
     };
     let (mut pipeline, shape) = build_prepared(plan, catalog, prepared, params, sink)?;
-    pipeline.run()?;
+    if let Err(error) = pipeline.run() {
+        // The rows delivered before the failure are kept for whoever reports it:
+        // SQLite hands out the rows of `SELECT ... ` that came before the row
+        // that raised the error, and a caller that wants them asks for them.
+        keep_partial_rows(std::mem::take(&mut *rows.borrow_mut()));
+        return Err(error);
+    }
     // **Taken, not cloned.** The sink is dropped with the pipeline and nothing
     // reads the buffer again, so cloning it copied every row of every answer to
     // hand back a second copy of what was about to be freed. On a one-row answer
@@ -141,12 +167,7 @@ pub fn run_compound(
     // built over it. See `crate::subquery` for why it is per execution.
     let folded = crate::subquery::fold(plan, catalog, params)?;
     let params = folded.as_ref().unwrap_or(params);
-    let collations: Vec<Collation> = plan
-        .select
-        .columns
-        .iter()
-        .map(|column| inillucent_sql::bind::result_collation(&column.expr))
-        .collect();
+    let collations = compound_collations(plan);
     let (mut rows, shape) = run_arm(plan, catalog, params)?;
     for (op, arm) in &plan.compounds {
         if !arm.compounds.is_empty() {
@@ -160,6 +181,24 @@ pub fn run_compound(
     }
     let ordered = order_compound(&plan.select, rows, params)?;
     Ok((ordered, shape))
+}
+/// Returns the collation each result column of a compound is compared under.
+///
+/// The leftmost arm whose column has a collation of its own decides, as in
+/// SQLite's `multiSelectCollSeq`, so an explicit `COLLATE` on a later arm counts
+/// when the earlier arms have only literals in that column.
+///
+/// @param plan - the head arm, carrying the rest in `compounds`
+fn compound_collations(plan: &PhysicalPlan) -> Vec<Collation> {
+    (0..plan.select.columns.len())
+        .map(|at| {
+            let arms = std::iter::once(&plan.select)
+                .chain(plan.compounds.iter().map(|(_, arm)| &arm.select))
+                .filter_map(|select| select.columns.get(at))
+                .map(|column| &column.expr);
+            inillucent_sql::bind::compound_collation(arms)
+        })
+        .collect()
 }
 /// Runs one arm of a compound, without the compound's own ordering or limit.
 ///

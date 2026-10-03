@@ -129,66 +129,6 @@ kinds = ["counters", "fixture"]
 reason = "Once a table holds rowid 9223372036854775807, both engines choose the next rowid at random, as SQLite documents. The two draws are not meant to agree; the rows that follow are compared."
 
 [[rule]]
-name = "settings-this-engine-refuses"
-detail = "cannot be set to"
-kinds = ["outcome", "reopen"]
-reason = "inillucent refuses to change a setting it does not implement, such as legacy_alter_table or cell_size_check, instead of accepting the PRAGMA and ignoring it. The refusal names the setting and its fixed value; the pragma family grades the reads."
-
-[[rule]]
-name = "temp-store-is-memory"
-detail = "temp_store file is not available here"
-kinds = ["outcome"]
-reason = "inillucent keeps temporary tables in memory and refuses PRAGMA temp_store = FILE rather than accepting it and ignoring it."
-
-[[rule]]
-name = "reading-a-setting-this-engine-refused"
-contains = ["legacy_alter_table"]
-kinds = ["rows", "reopen"]
-reason = "After a PRAGMA legacy_alter_table = ON that inillucent refuses (settings-this-engine-refuses), reading the setting back answers the value inillucent keeps."
-
-[[rule]]
-name = "reading-cell-size-check-this-engine-refused"
-contains = ["cell_size_check"]
-kinds = ["rows", "reopen"]
-reason = "After a PRAGMA cell_size_check = ON that inillucent refuses, reading the setting back answers the value inillucent keeps."
-
-[[rule]]
-name = "reading-temp-store-this-engine-refused"
-contains = ["temp_store"]
-kinds = ["rows", "reopen"]
-reason = "After a PRAGMA temp_store = FILE that inillucent refuses, reading the setting back answers MEMORY."
-
-[[rule]]
-name = "reading-fullfsync-this-engine-refused"
-contains = ["fullfsync"]
-kinds = ["rows", "reopen"]
-reason = "After a PRAGMA fullfsync = 1 that inillucent refuses (settings-this-engine-refuses), reading the setting back answers the value inillucent keeps, 0."
-
-[[rule]]
-name = "reading-journal-size-limit-this-engine-refused"
-contains = ["journal_size_limit"]
-kinds = ["rows", "reopen"]
-reason = "inillucent rolls its log at a checkpoint rather than trimming it to a size, so journal_size_limit is always -1 and setting it to anything else is refused."
-
-[[rule]]
-name = "reading-read-uncommitted-this-engine-refused"
-contains = ["read_uncommitted"]
-kinds = ["rows", "reopen"]
-reason = "inillucent has one writer and no shared cache to read uncommitted rows from, so read_uncommitted is always 0 and setting it to 1 is refused."
-
-[[rule]]
-name = "cache-spill-is-zero"
-contains = ["cache_spill"]
-kinds = ["rows", "reopen"]
-reason = "inillucent's buffer pool evicts by clock rather than spilling at a threshold, so it reports cache_spill as 0 against SQLite's page count. The comment on reported_value in crates/inillucent-engine/src/pragma.rs gives the reason."
-
-[[rule]]
-name = "wal-autocheckpoint-is-zero"
-contains = ["wal_autocheckpoint"]
-kinds = ["rows", "reopen"]
-reason = "inillucent folds its log in at an explicit checkpoint rather than every thousand frames, so it reports wal_autocheckpoint as 0. The comment on reported_value in crates/inillucent-engine/src/pragma.rs gives the reason."
-
-[[rule]]
 name = "journal-mode-arm"
 contains = ["PRAGMA journal_mode"]
 kinds = ["rows", "reopen"]

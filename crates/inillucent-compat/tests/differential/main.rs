@@ -50,3 +50,4 @@ mod services;
 mod syntax;
 mod temp_objects;
 mod trigger_depth;
+mod usage_corpus;

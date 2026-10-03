@@ -461,6 +461,15 @@ pub static CAPABILITIES: &[Capability] = &[
             sql: "ATTACH DATABASE ':memory:' AS o KEY \"x'1111111111111111111111111111111111111111111111111111111111111111'\"",
         },
     },
+    Capability {
+        name: "row_value_in_subquery",
+        support: Support::Yes,
+        note: "A row value on the left of IN takes a query as well as a value list: `(a, b) IN (SELECT x, y FROM s)` answers as SQLite does, NULLs included, and NOT IN is the negation.",
+        probe: Probe::Runs {
+            setup: &["CREATE TABLE t (a INTEGER, b INTEGER)", "CREATE TABLE s (x INTEGER, y INTEGER)"],
+            sql: "SELECT 1 FROM t WHERE (a, b) IN (SELECT x, y FROM s)",
+        },
+    },
     // —— what it does not do ——————————————————————————————————————
     Capability {
         name: "attach_computed_path",
@@ -469,15 +478,6 @@ pub static CAPABILITIES: &[Capability] = &[
         probe: Probe::Runs {
             setup: &[],
             sql: "ATTACH ? AS other",
-        },
-    },
-    Capability {
-        name: "row_value_in_subquery",
-        support: Support::No,
-        note: "A row value on the left of IN takes a value list and not a query: `(a, b) IN (SELECT x, y FROM s)` is refused.",
-        probe: Probe::Runs {
-            setup: &["CREATE TABLE t (a INTEGER, b INTEGER)", "CREATE TABLE s (x INTEGER, y INTEGER)"],
-            sql: "SELECT 1 FROM t WHERE (a, b) IN (SELECT x, y FROM s)",
         },
     },
     Capability {
@@ -651,8 +651,8 @@ pub static CAPABILITIES: &[Capability] = &[
     },
     Capability {
         name: "on_conflict_partial_index",
-        support: Support::No,
-        note: "An ON CONFLICT target names a column list of an ordinary unique index; a partial index's WHERE clause in the target is refused.",
+        support: Support::Yes,
+        note: "An ON CONFLICT target may name a partial unique index; its WHERE must match the index's predicate, as in SQLite.",
         probe: Probe::Runs {
             setup: &["CREATE TABLE t (a INTEGER, b INTEGER)", "CREATE UNIQUE INDEX t_a ON t(a) WHERE b > 0"],
             sql: "INSERT INTO t(a,b) VALUES (1,1) ON CONFLICT(a) WHERE b > 0 DO NOTHING",
@@ -660,8 +660,8 @@ pub static CAPABILITIES: &[Capability] = &[
     },
     Capability {
         name: "on_conflict_expression_index",
-        support: Support::No,
-        note: "An ON CONFLICT target names columns; an expression such as `ON CONFLICT(lower(a))` is refused.",
+        support: Support::Yes,
+        note: "An ON CONFLICT target may name the expression of a unique expression index, such as `ON CONFLICT(lower(a))`.",
         probe: Probe::Runs {
             setup: &["CREATE TABLE t (a TEXT)", "CREATE UNIQUE INDEX t_l ON t(lower(a))"],
             sql: "INSERT INTO t(a) VALUES ('x') ON CONFLICT(lower(a)) DO NOTHING",
@@ -669,8 +669,8 @@ pub static CAPABILITIES: &[Capability] = &[
     },
     Capability {
         name: "correlated_in_over_a_grouped_block",
-        support: Support::No,
-        note: "A correlated IN subquery runs, and one whose block groups, limits, or is itself a compound query is refused: the lowering pushes the equality into the block's WHERE, which is applied before either.",
+        support: Support::Yes,
+        note: "A correlated IN subquery runs when its block groups, limits or is itself a compound query. The block is evaluated for each outer row and the equality is applied to its result.",
         probe: Probe::Runs {
             setup: &["CREATE TABLE t (a INTEGER, b INTEGER)", "CREATE TABLE s (x INTEGER, y INTEGER)"],
             sql: "SELECT a FROM t WHERE a IN (SELECT x FROM s WHERE s.y = t.b GROUP BY x)",

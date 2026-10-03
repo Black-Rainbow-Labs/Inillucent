@@ -86,11 +86,8 @@ pub fn read(
             if let Some(Datum::Int(rowid)) = row.first() {
                 mark.rowid = Some(*rowid);
             }
-            match row.get(2) {
-                Some(Datum::Int(seq)) => mark.seq = mark.seq.max(*seq),
-                // A `seq` a person set to something that is not an integer is
-                // ignored rather than refused, the way SQLite ignores it.
-                _ => continue,
+            if let Some(cell) = row.get(2) {
+                mark.seq = mark.seq.max(integer_of(cell));
             }
         }
         Ok(true)
@@ -185,14 +182,77 @@ fn next_rowid(target: &mut dyn WriteTarget, sequence_root: u32) -> DbResult<i64>
 ///
 /// @param table - the table being written
 /// @param mark - the high-water mark as it stands
-pub fn allocate(table: &TableInfo, mark: i64) -> DbResult<i64> {
+pub fn allocate(_table: &TableInfo, mark: i64) -> DbResult<i64> {
     if mark == i64::MAX {
-        return Err(DbError::primary(PrimaryCode::Full)
-            .with_message("database or disk is full")
-            .with_detail(format!(
-                "{} has handed out every AUTOINCREMENT key",
-                String::from_utf8_lossy(&table.name)
-            )));
+        // The table's name is not in the text: the shell prints the detail in place
+        // of the message, and SQLite's text for this failure is the result code's.
+        return Err(DbError::primary(PrimaryCode::Full).with_message("database or disk is full"));
     }
     Ok(mark.saturating_add(1))
+}
+
+/// Reads a `sqlite_sequence.seq` cell as the integer SQLite takes from it.
+///
+/// **A `seq` a person edited is read the way SQLite reads it**: text takes its
+/// leading integer (`'5abc'` is 5), a real is truncated, and anything else is
+/// zero. The value is never refused, because the next insert has to be able to
+/// continue from whatever is there.
+///
+/// @param cell - the `seq` cell of the table's row
+fn integer_of(cell: &Datum<'_>) -> i64 {
+    match cell {
+        Datum::Int(seq) => *seq,
+        Datum::Real(seq) => *seq as i64,
+        Datum::Text(text) => leading_integer(text),
+        Datum::Blob(bytes) => leading_integer(bytes),
+        _ => 0,
+    }
+}
+
+/// Returns the integer a text starts with, saturating at the 64 bit limits.
+///
+/// @param text - the bytes of the value
+fn leading_integer(text: &[u8]) -> i64 {
+    let trimmed = text.trim_ascii_start();
+    let (negative, digits) = match trimmed.first() {
+        Some(b'-') => (true, trimmed.get(1..).unwrap_or_default()),
+        Some(b'+') => (false, trimmed.get(1..).unwrap_or_default()),
+        _ => (false, trimmed),
+    };
+    let mut value: i64 = 0;
+    for byte in digits.iter().take_while(|byte| byte.is_ascii_digit()) {
+        let digit = i64::from(byte - b'0');
+        value = match negative {
+            true => value.saturating_mul(10).saturating_sub(digit),
+            false => value.saturating_mul(10).saturating_add(digit),
+        };
+    }
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `seq` that was edited to text is read by its leading integer.
+    ///
+    /// SQLite reads `'5abc'` as 5 when it picks the next key, and a value with
+    /// no leading digits as 0, so the table can keep counting from whatever a
+    /// person left in `sqlite_sequence`.
+    #[test]
+    fn text_is_read_by_its_leading_integer() {
+        assert_eq!(leading_integer(b"5abc"), 5);
+        assert_eq!(leading_integer(b"  -12x"), -12);
+        assert_eq!(leading_integer(b"+7"), 7);
+        assert_eq!(leading_integer(b"zzz"), 0);
+        assert_eq!(leading_integer(b"99999999999999999999"), i64::MAX);
+    }
+
+    /// Reals are truncated and every other storage class reads as zero.
+    #[test]
+    fn other_values_are_truncated_or_zero() {
+        assert_eq!(integer_of(&Datum::Real(20.9)), 20);
+        assert_eq!(integer_of(&Datum::Null), 0);
+        assert_eq!(integer_of(&Datum::Int(4)), 4);
+    }
 }

@@ -46,3 +46,9 @@ fuzz/corpus/** -text
 # build repairs what 2.0.3's merges did to it. Bytes, like the interop fixtures.
 /crates/inillucent-compat/tests/fixtures/*/app.rdb binary
 /crates/inillucent-compat/tests/fixtures/*/app.rdb-wal.* binary
+
+# The usage corpus is fed to two shells and their output compared byte for
+# byte. A case may store a multi line CREATE TABLE, whose text SQLite keeps
+# exactly, so a checkout that turned LF into CRLF would change what the case
+# tests. LF everywhere.
+compat/corpus/usage/** text eol=lf

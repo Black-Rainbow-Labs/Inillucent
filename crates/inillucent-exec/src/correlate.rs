@@ -58,6 +58,10 @@ use crate::physical::{prepare_any, run_any_prepared_limited, Params, Prepared, T
 /// separation is a stated constant rather than "one past the highest we saw".
 const FIRST_CORRELATION_PARAMETER: u32 = crate::physical::ENGINE_PARAMETER_BASE;
 
+/// A subquery found in an expression: its number, its kind, whether `NOT` was
+/// written, its block, and for an `IN` the whole expression, operand included.
+type Found = (usize, SubqueryKind, bool, BoundSelect, Option<BoundExpr>);
+
 /// One correlated block, planned once.
 pub struct Correlation {
     /// The binder's statement-wide number for the subquery.
@@ -83,6 +87,15 @@ pub struct Correlation {
     /// For each replaced reference: the joined-row column that feeds it, and
     /// the parameter number it was given.
     feeds: Vec<(usize, u32)>,
+    /// Whether the block reads nothing of the row and nothing the statement
+    /// writes, so its first answer holds for the rest of the statement.
+    ///
+    /// SQLite keeps the answer of a subquery in `RETURNING` that does not read
+    /// the table being changed: `(SELECT count(*) FROM log)` is the same for
+    /// every row returned, even when a trigger writes `log` between rows.
+    once: bool,
+    /// The answer kept for a block that is `once`.
+    kept: std::cell::RefCell<Option<OwnedDatum>>,
 }
 
 /// Appends one column per correlated subquery to every row that passes.
@@ -233,10 +246,41 @@ impl Correlation {
     /// statement can write, so sharing one set between the blocks of one batch
     /// cannot let one of them read another's value.
     ///
+    /// A block that is `once` answers from the first run for the rest of the
+    /// statement; `forget` is what starts the statement again.
+    ///
     /// @param catalog - where the trees and layouts come from
     /// @param bound - the statement's parameters, to write this row's feeds into
     /// @param row - the joined row so far
     pub fn answer(
+        &self,
+        catalog: &dyn TreeCatalog,
+        bound: &mut Params,
+        row: &[OwnedDatum],
+    ) -> DbResult<OwnedDatum> {
+        if self.once {
+            if let Some(kept) = self.kept.borrow().clone() {
+                return Ok(kept);
+            }
+        }
+        let answer = self.run(catalog, bound, row)?;
+        if self.once {
+            *self.kept.borrow_mut() = Some(answer.clone());
+        }
+        Ok(answer)
+    }
+
+    /// Forgets the answer a `once` block kept, so the next statement runs it.
+    pub fn forget(&self) {
+        *self.kept.borrow_mut() = None;
+    }
+
+    /// Runs the block for one outer row.
+    ///
+    /// @param catalog - where the trees and layouts come from
+    /// @param bound - the statement's parameters, to write this row's feeds into
+    /// @param row - the joined row so far
+    fn run(
         &self,
         catalog: &dyn TreeCatalog,
         bound: &mut Params,
@@ -286,11 +330,34 @@ pub fn correlations_in(
     catalog: &dyn TreeCatalog,
     resolve: &dyn Fn(&BoundExpr) -> Option<usize>,
 ) -> DbResult<Vec<Correlation>> {
-    let mut found: Vec<(usize, SubqueryKind, bool, BoundSelect)> = Vec::new();
+    let mut found: Vec<Found> = Vec::new();
     for expr in exprs {
         gather_expression(expr, &mut found);
     }
-    prepare_blocks(found, catalog, resolve)
+    prepare_blocks(found, catalog, resolve, None)
+}
+
+/// Finds every subquery a list of expressions holds, correlated or not, and
+/// prepares it to be answered for each row.
+///
+/// For a `RETURNING` clause: SQLite evaluates its subqueries for each row it
+/// returns, after the row is written, so one that reads a table the statement
+/// changes sees the rows written so far.
+///
+/// @param exprs - the expressions to look through
+/// @param resolve - which row column an outer reference reads
+/// @param target_root - the root page of the table the statement changes
+pub fn correlations_in_every(
+    exprs: &[&BoundExpr],
+    catalog: &dyn TreeCatalog,
+    resolve: &dyn Fn(&BoundExpr) -> Option<usize>,
+    target_root: u32,
+) -> DbResult<Vec<Correlation>> {
+    let mut found: Vec<Found> = Vec::new();
+    for expr in exprs {
+        gather_every(expr, &mut found);
+    }
+    prepare_blocks(found, catalog, resolve, Some(target_root))
 }
 
 /// Finds every correlated block in a plan and prepares it.
@@ -308,9 +375,9 @@ pub fn correlations_of(
     if !plan.subqueries {
         return Ok(Vec::new());
     }
-    let mut found: Vec<(usize, SubqueryKind, bool, BoundSelect)> = Vec::new();
+    let mut found: Vec<Found> = Vec::new();
     gather_plan(plan, &mut found);
-    prepare_blocks(found, catalog, resolve)
+    prepare_blocks(found, catalog, resolve, None)
 }
 
 /// Whether a plan holds any correlated block at all.
@@ -326,7 +393,7 @@ pub fn has_correlations(plan: &PhysicalPlan) -> bool {
     if !plan.subqueries {
         return false;
     }
-    let mut found: Vec<(usize, SubqueryKind, bool, BoundSelect)> = Vec::new();
+    let mut found: Vec<Found> = Vec::new();
     gather_plan(plan, &mut found);
     !found.is_empty()
 }
@@ -336,19 +403,28 @@ pub fn has_correlations(plan: &PhysicalPlan) -> bool {
 /// @param found - the correlated blocks
 /// @param resolve - which row column an outer reference reads
 fn prepare_blocks(
-    found: Vec<(usize, SubqueryKind, bool, BoundSelect)>,
+    found: Vec<Found>,
     catalog: &dyn TreeCatalog,
     resolve: &dyn Fn(&BoundExpr) -> Option<usize>,
+    target_root: Option<u32>,
 ) -> DbResult<Vec<Correlation>> {
     let mut prepared = Vec::with_capacity(found.len());
-    for (id, kind, negated, block) in found {
-        if kind == SubqueryKind::In {
-            // An `IN` over a correlated block needs the whole list rather than
-            // one value, and this operator carries one column per block. Named
-            // rather than answered wrongly.
-            return crate::physical::unsupported("a correlated IN subquery");
-        }
+    for (id, kind, negated, block, membership) in found {
+        // **A correlated `IN` is answered as a scalar block that holds the whole
+        // test.** The operator carries one value per block, and the answer of
+        // `x IN (SELECT ...)` is one value: 1, 0 or NULL. Wrapped like that, the
+        // operand's outer references become parameters with the block's own, and
+        // the `IN` inside is an ordinary uncorrelated one for the run.
+        let (kind, negated, block) = match (kind, membership) {
+            (SubqueryKind::In, Some(node)) => (SubqueryKind::Scalar, false, membership_block(node)),
+            (SubqueryKind::In, None) => {
+                return crate::physical::unsupported("a correlated IN subquery");
+            }
+            (other, _) => (other, negated, block),
+        };
         let mut block = block;
+        let once = block.correlations.is_empty()
+            && target_root.is_some_and(|root| !reads_table(&block, root));
         let owned = owned_sources(&block);
         let mut feeds = Vec::new();
         let mut next = FIRST_CORRELATION_PARAMETER;
@@ -376,6 +452,11 @@ fn prepare_blocks(
             );
         }
         forget_parameterised(&mut block, &owned);
+        inillucent_sql::rewrite::rewrite_select(&mut block, &mut |expr: &mut BoundExpr| {
+            if let Some(inner) = expr.block_mut() {
+                inner.correlations.retain(|held| owned.contains(held));
+            }
+        });
         // Prepared here, once, which is the whole of section 4.3.1: the plan
         // and the schema decide the structural choice and neither depends on
         // the outer row.
@@ -388,9 +469,75 @@ fn prepare_blocks(
             plan,
             prepared: choice,
             feeds,
+            once,
+            kept: std::cell::RefCell::new(None),
         });
     }
     Ok(prepared)
+}
+
+/// Reports whether a block reads a table, at any depth.
+///
+/// @param block - the query
+/// @param root - the root page of the table
+fn reads_table(block: &BoundSelect, root: u32) -> bool {
+    if reads_in_from(block, root) {
+        return true;
+    }
+    let mut nested: Vec<BoundSelect> = Vec::new();
+    let mut copy = block.clone();
+    inillucent_sql::rewrite::rewrite_select(&mut copy, &mut |expr: &mut BoundExpr| {
+        if let Some(inner) = expr.block_mut() {
+            nested.push(inner.clone());
+        }
+    });
+    nested.iter().any(|inner| reads_in_from(inner, root))
+}
+
+/// Reports whether the FROM terms of a block, its derived tables and its
+/// compound arms read a table.
+///
+/// @param block - the query
+/// @param root - the root page of the table
+fn reads_in_from(block: &BoundSelect, root: u32) -> bool {
+    block.sources.iter().any(|source| match &source.rows {
+        SourceRows::Table => source.table.root == root,
+        SourceRows::Subquery(inner) => reads_in_from(inner, root),
+        _ => false,
+    }) || block
+        .compounds
+        .iter()
+        .any(|(_, arm)| reads_in_from(arm, root))
+}
+/// Builds the one row block that answers a whole `x IN (SELECT ...)` test.
+///
+/// @param node - the `IN` subquery expression, operand and block together
+fn membership_block(node: BoundExpr) -> BoundSelect {
+    let mut correlations = Vec::new();
+    node.sources_used(&mut correlations);
+    BoundSelect {
+        sources: Vec::new(),
+        filter: None,
+        group_by: Vec::new(),
+        having: None,
+        columns: vec![inillucent_sql::bind::BoundResultColumn {
+            expr: node,
+            name: b"in".to_vec(),
+            origin: None,
+            declared_type: Vec::new(),
+            written: None,
+        }],
+        distinct: false,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        aggregates: Vec::new(),
+        values: Vec::new(),
+        compounds: Vec::new(),
+        windows: Vec::new(),
+        correlations,
+        shared: None,
+    }
 }
 
 /// Takes the outer terms a block no longer reads off every correlation list in
@@ -479,7 +626,7 @@ fn collect_sources(block: &BoundSelect, into: &mut Vec<usize>) {
 ///
 /// @param plan - the planner's output
 /// @param into - the blocks found so far
-fn gather_plan(plan: &PhysicalPlan, into: &mut Vec<(usize, SubqueryKind, bool, BoundSelect)>) {
+fn gather_plan(plan: &PhysicalPlan, into: &mut Vec<Found>) {
     gather_select(&plan.select, into);
     for residual in plan.residuals.iter().flatten() {
         gather_expression(residual, into);
@@ -493,7 +640,7 @@ fn gather_plan(plan: &PhysicalPlan, into: &mut Vec<(usize, SubqueryKind, bool, B
 ///
 /// @param select - the query to walk
 /// @param into - the blocks found so far
-fn gather_select(select: &BoundSelect, into: &mut Vec<(usize, SubqueryKind, bool, BoundSelect)>) {
+fn gather_select(select: &BoundSelect, into: &mut Vec<Found>) {
     for column in &select.columns {
         gather_expression(&column.expr, into);
     }
@@ -558,7 +705,29 @@ fn gather_select(select: &BoundSelect, into: &mut Vec<(usize, SubqueryKind, bool
 ///
 /// @param expr - the expression to walk
 /// @param into - the blocks found so far
-fn gather_expression(expr: &BoundExpr, into: &mut Vec<(usize, SubqueryKind, bool, BoundSelect)>) {
+fn gather_expression(expr: &BoundExpr, into: &mut Vec<Found>) {
+    gather_expression_with(expr, into, false);
+}
+
+/// Collects the subqueries one expression holds, correlated or not.
+///
+/// For a `RETURNING` clause, whose subqueries SQLite evaluates for each row it
+/// returns, after that row is written. An uncorrelated one is folded once for
+/// the statement everywhere else, and the state of the table when it is folded
+/// is not the state the row sees.
+///
+/// @param expr - the expression to walk
+/// @param into - the blocks found so far
+fn gather_every(expr: &BoundExpr, into: &mut Vec<Found>) {
+    gather_expression_with(expr, into, true);
+}
+
+/// The walk behind [`gather_expression`] and [`gather_every`].
+///
+/// @param expr - the expression to walk
+/// @param into - the blocks found so far
+/// @param every - whether an uncorrelated subquery is collected too
+fn gather_expression_with(expr: &BoundExpr, into: &mut Vec<Found>, every: bool) {
     if let BoundExpr::Subquery {
         id,
         kind,
@@ -567,11 +736,13 @@ fn gather_expression(expr: &BoundExpr, into: &mut Vec<(usize, SubqueryKind, bool
         ..
     } = expr
     {
-        if !block.correlations.is_empty() && !into.iter().any(|(held, ..)| *held == *id) {
-            into.push((*id, *kind, *negated, (**block).clone()));
+        let wanted = !block.correlations.is_empty() || every;
+        if wanted && !into.iter().any(|(held, ..)| *held == *id) {
+            let membership = (*kind == SubqueryKind::In).then(|| expr.clone());
+            into.push((*id, *kind, *negated, (**block).clone(), membership));
         }
     }
     for child in expr.children() {
-        gather_expression(child, into);
+        gather_expression_with(child, into, every);
     }
 }

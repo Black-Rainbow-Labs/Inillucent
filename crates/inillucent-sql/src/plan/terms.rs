@@ -9,6 +9,7 @@
 //! these seven functions are one idea that three of its callers share.
 
 use super::*;
+use crate::bind::SubqueryKind;
 use inillucent_value::Affinity;
 
 /// Returns the collation a comparison uses, or BINARY.
@@ -44,15 +45,36 @@ pub(super) fn comparison_against_column(
     column: u16,
     term: &BoundExpr,
 ) -> Option<(BinaryOp, BoundExpr)> {
+    if let BoundExpr::Compare { left, right, .. } = term {
+        if compares_with_null(left, right) {
+            return None;
+        }
+    }
+    comparison_against_column_even_if_null(position, column, term)
+}
+
+/// Returns the operator and the other side when a term compares one column of
+/// one source against something else, a NULL literal included.
+///
+/// A table valued function's arguments are equality constraints on its hidden
+/// columns, and `generate_series(1, NULL)` has to offer the NULL to the module:
+/// without it the module sees no stop value and runs to its default of
+/// 4,294,967,295. SQLite offers it and the module answers no rows.
+///
+/// @param position - the source the column belongs to
+/// @param column - the column
+/// @param term - one `WHERE` conjunct
+pub(super) fn comparison_against_column_even_if_null(
+    position: usize,
+    column: u16,
+    term: &BoundExpr,
+) -> Option<(BinaryOp, BoundExpr)> {
     let BoundExpr::Compare {
         op, left, right, ..
     } = term
     else {
         return None;
     };
-    if compares_with_null(left, right) {
-        return None;
-    }
     if let BoundExpr::Column {
         source,
         column: candidate,
@@ -245,49 +267,83 @@ pub(super) fn virtual_constraint(
     }
     for column in 0..table.columns.len() {
         let column = column as u16;
-        if let Some((op, value)) = comparison_against_column(id, column, term) {
+        // Only a hidden column, which is how a table valued function receives
+        // an argument, is offered a NULL comparison: for an ordinary column the
+        // module is not required to apply the NULL rule, and the WHERE term
+        // would be dropped once the constraint is accepted.
+        let hidden = table
+            .columns
+            .get(usize::from(column))
+            .is_some_and(|info| info.hidden);
+        let found = if hidden {
+            comparison_against_column_even_if_null(id, column, term)
+        } else {
+            comparison_against_column(id, column, term)
+        };
+        if let Some((op, value)) = found {
             return binary_constraint(op).map(|op| (i32::from(column), op, value));
         }
     }
     None
 }
 
-/// Returns the column and the values when a term is `rowid IN (values)` on
-/// this term, with every value known before the scan starts.
+/// Returns the column and the values when a term is `IN (values)` on this
+/// term's rowid or on one of its hidden columns, with every value known before
+/// the scan starts.
 ///
 /// A value that reads any column is refused, so the list never depends on where
 /// the term sits in a join. `NOT IN` is refused because it is not an equality.
-/// Only the rowid, because a rowid compares as an integer and nothing else, so
-/// running the module once per value finds exactly the rows the list names;
-/// a declared column brings its own affinity and collation into the comparison.
+/// The rowid compares as an integer and nothing else, so running the module once
+/// per value finds exactly the rows the list names. A hidden column is the
+/// argument of a table valued function: SQLite runs `generate_series` and
+/// `json_each` once per value of `stop IN (5, 6)` or `json IN (...)`, and a scan
+/// that took the default argument instead would never finish. A declared column
+/// brings its own affinity and collation into the comparison, so it is refused.
+/// A list written as `IN (SELECT ...)` is kept as the subquery itself, whose
+/// values are read when the statement runs.
 ///
 /// @param id - the FROM term
+/// @param table - the FROM term's table
 /// @param term - one conjunct of the WHERE clause
-pub(super) fn constant_in_list(id: usize, term: &BoundExpr) -> Option<(i32, Vec<BoundExpr>)> {
-    let BoundExpr::InList {
-        negated: false,
-        operand,
-        list,
-        ..
-    } = term
-    else {
-        return None;
+pub(super) fn constant_in_list(
+    id: usize,
+    table: &TableInfo,
+    term: &BoundExpr,
+) -> Option<(i32, Vec<BoundExpr>)> {
+    let (operand, list) = match term {
+        BoundExpr::InList {
+            negated: false,
+            operand,
+            list,
+            ..
+        } if !list.is_empty() => (operand, list.clone()),
+        BoundExpr::Subquery {
+            kind: SubqueryKind::In,
+            negated: false,
+            operand: Some(operand),
+            block,
+            ..
+        } if block.correlations.is_empty() => (operand, vec![term.clone()]),
+        _ => return None,
     };
-    if list.is_empty() {
-        return None;
-    }
     let constant = |value: &BoundExpr| {
         let mut used = Vec::new();
         value.sources_used(&mut used);
         used.is_empty()
     };
-    if !list.iter().all(constant) {
+    let is_subquery = matches!(term, BoundExpr::Subquery { .. });
+    if !is_subquery && !list.iter().all(constant) {
         return None;
     }
-    if !matches!(operand.as_ref(), BoundExpr::Rowid { source } if *source == id) {
-        return None;
+    match operand.as_ref() {
+        BoundExpr::Rowid { source } if *source == id => Some((crate::vtab::ROWID_COLUMN, list)),
+        BoundExpr::Column { source, column, .. }
+            if *source == id && table.column(*column).is_some_and(|held| held.hidden) =>
+        {
+            Some((i32::from(*column), list))
+        }
+        _ => None,
     }
-    Some((crate::vtab::ROWID_COLUMN, list.clone()))
 }
 
 /// Returns the constraint operator one comparison offers, if any.
@@ -338,4 +394,20 @@ mod tests {
         assert_eq!(mirror(BinaryOp::GreaterEqual), BinaryOp::LessEqual);
         assert_eq!(mirror(BinaryOp::Equal), BinaryOp::Equal);
     }
+}
+
+/// Reports whether an expression reads any column or rowid.
+///
+/// A probe that did would be a different question per row, and the index
+/// answers one.
+///
+/// @param expr - the expression to look through
+pub(super) fn reads_a_column(expr: &BoundExpr) -> bool {
+    if matches!(
+        expr,
+        BoundExpr::Column { .. } | BoundExpr::Rowid { .. } | BoundExpr::VirtualFunction { .. }
+    ) {
+        return true;
+    }
+    expr.children().into_iter().any(reads_a_column)
 }

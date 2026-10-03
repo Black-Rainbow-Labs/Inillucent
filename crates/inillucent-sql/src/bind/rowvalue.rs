@@ -22,8 +22,9 @@
 
 use inillucent_value::Collation;
 
-use super::{comparison_rules, refused, result_collation, Binder, BoundExpr, SubqueryKind};
+use super::{comparison_rules, result_collation, Binder, BoundExpr, SubqueryKind};
 use crate::ast::{self, BinaryOp, Expr, ExprId, InRhs, SelectBody};
+use crate::bind::refused;
 use crate::diagnostic::{ParseError, ParseErrorKind};
 use crate::lexer::Span;
 
@@ -45,41 +46,82 @@ impl Binder<'_> {
         negated: bool,
         span: Span,
     ) -> Result<BoundExpr, ParseError> {
-        let rows = self.row_value_list(rhs).ok_or_else(|| {
-            ParseError::new(
-                ParseErrorKind::Unsupported("a row value IN a query rather than a value list"),
-                span,
-            )
-        })?;
         let mut bound_lefts = Vec::with_capacity(parts.len());
         for part in parts {
             bound_lefts.push(self.bind_expr(*part)?);
         }
-        let mut chain: Option<BoundExpr> = None;
+        self.bind_row_in_bound(bound_lefts, rhs, negated, span)
+    }
+
+    /// Binds `(a, b) [NOT] IN ...` for an operand row that is already bound.
+    ///
+    /// @param bound_lefts - the operand row's parts, bound
+    /// @param rhs - what was written after `IN`
+    /// @param negated - whether `NOT IN` was written
+    /// @param span - where the test was written
+    pub(super) fn bind_row_in_bound(
+        &mut self,
+        bound_lefts: Vec<BoundExpr>,
+        rhs: &InRhs,
+        negated: bool,
+        span: Span,
+    ) -> Result<BoundExpr, ParseError> {
+        let Some(rows) = self.row_value_list(rhs) else {
+            return match rhs {
+                InRhs::Select(select) => {
+                    self.bind_row_in_query(bound_lefts, *select, negated, span)
+                }
+                _ => Err(ParseError::new(
+                    ParseErrorKind::Unsupported("a row value IN a query rather than a value list"),
+                    span,
+                )),
+            };
+        };
+        let mut bound_rows = Vec::with_capacity(rows.len());
         for row in &rows {
-            if row.len() != parts.len() {
+            if row.len() != bound_lefts.len() {
+                // SQLite counts the terms of the element that does not fit and puts
+                // an `s` on `term` unless there is exactly one.
+                let plural = if row.len() == 1 { "" } else { "s" };
+                let _ = span;
                 return Err(ParseError::new(
                     ParseErrorKind::Refused(format!(
-                        "row value misused: {} values on the left and {} on the right",
-                        parts.len(),
-                        row.len()
+                        "IN(...) element has {} term{plural} - expected {}",
+                        row.len(),
+                        bound_lefts.len()
                     )),
-                    span,
+                    Span::default(),
                 ));
             }
             let mut bound_rights = Vec::with_capacity(row.len());
             for value in row {
                 bound_rights.push(self.bind_expr(*value)?);
             }
-            let one = equality_chain(&bound_lefts, &bound_rights);
+            bound_rows.push(bound_rights);
+        }
+        // One row is an ordinary row equality. Two or more are a query in
+        // SQLite, and the query's rules apply: see `row_in_rules`.
+        let rules = match bound_rows.len() {
+            0 | 1 => None,
+            _ => Some(row_in_rules(
+                &bound_lefts,
+                &bound_rows,
+                matches!(rhs, InRhs::Select(_)),
+            )),
+        };
+        let mut chain: Option<BoundExpr> = None;
+        for bound_rights in &bound_rows {
+            let one = match &rules {
+                Some(rules) => equality_chain_under(&bound_lefts, bound_rights, rules),
+                None => equality_chain(&bound_lefts, bound_rights),
+            };
             chain = Some(match chain {
                 None => one,
                 Some(held) => BoundExpr::Or(Box::new(held), Box::new(one)),
             });
-        }
-        // An empty list is false, and `NOT IN ()` is true, whatever the
-        // operand - including a NULL one. That is SQLite's rule and it is the
-        // one place `IN` is not three-valued.
+        } // An empty list is false, and `NOT IN ()` is true, whatever the
+          // operand - including a NULL one. That is SQLite's rule and it is the
+          // one place `IN` is not three-valued.
         let bound = chain.unwrap_or(BoundExpr::Integer(0));
         Ok(if negated {
             BoundExpr::Not(Box::new(bound))
@@ -156,14 +198,7 @@ impl Binder<'_> {
     ) -> Result<BoundExpr, ParseError> {
         let block = self.bind_value_subquery(select, span)?;
         if block.columns.len() != lefts.len() {
-            return Err(refused(
-                format!(
-                    "row value misused: {} values on the left and {} on the right",
-                    lefts.len(),
-                    block.columns.len()
-                ),
-                span,
-            ));
+            return Err(misused(span));
         }
         let mut bound_lefts = Vec::with_capacity(lefts.len());
         for part in lefts {
@@ -233,14 +268,7 @@ impl Binder<'_> {
         span: Span,
     ) -> Result<BoundExpr, ParseError> {
         if lefts.len() != rights.len() || lefts.is_empty() {
-            return Err(ParseError::new(
-                ParseErrorKind::Refused(format!(
-                    "row value misused: {} values on the left and {} on the right",
-                    lefts.len(),
-                    rights.len()
-                )),
-                span,
-            ));
+            return Err(misused(span));
         }
         let mut bound_lefts = Vec::with_capacity(lefts.len());
         let mut bound_rights = Vec::with_capacity(rights.len());
@@ -260,15 +288,106 @@ impl Binder<'_> {
             BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
                 Ok(lexicographic_chain(op, &bound_lefts, &bound_rights, 0))
             }
-            _ => Err(ParseError::new(
-                ParseErrorKind::Refused("row value misused".to_string()),
-                span,
-            )),
+            _ => Err(misused(span)),
         }
     }
 }
 
 impl Binder<'_> {
+    /// Returns the query when an expression is a subquery of several columns.
+    ///
+    /// **SQLite reads `(SELECT 1, 2) = (1, 2)` as a row value.** The subquery is
+    /// the row, one part per result column. The width comes from the text of the
+    /// query, so a `SELECT *` is not recognised here and keeps being refused as
+    /// a subquery that returns more than one column.
+    ///
+    /// @param id - the expression
+    pub(super) fn row_query(&self, id: ExprId) -> Option<ast::SelectId> {
+        let Some(Expr::Subquery(select)) = self.ast.expr(id) else {
+            return None;
+        };
+        let width = self.query_width(*select)?;
+        (width > 1).then_some(*select)
+    }
+
+    /// Returns how many result columns the first arm of a query writes, or
+    /// `None` when a `*` makes that depend on the tables.
+    ///
+    /// @param select - the query
+    fn query_width(&self, select: ast::SelectId) -> Option<usize> {
+        let held = self.ast.select(select)?;
+        match &self.ast.core(held.first)?.body {
+            SelectBody::Values(rows) => rows.first().map(Vec::len),
+            SelectBody::Select { columns, .. } => {
+                let star = columns
+                    .iter()
+                    .any(|column| matches!(self.ast.expr(column.expr), Some(Expr::Star { .. })));
+                (!star).then_some(columns.len())
+            }
+        }
+    }
+
+    /// Binds a comparison whose left operand is a subquery of several columns.
+    ///
+    /// @param op - the operator
+    /// @param select - the subquery on the left
+    /// @param right - the expression on the right
+    /// @param span - where the comparison was written
+    pub(super) fn bind_row_query_versus(
+        &mut self,
+        op: BinaryOp,
+        select: ast::SelectId,
+        right: ExprId,
+        span: Span,
+    ) -> Result<BoundExpr, ParseError> {
+        let lefts = self.bind_query_columns(select, span)?;
+        let rights = self.bind_row_operand(right, span)?;
+        if lefts.len() != rights.len() {
+            return Err(misused(span));
+        }
+        compare_bound_rows(op, &lefts, &rights, span)
+    }
+
+    /// Binds `<subquery of several columns> IS [NOT] <row>`.
+    ///
+    /// @param negated - whether the test is `IS NOT`
+    /// @param select - the subquery on the left
+    /// @param right - the expression on the right
+    /// @param span - where the test was written
+    pub(super) fn bind_row_query_is(
+        &mut self,
+        negated: bool,
+        select: ast::SelectId,
+        right: ExprId,
+        span: Span,
+    ) -> Result<BoundExpr, ParseError> {
+        let lefts = self.bind_query_columns(select, span)?;
+        let rights = self.bind_row_operand(right, span)?;
+        if lefts.len() != rights.len() {
+            return Err(misused(span));
+        }
+        Ok(is_chain(negated, &lefts, &rights))
+    }
+
+    /// Binds the parts of an expression that has to be a row: a row value or a
+    /// subquery of several columns.
+    ///
+    /// @param id - the expression
+    /// @param span - where the comparison was written
+    fn bind_row_operand(&mut self, id: ExprId, span: Span) -> Result<Vec<BoundExpr>, ParseError> {
+        if let Some(parts) = self.row_value_parts(id) {
+            let mut bound = Vec::with_capacity(parts.len());
+            for part in &parts {
+                bound.push(self.bind_expr(*part)?);
+            }
+            return Ok(bound);
+        }
+        match self.row_query(id) {
+            Some(select) => self.bind_query_columns(select, span),
+            None => Err(misused(span)),
+        }
+    }
+
     /// Binds a row value compared with whatever is on the other side: another
     /// row value or a one-row query.
     ///
@@ -313,28 +432,13 @@ impl Binder<'_> {
         if lefts.len() != rights.len() || lefts.is_empty() {
             return Err(misused(span));
         }
-        let mut chain: Option<BoundExpr> = None;
+        let mut bound_lefts = Vec::with_capacity(lefts.len());
+        let mut bound_rights = Vec::with_capacity(rights.len());
         for (left, right) in lefts.iter().zip(rights.iter()) {
-            let left = self.bind_expr(*left)?;
-            let right = self.bind_expr(*right)?;
-            let (affinity, collation) = comparison_rules(&left, &right);
-            let one = BoundExpr::Is {
-                negated: false,
-                left: Box::new(left),
-                right: Box::new(right),
-                affinity,
-                collation,
-            };
-            chain = Some(match chain {
-                None => one,
-                Some(held) => BoundExpr::And(Box::new(held), Box::new(one)),
-            });
+            bound_lefts.push(self.bind_expr(*left)?);
+            bound_rights.push(self.bind_expr(*right)?);
         }
-        let chain = chain.unwrap_or(BoundExpr::Null);
-        Ok(match negated {
-            true => BoundExpr::Not(Box::new(chain)),
-            false => chain,
-        })
+        Ok(is_chain(negated, &bound_lefts, &bound_rights))
     }
 
     /// Binds `(a, b) [NOT] BETWEEN (c, d) AND (e, f)`.
@@ -397,13 +501,55 @@ impl Binder<'_> {
     }
 }
 
+/// Returns the `AND` chain of `IS` tests that a row value `IS` another means.
+///
+/// @param negated - whether the test is `IS NOT`
+/// @param lefts - the left row's parts, bound
+/// @param rights - the right row's parts, bound
+fn is_chain(negated: bool, lefts: &[BoundExpr], rights: &[BoundExpr]) -> BoundExpr {
+    let mut chain: Option<BoundExpr> = None;
+    for (left, right) in lefts.iter().zip(rights.iter()) {
+        let (affinity, collation) = comparison_rules(left, right);
+        let one = BoundExpr::Is {
+            negated: false,
+            left: Box::new(left.clone()),
+            right: Box::new(right.clone()),
+            affinity,
+            collation,
+        };
+        chain = Some(match chain {
+            None => one,
+            Some(held) => BoundExpr::And(Box::new(held), Box::new(one)),
+        });
+    }
+    let chain = chain.unwrap_or(BoundExpr::Null);
+    match negated {
+        true => BoundExpr::Not(Box::new(chain)),
+        false => chain,
+    }
+}
+
+/// Returns SQLite's refusal of a query whose width is not the row value's.
+///
+/// @param found - how many columns the query returns
+/// @param expected - how many parts the row value has
+/// @param span - where the test was written
+pub(super) fn query_arity_refusal(found: usize, expected: usize, span: Span) -> ParseError {
+    refused(
+        format!("sub-select returns {found} columns - expected {expected}"),
+        span,
+    )
+}
+
 /// Returns SQLite's refusal of a row value where a single value belongs.
 ///
 /// @param span - where the row value was written
 pub(super) fn misused(span: Span) -> ParseError {
+    // SQLite prints no caret for this failure, so the position is dropped.
+    let _ = span;
     ParseError::new(
         ParseErrorKind::Refused("row value misused".to_string()),
-        span,
+        Span::default(),
     )
 }
 
@@ -411,10 +557,81 @@ pub(super) fn misused(span: Span) -> ParseError {
 ///
 /// @param lefts - the left row's parts, bound
 /// @param rights - the right row's parts, bound
-fn equality_chain(lefts: &[BoundExpr], rights: &[BoundExpr]) -> BoundExpr {
+pub(super) fn equality_chain(lefts: &[BoundExpr], rights: &[BoundExpr]) -> BoundExpr {
+    let rules: Vec<_> = lefts
+        .iter()
+        .zip(rights.iter())
+        .map(|(left, right)| comparison_rules(left, right))
+        .collect();
+    equality_chain_under(lefts, rights, &rules)
+}
+
+/// Returns the rules a row value `IN` over several rows compares each part with.
+///
+/// Measured against 3.53.4: SQLite turns `(a, b) IN ((1, 2), (3, 4))` into a
+/// query over the rows and reads the affinity and the collation of each part
+/// off ONE row of it, not off the row being compared. For a written list that
+/// row is the last one. For a `VALUES` clause the affinity also comes from the
+/// last row, but an explicit `COLLATE` comes from the first row (an implicit
+/// column collation still from the last), so `('a') IN (VALUES('A' COLLATE
+/// NOCASE), ('x'))` is true and the same with the `COLLATE` on `'x'` is false.
+///
+/// @param lefts - the left row's parts, bound
+/// @param rows - every right row, bound, at least one
+/// @param values_clause - whether the rows were written as a `VALUES` clause
+pub(super) fn row_in_rules(
+    lefts: &[BoundExpr],
+    rows: &[Vec<BoundExpr>],
+    values_clause: bool,
+) -> Vec<(Option<inillucent_value::Affinity>, Collation)> {
+    let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+        return Vec::new();
+    };
+    let mut rules = Vec::with_capacity(lefts.len());
+    for (at, left) in lefts.iter().enumerate() {
+        let (Some(first), Some(last)) = (first.get(at), last.get(at)) else {
+            rules.push((None, Collation::Binary));
+            continue;
+        };
+        let (mut affinity, mut collation) = comparison_rules(left, last);
+        if values_clause {
+            // The implicit collation of the last row: an expression with an
+            // explicit `COLLATE` anywhere in it is not asked for one.
+            let implicit = match last.explicit_collation() {
+                Some(_) => None,
+                None => last.collation(),
+            };
+            collation = left
+                .explicit_collation()
+                .or_else(|| first.explicit_collation())
+                .or_else(|| left.collation())
+                .or(implicit)
+                .unwrap_or(Collation::Binary);
+            // Measured: a `CAST` in a `VALUES` row gives the part no affinity,
+            // although it does in a written list and in a compound query.
+            if matches!(last, BoundExpr::Cast { .. }) {
+                affinity = left.affinity();
+            }
+        }
+        rules.push((affinity, collation));
+    }
+    rules
+}
+
+/// Returns the `AND` chain of part equalities, each compared under given rules.
+///
+/// @param lefts - the left row's parts, bound
+/// @param rights - the right row's parts, bound
+/// @param rules - the affinity and collation of each part, in part order
+pub(super) fn equality_chain_under(
+    lefts: &[BoundExpr],
+    rights: &[BoundExpr],
+    rules: &[(Option<inillucent_value::Affinity>, Collation)],
+) -> BoundExpr {
     let mut chain: Option<BoundExpr> = None;
-    for (left, right) in lefts.iter().zip(rights.iter()) {
-        let (affinity, collation) = comparison_rules(left, right);
+    for ((left, right), (affinity, collation)) in lefts.iter().zip(rights.iter()).zip(rules.iter())
+    {
+        let (affinity, collation) = (*affinity, *collation);
         let one = BoundExpr::Compare {
             op: BinaryOp::Equal,
             left: Box::new(left.clone()),
@@ -509,9 +726,6 @@ fn compare_bound_rows(
         BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
             Ok(lexicographic_chain(op, lefts, rights, 0))
         }
-        _ => Err(ParseError::new(
-            ParseErrorKind::Refused("row value misused".to_string()),
-            span,
-        )),
+        _ => Err(misused(span)),
     }
 }

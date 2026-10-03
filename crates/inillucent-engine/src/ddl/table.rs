@@ -229,7 +229,12 @@ impl crate::ImportedDatabase {
         // before it. Running the fill as an `INSERT` set all three to the
         // copied rows.
         let held = self.counters.live();
-        let filled = self.execute_any(&fill, &inillucent_exec::physical::Params::new());
+        // **The values are stored as the query produced them.** SQLite does not
+        // apply the new column's affinity on the way in, so a whole number
+        // that is REAL stays REAL in a column whose derived type is NUM.
+        let params = inillucent_exec::physical::Params::new();
+        params.keep_supplied_types();
+        let filled = self.execute_any(&fill, &params);
         self.counters.load(held);
         let outcome = filled?;
         self.seal()?;

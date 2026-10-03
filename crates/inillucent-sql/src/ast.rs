@@ -532,6 +532,11 @@ pub struct Window {
     pub exclude: FrameExclude,
     /// The span of the definition.
     pub span: Span,
+    /// Whether this is `OVER name` with no parentheses.
+    ///
+    /// SQLite accepts that form for a window that has a frame, and refuses
+    /// `OVER (name)`, so the two have to be told apart.
+    pub bare_name: bool,
 }
 
 /// The rows of one arm of a compound SELECT.
@@ -621,6 +626,10 @@ pub struct Select {
     pub offset: Option<ExprId>,
     /// The span of the whole statement.
     pub span: Span,
+    /// Whether the parser built this select for a parenthesised join of several
+    /// terms, which SQLite treats as a subquery whose inner table names stay
+    /// visible to the enclosing query.
+    pub nested_from: bool,
 }
 
 /// A conflict-resolution algorithm.
@@ -676,6 +685,11 @@ pub enum ColumnConstraint {
         expr: ExprId,
         /// Whether `STORED` was written.
         stored: bool,
+        /// Whether some other word followed the closing parenthesis.
+        ///
+        /// SQLite's grammar takes any identifier there and checks it afterwards, so
+        /// `b AS (a) WAT` is `error in generated column "b"` and not a syntax error.
+        bad_storage: bool,
     },
 }
 
@@ -731,6 +745,13 @@ pub struct ColumnDef {
     pub constraints: Vec<(Option<NameId>, ColumnConstraint)>,
     /// The span of the definition.
     pub span: Span,
+    /// A reason SQLite refuses the definition only after it has changed the
+    /// schema, set when the definition is read for `ALTER TABLE ... ADD COLUMN`.
+    ///
+    /// For example `subqueries prohibited in CHECK constraints`. The failure is
+    /// reported when the statement runs, as SQLite reports it, and not when it
+    /// is compiled.
+    pub deferred_failure: Option<&'static str>,
 }
 
 /// One indexed column of a table constraint or an index.
@@ -742,6 +763,8 @@ pub struct IndexedColumn {
     pub collation: Option<NameId>,
     /// The direction.
     pub order: SortOrder,
+    /// `NULLS FIRST` or `NULLS LAST`, which SQLite parses here and then refuses.
+    pub nulls: Option<NullOrder>,
 }
 
 /// A table-level constraint.
@@ -970,6 +993,30 @@ pub enum AlterAction {
     AddColumn(ColumnDef),
     /// `DROP [COLUMN] name`.
     DropColumn(NameId),
+    /// `ALTER [COLUMN] name SET NOT NULL [ON CONFLICT action]`.
+    SetNotNull {
+        /// The column.
+        column: NameId,
+        /// Where `NOT NULL` starts in the statement's own source.
+        start: u32,
+        /// Where the clause ends, after any `ON CONFLICT`.
+        end: u32,
+    },
+    /// `ALTER [COLUMN] name DROP NOT NULL`.
+    DropNotNull(NameId),
+    /// `ADD [CONSTRAINT name] CHECK (expr) [ON CONFLICT action]`.
+    AddCheck {
+        /// The constraint's name, when one was written.
+        name: Option<NameId>,
+        /// The predicate.
+        expr: ExprId,
+        /// Where the constraint starts in the statement's own source.
+        start: u32,
+        /// Where it ends, after any `ON CONFLICT`.
+        end: u32,
+    },
+    /// `DROP CONSTRAINT name`.
+    DropConstraint(NameId),
 }
 
 /// When a trigger fires.
@@ -1725,6 +1772,21 @@ impl Ast {
     /// Returns the number of expression nodes in the arena.
     pub fn expr_count(&self) -> usize {
         self.exprs.len()
+    }
+
+    /// Returns the number of compound SELECTs in the arena.
+    pub fn select_count(&self) -> usize {
+        self.selects.len()
+    }
+
+    /// Returns the number of SELECT arms in the arena.
+    pub fn core_count(&self) -> usize {
+        self.cores.len()
+    }
+
+    /// Returns the number of FROM terms in the arena.
+    pub fn from_term_count(&self) -> usize {
+        self.from_terms.len()
     }
 
     /// Adds a compound SELECT.

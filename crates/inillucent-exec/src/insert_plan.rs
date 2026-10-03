@@ -20,6 +20,7 @@ use inillucent_sql::catalog_view::TableInfo;
 use inillucent_sql::dml::{codes, BoundInsert, ColumnSource};
 use inillucent_tree::datum::OwnedDatum;
 
+use crate::correlate::Correlation;
 use crate::declared::WriteDeclarations;
 use crate::dml::{CompiledUpsert, Row, RowSpace};
 use crate::expr::Eval;
@@ -39,6 +40,11 @@ pub(crate) struct InsertPlan {
     pub(crate) upsert: Vec<CompiledUpsert>,
     /// The `RETURNING` expressions.
     pub(crate) returning: Vec<Box<dyn Eval>>,
+    /// The subqueries the `RETURNING` clause and the `DO UPDATE` arms hold,
+    /// prepared once, the `RETURNING` clause's first.
+    pub(crate) correlated: Vec<Correlation>,
+    /// How many of `correlated` belong to the `RETURNING` clause.
+    pub(crate) returned: usize,
 }
 
 /// Where one table column's value comes from, resolved to a tree column.
@@ -115,6 +121,49 @@ fn free_rowid(keys: &mut dyn RowidKeys) -> DbResult<i64> {
         )))
 }
 
+/// Allocates the rowid of a row the statement gave no key.
+///
+/// @param next_rowid - the largest rowid handed out so far, advanced here
+/// @param keys - what the table already holds, asked only when needed
+/// @param autoincrement - the table, when it never reuses a key
+pub(crate) fn allocate_key(
+    next_rowid: &mut Option<i64>,
+    keys: &mut dyn RowidKeys,
+    autoincrement: Option<&TableInfo>,
+) -> DbResult<i64> {
+    // A rowid the statement left out is one past the largest the table holds,
+    // which is SQLite's rule for a table that is not `AUTOINCREMENT`: deleted
+    // numbers are reused.
+    let held = match *next_rowid {
+        Some(held) => held,
+        None => keys.highest()?,
+    };
+    // An `AUTOINCREMENT` table that has reached `i64::MAX` has no next key, and
+    // handing one out would mean handing out one that is already there. SQLite
+    // reports `SQLITE_FULL`.
+    //
+    // **An ordinary rowid table at `i64::MAX` looks for a free key instead
+    // (task-1979, F8).** `held.saturating_add(1)` answered `i64::MAX` again, so
+    // the insert collided with the row already holding it and failed `UNIQUE
+    // constraint failed`; SQLite fills the gaps.
+    let allocated = match autoincrement {
+        Some(table) => crate::sequence::allocate(table, held)?,
+        None => match held == i64::MAX {
+            true => free_rowid(keys)?,
+            false => held.saturating_add(1),
+        },
+    };
+    // The mark stays at `i64::MAX` once the counting-up path is exhausted, so
+    // the next row of the same statement looks for its own free key rather than
+    // counting up from whichever gap this one landed in - which would collide
+    // again.
+    *next_rowid = Some(match held == i64::MAX {
+        true => i64::MAX,
+        false => allocated,
+    });
+    Ok(allocated)
+}
+
 /// Where an `INSERT`'s rowid comes from.
 enum PlannedRowid {
     /// Position in the supplied row.
@@ -131,12 +180,14 @@ impl InsertPlan {
     /// @param space - the row space the expressions read
     /// @param params - the bound parameters
     /// @param catalog - where a registered function's body is looked up
+    /// @param subqueries - the prepared subqueries, and how many are `RETURNING`'s
     pub(crate) fn compile(
         statement: &BoundInsert,
         layout: &SourceLayout,
         space: &RowSpace,
         params: &Params,
         catalog: &dyn TreeCatalog,
+        subqueries: (Vec<Correlation>, usize),
     ) -> DbResult<InsertPlan> {
         let mut columns = Vec::with_capacity(statement.columns.len());
         for (column, source) in statement.columns.iter().enumerate() {
@@ -198,7 +249,97 @@ impl InsertPlan {
             rowid,
             upsert,
             returning,
+            correlated: subqueries.0,
+            returned: subqueries.1,
         })
+    }
+
+    /// Prepares the subqueries an insert evaluates for each row.
+    ///
+    /// Those of the `RETURNING` clause come first, then those of the `DO UPDATE`
+    /// arms, which read the row that was there and `excluded`.
+    ///
+    /// @param statement - the bound insert
+    /// @param layout - the table tree's layout
+    /// @param catalog - where the subqueries' trees are read
+    pub(crate) fn subqueries(
+        statement: &BoundInsert,
+        layout: &SourceLayout,
+        catalog: &dyn TreeCatalog,
+    ) -> DbResult<(Vec<Correlation>, usize)> {
+        let returned: Vec<&inillucent_sql::bind::BoundExpr> = statement
+            .returning
+            .iter()
+            .map(|column| &column.expr)
+            .collect();
+        let mut found = crate::dml::returning_correlations(
+            &returned,
+            statement.target_source,
+            layout,
+            statement.table.root,
+            catalog,
+        )?;
+        let returned_count = found.len();
+        let mut arms: Vec<&inillucent_sql::bind::BoundExpr> = Vec::new();
+        for clause in statement.upsert.iter().filter(|clause| clause.do_update) {
+            arms.extend(
+                clause
+                    .assignments
+                    .iter()
+                    .map(|assignment| &assignment.value),
+            );
+            arms.extend(clause.filter.iter());
+        }
+        found.extend(crate::correlate::correlations_in_every(
+            &arms,
+            catalog,
+            &crate::dml::image_resolver(statement.target_source, true, layout),
+            statement.table.root,
+        )?);
+        Ok((found, returned_count))
+    }
+
+    /// Answers the `RETURNING` clause's subqueries for one written row.
+    ///
+    /// @param target - the file and its trees, as they are now
+    /// @param params - the bound parameters
+    /// @param row - the row as it was written
+    pub(crate) fn returning_answers(
+        &self,
+        target: &dyn crate::dml::WriteTarget,
+        params: &Params,
+        row: &[OwnedDatum],
+    ) -> DbResult<Vec<OwnedDatum>> {
+        let blocks = self.correlated.get(..self.returned).unwrap_or(&[]);
+        let answers = crate::dml::answer_correlations(blocks, target, params, row)?;
+        Ok(crate::dml::placed(answers, 0, self.correlated.len()))
+    }
+
+    /// Answers the `DO UPDATE` arms' subqueries for one conflict.
+    ///
+    /// @param target - the file and its trees, as they are now
+    /// @param params - the bound parameters
+    /// @param before - the row that was there
+    /// @param excluded - the row that was being inserted
+    pub(crate) fn upsert_answers(
+        &self,
+        target: &dyn crate::dml::WriteTarget,
+        params: &Params,
+        before: &[OwnedDatum],
+        excluded: &[OwnedDatum],
+    ) -> DbResult<Vec<OwnedDatum>> {
+        let blocks = self.correlated.get(self.returned..).unwrap_or(&[]);
+        if blocks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut both = before.to_vec();
+        both.extend_from_slice(excluded);
+        let answers = crate::dml::answer_correlations(blocks, target, params, &both)?;
+        Ok(crate::dml::placed(
+            answers,
+            self.returned,
+            self.correlated.len(),
+        ))
     }
 
     /// Builds one row image in tree-column order.
@@ -255,43 +396,15 @@ impl InsertPlan {
                 // A rowid the statement left out is one past the largest the
                 // table holds, which is SQLite's rule for a table that is not
                 // `AUTOINCREMENT`: deleted numbers are reused.
-                OwnedDatum::Null => {
-                    let held = match *next_rowid {
-                        Some(held) => held,
-                        None => keys.highest()?,
-                    };
-                    // An `AUTOINCREMENT` table that has reached `i64::MAX` has
-                    // no next key, and handing one out would mean handing out
-                    // one that is already there. SQLite reports `SQLITE_FULL`.
-                    //
-                    // **An ordinary rowid table at `i64::MAX` looks for a free
-                    // key instead (task-1979, F8).** `held.saturating_add(1)`
-                    // answered `i64::MAX` again, so the insert collided with the
-                    // row already holding it and failed
-                    // `UNIQUE constraint failed`; SQLite fills the gaps.
-                    let allocated = match autoincrement {
-                        Some(table) => crate::sequence::allocate(table, held)?,
-                        None => match held == i64::MAX {
-                            true => free_rowid(keys)?,
-                            false => held.saturating_add(1),
-                        },
-                    };
-                    // The mark stays at `i64::MAX` once the counting-up path is
-                    // exhausted, so the next row of the same statement looks for
-                    // its own free key rather than counting up from whichever
-                    // gap this one landed in - which would collide again.
-                    *next_rowid = Some(match held == i64::MAX {
-                        true => i64::MAX,
-                        false => allocated,
-                    });
-                    allocated
-                }
+                OwnedDatum::Null => allocate_key(next_rowid, keys, autoincrement)?,
                 // `INSERT INTO t(rowid) VALUES ('x')` is a mismatch rather than
                 // a conversion, which is what SQLite reports too.
-                other => {
+                // The value is left out of the error: formatting it with `{:?}` put
+                // Rust's `Text([120])` in front of the user, because the shell prints
+                // the detail in place of the message.
+                _ => {
                     return Err(DbError::new(ExtendedCode(codes::MISMATCH))
-                        .with_message("datatype mismatch")
-                        .with_detail(format!("a rowid must be an integer, not {other:?}")))
+                        .with_message("datatype mismatch"))
                 }
             };
             // A statement that supplies its own keys still moves the mark, so a
@@ -306,6 +419,32 @@ impl InsertPlan {
         // The generated columns, now that the rest of the row exists.
         self.apply_generated(space, &mut row, &[])?;
         Ok(row)
+    }
+
+    /// Reports whether a supplied row leaves the table's rowid to be allocated.
+    ///
+    /// The rowid is unassigned when the statement names no key column, or names
+    /// one and gives it NULL. A `BEFORE INSERT` trigger sees such a row's key as
+    /// -1, because SQLite fires it before the key is allocated.
+    ///
+    /// @param supplied - the values the statement's source produced
+    /// @param space - the row space the expressions read
+    pub(crate) fn rowid_is_unassigned(
+        &self,
+        supplied: &[OwnedDatum],
+        space: &RowSpace,
+    ) -> DbResult<bool> {
+        let key = match &self.rowid {
+            Some(PlannedRowid::Supplied(index)) => {
+                supplied.get(*index).cloned().unwrap_or(OwnedDatum::Null)
+            }
+            Some(PlannedRowid::Expr(eval)) => space.evaluate(eval.as_ref(), &[])?,
+            None => OwnedDatum::Null,
+        };
+        Ok(matches!(
+            crate::declared::to_key_affinity(key),
+            OwnedDatum::Null
+        ))
     }
 
     /// Applies the table's affinity to a row image and then computes its

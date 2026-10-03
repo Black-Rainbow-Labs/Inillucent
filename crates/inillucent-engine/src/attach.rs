@@ -352,9 +352,17 @@ impl ImportedDatabase {
     ///
     /// @param name - the name it was attached under
     pub(crate) fn detach(&mut self, name: &[u8]) -> DbResult<()> {
-        if name.eq_ignore_ascii_case(b"main") || name.eq_ignore_ascii_case(TEMP) {
+        // SQLite refuses `main` by name, and treats `temp` as a database that cannot
+        // be attached or detached by name at all: `no such database: temp`.
+        if name.eq_ignore_ascii_case(b"main") {
             return Err(refusal(format!(
                 "cannot detach database {}",
+                String::from_utf8_lossy(name)
+            )));
+        }
+        if name.eq_ignore_ascii_case(TEMP) {
+            return Err(refusal(format!(
+                "no such database: {}",
                 String::from_utf8_lossy(name)
             )));
         }
@@ -364,6 +372,16 @@ impl ImportedDatabase {
                 String::from_utf8_lossy(name)
             )));
         };
+        // SQLite refuses to detach a database the open transaction has used and says
+        // `database aux is locked`. This engine also refuses a detach while any write
+        // batch is open, because the batch numbers its participants by position, and
+        // that case keeps its own wording since SQLite allows it.
+        if self.writing.touched() & crate::schema_bit(at) != 0 {
+            return Err(refusal(format!(
+                "database {} is locked",
+                String::from_utf8_lossy(name)
+            )));
+        }
         if self.writing.batch().is_some() {
             return Err(refusal("cannot DETACH database within transaction"));
         }

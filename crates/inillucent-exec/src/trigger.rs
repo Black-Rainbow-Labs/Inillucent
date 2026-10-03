@@ -118,8 +118,25 @@ pub enum Fired {
 /// statement like any other and may fire again; carrying the count down the
 /// call chain is what makes the cap describe the actual nesting rather than a
 /// process-wide total.
+///
+/// **The second field is the conflict clause of the statement that started the
+/// chain.** SQLite's rule is that an `ON CONFLICT` clause on the statement that
+/// fires a trigger is used by every statement in the trigger's body instead of
+/// the body's own, so `INSERT OR REPLACE` into a table whose trigger inserts
+/// elsewhere replaces there too. It travels here because a body statement is
+/// run through the same entry points as a typed one and this is what they
+/// already receive.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Depth(pub usize);
+pub struct Depth(pub usize, pub Option<inillucent_sql::ast::ConflictAction>);
+
+impl Depth {
+    /// Returns the depth of a statement a person wrote, which starts a chain.
+    ///
+    /// @param on_conflict - the statement's own `OR` clause
+    pub fn outermost(on_conflict: Option<inillucent_sql::ast::ConflictAction>) -> Depth {
+        Depth(0, on_conflict)
+    }
+}
 
 impl Depth {
     /// Returns the depth one level further in.
@@ -137,7 +154,7 @@ impl Depth {
     /// The depth itself is still carried, because `fire` reports it and a
     /// trigger body's own statements are compiled against it.
     fn deeper(self) -> Depth {
-        Depth(self.0.saturating_add(1))
+        Depth(self.0.saturating_add(1), self.1)
     }
 }
 
@@ -231,6 +248,96 @@ pub fn fire(
     target: &mut dyn WriteTarget,
     firing: &TriggerFiring<'_>,
 ) -> DbResult<Fired> {
+    fire_where(triggers, time, target, firing, &|_| true)
+}
+
+/// Runs the triggers of one timing for a row that `REPLACE` is removing.
+///
+/// **The foreign key actions always run, and the triggers the table declares
+/// only run under `PRAGMA recursive_triggers`.** That is SQLite's rule for the
+/// delete a conflict makes: the pragma off means a `REPLACE` is not a `DELETE`
+/// to a trigger, but a foreign key cascade or `SET NULL` still has to happen.
+///
+/// @param triggers - the triggers the statement fires for a removed row
+/// @param time - `BEFORE` or `AFTER`
+/// @param target - the file and its trees
+/// @param firing - the row being removed as `OLD`
+pub fn fire_replaced(
+    triggers: &[BoundTrigger],
+    time: TriggerTime,
+    target: &mut dyn WriteTarget,
+    firing: &TriggerFiring<'_>,
+) -> DbResult<Fired> {
+    let recursive = firing.params.recursive_triggers();
+    fire_where(triggers, time, target, firing, &|trigger| {
+        trigger.foreign_key || recursive
+    })
+}
+
+/// Runs the `BEFORE INSERT` triggers of one row.
+///
+/// **A row whose key is still to be allocated shows `-1` as its key.** SQLite
+/// fires `BEFORE INSERT` before it allocates a rowid, so `NEW.rowid` and an
+/// `INTEGER PRIMARY KEY` column read as `-1` in the body when the statement
+/// gave no key (or gave NULL). The triggers the binder writes for foreign keys
+/// are not the application's, and are run on the real image: SQLite checks a
+/// foreign key itself and not through a trigger that could see the number.
+///
+/// @param triggers - the triggers the statement fires
+/// @param target - the file and its trees
+/// @param firing - the row as it will be written
+/// @param key_unassigned - whether the statement left the key to be allocated
+pub fn fire_before_insert(
+    triggers: &[BoundTrigger],
+    target: &mut dyn WriteTarget,
+    firing: &TriggerFiring<'_>,
+    key_unassigned: bool,
+) -> DbResult<Fired> {
+    let slot = firing.rowid;
+    let (true, Some(slot), Some(new)) = (key_unassigned, slot, firing.rows.new) else {
+        return fire(triggers, TriggerTime::Before, target, firing);
+    };
+    let mut shown = new.to_vec();
+    if let Some(cell) = shown.get_mut(slot) {
+        *cell = OwnedDatum::Int(-1);
+    }
+    let unassigned = TriggerFiring {
+        rows: TriggerRows {
+            old: None,
+            new: Some(shown.as_slice()),
+        },
+        ..*firing
+    };
+    let applications = |trigger: &BoundTrigger| !trigger.foreign_key;
+    let first = fire_where(
+        triggers,
+        TriggerTime::Before,
+        target,
+        &unassigned,
+        &applications,
+    )?;
+    if first == Fired::SkipRow {
+        return Ok(first);
+    }
+    fire_where(triggers, TriggerTime::Before, target, firing, &|trigger| {
+        trigger.foreign_key
+    })
+}
+
+/// Runs the triggers of one timing that a test selects, in schema order.
+///
+/// @param triggers - the triggers the statement fires
+/// @param time - `BEFORE` or `AFTER`
+/// @param target - the file and its trees
+/// @param firing - the row, the slots and the depth this firing runs at
+/// @param keep - whether a trigger is run
+fn fire_where(
+    triggers: &[BoundTrigger],
+    time: TriggerTime,
+    target: &mut dyn WriteTarget,
+    firing: &TriggerFiring<'_>,
+    keep: &dyn Fn(&BoundTrigger) -> bool,
+) -> DbResult<Fired> {
     if triggers.is_empty() {
         return Ok(Fired::Continue);
     }
@@ -246,7 +353,7 @@ pub fn fire(
         ..*firing
     };
     for trigger in triggers {
-        if trigger.time != time {
+        if trigger.time != time || !keep(trigger) {
             continue;
         }
         if let Some(guard) = &trigger.when {
@@ -336,6 +443,7 @@ fn truth_of(guard: &BoundExpr, target: &dyn WriteTarget, params: &Params) -> DbR
             name: b"when".to_vec(),
             origin: None,
             declared_type: Vec::new(),
+            written: None,
         }],
         distinct: false,
         order_by: Vec::new(),
@@ -346,6 +454,7 @@ fn truth_of(guard: &BoundExpr, target: &dyn WriteTarget, params: &Params) -> DbR
         compounds: Vec::new(),
         windows: Vec::new(),
         correlations: Vec::new(),
+        shared: None,
     };
     let rows = run_select(&select, target, params)?;
     Ok(rows
@@ -451,6 +560,7 @@ fn run_body(
         }
         BoundTriggerStatement::Insert(insert) => {
             let mut insert = (**insert).clone();
+            insert.on_conflict = depth.1.or(insert.on_conflict);
             if insert.triggers.is_empty() && same_table(&insert.table) {
                 insert.triggers = vec![trigger.clone()];
             }
@@ -473,11 +583,20 @@ fn run_body(
                 }
             };
             let params = folded.as_ref().unwrap_or(params);
-            dml::insert_at(&insert, target, params, &supplied, depth)?;
+            // The clause this statement runs with is what the triggers it
+            // fires are handed, as SQLite does; see `Depth`.
+            dml::insert_at(
+                &insert,
+                target,
+                params,
+                &supplied,
+                Depth(depth.0, insert.on_conflict),
+            )?;
             Ok(())
         }
         BoundTriggerStatement::Update(update) => {
             let mut update = (**update).clone();
+            update.on_conflict = depth.1.or(update.on_conflict);
             if update.triggers.is_empty() && same_table(&update.table) {
                 update.triggers = vec![trigger.clone()];
             }
@@ -495,7 +614,13 @@ fn run_body(
                 .collect();
             let folded = crate::subquery::fold_expressions(&assigned, target.catalog(), params)?;
             let params = folded.as_ref().unwrap_or(params);
-            dml::update_at(&update, target, params, &keys, depth)?;
+            dml::update_at(
+                &update,
+                target,
+                params,
+                &keys,
+                Depth(depth.0, update.on_conflict),
+            )?;
             Ok(())
         }
         BoundTriggerStatement::Delete(delete) => {
@@ -508,7 +633,9 @@ fn run_body(
                 &mut substitution(rows, slots, rowid),
             );
             let keys = keys_for_delete(&delete, target, params)?;
-            dml::delete_at(&delete, target, params, &keys, depth)?;
+            // A `DELETE` has no conflict clause to pass on, so the triggers it
+            // fires start again from their own statements' clauses.
+            dml::delete_at(&delete, target, params, &keys, Depth(depth.0, None))?;
             Ok(())
         }
     }

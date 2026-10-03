@@ -1178,6 +1178,7 @@ impl<'d> Connection<'d> {
             run: false,
             changed: 0,
             session: self.session,
+            pending: None,
         })
     }
 
@@ -1401,6 +1402,8 @@ pub struct Statement<'d> {
     changed: usize,
     /// The connection it was compiled on.
     session: u64,
+    /// The failure to report once the rows that came before it are handed out.
+    pending: Option<DbError>,
 }
 
 impl Statement<'_> {
@@ -1495,7 +1498,12 @@ impl Statement<'_> {
                 self.compiled = held.prepare_statement(&self.sql)?;
                 self.generation = held.schema_generation();
             }
-            let outcome = held.execute_statement(&self.compiled, &self.params)?;
+            inillucent_exec::physical::take_partial_rows();
+            let outcome = match held.execute_statement(&self.compiled, &self.params) {
+                Ok(outcome) => outcome,
+                Err(error) => return self.fail_after_rows(error),
+            };
+            self.pending = None;
             self.changed = outcome.changes.rows;
             self.database.changes.set(self.changed as i64);
             self.names = outcome.names;
@@ -1507,7 +1515,33 @@ impl Statement<'_> {
             self.at = self.at.saturating_add(1);
             return Ok(true);
         }
-        Ok(false)
+        match self.pending.take() {
+            Some(error) => Err(error),
+            None => Ok(false),
+        }
+    }
+
+    /// Reports a failure of a `SELECT` after the rows it had already produced.
+    ///
+    /// SQLite hands out the rows of a query that came before the row that
+    /// raised the error, and then reports the error from the same call that
+    /// would have returned the next row. A failed statement that delivered
+    /// nothing, or that is not a query, fails at once.
+    ///
+    /// @param error - what the statement failed with
+    fn fail_after_rows(&mut self, error: DbError) -> DbResult<bool> {
+        let delivered = inillucent_exec::physical::take_partial_rows();
+        let names = self.compiled.query_names();
+        let (Some(names), false) = (names, delivered.is_empty()) else {
+            return Err(error);
+        };
+        self.names = names;
+        self.rows = delivered;
+        self.at = 1;
+        self.changed = 0;
+        self.run = true;
+        self.pending = Some(error);
+        Ok(true)
     }
 
     /// Returns the row the last [`Statement::step`] arrived at.
@@ -1542,6 +1576,7 @@ impl Statement<'_> {
     /// Runs the statement again with the parameters bound since the last run.
     pub fn reset(&mut self) {
         self.run = false;
+        self.pending = None;
         self.at = 0;
     }
 }

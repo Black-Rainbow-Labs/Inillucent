@@ -68,6 +68,50 @@ pub(super) fn implies(computed: Option<&crate::dml::BoundIndexExprs>, terms: &[B
         .any(|term| compares_operand(term, operand.as_ref()))
 }
 
+/// Returns what a partial index has to hold to cover a query that repeats its predicate.
+///
+/// Every entry of a partial index satisfies the predicate, so a conjunct that is the predicate
+/// itself reads nothing from the row: the pinned release plans `SELECT 1 FROM t WHERE a = ? AND
+/// flag = 0` over an index on `(a)` declared `WHERE flag = 0` as a `COVERING INDEX` although
+/// `flag` is in no entry. The answer is the columns read outside the `WHERE`, plus the columns
+/// of every other conjunct, and the positions of the conjuncts that are the predicate, which the
+/// path then does not have to test again. `None` when no conjunct is the predicate.
+///
+/// @param id - the statement-wide number of the FROM term
+/// @param needed - what the whole query reads of the term
+/// @param terms - the statement's `WHERE` conjuncts
+/// @param computed - the index's bound expressions
+pub(super) fn needed_beyond_predicate(
+    id: usize,
+    needed: &ColumnUse,
+    terms: &[BoundExpr],
+    computed: Option<&crate::dml::BoundIndexExprs>,
+) -> Option<(ColumnUse, Vec<usize>)> {
+    let predicate = computed?.predicate.as_ref()?;
+    let implied: Vec<usize> = terms
+        .iter()
+        .enumerate()
+        .filter(|(_, term)| *term == predicate)
+        .map(|(position, _)| position)
+        .collect();
+    if implied.is_empty() {
+        return None;
+    }
+    let mut reduced = ColumnUse {
+        columns: needed.outside_filter.clone(),
+        rowid: needed.rowid,
+        opaque: needed.opaque,
+        functions: needed.functions.clone(),
+        outside_filter: needed.outside_filter.clone(),
+    };
+    for (position, term) in terms.iter().enumerate() {
+        if !implied.contains(&position) {
+            term.columns_read(id, &mut reduced);
+        }
+    }
+    Some((reduced, implied))
+}
+
 /// Reports whether a conjunct is a comparison that one operand has to be
 /// non-NULL to satisfy.
 ///

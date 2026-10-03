@@ -248,7 +248,7 @@ pub(crate) fn build_nested<'t>(
     // term would otherwise go.
     if let AccessPath::VirtualScan { offer, .. } = &source_term.path {
         if offer.iter().any(|held| reads_a_column(&held.value)) {
-            return build_lateral_join(plan, catalog, space, params, stage, downstream);
+            return build_lateral_join(plan, catalog, space, params, stage, index, downstream);
         }
     }
     // **An outer join whose key is its whole condition is an index nested
@@ -621,6 +621,42 @@ pub(crate) fn reads_a_parameter(expr: &BoundExpr) -> bool {
     }
     expr.children().iter().any(|child| reads_a_parameter(child))
 }
+/// Compiles the conditions on the terms before a lateral join, so the join can
+/// skip an outer row they reject before it calls the module.
+///
+/// **A module called for a row the `WHERE` removes can fail where SQLite never
+/// calls it.** `FROM sqlite_master m, pragma_foreign_key_check(m.name) f WHERE
+/// m.type = 'table'` calls the function for the index rows too, and the function
+/// fails for a name that is not a table. SQLite tests a condition at the first
+/// loop where its columns exist. Here every condition is tested above the joins,
+/// so the lateral join tests the ones on earlier terms itself. They are tested
+/// again above, which gives the same answer for a condition that can be tested
+/// twice; the others are left for the test above alone.
+///
+/// @param plan - the planner's output
+/// @param space - the joined column space
+/// @param params - the bound parameters
+/// @param outer_types - the types of the columns the outer terms produce
+/// @param index - the lateral stage's position; the conditions before it are the outer terms'
+fn outer_conditions(
+    plan: &PhysicalPlan,
+    space: &Space<'_>,
+    params: &Params,
+    outer_types: &[StaticType],
+    index: usize,
+) -> DbResult<Vec<Box<dyn crate::expr::Eval>>> {
+    let mut gate: Vec<Box<dyn crate::expr::Eval>> = Vec::new();
+    for residual in plan.residuals.iter().take(index).flatten() {
+        for term in inillucent_sql::plan::conjunction(residual) {
+            if !inillucent_sql::plan::is_repeatable_condition(&term) {
+                continue;
+            }
+            let translated = translate_scan(&term, space, params)?;
+            gate.push(compile(&translated, outer_types)?);
+        }
+    }
+    Ok(gate)
+}
 /// Builds an inner stage as a module driven once per outer row.
 ///
 /// @param plan - the planner's output
@@ -628,6 +664,7 @@ pub(crate) fn reads_a_parameter(expr: &BoundExpr) -> bool {
 /// @param space - the joined column space
 /// @param params - the bound parameters
 /// @param stage - the inner stage
+/// @param index - the stage's position
 /// @param downstream - what to push joined rows into
 fn build_lateral_join<'t>(
     plan: &PhysicalPlan,
@@ -635,6 +672,7 @@ fn build_lateral_join<'t>(
     space: &Space<'_>,
     params: &Params,
     stage: &PreparedStage,
+    index: usize,
     downstream: Box<dyn Sink + 't>,
 ) -> DbResult<Box<dyn Sink + 't>> {
     let source_term = plan
@@ -664,12 +702,31 @@ fn build_lateral_join<'t>(
         let translated = translate_scan(&constraint.value, space, params)?;
         arguments.push(compile(&translated, &outer_types)?);
     }
+    let gate = outer_conditions(plan, space, params, &outer_types, index)?;
+    let left = source_term.join == inillucent_sql::ast::JoinKind::Left;
+    let on = match (&source_term.on, left) {
+        (Some(expr), true) => {
+            let joined_types: Vec<StaticType> = space
+                .types
+                .get(..stage.offset.saturating_add(stage.width))
+                .map(<[StaticType]>::to_vec)
+                .unwrap_or_else(|| space.types.to_vec());
+            let translated = translate_scan(expr, space, params)?;
+            Some(compile(&translated, &joined_types)?)
+        }
+        _ => None,
+    };
     Ok(Box::new(crate::lateral::LateralModule::new(
         source_term.table.clone(),
         source_term.path.clone(),
         params.clone(),
         plan.select.columns_read(source_term.id),
-        arguments,
+        crate::lateral::OuterRowTests {
+            arguments,
+            gate,
+            left,
+            on,
+        },
         catalog,
         stage.width,
         downstream,
@@ -720,13 +777,13 @@ fn build_materialised_join<'t>(
         .get(..stage.offset.saturating_add(stage.width))
         .map(<[StaticType]>::to_vec)
         .unwrap_or_else(|| space.types.to_vec());
-    let condition = match &source_term.on {
-        Some(expr) => {
-            let translated = translate_scan(expr, space, params)?;
-            Some(compile(&translated, &joined_types)?)
-        }
-        None => None,
-    };
+    let (condition, correlated) = join_condition(
+        source_term.on.as_ref(),
+        catalog,
+        space,
+        params,
+        &joined_types,
+    )?;
     // **The automatic index.** When the condition is a conjunction of plain
     // equalities with one side of the join per term, the inner rows go into a
     // hash table keyed on the inner halves and every outer row probes it -
@@ -742,6 +799,11 @@ fn build_materialised_join<'t>(
     if plan
         .levers
         .has(inillucent_sql::plan::Levers::AUTOMATIC_INDEX)
+        && correlated.is_empty()
+        && !source_term
+            .on
+            .as_ref()
+            .is_some_and(inillucent_sql::plan::expression_holds_subquery)
     {
         // **`ON` for an outer join, the residual for an inner one.** A non-outer
         // join's constraint is split into the planner's term list before paths
@@ -797,10 +859,72 @@ fn build_materialised_join<'t>(
             }
         }
     }
+    let join = NestedLoopJoin::new(join_kind_of(source_term.join), rows, condition, downstream)
+        .with_widths(stage.offset, stage.width);
+    if correlated.is_empty() {
+        return Ok(Box::new(join));
+    }
     Ok(Box::new(
-        NestedLoopJoin::new(join_kind_of(source_term.join), rows, condition, downstream)
-            .with_widths(stage.offset, stage.width),
+        join.with_correlations(correlated, catalog, params),
     ))
+}
+/// Compiles a join's `ON` condition, preparing the subqueries in it that read
+/// a column of the pair being tested.
+///
+/// **A subquery in an `ON` is answered for each candidate pair**, so the
+/// condition cannot read it from the end of the finished row, which is where the
+/// operator above the joins puts it. The answers are put after the pair instead,
+/// and the condition is compiled over the pair and its answers.
+///
+/// @param on - the join's condition, when it has one
+/// @param catalog - where the subqueries read their tables
+/// @param space - the joined column space
+/// @param params - the bound parameters
+/// @param joined_types - the types of the pair's columns
+#[allow(clippy::type_complexity)]
+fn join_condition(
+    on: Option<&BoundExpr>,
+    catalog: &dyn TreeCatalog,
+    space: &Space<'_>,
+    params: &Params,
+    joined_types: &[StaticType],
+) -> DbResult<(
+    Option<Box<dyn crate::expr::Eval>>,
+    Vec<crate::correlate::Correlation>,
+)> {
+    let Some(expr) = on else {
+        return Ok((None, Vec::new()));
+    };
+    let width = joined_types.len();
+    let resolver = |held: &BoundExpr| match held {
+        BoundExpr::Column { source, column, .. } => space
+            .column(*source, usize::from(*column))
+            .filter(|at| *at < width),
+        BoundExpr::Rowid { source } => space.rowid(*source).filter(|at| *at < width),
+        _ => None,
+    };
+    let correlated = if inillucent_sql::plan::expression_holds_subquery(expr) {
+        crate::correlate::correlations_in(&[expr], catalog, &resolver)?
+    } else {
+        Vec::new()
+    };
+    let mapping: Vec<(usize, usize)> = correlated
+        .iter()
+        .enumerate()
+        .map(|(position, held)| (held.id, width.saturating_add(position)))
+        .collect();
+    let mut widened = joined_types.to_vec();
+    widened.extend(std::iter::repeat_n(StaticType::Unknown, correlated.len()));
+    let local = Space {
+        stages: space.stages,
+        layouts: space.layouts,
+        types: space.types,
+        order: space.order,
+        catalog: space.catalog,
+        correlations: &mapping,
+    };
+    let translated = translate_scan(expr, &local, params)?;
+    Ok((Some(compile(&translated, &widened)?), correlated))
 }
 /// Returns the executor's join kind for the one the statement wrote.
 ///
@@ -837,7 +961,11 @@ pub(crate) fn materialise_stage(
         .get(stage.term)
         .ok_or_else(|| misuse("a stage names a FROM term the plan does not have"))?;
     match &source_term.path {
-        AccessPath::Subquery { plan: inner, .. } => {
+        AccessPath::Subquery {
+            plan: inner,
+            affinities,
+            ..
+        } => {
             // **A compound is run as a compound.**
             // `SELECT ... FROM (a UNION ALL b)` is an ordinary derived table
             // whose inner plan happens to have arms, and `prepare` refuses a
@@ -852,14 +980,24 @@ pub(crate) fn materialise_stage(
             // while the same query at the top level ran. Ranking in an inner
             // query and filtering in an outer one is how "the rank of one row"
             // and "the top N per group" are written.
-            if !inner.select.windows.is_empty() {
-                Ok(crate::windowpass::run_windowed(inner, catalog, params)?.0)
+            // A common table expression used twice is evaluated once, so a body
+            // that calls `random()` gives every reference the same rows.
+            if let Some(rows) = inner.select.shared.and_then(|key| params.shared_rows(key)) {
+                return Ok(rows);
+            }
+            let rows = if !inner.select.windows.is_empty() {
+                crate::windowpass::run_windowed(inner, catalog, params)?.0
             } else if inner.compounds.is_empty() {
                 let prepared = prepare(inner, catalog, ForcePlan::default())?;
-                Ok(run_prepared(inner, catalog, &prepared, params)?.0)
+                run_prepared(inner, catalog, &prepared, params)?.0
             } else {
-                Ok(run_compound(inner, catalog, params)?.0)
+                run_compound(inner, catalog, params)?.0
+            };
+            let rows = store_with_affinity(rows, affinities);
+            if let Some(key) = inner.select.shared {
+                params.keep_shared_rows(key, &rows);
             }
+            Ok(rows)
         }
         AccessPath::VirtualScan { .. } => {
             let needed = plan.select.columns_read(source_term.id);
@@ -871,13 +1009,17 @@ pub(crate) fn materialise_stage(
             seeds,
             steps,
             width,
+            queue,
         } => crate::recursive::run_recursive(
-            source_term.id,
-            seeds,
-            steps,
-            *width,
-            catalog,
-            params,
+            &crate::recursive::Recursion {
+                cte: source_term.id,
+                seeds,
+                steps,
+                width: *width,
+                queue,
+                catalog,
+                params,
+            },
             limit,
         ),
         // The queue the fill loop is on, handed in by `run_recursive` through a
@@ -904,6 +1046,40 @@ pub(crate) fn materialise_stage(
             Ok(rows)
         }
     }
+}
+/// Widens the integers of a derived table's REAL columns to reals.
+///
+/// **Only REAL.** Reading a column that has REAL affinity out of a subquery
+/// makes a stored integer a real, so the 7 of the second arm of
+/// `SELECT r FROM p UNION ALL SELECT i FROM q` reads as 7.0. No other affinity
+/// changes a value on the way out: the 1.0 of a REAL arm stays real under an
+/// INTEGER first arm, and an integer stays one under TEXT.
+///
+/// @param rows - the rows the query produced
+/// @param affinities - each column's affinity, where Blob is none
+fn store_with_affinity(
+    rows: Vec<Vec<OwnedDatum>>,
+    affinities: &[inillucent_value::Affinity],
+) -> Vec<Vec<OwnedDatum>> {
+    if affinities
+        .iter()
+        .all(|held| *held != inillucent_value::Affinity::Real)
+    {
+        return rows;
+    }
+    rows.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .enumerate()
+                .map(|(at, value)| match affinities.get(at) {
+                    Some(held) if *held == inillucent_value::Affinity::Real => {
+                        crate::declared::stored_as(value, *held)
+                    }
+                    _ => value,
+                })
+                .collect()
+        })
+        .collect()
 }
 /// How many passes a recursive CTE may make before the engine refuses.
 ///

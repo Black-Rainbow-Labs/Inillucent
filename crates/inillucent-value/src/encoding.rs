@@ -144,12 +144,55 @@ pub fn next_utf8(bytes: &[u8], offset: usize) -> Option<(u32, usize)> {
     Some((value, extra.saturating_add(1)))
 }
 
+/// Reads the first code point of UTF-8 bytes exactly as SQLite's
+/// `sqlite3Utf8Read` does, for `unicode()`.
+///
+/// A first byte below 0xC0 is returned as it is, so a stray 0x80 is 128. A
+/// leader takes every continuation byte after it, whatever the leader promised,
+/// and the result is replaced by U+FFFD only when it is below 0x80, is a
+/// surrogate, or is U+FFFE or U+FFFF. A value above U+10FFFF is not replaced.
+///
+/// @param bytes - the text's bytes
+pub fn read_utf8_sqlite(bytes: &[u8]) -> Option<u32> {
+    let lead = u32::from(*bytes.first()?);
+    if lead < 0xc0 {
+        return Some(lead);
+    }
+    let mut code = match lead - 0xc0 {
+        0..=31 => lead & 0x1f,
+        32..=47 => lead & 0x0f,
+        48..=55 => lead & 0x07,
+        56..=59 => lead & 0x03,
+        60 | 61 => lead & 0x01,
+        _ => 0,
+    };
+    for byte in bytes.iter().skip(1) {
+        if byte & 0xc0 != 0x80 {
+            break;
+        }
+        code = (code << 6).wrapping_add(u32::from(byte & 0x3f));
+    }
+    if code < 0x80 || code & 0xffff_f800 == 0xd800 || code & 0xffff_fffe == 0xfffe {
+        code = 0xfffd;
+    }
+    Some(code)
+}
+
 /// Counts the code points in UTF-8 bytes, the way `length()` does.
+///
+/// SQLite's `SQLITE_SKIP_UTF8`: every byte starts a character, and only a byte
+/// of 0xC0 or more takes the continuation bytes (0x80 to 0xBF) after it along
+/// with it. So a lone 0x80 is one character and `x'AB' || 'text'` is five.
 pub fn utf8_character_count(bytes: &[u8]) -> usize {
     let mut offset = 0usize;
     let mut count = 0usize;
-    while let Some((_, width)) = next_utf8(bytes, offset) {
-        offset = offset.saturating_add(width);
+    while let Some(lead) = bytes.get(offset).copied() {
+        offset = offset.saturating_add(1);
+        if lead >= 0xc0 {
+            while bytes.get(offset).is_some_and(|byte| byte & 0xc0 == 0x80) {
+                offset = offset.saturating_add(1);
+            }
+        }
         count = count.saturating_add(1);
     }
     count

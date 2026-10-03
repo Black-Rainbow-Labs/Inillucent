@@ -18,7 +18,7 @@ use crate::constant::literal_value_in;
 // with them.
 use inillucent_pool::Pool;
 use inillucent_sql::ast::{NullOrder, SortOrder};
-use inillucent_sql::bind::BoundExpr;
+use inillucent_sql::bind::{BoundExpr, BoundSelect};
 use inillucent_sql::plan::{AccessPath, AggregationMode, PhysicalPlan};
 use inillucent_tree::datum::OwnedDatum;
 use inillucent_value::collation::Collation;
@@ -746,9 +746,37 @@ fn grouping_of(
         select.group_by.iter().map(expression_collation).collect();
     let grouped_walk = plan.aggregation == AggregationMode::Grouped
         && !prepared.forced.hash_group
+        // The keys of an `IN` list arrive in the order they were written, so
+        // the groups would too; the hash aggregate emits them in key order,
+        // which is the order SQLite's grouping gives.
+        && !drives_from_a_value_list(plan, prepared)
         && (is_scan_prefix(&group_exprs, &group_collations, scan_order)
             || (is_reverse_scan(prepared) && plan.grouped_walk));
     Ok((group_exprs, group_collations, grouped_walk))
+}
+
+/// Whether the outermost stage seeks once per value of an `IN` list.
+///
+/// **Such a source visits the keys in the order they were written, not in
+/// index order.** `a IN (5, 1, 3) ORDER BY a` on an indexed `a` read 5, 1, 3
+/// and skipped the sorter, because the stage's tree columns are the index's key
+/// columns and a walk over them is ordered. The planner already knew: it gives
+/// a union that has to be de-duplicated no ordering, so `plan.needs_sort` is
+/// true. The same list over a `TEXT` column made it visible in
+/// `a IN (1, '01') ORDER BY a`, where the values are compared as text after the
+/// column's affinity is applied.
+///
+/// @param plan - the planner's output
+/// @param prepared - the structural choices `prepare` made
+fn drives_from_a_value_list(plan: &PhysicalPlan, prepared: &Prepared) -> bool {
+    let Some(stage) = prepared.stages.first() else {
+        return false;
+    };
+    matches!(
+        plan.sources.get(stage.term).map(|source| &source.path),
+        Some(AccessPath::RowidSeekUnion { .. })
+            | Some(AccessPath::IndexSeekUnion { dedup: true, .. })
+    )
 }
 
 /// Whether the rows already arrive in the order the `ORDER BY` asks for.
@@ -777,6 +805,7 @@ fn already_sorted(
     // The one condition the forward walk and the skip scan both ask.
     let ascending = || {
         !sort_keys.is_empty()
+            && !drives_from_a_value_list(plan, prepared)
             && sort_keys.iter().all(|term| !term.descending)
             && output_is_sorted_by(
                 sort_keys,
@@ -944,14 +973,21 @@ fn push_sort(
 ) -> DbResult<Box<dyn Sink>> {
     let sort_keys = &up.outputs.sort_keys;
     if sort_keys.is_empty() || up.sorted_already {
-        let chain = match up.limit {
-            Some(limit) => push_limit(chain, operators, limit, up.offset),
-            None => chain,
+        let chain = match (up.limit, up.offset) {
+            (Some(limit), offset) => push_limit(chain, operators, limit, offset),
+            // A negative `LIMIT` means no limit but an `OFFSET` beside it still
+            // skips rows, so `LIMIT -1 OFFSET 3` is a limit that never stops.
+            (None, offset) if offset > 0 => push_limit(chain, operators, usize::MAX, offset),
+            (None, _) => chain,
         };
         return push_trim(chain, operators, up);
     }
     let chain = push_trim(chain, operators, up)?;
     let Some(limit) = up.limit else {
+        let chain = match up.offset {
+            0 => chain,
+            offset => push_limit(chain, operators, usize::MAX, offset),
+        };
         operators.add(|| "SORT".to_string());
         return Ok(Box::new(
             Sort::new(sort_keys.clone(), chain).spilling_to(spill_of(up)),
@@ -1096,10 +1132,33 @@ fn push_aggregate(
                 )))
             } else {
                 operators.add(|| "GROUP HASH".to_string());
-                Ok(Box::new(HashAggregate::new(keys, collations, specs, chain)))
+                let ordered = HashAggregate::new(keys, collations, specs, chain)
+                    .with_descending(group_directions(select));
+                Ok(Box::new(ordered))
             }
         }
     }
+}
+
+/// Returns, for each `GROUP BY` term, whether the groups are visited in
+/// descending order of it.
+///
+/// SQLite copies the direction of each `ORDER BY` term onto the `GROUP BY` term
+/// at the same position when the two lists have the same length, whatever the
+/// terms are. Only groups that compare equal under the `ORDER BY` are affected,
+/// because the sort that follows keeps the order of rows that tie; those come out
+/// in the order the groups were visited. See [`HashAggregate::with_descending`].
+///
+/// @param select - the bound statement
+fn group_directions(select: &BoundSelect) -> Vec<bool> {
+    if !select.compounds.is_empty() || select.group_by.len() != select.order_by.len() {
+        return Vec::new();
+    }
+    select
+        .order_by
+        .iter()
+        .map(|term| term.order == SortOrder::Descending)
+        .collect()
 }
 
 /// Puts the predicates the access paths did not consume on.
@@ -1429,6 +1488,7 @@ fn build_chain<'t>(
             .get(index)
             .ok_or_else(|| misuse("a stage vanished while building"))?;
         chain = build_nested(plan, catalog, space, params, stage, index, chain)?;
+        chain = hold_rows_before_join(plan, space, params, stage, chain)?;
         operators.add(|| {
             format!(
                 "{} tree {}{}",
@@ -1450,6 +1510,91 @@ fn build_chain<'t>(
         limit: upper.limit,
     })
 }
+/// Puts the `ON` terms of earlier inner joins in front of a `RIGHT` or `FULL`
+/// join, so they filter the rows that enter it.
+///
+/// The planner keeps such a term out of the filters above every join because
+/// the join null extends the rows of the terms before it, and the term would
+/// then reject the null extended rows. See [`PlannedSource::before`].
+///
+/// @param plan - the planner's output
+/// @param space - the joined column space
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param stage - the stage whose join was just built
+/// @param chain - the join, which the filter is put in front of
+fn hold_rows_before_join<'t>(
+    plan: &PhysicalPlan,
+    space: &Space<'_>,
+    params: &Params,
+    stage: &PreparedStage,
+    chain: Box<dyn Sink + 't>,
+) -> DbResult<Box<dyn Sink + 't>> {
+    let Some(before) = plan
+        .sources
+        .get(stage.term)
+        .and_then(|term| term.before.as_ref())
+    else {
+        return Ok(chain);
+    };
+    let translated = translate_scan(before, space, params)?;
+    let outer_types: Vec<StaticType> = space
+        .types
+        .get(..stage.offset)
+        .map(<[StaticType]>::to_vec)
+        .unwrap_or_default();
+    Ok(Box::new(HeldBefore {
+        predicate: compile(&translated, &outer_types)?,
+        selection: Vec::new(),
+        downstream: chain,
+    }))
+}
+
+/// A filter in front of a join, which borrows the catalog the join does.
+///
+/// [`Filter`] owns a `'static` sink, and a join reads trees it borrows, so the
+/// filter that goes in front of a `RIGHT` or `FULL` join cannot be one.
+struct HeldBefore<'t> {
+    /// The compiled terms, over the rows entering the join.
+    predicate: Box<dyn crate::expr::Eval>,
+    /// Reused across batches.
+    selection: Vec<u32>,
+    /// The join.
+    downstream: Box<dyn Sink + 't>,
+}
+
+impl Sink for HeldBefore<'_> {
+    fn push(&mut self, batch: &crate::batch::Batch<'_>) -> DbResult<crate::ops::Flow> {
+        use crate::batch::Batch;
+        use crate::ops::Flow;
+        self.selection.clear();
+        for nth in 0..batch.live() {
+            let verdict = self.predicate.value(batch, nth)?;
+            if crate::expr::truth(&verdict.get()) == Some(true) {
+                self.selection.push(batch.row_at(nth) as u32);
+            }
+        }
+        if self.selection.is_empty() {
+            return Ok(Flow::Continue);
+        }
+        let filtered = Batch {
+            rows: batch.rows,
+            selection: Some(&self.selection),
+            columns: batch.columns.clone(),
+        };
+        self.downstream.push(&filtered)
+    }
+
+    fn finish(&mut self) -> DbResult<()> {
+        self.downstream.finish()
+    }
+
+    /// Returns this operator and everything below it to its pre-input state.
+    fn reset(&mut self) -> DbResult<()> {
+        self.selection.clear();
+        self.downstream.reset()
+    }
+}
+
 /// A prepared statement: an operator chain built once and run many times.
 ///
 /// **This is the difference between preparing a plan and preparing a
@@ -1655,6 +1800,37 @@ pub(crate) fn source_pool<'t>(
 ) -> Option<&'t Pool> {
     catalog.pool_for(prepared.stages.first()?.root)
 }
+/// Reports whether a `WHERE` term that reads no table is already known to be
+/// false or NULL, so that no row needs to be read at all.
+///
+/// **SQLite evaluates such a term once, before its loop.** The filter operator
+/// would also drop every row, but only after the source produced it, and a
+/// source such as `generate_series(1)` produces four billion rows:
+/// `SELECT * FROM generate_series(1) WHERE 0 LIMIT 1` never finished. Only a
+/// result that is certainly not true (NULL, integer 0, real 0.0) is acted on; a
+/// term that cannot be folded here, or folds to text or a blob, is left to the
+/// filter operator.
+///
+/// @param plan - the planner's output
+/// @param params - the bound parameters
+fn constant_filter_rejects(plan: &PhysicalPlan, params: &Params) -> bool {
+    let Some(constant) = &plan.constant_filter else {
+        return false;
+    };
+    // A term that calls random() is tested by the filter operator and must not
+    // be tested a second time here, which would change its odds.
+    if inillucent_sql::plan::calls_a_volatile_function(constant) {
+        return false;
+    }
+    matches!(
+        crate::constant::literal_value(constant, params),
+        Ok(OwnedDatum::Null) | Ok(OwnedDatum::Int(0))
+    ) || matches!(
+        crate::constant::literal_value(constant, params),
+        Ok(OwnedDatum::Real(number)) if number == 0.0
+    )
+}
+
 /// Returns what drives a pipeline, without the `EXPLAIN` line.
 ///
 /// **The one place that decides what a plan drives**, so the callers - a
@@ -1689,7 +1865,7 @@ pub(crate) fn source_for_run<'t>(
     // matrix found it on seeds 20261005 and 20261007. An empty source still
     // runs everything above it, so an aggregate answers its one row and the
     // limit above it drops that row, as SQLite answers no row.
-    if constant_limit(&plan.select, params)? == Some(0) {
+    if constant_limit(&plan.select, params)? == Some(0) || constant_filter_rejects(plan, params) {
         return Ok(Source::Rows(Vec::new()));
     }
     match prepared.stages.first() {
@@ -1896,8 +2072,14 @@ fn build_source<'t>(
             let keys = match path {
                 AccessPath::RowidSeekUnion { keys, .. } => rowid_union_keys(keys, space, params)?,
                 AccessPath::IndexSeekUnion {
-                    branches, columns, ..
-                } => index_union_keys(branches, table, columns, space, params)?,
+                    branches,
+                    columns,
+                    collations,
+                    descending,
+                    ..
+                } => index_union_keys(
+                    branches, table, columns, collations, descending, space, params,
+                )?,
                 _ => return Err(misuse("a seek-union stage over a path that is not one")),
             };
             Ok(Source::SeekUnion(probe_over, keys))

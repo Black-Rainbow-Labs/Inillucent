@@ -9,7 +9,6 @@ use inillucent_base::error::{refusal, statement_refusal};
 use inillucent_base::DbResult;
 use inillucent_catalog::ddl::canonical_sql;
 use inillucent_catalog::paged::{tables_from_entries, ObjectKind, SchemaEntry};
-use inillucent_catalog::rename;
 use inillucent_exec::physical::SourceLayout;
 use inillucent_pool::PageId;
 use inillucent_sql::catalog_view::TableInfo;
@@ -220,6 +219,9 @@ impl crate::ImportedDatabase {
         for rowid in doomed {
             self.forget(rowid)?;
         }
+        if folded != b"sqlite_stat1" {
+            self.forget_stat1_of(at, Some(name), None)?;
+        }
         for index in &owner.indexes {
             self.release_tree(index.root)?;
         }
@@ -304,6 +306,7 @@ impl crate::ImportedDatabase {
         for rowid in rowids {
             self.forget(rowid)?;
         }
+        self.forget_stat1_of(owner, None, Some(name))?;
         self.release_tree(index_root)?;
         let _ = (table_at, index_at);
         self.sort_covering(table_root);
@@ -349,7 +352,8 @@ impl crate::ImportedDatabase {
     ///
     /// Every rewrite is a rewrite of *stored text*, and the catalog is then
     /// rebuilt from that text, so there is one derivation of what a schema means
-    /// and `ALTER` does not get its own.
+    /// and `ALTER` does not get its own. The new text of every row is worked out
+    /// and checked before any of it is written (see `alter_rewrite`).
     ///
     /// @param source - the statement text, for `ADD COLUMN`'s definition
     /// @param table - the table being altered
@@ -373,98 +377,23 @@ impl crate::ImportedDatabase {
                 String::from_utf8_lossy(table)
             )));
         }
+        if let AlterKind::AddColumnFailsAfter { message } = action {
+            return Err(statement_refusal(message.clone()));
+        }
         if let AlterKind::AddColumn { risk, .. } = action {
             self.refuse_a_column_past_the_limit(at, &folded)?;
-            if let Some(message) = risk.refusal() {
-                // All three of SQLite's refusals here are `SQLITE_ERROR` (1).
-                if self.table_has_a_row(at, &folded)? {
-                    return Err(statement_refusal(message));
-                }
-            }
+            self.refuse_an_unaddable_column(at, &folded, risk)?;
         }
-        let mut updates: Vec<(i64, SchemaEntry)> = Vec::new();
-        for held in self.entries_of(at) {
-            let (rowid, entry) = (&held.rowid, &held.entry);
-            let owns = entry.table.to_ascii_lowercase() == folded;
-            let itself =
-                entry.name.to_ascii_lowercase() == folded && entry.kind == ObjectKind::Table;
-            if entry.sql.is_empty() {
-                // An automatic index has no statement of its own, but its
-                // `tbl_name` and its generated name still follow a rename.
-                if owns {
-                    if let AlterKind::RenameTable { to } = action {
-                        let mut moved = entry.clone();
-                        moved.table = to.clone();
-                        moved.name = renamed_automatic(&entry.name, table, to);
-                        updates.push((*rowid, moved));
-                    }
-                }
-                continue;
-            }
-            let rewritten = match action {
-                AlterKind::RenameTable { to } => {
-                    let next = rename::rewrite(&entry.sql, rename::Rename::Table, table, to)?;
-                    if next == entry.sql && !owns {
-                        continue;
-                    }
-                    let mut moved = entry.clone();
-                    moved.sql = rename::reparsed(next)?;
-                    if itself {
-                        moved.name = to.clone();
-                        moved.table = to.clone();
-                    } else if owns {
-                        moved.table = to.clone();
-                    }
-                    moved
-                }
-                AlterKind::RenameColumn { from, to } => {
-                    if !owns {
-                        let reads = rename::referenced_tables(&entry.sql);
-                        if !reads.contains(&folded) {
-                            continue;
-                        }
-                        if reads.len() > 1 {
-                            return Err(refusal(format!(
-                                "error in {}: cannot rename a column it reads alongside another table",
-                                String::from_utf8_lossy(&entry.name)
-                            )));
-                        }
-                    }
-                    let next = rename::rewrite(&entry.sql, rename::Rename::Column, from, to)?;
-                    if next == entry.sql {
-                        continue;
-                    }
-                    let mut moved = entry.clone();
-                    moved.sql = rename::reparsed(next)?;
-                    moved
-                }
-                AlterKind::AddColumn { start, end, .. } => {
-                    if !itself {
-                        continue;
-                    }
-                    let definition = source
-                        .get(*start as usize..*end as usize)
-                        .unwrap_or_default()
-                        .to_vec();
-                    let mut moved = entry.clone();
-                    moved.sql = rename::reparsed(rename::add_column(&entry.sql, &definition)?)?;
-                    moved
-                }
-                AlterKind::DropColumn { position, .. } => {
-                    if !itself {
-                        continue;
-                    }
-                    let mut moved = entry.clone();
-                    moved.sql =
-                        rename::reparsed(rename::drop_column(&entry.sql, usize::from(*position))?)?;
-                    moved
-                }
-            };
-            updates.push((*rowid, rewritten));
-        }
+        self.check_schema_before(at, action)?;
+        self.check_constraint_names(at, &folded, action)?;
+        let updates = self.altered_entries(at, source, table, &folded, action)?;
+        self.check_constraint_rows(at, &folded, source, action, !updates.is_empty())?;
+        self.check_new_texts(at, &folded, &updates, action)?;
+        self.rename_sequence(at, &folded, action)?;
         for (rowid, entry) in updates {
             self.rewrite(rowid, entry)?;
         }
+        self.rewrite_temp_dependents(at, source, table, &folded, action)?;
         self.rebuild_tables()?;
         // A `DROP COLUMN` changes the *rows*, not only the text, and the tree is
         // rebuilt rather than edited in place: every leaf's column directory
@@ -482,37 +411,44 @@ impl crate::ImportedDatabase {
             self.refresh_index_layouts(at, &folded);
         }
         self.refresh_catalog();
-        if let AlterKind::DropColumn { .. } = action {
-            self.views_still_bind(at, "after drop column")?;
-        }
+        self.check_schema_after(at, &folded, action)?;
         self.seal()?;
         Ok(Outcome::empty())
     }
-    /// Refuses a schema change that leaves a view which no longer binds.
+    /// Writes the temporary triggers and views a rename in another schema changed.
     ///
-    /// **SQLite's `renameTestSchema`.** After `ALTER TABLE t DROP COLUMN c`
-    /// SQLite re-reads every view in the schema and in `temp`, and refuses the
-    /// statement with "error in view v after drop column: no such column: c"
-    /// when one of them names the column. Without it the drop succeeded and
-    /// left a view that every later read of it failed on. The caller's
-    /// statement is undone by `execute_ddl`'s rollback when this refuses.
+    /// The rows live in the temporary database, so the write is made with that
+    /// schema as the one being changed and the schema is put back afterwards.
     ///
-    /// @param at - the schema the change was made in
-    /// @param when - the words SQLite puts after the view's name
-    fn views_still_bind(&self, at: usize, when: &str) -> DbResult<()> {
-        for table in &self.schema.tables {
-            if table.database != at && table.database != crate::TEMP {
-                continue;
-            }
-            if let Some(Err(error)) = self.bind_view(table) {
-                return Err(inillucent_base::error::statement_refusal(format!(
-                    "error in view {} {when}: {}",
-                    String::from_utf8_lossy(&table.name),
-                    error.message()
-                )));
+    /// @param at - the schema the altered table is in
+    /// @param source - the statement text
+    /// @param table - the table's name as written
+    /// @param folded - the table's folded name
+    /// @param action - what the statement does
+    fn rewrite_temp_dependents(
+        &mut self,
+        at: usize,
+        source: &[u8],
+        table: &[u8],
+        folded: &[u8],
+        action: &AlterKind,
+    ) -> DbResult<()> {
+        let updates = self.temp_dependents_altered(at, source, table, folded, action)?;
+        if updates.is_empty() {
+            return Ok(());
+        }
+        self.schema.ddl_schema = crate::TEMP;
+        let mut written = Ok(());
+        for (rowid, entry) in updates {
+            written = self.rewrite(rowid, entry);
+            if written.is_err() {
+                break;
             }
         }
-        Ok(())
+        self.schema.ddl_schema = at;
+        self.writing
+            .set_touched(self.writing.touched() | crate::schema_bit(crate::TEMP));
+        written
     }
     /// Returns the value a column's `DEFAULT` has for a row that predates it.
     ///
@@ -528,6 +464,20 @@ impl crate::ImportedDatabase {
     ///
     /// @param default_sql - the `DEFAULT` text as the declaration wrote it
     fn constant_default(&mut self, default_sql: &[u8]) -> DbResult<OwnedDatum> {
+        // A bare word, quoted or not, is a string in a default (`DEFAULT "q"`,
+        // `DEFAULT hello`), because a default has no column in scope. Running it
+        // as `SELECT "q"` would look for a column.
+        let limits = inillucent_base::limits::Limits::default();
+        if let Ok((ast, expr)) = inillucent_sql::parser::parse_expression(default_sql, &limits) {
+            if let Some(inillucent_sql::ast::Expr::Column {
+                database: None,
+                table: None,
+                column,
+            }) = ast.expr(expr)
+            {
+                return Ok(OwnedDatum::Text(ast.text(*column).to_vec()));
+            }
+        }
         let text = String::from_utf8_lossy(default_sql).into_owned();
         let rows = self.query_internally(&format!("SELECT {text}"))?;
         Ok(rows
@@ -652,7 +602,7 @@ impl crate::ImportedDatabase {
     ///
     /// @param at - the schema the table is in
     /// @param folded - the table's folded name
-    fn table_has_a_row(&mut self, at: usize, folded: &[u8]) -> DbResult<bool> {
+    pub(super) fn table_has_a_row(&mut self, at: usize, folded: &[u8]) -> DbResult<bool> {
         let Some(root) = self
             .schema
             .tables
@@ -864,10 +814,26 @@ impl crate::ImportedDatabase {
             // column's affinity to a default wherever it is used, which is what
             // makes the two halves agree.
             let value = self.constant_default(&default)?;
-            let value = with_column_affinity(
+            let mut value = with_column_affinity(
                 value,
                 info.columns.get(declared).map(|column| column.affinity),
             );
+            if info.strict {
+                let declared = info
+                    .columns
+                    .get(declared)
+                    .map(|column| column.declared_type.as_slice())
+                    .unwrap_or_default();
+                // A REAL column stores an integer as a real, so `DEFAULT 5` fits.
+                if let OwnedDatum::Int(whole) = value {
+                    if declared.eq_ignore_ascii_case(b"REAL") {
+                        value = OwnedDatum::Real(whole as f64);
+                    }
+                }
+                if !strict_default_fits(declared, &value) {
+                    return Err(statement_refusal("type mismatch on DEFAULT"));
+                }
+            }
             if let Some(cell) = from.get_mut(*slot) {
                 *cell = Fill::Constant(value);
             }
@@ -991,6 +957,25 @@ impl crate::ImportedDatabase {
         // statement will run once for that statement rather than twice.
         self.apply_compiled(&std::rc::Rc::new(compiled), &Params::new())?;
         Ok(())
+    }
+}
+
+/// Returns whether a default, after the column's affinity, is a class a `STRICT` column admits.
+///
+/// SQLite runs this check only when the table already has a row, so the caller
+/// does too. `ANY` and an untyped name admit every class, and NULL is always fine.
+///
+/// @param declared - the column's declared type, as written
+/// @param value - the default after affinity was applied
+fn strict_default_fits(declared: &[u8], value: &OwnedDatum) -> bool {
+    let folded = declared.to_ascii_uppercase();
+    match (folded.as_slice(), value) {
+        (_, OwnedDatum::Null) => true,
+        (b"INT" | b"INTEGER", other) => matches!(other, OwnedDatum::Int(_)),
+        (b"REAL", other) => matches!(other, OwnedDatum::Real(_)),
+        (b"TEXT", other) => matches!(other, OwnedDatum::Text(_)),
+        (b"BLOB", other) => matches!(other, OwnedDatum::Blob(_)),
+        _ => true,
     }
 }
 

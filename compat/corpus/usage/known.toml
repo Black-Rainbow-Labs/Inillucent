@@ -1,0 +1,92 @@
+# Usage corpus cases that do not yet print what SQLite 3.53.4 prints.
+#
+# differential::usage_corpus fails when a case differs and is not listed here,
+# and when a listed case matches, so a row comes out when its case is fixed.
+# kind is "defect" for something to fix and "deviation" for a deliberate
+# difference that docs/sql.md also describes. reason names the defect group of
+# tasks/task-2174-sqlite-usage-parity-tdd.md section 4.
+
+[[known]]
+case = "dml/delete-update-limit-refused"
+kind = "deviation"
+reason = "N1: UPDATE/DELETE ... LIMIT: the pinned sqlite3 shell is built without SQLITE_ENABLE_UPDATE_DELETE_LIMIT"
+
+[[known]]
+case = "holdout/attach-and-temp-schemas/532-pragma-temp-freelist-count-reports-the-temp-databa"
+kind = "deviation"
+reason = "N2: page size. inillucent writes 32768 byte pages, fixed when the file is created, and PRAGMA page_size before the first write is ignored; the pinned sqlite3 uses 4096 and honours the pragma. PRAGMA temp.freelist_count counts pages, and the same deleted rows free 2 pages of 32768 bytes where SQLite frees 13 pages of 4096"
+
+[[known]]
+case = "holdout/attach-and-temp-schemas/533-pragma-aux-page-size-changes-only-the-attached-dat"
+kind = "deviation"
+reason = "N2: page size. inillucent writes 32768 byte pages, fixed when the file is created, and PRAGMA page_size before the first write is ignored; the pinned sqlite3 uses 4096 and honours the pragma. PRAGMA n.page_size = 512 on an attached database reads back 32768 for main and for the attached database"
+
+[[known]]
+case = "holdout/ctes/380-explain-query-plan-text-for-a-materialized-cte-ref"
+kind = "defect"
+reason = "EXPLAIN QUERY PLAN prints a flat list. It does not describe a subquery, a CTE or a compound query as SQLite does (MATERIALIZE, CO-ROUTINE, MERGE, LIST SUBQUERY and the nested lines under each). Fixing this case needs a nested plan renderer and the planner decisions behind it, which is a feature of its own"
+
+[[known]]
+case = "holdout/indexes/648-a-table-with-a-65536-byte-page-size-and-index-entr"
+kind = "deviation"
+reason = "N2: page size. inillucent writes 32768 byte pages, fixed when the file is created, and PRAGMA page_size before the first write is ignored; the pinned sqlite3 uses 4096 and honours the pragma. PRAGMA page_size = 65536 is ignored, so the last PRAGMA page_size reads 32768; every other line of the case matches"
+
+[[known]]
+case = "holdout/indexes/724-pragma-max-page-count-and-index-balancing"
+kind = "deviation"
+reason = "N2: page size. inillucent writes 32768 byte pages, fixed when the file is created, and PRAGMA page_size before the first write is ignored; the pinned sqlite3 uses 4096 and honours the pragma. PRAGMA page_size = 512 is ignored, so the 96 rows need 6 pages and not 43, and PRAGMA page_count reads 6"
+
+[[known]]
+case = "holdout/indexes/795-natural-scan-order-of-a-without-rowid-table-follow"
+kind = "deviation"
+reason = "N4: a WITHOUT ROWID table whose PRIMARY KEY declares DESC stores its rows in ascending key order, where SQLite stores them descending. A query with no ORDER BY returns the rows in ascending order. Seeks, ranges and ORDER BY on the key return the same rows as SQLite"
+
+[[known]]
+case = "holdout/joins/464-predicate-on-the-right-side-of-a-left-join-subquer"
+kind = "defect"
+reason = "Only the EXPLAIN QUERY PLAN text differs; the rows match. SQLite flattens the derived table and prints a plan tree with a COMPOUND QUERY node; inillucent has no subquery flattener and prints a flat list. Needs a plan tree with parent ids and a flattener."
+
+[[known]]
+case = "holdout/schema/821-readback-of-settings-pragmas"
+kind = "deviation"
+reason = "N2: engine configuration defaults. PRAGMA page_size reads 32768 (4096), PRAGMA cache_size reads -131072 (-2000), PRAGMA busy_timeout reads 5000 (0 in the sqlite3 shell) and PRAGMA page_count reads 4 on an empty file (0). Every other pragma in the case matches"
+
+[[known]]
+case = "holdout/schema/837-default-cache-size-and-cache-size-defaults"
+kind = "deviation"
+reason = "N2: engine configuration defaults. The default cache size is -131072 (128 MiB of 32768 byte pages) where SQLite reads -2000; setting PRAGMA default_cache_size = 500 reads back 500 in both"
+
+[[known]]
+case = "holdout/string-functions/5-sqlite-schema-stores-the-unquoted-name-and-the-sql"
+kind = "deviation"
+reason = "N3: file layout. sqlite_schema.rootpage of the first table is 4 and SQLite writes 2, because inillucent keeps its own catalog trees on the first pages of the file. type, name, tbl_name and sql match"
+
+[[known]]
+case = "holdout/subqueries/370-outer-where-applied-to-a-union-all-subquery"
+kind = "defect"
+reason = "Only the EXPLAIN QUERY PLAN text differs; the rows match. SQLite flattens the derived table and prints a plan tree with a COMPOUND QUERY node; inillucent has no subquery flattener and prints a flat list. Needs a plan tree with parent ids and a flattener."
+
+[[known]]
+case = "holdout/upsert/733-pragma-max-page-count-with-a-failed-insert-inside-"
+kind = "deviation"
+reason = "N2: page size. inillucent writes 32768 byte pages, fixed when the file is created, and PRAGMA page_size before the first write is ignored; the pinned sqlite3 uses 4096 and honours the pragma. With 32768 byte pages the rows inserted under PRAGMA max_page_count = 3 fit in the pages the file already has, so the second INSERT does not fail with database or disk is full, and PRAGMA max_page_count = 3 reads back 5 because a limit below the current page count reads back as the page count"
+
+[[known]]
+case = "orm/1/1.9-cache-size-default-and-negative-kib-form"
+kind = "deviation"
+reason = "N2: engine configuration defaults. The default cache size is -131072 (128 MiB of 32768 byte pages) where SQLite reads -2000. Setting PRAGMA cache_size = -64000 and 2000 reads back the same in both"
+
+[[known]]
+case = "orm/1/1.14-page-size-default-and-change-before-first-write"
+kind = "deviation"
+reason = "N2: page size. inillucent writes 32768 byte pages, fixed when the file is created, and PRAGMA page_size = 8192 before the first write is ignored, so PRAGMA page_size reads 32768 before and after; the pinned sqlite3 reads 4096 and then 8192"
+
+[[known]]
+case = "orm/1/1.15-page-size-ignored-after-tables-exist-in-wal-needs-vacuum"
+kind = "deviation"
+reason = "N2: page size. PRAGMA page_size reads 32768 in inillucent and 4096 in the pinned sqlite3; the pragma is ignored after tables exist in both. inillucent also prints nothing for the PRAGMA page_size = 8192 statement, as SQLite does"
+
+[[known]]
+case = "orm/4/4.44-update-with-limit-needs-sqlite-enable-update-delete-limit-de"
+kind = "deviation"
+reason = "N1: UPDATE/DELETE ... LIMIT: the pinned sqlite3 shell is built without SQLITE_ENABLE_UPDATE_DELETE_LIMIT"

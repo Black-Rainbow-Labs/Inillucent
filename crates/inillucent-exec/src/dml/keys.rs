@@ -105,6 +105,7 @@ pub fn keys_query_joined(
             name: b"key".to_vec(),
             origin: None,
             declared_type: Vec::new(),
+            written: None,
         })
         .collect();
     for expr in assigned {
@@ -113,6 +114,7 @@ pub fn keys_query_joined(
             name: b"value".to_vec(),
             origin: None,
             declared_type: Vec::new(),
+            written: None,
         });
     }
     let mut sources = vec![BoundSource {
@@ -125,6 +127,7 @@ pub fn keys_query_joined(
         constraint: None,
         suppressed: Vec::new(),
         index_exprs: Vec::new(),
+        written_schema: None,
     }];
     sources.extend(joined.iter().cloned());
     Ok(BoundSelect {
@@ -142,6 +145,7 @@ pub fn keys_query_joined(
         compounds: Vec::new(),
         windows: Vec::new(),
         correlations: Vec::new(),
+        shared: None,
     })
 }
 /// Returns an `UPDATE ... FROM`'s key rows with one row per target row.
@@ -216,6 +220,7 @@ pub fn module_keys_query(
             constraint: None,
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
+            written_schema: None,
         }],
         filter: filter.cloned(),
         group_by: Vec::new(),
@@ -225,6 +230,7 @@ pub fn module_keys_query(
             name: b"key".to_vec(),
             origin: None,
             declared_type: Vec::new(),
+            written: None,
         }],
         distinct: false,
         order_by: Vec::new(),
@@ -235,6 +241,7 @@ pub fn module_keys_query(
         compounds: Vec::new(),
         windows: Vec::new(),
         correlations: Vec::new(),
+        shared: None,
     }
 }
 

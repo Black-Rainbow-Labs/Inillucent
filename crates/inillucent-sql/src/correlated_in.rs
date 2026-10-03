@@ -64,6 +64,9 @@ fn walk_statement(statement: &mut BoundStatement, rewrite: crate::rewrite::Rewri
         BoundStatement::Insert(insert) => {
             crate::rewrite::rewrite_insert(insert, rewrite);
             walk_triggers(&mut insert.triggers, rewrite);
+            for clause in &mut insert.upsert {
+                walk_triggers(&mut clause.triggers, rewrite);
+            }
         }
         BoundStatement::Update(update) => {
             crate::rewrite::rewrite_update(update, rewrite);
@@ -93,6 +96,9 @@ fn walk_triggers(triggers: &mut [crate::dml::BoundTrigger], rewrite: crate::rewr
                 BoundTriggerStatement::Insert(insert) => {
                     crate::rewrite::rewrite_insert(insert, rewrite);
                     walk_triggers(&mut insert.triggers, rewrite);
+                    for clause in &mut insert.upsert {
+                        walk_triggers(&mut clause.triggers, rewrite);
+                    }
                 }
                 BoundTriggerStatement::Update(update) => {
                     crate::rewrite::rewrite_update(update, rewrite);

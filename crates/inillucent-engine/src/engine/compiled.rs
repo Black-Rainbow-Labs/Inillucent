@@ -37,6 +37,28 @@ const CONNECTION_PRAGMAS: [&str; 15] = [
     "trusted_schema",
 ];
 
+/// Gives the target of a write plan the schema name the statement wrote before it.
+///
+/// The row finding query is built from the table alone, so the name the statement wrote does not
+/// reach it, and `EXPLAIN QUERY PLAN DELETE FROM aux.t` has to print `aux.t`.
+///
+/// @param plan - the plan of the query that finds the rows
+/// @param schema - the schema as written, when one was
+fn name_written_schema(plan: &mut PhysicalPlan, schema: &Option<Vec<u8>>) {
+    if let Some(first) = plan.sources.first_mut() {
+        first.written_schema = schema.clone();
+    }
+}
+
+/// Reports whether a bind failure is the refusal of `RAISE()` outside a trigger body.
+///
+/// @param error - the failure the binder returned
+fn is_raise_outside_trigger(error: &inillucent_base::DbError) -> bool {
+    error
+        .message()
+        .contains("RAISE() may only be used within a trigger-program")
+}
+
 impl crate::ImportedDatabase {
     /// Runs one already-compiled statement.
     ///
@@ -56,6 +78,7 @@ impl crate::ImportedDatabase {
         // cached by its text, and a value baked into the plan would answer with
         // whatever was true when it was first compiled.
         params.set_context(self.scalar_context());
+        params.forget_shared_rows();
         params.set_recursive_triggers(self.pragmas.recursive_triggers());
         // **The file lock, taken here and released here.** Both entry points -
         // `execute_any` and `execute_statement` - come through this function, so
@@ -696,28 +719,46 @@ impl crate::ImportedDatabase {
             // the index" is the same question as "did the search use it".
             // Answering "a delete" would be answering that it is a delete,
             // which the reader wrote.
-            BoundStatement::Update(statement) => self
-                .keys_plan(
-                    &statement.table,
-                    statement.source,
-                    statement.filter.as_ref(),
-                    KeptRows::of(&statement.order_by, &statement.limit, &statement.offset),
-                    &statement.index_hint,
-                    &statement.index_exprs,
-                )?
-                .0
-                .describe(),
-            BoundStatement::Delete(statement) => self
-                .keys_plan(
-                    &statement.table,
-                    statement.source,
-                    statement.filter.as_ref(),
-                    KeptRows::of(&statement.order_by, &statement.limit, &statement.offset),
-                    &statement.index_hint,
-                    &statement.index_exprs,
-                )?
-                .0
-                .describe(),
+            BoundStatement::Update(statement) => {
+                let mut plan = self
+                    .keys_plan(
+                        &statement.table,
+                        statement.source,
+                        statement.filter.as_ref(),
+                        KeptRows::of(&statement.order_by, &statement.limit, &statement.offset),
+                        &statement.index_hint,
+                        &statement.index_exprs,
+                    )?
+                    .0;
+                name_written_schema(&mut plan, &statement.written_schema);
+                plan.describe_write()
+            }
+            // SQLite empties the table without visiting a row when a `DELETE` has no `WHERE`,
+            // no `RETURNING`, no trigger and no foreign key to check, and then the plan has
+            // no line at all.
+            BoundStatement::Delete(statement)
+                if statement.filter.is_none()
+                    && statement.returning.is_empty()
+                    && statement.triggers.is_empty()
+                    && statement.limit.is_none()
+                    && !self.pragmas.foreign_keys() =>
+            {
+                Vec::new()
+            }
+            BoundStatement::Delete(statement) => {
+                let mut plan = self
+                    .keys_plan(
+                        &statement.table,
+                        statement.source,
+                        statement.filter.as_ref(),
+                        KeptRows::of(&statement.order_by, &statement.limit, &statement.offset),
+                        &statement.index_hint,
+                        &statement.index_exprs,
+                    )?
+                    .0;
+                name_written_schema(&mut plan, &statement.written_schema);
+                plan.describe_write()
+            }
             other => vec![describe_statement(&other).to_string()],
         };
         if query_plan {
@@ -756,8 +797,23 @@ impl crate::ImportedDatabase {
                 .map(|cached| (cached, parameters));
         }
         let bound = self.bind_parsed(sql, &parsed);
+        // SQLite finds `RAISE()` outside a trigger in a generated column while the
+        // `CREATE TABLE` runs, when it reads the new schema entry back, so prepare succeeds and
+        // the first step fails. Running the statement re-binds it and fails there the same way.
+        let create_table = matches!(
+            parsed.statement,
+            inillucent_sql::ast::Statement::CreateTable { .. }
+        );
+        if create_table && bound.as_ref().is_err_and(is_raise_outside_trigger) {
+            self.compiled.recycle(parsed);
+            return Ok((Cached::Ddl(sql.to_string()), parameters));
+        }
         self.compiled.recycle(parsed);
-        self.compile_bound(sql, bound?)
+        let bound = bound?;
+        if let BoundStatement::Directive(directive) = &bound {
+            self.check_pragma_at_prepare(directive)?;
+        }
+        self.compile_bound(sql, bound)
             .map(|cached| (cached, parameters))
     }
 
@@ -990,10 +1046,14 @@ impl crate::ImportedDatabase {
         params: &Params,
     ) -> DbResult<Vec<Vec<inillucent_tree::datum::OwnedDatum>>> {
         let keys = self.keys_of(query, params)?;
-        Ok(match statement.from.is_empty() {
-            true => keys,
-            false => dml::one_row_per_target(keys, statement.assignments.len()),
-        })
+        // A view fires its trigger once for every row of the join, so its rows
+        // are not reduced to one per target row.
+        Ok(
+            match statement.from.is_empty() || statement.view_rows.is_some() {
+                true => keys,
+                false => dml::one_row_per_target(keys, statement.assignments.len()),
+            },
+        )
     }
 
     /// Returns the query that finds an `UPDATE`'s rows, and its shape.
@@ -1528,6 +1588,7 @@ fn push_value_columns<'v>(
                 name: format!("value{at}").into_bytes(),
                 origin: None,
                 declared_type: Vec::new(),
+                written: None,
             });
     }
 }

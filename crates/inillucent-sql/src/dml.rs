@@ -121,6 +121,22 @@ pub struct BoundDefault {
     pub expr: BoundExpr,
 }
 
+/// A `VIRTUAL` generated column whose value a write has to look at.
+///
+/// A virtual column is in no record, so the row a write builds does not hold
+/// it. `NOT NULL` and a `STRICT` table's type check test the value that would be
+/// read back, which has to be computed from the row. Only the columns that
+/// declare one of those are here, so a table with no such column carries an
+/// empty vector and the write path does nothing extra.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundVirtualColumn {
+    /// The column, by declared position.
+    pub column: u16,
+    /// The column's value as it is read: the expression, converted by the
+    /// column's affinity.
+    pub expr: BoundExpr,
+}
+
 /// The expressions one index needs evaluated per row to be maintained.
 ///
 /// **An index is usually just columns of the row, and then it needs none of
@@ -240,6 +256,8 @@ pub struct BoundInsert {
     pub checks: Vec<BoundCheck>,
     /// The `DEFAULT`s a `REPLACE` may stand in for a NULL, by column.
     pub not_null_defaults: Vec<BoundDefault>,
+    /// The virtual generated columns the row has to satisfy.
+    pub virtual_columns: Vec<BoundVirtualColumn>,
     /// The expressions the table's partial and expression indexes need.
     pub index_exprs: Vec<BoundIndexExprs>,
     /// The `ON CONFLICT ... DO UPDATE` clause, when there is one.
@@ -264,22 +282,37 @@ pub struct BoundInsert {
     pub replace_triggers: Vec<BoundTrigger>,
 }
 
+/// The constraint an `ON CONFLICT` clause names.
+///
+/// **An index by position, not a set of columns.** A table may hold a partial
+/// unique index and a plain one over the same columns, or two expression
+/// indexes over the same column, and a conflict target picks exactly one of
+/// them. Comparing column sets could not tell them apart, so the clause that
+/// matched was the first one that happened to share the columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpsertConstraint {
+    /// No target was written, so the clause answers a conflict on any constraint.
+    Any,
+    /// The table's own key: the rowid, or the primary key of a `WITHOUT ROWID` table.
+    OwnKey,
+    /// The unique index at this position in `TableInfo::indexes`.
+    Index(usize),
+}
+
 /// A bound `ON CONFLICT ... DO UPDATE` clause.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundUpsert {
-    /// The conflict target columns, when written; empty means any constraint.
-    ///
-    /// Sorted, because a conflict target names a *set* of columns and
-    /// `ON CONFLICT(a,b)` and `ON CONFLICT(b,a)` name the same one. Matching
-    /// them against an index's columns is a set comparison, and sorting here
-    /// is what makes it one comparison rather than a search per column.
-    pub target: Vec<u16>,
+    /// The constraint the clause's conflict target names.
+    pub constraint: UpsertConstraint,
     /// The assignments, or empty for `DO NOTHING`.
     pub assignments: Vec<BoundAssignment>,
     /// Whether the action is `DO UPDATE`.
     pub do_update: bool,
     /// The `WHERE` on the `DO UPDATE`.
     pub filter: Option<BoundExpr>,
+    /// The `UPDATE` triggers the clause fires, and the foreign key checks an
+    /// update of the assigned columns needs. Empty for `DO NOTHING`.
+    pub triggers: Vec<BoundTrigger>,
 }
 
 /// One `SET` assignment.
@@ -306,6 +339,9 @@ pub struct BoundAssignment {
 pub struct BoundUpdate {
     /// The table being written.
     pub table: TableInfo,
+    /// The schema the statement wrote before the target's name, when it wrote one and no alias.
+    /// `EXPLAIN QUERY PLAN` repeats it.
+    pub written_schema: Option<Vec<u8>>,
     /// The statement-wide number of the FROM term being written.
     ///
     /// It used to be implicitly zero, because a DML statement had exactly one
@@ -353,6 +389,8 @@ pub struct BoundUpdate {
     pub checks: Vec<BoundCheck>,
     /// The `DEFAULT`s a `REPLACE` may stand in for a NULL, by column.
     pub not_null_defaults: Vec<BoundDefault>,
+    /// The virtual generated columns the row has to satisfy.
+    pub virtual_columns: Vec<BoundVirtualColumn>,
     /// The expressions the table's partial and expression indexes need.
     pub index_exprs: Vec<BoundIndexExprs>,
     /// `INDEXED BY` or `NOT INDEXED` on the target, which the query that finds
@@ -374,6 +412,9 @@ pub struct BoundUpdate {
     pub offset: Option<BoundExpr>,
     /// The triggers this write fires, in schema order.
     pub triggers: Vec<BoundTrigger>,
+    /// The triggers a row removed by `UPDATE OR REPLACE` fires, as
+    /// [`BoundInsert::replace_triggers`] describes.
+    pub replace_triggers: Vec<BoundTrigger>,
     /// The rows to fire an `INSTEAD OF` trigger for, when the target is a view.
     ///
     /// A view has no rows of its own, so `OLD` has to come from running the
@@ -387,6 +428,9 @@ pub struct BoundUpdate {
 pub struct BoundDelete {
     /// The table being written.
     pub table: TableInfo,
+    /// The schema the statement wrote before the target's name, when it wrote one and no alias.
+    /// `EXPLAIN QUERY PLAN` repeats it.
+    pub written_schema: Option<Vec<u8>>,
     /// The expressions the table's partial and expression indexes need.
     ///
     /// A delete needs them too: an entry only comes out of a partial index if
@@ -502,11 +546,62 @@ fn mark_raises(trigger: &mut BoundTrigger, foreign_key: bool) {
 }
 
 /// Returns whether a view has an `INSTEAD OF` trigger for one event.
+///
+/// An `UPDATE` event matches any `INSTEAD OF UPDATE` trigger here, whatever its
+/// `OF` column list says, because the columns the statement assigns are not
+/// known yet when the target is resolved. `check_view_update_columns` applies
+/// the column list once they are.
+///
+/// @param table - the view
+/// @param event - the kind of write
 fn has_instead_of(table: &TableInfo, event: &TriggerEventInfo) -> bool {
-    table
+    table.triggers.iter().any(|trigger| {
+        trigger.time == ast::TriggerTime::InsteadOf
+            && matches!(
+                (&trigger.event, event),
+                (TriggerEventInfo::Insert, TriggerEventInfo::Insert)
+                    | (TriggerEventInfo::Delete, TriggerEventInfo::Delete)
+                    | (TriggerEventInfo::Update(_), TriggerEventInfo::Update(_))
+            )
+    })
+}
+
+/// Builds the message SQLite gives for a write to a view with no `INSTEAD OF`
+/// trigger for it.
+///
+/// @param table - the view
+fn view_not_writable(table: &TableInfo) -> ParseError {
+    refused(
+        format!(
+            "cannot modify {} because it is a view",
+            String::from_utf8_lossy(&table.name)
+        ),
+        Span::default(),
+    )
+}
+
+/// Refuses an `UPDATE` of a view when no `INSTEAD OF UPDATE` trigger covers the
+/// columns the statement assigns.
+///
+/// SQLite looks for a trigger whose `OF` list names an assigned column, so
+/// `UPDATE v SET a = 1` is refused when the only trigger is `UPDATE OF b`.
+///
+/// @param table - the target
+/// @param changed - the folded names of the assigned columns
+fn check_view_update_columns(table: &TableInfo, changed: &[Vec<u8>]) -> Result<(), ParseError> {
+    if table.kind != TableKind::View {
+        return Ok(());
+    }
+    let event = TriggerEventInfo::Update(Vec::new());
+    let covered = table
         .triggers
         .iter()
-        .any(|trigger| trigger.time == ast::TriggerTime::InsteadOf && trigger.fires_for(event, &[]))
+        .any(|t| t.time == ast::TriggerTime::InsteadOf && t.fires_for(&event, changed));
+    if covered {
+        Ok(())
+    } else {
+        Err(view_not_writable(table))
+    }
 }
 
 /// The target position that stands for the rowid rather than a column.
@@ -574,6 +669,55 @@ impl<'a> Binder<'a> {
         bound
     }
 
+    /// Returns the failure for an `INSERT` that supplies the wrong number of values.
+    ///
+    /// SQLite words it two ways. With a column list it counts against the list:
+    /// `2 values for 1 columns`. Without one it names the table, as written, with
+    /// the schema when one was written: `table main.u has 2 columns but 1 values
+    /// were supplied`. An alias on the table replaces the name.
+    ///
+    /// @param insert - the statement as written
+    /// @param supplied - how many values the source produces
+    /// @param wanted - how many columns the statement writes
+    fn insert_arity_failure(
+        &self,
+        insert: &ast::Insert,
+        supplied: usize,
+        wanted: usize,
+    ) -> ParseError {
+        if !insert.columns.is_empty() {
+            return refused(
+                format!("{supplied} values for {wanted} columns"),
+                Span::default(),
+            );
+        }
+        let written = self.insert_target_label(insert);
+        refused(
+            format!("table {written} has {wanted} columns but {supplied} values were supplied"),
+            Span::default(),
+        )
+    }
+
+    /// Returns the table as SQLite names it in an `INSERT` failure.
+    ///
+    /// The alias when the statement has one, otherwise the table name as written with
+    /// the schema in front of it when the statement wrote one.
+    ///
+    /// @param insert - the statement as written
+    fn insert_target_label(&self, insert: &ast::Insert) -> String {
+        let name = String::from_utf8_lossy(self.ast.text(insert.table)).into_owned();
+        match (insert.alias, insert.database) {
+            (Some(alias), _) => String::from_utf8_lossy(self.ast.text(alias)).into_owned(),
+            (None, Some(database)) => {
+                format!(
+                    "{}.{name}",
+                    String::from_utf8_lossy(self.ast.text(database))
+                )
+            }
+            (None, None) => name,
+        }
+    }
+
     /// Binds an `INSERT` with its CTEs already in scope.
     fn bind_insert_body(&mut self, insert: &ast::Insert) -> Result<BoundInsert, ParseError> {
         let table = self.writable_target(
@@ -592,29 +736,28 @@ impl<'a> Binder<'a> {
         // not allow a column list with it, so there is none to honour.
         let targets = match insert.source {
             ast::InsertSource::DefaultValues => Vec::new(),
-            ast::InsertSource::Select(_) => self.insert_targets(&table, &insert.columns)?,
+            ast::InsertSource::Select(_) => {
+                self.insert_targets(&table, &insert.columns, &self.insert_target_label(insert))?
+            }
         };
         let (source, arity) = self.bind_insert_source(&insert.source, &table, &targets)?;
         if arity != targets.len() {
-            return Err(refused(
-                format!("{} values for {} columns", arity, targets.len()),
-                Span::default(),
-            ));
+            return Err(self.insert_arity_failure(insert, arity, targets.len()));
         }
         let (columns, rowid) = self.column_sources(&table, &targets)?;
-        let named_rowid = targets.iter().position(|target| *target == ROWID_TARGET);
+        let named_rowid = targets.iter().rposition(|target| *target == ROWID_TARGET);
         let checks = self.bind_checks(&table)?;
         let not_null_defaults = self.bind_not_null_defaults(&table)?;
+        let virtual_columns = self.bind_virtual_columns(&table)?;
         let index_exprs = self.bind_index_exprs(&table)?;
         let upsert = self.bind_upsert(&table, insert)?;
         let returning = self.bind_returning(&insert.returning)?;
-        let mut triggers = self.bind_triggers(&table, TriggerEventInfo::Insert, &[])?;
+        let on_conflict = self.trigger_conflict.or(insert.on_conflict);
+        let mut triggers = self.with_trigger_conflict(on_conflict, |binder| {
+            binder.bind_triggers(&table, TriggerEventInfo::Insert, &[])
+        })?;
         triggers.extend(self.bind_foreign_keys(&table, TriggerEventInfo::Insert, &[])?);
-        let replace_triggers = if can_replace(&table, insert.on_conflict) {
-            self.bind_foreign_keys(&table, TriggerEventInfo::Delete, &[])?
-        } else {
-            Vec::new()
-        };
+        let replace_triggers = self.bind_replace_triggers(&table, insert.on_conflict)?;
         let sequence_root = if table.autoincrement {
             self.catalog
                 .find_table(None, b"sqlite_sequence")
@@ -631,15 +774,40 @@ impl<'a> Binder<'a> {
             named_rowid,
             source,
             arity,
-            on_conflict: insert.on_conflict,
+            on_conflict,
             checks,
             not_null_defaults,
+            virtual_columns,
             upsert,
             sequence_root,
             returning,
             triggers,
             replace_triggers,
         })
+    }
+
+    /// Binds the triggers a row removed by `REPLACE` fires.
+    ///
+    /// **Foreign key actions always, written `DELETE` triggers only when
+    /// `recursive_triggers` is on.** SQLite runs the foreign key actions of
+    /// every row a conflict removes, and fires the delete triggers the table
+    /// declares only under that pragma. The pragma is a run time setting, so
+    /// the written triggers are bound here and the executor drops them when it
+    /// is off.
+    ///
+    /// @param table - the table being written
+    /// @param on_conflict - the statement's own conflict clause
+    fn bind_replace_triggers(
+        &mut self,
+        table: &TableInfo,
+        on_conflict: Option<ConflictAction>,
+    ) -> Result<Vec<BoundTrigger>, ParseError> {
+        if !can_replace(table, on_conflict) {
+            return Ok(Vec::new());
+        }
+        let mut bound = self.bind_triggers(table, TriggerEventInfo::Delete, &[])?;
+        bound.extend(self.bind_foreign_keys(table, TriggerEventInfo::Delete, &[])?);
+        Ok(bound)
     }
 
     /// Binds an `UPDATE`.
@@ -691,19 +859,15 @@ impl<'a> Binder<'a> {
         Ok((joined, arguments))
     }
 
-    /// Binds an `UPDATE` with its CTEs already in scope.
-    fn bind_update_body(&mut self, update: &ast::Update) -> Result<BoundUpdate, ParseError> {
-        if let Some(refusal) = order_without_limit(update.limited_at, update.limit, "UPDATE") {
-            return Err(refusal);
-        }
-        let (table, source) =
-            self.write_target_from_term(update.target, &TriggerEventInfo::Update(Vec::new()))?;
-        refuse_module_returning(&table, &update.returning, "UPDATE")?;
-        // **The `FROM` terms are bound after the target**, so the target keeps
-        // the lowest source number and every reference to an unqualified column
-        // resolves to it first - which is SQLite's rule and the reason
-        // `UPDATE t SET v = v + 1 FROM s` means the target's `v`.
-        let (joined, arguments) = self.bind_update_from(&update.from)?;
+    /// Binds an `UPDATE`'s `SET` list into one assignment per column.
+    ///
+    /// @param update - the statement as written
+    /// @param table - the target, whose columns the names resolve against
+    fn bind_update_assignments(
+        &mut self,
+        update: &ast::Update,
+        table: &TableInfo,
+    ) -> Result<Vec<BoundAssignment>, ParseError> {
         let mut assignments = Vec::new();
         for (names, value) in &update.assignments {
             let values = self.assigned_values(names, *value)?;
@@ -713,15 +877,10 @@ impl<'a> Binder<'a> {
                 // declared column, unless the table declares a column by one of
                 // those names - which is what `is_rowid_name` decides.
                 if table.is_rowid_name(&folded) {
-                    if assignments.iter().any(|held: &BoundAssignment| held.rowid) {
-                        return Err(refused(
-                            format!(
-                                "column {} is assigned twice",
-                                String::from_utf8_lossy(self.ast.text(*name))
-                            ),
-                            Span::default(),
-                        ));
-                    }
+                    // **The last assignment to a column wins.** SQLite accepts
+                    // `SET a = 1, a = 2` and stores 2; it does not refuse the
+                    // repeat.
+                    assignments.retain(|held: &BoundAssignment| !held.rowid);
                     assignments.push(BoundAssignment {
                         column: 0,
                         rowid: true,
@@ -740,19 +899,10 @@ impl<'a> Binder<'a> {
                 // agreeing with its own expression, or the recompute above put
                 // it back and the assignment was silently dropped. `INSERT`
                 // already refused the same thing.
-                self.refuse_generated(&table, position, "UPDATE", Span::default())?;
-                if assignments
-                    .iter()
-                    .any(|existing: &BoundAssignment| existing.column == position)
-                {
-                    return Err(refused(
-                        format!(
-                            "column {} is assigned twice",
-                            String::from_utf8_lossy(self.ast.text(*name))
-                        ),
-                        Span::default(),
-                    ));
-                }
+                self.refuse_generated(table, position, "UPDATE", Span::default())?;
+                assignments.retain(|existing: &BoundAssignment| {
+                    existing.rowid || existing.column != position
+                });
                 assignments.push(BoundAssignment {
                     column: position,
                     rowid: false,
@@ -764,6 +914,23 @@ impl<'a> Binder<'a> {
         // ahead of them, because `column` says nothing for it and the order
         // only has to be stable.
         assignments.sort_by_key(|assignment| (assignment.rowid, assignment.column));
+        Ok(assignments)
+    }
+
+    /// Binds an `UPDATE` with its CTEs already in scope.
+    fn bind_update_body(&mut self, update: &ast::Update) -> Result<BoundUpdate, ParseError> {
+        if let Some(refusal) = order_without_limit(update.limited_at, update.limit, "UPDATE") {
+            return Err(refusal);
+        }
+        let (table, source) =
+            self.write_target_from_term(update.target, &TriggerEventInfo::Update(Vec::new()))?;
+        refuse_module_returning(&table, &update.returning, "UPDATE")?;
+        // **The `FROM` terms are bound after the target**, so the target keeps
+        // the lowest source number and every reference to an unqualified column
+        // resolves to it first - which is SQLite's rule and the reason
+        // `UPDATE t SET v = v + 1 FROM s` means the target's `v`.
+        let (joined, arguments) = self.bind_update_from(&update.from)?;
+        let assignments = self.bind_update_assignments(update, &table)?;
         let mut filter = match update.filter {
             Some(expr) => Some(self.bind_expr(expr)?),
             None => None,
@@ -782,7 +949,7 @@ impl<'a> Binder<'a> {
         let saved_scopes = core::mem::replace(&mut self.scopes, vec![vec![source]]);
         let schema = self.bind_update_schema(&table);
         self.scopes = saved_scopes;
-        let (generated, checks, not_null_defaults, index_exprs) = schema?;
+        let (generated, checks, not_null_defaults, index_exprs, virtual_columns) = schema?;
         // `RETURNING` reads the row written and nothing else: SQLite does not
         // let a `FROM` term take part in it, so an unqualified `k` that both
         // the target and a `FROM` term have is the target's.
@@ -809,19 +976,31 @@ impl<'a> Binder<'a> {
             .filter_map(|assignment| table.column(assignment.column))
             .map(|column| column.folded.clone())
             .collect();
-        let mut triggers =
-            self.bind_triggers(&table, TriggerEventInfo::Update(Vec::new()), &changed)?;
+        check_view_update_columns(&table, &changed)?;
+        let on_conflict = self.trigger_conflict.or(update.on_conflict);
+        let mut triggers = self.with_trigger_conflict(on_conflict, |binder| {
+            binder.bind_triggers(&table, TriggerEventInfo::Update(Vec::new()), &changed)
+        })?;
+        // Foreign keys see the generated columns whose inputs were assigned.
+        let key_changes = self.changed_with_generated(&table, &changed)?;
         triggers.extend(self.bind_foreign_keys(
             &table,
             TriggerEventInfo::Update(Vec::new()),
-            &changed,
+            &key_changes,
         )?);
         let view_rows = self
             .view_rows(&table, filter.clone())
+            .map(|rows| join_view_rows(rows, &joined, &assignments))
             .map(|rows| limit_view_rows(rows, &order_by, &limit, &offset));
         let index_hint = self.write_hint(source, &index_exprs, filter.as_ref(), &joined)?;
+        let replace_triggers = self.bind_replace_triggers(&table, update.on_conflict)?;
+        let written_schema = self
+            .sources
+            .get(source)
+            .and_then(|held| held.written_schema.clone());
         Ok(BoundUpdate {
             table,
+            written_schema,
             index_exprs,
             index_hint,
             source,
@@ -829,14 +1008,16 @@ impl<'a> Binder<'a> {
             assignments,
             generated,
             filter,
-            on_conflict: update.on_conflict,
+            on_conflict,
             checks,
             not_null_defaults,
+            virtual_columns,
             returning,
             order_by,
             limit,
             offset,
             triggers,
+            replace_triggers,
             view_rows,
         })
     }
@@ -874,14 +1055,38 @@ impl<'a> Binder<'a> {
             Some(expr) => Some(self.bind_expr(expr)?),
             None => None,
         };
-        let mut triggers = self.bind_triggers(&table, TriggerEventInfo::Delete, &[])?;
+        // A `DELETE` hands its triggers no conflict action (`sqlite3DeleteFrom`
+        // passes `OE_Default`), so what an outer `INSERT OR IGNORE` named stops
+        // here instead of reaching the bodies of the triggers a delete fires.
+        let mut triggers = self.with_trigger_conflict(None, |binder| {
+            binder.bind_triggers(&table, TriggerEventInfo::Delete, &[])
+        })?;
         triggers.extend(self.bind_foreign_keys(&table, TriggerEventInfo::Delete, &[])?);
         let view_rows = self
             .view_rows(&table, filter.clone())
             .map(|rows| limit_view_rows(rows, &order_by, &limit, &offset));
-        let index_hint = self.write_hint(source, &index_exprs, filter.as_ref(), &[])?;
+        // **A `DELETE` that removes every row empties the table without
+        // looking at an index**, so SQLite never asks whether the named one can
+        // answer it, and `DELETE FROM u INDEXED BY a_partial_index` runs. A
+        // trigger, a foreign key, `RETURNING`, `ORDER BY` or `LIMIT` makes it
+        // an ordinary delete, which does ask.
+        let empties_the_table = filter.is_none()
+            && triggers.is_empty()
+            && returning.is_empty()
+            && order_by.is_empty()
+            && limit.is_none();
+        let index_hint = if empties_the_table {
+            crate::bind::IndexChoice::Any
+        } else {
+            self.write_hint(source, &index_exprs, filter.as_ref(), &[])?
+        };
+        let written_schema = self
+            .sources
+            .get(source)
+            .and_then(|held| held.written_schema.clone());
         Ok(BoundDelete {
             table,
+            written_schema,
             index_exprs,
             index_hint,
             source,
@@ -924,6 +1129,9 @@ impl<'a> Binder<'a> {
         event: TriggerEventInfo,
         changed: &[Vec<u8>],
     ) -> Result<Vec<BoundTrigger>, ParseError> {
+        if self.skip_triggers {
+            return Ok(Vec::new());
+        }
         // The catalog reference is copied out of `self` first: the trigger's
         // arena has to outlive the binder for the body to be bound in place,
         // and a borrow taken through `&self` would end at the first `&mut self`.
@@ -980,9 +1188,32 @@ impl<'a> Binder<'a> {
             self.row_aliases = saved_aliases;
             self.view_target = saved_target;
             self.firing.pop();
-            bound.push(result?);
+            let schema = catalog.database_name(table.database).to_vec();
+            bound.push(result.map_err(|error| crate::bind::qualify_missing_table(error, &schema))?);
         }
         Ok(bound)
+    }
+
+    /// Runs a bind with the conflict action the write's trigger bodies inherit.
+    ///
+    /// **A statement in a trigger body uses the conflict action of the statement
+    /// that fired the trigger, whatever the body wrote.** SQLite sets the
+    /// action for each step from the firing statement when that statement named
+    /// one (`codeTriggerProgram`), so `INSERT OR REPLACE INTO t1` makes a body's
+    /// plain `INSERT INTO t2` replace, and the body of a trigger that fires in
+    /// turn inherits it again.
+    ///
+    /// @param inherited - the action the bodies inherit, `None` when none was written
+    /// @param bind - binds the triggers
+    fn with_trigger_conflict<T>(
+        &mut self,
+        inherited: Option<ast::ConflictAction>,
+        bind: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        let saved = core::mem::replace(&mut self.trigger_conflict, inherited);
+        let bound = bind(self);
+        self.trigger_conflict = saved;
+        bound
     }
 
     /// Binds the triggers this write's foreign keys imply.
@@ -1108,6 +1339,37 @@ impl<'a> Binder<'a> {
         Ok(bound)
     }
 
+    /// Binds one trigger's guard and body only to learn whether every name in
+    /// them resolves.
+    ///
+    /// **This is `ALTER TABLE`'s check of the schema.** After a rename or a
+    /// dropped column SQLite re-reads every trigger and refuses the statement
+    /// when one names a table or column that is no longer there. The binder must
+    /// have been built over the trigger's own arena (`Binder::new(catalog,
+    /// &trigger.ast, ..)`), and the triggers of the tables the body writes are
+    /// not expanded.
+    ///
+    /// @param trigger - the trigger
+    /// @param table - the table the trigger is on
+    pub fn check_trigger(
+        &mut self,
+        trigger: &TriggerInfo,
+        table: &TableInfo,
+    ) -> Result<(), ParseError> {
+        let (old, new) = match trigger.event {
+            TriggerEventInfo::Insert => (false, true),
+            TriggerEventInfo::Delete => (true, false),
+            TriggerEventInfo::Update(_) => (true, true),
+        };
+        self.skip_triggers = true;
+        self.row_aliases = Some(crate::bind::RowAliases {
+            table: table.clone(),
+            old,
+            new,
+        });
+        self.bind_trigger_body(trigger, table).map(|_| ())
+    }
+
     /// Binds one trigger's guard and body statements.
     fn bind_trigger_body(
         &mut self,
@@ -1203,7 +1465,13 @@ impl<'a> Binder<'a> {
             .find_table(qualifier.as_deref(), &folded)
             .cloned()
         else {
-            return Err(crate::bind::no_such_table(self.ast.text(name), span));
+            let written = match database {
+                Some(schema) => {
+                    [self.ast.text(schema), b".".as_slice(), self.ast.text(name)].concat()
+                }
+                None => self.ast.text(name).to_vec(),
+            };
+            return Err(crate::bind::no_such_table(&written, span));
         };
         match table.kind {
             TableKind::View => {
@@ -1211,7 +1479,7 @@ impl<'a> Binder<'a> {
                 // trigger for this event: the trigger *is* the write, and the
                 // view itself is never touched.
                 if !has_instead_of(&table, event) {
-                    return Err(unsupported("writing to a view", span));
+                    return Err(view_not_writable(&table));
                 }
                 let expanded = self.expanded_view(&table, span)?;
                 self.record_write_dependency(table.database);
@@ -1294,6 +1562,7 @@ impl<'a> Binder<'a> {
                 constraint: None,
                 suppressed: Vec::new(),
                 index_exprs: Vec::new(),
+                written_schema: None,
             };
             self.view_target = Some(source.id);
             let scope = source.id;
@@ -1303,8 +1572,13 @@ impl<'a> Binder<'a> {
         }
         let scope = self.push_write_source(table.clone(), alias);
         let choice = self.index_choice(indexed_by);
+        let written_schema = match (term.alias, database) {
+            (None, Some(schema)) => Some(self.ast.text(schema).to_vec()),
+            _ => None,
+        };
         if let Some(source) = self.sources.get_mut(scope) {
             source.index_hint = choice;
+            source.written_schema = written_schema;
         }
         Ok((table, scope))
     }
@@ -1393,6 +1667,7 @@ impl<'a> Binder<'a> {
                 name: column.name.clone(),
                 origin: None,
                 declared_type: column.declared_type.clone(),
+                written: None,
             })
             .collect();
         Some(Box::new(crate::bind::block_over(source, filter, columns)))
@@ -1451,6 +1726,7 @@ impl<'a> Binder<'a> {
             constraint: None,
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
+            written_schema: None,
         });
         self.scopes.push(vec![id]);
         id
@@ -1495,10 +1771,15 @@ impl<'a> Binder<'a> {
     /// which is why adding a column to a table changes what a positional
     /// INSERT means - SQLite's behaviour, and the reason the column list is
     /// worth writing.
+    ///
+    /// @param table - the table written
+    /// @param columns - the column list as written
+    /// @param label - the table as SQLite names it in a failure
     fn insert_targets(
         &self,
         table: &TableInfo,
         columns: &[ast::NameId],
+        label: &str,
     ) -> Result<Vec<u16>, ParseError> {
         if columns.is_empty() {
             // A bare `INSERT INTO t VALUES (...)` supplies the columns a person
@@ -1527,17 +1808,19 @@ impl<'a> Binder<'a> {
                 // key. A declared column of the same name wins, which is why
                 // this is the fallback rather than the first thing tried.
                 None if table.has_rowid() && is_rowid_name(&folded) => ROWID_TARGET,
-                None => return Err(no_such_column(self.ast.text(*name), Span::default())),
+                None => {
+                    return Err(refused(
+                        format!(
+                            "table {label} has no column named {}",
+                            String::from_utf8_lossy(self.ast.text(*name))
+                        ),
+                        Span::default(),
+                    ))
+                }
             };
-            if targets.contains(&position) {
-                return Err(refused(
-                    format!(
-                        "column {} is named twice",
-                        String::from_utf8_lossy(self.ast.text(*name))
-                    ),
-                    Span::default(),
-                ));
-            }
+            // A column named twice is accepted. The first value is the one a
+            // table column takes and the last is the one the rowid takes, which
+            // is how SQLite reads `INSERT INTO t(a, a)` and `INSERT INTO t(rowid, oid)`.
             if position != ROWID_TARGET {
                 self.refuse_generated(table, position, "INSERT into", Span::default())?;
             }
@@ -1577,17 +1860,16 @@ impl<'a> Binder<'a> {
                     }
                 };
                 self.scopes = saved;
-                if bound.values.is_empty() {
+                // A VALUES list followed by `UNION ALL` and more rows is a
+                // compound, whose later arms the plain list would drop.
+                if bound.values.is_empty() || !bound.compounds.is_empty() {
                     let arity = bound.columns.len();
                     return Ok((BoundInsertSource::Select(Box::new(bound)), arity));
                 }
                 let arity = bound.values.first().map_or(0, Vec::len);
                 for row in &bound.values {
                     if row.len() != arity {
-                        return Err(unsupported(
-                            "all VALUES rows must have the same number of columns",
-                            Span::default(),
-                        ));
+                        return Err(crate::bind::values_width_mismatch(Span::default()));
                     }
                 }
                 Ok((BoundInsertSource::Values(bound.values), arity))
@@ -1614,8 +1896,17 @@ impl<'a> Binder<'a> {
                 columns.push(ColumnSource::Generated(expr));
                 continue;
             }
-            let source = match targets.iter().position(|target| *target == position) {
+            let named = if table.rowid_alias == Some(position) {
+                targets.iter().rposition(|target| *target == position)
+            } else {
+                targets.iter().position(|target| *target == position)
+            };
+            let source = match named {
                 Some(index) => ColumnSource::Row(index),
+                // **A rowid alias takes no `DEFAULT`.** SQLite ignores the
+                // default of an `INTEGER PRIMARY KEY` column and allocates a
+                // rowid, so `DEFAULT 100` on the key is never used.
+                None if table.rowid_alias == Some(position) => ColumnSource::Expr(BoundExpr::Null),
                 None => ColumnSource::Expr(self.default_expr(table, position)?),
             };
             columns.push(source);
@@ -1661,6 +1952,7 @@ impl<'a> Binder<'a> {
             Vec<BoundCheck>,
             Vec<BoundDefault>,
             Vec<BoundIndexExprs>,
+            Vec<BoundVirtualColumn>,
         ),
         ParseError,
     > {
@@ -1668,7 +1960,41 @@ impl<'a> Binder<'a> {
         let checks = self.bind_checks(table)?;
         let not_null_defaults = self.bind_not_null_defaults(table)?;
         let index_exprs = self.bind_index_exprs(table)?;
-        Ok((generated, checks, not_null_defaults, index_exprs))
+        let virtual_columns = self.bind_virtual_columns(table)?;
+        Ok((
+            generated,
+            checks,
+            not_null_defaults,
+            index_exprs,
+            virtual_columns,
+        ))
+    }
+
+    /// Binds the virtual generated columns a write has to test.
+    ///
+    /// A column is included when it is `NOT NULL`, or when the table is
+    /// `STRICT` and so checks every column's type. Each is bound as a read of
+    /// the column, which is the expression converted by the column's affinity:
+    /// SQLite tests that value, and not the bare expression.
+    ///
+    /// @param table - the table being written
+    fn bind_virtual_columns(
+        &mut self,
+        table: &TableInfo,
+    ) -> Result<Vec<BoundVirtualColumn>, ParseError> {
+        let mut bound = Vec::new();
+        for (position, column) in table.columns.iter().enumerate() {
+            let virtual_column = column.generated && !column.stored;
+            if !virtual_column || !(column.not_null || table.strict) {
+                continue;
+            }
+            let expr = self.bind_schema_expr(&crate::catalog_view::quoted_name(&column.name))?;
+            bound.push(BoundVirtualColumn {
+                column: position as u16,
+                expr,
+            });
+        }
+        Ok(bound)
     }
 
     /// Binds every `STORED` generated column's expression.
@@ -1714,6 +2040,28 @@ impl<'a> Binder<'a> {
         if sql.is_empty() {
             return Ok(BoundExpr::Null);
         }
+        self.bind_default_sql(&sql.clone())
+    }
+
+    /// Binds the text of a `DEFAULT`.
+    ///
+    /// **An unparenthesised word is a string**, as SQLite reads
+    /// `DEFAULT hello`; the parser gives it that meaning, and the stored text
+    /// is the word as written, so it is given the meaning again here. A default
+    /// has no column in scope for a word to name.
+    ///
+    /// @param sql - the default as stored
+    pub(crate) fn bind_default_sql(&mut self, sql: &[u8]) -> Result<BoundExpr, ParseError> {
+        let limits = Limits::default();
+        let (ast, expr) = parse_expression(sql, &limits)?;
+        if let Some(ast::Expr::Column {
+            database: None,
+            table: None,
+            column,
+        }) = ast.expr(expr)
+        {
+            return Ok(BoundExpr::Text(ast.text(*column).to_vec()));
+        }
         self.bind_schema_expr(sql)
     }
 
@@ -1743,7 +2091,7 @@ impl<'a> Binder<'a> {
             if sql.is_empty() {
                 continue;
             }
-            let expr = self.bind_schema_expr(&sql.clone())?;
+            let expr = self.bind_default_sql(&sql.clone())?;
             defaults.push(BoundDefault {
                 column: position as u16,
                 expr,
@@ -1784,8 +2132,8 @@ impl<'a> Binder<'a> {
             };
             let mut keys = Vec::with_capacity(index.columns.len());
             for key in &index.columns {
-                keys.push(match key.expr_sql.as_ref() {
-                    Some(sql) => Some(self.bind_schema_expr(sql)?),
+                keys.push(match key.computed_text(table) {
+                    Some(sql) => Some(self.bind_schema_expr(&sql)?),
                     None => None,
                 });
             }
@@ -1838,6 +2186,14 @@ impl<'a> Binder<'a> {
         if insert.upserts.is_empty() {
             return Ok(Vec::new());
         }
+        // A view has no constraint for a conflict to name, and SQLite says so before it
+        // looks at the clause.
+        if table.kind == TableKind::View {
+            return Err(crate::bind::schema_refused(
+                "cannot UPSERT a view",
+                Span::default(),
+            ));
+        }
         // A module decides for itself what a clash is, so there is no
         // constraint for a conflict target to name. SQLite refuses the clause
         // on a virtual table outright, in these words.
@@ -1850,19 +2206,19 @@ impl<'a> Binder<'a> {
                 Span::default(),
             ));
         }
+        // A view has no constraint a clash could be found on, whether or not an
+        // `INSTEAD OF INSERT` trigger lets it be written.
+        if table.kind == TableKind::View {
+            return Err(crate::bind::schema_refused(
+                "cannot UPSERT a view",
+                Span::default(),
+            ));
+        }
         // **Every clause is bound, in written order.** A statement may carry
         // several - `ON CONFLICT(k) DO UPDATE ... ON CONFLICT(id) DO UPDATE ...`
         // - and which one runs is decided at *run time*, by which constraint
         // the row actually collided with. Binding only the first was the whole
         // of the old refusal.
-        for upsert in &insert.upserts {
-            if upsert.target_filter.is_some() {
-                return Err(unsupported(
-                    "a partial-index conflict target",
-                    Span::default(),
-                ));
-            }
-        }
         // A clause with no conflict target matches any constraint, so anything
         // written after it could never run. SQLite refuses that rather than
         // accepting a clause it will never reach.
@@ -1906,28 +2262,7 @@ impl<'a> Binder<'a> {
         table: &TableInfo,
         upsert: &ast::Upsert,
     ) -> Result<Option<BoundUpsert>, ParseError> {
-        let mut target = Vec::new();
-        let mut collated: Vec<(u16, Option<Vec<u8>>)> = Vec::new();
-        for column in &upsert.target {
-            let Some(name) = bare_indexed_column(self.ast, column) else {
-                return Err(unsupported(
-                    "an expression in a conflict target",
-                    Span::default(),
-                ));
-            };
-            let Some(position) = table.column_position(&name) else {
-                return Err(no_such_column(&name, Span::default()));
-            };
-            target.push(position);
-            collated.push((position, target_collation(self.ast, column)));
-        }
-        target.sort_unstable();
-        if !target.is_empty() && !conflict_target_matches(table, &collated) {
-            return Err(crate::bind::schema_refused(
-                "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
-                Span::default(),
-            ));
-        }
+        let constraint = self.upsert_constraint(table, upsert)?;
         let mut assignments = Vec::new();
         for (names, value) in &upsert.assignments {
             let values = self.assigned_values(names, *value)?;
@@ -1948,12 +2283,243 @@ impl<'a> Binder<'a> {
             Some(expr) => Some(self.bind_expr(expr)?),
             None => None,
         };
+        let triggers = match upsert.do_update {
+            true => self.bind_upsert_update_triggers(table, &assignments)?,
+            false => Vec::new(),
+        };
         Ok(Some(BoundUpsert {
-            target,
+            constraint,
             assignments,
             do_update: upsert.do_update,
             filter,
+            triggers,
         }))
+    }
+
+    /// Binds the triggers a `DO UPDATE` fires, which are `UPDATE` triggers.
+    ///
+    /// **A conflict resolved by `DO UPDATE` is an update of the row already
+    /// there.** SQLite fires the table's `BEFORE UPDATE` and `AFTER UPDATE`
+    /// triggers for it, with the columns the clause assigns as the columns that
+    /// changed, and does not fire `AFTER INSERT`. The foreign keys that watch
+    /// an update are checked the same way.
+    ///
+    /// @param table - the table being inserted into
+    /// @param assignments - the clause's assignments
+    fn bind_upsert_update_triggers(
+        &mut self,
+        table: &TableInfo,
+        assignments: &[BoundAssignment],
+    ) -> Result<Vec<BoundTrigger>, ParseError> {
+        let changed: Vec<Vec<u8>> = assignments
+            .iter()
+            .filter_map(|assignment| table.column(assignment.column))
+            .map(|column| column.folded.clone())
+            .collect();
+        self.bind_update_triggers(table, &changed)
+    }
+
+    /// Binds the triggers and foreign key checks an update of some columns fires.
+    ///
+    /// The application's triggers see the columns the statement assigns. The
+    /// foreign keys see those and every generated column that reads one, because
+    /// SQLite checks a key on a generated column again when its inputs change.
+    ///
+    /// @param table - the table being updated
+    /// @param changed - the folded names of the columns the statement assigns
+    fn bind_update_triggers(
+        &mut self,
+        table: &TableInfo,
+        changed: &[Vec<u8>],
+    ) -> Result<Vec<BoundTrigger>, ParseError> {
+        let mut triggers =
+            self.bind_triggers(table, TriggerEventInfo::Update(Vec::new()), changed)?;
+        let key_changes = self.changed_with_generated(table, changed)?;
+        triggers.extend(self.bind_foreign_keys(
+            table,
+            TriggerEventInfo::Update(Vec::new()),
+            &key_changes,
+        )?);
+        Ok(triggers)
+    }
+
+    /// Adds to the assigned columns every generated column that reads one.
+    ///
+    /// SQLite treats a generated column as changed when an `UPDATE` assigns a
+    /// column its expression reads, and that is what decides whether a foreign
+    /// key on the generated column has to be checked again. A user trigger's
+    /// `UPDATE OF` list is not widened this way: it fires only for the columns
+    /// the `SET` clause names, which is why the foreign key triggers get this
+    /// list and the application's triggers do not.
+    ///
+    /// @param table - the table being updated
+    /// @param changed - the folded names of the columns the statement assigns
+    fn changed_with_generated(
+        &mut self,
+        table: &TableInfo,
+        changed: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>, ParseError> {
+        let mut all = changed.to_vec();
+        let mut reads: Vec<(Vec<u8>, Vec<u16>)> = Vec::new();
+        for (position, column) in table.columns.iter().enumerate() {
+            if !column.generated {
+                continue;
+            }
+            let Some(expr) = self.generated_expr(table, position as u16)? else {
+                continue;
+            };
+            let mut used = Vec::new();
+            expr.columns_used(&mut used);
+            reads.push((column.folded.clone(), used));
+        }
+        loop {
+            let mut grew = false;
+            for (name, used) in &reads {
+                let reads_changed = used
+                    .iter()
+                    .filter_map(|held| table.column(*held))
+                    .any(|held| all.contains(&held.folded));
+                if reads_changed && !all.contains(name) {
+                    all.push(name.clone());
+                    grew = true;
+                }
+            }
+            if !grew {
+                return Ok(all);
+            }
+        }
+    }
+
+    /// Finds the constraint an `ON CONFLICT` clause's target names.
+    ///
+    /// SQLite (`sqlite3UpsertAnalyzeTarget`) accepts a target that is the
+    /// rowid, the rowid alias column, or exactly the keys of a unique index in
+    /// any order. A key may be a column or an expression, and an expression is
+    /// compared with the index's by its bound form, so `lower(name)` and
+    /// `LOWER( name )` are the same key. A partial index is named only by a
+    /// target whose `WHERE` is the index's own predicate. A `WHERE` on a target
+    /// that names a complete index is ignored. A target that names no
+    /// constraint is refused, because no insert could clash on it and the
+    /// clause would never run.
+    ///
+    /// @param table - the table being inserted into
+    /// @param upsert - the clause
+    fn upsert_constraint(
+        &mut self,
+        table: &TableInfo,
+        upsert: &ast::Upsert,
+    ) -> Result<UpsertConstraint, ParseError> {
+        if upsert.target.is_empty() {
+            return Ok(UpsertConstraint::Any);
+        }
+        let terms = self.bind_target_terms(table, &upsert.target)?;
+        let target_where = match upsert.target_filter {
+            Some(expr) => Some(self.bind_expr(expr)?),
+            None => None,
+        };
+        if names_own_key(table, &terms) {
+            return Ok(UpsertConstraint::OwnKey);
+        }
+        for (position, index) in table.indexes.iter().enumerate() {
+            if !self.index_matches_target(index, &terms, target_where.as_ref())? {
+                continue;
+            }
+            return Ok(if index.root == table.root {
+                UpsertConstraint::OwnKey
+            } else {
+                UpsertConstraint::Index(position)
+            });
+        }
+        Err(crate::bind::schema_refused(
+            "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+            Span::default(),
+        ))
+    }
+
+    /// Binds each term of a conflict target against the table being inserted into.
+    ///
+    /// @param table - the table being inserted into
+    /// @param target - the written terms
+    fn bind_target_terms(
+        &mut self,
+        table: &TableInfo,
+        target: &[ast::IndexedColumn],
+    ) -> Result<Vec<TargetTerm>, ParseError> {
+        let mut terms = Vec::with_capacity(target.len());
+        for column in target {
+            let collation = target_collation(self.ast, column);
+            let operand = target_operand(self.ast, column);
+            if let Some(ast::Expr::Column {
+                table: None,
+                column: name,
+                ..
+            }) = self.ast.expr(operand)
+            {
+                let folded = self.ast.folded(*name).to_vec();
+                if let Some(position) = table.column_position(&folded) {
+                    terms.push(TargetTerm::Column(position, collation));
+                    continue;
+                }
+                if table.is_rowid_name(&folded) {
+                    terms.push(TargetTerm::Rowid);
+                    continue;
+                }
+                return Err(no_such_column(&folded, Span::default()));
+            }
+            terms.push(match self.bind_expr(operand)? {
+                BoundExpr::Column { column, .. } => TargetTerm::Column(column, collation),
+                BoundExpr::Rowid { .. } => TargetTerm::Rowid,
+                other => TargetTerm::Expr(other, collation),
+            });
+        }
+        Ok(terms)
+    }
+
+    /// Reports whether a conflict target names exactly one unique index.
+    ///
+    /// @param index - the candidate
+    /// @param terms - the bound target
+    /// @param target_where - the target's own `WHERE`, bound
+    fn index_matches_target(
+        &mut self,
+        index: &IndexInfo,
+        terms: &[TargetTerm],
+        target_where: Option<&BoundExpr>,
+    ) -> Result<bool, ParseError> {
+        if !index.unique || index.columns.len() != terms.len() {
+            return Ok(false);
+        }
+        if let Some(sql) = index.partial_sql.as_ref() {
+            let Some(wanted) = target_where else {
+                return Ok(false);
+            };
+            if self.bind_schema_expr(sql)? != *wanted {
+                return Ok(false);
+            }
+        }
+        for key in &index.columns {
+            // A key on a virtual generated column names the column, and a target
+            // that names the column is the same constraint even though the index
+            // computes its entries (`column` is set on both kinds of key).
+            let found = match (key.column, key.expr_sql.as_ref()) {
+                (Some(position), _) => terms.iter().any(|term| {
+                    matches!(term, TargetTerm::Column(held, named)
+                        if *held == position && collation_fits(named, &key.collation))
+                }),
+                (None, Some(sql)) => {
+                    let bound = self.bind_schema_expr(sql)?;
+                    terms.iter().any(|term| {
+                        matches!(term, TargetTerm::Expr(held, named)
+                            if *held == bound && collation_fits(named, &key.collation))
+                    })
+                }
+                (None, None) => false,
+            };
+            if !found {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Binds the value of one `SET` assignment, one bound value per column it
@@ -1993,9 +2559,10 @@ impl<'a> Binder<'a> {
             _ => vec![self.bind_expr(value)?],
         };
         if values.len() != names.len() {
+            // No position: SQLite's message for this carries no caret.
             return Err(refused(
                 format!("{} columns assigned {} values", names.len(), values.len()),
-                span,
+                Span::default(),
             ));
         }
         Ok(values)
@@ -2018,11 +2585,44 @@ impl<'a> Binder<'a> {
             if let Some(ast::Expr::Star { table: Some(_) }) = self.ast.expr(column.expr) {
                 return Err(refused(
                     "RETURNING may not use \"TABLE.*\" wildcards",
-                    column.span,
+                    Span::default(),
                 ));
             }
         }
+        for column in columns {
+            self.refuse_schema_qualified_column(column.expr)?;
+        }
         self.bind_result_columns_public(columns)
+    }
+
+    /// Refuses a column written with a schema name inside a `RETURNING` expression.
+    ///
+    /// SQLite resolves `RETURNING` names against the table being changed alone, so `main.users.id`
+    /// there is `no such column: main.users.id` although the same name works in a `SELECT`.
+    ///
+    /// @param expr - the root of one `RETURNING` expression
+    fn refuse_schema_qualified_column(&self, expr: ast::ExprId) -> Result<(), ParseError> {
+        if let Some(ast::Expr::Column {
+            database: Some(database),
+            table,
+            column,
+        }) = self.ast.expr(expr)
+        {
+            let written = [Some(*database), *table, Some(*column)]
+                .iter()
+                .flatten()
+                .map(|name| String::from_utf8_lossy(self.ast.text(*name)).into_owned())
+                .collect::<Vec<_>>()
+                .join(".");
+            return Err(refused(
+                format!("no such column: {written}"),
+                Span::default(),
+            ));
+        }
+        for child in crate::directive::expression_children(self.ast, expr) {
+            self.refuse_schema_qualified_column(child)?;
+        }
+        Ok(())
     }
 }
 
@@ -2043,23 +2643,62 @@ fn target_collation(ast: &crate::Ast, column: &ast::IndexedColumn) -> Option<Vec
     }
 }
 
-/// Returns an indexed column's bare folded name, when it names a column.
+/// Returns the expression of a conflict target term with any `COLLATE` around
+/// it removed.
 ///
-/// A `COLLATE` around the name is looked through, because a conflict target
-/// may name its collation that way; `target_collation` reads it.
-fn bare_indexed_column(ast: &crate::Ast, column: &ast::IndexedColumn) -> Option<Vec<u8>> {
-    let expr = match ast.expr(column.expr) {
+/// A conflict target may name its collation by wrapping the term in `COLLATE`;
+/// `target_collation` reads the name, and the term is what is compared with an
+/// index key.
+///
+/// @param ast - the statement's arena
+/// @param column - one term of the conflict target
+fn target_operand(ast: &crate::Ast, column: &ast::IndexedColumn) -> ast::ExprId {
+    match ast.expr(column.expr) {
         Some(ast::Expr::Collate { operand, .. }) => *operand,
         _ => column.expr,
-    };
-    match ast.expr(expr) {
-        Some(ast::Expr::Column {
-            table: None,
-            column: name,
-            ..
-        }) => Some(ast.folded(*name).to_vec()),
-        _ => None,
     }
+}
+
+/// Reports whether a bound conflict target names the table's own key.
+///
+/// That is `rowid` alone, or the rowid alias column alone with no collation. A
+/// collation on the alias never matches it, which is how
+/// `sqlite3UpsertAnalyzeTarget` compares them. A `WITHOUT ROWID` table has no
+/// rowid, so its key is matched through its primary key index instead.
+///
+/// @param table - the table being inserted into
+/// @param terms - the bound target
+fn names_own_key(table: &TableInfo, terms: &[TargetTerm]) -> bool {
+    if table.without_rowid {
+        return false;
+    }
+    match terms {
+        [TargetTerm::Rowid] => true,
+        [TargetTerm::Column(column, None)] => table.rowid_alias == Some(*column),
+        _ => false,
+    }
+}
+
+/// One term of a conflict target after it is bound.
+enum TargetTerm {
+    /// A column of the table, by declared position, with the collation it names.
+    Column(u16, Option<Vec<u8>>),
+    /// The rowid, written as `rowid`, `oid` or `_rowid_`.
+    Rowid,
+    /// Any other expression, with the collation it names.
+    Expr(BoundExpr, Option<Vec<u8>>),
+}
+
+/// Reports whether a collation a target term names fits an index key.
+///
+/// A term that names none fits any key.
+///
+/// @param named - the collation the term names, folded
+/// @param key_collation - the collation the index key is ordered by, folded
+fn collation_fits(named: &Option<Vec<u8>>, key_collation: &[u8]) -> bool {
+    named
+        .as_deref()
+        .is_none_or(|name| name.eq_ignore_ascii_case(key_collation))
 }
 
 /// The extended result codes a rejected write reports.
@@ -2102,6 +2741,17 @@ pub mod codes {
 /// @param table - the table the index belongs to
 /// @param index - the index whose key collided
 pub fn unique_message(table: &TableInfo, index: &IndexInfo) -> String {
+    // **An index with an expression in its key names the index, not columns.**
+    // SQLite has no column to print for `lower(a)`, so it says `UNIQUE constraint
+    // failed: index 'i'`; the columns of a plain key come out as `t.a, t.b`. The
+    // engine printed the empty list of the column keys, and for a mixed key left the
+    // expression out of the list.
+    if index.columns.iter().any(|key| key.column.is_none()) {
+        return format!(
+            "UNIQUE constraint failed: index '{}'",
+            String::from_utf8_lossy(&index.name)
+        );
+    }
     let names: Vec<String> = index
         .columns
         .iter()
@@ -2154,6 +2804,39 @@ pub fn rowid_message(table: &TableInfo) -> (i32, String) {
             ),
         ),
     }
+}
+
+/// Joins the `FROM` terms of an `UPDATE ... FROM` to the query that finds a
+/// view's rows, and projects the assigned values after the view's columns.
+///
+/// **A view has no tree to read a joined row's values from later**, so the
+/// values each assignment computes travel with the row, as they do for a table
+/// in `keys_query_joined`: the row is the view's columns followed by one value
+/// per assignment, in assignment order. SQLite fires the `INSTEAD OF UPDATE`
+/// trigger once for every row of the join, so a view row matched twice fires
+/// twice.
+///
+/// @param rows - the query over the view the binder built
+/// @param joined - the `FROM` terms, empty for an ordinary `UPDATE`
+/// @param assignments - the bound assignments, whose values are projected
+fn join_view_rows(
+    mut rows: Box<BoundSelect>,
+    joined: &[crate::bind::BoundSource],
+    assignments: &[BoundAssignment],
+) -> Box<BoundSelect> {
+    if joined.is_empty() {
+        return rows;
+    }
+    rows.sources.extend(joined.iter().cloned());
+    rows.columns
+        .extend(assignments.iter().map(|assignment| BoundResultColumn {
+            expr: assignment.value.clone(),
+            name: b"value".to_vec(),
+            origin: None,
+            declared_type: Vec::new(),
+            written: None,
+        }));
+    rows
 }
 
 /// Puts a limited write's order, limit and offset on the query that finds a
@@ -2236,44 +2919,6 @@ fn refuse_module_returning(
         format!("{statement} RETURNING is not available on virtual tables"),
         Span::default(),
     ))
-}
-
-/// Reports whether an upsert's conflict target names a key of the table.
-///
-/// SQLite accepts a target only when it is exactly the columns of the rowid
-/// alias, or of a `PRIMARY KEY` or `UNIQUE` index that is not partial, in any
-/// order. A target that names no key is refused, because no insert could ever
-/// clash on it and the `DO` clause would never run. A partial index needs the
-/// target's own `WHERE`, which is refused before this is asked. A column that
-/// names a collation matches only an index key ordered by that collation, and
-/// never the rowid alias, which is how `sqlite3UpsertAnalyzeTarget` compares
-/// them.
-///
-/// @param table - the table being inserted into
-/// @param target - each target column's position and the collation it names
-fn conflict_target_matches(table: &TableInfo, target: &[(u16, Option<Vec<u8>>)]) -> bool {
-    if let (false, Some(alias), [(column, None)]) = (table.without_rowid, table.rowid_alias, target)
-    {
-        if *column == alias {
-            return true;
-        }
-    }
-    table.indexes.iter().any(|index| {
-        if !index.unique || index.partial_sql.is_some() || index.columns.len() != target.len() {
-            return false;
-        }
-        index.columns.iter().all(|key| {
-            let Some(position) = key.plain_column() else {
-                return false;
-            };
-            target.iter().any(|(column, collation)| {
-                *column == position
-                    && collation
-                        .as_deref()
-                        .is_none_or(|named| named.eq_ignore_ascii_case(&key.collation))
-            })
-        })
-    })
 }
 
 #[cfg(test)]
