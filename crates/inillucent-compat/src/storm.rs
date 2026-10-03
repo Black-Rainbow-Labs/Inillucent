@@ -403,6 +403,17 @@ fn drive(run: &mut Run<'_>) -> Result<(), String> {
             next_kill = Instant::now() + Duration::from_millis(50 + run.mix.range(0, 400));
         }
     }
+    // **The readers get time to reach their floor before they are stopped.**
+    // On a two core CI runner a debug build decrypting the log finished no
+    // check in fifteen seconds, and the run failed for having nothing to grade
+    // from its readers rather than for anything the readers saw. The workers
+    // keep committing meanwhile, so the readers are still checking beside
+    // writes. Two minutes at most.
+    let grace = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < grace && checks_so_far(run) < run.storm.least_checks {
+        std::thread::sleep(Duration::from_millis(50));
+        run.drain();
+    }
     stop_readers(run);
     let deadline = Instant::now() + Duration::from_secs(600);
     while !run.running.is_empty() && Instant::now() < deadline {
@@ -422,6 +433,13 @@ fn drive(run: &mut Run<'_>) -> Result<(), String> {
     std::thread::sleep(Duration::from_millis(200));
     run.drain();
     Ok(())
+}
+
+/// Returns how many snapshots the readers have checked so far.
+///
+/// @param run - the run's state
+fn checks_so_far(run: &Run<'_>) -> u64 {
+    run.records.iter().map(|record| record.checks).sum()
 }
 
 /// Kills every reader still running, since a reader never stops on its own.
