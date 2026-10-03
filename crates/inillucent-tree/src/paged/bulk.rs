@@ -511,6 +511,7 @@ impl PagedTree {
             leaf_hints: std::cell::RefCell::new(Vec::new()),
             hint_victim: std::cell::Cell::new(0),
             stats: std::cell::Cell::new(crate::write::WriteStats::default()),
+            last_leaf: std::cell::Cell::new(None),
         })
     }
 }

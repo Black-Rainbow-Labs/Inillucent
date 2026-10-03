@@ -192,24 +192,6 @@ pub struct SortTerm {
 #[derive(Clone, Debug)]
 pub struct Accumulator {
     kind: AggregateKind,
-    /// The argument values already folded in, when the call said `DISTINCT`.
-    ///
-    /// `count(DISTINCT team)` counts the distinct teams, not the rows, and the
-    /// set is what makes that true. It is per accumulator rather than per
-    /// operator because `GROUP BY` gives each group its own - `count(DISTINCT
-    /// x)` inside a group counts the distinct values *of that group*, and a set
-    /// shared across groups would count each value once for the whole query.
-    ///
-    /// The values are encoded under the argument's collation, through the same
-    /// `inillucent_tree::key` encoding `DISTINCT` and the set operations use, so
-    /// `count(DISTINCT team)` over a `NOCASE` column agrees with `SELECT DISTINCT
-    /// team` over it.
-    seen: Option<(Collation, HashSet<Vec<u8>>)>,
-    /// The encoded key `seen` is asked about, reused between rows.
-    ///
-    /// One buffer rather than one allocation per row; see the note in `push`
-    /// (task-1932, M7).
-    scratch: Vec<u8>,
     /// Rows counted, or non-NULL values seen.
     count: i64,
     /// The integer running total, while the sum is still exact.
@@ -241,6 +223,40 @@ pub struct Accumulator {
     ordering: Collation,
     /// The value a bare column has settled on, and the witness that chose it.
     chosen: Option<OwnedDatum>,
+    /// The parts only some calls use, boxed and made on first use.
+    ///
+    /// **Most accumulators are a `count`, a `sum`, a `min` or a `max` (task-2175).**
+    /// With every field inline an accumulator was several hundred bytes, and a
+    /// `GROUP BY` of 50,000 groups made, finished and dropped 50,000 of them:
+    /// the hash aggregate's profile was mostly cache misses on them. What a
+    /// `DISTINCT`, an `ORDER BY` inside the call, a JSON aggregate,
+    /// `group_concat` or a registered aggregate needs lives here instead.
+    rare: Option<Box<Rare>>,
+}
+
+/// What only some aggregate calls keep, apart from the fields every call uses.
+///
+/// See [`Accumulator`]'s `rare` field for why these are boxed.
+#[derive(Clone, Debug, Default)]
+struct Rare {
+    /// The argument values already folded in, when the call said `DISTINCT`.
+    ///
+    /// `count(DISTINCT team)` counts the distinct teams, not the rows, and the
+    /// set is what makes that true. It is per accumulator rather than per
+    /// operator because `GROUP BY` gives each group its own - `count(DISTINCT
+    /// x)` inside a group counts the distinct values *of that group*, and a set
+    /// shared across groups would count each value once for the whole query.
+    ///
+    /// The values are encoded under the argument's collation, through the same
+    /// `inillucent_tree::key` encoding `DISTINCT` and the set operations use, so
+    /// `count(DISTINCT team)` over a `NOCASE` column agrees with `SELECT DISTINCT
+    /// team` over it.
+    seen: Option<(Collation, HashSet<Vec<u8>>)>,
+    /// The encoded key `seen` is asked about, reused between rows.
+    ///
+    /// One buffer rather than one allocation per row; see the note in `push`
+    /// (task-1932, M7).
+    scratch: Vec<u8>,
     /// Where the sort keys start in a collected row, and their directions.
     ///
     /// `None` for a call with no `ORDER BY` of its own, which is nearly all of
@@ -294,24 +310,47 @@ impl Accumulator {
     pub fn new(kind: AggregateKind) -> Accumulator {
         Accumulator {
             kind,
-            seen: None,
-            scratch: Vec::new(),
             count: 0,
             integer_sum: 0,
             real_sum: 0.0,
             compensation: 0.0,
             chosen: None,
-            sort: None,
-            json_rows: Vec::new(),
-            json_marks: Vec::new(),
             is_real: false,
             overflowed: false,
             saw_real: false,
             extreme: None,
             ordering: Collation::Binary,
-            joined: String::new(),
-            rows: Vec::new(),
+            rare: None,
         }
+    }
+
+    /// Returns the rarely used parts, making them on first use.
+    fn rare_mut(&mut self) -> &mut Rare {
+        self.rare.get_or_insert_with(Box::default)
+    }
+
+    /// Returns the rows a registered or a collecting aggregate kept.
+    fn kept_rows(&self) -> &[Vec<inillucent_value::value::Value<'static>>] {
+        self.rare.as_ref().map_or(&[], |rare| rare.rows.as_slice())
+    }
+
+    /// Returns the rows a JSON or an ordered aggregate kept.
+    fn json_kept(&self) -> &[Vec<inillucent_value::value::Value<'static>>] {
+        self.rare
+            .as_ref()
+            .map_or(&[], |rare| rare.json_rows.as_slice())
+    }
+
+    /// Returns which values of each kept JSON row carry the JSON subtype.
+    fn json_marked(&self) -> &[u32] {
+        self.rare
+            .as_ref()
+            .map_or(&[], |rare| rare.json_marks.as_slice())
+    }
+
+    /// Returns the call's own `ORDER BY`, when it has one.
+    fn sort_terms(&self) -> Option<&(usize, Vec<SortTerm>)> {
+        self.rare.as_ref().and_then(|rare| rare.sort.as_ref())
     }
 
     /// Returns an accumulator that folds each distinct argument value once.
@@ -320,7 +359,7 @@ impl Accumulator {
     /// @param collation - the collation the argument is compared under
     pub fn distinct(kind: AggregateKind, collation: Collation) -> Accumulator {
         let mut accumulator = Accumulator::new(kind);
-        accumulator.seen = Some((collation, HashSet::new()));
+        accumulator.rare_mut().seen = Some((collation, HashSet::new()));
         accumulator
     }
 
@@ -345,7 +384,7 @@ impl Accumulator {
     /// asks rather than the caller remembering, because the caller is three
     /// operators and the accumulator is one.
     pub fn takes_dense(&self) -> bool {
-        self.seen.is_none()
+        self.rare.as_ref().is_none_or(|rare| rare.seen.is_none())
             && !matches!(
                 self.kind,
                 AggregateKind::External(_)
@@ -363,7 +402,7 @@ impl Accumulator {
     /// @param at - the position of the first sort key in a collected row
     /// @param terms - how each key is compared, in key order
     pub fn sort_by(&mut self, at: usize, terms: Vec<SortTerm>) {
-        self.sort = Some((at, terms));
+        self.rare_mut().sort = Some((at, terms));
     }
 
     /// Folds one whole row of arguments in, for a registered aggregate.
@@ -456,17 +495,18 @@ impl Accumulator {
         if !self.keep_distinct(values.first()) {
             return;
         }
-        if self.sort.is_some()
+        if self.sort_terms().is_some()
             || matches!(
                 self.kind,
                 AggregateKind::JsonGroupArray(_) | AggregateKind::JsonGroupObject(_)
             )
         {
-            self.json_rows.push(values);
-            self.json_marks.push(marks);
+            let rare = self.rare_mut();
+            rare.json_rows.push(values);
+            rare.json_marks.push(marks);
             return;
         }
-        self.rows.push(values);
+        self.rare_mut().rows.push(values);
     }
 
     /// Reports whether a value is new, and records it when it is.
@@ -479,19 +519,23 @@ impl Accumulator {
     ///
     /// @param value - the call's first argument for this row
     fn keep_distinct(&mut self, value: Option<&inillucent_value::value::Value<'static>>) -> bool {
-        let Some((collation, seen)) = &mut self.seen else {
+        let Some(rare) = self.rare.as_deref_mut() else {
+            return true;
+        };
+        let Rare { seen, scratch, .. } = rare;
+        let Some((collation, seen)) = seen else {
             return true;
         };
         let Some(value) = value else {
             return true;
         };
         let datum = OwnedDatum::from(value.clone());
-        self.scratch.clear();
-        inillucent_tree::key::encode_into_with(&datum.borrow(), *collation, &mut self.scratch);
-        if seen.contains(&self.scratch) {
+        scratch.clear();
+        inillucent_tree::key::encode_into_with(&datum.borrow(), *collation, scratch);
+        if seen.contains(scratch.as_slice()) {
             return false;
         }
-        seen.insert(self.scratch.clone());
+        seen.insert(scratch.clone());
         true
     }
 
@@ -526,18 +570,23 @@ impl Accumulator {
         if value.is_null() {
             return;
         }
-        if let Some((collation, seen)) = &mut self.seen {
+        if let Some(Rare {
+            seen: Some((collation, seen)),
+            scratch,
+            ..
+        }) = self.rare.as_deref_mut()
+        {
             // **Encoded into a reused buffer and only cloned when the value is
             // new (task-1932, M7).** A `DISTINCT` aggregate over a column with
             // few distinct values allocated one key per *row* and dropped
             // almost all of them - `count(DISTINCT status)` over a million rows
             // with six statuses allocated a million times to keep six.
-            self.scratch.clear();
-            inillucent_tree::key::encode_into_with(value, *collation, &mut self.scratch);
-            if seen.contains(&self.scratch) {
+            scratch.clear();
+            inillucent_tree::key::encode_into_with(value, *collation, scratch);
+            if seen.contains(scratch.as_slice()) {
                 return;
             }
-            seen.insert(self.scratch.clone());
+            seen.insert(scratch.clone());
         }
         self.count = self.count.saturating_add(1);
         match &self.kind {
@@ -554,6 +603,8 @@ impl Accumulator {
             // conversion this replaced did, and is the only answer an
             // infallible `push` can give.
             | AggregateKind::VectorFold(_) => self
+                .rare
+                .get_or_insert_with(Box::default)
                 .rows
                 .push(vec![Value::from(value).into_owned().unwrap_or(Value::Null)]),
             AggregateKind::Sum | AggregateKind::Total | AggregateKind::Average => {
@@ -562,10 +613,11 @@ impl Accumulator {
             AggregateKind::Minimum => self.push_extreme(value, std::cmp::Ordering::Less),
             AggregateKind::Maximum => self.push_extreme(value, std::cmp::Ordering::Greater),
             AggregateKind::GroupConcat(separator) => {
+                let rare = self.rare.get_or_insert_with(Box::default);
                 if self.count > 1 {
-                    self.joined.push_str(separator);
+                    rare.joined.push_str(separator);
                 }
-                self.joined.push_str(&render(value));
+                rare.joined.push_str(&render(value));
             }
             // Unreachable: `AggregateSpec::takes_whole_row` sends all three of
             // these through `push_values`. Stated rather than folded into
@@ -587,7 +639,7 @@ impl Accumulator {
     fn group_concat_computed(&self) -> OwnedDatum {
         let mut joined = String::new();
         let mut any = false;
-        for row in &self.rows {
+        for row in self.kept_rows() {
             let Some(value) = row.first() else {
                 continue;
             };
@@ -628,7 +680,7 @@ impl Accumulator {
     /// @param which - which of the four is being computed
     fn finish_percentile(&self, which: Percentile) -> OwnedDatum {
         let argument = self
-            .rows
+            .kept_rows()
             .first()
             .and_then(|row| row.get(1))
             .and_then(numeric_value);
@@ -636,7 +688,7 @@ impl Accumulator {
             return OwnedDatum::Null;
         };
         let mut values: Vec<f64> = self
-            .rows
+            .kept_rows()
             .iter()
             .filter_map(|row| row.first().and_then(numeric_value))
             .collect();
@@ -669,7 +721,7 @@ impl Accumulator {
     /// an aggregate that was never stepped.
     fn finish_geopoly_box(&self) -> OwnedDatum {
         let mut bounds: Option<[f32; 4]> = None;
-        for row in &self.rows {
+        for row in self.kept_rows() {
             let Some(value) = row.first() else {
                 continue;
             };
@@ -707,7 +759,7 @@ impl Accumulator {
     fn finish_vector_fold(&self, average: bool) -> OwnedDatum {
         let mut total: Vec<f64> = Vec::new();
         let mut counted = 0i64;
-        for row in &self.rows {
+        for row in self.kept_rows() {
             let Some(inillucent_value::value::Value::Blob(blob)) = row.first() else {
                 continue;
             };
@@ -979,7 +1031,7 @@ impl Accumulator {
     /// @param row - the row's position in `json_rows`
     /// @param value - the value's position in the row
     fn marked(&self, row: usize, value: u32) -> bool {
-        self.json_marks
+        self.json_marked()
             .get(row)
             .is_some_and(|marks| marks.checked_shr(value).is_some_and(|bits| bits & 1 == 1))
     }
@@ -988,13 +1040,13 @@ impl Accumulator {
     pub fn finish(&self) -> DbResult<OwnedDatum> {
         // A call with its own `ORDER BY` collected its rows; they are folded
         // here, in the order the keys give.
-        if let Some((at, terms)) = &self.sort {
+        if let Some((at, terms)) = self.sort_terms() {
             return self.finish_sorted(*at, terms);
         }
         Ok(match &self.kind {
             AggregateKind::CountStar | AggregateKind::Count => OwnedDatum::Int(self.count),
             // The whole group at once, which is what the boundary promises.
-            AggregateKind::External(body) => OwnedDatum::from((body.0)(&self.rows)?),
+            AggregateKind::External(body) => OwnedDatum::from((body.0)(self.kept_rows())?),
             AggregateKind::Percentile(which) => self.finish_percentile(*which),
             AggregateKind::GeopolyBox => self.finish_geopoly_box(),
             AggregateKind::VectorFold(average) => self.finish_vector_fold(*average),
@@ -1042,8 +1094,8 @@ impl Accumulator {
                 }
             }
             AggregateKind::JsonGroupArray(binary) => {
-                let mut items = Vec::with_capacity(self.json_rows.len());
-                for (position, row) in self.json_rows.iter().enumerate() {
+                let mut items = Vec::with_capacity(self.json_kept().len());
+                for (position, row) in self.json_kept().iter().enumerate() {
                     let value = row
                         .first()
                         .cloned()
@@ -1059,8 +1111,8 @@ impl Accumulator {
                 OwnedDatum::from(inillucent_scalar::json::group_array_final(items, *binary)?.value)
             }
             AggregateKind::JsonGroupObject(binary) => {
-                let mut members = Vec::with_capacity(self.json_rows.len());
-                for (position, row) in self.json_rows.iter().enumerate() {
+                let mut members = Vec::with_capacity(self.json_kept().len());
+                for (position, row) in self.json_kept().iter().enumerate() {
                     let label = row
                         .first()
                         .cloned()
@@ -1090,7 +1142,11 @@ impl Accumulator {
                 if self.count == 0 {
                     OwnedDatum::Null
                 } else {
-                    OwnedDatum::Text(self.joined.clone().into_bytes())
+                    OwnedDatum::Text(
+                        self.rare
+                            .as_ref()
+                            .map_or_else(Vec::new, |rare| rare.joined.clone().into_bytes()),
+                    )
                 }
             }
             AggregateKind::GroupConcatComputed => self.group_concat_computed(),
@@ -1113,7 +1169,7 @@ impl Accumulator {
     /// @param at - the position of the first sort key in a collected row
     /// @param terms - how each key is compared, in key order
     fn finish_sorted(&self, at: usize, terms: &[SortTerm]) -> DbResult<OwnedDatum> {
-        let mut order: Vec<usize> = (0..self.json_rows.len()).collect();
+        let mut order: Vec<usize> = (0..self.json_kept().len()).collect();
         let key_of = |row: &Vec<inillucent_value::value::Value<'static>>, which: usize| {
             let mut encoded = Vec::new();
             let value = row
@@ -1130,7 +1186,8 @@ impl Accumulator {
             (null, encoded)
         };
         order.sort_by(|left, right| {
-            let (Some(a), Some(b)) = (self.json_rows.get(*left), self.json_rows.get(*right)) else {
+            let (Some(a), Some(b)) = (self.json_kept().get(*left), self.json_kept().get(*right))
+            else {
                 return std::cmp::Ordering::Equal;
             };
             for (which, term) in terms.iter().enumerate() {
@@ -1162,8 +1219,8 @@ impl Accumulator {
         let sorted: Vec<(Vec<inillucent_value::value::Value<'static>>, u32)> = order
             .into_iter()
             .filter_map(|at| {
-                let marks = self.json_marks.get(at).copied().unwrap_or(0);
-                self.json_rows.get(at).cloned().map(|row| (row, marks))
+                let marks = self.json_marked().get(at).copied().unwrap_or(0);
+                self.json_kept().get(at).cloned().map(|row| (row, marks))
             })
             .collect();
         let mut folded = Accumulator::new(self.kind.clone());
@@ -1243,6 +1300,16 @@ fn numeric_value(value: &inillucent_value::value::Value<'static>) -> Option<f64>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An accumulator stays small enough that a group table of them stays in cache.
+    ///
+    /// The parts only some calls use are boxed in `Rare`; a field added inline
+    /// for one kind of aggregate grows every group of every `GROUP BY`.
+    #[test]
+    fn an_accumulator_keeps_its_rare_parts_out_of_line() {
+        let size = std::mem::size_of::<Accumulator>();
+        assert!(size <= 160, "an accumulator is {size} bytes");
+    }
 
     fn fold(kind: AggregateKind, values: &[Datum<'_>]) -> OwnedDatum {
         let mut accumulator = Accumulator::new(kind);

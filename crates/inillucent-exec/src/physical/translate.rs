@@ -1278,7 +1278,19 @@ pub(crate) fn constant_count(
         // the same rule a bound value is. All but a negated integer were
         // refused as not built, with `SQLITE_MISUSE`; SQLite answers every one
         // of them.
-        Some(other) => must_be_integer(crate::constant::literal_value(other, params)?)?,
+        //
+        // **An expression over a parameter is a constant of this execution
+        // only (task-2175).** The fold reads `?N` through the bindings, which
+        // does not count as a read, so a chain built with
+        // `OFFSET (?1 % 250) * 20` was kept across rebinds and every later page
+        // started where the first one did. Noting it is the guard a folded
+        // `now()` and a folded function argument already use.
+        Some(other) => {
+            if crate::physical::joins::reads_a_parameter(other) {
+                params.note_execution_constant();
+            }
+            must_be_integer(crate::constant::literal_value(other, params)?)?
+        }
     };
     if number < 0 {
         return Ok(match negative {

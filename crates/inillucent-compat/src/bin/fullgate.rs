@@ -151,6 +151,8 @@ struct Settings {
     engine_child: bool,
     /// Whether a busy machine stops the pass being graded, and whether to record a reference (task-2110).
     quiet: inillucent_compat::quiet::Options,
+    /// Which plan to run: `contract`, the default, or `hillclimb` (task-2175).
+    plan: String,
 }
 
 fn main() -> ExitCode {
@@ -195,7 +197,7 @@ fn main() -> ExitCode {
             "usage: inillucent-fullgate <sqlite fixture> [--rounds N] [--page-size N] \
              [--scale S] [--frames N] [--families a,b] [--repeat N] [--locking normal|exclusive] \
              [--module-split] [--put-split] [--cores performance|efficiency|any] \
-             [--samples <file>] [--engine-child] [--quiet-threshold PERCENT]              [--record-quiet-reference]"
+             [--samples <file>] [--engine-child] [--quiet-threshold PERCENT]              [--record-quiet-reference] [--plan contract|hillclimb]"
         );
         return ExitCode::from(2);
     };
@@ -305,6 +307,12 @@ fn settings_from(arguments: &[String]) -> Settings {
         samples: flag(arguments, "--samples").map(PathBuf::from),
         engine_child: arguments.iter().any(|value| value == "--engine-child"),
         quiet: inillucent_compat::quiet::Options::from_arguments(arguments),
+        // **`contract` by default, so no published number moves (task-2175).**
+        // `hillclimb` runs the plan in `perf::hillclimb`: tables built with
+        // `INSERT` and read while fresh, churn, application queries and edge
+        // cases. Its workloads are in no weighted family, so they are reported
+        // one by one and reach no headline.
+        plan: flag(arguments, "--plan").unwrap_or_else(|| "contract".to_string()),
     }
 }
 
@@ -319,6 +327,20 @@ fn settings_from(arguments: &[String]) -> Settings {
 /// @param settings - the page size, frame count, scale and family filter
 fn memory_round(database: &Path, settings: &Settings) -> Result<(), String> {
     let plan = filtered_plan(settings)?;
+    // **Through the shipped API when the timed arm was (task-2175).** The
+    // pipeline refuses windows and compounds that a `Connection` answers, and
+    // what an application pays in memory and processor time is the cost of
+    // the API it calls. There are no per workload marks on this path, for the
+    // reason `round_through_a_connection` gives.
+    if settings.api == Api::Connection {
+        let database = ConnectedDatabase::open_at(database, settings.page_size, settings.frames)
+            .map_err(|error| format!("open failed: {}", why(&error)))?;
+        let (_, _, cost) = round_through_a_connection(&database, &plan)?;
+        for (name, peak, resident, frames) in &cost.marks {
+            println!("mark	{name}	{peak}	{resident}	{frames}");
+        }
+        return Ok(());
+    }
     let mut opened =
         ImportedDatabase::open(database.to_path_buf(), settings.page_size, settings.frames)
             .map_err(|error| format!("open failed: {}", why(&error)))?;
@@ -443,6 +465,8 @@ fn child_arguments(settings: &Settings) -> Vec<String> {
         settings.families.join(","),
         "--locking".to_string(),
         settings.locking.clone(),
+        "--plan".to_string(),
+        settings.plan.clone(),
     ];
     if let Some(repeat) = settings.repeat_override {
         arguments.push("--repeat".to_string());
@@ -519,7 +543,11 @@ fn record_samples(
 ///
 /// @param settings - the scale, the family filter and any repeat override
 fn filtered_plan(settings: &Settings) -> Result<inillucent_compat::perf::Plan, String> {
-    let mut plan = plan_for(&settings.scale);
+    let mut plan = if settings.plan == "hillclimb" {
+        inillucent_compat::perf::hillclimb::plan_for(&settings.scale)
+    } else {
+        plan_for(&settings.scale)
+    };
     plan.setup.clear();
     // **A workload whose family no table weights still runs** (task-2066
     // §4.3.1). `--families` names which of the ten weighted families to
@@ -1332,6 +1360,11 @@ fn round_through_a_connection(
     warm_through_a_connection(&connection)?;
     let opened = ProcessCost::now();
     let mut samples = Vec::with_capacity(plan.workloads.len());
+    // The process's high-water mark after each workload (task-2175). The pool
+    // is not reachable through a `Connection`, so the frame count is zero; the
+    // peak and the resident set are the operating system's and need nothing
+    // from the engine.
+    let mut marks: Vec<(String, u64, u64, usize)> = Vec::with_capacity(plan.workloads.len());
     for workload in &plan.workloads {
         if let Some(pre) = &workload.pre {
             if let Err(reason) = batch_through_a_connection(&connection, pre) {
@@ -1350,6 +1383,13 @@ fn round_through_a_connection(
                 eprintln!("  {}: post refused: {reason}", workload.name);
             }
         }
+        let now = ProcessCost::now();
+        marks.push((
+            workload.name.clone(),
+            now.peak_working_set,
+            now.working_set,
+            0,
+        ));
     }
     let mut state = Vec::with_capacity(AGREEMENT.len());
     for question in AGREEMENT {
@@ -1372,7 +1412,7 @@ fn round_through_a_connection(
         RoundCost {
             round: ProcessCost::now().since(&opened),
             costs: Vec::new(),
-            marks: Vec::new(),
+            marks,
         },
     ))
 }
@@ -2263,6 +2303,15 @@ fn measure_in_a_child(fixture: &Path, scratch: &Path, settings: &Settings) -> Op
             .arg(settings.frames.to_string())
             .arg("--families")
             .arg(settings.families.join(","))
+            // The plan and the way in, so the child's figure is about the
+            // workloads the reference child ran and through the same API the
+            // timed arm used (task-2175). Without `--plan` a hillclimb run
+            // compared SQLite's cost of the hillclimb plan with this engine's
+            // cost of the contract's plan.
+            .arg("--plan")
+            .arg(&settings.plan)
+            .arg("--api")
+            .arg(settings.api.name())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped()),
         "the memory child",

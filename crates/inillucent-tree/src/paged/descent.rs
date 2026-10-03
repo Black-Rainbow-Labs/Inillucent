@@ -15,6 +15,37 @@ use inillucent_pool::{PageGuard, PageId, Pool, Swip};
 use super::*;
 
 impl PagedTree {
+    /// Encodes a key tuple without allocating when it fits inline.
+    ///
+    /// The hot form. [`PagedTree::encode_key`] stays for the callers that want
+    /// an owned `Vec` - the bulk builder's separators, which are kept - and
+    /// this one is what every descent uses.
+    ///
+    /// @param values - the key tuple, in key-column order
+    pub fn encode_key_small(&self, values: &[Datum<'_>]) -> KeyBytes {
+        if let (KeyEncoding::Rowid, [Datum::Int(number)]) = (self.encoding, values) {
+            let mut inline = [0u8; KeyBytes::INLINE];
+            if let Some(slot) = inline.get_mut(..8) {
+                slot.copy_from_slice(&key::order_preserving_int(*number));
+            }
+            return KeyBytes::Inline(inline, 8);
+        }
+        if self.encoding == KeyEncoding::General {
+            let mut scratch = self.scratch.borrow_mut();
+            scratch.clear();
+            for (index, value) in values.iter().enumerate() {
+                let collation = self.collations.get(index).copied().unwrap_or_default();
+                key::encode_into_with(value, collation, &mut scratch);
+            }
+            return KeyBytes::from_slice(&scratch);
+        }
+        KeyBytes::from_slice(&self.encoding.encode_ordered(
+            values,
+            &self.collations,
+            &self.directions,
+        ))
+    }
+
     /// Returns the leftmost leaf, where a full scan starts.
     pub fn first_leaf(&self) -> PageId {
         self.first_leaf

@@ -197,6 +197,25 @@ pub enum AccessPath {
         /// The keys to look up, in the order they are probed.
         keys: Vec<BoundExpr>,
     },
+    /// Rows found by rowid through several ways in, one per arm of an `OR`.
+    ///
+    /// **SQLite's multi index `OR` (task-2175).** `WHERE key = ?1 OR id = ?1`
+    /// split on `AND` only, so the whole `OR` stayed one residual over a scan
+    /// of the table: 11.6 ms against SQLite's 26 microseconds on 100,000 rows.
+    /// Each arm here is a seek the planner would choose for that arm alone - a
+    /// [`RowidSeek`](Self::RowidSeek), a
+    /// [`RowidSeekUnion`](Self::RowidSeekUnion), an
+    /// [`IndexSeek`](Self::IndexSeek) or an equality
+    /// [`IndexSeekUnion`](Self::IndexSeekUnion) - and the executor collects
+    /// every rowid the arms reach, drops the repeats, and reads those rows.
+    /// The `OR` itself is never consumed: it stays a residual and is tested on
+    /// every row read, so an arm only has to reach a superset of its rows.
+    OrUnion {
+        /// The table B-tree's root page.
+        root: u32,
+        /// One seek per arm of the disjunction.
+        arms: Vec<AccessPath>,
+    },
     /// Rows found through one index - several seeks over the same tree,
     /// concatenated.
     ///
@@ -404,6 +423,7 @@ impl AccessPath {
             AccessPath::RowidSeekUnion { .. } => {
                 format!("SEARCH {table} USING INTEGER PRIMARY KEY (rowid=?)")
             }
+            AccessPath::OrUnion { .. } => "MULTI-INDEX OR".to_string(),
             AccessPath::Recursive { .. } => format!("SCAN {table} USING RECURSIVE QUEUE"),
             AccessPath::RecursiveSelf { .. } => format!("SCAN {table}"),
             AccessPath::VectorProbe { index, depth, .. } => format!(
@@ -1657,6 +1677,19 @@ fn path_cost(source: &BoundSource, path: &AccessPath) -> (f64, f64) {
             }
             (total_cost, total_matches.max(1.0))
         }
+        // Every arm runs, so the arms' costs add, and then the rows they reach
+        // are read by rowid once each.
+        AccessPath::OrUnion { arms, .. } => {
+            let mut total_cost = 0.0f64;
+            let mut total_matches = 0.0f64;
+            for arm in arms {
+                let (arm_cost, arm_matches) = path_cost(source, arm);
+                total_cost += arm_cost;
+                total_matches += arm_matches;
+            }
+            let fetched = cost::search_cost(rows, total_matches.max(1.0), true);
+            (total_cost + fetched, total_matches.max(1.0))
+        }
         // A materialised term is built once and then scanned; the build is
         // charged where it happens, which is the block that fills it.
         AccessPath::Subquery { .. } | AccessPath::Recursive { .. } => (cost::scan_cost(rows), rows),
@@ -1986,6 +2019,13 @@ fn choose_path(
             id, position, ids, source, terms, &mut trial, &needed, levers,
         ) {
             candidates.push((path, trial));
+        }
+        // The `OR` it reads stays a residual, so the consumed list is the one
+        // it was given.
+        if let Some(path) =
+            seek_union::or_union_path(id, position, ids, source, terms, consumed, levers)
+        {
+            candidates.push((path, consumed.to_vec()));
         }
     }
     candidates.push((

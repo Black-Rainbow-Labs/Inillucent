@@ -19,7 +19,10 @@ use inillucent_tree::datum::OwnedDatum;
 use inillucent_value::collation::Collation;
 
 use crate::ops::{compare_by, SortKey};
-use crate::physical::{constant_count, run_any, Negative, Params, TreeCatalog, WithQueue};
+use crate::physical::{
+    constant_count, prepare_any, run_any, run_any_prepared, Negative, Params, Prepared,
+    TreeCatalog, WithQueue,
+};
 use crate::setop::SetKeys;
 
 /// What a recursive CTE is filled from.
@@ -108,16 +111,35 @@ fn fill_in_passes(
         .chain(steps.iter())
         .any(|(op, _)| *op == inillucent_sql::ast::CompoundOp::Union);
     let collations = vec![Collation::Binary; width.max(1)];
-    let mut produced: Vec<Vec<OwnedDatum>> = Vec::new();
+    let mut answer: Vec<Vec<OwnedDatum>> = Vec::new();
     for (_, arm) in seeds {
         let (rows, _) = run_any(arm, catalog, params)?;
-        produced.extend(rows);
+        answer.extend(rows);
     }
+    // **One set of the rows a `UNION` has kept, for the whole fill (task-2175).**
+    // Each pass used to copy the whole answer and build a new set from it to
+    // drop the pass's repeats, so the work grew with the square of the passes.
+    let mut seen = SetKeys::new(collations);
     if distinct {
-        produced = distinct_rows(produced, &collations, &mut Vec::new());
+        answer.retain(|row| seen.remember(row));
     }
-    let mut answer = produced.clone();
-    let mut working = produced;
+    // **Each step arm is prepared once, not once a pass (task-2175).** The
+    // structural choice reads the trees the arm names and not the queue,
+    // which `WithQueue` hands over when the pipeline runs, so it is the same
+    // choice on every pass. Preparing it per pass was the whole of the gap
+    // on a 10,000 pass counter: 12 ms against SQLite's 1.5 ms.
+    let preparing = WithQueue {
+        inner: catalog,
+        cte,
+        rows: &[],
+    };
+    let mut arms = steps
+        .iter()
+        .map(|(_, arm)| prepare_any(arm, &preparing).map(StepArm::new))
+        .collect::<DbResult<Vec<StepArm>>>()?;
+    // The rows the next pass reads are the last ones added to the answer, so
+    // they are a range of it rather than a copy.
+    let mut working = 0..answer.len();
     // **A recursion with no base case is stopped by the `LIMIT` above it.**
     // `WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n)
     //  SELECT ... FROM (SELECT x FROM n LIMIT 1000)` is how every counter and
@@ -154,15 +176,14 @@ fn fill_in_passes(
         let queued = WithQueue {
             inner: catalog,
             cte,
-            rows: &working,
+            rows: answer.get(working.clone()).unwrap_or_default(),
         };
         let mut fresh: Vec<Vec<OwnedDatum>> = Vec::new();
-        for (_, arm) in steps {
-            let (rows, _) = run_any(arm, &queued, params)?;
-            fresh.extend(rows);
+        for ((_, arm), step) in steps.iter().zip(arms.iter_mut()) {
+            fresh.extend(step.run(arm, &queued, params)?);
         }
         if distinct {
-            fresh = distinct_rows(fresh, &collations, &mut answer.clone());
+            fresh.retain(|row| seen.remember(row));
         }
         if fresh.is_empty() {
             return Ok(answer);
@@ -175,11 +196,78 @@ fn fill_in_passes(
         for row in &fresh {
             inillucent_base::budget::materialise(crate::ops::owned_row_bytes(row))?;
         }
-        answer.extend(fresh.clone());
+        let start = answer.len();
+        answer.extend(fresh);
         if enough(&answer) {
             return Ok(answer);
         }
-        working = fresh;
+        working = start..answer.len();
+    }
+}
+
+/// One recursive arm, prepared once and compiled into a reusable chain when it can be.
+///
+/// **The chain is built once, not once a pass (task-2175).** Preparing once
+/// still left `run_any_prepared` building the operator chain on every pass -
+/// translating and compiling the filter and the projection again - which was
+/// most of what a pass cost on a 10,000 pass counter. A `Compiled` chain keeps
+/// those and builds only its source per run, and the source is what reads the
+/// queue through `WithQueue`, so each pass sees its own rows. The rules for
+/// trying and keeping one are the engine's own `Slot`: tried on the first
+/// pass, kept only when it is reusable, and not used when the settings it was
+/// built under have changed.
+struct StepArm {
+    /// The arm's structural choice.
+    prepared: Prepared,
+    /// The arm's compiled chain, when it has one that can be run again.
+    compiled: Option<crate::compiled::Compiled>,
+    /// Whether a compile has been tried.
+    tried: bool,
+}
+
+impl StepArm {
+    /// Returns an arm that has not been compiled yet.
+    ///
+    /// @param prepared - the arm's structural choice
+    fn new(prepared: Prepared) -> StepArm {
+        StepArm {
+            prepared,
+            compiled: None,
+            tried: false,
+        }
+    }
+
+    /// Runs the arm over one pass's queue and returns the rows it produced.
+    ///
+    /// @param plan - the arm's plan
+    /// @param catalog - the catalog with this pass's queue
+    /// @param params - the statement's bound parameters
+    fn run(
+        &mut self,
+        plan: &PhysicalPlan,
+        catalog: &dyn TreeCatalog,
+        params: &Params,
+    ) -> DbResult<Vec<Vec<OwnedDatum>>> {
+        if !self.tried {
+            self.tried = true;
+            if let Some(mut compiled) =
+                crate::compiled::try_compile(plan, catalog, &self.prepared, params)?
+            {
+                compiled.run(plan, catalog, params)?;
+                let rows = compiled.take_rows();
+                if compiled.rebindable() {
+                    self.compiled = Some(compiled);
+                }
+                return Ok(rows);
+            }
+        }
+        if let Some(compiled) = self.compiled.as_mut() {
+            if compiled.built_under(params) {
+                compiled.run(plan, catalog, params)?;
+                return Ok(compiled.take_rows());
+            }
+        }
+        Ok(run_any_prepared(plan, catalog, &self.prepared, params)?.0)
     }
 }
 
@@ -219,6 +307,16 @@ fn fill_in_order(
         let (rows, _) = run_any(arm, catalog, params)?;
         queue_new_rows(rows, distinct, &mut seen, &mut waiting)?;
     }
+    // Prepared once, for the reason `fill_in_passes` gives (task-2175).
+    let preparing = WithQueue {
+        inner: catalog,
+        cte,
+        rows: &[],
+    };
+    let prepared = steps
+        .iter()
+        .map(|(_, arm)| prepare_any(arm, &preparing))
+        .collect::<DbResult<Vec<Prepared>>>()?;
     let mut answer: Vec<Vec<OwnedDatum>> = Vec::new();
     let reached = |answer: &Vec<Vec<OwnedDatum>>| wanted.is_some_and(|want| answer.len() >= want);
     while !reached(&answer) {
@@ -237,8 +335,8 @@ fn fill_in_order(
             cte,
             rows: &current,
         };
-        for (_, arm) in steps {
-            let (rows, _) = run_any(arm, &queued, params)?;
+        for ((_, arm), prepared) in steps.iter().zip(&prepared) {
+            let (rows, _) = run_any_prepared(arm, &queued, prepared, params)?;
             queue_new_rows(rows, distinct, &mut seen, &mut waiting)?;
         }
     }
@@ -309,28 +407,4 @@ fn queue_keys(terms: &[inillucent_sql::bind::BoundOrderTerm]) -> DbResult<Vec<So
             })
         })
         .collect()
-}
-
-/// Returns the rows that are neither duplicates of each other nor already seen.
-///
-/// @param rows - the rows a pass produced
-/// @param collations - the collation of each column
-/// @param seen - the rows already produced, extended with the ones kept
-#[allow(clippy::ptr_arg)]
-fn distinct_rows(
-    rows: Vec<Vec<OwnedDatum>>,
-    collations: &[Collation],
-    seen: &mut Vec<Vec<OwnedDatum>>,
-) -> Vec<Vec<OwnedDatum>> {
-    let mut keys = SetKeys::new(collations.to_vec());
-    for row in seen.iter() {
-        keys.remember(row);
-    }
-    let mut kept = Vec::with_capacity(rows.len());
-    for row in rows {
-        if keys.remember(&row) {
-            kept.push(row);
-        }
-    }
-    kept
 }

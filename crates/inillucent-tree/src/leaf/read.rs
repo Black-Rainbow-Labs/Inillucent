@@ -734,6 +734,56 @@ impl<'p> LeafRef<'p> {
         page_size.saturating_sub(gap)
     }
 
+    /// Returns the largest integer the first key column holds in a live row, or `None`.
+    ///
+    /// **Two reads, not a merge of the leaf (task-2175).** Every `INSERT` that
+    /// lets the engine choose the rowid asks for the largest one, and that used
+    /// to visit every live row of the rightmost leaf through `visit_live`: about
+    /// a thousand rows, 16 of the 19 microseconds such an insert cost through
+    /// the `Connection`, where the same insert with its rowid given cost 2.5.
+    /// The sorted region is in key order, so its largest live key is the last
+    /// row that is not tombstoned. The delta area holds only live rows, since
+    /// a delete removes a delta row rather than marking it, and a delta row
+    /// that shadows a sorted one has that row's key, so it does not change the
+    /// maximum. A format 2 delta directory is in key order and its last entry is
+    /// its largest key; a format 1 area is in arrival order and is scanned.
+    pub fn largest_live_int_key(&self) -> DbResult<Option<i64>> {
+        let mut largest: Option<i64> = None;
+        let mut consider = |value: Datum<'_>| {
+            if let Datum::Int(number) = value {
+                largest = Some(largest.map_or(number, |held| held.max(number)));
+            }
+        };
+        if self.row_count > 0 {
+            let tombstones = match self.has_tombstones() {
+                true => Some(self.tombstones()?),
+                false => None,
+            };
+            let keys = self.column(0)?;
+            for row in (0..self.row_count).rev() {
+                if is_set(tombstones, row)? {
+                    continue;
+                }
+                consider(keys.value(row)?);
+                break;
+            }
+        }
+        if self.has_delta_directory() {
+            if let Some(last) = self.delta_count.checked_sub(1) {
+                if let Some(value) = self.delta_key(last)?.into_iter().next() {
+                    consider(value);
+                }
+            }
+        } else {
+            for index in 0..self.delta_count {
+                if let Some(value) = self.delta_key(index)?.into_iter().next() {
+                    consider(value);
+                }
+            }
+        }
+        Ok(largest)
+    }
+
     /// Whether any live row of this leaf sorts after a probe.
     ///
     /// **The question an equality walk has to ask before it follows the right

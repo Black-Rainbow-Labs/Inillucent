@@ -154,7 +154,7 @@ pub fn insert_at(
     let mut high_water = sequence_mark.as_ref().map_or(0, |mark| mark.seq);
     let mut changes = Changes::default();
     let captured = target.captures(table.root);
-    for supplied_row in &rows {
+    for supplied_row in rows.iter() {
         // See `give_back`: a skipped row hands its rowid back.
         let rowid_before = next_rowid;
         let mut image = plan.build_row(
@@ -427,15 +427,19 @@ fn note_single_row(statement: &BoundInsert, target: &dyn WriteTarget, depth: Dep
 /// @param params - the bound parameters
 /// @param catalog - where a registered function's body is looked up
 /// @param supplied - the rows a `SELECT` source produced
-fn rows_to_insert(
+fn rows_to_insert<'s>(
     statement: &BoundInsert,
     space: &RowSpace,
     params: &Params,
     catalog: &dyn crate::physical::TreeCatalog,
-    supplied: &[Row],
-) -> DbResult<Vec<Row>> {
+    supplied: &'s [Row],
+) -> DbResult<std::borrow::Cow<'s, [Row]>> {
+    // **The rows a `SELECT` produced are read where they are (task-2175).**
+    // This copied them, every value of every row, so an `INSERT ... SELECT`
+    // of 100,000 rows held them twice: the copy was a third of the 65 MiB
+    // that statement added to the process's peak.
     let BoundInsertSource::Values(values) = &statement.source else {
-        return Ok(supplied.to_vec());
+        return Ok(std::borrow::Cow::Borrowed(supplied));
     };
     let mut built = Vec::with_capacity(values.len());
     for row in values {
@@ -446,7 +450,7 @@ fn rows_to_insert(
         }
         built.push(cells);
     }
-    Ok(built)
+    Ok(std::borrow::Cow::Owned(built))
 }
 
 /// Records the rowid a written row was given, and returns it.
@@ -639,7 +643,7 @@ fn insert_into_view(
     let rows = rows_to_insert(statement, &space, params, catalog, supplied)?;
     let mut changes = Changes::default();
     let mut never = None;
-    for supplied_row in &rows {
+    for supplied_row in rows.iter() {
         // A view has no tree to allocate a key in, and its rows never reach one:
         // an `INSTEAD OF` trigger writes whatever it writes.
         let image = plan.build_row(supplied_row, &space, &mut never, &mut NoKeys, None)?;

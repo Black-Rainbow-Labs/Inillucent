@@ -182,6 +182,17 @@ is SQLite's message.
 - `INDEXED BY` may name a partial index where SQLite accepts it.
 - `RETURNING` is evaluated right after each row is written, before `AFTER` triggers run.
 
+**How a `WHERE` is searched.**
+
+- An `OR` whose every arm can use the rowid or an index is answered with one search for each arm,
+  and each row is read once, as SQLite's multi index `OR` does. `WHERE key = ?1 OR id = ?1` over
+  100,000 rows reads a few rows instead of the table. `EXPLAIN QUERY PLAN` prints `MULTI-INDEX OR`.
+  An `OR` with one arm that needs a scan scans the table.
+- `x IN (...)` and `x NOT IN (...)` over eight or more values, written out or returned by a
+  subquery, are answered by a binary search of the sorted values instead of a comparison with each
+  one. It keeps SQLite's `NULL` rules: a value that matches nothing is `NULL` when the list holds a
+  `NULL`, so `NOT IN` keeps no row in that case.
+
 **Messages and ordering.** `ORDER BY` or `LIMIT` before a compound operator is an error with
 SQLite's wording. A circular CTE fails with `circular reference: name`. `GROUP BY` takes the direction
 of an `ORDER BY` with the same number of terms, which decides the order of tied groups. `CREATE TABLE
@@ -356,7 +367,7 @@ These differences change how an application runs, and they do not show up in a p
 | `PRAGMA busy_timeout` default | 5000 ms | 0 in the `sqlite3` shell |
 | `sqlite_schema.rootpage` | the first table has root page 4, because inillucent keeps its own catalog trees on the first pages. The other columns match | the first table has root page 2 |
 | a `WITHOUT ROWID` table whose primary key term is `DESC` | a query with no `ORDER BY` returns rows in ascending key order. Range predicates, seeks and `ORDER BY` on the key return the same rows as SQLite | the rows come back in descending key order |
-| `EXPLAIN QUERY PLAN` for a subquery, a CTE or a compound query | a flat list of lines. It has no `MATERIALIZE`, `CO-ROUTINE`, `MERGE` or `COMPOUND QUERY` blocks, and does not flatten a subquery in the plan text. The rows of the query match | a plan tree with those blocks |
+| `EXPLAIN QUERY PLAN` for a subquery, a CTE or a compound query | a flat list of lines. It has no `MATERIALIZE`, `CO-ROUTINE`, `MERGE` or `COMPOUND QUERY` blocks, and does not flatten a subquery in the plan text. An `OR` answered by one search per arm prints `MULTI-INDEX OR` with no line for each arm. The rows of the query match | a plan tree with those blocks |
 | `mmap_size`, `wal_autocheckpoint`, `journal_size_limit`, `temp_store = FILE`, `synchronous = EXTRA`, `threads`, the heap limits and `cache_spill` | stored and read back as SQLite reports them, and they do not change how inillucent runs. It maps no pages, has one thread, and folds the log at checkpoints | each changes how SQLite runs |
 | `$1`, `$2` placeholders | `$N` binds the Nth value, as `?N` does and as PostgreSQL does. `SET a = $2 WHERE id = $1` takes `a` from the second value | `$1` is a name, numbered by the order names first appear, so the same statement takes `a` from the first value |
 
@@ -385,7 +396,9 @@ database attached, still takes EXCLUSIVE for the whole transaction.
 **`PRAGMA locking_mode = exclusive`.** `normal` is the default, as in SQLite. With `exclusive`, the
 engine keeps the file locked between statements, so a second process waits for the first to close.
 A program that never opens a second connection can use `exclusive` to save work: under `normal`, the
-engine reads the file header and the end of the log again before each statement.
+engine reads the file header and the end of the log again before each statement. A statement that
+reads no table, such as `SELECT 1` or `SELECT json_extract(?1, '$.a')`, takes no lock and reads
+neither, which is what SQLite does.
 
 **A large transaction.** Under `wal`, `memory` and `off`, a changed page cannot be written to the
 file before its commit, and it cannot be dropped from memory either. The transaction fails with an

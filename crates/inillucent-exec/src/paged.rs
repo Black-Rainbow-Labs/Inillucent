@@ -143,7 +143,22 @@ impl<'t> FullScan<'t> {
             // the general vector path, which is why the test is `has_writes`
             // and not `is_clean`. Confusing the two cost the SLT corpus
             // thirty-four refusals once.
+            //
+            // **Straight into columns, not a vector per row (task-2175).** A
+            // table an application filled with `INSERT` has rows in the delta
+            // area of nearly every leaf, and `live` built a vector for every
+            // live row before `push_merged` copied the projected values out of
+            // them into columns. The merge order gives each live row's value
+            // by position, so the columns are filled from it directly. A leaf
+            // with values out of line keeps the old path, because those values
+            // need the extents `live` reads.
             if leaf.needs_materialising() {
+                if !leaf.has_extents() {
+                    let order = leaf.live_order()?;
+                    return Ok(
+                        push_live_order(&order, &self.projection, downstream)? == Flow::Continue
+                    );
+                }
                 let rows = leaf.live()?;
                 return Ok(push_merged(&rows, &self.projection, downstream)? == Flow::Continue);
             }
@@ -152,6 +167,44 @@ impl<'t> FullScan<'t> {
         })?;
         downstream.finish()
     }
+}
+
+/// Pushes a written leaf's live rows downstream, projected, in key order, a batch at a time.
+///
+/// Each projected column is filled from the merge order in one pass over the
+/// batch's rows, so no row is ever a vector of its own.
+///
+/// @param order - the leaf's live rows in key order
+/// @param projection - which tree columns to expose, in output order
+/// @param downstream - the head of the operator chain
+fn push_live_order<'p>(
+    order: &inillucent_tree::leaf::LiveOrder<'p>,
+    projection: &Projection,
+    downstream: &mut dyn Sink,
+) -> DbResult<Flow> {
+    let rows = order.len();
+    let mut start = 0usize;
+    while start < rows {
+        let end = start.saturating_add(crate::batch::BATCH_ROWS).min(rows);
+        let mut columns_owned: Vec<Vec<Datum<'p>>> = Vec::with_capacity(projection.0.len());
+        for column in &projection.0 {
+            let mut values = Vec::with_capacity(end.saturating_sub(start));
+            for row in start..end {
+                values.push(order.value(row, *column)?);
+            }
+            columns_owned.push(values);
+        }
+        let columns: Vec<Vector<'_>> = columns_owned
+            .iter()
+            .map(|values| Vector::Values(values.as_slice()))
+            .collect();
+        let batch = Batch::new(end.saturating_sub(start), columns);
+        if downstream.push(&batch)? == Flow::Stop {
+            return Ok(Flow::Stop);
+        }
+        start = end;
+    }
+    Ok(Flow::Continue)
 }
 
 /// A key range of a tree, in key order.

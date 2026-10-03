@@ -305,7 +305,7 @@ mod tests {
         grouped.push(&batch).unwrap();
         assert_eq!(grouped.groups.len(), 7);
         let mut total = 0i64;
-        for (key, accumulators) in grouped.groups.values() {
+        for (key, accumulators) in grouped.group_rows() {
             let count = accumulators[0].finish().unwrap().borrow().as_int().unwrap();
             let category = key[0].borrow().as_int().unwrap();
             assert_eq!(

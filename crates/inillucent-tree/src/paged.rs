@@ -559,6 +559,13 @@ pub struct PagedTree {
     /// counter can be bumped from a `&self` method - the read side reports them
     /// and the write side is the only thing that moves them.
     pub(crate) stats: std::cell::Cell<crate::write::WriteStats>,
+    /// The leaf the last point probe of this tree landed on (task-2175).
+    ///
+    /// `PagedTree::update_in_place` looks here before descending from the root:
+    /// an `UPDATE` reads each row by key and then writes it, so the leaf it
+    /// wants is the one the read just found. See `update_in_place` for why a
+    /// key found in it proves it is the key's leaf.
+    pub(crate) last_leaf: std::cell::Cell<Option<PageId>>,
     /// The page this tree's rightmost leaf was on, the last time a write looked.
     ///
     /// **The leaf hint** (task-2000, designs 6 and 7). A write descends from the
@@ -813,6 +820,7 @@ impl PagedTree {
             leaf_hints: std::cell::RefCell::new(Vec::new()),
             hint_victim: std::cell::Cell::new(0),
             stats: std::cell::Cell::new(crate::write::WriteStats::default()),
+            last_leaf: std::cell::Cell::new(None),
         })
     }
 
@@ -925,37 +933,6 @@ impl PagedTree {
     /// `CREATE INDEX ic ON t(c DESC)` returned no rows at all.
     pub fn directions(&self) -> &[bool] {
         &self.directions
-    }
-
-    /// Encodes a key tuple without allocating when it fits inline.
-    ///
-    /// The hot form. [`PagedTree::encode_key`] stays for the callers that want
-    /// an owned `Vec` - the bulk builder's separators, which are kept - and
-    /// this one is what every descent uses.
-    ///
-    /// @param values - the key tuple, in key-column order
-    pub fn encode_key_small(&self, values: &[Datum<'_>]) -> KeyBytes {
-        if let (KeyEncoding::Rowid, [Datum::Int(number)]) = (self.encoding, values) {
-            let mut inline = [0u8; KeyBytes::INLINE];
-            if let Some(slot) = inline.get_mut(..8) {
-                slot.copy_from_slice(&key::order_preserving_int(*number));
-            }
-            return KeyBytes::Inline(inline, 8);
-        }
-        if self.encoding == KeyEncoding::General {
-            let mut scratch = self.scratch.borrow_mut();
-            scratch.clear();
-            for (index, value) in values.iter().enumerate() {
-                let collation = self.collations.get(index).copied().unwrap_or_default();
-                key::encode_into_with(value, collation, &mut scratch);
-            }
-            return KeyBytes::from_slice(&scratch);
-        }
-        KeyBytes::from_slice(&self.encoding.encode_ordered(
-            values,
-            &self.collations,
-            &self.directions,
-        ))
     }
 
     /// Attaches to a tree given only its root, discovering the rest by walking.

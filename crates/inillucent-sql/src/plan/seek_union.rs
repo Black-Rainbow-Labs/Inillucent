@@ -516,3 +516,128 @@ fn keyset_branches(
     ordered.reverse();
     Some(ordered)
 }
+
+/// The most arms an `OR` may have and still be read as a union of seeks.
+///
+/// Each arm is planned on its own, which is a planner call per arm; past this
+/// the disjunction is left to the scan, which is what it was before.
+const MAX_OR_ARMS: usize = 64;
+
+/// Returns a union of the seeks each arm of an `OR` would use alone.
+///
+/// **Every arm must be a seek, or there is no union** (task-2175). An arm that
+/// can only be answered by a scan makes the whole disjunction a scan, so
+/// building the others would be work for nothing; SQLite's multi index `OR`
+/// makes the same all or nothing choice. Each arm is split on `AND` and
+/// handed to the same `rowid_path` and `index_path` a whole `WHERE` gets, so
+/// an arm finds exactly the seek it would find alone, partial indexes and
+/// collations included. An index arm is planned as if it read no column, so
+/// that only the rowid in each entry is needed.
+///
+/// The `OR` is not marked consumed. It is tested on every row the union reads,
+/// so an arm whose seek used only some of its conjuncts, a parameter that
+/// converts differently in two arms, and a row two arms both reach all come
+/// out as the `OR` itself decides.
+///
+/// @param id - the term's source id
+/// @param position - the term's place in the join order
+/// @param ids - the source id of every term, in join order
+/// @param source - the FROM term
+/// @param terms - the conjuncts of the `WHERE`
+/// @param consumed - which of them a path already used
+/// @param levers - the planner's switches
+pub(super) fn or_union_path(
+    id: usize,
+    position: usize,
+    ids: &[usize],
+    source: &BoundSource,
+    terms: &[BoundExpr],
+    consumed: &[bool],
+    levers: Levers,
+) -> Option<AccessPath> {
+    let table = &source.table;
+    // Outermost only, for the reason `rowid_in_list_path` gives, and only on
+    // a rowid table, whose index entries end in the rowid this reads.
+    if position != 0 || !table.has_rowid() || table.module.is_some() {
+        return None;
+    }
+    if source.index_hint != crate::bind::IndexChoice::Any {
+        return None;
+    }
+    for (index, term) in terms.iter().enumerate() {
+        if consumed.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        if !matches!(term, BoundExpr::Or(..)) {
+            continue;
+        }
+        let mut arms: Vec<BoundExpr> = Vec::new();
+        flatten_or(term, &mut arms);
+        if arms.len() < 2 || arms.len() > MAX_OR_ARMS {
+            continue;
+        }
+        let planned: Option<Vec<AccessPath>> = arms
+            .iter()
+            .map(|arm| arm_seek(id, position, ids, source, arm, levers))
+            .collect();
+        if let Some(arms) = planned {
+            return Some(AccessPath::OrUnion {
+                root: table.root,
+                arms,
+            });
+        }
+    }
+    None
+}
+
+/// Returns the seek one arm of an `OR` would use alone, or `None` when it would scan.
+///
+/// @param id - the term's source id
+/// @param position - the term's place in the join order
+/// @param ids - the source id of every term, in join order
+/// @param source - the FROM term
+/// @param arm - the arm
+/// @param levers - the planner's switches
+fn arm_seek(
+    id: usize,
+    position: usize,
+    ids: &[usize],
+    source: &BoundSource,
+    arm: &BoundExpr,
+    levers: Levers,
+) -> Option<AccessPath> {
+    let mut conjuncts: Vec<BoundExpr> = Vec::new();
+    super::split_conjunction(arm, &mut conjuncts);
+    let mut used = vec![false; conjuncts.len()];
+    if let Some(path) = super::rowid_path(id, position, ids, &source.table, &conjuncts, &mut used) {
+        return match path {
+            AccessPath::RowidSeek { .. } | AccessPath::RowidSeekUnion { .. } => Some(path),
+            _ => None,
+        };
+    }
+    let mut used = vec![false; conjuncts.len()];
+    let needed = crate::bind::ColumnUse::default();
+    let path = super::index_path(
+        id, position, ids, source, &conjuncts, &mut used, &needed, levers,
+    )?;
+    match &path {
+        AccessPath::IndexSeek {
+            equalities,
+            low,
+            high,
+            without_rowid: false,
+            ..
+        } if !equalities.is_empty() || low.is_some() || high.is_some() => Some(path),
+        AccessPath::IndexSeekUnion {
+            branches,
+            without_rowid: false,
+            ..
+        } if branches
+            .iter()
+            .all(|branch| branch.low.is_none() && branch.high.is_none()) =>
+        {
+            Some(path)
+        }
+        _ => None,
+    }
+}

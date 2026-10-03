@@ -775,6 +775,7 @@ fn drives_from_a_value_list(plan: &PhysicalPlan, prepared: &Prepared) -> bool {
     matches!(
         plan.sources.get(stage.term).map(|source| &source.path),
         Some(AccessPath::RowidSeekUnion { .. })
+            | Some(AccessPath::OrUnion { .. })
             | Some(AccessPath::IndexSeekUnion { dedup: true, .. })
     )
 }
@@ -2071,6 +2072,11 @@ fn build_source<'t>(
             let probe_over = PointProbe::new(tree, projection);
             let keys = match path {
                 AccessPath::RowidSeekUnion { keys, .. } => rowid_union_keys(keys, space, params)?,
+                AccessPath::OrUnion { arms, .. } => {
+                    let (keys, scans) =
+                        super::keys::or_union_parts(arms, table, catalog, space, params)?;
+                    return Ok(Source::OrUnion(probe_over, keys, scans));
+                }
                 AccessPath::IndexSeekUnion {
                     branches,
                     columns,

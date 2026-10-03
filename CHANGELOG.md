@@ -10,6 +10,45 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**Two wrong answers fixed, found by a new performance plan.**
+
+- **`WHERE g = ? ORDER BY c DESC LIMIT n` over an index on `(g, c)` returned rows from the middle
+  of the group**, or fewer than `n` rows, when the group's entries crossed a leaf boundary: the
+  backward walk started at the leaf where the group begins. It now starts past the group's last
+  entry and applies the upper bound on every leaf.
+- **`LIMIT n OFFSET <expression over a parameter>` kept the first execution's offset** when the
+  statement was prepared once and bound again, so every page after the first repeated it.
+
+**Faster for the statements an application sends.** Measured through the `Connection` API against
+SQLite 3.53.4 with `inillucent-fullgate --plan hillclimb --api connection`, a plan of 48 workloads
+over tables built with `INSERT`, the same tables after updates and deletes, common application
+queries and edge cases (see `docs/performance.md`). Over that plan the geometric mean went from
+0.85x to 1.30x of SQLite's speed on the workloads the changes were tuned on and from 0.67x to 1.15x
+on the held out third. One round's peak memory went from 101 to 83 MiB and its processor time from
+3,906 to 1,750 ms. The contract plan through the `Connection` went from 1.94x to 2.37x.
+
+- **An insert that lets the engine choose the rowid** read every live row of the last leaf to find
+  the largest one. It reads two values now: 19.0 to 2.6 microseconds for a single row insert.
+- **An `OR` whose every arm can use the rowid or an index** is one search per arm, read by rowid once
+  each, where it scanned the table: `WHERE key = ?1 OR id = ?1` over 100,000 rows is 664 times
+  faster. `EXPLAIN QUERY PLAN` prints `MULTI-INDEX OR`.
+- **`IN` and `NOT IN` over eight or more values**, written out or returned by a subquery, use a
+  binary search: `NOT IN (SELECT ...)` over 25,000 rows is 166 times faster.
+- **A query that reads no table** (`SELECT 1`, `SELECT json_extract(?1, '$.a')`) takes no file
+  lock under `locking_mode = normal`, as in SQLite: 28 and 15 times faster through a `Connection`.
+- **A recursive CTE** compiles its step once instead of once per pass: 2.7 times faster on a
+  10,000 pass counter.
+- **A `GROUP BY` with many groups** keeps its accumulators in one vector and each accumulator is
+  144 bytes: 2.1 times faster on 50,000 groups, and a lower peak memory.
+- **`LIKE '%text%'`, `'text%'`, `'%text'` and plain text** compare in place without the general
+  matcher: 2.7 times faster on a scan of 100,000 rows.
+- **Bulk `DELETE` and `UPDATE`** look first in the leaf the last row used, and a scan of a table
+  that took writes fills its columns without a vector per row.
+- **`INSERT ... SELECT` no longer copies the query's rows**, which lowered that statement's rise in
+  peak memory from 65 to 46 MiB on 100,000 rows.
+- **`json_extract` over a column of distinct documents** stops keeping each document after a few
+  misses in a row.
+
 **A usage corpus of 1,719 application scripts, and the defects it found, fixed.** The new suite
 `differential::usage_corpus` runs the scripts in `compat/corpus/usage` through `inillucent-shell` and
 through the pinned `sqlite3` 3.53.4 shell and compares the output byte for byte, including column

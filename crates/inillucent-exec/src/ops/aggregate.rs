@@ -299,7 +299,20 @@ pub struct HashAggregate {
     keys: Vec<Box<dyn Eval>>,
     collations: Vec<Collation>,
     specs: Vec<AggregateSpec>,
-    pub(crate) groups: HashMap<Vec<u8>, (Vec<OwnedDatum>, Vec<Accumulator>)>,
+    /// Each group's encoded key, and the group's position in `held`.
+    ///
+    /// **A position, not the group (task-2175).** Each group used to own its
+    /// key values and a vector of its accumulators, two allocations per group
+    /// scattered over the heap. A `GROUP BY` with 50,000 groups then spent a
+    /// quarter of its time finishing and dropping accumulators it reached one
+    /// cache miss at a time, and every row of an existing group cloned its key
+    /// to ask `entry`. The groups' accumulators now sit in one vector in the
+    /// order the groups were found, and a row of a known group is one lookup.
+    pub(crate) groups: HashMap<Vec<u8>, usize>,
+    /// Each group's key values, by position.
+    held: Vec<Vec<OwnedDatum>>,
+    /// Every group's accumulators, `specs.len()` of them per group, by position.
+    accumulators: Vec<Accumulator>,
     /// For each key, whether the groups are emitted in descending order of it.
     /// Empty when every key is ascending, which is nearly every statement.
     descending: Vec<bool>,
@@ -323,6 +336,8 @@ impl HashAggregate {
             collations,
             specs,
             groups: HashMap::new(),
+            held: Vec::new(),
+            accumulators: Vec::new(),
             descending: Vec::new(),
             downstream,
         }
@@ -371,12 +386,65 @@ impl HashAggregate {
         Ordering::Equal
     }
 }
+impl HashAggregate {
+    /// Returns each group's key values and accumulators, in the order the groups were found.
+    #[cfg(test)]
+    pub(crate) fn group_rows(&self) -> impl Iterator<Item = (&[OwnedDatum], &[Accumulator])> {
+        let width = self.specs.len();
+        self.held.iter().enumerate().map(move |(at, key)| {
+            let from = at.saturating_mul(width);
+            let accumulators = self
+                .accumulators
+                .get(from..from.saturating_add(width))
+                .unwrap_or(&[]);
+            (key.as_slice(), accumulators)
+        })
+    }
+
+    /// Returns the position of a new group, after charging and holding its key.
+    ///
+    /// @param encoded - the group's encoded key
+    /// @param values - the group's key values
+    fn add_group(
+        &mut self,
+        encoded: &[u8],
+        values: &[crate::expr::Computed<'_>],
+    ) -> DbResult<usize> {
+        // **The group table is charged as it grows (task-1932, H6).**
+        // A new key is memory the statement holds until it finishes, and
+        // the number of them is decided by the data rather than by the
+        // query - `GROUP BY` over a column with a hundred million distinct
+        // values builds a hundred million groups to answer with a hundred
+        // million rows. The input is deliberately not charged: a `GROUP BY`
+        // over a large table that answers in four rows is the shape this
+        // operator exists for.
+        let bytes = values
+            .iter()
+            .map(crate::expr::Computed::get)
+            .map(|value| datum_bytes(&value))
+            .sum::<u64>();
+        inillucent_base::budget::materialise(bytes.saturating_add(encoded.len() as u64))?;
+        let at = self.held.len();
+        self.held.push(
+            values
+                .iter()
+                .map(|value| OwnedDatum::from_datum(&value.get()))
+                .collect(),
+        );
+        self.accumulators
+            .extend(self.specs.iter().map(|spec| spec.accumulator()));
+        self.groups.insert(encoded.to_vec(), at);
+        Ok(at)
+    }
+}
 impl Sink for HashAggregate {
     fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
         let mut encoded = Vec::with_capacity(32);
+        let mut values = Vec::with_capacity(self.keys.len());
+        let width = self.specs.len();
         for nth in 0..batch.live() {
             encoded.clear();
-            let mut values = Vec::with_capacity(self.keys.len());
+            values.clear();
             for expression in &self.keys {
                 let value = expression.value(batch, nth)?;
                 key::encode_into_with(
@@ -389,37 +457,14 @@ impl Sink for HashAggregate {
                 );
                 values.push(value);
             }
-            // **The group table is charged as it grows (task-1932, H6).**
-            // A new key is memory the statement holds until it finishes, and
-            // the number of them is decided by the data rather than by the
-            // query - `GROUP BY` over a column with a hundred million distinct
-            // values builds a hundred million groups to answer with a hundred
-            // million rows. The input is deliberately not charged: a `GROUP BY`
-            // over a large table that answers in four rows is the shape this
-            // operator exists for.
-            let fresh = !self.groups.contains_key(&encoded);
-            if fresh {
-                let held = values
-                    .iter()
-                    .map(crate::expr::Computed::get)
-                    .map(|value| datum_bytes(&value))
-                    .sum::<u64>();
-                inillucent_base::budget::materialise(held.saturating_add(encoded.len() as u64))?;
-            }
-            let entry = self.groups.entry(encoded.clone()).or_insert_with(|| {
-                (
-                    values
-                        .iter()
-                        .map(crate::expr::Computed::get)
-                        .collect::<Vec<_>>()
-                        .iter()
-                        .map(OwnedDatum::from_datum)
-                        .collect(),
-                    self.specs.iter().map(|spec| spec.accumulator()).collect(),
-                )
-            });
+            let at = match self.groups.get(&encoded) {
+                Some(at) => *at,
+                None => self.add_group(&encoded, &values)?,
+            };
+            let from = at.saturating_mul(width);
             for (index, spec) in self.specs.iter().enumerate() {
-                let Some(accumulator) = entry.1.get_mut(index) else {
+                let Some(accumulator) = self.accumulators.get_mut(from.saturating_add(index))
+                else {
                     continue;
                 };
                 spec.feed(accumulator, batch, nth)?;
@@ -432,25 +477,45 @@ impl Sink for HashAggregate {
         // Emitted in encoded-key order, which is value order, so a downstream
         // `ORDER BY` on the group key has nothing to do. It still runs - the
         // planner does not yet prove the property - but it sorts sorted input.
-        let mut keys: Vec<&Vec<u8>> = self.groups.keys().collect();
-        keys.sort_unstable();
+        let mut order: Vec<(&Vec<u8>, usize)> = self
+            .groups
+            .iter()
+            .map(|(encoded, at)| (encoded, *at))
+            .collect();
+        order.sort_unstable_by(|left, right| left.0.cmp(right.0));
         if !self.descending.is_empty() {
-            keys.sort_by(
-                |left, right| match (self.groups.get(*left), self.groups.get(*right)) {
-                    (Some(a), Some(b)) => self.compare_keys(&a.0, &b.0),
+            order.sort_by(
+                |left, right| match (self.held.get(left.1), self.held.get(right.1)) {
+                    (Some(a), Some(b)) => self.compare_keys(a, b),
                     _ => Ordering::Equal,
                 },
             );
         }
-        let mut rows: Vec<Vec<OwnedDatum>> = Vec::with_capacity(keys.len());
-        for encoded in keys {
-            let Some((group, accumulators)) = self.groups.get(encoded) else {
+        let width = self.specs.len();
+        // **Finished in the order they are stored, then placed in key order.**
+        // An accumulator is a large struct, and visiting them in key order
+        // jumps across the whole vector, one cache miss per group: with 50,000
+        // groups that was a sixth of the statement. The finished values are a
+        // few words each, so it is those that are visited out of order.
+        let mut finished: Vec<OwnedDatum> = Vec::with_capacity(self.accumulators.len());
+        for accumulator in &self.accumulators {
+            finished.push(accumulator.finish()?);
+        }
+        let mut rows: Vec<Vec<OwnedDatum>> = Vec::with_capacity(order.len());
+        for (_, at) in order {
+            let Some(group) = self.held.get(at) else {
                 continue;
             };
-            let mut row = group.clone();
-            for accumulator in accumulators {
-                row.push(accumulator.finish()?);
-            }
+            let mut row = Vec::with_capacity(group.len().saturating_add(width));
+            row.extend(group.iter().cloned());
+            let from = at.saturating_mul(width);
+            row.extend(
+                finished
+                    .get(from..from.saturating_add(width))
+                    .unwrap_or(&[])
+                    .iter()
+                    .cloned(),
+            );
             rows.push(row);
         }
         emit_rows(&rows, self.downstream.as_mut())?;
@@ -460,6 +525,8 @@ impl Sink for HashAggregate {
     /// Returns this operator and everything below it to its pre-input state.
     fn reset(&mut self) -> DbResult<()> {
         self.groups.clear();
+        self.held.clear();
+        self.accumulators.clear();
         self.downstream.reset()
     }
 }

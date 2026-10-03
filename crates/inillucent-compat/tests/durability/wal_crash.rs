@@ -53,6 +53,15 @@ const WORKLOAD: &str = "BEGIN;
      DELETE FROM t WHERE a = 3;
      COMMIT;";
 
+/// The statement run after the workload, so that some cuts land after the commit finished.
+///
+/// **It reads the table (task-2175).** It was `SELECT 1`, which took the file
+/// lock and read the meta record and the log's end like any statement. A query
+/// that reads no table now takes no lock and does no I/O at all, as in SQLite,
+/// so every cut point was inside the commit, and the commit campaign found no
+/// cut that left the new state.
+const TAIL: &str = "SELECT count(*) FROM t";
+
 /// Returns a simulator with the pessimistic device model.
 fn simulator(seed: u64) -> Arc<SimVfs> {
     Arc::new(SimVfs::new(SimConfig {
@@ -287,7 +296,7 @@ fn campaign(
 /// Every cut of a WAL commit leaves the database in one state or the other.
 #[test]
 fn every_cut_of_a_wal_commit_is_recoverable() {
-    let report = campaign("commit", Failure::Crash, "SELECT 1", false, false);
+    let report = campaign("commit", Failure::Crash, TAIL, false, false);
     record("wal-commit.tsv", &report);
 }
 
@@ -317,14 +326,14 @@ fn every_cut_of_a_wal_checkpoint_is_recoverable() {
 /// against a device that lies about its writes.
 #[test]
 fn every_short_write_of_a_wal_commit_is_recoverable() {
-    let report = campaign("short write", Failure::ShortWrite, "SELECT 1", true, true);
+    let report = campaign("short write", Failure::ShortWrite, TAIL, true, true);
     record("wal-short-write.tsv", &report);
 }
 
 /// An I/O error at every cut point leaves a recoverable database.
 #[test]
 fn every_io_error_of_a_wal_commit_is_recoverable() {
-    let report = campaign("io error", Failure::IoError, "SELECT 1", true, false);
+    let report = campaign("io error", Failure::IoError, TAIL, true, false);
     record("wal-io-error.tsv", &report);
 }
 

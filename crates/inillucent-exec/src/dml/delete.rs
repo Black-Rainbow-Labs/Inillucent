@@ -280,13 +280,17 @@ fn delete_unwatched(
 ) -> DbResult<Changes> {
     let mut entries: Vec<Vec<Row>> = maintained(table).map(|_| Vec::new()).collect();
     let mut changes = Changes::default();
+    // The leaf the last delete used, per tree: the keys arrive in each tree's
+    // order, so the next one is nearly always there (task-2175). See
+    // `PagedTree::delete_near`.
+    let mut near = None;
     for key in keys {
         let (database, trees, log) = target.parts_for(table.root)?;
         let tree = trees
             .get_mut(table.root)
             .ok_or_else(|| missing_tree(table))?;
         let borrowed: Vec<Datum<'_>> = key.iter().map(OwnedDatum::borrow).collect();
-        let Some(row) = tree.delete(database, log, &borrowed)? else {
+        let Some(row) = tree.delete_near(database, log, &borrowed, &mut near)? else {
             continue;
         };
         for ((position, index), held) in maintained(table).zip(entries.iter_mut()) {
@@ -297,8 +301,14 @@ fn delete_unwatched(
         count_row(&mut changes, target, depth);
     }
     for ((_, index), held) in maintained(table).zip(entries.iter()) {
+        let mut near = None;
         for entry in sorted_by_tree(target, index.root, held.iter().collect())? {
-            write_index_entry(index, target, entry, false)?;
+            let (database, trees, log) = target.parts_for(index.root)?;
+            let Some(tree) = trees.get_mut(index.root) else {
+                break;
+            };
+            let borrowed: Vec<Datum<'_>> = entry.iter().map(OwnedDatum::borrow).collect();
+            tree.delete_near(database, log, &borrowed, &mut near)?;
         }
     }
     Ok(changes)

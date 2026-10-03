@@ -263,8 +263,8 @@ a prerequisite and its suite cannot skip. Those two checks keep this table equal
 
 ## What the tests cover
 
-The workspace has 4,097 tests across 307 test targets, counted tier by tier in the tier table of
-`tests/inillucent-testing-tdd.md`. There are 307 rows in `tests/selection.toml`,
+The workspace has 4,109 tests across 308 test targets, counted tier by tier in the tier table of
+`tests/inillucent-testing-tdd.md`. There are 308 rows in `tests/selection.toml`,
 and each row is one `[[target]]` that the runner runs. `tools/doc-facts/check.mjs` fails when this
 page gives a different count from `tests/selection.toml`.
 

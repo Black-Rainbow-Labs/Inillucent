@@ -1104,8 +1104,13 @@ fn a_statement_outside_a_transaction_rereads_nothing() {
     let directory = scratch("implicit-transaction");
     let database = build(&directory.join("b.rdb"));
     let connection = database.session();
+    // **A statement that reads a page (task-2175).** This was `SELECT 1`, and a
+    // query that reads no table now takes no file lock at all, as in SQLite, so
+    // it no longer went through the lock and the checks this guard is about.
+    // A point read of one row takes them and returns one value, as `SELECT 1`
+    // did.
     let mut statement = connection
-        .prepare("SELECT 1")
+        .prepare("SELECT 1 FROM t WHERE id = 1")
         .expect("the statement prepares");
 
     // The first run of a fresh statement reads the slots in full, because this
@@ -1144,7 +1149,7 @@ fn a_statement_outside_a_transaction_rereads_nothing() {
 
     // The runner gives this tier `--show-output`, so the numbers are in the log
     // of every run and not only in the comment above.
-    println!("`SELECT 1` stepped {RUNS} times through a connection:");
+    println!("`SELECT 1 FROM t WHERE id = 1` stepped {RUNS} times through a connection:");
     println!(
         "  outside a transaction: {meta_reads} full meta read(s), \
          {meta_probes} record read(s), {outside_allocations} allocation(s) \
@@ -1190,9 +1195,17 @@ fn a_statement_outside_a_transaction_rereads_nothing() {
     // **A number, because the assertion above is a comparison** (task-2066
     // section 4.3.5). Both sides of it moved together when a `SELECT`'s result
     // column names were built on every execution, so three allocations a step
-    // could be added without it noticing. This reads what one step costs.
+    // could be added without it noticing. This reads what one step of
+    // `SELECT 1` itself costs, warmed first.
+    drop(statement);
+    let mut trivial = connection
+        .prepare("SELECT 1")
+        .expect("the statement prepares");
+    step_once(&mut trivial);
+    let trivial_allocations = allocations(|| step_once(&mut trivial));
+    println!("  `SELECT 1` alone:      {trivial_allocations} allocation(s) for one step");
     assert!(
-        inside_allocations <= STEP_ALLOCATIONS,
-        "one step of `SELECT 1` made {inside_allocations} allocation(s) against a bound of {STEP_ALLOCATIONS}"
+        trivial_allocations <= STEP_ALLOCATIONS,
+        "one step of `SELECT 1` made {trivial_allocations} allocation(s) against a bound of {STEP_ALLOCATIONS}"
     );
 }

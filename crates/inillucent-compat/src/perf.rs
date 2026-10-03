@@ -32,6 +32,8 @@
 
 use std::fmt::Write as _;
 
+pub mod hillclimb;
+
 use inillucent_base::rng::Rng;
 
 /// The plan format version, written into the file both engines read.

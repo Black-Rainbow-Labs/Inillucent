@@ -438,8 +438,24 @@ impl PagedTree {
         high_inclusive: bool,
         visit: &mut dyn FnMut(&LeafRef<'_>, usize, usize) -> DbResult<bool>,
     ) -> DbResult<()> {
-        let from = high.map(|values| self.encode_key(values));
-        let mut first = true;
+        // **An inclusive bound descends past every key it prefixes (task-2175).**
+        // Descending to `enc(high)` lands on the leaf where the run equal to
+        // `high` *starts*. On an index `high` is always a prefix of the key,
+        // since the rowid follows it, so when the run spans leaves the walk
+        // started left of its newest entries and never saw them:
+        // `WHERE grp = 26 ORDER BY created DESC LIMIT 20` returned 20 rows
+        // from the middle of the group after 20,000 inserts in batches.
+        // `enc(high)` followed by 0xFF bytes sorts after every key that starts
+        // with `enc(high)`: an ascending column's class byte is at most 0x03,
+        // and a descending NULL is 0xFF, so the suffix is long enough for
+        // that many descending NULL columns in a row.
+        let from = high.map(|values| {
+            let mut key = self.encode_key(values);
+            if high_inclusive {
+                key.extend_from_slice(&[0xFF; 32]);
+            }
+            key
+        });
         self.visit_reverse(pool, from.as_deref(), &mut |leaf| {
             let rows = leaf.row_count();
             // **Both bounds, on every leaf, exactly as the forward walk applies
@@ -457,16 +473,16 @@ impl PagedTree {
             // exclusive means before it - which is `upper_bound` and
             // `lower_bound` respectively, the same pair the forward walk uses
             // and in the same roles.
-            let end = if first {
-                match high {
-                    Some(values) if high_inclusive => upper_bound(leaf, values)?,
-                    Some(values) => lower_bound(leaf, values)?,
-                    None => rows,
-                }
-            } else {
-                rows
+            //
+            // The upper bound is applied on every leaf, not only the first:
+            // the descent can land on a leaf right of the bound, and the leaf
+            // left of it can still hold keys above the bound. On a leaf wholly
+            // below the bound it is one binary search that returns `rows`.
+            let end = match high {
+                Some(values) if high_inclusive => upper_bound(leaf, values)?,
+                Some(values) => lower_bound(leaf, values)?,
+                None => rows,
             };
-            first = false;
             let end = end.min(rows);
             // An exclusive lower bound starts past the run equal to it, so it
             // is an upper bound on the same key.
@@ -530,7 +546,8 @@ impl PagedTree {
             return Ok(None);
         }
         let key = self.encode_key_small(probe);
-        let (guard, _) = self.descend_guard(pool, key.as_slice())?;
+        let (guard, page) = self.descend_guard(pool, key.as_slice())?;
+        self.last_leaf.set(Some(page));
         let leaf = LeafRef::parse(&guard)?
             .with_collations(&self.collations)
             .with_directions(&self.directions);

@@ -338,6 +338,14 @@ impl ColumnInfo {
     /// reference about what an affinity is. What the declaration buys is the
     /// width check on write, and a column an index can be built over.
     pub fn vector_dimensions(&self) -> Option<usize> {
+        // **The common answer before any allocation (task-2175).** The write
+        // path asks this of every column of every row it writes, and lowering
+        // the whole declared type first was an allocation per column per row:
+        // 4% of an `UPDATE` of 100,000 rows, for columns declared `TEXT`.
+        let head = self.declared_type.get(..6)?;
+        if !head.eq_ignore_ascii_case(b"vector") {
+            return None;
+        }
         let declared = self.declared_type.to_ascii_lowercase();
         let rest = declared.strip_prefix(b"vector".as_slice())?;
         let inside: Vec<u8> = rest

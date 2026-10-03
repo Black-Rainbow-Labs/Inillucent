@@ -1292,13 +1292,59 @@ impl PagedTree {
         log: &mut dyn TreeLog,
         key: &[Datum<'_>],
     ) -> DbResult<Option<Vec<OwnedDatum>>> {
+        self.delete_near(database, log, key, &mut None)
+    }
+
+    /// Deletes one row by key, looking first in the leaf the last delete used.
+    ///
+    /// **A statement that deletes many rows hands its keys over in the tree's
+    /// order (task-2175)**, so the next key is nearly always in the leaf the
+    /// last one was. Each delete used to descend from the root, read the row,
+    /// then search the leaf for the same key twice more, and build the path
+    /// from the root whether or not anything would need it: 2.45 microseconds
+    /// a row for `DELETE FROM t WHERE id BETWEEN ...` over 40,000 rows, where
+    /// SQLite took 0.29.
+    ///
+    /// A key found in `near` is in `near`: a key is held by one leaf of a tree
+    /// at most, so finding it there is the whole proof, and a key not found
+    /// there takes the descent it always took. `near` is checked to still be a
+    /// leaf of this tree first, because a merge can free it. The row is read
+    /// and located in one search, and that place is used for the change,
+    /// because appending the record does not change the page. The path from
+    /// the root is built only when a split or a merge needs it.
+    ///
+    /// @param database - the file, for freeing a page a merge empties
+    /// @param log - where the record goes
+    /// @param key - the key, one value per key column
+    /// @param near - the leaf to look in first; set to the leaf this delete used
+    pub fn delete_near(
+        &mut self,
+        database: &mut Database,
+        log: &mut dyn TreeLog,
+        key: &[Datum<'_>],
+        near: &mut Option<PageId>,
+    ) -> DbResult<Option<Vec<OwnedDatum>>> {
         let encoded_key = self.encode_key(key);
-        let (page, path) = self.leaf_for(database.pool(), &encoded_key)?;
-        let previous = self.row_at(database.pool(), page, key)?;
-        if previous.is_none() {
-            return Ok(None);
+        let mut found = None;
+        if let Some(page) = *near {
+            if self.is_own_leaf(database.pool(), page) {
+                found = self
+                    .row_and_place(database.pool(), page, key)?
+                    .map(|(row, located)| (page, None, row, located));
+            }
         }
-        let located = self.locate(database.pool(), page, key)?;
+        let (page, mut path, previous, located) = match found {
+            Some(found) => found,
+            None => {
+                let (page, path) = self.leaf_for(database.pool(), &encoded_key)?;
+                *near = Some(page);
+                let Some((row, located)) = self.row_and_place(database.pool(), page, key)? else {
+                    return Ok(None);
+                };
+                (page, Some(path), row, located)
+            }
+        };
+        *near = Some(page);
         if let Located::Sorted(_) = located {
             let room = database.pool().modify(page, |bytes| {
                 LeafMut::new(bytes)?.has_room_for_a_tombstone()
@@ -1310,12 +1356,17 @@ impl PagedTree {
                 // compaction hands back the whole delta area. Said here rather
                 // than recursed on, because `make_room` answering `false`
                 // twice is what an infinite recursion looks like from outside.
+                let path = match path.take() {
+                    Some(path) => path,
+                    None => self.leaf_for(database.pool(), &encoded_key)?.1,
+                };
                 if !self.make_room(database, log, page, &path, None, 0)? {
                     return Err(corrupt(
                         "a leaf has no room for a tombstone and cannot be split",
                     ));
                 }
-                return self.delete(database, log, key);
+                *near = None;
+                return self.delete_near(database, log, key, near);
             }
         }
         // The key goes into the record as **tagged values**, not as the
@@ -1329,7 +1380,7 @@ impl PagedTree {
         // Recorded after the room handling, because the retry above deletes
         // again and would record the same row twice.
         if log.wants_undo() {
-            log.undo(self.tree_id(), key, previous.clone())?;
+            log.undo(self.tree_id(), key, Some(previous.clone()))?;
         }
         let mut tagged_key = Vec::new();
         for value in key.iter().take(self.key_columns()) {
@@ -1340,7 +1391,6 @@ impl PagedTree {
             page: page.0,
             key: &tagged_key,
         })?;
-        let located = self.locate(database.pool(), page, key)?;
         // A delta row's out-of-line pages are nobody's once the row is gone: a
         // tombstoned sorted row still names its extent for the next repack to
         // free, and a removed delta row names nothing at all.
@@ -1365,10 +1415,8 @@ impl PagedTree {
                     leaf.set_tombstone(row_index)?;
                 }
                 Located::Delta(index) => leaf.remove_delta(index)?,
-                // Unreachable: `previous` was `Some`, which is exactly the
-                // condition under which `locate` finds the key. Reported rather
-                // than ignored, because the two disagreeing would mean a row
-                // vanished between two reads of the same page.
+                // Unreachable: the row was read at this place, and nothing
+                // between that read and here changes the page.
                 Located::Absent => {
                     return Err(corrupt("a row that was read could not be found to delete"))
                 }
@@ -1382,8 +1430,38 @@ impl PagedTree {
         stats.deleted = stats.deleted.saturating_add(1);
         self.stats.set(stats);
         self.note_rows(-1);
+        // The path, only for a leaf that has emptied enough to merge.
+        let path = match path {
+            Some(path) => path,
+            None => {
+                let underflowed = {
+                    let guard = database.pool().fetch(page)?;
+                    underflows(&LeafRef::parse(&guard)?)?
+                };
+                if !underflowed {
+                    return Ok(Some(previous));
+                }
+                self.leaf_for(database.pool(), &encoded_key)?.1
+            }
+        };
         self.merge_if_small(database, log, page, &path)?;
-        Ok(previous)
+        Ok(Some(previous))
+    }
+
+    /// Reports whether a page is still a leaf of this tree.
+    ///
+    /// A merge frees a leaf, and the page can then belong to another tree or
+    /// be an interior page, so a leaf remembered between two deletes is checked
+    /// before it is searched.
+    ///
+    /// @param pool - the buffer pool
+    /// @param page - the page
+    fn is_own_leaf(&self, pool: &Pool, page: PageId) -> bool {
+        let Ok(guard) = pool.fetch(page) else {
+            return false;
+        };
+        page::kind_of(&guard).ok() == Some(page::PageKind::Leaf)
+            && page::tree_of(&guard).ok() == Some(self.tree_id())
     }
 
     /// Overwrites one fixed-width column of one row, in place.
@@ -1414,9 +1492,29 @@ impl PagedTree {
             // and a delete rather than an update.
             return Ok(false);
         }
-        let encoded_key = self.encode_key(key);
-        let (page, _) = self.leaf_for(database.pool(), &encoded_key)?;
-        let Located::Sorted(row_index) = self.locate(database.pool(), page, key)? else {
+        // **The leaf the read before this write found, when the key is still in
+        // it (task-2175).** Descending again from the root was a fifth of this
+        // function in a profile of a 100,000 row `UPDATE`. The page is kept only
+        // when it is still a leaf of this tree and the key is in it, which
+        // proves it is the key's leaf: a tree holds a key in one leaf at most.
+        let remembered = match self.last_leaf.get() {
+            Some(page) if self.is_own_leaf(database.pool(), page) => {
+                match self.locate(database.pool(), page, key)? {
+                    Located::Absent => None,
+                    located => Some((page, located)),
+                }
+            }
+            _ => None,
+        };
+        let (page, located) = match remembered {
+            Some(found) => found,
+            None => {
+                let encoded_key = self.encode_key(key);
+                let (page, _) = self.leaf_for(database.pool(), &encoded_key)?;
+                (page, self.locate(database.pool(), page, key)?)
+            }
+        };
+        let Located::Sorted(row_index) = located else {
             return Ok(false);
         };
         // **Costed by asking, not by writing to a copy of the page.** The page
@@ -2870,6 +2968,49 @@ impl PagedTree {
             }
             Located::Absent => Ok(None),
         }
+    }
+
+    /// Returns the row a key names in a leaf, copied out, and where it sits.
+    ///
+    /// One search for both, where reading the row and then locating it for
+    /// the change searched the leaf twice.
+    ///
+    /// @param pool - the buffer pool
+    /// @param page - the leaf
+    /// @param key - the key
+    fn row_and_place(
+        &self,
+        pool: &Pool,
+        page: PageId,
+        key: &[Datum<'_>],
+    ) -> DbResult<Option<(Vec<OwnedDatum>, Located)>> {
+        let guard = pool.fetch(page)?;
+        let leaf = LeafRef::parse(&guard)?
+            .with_collations(self.collations())
+            .with_directions(self.directions());
+        let located = self.locate_in(&leaf, key)?;
+        let values = match located {
+            Located::Sorted(row) => {
+                let held = self.read_extents_row(pool, &leaf, row)?;
+                let leaf = leaf.with_extents(&held);
+                let mut values = Vec::with_capacity(leaf.column_count());
+                for column in 0..leaf.column_count() {
+                    values.push(OwnedDatum::from_datum(&leaf.value(row, column)?));
+                }
+                values
+            }
+            Located::Delta(index) => {
+                let held = self.read_extents_delta(pool, &leaf, index)?;
+                let leaf = leaf.with_extents(&held);
+                let mut values = Vec::with_capacity(leaf.column_count());
+                for column in 0..leaf.column_count() {
+                    values.push(OwnedDatum::from_datum(&leaf.delta_value(index, column)?));
+                }
+                values
+            }
+            Located::Absent => return Ok(None),
+        };
+        Ok(Some((values, located)))
     }
 
     /// Returns where a key sits in a leaf already parsed.

@@ -307,18 +307,76 @@ time does not.
 Neither the allocator change, which took the Windows medium gate from 3.24x to 3.86x, nor any later
 change has been measured on Linux.
 
+## Through the Connection, on common and edge case workloads
+
+The headline above calls the engine's `pipeline` functions directly. An application calls
+`Connection::prepare` and `Statement::step`, and pays for the plan cache lookup, a `String` per
+result column, and the file lock a statement takes outside a transaction. `--api connection` runs
+the gate through those calls. `--plan hillclimb` replaces the contract plan with 48 workloads an
+application meets and the contract plan does not: reading right after a batch of inserts, deleting
+and refilling half a table, inserting with `RETURNING`, a recursive CTE, an `OR` of two indexed
+columns, `NOT IN` over a subquery, `LIKE '%text%'`, a `GROUP BY` with 50,000 groups, and an
+`INSERT ... SELECT` of 100,000 rows.
+
+```sh
+inillucent-fullgate medium.db --plan hillclimb --api connection --rounds 10 --samples hc.samples
+inillucent-fullgate medium.db --api connection --rounds 10 --samples cc.samples
+node tools/perf-hillclimb/score.mjs --base before.samples --cand after.samples
+```
+
+A third of the workloads, chosen by a hash of the name, are a test set. A change was kept only when
+it made the other two thirds faster and did not make the test third slower, so a change that helps
+only the workload it was written for shows up as a test set that did not move.
+
+Measured on 3 October 2026, ten rounds each, on the machine in the summary. The rows are the
+geometric mean of each set's ratios, where above 1.00x is faster than SQLite.
+
+| Plan, through the Connection | Before | After |
+|---|---|---|
+| hillclimb plan, 28 train workloads | 0.85x | **1.30x** |
+| hillclimb plan, 20 test workloads | 0.67x | **1.15x** |
+| hillclimb plan, peak resident memory of one round | 100.96 MiB (SQLite 38.30) | 82.82 MiB (SQLite 38.27) |
+| hillclimb plan, processor time of one round | 3,906 ms (SQLite 1,820) | 1,750 ms (SQLite 1,891) |
+| contract plan, weighted over the ten families | 1.94x | **2.37x** |
+
+The contract plan through the pipeline read 5.12x before and 5.10x after.
+
+The workloads that moved most:
+
+| Workload | Before | After | What changed |
+|---|---|---|---|
+| `edge.or.two.indexes` | 0.002x | 1.58x | an `OR` whose every arm can use an index reads each arm's index and then each row once, shown as `MULTI-INDEX OR` |
+| `edge.not.in` | 0.005x | 1.11x | `IN` and `NOT IN` over 8 or more constants, written out or from a subquery, are answered by a binary search |
+| `prepare.trivial`, contract plan | 0.05x | 1.98x | a statement that reads no table and calls no registered function takes no file lock |
+| `ai.build` | 0.35x | 1.20x | the next rowid is read from the last row of the rightmost leaf instead of from every live row in it |
+| `app.cte.recursive` | 0.15x | 0.46x | a recursive CTE prepares its step once and runs it on each pass |
+| `edge.like.contains` | 0.33x | 0.85x | `LIKE` with no `ESCAPE` compares text in place |
+| `edge.group.high` | 0.24x | 0.45x | a hash `GROUP BY` keeps each group's position in the map and its accumulators in one vector |
+| `app.upsert.counter` | 0.94x | 2.29x | an `UPDATE` uses the leaf the read before it found |
+
+Five workloads are still under 0.5x: `ai.copy` (0.22x), `edge.delete.range` (0.18x),
+`churn.delete.half` (0.26x), `edge.update.all` (0.28x) and `app.insert.returning` (0.35x). Each
+writes many rows, and each logs a page image for every leaf it changes where SQLite logs less.
+
+The three workloads bound by `fsync` (`txn.autocommit`, `txn.batched` and
+`write.insert.autocommit`) read slower in the after run than in the before run. SQLite's own time
+for them rose 3.3x to 5.6x between the two runs. Run again back to back on the same disk, the build
+before these changes and the build after them read the same: `txn.autocommit` 1.06x and 1.03x,
+`write.insert.autocommit` 3.12x and 3.15x.
+
 ## What this page does not measure
 
-- **The API an application uses.** The gate calls the engine's `plan`, `prepare` and `pipeline`
-  functions directly. It never calls `Database::open`, never opens a `Connection` and never steps a
-  `Statement`. So no figure here includes the plan cache lookup, the parameter count, a `String` per
-  result column per execution, the dirty frame walk on release, or the file lock a statement takes
-  outside a transaction under `locking_mode = normal`. `inillucent-fullgate --api connection` drives
-  `Connection::prepare` and `Statement::step`. `--api both` runs the two in the same round, so the
-  difference is paired. `inillucent-prepareperf` measures the lock cost: `SELECT 1` once cost 132,884
-  ns outside a transaction against 1,126 ns inside one, on the same connection and file, and costs
-  10,095 against 727 now. Both readings were taken on a busy machine, so the ratio between them is
-  the result and the nanoseconds are not.
+- **The API an application uses, in the headline.** The headline calls the engine's `plan`,
+  `prepare` and `pipeline` functions directly. It never calls `Database::open`, never opens a
+  `Connection` and never steps a `Statement`. So no headline figure includes the plan cache lookup,
+  the parameter count, a `String` per result column per execution, the dirty frame walk on release,
+  or the file lock a statement takes outside a transaction under `locking_mode = normal`.
+  [Through the Connection](#through-the-connection-on-common-and-edge-case-workloads) has the gate
+  run through `Connection::prepare` and `Statement::step` with `--api connection`. `--api both`
+  runs the two in the same round, so the difference is paired. `inillucent-prepareperf` measures
+  the lock cost: `SELECT 1` once cost 132,884 ns outside a transaction against 1,126 ns inside one,
+  on the same connection and file. A statement that reads no table now takes no lock, so
+  `SELECT 1` no longer shows that cost; a statement that reads a table still pays it.
 - **A table larger than the page pool.** Every family here fits in the pool.
   `story_large_table_nightly` in the `nightly` test tier builds a table larger than the pool, then
   scans, sorts and deletes half of it.

@@ -385,7 +385,18 @@ struct ExtractCache {
     document: Option<(Vec<u8>, json::Node)>,
     /// The last path seen, and the steps it parsed to.
     steps: Option<(Vec<u8>, Vec<json::path::Step>)>,
+    /// How many calls in a row asked about a document other than the held one.
+    ///
+    /// **A column of distinct documents misses every row (task-2175).** Each
+    /// miss copied the document twice, once to parse and once to keep, and
+    /// freed the tree it replaced: `json_extract(body, '$.k') = ?` over 5,000
+    /// rows spent 43% of its time in the system heap. After a few misses in a
+    /// row the document is parsed where it lies and not kept.
+    misses: u32,
 }
+
+/// How many misses in a row stop the cache keeping documents.
+const EXTRACT_MISSES_BEFORE_PASSING: u32 = 4;
 
 /// One argument of a JSON call.
 enum JsonOperand {
@@ -495,6 +506,26 @@ impl JsonCall {
                 return Ok(None);
             };
             held.steps = Some((path.to_vec(), json::path::parse(text)?));
+        }
+        if held.document.as_ref().map(|(seen, _)| seen.as_slice()) == Some(document) {
+            held.misses = 0;
+        } else {
+            held.misses = held.misses.saturating_add(1);
+        }
+        // Every 64th miss is still kept, so a column whose documents start
+        // repeating finds the cache again.
+        if held.misses >= EXTRACT_MISSES_BEFORE_PASSING && held.misses % 64 != 0 && !blob {
+            // Parsed from the bytes where they lie, answered, and dropped.
+            let Ok(text) = std::str::from_utf8(document) else {
+                return Err(json::malformed());
+            };
+            let node = json::parse::parse(text)
+                .map_err(|_| json::malformed())?
+                .node;
+            let Some((_, steps)) = held.steps.as_ref() else {
+                return Ok(None);
+            };
+            return Ok(Some(json::extract_parsed(&node, steps, binary)?));
         }
         if held.document.as_ref().map(|(seen, _)| seen.as_slice()) != Some(document) {
             let owned = if blob {
@@ -1033,6 +1064,19 @@ impl Eval for Pattern {
             }
             None => None,
         };
+        // **Text against text needs no copy, and the common shapes no matcher
+        // (task-2175).** Copying both sides into owned values for every row was
+        // nearly half of `label LIKE '%9 lorem%'` over 100,000 rows, and the
+        // general matcher most of the rest. See `like_shape`.
+        if let (PatternKind::Like, None, Datum::Text(subject), Datum::Text(written)) =
+            (self.kind, &escape, operand.get(), pattern.get())
+        {
+            if let Some(matched) = like_shape(written, subject, !self.case_sensitive) {
+                return Ok(Computed::Borrowed(Datum::Int(i64::from(
+                    matched != self.negated,
+                ))));
+            }
+        }
         let subject = eval::text_bytes(&Value::from(&operand.get()).into_owned()?, ENCODING);
         let pattern_bytes = eval::text_bytes(&Value::from(&pattern.get()).into_owned()?, ENCODING);
         let matched = match self.kind {
@@ -1050,11 +1094,131 @@ impl Eval for Pattern {
     }
 }
 
+/// Answers a `LIKE` with no `ESCAPE` whose pattern is one of four common shapes, or `None`.
+///
+/// The shapes are a literal, `literal%`, `%literal` and `%literal%`, where the
+/// literal holds no `%` and no `_`; a pattern of nothing but `%` matches any
+/// text. Every other pattern, and any text holding a NUL, returns `None` and
+/// goes to the general matcher.
+/// Letters are compared without regard to case when `fold` is set, and only
+/// ASCII letters, which is SQLite's rule without ICU: a byte of a multi byte
+/// UTF-8 character is never an ASCII letter, so folding byte by byte folds
+/// exactly the characters SQLite folds.
+///
+/// @param pattern - the pattern's text
+/// @param subject - the text being matched
+/// @param fold - whether ASCII letters match regardless of case
+pub(crate) fn like_shape(pattern: &[u8], subject: &[u8], fold: bool) -> Option<bool> {
+    // SQLite reads a pattern and a subject as C strings, so each ends at its
+    // first NUL: `'a' LIKE ('a' || x'00' || 'zz')` is 1. The general matcher
+    // keeps that rule, and text holding a NUL goes to it.
+    if pattern.contains(&0) || subject.contains(&0) {
+        return None;
+    }
+    if pattern.iter().all(|byte| *byte == b'%') && !pattern.is_empty() {
+        return Some(true);
+    }
+    let leading = pattern.first() == Some(&b'%');
+    let trailing = pattern.len() > 1 && pattern.last() == Some(&b'%');
+    let from = usize::from(leading);
+    let to = pattern.len().saturating_sub(usize::from(trailing));
+    let literal = pattern.get(from..to)?;
+    if literal.iter().any(|byte| *byte == b'%' || *byte == b'_') {
+        return None;
+    }
+    let same = |left: &[u8], right: &[u8]| {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(a, b)| a == b || (fold && a.eq_ignore_ascii_case(b)))
+    };
+    Some(match (leading, trailing) {
+        (false, false) => same(literal, subject),
+        (false, true) => subject
+            .get(..literal.len())
+            .is_some_and(|head| same(literal, head)),
+        (true, false) => subject
+            .len()
+            .checked_sub(literal.len())
+            .and_then(|at| subject.get(at..))
+            .is_some_and(|tail| same(literal, tail)),
+        (true, true) => {
+            literal.is_empty()
+                || subject
+                    .windows(literal.len())
+                    .any(|window| same(literal, window))
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::batch::Vector;
     use crate::expr::{compile, Expr, StaticType};
+
+    /// The `LIKE` shortcut answers what the general matcher answers, for every shape it takes.
+    #[test]
+    fn like_shapes_agree_with_the_matcher() {
+        let patterns: [&[u8]; 18] = [
+            b"",
+            b"%",
+            b"%%",
+            b"abc",
+            b"ABC",
+            b"abc%",
+            b"%abc",
+            b"%abc%",
+            b"%B%",
+            b"a%",
+            b"%c",
+            b"%9 lorem%",
+            b"%\xc3\xa9%",
+            b"\xc3\x89t\xc3\xa9",
+            b"%a_c%",
+            b"a%c",
+            b"_",
+            b"%%a",
+        ];
+        let subjects: [&[u8]; 10] = [
+            b"",
+            b"abc",
+            b"ABC",
+            b"xabcx",
+            b"aBc",
+            b"row 19 lorem ipsum",
+            b"\xc3\xa9t\xc3\xa9",
+            b"\xc3\x89t\xc3\xa9",
+            b"a",
+            b"cab",
+        ];
+        for fold in [true, false] {
+            for pattern in patterns {
+                for subject in subjects {
+                    let general = pattern::like_folding(pattern, subject, None, fold);
+                    if let Some(short) = like_shape(pattern, subject, fold) {
+                        assert_eq!(short, general, "{pattern:?} LIKE {subject:?}, fold {fold}");
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            like_shape(b"%a_c%", b"abc", true),
+            None,
+            "an underscore goes to the matcher"
+        );
+        assert_eq!(
+            like_shape(b"a\x00zz", b"a", true),
+            None,
+            "a NUL goes to the matcher"
+        );
+        assert_eq!(
+            like_shape(b"a%", b"a\x00b", true),
+            None,
+            "a NUL goes to the matcher"
+        );
+    }
 
     /// Returns a one-row batch over the given values.
     fn one_row<'p>(values: &[Datum<'p>]) -> Batch<'p> {

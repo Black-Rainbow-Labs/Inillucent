@@ -2332,6 +2332,14 @@ kind = "test"
 name = "edges"
 tier = "e2e"
 
+# Wrong answers the performance hill climb plan found (task-2175): a backward
+# walk of an index prefix that spans leaves, and an OFFSET over a parameter.
+[[target]]
+package = "inillucent"
+kind = "test"
+name = "hillclimb_answers"
+tier = "e2e"
+
 # Nikaya's startup, against populated tables, at every arm (task-2036). The
 # escape it is shaped around answered `count(*)` correctly while the table it
 # corrupted was unreadable, so the story reads every column of every row back

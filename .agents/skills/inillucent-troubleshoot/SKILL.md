@@ -180,6 +180,9 @@ command prints `SEARCH n USING INDEX n_k (k=?)`, which means the engine uses the
 | gather the statistics the query planner reads | `inillucent --db app.rdb analyze` |
 | the query plan | `inillucent --db app.rdb explain "<SQL>"` |
 
+An `OR` uses an index only when every arm of it can: `WHERE a = 1 OR b = 2` prints `MULTI-INDEX OR`
+and reads a few rows when both `a` and `b` are indexed, and scans the table when one of them is not.
+
 Two things cost more than they appear to:
 
 - **`--limit` does not make a query cheaper.** The engine computes the whole result, so `total` is

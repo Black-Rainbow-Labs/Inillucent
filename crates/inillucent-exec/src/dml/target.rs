@@ -815,23 +815,13 @@ fn largest_key(tree: &PagedTree, pool: &Pool) -> DbResult<i64> {
 /// Returns the largest integer key a leaf holds live, or `None` when it holds
 /// no live row.
 ///
-/// `visit_live` merges the sorted region and the delta area and reads only the
-/// key column; the rows it visits are not in key order, so this takes the
-/// maximum rather than the last. See [`largest_key`] for why only the key.
+/// The last live row of the sorted region and the largest delta key, rather
+/// than every live row of the leaf (task-2175). See
+/// `LeafRef::largest_live_int_key` for why the two are enough.
 ///
 /// @param leaf - the leaf
 fn largest_in_leaf(leaf: &LeafRef<'_>) -> DbResult<Option<i64>> {
-    let mut largest: Option<i64> = None;
-    leaf.visit_live(&[0], &mut |values| {
-        if let Some(Datum::Int(number)) = values.first() {
-            largest = Some(match largest {
-                Some(held) if held >= *number => held,
-                _ => *number,
-            });
-        }
-        Ok(())
-    })?;
-    Ok(largest)
+    leaf.largest_live_int_key()
 }
 
 /// What every row a statement writes is written under.

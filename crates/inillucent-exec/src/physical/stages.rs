@@ -228,6 +228,11 @@ pub enum Source<'t> {
     /// keeps their combined output in the composite key's order - what
     /// `AccessKind::RangeUnion` runs.
     RangeUnion(Vec<SpanScan<'t>>),
+    /// The rows the arms of an `OR` reach, read by rowid once each - what
+    /// `AccessPath::OrUnion` runs. The rowids the rowid arms name are already
+    /// evaluated; each index arm is a range of its index whose entries end in
+    /// the rowid, walked when the source runs because that needs the pool.
+    OrUnion(PointProbe<'t>, Vec<Vec<OwnedDatum>>, Vec<SpanScan<'t>>),
     /// The rows an index a module owns named, by rowid, in its order.
     Vector(PointProbe<'t>, Vec<i64>),
     /// Rows a nested query produced, already materialised.
@@ -357,6 +362,11 @@ impl Source<'_> {
                 crate::ops::emit_rows(&rows, downstream)?;
                 downstream.finish()
             }
+            Source::OrUnion(probe, keys, scans) => {
+                let rows = or_union_rows(needs_pool(pool)?, probe, keys, scans)?;
+                crate::ops::emit_rows(&rows, downstream)?;
+                downstream.finish()
+            }
             Source::Vector(probe, keys) => {
                 let pool = needs_pool(pool)?;
                 // One descent per candidate, and the candidates are already the
@@ -406,12 +416,58 @@ impl Source<'_> {
             Source::Point(_, _) => "POINT PROBE",
             Source::SeekUnion(_, _) => "SEEK UNION",
             Source::RangeUnion(_) => "RANGE UNION",
+            Source::OrUnion(_, _, _) => "MULTI-INDEX OR",
             Source::Vector(_, _) => "VECTOR SEARCH",
             Source::Rows(_) => "SCAN SUBQUERY",
             Source::Virtual(_) => "SCAN VIRTUAL TABLE",
             Source::Constant(_) => "CONSTANT ROW",
         }
     }
+}
+/// Reads the rows an `OR` union reaches: every rowid its arms name, once each, in ascending order.
+///
+/// The index arms' entries end in the rowid, so the last value of each entry
+/// a scan collects is the row's key. A rowid two arms both reach is read once,
+/// which is what keeps a row matching both arms of `a = 1 OR b = 2` from
+/// coming back twice; the `OR` is tested again on every row read.
+///
+/// @param pool - the pool the trees live in
+/// @param probe - the table's point probe
+/// @param keys - the rowids the rowid arms named
+/// @param scans - one range per index arm
+fn or_union_rows(
+    pool: &Pool,
+    probe: &PointProbe<'_>,
+    keys: &[Vec<OwnedDatum>],
+    scans: &[SpanScan<'_>],
+) -> DbResult<Vec<Vec<OwnedDatum>>> {
+    let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut sink = crate::ops::CollectInto::new(std::rc::Rc::clone(&collected));
+    for scan in scans {
+        scan.run(pool, &mut sink)?;
+    }
+    let mut rowids: Vec<i64> = keys
+        .iter()
+        .filter_map(|key| match key.first() {
+            Some(OwnedDatum::Int(rowid)) => Some(*rowid),
+            _ => None,
+        })
+        .collect();
+    for entry in collected.borrow().iter() {
+        if let Some(OwnedDatum::Int(rowid)) = entry.last() {
+            rowids.push(*rowid);
+        }
+    }
+    rowids.sort_unstable();
+    rowids.dedup();
+    let mut buffer: Vec<OwnedDatum> = Vec::new();
+    let mut rows: Vec<Vec<OwnedDatum>> = Vec::with_capacity(rowids.len());
+    for rowid in rowids {
+        if probe.lookup(pool, &[Datum::Int(rowid)], &mut buffer)? {
+            rows.push(buffer.clone());
+        }
+    }
+    Ok(rows)
 }
 /// What a built plan produces, so a caller can name its columns.
 #[derive(Clone, Debug)]
@@ -799,7 +855,7 @@ fn walk_stages(
         // way at any level, one loop per branch, which is why the same SQL runs
         // on both engines while only one of them takes the fast path
         // everywhere the planner found one.
-        AccessPath::RowidSeekUnion { root, .. } => {
+        AccessPath::RowidSeekUnion { root, .. } | AccessPath::OrUnion { root, .. } => {
             if !term.outermost() {
                 return unsupported("a seek union as an inner join term");
             }

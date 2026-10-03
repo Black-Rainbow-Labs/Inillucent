@@ -242,6 +242,78 @@ pub(super) fn index_union_keys(
     Ok(seen)
 }
 
+/// Returns what an `OR` union reads: the rowids its rowid arms name, and a range per index arm.
+///
+/// Each index arm is the seek the planner chose for that arm alone, so its
+/// bounds come from [`span_bounds`] exactly as a lone seek's do, NULL keys
+/// included: an arm whose key is NULL reaches no row and is left out. An
+/// equality `IndexSeekUnion` arm is one range per value, the ranges
+/// [`range_union_bounds`] builds for it. Every scan projects the whole entry,
+/// and the caller reads the rowid from its last value.
+///
+/// @param arms - the arms, each a seek
+/// @param table - the table every arm reads
+/// @param catalog - where the index trees come from
+/// @param space - the joined column space
+/// @param params - the bound parameters
+pub(super) fn or_union_parts<'t>(
+    arms: &[AccessPath],
+    table: &TableInfo,
+    catalog: &'t dyn TreeCatalog,
+    space: &Space<'_>,
+    params: &Params,
+) -> DbResult<(Vec<Vec<OwnedDatum>>, Vec<SpanScan<'t>>)> {
+    let mut keys: Vec<Vec<OwnedDatum>> = Vec::new();
+    let mut scans: Vec<SpanScan<'t>> = Vec::new();
+    for arm in arms {
+        match arm {
+            AccessPath::RowidSeek { key, .. } => keys.push(vec![constant_value(
+                key,
+                space,
+                params,
+                Some(Affinity::Integer),
+            )?]),
+            AccessPath::RowidSeekUnion { keys: listed, .. } => {
+                keys.extend(rowid_union_keys(listed, space, params)?);
+            }
+            AccessPath::IndexSeek { index_root, .. } => {
+                let tree = index_tree(catalog, *index_root)?;
+                let bounds = span_bounds(arm, table, space, params)?;
+                if bounds.matches_nothing {
+                    continue;
+                }
+                scans.push(SpanScan::new(
+                    tree,
+                    Projection::all(tree.columns().len()),
+                    bounds.low,
+                    bounds.low_inclusive,
+                    bounds.high,
+                    bounds.high_inclusive,
+                ));
+            }
+            AccessPath::IndexSeekUnion { index_root, .. } => {
+                let tree = index_tree(catalog, *index_root)?;
+                let projection = Projection::all(tree.columns().len());
+                scans.extend(range_union_bounds(
+                    tree, projection, arm, table, space, params,
+                )?);
+            }
+            _ => return Err(misuse("an OR union arm that is not a seek")),
+        }
+    }
+    Ok((keys, scans))
+}
+
+/// Returns an index's tree from the catalog, or the refusal a missing one is.
+///
+/// @param catalog - where the trees come from
+/// @param root - the index's root page
+fn index_tree(catalog: &dyn TreeCatalog, root: u32) -> DbResult<&PagedTree> {
+    catalog
+        .tree(root)
+        .ok_or_else(|| misuse(format!("no tree imported for index root page {root}")))
+}
+
 /// Returns the range scans a keyset-range union runs, in the order the
 /// branches were built.
 ///

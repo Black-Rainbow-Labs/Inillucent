@@ -95,9 +95,15 @@ impl crate::ImportedDatabase {
         // first statement writes look like one that read first, and those are
         // refused when another process committed in between rather than made
         // to wait.
+        //
+        // **Neither does a query that reads nothing from the file (task-2175).**
+        // `SELECT 1` and `SELECT json_extract(?1, '$.a')` paid the shared lock
+        // and the checks for another process's commit, seven system calls on
+        // Windows, for a statement that never looks at a page. SQLite takes
+        // no lock for them either. See `lockless`.
         let lockless = self.writing.batch().is_none()
             && self.writing.running() == 0
-            && begins_without_a_lock(cached);
+            && (begins_without_a_lock(cached) || super::lockless::reads_no_file(cached));
         if !lockless {
             self.enter(writing)?;
         }

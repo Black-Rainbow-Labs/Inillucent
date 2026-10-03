@@ -862,6 +862,23 @@ fn in_list(
     collation: Collation,
     types: &[StaticType],
 ) -> DbResult<Box<dyn Eval>> {
+    // **A long list of constants is searched, not walked (task-2175).** A
+    // folded `NOT IN (SELECT ...)` arrives here as one literal per row the
+    // subquery returned, and the walk compared every outer row with every one
+    // of them. See `inset` for why the two give the same answer.
+    let constants = crate::inset::constants_of(list, |entry| match entry {
+        Expr::Literal(value) => Some(value),
+        _ => None,
+    });
+    if let Some(constants) = constants {
+        return Ok(Box::new(crate::inset::InSet::new(
+            negated,
+            compile(operand, types)?,
+            &constants,
+            affinity,
+            collation,
+        )?));
+    }
     Ok(Box::new(crate::scalar::InList {
         negated,
         operand: compile(operand, types)?,

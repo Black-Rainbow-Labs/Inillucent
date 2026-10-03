@@ -205,7 +205,7 @@ writes.
 
 | Setting | What it does |
 |---|---|
-| `locking_mode = normal` (default) | a statement takes the file lock when it starts and releases it when it ends. A read takes a shared lock. A write takes an exclusive lock. An open transaction keeps the lock from its first write to its `COMMIT` |
+| `locking_mode = normal` (default) | a statement takes the file lock when it starts and releases it when it ends. A read takes a shared lock. A write takes an exclusive lock. An open transaction keeps the lock from its first write to its `COMMIT`. A query that reads no table, such as `SELECT 1`, takes no lock |
 | `locking_mode = exclusive` | the connection keeps the lock until it closes. No other process can use the file |
 | `busy_timeout` | how long a statement waits for a lock another process holds. After 5000 milliseconds by default, the statement fails with the status `busy` |
 

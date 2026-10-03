@@ -51,6 +51,7 @@ pub mod declared;
 pub mod dml;
 pub mod expr;
 pub mod insert_plan;
+pub mod inset;
 pub mod join;
 pub mod lateral;
 pub mod ops;
