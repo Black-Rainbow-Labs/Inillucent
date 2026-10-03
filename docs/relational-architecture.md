@@ -215,11 +215,41 @@ engine does not use it between processes. There is no shared memory index a read
 process could use to find the log, so the engine holds the file lock instead. [The roadmap](roadmap.md) describes the change that would let a
 reader of another process read a snapshot while a writer works.
 
+`BEGIN` and `BEGIN DEFERRED` take no lock, which is what SQLite's do. The first statement inside the
+transaction takes the lock that statement needs: a read takes the shared lock and a write takes the
+write lock. The transaction keeps the lock it holds until `COMMIT` or `ROLLBACK`. So a reader's
+`BEGIN; SELECT ...; COMMIT` reads beside another process's open write transaction. `BEGIN IMMEDIATE`
+and `BEGIN EXCLUSIVE` take the write lock at once. A transaction that reads first and then writes is
+refused with `busy` when another process committed after its first read. Roll it back and run it
+again, or start it with `BEGIN IMMEDIATE`. Before version 2.0.8 every `BEGIN` took the write lock,
+so a read transaction failed with `busy` for as long as any other process had a transaction open.
+
 When a connection takes the lock, it checks whether another process changed the file or the log
 since it last looked. If either moved, it drops its cached pages and replays the log from the file's
 last checkpoint before it reads anything. If a rollback journal is beside the file at that moment,
 a process died while it held the lock, and the connection puts the journal's old pages back before
 it replays, as an open does.
+
+Three more moments make the same check:
+
+- **The end of an open.** An open replays the log under the shared lock and then releases the lock,
+  so the first statement takes its own lock and sees what other processes committed during the
+  open. The open writes the file itself only when the log still ends where its replay ended.
+  Before version 2.0.8 an open kept its lock, and a commit by its first statement could be appended
+  at the end of the log as the open had read it, over another process's committed records.
+- **A transaction's number.** A deferred `BEGIN` numbers its transaction before any lock is taken,
+  and the first statement's check renumbers it above every number in the log. Recovery decides
+  which records to replay by transaction number, so a reused number made the records of another
+  process's unfinished transaction look committed.
+- **A checkpoint called on the database handle.** `Database::checkpoint`, `backup_to` and an export
+  take the lock the way a statement does before they fold. Before version 2.0.8 they folded this
+  connection's pages as they stood, over another process's newer commit.
+
+A write the file system refuses, for example because the disk is full, fails its statement with the
+status `full` and poisons the connection's log for that statement. The next statement outside a
+transaction rebuilds the log from the files, so once space is free the same connection writes
+again. A file the process may not write is opened read only. Its rows can be read, and a statement
+that writes fails with the status `readonly`.
 
 A connection holding the shared lock never writes the file. A replay can change more pages than
 the pool holds, and the pool then spills them, as a writer's pool does (section 3), so the replay

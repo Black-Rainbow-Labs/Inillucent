@@ -614,14 +614,79 @@ impl crate::ImportedDatabase {
         opened.reconnect_modules()?;
         opened.rebuild_tables()?;
         opened.refresh_catalog();
-        // **The tail is given back only now, because every step above can
-        // refuse** (task-2070). See `header_accounts_for_every_object`.
-        if !read_only
-            && header_accounts_for_every_object(&opened.schema.entries, &opened.storage.database)
-        {
-            opened.storage.database.give_back_the_unclaimed_tail()?;
-        }
+        opened.finish_the_open(read_only)?;
         Ok(opened)
+    }
+
+    /// The last two steps of an open: the unclaimed tail of the file is given
+    /// back, and the lock is let go.
+    ///
+    /// **The tail is given back only now, because every step before can
+    /// refuse** (task-2070). See `header_accounts_for_every_object`.
+    ///
+    /// @param read_only - whether this connection may write the file
+    fn finish_the_open(&mut self, read_only: bool) -> DbResult<()> {
+        if !read_only
+            && header_accounts_for_every_object(&self.schema.entries, &self.storage.database)
+            && self.may_write_what_the_open_read()?
+        {
+            self.storage.database.give_back_the_unclaimed_tail()?;
+        }
+        self.let_go_after_the_open()
+    }
+
+    /// Takes the write lock for a change the open itself makes, and reports
+    /// whether what the open read is still what the file and the log hold.
+    ///
+    /// **The open read under SHARED, and another process may commit beside
+    /// SHARED (task-2173).** Giving back the tail of the file from a page count
+    /// another process has since moved would cut pages that process's commit
+    /// counts on. So the change waits for EXCLUSIVE, which no writer holds at
+    /// the same time, and then asks the same two questions a statement asks.
+    /// A refusal or a move leaves the change to a later statement, which
+    /// catches up first, and puts the lock back to SHARED.
+    fn may_write_what_the_open_read(&mut self) -> DbResult<bool> {
+        let held = self.storage.database.pool().hold_for_writing();
+        if let Err(error) = held {
+            if error.code() != inillucent_base::error::PrimaryCode::Busy {
+                return Err(error);
+            }
+            self.storage
+                .database
+                .pool()
+                .unlock(inillucent_vfs::FileLock::Shared)?;
+            return Ok(false);
+        }
+        if self.the_meta_moved()? || self.the_log_moved()? {
+            self.storage
+                .database
+                .pool()
+                .unlock(inillucent_vfs::FileLock::Shared)?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Lets the file go once the open is done, so the first statement takes
+    /// its own lock and checks for other processes' commits.
+    ///
+    /// **The open used to keep whatever lock it ended with (task-2173).** A
+    /// statement re-derives what moved only when it takes the lock, and a
+    /// statement inside a transaction only when the transaction holds none.
+    /// A deferred `BEGIN` takes no lock, so the first statement of an
+    /// application's first transaction found the open's lock still held and
+    /// trusted the open's replay. Another process had committed beside the
+    /// open's SHARED in the meantime, and the open had raised to EXCLUSIVE to
+    /// fold: the first commit was then appended at the replay's end of the
+    /// log, over the other process's committed records. The multi process
+    /// stress run lost acknowledged transactions and left indexes that
+    /// disagreed with their tables this way. A file with no path has no other
+    /// process and keeps its state.
+    fn let_go_after_the_open(&mut self) -> DbResult<()> {
+        if self.storage.path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        self.storage.database.end_access()
     }
 }
 

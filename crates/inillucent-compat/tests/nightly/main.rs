@@ -19,4 +19,5 @@
 mod matrix;
 mod matrix_random;
 mod release_format_history;
+mod storm_nightly;
 mod story_large_table_nightly;

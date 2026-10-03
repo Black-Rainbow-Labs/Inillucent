@@ -201,6 +201,38 @@ fn there_is_a_database_at(path: &Path) -> DbResult<bool> {
     }
 }
 
+/// Opens a database read only after an open for writing was refused permission,
+/// or returns the refusal.
+///
+/// **A file this process may not write is opened read only, which is what
+/// SQLite does (task-2173).** A database on read only media, copied out of a
+/// backup with its read only attribute, or owned by another account was
+/// refused outright: `inillucent --db x.rdb query "SELECT 1"` failed with
+/// `could not open ...: access permission denied`, status `invalid_state`,
+/// although nothing asked to write. Reading works now, and a statement that
+/// writes is refused with status `readonly`, which names the cause. Only a
+/// refused permission is retried: any other failure, and a read only open that
+/// fails too, reports the error the open for writing gave, so a path outside
+/// `--root` keeps its own refusal.
+///
+/// @param error - why the open for writing failed
+/// @param vfs - the file system the database lives on
+/// @param path - the database file
+/// @param page_size - the page size to build at, or the one the file has
+/// @param frames - how many frames the buffer pool holds
+fn opened_read_only_instead(
+    error: inillucent_base::error::DbError,
+    vfs: std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    path: &Path,
+    page_size: usize,
+    frames: usize,
+) -> DbResult<ImportedDatabase> {
+    if error.code() != inillucent_base::error::PrimaryCode::Perm {
+        return Err(error);
+    }
+    ImportedDatabase::open_as(vfs, path.to_path_buf(), page_size, frames, true).map_err(|_| error)
+}
+
 /// Runs an open that waits up to `millis` for a lock another process holds.
 ///
 /// Every open function here reads the file under a lock before a connection
@@ -375,7 +407,16 @@ impl Database {
         let explain = |error| crate::encryption::explain_a_wrong_key(error, keyed);
         let engine = match (exists, read_only) {
             (true, false) => {
-                ImportedDatabase::open_on(vfs, path.clone(), page_size, frames).map_err(explain)?
+                match ImportedDatabase::open_on(
+                    std::sync::Arc::clone(&vfs),
+                    path.clone(),
+                    page_size,
+                    frames,
+                ) {
+                    Ok(engine) => engine,
+                    Err(error) => opened_read_only_instead(error, vfs, &path, page_size, frames)
+                        .map_err(explain)?,
+                }
             }
             (true, true) => ImportedDatabase::open_as(vfs, path.clone(), page_size, frames, true)
                 .map_err(explain)?,

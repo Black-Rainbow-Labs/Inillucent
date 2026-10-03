@@ -465,11 +465,17 @@ pub fn batch(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fa
         .connection()
         .total_changes()
         .map_err(|error| Failed::from_engine(&error))?;
+    // **`BEGIN` and `COMMIT` keep the engine's error too (task-2173).** They
+    // went through `Shell::execute` and every failure was labelled `syntax`,
+    // so a `COMMIT` refused because another process held the file came back
+    // as a syntax error with exit code 1, and a script could not tell it to
+    // retry.
     if !joined {
         context
             .shell()
-            .execute("BEGIN")
-            .map_err(|message| Failed::said(Status::Syntax, message))?;
+            .connection()
+            .execute_batch("BEGIN")
+            .map_err(|error| Failed::from_engine(&error))?;
     }
     // **The engine's error is kept, so its status reaches the caller.** This
     // went through `Shell::execute`, which returns the error's text alone, and
@@ -498,8 +504,9 @@ pub fn batch(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fa
     if !joined {
         context
             .shell()
-            .execute("COMMIT")
-            .map_err(|message| Failed::said(Status::Syntax, message))?;
+            .connection()
+            .execute_batch("COMMIT")
+            .map_err(|error| Failed::from_engine(&error))?;
     }
     let after = context
         .shell()
@@ -1257,10 +1264,13 @@ pub fn analyze(context: &mut Context, arguments: &Arguments) -> Result<Outcome, 
         Some(name) => format!("ANALYZE {}", quoted(name)),
         None => "ANALYZE".to_string(),
     };
+    // The engine's error, so a refusal because another process holds the file
+    // is `busy` and not `syntax` (task-2173).
     context
         .shell()
-        .execute(&sql)
-        .map_err(|message| Failed::said(Status::Syntax, message))?;
+        .connection()
+        .execute_batch(&sql)
+        .map_err(|error| Failed::from_engine(&error))?;
     Ok(Outcome::said("analyze", "ok. sqlite_stat1 is up to date."))
 }
 

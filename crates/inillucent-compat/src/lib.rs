@@ -30,6 +30,9 @@
 // Which processors a measurement runs on, and pinning both arms of a gate to
 // one core class (task-2085).
 pub mod affinity;
+// The seeded workload several processes run at once, with readers checking it
+// while it runs and a checker grading it afterwards (task-2173).
+pub mod chaos;
 pub mod cliproc;
 pub mod corpus;
 pub mod crashcampaign;
@@ -72,6 +75,8 @@ pub mod slt;
 // (task-2135's design, built in task-2137).
 pub mod statement_matrix;
 pub mod stories;
+// Several chaos processes on one file, killed at random, and graded (task-2173).
+pub mod storm;
 // Running one child and knowing when to stop waiting for it. `Command::output`
 // waits for the child's pipes to close rather than for the child to exit, which
 // are different events as soon as anything inherits a handle - and the runner

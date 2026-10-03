@@ -164,6 +164,13 @@ path = "src/bin/vectorprobe.rs"
 name = "inillucent-childcost"
 path = "src/bin/childcost.rs"
 
+# One process of a multi process run: a worker, a reader or the checker
+# (task-2173). The durability suites start several of these at once and kill
+# them at random.
+[[bin]]
+name = "inillucent-chaos"
+path = "src/bin/chaos.rs"
+
 [[bin]]
 name = "inillucent-exprperf"
 path = "src/bin/exprperf.rs"

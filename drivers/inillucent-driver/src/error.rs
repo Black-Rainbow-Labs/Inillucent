@@ -203,6 +203,13 @@ impl Error {
             (None, None, PrimaryCode::IoErr) | (None, None, PrimaryCode::CantOpen) => Status::Io,
             (None, None, PrimaryCode::Full) => Status::Full,
             (None, None, PrimaryCode::TooBig) => Status::TooBig,
+            // **Out of memory is a limit, and it was reported as `syntax`
+            // (task-2173).** With no arm here it fell through to the last one,
+            // so an open whose replay could not find a free frame told the
+            // caller its SQL was wrong. The pool's refusals under this code
+            // are limits a caller can lift - a transaction may not dirty more
+            // pages than the pool holds - which is what `TooBig` says.
+            (None, None, PrimaryCode::NoMem) => Status::TooBig,
             (None, None, PrimaryCode::Internal) => Status::Internal,
             // **A path a confined process may not reach** (task-2066 section
             // 4.2, item 27). `inillucent-vfs`'s `confine` refuses with
@@ -299,6 +306,19 @@ mod tests {
         assert_eq!(error.status, Status::InvalidState);
         assert_eq!(error.message, said);
         assert_eq!(error.feature, None, "it is refused, it is not unbuilt");
+    }
+
+    /// **Out of memory is `too_big`, and it used to be `syntax` (task-2173).**
+    /// The open of a file whose log held more pages than a small pool could
+    /// hold failed with the pool's out of memory refusal, and the caller was
+    /// told its SQL was wrong.
+    #[test]
+    fn out_of_memory_is_too_big_and_not_a_syntax_error() {
+        let said = "every frame in the buffer pool is pinned; nothing can be evicted";
+        let engine = DbError::primary(PrimaryCode::NoMem).with_message(said);
+        let error = Error::from_engine(&engine, false);
+        assert_eq!(error.status, Status::TooBig);
+        assert_eq!(error.message, said);
     }
 
     /// A component this machine has not got is its own status, and it is not

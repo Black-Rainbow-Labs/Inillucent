@@ -32,15 +32,18 @@ impl crate::ImportedDatabase {
         if self.writing.batch().is_some() {
             return;
         }
-        // **The file is taken here, not at the first write.** A transaction
-        // that raised its lock halfway through could be refused halfway
-        // through, with statements already applied; taking it at `BEGIN` means
-        // a transaction that starts is a transaction that can finish. It is
-        // also why this engine's transactions serialise across processes rather
-        // than overlapping: there is no shared-memory index that would let a
-        // reader follow a writer's log, and pretending otherwise is what would
-        // corrupt a file.
-        let _ = self.storage.database.begin_write_within(true);
+        // **No lock is taken here (task-2173).** This raised the file to the
+        // write lock with `begin_write_within`, and dropped both its error and
+        // its answer to "did the file move while I waited". When `BEGIN` took
+        // the write lock in `enter`, the call did nothing. Once a deferred
+        // `BEGIN` stopped doing so, it raised the lock after `enter` had decided
+        // nothing had moved, waited while another process committed and folded,
+        // and then wrote from pages and a log position that process had made
+        // stale. Its commit went into a log segment the next recovery started
+        // after, and two writer processes lost up to twelve of 120 acknowledged
+        // inserts. The first statement inside the transaction takes the lock it
+        // needs through `enter`, which re-derives what moved before it reads or
+        // writes anything.
         let txn = self.writing.next_txn();
         self.writing.set_next_txn(txn.saturating_add(1));
         self.writing.set_batch(Some(txn));
@@ -1025,7 +1028,15 @@ impl crate::ImportedDatabase {
             }
             wrote_any = true;
         }
-        if !wrote_any {
+        // **Only with the writer's slot (task-2173).** A transaction that wrote
+        // nothing may hold no more than SHARED now that `BEGIN` is deferred, and
+        // the log is shared with every other process: appending a commit record
+        // beside another process's RESERVED would write into the middle of that
+        // process's records. A transaction with no records needs no commit
+        // record, so a reader's `BEGIN; SELECT; COMMIT` writes nothing at all.
+        let may_append = self.storage.path.as_os_str().is_empty()
+            || self.storage.database.lock_level() >= inillucent_vfs::FileLock::Reserved;
+        if !wrote_any && may_append {
             self.storage.wal.commit(txn, txn)?;
             self.storage
                 .database

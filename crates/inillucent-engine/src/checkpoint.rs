@@ -211,8 +211,32 @@ impl ImportedDatabase {
     /// The log is synced *first*, so that every page about to be written is one
     /// the log has already described durably. The other order is the durability
     /// mutant the Phase 3 gate exists to kill.
+    ///
+    /// **Called between statements, it takes the lock the way a statement does
+    /// (task-2173).** A statement catches up with other processes in `enter`: it
+    /// asks whether the meta record or the log moved and replays the log when
+    /// either did. This went straight to the fold, which raised the lock to
+    /// EXCLUSIVE and wrote this connection's dirty pages into the file as they
+    /// stood. A process that committed, let another process commit on top of
+    /// it, and then asked for a checkpoint therefore wrote its older pages over
+    /// the other process's commit and moved the recovery point past the records
+    /// that described it. `process_interleavings` measured it: another
+    /// process's `DELETE` of five rows came back, and the multi process stress
+    /// run left an extent page overwritten with a leaf. `Database::checkpoint`,
+    /// `backup_to`, `export_to` and a key change all reach this from outside a
+    /// statement. Inside one, `enter` has already run and the lock is held.
     pub fn checkpoint(&mut self) -> DbResult<()> {
-        self.checkpoint_of(true)
+        let outside = self.writing.running() == 0
+            && self.writing.batch().is_none()
+            && !self.storage.read_only
+            && !self.storage.path.as_os_str().is_empty();
+        if !outside {
+            return self.checkpoint_of(true);
+        }
+        self.enter(true)?;
+        let folded = self.checkpoint_of(true);
+        let left = self.leave();
+        folded.and(left)
     }
 
     /// Writes every dirty page and advances the log's recovery point, doing as much

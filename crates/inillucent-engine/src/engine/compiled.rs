@@ -64,7 +64,20 @@ impl crate::ImportedDatabase {
         // lets a second process have the file between statements, and what makes
         // this connection notice when one has written to it.
         let writing = Self::writes_of(cached) && !takes_no_write_lock(cached);
-        self.enter(writing)?;
+        // **A deferred `BEGIN` takes no lock at all (task-2173)**, which is what
+        // SQLite's does. It reads and writes nothing, and the first statement
+        // inside the transaction takes the lock that statement needs, through
+        // `enter`, with every check for another process's commit. Taking SHARED
+        // here and keeping it for the transaction would make a transaction whose
+        // first statement writes look like one that read first, and those are
+        // refused when another process committed in between rather than made
+        // to wait.
+        let lockless = self.writing.batch().is_none()
+            && self.writing.running() == 0
+            && begins_without_a_lock(cached);
+        if !lockless {
+            self.enter(writing)?;
+        }
         let reads = self.session_state.nesting.get() == 0 && opens_a_transaction(cached);
         self.session_state
             .nesting
@@ -76,7 +89,9 @@ impl crate::ImportedDatabase {
         if reads && self.writing.batch().is_none() {
             self.clear_defer_foreign_keys();
         }
-        self.leave()?;
+        if !lockless {
+            self.leave()?;
+        }
         let outcome = outcome?;
         // **The cyclic half of a foreign key's action happens here**, after the
         // statement rather than inside it, because a cascade that can reach
@@ -1517,6 +1532,26 @@ fn push_value_columns<'v>(
     }
 }
 
+/// Reports whether a statement opens a transaction without taking any lock:
+/// a `BEGIN` that is not `IMMEDIATE` or `EXCLUSIVE`, and a `SAVEPOINT`, which
+/// opens one when none is open.
+///
+/// @param cached - the compiled statement
+fn begins_without_a_lock(cached: &Cached) -> bool {
+    let Cached::Ddl(sql) = cached else {
+        return false;
+    };
+    let text = sql.trim_start().to_ascii_lowercase();
+    let mut words = text
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .filter(|word| !word.is_empty());
+    match words.next() {
+        Some("begin") => !matches!(words.next(), Some("immediate") | Some("exclusive")),
+        Some("savepoint") => true,
+        _ => false,
+    }
+}
+
 /// Reports whether a directive needs only the read lock, though it is not a
 /// query.
 ///
@@ -1527,11 +1562,17 @@ fn push_value_columns<'v>(
 /// `PRAGMA` that sets or reads a setting of this connection only, such as
 /// `busy_timeout` or `foreign_keys`, needs no write lock.
 ///
-/// **A plain `BEGIN` keeps taking the write lock.** Running it under the
-/// read lock was tried: `two_writer_processes_lose_nothing_one_statement_each`
-/// then lost up to seventeen of 120 acknowledged inserts, and the cause was not
-/// traced, so the change was taken back. A `BEGIN` takes RESERVED now, so readers
-/// in other processes still read beside it.
+/// **Neither does a deferred `BEGIN`, nor the statements that end or name a
+/// point in a transaction (task-2173).** Every `BEGIN` took the write lock, so
+/// a reader's `BEGIN; SELECT ...; COMMIT` in one process failed with `busy` for
+/// as long as any other process held a transaction open. Running `BEGIN` under
+/// the read lock was tried before and lost up to seventeen of 120 acknowledged
+/// inserts in `two_writer_processes_lose_nothing_one_statement_each`. The cause
+/// was `begin_batch`, which raised the lock itself after `enter` had checked
+/// for other processes' commits and ignored what the raise found. It no longer
+/// raises anything. `BEGIN IMMEDIATE` and `BEGIN EXCLUSIVE` still take the
+/// write lock at once. A `COMMIT` or `ROLLBACK` of a transaction that wrote
+/// keeps the write lock it already holds.
 ///
 /// @param cached - the compiled statement
 fn takes_no_write_lock(cached: &Cached) -> bool {
@@ -1549,6 +1590,13 @@ fn takes_no_write_lock(cached: &Cached) -> bool {
                 .collect();
             let name = name.rsplit('.').next().unwrap_or_default();
             CONNECTION_PRAGMAS.contains(&name)
+        }
+        Some("begin") => {
+            let mode = words.find(|word| !word.is_empty());
+            !matches!(mode, Some("immediate") | Some("exclusive"))
+        }
+        Some("commit") | Some("end") | Some("rollback") | Some("savepoint") | Some("release") => {
+            true
         }
         _ => false,
     }

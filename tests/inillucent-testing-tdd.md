@@ -164,14 +164,14 @@ check a run against.
 | `unit` | 31 | 1,471 | `change` | every crate's own `#[cfg(test)]` modules |
 | `engine` | 78 | 488 | `change` | SQL and storage behaviour over real database files |
 | `differential` | 34 | 349 | `change` | graded against the pinned SQLite 3.53.4 |
-| `durability` | 37 | 245 | `merge` | crashes, injected faults, corruption and concurrency |
+| `durability` | 41 | 265 | `merge` | crashes, injected faults, corruption and concurrency |
 | `e2e` | 36 | 437 | `change` | the public surfaces an application binds to, end to end |
 | `perf` | 1 | 8 | `merge` | the cost guards — **runs alone**, see §5 |
 | `retrieval` | 12 | 570 | `change` | the embedding and retrieval engine, and its graded harness |
 | `tooling` | 18 | 153 | `change` | the checks that keep the repository's own rules true |
 | `matrix` | 24 | 187 | `change` | the SQL statement matrix: every statement form with every pair of contexts, graded against the pinned SQLite |
 | `matrix_deep` | 24 | 54 | `merge` | the statement matrix at every configuration arm, every triple of contexts, and the driver's other surfaces |
-| `nightly` | 5 | 102 | `nightly` | the long forms, run on a schedule rather than on a change |
+| `nightly` | 6 | 105 | `nightly` | the long forms, run on a schedule rather than on a change |
 
 The map that assigns them is `tests/selection.toml`, and it is data rather than
 code so that a person can read the whole arrangement in one file.
@@ -199,6 +199,8 @@ cadence column against the map as well as the target column.
 | what an application does with the public API | `crates/inillucent/tests/` — tier `e2e` |
 | **a sequence an application performs, at every configuration** | `crates/inillucent/tests/story_*.rs`, through `scenario!` — tier `e2e`, see §2.2 |
 | what survives a crash or an injected fault | `inillucent-compat/tests/durability/`, under the simulator — tier `durability` |
+| **what several processes do to one file at once** | two processes at a chosen moment in `durability/process_interleavings.rs`; many processes killed at random in `durability/process_storm.rs`, through `inillucent_compat::storm` and the `inillucent-chaos` program, with its long form in `nightly/storm_nightly.rs` |
+| **what other programs and the machine do to the files** | a copy taken during a write, a removed or foreign log segment and damage at every page in `durability/file_damage.rs`; a full disk, a read only file and unusual paths in `durability/environment.rs` |
 | **what a language binding must answer** | a case in `drivers/conformance/suite.json`, which all five runners read |
 | **what an earlier release wrote, or will read** | a fixture in `tests/interop/<version>/` — tier `e2e`, see §2.2 |
 | **a defect that escaped, and what holds it now** | a row in `tests/escapes.toml` — tier `tooling` |

@@ -138,6 +138,28 @@ pub fn admits(sql: &str) -> bool {
     }
 }
 
+/// Returns whether a statement would change the database if it ran.
+///
+/// **What the engine refuses on a connection that opened the file read only
+/// (task-2173).** [`admits`] is the command surface's filter and refuses
+/// `BEGIN` too, for the reason it gives. The engine's own check is narrower: a
+/// transaction statement changes nothing on its own, and the statements inside
+/// it are checked as they run. Without this check a connection opened read
+/// only accepted an `INSERT`, reported one row changed, and kept the row only
+/// in its own memory, so the caller believed a write had happened that no
+/// other connection would ever see.
+///
+/// @param sql - the statement, as the caller wrote it
+pub fn writes_the_file(sql: &str) -> bool {
+    match classify_statement(sql.as_bytes()) {
+        StatementClass::ReadOnly | StatementClass::Empty | StatementClass::TransactionControl => {
+            false
+        }
+        StatementClass::Pragma => !admits_pragma(sql),
+        StatementClass::Write | StatementClass::SchemaChange | StatementClass::Unknown => true,
+    }
+}
+
 /// The pragmas that write even with no argument.
 ///
 /// **The three that are verbs rather than settings.** `PRAGMA optimize` runs

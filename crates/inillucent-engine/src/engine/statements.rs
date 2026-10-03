@@ -485,8 +485,23 @@ impl ImportedDatabase {
     /// @param sql - the statement text
     /// @param params - the values bound to `?1`, `?2`, ...
     pub fn execute_any(&mut self, sql: &str, params: &Params) -> DbResult<Outcome> {
+        self.refuse_a_write_on_a_read_only_file(sql)?;
         let cached = self.compiled(sql)?;
         self.execute_compiled(&cached, params)
+    }
+
+    /// Refuses a statement that would change the file on a connection that
+    /// opened it read only. See `crate::readonly::writes_the_file`.
+    ///
+    /// @param sql - the statement text
+    fn refuse_a_write_on_a_read_only_file(&self, sql: &str) -> DbResult<()> {
+        if !self.storage.read_only || !crate::readonly::writes_the_file(sql) {
+            return Ok(());
+        }
+        Err(
+            inillucent_base::error::DbError::primary(inillucent_base::error::PrimaryCode::ReadOnly)
+                .with_message("attempt to write a readonly database"),
+        )
     }
 
     /// Compiles one statement and hands back the handle, without running it.
@@ -527,6 +542,7 @@ impl ImportedDatabase {
         statement: &Statement,
         params: &Params,
     ) -> DbResult<Outcome> {
+        self.refuse_a_write_on_a_read_only_file(&statement.sql)?;
         let held = self.current_plan(statement)?;
         self.execute_compiled(&held, params)
     }

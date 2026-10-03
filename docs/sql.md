@@ -324,7 +324,15 @@ These differences change how an application runs, and they do not show up in a p
 
 **Multiple processes.** Two processes can write the same file, one at a time. The number of rows in
 the file equals the number of commits acknowledged. `crates/inillucent-compat/tests/durability/process_concurrency.rs`
-checks this with two real writer processes.
+checks this with two real writer processes, and `crates/inillucent-compat/tests/durability/process_storm.rs`
+with four writers and two readers killed at random, graded byte for byte against what each writer
+acknowledged.
+
+**`BEGIN` is deferred, as in SQLite.** `BEGIN` and `BEGIN DEFERRED` take no lock. The first
+statement inside the transaction takes the lock it needs, so a read transaction reads beside another
+process's open write transaction. `BEGIN IMMEDIATE` and `BEGIN EXCLUSIVE` take the write lock at
+once. A transaction that reads first and then writes fails with `busy` when another process
+committed after its first read: roll it back and run it again, or start it with `BEGIN IMMEDIATE`.
 
 **A reader during a write.** A write transaction holds the RESERVED lock, which readers share, so a
 query in another process reads the last committed state while the transaction runs.

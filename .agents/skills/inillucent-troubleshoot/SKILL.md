@@ -48,14 +48,18 @@ The statuses you will see most often, each produced by the release build:
 | `syntax` | the statement is not valid SQL | `near "SELEC": syntax error` |
 | `not_found` | no such table, column, index, function or capability | `no such table: nothere` |
 | `constraint` | a constraint refused the write | `UNIQUE constraint failed: t.a` |
-| `readonly` | a write on a connection opened with `--readonly` | `'exec' changes the database, and this is read only.` |
+| `readonly` | a write on a connection opened with `--readonly`, or on a file this process may not write, which opens read only | `'exec' changes the database, and this is read only.` |
 | `busy` | another process holds the file for writing, for longer than `PRAGMA busy_timeout` | `another process holds the file for writing; ...` |
 | `corrupt` | the file is not a database, or is damaged | `database disk image is malformed` |
 | `io` | the file system refused a read or a write | |
 | `invalid_state` | a misuse the command itself refused: a file that already exists, a path outside `--root`, two statements given to `query` or `exec` | `exec runs one statement and this is several; ... Use batch` |
 
 The driver has four more statuses: `interrupted`, `full`, `too_big` and `internal`. `internal` is a
-defect in inillucent. Report it.
+defect in inillucent. Report it. `full` means the disk refused a write. The statement that met it
+failed, and the next statement on the same connection writes again once space is free. `too_big`
+also covers a page cache with no page it can give up, which a larger `PRAGMA cache_size` lifts.
+Before version 2.0.8 `inillucent batch` and `inillucent analyze` reported `busy` as `syntax`, and the
+driver reported out of memory as `syntax`.
 
 With `--output json`, a failure prints one object with these members:
 
@@ -141,6 +145,13 @@ Error [busy]: could not open "<path>": another process holds the file for writin
 
 Find the process that holds a write transaction open, and make it commit or roll back. To wait
 longer, run `PRAGMA busy_timeout = <milliseconds>` on the connection that waits.
+
+A transaction that reads first and then writes can fail with `busy` at its first write:
+`another process committed after this transaction began reading, so it cannot write`. Roll it back
+and run it again, or start it with `BEGIN IMMEDIATE`, which takes the write lock at `BEGIN`. A plain
+`BEGIN` takes no lock from version 2.0.8 on, so a read transaction no longer waits for a writer;
+before it, every `BEGIN` took the write lock and failed with `busy` beside any open write
+transaction.
 
 When the message starts `could not open`, the wait was the open's, and `PRAGMA busy_timeout` cannot
 reach it. Set `INILLUCENT_BUSY_TIMEOUT=<milliseconds>` in the environment of the process that

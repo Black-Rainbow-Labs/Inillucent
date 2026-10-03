@@ -485,6 +485,85 @@ fn replay_with_repair(
     }
 }
 
+/// Folds what an open's replay added to the file, when that is safe now.
+///
+/// **The file's own header is made to describe the file.** A transaction that
+/// grew the file and then did not become durable leaves a file longer than the
+/// meta record claims: the pool grows the file when it writes a page past the
+/// end, the meta record is written last on purpose, and the rollback journal
+/// restores a page's contents and says nothing about the file's length.
+/// Recovery has just settled what the file holds, so this is the moment the two
+/// can be made to agree. The checkpoint runs only when the count has moved, so
+/// an ordinary open of a clean file writes nothing. `durability.rs`'s
+/// `a_recovered_database_is_no_longer_than_its_header_says` measures it, at
+/// every call of a growing transaction (task-1980).
+///
+/// **Only when no other process holds the file for writing (task-2173).** The
+/// open replayed under SHARED and the fold needs EXCLUSIVE. While another
+/// process is in the middle of a write its RESERVED lock refuses the raise, and
+/// the open failed with `busy` whatever busy timeout the caller had set: the
+/// multi process stress run lost every reader and every new writer it started
+/// during a write. Waiting is not the answer, because that writer is waiting
+/// for this open's SHARED lock to go. Skipping is safe: nothing has been
+/// written when the raise is refused, every page the fold would write is in
+/// the log, and the process holding the file folds it later.
+///
+/// **And only when the log still ends where the replay ended (task-2173).**
+/// SHARED lets another process commit to the log under RESERVED while this
+/// open replays, so by the time EXCLUSIVE is granted the pages this open holds
+/// can be older than the log. Folding them, and carrying on from the replay's
+/// end, is what wrote one process's commit over another's committed records in
+/// the stress run: every later recovery stopped at the overwritten bytes, and
+/// acknowledged transactions were lost. When the log moved the fold is left to
+/// the next statement, which catches up first.
+///
+/// A refusal can come after RESERVED was granted and EXCLUSIVE was not, so the
+/// lock goes back to SHARED either way.
+///
+/// @param database - the file, just replayed
+/// @param vfs - the file system the file and its log live on
+/// @param db_path - the database file
+/// @param outcome - where the replay ended
+fn fold_what_the_replay_grew(
+    database: &mut Database,
+    vfs: &std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    db_path: &DbPath,
+    outcome: &inillucent_wal::Recovered,
+) -> DbResult<()> {
+    if database.pool().page_count() == database.meta().page_count {
+        return Ok(());
+    }
+    match database.pool().hold_for_writing() {
+        Ok(()) if the_log_ends_where_the_replay_did(vfs, db_path, database.uuid(), outcome)? => {
+            database.checkpoint()
+        }
+        Ok(()) => database.pool().unlock(inillucent_vfs::FileLock::Shared),
+        Err(error) if error.code() == inillucent_base::error::PrimaryCode::Busy => {
+            database.pool().unlock(inillucent_vfs::FileLock::Shared)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Reports whether the log on disk ends exactly where a replay stopped.
+///
+/// @param vfs - the file system the log lives on
+/// @param db_path - the database file the segments are named after
+/// @param uuid - the database's identity
+/// @param outcome - where the replay ended
+pub(crate) fn the_log_ends_where_the_replay_did(
+    vfs: &std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    db_path: &DbPath,
+    uuid: u128,
+    outcome: &inillucent_wal::Recovered,
+) -> DbResult<bool> {
+    let tail = inillucent_wal::tail_on_disk(vfs.as_ref(), db_path, uuid, outcome.sequence.max(1))?;
+    Ok(match tail {
+        Some(tail) => tail.sequence == outcome.sequence && tail.next_lsn == outcome.next_lsn,
+        None => true,
+    })
+}
+
 /// Rebuilds a connection's view of a file another process has written, without
 /// letting the file go.
 ///
@@ -727,6 +806,11 @@ pub(crate) fn open_file_as(
         error.with_detail(format!("opening the file before redo: {said}"))
     })?;
     database.refuse_a_page_count_that_cannot_be_addressed()?;
+    // **Registered before the replay (task-2173).** A replay larger than the
+    // pool evicts dirty pages, and without a spill file the pool writes them
+    // into the database file, which needs the EXCLUSIVE lock a writer in
+    // another process can refuse. See `let_the_pool_spill`.
+    let_the_pool_spill(database.pool(), vfs);
 
     // **Recovery.** The log is replayed into the file before anything is read
     // out of it, which is what makes this an open rather than a reader of
@@ -765,22 +849,10 @@ pub(crate) fn open_file_as(
     // An open replays under SHARED, so it cuts no torn tail; see `with_writer_slot`.
     let cut = || inillucent_wal::truncate_after(vfs.as_ref(), db_path, &outcome);
     database.with_writer_slot(cut)?;
-    // **And the file's own header is made to describe the file.** A
-    // transaction that grew the file and then did not become durable leaves a
-    // file longer than the meta record claims: the pool grows the file when it
-    // writes a page past the end, the meta record is written last on purpose,
-    // and the rollback journal restores a page's contents and says nothing
-    // about the file's length. Recovery has just settled what the file holds,
-    // so this is the moment the two can be made to agree - and they have to,
-    // because a header that under-counts is a file whose tail nothing will ever
-    // reclaim and nothing can account for.
-    //
-    // The checkpoint runs only when the count has moved, so an ordinary open of
-    // a clean file writes nothing. `durability.rs`'s
-    // `a_recovered_database_is_no_longer_than_its_header_says` is what measures
-    // it, at every call of a growing transaction (task-1980).
-    if !read_only && database.pool().page_count() != database.meta().page_count {
-        database.checkpoint()?;
+    // **And the file's own header is made to describe the file.** See
+    // `fold_what_the_replay_grew`.
+    if !read_only {
+        fold_what_the_replay_grew(&mut database, vfs, db_path, &outcome)?;
     }
     // **The trim that used to follow waits until the open has succeeded**
     // (task-2070). See `crate::engine::open::header_accounts_for_every_object`,

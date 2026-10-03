@@ -2111,6 +2111,17 @@ module = "story_large_table_nightly"
 tier = "nightly"
 covers = ["inillucent-pool", "inillucent-tree", "inillucent-exec", "inillucent-engine"]
 
+# The long form of process_storm: eight workers and four readers for three
+# minutes per case, including the 64 page pool, bulk and search table
+# combination that failed only together (task-2173).
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "nightly"
+module = "storm_nightly"
+tier = "nightly"
+covers = ["inillucent-driver", "inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-vfs", "inillucent-search"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"
@@ -2593,6 +2604,52 @@ covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-p
 # present must equal commits acknowledged, under both locking modes, through
 # ATTACH, and with a read only process reading a file a writer holds
 # (task-1979, section 4).
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "process_interleavings"
+tier = "durability"
+covers = ["inillucent-driver", "inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-vfs"]
+# Two processes interleaved at a chosen moment: a checkpoint, backup or export
+# called on the handle between statements, after another process committed,
+# must keep that commit (task-2173).
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "process_storm"
+tier = "durability"
+covers = ["inillucent-driver", "inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-vfs", "inillucent-search"]
+# Four workers and two readers on one file, killed at random under
+# locking_mode = normal, graded by a process that wrote nothing: the default
+# pool, no kills, a pool smaller than a transaction, the search table, and an
+# encrypted file (task-2173).
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "file_damage"
+tier = "durability"
+covers = ["inillucent-driver", "inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-cli"]
+# What other programs do to the files: a copy taken while a writer runs, a log
+# segment removed or swapped for another database's, and every page of a file
+# zeroed, flipped or cut. Each opens consistent or is refused (task-2173).
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "environment"
+tier = "durability"
+covers = ["inillucent-driver", "inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-vfs", "inillucent-sim", "inillucent-cli"]
+# The machine around a database: a disk that fills while a connection is open,
+# a file the process may not write, one file under several spellings of its
+# path, and paths that are not ASCII or are longer than 260 characters
+# (task-2173).
 
 [[target]]
 package = "inillucent-migrate"

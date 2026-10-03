@@ -114,8 +114,17 @@ impl ImportedDatabase {
                 .all(|held| held.path.is_none());
         self.storage.database.set_reserved_writes(reserved);
         let held_before = self.storage.database.lock_level();
+        // **A transaction that holds no lock yet may let go while it waits
+        // (task-2173).** `may_release` is false inside a transaction because
+        // letting go of a lock the transaction has read or written under would
+        // let another process write through the middle of it. A deferred `BEGIN`
+        // takes no lock, so the first statement inside it holds nothing, and
+        // keeping SHARED while waiting for RESERVED made a cycle with a writer
+        // that held RESERVED and waited for every SHARED to leave so it could
+        // fold: both waited out the busy timeout and one was refused.
+        let may_release = !inside || held_before == inillucent_vfs::FileLock::None;
         let reloaded = if writing {
-            self.storage.database.begin_write_within(!inside)?
+            self.storage.database.begin_write_within(may_release)?
         } else {
             self.storage.database.begin_read()?
         };
@@ -154,8 +163,19 @@ impl ImportedDatabase {
         // that has held no lock has read and written nothing under one, so there
         // is nothing of its own for a resynchronisation to throw away.
         let settles = !inside || held_before == inillucent_vfs::FileLock::None;
-        let moved =
-            reloaded || (taking && settles && (self.the_meta_moved()? || self.the_log_moved()?));
+        // **A log a failed write poisoned is rebuilt before the next statement
+        // outside a transaction (task-2173).** The poison is right for the
+        // statement that met the failure: a log that failed a write and carried
+        // on would have a durable part that is not a prefix. It was also
+        // permanent, so a connection that met a full disk once refused every
+        // statement afterwards, with space back, until it was closed. The
+        // resynchronisation rebuilds the log from the files: the failed
+        // transaction has no commit record, so recovery treats its records as
+        // unfinished, and the next write starts where the valid log ends.
+        let poisoned = !inside && self.storage.wal.is_poisoned();
+        let moved = reloaded
+            || poisoned
+            || (taking && settles && (self.the_meta_moved()? || self.the_log_moved()?));
         if moved && settles {
             self.settle_a_journal_left_by_the_dead(writing)?;
             self.resync_from_file()?;
@@ -391,6 +411,7 @@ impl ImportedDatabase {
         held.wal = wal;
         // Past every number the shared log holds - see `resync_file`.
         self.writing.raise_transactions_past(highest_txn);
+        self.renumber_an_untouched_transaction();
         Ok(())
     }
 
@@ -428,7 +449,7 @@ impl ImportedDatabase {
     /// See `Database::disk_meta`.
     ///
     /// A database with no file has no second process and answers no.
-    fn the_meta_moved(&mut self) -> DbResult<bool> {
+    pub(crate) fn the_meta_moved(&mut self) -> DbResult<bool> {
         if self.storage.path.as_os_str().is_empty() {
             return Ok(false);
         }
@@ -483,7 +504,7 @@ impl ImportedDatabase {
     ///
     /// A database with no file - `:memory:` and a temporary one - has no
     /// segment and no second process, so it answers no.
-    fn the_log_moved(&self) -> DbResult<bool> {
+    pub(crate) fn the_log_moved(&self) -> DbResult<bool> {
         if self.storage.path.as_os_str().is_empty() {
             return Ok(false);
         }
@@ -610,7 +631,35 @@ impl ImportedDatabase {
         self.storage.wal.set_synchronous(synchronous);
         // Past every number the shared log holds - see `resync_file`.
         self.writing.raise_transactions_past(highest_txn);
+        self.renumber_an_untouched_transaction();
         Ok(())
+    }
+
+    /// Gives an open transaction that has written nothing a number above every
+    /// one the log holds.
+    ///
+    /// **A deferred `BEGIN` numbers its transaction before any lock is taken
+    /// (task-2173).** The number comes from this connection's counter, and the
+    /// counter is raised past the log's numbers only by a resynchronisation,
+    /// which the first statement inside the transaction makes. So the
+    /// transaction kept a number another process had already used. Recovery
+    /// decides which records to replay by transaction number, and a `Commit`
+    /// under a reused number made the records of another process's unfinished
+    /// transaction look committed: readers in the stress run saw 31 and then 95
+    /// of the 120 rows of a transaction whose process had been killed, and the
+    /// file was left with a leaf chain its interior levels did not reach. A
+    /// transaction that has written nothing has put its number in no record, so
+    /// changing it here changes nothing else.
+    fn renumber_an_untouched_transaction(&mut self) {
+        if self.writing.batch().is_none()
+            || self.writing.touched() != 0
+            || !self.writing.undo().borrow().is_empty()
+        {
+            return;
+        }
+        let txn = self.writing.next_txn();
+        self.writing.set_next_txn(txn.saturating_add(1));
+        self.writing.set_batch(Some(txn));
     }
 
     /// Releases the lock when nothing holds the connection to the file.

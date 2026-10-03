@@ -839,6 +839,18 @@ they are touching do not collide; two that have not, do.
   imported. A first `sync` of the corpus embeds 3,696 chunks and took 11 minutes on the processor;
   keep the synced database and copy it for each variant rather than syncing again. (task-2130)
 
+- **Without `.sqlite-ref/` in the worktree, `inillucent-testrun --changed` reports 17 matrix and
+  differential targets failing for that reason alone.** The matrix then grades against the answers
+  recorded for SQLite, where `generate_series`, `REGEXP`, `ON CONFLICT` targets and others were
+  errors, and the differential suites cannot start their oracle. Copy the whole directory:
+  `cp -r <main checkout>/.sqlite-ref <worktree>/.sqlite-ref` (42 MB). With it, the same 31
+  targets passed. (task-2169)
+- **A `-journal` file no longer means a statement is still running.** A writer under
+  `locking_mode = normal` evicts the pages it cannot keep to a spill file of its own and never writes
+  the database file before its commit, so the journal appears only during the fold after the commit.
+  A process test that waits for the journal and then kills the writer has to put the writer in
+  `locking_mode = exclusive` first, as `process_journal_handoff` does. (task-2169)
+
 ## The SQL statement matrix (tiers `matrix` and `matrix_deep`)
 
 - A fix to the engine can make a `matrix` case start agreeing with SQLite. The group then fails
@@ -878,3 +890,14 @@ they are touching do not collide; two that have not, do.
   `tmp/matrix/s0/<family>-0-default` scratch and deleted each other's fixtures, which showed as
   "unable to open database file" and "disk I/O error" against SQLite only when both ran. Each
   cadence has its own directory now. (task-2168)
+- **A multi process defect is found with a storm and explained with a lock trace.** `inillucent-chaos`
+  (`crates/inillucent-compat/src/chaos.rs`) runs seeded workers and invariant checking readers, and
+  `inillucent_compat::storm` kills them at random; `durability::process_storm` is the short form.
+  The defects it found showed only under load: run six storms at once with the debug build and a
+  64 page pool (`--frames 64 --bulk-parts 120`) to reproduce them. To explain one, a temporary
+  trace in `ImportedDatabase::enter_within`, the resync, the commit and the open, appending one
+  line per event with the process id, the lock level, the log position and the meta generation to a
+  file named by an environment variable, found every cause in minutes. Remove it before merging.
+  `BEGIN` is deferred now, so a statement inside a transaction can be the one that takes the lock:
+  anything that raises a lock outside `enter`, or numbers a transaction before `enter` ran, is the
+  class of defect to look for first. (task-2173)

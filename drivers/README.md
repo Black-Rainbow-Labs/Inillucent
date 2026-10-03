@@ -294,13 +294,13 @@ Every binding follows the same six steps.
 | `INILLUCENT_SYNTAX` | 2 | The statement is not valid SQL |
 | `INILLUCENT_NOT_FOUND` | 3 | No such table, column or index |
 | `INILLUCENT_CONSTRAINT` | 4 | A constraint refused the write |
-| `INILLUCENT_READONLY` | 5 | A write on a read only database |
+| `INILLUCENT_READONLY` | 5 | A write on a read only database, including a file this process may not write, which opens read only |
 | `INILLUCENT_BUSY` | 6 | Another writer holds the database |
 | `INILLUCENT_INTERRUPTED` | 7 | The statement was cancelled |
 | `INILLUCENT_CORRUPT` | 8 | The file is damaged |
 | `INILLUCENT_IO` | 9 | The operating system reported an error |
 | `INILLUCENT_FULL` | 10 | The disk is full |
-| `INILLUCENT_TOO_BIG` | 11 | A value or result exceeds a limit |
+| `INILLUCENT_TOO_BIG` | 11 | A value or result exceeds a limit, or the page cache ran out of pages it could give up |
 | `INILLUCENT_INVALID_STATE` | 12 | The caller broke the ABI's contract. `INILLUCENT_MISUSE` is the same value |
 | `INILLUCENT_INTERNAL` | 13 | A defect in inillucent. Please report it |
 

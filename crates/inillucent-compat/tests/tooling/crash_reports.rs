@@ -132,25 +132,49 @@ const FLOORS: [Floor; 19] = [
         shape: Shape::CutPoints,
         least: 54,
     },
+    // **Three fewer since `BEGIN` became deferred (task-2173).** The
+    // workload opens with `BEGIN`, which took the write lock itself before
+    // the first `INSERT` did. It takes no lock now, and the campaign lost
+    // three cut points, all of them `old`: the report
+    // went from 24 old and 3 new to 21 old and 3 new. Every cut that lands
+    // after the first write is still made.
     Floor {
         name: "wal-commit.tsv",
         shape: Shape::HashCuts,
-        least: 27,
+        least: 24,
     },
+    // **Three fewer since `BEGIN` became deferred (task-2173).** The
+    // workload opens with `BEGIN`, which took the write lock itself before
+    // the first `INSERT` did. It takes no lock now, and the campaign lost
+    // three cut points, all of them `old`: the report
+    // went from 24 old and 3 new to 21 old and 3 new. Every cut that lands
+    // after the first write is still made.
     Floor {
         name: "wal-io-error.tsv",
         shape: Shape::HashCuts,
-        least: 27,
+        least: 24,
     },
+    // **Three fewer since `BEGIN` became deferred (task-2173).** The
+    // workload opens with `BEGIN`, which took the write lock itself before
+    // the first `INSERT` did. It takes no lock now, and the campaign lost
+    // three cut points, all of them `old`: the report
+    // went from 24 old and 3 new to 21 old and 3 new. Every cut that lands
+    // after the first write is still made.
     Floor {
         name: "wal-short-write.tsv",
         shape: Shape::HashCuts,
-        least: 27,
+        least: 24,
     },
+    // **Three fewer since `BEGIN` became deferred (task-2173).** The
+    // workload opens with `BEGIN`, which took the write lock itself before
+    // the first `INSERT` did. It takes no lock now, and the campaign lost
+    // three cut points, all of them `old`: the report
+    // went from 24 old and 3 new to 21 old and 3 new. Every cut that lands
+    // after the first write is still made.
     Floor {
         name: "wal-checkpoint.tsv",
         shape: Shape::HashCuts,
-        least: 57,
+        least: 54,
     },
     Floor {
         name: "multi-database-commit.tsv",

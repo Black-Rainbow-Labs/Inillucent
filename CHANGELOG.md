@@ -10,6 +10,58 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**Eleven defects found by new tests that run several real processes against one file, and fixed.**
+Four workers and two readers open one file, commit seeded transactions, and are killed at random
+moments; a checker rebuilds every acknowledged transaction from its seed and compares the file byte
+for byte. On 2.0.7 its first minute found the first four defects below with no kill at all. Each
+defect below has a test that fails without its fix.
+
+- **A checkpoint or a backup called on the database handle undid another process's commit.**
+  `Database::checkpoint` and `backup_to` folded this process's pages as they stood, without first
+  catching up with the log, so rows another process had deleted came back and an extent page could
+  be overwritten with a leaf. They now take the lock the way a statement does.
+- **Opening a file while another process held a write transaction failed with `busy` at once**,
+  whatever busy timeout was set. The open tried to fold the pages it replayed, and the writer's
+  lock refused it. The open now leaves that fold to the writer.
+- **Opening with a small page cache beside a writer failed with `every frame in the buffer pool is
+  pinned`.** The open's replay had no spill file to put pages in. It has one now.
+- **`BEGIN` took the write lock, so a read transaction in one process failed with `busy` while any
+  other process had a transaction open.** `BEGIN` and `BEGIN DEFERRED` now take no lock, as in
+  SQLite, and the first statement inside the transaction takes the lock it needs. `BEGIN IMMEDIATE`
+  and `BEGIN EXCLUSIVE` still take the write lock at once. A transaction that reads first and then
+  writes is refused with `busy` when another process committed in between, as in SQLite.
+- **Making `BEGIN` deferred had been tried before and lost acknowledged inserts.** The cause was the
+  transaction manager raising the lock on its own after the statement had checked for other
+  processes' commits, so a transaction wrote from stale pages into a log segment the next recovery
+  started after. It no longer raises the lock. Two writer processes running 60 inserts each lost up
+  to 12 of 120; they lose none in 8 runs now.
+- **An open kept its lock after it finished**, so the first statement of the first transaction
+  trusted the open's replay, and a commit could be written over another process's committed
+  records in the log. Every later recovery stopped at those bytes, losing acknowledged transactions
+  and leaving indexes that disagreed with their tables. An open now releases the lock when it is
+  done, and writes the file itself only when the log has not moved since its replay.
+- **A transaction could reuse a number another process had used**, which made the records of a
+  killed process's unfinished transaction look committed: readers saw part of a transaction that
+  never committed. A transaction that has written nothing is renumbered when its first statement
+  catches up with the log.
+- **A full disk made a connection refuse every statement until it was closed.** The log stays
+  refused for the statement that met the failure, and the next statement rebuilds it from the
+  files, so the same connection writes again once space is free.
+- **A file the process may not write could not be opened, even to read.** It now opens read only:
+  reads work and a write fails with the status `readonly`. A connection opened read only also
+  refuses a write itself now, where it used to report one row changed and keep it only in memory.
+- **`inillucent batch` and `inillucent analyze` reported `busy` as `syntax`**, and the driver
+  reported out of memory as `syntax`. They report `busy` and `too_big`.
+- A commit of a transaction that wrote nothing no longer appends a commit record to the shared log
+  without the write lock.
+
+New suites: `durability::process_storm` (the storms above, with a 64 page pool, the search table
+and an encrypted file), `durability::process_interleavings` (one test per defect above, each the
+smallest sequence that shows it), `durability::file_damage` (a copy taken during a write, a removed
+or foreign log segment, and damage at every page), `durability::environment` (a full disk, a read
+only file, one file under several spellings of its path, and unusual paths), and
+`nightly::storm_nightly`. The program they drive is `inillucent-chaos`.
+
 **Six problems a user of 2.0.4 reported, fixed, and five more found while fixing them.** Each was
 reproduced first, with the user's own scripts where there were scripts, and every number below was
 measured with the same script before and after.

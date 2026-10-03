@@ -220,6 +220,8 @@ where a test goes. The common cases:
 | what an application does with the public API | `crates/inillucent/tests/` | `e2e` |
 | a sequence an application performs, at every configuration | `crates/inillucent/tests/story_*.rs`, through `scenario!` | `e2e` |
 | what survives a crash or an injected fault | `inillucent-compat/tests/`, under the simulator | `durability` |
+| what several processes do to one file | `durability/process_interleavings.rs` for two processes at a chosen moment; `durability/process_storm.rs`, through `inillucent_compat::storm` and `inillucent-chaos`, for many processes killed at random | `durability` |
+| what other programs and the machine do to the files | `durability/file_damage.rs` and `durability/environment.rs` | `durability` |
 | what every language binding must answer | a case in `drivers/conformance/suite.json` | |
 | a cost that must not change | `crates/inillucent/tests/budget.rs` | `perf` |
 
