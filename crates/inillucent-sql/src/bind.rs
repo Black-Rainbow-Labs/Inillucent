@@ -3949,7 +3949,7 @@ impl<'a> Binder<'a> {
             {
                 return Ok(expr.clone());
             }
-            if let Some(bound) = self.bind_where_alias(&folded)? {
+            if let Some(bound) = self.bind_where_alias(folded)? {
                 return Ok(bound);
             }
         }

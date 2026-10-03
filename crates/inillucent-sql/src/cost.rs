@@ -135,48 +135,6 @@ pub fn log2(rows: f64) -> f64 {
     rows.max(2.0).log2()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A search that returns one row of a million beats a scan, and by a lot.
-    #[test]
-    fn a_selective_search_beats_a_scan() {
-        let rows = 1_000_000.0;
-        assert!(search_cost(rows, 1.0, false) < scan_cost(rows) / 1000.0);
-    }
-
-    /// A search that returns every row does not - it pays a second descent per
-    /// row for the privilege of reading the same table.
-    #[test]
-    fn an_unselective_search_does_not() {
-        let rows = 1_000.0;
-        assert!(search_cost(rows, rows, false) > scan_cost(rows));
-    }
-
-    /// The crossover is where it should be: a search that returns a fifth of a
-    /// table is still worth it, and one that returns half is not.
-    #[test]
-    fn the_crossover_is_a_fraction_of_the_table() {
-        let rows = 10_000.0;
-        assert!(search_cost(rows, rows / 5.0, false) < scan_cost(rows));
-        assert!(search_cost(rows, rows / 2.0, false) > scan_cost(rows));
-    }
-
-    /// A covering index is cheaper than the same search that has to fetch.
-    #[test]
-    fn covering_is_cheaper_than_fetching() {
-        assert!(search_cost(1_000.0, 100.0, true) < search_cost(1_000.0, 100.0, false));
-    }
-
-    /// An empty table still costs a descent, so nothing is free.
-    #[test]
-    fn nothing_costs_nothing() {
-        assert!(scan_cost(0.0) > 0.0);
-        assert!(search_cost(0.0, 0.0, true) > 0.0);
-    }
-}
-
 /// Returns SQLite's estimate of how wide one column's values are.
 ///
 /// SQLite's `szEst`: 1 for a column with no declared type and for every numeric
@@ -244,4 +202,46 @@ pub fn index_is_narrower(
         .sum::<u32>()
         .saturating_add(1);
     entry < row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A search that returns one row of a million beats a scan, and by a lot.
+    #[test]
+    fn a_selective_search_beats_a_scan() {
+        let rows = 1_000_000.0;
+        assert!(search_cost(rows, 1.0, false) < scan_cost(rows) / 1000.0);
+    }
+
+    /// A search that returns every row does not - it pays a second descent per
+    /// row for the privilege of reading the same table.
+    #[test]
+    fn an_unselective_search_does_not() {
+        let rows = 1_000.0;
+        assert!(search_cost(rows, rows, false) > scan_cost(rows));
+    }
+
+    /// The crossover is where it should be: a search that returns a fifth of a
+    /// table is still worth it, and one that returns half is not.
+    #[test]
+    fn the_crossover_is_a_fraction_of_the_table() {
+        let rows = 10_000.0;
+        assert!(search_cost(rows, rows / 5.0, false) < scan_cost(rows));
+        assert!(search_cost(rows, rows / 2.0, false) > scan_cost(rows));
+    }
+
+    /// A covering index is cheaper than the same search that has to fetch.
+    #[test]
+    fn covering_is_cheaper_than_fetching() {
+        assert!(search_cost(1_000.0, 100.0, true) < search_cost(1_000.0, 100.0, false));
+    }
+
+    /// An empty table still costs a descent, so nothing is free.
+    #[test]
+    fn nothing_costs_nothing() {
+        assert!(scan_cost(0.0) > 0.0);
+        assert!(search_cost(0.0, 0.0, true) > 0.0);
+    }
 }

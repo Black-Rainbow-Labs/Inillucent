@@ -160,42 +160,6 @@ pub fn subquery_columns(select: &BoundSelect, names: &[Vec<u8>]) -> Vec<ColumnIn
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn names(list: &[&str]) -> Vec<Vec<u8>> {
-        list.iter().map(|name| name.as_bytes().to_vec()).collect()
-    }
-
-    /// Duplicates get `:1`, `:2`, and the comparison ignores case.
-    #[test]
-    fn duplicates_are_numbered_without_regard_to_case() {
-        assert_eq!(
-            unique_column_names(&names(&["a", "a", "A"])),
-            names(&["a", "a:1", "A:2"])
-        );
-    }
-
-    /// An existing `:digits` suffix is replaced, not extended.
-    #[test]
-    fn an_existing_suffix_is_replaced() {
-        assert_eq!(
-            unique_column_names(&names(&["x:1", "x", "x"])),
-            names(&["x:1", "x", "x:2"])
-        );
-    }
-
-    /// An empty name, `true` and `false` become `column` and a position.
-    #[test]
-    fn unnamed_columns_are_called_column_and_a_position() {
-        assert_eq!(
-            unique_column_names(&names(&["", "TRUE", "b"])),
-            names(&["column1", "column2", "b"])
-        );
-    }
-}
-
 impl super::Binder<'_> {
     /// Returns the name a bare column reference was written with, looking
     /// through `COLLATE`.
@@ -240,5 +204,41 @@ impl super::Binder<'_> {
         }
         label.extend_from_slice(self.ast.text(column));
         label
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(list: &[&str]) -> Vec<Vec<u8>> {
+        list.iter().map(|name| name.as_bytes().to_vec()).collect()
+    }
+
+    /// Duplicates get `:1`, `:2`, and the comparison ignores case.
+    #[test]
+    fn duplicates_are_numbered_without_regard_to_case() {
+        assert_eq!(
+            unique_column_names(&names(&["a", "a", "A"])),
+            names(&["a", "a:1", "A:2"])
+        );
+    }
+
+    /// An existing `:digits` suffix is replaced, not extended.
+    #[test]
+    fn an_existing_suffix_is_replaced() {
+        assert_eq!(
+            unique_column_names(&names(&["x:1", "x", "x"])),
+            names(&["x:1", "x", "x:2"])
+        );
+    }
+
+    /// An empty name, `true` and `false` become `column` and a position.
+    #[test]
+    fn unnamed_columns_are_called_column_and_a_position() {
+        assert_eq!(
+            unique_column_names(&names(&["", "TRUE", "b"])),
+            names(&["column1", "column2", "b"])
+        );
     }
 }

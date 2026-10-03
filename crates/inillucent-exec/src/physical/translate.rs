@@ -1415,6 +1415,61 @@ fn name_of(expr: &BoundExpr) -> &'static str {
     }
 }
 
+/// Translates a `VIRTUAL` generated column's value.
+///
+/// @param expr - the bound [`BoundExpr::Generated`]
+/// @param space - the joined column space
+/// @param params - the statement's bound values
+/// @param frame - which pass is translating
+fn translate_generated(
+    expr: &BoundExpr,
+    space: &Space<'_>,
+    params: &Params,
+    frame: Frame<'_>,
+) -> DbResult<Expr> {
+    let BoundExpr::Generated {
+        operand,
+        present,
+        affinity,
+        ..
+    } = expr
+    else {
+        return unsupported("a generated column value that is not one");
+    };
+    let value = translate(operand, space, params, frame)?;
+    let present = translate(present, space, params, frame)?;
+    Ok(generated_value(value, present, *affinity))
+}
+
+/// Builds the evaluation of a `VIRTUAL` generated column's value.
+///
+/// The column's expression is converted with the column's declared affinity,
+/// because SQLite stores and compares a generated value as it would a value
+/// written to that column. The result is NULL when the FROM term has no row,
+/// which is what an outer join gives for every column of the row it left out.
+/// Without that test, an expression that reads no column (`AS (1)`) would still
+/// produce a value for the row that does not exist.
+///
+/// @param value - the translated generated expression
+/// @param present - the translated expression that is NULL only for a missing row
+/// @param affinity - the column's declared affinity
+fn generated_value(value: Expr, present: Expr, affinity: inillucent_value::Affinity) -> Expr {
+    let converted = match affinity {
+        inillucent_value::Affinity::Blob => value,
+        other => Expr::Affinity {
+            operand: Box::new(value),
+            affinity: other,
+            widen: other == inillucent_value::Affinity::Real,
+        },
+    };
+    Expr::Case {
+        operand: None,
+        branches: vec![(Expr::IsNotNull(Box::new(present)), converted)],
+        otherwise: None,
+        comparisons: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1501,60 +1556,5 @@ mod tests {
                 .is_empty(),
             "a statement that selects nothing reads nothing"
         );
-    }
-}
-
-/// Translates a `VIRTUAL` generated column's value.
-///
-/// @param expr - the bound [`BoundExpr::Generated`]
-/// @param space - the joined column space
-/// @param params - the statement's bound values
-/// @param frame - which pass is translating
-fn translate_generated(
-    expr: &BoundExpr,
-    space: &Space<'_>,
-    params: &Params,
-    frame: Frame<'_>,
-) -> DbResult<Expr> {
-    let BoundExpr::Generated {
-        operand,
-        present,
-        affinity,
-        ..
-    } = expr
-    else {
-        return unsupported("a generated column value that is not one");
-    };
-    let value = translate(operand, space, params, frame)?;
-    let present = translate(present, space, params, frame)?;
-    Ok(generated_value(value, present, *affinity))
-}
-
-/// Builds the evaluation of a `VIRTUAL` generated column's value.
-///
-/// The column's expression is converted with the column's declared affinity,
-/// because SQLite stores and compares a generated value as it would a value
-/// written to that column. The result is NULL when the FROM term has no row,
-/// which is what an outer join gives for every column of the row it left out.
-/// Without that test, an expression that reads no column (`AS (1)`) would still
-/// produce a value for the row that does not exist.
-///
-/// @param value - the translated generated expression
-/// @param present - the translated expression that is NULL only for a missing row
-/// @param affinity - the column's declared affinity
-fn generated_value(value: Expr, present: Expr, affinity: inillucent_value::Affinity) -> Expr {
-    let converted = match affinity {
-        inillucent_value::Affinity::Blob => value,
-        other => Expr::Affinity {
-            operand: Box::new(value),
-            affinity: other,
-            widen: other == inillucent_value::Affinity::Real,
-        },
-    };
-    Expr::Case {
-        operand: None,
-        branches: vec![(Expr::IsNotNull(Box::new(present)), converted)],
-        otherwise: None,
-        comparisons: Vec::new(),
     }
 }

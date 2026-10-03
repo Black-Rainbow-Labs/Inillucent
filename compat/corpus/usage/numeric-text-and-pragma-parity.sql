@@ -39,9 +39,11 @@ SELECT 9e999, -9e999, 1e999 = 9e999, quote(9e999), quote(1e308*10), quote(-1e308
 SELECT json_insert('{}', '$.a', x) FROM t;
 SELECT json_group_array(x), json_array(9e999, -9e999), hex(jsonb_array(x)) FROM t;
 -- case: numbers/math-functions-last-digits
-SELECT atanh(tanh(-1.0)), trunc(atanh(tanh(-2.0))), atanh(-0.999), atanh(0.999), atanh(0.5), atanh(-0.5);
-SELECT asinh(1.5), asinh(-1.5), asinh(0.001), asinh(10), asinh(1e6), asinh(2.7e8), asinh(1e12), asinh(1e100);
-SELECT acosh(1), acosh(1.0000001), acosh(1.5), acosh(2.5), acosh(10), acosh(1e6), acosh(2.8e8), acosh(1e12), acosh(1e100);
+-- The last digit of these functions comes from the platform math library, and SQLite's own
+-- answer differs between glibc and the Windows runtime, so 13 significant digits are compared.
+SELECT printf('%.13g', atanh(tanh(-1.0))), trunc(atanh(tanh(-2.0))), printf('%.13g', atanh(-0.999)), printf('%.13g', atanh(0.999)), printf('%.13g', atanh(0.5)), printf('%.13g', atanh(-0.5));
+SELECT printf('%.13g', asinh(1.5)), printf('%.13g', asinh(-1.5)), printf('%.13g', asinh(0.001)), printf('%.13g', asinh(10)), printf('%.13g', asinh(1e6)), printf('%.13g', asinh(2.7e8)), printf('%.13g', asinh(1e12)), printf('%.13g', asinh(1e100));
+SELECT printf('%.13g', acosh(1)), printf('%.13g', acosh(1.0000001)), printf('%.13g', acosh(1.5)), printf('%.13g', acosh(2.5)), printf('%.13g', acosh(10)), printf('%.13g', acosh(1e6)), printf('%.13g', acosh(2.8e8)), printf('%.13g', acosh(1e12)), printf('%.13g', acosh(1e100));
 -- case: tokenizer/numeric-literal-digit-separators
 SELECT 0x1_0, 1.5_5, 1_0.5, 1_000, typeof(1_000);
 SELECT 1e1_0;

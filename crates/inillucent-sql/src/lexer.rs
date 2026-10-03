@@ -567,8 +567,7 @@ impl<'a> Lexer<'a> {
     fn scan_hex_number(&mut self, start: usize) -> Result<Token, LexError> {
         let mut cursor = start + 2;
         let digits = cursor;
-        loop {
-            let Some(byte) = self.byte(cursor) else { break };
+        while let Some(byte) = self.byte(cursor) {
             // SQLite 3.46 and later accept a `_` between two hex digits.
             let separator = byte == b'_'
                 && cursor > digits

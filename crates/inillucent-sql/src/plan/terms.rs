@@ -360,6 +360,22 @@ pub(super) fn binary_constraint(op: BinaryOp) -> Option<crate::vtab::ConstraintO
     })
 }
 
+/// Reports whether an expression reads any column or rowid.
+///
+/// A probe that did would be a different question per row, and the index
+/// answers one.
+///
+/// @param expr - the expression to look through
+pub(super) fn reads_a_column(expr: &BoundExpr) -> bool {
+    if matches!(
+        expr,
+        BoundExpr::Column { .. } | BoundExpr::Rowid { .. } | BoundExpr::VirtualFunction { .. }
+    ) {
+        return true;
+    }
+    expr.children().into_iter().any(reads_a_column)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,20 +410,4 @@ mod tests {
         assert_eq!(mirror(BinaryOp::GreaterEqual), BinaryOp::LessEqual);
         assert_eq!(mirror(BinaryOp::Equal), BinaryOp::Equal);
     }
-}
-
-/// Reports whether an expression reads any column or rowid.
-///
-/// A probe that did would be a different question per row, and the index
-/// answers one.
-///
-/// @param expr - the expression to look through
-pub(super) fn reads_a_column(expr: &BoundExpr) -> bool {
-    if matches!(
-        expr,
-        BoundExpr::Column { .. } | BoundExpr::Rowid { .. } | BoundExpr::VirtualFunction { .. }
-    ) {
-        return true;
-    }
-    expr.children().into_iter().any(reads_a_column)
 }

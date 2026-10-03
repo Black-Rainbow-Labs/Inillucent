@@ -97,13 +97,14 @@ impl Parser<'_> {
         let (Some(a), Some(b), Some(c)) = (self.peek(), self.peek_at(1), self.peek_at(2)) else {
             return 0;
         };
-        let is_space = match (a, b, c) {
-            (0xe1, 0x9a, 0x80) | (0xe2, 0x81, 0x9f) | (0xe3, 0x80, 0x80) | (0xef, 0xbb, 0xbf) => {
-                true
-            }
-            (0xe2, 0x80, 0x80..=0x8a | 0xa8 | 0xa9 | 0xaf) => true,
-            _ => false,
-        };
+        let is_space = matches!(
+            (a, b, c),
+            (0xe1, 0x9a, 0x80)
+                | (0xe2, 0x81, 0x9f)
+                | (0xe3, 0x80, 0x80)
+                | (0xef, 0xbb, 0xbf)
+                | (0xe2, 0x80, 0x80..=0x8a | 0xa8 | 0xa9 | 0xaf)
+        );
         if is_space {
             3
         } else {
