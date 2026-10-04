@@ -719,8 +719,7 @@ fn run_and_watch(binary: &std::path::Path, sql: &str) -> (Option<i32>, String, u
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                highest =
-                    highest.max(inillucent_compat::procstat::child_cost(&child).peak_working_set);
+                highest = highest.max(inillucent_compat::procstat::running_child_peak(&child));
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             Err(error) => panic!("waiting on the binary: {error}"),

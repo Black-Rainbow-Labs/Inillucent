@@ -102,6 +102,26 @@ pub fn child_cost(child: &std::process::Child) -> ProcessCost {
     platform::child_cost(child)
 }
 
+/// Returns the peak resident set a child that is still running has reached so far, in bytes.
+///
+/// **This child's own number, not the largest of every child (task-2183).**
+/// On Linux [`child_cost`] reads `RUSAGE_CHILDREN`, whose `ru_maxrss` is the
+/// largest resident set of any child this process has already reaped. A test
+/// that watched one child with it while other tests in the same binary ran
+/// their own children read their peak instead: the hostile suite's
+/// `zeroblob(1073741824)` case reported 1,560 MiB on a CI runner while the
+/// same query, run alone, peaked at 10.7 MiB. A child that has not been reaped
+/// is not in that number at all. Linux reads the child's own `VmHWM` from
+/// `/proc/<pid>/status`; Windows reads the child's handle, as [`child_cost`]
+/// already does there.
+///
+/// Zero when the platform will not say.
+///
+/// @param child - the child, not yet waited on
+pub fn running_child_peak(child: &std::process::Child) -> u64 {
+    platform::running_child_peak(child)
+}
+
 #[cfg(windows)]
 mod platform {
     use super::ProcessCost;
@@ -164,6 +184,13 @@ mod platform {
     pub fn child_cost(child: &std::process::Child) -> ProcessCost {
         use std::os::windows::io::AsRawHandle;
         of_handle(child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE)
+    }
+
+    /// Returns the peak working set a running child has reached so far.
+    ///
+    /// @param child - the child, not yet waited on
+    pub fn running_child_peak(child: &std::process::Child) -> u64 {
+        child_cost(child).peak_working_set
     }
 }
 
@@ -245,6 +272,19 @@ mod platform {
             }
         }
         cost
+    }
+
+    /// Returns the peak resident set a running child has reached so far.
+    ///
+    /// The child's own `VmHWM`, from the kernel's accounting for that pid. A
+    /// child that has exited and not been reaped no longer has the field, so
+    /// the caller keeps the highest value it read while the child ran.
+    ///
+    /// @param child - the child, not yet waited on
+    pub fn running_child_peak(child: &std::process::Child) -> u64 {
+        let path = format!("/proc/{}/status", child.id());
+        let status = std::fs::read_to_string(path).unwrap_or_default();
+        kilobytes(&status, "VmHWM")
     }
 }
 
