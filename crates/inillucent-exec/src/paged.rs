@@ -40,14 +40,111 @@ use crate::batch::{Batch, Vector};
 use crate::ops::{Flow, Sink};
 use crate::scan::Projection;
 
+/// Which of a projection's outputs the query reads, by output position.
+///
+/// **The columns nobody reads are a constant NULL (task-2183).** A stage is
+/// projected in full, because every compiled expression addresses a column by
+/// its place in the joined row, and the places cannot move. So a column the
+/// query does not read keeps its place and its vector is `Const(NULL)`, which
+/// costs nothing to make: a scan of a leaf that took writes no longer decodes
+/// every column of every delta row to answer `count(*)`. `None` reads every
+/// output, which is what every source did before.
+pub type Needed = Option<ColumnMask>;
+
+/// The outputs a query reads, one bit per output position.
+///
+/// **Bits, not a list (task-2183).** The mask was an `Rc<[bool]>`, two
+/// allocations for every stage of every statement compiled, which the
+/// compile allocation budget in `crates/inillucent/tests/budget.rs` counts.
+/// A stage wider than [`ColumnMask::WIDTH`] columns has no mask and reads
+/// every output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColumnMask(u64);
+
+impl ColumnMask {
+    /// The most outputs a mask can describe.
+    pub const WIDTH: usize = 64;
+
+    /// Returns a mask that reads nothing.
+    pub fn empty() -> ColumnMask {
+        ColumnMask(0)
+    }
+
+    /// Marks an output as read; returns `false` when it is past the mask's width.
+    ///
+    /// @param at - the output's position
+    pub fn mark(&mut self, at: usize) -> bool {
+        if at >= Self::WIDTH {
+            return false;
+        }
+        self.0 |= 1u64 << at;
+        true
+    }
+
+    /// Reports whether an output is read. A position past the width is.
+    ///
+    /// @param at - the output's position
+    pub fn reads(self, at: usize) -> bool {
+        at >= Self::WIDTH || (self.0 >> at) & 1 == 1
+    }
+
+    /// Reports whether every one of the first `width` outputs is read.
+    ///
+    /// @param width - how many outputs there are
+    pub fn reads_all(self, width: usize) -> bool {
+        (0..width).all(|at| self.reads(at))
+    }
+}
+
+/// Reports whether a projection output is read.
+///
+/// @param needed - the outputs read, or `None` for all of them
+/// @param at - the output's position in the projection
+pub(crate) fn is_needed(needed: &Needed, at: usize) -> bool {
+    needed.is_none_or(|mask| mask.reads(at))
+}
+
+/// Reports whether a scan's consumer reads none of its outputs, which is `count(*)`.
+///
+/// @param needed - the outputs read, or `None` for all of them
+fn reads_nothing(needed: &Needed) -> bool {
+    *needed == Some(ColumnMask::empty())
+}
+
+/// Returns how many leading tree columns a written leaf's delta rows must be decoded to.
+///
+/// One past the largest tree column an output that is read names. The key
+/// columns are decoded whatever this says, because the merge compares them.
+///
+/// @param projection - which tree columns the scan exposes
+/// @param needed - which outputs are read
+fn decode_width(projection: &Projection, needed: &Needed) -> usize {
+    projection
+        .0
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| is_needed(needed, *at))
+        .map(|(_, column)| column.saturating_add(1))
+        .max()
+        .unwrap_or(0)
+}
+
 /// Builds the vectors of one leaf, in the projection's order.
 ///
 /// @param leaf - the leaf to read
 /// @param projection - which tree columns to expose, in output order
-fn vectors<'p>(leaf: &LeafRef<'p>, projection: &Projection) -> DbResult<Vec<Vector<'p>>> {
+/// @param needed - which outputs are read; the others are a constant NULL
+fn vectors<'p>(
+    leaf: &LeafRef<'p>,
+    projection: &Projection,
+    needed: &Needed,
+) -> DbResult<Vec<Vector<'p>>> {
     let mut columns = Vec::with_capacity(projection.0.len());
-    for index in &projection.0 {
-        columns.push(Vector::from_column(leaf.column(*index)?));
+    for (at, index) in projection.0.iter().enumerate() {
+        columns.push(match is_needed(needed, at) {
+            true => Vector::from_column(leaf.column(*index)?),
+            false => Vector::Const(Datum::Null),
+        });
     }
     Ok(columns)
 }
@@ -67,10 +164,12 @@ fn vectors<'p>(leaf: &LeafRef<'p>, projection: &Projection) -> DbResult<Vec<Vect
 ///
 /// @param rows - the leaf's live rows, in key order
 /// @param projection - which tree columns to expose, in output order
+/// @param needed - which outputs are read; the others are a constant NULL
 /// @param downstream - the head of the operator chain
 fn push_merged(
     rows: &[Vec<Datum<'_>>],
     projection: &Projection,
+    needed: &Needed,
     downstream: &mut dyn Sink,
 ) -> DbResult<Flow> {
     let mut start = 0usize;
@@ -79,18 +178,21 @@ fn push_merged(
             .saturating_add(crate::batch::BATCH_ROWS)
             .min(rows.len());
         let chunk = rows.get(start..end).unwrap_or(&[]);
-        let mut columns_owned: Vec<Vec<Datum<'_>>> = Vec::with_capacity(projection.0.len());
-        for index in &projection.0 {
-            columns_owned.push(
+        let mut columns_owned: Vec<Option<Vec<Datum<'_>>>> = Vec::with_capacity(projection.0.len());
+        for (at, index) in projection.0.iter().enumerate() {
+            columns_owned.push(is_needed(needed, at).then(|| {
                 chunk
                     .iter()
                     .map(|row| row.get(*index).copied().unwrap_or(Datum::Null))
-                    .collect(),
-            );
+                    .collect()
+            }));
         }
         let columns: Vec<Vector<'_>> = columns_owned
             .iter()
-            .map(|values| Vector::Values(values.as_slice()))
+            .map(|values| match values {
+                Some(values) => Vector::Values(values.as_slice()),
+                None => Vector::Const(Datum::Null),
+            })
             .collect();
         let batch = Batch::new(chunk.len(), columns);
         if downstream.push(&batch)? == Flow::Stop {
@@ -105,6 +207,7 @@ fn push_merged(
 pub struct FullScan<'t> {
     tree: &'t PagedTree,
     projection: Projection,
+    needed: Needed,
 }
 
 impl<'t> FullScan<'t> {
@@ -113,7 +216,19 @@ impl<'t> FullScan<'t> {
     /// @param tree - the tree to read
     /// @param projection - which tree columns to expose, in output order
     pub fn new(tree: &'t PagedTree, projection: Projection) -> FullScan<'t> {
-        FullScan { tree, projection }
+        FullScan {
+            tree,
+            projection,
+            needed: None,
+        }
+    }
+
+    /// Returns the scan producing only the outputs a query reads, the rest as NULL.
+    ///
+    /// @param needed - which outputs are read, by position, or `None` for all
+    pub fn with_needed(mut self, needed: Needed) -> FullScan<'t> {
+        self.needed = needed;
+        self
     }
 
     /// Drives the scan until the tree runs out or the pipeline says stop.
@@ -121,51 +236,102 @@ impl<'t> FullScan<'t> {
     /// @param pool - the buffer pool the tree's pages live in
     /// @param downstream - the head of the operator chain
     pub fn run(&self, pool: &Pool, downstream: &mut dyn Sink) -> DbResult<()> {
-        self.tree.visit_leaves(pool, &mut |leaf| {
-            // **Checked per leaf, not per row.** A scan whose predicate rejects
-            // everything hands nothing to `Collect`, so the result budget never
-            // sees it - and a full scan of a large table is exactly the request
-            // a deadline exists for. A leaf is a few thousand rows, which makes
-            // this an atomic load and one clock read per few thousand rows.
-            inillucent_base::budget::check()?;
-            // **The empty test is `has no live rows`, not `has no packed
-            // rows`.** A leaf built empty and then written to holds every one of
-            // its rows in the delta area with `row_count` still zero, which is
-            // exactly the shape a `CREATE TABLE` followed by an `INSERT`
-            // produces - and skipping it here made such a table read back as
-            // nothing at all while the rows were in the file.
-            if leaf.row_count() == 0 && !leaf.needs_materialising() {
-                return Ok(true);
+        // **A scan that reads only some columns does not read the others'
+        // out-of-line values (task-2183)**; see `visit_leaves_unresolved`. A
+        // leaf whose read columns hold none is scanned as it lies, and any
+        // other leaf has its values read first, as every walk does.
+        let mut visit = |leaf: &LeafRef<'_>| -> DbResult<bool> {
+            if !leaf.has_extents() || self.reads_nothing_out_of_line(leaf)? {
+                return self.scan_leaf(leaf, downstream);
             }
-            // A leaf that has been written to is merged rather than read as
-            // mini-columns. *Exceptions* are a different thing entirely - a
-            // value of the wrong class for its column - and are read through
-            // the general vector path, which is why the test is `has_writes`
-            // and not `is_clean`. Confusing the two cost the SLT corpus
-            // thirty-four refusals once.
-            //
-            // **Straight into columns, not a vector per row (task-2175).** A
-            // table an application filled with `INSERT` has rows in the delta
-            // area of nearly every leaf, and `live` built a vector for every
-            // live row before `push_merged` copied the projected values out of
-            // them into columns. The merge order gives each live row's value
-            // by position, so the columns are filled from it directly. A leaf
-            // with values out of line keeps the old path, because those values
-            // need the extents `live` reads.
-            if leaf.needs_materialising() {
-                if !leaf.has_extents() {
-                    let order = leaf.live_order()?;
-                    return Ok(
-                        push_live_order(&order, &self.projection, downstream)? == Flow::Continue
-                    );
-                }
-                let rows = leaf.live()?;
-                return Ok(push_merged(&rows, &self.projection, downstream)? == Flow::Continue);
-            }
-            let batch = Batch::new(leaf.row_count(), vectors(leaf, &self.projection)?);
-            Ok(downstream.push(&batch)? == Flow::Continue)
-        })?;
+            let held = self.tree.read_extents(pool, leaf)?;
+            self.scan_leaf(&leaf.with_extents(&held), downstream)
+        };
+        match self.needed.is_some() {
+            true => self.tree.visit_leaves_unresolved(pool, &mut visit)?,
+            false => self.tree.visit_leaves(pool, &mut visit)?,
+        }
         downstream.finish()
+    }
+
+    /// Reports whether a leaf can be scanned without its out-of-line values.
+    ///
+    /// True when nothing has been written to it and no column the query reads
+    /// holds a value out of line, so every column it reads is a mini-column it
+    /// can lend as it lies.
+    ///
+    /// @param leaf - the leaf, its values not read
+    fn reads_nothing_out_of_line(&self, leaf: &LeafRef<'_>) -> DbResult<bool> {
+        if leaf.has_writes() || self.needed.is_none() {
+            return Ok(false);
+        }
+        for (at, column) in self.projection.0.iter().enumerate() {
+            if is_needed(&self.needed, at) && leaf.column(*column)?.any_extent()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Pushes one leaf's rows downstream; returns whether the scan goes on.
+    ///
+    /// @param leaf - the leaf, with its out-of-line values when it is read through them
+    /// @param downstream - the head of the operator chain
+    fn scan_leaf(&self, leaf: &LeafRef<'_>, downstream: &mut dyn Sink) -> DbResult<bool> {
+        // **Checked per leaf, not per row.** A scan whose predicate rejects
+        // everything hands nothing to `Collect`, so the result budget never
+        // sees it - and a full scan of a large table is exactly the request
+        // a deadline exists for. A leaf is a few thousand rows, which makes
+        // this an atomic load and one clock read per few thousand rows.
+        inillucent_base::budget::check()?;
+        // **The empty test is `has no live rows`, not `has no packed
+        // rows`.** A leaf built empty and then written to holds every one of
+        // its rows in the delta area with `row_count` still zero, which is
+        // exactly the shape a `CREATE TABLE` followed by an `INSERT`
+        // produces - and skipping it here made such a table read back as
+        // nothing at all while the rows were in the file.
+        if leaf.row_count() == 0 && !leaf.has_writes() {
+            return Ok(true);
+        }
+        // A leaf that has been written to is merged rather than read as
+        // mini-columns. *Exceptions* are a different thing entirely - a
+        // value of the wrong class for its column - and are read through
+        // the general vector path, which is why the test is `has_writes`
+        // and not `is_clean`. Confusing the two cost the SLT corpus
+        // thirty-four refusals once.
+        //
+        // **Straight into columns, not a vector per row (task-2175).** A
+        // table an application filled with `INSERT` has rows in the delta
+        // area of nearly every leaf, and `live` built a vector for every
+        // live row before `push_merged` copied the projected values out of
+        // them into columns. The merge order gives each live row's value
+        // by position, so the columns are filled from it directly. A leaf
+        // with values out of line keeps the old path, because those values
+        // need the extents `live` reads.
+        if leaf.needs_materialising() && !self.reads_nothing_out_of_line(leaf)? {
+            if !leaf.has_extents() {
+                // `count(*)` reads no column, so a written leaf is asked
+                // how many rows it holds and not for the rows.
+                if reads_nothing(&self.needed) {
+                    let columns = vec![Vector::Const(Datum::Null); self.projection.0.len()];
+                    let batch = Batch::new(leaf.live_count()?, columns);
+                    return Ok(downstream.push(&batch)? == Flow::Continue);
+                }
+                let order =
+                    leaf.live_order_decoding(decode_width(&self.projection, &self.needed))?;
+                let flow =
+                    push_live_runs(leaf, &order, &self.projection, &self.needed, downstream)?;
+                return Ok(flow == Flow::Continue);
+            }
+            let rows = leaf.live()?;
+            let flow = push_merged(&rows, &self.projection, &self.needed, downstream)?;
+            return Ok(flow == Flow::Continue);
+        }
+        let batch = Batch::new(
+            leaf.row_count(),
+            vectors(leaf, &self.projection, &self.needed)?,
+        );
+        Ok(downstream.push(&batch)? == Flow::Continue)
     }
 }
 
@@ -176,33 +342,166 @@ impl<'t> FullScan<'t> {
 ///
 /// @param order - the leaf's live rows in key order
 /// @param projection - which tree columns to expose, in output order
+/// @param needed - which outputs are read; the others are a constant NULL
 /// @param downstream - the head of the operator chain
 fn push_live_order<'p>(
     order: &inillucent_tree::leaf::LiveOrder<'p>,
     projection: &Projection,
+    needed: &Needed,
     downstream: &mut dyn Sink,
 ) -> DbResult<Flow> {
     let rows = order.len();
     let mut start = 0usize;
     while start < rows {
         let end = start.saturating_add(crate::batch::BATCH_ROWS).min(rows);
-        let mut columns_owned: Vec<Vec<Datum<'p>>> = Vec::with_capacity(projection.0.len());
-        for column in &projection.0 {
+        let mut columns_owned: Vec<Option<Vec<Datum<'p>>>> = Vec::with_capacity(projection.0.len());
+        for (at, column) in projection.0.iter().enumerate() {
+            if !is_needed(needed, at) {
+                columns_owned.push(None);
+                continue;
+            }
             let mut values = Vec::with_capacity(end.saturating_sub(start));
             for row in start..end {
                 values.push(order.value(row, *column)?);
             }
-            columns_owned.push(values);
+            columns_owned.push(Some(values));
         }
         let columns: Vec<Vector<'_>> = columns_owned
             .iter()
-            .map(|values| Vector::Values(values.as_slice()))
+            .map(|values| match values {
+                Some(values) => Vector::Values(values.as_slice()),
+                None => Vector::Const(Datum::Null),
+            })
             .collect();
         let batch = Batch::new(end.saturating_sub(start), columns);
         if downstream.push(&batch)? == Flow::Stop {
             return Ok(Flow::Stop);
         }
         start = end;
+    }
+    Ok(Flow::Continue)
+}
+
+/// Pushes a written leaf's live rows downstream as runs: sorted rows as the leaf's own vectors.
+///
+/// **Most of a written leaf is still its sorted region (task-2183).** A leaf
+/// of a table filled by `INSERT` is packed when it splits, and the rows added
+/// since sit in the delta area after it, so the merge order is one long run of
+/// sorted rows and one run of delta rows. The sorted run is pushed as the
+/// leaf's mini-columns under a selection of its row numbers, exactly as a
+/// clean leaf is, and only the delta rows are copied into values. A leaf whose
+/// delta rows are spread between its sorted ones, which an index whose keys
+/// arrive in no order has, makes runs of a row or two; it is read the way it
+/// was, value by value, because a batch per run would cost more than the
+/// values.
+///
+/// @param leaf - the leaf
+/// @param order - its live rows in key order, decoded to the outputs read
+/// @param projection - which tree columns to expose, in output order
+/// @param needed - which outputs are read; the others are a constant NULL
+/// @param downstream - the head of the operator chain
+fn push_live_runs<'p>(
+    leaf: &LeafRef<'p>,
+    order: &inillucent_tree::leaf::LiveOrder<'p>,
+    projection: &Projection,
+    needed: &Needed,
+    downstream: &mut dyn Sink,
+) -> DbResult<Flow> {
+    use inillucent_tree::leaf::LiveRow;
+    let positions = order.order();
+    let runs = 1 + positions
+        .windows(2)
+        .filter(|pair| {
+            matches!(
+                (pair.first(), pair.get(1)),
+                (Some(LiveRow::Sorted(_)), Some(LiveRow::Delta(_)))
+                    | (Some(LiveRow::Delta(_)), Some(LiveRow::Sorted(_)))
+            )
+        })
+        .count();
+    // A run costs a batch; a value costs a decode. Below about sixteen rows a
+    // run, the values are cheaper.
+    if runs.saturating_mul(16) > positions.len() {
+        return push_live_order(order, projection, needed, downstream);
+    }
+    let leaf_columns = vectors(leaf, projection, needed)?;
+    let mut selection: Vec<u32> = Vec::new();
+    let mut start = 0usize;
+    while start < positions.len() {
+        let delta_run = matches!(positions.get(start), Some(LiveRow::Delta(_)));
+        let mut end = start;
+        while let Some(at) = positions.get(end) {
+            if matches!(at, LiveRow::Delta(_)) != delta_run {
+                break;
+            }
+            end = end.saturating_add(1);
+        }
+        let run = positions.get(start..end).unwrap_or(&[]);
+        let flow = match delta_run {
+            false => {
+                selection.clear();
+                selection.extend(run.iter().filter_map(|at| match at {
+                    LiveRow::Sorted(row) => Some(*row),
+                    LiveRow::Delta(_) => None,
+                }));
+                let mut batch = Batch::over(leaf.row_count(), &leaf_columns);
+                batch.selection = Some(selection.as_slice());
+                downstream.push(&batch)?
+            }
+            true => push_delta_run(order, run, projection, needed, downstream)?,
+        };
+        if flow == Flow::Stop {
+            return Ok(Flow::Stop);
+        }
+        start = end;
+    }
+    Ok(Flow::Continue)
+}
+
+/// Pushes a run of delta rows downstream as values, a batch at a time.
+///
+/// @param order - the leaf's merge, which holds the decoded delta rows
+/// @param run - the run's positions, every one a delta row
+/// @param projection - which tree columns to expose, in output order
+/// @param needed - which outputs are read; the others are a constant NULL
+/// @param downstream - the head of the operator chain
+fn push_delta_run<'p>(
+    order: &inillucent_tree::leaf::LiveOrder<'p>,
+    run: &[inillucent_tree::leaf::LiveRow],
+    projection: &Projection,
+    needed: &Needed,
+    downstream: &mut dyn Sink,
+) -> DbResult<Flow> {
+    for chunk in run.chunks(crate::batch::BATCH_ROWS) {
+        let mut columns_owned: Vec<Option<Vec<Datum<'p>>>> = Vec::with_capacity(projection.0.len());
+        for (at, column) in projection.0.iter().enumerate() {
+            if !is_needed(needed, at) {
+                columns_owned.push(None);
+                continue;
+            }
+            let mut values = Vec::with_capacity(chunk.len());
+            for position in chunk {
+                let value = match position {
+                    inillucent_tree::leaf::LiveRow::Delta(index) => order
+                        .delta_row(*index as usize)
+                        .and_then(|row| row.get(*column).copied())
+                        .unwrap_or(Datum::Null),
+                    inillucent_tree::leaf::LiveRow::Sorted(_) => Datum::Null,
+                };
+                values.push(value);
+            }
+            columns_owned.push(Some(values));
+        }
+        let columns: Vec<Vector<'_>> = columns_owned
+            .iter()
+            .map(|values| match values {
+                Some(values) => Vector::Values(values.as_slice()),
+                None => Vector::Const(Datum::Null),
+            })
+            .collect();
+        if downstream.push(&Batch::new(chunk.len(), columns))? == Flow::Stop {
+            return Ok(Flow::Stop);
+        }
     }
     Ok(Flow::Continue)
 }
@@ -216,6 +515,7 @@ fn push_live_order<'p>(
 pub struct SpanScan<'t> {
     tree: &'t PagedTree,
     projection: Projection,
+    needed: Needed,
     low: Option<Vec<OwnedDatum>>,
     low_inclusive: bool,
     high: Option<Vec<OwnedDatum>>,
@@ -242,11 +542,20 @@ impl<'t> SpanScan<'t> {
         SpanScan {
             tree,
             projection,
+            needed: None,
             low,
             low_inclusive,
             high,
             high_inclusive,
         }
+    }
+
+    /// Returns the scan producing only the outputs a query reads, the rest as NULL.
+    ///
+    /// @param needed - which outputs are read, by position, or `None` for all
+    pub fn with_needed(mut self, needed: Needed) -> SpanScan<'t> {
+        self.needed = needed;
+        self
     }
 
     /// Drives the scan.
@@ -285,9 +594,10 @@ impl<'t> SpanScan<'t> {
                         high.as_deref(),
                         self.high_inclusive,
                     )?;
-                    return Ok(push_merged(&rows, &self.projection, downstream)? == Flow::Continue);
+                    let flow = push_merged(&rows, &self.projection, &self.needed, downstream)?;
+                    return Ok(flow == Flow::Continue);
                 }
-                let columns = vectors(leaf, &self.projection)?;
+                let columns = vectors(leaf, &self.projection, &self.needed)?;
                 let flow = if start == 0 && end == leaf.row_count() {
                     // The whole leaf is in range, so no selection vector at
                     // all: the batch is dense and every consumer takes its
@@ -331,6 +641,7 @@ pub struct ReverseScan<'t> {
     /// Whether a key equal to the upper bound is in the range.
     high_inclusive: bool,
     limit: Option<usize>,
+    needed: Needed,
 }
 
 impl<'t> ReverseScan<'t> {
@@ -361,7 +672,16 @@ impl<'t> ReverseScan<'t> {
             high: bounds.high,
             high_inclusive: bounds.high_inclusive,
             limit,
+            needed: None,
         }
+    }
+
+    /// Returns the scan producing only the outputs a query reads, the rest as NULL.
+    ///
+    /// @param needed - which outputs are read, by position, or `None` for all
+    pub fn with_needed(mut self, needed: Needed) -> ReverseScan<'t> {
+        self.needed = needed;
+        self
     }
 
     /// Drives the scan.
@@ -413,7 +733,8 @@ impl<'t> ReverseScan<'t> {
                         return Ok(true);
                     }
                     produced = produced.saturating_add(rows.len());
-                    if push_merged(&rows, &self.projection, downstream)? == Flow::Stop {
+                    if push_merged(&rows, &self.projection, &self.needed, downstream)? == Flow::Stop
+                    {
                         return Ok(false);
                     }
                     if let Some(limit) = self.limit {
@@ -437,7 +758,10 @@ impl<'t> ReverseScan<'t> {
                     return Ok(true);
                 }
                 produced = produced.saturating_add(selection.len());
-                let mut batch = Batch::new(leaf.row_count(), vectors(leaf, &self.projection)?);
+                let mut batch = Batch::new(
+                    leaf.row_count(),
+                    vectors(leaf, &self.projection, &self.needed)?,
+                );
                 batch.selection = Some(selection.as_slice());
                 if downstream.push(&batch)? == Flow::Stop {
                     return Ok(false);
@@ -530,6 +854,7 @@ const PROBE_INLINE_COLUMNS: usize = 8;
 pub struct PointProbe<'t> {
     tree: &'t PagedTree,
     projection: Projection,
+    needed: Needed,
 }
 
 impl<'t> PointProbe<'t> {
@@ -538,7 +863,23 @@ impl<'t> PointProbe<'t> {
     /// @param tree - the tree to read
     /// @param projection - which tree columns to produce, in output order
     pub fn new(tree: &'t PagedTree, projection: Projection) -> PointProbe<'t> {
-        PointProbe { tree, projection }
+        PointProbe {
+            tree,
+            projection,
+            needed: None,
+        }
+    }
+
+    /// Returns the probe producing only the outputs a query reads, the rest as NULL.
+    ///
+    /// **A probe that copies a row copies only what is read (task-2183).**
+    /// `WHERE id IN (600 values)` probes once per value and copied every column
+    /// of every row it found, a text and a blob among them, to sum one integer.
+    ///
+    /// @param needed - which outputs are read, by position, or `None` for all
+    pub fn with_needed(mut self, needed: Needed) -> PointProbe<'t> {
+        self.needed = needed;
+        self
     }
 
     /// Returns the tree the probe reads.
@@ -563,8 +904,11 @@ impl<'t> PointProbe<'t> {
     ) -> DbResult<bool> {
         out.clear();
         let found = self.tree.probe(pool, key, |leaf, hit| {
-            for column in &self.projection.0 {
-                out.push(OwnedDatum::from_datum(&leaf.value_at(hit, *column)?));
+            for (at, column) in self.projection.0.iter().enumerate() {
+                out.push(match is_needed(&self.needed, at) {
+                    true => OwnedDatum::from_datum(&leaf.value_at(hit, *column)?),
+                    false => OwnedDatum::Null,
+                });
             }
             Ok(())
         })?;
@@ -602,6 +946,9 @@ impl<'t> PointProbe<'t> {
                 let mut inline: [Vector<'_>; PROBE_INLINE_COLUMNS] =
                     [Vector::Const(Datum::Null); PROBE_INLINE_COLUMNS];
                 for (at, column) in self.projection.0.iter().enumerate() {
+                    if !is_needed(&self.needed, at) {
+                        continue;
+                    }
                     if let Some(slot) = inline.get_mut(at) {
                         // A row in the delta area has no mini-column to borrow,
                         // so its values go downstream as constants. The sorted

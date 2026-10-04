@@ -110,7 +110,7 @@ fn delta_heap_if_it_fits(order: &LiveOrder<'_>, page_size: usize) -> DbResult<Op
         let LiveRow::Delta(index) = at else {
             continue;
         };
-        let Some(values) = order.delta().get(*index as usize) else {
+        let Some(values) = order.delta_row(*index as usize) else {
             return Err(misuse("a live row names a delta row that was not decoded"));
         };
         for (column, value) in order.columns().iter().zip(values.iter()) {
@@ -276,7 +276,7 @@ fn write_column(
     while let Some(at) = positions.get(row).copied() {
         let slot = values_at.saturating_add(row.saturating_mul(width));
         let LiveRow::Sorted(first) = at else {
-            let value = live_value(order.columns(), order.delta(), at, index)?;
+            let value = live_value(order, at, index)?;
             let class = classify_at(held.physical, &value, usize::MAX);
             heap_end = write_delta_value(page, held, &value, class, slot, heap_end)?;
             set_class(page, base, row, class)?;
@@ -421,9 +421,7 @@ fn write_spliced_header(
     page::write_u32(page, leaf_header::DELTA_START, heap_end as u32)?;
     page::write_u64(page, leaf_header::MAX_CTS, 0)?;
     let low_fence = match order.order().first() {
-        Some(first) => live_value(order.columns(), order.delta(), *first, 0)?
-            .as_int()
-            .unwrap_or(0),
+        Some(first) => live_value(order, *first, 0)?.as_int().unwrap_or(0),
         None => 0,
     };
     page::write_u64(page, leaf_header::LOW_FENCE, low_fence as u64)?;

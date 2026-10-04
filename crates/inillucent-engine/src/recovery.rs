@@ -23,7 +23,7 @@ use inillucent_base::error::refusal;
 use inillucent_catalog::paged::ObjectKind;
 use inillucent_pool::PageId;
 use inillucent_tree::datum::Datum;
-use inillucent_txn::redo::{RowRedo, TreeRows};
+use inillucent_txn::redo::{LogicalSplit, RowRedo, TreeRows};
 
 /// Returns which segment of a database a file name beside it is.
 ///
@@ -1204,6 +1204,13 @@ impl RowRedo for LearningRows {
         let result = self.rows.compact_leaf(database, tree, page, lsn, from_lsn);
         self.retry_after_reading_the_catalog(database, tree, result, |rows, database| {
             rows.compact_leaf(database, tree, page, lsn, from_lsn)
+        })
+    }
+
+    fn split_leaf(&mut self, database: &mut Database, split: &LogicalSplit<'_>) -> DbResult<()> {
+        let result = self.rows.split_leaf(database, split);
+        self.retry_after_reading_the_catalog(database, split.tree, result, |rows, database| {
+            rows.split_leaf(database, split)
         })
     }
 }

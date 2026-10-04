@@ -39,6 +39,13 @@ pub struct IndexNestedLoopJoin<'t> {
     outer_keys: std::rc::Rc<[Box<dyn Eval>]>,
     /// Which inner columns to emit, in order.
     inner_projection: Projection,
+    /// Which of the inner columns the statement reads, or `None` for all.
+    ///
+    /// **An unread inner column is a NULL constant (task-2183).** A probe
+    /// made a column vector for every inner column, and on a five column
+    /// table read for one value that was 11% of a dashboard query's time in
+    /// `LeafRef::column`, each call decoding a mini-column header.
+    needed: crate::paged::Needed,
     /// Whether the key is a full inner key (a probe) or a prefix (a range).
     full_key: bool,
     downstream: Box<dyn Sink + 't>,
@@ -73,10 +80,19 @@ impl<'t> IndexNestedLoopJoin<'t> {
             pool,
             outer_keys,
             inner_projection,
+            needed: None,
             full_key,
             downstream,
             selection: Vec::new(),
         }
+    }
+
+    /// Returns the join emitting only the inner columns the statement reads.
+    ///
+    /// @param needed - which inner columns are read, or `None` for all
+    pub fn with_needed(mut self, needed: crate::paged::Needed) -> IndexNestedLoopJoin<'t> {
+        self.needed = needed;
+        self
     }
 }
 impl Sink for IndexNestedLoopJoin<'_> {
@@ -108,6 +124,7 @@ impl Sink for IndexNestedLoopJoin<'_> {
             pool,
             outer_keys,
             inner_projection,
+            needed,
             full_key,
             downstream,
             selection,
@@ -119,6 +136,7 @@ impl Sink for IndexNestedLoopJoin<'_> {
             inner,
             pool,
             inner_projection,
+            needed,
             full_key: *full_key,
             width,
             inner_width,
@@ -232,6 +250,8 @@ struct Probing<'a, 't> {
     pool: &'t Pool,
     /// Which inner columns to emit, in order.
     inner_projection: &'a Projection,
+    /// Which of the inner columns the statement reads, or `None` for all.
+    needed: &'a crate::paged::Needed,
     /// Whether the key is a full inner key (a probe) or a prefix (a range).
     full_key: bool,
     /// How many outer columns a joined row starts with.
@@ -366,6 +386,7 @@ impl Probing<'_, '_> {
             inner,
             pool,
             inner_projection,
+            needed,
             width,
             inner_width,
             downstream,
@@ -412,7 +433,7 @@ impl Probing<'_, '_> {
                 at = at.saturating_add(1);
             }
             if kind != JoinKind::Semi {
-                for column in &inner_projection.0 {
+                for (position, column) in inner_projection.0.iter().enumerate() {
                     // A row in the leaf's *delta* area has no
                     // mini-column to borrow, so its values go
                     // downstream as constants. That is the only
@@ -420,6 +441,9 @@ impl Probing<'_, '_> {
                     // the sorted-region case below is byte for
                     // byte the code that was benchmarked.
                     let vector = match hit {
+                        _ if !crate::paged::is_needed(needed, position) => {
+                            Vector::Const(Datum::Null)
+                        }
                         // A leaf with an out-of-line value cannot
                         // lend its mini-column: the slot holds a
                         // reference rather than the value.
@@ -479,6 +503,7 @@ impl Probing<'_, '_> {
             inner,
             pool,
             inner_projection,
+            needed,
             width,
             inner_width,
             downstream,
@@ -547,7 +572,9 @@ impl Probing<'_, '_> {
                 }
             }
             for (position, column) in inner_projection.0.iter().enumerate() {
-                let vector = if leaf.needs_materialising() {
+                let vector = if !crate::paged::is_needed(needed, position) {
+                    Vector::Const(Datum::Null)
+                } else if leaf.needs_materialising() {
                     Vector::Values(held.get(position).map(Vec::as_slice).unwrap_or(&[]))
                 } else {
                     Vector::from_column(leaf.column(*column)?)

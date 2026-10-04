@@ -5,6 +5,8 @@
 //! half - converges on it, so the declarations a column carries are checked in
 //! one place rather than in four that drift.
 
+pub mod bulk;
+
 use index::{index_entry, key_of, maintained, unique_indexes, write_index_entry};
 
 use inillucent_base::error::misuse;
@@ -106,42 +108,13 @@ pub fn insert_at(
         return insert_into_view(statement, target, params, supplied, depth);
     }
     note_single_row(statement, target, depth);
-    let layout = layout_of(target, table)?;
-    // `excluded` only exists inside an `ON CONFLICT ... DO UPDATE`, so a plain
-    // insert carries one image rather than two.
-    let mut sources = vec![statement.target_source];
-    if !statement.upsert.is_empty() {
-        sources.push(EXCLUDED_SOURCE);
-    }
-    // The catalog the write path's registered function lookups read: the one
-    // `WriteTarget::catalog` gives a trigger body, because a `VALUES` row calling
-    // `embed(?1)` needs the same view (`docs/roadmap.md` item 13).
+    let CompiledInsert {
+        layout,
+        space,
+        plan,
+        declarations,
+    } = compile_insert(statement, target, params)?;
     let catalog = target.catalog();
-    let subqueries = InsertPlan::subqueries(statement, &layout, catalog)?;
-    let space = super::answers::space_with_subqueries(&sources, &layout, &subqueries.0);
-    let plan = InsertPlan::compile(statement, &layout, &space, params, catalog, subqueries)?;
-    // What the table's declarations require of every row, compiled once: the
-    // affinities that convert a value on the way in, the `STRICT` type classes,
-    // and the `CHECK` predicates. All three were collected by the catalog and
-    // used to be consulted by nobody.
-    let declarations = WriteDeclarations::compile(
-        table,
-        &layout,
-        BoundDeclarations {
-            checks: &statement.checks,
-            defaults: &statement.not_null_defaults,
-            virtual_columns: &statement.virtual_columns,
-            index_exprs: &statement.index_exprs,
-        },
-        &space,
-        params,
-        catalog,
-    )?;
-    let declarations = match params.keeps_supplied_types() {
-        true => declarations.without_affinities(),
-        false => declarations,
-    };
-
     let rows = rows_to_insert(statement, &space, params, catalog, supplied)?;
 
     // **Found on demand, not up front.** Reading the largest rowid costs a
@@ -293,6 +266,75 @@ pub fn insert_at(
     }
     close_sequence(statement, target, sequence_mark.as_ref(), high_water)?;
     Ok(changes)
+}
+/// Everything an insert compiles once before its first row.
+///
+/// Shared by [`insert_at`] and by the bulk path in `bulk.rs`, so a row built
+/// for a bulk build passes through exactly the plan and the declarations an
+/// ordinary insert would have used.
+pub(super) struct CompiledInsert {
+    /// Which tree column each declared column holds.
+    pub(super) layout: std::rc::Rc<SourceLayout>,
+    /// The row images the plan evaluates against.
+    pub(super) space: RowSpace,
+    /// How each column of a new row is found.
+    pub(super) plan: InsertPlan,
+    /// The affinities, `STRICT` classes and `CHECK` predicates every row meets.
+    pub(super) declarations: WriteDeclarations,
+}
+
+/// Compiles an insert's plan and its table's declarations.
+///
+/// @param statement - the bound insert
+/// @param target - the file and its trees
+/// @param params - the bound parameters
+pub(super) fn compile_insert(
+    statement: &BoundInsert,
+    target: &dyn WriteTarget,
+    params: &Params,
+) -> DbResult<CompiledInsert> {
+    let table = &statement.table;
+    let layout = layout_of(target, table)?;
+    // `excluded` only exists inside an `ON CONFLICT ... DO UPDATE`, so a plain
+    // insert carries one image rather than two.
+    let mut sources = vec![statement.target_source];
+    if !statement.upsert.is_empty() {
+        sources.push(EXCLUDED_SOURCE);
+    }
+    // The catalog the write path's registered function lookups read: the one
+    // `WriteTarget::catalog` gives a trigger body, because a `VALUES` row calling
+    // `embed(?1)` needs the same view (`docs/roadmap.md` item 13).
+    let catalog = target.catalog();
+    let subqueries = InsertPlan::subqueries(statement, &layout, catalog)?;
+    let space = super::answers::space_with_subqueries(&sources, &layout, &subqueries.0);
+    let plan = InsertPlan::compile(statement, &layout, &space, params, catalog, subqueries)?;
+    // What the table's declarations require of every row, compiled once: the
+    // affinities that convert a value on the way in, the `STRICT` type classes,
+    // and the `CHECK` predicates. All three were collected by the catalog and
+    // used to be consulted by nobody.
+    let declarations = WriteDeclarations::compile(
+        table,
+        &layout,
+        BoundDeclarations {
+            checks: &statement.checks,
+            defaults: &statement.not_null_defaults,
+            virtual_columns: &statement.virtual_columns,
+            index_exprs: &statement.index_exprs,
+        },
+        &space,
+        params,
+        catalog,
+    )?;
+    let declarations = match params.keeps_supplied_types() {
+        true => declarations.without_affinities(),
+        false => declarations,
+    };
+    Ok(CompiledInsert {
+        layout,
+        space,
+        plan,
+        declarations,
+    })
 }
 /// Evaluates `RETURNING` for a row straight after it is written.
 ///
@@ -1164,6 +1206,8 @@ pub(crate) fn declarations_are_met(
     row: &mut [OwnedDatum],
     resolution: Resolution,
 ) -> DbResult<bool> {
+    // A `STRICT` table with a generated column type checks before `NOT NULL`.
+    declarations.generated_types_are_met(table, space, row)?;
     // **Two passes: the generated columns come after the ordinary ones.**
     // SQLite tests `NOT NULL` on every ordinary column first and on the
     // generated columns, stored or virtual, in a second pass, so a row that

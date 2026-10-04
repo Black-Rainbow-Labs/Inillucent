@@ -81,6 +81,7 @@ fn storm(name: &str, seed: u64) -> Storm {
         },
         least_acknowledged: 20,
         least_checks: 1,
+        kill_all_at_end: false,
     }
 }
 
@@ -155,4 +156,35 @@ fn a_storm_on_an_encrypted_file_loses_nothing() {
     storm.least_acknowledged = 10;
     storm.settings.key = Some("storm passphrase".to_string());
     passes(&storm, &area("encrypted"));
+}
+
+/// The shape of the 2.0.7 damage report: every worker rewrites a value on a
+/// shared extent page in an autocommit statement before each transaction, the
+/// search table is written and searched, readers write a small row after each
+/// check, and the run ends with every process killed at the same moment.
+///
+/// The report's file failed `integrity_check` with a reference to a slot of a
+/// shared page that the page did not hold, and only when the reader still had
+/// the file open as the writer died. Nothing is killed before the end here, so
+/// the log is as long as two live processes let it grow and the first replay
+/// of it is the grading process's open.
+#[test]
+fn a_storm_in_the_shape_of_the_2_0_7_damage_report_loses_nothing() {
+    let mut storm = storm("report-shape", 0x2177_0001);
+    storm.kills = false;
+    storm.kill_all_at_end = true;
+    storm.settings.search = true;
+    storm.settings.rewrite = true;
+    passes(&storm, &area("report-shape"));
+}
+
+/// The same shape with kills during the run as well, so some workers die with
+/// a rewrite committed and its transaction not.
+#[test]
+fn a_storm_in_the_shape_of_the_2_0_7_damage_report_with_kills_loses_nothing() {
+    let mut storm = storm("report-shape-kills", 0x2177_0002);
+    storm.kill_all_at_end = true;
+    storm.settings.search = true;
+    storm.settings.rewrite = true;
+    passes(&storm, &area("report-shape-kills"));
 }

@@ -40,7 +40,7 @@
 //!
 //! Usage:
 //!   inillucent-fullgate `<sqlite fixture>` [--rounds N] [--page-size N]
-//!                       [--scale S] [--frames N] [--families a,b] [--repeat N]
+//!                       [--scale S] [--frames N] [--families a,b] [--workloads a,b] [--repeat N]
 //!                       [--module-split] [--put-split]
 //!
 //! `--put-split` prints, under every workload that writes rows, where one row's
@@ -135,6 +135,11 @@ struct Settings {
     frames: usize,
     scale: String,
     families: Vec<String>,
+    /// The workloads to run by name, or empty for every one the families hold.
+    ///
+    /// For profiling one workload on the gate's own database; a run that
+    /// names workloads grades nothing a published number reads.
+    workloads: Vec<String>,
     repeat_override: Option<u32>,
     /// The locking mode SQLite's arm runs in: `normal` or `exclusive`.
     locking: String,
@@ -195,7 +200,7 @@ fn main() -> ExitCode {
     let Some(fixture) = arguments.first().filter(|first| !first.starts_with("--")) else {
         eprintln!(
             "usage: inillucent-fullgate <sqlite fixture> [--rounds N] [--page-size N] \
-             [--scale S] [--frames N] [--families a,b] [--repeat N] [--locking normal|exclusive] \
+             [--scale S] [--frames N] [--families a,b] [--workloads a,b] [--repeat N] [--locking normal|exclusive] \
              [--module-split] [--put-split] [--cores performance|efficiency|any] \
              [--samples <file>] [--engine-child] [--quiet-threshold PERCENT]              [--record-quiet-reference] [--plan contract|hillclimb]"
         );
@@ -271,6 +276,15 @@ fn settings_from(arguments: &[String]) -> Settings {
         families: flag(arguments, "--families")
             .map(|value| value.split(',').map(str::to_string).collect())
             .unwrap_or_else(|| FAMILIES.iter().map(|(name, _)| name.to_string()).collect()),
+        workloads: flag(arguments, "--workloads")
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
         repeat_override: flag(arguments, "--repeat").and_then(|value| value.parse().ok()),
         locking: flag(arguments, "--locking").unwrap_or_else(|| "normal".to_string()),
         // **`pipeline` by default, so no published number moves.** Every
@@ -463,6 +477,8 @@ fn child_arguments(settings: &Settings) -> Vec<String> {
         settings.frames.to_string(),
         "--families".to_string(),
         settings.families.join(","),
+        "--workloads".to_string(),
+        settings.workloads.join(","),
         "--locking".to_string(),
         settings.locking.clone(),
         "--plan".to_string(),
@@ -562,6 +578,10 @@ fn filtered_plan(settings: &Settings) -> Result<inillucent_compat::perf::Plan, S
         asked.contains(&workload.family)
             || !FAMILIES.iter().any(|(name, _)| *name == workload.family)
     });
+    if !settings.workloads.is_empty() {
+        plan.workloads
+            .retain(|workload| settings.workloads.contains(&workload.name));
+    }
     if let Some(repeat) = settings.repeat_override {
         for workload in &mut plan.workloads {
             workload.repeat = repeat;

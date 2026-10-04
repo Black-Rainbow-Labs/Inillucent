@@ -199,29 +199,186 @@ pub fn crc32(data: &[u8]) -> u32 {
 /// @param previous - the result so far, or zero to start
 /// @param data - the next piece
 pub fn crc32_continue(previous: u32, data: &[u8]) -> u32 {
-    let mut crc = !previous;
-    let mut chunks = data.chunks_exact(8);
-    for chunk in &mut chunks {
-        let (low, high) = chunk.split_at(4);
-        let mut first = [0u8; 4];
-        let mut second = [0u8; 4];
-        first.copy_from_slice(low);
-        second.copy_from_slice(high);
-        let one = u32::from_le_bytes(first) ^ crc;
-        let two = u32::from_le_bytes(second);
-        crc = slice(6, one)
-            ^ slice(5, one >> 8)
-            ^ slice(4, one >> 16)
-            ^ slice(3, one >> 24)
-            ^ slice(2, two)
-            ^ slice(1, two >> 8)
-            ^ slice(0, two >> 16)
-            ^ byte_entry(two >> 24);
+    /// How long a piece has to be before it is split into four streams.
+    const SPLIT_FROM: usize = 4_096;
+    if data.len() < SPLIT_FROM {
+        return !fold_tail(!previous, data);
     }
-    for byte in chunks.remainder() {
+    crc32_four_streams(previous, data)
+}
+
+/// [`crc32_continue`] over a long piece, as four CRCs computed side by side.
+///
+/// **Four streams, then combined (task-2183).** Slice-by-eight is a chain:
+/// each eight bytes' lookups wait for the previous eight's result, so the
+/// processor has one dependency chain to work on and most of its load ports
+/// idle. Reading a 32 KiB page checked its CRC at about 12 us, which was most
+/// of a cold index probe. The piece is cut into four quarters, the four CRCs
+/// advance in the same loop as four independent chains, and they are joined
+/// with zlib's `crc32_combine` arithmetic, which is exact: the answer is the
+/// one the single chain gives, bit for bit, so no page or log record written
+/// before reads differently. `crc32_matches_the_byte_at_a_time_form` checks it.
+/// Measured by `crc32_page_timing` over a 32 KiB page: 12.19 us as one chain,
+/// 3.93 us as four. Below 4 KiB the three joins cost more than they save.
+///
+/// @param previous - the result so far, or zero to start
+/// @param data - the next piece, at least a few kilobytes
+fn crc32_four_streams(previous: u32, data: &[u8]) -> u32 {
+    let quarter = (data.len() / 4) & !7;
+    let (first, rest) = data.split_at(quarter);
+    let (second, rest) = rest.split_at(quarter);
+    let (third, fourth) = rest.split_at(quarter);
+    let (fourth_head, fourth_tail) = fourth.split_at(quarter);
+    let mut crcs = [!0u32; 4];
+    let (a, _) = first.as_chunks::<8>();
+    let (b, _) = second.as_chunks::<8>();
+    let (c, _) = third.as_chunks::<8>();
+    let (d, _) = fourth_head.as_chunks::<8>();
+    for (((one, two), three), four) in a.iter().zip(b).zip(c).zip(d) {
+        let [w, x, y, z] = crcs;
+        crcs = [
+            fold_eight(w, one),
+            fold_eight(x, two),
+            fold_eight(y, three),
+            fold_eight(z, four),
+        ];
+    }
+    let [one, two, three, four] = crcs;
+    let fourth_crc = !fold_tail(four, fourth_tail);
+    let joined = crc32_combine(previous, !one, quarter);
+    let joined = crc32_combine(joined, !two, quarter);
+    let joined = crc32_combine(joined, !three, quarter);
+    crc32_combine(joined, fourth_crc, fourth.len())
+}
+
+/// Folds eight bytes into a running (inverted) CRC, slice-by-eight.
+///
+/// @param crc - the running value, inverted as the loop keeps it
+/// @param chunk - the next eight bytes
+#[inline(always)]
+fn fold_eight(crc: u32, chunk: &[u8; 8]) -> u32 {
+    let [b0, b1, b2, b3, b4, b5, b6, b7] = *chunk;
+    let one = u32::from_le_bytes([b0, b1, b2, b3]) ^ crc;
+    let two = u32::from_le_bytes([b4, b5, b6, b7]);
+    slice(6, one)
+        ^ slice(5, one >> 8)
+        ^ slice(4, one >> 16)
+        ^ slice(3, one >> 24)
+        ^ slice(2, two)
+        ^ slice(1, two >> 8)
+        ^ slice(0, two >> 16)
+        ^ byte_entry(two >> 24)
+}
+
+/// Folds any number of bytes into a running (inverted) CRC.
+///
+/// @param crc - the running value, inverted as the loop keeps it
+/// @param data - the bytes
+fn fold_tail(crc: u32, data: &[u8]) -> u32 {
+    let mut crc = crc;
+    let (chunks, rest) = data.as_chunks::<8>();
+    for chunk in chunks {
+        crc = fold_eight(crc, chunk);
+    }
+    for byte in rest {
         crc = byte_entry(crc ^ u32::from(*byte)) ^ (crc >> 8);
     }
-    !crc
+    crc
+}
+
+/// The reflected polynomial, as [`build_crc32_table`] uses it.
+const POLYNOMIAL: u32 = 0xedb8_8320;
+
+/// Returns the CRC of two pieces joined, from the CRC of each and the second's length.
+///
+/// zlib's `crc32_combine`: the first CRC is carried past the second piece's
+/// length by multiplying it by x to the power of eight times that length,
+/// modulo the polynomial, and the second CRC is added.
+///
+/// @param first - the CRC of the first piece
+/// @param second - the CRC of the second piece
+/// @param length - the second piece's length in bytes
+fn crc32_combine(first: u32, second: u32, length: usize) -> u32 {
+    multiply_mod(x_to_eight_n(length), first) ^ second
+}
+
+/// Multiplies two polynomials modulo the CRC polynomial, in the reflected order.
+///
+/// @param a - one factor
+/// @param b - the other
+fn multiply_mod(a: u32, b: u32) -> u32 {
+    let mut product = 0u32;
+    let mut b = b;
+    let mut bit = 1u32 << 31;
+    while bit != 0 {
+        if a & bit != 0 {
+            product ^= b;
+        }
+        b = if b & 1 != 0 {
+            (b >> 1) ^ POLYNOMIAL
+        } else {
+            b >> 1
+        };
+        bit >>= 1;
+    }
+    product
+}
+
+/// Returns x to the power of `8 * length`, modulo the CRC polynomial.
+///
+/// By squaring: `X_POWERS[k]` is x to the power of `2^k`, and the bits of
+/// `8 * length` say which of them to multiply together.
+///
+/// @param length - a byte count
+fn x_to_eight_n(length: usize) -> u32 {
+    let mut result = 1u32 << 31;
+    let mut remaining = length;
+    let mut power = 3usize;
+    while remaining != 0 {
+        if remaining & 1 != 0 {
+            result = multiply_mod(X_POWERS.get(power % 32).copied().unwrap_or(0), result);
+        }
+        remaining >>= 1;
+        power = power.saturating_add(1);
+    }
+    result
+}
+
+/// x to the power of `2^k` modulo the polynomial, for `k` from 0 to 31.
+const X_POWERS: [u32; 32] = build_x_powers();
+
+/// Builds [`X_POWERS`] by repeated squaring, at compile time.
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+const fn build_x_powers() -> [u32; 32] {
+    let mut powers = [0u32; 32];
+    let mut value = 1u32 << 30;
+    let mut index = 0usize;
+    while index < 32 {
+        powers[index] = value;
+        value = const_multiply_mod(value, value);
+        index += 1;
+    }
+    powers
+}
+
+/// [`multiply_mod`], for the compile time table.
+#[allow(clippy::arithmetic_side_effects)]
+const fn const_multiply_mod(a: u32, b: u32) -> u32 {
+    let mut product = 0u32;
+    let mut b = b;
+    let mut bit = 1u32 << 31;
+    while bit != 0 {
+        if a & bit != 0 {
+            product ^= b;
+        }
+        b = if b & 1 != 0 {
+            (b >> 1) ^ POLYNOMIAL
+        } else {
+            b >> 1
+        };
+        bit >>= 1;
+    }
+    product
 }
 
 /// The byte-at-a-time form, kept as what the fast one is graded against.
@@ -282,6 +439,16 @@ mod tests {
             );
         }
         assert_eq!(crc32(&data), crc32_one_byte_at_a_time(0, &data));
+        // Long pieces take the four stream path, at every length around a
+        // quarter boundary and from a nonzero start.
+        for length in (4_090..4_130usize).chain([8_191, 8_192]) {
+            let piece = data.get(..length).unwrap_or(&[]);
+            assert_eq!(
+                crc32_continue(0x1234_5678, piece),
+                crc32_one_byte_at_a_time(0x1234_5678, piece),
+                "length {length}"
+            );
+        }
         // And continuing, because the log checksums a record in pieces.
         let mut running = 0;
         let mut slow = 0;
@@ -290,6 +457,31 @@ mod tests {
             slow = crc32_one_byte_at_a_time(slow, chunk);
         }
         assert_eq!(running, slow);
+    }
+
+    /// Prints how long a 32 KiB page's CRC takes; run by hand with `--ignored`.
+    #[test]
+    #[ignore]
+    fn crc32_page_timing() {
+        let mut rng = Rng::new(7);
+        let mut data = vec![0u8; 32_768];
+        rng.fill(&mut data);
+        let started = std::time::Instant::now();
+        let mut sum = 0u32;
+        for _ in 0..20_000 {
+            sum ^= crc32(&data);
+        }
+        let fast = started.elapsed().as_secs_f64() / 20_000.0;
+        let started = std::time::Instant::now();
+        for _ in 0..20_000 {
+            sum ^= !fold_tail(!0, &data);
+        }
+        let chain = started.elapsed().as_secs_f64() / 20_000.0;
+        println!(
+            "page crc: four streams {:.2} us, one chain {:.2} us ({sum})",
+            fast * 1e6,
+            chain * 1e6
+        );
     }
 
     /// A one-bit change must change the CRC; this is the property the check

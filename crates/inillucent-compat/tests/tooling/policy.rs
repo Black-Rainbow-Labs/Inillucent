@@ -2749,7 +2749,7 @@ const FUNCTION_CEILINGS: [(&str, &str, usize); 52] = [
         192,
     ),
     ("crates/inillucent-remote/src/migrate.rs", "run", 191),
-    ("crates/inillucent-sql/src/plan.rs", "plan_select_with", 189),
+    ("crates/inillucent-sql/src/plan.rs", "plan_block", 167),
     ("crates/inillucent-migrate/src/lib.rs", "migrate", 189),
     // 183 before task-1962 A9: `record` takes a `Timed` and the eight call
     // sites are struct literals, which rustfmt writes one field per line.

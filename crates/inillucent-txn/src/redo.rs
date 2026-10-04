@@ -38,6 +38,39 @@ use inillucent_tree::write::Located;
 use inillucent_wal::record::{Body, Record};
 use inillucent_wal::Redo;
 
+/// One logical split record, as a replay needs it.
+///
+/// See `inillucent_wal::record::Body::SplitLeaf` for what each field is and
+/// why each of the three pages is replayed from its own state.
+#[derive(Clone, Copy, Debug)]
+pub struct LogicalSplit<'r> {
+    /// The tree the leaves belong to.
+    pub tree: u64,
+    /// The leaf that was split.
+    pub left: PageId,
+    /// The new page holding the right half.
+    pub right: PageId,
+    /// The interior page that gained the separator.
+    pub parent: PageId,
+    /// The page the right half points at.
+    pub right_sibling: PageId,
+    /// The commit watermark both halves carry.
+    pub max_cts: u64,
+    /// The left page's stamp before the split, for a diagnosis.
+    pub from_lsn: u64,
+    /// How many live rows the left page keeps.
+    pub kept: usize,
+    /// The separator the parent gained.
+    pub separator: &'r [u8],
+    /// The right half's rows, as `inillucent_tree::split_log::encode_rows`
+    /// wrote them.
+    pub rows: &'r [u8],
+    /// The record's LSN, to stamp each page with.
+    pub lsn: u64,
+    /// Which of left, right and parent still need the record, in that order.
+    pub wanted: [bool; 3],
+}
+
 /// Applies the three logical row records, which need a tree.
 pub trait RowRedo {
     /// Puts a row back into a leaf.
@@ -71,6 +104,32 @@ pub trait RowRedo {
         key: &[u8],
         lsn: u64,
     ) -> DbResult<()>;
+
+    /// Takes several rows back out of one leaf, as one `DeleteRows` record says.
+    ///
+    /// Each key is removed the way [`RowRedo::delete_row`] removes one, in the
+    /// order the record lists them, and the page is stamped with the record's
+    /// LSN. The page-LSN rule was asked once, for the whole record, before this
+    /// is called.
+    ///
+    /// @param database - the file the leaf lives in
+    /// @param tree - the tree the leaf belongs to
+    /// @param page - the leaf's page number
+    /// @param keys - the rows' keys, as `put_key_list` wrote them
+    /// @param lsn - the record's LSN, to stamp the page with
+    fn delete_rows(
+        &mut self,
+        database: &mut Database,
+        tree: u64,
+        page: PageId,
+        keys: &[u8],
+        lsn: u64,
+    ) -> DbResult<()> {
+        for key in inillucent_wal::record::key_list(keys)? {
+            self.delete_row(database, tree, page, key, lsn)?;
+        }
+        Ok(())
+    }
 
     /// Repacks a leaf's live rows, the way the write path did.
     ///
@@ -113,6 +172,13 @@ pub trait RowRedo {
         value: &[u8],
         lsn: u64,
     ) -> DbResult<()>;
+
+    /// Redoes a leaf split that was logged as what it did, for each of its
+    /// pages that still needs it.
+    ///
+    /// @param database - the file the pages live in
+    /// @param split - the record
+    fn split_leaf(&mut self, database: &mut Database, split: &LogicalSplit<'_>) -> DbResult<()>;
 }
 
 /// A `RowRedo` that refuses, for a caller with no tree to apply into.
@@ -180,6 +246,13 @@ impl RowRedo for RefuseRows {
         Err(misuse(format!(
             "an UpdateInPlace record for page {} needs a tree to apply into",
             page.0
+        )))
+    }
+
+    fn split_leaf(&mut self, _database: &mut Database, split: &LogicalSplit<'_>) -> DbResult<()> {
+        Err(misuse(format!(
+            "a SplitLeaf record for page {} needs a tree to repack it",
+            split.left.0
         )))
     }
 }
@@ -599,6 +672,98 @@ impl RowRedo for TreeRows {
             leaf.set_lsn(lsn)
         })
     }
+
+    fn split_leaf(&mut self, database: &mut Database, split: &LogicalSplit<'_>) -> DbResult<()> {
+        let shape = self.shape(split.tree)?.clone();
+        let builder = LeafBuilder::new(
+            database.page_size(),
+            split.tree,
+            shape.columns.clone(),
+            shape.key_columns,
+        )?;
+        let [left, right, parent] = split.wanted;
+        // Three pages, each from its own state: see
+        // `inillucent_tree::split_log` for why none of them may read another.
+        if left {
+            let mut image = split_left_image(database, &builder, &shape, split)?;
+            page::write_u64(&mut image, header::LSN, split.lsn)?;
+            database.install(split.left, &image)?;
+        }
+        if right {
+            let rows = inillucent_tree::split_log::decode_rows(split.rows)?;
+            let mut image = inillucent_tree::split_log::right_image(
+                &builder,
+                &rows,
+                split.right_sibling,
+                split.max_cts,
+            )?;
+            page::write_u64(&mut image, header::LSN, split.lsn)?;
+            database.install(split.right, &image)?;
+        }
+        if parent {
+            let Some(mut image) = inillucent_tree::split_log::parent_image(
+                database.pool(),
+                database.page_size(),
+                split.tree,
+                split.parent,
+                split.left,
+                split.separator,
+                split.right,
+            )?
+            else {
+                return Err(corrupt(format!(
+                    "replaying a split of leaf {} at lsn {} could not add its separator to \
+                     interior page {}: the page does not route to the leaf or has no room",
+                    split.left.0, split.lsn, split.parent.0
+                )));
+            };
+            page::write_u64(&mut image, header::LSN, split.lsn)?;
+            database.install(split.parent, &image)?;
+        }
+        Ok(())
+    }
+}
+
+/// Rebuilds the left half of a logical split from the leaf the split read.
+///
+/// @param database - the file the leaf lives in
+/// @param builder - the tree's leaf builder
+/// @param shape - the tree's column directory and key width
+/// @param split - the record
+fn split_left_image(
+    database: &mut Database,
+    builder: &LeafBuilder,
+    shape: &RedoTree,
+    split: &LogicalSplit<'_>,
+) -> DbResult<Vec<u8>> {
+    let (collations, directions) = key_order(shape);
+    let guard = database.pool().fetch(split.left)?;
+    let leaf = LeafRef::parse(&guard)?
+        .with_collations(&collations)
+        .with_directions(&directions);
+    if let Some(image) = inillucent_tree::split_log::left_image(
+        builder,
+        &leaf,
+        split.kept,
+        split.right,
+        split.max_cts,
+    )? {
+        return Ok(image);
+    }
+    // The same diagnosis a compaction gives, for the same reason: a page
+    // with too few rows is either built wrong or one a record was skipped on,
+    // and the two stamps say which.
+    let stamped = page::read_u64(&guard, header::LSN).unwrap_or(0);
+    Err(corrupt(format!(
+        "replaying a split of leaf {} at lsn {} found {} live rows where the split kept {} on \
+         the left; it was written against a page stamped {} and this one is stamped {}",
+        split.left.0,
+        split.lsn,
+        leaf.live_rows()?,
+        split.kept,
+        split.from_lsn,
+        stamped
+    )))
 }
 
 /// What a replay did, for the report and for the tests.
@@ -722,6 +887,11 @@ impl<'a, R: RowRedo> Applier<'a, R> {
             // carries whole is whole.
             Body::CompactLeaf { image: [], .. } => {}
             Body::CompactLeaf { page, image, .. } => self.put_image(page, image, lsn)?,
+            // A logical split reads its left page and its parent, which is
+            // what this pass exists to make safe, and its right page needs the
+            // tree's shape, which this pass does not have. The logical pass
+            // replays all three.
+            Body::SplitLeaf { .. } => {}
             Body::Structural {
                 left,
                 right,
@@ -909,6 +1079,41 @@ impl<R: RowRedo> Redo for Applier<'_, R> {
                     }
                 }
             }
+            Body::SplitLeaf {
+                tree,
+                left,
+                right,
+                parent,
+                right_sibling,
+                max_cts,
+                from_lsn,
+                kept,
+                separator,
+                rows,
+            } => {
+                let mut pages = [false; 3];
+                for (slot, take) in pages.iter_mut().zip(wanted.iter()) {
+                    *slot = *take;
+                }
+                let split = LogicalSplit {
+                    tree,
+                    left: PageId(left),
+                    right: PageId(right),
+                    parent: PageId(parent),
+                    right_sibling: PageId(right_sibling),
+                    max_cts,
+                    from_lsn,
+                    kept: kept as usize,
+                    separator,
+                    rows,
+                    lsn,
+                    wanted: pages,
+                };
+                self.rows.split_leaf(self.database, &split)?;
+                let applied = pages.iter().filter(|take| **take).count() as u64;
+                self.stats.images = self.stats.images.saturating_add(applied);
+                self.stats.skipped = self.stats.skipped.saturating_add(3 - applied);
+            }
             Body::InsertRow { tree, page, row } => {
                 self.rows
                     .insert_row(self.database, tree, PageId(page), row, lsn)?;
@@ -917,6 +1122,11 @@ impl<R: RowRedo> Redo for Applier<'_, R> {
             Body::DeleteRow { tree, page, key } => {
                 self.rows
                     .delete_row(self.database, tree, PageId(page), key, lsn)?;
+                self.stats.rows = self.stats.rows.saturating_add(1);
+            }
+            Body::DeleteRows { tree, page, keys } => {
+                self.rows
+                    .delete_rows(self.database, tree, PageId(page), keys, lsn)?;
                 self.stats.rows = self.stats.rows.saturating_add(1);
             }
             Body::UpdateInPlace {

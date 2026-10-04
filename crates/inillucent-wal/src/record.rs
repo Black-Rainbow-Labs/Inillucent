@@ -117,6 +117,23 @@ pub enum Body<'a> {
         /// The key of the row that went away.
         key: &'a [u8],
     },
+    /// Several rows were removed from one leaf, by tombstone or by delta removal.
+    ///
+    /// **One record for a run of a bulk delete, not one per row (task-2183).**
+    /// A `DELETE` of 40,000 rows wrote 40,000 `DeleteRow` records, each a
+    /// 32 byte header around a nine byte key, and paid the log's lock, its
+    /// checksum and its buffer once per row; the volume alone brought the next
+    /// checkpoint forward. A replay removes the keys in order, each the way a
+    /// `DeleteRow` for it would, and the page-LSN rule is asked once for the
+    /// whole record.
+    DeleteRows {
+        /// The tree the leaf belongs to.
+        tree: u64,
+        /// The leaf's page number.
+        page: u64,
+        /// The keys of the rows that went away, as [`put_key_list`] writes them.
+        keys: &'a [u8],
+    },
     /// One fixed-width slot of one row was overwritten.
     UpdateInPlace {
         /// The tree the leaf belongs to.
@@ -172,6 +189,63 @@ pub enum Body<'a> {
         right_image: &'a [u8],
         /// The parent's whole page.
         parent_image: &'a [u8],
+    },
+    /// A leaf split, as what it did rather than the three pages it produced.
+    ///
+    /// **Each of the three pages replays from its own state and from nothing
+    /// else.** The obvious logical record names the left page and the point,
+    /// and rebuilds both halves from the left page's rows. That is not safe
+    /// here, because an eviction writes one dirty page to the data file
+    /// without the others: once the left page is in the file at its state
+    /// after the split, the rows the right page was built from are gone from
+    /// it, and a right page the eviction did not reach could not be rebuilt.
+    /// So the record carries what each page needs by itself:
+    ///
+    /// - the **left** page is the leaf the split read, so its replay repacks
+    ///   the first `kept` live rows of that same page, which the page LSN rule
+    ///   says is in the state the split saw;
+    /// - the **right** page is new, so its replay packs `rows`, the right
+    ///   half's rows in the tagged encoding a row record uses, and reads no
+    ///   page at all;
+    /// - the **parent** gains `separator` and a child pointer to `right`
+    ///   immediately after its pointer to `left`.
+    ///
+    /// The right half's rows are most of the record, and they are rows rather
+    /// than a page: a split of rows arriving in key order keeps about
+    /// ninety five percent of them on the left, so the record is a few
+    /// kilobytes where [`Body::Structural`] was three whole pages.
+    ///
+    /// The write path uses [`Body::Structural`] instead when any of these
+    /// would not be true: a root split, whose left half is a new page built
+    /// from the old root's rows; a parent with no room, whose own split is
+    /// logged as page images; and a split that moved an out of line value,
+    /// because the run it moved into came from the free map and a replay
+    /// would allocate somewhere else.
+    SplitLeaf {
+        /// The tree the leaves belong to.
+        tree: u64,
+        /// The leaf that was split, which keeps the left half.
+        left: u64,
+        /// The new page holding the right half.
+        right: u64,
+        /// The interior page that gained the separator.
+        parent: u64,
+        /// The page the right half points at, which is the page the left one
+        /// pointed at before the split.
+        right_sibling: u64,
+        /// The commit watermark the split leaf carried, which both halves get.
+        max_cts: u64,
+        /// The LSN the left page carried before the split, for the message a
+        /// replay that cannot fit the rows reports. See `CompactLeaf::from_lsn`.
+        from_lsn: u64,
+        /// How many of the left page's live rows it keeps, in key order.
+        kept: u32,
+        /// The right half's first key, in the comparison encoding an interior
+        /// page stores.
+        separator: &'a [u8],
+        /// The right half's rows: a `u32` count, then each row as a `u32`
+        /// length and its tagged values.
+        rows: &'a [u8],
     },
     /// A whole page was written: bulk build, free map, interior rewrite.
     WritePage {
@@ -268,6 +342,7 @@ impl Body<'_> {
         match self {
             Body::InsertRow { .. } => kind::INSERT_ROW,
             Body::DeleteRow { .. } => kind::DELETE_ROW,
+            Body::DeleteRows { .. } => kind::DELETE_ROWS,
             Body::UpdateInPlace { .. } => kind::UPDATE_IN_PLACE,
             Body::CompactLeaf { .. } => kind::COMPACT_LEAF,
             Body::Structural {
@@ -278,6 +353,7 @@ impl Body<'_> {
                 kind: Structural::Merge,
                 ..
             } => kind::MERGE_LEAF,
+            Body::SplitLeaf { .. } => kind::SPLIT_LOGICAL,
             Body::WritePage { .. } => kind::WRITE_PAGE,
             Body::AllocPage { .. } => kind::ALLOC_PAGE,
             Body::FreePage { .. } => kind::FREE_PAGE,
@@ -328,6 +404,20 @@ pub mod kind {
     /// read by an older build, which refuses with "a log record has kind 15, which
     /// this format does not define" rather than misreading it.
     pub const BULK_BUILT: u8 = 15;
+    /// [`super::Body::SplitLeaf`].
+    ///
+    /// A log written before it holds no record of this kind, so an older log
+    /// reads unchanged, and an older build refuses a log holding one with "a
+    /// log record has kind 16, which this format does not define" rather than
+    /// misreading it.
+    pub const SPLIT_LOGICAL: u8 = 16;
+    /// [`super::Body::DeleteRows`].
+    ///
+    /// A log written before it holds no record of this kind, so an older log
+    /// reads unchanged, and an older build refuses a log holding one with "a
+    /// log record has kind 17, which this format does not define" rather than
+    /// misreading it.
+    pub const DELETE_ROWS: u8 = 17;
 }
 
 /// One decoded log record.
@@ -355,10 +445,17 @@ impl<'a> Record<'a> {
         match self.body {
             Body::InsertRow { page, .. }
             | Body::DeleteRow { page, .. }
+            | Body::DeleteRows { page, .. }
             | Body::UpdateInPlace { page, .. }
             | Body::CompactLeaf { page, .. }
             | Body::WritePage { page, .. } => PageList::one(page),
             Body::Structural {
+                left,
+                right,
+                parent,
+                ..
+            }
+            | Body::SplitLeaf {
                 left,
                 right,
                 parent,
@@ -546,6 +643,9 @@ fn encode_body(body: &Body<'_>, out: &mut Vec<u8>) -> DbResult<()> {
         Body::DeleteRow { tree, page, key } => {
             put_tree_page_bytes(out, *tree, *page, key);
         }
+        Body::DeleteRows { tree, page, keys } => {
+            put_tree_page_bytes(out, *tree, *page, keys);
+        }
         Body::UpdateInPlace {
             tree,
             page,
@@ -585,6 +685,25 @@ fn encode_body(body: &Body<'_>, out: &mut Vec<u8>) -> DbResult<()> {
             put_bytes(out, left_image);
             put_bytes(out, right_image);
             put_bytes(out, parent_image);
+        }
+        Body::SplitLeaf {
+            tree,
+            left,
+            right,
+            parent,
+            right_sibling,
+            max_cts,
+            from_lsn,
+            kept,
+            separator,
+            rows,
+        } => {
+            for word in [tree, left, right, parent, right_sibling, max_cts, from_lsn] {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+            out.extend_from_slice(&kept.to_le_bytes());
+            put_bytes(out, separator);
+            put_bytes(out, rows);
         }
         Body::WritePage { page, image } => {
             out.extend_from_slice(&page.to_le_bytes());
@@ -633,6 +752,10 @@ fn decode_body(kind: u8, payload: &[u8]) -> DbResult<(Body<'_>, usize)> {
         kind::DELETE_ROW => {
             let (tree, page, key) = cursor.tree_page_bytes()?;
             Body::DeleteRow { tree, page, key }
+        }
+        kind::DELETE_ROWS => {
+            let (tree, page, keys) = cursor.tree_page_bytes()?;
+            Body::DeleteRows { tree, page, keys }
         }
         kind::UPDATE_IN_PLACE => {
             let tree = cursor.u64()?;
@@ -690,6 +813,18 @@ fn decode_body(kind: u8, payload: &[u8]) -> DbResult<(Body<'_>, usize)> {
                 parent_image,
             }
         }
+        kind::SPLIT_LOGICAL => Body::SplitLeaf {
+            tree: cursor.u64()?,
+            left: cursor.u64()?,
+            right: cursor.u64()?,
+            parent: cursor.u64()?,
+            right_sibling: cursor.u64()?,
+            max_cts: cursor.u64()?,
+            from_lsn: cursor.u64()?,
+            kept: cursor.u32()?,
+            separator: cursor.bytes()?,
+            rows: cursor.bytes()?,
+        },
         kind::WRITE_PAGE => {
             let page = cursor.u64()?;
             let image = cursor.bytes()?;
@@ -742,6 +877,40 @@ fn put_tree_page_bytes(out: &mut Vec<u8>, tree: u64, page: u64, bytes: &[u8]) {
     out.extend_from_slice(&tree.to_le_bytes());
     out.extend_from_slice(&page.to_le_bytes());
     put_bytes(out, bytes);
+}
+
+/// Appends a list of keys in the form a `DeleteRows` record carries them.
+///
+/// A `u32` count, then each key as a `u32` length and its bytes.
+///
+/// @param out - the buffer to append to
+/// @param keys - the keys, each in the tagged encoding
+pub fn put_key_list<'k>(out: &mut Vec<u8>, keys: impl ExactSizeIterator<Item = &'k [u8]>) {
+    out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for key in keys {
+        put_bytes(out, key);
+    }
+}
+
+/// Reads the keys [`put_key_list`] wrote.
+///
+/// @param list - the bytes
+pub fn key_list(list: &[u8]) -> DbResult<Vec<&[u8]>> {
+    let mut cursor = Cursor::new(list);
+    let count = cursor.u32()? as usize;
+    // Every key takes at least its four byte length, so a count the bytes
+    // cannot hold is refused before anything is allocated for it.
+    if count > list.len() / 4 {
+        return Err(corrupt("a key list names more keys than it holds"));
+    }
+    let mut keys = Vec::with_capacity(count);
+    for _ in 0..count {
+        keys.push(cursor.bytes()?);
+    }
+    if cursor.remaining() != 0 {
+        return Err(corrupt("a key list has bytes after its last key"));
+    }
+    Ok(keys)
 }
 
 /// Writes a `u32` length followed by the bytes.
@@ -929,6 +1098,11 @@ mod tests {
                 page: 9,
                 key: b"key",
             },
+            Body::DeleteRows {
+                tree: 7,
+                page: 9,
+                keys: b"\x01\x00\x00\x00\x03\x00\x00\x00key",
+            },
             Body::UpdateInPlace {
                 tree: 7,
                 page: 9,
@@ -961,6 +1135,18 @@ mod tests {
                 left_image: b"left",
                 right_image: b"right!",
                 parent_image: b"parent",
+            },
+            Body::SplitLeaf {
+                tree: 7,
+                left: 9,
+                right: 10,
+                parent: 4,
+                right_sibling: 11,
+                max_cts: 77,
+                from_lsn: 4_000,
+                kept: 120,
+                separator: b"sep",
+                rows: b"\x01\x00\x00\x00\x02\x00\x00\x00ab",
             },
             Body::WritePage {
                 page: 12,
@@ -1035,6 +1221,9 @@ mod tests {
         // Added by task-2000, design 2. Fifteen was not a defined kind before it,
         // so no file holds a record of this number with another meaning.
         assert_eq!(kind::BULK_BUILT, 15);
+        // Added with the logical split record. Sixteen was not a defined kind
+        // before it.
+        assert_eq!(kind::SPLIT_LOGICAL, 16);
     }
 
     /// A kind this format does not define is refused rather than guessed at.
@@ -1091,6 +1280,7 @@ mod tests {
             match body {
                 Body::InsertRow { page, .. }
                 | Body::DeleteRow { page, .. }
+                | Body::DeleteRows { page, .. }
                 | Body::UpdateInPlace { page, .. }
                 | Body::CompactLeaf { page, .. }
                 | Body::WritePage { page, .. } => {
@@ -1102,6 +1292,12 @@ mod tests {
                     right,
                     parent,
                     ..
+                }
+                | Body::SplitLeaf {
+                    left,
+                    right,
+                    parent,
+                    ..
                 } => {
                     assert_eq!(pages.as_slice(), &[left, right, parent]);
                     with_pages += 1;
@@ -1109,7 +1305,7 @@ mod tests {
                 _ => assert!(pages.as_slice().is_empty(), "{body:?} named a page"),
             }
         }
-        assert!(with_pages >= 7, "only {with_pages} kinds name a page");
+        assert!(with_pages >= 8, "only {with_pages} kinds name a page");
     }
 
     /// Every truncation of every record is refused, and none of them panics.

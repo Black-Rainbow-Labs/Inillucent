@@ -33,7 +33,8 @@ fn chaos() -> PathBuf {
 /// @param name - the case's name, which is also its directory's
 /// @param seed - the seed
 /// @param settings - what the workload includes
-fn long_storm(name: &str, seed: u64, settings: Settings) {
+/// @param kill_all_at_end - whether the run ends with every process killed at once
+fn long_storm(name: &str, seed: u64, settings: Settings, kill_all_at_end: bool) {
     let directory = workspace_root()
         .join("_agent_output/storm-nightly")
         .join(name);
@@ -53,6 +54,7 @@ fn long_storm(name: &str, seed: u64, settings: Settings) {
         },
         least_acknowledged: 200,
         least_checks: 20,
+        kill_all_at_end,
     };
     match run(&storm, &chaos(), &directory) {
         Ok(report) => eprintln!(
@@ -69,7 +71,7 @@ fn long_storm(name: &str, seed: u64, settings: Settings) {
 /// Eight workers and four readers with the default pool.
 #[test]
 fn a_long_storm_loses_nothing() {
-    long_storm("default", 0x2173_1001, Settings::default());
+    long_storm("default", 0x2173_1001, Settings::default(), false);
 }
 
 /// A 64 page pool, bulk transactions and the search table, together.
@@ -84,6 +86,24 @@ fn a_long_storm_with_a_small_pool_bulk_and_search_loses_nothing() {
             search: true,
             ..Settings::default()
         },
+        false,
+    );
+}
+
+/// The shape of the 2.0.7 damage report for three minutes: autocommit rewrites
+/// of values on shared extent pages, the search table, readers that write, and
+/// every process killed at the same moment at the end.
+#[test]
+fn a_long_storm_in_the_shape_of_the_2_0_7_damage_report_loses_nothing() {
+    long_storm(
+        "report-shape",
+        0x2177_1001,
+        Settings {
+            search: true,
+            rewrite: true,
+            ..Settings::default()
+        },
+        true,
     );
 }
 
@@ -100,5 +120,6 @@ fn a_long_storm_on_an_encrypted_file_with_a_small_pool_loses_nothing() {
             key: Some("nightly storm".to_string()),
             ..Settings::default()
         },
+        false,
     );
 }

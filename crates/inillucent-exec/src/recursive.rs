@@ -178,10 +178,17 @@ fn fill_in_passes(
             cte,
             rows: answer.get(working.clone()).unwrap_or_default(),
         };
-        let mut fresh: Vec<Vec<OwnedDatum>> = Vec::new();
-        for ((_, arm), step) in steps.iter().zip(arms.iter_mut()) {
-            fresh.extend(step.run(arm, &queued, params)?);
-        }
+        // One step arm's rows are the pass's rows, with no second list to copy them into.
+        let mut fresh: Vec<Vec<OwnedDatum>> = match (steps, arms.as_mut_slice()) {
+            ([(_, arm)], [step]) => step.run(arm, &queued, params)?,
+            _ => {
+                let mut fresh = Vec::new();
+                for ((_, arm), step) in steps.iter().zip(arms.iter_mut()) {
+                    fresh.extend(step.run(arm, &queued, params)?);
+                }
+                fresh
+            }
+        };
         if distinct {
             fresh.retain(|row| seen.remember(row));
         }
@@ -223,6 +230,9 @@ struct StepArm {
     compiled: Option<crate::compiled::Compiled>,
     /// Whether a compile has been tried.
     tried: bool,
+    /// The arm's filter and columns evaluated on each queued row, when the arm
+    /// reads nothing but the queue; see [`DirectStep`].
+    direct: Option<DirectStep>,
 }
 
 impl StepArm {
@@ -234,6 +244,7 @@ impl StepArm {
             prepared,
             compiled: None,
             tried: false,
+            direct: None,
         }
     }
 
@@ -248,8 +259,16 @@ impl StepArm {
         catalog: &dyn TreeCatalog,
         params: &Params,
     ) -> DbResult<Vec<Vec<OwnedDatum>>> {
+        if let Some(direct) = &self.direct {
+            return direct.run(catalog);
+        }
         if !self.tried {
             self.tried = true;
+            if let Some(direct) = DirectStep::compile(plan, catalog, params)? {
+                let rows = direct.run(catalog)?;
+                self.direct = Some(direct);
+                return Ok(rows);
+            }
             if let Some(mut compiled) =
                 crate::compiled::try_compile(plan, catalog, &self.prepared, params)?
             {
@@ -269,6 +288,204 @@ impl StepArm {
         }
         Ok(run_any_prepared(plan, catalog, &self.prepared, params)?.0)
     }
+}
+
+/// A step arm that reads only the queue, evaluated one queued row at a time.
+///
+/// **`SELECT x + 1 FROM c WHERE x < 10000` needs no pipeline (task-2183).**
+/// A counter, a series and most string splitting are this shape, and each
+/// pass of such a fill hands one row to the step arm. Running the arm's
+/// compiled chain for it built a source over a copy of the row, pushed a batch
+/// through a filter, a projection and a collector, and copied the answer out:
+/// about 200 ns a pass, where SQLite's whole step is about 80. Here the arm's
+/// `WHERE` and result columns are compiled once against the queue's row and
+/// evaluated on each queued row directly. The expressions are the same
+/// compiled expressions the chain runs, so a row comes out with the same
+/// values; an arm with anything else in it - a join, an aggregate, a window,
+/// a subquery, an `ORDER BY` or a `LIMIT` - runs as it did.
+struct DirectStep {
+    /// The CTE whose queue the arm reads.
+    cte: usize,
+    /// The space the expressions were compiled in: one row image of the queue.
+    space: crate::dml::RowSpace,
+    /// The arm's `WHERE`, when it has one.
+    filter: Option<Box<dyn crate::expr::Eval>>,
+    /// The arm's result columns.
+    columns: Vec<Box<dyn crate::expr::Eval>>,
+}
+
+impl DirectStep {
+    /// Compiles an arm that reads only the queue, or returns `None` for any other arm.
+    ///
+    /// @param plan - the arm's plan
+    /// @param catalog - the catalog, for a registered function's body
+    /// @param params - the statement's bound parameters
+    fn compile(
+        plan: &PhysicalPlan,
+        catalog: &dyn TreeCatalog,
+        params: &Params,
+    ) -> DbResult<Option<DirectStep>> {
+        let select = &plan.select;
+        let [source] = select.sources.as_slice() else {
+            return Ok(None);
+        };
+        let inillucent_sql::bind::SourceRows::RecursiveSelf { cte } = source.rows else {
+            return Ok(None);
+        };
+        let shaped = source.constraint.is_none()
+            && select.aggregates.is_empty()
+            && select.group_by.is_empty()
+            && select.having.is_none()
+            && select.windows.is_empty()
+            && select.order_by.is_empty()
+            && select.limit.is_none()
+            && select.offset.is_none()
+            && !select.distinct
+            && select.compounds.is_empty()
+            && select.values.is_empty()
+            && select.correlations.is_empty()
+            && select.filter.iter().all(reads_only_its_row)
+            && select
+                .columns
+                .iter()
+                .all(|column| reads_only_its_row(&column.expr));
+        if !shaped {
+            return Ok(None);
+        }
+        let Some(queue) = catalog.recursive_rows(cte) else {
+            return Ok(None);
+        };
+        // The queue's rows are as wide as the CTE's column list; an empty
+        // queue at compile time says nothing, so the width comes from the
+        // columns the arm's expressions read.
+        let width = queue
+            .first()
+            .map(Vec::len)
+            .unwrap_or(0)
+            .max(widest_read(select, source.id));
+        let layout = std::rc::Rc::new(crate::physical::SourceLayout {
+            tree_key: 0,
+            slots: (0..width).map(Some).collect(),
+            rowid: None,
+            identity: Vec::new(),
+            types: vec![crate::expr::StaticType::Unknown; width],
+            width,
+            key_columns: Vec::new(),
+        });
+        let space = crate::dml::RowSpace::new(&[source.id], &layout);
+        let filter = match &select.filter {
+            Some(expr) => Some(space.compile(expr, params, catalog)?),
+            None => None,
+        };
+        let columns = select
+            .columns
+            .iter()
+            .map(|column| space.compile(&column.expr, params, catalog))
+            .collect::<DbResult<Vec<_>>>()?;
+        Ok(Some(DirectStep {
+            cte,
+            space,
+            filter,
+            columns,
+        }))
+    }
+
+    /// Runs the arm over the rows the queue holds this pass.
+    ///
+    /// @param catalog - the catalog holding this pass's queue
+    fn run(&self, catalog: &dyn TreeCatalog) -> DbResult<Vec<Vec<OwnedDatum>>> {
+        use inillucent_tree::datum::Datum;
+        let rows = catalog.recursive_rows(self.cte).unwrap_or(&[]);
+        // The pass's rows as one batch, a vector a column, so the expressions
+        // are evaluated without building a batch per row and per expression.
+        let width = self.space.width;
+        // **One row is evaluated with nothing built for it (task-2183).** A
+        // counter such as `SELECT x + 1 FROM c WHERE x < 10000` holds one row
+        // in the queue on every pass, and a pass built a list a column, a list
+        // of vectors and a batch to evaluate it: six allocations a step, for
+        // ten thousand steps.
+        const INLINE: usize = 8;
+        if let ([row], true) = (rows, width <= INLINE) {
+            let mut inline = [crate::batch::Vector::Const(Datum::Null); INLINE];
+            for (slot, value) in inline.iter_mut().zip(row.iter()) {
+                *slot = crate::batch::Vector::Const(value.borrow());
+            }
+            let batch = crate::batch::Batch::over(1, inline.get(..width).unwrap_or(&[]));
+            if let Some(filter) = &self.filter {
+                let kept = filter.value(&batch, 0)?;
+                if crate::expr::truth(&kept.get()) != Some(true) {
+                    return Ok(Vec::new());
+                }
+            }
+            let mut produced = Vec::with_capacity(self.columns.len());
+            for column in &self.columns {
+                produced.push(OwnedDatum::from_datum(&column.value(&batch, 0)?.get()));
+            }
+            return Ok(vec![produced]);
+        }
+        let cells: Vec<Vec<Datum<'_>>> = (0..width)
+            .map(|column| {
+                rows.iter()
+                    .map(|row| row.get(column).map_or(Datum::Null, OwnedDatum::borrow))
+                    .collect()
+            })
+            .collect();
+        let vectors: Vec<crate::batch::Vector<'_>> = cells
+            .iter()
+            .map(|values| crate::batch::Vector::Values(values.as_slice()))
+            .collect();
+        let batch = crate::batch::Batch::new(rows.len(), vectors);
+        let mut out = Vec::with_capacity(rows.len());
+        for nth in 0..rows.len() {
+            if let Some(filter) = &self.filter {
+                let kept = filter.value(&batch, nth)?;
+                if crate::expr::truth(&kept.get()) != Some(true) {
+                    continue;
+                }
+            }
+            let mut produced = Vec::with_capacity(self.columns.len());
+            for column in &self.columns {
+                produced.push(OwnedDatum::from_datum(&column.value(&batch, nth)?.get()));
+            }
+            out.push(produced);
+        }
+        Ok(out)
+    }
+}
+
+/// Reports whether an expression reads nothing but the row it is evaluated on.
+///
+/// A subquery, an aggregate, a window, a module's function and a `RAISE` all
+/// read or do something else, so an arm holding one takes the pipeline.
+///
+/// @param expr - the expression
+fn reads_only_its_row(expr: &BoundExpr) -> bool {
+    let plain = !matches!(
+        expr,
+        BoundExpr::Subquery { .. }
+            | BoundExpr::Aggregate { .. }
+            | BoundExpr::WindowRef { .. }
+            | BoundExpr::SorterColumn { .. }
+            | BoundExpr::VirtualFunction { .. }
+            | BoundExpr::External { .. }
+            | BoundExpr::Raise { .. }
+            | BoundExpr::Rowid { .. }
+            | BoundExpr::Generated { .. }
+    );
+    plain && expr.children().into_iter().all(reads_only_its_row)
+}
+
+/// Returns one past the highest column of a FROM term the arm's expressions read.
+///
+/// @param select - the arm
+/// @param source - the term's statement-wide number
+fn widest_read(select: &inillucent_sql::bind::BoundSelect, source: usize) -> usize {
+    let used = select.columns_read(source);
+    used.columns
+        .iter()
+        .map(|slot| usize::from(*slot).saturating_add(1))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Fills a recursive CTE whose queue is ordered by the query's own `ORDER BY`.

@@ -14,6 +14,7 @@
 //! `NaN` becomes `null`, which is what the pinned release stores.
 
 use super::node::Node;
+use super::path::Step;
 
 /// Why a document would not parse, and where.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,14 +34,39 @@ pub struct Parsed {
 
 /// Parses one JSON or JSON5 document, which must be the whole of the text.
 pub fn parse(text: &str) -> Result<Parsed, ParseFailure> {
+    parse_pruned(text, &[])
+}
+
+/// Parses a whole document but builds only the part one path reads.
+///
+/// **What `json_extract(column, '$.k')` over a column of different documents
+/// needs (task-2183).** Every value of the document is still read and checked,
+/// so a malformed document fails exactly as [`parse`] fails, and `used_json5`
+/// says what it says there. But a member whose label is not the path's next
+/// key, and an element before the path's next index, is read without building
+/// a node for it, and nothing after the first matching member is built. Each
+/// string and number of a document was an allocation of its own, which was
+/// most of the cost of extracting one key.
+///
+/// The tree comes back with the same answer for `steps` that [`parse`]'s tree
+/// gives: [`super::path::lookup`] takes an object's first matching member, and
+/// that is the only member kept; an array keeps its elements up to the wanted
+/// index, the ones before it as `null`. A step this does not prune by - from
+/// the end, the append position, a malformed step - builds the rest of that
+/// value whole.
+///
+/// @param text - the document
+/// @param steps - the path that will be looked up in the answer
+pub fn parse_pruned(text: &str, steps: &[Step]) -> Result<Parsed, ParseFailure> {
     let mut parser = Parser {
         bytes: text.as_bytes(),
         at: 0,
         used_json5: false,
         depth: 0,
+        skipping: false,
     };
     parser.skip_space();
-    let node = parser.value()?;
+    let node = parser.value_pruned(steps)?;
     parser.skip_space();
     if parser.at != parser.bytes.len() {
         return Err(parser.fail());
@@ -64,6 +90,10 @@ struct Parser<'text> {
     at: usize,
     used_json5: bool,
     depth: usize,
+    /// Whether the value being read is being checked and passed over, so
+    /// nothing it holds is kept: a string or number is an empty node and a
+    /// container keeps no children.
+    skipping: bool,
 }
 
 impl Parser<'_> {
@@ -150,6 +180,174 @@ impl Parser<'_> {
         }
     }
 
+    /// Parses one value, building only what a path will read; see [`parse_pruned`].
+    ///
+    /// @param steps - the rest of the path, at this value
+    fn value_pruned(&mut self, steps: &[Step]) -> Result<Node, ParseFailure> {
+        match (steps.split_first(), self.peek()) {
+            (None, _) => self.value(),
+            (Some((Step::Key(name), rest)), Some(b'{')) => self.object_pruned(name, rest),
+            (Some((Step::Index(index), rest)), Some(b'[')) => self.array_pruned(*index, rest),
+            // A key or an index meeting a value it cannot step into: the
+            // lookup answers nothing whatever the value is.
+            (Some((Step::Key(_) | Step::Index(_), _)), _) => {
+                self.skip_value()?;
+                Ok(Node::Null)
+            }
+            _ => self.value(),
+        }
+    }
+
+    /// Reads one value and keeps nothing of it.
+    fn skip_value(&mut self) -> Result<(), ParseFailure> {
+        let was = self.skipping;
+        self.skipping = true;
+        let read = self.value();
+        self.skipping = was;
+        read.map(|_| ())
+    }
+
+    /// Parses an object, keeping only the first member whose label is `name`.
+    ///
+    /// @param name - the key the path steps into
+    /// @param rest - the path after it
+    fn object_pruned(&mut self, name: &str, rest: &[Step]) -> Result<Node, ParseFailure> {
+        if self.depth >= MAX_DEPTH {
+            return Err(self.fail());
+        }
+        self.at += 1;
+        self.depth += 1;
+        let mut members = Vec::new();
+        let mut seen = false;
+        loop {
+            self.skip_space();
+            if self.peek() == Some(b'}') {
+                if seen {
+                    self.used_json5 = true;
+                }
+                self.at += 1;
+                break;
+            }
+            seen = true;
+            let label = match members.is_empty() {
+                true => self.label_if(name)?,
+                false => {
+                    self.skip_label()?;
+                    None
+                }
+            };
+            self.skip_space();
+            if self.peek() != Some(b':') {
+                return Err(self.fail());
+            }
+            self.at += 1;
+            self.skip_space();
+            match label {
+                Some(label) => {
+                    let value = self.value_pruned(rest)?;
+                    members.push((label, value));
+                }
+                None => self.skip_value()?,
+            }
+            self.skip_space();
+            match self.peek() {
+                Some(b',') => self.at += 1,
+                Some(b'}') => {
+                    self.at += 1;
+                    break;
+                }
+                _ => return Err(self.fail()),
+            }
+        }
+        self.depth -= 1;
+        Ok(Node::Object(members))
+    }
+
+    /// Reads one label and keeps nothing of it.
+    fn skip_label(&mut self) -> Result<(), ParseFailure> {
+        let was = self.skipping;
+        self.skipping = true;
+        let read = self.label();
+        self.skipping = was;
+        read.map(|_| ())
+    }
+
+    /// Reads one label and returns it when it spells `name`.
+    ///
+    /// A label with no escape in it is its own spelling, so it is compared
+    /// where it lies, with nothing allocated; only a label holding an escape
+    /// is built and unescaped to be compared.
+    ///
+    /// @param name - the key the path steps into
+    fn label_if(&mut self, name: &str) -> Result<Option<Node>, ParseFailure> {
+        let start = self.at;
+        let was = self.skipping;
+        self.skipping = true;
+        let read = self.label();
+        self.skipping = was;
+        let kind = read?;
+        let quoted = matches!(self.bytes.get(start), Some(b'"' | b'\''));
+        let (from, to) = match quoted {
+            true => (start.saturating_add(1), self.at.saturating_sub(1)),
+            false => (start, self.at),
+        };
+        if matches!(kind, Node::Text(_)) || !quoted {
+            let spelled = self.bytes.get(from..to) == Some(name.as_bytes());
+            return Ok(spelled.then(|| Node::Text(name.to_string())));
+        }
+        // An escape: read it again, kept, and compare what it denotes.
+        let end = self.at;
+        self.at = start;
+        let label = self.label()?;
+        self.at = end;
+        Ok(super::path::label_matches(&label, name).then_some(label))
+    }
+
+    /// Parses an array, keeping the elements up to `wanted`, the earlier ones as `null`.
+    ///
+    /// @param wanted - the index the path steps into
+    /// @param rest - the path after it
+    fn array_pruned(&mut self, wanted: usize, rest: &[Step]) -> Result<Node, ParseFailure> {
+        if self.depth >= MAX_DEPTH {
+            return Err(self.fail());
+        }
+        self.at += 1;
+        self.depth += 1;
+        let mut items = Vec::new();
+        let mut count = 0usize;
+        loop {
+            self.skip_space();
+            if self.peek() == Some(b']') {
+                if count > 0 {
+                    self.used_json5 = true;
+                }
+                self.at += 1;
+                break;
+            }
+            if count == wanted {
+                let item = self.value_pruned(rest)?;
+                items.push(item);
+            } else {
+                self.skip_value()?;
+                if count < wanted {
+                    items.push(Node::Null);
+                }
+            }
+            count = count.saturating_add(1);
+            self.skip_space();
+            match self.peek() {
+                Some(b',') => self.at += 1,
+                Some(b']') => {
+                    self.at += 1;
+                    break;
+                }
+                _ => return Err(self.fail()),
+            }
+        }
+        self.depth -= 1;
+        Ok(Node::Array(items))
+    }
+
     /// Parses one value.
     fn value(&mut self) -> Result<Node, ParseFailure> {
         if self.depth >= MAX_DEPTH {
@@ -205,16 +403,18 @@ impl Parser<'_> {
         self.at += 1;
         self.depth += 1;
         let mut members = Vec::new();
+        let mut seen = false;
         loop {
             self.skip_space();
             if self.peek() == Some(b'}') {
-                if !members.is_empty() {
+                if seen {
                     // A `}` straight after a comma is JSON5's trailing comma.
                     self.used_json5 = true;
                 }
                 self.at += 1;
                 break;
             }
+            seen = true;
             let label = self.label()?;
             self.skip_space();
             if self.peek() != Some(b':') {
@@ -223,7 +423,9 @@ impl Parser<'_> {
             self.at += 1;
             self.skip_space();
             let value = self.value()?;
-            members.push((label, value));
+            if !self.skipping {
+                members.push((label, value));
+            }
             self.skip_space();
             match self.peek() {
                 Some(b',') => self.at += 1,
@@ -266,17 +468,21 @@ impl Parser<'_> {
         self.at += 1;
         self.depth += 1;
         let mut items = Vec::new();
+        let mut seen = false;
         loop {
             self.skip_space();
             if self.peek() == Some(b']') {
-                if !items.is_empty() {
+                if seen {
                     self.used_json5 = true;
                 }
                 self.at += 1;
                 break;
             }
+            seen = true;
             let item = self.value()?;
-            items.push(item);
+            if !self.skipping {
+                items.push(item);
+            }
             self.skip_space();
             match self.peek() {
                 Some(b',') => self.at += 1,
@@ -294,6 +500,11 @@ impl Parser<'_> {
     /// Returns a byte range of the source as text.
     fn slice(&self, start: usize, end: usize) -> Result<String, ParseFailure> {
         let bytes = self.bytes.get(start..end).ok_or_else(|| self.fail())?;
+        // A value being passed over keeps nothing, and the document is text
+        // already, so there is nothing about these bytes to check.
+        if self.skipping {
+            return Ok(String::new());
+        }
         String::from_utf8(bytes.to_vec()).map_err(|_| self.fail())
     }
 
@@ -580,5 +791,73 @@ mod tests {
     fn nesting_is_bounded() {
         let deep = "[".repeat(2000);
         assert!(parse(&deep).is_err());
+        let pruned = super::super::path::parse("$.a").unwrap();
+        assert!(parse_pruned(&deep, &pruned).is_err());
+    }
+
+    /// A pruned parse answers every path the way a whole parse does, and fails where it fails.
+    ///
+    /// The documents hold a key twice (the first wins), JSON5 spellings, a
+    /// trailing comma, nested containers and values of the wrong kind for the
+    /// step; the paths step through objects and arrays, past the end, from the
+    /// end and into a scalar.
+    #[test]
+    fn a_pruned_parse_answers_like_a_whole_one() {
+        let documents = [
+            r#"{"k":5,"name":"row 5","tags":[5,5]}"#,
+            r#"{"k":1,"k":2,"a":{"b":[10,{"c":"x
+y"}]}}"#,
+            r#"{k:0x10, 'name':'sq', list:[1,2,3,], nested:{deep:[[1],[2,[3]]]}}"#,
+            r#"[1,{"k":[true,false,null]},"text",1.5e3]"#,
+            r#""just text""#,
+            "42",
+            r#"{"a":[1,2,3]}"#,
+        ];
+        let paths = [
+            "$",
+            "$.k",
+            "$.name",
+            "$.tags",
+            "$.tags[1]",
+            "$.a.b[1].c",
+            "$.a.b[5]",
+            "$.list[3]",
+            "$.list[#-1]",
+            "$.nested.deep[1][1][0]",
+            "$[1].k[2]",
+            "$[3]",
+            "$.missing",
+            "$[0]",
+            "$.k.inner",
+            "$.a[#]",
+        ];
+        for document in documents {
+            let whole = parse(document).unwrap();
+            for path in paths {
+                let steps = super::super::path::parse(path).unwrap();
+                let pruned = parse_pruned(document, &steps).unwrap();
+                assert_eq!(pruned.used_json5, whole.used_json5, "{document} {path}");
+                let expected = super::super::path::lookup(&whole.node, &steps)
+                    .ok()
+                    .flatten();
+                let found = super::super::path::lookup(&pruned.node, &steps)
+                    .ok()
+                    .flatten();
+                assert_eq!(found, expected, "{document} {path}");
+            }
+        }
+        for broken in [
+            r#"{"k":5,"x":[1,}"#,
+            r#"{"a":1} x"#,
+            r#"{"a":01}"#,
+            r#"[1,2"#,
+        ] {
+            let steps = super::super::path::parse("$.a").unwrap();
+            assert_eq!(
+                parse_pruned(broken, &steps).err(),
+                parse(broken).err(),
+                "{broken}"
+            );
+        }
     }
 }

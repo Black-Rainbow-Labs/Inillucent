@@ -176,7 +176,13 @@ impl crate::ImportedDatabase {
                 session,
                 at,
             )?;
-            match &entry.row {
+            let from_page = match &entry.page {
+                Some((page, located)) => {
+                    Some(inillucent_tree::write::row_from_page(page, *located)?)
+                }
+                None => None,
+            };
+            match from_page.as_ref().or(entry.row.as_ref()) {
                 Some(row) => {
                     let values: Vec<Datum<'_>> = row.iter().map(OwnedDatum::borrow).collect();
                     tree.put(database, &mut log, &values)?;

@@ -203,8 +203,13 @@ fn reached_malformed<T>(array_only: bool, text: &str, held: &Node) -> DbResult<O
 }
 
 /// Returns whether an object label spells a path key.
-fn label_matches(label: &Node, name: &str) -> bool {
-    super::render::unescape(label) == name
+pub(super) fn label_matches(label: &Node, name: &str) -> bool {
+    // A label with no escape is its own spelling, so it is compared as it is.
+    // Unescaping it first copied it twice for every member a lookup passed.
+    match label {
+        Node::Text(text) | Node::TextRaw(text) => text == name,
+        _ => String::from_utf8_lossy(&super::render::unescape_bytes(label)) == name,
+    }
 }
 
 /// What an edit does when the path is already there, and when it is not.

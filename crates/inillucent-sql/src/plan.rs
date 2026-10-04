@@ -20,14 +20,20 @@ use crate::bind::{BoundExpr, BoundSelect, BoundSource, ColumnUse, SourceRows};
 use crate::catalog_view::{IndexInfo, TableInfo};
 use crate::cost;
 
+mod adjacent;
 mod covering;
 mod describe;
+mod flatten;
 mod hint;
 mod outer_paths;
 mod partial;
 mod pattern;
 mod pushdown;
+mod tree;
+
+pub use tree::{subquery_nodes, PlanLine};
 mod range;
+mod reverse;
 mod terms;
 use covering::covering_slots;
 use describe::{index_seek_detail, range_detail};
@@ -383,9 +389,10 @@ pub struct VirtualConstraint {
     /// tested each one against the whole list: 4.94 s to delete 2,000 rows of
     /// 120,000, where deleting them one statement at a time took a fraction of a
     /// second. `value` holds the first item, so a module asked about the
-    /// constraint sees an ordinary `=`. The term stays among the statement's own
-    /// filters, so a module that ignores the constraint, or one the engine cannot
-    /// drive this way, still returns the right rows.
+    /// constraint sees an ordinary `=`. The scan, not the statement, tests the
+    /// list, and skips the test when the module was run once per value and
+    /// promised `omit`, as SQLite does: `generate_series(1) WHERE stop IN ('3')`
+    /// stops at the integer 3.
     pub in_list: Vec<BoundExpr>,
 }
 
@@ -424,7 +431,9 @@ impl AccessPath {
                 format!("SEARCH {table} USING INTEGER PRIMARY KEY (rowid=?)")
             }
             AccessPath::OrUnion { .. } => "MULTI-INDEX OR".to_string(),
-            AccessPath::Recursive { .. } => format!("SCAN {table} USING RECURSIVE QUEUE"),
+            // SQLite runs a recursive CTE as a co-routine or fills a table
+            // with it, and the loop over either is a plain scan.
+            AccessPath::Recursive { .. } => format!("SCAN {table}"),
             AccessPath::RecursiveSelf { .. } => format!("SCAN {table}"),
             AccessPath::VectorProbe { index, depth, .. } => format!(
                 "SEARCH {table} USING VECTOR INDEX {} (k={depth})",
@@ -528,7 +537,7 @@ pub struct PlannedSource {
     /// The statement-wide number every bound expression refers to it by.
     pub id: usize,
     /// The table.
-    pub table: TableInfo,
+    pub table: std::rc::Rc<TableInfo>,
     /// The name the query calls it.
     pub alias: Vec<u8>,
     /// The schema the query wrote before the name, which `EXPLAIN QUERY PLAN` repeats.
@@ -604,6 +613,10 @@ pub struct PhysicalPlan {
     /// set when [`needs_sort`](Self::needs_sort) is false: a plan that sorts
     /// does not care which way its input arrived.
     pub reverse: bool,
+    /// Whether the joined rows are passed on last first, before any aggregate
+    /// or `LIMIT` sees them; see `reverse::reverses_the_row_stream`. When this
+    /// is set [`reverse`](Self::reverse) is not.
+    pub reverse_stream: bool,
     /// Whether the walk already brings the rows of each group together.
     ///
     /// Grouping needs adjacency, not order: if every row of a group arrives
@@ -676,9 +689,19 @@ impl PhysicalPlan {
         describe::write_lines(self)
     }
 
-    /// Returns the `EXPLAIN QUERY PLAN` lines this plan renders as.
+    /// Returns the `EXPLAIN QUERY PLAN` lines, without their depths.
     pub fn describe(&self) -> Vec<String> {
-        describe::plan_lines(self)
+        self.describe_tree()
+            .into_iter()
+            .map(|line| line.detail)
+            .collect()
+    }
+
+    /// Returns the `EXPLAIN QUERY PLAN` tree: each line with its depth.
+    pub fn describe_tree(&self) -> Vec<PlanLine> {
+        let mut lines = Vec::new();
+        tree::tree_of(self, 0, &mut lines);
+        lines
     }
 }
 
@@ -811,7 +834,19 @@ impl Levers {
 /// @param select - the bound statement
 /// @param levers - which optimizations are on
 pub fn plan_select_with(select: BoundSelect, levers: Levers) -> PhysicalPlan {
+    let in_compound = !select.compounds.is_empty();
+    plan_block(select, levers, in_compound)
+}
+
+/// Plans one block: a statement, or one arm of a compound.
+///
+/// @param select - the bound block
+/// @param levers - which optimizations are on
+/// @param in_compound - whether the block is an arm of a compound
+fn plan_block(select: BoundSelect, levers: Levers, in_compound: bool) -> PhysicalPlan {
     let mut select = select;
+    flatten::flatten_derived_tables(&mut select, in_compound);
+    flatten::unshare_coroutines(&mut select);
     pushdown::push_into_derived_tables(&mut select);
     let compound_arms = core::mem::take(&mut select.compounds);
     let (terms, owners) = hint::statement_terms_with_owners(&select);
@@ -869,7 +904,7 @@ pub fn plan_select_with(select: BoundSelect, levers: Levers) -> PhysicalPlan {
             cost,
             rows,
             id: source.id,
-            table: (*source.table).clone(),
+            table: std::rc::Rc::clone(&source.table),
             alias: source.alias.clone(),
             written_schema: source.written_schema.clone(),
             path,
@@ -902,18 +937,13 @@ pub fn plan_select_with(select: BoundSelect, levers: Levers) -> PhysicalPlan {
     // so whatever order the walk delivered is not the order the result comes
     // out in - which is why `windows` disqualifies a statement here even though
     // it has nothing to do with the access path.
-    // Adjacency is a weaker property than order, so it is asked first and for a
-    // wider set of statements: a grouped aggregate can be streamed whether or
-    // not it also answers an ORDER BY.
-    let adjacent = levers.has(Levers::STREAMING_GROUP)
-        && sources.len() == 1
-        && select.windows.is_empty()
-        && select.compounds.is_empty();
+    let adjacent = adjacent::walk_keeps_rows_together(&select, &sources, levers);
     let outer = sources.first();
     let grouped_walk = adjacent
         && aggregation == AggregationMode::Grouped
-        && outer.is_some_and(|outer| grouped_by_walk(&select, outer));
-    let distinct_walk = adjacent && outer.is_some_and(|outer| distinct_by_walk(&select, outer));
+        && outer.is_some_and(|outer| adjacent::grouped_by_walk(&select, outer));
+    let distinct_walk =
+        adjacent && outer.is_some_and(|outer| adjacent::distinct_by_walk(&select, outer));
     // A statement that streams its grouping or its de-duplication still comes
     // out in the order the walk delivered: the rows of a key arrive together,
     // one output row is emitted per key, and the keys arrive in key order. So
@@ -946,10 +976,12 @@ pub fn plan_select_with(select: BoundSelect, levers: Levers) -> PhysicalPlan {
         None
     };
     let needs_sort = !select.order_by.is_empty() && provided.is_none();
-    let reverse = provided.unwrap_or(false) || reverses_unordered_scan(&select, &sources, levers);
+    let reverse_stream = reverse::reverses_the_row_stream(&select, &sources, levers);
+    let reverse = provided.unwrap_or(false)
+        || (!reverse_stream && reverse::reverses_unordered_scan(&select, &sources, levers));
     let compounds: Vec<(CompoundOp, PhysicalPlan)> = compound_arms
         .into_iter()
-        .map(|(op, arm)| (op, plan_select_with(arm, levers)))
+        .map(|(op, arm)| (op, plan_block(arm, levers, true)))
         .collect();
     let subqueries = holds_subquery(&select)
         || residuals.iter().flatten().any(expression_holds_subquery)
@@ -965,46 +997,13 @@ pub fn plan_select_with(select: BoundSelect, levers: Levers) -> PhysicalPlan {
         aggregation,
         needs_sort,
         reverse,
+        reverse_stream,
         grouped_walk,
         distinct_walk,
         compounds,
         subqueries,
         levers,
     }
-}
-
-/// Returns whether `PRAGMA reverse_unordered_selects` makes the outer scan run
-/// backwards.
-///
-/// SQLite reverses every scan whose direction nothing asks for. This reverses
-/// the outermost term of a query with no `ORDER BY`, no `GROUP BY` and no
-/// `DISTINCT` (a plain aggregate such as `group_concat(a)` is included, because
-/// the order the rows reach it in is visible), which is the order the rows leave in when the inner terms are
-/// seeks that find one row each. A statement that sorts anyway, or whose outer
-/// term is not a scan of a table or an index, is left alone.
-///
-/// @param select - the bound statement
-/// @param sources - the planned FROM terms
-/// @param levers - the optimizations that were on when the plan was chosen
-fn reverses_unordered_scan(
-    select: &BoundSelect,
-    sources: &[PlannedSource],
-    levers: Levers,
-) -> bool {
-    !levers.has(Levers::FORWARD_UNORDERED)
-        && select.order_by.is_empty()
-        && !select.distinct
-        && select.group_by.is_empty()
-        && select.windows.is_empty()
-        && select.compounds.is_empty()
-        && sources.first().is_some_and(|outer| {
-            matches!(
-                outer.path,
-                AccessPath::TableScan { .. }
-                    | AccessPath::RowidRange { .. }
-                    | AccessPath::IndexSeek { .. }
-            )
-        })
 }
 
 /// Returns whether a select holds a subquery used as a value.
@@ -1079,92 +1078,6 @@ pub fn expression_holds_subquery(expr: &BoundExpr) -> bool {
             .children()
             .iter()
             .any(|child| expression_holds_subquery(child))
-}
-
-/// Returns whether the walk brings the rows of each `GROUP BY` key together.
-///
-/// Grouping needs adjacency rather than order, so the direction does not
-/// matter: what matters is that the walk's leading keys are exactly the group
-/// columns. Exactly, not merely a superset - a walk ordered by `(a, b)` groups
-/// `a` and groups `(a, b)`, and does not group `b`.
-///
-/// The collation does matter. Grouping compares keys with the result collation
-/// and the walk compares them with the structure's, so a `NOCASE` index does
-/// not group a `BINARY` key: it would put `Ada` and `ADA` next to each other
-/// and the grouping would then treat them as one.
-/// @param select - the bound statement
-/// @param outer - the planned outer term
-fn grouped_by_walk(select: &BoundSelect, outer: &PlannedSource) -> bool {
-    if select.group_by.is_empty() {
-        return false;
-    }
-    let Some(key) = path_ordering(&outer.table, &outer.path) else {
-        return false;
-    };
-    let mut wanted: Vec<(OrderedBy, Collation)> = Vec::new();
-    for expr in &select.group_by {
-        let Some(named) = walk_key_of(expr, outer.id, &outer.table) else {
-            return false;
-        };
-        let collation = crate::bind::result_collation(expr);
-        if !wanted.iter().any(|(held, _)| *held == named) {
-            wanted.push((named, collation));
-        }
-    }
-    covers_prefix(&key, &wanted)
-}
-
-/// Returns whether the walk brings duplicate result rows together.
-///
-/// The same rule as [`grouped_by_walk`], over the result columns rather than
-/// the group ones - and it is only asked when there is no grouping, because a
-/// `DISTINCT` over aggregates is distinct over values the walk never saw.
-/// @param select - the bound statement
-/// @param outer - the planned outer term
-fn distinct_by_walk(select: &BoundSelect, outer: &PlannedSource) -> bool {
-    if !select.distinct || !select.group_by.is_empty() || !select.aggregates.is_empty() {
-        return false;
-    }
-    let Some(key) = path_ordering(&outer.table, &outer.path) else {
-        return false;
-    };
-    let mut wanted: Vec<(OrderedBy, Collation)> = Vec::new();
-    for column in &select.columns {
-        let Some(named) = walk_key_of(&column.expr, outer.id, &outer.table) else {
-            return false;
-        };
-        let collation = crate::bind::result_collation(&column.expr);
-        if !wanted.iter().any(|(held, _)| *held == named) {
-            wanted.push((named, collation));
-        }
-    }
-    covers_prefix(&key, &wanted)
-}
-
-/// Returns whether a set of keys is exactly the walk's leading keys.
-///
-/// A key an equality pinned counts as held: it has one value for every row the
-/// walk returns, so it is constant across the whole scan and cannot separate
-/// two rows that are otherwise equal.
-/// @param key - what the walk is ordered by
-/// @param wanted - the keys that have to arrive together, with their collations
-fn covers_prefix(key: &PathOrdering, wanted: &[(OrderedBy, Collation)]) -> bool {
-    let free: Vec<&(OrderedBy, Collation)> = wanted
-        .iter()
-        .filter(|(named, _)| !key.pinned.contains(named))
-        .collect();
-    if free.len() > key.columns.len() {
-        return false;
-    }
-    let prefix = match key.columns.get(..free.len()) {
-        Some(prefix) => prefix,
-        None => return false,
-    };
-    free.iter().all(|(named, collation)| {
-        prefix
-            .iter()
-            .any(|(held, _, held_collation)| held == named && held_collation == collation)
-    })
 }
 
 /// Returns which of the walk's keys an expression names, if it names one.
@@ -2142,18 +2055,22 @@ fn virtual_path(
             *slot = true;
         }
     }
-    // **One `IN` list of constant values, offered as `=` and not consumed.** See
-    // `VirtualConstraint::in_list`. Only one, because the engine drives the
-    // module once per value of one list; two lists would need every pair.
-    let lists: Vec<(i32, Vec<BoundExpr>, &BoundExpr)> = terms
+    // **Each `IN` list of constant values, offered as `=` and consumed.** See
+    // `VirtualConstraint::in_list`. The scan tests the list itself, unless the
+    // module was run once per value and promised `omit`, which is when SQLite
+    // does not test it either.
+    let lists: Vec<(usize, i32, Vec<BoundExpr>, &BoundExpr)> = terms
         .iter()
         .enumerate()
         .filter(|(index, _)| !consumed.get(*index).copied().unwrap_or(false))
-        .filter_map(|(_, term)| {
-            constant_in_list(id, table, term).map(|(column, list)| (column, list, term))
+        .filter_map(|(index, term)| {
+            constant_in_list(id, table, term).map(|(column, list)| (index, column, list, term))
         })
         .collect();
-    for (column, list, term) in lists {
+    for (index, column, list, term) in lists {
+        if let Some(slot) = consumed.get_mut(index) {
+            *slot = true;
+        }
         if let Some(first) = list.first().cloned() {
             // A list written as a subquery has no first value to show the
             // module; its values are read when the scan runs.
@@ -2259,6 +2176,7 @@ pub fn write_path_with(
         suppressed: Vec::new(),
         index_exprs: Vec::new(),
         written_schema: None,
+        derived: Default::default(),
     };
     let mut consumed = vec![false; terms.len()];
     // A write reads the whole row it is about to change, so no index covers it.

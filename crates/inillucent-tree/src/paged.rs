@@ -52,10 +52,13 @@
 // holds is a fourth question, asked by `DROP` and by the integrity checker and
 // by nothing that reads a row.
 mod bulk;
+mod copies;
 mod cursor;
 mod descent;
 mod occupancy;
 mod skip;
+
+pub(crate) use copies::Copies;
 
 use std::cell::RefCell;
 
@@ -1008,7 +1011,7 @@ impl PagedTree {
         // page, so the walk is followed here by the sibling links it takes.
         let mut at = self.first_leaf;
         let mut previous_leaf = PageId::NONE;
-        self.visit_leaves(pool, &mut |leaf| {
+        self.visit_from_reading(pool, self.first_leaf, Copies::Refused, true, &mut |leaf| {
             leaf.integrity()?;
             chain = chain.saturating_add(1);
             for row in leaf.live()? {
@@ -1142,16 +1145,32 @@ impl PagedTree {
     /// a round with this, against 25.87 and 25.71 without it, and no pass of one
     /// build overlapped a pass of the other.
     ///
+    /// **A leaf that took writes may be handed over as a packed copy**, when
+    /// the walk names its page (task-2183). The copy holds the same live rows
+    /// in the same order, so every reader gets the answer the page gives; see
+    /// [`PagedTree::merged_copy`]. A walk that has to see the page itself
+    /// passes `None`.
+    ///
     /// @param pool - the buffer pool the file is open through
+    /// @param page - the leaf's page, when a packed copy may stand in for it
     /// @param leaf - the leaf to hand over
     /// @param visit - what to do with it
     pub fn with_leaf_extents<R>(
         &self,
         pool: &Pool,
+        page: Option<PageId>,
         leaf: LeafRef<'_>,
         visit: impl FnOnce(&LeafRef<'_>) -> DbResult<R>,
     ) -> DbResult<R> {
         if !leaf.has_extents() {
+            if let Some(page) = page.filter(|_| leaf.has_writes()) {
+                if let Some(image) = self.merged_copy(pool, page, &leaf)? {
+                    let packed = LeafRef::parse(&image)?
+                        .with_collations(&self.collations)
+                        .with_directions(&self.directions);
+                    return visit(&packed);
+                }
+            }
             return visit(&leaf);
         }
         let held = self.read_extents(pool, &leaf)?;
@@ -1374,7 +1393,7 @@ impl PagedTree {
                 let leaf = LeafRef::parse(&guard)?
                     .with_collations(&self.collations)
                     .with_directions(&self.directions);
-                return self.with_leaf_extents(pool, leaf, |leaf| visit(leaf));
+                return self.with_leaf_extents(pool, None, leaf, |leaf| visit(leaf));
             }
             let interior = InteriorRef::parse(&guard)?;
             let mut children = Vec::with_capacity(interior.children());

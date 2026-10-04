@@ -118,6 +118,77 @@ impl Sink for Collect {
         Ok(())
     }
 }
+/// Holds every row it is given and passes them on last first.
+///
+/// What `PRAGMA reverse_unordered_selects` does to a query with no `ORDER BY`.
+/// SQLite runs every loop of such a query backwards: the outer scan, each inner
+/// join term, and the values of an `IN` list. A nested loop whose every level
+/// runs backwards produces exactly the reverse of what it produces forwards, so
+/// reversing the joined rows gives SQLite's order however many terms there are.
+/// The planner puts this in only when every term reads a table or an index,
+/// because SQLite cannot run a virtual table or a subquery backwards.
+///
+/// It sits below the aggregate and the `LIMIT`, so `LIMIT 1` keeps the last row
+/// and `group_concat` sees the rows last first, as they do in SQLite. Rows a
+/// query reads no column of are counted rather than kept, because a batch with
+/// no columns still carries how many rows it has.
+pub struct Reversed {
+    rows: Vec<Vec<OwnedDatum>>,
+    /// Rows seen with no columns at all.
+    bare: usize,
+    downstream: Box<dyn Sink>,
+}
+impl Reversed {
+    /// Returns a sink that reverses everything it is given.
+    ///
+    /// @param downstream - what the rows are passed on to
+    pub fn new(downstream: Box<dyn Sink>) -> Reversed {
+        Reversed {
+            rows: Vec::new(),
+            bare: 0,
+            downstream,
+        }
+    }
+}
+impl Sink for Reversed {
+    /// Keeps one batch, counting it against the request's budget.
+    fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
+        inillucent_base::budget::check()?;
+        inillucent_base::budget::spend(batch.live() as u64, batch_bytes(batch))?;
+        if batch.columns.is_empty() {
+            self.bare = self.bare.saturating_add(batch.live());
+            return Ok(Flow::Continue);
+        }
+        for nth in 0..batch.live() {
+            let mut row = Vec::with_capacity(batch.columns.len());
+            for column in 0..batch.columns.len() {
+                row.push(OwnedDatum::from_datum(&batch.value(nth, column)?));
+            }
+            self.rows.push(row);
+        }
+        Ok(Flow::Continue)
+    }
+
+    fn finish(&mut self) -> DbResult<()> {
+        let mut rows = std::mem::take(&mut self.rows);
+        rows.reverse();
+        let mut flow = emit_rows(&rows, self.downstream.as_mut())?;
+        let mut bare = std::mem::take(&mut self.bare);
+        while bare > 0 && flow == Flow::Continue {
+            let chunk = bare.min(crate::batch::BATCH_ROWS);
+            flow = self.downstream.push(&Batch::new(chunk, Vec::new()))?;
+            bare -= chunk;
+        }
+        self.downstream.finish()
+    }
+
+    /// Returns this operator and everything below it to its pre-input state.
+    fn reset(&mut self) -> DbResult<()> {
+        self.rows.clear();
+        self.bare = 0;
+        self.downstream.reset()
+    }
+}
 /// A sink that appends into a buffer the caller still holds.
 ///
 /// The pipeline owns its sink, so a caller that wants the rows back cannot

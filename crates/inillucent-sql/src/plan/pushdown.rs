@@ -84,6 +84,13 @@ fn push_filters(select: &mut BoundSelect) {
         if block.shared.is_some() {
             continue;
         }
+        // SQLite pushes nothing into a `MATERIALIZED` CTE, nor into a CTE named
+        // by more than one FROM term, which it fills once for all of them.
+        if source.derived.cte
+            && (source.derived.materialized == Some(true) || source.derived.uses >= 2)
+        {
+            continue;
+        }
         if block.compounds.is_empty() {
             if accepts_a_pushed_filter(block) {
                 push_into_arm(block, id, &conjuncts);

@@ -18,6 +18,7 @@
 
 mod advanced_sql;
 mod attach;
+mod bulk_insert;
 mod catalog;
 mod cli;
 mod differential;

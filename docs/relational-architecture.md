@@ -83,8 +83,9 @@ A statement moves down this picture in five steps.
 2. **Bind.** Names become columns, checked against a snapshot of the catalog. The binder decides
    here whether the statement reads or writes. `--readonly` refuses on that decision, so
    `SELECT 1; DROP TABLE t` is refused and a `SELECT` that contains the word "delete" is not.
-3. **Plan.** The planner picks an access path and a join order. `EXPLAIN QUERY PLAN` prints its
-   choice.
+3. **Plan.** The planner first copies each derived table, view and CTE into the query where SQLite
+   would, and plans an outer join the `WHERE` cannot null extend as an inner join. Then it picks an
+   access path and a join order. `EXPLAIN QUERY PLAN` prints its choice as SQLite's tree.
 4. **Compile.** The plan becomes a chain of operators. The compiled form is cached by statement text,
    so preparing the same text again is a lookup.
 5. **Run.** Batches of column values flow up the chain. A statement runs to the end on its first
@@ -328,6 +329,96 @@ records are on disk. A single connection does one write and one sync for each co
 later call returns it. The engine then refuses to start new work, because a log with a gap in its
 durable records cannot be trusted.
 
+### A copy into an empty table
+
+`INSERT INTO t SELECT ...` writes its rows one at a time like any other insert, with one exception.
+When `t` holds no row and the query returns at least 1,024 rows, the engine builds `t`'s tree in one
+pass instead:
+
+1. Every row is built and checked first: column affinity, `NOT NULL`, `CHECK`, `STRICT` types, and
+   the rowid against the rows already built. Nothing is written yet. A row that fails a check fails
+   the statement with the same error, and the same `last_insert_rowid()`, as the row by row insert.
+2. The rows are sorted by rowid and packed into full leaves. Each index of `t` is built the way
+   `CREATE INDEX` builds one. A duplicate in a `UNIQUE` index hands the statement back to the row by
+   row insert, which reports the constraint SQLite reports.
+3. The pages go straight into the database file, and the file is synced before the commit. The log
+   gets one allocation record per page and no page images. The catalog rows are rewritten to name
+   the new roots.
+
+A crash before the commit leaves `t` empty. A crash after it leaves every row. A rollback, a
+`ROLLBACK TO` and a statement that fails all leave `t` empty with every page given back.
+
+The engine uses the row by row insert when `t` is a `WITHOUT ROWID` table, has `AUTOINCREMENT`, has
+a trigger or a foreign key in either direction, is followed by a vector index, or when the statement
+has `RETURNING`, an upsert, or a conflict clause other than `ABORT`. A column's own
+`NOT NULL ON CONFLICT IGNORE` or `REPLACE` does not stop the bulk build. `CREATE TABLE ... AS
+SELECT` fills its table through the same statement, so it gets the bulk build too.
+
+### A `DELETE` or `UPDATE` of many rows
+
+A `DELETE` or an `UPDATE` that nothing can watch changes each leaf once for all of the statement's
+rows in that leaf. Nothing can watch the statement when it has no trigger, no foreign key action and
+no `RETURNING`, and, for an `UPDATE`, no `FROM` and no subquery that reads the row being changed.
+
+1. The rows are put in the table's order.
+2. For each leaf, the engine reads the leaf once and finds every row of the statement that the leaf
+   holds.
+3. A `DELETE` writes one `DeleteRows` record for all of the leaf's rows, which names the leaf and
+   lists the keys, and one undo entry per row. The undo entry is read from a copy of the leaf, and
+   the row is copied out only when something reads it. An `UPDATE` writes one log record and one
+   undo entry per row, the records the row by row path writes.
+4. It changes the leaf once and stamps it with the last record's LSN.
+5. A `DELETE` checks once whether the leaf has emptied enough to merge with its neighbour. Then it
+   removes each index's entries the same way, in that index's order.
+
+An `UPDATE` writes a row this way when exactly one column outside the key changes. When a new value
+fits where the old one lies, the row is changed in place. When one does not, the leaf is packed again
+with every change of the run, and the new page is logged whole as one `CompactLeaf` record; a leaf
+the changes no longer fit in is split. The row by row path writes every other row: a row whose key or
+index entry changes, and a row with more than one changed column.
+
+A build older than 2.1.3 cannot replay a log that holds a `DeleteRows` record, and refuses it with
+`a log record has kind 17, which this format does not define`. A clean close folds the log into the
+file, so this only matters for a database whose connection stopped without closing and is then
+opened by an older build.
+
+The order rows are written in can change what an `UPDATE` leaves. `OR FAIL` keeps the rows written
+before the failing one, and `OR IGNORE` and `OR REPLACE` keep the first row to claim a unique value.
+When the statement or a constraint carries one of those clauses, the engine keeps the order the query
+found the rows in, and uses the leaf at a time write only when that order is already the table's.
+A statement that fails part way has the rows before the failing row written first, so it leaves what
+the row by row path leaves.
+
+### A leaf split
+
+A leaf splits when it has no room for a row and its rows do not fit one page after they are packed
+again. The first rows stay on the leaf, the rest move to a new page, and the parent gains a key that
+points at the new page. When rows arrive in key order the leaf keeps 95% of a page. Otherwise the
+rows are split evenly.
+
+The log describes most splits by what they did, in one `SplitLeaf` record. Recovery rebuilds each of
+the three pages from that page's own state:
+
+| Page | How recovery rebuilds it |
+|---|---|
+| the leaf that split | packs again the first rows it keeps, read from the leaf itself |
+| the new page | packs the moved rows, which the record carries |
+| the parent | adds the key and the pointer, which the record carries |
+
+Each page stands alone because the buffer pool can write one of the three pages to the file before
+the other two. If the new page were rebuilt from the old leaf's rows, a crash after the old leaf had
+reached the file would leave nothing to rebuild the new page from.
+
+Three kinds of split still log the three pages whole: a split of the root, a split whose parent has
+no room for the key, and a split that moved a value stored outside the page. Three whole pages are
+98,304 bytes of log at a 32 KiB page. A `SplitLeaf` record is the moved rows, four bytes for each
+of them, the key, and 104 bytes.
+
+A build of 2.1.2 or earlier cannot replay a log that holds a `SplitLeaf` record, and refuses it with
+`a log record has kind 16, which this format does not define`. A clean close folds the log into the
+file, so this only matters for a database whose connection stopped without closing and is then
+opened by an older build.
+
 The log is stored in segment files beside the database: `app.rdb-wal.0000000001`,
 `app.rdb-wal.0000000002`, and so on. A segment holds up to 64 MiB before the log moves to the next
 one. A checkpoint deletes the segments it no longer needs. After a clean close, one small segment
@@ -508,7 +599,15 @@ Format 2 changed two things in a page:
   binary search, and the area can use the leaf's whole free space. The layout is in
   `crates/inillucent-tree/src/leaf/delta.rs`.
 - **A page's checksum covers its LSN.** In format 1 a flipped bit in the LSN went undetected. The
-  rule is in `crates/inillucent-pool/src/page.rs`.
+  rule is in `crates/inillucent-pool/src/page.rs`. The checksum is CRC-32/ISO-HDLC; over a page it
+  is computed as four interleaved streams joined with zlib's combine arithmetic, which gives the same
+  value as one stream.
+
+A read of a leaf that took writes merges the delta area into the packed rows. The second time a
+reader reads such a leaf without the page changing, it packs a copy of the leaf, and the buffer pool
+keeps up to 64 of these copies beside their pages. Later reads use the copy until the page changes.
+A copy is never written to the file or the log; the pool drops it when the page's bytes change.
+The code is `crates/inillucent-pool/src/pool/merged.rs` and `crates/inillucent-tree/src/paged/copies.rs`.
 
 This build reads a format 1 file page by page. A leaf carries the flag `LEAF_DELTA_DIRECTORY` that
 says which layout its delta area uses, and a checksum is accepted under either rule. A format 1 leaf

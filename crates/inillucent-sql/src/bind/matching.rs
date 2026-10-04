@@ -118,6 +118,7 @@ impl Binder<'_> {
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
             written_schema: None,
+            derived: Default::default(),
         };
         self.sources.push(searched.clone());
         let mut column = operand.as_ref().clone();
@@ -152,6 +153,7 @@ impl Binder<'_> {
             windows: Vec::new(),
             correlations: Vec::new(),
             shared: None,
+            serial: 0,
         };
         let tested = BoundExpr::Rowid { source: outer };
         let (affinity, collation) = comparison_rules(&tested, &BoundExpr::Rowid { source: inner });

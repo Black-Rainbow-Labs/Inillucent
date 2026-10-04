@@ -563,10 +563,9 @@ impl SearchTable {
         for mut state in in_flight {
             let segments = merge::live_segments(context, &self.store)?;
             let crisis = count_at(&segments, state.source_level) >= crisis_at;
-            if self.continue_merge(context, &mut state, &mut budget, &mut spent, crisis)? {
-                self.finish_merge(context, state)?;
-            } else {
-                kept.push(state);
+            match self.continue_merge(context, &mut state, &mut budget, &mut spent, crisis)? {
+                Some(finished) => self.finish_merge(context, state, finished)?,
+                None => kept.push(state),
             }
         }
 
@@ -615,10 +614,9 @@ impl SearchTable {
                 break;
             }
             let mut state = self.begin_merge(context, level, &claimed)?;
-            if self.continue_merge(context, &mut state, &mut budget, &mut spent, crisis)? {
-                self.finish_merge(context, state)?;
-            } else {
-                kept.push(state);
+            match self.continue_merge(context, &mut state, &mut budget, &mut spent, crisis)? {
+                Some(finished) => self.finish_merge(context, state, finished)?,
+                None => kept.push(state),
             }
         }
 
@@ -666,7 +664,15 @@ impl SearchTable {
 
     /// Folds as many of an in-flight merge's remaining inputs into its
     /// accumulator as the budget allows, checkpointing the result under a
-    /// fresh `%_gen` id, and returns whether every input is now folded in.
+    /// fresh `%_gen` id. Returns the finished accumulator once every input is
+    /// folded in, with the ids of the inputs this call read, and nothing while
+    /// the merge has more to fold.
+    ///
+    /// **The accumulator goes to [`Self::finish_merge`] as it is in memory.**
+    /// That function used to read it back out of `%_gen`, the whole chain of
+    /// links, a moment after this one built it, and then read every original
+    /// input back as well, only to learn which ids each one held. See
+    /// [`merge::dead_after_merge`] for what that cost.
     ///
     /// **At least one input folds even with no budget left** - the check is
     /// only made after the first fold of this call - so a merge that keeps
@@ -713,13 +719,27 @@ impl SearchTable {
         budget: &mut u64,
         spent: &mut u64,
         crisis: bool,
-    ) -> DbResult<bool> {
+    ) -> DbResult<Option<FinishedMerge>> {
         if state.folded >= state.inputs.len() {
-            return Ok(true);
+            let accumulator =
+                merge::load_segment(context, &self.store, &self.options, state.accumulator)?;
+            return Ok(Some(FinishedMerge {
+                accumulator,
+                read: Vec::new(),
+            }));
         }
         let previous = state.accumulator;
         let mut accumulator =
             merge::load_segment_resumable(context, &self.store, &self.options, previous)?;
+        // The ids every input this call reads held live, for the tombstone list
+        // the merge publishes when it finishes. A merge that has folded nothing
+        // yet is still the oldest input itself, so its ids are read here too.
+        let mut read: Vec<(i64, Vec<i64>)> = Vec::new();
+        if let Some(first) = state.inputs.first() {
+            if state.folded == 1 && first.id == previous {
+                read.push((first.id, merge::live_ids_of(&accumulator)));
+            }
+        }
         // Recording turns this checkpoint's real fold - the one below, the
         // only expensive part of any of this - into content this checkpoint
         // can write out directly. Nothing here re-runs it: the graph and the
@@ -747,6 +767,7 @@ impl SearchTable {
                 break;
             }
             let segment = merge::load_segment(context, &self.store, &self.options, input.id)?;
+            read.push((input.id, merge::live_ids_of(&segment)));
             let (_inserted, recorded) =
                 merge::fold_segment_recording(&mut accumulator, &segment, &input.tombstoned)?;
             batches.push(inillucent_core::persist::DeltaBatch {
@@ -791,21 +812,20 @@ impl SearchTable {
         let id = self.next_segment_id(context)?;
         self.store.write_generation(context, id, &bytes)?;
         state.accumulator = id;
-        Ok(done)
+        Ok(done.then_some(FinishedMerge { accumulator, read }))
     }
 
     /// Publishes a finished merge's accumulator as the live segment at its
     /// target level, in place of every input it replaced, and clears the
     /// resumable state.
     ///
-    /// Recomputes the tombstoned list here by reloading every original input
-    /// fresh ([`merge::touched_and_dead`]), rather than carrying one forward
-    /// from `continue_merge`: those inputs are untouched on disk until this
+    /// Recomputes the tombstoned list here from the ids every original input
+    /// held ([`merge::dead_after_merge`]), rather than carrying one forward
+    /// through every checkpoint: those inputs are untouched on disk until this
     /// moment - only the manifest names what is live, and every original
-    /// input stays named there until this call runs - so the reload costs
-    /// exactly what re-reading a level's own segments once already costs, and
-    /// nothing is gained by threading a running set through every checkpoint
-    /// instead.
+    /// input stays named there until this call runs. An input the same commit
+    /// read while folding it is not read again; one an earlier commit folded
+    /// is loaded once, for its ids.
     ///
     /// **Read safety across the swap.** Everything up to and including
     /// `write_segments` below runs inside the caller's transaction, so a
@@ -818,15 +838,29 @@ impl SearchTable {
     /// doubles a row.
     /// @param context - the module's reach into the database
     /// @param state - the finished merge
-    fn finish_merge(&mut self, context: &mut Context<'_>, state: MergeState) -> DbResult<()> {
-        let accumulator =
-            merge::load_segment(context, &self.store, &self.options, state.accumulator)?;
-        let mut originals = Vec::with_capacity(state.inputs.len());
+    /// @param finished - the accumulator `continue_merge` built, and the ids of
+    ///   the inputs it read
+    fn finish_merge(
+        &mut self,
+        context: &mut Context<'_>,
+        state: MergeState,
+        finished: FinishedMerge,
+    ) -> DbResult<()> {
+        let FinishedMerge { accumulator, read } = finished;
+        let mut touched = Vec::with_capacity(state.inputs.len());
         for input in &state.inputs {
-            let loaded = merge::load_segment(context, &self.store, &self.options, input.id)?;
-            originals.push((input.clone(), loaded));
+            let ids = match read.iter().find(|(id, _)| *id == input.id) {
+                Some((_, ids)) => ids.clone(),
+                None => merge::live_ids_of(&merge::load_segment(
+                    context,
+                    &self.store,
+                    &self.options,
+                    input.id,
+                )?),
+            };
+            touched.push((input.clone(), ids));
         }
-        let tombstoned = merge::touched_and_dead(&accumulator, &originals);
+        let tombstoned = merge::dead_after_merge(&accumulator, &touched);
         let chunks = accumulator.store().n_chunks() as i64;
         let covers_from = state
             .inputs
@@ -967,6 +1001,14 @@ impl SearchTable {
         self.cache.forget();
         Ok(())
     }
+}
+
+/// A merge whose every input is folded, as `continue_merge` hands it on.
+struct FinishedMerge {
+    /// The merged index, as the fold left it in memory.
+    accumulator: inillucent_core::index::Index,
+    /// The ids each input read by the same call held live, by the input's id.
+    read: Vec<(i64, Vec<i64>)>,
 }
 
 /// Returns how many chunks the first fold of a new merge at a level would

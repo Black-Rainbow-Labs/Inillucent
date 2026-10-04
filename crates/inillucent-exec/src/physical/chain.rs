@@ -459,7 +459,7 @@ pub(crate) struct Upper {
     /// `head` - building [`crate::correlate::Correlated`] needs a catalog
     /// borrowed for the chain's own lifetime, which is exactly what this
     /// function does not take.
-    pub(crate) correlations: Vec<crate::correlate::Correlation>,
+    pub(crate) correlations: Option<std::rc::Rc<[crate::correlate::Correlation]>>,
     /// The `WHERE` conjuncts that read no subquery, compiled for
     /// [`crate::correlate::Correlated`] to test before it answers a block.
     /// Empty whenever `correlations` is.
@@ -581,6 +581,14 @@ fn is_skip_scan(prepared: &Prepared) -> bool {
         .unwrap_or(false)
 }
 
+/// A statement's correlated blocks, each block's number and output column, and
+/// the widened column types; see [`correlated_columns`].
+type CorrelatedColumns = (
+    Option<std::rc::Rc<[crate::correlate::Correlation]>>,
+    Vec<(usize, usize)>,
+    Vec<StaticType>,
+);
+
 /// The statement's correlated blocks, and the columns they are answered in.
 ///
 /// **A correlated block is answered beside the row, not inside an
@@ -603,12 +611,9 @@ fn is_skip_scan(prepared: &Prepared) -> bool {
 fn correlated_columns(
     plan: &PhysicalPlan,
     catalog: &dyn TreeCatalog,
+    prepared: &Prepared,
     space: &Space<'_>,
-) -> DbResult<(
-    Vec<crate::correlate::Correlation>,
-    Vec<(usize, usize)>,
-    Vec<StaticType>,
-)> {
+) -> DbResult<CorrelatedColumns> {
     let outer = Space {
         stages: space.stages,
         layouts: space.layouts,
@@ -617,12 +622,16 @@ fn correlated_columns(
         catalog: Some(catalog),
         correlations: &[],
     };
-    let correlations =
+    if !plan.subqueries {
+        return Ok((None, Vec::new(), Vec::new()));
+    }
+    let correlations = prepared.blocks.get_or_build(|| {
         crate::correlate::correlations_of(plan, catalog, &|expr: &BoundExpr| match expr {
             BoundExpr::Column { source, column, .. } => outer.column(*source, *column as usize),
             BoundExpr::Rowid { source } => outer.rowid(*source),
             _ => None,
-        })?;
+        })
+    })?;
     let joined_width = space.types.len();
     let columns: Vec<(usize, usize)> = correlations
         .iter()
@@ -636,7 +645,7 @@ fn correlated_columns(
         widened.extend(std::iter::repeat_n(StaticType::Unknown, correlations.len()));
         widened
     };
-    Ok((correlations, columns, widened_types))
+    Ok((Some(correlations), columns, widened_types))
 }
 
 /// Translates the result columns and the `ORDER BY` terms.
@@ -721,6 +730,12 @@ fn plan_outputs(plan: &PhysicalPlan, space: &Space<'_>, params: &Params) -> DbRe
 /// So the adjacency question is asked of the planner for a reverse walk, which
 /// decided it from the access path rather than from the direction.
 ///
+/// **And for a join (task-2183).** `space.order` keeps the outer walk's order
+/// only behind table lookups, because it also answers questions a join's
+/// inner rows would get wrong. Adjacency is not one of them: every inner term
+/// is joined one outer row at a time, so the planner, which knows the join
+/// kinds, decides it.
+///
 /// @param plan - the planner's output
 /// @param prepared - the structural choices `prepare` made
 /// @param space - the joined column space
@@ -751,7 +766,8 @@ fn grouping_of(
         // which is the order SQLite's grouping gives.
         && !drives_from_a_value_list(plan, prepared)
         && (is_scan_prefix(&group_exprs, &group_collations, scan_order)
-            || (is_reverse_scan(prepared) && plan.grouped_walk));
+            || (is_reverse_scan(prepared) && plan.grouped_walk)
+            || (prepared.stages.len() > 1 && plan.grouped_walk));
     Ok((group_exprs, group_collations, grouped_walk))
 }
 
@@ -902,6 +918,9 @@ fn source_limit_of(
             && !plan.select.distinct
             && plan.aggregation == AggregationMode::None
             && plan.select.windows.is_empty()
+            // The rows are turned around before the `LIMIT`, so the source
+            // has to deliver every one of them.
+            && !plan.reverse_stream
     })
 }
 
@@ -1305,9 +1324,10 @@ pub(crate) fn build_upper(
     let select = &plan.select;
     refuse_unhandled(select)?;
     let (correlations, correlation_columns, widened_types) =
-        correlated_columns(plan, catalog, space)?;
+        correlated_columns(plan, catalog, prepared, space)?;
     let joined_types = space.types;
-    let scan_types: &[StaticType] = if correlations.is_empty() {
+    let no_blocks = correlations.as_ref().is_none_or(|held| held.is_empty());
+    let scan_types: &[StaticType] = if no_blocks {
         space.types
     } else {
         &widened_types
@@ -1325,7 +1345,7 @@ pub(crate) fn build_upper(
     let (group_exprs, group_collations, grouped_walk) =
         grouping_of(plan, prepared, space, params, &scan_order)?;
     let limit = constant_limit(select, params)?;
-    let (filters_above, gate) = if correlations.is_empty() {
+    let (filters_above, gate) = if no_blocks {
         (None, Vec::new())
     } else {
         let (above, below) = place_around_correlation(plan);
@@ -1368,6 +1388,10 @@ pub(crate) fn build_upper(
     chain = push_projection(chain, &mut operators, &up)?;
     chain = push_having(chain, &mut operators, &up)?;
     chain = push_aggregate(chain, &mut operators, &up)?;
+    if plan.reverse_stream {
+        operators.add(|| "REVERSE".to_string());
+        chain = Box::new(crate::ops::Reversed::new(chain));
+    }
     chain = push_filters(chain, &mut operators, &up)?;
 
     let names = select
@@ -1436,14 +1460,17 @@ fn build_chain<'t>(
     // that row. The conjuncts that read no block are its gate and are tested
     // inside it, before a block is answered (task-2076); they are listed
     // beneath it because that is where they run.
-    if !upper.correlations.is_empty() {
+    if let Some(correlations) = upper
+        .correlations
+        .filter(|correlations| !correlations.is_empty())
+    {
         operators.add(|| "CORRELATED SUBQUERY".to_string());
         for _ in &upper.gate {
             operators.add(|| "FILTER RESIDUAL".to_string());
         }
         chain = Box::new(crate::correlate::Correlated::new(
-            upper.correlations,
-            upper.gate,
+            correlations,
+            upper.gate.into(),
             catalog,
             params,
             chain,
@@ -1891,7 +1918,7 @@ pub(crate) fn source_for_run<'t>(
                 let needed = plan.select.columns_read(term.id);
                 return Ok(Source::Virtual(Box::new(VirtualScanSource {
                     catalog,
-                    table: term.table.clone(),
+                    table: (*term.table).clone(),
                     path: term.path.clone(),
                     params: params.clone(),
                     needed,
@@ -1950,6 +1977,7 @@ pub(crate) fn push_materialised(
 ) {
     stages.push(PreparedStage {
         functions: Vec::new(),
+        needed: None,
         root: 0,
         kind: AccessKind::Materialised,
         source,
@@ -2007,7 +2035,9 @@ fn build_source<'t>(
     let path = &source_term.path;
     let table = &source_term.table;
     match stage.kind {
-        AccessKind::Full => Ok(Source::Scan(FullScan::new(tree, projection))),
+        AccessKind::Full => Ok(Source::Scan(
+            FullScan::new(tree, projection).with_needed(stage.needed),
+        )),
         AccessKind::Skip => {
             let prefix = space
                 .order
@@ -2017,30 +2047,36 @@ fn build_source<'t>(
         }
         AccessKind::Point => {
             let key = point_key(path, space, params)?;
-            Ok(Source::Point(PointProbe::new(tree, projection), key))
+            Ok(Source::Point(
+                PointProbe::new(tree, projection).with_needed(stage.needed),
+                key,
+            ))
         }
         AccessKind::Span => {
             let bounds = span_bounds(path, table, space, params)?;
             if bounds.matches_nothing {
                 return Ok(Source::Rows(Vec::new()));
             }
-            Ok(Source::Span(SpanScan::new(
-                tree,
-                projection,
-                bounds.low,
-                bounds.low_inclusive,
-                bounds.high,
-                bounds.high_inclusive,
-            )))
+            Ok(Source::Span(
+                SpanScan::new(
+                    tree,
+                    projection,
+                    bounds.low,
+                    bounds.low_inclusive,
+                    bounds.high,
+                    bounds.high_inclusive,
+                )
+                .with_needed(stage.needed),
+            ))
         }
         AccessKind::Reverse => {
             let bounds = span_bounds(path, table, space, params)?;
             if bounds.matches_nothing {
                 return Ok(Source::Rows(Vec::new()));
             }
-            Ok(Source::Reverse(ReverseScan::new(
-                tree, projection, bounds, limit,
-            )))
+            Ok(Source::Reverse(
+                ReverseScan::new(tree, projection, bounds, limit).with_needed(stage.needed),
+            ))
         }
         AccessKind::Vector => {
             let AccessPath::VectorProbe {
@@ -2069,7 +2105,7 @@ fn build_source<'t>(
             Ok(Source::Vector(probe_over, keys))
         }
         AccessKind::SeekUnion => {
-            let probe_over = PointProbe::new(tree, projection);
+            let probe_over = PointProbe::new(tree, projection).with_needed(stage.needed);
             let keys = match path {
                 AccessPath::RowidSeekUnion { keys, .. } => rowid_union_keys(keys, space, params)?,
                 AccessPath::OrUnion { arms, .. } => {

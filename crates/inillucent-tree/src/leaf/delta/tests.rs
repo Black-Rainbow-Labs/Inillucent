@@ -127,6 +127,72 @@ fn live_order_agrees_with_the_reference() {
     }
 }
 
+/// `live_count` and a merge that decodes only some columns agree with the rules.
+///
+/// `live_count` never builds the merge, so it is a second statement of the
+/// shadowing rules: a tombstoned sorted row is not live, a key the delta area
+/// holds twice counts once, and a delta row replaces the sorted row with its
+/// key whether or not that row was tombstoned. The leaves here hit each of
+/// those, the last one with the replaced sorted row tombstoned as well, and
+/// one with every delta row past the sorted region, which is how rows appended
+/// in key order lie. A merge decoding two of three columns must place the rows
+/// where the full merge does and read the same first two columns.
+#[test]
+fn live_count_agrees_with_live_order() {
+    let columns = vec![
+        ColumnSpec::key(PhysicalType::Int64),
+        ColumnSpec::new(PhysicalType::Text),
+        ColumnSpec::new(PhysicalType::Int64),
+    ];
+    let builder = LeafBuilder::new(4096, 1, columns, 1).unwrap();
+    let labels: Vec<String> = (0..24).map(|n| format!("row-{n:04}")).collect();
+    let rows: Vec<Vec<Datum<'_>>> = (0..24i64)
+        .map(|n| {
+            vec![
+                Datum::Int(n * 2),
+                Datum::Text(labels[n as usize].as_bytes()),
+                Datum::Int(n * 5),
+            ]
+        })
+        .collect();
+    let packed = builder.encode(&rows).unwrap();
+    let fresh = vec![Datum::Int(7), Datum::Text(b"inserted"), Datum::Int(70)];
+    let shadow = vec![Datum::Int(10), Datum::Text(b"replaced"), Datum::Int(99)];
+    let newer = vec![Datum::Int(31), Datum::Text(b"newer"), Datum::Int(1)];
+    let older = vec![Datum::Int(31), Datum::Text(b"older"), Datum::Int(2)];
+    let past = vec![Datum::Int(100), Datum::Text(b"past"), Datum::Int(3)];
+    let after = vec![Datum::Int(101), Datum::Text(b"after"), Datum::Int(4)];
+    let cases: Vec<(Vec<Vec<Datum<'_>>>, Vec<usize>)> = vec![
+        (vec![fresh.clone(), shadow.clone(), newer, older], vec![3]),
+        (vec![fresh, shadow], vec![3, 5]),
+        (vec![past, after], Vec::new()),
+    ];
+    for (delta, tombstoned) in cases {
+        let mut page = with_delta(&packed, &delta);
+        for row in &tombstoned {
+            crate::mutate::LeafMut::new(&mut page)
+                .unwrap()
+                .set_tombstone(*row)
+                .unwrap();
+        }
+        let leaf = LeafRef::parse(&page).unwrap();
+        let expected = live_by_the_rules(&leaf);
+        assert_eq!(leaf.live_count().unwrap(), expected.len(), "{tombstoned:?}");
+        let full = leaf.live_order().unwrap();
+        let narrow = leaf.live_order_decoding(2).unwrap();
+        assert_eq!(full.order(), narrow.order(), "{tombstoned:?}");
+        for (row, want) in expected.iter().enumerate() {
+            for (column, wanted) in want.iter().enumerate().take(2) {
+                assert_eq!(
+                    format!("{:?}", narrow.value(row, column).unwrap()),
+                    format!("{:?}", wanted),
+                    "row {row} column {column}"
+                );
+            }
+        }
+    }
+}
+
 /// `delta_search` answers every probe the way a walk of the directory from
 /// its first entry would, including a probe past the last entry, which
 /// task-2082 answers from that entry alone.

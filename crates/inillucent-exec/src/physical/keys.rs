@@ -473,7 +473,7 @@ impl SpanBounds {
 /// @param table - the indexed table
 /// @param columns - which table column each index position holds
 /// @param position - the key position
-fn index_affinity(
+pub(crate) fn index_affinity(
     table: &inillucent_sql::catalog_view::TableInfo,
     columns: &[Option<u16>],
     position: usize,
@@ -510,7 +510,7 @@ fn index_affinity(
 ///
 /// @param unconverted - whether the comparison converts nothing
 /// @param index - the indexed column's affinity, if the key position has one
-fn probe_affinity(unconverted: bool, index: Option<Affinity>) -> Option<Affinity> {
+pub(crate) fn probe_affinity(unconverted: bool, index: Option<Affinity>) -> Option<Affinity> {
     if unconverted {
         return None;
     }

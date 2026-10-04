@@ -72,7 +72,7 @@ pub(crate) enum Cached {
     /// The lines describe the plan and the plan depends on the schema, so this
     /// is cached and invalidated exactly like the query it describes - which is
     /// the point of holding it here rather than rendering it per execution.
-    QueryPlan(Vec<String>),
+    QueryPlan(Vec<inillucent_sql::plan::PlanLine>),
     /// A plain `EXPLAIN`, rendered when the statement was compiled.
     ///
     /// One entry per step: the opcode's name, its first two operands, its

@@ -121,9 +121,15 @@ fn a_query_plan_has_the_columns_a_caller_expects() {
         .expect("the plan is produced");
     let first = rows.first().expect("a plan has at least one line");
     assert_eq!(first.len(), 4, "id, parent, notused, detail");
+    // SQLite numbers the lines from 1, because a parent of 0 means the line
+    // is at the top of the tree.
     assert!(
-        matches!(first.first(), Some(OwnedDatum::Int(0))),
-        "the first line is numbered 0"
+        matches!(first.first(), Some(OwnedDatum::Int(1))),
+        "the first line is numbered 1"
+    );
+    assert!(
+        matches!(first.get(1), Some(OwnedDatum::Int(0))),
+        "the first line is at the top of the tree"
     );
     assert!(
         matches!(first.get(3), Some(OwnedDatum::Text(_))),

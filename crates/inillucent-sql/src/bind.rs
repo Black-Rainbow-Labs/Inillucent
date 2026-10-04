@@ -39,10 +39,12 @@ use column_names::finish_view_columns;
 mod view_term;
 pub use column_names::{subquery_columns, unique_column_names};
 pub use column_use::ColumnUse;
+mod derived_note;
 mod having;
 mod json_subtype;
 mod literal;
 mod matching;
+mod nested_names;
 mod order_alias;
 mod ordinal;
 mod outer_aggregate;
@@ -64,6 +66,9 @@ pub use set_rules::{compound_collation, in_list_rules};
 
 use cte::RecursiveTarget;
 pub use cte::{CteBinding, FIRST_ANONYMOUS_SHARED};
+pub use derived_note::DerivedNote;
+pub(crate) use nested_names::NestedName;
+use nested_names::{nested_hits, NestedHits};
 pub use scratch::BinderScratch;
 
 use inillucent_value::{Affinity, Collation};
@@ -624,6 +629,10 @@ pub struct BoundSource {
     /// alias. `EXPLAIN QUERY PLAN` repeats it (`SEARCH aux.t1 ...`) and prints the bare name
     /// when the query wrote none, whichever schema the name resolved in.
     pub written_schema: Option<Vec<u8>>,
+    /// Where a derived table came from, which decides how SQLite plans it.
+    ///
+    /// Empty for a table. See [`DerivedNote`].
+    pub derived: DerivedNote,
     /// `INDEXED BY name` or `NOT INDEXED`, as the FROM term wrote it.
     ///
     /// **The planner could not see this until task-2066 section 4.4.14.** The
@@ -846,6 +855,14 @@ pub struct BoundSelect {
     /// calls `random()`, which must give both references the same value. `None`
     /// for every other block.
     pub shared: Option<usize>,
+    /// SQLite's number for this arm, the order its parser finished the arm in,
+    /// counting from 1. Zero for a block the parser did not write.
+    ///
+    /// `EXPLAIN QUERY PLAN` names an expression subquery by it (`SCALAR
+    /// SUBQUERY 2`) and a derived table that has no name (`(subquery-1)`). A
+    /// compound is named by its last arm, because SQLite's `Select` for a
+    /// compound is the rightmost one.
+    pub serial: u32,
 }
 
 impl BoundSelect {
@@ -1239,52 +1256,6 @@ pub struct Binder<'a> {
     /// The conflict action the statement being bound inherits from the write
     /// whose trigger it belongs to; `None` outside a trigger body.
     pub(crate) trigger_conflict: Option<ast::ConflictAction>,
-}
-
-/// What a name matched among the inner columns of a parenthesised join.
-enum NestedHits {
-    /// The derived columns, by position, that carry the name.
-    Some(Vec<u16>),
-    /// Nothing carries the name, and the lookup is settled for this term.
-    NoneButNamed,
-    /// The reference names something else, such as the derived table's alias.
-    Unrelated,
-}
-
-/// Looks a column name up among the inner columns of a parenthesised join.
-///
-/// A bare name settles the lookup for the term whether or not it matched. A
-/// qualified name does only when the qualifier is the name of an inner table.
-///
-/// @param names - where each derived column came from
-/// @param column - the folded column name
-/// @param qualifier - the folded qualifier, when one was written
-fn nested_hits(names: &[NestedName], column: &[u8], qualifier: Option<&[u8]>) -> NestedHits {
-    let named_table = qualifier.is_none_or(|wanted| names.iter().any(|held| held.table == wanted));
-    if !named_table {
-        return NestedHits::Unrelated;
-    }
-    let hits: Vec<u16> = names
-        .iter()
-        .filter(|held| held.column == column && qualifier.is_none_or(|wanted| held.table == wanted))
-        .map(|held| held.index)
-        .collect();
-    if hits.is_empty() {
-        NestedHits::NoneButNamed
-    } else {
-        NestedHits::Some(hits)
-    }
-}
-
-/// Where one column of a parenthesised join came from.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NestedName {
-    /// The folded name of the inner table.
-    pub table: Vec<u8>,
-    /// The folded name of the inner column.
-    pub column: Vec<u8>,
-    /// The position of the derived table's column that carries it.
-    pub index: u16,
 }
 
 /// How deeply query blocks may nest.
@@ -1681,10 +1652,14 @@ impl<'a> Binder<'a> {
         let Some(core) = self.ast.core(id) else {
             return Err(unsupported("missing select core", Span::default()));
         };
-        match &core.body {
+        let mut bound = match &core.body {
             SelectBody::Values(rows) => self.bind_values(rows, core.span),
             SelectBody::Select { .. } => self.bind_select_core(id),
-        }
+        }?;
+        // The parser adds an arm after everything inside it, which is the order
+        // SQLite's parser numbers its `Select`s in.
+        bound.serial = id.0.saturating_add(1);
+        Ok(bound)
     }
 
     /// Returns the FROM-term ids the innermost block owns.
@@ -1752,6 +1727,7 @@ impl<'a> Binder<'a> {
             windows: Vec::new(),
             correlations: Vec::new(),
             shared: None,
+            serial: 0,
         })
     }
 
@@ -1893,6 +1869,7 @@ impl<'a> Binder<'a> {
             windows: Vec::new(),
             correlations: Vec::new(),
             shared: None,
+            serial: 0,
         })
     }
 
@@ -2110,6 +2087,7 @@ impl<'a> Binder<'a> {
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
             written_schema,
+            derived: Default::default(),
         });
         if let Some(scope) = self.scopes.last_mut() {
             scope.push(id);
@@ -2334,9 +2312,13 @@ impl<'a> Binder<'a> {
         } else {
             Vec::new()
         };
+        let anonymous = alias.is_none();
         let alias = alias.unwrap_or_else(|| b"subquery".to_vec());
         let id = self.sources.len();
         self.push_subquery_source(bound, alias, columns, join, span)?;
+        if let Some(source) = self.sources.get_mut(id) {
+            source.derived.anonymous = anonymous;
+        }
         if !names.is_empty() {
             self.nested_names.push((id, names));
         }
@@ -2406,6 +2388,7 @@ impl<'a> Binder<'a> {
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
             written_schema: None,
+            derived: Default::default(),
         });
         if let Some(scope) = self.scopes.last_mut() {
             scope.push(id);
@@ -4420,6 +4403,7 @@ pub fn block_over(
         windows: Vec::new(),
         correlations: Vec::new(),
         shared: None,
+        serial: 0,
     }
 }
 

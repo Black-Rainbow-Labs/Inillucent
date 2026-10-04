@@ -285,7 +285,12 @@ const STEP_ALLOCATIONS: u64 = 8;
 /// [`TRIVIAL_COMPILE_ALLOCATIONS`] gives.
 /// **Ninety-three rather than ninety-two since task-2066 section 4.3.5**, for
 /// the same one `Rc` [`TRIVIAL_COMPILE_ALLOCATIONS`] gained and the same reason.
-const POINT_COMPILE_ALLOCATIONS: u64 = 93;
+///
+/// **Ninety-four since task-2183.** A stage now produces only the columns the
+/// statement reads, and finding them is one `ColumnUse` list per FROM term at
+/// prepare. The mask itself is a bit set and allocates nothing; it was an
+/// `Rc<[bool]>`, two more, before this bound was checked against it.
+const POINT_COMPILE_ALLOCATIONS: u64 = 94;
 
 /// How many more allocations a compile makes when the in-process embedder is
 /// compiled in.

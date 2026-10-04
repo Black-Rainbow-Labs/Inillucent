@@ -313,6 +313,10 @@ pub(crate) fn generic_arith<'p>(
     left: &Datum<'_>,
     right: &Datum<'_>,
 ) -> DbResult<Computed<'p>> {
+    // Two integers need no conversion, and are the common case.
+    if let (Datum::Int(a), Datum::Int(b)) = (left, right) {
+        return Ok(Computed::Borrowed(integer_arith(op, *a, *b)));
+    }
     if left.is_null() || right.is_null() {
         return Ok(Computed::Borrowed(Datum::Null));
     }
@@ -471,6 +475,21 @@ impl Eval for AffinityCompare {
             return Ok(Computed::Borrowed(Datum::Null));
         }
         let (left, right) = (left.get(), right.get());
+        // **Two integers under an affinity that leaves an integer alone
+        // (task-2183)** compare as integers. `x < 10000` over a recursive
+        // CTE's untyped column converted both sides to values and through the
+        // affinity on every pass. `TEXT` and `REAL` change an integer, so they
+        // take the general path.
+        if let (Datum::Int(a), Datum::Int(b)) = (left, right) {
+            if matches!(
+                self.affinity,
+                None | Some(Affinity::Blob | Affinity::Integer | Affinity::Numeric)
+            ) {
+                return Ok(Computed::Borrowed(Datum::Int(i64::from(
+                    self.op.holds(a.cmp(&b)),
+                ))));
+            }
+        }
         let (left, right) = (Value::from(&left), Value::from(&right));
         let (left, right) = match self.affinity {
             None => (left, right),

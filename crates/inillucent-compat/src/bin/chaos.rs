@@ -14,7 +14,7 @@
 //!   inillucent-chaos reader <db> --checks C [--hold-ms H] [options]
 //!   inillucent-chaos verify <db> --incarnation name:seed:acked:finished ... [options]
 //!
-//! Options: --frames F, --key K, --search, --bulk-parts B, --busy-ms M.
+//! Options: --frames F, --key K, --search, --rewrite, --bulk-parts B, --busy-ms M.
 //!
 //! Exit codes: 0 done, 1 an operation failed, 2 bad arguments, 3 a reader saw
 //! a snapshot that broke an invariant.
@@ -24,7 +24,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use inillucent_compat::chaos::{
-    attempt, check_snapshot, open, setup, step, verify, Check, Incarnation, Outcome, Settings,
+    attempt, check_snapshot, open, reader_write, setup, step, verify, Check, Incarnation, Outcome,
+    Settings,
 };
 
 /// The parsed command line.
@@ -91,6 +92,10 @@ fn parse(words: &[String]) -> Result<Arguments, String> {
             "--incarnation" => arguments.incarnations.push(incarnation(&value)?),
             "--search" => {
                 arguments.settings.search = true;
+                index -= 1;
+            }
+            "--rewrite" => {
+                arguments.settings.rewrite = true;
                 index -= 1;
             }
             other => return Err(format!("unknown option {other}")),
@@ -193,6 +198,13 @@ fn reader(arguments: &Arguments) -> ExitCode {
                 held += 1;
                 seen = seen.max(transactions);
                 say(&format!("CHECKED {held} seen={transactions}"));
+                // The report's search service wrote a small row now and then.
+                if arguments.settings.rewrite {
+                    if let Err(why) = reader_write(&connection, held) {
+                        say(&format!("ERROR reader write: {why}"));
+                        return ExitCode::from(1);
+                    }
+                }
             }
             Check::Busy(why) => {
                 busy += 1;

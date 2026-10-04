@@ -991,6 +991,13 @@ fn bare_columns(select: &BoundSelect) -> Vec<BoundExpr> {
             ) {
                 continue;
             }
+            // **A `GROUP BY` term is read from the group's key, whole (task-2183).**
+            // `SELECT key % 50000, count(*) ... GROUP BY 1` found `key` under the
+            // term and kept it as a bare column, an accumulator fed a copy of
+            // every row for a value nothing reads.
+            if select.group_by.contains(&node) {
+                continue;
+            }
             if matches!(node, BoundExpr::Column { .. } | BoundExpr::Rowid { .. }) {
                 if !select.group_by.contains(&node) && !found.contains(&node) {
                     found.push(node);

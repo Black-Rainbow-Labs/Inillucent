@@ -342,3 +342,13 @@ held_by = [
   "inillucent-migrate::migration::removing_a_tombstoned_chunk_after_the_search_changes_the_order",
   "inillucent-compat::search::a_facet_is_applied_inside_the_search_rather_than_to_its_answer",
 ]
+
+[[escape]]
+ref = "task-2177"
+surface = "multi process recovery, shared extent pages"
+what = "a 3.6 GB database that a background job and a search service both had open failed `integrity_check` after both were stopped with SIGTERM at the same moment on 2.0.7: `a reference names slot 5 of a shared page that holds 5`, and a full scan failed with `database disk image is malformed`. One round in ten in the user's Node application; never with the job alone"
+found_by = "a user's application stopped by its service manager, with a reader open beside the writer; no storm rewrote values on shared extent pages or ended with every process killed at once"
+held_by = [
+  "inillucent-compat::process_storm::a_storm_in_the_shape_of_the_2_0_7_damage_report_loses_nothing",
+  "inillucent-compat::process_storm::a_storm_in_the_shape_of_the_2_0_7_damage_report_with_kills_loses_nothing",
+]

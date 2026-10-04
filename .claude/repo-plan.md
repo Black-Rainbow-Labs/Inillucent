@@ -901,3 +901,29 @@ they are touching do not collide; two that have not, do.
   `BEGIN` is deferred now, so a statement inside a transaction can be the one that takes the lock:
   anything that raises a lock outside `enter`, or numbers a transaction before `enter` ran, is the
   class of defect to look for first. (task-2173)
+- **A change that writes less log moves the 4 MiB log housekeeping to a later workload, and the
+  gate reads that as a regression next to a gain of the same size.** The housekeeping runs once
+  the log has grown by `RECLAIM_BYTES` (4 MiB) and costs about 13 to 24 ms. When the bulk copy
+  stopped writing a log record per row, `churn.update.grow` and `edge.update.all` read 30% slower
+  and `app.insert.returning` and `edge.delete.range` faster by the same milliseconds, every round,
+  though none of the four reached the changed code. Before rejecting a candidate on such a pair,
+  sum the medians of every workload except the one the change targets, for both builds: here it
+  was 1,845.4 ms and 1,845.5 ms. `score.mjs` does not do this sum. (task-2178)
+- **A statement that rebuilds a table's trees has to run with `ddl_schema` set to the table's
+  schema**, because `release_tree`, `build_tree_rows`, `rewrite` and `seal` all write through
+  `self.schema.ddl_schema`. `engine/bulk.rs` sets it and puts it back, the way `execute_ddl` does;
+  without it an `INSERT ... SELECT` into an attached or `TEMP` table would write its catalog row
+  into `main`. (task-2178)
+- **A bulk `DELETE` or `UPDATE` goes through `crates/inillucent-tree/src/write/sorted.rs`.**
+  `delete_sorted` and `update_sorted` take the keys one leaf holds, write a record and an undo
+  image per row, and change the leaf once. A ticket that changes what a `DeleteRow` or an
+  `UpdateInPlace` record means, or how `LeafMut::remove_delta` lays out the delta area, has to keep
+  `remove_deltas` producing the same bytes: `mutate::tests::removing_delta_rows_together_*` compares
+  whole pages. The executor halves are `delete_unwatched` in `dml/delete.rs` and
+  `dml/update/unwatched.rs`. An `UPDATE` may reorder its rows only when no `FAIL`, `IGNORE` or
+  `REPLACE` can apply, because those keep different rows in a different order. (task-2180)
+- **For a before and after, build the base from `git archive <commit> | tar -x` into the
+  scratchpad, with its own `CARGO_TARGET_DIR`.** Then source edits made while it compiles cannot
+  leak into the base binary. The gate binaries look for `.sqlite-ref` under the tree they were
+  built from, so junction it into the export as well, and remove that junction with
+  `cmd /c rmdir`, never a recursive delete. (task-2180)

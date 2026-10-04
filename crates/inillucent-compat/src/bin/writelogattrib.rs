@@ -107,7 +107,7 @@ struct TreeTotal {
 /// What one batch of inserts cost, in the two currencies that matter.
 struct Attribution {
     /// Bytes written to the log, indexed by [`inillucent_wal::record::Body::kind`].
-    by_kind: [KindTotal; 14],
+    by_kind: [KindTotal; 17],
     /// Bytes written to the log, by which tree the record names.
     by_tree: Vec<TreeTotal>,
     /// Bytes no record ties to a tree - `Commit`, `Checkpoint`, and an
@@ -495,6 +495,7 @@ fn kind_name(byte: u8) -> &'static str {
     match byte {
         kind::INSERT_ROW => "InsertRow",
         kind::DELETE_ROW => "DeleteRow",
+        kind::DELETE_ROWS => "DeleteRows",
         kind::UPDATE_IN_PLACE => "UpdateInPlace",
         kind::COMPACT_LEAF => "CompactLeaf",
         kind::SPLIT_LEAF => "Structural(Split)",
@@ -506,6 +507,9 @@ fn kind_name(byte: u8) -> &'static str {
         kind::ABORT => "Abort",
         kind::CHECKPOINT => "Checkpoint",
         kind::CATALOG_CHANGE => "CatalogChange",
+        kind::PAD => "Pad",
+        kind::BULK_BUILT => "BulkBuilt",
+        kind::SPLIT_LOGICAL => "SplitLeaf",
         _ => "unknown",
     }
 }
@@ -517,9 +521,11 @@ fn tree_of(body: &Body<'_>) -> Option<u64> {
     match *body {
         Body::InsertRow { tree, .. }
         | Body::DeleteRow { tree, .. }
+        | Body::DeleteRows { tree, .. }
         | Body::UpdateInPlace { tree, .. }
         | Body::CompactLeaf { tree, .. }
-        | Body::Structural { tree, .. } => Some(tree),
+        | Body::Structural { tree, .. }
+        | Body::SplitLeaf { tree, .. } => Some(tree),
         _ => None,
     }
 }
@@ -543,7 +549,7 @@ fn attribute_log(
     roots: &[(u64, String)],
 ) -> Result<Attribution, String> {
     let wal = database.wal();
-    let mut by_kind = [KindTotal::default(); 14];
+    let mut by_kind = [KindTotal::default(); 17];
     let mut by_tree_bytes = std::collections::BTreeMap::<u64, (u64, u64)>::new();
     let mut untied_bytes = 0u64;
     let mut untied_records = 0u64;

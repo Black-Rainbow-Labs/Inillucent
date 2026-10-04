@@ -17,6 +17,8 @@ use crate::expr::Eval;
 use crate::physical::{Params, SourceLayout, TreeCatalog};
 use crate::trigger::{self, Depth};
 
+mod unwatched;
+
 /// Applies an `UPDATE` to rows a query has already selected.
 ///
 /// @param statement - the bound update
@@ -176,8 +178,14 @@ pub fn update_at_cached(
     for held in correlated {
         held.forget();
     }
-    let mut changes = Changes::default();
     let captured = target.captures(table.root);
+    // Nothing can watch the rows change, so they go a leaf at a time (task-2180).
+    if let Some(changes) =
+        unwatched::update_unwatched(statement, target, params, keys, depth, &held, captured)?
+    {
+        return Ok(changes);
+    }
+    let mut changes = Changes::default();
     for row in keys {
         // An `UPDATE ... FROM` carries its assigned values after the key, so
         // the probe is the key columns and no more.

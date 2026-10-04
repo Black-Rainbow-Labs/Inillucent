@@ -147,7 +147,7 @@ fn numeric_arithmetic(op: BinaryOp, left: &Value<'_>, right: &Value<'_>) -> Valu
 /// @param op - the operator
 /// @param a - the left operand
 /// @param b - the right operand
-fn integer_arithmetic(op: BinaryOp, a: i64, b: i64) -> Option<Value<'static>> {
+pub fn integer_arithmetic(op: BinaryOp, a: i64, b: i64) -> Option<Value<'static>> {
     let value = match op {
         BinaryOp::Add => a.checked_add(b)?,
         BinaryOp::Subtract => a.checked_sub(b)?,

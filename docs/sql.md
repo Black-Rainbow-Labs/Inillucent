@@ -152,7 +152,7 @@ otherwise.
 | Transactions | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`. A `ROLLBACK` also undoes `CREATE` and `DROP TABLE` |
 | Several databases | `ATTACH` and `DETACH`, joins across files, and one transaction that commits to two files or to neither. Temporary tables, views and triggers |
 | Schema and maintenance | `sqlite_schema` and `sqlite_master`, `VACUUM`, `VACUUM INTO`, `integrity_check` and `quick_check` |
-| Plans | `EXPLAIN QUERY PLAN` in SQLite's line format, with attached schema names, automatic index lines and `LEFT-JOIN` markers. The plan is a flat list, see [below](#how-inillucent-behaves-differently-from-sqlite). Plain `EXPLAIN` runs and prints a different program, see [below](#five-follow-from-how-inillucent-is-built) |
+| Plans | `EXPLAIN QUERY PLAN` as SQLite's tree, with attached schema names, automatic index lines, `LEFT-JOIN` markers, `CO-ROUTINE` and `MATERIALIZE` nodes for derived tables and CTEs, `COMPOUND QUERY` and `MERGE` nodes for compound queries, and `SCALAR SUBQUERY` and `LIST SUBQUERY` nodes. A derived table is flattened into the query that reads it where SQLite flattens it. Some plans still differ, see [below](#how-inillucent-behaves-differently-from-sqlite). Plain `EXPLAIN` runs and prints a different program, see [below](#five-follow-from-how-inillucent-is-built) |
 | Table valued functions | `generate_series`, `chunk_text(text, size, overlap, heading)`, which cuts a document into windows of characters for embedding, `json_each`, `json_tree`, a `pragma_*` function for every pragma that returns a value, such as `pragma_table_info('t')`, `pragma_foreign_key_check` and `pragma_user_version`, which can take its argument from an earlier `FROM` term, as in `FROM sqlite_master m, pragma_index_list(m.name)`, and any module an application registers |
 
 ### Rules a reader asks about
@@ -367,7 +367,7 @@ These differences change how an application runs, and they do not show up in a p
 | `PRAGMA busy_timeout` default | 5000 ms | 0 in the `sqlite3` shell |
 | `sqlite_schema.rootpage` | the first table has root page 4, because inillucent keeps its own catalog trees on the first pages. The other columns match | the first table has root page 2 |
 | a `WITHOUT ROWID` table whose primary key term is `DESC` | a query with no `ORDER BY` returns rows in ascending key order. Range predicates, seeks and `ORDER BY` on the key return the same rows as SQLite | the rows come back in descending key order |
-| `EXPLAIN QUERY PLAN` for a subquery, a CTE or a compound query | a flat list of lines. It has no `MATERIALIZE`, `CO-ROUTINE`, `MERGE` or `COMPOUND QUERY` blocks, and does not flatten a subquery in the plan text. An `OR` answered by one search per arm prints `MULTI-INDEX OR` with no line for each arm. The rows of the query match | a plan tree with those blocks |
+| `EXPLAIN QUERY PLAN` where the planners choose differently | the same tree, with the loops this planner chose. It does not seek an index by `IN (SELECT ...)`, so it prints `SCAN` and a bloom filter under the `LIST SUBQUERY` node. It does not turn `EXISTS` into a join, walk an index to avoid a sort, or sort only the last term of an `ORDER BY`. It may join a derived table in another order. An `OR` answered by one search per arm prints `MULTI-INDEX OR` with no line for each arm. The rows of the query match | `SEARCH` by the subquery's rows, an `EXISTS` loop, an index walk, `USE TEMP B-TREE FOR LAST TERM OF ORDER BY` |
 | `mmap_size`, `wal_autocheckpoint`, `journal_size_limit`, `temp_store = FILE`, `synchronous = EXTRA`, `threads`, the heap limits and `cache_spill` | stored and read back as SQLite reports them, and they do not change how inillucent runs. It maps no pages, has one thread, and folds the log at checkpoints | each changes how SQLite runs |
 | `$1`, `$2` placeholders | `$N` binds the Nth value, as `?N` does and as PostgreSQL does. `SET a = $2 WHERE id = $1` takes `a` from the second value | `$1` is a name, numbered by the order names first appear, so the same statement takes `a` from the first value |
 
@@ -375,7 +375,9 @@ These differences change how an application runs, and they do not show up in a p
 the file equals the number of commits acknowledged. `crates/inillucent-compat/tests/durability/process_concurrency.rs`
 checks this with two real writer processes, and `crates/inillucent-compat/tests/durability/process_storm.rs`
 with four writers and two readers killed at random, graded byte for byte against what each writer
-acknowledged.
+acknowledged. Two of its cases rewrite values of 4 to 20 KB in autocommit statements, let the
+readers write too, and end with every process killed at the same moment, which is how an
+application stopped by a service manager leaves the file.
 
 **`BEGIN` is deferred, as in SQLite.** `BEGIN` and `BEGIN DEFERRED` take no lock. The first
 statement inside the transaction takes the lock it needs, so a read transaction reads beside another

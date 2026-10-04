@@ -185,7 +185,7 @@ fn in_tree_order<'k>(
     target: &mut dyn WriteTarget,
     keys: &'k [Row],
     captured: bool,
-) -> DbResult<Option<Vec<&'k Row>>> {
+) -> DbResult<Option<Vec<&'k [OwnedDatum]>>> {
     let table = &statement.table;
     let observable = !statement.triggers.is_empty()
         || !table.foreign_key_triggers.is_empty()
@@ -197,7 +197,7 @@ fn in_tree_order<'k>(
     Ok(Some(sorted_by_tree(
         target,
         table.root,
-        keys.iter().collect(),
+        keys.iter().map(Vec::as_slice).collect(),
     )?))
 }
 /// Sorts tuples into the order one tree holds them, dropping repeats.
@@ -210,16 +210,44 @@ fn in_tree_order<'k>(
 /// @param target - the file and its trees
 /// @param root - the tree whose order to use
 /// @param tuples - the key tuples, or the index entries
-fn sorted_by_tree<'k>(
+pub(super) fn sorted_by_tree<'k>(
     target: &mut dyn WriteTarget,
     root: u32,
-    tuples: Vec<&'k Row>,
-) -> DbResult<Vec<&'k Row>> {
+    tuples: Vec<&'k [OwnedDatum]>,
+) -> DbResult<Vec<&'k [OwnedDatum]>> {
     let (_, trees, _) = target.parts_for(root)?;
     let Some(tree) = trees.get(root) else {
         return Ok(tuples);
     };
-    let mut encoded: Vec<(Vec<u8>, &'k Row)> = tuples
+    // **A rowid is an integer, and integers are compared as integers
+    // (task-2183).** Encoding each key to bytes to sort by was an allocation per
+    // key, 5.5% of a 40,000 row range delete whose keys came from a scan of the
+    // same tree and so were in order already. An ascending integer key sorts in
+    // integer order, and keys that are in order are checked, not sorted.
+    let ascending_integer_key = tree.key_columns() == 1
+        && !tree.directions().first().copied().unwrap_or(false)
+        && tuples
+            .iter()
+            .all(|tuple| matches!(tuple, [OwnedDatum::Int(_)]));
+    if ascending_integer_key {
+        let integer = |tuple: &[OwnedDatum]| match tuple.first() {
+            Some(OwnedDatum::Int(value)) => *value,
+            _ => i64::MIN,
+        };
+        let mut tuples = tuples;
+        let ordered = tuples
+            .windows(2)
+            .all(|pair| match (pair.first(), pair.get(1)) {
+                (Some(left), Some(right)) => integer(left) < integer(right),
+                _ => true,
+            });
+        if !ordered {
+            tuples.sort_by_key(|tuple| integer(tuple));
+            tuples.dedup_by_key(|tuple| integer(tuple));
+        }
+        return Ok(tuples);
+    }
+    let mut encoded: Vec<(Vec<u8>, &'k [OwnedDatum])> = tuples
         .into_iter()
         .map(|tuple| {
             let borrowed: Vec<Datum<'_>> = tuple.iter().map(OwnedDatum::borrow).collect();
@@ -274,41 +302,73 @@ fn delete_unwatched(
     table: &TableInfo,
     layout: &SourceLayout,
     target: &mut dyn WriteTarget,
-    keys: Vec<&Row>,
+    keys: Vec<&[OwnedDatum]>,
     indexes: IndexExprs<'_>,
     depth: Depth,
 ) -> DbResult<Changes> {
     let mut entries: Vec<Vec<Row>> = maintained(table).map(|_| Vec::new()).collect();
+    let has_maintained = !entries.is_empty();
     let mut changes = Changes::default();
-    // The leaf the last delete used, per tree: the keys arrive in each tree's
-    // order, so the next one is nearly always there (task-2175). See
-    // `PagedTree::delete_near`.
+    let borrowed: Vec<Vec<Datum<'_>>> = keys
+        .iter()
+        .map(|key| key.iter().map(OwnedDatum::borrow).collect())
+        .collect();
+    // The leaf the last run used, per tree: the keys arrive in each tree's
+    // order, so the next run nearly always starts there (task-2175). Each call
+    // deletes the keys one leaf holds with one change to it (task-2180), and
+    // the rows are counted after each, so a failure part way leaves the count
+    // at the rows that went. See `PagedTree::delete_sorted`.
     let mut near = None;
-    for key in keys {
+    let mut at = 0usize;
+    while let Some(rest) = borrowed.get(at..).filter(|rest| !rest.is_empty()) {
+        let mut removed = 0usize;
         let (database, trees, log) = target.parts_for(table.root)?;
         let tree = trees
             .get_mut(table.root)
             .ok_or_else(|| missing_tree(table))?;
-        let borrowed: Vec<Datum<'_>> = key.iter().map(OwnedDatum::borrow).collect();
-        let Some(row) = tree.delete_near(database, log, &borrowed, &mut near)? else {
-            continue;
-        };
-        for ((position, index), held) in maintained(table).zip(entries.iter_mut()) {
-            if indexes.holds(position, &row)? {
-                held.push(index_entry(position, index, layout, &row, indexes)?);
-            }
+        // A table with no index to keep is not shown its rows, so the run
+        // copies none out (task-2183).
+        at = at.saturating_add(tree.delete_sorted(
+            database,
+            log,
+            rest,
+            &mut near,
+            &mut |row| {
+                removed = removed.saturating_add(1);
+                for ((position, index), held) in maintained(table).zip(entries.iter_mut()) {
+                    if indexes.holds(position, row)? {
+                        held.push(index_entry(position, index, layout, row, indexes)?);
+                    }
+                }
+                Ok(())
+            },
+            has_maintained,
+        )?);
+        for _ in 0..removed {
+            count_row(&mut changes, target, depth);
         }
-        count_row(&mut changes, target, depth);
     }
     for ((_, index), held) in maintained(table).zip(entries.iter()) {
+        let sorted: Vec<Vec<Datum<'_>>> =
+            sorted_by_tree(target, index.root, held.iter().map(Vec::as_slice).collect())?
+                .into_iter()
+                .map(|entry| entry.iter().map(OwnedDatum::borrow).collect())
+                .collect();
         let mut near = None;
-        for entry in sorted_by_tree(target, index.root, held.iter().collect())? {
+        let mut at = 0usize;
+        while let Some(rest) = sorted.get(at..).filter(|rest| !rest.is_empty()) {
             let (database, trees, log) = target.parts_for(index.root)?;
             let Some(tree) = trees.get_mut(index.root) else {
                 break;
             };
-            let borrowed: Vec<Datum<'_>> = entry.iter().map(OwnedDatum::borrow).collect();
-            tree.delete_near(database, log, &borrowed, &mut near)?;
+            at = at.saturating_add(tree.delete_sorted(
+                database,
+                log,
+                rest,
+                &mut near,
+                &mut |_| Ok(()),
+                false,
+            )?);
         }
     }
     Ok(changes)

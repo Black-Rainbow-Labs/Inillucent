@@ -518,8 +518,19 @@ impl VirtualTable for Fts5Table {
     /// evaluate one: the operator means nothing outside the module, and a
     /// module that claimed it without applying it would return every row. It is
     /// the one constraint here that the module promises absolutely.
+    ///
+    /// **A match is chosen before a rowid lookup, wherever it was written.**
+    /// The lookup used to be taken as soon as it was seen, so `WHERE rowid = 1
+    /// AND f MATCH 'x'` handed the module only the rowid, the match was tested
+    /// outside the module, and every row failed it. With the match chosen, the
+    /// engine tests the rowid against the matched rows.
     fn best_index(&self, query: &mut IndexQuery) -> DbResult<()> {
         let mut plan = PLAN_SCAN;
+        let matches = query.constraints.iter().any(|constraint| {
+            constraint.usable
+                && constraint.op == ConstraintOp::Match
+                && (0..=self.match_column()).contains(&constraint.column)
+        });
         for index in 0..query.constraints.len() {
             let Some(constraint) = query.constraints.get(index).copied() else {
                 continue;
@@ -545,7 +556,10 @@ impl VirtualTable for Fts5Table {
             // slot, which is why the dialect has to be checked and not just
             // the column number.
             let docid = self.dialect == Dialect::Three && constraint.column == self.rank_column();
-            if constraint.op == ConstraintOp::Eq && (constraint.column == ROWID_COLUMN || docid) {
+            if !matches
+                && constraint.op == ConstraintOp::Eq
+                && (constraint.column == ROWID_COLUMN || docid)
+            {
                 query.use_constraint(index, true);
                 query.index_number = PLAN_ROWID;
                 query.estimated_cost = 1.0;

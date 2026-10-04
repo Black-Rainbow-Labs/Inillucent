@@ -20,6 +20,8 @@ mod analyze_reopen;
 mod analyze_same_session;
 mod autoindex_reopen;
 mod budget;
+mod bulk_insert_storage;
+mod bulk_write_log;
 mod chunk_text;
 mod compiled_chain_reuse;
 mod conformance;

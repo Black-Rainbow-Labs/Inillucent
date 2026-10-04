@@ -266,6 +266,10 @@ pub struct WriteDeclarations {
     /// The virtual generated columns that are `NOT NULL` or in a `STRICT`
     /// table. They have no slot in the row, so their values are computed.
     virtuals: Vec<CompiledVirtual>,
+    /// Whether the table is `STRICT` and has a generated column, which moves
+    /// the type check of its ordinary and virtual columns ahead of `NOT NULL`.
+    /// See [`WriteDeclarations::generated_types_are_met`].
+    types_before_not_null: bool,
 }
 
 /// One `NOT NULL` column's `DEFAULT`, compiled.
@@ -397,6 +401,7 @@ impl WriteDeclarations {
             index_exprs: indexed,
             defaults: standins,
             virtuals,
+            types_before_not_null: table.strict && table.columns.iter().any(|c| c.generated),
         })
     }
 
@@ -499,11 +504,41 @@ impl WriteDeclarations {
         }
     }
 
+    /// Refuses a value outside a `STRICT` column's type class, for a table
+    /// with a generated column, before `NOT NULL` is checked.
+    ///
+    /// SQLite computes the generated columns before it checks any constraint,
+    /// and it type checks the ordinary columns and each virtual column as part
+    /// of that computation. So in a `STRICT` table with a generated column, a
+    /// row that has a wrong class and a missing `NOT NULL` value reports the
+    /// class, while the same row in a table with no generated column reports
+    /// the `NOT NULL`. Measured against the pinned shell for stored and
+    /// virtual columns. Does nothing for any other table.
+    ///
+    /// @param table - the table being written
+    /// @param space - the statement's row space, which computes a virtual column
+    /// @param row - the image about to be written
+    pub fn generated_types_are_met(
+        &self,
+        table: &TableInfo,
+        space: &RowSpace,
+        row: &[OwnedDatum],
+    ) -> DbResult<()> {
+        if !self.types_before_not_null {
+            return Ok(());
+        }
+        self.typed_columns_are_met(table, row, false)?;
+        self.virtual_types_are_met(table, space, row)
+    }
+
     /// Refuses a value outside a `STRICT` column's type class.
     ///
     /// Runs after `NOT NULL` and before the `CHECK` predicates, which is
     /// SQLite's order: a `STRICT` table whose row is missing a `NOT NULL`
-    /// column reports the missing value rather than the wrong class.
+    /// column reports the missing value rather than the wrong class. A table
+    /// with a generated column had its ordinary and virtual columns checked
+    /// by [`WriteDeclarations::generated_types_are_met`] already, so only its
+    /// stored generated columns are left.
     ///
     /// @param table - the table being written
     /// @param space - the statement's row space, which computes a virtual column
@@ -514,10 +549,32 @@ impl WriteDeclarations {
         space: &RowSpace,
         row: &[OwnedDatum],
     ) -> DbResult<()> {
+        if self.types_before_not_null {
+            return self.typed_columns_are_met(table, row, true);
+        }
         // SQLite checks the ordinary columns first, then the virtual generated
         // ones, then the stored generated ones. Which message a row with two
         // wrong values gets is the only thing the order decides.
         self.typed_columns_are_met(table, row, false)?;
+        if !table.strict {
+            return Ok(());
+        }
+        self.virtual_types_are_met(table, space, row)?;
+        self.typed_columns_are_met(table, row, true)
+    }
+
+    /// Refuses a virtual generated column of a `STRICT` table whose computed
+    /// value is outside its type class.
+    ///
+    /// @param table - the table being written
+    /// @param space - the statement's row space, which computes the column
+    /// @param row - the image about to be written
+    fn virtual_types_are_met(
+        &self,
+        table: &TableInfo,
+        space: &RowSpace,
+        row: &[OwnedDatum],
+    ) -> DbResult<()> {
         if !table.strict {
             return Ok(());
         }
@@ -531,7 +588,7 @@ impl WriteDeclarations {
             let value = space.evaluate(held.expr.as_ref(), &[row])?;
             wrong_class(table, &column.name, &column.declared_type, class, &value)?;
         }
-        self.typed_columns_are_met(table, row, true)
+        Ok(())
     }
 
     /// Checks the `STRICT` columns the row holds, either the ones that are

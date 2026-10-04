@@ -1,6 +1,6 @@
 # inillucent performance scorecard
 
-Label `nightly-20260925-174312`, platform `windows-x86_64`, 30 paired rounds per scale, bootstrap seed 17900001. Every optimization is on, which is the shipped engine.
+Label `nightly-20261004-143426`, platform `windows-x86_64`, 30 paired rounds per scale, bootstrap seed 17900001. Every optimization is on, which is the shipped engine.
 
 Both engines read the same plan file. The ratio is SQLite over inillucent, so **above one means inillucent is faster**. A workload whose two engines returned different answers is reported as a correctness failure and is not timed.
 
@@ -21,59 +21,59 @@ That is *not* automatic for the vectorised engine, and the Phase 1 numbers were 
 
 ## Scale `medium` - 100000 rows
 
-Weighted geometric mean **0.754x**, 95% interval [0.745, 0.760]. The release bound is a lower bound of at least 3.00x.
+Weighted geometric mean **1.738x**, 95% interval [1.638, 1.807]. The release bound is a lower bound of at least 3.00x.
 
 ### By family
 
 | family | weight | ratio | 95% interval | verdict | required floor |
 |---|---:|---:|---|---|---|
-| `open.prepare` | 0.08 | 0.330x | [0.327, 0.332] | loss | **below 1.00x** |
-| `read.point` | 0.16 | 1.481x | [1.467, 1.495] | win | met |
-| `read.range` | 0.12 | 0.917x | [0.905, 0.930] | loss | **below 1.00x** |
-| `read.analytical` | 0.10 | 0.308x | [0.307, 0.310] | loss | **below 1.00x** |
-| `read.join` | 0.08 | 0.635x | [0.624, 0.645] | loss | **below 1.00x** |
-| `write` | 0.20 | 0.747x | [0.720, 0.773] | loss | **below 1.00x** |
-| `transaction` | 0.10 | 0.774x | [0.755, 0.792] | loss | **below 1.00x** |
-| `schema` | 0.04 | 1.425x | [1.404, 1.445] | win | met |
-| `extension` | 0.08 | 0.532x | [0.496, 0.554] | loss | **below 1.00x** |
-| `large.values` | 0.04 | 1.941x | [1.815, 2.093] | win | met |
+| `open.prepare` | 0.08 | 1.120x | [1.021, 1.239] | inconclusive | met |
+| `read.point` | 0.16 | 1.647x | [1.534, 1.765] | win | met |
+| `read.range` | 0.12 | 1.543x | [1.451, 1.655] | win | met |
+| `read.analytical` | 0.10 | 8.854x | [8.023, 9.739] | win | met |
+| `read.join` | 0.08 | 1.150x | [0.937, 1.383] | inconclusive | **below 1.00x** |
+| `write` | 0.20 | 1.707x | [1.588, 1.829] | win | met |
+| `transaction` | 0.10 | 2.053x | [1.826, 2.248] | win | met |
+| `schema` | 0.04 | 0.583x | [0.496, 0.695] | loss | **below 1.00x** |
+| `extension` | 0.08 | 0.838x | [0.780, 0.896] | loss | **below 1.00x** |
+| `large.values` | 0.04 | 2.195x | [1.796, 2.732] | win | met |
 
 ### By workload
 
 | workload | family | inillucent median | SQLite median | ratio | 95% interval | samples |
 |---|---|---:|---:|---:|---|---:|
-| `prepare.trivial` | `open.prepare` | 18.46 ms | 1.61 ms | 0.087x | [0.086, 0.088] | 30 |
-| `prepare.point` | `open.prepare` | 35.62 ms | 44.53 ms | 1.250x | [1.232, 1.263] | 30 |
-| `point.rowid` | `read.point` | 20.16 ms | 38.19 ms | 1.909x | [1.891, 1.938] | 30 |
-| `point.index` | `read.point` | 25.37 ms | 29.94 ms | 1.181x | [1.170, 1.197] | 30 |
-| `point.miss` | `read.point` | 18.49 ms | 26.40 ms | 1.441x | [1.416, 1.453] | 30 |
-| `range.covering` | `read.range` | 19.72 ms | 10.83 ms | 0.545x | [0.542, 0.555] | 30 |
-| `range.lookaside` | `read.range` | 37.54 ms | 33.89 ms | 0.909x | [0.877, 0.922] | 30 |
-| `range.reverse` | `read.range` | 9.29 ms | 14.49 ms | 1.561x | [1.545, 1.585] | 30 |
-| `scan.aggregate` | `read.analytical` | 228.48 ms | 91.15 ms | 0.401x | [0.398, 0.403] | 30 |
-| `scan.group` | `read.analytical` | 206.73 ms | 76.09 ms | 0.366x | [0.364, 0.369] | 30 |
-| `scan.sort` | `read.analytical` | 29.26 ms | 282.33 ms | 9.658x | [9.578, 9.762] | 30 |
-| `scan.distinct` | `read.analytical` | 156.53 ms | 972.65 us | 0.006x | [0.006, 0.006] | 30 |
-| `join.selective` | `read.join` | 18.37 ms | 20.19 ms | 1.107x | [1.070, 1.117] | 30 |
-| `join.range` | `read.join` | 61.45 ms | 22.44 ms | 0.365x | [0.363, 0.374] | 30 |
-| `correlated.exists` | `read.correlated` | 2.26 ms | 167.75 us | 0.074x | [0.074, 0.079] | 30 |
-| `correlated.in` | `read.correlated` | 1.49 ms | 90.95 us | 0.062x | [0.060, 0.064] | 30 |
-| `correlated.exists.selective` | `read.correlated` | 52.60 us | 17.00 us | 0.322x | [0.307, 0.336] | 30 |
-| `correlated.scalar.selective` | `read.correlated` | 43.45 us | 16.05 us | 0.374x | [0.362, 0.386] | 30 |
-| `write.insert.batch` | `write` | 18.00 ms | 19.76 ms | 1.073x | [0.757, 0.995] | 30 |
-| `write.insert.autocommit` | `write` | 133.13 ms | 424.52 ms | 3.190x | [2.879, 3.246] | 30 |
-| `write.update.indexed` | `write` | 621.28 ms | 98.97 ms | 0.158x | [0.154, 0.160] | 30 |
-| `write.delete` | `write` | 177.89 ms | 92.05 ms | 0.520x | [0.511, 0.526] | 30 |
-| `write.upsert` | `write` | 5.88 ms | 6.48 ms | 1.067x | [1.031, 1.089] | 30 |
-| `txn.autocommit` | `transaction` | 137.98 ms | 120.15 ms | 0.868x | [0.860, 0.880] | 30 |
-| `txn.batched` | `transaction` | 270.30 ms | 866.78 ms | 3.227x | [3.013, 3.408] | 30 |
-| `txn.large` | `transaction` | 53.87 ms | 8.96 ms | 0.166x | [0.162, 0.170] | 30 |
-| `schema.index` | `schema` | 31.88 ms | 45.30 ms | 1.428x | [1.404, 1.445] | 30 |
-| `extension.json` | `extension` | 19.18 ms | 1.13 ms | 0.059x | [0.058, 0.062] | 30 |
-| `extension.fts.build` | `extension` | 5.29 ms | 5.49 ms | 1.047x | [0.794, 1.047] | 30 |
-| `extension.fts.query` | `extension` | 18.29 ms | 9.13 ms | 0.498x | [0.493, 0.504] | 30 |
-| `extension.rtree.insert` | `extension` | 2.80 ms | 5.43 ms | 1.923x | [1.360, 1.860] | 30 |
-| `extension.rtree.query` | `extension` | 4.50 ms | 4.11 ms | 0.909x | [0.889, 0.931] | 30 |
-| `large.read` | `large.values` | 11.15 ms | 13.55 ms | 1.209x | [1.200, 1.223] | 30 |
-| `large.write` | `large.values` | 1.46 ms | 4.79 ms | 3.296x | [2.728, 3.619] | 30 |
+| `prepare.trivial` | `open.prepare` | 2.57 ms | 2.60 ms | 0.990x | [0.953, 1.053] | 30 |
+| `prepare.point` | `open.prepare` | 67.92 ms | 82.45 ms | 1.315x | [1.051, 1.512] | 30 |
+| `point.rowid` | `read.point` | 34.66 ms | 67.12 ms | 2.004x | [1.884, 2.230] | 30 |
+| `point.index` | `read.point` | 40.73 ms | 56.39 ms | 1.477x | [1.312, 1.557] | 30 |
+| `point.miss` | `read.point` | 31.75 ms | 47.63 ms | 1.446x | [1.404, 1.668] | 30 |
+| `range.covering` | `read.range` | 11.58 ms | 18.61 ms | 1.663x | [1.585, 1.823] | 30 |
+| `range.lookaside` | `read.range` | 49.43 ms | 59.71 ms | 1.191x | [1.145, 1.318] | 30 |
+| `range.reverse` | `read.range` | 15.15 ms | 25.26 ms | 1.654x | [1.604, 1.975] | 30 |
+| `scan.aggregate` | `read.analytical` | 4.32 ms | 160.93 ms | 36.534x | [24.819, 39.205] | 30 |
+| `scan.group` | `read.analytical` | 5.31 ms | 137.93 ms | 25.876x | [22.266, 26.925] | 30 |
+| `scan.sort` | `read.analytical` | 45.32 ms | 488.00 ms | 10.522x | [10.157, 11.944] | 30 |
+| `scan.distinct` | `read.analytical` | 2.55 ms | 1.58 ms | 0.654x | [0.621, 0.826] | 30 |
+| `join.selective` | `read.join` | 24.35 ms | 36.73 ms | 1.586x | [1.235, 1.808] | 30 |
+| `join.range` | `read.join` | 46.79 ms | 43.19 ms | 0.926x | [0.712, 1.058] | 30 |
+| `correlated.exists` | `read.correlated` | 2.42 ms | 280.80 us | 0.119x | [0.073, 0.242] | 30 |
+| `correlated.in` | `read.correlated` | 270.80 us | 156.60 us | 0.570x | [0.493, 0.617] | 30 |
+| `correlated.exists.selective` | `read.correlated` | 62.25 us | 28.10 us | 0.456x | [0.398, 0.516] | 30 |
+| `correlated.scalar.selective` | `read.correlated` | 58.75 us | 27.05 us | 0.463x | [0.402, 0.490] | 30 |
+| `write.insert.batch` | `write` | 20.62 ms | 16.30 ms | 0.724x | [0.601, 0.849] | 30 |
+| `write.insert.autocommit` | `write` | 152.70 ms | 510.88 ms | 3.279x | [2.661, 3.454] | 30 |
+| `write.update.indexed` | `write` | 57.62 ms | 137.42 ms | 2.347x | [2.271, 2.588] | 30 |
+| `write.delete` | `write` | 57.35 ms | 136.62 ms | 2.421x | [2.208, 2.498] | 30 |
+| `write.upsert` | `write` | 7.42 ms | 8.44 ms | 1.147x | [1.054, 1.343] | 30 |
+| `txn.autocommit` | `transaction` | 150.39 ms | 145.49 ms | 0.963x | [0.893, 1.215] | 30 |
+| `txn.batched` | `transaction` | 319.24 ms | 1.05 s | 3.334x | [2.822, 3.460] | 30 |
+| `txn.large` | `transaction` | 4.36 ms | 12.39 ms | 2.901x | [2.196, 3.033] | 30 |
+| `schema.index` | `schema` | 134.21 ms | 74.58 ms | 0.555x | [0.496, 0.695] | 30 |
+| `extension.json` | `extension` | 2.29 ms | 1.80 ms | 0.777x | [0.662, 0.796] | 30 |
+| `extension.fts.build` | `extension` | 8.04 ms | 6.75 ms | 0.885x | [0.731, 0.911] | 30 |
+| `extension.fts.query` | `extension` | 31.18 ms | 15.24 ms | 0.461x | [0.415, 0.509] | 30 |
+| `extension.rtree.insert` | `extension` | 4.24 ms | 6.83 ms | 1.691x | [1.530, 2.193] | 30 |
+| `extension.rtree.query` | `extension` | 7.91 ms | 6.75 ms | 0.840x | [0.767, 0.925] | 30 |
+| `large.read` | `large.values` | 17.82 ms | 22.75 ms | 1.242x | [1.121, 1.319] | 30 |
+| `large.write` | `large.values` | 1.77 ms | 6.01 ms | 3.492x | [2.722, 6.064] | 30 |
 

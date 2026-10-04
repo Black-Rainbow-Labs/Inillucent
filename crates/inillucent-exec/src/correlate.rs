@@ -42,7 +42,7 @@
 use inillucent_base::DbResult;
 use inillucent_sql::bind::{BoundExpr, BoundSelect, SourceRows, SubqueryKind};
 use inillucent_sql::plan::{plan_select_with, Levers, PhysicalPlan};
-use inillucent_tree::datum::{Datum, OwnedDatum};
+use inillucent_tree::datum::OwnedDatum;
 
 use crate::batch::{Batch, Vector};
 use crate::expr::Eval;
@@ -96,6 +96,38 @@ pub struct Correlation {
     once: bool,
     /// The answer kept for a block that is `once`.
     kept: std::cell::RefCell<Option<OwnedDatum>>,
+    /// The block's chain, built at its first outer row and run again for each
+    /// one after (task-2183).
+    ///
+    /// **The block was built for every outer row**: `run_any_prepared_limited`
+    /// translated and compiled its filter and projection again each time,
+    /// which was 39% of `wide.id IN (SELECT owner FROM side_table WHERE owner
+    /// = wide.id)` over 400 rows. The outer row reaches the block as
+    /// parameters, and a chain whose build read no parameter answers a fresh
+    /// set of them without being built again, which is the rule the engine's
+    /// statement cache keeps.
+    chain: std::cell::RefCell<Option<crate::compiled::Compiled>>,
+    /// Whether a chain has been tried for the block.
+    tried: std::cell::Cell<bool>,
+    /// The index probe an `EXISTS` block is answered by, once its chain has
+    /// shown it has one; see [`Correlation::probe_directly`].
+    direct: std::cell::RefCell<Option<DirectProbe>>,
+}
+
+/// An `EXISTS` block answered by probing one index with the outer row's values.
+///
+/// **For the commonest correlated block there is (task-2183).** `EXISTS
+/// (SELECT 1 FROM side_table b WHERE b.owner = a.id)` over an index on
+/// `owner` is one equality probe per outer row. Through the block's chain it
+/// wrote the outer value into the parameter set, built the source's bounds
+/// back out of it, built a span scan and ran it into a sink: 330 ns an outer
+/// row, against 395 ns for SQLite's whole statement.
+struct DirectProbe {
+    /// The index's root page.
+    root: u32,
+    /// For each equality of the key, in index order: the joined-row column
+    /// that feeds it, and the affinity the seek converts it to.
+    keys: Vec<(usize, Option<inillucent_value::Affinity>)>,
 }
 
 /// Appends one column per correlated subquery to every row that passes.
@@ -129,15 +161,24 @@ pub struct Correlation {
 /// and it failed on this engine before the change.
 pub struct Correlated<'t> {
     /// The blocks, in the order their columns are appended.
-    correlations: Vec<Correlation>,
+    correlations: std::rc::Rc<[Correlation]>,
     /// The `WHERE` conjuncts that read no block, compiled against the row as
     /// the joins produce it. A row answers a block only when all of them are
     /// true, which is exactly when the filter above would have kept it.
-    gate: Vec<Box<dyn Eval>>,
+    gate: std::rc::Rc<[Box<dyn Eval>]>,
     /// Where the trees and layouts come from.
     catalog: &'t dyn TreeCatalog,
     /// The statement's own bound parameters, which a block may also read.
     params: Params,
+    /// The copy of `params` the blocks write their outer values into, made at
+    /// the first row that passes the gate and kept for the execution.
+    ///
+    /// **Not one copy per batch (task-2183).** A scan of a table with wide rows
+    /// pushes a batch per leaf, and `WHERE a.id % 100 = 0 AND EXISTS (...)`
+    /// copied the parameter set forty times to answer four blocks: 7% of the
+    /// statement. Each block writes only its own numbers, so one copy serves
+    /// every batch the way it already served every row of one.
+    bound: Option<Params>,
     downstream: Box<dyn Sink + 't>,
 }
 
@@ -150,8 +191,8 @@ impl<'t> Correlated<'t> {
     /// @param params - the statement's bound parameters
     /// @param downstream - what to push widened rows into
     pub fn new(
-        correlations: Vec<Correlation>,
-        gate: Vec<Box<dyn Eval>>,
+        correlations: std::rc::Rc<[Correlation]>,
+        gate: std::rc::Rc<[Box<dyn Eval>]>,
         catalog: &'t dyn TreeCatalog,
         params: &Params,
         downstream: Box<dyn Sink + 't>,
@@ -167,6 +208,7 @@ impl<'t> Correlated<'t> {
             // "a correlated subquery" - a true sentence about the slot and a
             // false one about the query.
             params: params.without_subqueries(),
+            bound: None,
             downstream,
         }
     }
@@ -175,29 +217,61 @@ impl<'t> Correlated<'t> {
 impl Sink for Correlated<'_> {
     fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
         let width = batch.columns.len();
-        // **Once per batch, not once per row** (task-2066 §4.3.1). See
-        // `Correlation::answer` for what that clone cost.
-        let mut bound = self.params.clone();
+        // **Once per execution, not once per row** (task-2066 §4.3.1). See
+        // `Correlation::answer` for what that clone cost, and `bound`.
+        // **The outer row is not copied (task-2183).** Each row used to be
+        // copied into owned values, every column of it, and then into a
+        // second list of borrowed ones, to push a batch of one row of
+        // constants. A block reads only the columns it is fed, so those are
+        // read where they lie, and the row goes downstream as the outer
+        // batch's own vectors under a one row selection, with the answers
+        // appended as constants.
+        let mut answers: Vec<OwnedDatum> = Vec::with_capacity(self.correlations.len());
         for nth in 0..batch.live() {
             if !passes(&self.gate, batch, nth)? {
                 continue;
             }
-            let mut row: Vec<OwnedDatum> =
-                Vec::with_capacity(width.saturating_add(self.correlations.len()));
-            for column in 0..width {
-                row.push(OwnedDatum::from_datum(&batch.value(nth, column)?));
-            }
-            for position in 0..self.correlations.len() {
-                let answer = match self.correlations.get(position) {
-                    Some(correlation) => correlation.answer(self.catalog, &mut bound, &row)?,
-                    None => OwnedDatum::Null,
+            answers.clear();
+            let bound = self.bound.get_or_insert_with(|| self.params.clone());
+            for correlation in self.correlations.iter() {
+                let feed = |column: usize| -> DbResult<OwnedDatum> {
+                    match column.checked_sub(width) {
+                        None => Ok(OwnedDatum::from_datum(&batch.value(nth, column)?)),
+                        Some(earlier) => {
+                            Ok(answers.get(earlier).cloned().unwrap_or(OwnedDatum::Null))
+                        }
+                    }
                 };
-                row.push(answer);
+                let answer = correlation.answer_from(self.catalog, bound, &feed)?;
+                answers.push(answer);
             }
-            let borrowed: Vec<Datum<'_>> = row.iter().map(OwnedDatum::borrow).collect();
-            let columns: Vec<Vector<'_>> =
-                borrowed.iter().map(|value| Vector::Const(*value)).collect();
-            if self.downstream.push(&Batch::new(1, columns))? == Flow::Stop {
+            // On the stack when the row is narrow, as an index nested loop's
+            // joined row is; see `crate::join::IndexNestedLoopJoin`.
+            const INLINE: usize = 8;
+            let total = width.saturating_add(answers.len());
+            let mut inline = [Vector::Const(inillucent_tree::datum::Datum::Null); INLINE];
+            let mut spilled: Vec<Vector<'_>> = Vec::new();
+            let every = batch
+                .columns
+                .iter()
+                .copied()
+                .chain(answers.iter().map(|value| Vector::Const(value.borrow())));
+            let columns: &[Vector<'_>] = if total <= INLINE {
+                for (slot, vector) in inline.iter_mut().zip(every) {
+                    *slot = vector;
+                }
+                inline.get(..total).unwrap_or(&[])
+            } else {
+                spilled.extend(every);
+                &spilled
+            };
+            let selected = [batch.row_at(nth) as u32];
+            let one = Batch {
+                rows: batch.rows,
+                selection: Some(&selected),
+                columns: crate::batch::Columns::Borrowed(columns),
+            };
+            if self.downstream.push(&one)? == Flow::Stop {
                 return Ok(Flow::Stop);
             }
         }
@@ -209,8 +283,33 @@ impl Sink for Correlated<'_> {
     }
 
     fn reset(&mut self) -> DbResult<()> {
+        self.bound = None;
         self.downstream.reset()
     }
+}
+
+/// Reports whether a tree holds a live row whose key begins with a prefix.
+///
+/// @param tree - the index
+/// @param pool - the pool its pages live in
+/// @param key - the prefix, already converted to the seek's affinity
+fn holds_key(
+    tree: &inillucent_tree::paged::PagedTree,
+    pool: &inillucent_pool::Pool,
+    key: &[inillucent_tree::datum::Datum<'_>],
+) -> DbResult<bool> {
+    let mut found = false;
+    tree.visit_equal(pool, key, &mut |leaf, start, end| {
+        // A written leaf's live rows are not its sorted run, so they are
+        // matched again, the way an index nested loop's range probe does.
+        found = if leaf.needs_materialising() {
+            !leaf.live_matching(key, 8)?.is_empty()
+        } else {
+            end > start
+        };
+        Ok(!found)
+    })?;
+    Ok(found)
 }
 
 /// Whether one row passes every conjunct of a gate.
@@ -258,16 +357,205 @@ impl Correlation {
         bound: &mut Params,
         row: &[OwnedDatum],
     ) -> DbResult<OwnedDatum> {
+        self.answer_from(catalog, bound, &|column| {
+            Ok(row.get(column).cloned().unwrap_or(OwnedDatum::Null))
+        })
+    }
+
+    /// [`Correlation::answer`], reading each fed column through a function.
+    ///
+    /// @param catalog - where the trees and layouts come from
+    /// @param bound - the statement's parameters, to write this row's feeds into
+    /// @param feed - returns the joined row's value in one column
+    pub fn answer_from(
+        &self,
+        catalog: &dyn TreeCatalog,
+        bound: &mut Params,
+        feed: &dyn Fn(usize) -> DbResult<OwnedDatum>,
+    ) -> DbResult<OwnedDatum> {
         if self.once {
             if let Some(kept) = self.kept.borrow().clone() {
                 return Ok(kept);
             }
         }
-        let answer = self.run(catalog, bound, row)?;
+        let answer = self.run(catalog, bound, feed)?;
         if self.once {
             *self.kept.borrow_mut() = Some(answer.clone());
         }
         Ok(answer)
+    }
+
+    /// Runs the block's kept chain for one outer row, or builds it at the first.
+    ///
+    /// `None` when the block has no chain that can be run again - a shape the
+    /// chain builder refuses, a build that read a parameter, settings that
+    /// have changed since - and the caller builds and runs it the old way.
+    ///
+    /// @param catalog - where the trees and layouts come from
+    /// @param bound - the statement's parameters, with this row's feeds in them
+    fn run_chain(
+        &self,
+        catalog: &dyn TreeCatalog,
+        bound: &Params,
+    ) -> DbResult<Option<Vec<Vec<OwnedDatum>>>> {
+        self.with_chain(catalog, bound, &mut |compiled| {
+            compiled.run(&self.plan, catalog, bound)?;
+            Ok(compiled.take_rows())
+        })
+    }
+
+    /// Answers whether an `EXISTS` block produces a row, through its kept chain.
+    ///
+    /// A block whose access path answers its whole `WHERE` reads at most one
+    /// row of its source and nothing above it; see `Compiled::any_row`.
+    /// `None` when the block has no chain, as for [`Correlation::run_chain`].
+    ///
+    /// @param catalog - where the trees and layouts come from
+    /// @param bound - the statement's parameters, with this row's feeds in them
+    fn exists_by_chain(&self, catalog: &dyn TreeCatalog, bound: &Params) -> DbResult<Option<bool>> {
+        self.with_chain(catalog, bound, &mut |compiled| {
+            if compiled.answers_existence(&self.plan) {
+                if let Ok(mut direct) = self.direct.try_borrow_mut() {
+                    if direct.is_none() && compiled.rebindable() {
+                        *direct = self.direct_probe();
+                    }
+                }
+                return compiled.any_row(&self.plan, catalog, bound);
+            }
+            compiled.run(&self.plan, catalog, bound)?;
+            Ok(!compiled.take_rows().is_empty())
+        })
+    }
+
+    /// Returns the index probe this `EXISTS` block reduces to, when it does.
+    ///
+    /// One stage reading an index by an equality prefix and nothing else,
+    /// every value of which is a parameter the outer row feeds. The caller has
+    /// already checked that the access path consumes the whole `WHERE`.
+    fn direct_probe(&self) -> Option<DirectProbe> {
+        let [stage] = self.prepared.stages.as_slice() else {
+            return None;
+        };
+        if stage.kind != crate::physical::AccessKind::Span {
+            return None;
+        }
+        let term = self.plan.sources.get(stage.term)?;
+        let inillucent_sql::plan::AccessPath::IndexSeek {
+            equalities,
+            unconverted,
+            low: None,
+            high: None,
+            columns,
+            ..
+        } = &term.path
+        else {
+            return None;
+        };
+        if equalities.is_empty() {
+            return None;
+        }
+        let mut keys = Vec::with_capacity(equalities.len());
+        for (position, expr) in equalities.iter().enumerate() {
+            let BoundExpr::Parameter(number) = expr else {
+                return None;
+            };
+            let (column, _) = self.feeds.iter().find(|(_, fed)| fed == number)?;
+            let affinity = crate::physical::probe_affinity(
+                unconverted.contains(&position),
+                crate::physical::index_affinity(&term.table, columns, position),
+            );
+            keys.push((*column, affinity));
+        }
+        Some(DirectProbe {
+            root: stage.root,
+            keys,
+        })
+    }
+
+    /// Answers an `EXISTS` block by its index probe, when it has one.
+    ///
+    /// `None` when the block has no [`DirectProbe`] yet; the first outer row
+    /// runs the chain, which is what finds out whether it has one.
+    ///
+    /// @param catalog - where the trees come from
+    /// @param feed - returns the joined row's value in one column
+    fn probe_directly(
+        &self,
+        catalog: &dyn TreeCatalog,
+        feed: &dyn Fn(usize) -> DbResult<OwnedDatum>,
+    ) -> DbResult<Option<bool>> {
+        let Ok(held) = self.direct.try_borrow() else {
+            return Ok(None);
+        };
+        let Some(direct) = held.as_ref() else {
+            return Ok(None);
+        };
+        let (Some(tree), Some(pool)) = (catalog.tree(direct.root), catalog.pool_for(direct.root))
+        else {
+            return Ok(None);
+        };
+        // One key value is the common case, and it needs no list.
+        if let [(column, affinity)] = direct.keys.as_slice() {
+            let value = crate::constant::seek_value(feed(*column)?, *affinity)?;
+            // `x = NULL` is never true, which is the span the seek would build.
+            if value == OwnedDatum::Null {
+                return Ok(Some(false));
+            }
+            return holds_key(tree, pool, &[value.borrow()]).map(Some);
+        }
+        let mut values = Vec::with_capacity(direct.keys.len());
+        for (column, affinity) in &direct.keys {
+            let value = crate::constant::seek_value(feed(*column)?, *affinity)?;
+            if value == OwnedDatum::Null {
+                return Ok(Some(false));
+            }
+            values.push(value);
+        }
+        let key: Vec<inillucent_tree::datum::Datum<'_>> =
+            values.iter().map(OwnedDatum::borrow).collect();
+        holds_key(tree, pool, &key).map(Some)
+    }
+
+    /// Hands the block's kept chain to `work`, building it at the first call.
+    ///
+    /// `None` when the block has no chain that can be run again - a shape the
+    /// chain builder refuses, a build that read a parameter, settings that
+    /// have changed since - and the caller builds and runs it the old way.
+    ///
+    /// @param catalog - where the trees and layouts come from
+    /// @param bound - the statement's parameters, with this row's feeds in them
+    /// @param work - what to do with the chain
+    fn with_chain<R>(
+        &self,
+        catalog: &dyn TreeCatalog,
+        bound: &Params,
+        work: &mut dyn FnMut(&mut crate::compiled::Compiled) -> DbResult<R>,
+    ) -> DbResult<Option<R>> {
+        let Ok(mut held) = self.chain.try_borrow_mut() else {
+            return Ok(None);
+        };
+        if !self.tried.get() {
+            self.tried.set(true);
+            let Some(mut compiled) = crate::compiled::try_compile_limited(
+                &self.plan,
+                catalog,
+                &self.prepared,
+                bound,
+                Some(1),
+            )?
+            else {
+                return Ok(None);
+            };
+            let answer = work(&mut compiled)?;
+            if compiled.rebindable() {
+                *held = Some(compiled);
+            }
+            return Ok(Some(answer));
+        }
+        match held.as_mut() {
+            Some(compiled) if compiled.built_under(bound) => Ok(Some(work(compiled)?)),
+            _ => Ok(None),
+        }
     }
 
     /// Forgets the answer a `once` block kept, so the next statement runs it.
@@ -279,26 +567,37 @@ impl Correlation {
     ///
     /// @param catalog - where the trees and layouts come from
     /// @param bound - the statement's parameters, to write this row's feeds into
-    /// @param row - the joined row so far
+    /// @param feed - returns the joined row's value in one column
     fn run(
         &self,
         catalog: &dyn TreeCatalog,
         bound: &mut Params,
-        row: &[OwnedDatum],
+        feed: &dyn Fn(usize) -> DbResult<OwnedDatum>,
     ) -> DbResult<OwnedDatum> {
+        if self.kind == SubqueryKind::Exists {
+            if let Some(found) = self.probe_directly(catalog, feed)? {
+                return Ok(OwnedDatum::Int(i64::from(found != self.negated)));
+            }
+        }
         for (column, number) in &self.feeds {
-            bound.set(
-                *number,
-                row.get(*column).cloned().unwrap_or(OwnedDatum::Null),
-            );
+            bound.set(*number, feed(*column)?);
+        }
+        if self.kind == SubqueryKind::Exists {
+            if let Some(found) = self.exists_by_chain(catalog, bound)? {
+                return Ok(OwnedDatum::Int(i64::from(found != self.negated)));
+            }
         }
         // **One row is all any of the three forms reads.** `Exists` asks
         // whether the block produced anything and `Scalar` takes the first row
         // and drops the rest, so the unlimited run was reading an inner result
         // set to throw it away. `In` is refused in `correlations_of` and is
         // stated below so a variant added later is a compilation error.
-        let (rows, _shape) =
-            run_any_prepared_limited(&self.plan, catalog, &self.prepared, bound, Some(1))?;
+        let rows = match self.run_chain(catalog, bound)? {
+            Some(rows) => rows,
+            None => {
+                run_any_prepared_limited(&self.plan, catalog, &self.prepared, bound, Some(1))?.0
+            }
+        };
         let mut column = rows
             .into_iter()
             .map(|row| row.into_iter().next().unwrap_or(OwnedDatum::Null));
@@ -313,6 +612,53 @@ impl Correlation {
             // later is a compilation error rather than a NULL.
             SubqueryKind::In => OwnedDatum::Null,
         })
+    }
+}
+
+/// A statement's prepared correlated blocks, kept for its next execution.
+///
+/// **Prepared once per statement, not once per execution (task-2183).**
+/// Every execution planned and prepared each block again, and its first outer
+/// row compiled the block's chain again: a fifth of `WHERE a.id % 100 = 0 AND
+/// EXISTS (...)`, which answers four blocks. A block's plan, its structural
+/// choices and its chain depend on the statement and the schema, as the
+/// `Prepared` that holds this does, and a kept chain is checked against the
+/// connection's settings before each run. A `once` block's kept answer is
+/// forgotten at each execution, because it depends on the parameters.
+///
+/// A cell rather than a shared one: a statement that has no block allocates
+/// nothing for it, which the compile allocation bound for `SELECT 1` counts,
+/// and a clone made after the blocks were built shares them.
+#[derive(Clone, Default)]
+pub struct KeptBlocks(std::cell::RefCell<Option<std::rc::Rc<[Correlation]>>>);
+
+impl KeptBlocks {
+    /// Returns the kept blocks, ready for a new execution, or builds and keeps them.
+    ///
+    /// @param build - prepares the blocks when none are kept
+    pub fn get_or_build(
+        &self,
+        build: impl FnOnce() -> DbResult<Vec<Correlation>>,
+    ) -> DbResult<std::rc::Rc<[Correlation]>> {
+        if let Some(kept) = self.0.borrow().as_ref() {
+            for correlation in kept.iter() {
+                correlation.forget();
+            }
+            return Ok(std::rc::Rc::clone(kept));
+        }
+        let built: std::rc::Rc<[Correlation]> = build()?.into();
+        *self.0.borrow_mut() = Some(std::rc::Rc::clone(&built));
+        Ok(built)
+    }
+}
+
+impl std::fmt::Debug for KeptBlocks {
+    /// Says how many blocks are kept; a block itself has nothing to print.
+    ///
+    /// @param formatter - where the text goes
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held = self.0.borrow().as_ref().map(|kept| kept.len());
+        write!(formatter, "KeptBlocks({held:?})")
     }
 }
 
@@ -334,7 +680,7 @@ pub fn correlations_in(
     for expr in exprs {
         gather_expression(expr, &mut found);
     }
-    prepare_blocks(found, catalog, resolve, None)
+    prepare_blocks(found, catalog, resolve, None, Levers::default())
 }
 
 /// Finds every subquery a list of expressions holds, correlated or not, and
@@ -357,7 +703,13 @@ pub fn correlations_in_every(
     for expr in exprs {
         gather_every(expr, &mut found);
     }
-    prepare_blocks(found, catalog, resolve, Some(target_root))
+    prepare_blocks(
+        found,
+        catalog,
+        resolve,
+        Some(target_root),
+        Levers::default(),
+    )
 }
 
 /// Finds every correlated block in a plan and prepares it.
@@ -377,36 +729,21 @@ pub fn correlations_of(
     }
     let mut found: Vec<Found> = Vec::new();
     gather_plan(plan, &mut found);
-    prepare_blocks(found, catalog, resolve, None)
-}
-
-/// Whether a plan holds any correlated block at all.
-///
-/// **A walk, and nothing else** (task-2066 §4.3.1). `compiled.rs` asks only
-/// whether the list is empty, and it used to ask by building the list - which
-/// plans every block and, since blocks are prepared now, would prepare them
-/// too. The comment above that call promises a shape it refuses costs nothing
-/// beyond the walk, and this is what keeps that true.
-///
-/// @param plan - the planner's output
-pub fn has_correlations(plan: &PhysicalPlan) -> bool {
-    if !plan.subqueries {
-        return false;
-    }
-    let mut found: Vec<Found> = Vec::new();
-    gather_plan(plan, &mut found);
-    !found.is_empty()
+    prepare_blocks(found, catalog, resolve, None, plan.levers)
 }
 
 /// Rewrites each gathered block's outer references into parameters, and plans it.
 ///
 /// @param found - the correlated blocks
 /// @param resolve - which row column an outer reference reads
+/// @param levers - the outer statement's optimizations, which each block is
+///   planned with, so `PRAGMA reverse_unordered_selects` reaches it too
 fn prepare_blocks(
     found: Vec<Found>,
     catalog: &dyn TreeCatalog,
     resolve: &dyn Fn(&BoundExpr) -> Option<usize>,
     target_root: Option<u32>,
+    levers: Levers,
 ) -> DbResult<Vec<Correlation>> {
     let mut prepared = Vec::with_capacity(found.len());
     for (id, kind, negated, block, membership) in found {
@@ -460,7 +797,7 @@ fn prepare_blocks(
         // Prepared here, once, which is the whole of section 4.3.1: the plan
         // and the schema decide the structural choice and neither depends on
         // the outer row.
-        let plan = plan_select_with(block, Levers::default());
+        let plan = plan_select_with(block, levers);
         let choice = prepare_any(&plan, catalog)?;
         prepared.push(Correlation {
             id,
@@ -471,6 +808,9 @@ fn prepare_blocks(
             feeds,
             once,
             kept: std::cell::RefCell::new(None),
+            chain: std::cell::RefCell::new(None),
+            tried: std::cell::Cell::new(false),
+            direct: std::cell::RefCell::new(None),
         });
     }
     Ok(prepared)
@@ -537,6 +877,7 @@ fn membership_block(node: BoundExpr) -> BoundSelect {
         windows: Vec::new(),
         correlations,
         shared: None,
+        serial: 0,
     }
 }
 

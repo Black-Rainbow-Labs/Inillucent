@@ -38,6 +38,17 @@
 //!
 //! Before some transactions it also opens one, writes to it and rolls it back,
 //! because a rollback that left anything behind is the defect task-2169 fixed.
+//!
+//! ## The shape of the 2.0.7 damage report
+//!
+//! With [`Settings::rewrite`] the workload also does what the application in
+//! that report did. Before each transaction a worker rewrites one row of `doc`
+//! in an autocommit statement of its own, with a value of 4 to 20 KB, which is
+//! the band the engine packs onto shared extent pages several to a page; the
+//! report's damage was a reference to a slot of such a page that the page did
+//! not hold. Readers also write a small row now and then, as the report's
+//! search service did, and the parent can end the run by killing every process
+//! at the same moment, which is how the report's file was damaged.
 
 use inillucent_driver::{Connection, Database, EncryptionKey, OpenOptions, Status, Value};
 
@@ -71,6 +82,35 @@ pub struct Settings {
     pub bulk_parts: usize,
     /// How long to wait for a lock another process holds, in milliseconds.
     pub busy_ms: u64,
+    /// Whether each transaction is preceded by an autocommit rewrite of a `doc`
+    /// row with a value on a shared extent page, and readers write too. See
+    /// the module documentation.
+    pub rewrite: bool,
+}
+
+/// How many `doc` rows each worker rewrites in turn.
+pub const DOC_SLOTS: i64 = 8;
+
+/// Returns the `doc` slot transaction `seq` rewrites.
+///
+/// @param seq - the transaction's number
+pub fn doc_slot(seq: i64) -> i64 {
+    seq.rem_euclid(DOC_SLOTS)
+}
+
+/// Returns the value transaction `seq` of the worker with this seed writes
+/// into its `doc` slot.
+///
+/// **A generator of its own**, so the plans of every existing case are the
+/// bytes they always were: drawing these from the step's generator would move
+/// every value drawn after them.
+///
+/// @param seed - the worker's seed
+/// @param seq - the transaction's number
+pub fn doc_body(seed: u64, seq: i64) -> Vec<u8> {
+    let mut mix = Mix::new(seed ^ 0x2177_d0c5 ^ (seq as u64).wrapping_mul(0x9FB2_1C65_1E98_DF25));
+    let length = mix.range(4_200, 20_000) as usize;
+    body(&mut mix, length)
 }
 
 /// What one transaction of one worker writes, rebuilt from the seed.
@@ -90,6 +130,9 @@ pub struct Step {
     pub rollback_first: bool,
     /// Whether the worker asks for a checkpoint after this one commits.
     pub checkpoint_after: bool,
+    /// The value the autocommit rewrite before this transaction writes into
+    /// the worker's `doc` slot, when [`Settings::rewrite`] is on.
+    pub doc: Option<Vec<u8>>,
 }
 
 /// A small generator with a seed, splitmix64.
@@ -198,6 +241,7 @@ pub fn step(seed: u64, seq: i64, settings: &Settings) -> Step {
         amount: mix.range(1, 50) as i64,
         rollback_first: mix.one_in(9),
         checkpoint_after: mix.one_in(15),
+        doc: settings.rewrite.then(|| doc_body(seed, seq)),
     }
 }
 
@@ -218,7 +262,47 @@ pub fn schema(settings: &Settings) -> String {
             "CREATE VIRTUAL TABLE note USING inillucent_search(worker, body, dims = 4, compact = 0);",
         );
     }
+    if settings.rewrite {
+        sql.push_str(
+            "CREATE TABLE doc (worker TEXT NOT NULL, slot INTEGER NOT NULL, version INTEGER NOT NULL,
+                               body BLOB NOT NULL, digest INTEGER NOT NULL, PRIMARY KEY (worker, slot));
+             CREATE INDEX doc_version ON doc (version);
+             CREATE TABLE reader_log (id INTEGER PRIMARY KEY, at INTEGER NOT NULL);",
+        );
+    }
     sql
+}
+
+/// Rewrites the worker's `doc` slot for transaction `seq`, in an autocommit
+/// statement of its own.
+///
+/// An upsert, so the first pass over the slots inserts and every later one is
+/// an `UPDATE` of a row whose value is on a shared extent page.
+///
+/// @param connection - the worker's connection, with no transaction open
+/// @param name - the worker's name
+/// @param seq - the transaction this rewrite goes before
+/// @param bytes - the value, from [`doc_body`]
+fn rewrite_doc(
+    connection: &Connection<'_>,
+    name: &str,
+    seq: i64,
+    bytes: &[u8],
+) -> inillucent_driver::Result<()> {
+    let digest = digest(bytes);
+    connection.execute(
+        "INSERT INTO doc (worker, slot, version, body, digest) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (worker, slot) DO UPDATE SET version = excluded.version, body = excluded.body,
+                                                  digest = excluded.digest",
+        &[
+            Value::Text(name.to_string()),
+            Value::Integer(doc_slot(seq)),
+            Value::Integer(seq),
+            Value::Blob(bytes.to_vec()),
+            Value::Integer(digest),
+        ],
+    )?;
+    Ok(())
 }
 
 /// Opens the database the way every process in a run opens it.
@@ -414,6 +498,13 @@ pub fn attempt(
     };
     if step.rollback_first {
         if let Err(error) = doomed(connection, name, step) {
+            return classify(error);
+        }
+    }
+    // The rewrite is its own autocommit statement, as the report's `UPDATE`s
+    // were. A busy refusal retries it with the same bytes, which is harmless.
+    if let Some(bytes) = &step.doc {
+        if let Err(error) = rewrite_doc(connection, name, step.seq, bytes) {
             return classify(error);
         }
     }
@@ -658,7 +749,82 @@ fn snapshot_verdict(
     if settings.search {
         check_search(transaction)?;
     }
+    if settings.rewrite {
+        check_docs(transaction)?;
+    }
     Ok(seen)
+}
+
+/// Checks that every `doc` value matches its digest and that the table and its
+/// index on `version` hold the same rows.
+///
+/// Every value is read, not a sample: a value is a slot of a shared extent
+/// page, and a reference to a slot the page does not hold fails here as
+/// `corrupt` rather than going unread.
+///
+/// @param transaction - the connection holding the open read transaction
+fn check_docs(transaction: &Connection<'_>) -> Result<(), Fault> {
+    let docs = read(
+        transaction,
+        "SELECT worker, slot, version, body, digest FROM doc",
+        &[],
+    )?;
+    for row in &docs.rows {
+        let stored = as_integer(row.get(4)).map_err(Fault::Broken)?;
+        let actual = match row.get(3) {
+            Some(Value::Blob(bytes)) => digest(bytes),
+            other => {
+                return Err(Fault::Broken(format!(
+                    "a doc body is {other:?}, not a blob"
+                )))
+            }
+        };
+        if stored != actual {
+            return Err(Fault::Broken(format!(
+                "doc {:?} slot {:?} version {:?} no longer matches its digest",
+                row.first(),
+                row.get(1),
+                row.get(2)
+            )));
+        }
+    }
+    let through_index = integer(&read(
+        transaction,
+        "SELECT count(*) FROM doc INDEXED BY doc_version WHERE version >= 0",
+        &[],
+    )?);
+    if through_index != Some(docs.rows.len() as i64) {
+        return Err(Fault::Broken(format!(
+            "doc holds {} rows and its version index {through_index:?}",
+            docs.rows.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Writes one small row the way the report's search service did between its
+/// searches, retrying while the file is busy.
+///
+/// Returns whether the row was written. A reader that cannot write within its
+/// retries carries on reading; the write is there to put a second writer's
+/// commits in the log, not to be counted.
+///
+/// @param connection - the reader's connection, with no transaction open
+/// @param at - a number to store, so the rows differ
+pub fn reader_write(connection: &Connection<'_>, at: i64) -> Result<bool, String> {
+    for _ in 0..50 {
+        match connection.execute(
+            "INSERT INTO reader_log (at) VALUES (?1)",
+            &[Value::Integer(at)],
+        ) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.status == Status::Busy => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(describe(&error)),
+        }
+    }
+    Ok(false)
 }
 
 /// Checks that the search table holds one row per transaction in each window,
@@ -805,6 +971,73 @@ fn verify_worker(
                 ));
             }
             checked += 1;
+        }
+    }
+    if settings.rewrite {
+        checked += verify_docs(connection, incarnation, last)?;
+    }
+    Ok(checked)
+}
+
+/// Grades one worker's `doc` rows against its seed.
+///
+/// The rewrite before transaction `seq` is its own commit, so after a kill a
+/// slot may hold the version of the transaction after the last one recorded:
+/// that rewrite committed and its transaction did not. Any other version, or
+/// bytes other than the ones the seed says that version wrote, is a lost or
+/// damaged commit.
+///
+/// @param connection - a connection on the file
+/// @param incarnation - the worker
+/// @param last - the `seq` the file records for it
+fn verify_docs(
+    connection: &Connection<'_>,
+    incarnation: &Incarnation,
+    last: i64,
+) -> Result<usize, String> {
+    let found = connection
+        .query_all(
+            "SELECT slot, version, body FROM doc WHERE worker = ?1",
+            &[Value::Text(incarnation.name.clone())],
+        )
+        .map_err(|error| describe(&error))?;
+    let mut checked = 0usize;
+    for slot in 0..DOC_SLOTS {
+        let committed = (1..=last).rev().find(|seq| doc_slot(*seq) == slot);
+        let allowed: Vec<i64> = committed
+            .into_iter()
+            .chain((doc_slot(last + 1) == slot).then_some(last + 1))
+            .collect();
+        let row = found
+            .rows
+            .iter()
+            .find(|row| row.first() == Some(&Value::Integer(slot)));
+        match row {
+            // No recorded transaction wrote this slot, so it may be empty, or
+            // hold the rewrite of the one transaction after the last.
+            None if committed.is_none() => {}
+            None => {
+                return Err(format!(
+                    "worker {} has no doc row for slot {slot}, and seq {committed:?} wrote one",
+                    incarnation.name
+                ))
+            }
+            Some(row) => {
+                let version = as_integer(row.get(1))?;
+                if !allowed.contains(&version) {
+                    return Err(format!(
+                        "worker {} doc slot {slot} holds version {version}; the file records seq {last}, so it must be one of {allowed:?}",
+                        incarnation.name
+                    ));
+                }
+                if row.get(2) != Some(&Value::Blob(doc_body(incarnation.seed, version))) {
+                    return Err(format!(
+                        "worker {} doc slot {slot} version {version} does not hold the bytes its plan wrote",
+                        incarnation.name
+                    ));
+                }
+                checked += 1;
+            }
         }
     }
     Ok(checked)

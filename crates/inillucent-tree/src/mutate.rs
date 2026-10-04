@@ -648,6 +648,54 @@ impl<'p> LeafMut<'p> {
         Ok(())
     }
 
+    /// Removes several rows from the delta area with one rewrite of it.
+    ///
+    /// **The bytes are the ones [`LeafMut::remove_delta`] leaves after removing
+    /// the same rows one at a time, in any order.** `rewrite_delta` lays the
+    /// area out from the kept rows alone, in directory order, so the kept set
+    /// decides the page and the order of removal does not. That is what lets a
+    /// bulk delete write one `DeleteRow` record per row, which recovery replays
+    /// one at a time, and change the page once (task-2180): removing forty rows
+    /// one by one copied the rest of the area forty times.
+    ///
+    /// @param indexes - the rows' positions in the delta area, each at most once
+    pub fn remove_deltas(&mut self, indexes: &[usize]) -> DbResult<()> {
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        let leaf = LeafRef::parse(self.page)?;
+        let count = leaf.delta_count();
+        if let Some(index) = indexes.iter().find(|index| **index >= count) {
+            return Err(misuse(format!("delta row {index} does not exist")));
+        }
+        let mut dropping = vec![false; count];
+        let mut dropped_extent = false;
+        for index in indexes {
+            if let Some(flag) = dropping.get_mut(*index) {
+                *flag = true;
+            }
+            dropped_extent = dropped_extent || leaf.delta_extents_in(*index)?;
+        }
+        let kept: Vec<Vec<u8>> = (0..count)
+            .filter(|position| !dropping.get(*position).copied().unwrap_or(false))
+            .map(|position| leaf.delta_row(position).map(<[u8]>::to_vec))
+            .collect::<DbResult<Vec<Vec<u8>>>>()?;
+        self.rewrite_delta(&kept)?;
+        // The extent flag, as `remove_delta` settles it and for its reason.
+        if dropped_extent {
+            let union = {
+                let leaf = LeafRef::parse(self.page)?;
+                let mut seen = leaf.any_delta_extent_unchecked_pub()?;
+                for column in 0..leaf.column_count() {
+                    seen = seen || leaf.column(column)?.any_extent()?;
+                }
+                seen
+            };
+            self.set_flag(crate::leaf::LEAF_HAS_EXTENTS, union)?;
+        }
+        Ok(())
+    }
+
     /// Replaces the whole delta area with the given rows, in directory order.
     ///
     /// The rows are laid out in the order given, from just past the new
@@ -713,6 +761,22 @@ impl<'p> LeafMut<'p> {
                 .ok_or_else(|| corrupt("a delta row ran past the page"))?;
             body.copy_from_slice(row);
             at = at.saturating_add(2).saturating_add(row.len());
+        }
+        // **The bytes the area gave up are zeroed (task-2180).** A removal moves
+        // the area up and used to leave the old rows' bytes below it, so the
+        // gap held whatever the order of removals left there: two removals one
+        // at a time and the same two in one rewrite made pages that differed
+        // in bytes nobody reads. Recovery replays removals one at a time while
+        // a bulk delete makes them in one rewrite, and a page whose recovered
+        // bytes differ from the session's is a page no byte comparison can
+        // vouch for. Zeroed, the page depends only on the rows kept.
+        let freed_from = old_delta_start.saturating_sub(bitmap);
+        let freed_to = new_delta_start.saturating_sub(bitmap);
+        if freed_to > freed_from {
+            self.page
+                .get_mut(freed_from..freed_to)
+                .ok_or_else(|| corrupt("the freed delta area ran past the page"))?
+                .fill(0);
         }
         if bitmap > 0 {
             let to = new_delta_start.saturating_sub(bitmap);
@@ -1479,6 +1543,73 @@ mod tests {
         assert!(view.is_tombstoned(5).unwrap(), "the bitmap was lost");
         view.integrity().expect("the page is sound");
         assert!(leaf.remove_delta(9).is_err());
+    }
+
+    /// Removing several delta rows at once leaves the page one at a time leaves.
+    ///
+    /// The bulk delete changes a leaf with `remove_deltas` and logs a
+    /// `DeleteRow` per row, which recovery replays with `remove_delta` one at a
+    /// time and in key order. A page that came out differently would be a page
+    /// whose recovered bytes disagree with the ones the session wrote, so the
+    /// whole page is compared, against both orders of removal one at a time.
+    #[test]
+    fn removing_delta_rows_together_matches_removing_them_one_at_a_time() {
+        let mut page = leaf_of(2_048, 24);
+        {
+            let mut leaf = LeafMut::new(&mut page).expect("a leaf");
+            leaf.set_tombstone(5).expect("a tombstone");
+            for round in 0..7i64 {
+                leaf.insert_delta(
+                    &columns(),
+                    &[
+                        Datum::Int(200 + round),
+                        Datum::Text(format!("delta-{round}").as_bytes()),
+                        Datum::Int(round),
+                    ],
+                )
+                .expect("an insert");
+            }
+        }
+        let mut together = page.clone();
+        LeafMut::new(&mut together)
+            .expect("a leaf")
+            .remove_deltas(&[1, 4, 5])
+            .expect("the removals");
+        let mut highest_first = page.clone();
+        {
+            let mut leaf = LeafMut::new(&mut highest_first).expect("a leaf");
+            for index in [5, 4, 1] {
+                leaf.remove_delta(index).expect("a removal");
+            }
+        }
+        // In key order, as recovery replays them: each removal shifts the
+        // later rows down one place.
+        let mut in_key_order = page.clone();
+        {
+            let mut leaf = LeafMut::new(&mut in_key_order).expect("a leaf");
+            for index in [1, 3, 3] {
+                leaf.remove_delta(index).expect("a removal");
+            }
+        }
+        assert!(
+            together == highest_first,
+            "the page differs from removing highest first"
+        );
+        assert!(
+            together == in_key_order,
+            "the page differs from removing in key order"
+        );
+        let view = LeafRef::parse(&together).expect("the page parses");
+        let remaining: Vec<i64> = (0..view.delta_count())
+            .map(|index| view.delta_value(index, 2).unwrap().as_int().unwrap_or(-1))
+            .collect();
+        assert_eq!(remaining, vec![0, 2, 3, 6], "the wrong rows were removed");
+        assert!(view.is_tombstoned(5).unwrap(), "the bitmap was lost");
+        view.integrity().expect("the page is sound");
+        assert!(LeafMut::new(&mut together)
+            .expect("a leaf")
+            .remove_deltas(&[9])
+            .is_err());
     }
 
     /// Emptying the delta area clears its flag.

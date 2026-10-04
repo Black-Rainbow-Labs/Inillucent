@@ -70,6 +70,9 @@ struct JoinRecipe {
     keys: std::rc::Rc<[Box<dyn Eval>]>,
     /// Which inner columns to emit, in order.
     inner_projection: Projection,
+    /// Which of the inner columns the statement reads; see
+    /// `IndexNestedLoopJoin::with_needed`.
+    needed: crate::paged::Needed,
     /// Whether the key is a full inner key (a probe) or a prefix (a range).
     full_key: bool,
 }
@@ -168,6 +171,7 @@ fn try_join_recipe(
         root: stage.root,
         keys: compiled.into(),
         inner_projection: Projection::all(stage.width),
+        needed: stage.needed,
         full_key,
     }))
 }
@@ -243,6 +247,25 @@ pub struct Compiled {
     /// Where `upper`'s `CollectInto` writes the rows, and where
     /// [`Compiled::take_rows`] takes them back out.
     collected: std::rc::Rc<std::cell::RefCell<Vec<Vec<OwnedDatum>>>>,
+    /// The statement's correlated blocks and their gate, wrapped around
+    /// `upper` on every run the way a join is; see [`CorrelatedRecipe`].
+    correlated: Option<CorrelatedRecipe>,
+}
+
+/// What a kept chain needs to put the correlation operator back each run.
+///
+/// **A statement with a correlated block is kept too (task-2183).** It was
+/// refused, because `crate::correlate::Correlated` borrows the catalog, and
+/// so every execution built its whole chain again: translating and compiling
+/// the projection, the aggregate and the filters to answer `WHERE a.id % 100
+/// = 0 AND EXISTS (...)` over four rows. The operator is rebuilt over the
+/// kept `upper` for each run, from the blocks and the compiled gate, which
+/// hold no borrow - the shape [`JoinRecipe`] already has for a join.
+struct CorrelatedRecipe {
+    /// The prepared blocks, shared with the statement's `Prepared`.
+    correlations: std::rc::Rc<[crate::correlate::Correlation]>,
+    /// The `WHERE` conjuncts a row must pass before a block is answered.
+    gate: std::rc::Rc<[Box<dyn Eval>]>,
 }
 
 impl Compiled {
@@ -306,7 +329,7 @@ impl Compiled {
         // of `upper`.
         self.upper.reset()?;
         let pool = source_pool(catalog, &self.prepared);
-        if self.joins.is_empty() {
+        if self.joins.is_empty() && self.correlated.is_none() {
             // The common case - and the one the paired measurement's `SELECT
             // 1` and point-probe shapes are - pays nothing for a tower that
             // is not there: `self.upper` is pushed into directly, exactly as
@@ -320,6 +343,19 @@ impl Compiled {
         // Innermost (the highest-indexed stage) is wrapped first, matching
         // `build_chain`'s own `(1..stages.len()).rev()` order.
         let mut chain: Box<dyn Sink + '_> = Box::new(Borrowed(self.upper.as_mut()));
+        if let Some(recipe) = &self.correlated {
+            // A `once` block's kept answer belongs to the last execution.
+            for correlation in recipe.correlations.iter() {
+                correlation.forget();
+            }
+            chain = Box::new(crate::correlate::Correlated::new(
+                std::rc::Rc::clone(&recipe.correlations),
+                std::rc::Rc::clone(&recipe.gate),
+                catalog,
+                params,
+                chain,
+            ));
+        }
         for recipe in self.joins.iter().rev() {
             let inner = catalog
                 .tree(recipe.root)
@@ -327,17 +363,72 @@ impl Compiled {
             let inner_pool = catalog.pool_for(recipe.root).ok_or_else(|| {
                 misuse("the inner side of a join names a database this connection does not hold")
             })?;
-            chain = Box::new(IndexNestedLoopJoin::new(
-                recipe.kind,
-                inner,
-                inner_pool,
-                std::rc::Rc::clone(&recipe.keys),
-                recipe.inner_projection.clone(),
-                recipe.full_key,
-                chain,
-            ));
+            chain = Box::new(
+                IndexNestedLoopJoin::new(
+                    recipe.kind,
+                    inner,
+                    inner_pool,
+                    std::rc::Rc::clone(&recipe.keys),
+                    recipe.inner_projection.clone(),
+                    recipe.full_key,
+                    chain,
+                )
+                .with_needed(recipe.needed),
+            );
         }
         source.run(pool, chain.as_mut())
+    }
+
+    /// Reports whether the source alone answers "does the statement produce a row".
+    ///
+    /// True when nothing above the source can drop or add a row: one stage,
+    /// a path that consumes the whole `WHERE`, and no grouping, aggregate,
+    /// compound arm, window, `LIMIT` or `OFFSET`. See [`Compiled::any_row`].
+    ///
+    /// @param plan - the planner's output this chain was compiled from
+    pub fn answers_existence(&self, plan: &PhysicalPlan) -> bool {
+        let select = &plan.select;
+        self.joins.is_empty()
+            && self.correlated.is_none()
+            && self.prepared.stages.len() == 1
+            && plan.residuals.iter().all(Option::is_none)
+            && plan.constant_filter.is_none()
+            && select.group_by.is_empty()
+            && select.aggregates.is_empty()
+            && select.having.is_none()
+            && select.compounds.is_empty()
+            && select.windows.is_empty()
+            && select.limit.is_none()
+            && select.offset.is_none()
+    }
+
+    /// Reports whether the statement produces any row, reading at most one.
+    ///
+    /// **For a correlated `EXISTS` (task-2183).** The block runs once per outer
+    /// row, and the chain above its source projected, limited and collected
+    /// the one row it found only for the caller to ask whether there was one.
+    /// The source is run into a sink that stops at the first live row instead.
+    /// Only valid when [`Compiled::answers_existence`] is true.
+    ///
+    /// @param plan - the planner's output this chain was compiled from
+    /// @param catalog - where the trees and layouts come from, for this call only
+    /// @param params - this execution's parameters
+    pub fn any_row(
+        &self,
+        plan: &PhysicalPlan,
+        catalog: &dyn TreeCatalog,
+        params: &Params,
+    ) -> DbResult<bool> {
+        let folded = crate::subquery::fold(plan, catalog, params)?;
+        let params = folded.as_ref().unwrap_or(params);
+        let source = {
+            let mut space = self.held.view(&self.prepared.stages);
+            space.catalog = Some(catalog);
+            source_for_run(plan, catalog, &space, params, &self.prepared, Some(1))?
+        };
+        let mut seen = Seen { any: false };
+        source.run(source_pool(catalog, &self.prepared), &mut seen)?;
+        Ok(seen.any)
     }
 
     /// Takes the rows the last [`Compiled::run`] produced, leaving the buffer
@@ -348,6 +439,36 @@ impl Compiled {
     /// nothing reads the buffer again before the next run clears it.
     pub fn take_rows(&self) -> Vec<Vec<OwnedDatum>> {
         std::mem::take(&mut *self.collected.borrow_mut())
+    }
+}
+
+/// A sink that records whether any live row reached it, and stops at the first.
+struct Seen {
+    /// Whether a live row has been pushed.
+    any: bool,
+}
+
+impl Sink for Seen {
+    /// Records a batch that holds a live row, and stops the source.
+    ///
+    /// @param batch - the source's rows
+    fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
+        if batch.live() == 0 {
+            return Ok(Flow::Continue);
+        }
+        self.any = true;
+        Ok(Flow::Stop)
+    }
+
+    /// Nothing is held, so nothing is flushed.
+    fn finish(&mut self) -> DbResult<()> {
+        Ok(())
+    }
+
+    /// Forgets the row seen.
+    fn reset(&mut self) -> DbResult<()> {
+        self.any = false;
+        Ok(())
     }
 }
 
@@ -406,6 +527,26 @@ pub fn try_compile(
     prepared: &Prepared,
     params: &Params,
 ) -> DbResult<Option<Compiled>> {
+    try_compile_limited(plan, catalog, prepared, params, None)
+}
+
+/// [`try_compile`], with a chain that stops once it has collected `limit` rows.
+///
+/// For a correlated block, which reads one row of its answer and no more
+/// (task-2183); see `crate::correlate::Correlation::run`.
+///
+/// @param plan - the planner's output
+/// @param catalog - where the trees and layouts come from, for this one build
+/// @param prepared - the structural choices `prepare` made
+/// @param params - the first execution's bound values
+/// @param limit - how many rows the chain collects before it stops, or `None` for all
+pub fn try_compile_limited(
+    plan: &PhysicalPlan,
+    catalog: &dyn TreeCatalog,
+    prepared: &Prepared,
+    params: &Params,
+    limit: Option<usize>,
+) -> DbResult<Option<Compiled>> {
     // **A compound has no single pipeline to compile.** `prepare_any` hands a
     // compound an empty `Prepared` on purpose - see its own doc comment - so
     // that its arms are re-decided per execution by `run_compound` rather than
@@ -460,9 +601,6 @@ pub fn try_compile(
     // subquery - so a shape they refuse costs this call nothing beyond the
     // walk itself, and `run_any_prepared`'s build is the only one that ever
     // happens for it.
-    if crate::correlate::has_correlations(plan) {
-        return Ok(None);
-    }
     let mut joins = Vec::with_capacity(prepared.stages.len().saturating_sub(1));
     for index in 1..prepared.stages.len() {
         let stage = prepared
@@ -480,7 +618,10 @@ pub fn try_compile(
     // exactly once no matter what the rest of this function decides.
     let before = params.reads();
     let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let sink = Box::new(CollectInto::new(std::rc::Rc::clone(&collected)));
+    let sink = Box::new(match limit {
+        Some(limit) => CollectInto::with_limit(std::rc::Rc::clone(&collected), limit),
+        None => CollectInto::new(std::rc::Rc::clone(&collected)),
+    });
     // The listing is kept here: a `Compiled` builds its chain once and every
     // later execution reuses it, so rendering the operators costs one render
     // per compiled statement rather than one per execution, and
@@ -494,16 +635,22 @@ pub fn try_compile(
         sink,
         crate::physical::Listing::kept(),
     )?;
-    if !upper.correlations.is_empty() {
-        // Should not happen - the cheap check above already refused any plan
-        // with one - but `build_upper` is the ground truth here, and a
-        // correlated chain still cannot be run without the operator this
-        // function does not build.
-        return Ok(None);
-    }
+    let correlated = upper
+        .correlations
+        .filter(|correlations| !correlations.is_empty())
+        .map(|correlations| CorrelatedRecipe {
+            correlations,
+            gate: upper.gate.into(),
+        });
     let rebindable = params.reads() == before;
     let bindings = params.bindings();
     let mut listing = upper.operators;
+    if let Some(recipe) = &correlated {
+        listing.add(|| "CORRELATED SUBQUERY".to_string());
+        for _ in recipe.gate.iter() {
+            listing.add(|| "FILTER RESIDUAL".to_string());
+        }
+    }
     listing.add(|| describe_source(prepared));
     let mut operators = listing.into_lines();
     operators.reverse();
@@ -521,6 +668,7 @@ pub fn try_compile(
         settings: params.settings(),
         bindings,
         collected,
+        correlated,
     }))
 }
 

@@ -94,7 +94,7 @@ pub fn run_windowed(
     // unnecessary.
     let groups = window_groups(select);
     let pre = window_inputs(select);
-    let rows = window_input_rows(select, &pre, first, catalog, params)?;
+    let rows = window_input_rows(select, &pre, first, catalog, params, plan.levers)?;
     // The output row is the buffered values followed by one slot per call, in
     // the order the binder numbered them - which is the space
     // `Frame::Window` addresses and the reason the slots are filled by
@@ -109,6 +109,35 @@ pub fn run_windowed(
     // made rather than estimated up front, because the number of copies is
     // decided by the statement rather than by the data.
     inillucent_base::budget::materialise(owned_rows_bytes(&rows))?;
+    // **One frame needs no second copy of the rows (task-2183).** The rows
+    // arrive in that frame's order, so its values are computed over them as
+    // they are and appended to the rows themselves, which are moved rather
+    // than copied into the widened list, then into a tagged list, then into
+    // the pass's output. Its calls are numbered in slot order, because a
+    // single group holds every call in the order the binder numbered them.
+    if let [group] = groups.as_slice() {
+        let pass = window_plan(select, &pre, group)?;
+        let values = crate::window::compute_values(&rows, &pass)?;
+        let calls = group.slots.len();
+        let in_order = group
+            .slots
+            .iter()
+            .enumerate()
+            .all(|(nth, slot)| nth == *slot)
+            && calls == select.windows.len();
+        if in_order {
+            let mut values = values.into_iter();
+            let widened: Vec<Vec<OwnedDatum>> = rows
+                .into_iter()
+                .map(|mut row| {
+                    row.reserve(calls);
+                    row.extend(values.by_ref().take(calls));
+                    row
+                })
+                .collect();
+            return project_over_window(select, &pre, width, widened, params);
+        }
+    }
     let mut widened: Vec<Vec<OwnedDatum>> = rows
         .iter()
         .map(|row| {
@@ -351,12 +380,14 @@ fn gather_leaves(expr: &BoundExpr, pre: &mut Vec<BoundExpr>) {
 /// @param window - the window every call shares
 /// @param catalog - where the trees and layouts come from
 /// @param params - the bound parameters
+/// @param levers - the planner levers the statement was planned with
 fn window_input_rows(
     select: &BoundSelect,
     pre: &[BoundExpr],
     window: &BoundWindow,
     catalog: &dyn TreeCatalog,
     params: &Params,
+    levers: Levers,
 ) -> DbResult<Vec<Vec<OwnedDatum>>> {
     let mut inner = select.clone();
     inner.columns = pre
@@ -387,7 +418,9 @@ fn window_input_rows(
         })
         .chain(window.order_by.iter().cloned())
         .collect();
-    let planned = plan_select_with(inner, Levers::default());
+    // The statement's own levers, so an optimization a pragma turned off for
+    // the statement is off for the rows its window reads as well.
+    let planned = plan_select_with(inner, levers);
     let prepared = prepare(&planned, catalog, ForcePlan::default())?;
     Ok(run_prepared(&planned, catalog, &prepared, params)?.0)
 }

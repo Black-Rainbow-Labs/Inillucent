@@ -298,7 +298,11 @@ pub(super) fn virtual_constraint(
 /// argument of a table valued function: SQLite runs `generate_series` and
 /// `json_each` once per value of `stop IN (5, 6)` or `json IN (...)`, and a scan
 /// that took the default argument instead would never finish. A declared column
-/// brings its own affinity and collation into the comparison, so it is refused.
+/// brings its own affinity and collation into the comparison, so it is refused,
+/// unless it has neither: a column with no declared type and the default
+/// collation compares a value exactly as the list wrote it, which is how
+/// `generate_series` declares `value`, and SQLite offers `value IN ('3', '5')`
+/// to the module one value at a time.
 /// A list written as `IN (SELECT ...)` is kept as the subquery itself, whose
 /// values are read when the statement runs.
 ///
@@ -338,12 +342,24 @@ pub(super) fn constant_in_list(
     match operand.as_ref() {
         BoundExpr::Rowid { source } if *source == id => Some((crate::vtab::ROWID_COLUMN, list)),
         BoundExpr::Column { source, column, .. }
-            if *source == id && table.column(*column).is_some_and(|held| held.hidden) =>
+            if *source == id && table.column(*column).is_some_and(compares_as_written) =>
         {
             Some((i32::from(*column), list))
         }
         _ => None,
     }
+}
+
+/// Reports whether a module column compares a value exactly as it was written.
+///
+/// A hidden column is an argument and always does. Any other column does when it
+/// has no affinity to convert the value with and no collation but the default.
+///
+/// @param column - the module's column
+fn compares_as_written(column: &crate::catalog_view::ColumnInfo) -> bool {
+    column.hidden
+        || (column.affinity == inillucent_value::affinity::Affinity::Blob
+            && (column.collation.is_empty() || column.collation.eq_ignore_ascii_case(b"binary")))
 }
 
 /// Returns the constraint operator one comparison offers, if any.

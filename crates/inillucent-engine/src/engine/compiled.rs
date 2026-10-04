@@ -518,11 +518,7 @@ impl crate::ImportedDatabase {
                     None
                 };
                 let params = folded.as_ref().unwrap_or(params);
-                self.write(
-                    params,
-                    returning_names(&statement.returning),
-                    |target, params| dml::insert(statement, target, params, &rows),
-                )
+                self.insert_rows(statement, params, rows)
             }
             Cached::Update(statement, query, assignments_hold_subquery, setup) => {
                 self.run_update(statement, query, *assignments_hold_subquery, setup, params)
@@ -716,9 +712,15 @@ impl crate::ImportedDatabase {
         let outcome = binder.bind_statement(inner);
         self.compiled.recycle_binder(binder.into_scratch());
         let bound = outcome.map_err(refused)?;
+        let flat = |lines: Vec<String>| -> Vec<inillucent_sql::plan::PlanLine> {
+            lines
+                .into_iter()
+                .map(|detail| inillucent_sql::plan::PlanLine { depth: 0, detail })
+                .collect()
+        };
         let lines = match bound {
             BoundStatement::Select(select) => {
-                plan_select_with(*select, self.pragmas.levers()).describe()
+                plan_select_with(*select, self.pragmas.levers()).describe_tree()
             }
             // A write's plan is the query that finds the rows it changes, and
             // that is the thing a reader is asking about - "did my DELETE use
@@ -737,7 +739,20 @@ impl crate::ImportedDatabase {
                     )?
                     .0;
                 name_written_schema(&mut plan, &statement.written_schema);
-                plan.describe_write()
+                // The subqueries come after the search, the `WHERE`'s first and
+                // then the new values', as SQLite prints them.
+                let values: Vec<&inillucent_sql::bind::BoundExpr> = statement
+                    .assignments
+                    .iter()
+                    .map(|assignment| &assignment.value)
+                    .collect();
+                let mut lines = flat(plan.describe_write());
+                lines.extend(inillucent_sql::plan::subquery_nodes(
+                    statement.filter.as_ref(),
+                    &values,
+                    self.pragmas.levers(),
+                ));
+                lines
             }
             // SQLite empties the table without visiting a row when a `DELETE` has no `WHERE`,
             // no `RETURNING`, no trigger and no foreign key to check, and then the plan has
@@ -763,14 +778,33 @@ impl crate::ImportedDatabase {
                     )?
                     .0;
                 name_written_schema(&mut plan, &statement.written_schema);
-                plan.describe_write()
+                let mut lines = flat(plan.describe_write());
+                lines.extend(inillucent_sql::plan::subquery_nodes(
+                    statement.filter.as_ref(),
+                    &[],
+                    self.pragmas.levers(),
+                ));
+                lines
             }
-            other => vec![describe_statement(&other).to_string()],
+            // An `INSERT` reads its rows from a query or from `VALUES`, and the
+            // plan is that query's, or the subqueries the `VALUES` hold.
+            BoundStatement::Insert(statement) => match &statement.source {
+                inillucent_sql::dml::BoundInsertSource::Select(select) => {
+                    plan_select_with((**select).clone(), self.pragmas.levers()).describe_tree()
+                }
+                inillucent_sql::dml::BoundInsertSource::Values(rows) => {
+                    let values: Vec<&inillucent_sql::bind::BoundExpr> =
+                        rows.iter().flatten().collect();
+                    inillucent_sql::plan::subquery_nodes(None, &values, self.pragmas.levers())
+                }
+            },
+            other => flat(vec![describe_statement(&other).to_string()]),
         };
         if query_plan {
             return Ok(Cached::QueryPlan(lines));
         }
-        Ok(Cached::Program(program_of(&lines)))
+        let texts: Vec<String> = lines.into_iter().map(|line| line.detail).collect();
+        Ok(Cached::Program(program_of(&texts)))
     }
 
     /// Compiles one statement as far as its parameters allow.
@@ -1153,98 +1187,13 @@ impl crate::ImportedDatabase {
                 (txn, true)
             }
         };
-        // **Collected whether or not a transaction is open**, because a
-        // statement is abandoned by more than a rollback. SQLite's default
-        // algorithm is `ABORT`, which undoes *the statement* and keeps the
-        // transaction, and an autocommit statement gets it too: this buffer
-        // used to be `None` outside a transaction on the reasoning that
-        // "an autocommit statement cannot be abandoned", and that was the bug -
-        // a four-row `INSERT` failing on its third row kept the first two and
-        // committed them.
-        //
-        // Outside a transaction it holds at most one statement: `write` clears
-        // it when the statement ends, either way. Every schema's log appends to
-        // the one buffer, because a rollback undoes one *transaction* rather
-        // than one file - and each record carries the schema it came out of.
-        let undo = Some(self.writing.undo());
         // Where this statement's writes begin, in both of the transaction's
         // records. See `statement_mark` for why it costs nothing.
         let mark = self.statement_mark();
-        let main_log = WalLog {
-            wal: std::rc::Rc::clone(&self.storage.wal),
-            txn,
-            schema: MAIN,
-            wrote: false,
-            undo,
-            uncommitted: self.storage.database.pool().uncommitted_handle(),
-        };
-        let logs = if self.session_state.attached.is_empty() && self.session_state.temps.is_empty()
-        {
-            Logs::One(main_log)
-        } else {
-            // One per schema *number*, so that `logs[at]` is the log of the file
-            // schema `at` names. The temporary slot is filled with `main`'s log
-            // when this session has no temporary database, and nothing can reach
-            // it: a handle that resolved to `TEMP` could only have come from a
-            // temporary tree, which only exists when the schema does.
-            let mut held: Vec<WalLog<'_>> =
-                Vec::with_capacity(self.session_state.attached.len().saturating_add(2));
-            held.push(main_log);
-            held.push(match self.session_state.schema_at(TEMP) {
-                Some(temp) => WalLog {
-                    wal: std::rc::Rc::clone(&temp.wal),
-                    txn,
-                    schema: TEMP,
-                    wrote: false,
-                    undo,
-                    uncommitted: temp.database.pool().uncommitted_handle(),
-                },
-                None => WalLog {
-                    wal: std::rc::Rc::clone(&self.storage.wal),
-                    txn,
-                    schema: MAIN,
-                    wrote: false,
-                    undo,
-                    uncommitted: self.storage.database.pool().uncommitted_handle(),
-                },
-            });
-            for (nth, attached) in self.session_state.attached.iter().enumerate() {
-                held.push(WalLog {
-                    wal: std::rc::Rc::clone(&attached.wal),
-                    txn,
-                    schema: FIRST_ATTACHED.saturating_add(nth),
-                    wrote: false,
-                    undo,
-                    uncommitted: attached.database.pool().uncommitted_handle(),
-                });
-            }
-            Logs::Many(held)
-        };
-        let session = self.session_state.session.get();
-        let (applied, wrote, counted, deferred, pending_keys) = {
-            let mut view = WriteView {
-                database: &mut self.storage.database,
-                attached: &mut self.session_state.attached,
-                temps: &mut self.session_state.temps,
-                session,
-                logs,
-                owner: &self.session_state.owner,
-                trees: &mut self.schema.trees,
-                layouts: &self.schema.layouts,
-                covering: &self.schema.covering,
-                indexed: &self.session_state.vector_indexes,
-                counted: std::cell::Cell::new((0, 0, None)),
-                registry: &self.session_state.registry,
-                modules: &self.session_state.virtual_tables,
-                pragmas: &self.pragmas,
-                schema_catalog: &self.schema.catalog,
-                deferred: Vec::new(),
-                pending_keys: std::cell::RefCell::new(Vec::new()),
-                single_row: std::cell::Cell::new(false),
-            };
+        let (applied, wrote, counted, deferred, pending_keys) = self.with_write_view(txn, |view| {
             // **Not `?`.** A failed statement has writes of its own to put
             // back, and the borrow of the trees has to end before anything can.
-            let applied = apply(&mut view, params);
+            let applied = apply(view, params);
             // **The participant set, read off the logs that were used.** A
             // transaction that wrote one file commits the way it always has; one
             // that wrote two is decided by a super-journal, and this is the only
@@ -1259,7 +1208,7 @@ impl crate::ImportedDatabase {
             let deferred = std::mem::take(&mut view.deferred);
             let pending_keys = view.pending_keys.take();
             (applied, wrote, counted, deferred, pending_keys)
-        };
+        });
         let changes = match applied {
             Ok(changes) => changes,
             Err(error) => {
@@ -1334,6 +1283,110 @@ impl crate::ImportedDatabase {
             names: std::rc::Rc::new(names),
             changes,
         })
+    }
+
+    /// Builds the view a write is performed against, and runs one piece of
+    /// work against it.
+    ///
+    /// Split out of [`Self::write`] for the bulk insert in `bulk.rs`, which
+    /// needs the same view to build and check its rows before it writes
+    /// anything, and then writes through the catalog rather than through the
+    /// view. Both get the logs, the undo buffer and the trees exactly as an
+    /// ordinary statement does.
+    ///
+    /// @param txn - the transaction the view's logs write under
+    /// @param work - what to run against the view
+    pub(crate) fn with_write_view<R>(
+        &mut self,
+        txn: u64,
+        work: impl FnOnce(&mut WriteView<'_>) -> R,
+    ) -> R {
+        // **Collected whether or not a transaction is open**, because a
+        // statement is abandoned by more than a rollback. SQLite's default
+        // algorithm is `ABORT`, which undoes *the statement* and keeps the
+        // transaction, and an autocommit statement gets it too: this buffer
+        // used to be `None` outside a transaction on the reasoning that
+        // "an autocommit statement cannot be abandoned", and that was the bug -
+        // a four-row `INSERT` failing on its third row kept the first two and
+        // committed them.
+        //
+        // Outside a transaction it holds at most one statement: `write` clears
+        // it when the statement ends, either way. Every schema's log appends to
+        // the one buffer, because a rollback undoes one *transaction* rather
+        // than one file - and each record carries the schema it came out of.
+        let undo = Some(self.writing.undo());
+        let main_log = WalLog {
+            wal: std::rc::Rc::clone(&self.storage.wal),
+            txn,
+            schema: MAIN,
+            wrote: false,
+            undo,
+            uncommitted: self.storage.database.pool().uncommitted_handle(),
+        };
+        let logs = if self.session_state.attached.is_empty() && self.session_state.temps.is_empty()
+        {
+            Logs::One(main_log)
+        } else {
+            // One per schema *number*, so that `logs[at]` is the log of the file
+            // schema `at` names. The temporary slot is filled with `main`'s log
+            // when this session has no temporary database, and nothing can reach
+            // it: a handle that resolved to `TEMP` could only have come from a
+            // temporary tree, which only exists when the schema does.
+            let mut held: Vec<WalLog<'_>> =
+                Vec::with_capacity(self.session_state.attached.len().saturating_add(2));
+            held.push(main_log);
+            held.push(match self.session_state.schema_at(TEMP) {
+                Some(temp) => WalLog {
+                    wal: std::rc::Rc::clone(&temp.wal),
+                    txn,
+                    schema: TEMP,
+                    wrote: false,
+                    undo,
+                    uncommitted: temp.database.pool().uncommitted_handle(),
+                },
+                None => WalLog {
+                    wal: std::rc::Rc::clone(&self.storage.wal),
+                    txn,
+                    schema: MAIN,
+                    wrote: false,
+                    undo,
+                    uncommitted: self.storage.database.pool().uncommitted_handle(),
+                },
+            });
+            for (nth, attached) in self.session_state.attached.iter().enumerate() {
+                held.push(WalLog {
+                    wal: std::rc::Rc::clone(&attached.wal),
+                    txn,
+                    schema: FIRST_ATTACHED.saturating_add(nth),
+                    wrote: false,
+                    undo,
+                    uncommitted: attached.database.pool().uncommitted_handle(),
+                });
+            }
+            Logs::Many(held)
+        };
+        let session = self.session_state.session.get();
+        let mut view = WriteView {
+            database: &mut self.storage.database,
+            attached: &mut self.session_state.attached,
+            temps: &mut self.session_state.temps,
+            session,
+            logs,
+            owner: &self.session_state.owner,
+            trees: &mut self.schema.trees,
+            layouts: &self.schema.layouts,
+            covering: &self.schema.covering,
+            indexed: &self.session_state.vector_indexes,
+            counted: std::cell::Cell::new((0, 0, None)),
+            registry: &self.session_state.registry,
+            modules: &self.session_state.virtual_tables,
+            pragmas: &self.pragmas,
+            schema_catalog: &self.schema.catalog,
+            deferred: Vec::new(),
+            pending_keys: std::cell::RefCell::new(Vec::new()),
+            single_row: std::cell::Cell::new(false),
+        };
+        work(&mut view)
     }
 
     /// Does the module work a statement's tree writes leave, before the commit.

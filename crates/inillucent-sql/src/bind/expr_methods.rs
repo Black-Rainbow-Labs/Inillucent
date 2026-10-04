@@ -321,9 +321,10 @@ impl BoundExpr {
 
     /// Records which of one FROM term's columns this expression reads.
     ///
-    /// A correlated subquery makes the answer unknowable from here - the block
-    /// is a query of its own and could read any column of the term it
-    /// correlates to - so it is recorded as opaque rather than guessed at.
+    /// A correlated subquery's reads are the block's own reads of the term,
+    /// gathered by walking the block; a derived table inside it that
+    /// correlates to the term is recorded as opaque.
+    ///
     /// @param source - the FROM term to look for
     /// @param into - what has been found so far
     pub fn columns_read(&self, source: usize, into: &mut ColumnUse) {
@@ -332,8 +333,28 @@ impl BoundExpr {
                 source: held, slot, ..
             } if *held == source => into.add(*slot),
             BoundExpr::Rowid { source: held } if *held == source => into.rowid = true,
+            // `sqlite_offset(x)` finds the row's page by its rowid, so it reads
+            // the rowid of the term `x` belongs to as well as `x`.
+            BoundExpr::Function {
+                func: crate::function::ScalarFunc::Offset,
+                arguments,
+                ..
+            } if arguments.first().is_some_and(|argument| {
+                matches!(argument, BoundExpr::Column { source: held, .. } if *held == source)
+            }) =>
+            {
+                into.rowid = true;
+            }
+            // **A correlated block's reads are listed, not given up on
+            // (task-2183).** They were recorded as opaque, which made every
+            // scan of the outer term decode every column: `wide.body` for each
+            // row of `SELECT count(*) FROM wide a WHERE EXISTS (SELECT 1 FROM
+            // side_table b WHERE b.owner = a.id)`, which reads only `a.id`.
+            // The block's own walk finds every outer reference it makes, and
+            // stays opaque for the derived tables inside it that it cannot see
+            // into.
             BoundExpr::Subquery { block, .. } if block.correlations.contains(&source) => {
-                into.opaque = true;
+                block.gather_columns(source, into, true);
             }
             BoundExpr::VirtualFunction {
                 source: held,

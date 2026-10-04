@@ -175,20 +175,27 @@ pub(crate) fn collect_sources(
     }
 }
 
-pub(crate) fn query_plan_rows(lines: &[String]) -> Outcome {
+pub(crate) fn query_plan_rows(lines: &[inillucent_sql::plan::PlanLine]) -> Outcome {
+    // Each line's id is its position counted from 1, and its parent is the id
+    // of the nearest line above it one level up, or 0 at the top level. A shell
+    // draws the tree from the parents; the ids are not SQLite's, which are
+    // addresses in its program.
+    let mut open: Vec<i64> = Vec::new();
+    let mut rows = Vec::with_capacity(lines.len());
+    for (position, line) in lines.iter().enumerate() {
+        let id = position as i64 + 1;
+        open.truncate(usize::from(line.depth));
+        let parent = open.last().copied().unwrap_or(0);
+        open.push(id);
+        rows.push(vec![
+            OwnedDatum::Int(id),
+            OwnedDatum::Int(parent),
+            OwnedDatum::Int(0),
+            OwnedDatum::Text(line.detail.as_bytes().to_vec()),
+        ]);
+    }
     Outcome {
-        rows: lines
-            .iter()
-            .enumerate()
-            .map(|(position, line)| {
-                vec![
-                    OwnedDatum::Int(position as i64),
-                    OwnedDatum::Int(0),
-                    OwnedDatum::Int(0),
-                    OwnedDatum::Text(line.as_bytes().to_vec()),
-                ]
-            })
-            .collect(),
+        rows,
         names: std::rc::Rc::new(vec![
             "id".to_string(),
             "parent".to_string(),

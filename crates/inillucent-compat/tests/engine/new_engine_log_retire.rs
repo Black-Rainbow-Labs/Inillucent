@@ -158,7 +158,10 @@ fn a_checkpoint_reclaims_the_log() {
     let path = scratch("reclaims");
     let mut database =
         ImportedDatabase::create(path.clone(), PAGE, FRAMES).expect("a fresh database");
-    fill(&mut database, 13);
+    // Fifteen doublings rather than thirteen since a leaf split stopped logging
+    // three whole pages: thirteen then wrote 1.7 MiB of log, under the 4 MiB
+    // this case needs to have something for the checkpoint to reclaim.
+    fill(&mut database, 15);
     let (before_count, before_bytes) = segments(&path);
     assert!(
         before_bytes > 4 * 1024 * 1024,

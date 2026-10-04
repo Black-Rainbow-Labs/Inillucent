@@ -809,12 +809,23 @@ fn general_arith(
     length_limit: i64,
     types: &[StaticType],
 ) -> DbResult<Box<dyn Eval>> {
-    Ok(Box::new(crate::scalar::GeneralArith {
+    let general = crate::scalar::GeneralArith {
         length_limit,
         op,
         left: compile(left, types)?,
         right: compile(right, types)?,
-    }))
+    };
+    if let (BinaryOp::Modulo | BinaryOp::Divide, Expr::Literal(OwnedDatum::Int(divisor))) =
+        (op, right)
+    {
+        if *divisor != 0 && *divisor != -1 {
+            return Ok(Box::new(crate::scalar::IntByConstant {
+                divisor: *divisor,
+                general,
+            }));
+        }
+    }
+    Ok(Box::new(general))
 }
 
 /// Compiles a comparison's affinity conversion.

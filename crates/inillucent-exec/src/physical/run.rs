@@ -304,6 +304,7 @@ pub fn prepare_any(plan: &PhysicalPlan, catalog: &dyn TreeCatalog) -> DbResult<P
         return Ok(Prepared {
             stages: Vec::new(),
             forced: ForcePlan::default(),
+            blocks: Default::default(),
         });
     }
     prepare(plan, catalog, ForcePlan::default())

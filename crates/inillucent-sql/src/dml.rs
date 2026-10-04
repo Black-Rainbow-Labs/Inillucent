@@ -1563,6 +1563,7 @@ impl<'a> Binder<'a> {
                 suppressed: Vec::new(),
                 index_exprs: Vec::new(),
                 written_schema: None,
+                derived: Default::default(),
             };
             self.view_target = Some(source.id);
             let scope = source.id;
@@ -1648,7 +1649,8 @@ impl<'a> Binder<'a> {
             return None;
         }
         let id = self.view_target.take()?;
-        let source = self.sources.get(id)?.clone();
+        let mut source = self.sources.get(id)?.clone();
+        source.derived.pinned = true;
         let columns = table
             .columns
             .iter()
@@ -1727,6 +1729,7 @@ impl<'a> Binder<'a> {
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
             written_schema: None,
+            derived: Default::default(),
         });
         self.scopes.push(vec![id]);
         id

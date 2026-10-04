@@ -377,24 +377,27 @@ fn build_index_probe<'t>(
         .iter()
         .map(|expr| compile(expr, &outer_types))
         .collect::<DbResult<Vec<_>>>()?;
-    Ok(Box::new(IndexNestedLoopJoin::new(
-        // **The lookup stage carries the same kind as the seek that fed it.**
-        // A null-extended index row probes the table with a NULL identity and
-        // finds nothing; an `Inner` lookup would drop it, which would lose the
-        // very row the outer join produced it for.
-        kind,
-        tree,
-        // **This stage's pool, not the pipeline's.** The inner side of an index
-        // nested loop is where a join across two databases reaches the second
-        // file, so the pool travels with the stage that reads it.
-        catalog.pool_for(stage.root).ok_or_else(|| {
-            misuse("the inner side of a join names a database this connection does not hold")
-        })?,
-        compiled,
-        Projection::all(stage.width),
-        full_key,
-        downstream,
-    )))
+    Ok(Box::new(
+        IndexNestedLoopJoin::new(
+            // **The lookup stage carries the same kind as the seek that fed it.**
+            // A null-extended index row probes the table with a NULL identity and
+            // finds nothing; an `Inner` lookup would drop it, which would lose the
+            // very row the outer join produced it for.
+            kind,
+            tree,
+            // **This stage's pool, not the pipeline's.** The inner side of an index
+            // nested loop is where a join across two databases reaches the second
+            // file, so the pool travels with the stage that reads it.
+            catalog.pool_for(stage.root).ok_or_else(|| {
+                misuse("the inner side of a join names a database this connection does not hold")
+            })?,
+            compiled,
+            Projection::all(stage.width),
+            full_key,
+            downstream,
+        )
+        .with_needed(stage.needed),
+    ))
 }
 /// Returns the first stage of a left join term that has to be probed and then
 /// tested, when `index` is that term's last stage.
@@ -717,7 +720,7 @@ fn build_lateral_join<'t>(
         _ => None,
     };
     Ok(Box::new(crate::lateral::LateralModule::new(
-        source_term.table.clone(),
+        (*source_term.table).clone(),
         source_term.path.clone(),
         params.clone(),
         plan.select.columns_read(source_term.id),

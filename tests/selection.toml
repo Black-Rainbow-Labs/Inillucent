@@ -1578,6 +1578,17 @@ tier = "differential"
 covers = ["inillucent-storage"]
 requires = ["oracle"]
 
+# `INSERT ... SELECT` into an empty table, which builds the tree in one pass:
+# the same rows, errors and counters as the row by row insert.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "differential"
+module = "bulk_insert"
+tier = "differential"
+covers = ["inillucent-engine", "inillucent-exec"]
+requires = ["oracle"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"
@@ -2138,6 +2149,14 @@ covers = ["inillucent-driver", "inillucent-engine", "inillucent-txn", "inillucen
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "bulk_write_log"
+tier = "engine"
+covers = ["inillucent-pool", "inillucent-wal", "inillucent-tree", "inillucent-txn", "inillucent-exec", "inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "delete_order"
 tier = "engine"
 covers = ["inillucent-pool", "inillucent-tree", "inillucent-exec", "inillucent-engine"]
@@ -2214,6 +2233,18 @@ module = "wal_crash"
 tier = "durability"
 covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim"]
 
+# A transaction whose leaf splits are logged as what they did, and the fold
+# after it, cut at every call under both journal modes: the fold's after
+# images and the rollback journal are what repair a torn page that a logical
+# split's replay reads.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "logical_split_crash"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim"]
+
 # What a statement costs and what a fold costs, counted at the file system rather
 # than at a counter in the engine (task-2000, design 1). It is `durability`
 # because the two syncs it counts *are* the durability order, and because it
@@ -2233,6 +2264,17 @@ covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-p
 # statement's own records. This is the campaign that says the ordering holds:
 # every cut leaves the index whole or absent, and never a catalog row naming
 # pages nobody wrote.
+# Power loss at every cut point of an `INSERT ... SELECT` into an empty table,
+# which builds the table and its index with the bulk builder and rewrites their
+# catalog rows: the copy comes back whole or not at all.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "bulk_insert_crash"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-exec", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"
@@ -2869,6 +2911,17 @@ name = "redo_bytes"
 tier = "durability"
 covers = ["inillucent-tree", "inillucent-txn", "inillucent-pool", "inillucent-wal"]
 
+# A leaf split logged as what it did: every subset of its three pages written
+# to the file before a crash, a torn right page, a crash at every write and
+# sync of its transaction, and the three image record an older build wrote,
+# each recovered and compared byte for byte.
+[[target]]
+package = "inillucent-model"
+kind = "test"
+name = "logical_split_crash"
+tier = "durability"
+covers = ["inillucent-tree", "inillucent-txn", "inillucent-pool", "inillucent-wal"]
+
 [[target]]
 package = "inillucent-search"
 kind = "lib"
@@ -3028,6 +3081,17 @@ covers = ["inillucent-cli"]
 # `--root` against the file system rather than against path text.
 # It drives the two shipped front ends, because the defect it guards was not in
 # the check's arithmetic - it was in which file operations reached the check.
+# `INSERT ... SELECT` into an empty table, which builds the tree in one pass:
+# the rows on disk after a reopen, a rollback and a failure that write nothing,
+# and the log record count that shows the bulk build is the path taken.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "bulk_insert_storage"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-exec", "inillucent-tree"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"

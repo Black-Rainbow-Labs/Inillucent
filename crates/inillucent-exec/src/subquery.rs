@@ -108,7 +108,7 @@ pub fn fold(
     if found.is_empty() {
         return Ok(None);
     }
-    fill(found, catalog, params).map(Some)
+    fill(found, catalog, params, plan.levers).map(Some)
 }
 
 /// Runs each gathered block and returns the parameters carrying the answers.
@@ -116,7 +116,14 @@ pub fn fold(
 /// @param found - the blocks, innermost first
 /// @param catalog - where the trees and layouts come from
 /// @param params - the values bound for this execution
-fn fill(found: Vec<Block<'_>>, catalog: &dyn TreeCatalog, params: &Params) -> DbResult<Params> {
+/// @param levers - the outer statement's optimizations, which each block is
+///   planned with, so `PRAGMA reverse_unordered_selects` reaches it too
+fn fill(
+    found: Vec<Block<'_>>,
+    catalog: &dyn TreeCatalog,
+    params: &Params,
+    levers: Levers,
+) -> DbResult<Params> {
     let width = found
         .iter()
         .map(|block| block.id.saturating_add(1))
@@ -132,7 +139,7 @@ fn fill(found: Vec<Block<'_>>, catalog: &dyn TreeCatalog, params: &Params) -> Db
             // filling it with an empty answer would be a wrong answer.
             continue;
         }
-        let inner = plan_select_with(block.select.clone(), Levers::default());
+        let inner = plan_select_with(block.select.clone(), levers);
         let (rows, _shape) = run_any(&inner, catalog, &folded)?;
         let column = rows
             .into_iter()
@@ -197,7 +204,7 @@ pub fn fold_expressions(
     if found.is_empty() {
         return Ok(None);
     }
-    fill(found, catalog, params).map(Some)
+    fill(found, catalog, params, Levers::default()).map(Some)
 }
 
 /// One subquery the fold has to evaluate.

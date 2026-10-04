@@ -28,6 +28,7 @@
 //! | [`integrity`] | walking every tree and every index |
 //! | [`pages`] | which pages the trees reach, and whether the free map agrees |
 //! | [`functions`] | the function registry, the collations, the authorizer, the levers |
+//! | [`bulk`] | `INSERT ... SELECT` into an empty table, built as one tree |
 //! | [`compiled`] | the write path: compiling a statement and applying what it decided |
 //! | [`explain`] | rendering `EXPLAIN` and `EXPLAIN QUERY PLAN` as rows |
 //! | [`rowshape`] | what a table's rows look like on disk, and reading a schema back |
@@ -40,6 +41,7 @@
 
 pub mod accessors;
 pub mod batch;
+pub mod bulk;
 pub mod compiled;
 pub mod counters;
 pub mod explain;

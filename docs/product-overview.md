@@ -81,6 +81,8 @@ with both engines reading the same vectors.
 | Result | Detail | Source |
 |---|---|---|
 | **419% faster than SQLite 3.53.4** | 5.19x, weighted over ten workload families | [Performance](performance.md) |
+| **137% faster than SQLite through the `Connection`** | 2.37x on the same ten families, through `Connection::prepare` and `Statement::step`, on 2026-10-03 with release 2.1.2 | [Performance](performance.md#through-the-connection-on-common-and-edge-case-workloads) |
+| **69% faster on 48 common and edge case workloads** | the hillclimb plan through the `Connection`, where release 2.1.2 was 34% faster and 2.1.1 was 30% slower | [Performance](performance.md#a-second-hill-climb) |
 | **67% less processor time** | 344 ms against 1,043 ms for one round of the same plan | [Performance](performance.md) |
 | **11.5% more memory** | 41.48 MiB against 37.21 MiB peak, with the same 128 MiB cache. SQLite uses less | [Performance](performance.md#memory) |
 | **A file 3.6% larger** | 17,432,576 bytes against 16,830,464 bytes for the same imported data | [Performance](performance.md#disk) |

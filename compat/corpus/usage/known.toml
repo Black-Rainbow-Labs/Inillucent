@@ -22,11 +22,6 @@ kind = "deviation"
 reason = "N2: page size. inillucent writes 32768 byte pages, fixed when the file is created, and PRAGMA page_size before the first write is ignored; the pinned sqlite3 uses 4096 and honours the pragma. PRAGMA n.page_size = 512 on an attached database reads back 32768 for main and for the attached database"
 
 [[known]]
-case = "holdout/ctes/380-explain-query-plan-text-for-a-materialized-cte-ref"
-kind = "defect"
-reason = "EXPLAIN QUERY PLAN prints a flat list. It does not describe a subquery, a CTE or a compound query as SQLite does (MATERIALIZE, CO-ROUTINE, MERGE, LIST SUBQUERY and the nested lines under each). Fixing this case needs a nested plan renderer and the planner decisions behind it, which is a feature of its own"
-
-[[known]]
 case = "holdout/indexes/648-a-table-with-a-65536-byte-page-size-and-index-entr"
 kind = "deviation"
 reason = "N2: page size. inillucent writes 32768 byte pages, fixed when the file is created, and PRAGMA page_size before the first write is ignored; the pinned sqlite3 uses 4096 and honours the pragma. PRAGMA page_size = 65536 is ignored, so the last PRAGMA page_size reads 32768; every other line of the case matches"
@@ -42,11 +37,6 @@ kind = "deviation"
 reason = "N4: a WITHOUT ROWID table whose PRIMARY KEY declares DESC stores its rows in ascending key order, where SQLite stores them descending. A query with no ORDER BY returns the rows in ascending order. Seeks, ranges and ORDER BY on the key return the same rows as SQLite"
 
 [[known]]
-case = "holdout/joins/464-predicate-on-the-right-side-of-a-left-join-subquer"
-kind = "defect"
-reason = "Only the EXPLAIN QUERY PLAN text differs; the rows match. SQLite flattens the derived table and prints a plan tree with a COMPOUND QUERY node; inillucent has no subquery flattener and prints a flat list. Needs a plan tree with parent ids and a flattener."
-
-[[known]]
 case = "holdout/schema/821-readback-of-settings-pragmas"
 kind = "deviation"
 reason = "N2: engine configuration defaults. PRAGMA page_size reads 32768 (4096), PRAGMA cache_size reads -131072 (-2000), PRAGMA busy_timeout reads 5000 (0 in the sqlite3 shell) and PRAGMA page_count reads 4 on an empty file (0). Every other pragma in the case matches"
@@ -60,11 +50,6 @@ reason = "N2: engine configuration defaults. The default cache size is -131072 (
 case = "holdout/string-functions/5-sqlite-schema-stores-the-unquoted-name-and-the-sql"
 kind = "deviation"
 reason = "N3: file layout. sqlite_schema.rootpage of the first table is 4 and SQLite writes 2, because inillucent keeps its own catalog trees on the first pages of the file. type, name, tbl_name and sql match"
-
-[[known]]
-case = "holdout/subqueries/370-outer-where-applied-to-a-union-all-subquery"
-kind = "defect"
-reason = "Only the EXPLAIN QUERY PLAN text differs; the rows match. SQLite flattens the derived table and prints a plan tree with a COMPOUND QUERY node; inillucent has no subquery flattener and prints a flat list. Needs a plan tree with parent ids and a flattener."
 
 [[known]]
 case = "holdout/upsert/733-pragma-max-page-count-with-a-failed-insert-inside-"

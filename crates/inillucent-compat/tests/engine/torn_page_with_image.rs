@@ -162,6 +162,7 @@ impl Redo for WhatTheLogSays {
             }
             Body::InsertRow { page, .. }
             | Body::DeleteRow { page, .. }
+            | Body::DeleteRows { page, .. }
             | Body::UpdateInPlace { page, .. } => {
                 self.pages.entry(page).or_default().logical = Some(lsn);
             }

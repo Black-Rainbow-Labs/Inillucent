@@ -407,6 +407,9 @@ impl Pool {
         // caller has already refused when [`Pool::dirty_pages`], which counts
         // spilled pages, was not zero, so nothing here is a change the file lacks.
         self.forget_every_spilled_page();
+        // The copies are of pages that are going; they could not match a
+        // reloaded page anyway, and they are memory.
+        self.merged.borrow_mut().clear();
         let mut gone = 0usize;
         // Bounded by the frame count: a pinned frame cannot be evicted, and a
         // caller that still holds a guard gets fewer frames dropped rather than

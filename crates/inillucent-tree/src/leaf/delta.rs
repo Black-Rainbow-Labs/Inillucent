@@ -386,6 +386,33 @@ impl<'p> LeafRef<'p> {
         Ok(values)
     }
 
+    /// Decodes the first `decode` columns of one delta row onto the end of a vector.
+    ///
+    /// **One vector for every delta row of a leaf (task-2183).** A scan of a
+    /// table filled by `INSERT` reads leaves holding a thousand delta rows, and
+    /// one `Vec` per row was a third of `SELECT count(*)` over such a table. The
+    /// columns past `decode` are not decoded at all: their tags are not even
+    /// measured, because nothing after them is read.
+    ///
+    /// @param index - the row's position in the directory
+    /// @param decode - how many leading columns to decode, at most the leaf's width
+    /// @param out - where the values go, `decode` of them
+    pub(super) fn delta_row_into(
+        &self,
+        index: usize,
+        decode: usize,
+        out: &mut Vec<Datum<'p>>,
+    ) -> DbResult<()> {
+        let row = self.delta_row(index)?;
+        let mut cursor = 0usize;
+        for column in 0..decode.min(self.column_count) {
+            let (value, next) = self.delta_column_at(row, cursor, index, column)?;
+            out.push(value);
+            cursor = next;
+        }
+        Ok(())
+    }
+
     /// Compares one delta row's key against a probe, in the tree's order.
     ///
     /// Only the columns the probe names are compared, so a probe shorter than

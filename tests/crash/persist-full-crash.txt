@@ -1,4 +1,4 @@
-cut points: 161, acknowledged commits: 55, detected damage: 0, lost to a half written call: 0
+cut points: 153, acknowledged commits: 47, detected damage: 0, lost to a half written call: 0
 1	failed	old
 2	failed	old
 3	failed	old
@@ -152,12 +152,4 @@ cut points: 161, acknowledged commits: 55, detected damage: 0, lost to a half wr
 151	committed	new
 152	committed	new
 153	committed	new
-154	committed	new
-155	committed	new
-156	committed	new
-157	committed	new
-158	committed	new
-159	committed	new
-160	committed	new
-161	committed	new
-162	acknowledged	new
+154	acknowledged	new

@@ -138,9 +138,25 @@ pub(crate) fn constant_value(
     // rowid is compared - and a probe that descended for the *text* `'4'`
     // found nothing at all. The predicate path already applied this; the seek
     // path did not, and the two disagreeing is worse than either being wrong.
+    seek_value(value, affinity)
+}
+
+/// Converts a seek key's value to the affinity its comparison applies.
+///
+/// An integer under an integer or numeric affinity is already what the
+/// conversion would give, and is returned without going through a `Value`.
+///
+/// @param value - the key's value
+/// @param affinity - the affinity, or `None` when the comparison converts nothing
+pub(crate) fn seek_value(value: OwnedDatum, affinity: Option<Affinity>) -> DbResult<OwnedDatum> {
     let Some(affinity) = affinity else {
         return Ok(value);
     };
+    if matches!(value, OwnedDatum::Int(_))
+        && matches!(affinity, Affinity::Integer | Affinity::Numeric)
+    {
+        return Ok(value);
+    }
     let borrowed = value.borrow();
     let converted = inillucent_value::affinity::apply_affinity(
         Value::from(&borrowed).into_owned()?,

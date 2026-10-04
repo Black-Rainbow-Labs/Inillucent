@@ -59,6 +59,15 @@ pub struct Storm {
     pub least_acknowledged: i64,
     /// The least number of reader checks a passing run must have.
     pub least_checks: u64,
+    /// Whether the run ends by killing every process at the same moment, workers
+    /// included, rather than by letting the workers finish.
+    ///
+    /// The 2.0.7 damage report stopped its writer and its reader with one
+    /// signal each at the same moment, and damage was seen only when the reader
+    /// still had the file open as the writer died. Ending this way leaves the
+    /// log as two live processes left it, with no process alive to catch up
+    /// on it, so the first replay is the grading process's own open.
+    pub kill_all_at_end: bool,
 }
 
 /// What a storm did.
@@ -114,6 +123,9 @@ fn options(settings: &Settings) -> Vec<String> {
     }
     if settings.search {
         out.push("--search".to_string());
+    }
+    if settings.rewrite {
+        out.push("--rewrite".to_string());
     }
     if settings.bulk_parts > 0 {
         out.extend(["--bulk-parts".to_string(), settings.bulk_parts.to_string()]);
@@ -414,6 +426,12 @@ fn drive(run: &mut Run<'_>) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(50));
         run.drain();
     }
+    if run.storm.kill_all_at_end {
+        kill_everything(run);
+        std::thread::sleep(Duration::from_millis(200));
+        run.drain();
+        return Ok(());
+    }
     stop_readers(run);
     let deadline = Instant::now() + Duration::from_secs(600);
     while !run.running.is_empty() && Instant::now() < deadline {
@@ -440,6 +458,27 @@ fn drive(run: &mut Run<'_>) -> Result<(), String> {
 /// @param run - the run's state
 fn checks_so_far(run: &Run<'_>) -> u64 {
     run.records.iter().map(|record| record.checks).sum()
+}
+
+/// Kills every process still running at the same moment, and records each one
+/// as killed.
+///
+/// Every kill is sent before any process is waited for, so no process outlives
+/// another by more than the time it takes to send the next kill.
+///
+/// @param run - the run's state
+fn kill_everything(run: &mut Run<'_>) {
+    let mut ended: Vec<Running> = run.running.drain(..).collect();
+    for running in ended.iter_mut() {
+        let _ = running.child.kill();
+    }
+    for running in ended.iter_mut() {
+        let _ = running.child.wait();
+        if let Some(record) = run.records.get_mut(running.slot) {
+            record.killed = true;
+        }
+    }
+    run.kills += ended.len();
 }
 
 /// Kills every reader still running, since a reader never stops on its own.

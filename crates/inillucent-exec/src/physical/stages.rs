@@ -6,6 +6,7 @@
 //! the construct named, instead of as a wrong answer from a plan that quietly
 //! dropped a clause.
 
+use crate::paged::ColumnMask;
 use inillucent_base::error::misuse;
 use inillucent_base::DbResult;
 // `literal_value` is named by path from a dozen call sites in
@@ -135,6 +136,13 @@ pub struct PreparedStage {
     /// synthesising one *here* rather than registering it in the catalog is
     /// what keeps the catalog a description of the file.
     pub layout: Option<std::rc::Rc<SourceLayout>>,
+    /// Which of the stage's tree columns the statement reads, when it is the driving scan.
+    ///
+    /// Decided once at prepare from the bound statement, because it depends
+    /// on the statement and the tree and not on the data (task-2183). `None`
+    /// reads every column, which is what every stage did before and what a
+    /// stage this was not worked out for still does.
+    pub needed: crate::paged::Needed,
 }
 /// What a statement's physical choices are, decided once.
 ///
@@ -150,6 +158,8 @@ pub struct Prepared {
     pub stages: Vec<PreparedStage>,
     /// The levers this plan was prepared under.
     pub forced: ForcePlan,
+    /// The statement's correlated blocks, prepared at its first execution.
+    pub blocks: crate::correlate::KeptBlocks,
 }
 impl Prepared {
     /// Returns the tree the outermost stage reads.
@@ -546,11 +556,13 @@ pub fn prepare(
                 continue;
             }
             let trial = plan_stages(plan, catalog, Some(candidate))?;
-            let attempt = Prepared {
+            let mut attempt = Prepared {
                 stages: trial,
                 forced,
+                blocks: Default::default(),
             };
             if build_prepared(plan, catalog, &attempt, &Params::new(), dummy_sink()).is_ok() {
+                mark_needed(plan, catalog, &mut attempt.stages);
                 return Ok(attempt);
             }
         }
@@ -565,7 +577,99 @@ pub fn prepare(
             stage.kind = AccessKind::Skip;
         }
     }
-    Ok(Prepared { stages, forced })
+    mark_needed(plan, catalog, &mut stages);
+    Ok(Prepared {
+        stages,
+        forced,
+        blocks: Default::default(),
+    })
+}
+
+/// Records which tree columns each stage has to produce.
+///
+/// The columns the bound statement reads of the stage's FROM term, mapped
+/// through the tree's layout. When another stage follows, also every column
+/// that stage reads by position rather than through an expression: the key,
+/// the rowid and the columns that identify a table row, which a lookup into
+/// the table and a join read. A statement whose reads cannot be
+/// listed - a correlated subquery over the term, a module's function - and a
+/// read the tree does not hold leave the stage reading everything.
+///
+/// @param plan - the planner's output
+/// @param catalog - where the layouts come from
+/// @param stages - the stages; the first feeds its source, and each later one feeds an index nested loop join
+fn mark_needed(plan: &PhysicalPlan, catalog: &dyn TreeCatalog, stages: &mut [PreparedStage]) {
+    let count = stages.len();
+    // An index seek and the table lookup behind it are one FROM term, so the
+    // term's reads are gathered once for both.
+    let mut gathered: Option<(usize, inillucent_sql::bind::ColumnUse)> = None;
+    for (index, stage) in stages.iter_mut().enumerate() {
+        let stages_after = count.saturating_sub(index).saturating_sub(1);
+        let Some(term) = plan.sources.get(stage.term) else {
+            continue;
+        };
+        if gathered.as_ref().is_none_or(|(id, _)| *id != term.id) {
+            gathered = Some((term.id, plan.select.columns_read(term.id)));
+        }
+        if let Some((_, used)) = &gathered {
+            mark_stage_needed(catalog, stage, used, stages_after);
+        }
+    }
+}
+
+/// Marks the columns one stage's reads need; see [`mark_needed`].
+///
+/// @param catalog - where the layouts come from
+/// @param stage - the stage to mark
+/// @param used - what the statement reads of the stage's FROM term
+/// @param stages_after - how many stages read this one's row after it
+fn mark_stage_needed(
+    catalog: &dyn TreeCatalog,
+    stage: &mut PreparedStage,
+    used: &inillucent_sql::bind::ColumnUse,
+    stages_after: usize,
+) {
+    if stage.layout.is_some() || stage.kind == AccessKind::Materialised {
+        return;
+    }
+    let Some(layout) = catalog.layout(stage.root) else {
+        return;
+    };
+    if used.opaque || !used.functions.is_empty() || layout.width > ColumnMask::WIDTH {
+        return;
+    }
+    let width = layout.width;
+    let mut needed = ColumnMask::empty();
+    let mut mark = |column: usize| column < width && needed.mark(column);
+    for slot in &used.columns {
+        match layout.slots.get(usize::from(*slot)).copied().flatten() {
+            Some(column) if mark(column) => {}
+            _ => return,
+        }
+    }
+    if used.rowid {
+        match layout.rowid {
+            Some(column) if mark(column) => {}
+            _ => return,
+        }
+    }
+    // A stage after this one reads this one's row by position: a lookup
+    // probes the table with the entry's identity, and a join may compare keys.
+    // A single stage is read only through the statement's own expressions.
+    if stages_after > 0 {
+        for column in layout.identity.iter().chain(layout.key_columns.iter()) {
+            if !mark(*column) {
+                return;
+            }
+        }
+        if let Some(column) = layout.rowid {
+            mark(column);
+        }
+    }
+    if width != stage.width || needed.reads_all(width) {
+        return;
+    }
+    stage.needed = Some(needed);
 }
 /// Returns the collation an expression is compared and ordered under.
 ///
@@ -1088,6 +1192,7 @@ fn virtual_scan_stage(term: &Term<'_>, stages: &mut Vec<PreparedStage>, offset: 
         .saturating_add(functions.len());
     stages.push(PreparedStage {
         functions: functions.clone(),
+        needed: None,
         root: 0,
         kind: AccessKind::Materialised,
         source: term.source.id,
@@ -1181,6 +1286,7 @@ fn push_stage(
         offset: *offset,
         width: layout.width,
         layout: None,
+        needed: None,
     });
     *offset = offset.saturating_add(layout.width);
     Ok(())

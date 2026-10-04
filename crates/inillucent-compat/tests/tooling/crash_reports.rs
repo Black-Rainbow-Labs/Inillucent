@@ -77,60 +77,142 @@ enum Shape {
 /// the cut points that went: five to eight per campaign, all of them before the
 /// commit, with every state and every recovered answer unchanged.
 const FLOORS: [Floor; 19] = [
+    // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
+    // their slots (task-2183).** Measured by running this campaign at the
+    // commit before that change and at the change itself: 88 cut points
+    // became 80. In
+    // `delete-full-crash.txt` all eight were calls made after the commit was
+    // acknowledged, which in this workload are the checkpoint's: the calls
+    // before the commit are the same 33. Every cut point still recovers to a
+    // state the campaign accepts.
     Floor {
         name: "delete-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 86,
+        least: 78,
     },
+    // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
+    // their slots (task-2183).** Measured by running this campaign at the
+    // commit before that change and at the change itself: 88 cut points
+    // became 80. In
+    // `delete-full-crash.txt` all eight were calls made after the commit was
+    // acknowledged, which in this workload are the checkpoint's: the calls
+    // before the commit are the same 33. Every cut point still recovers to a
+    // state the campaign accepts.
     Floor {
         name: "delete-full-disk-full.txt",
         shape: Shape::CutPoints,
-        least: 86,
+        least: 78,
     },
+    // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
+    // their slots (task-2183).** Measured by running this campaign at the
+    // commit before that change and at the change itself: 88 cut points
+    // became 80. In
+    // `delete-full-crash.txt` all eight were calls made after the commit was
+    // acknowledged, which in this workload are the checkpoint's: the calls
+    // before the commit are the same 33. Every cut point still recovers to a
+    // state the campaign accepts.
     Floor {
         name: "delete-full-io-error.txt",
         shape: Shape::CutPoints,
-        least: 86,
+        least: 78,
     },
+    // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
+    // their slots (task-2183).** Measured by running this campaign at the
+    // commit before that change and at the change itself: 88 cut points
+    // became 80. In
+    // `delete-full-crash.txt` all eight were calls made after the commit was
+    // acknowledged, which in this workload are the checkpoint's: the calls
+    // before the commit are the same 33. Every cut point still recovers to a
+    // state the campaign accepts.
     Floor {
         name: "delete-full-short-write.txt",
         shape: Shape::CutPoints,
-        least: 86,
+        least: 78,
     },
+    // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
+    // their slots (task-2183).** 161 cut points became 153 over the same
+    // commits that took eight from `delete-full-crash.txt`, where the eight
+    // were traced to that change by running the campaign before and after it.
+    // Every cut point still recovers to a state the campaign accepts.
     Floor {
         name: "truncate-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 159,
+        least: 151,
     },
+    // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
+    // their slots (task-2183).** 161 cut points became 153 over the same
+    // commits that took eight from `delete-full-crash.txt`, where the eight
+    // were traced to that change by running the campaign before and after it.
+    // Every cut point still recovers to a state the campaign accepts.
     Floor {
         name: "persist-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 159,
+        least: 151,
     },
+    // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
+    // their slots (task-2183).** Measured by running this campaign at the
+    // commit before that change and at the change itself: 55 cut points
+    // became 47. In
+    // `delete-full-crash.txt` all eight were calls made after the commit was
+    // acknowledged, which in this workload are the checkpoint's: the calls
+    // before the commit are the same 33. Every cut point still recovers to a
+    // state the campaign accepts.
     Floor {
         name: "delete-full-checkpoint-crash.txt",
         shape: Shape::CutPoints,
-        least: 55,
+        least: 47,
     },
+    // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
+    // their slots (task-2183).** Measured by running this campaign at the
+    // commit before that change and at the change itself: 55 cut points
+    // became 47. In
+    // `delete-full-crash.txt` all eight were calls made after the commit was
+    // acknowledged, which in this workload are the checkpoint's: the calls
+    // before the commit are the same 33. Every cut point still recovers to a
+    // state the campaign accepts.
     Floor {
         name: "delete-full-checkpoint-disk-full.txt",
         shape: Shape::CutPoints,
-        least: 55,
+        least: 47,
     },
+    // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
+    // their slots (task-2183).** Measured by running this campaign at the
+    // commit before that change and at the change itself: 55 cut points
+    // became 47. In
+    // `delete-full-crash.txt` all eight were calls made after the commit was
+    // acknowledged, which in this workload are the checkpoint's: the calls
+    // before the commit are the same 33. Every cut point still recovers to a
+    // state the campaign accepts.
     Floor {
         name: "delete-full-checkpoint-io-error.txt",
         shape: Shape::CutPoints,
-        least: 55,
+        least: 47,
     },
+    // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
+    // their slots (task-2183).** Measured by running this campaign at the
+    // commit before that change and at the change itself: 54 cut points
+    // became 46. In
+    // `delete-full-crash.txt` all eight were calls made after the commit was
+    // acknowledged, which in this workload are the checkpoint's: the calls
+    // before the commit are the same 33. Every cut point still recovers to a
+    // state the campaign accepts.
     Floor {
         name: "truncate-full-checkpoint-crash.txt",
         shape: Shape::CutPoints,
-        least: 54,
+        least: 46,
     },
+    // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
+    // their slots (task-2183).** Measured by running this campaign at the
+    // commit before that change and at the change itself: 54 cut points
+    // became 46. In
+    // `delete-full-crash.txt` all eight were calls made after the commit was
+    // acknowledged, which in this workload are the checkpoint's: the calls
+    // before the commit are the same 33. Every cut point still recovers to a
+    // state the campaign accepts.
     Floor {
         name: "persist-full-checkpoint-crash.txt",
         shape: Shape::CutPoints,
-        least: 54,
+        least: 46,
     },
     // **Three fewer since `BEGIN` became deferred (task-2173).** The
     // workload opens with `BEGIN`, which took the write lock itself before

@@ -116,12 +116,16 @@ fn a_limit_stops_an_unbounded_series() {
 /// materialisation defect from the binding one. On the tree before this change
 /// it runs past the deadline; the eponymous cases above merely report
 /// `no such table`.
+///
+/// The `start` is given, because SQLite's `generate_series` refuses a scan
+/// without one (`first argument to "generate_series()" missing or unusable`)
+/// and so does this module. With no `stop` the series is still unbounded.
 #[test]
 fn a_limit_stops_a_created_series() {
     let (rows, elapsed) = answer_within(
         "created-limit",
         &["CREATE VIRTUAL TABLE gs USING generate_series"],
-        "SELECT value FROM gs LIMIT 3",
+        "SELECT value FROM gs WHERE start = 1 LIMIT 3",
     );
     assert_eq!(rows.len(), 3, "took {elapsed:?}, rows {rows:?}");
 }

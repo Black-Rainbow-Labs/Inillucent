@@ -38,12 +38,12 @@ fn area() -> PathBuf {
 /// How many rows the table holds.
 ///
 /// The slow statement is a three way cross join over it, so the work is the
-/// cube of this: 150 rows is 3.4 million combinations, which takes this engine
-/// a few seconds and is far short of the sixty second deadline a served request
-/// runs under. The gap between "a few seconds" and "sixty" is what makes the
-/// timing assertion below mean something, and the number is kept small because
-/// the uncancelled arm has to run the whole thing to measure it.
-const ROWS: usize = 150;
+/// cube of this: 200 rows is 8 million combinations. The test below checks
+/// that they take more than half a second, and they are far short of the
+/// sixty second deadline a served request runs under. That gap is what makes
+/// the timing assertion below mean something, and the number is kept small
+/// because the uncancelled arm has to run the whole thing to measure it.
+const ROWS: usize = 200;
 
 /// A database with enough rows that a statement over it takes a while.
 ///
@@ -84,7 +84,12 @@ fn database(name: &str) -> PathBuf {
 /// long the server is *held*, and a statement that also produced a large answer
 /// would be stopped by the row ceiling instead and prove nothing about
 /// cancellation.
-const SLOW: &str = "SELECT count(*) FROM t AS a, t AS b, t AS c";
+///
+/// **The `WHERE` reads every combination's values (task-2183).** A count over
+/// the bare cross join needs no row at all, and once the scan stopped building
+/// rows nobody reads, 3.4 million combinations were counted in 0.22 s, too
+/// fast to cancel.
+const SLOW: &str = "SELECT count(*) FROM t AS a, t AS b, t AS c WHERE a.n + b.n + c.n >= 0";
 
 /// An MCP server on a database, and the two pipes to it.
 struct Server {

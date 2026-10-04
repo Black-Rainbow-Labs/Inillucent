@@ -128,6 +128,7 @@ pub fn keys_query_joined(
         suppressed: Vec::new(),
         index_exprs: Vec::new(),
         written_schema: None,
+        derived: Default::default(),
     }];
     sources.extend(joined.iter().cloned());
     Ok(BoundSelect {
@@ -146,6 +147,7 @@ pub fn keys_query_joined(
         windows: Vec::new(),
         correlations: Vec::new(),
         shared: None,
+        serial: 0,
     })
 }
 /// Returns an `UPDATE ... FROM`'s key rows with one row per target row.
@@ -221,6 +223,7 @@ pub fn module_keys_query(
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
             written_schema: None,
+            derived: Default::default(),
         }],
         filter: filter.cloned(),
         group_by: Vec::new(),
@@ -242,6 +245,7 @@ pub fn module_keys_query(
         windows: Vec::new(),
         correlations: Vec::new(),
         shared: None,
+        serial: 0,
     }
 }
 

@@ -260,9 +260,11 @@ say 8 bytes. Tree by tree over the medium fixture, at 32 KiB pages:
 `main_category` leads on a column with 64 distinct values, so its width is one byte and it saves the
 most. `wide` holds text and does not change, which checks that nothing narrowed that should not.
 
-A table built with `INSERT ... SELECT` instead of an import is larger: 200,000 rows are 15.9 MB in
-inillucent against 8.7 MB in SQLite, at 32 KiB pages. The redo log shrinks to 0.0 MB at a
-checkpoint. It used to keep 94.6 MB across two segments.
+A database built with `INSERT ... SELECT` instead of an import is now smaller than SQLite's. The
+three tables shaped like the medium fixture's, 100,000, 25,000 and 400 rows with three indexes,
+filled from recursive queries into empty tables, are 7,208,960 B in inillucent against 7,618,560 B in SQLite 3.53.4, at 32 KiB pages, measured on
+3 October 2026. Before a copy into an empty table built its tree in one pass, the same file was
+7,471,104 B. The redo log shrinks to 0.0 MB at a checkpoint.
 
 ## Other table sizes
 
@@ -328,41 +330,166 @@ A third of the workloads, chosen by a hash of the name, are a test set. A change
 it made the other two thirds faster and did not make the test third slower, so a change that helps
 only the workload it was written for shows up as a test set that did not move.
 
-Measured on 3 October 2026, ten rounds each, on the machine in the summary. The rows are the
-geometric mean of each set's ratios, where above 1.00x is faster than SQLite.
+Measured on 3 October 2026, ten rounds each, on the machine in the summary, with release 2.1.1
+and the two answer fixes in the changelog before the changes, and release 2.1.2 after them. A speed row is the geometric mean of each set's
+ratios against SQLite.
 
-| Plan, through the Connection | Before | After |
-|---|---|---|
-| hillclimb plan, 28 train workloads | 0.85x | **1.30x** |
-| hillclimb plan, 20 test workloads | 0.67x | **1.15x** |
-| hillclimb plan, peak resident memory of one round | 100.96 MiB (SQLite 38.30) | 82.82 MiB (SQLite 38.27) |
-| hillclimb plan, processor time of one round | 3,906 ms (SQLite 1,820) | 1,750 ms (SQLite 1,891) |
-| contract plan, weighted over the ten families | 1.94x | **2.37x** |
-
-The contract plan through the pipeline read 5.12x before and 5.10x after.
-
-The workloads that moved most:
-
-| Workload | Before | After | What changed |
+| Through the Connection | 2.1.1 | 2.1.2 | Change in inillucent |
 |---|---|---|---|
-| `edge.or.two.indexes` | 0.002x | 1.58x | an `OR` whose every arm can use an index reads each arm's index and then each row once, shown as `MULTI-INDEX OR` |
-| `edge.not.in` | 0.005x | 1.11x | `IN` and `NOT IN` over 8 or more constants, written out or from a subquery, are answered by a binary search |
-| `prepare.trivial`, contract plan | 0.05x | 1.98x | a statement that reads no table and calls no registered function takes no file lock |
-| `ai.build` | 0.35x | 1.20x | the next rowid is read from the last row of the rightmost leaf instead of from every live row in it |
-| `app.cte.recursive` | 0.15x | 0.46x | a recursive CTE prepares its step once and runs it on each pass |
-| `edge.like.contains` | 0.33x | 0.85x | `LIKE` with no `ESCAPE` compares text in place |
-| `edge.group.high` | 0.24x | 0.45x | a hash `GROUP BY` keeps each group's position in the map and its accumulators in one vector |
-| `app.upsert.counter` | 0.94x | 2.29x | an `UPDATE` uses the leaf the read before it found |
+| hillclimb plan, 28 train workloads | 18% slower than SQLite | **30% faster** than SQLite | 53% faster |
+| hillclimb plan, 20 test workloads | 49% slower than SQLite | **15% faster** than SQLite | 71% faster |
+| hillclimb plan, all 48 workloads | 30% slower than SQLite | **24% faster** than SQLite | 60% faster |
+| hillclimb plan, peak resident memory of one round | 100.96 MiB, 164% more than SQLite | 82.82 MiB, 116% more than SQLite | 18% less memory |
+| hillclimb plan, processor time of one round | 3,906 ms, 115% more than SQLite | 1,750 ms, 7% less than SQLite | 55% less processor time |
+| contract plan, weighted over the ten families | 94% faster than SQLite | **137% faster** than SQLite | 22% faster |
 
-Five workloads are still under 0.5x: `ai.copy` (0.22x), `edge.delete.range` (0.18x),
-`churn.delete.half` (0.26x), `edge.update.all` (0.28x) and `app.insert.returning` (0.35x). Each
-writes many rows, and each logs a page image for every leaf it changes where SQLite logs less.
+The contract plan through the pipeline, the headline at the top of this page, read 412% faster
+before and 410% faster after, which is the same within a run's noise.
+
+The four largest changes are clearest as times. Each is the median time for the workload's
+repetitions in one round.
+
+| Workload | inillucent 2.1.1 | inillucent 2.1.2 | SQLite | What changed |
+|---|---|---|---|---|
+| `edge.or.two.indexes`, 100 queries | 588 ms | 0.88 ms | 1.38 ms | an `OR` whose every arm can use an index reads each arm's index and then each row once, shown as `MULTI-INDEX OR` |
+| `edge.not.in`, 2 queries | 958 ms | 4.44 ms | 5.01 ms | `IN` and `NOT IN` over 8 or more constants, written out or from a subquery, are answered by a binary search |
+| `extension.json`, contract plan, 4,000 statements | 24.4 ms | 1.70 ms | 1.12 ms | a statement that reads no table and calls no registered function takes no file lock |
+| `prepare.trivial`, contract plan, 4,000 statements | 23.3 ms | 0.82 ms | 1.62 ms | the same change, for `SELECT 1` |
+
+The other workloads that moved, as the change in inillucent's own speed:
+
+| Workload | Against SQLite, 2.1.1 | Against SQLite, 2.1.2 | Change in inillucent | What changed |
+|---|---|---|---|---|
+| `app.insert.prepare_each` | 424% slower | 37% slower | 282% faster | the next rowid is read from the last row of the rightmost leaf instead of from every live row in it |
+| `ai.build` | 188% slower | 20% faster | 246% faster | the same |
+| `app.cte.recursive` | 571% slower | 116% slower | 211% faster | a recursive CTE prepares its step once and runs it on each pass |
+| `edge.like.contains` | 205% slower | 17% slower | 160% faster | `LIKE` with no `ESCAPE` compares text in place |
+| `app.upsert.counter` | 7% slower | 129% faster | 145% faster | an `UPDATE` uses the leaf the read before it found |
+| `edge.group.high` | 320% slower | 122% slower | 89% faster | a hash `GROUP BY` keeps each group's position in the map and its accumulators in one vector |
+| `app.insert.returning` | 435% slower | 189% slower | 85% faster | the rowid change |
+| `edge.update.all` | 510% slower | 261% slower | 69% faster | the `UPDATE` change |
+| `churn.delete.half` | 502% slower | 288% slower | 56% faster | a bulk delete looks first in the leaf the last delete used |
+| `ai.group.total` | 73% faster | 169% faster | 55% faster | the `GROUP BY` change |
+| `edge.delete.range` | 625% slower | 446% slower | 32% faster | the bulk delete change |
+| `ai.copy` | 452% slower | 350% slower | 23% faster | `INSERT ... SELECT` reads the query's rows where they are instead of copying them |
+| `churn.scan` | 48% slower | 25% slower | 18% faster | a scan of a table that took writes fills its columns without a vector per row |
+| `check.fresh` | 33% slower | 17% slower | 14% faster | the same |
+| `ai.count` | 117% slower | 97% slower | 10% faster | the same |
+| `app.json.where` | 111% slower | 93% slower | 9% faster | `json_extract` over distinct documents stops keeping each one |
+
+Five workloads were still more than 100% slower than SQLite after 2.1.2: `edge.delete.range`
+(446% slower), `ai.copy` (350%), `churn.delete.half` (288%), `edge.update.all` (261%) and
+`app.insert.returning` (189%). Each writes many rows, and each logs a page image for every leaf it
+changes where SQLite logs less.
+
+### A copy into an empty table
+
+`ai.copy` is `INSERT INTO copied SELECT ... FROM main_table`, 100,000 rows into an empty table. It
+now builds the table's tree in one pass, the way `CREATE INDEX` builds an index, and logs no page
+images ([how it works](relational-architecture.md#a-copy-into-an-empty-table)). Measured on 3
+October 2026, ten rounds, two runs of each build, with the two other tickets on this machine paused:
+
+| Through the Connection | Before | After | Change in inillucent |
+|---|---|---|---|
+| `ai.copy` | 191.0 ms, 352% slower than SQLite | 55.8 ms, 35% slower than SQLite | 242% faster |
+| hillclimb plan, 28 train workloads | 30% faster than SQLite | **40% faster** than SQLite | 8% faster |
+| hillclimb plan, 20 test workloads | 13% faster than SQLite | **15% faster** than SQLite | 1% faster |
+| peak resident memory of one round | 79.75 MiB | 75.53 MiB | 5% less memory |
+| processor time of one round | 1,813 ms | 1,609 ms | 11% less processor time |
+
+The same copy into a table with a plain index and a unique index took 715 ms to 1,213 ms before and
+109 ms to 132 ms after, against 132 ms to 146 ms in SQLite, timed with each engine's shell.
+
+Four other workloads moved, and none of them runs the bulk build. `edge.delete.range` (443% slower
+than SQLite before, 181% slower after) and `app.insert.returning` (199% slower before, 5% slower
+after) are faster. `churn.update.grow` (266% faster than SQLite before, 151% faster after) and
+`edge.update.all` (265% slower before, 435% slower after) are slower. The cause is the log
+housekeeping that runs once the log has grown by 4 MiB. The old copy wrote enough log to run it
+during `ai.copy`; the new copy writes almost none, so the next two runs of it land on other
+workloads. Each pair moves by about 24 ms in opposite directions, and the plan's time without
+`ai.copy`, summed over the medians of every other workload, is 1,845.4 ms and 1,837.6 ms before and
+1,845.5 ms and 1,837.8 ms after. `edge.delete.range` also gains from deleting out of packed leaves.
 
 The three workloads bound by `fsync` (`txn.autocommit`, `txn.batched` and
-`write.insert.autocommit`) read slower in the after run than in the before run. SQLite's own time
-for them rose 3.3x to 5.6x between the two runs. Run again back to back on the same disk, the build
-before these changes and the build after them read the same: `txn.autocommit` 1.06x and 1.03x,
-`write.insert.autocommit` 3.12x and 3.15x.
+`write.insert.autocommit`) read slower in the 2.1.2 run than in the 2.1.1 run, and the write
+workloads of the contract plan read faster. SQLite's own time for the three rose 3.3 to 5.6 times
+between the two runs, so the disk was slower. Run again back to back on the same disk, the two
+builds read the same: `txn.autocommit` 6% and 3% faster than SQLite, `write.insert.autocommit`
+212% and 215% faster. Neither the losses nor the gains of those workloads are counted above.
+
+### A `DELETE` or `UPDATE` of many rows
+
+A `DELETE` or `UPDATE` that nothing can watch now changes each leaf once for all of its rows there,
+with the same log records as before. The second hill climb below changed the records a bulk
+`DELETE` writes
+([how it works](relational-architecture.md#a-delete-or-update-of-many-rows)). Measured on
+3 October 2026 through the Connection, hillclimb plan, ten rounds, two runs of each build in
+turn, with three other tickets working on this machine:
+
+| Through the Connection | Before | After | Change in inillucent |
+|---|---|---|---|
+| `edge.delete.range`, 40,000 rows | 32.5 ms, 181% slower than SQLite | 23.8 ms, 107% slower than SQLite | 35% faster |
+| `churn.delete.half`, three trees | 72.5 ms, 289% slower than SQLite | 64.2 ms, 246% slower than SQLite | 13% faster |
+| `edge.update.all`, every row of `side_table` | 75.3 ms, 435% slower than SQLite | 68.8 ms, 374% slower than SQLite | 13% faster |
+| hillclimb plan, 28 train workloads | 40% faster than SQLite | **43% faster** than SQLite | 2% faster |
+| hillclimb plan, 20 test workloads | 15% faster than SQLite | **16% faster** than SQLite | 1% faster |
+| peak resident memory of one round | 75.46 MiB | 75.93 MiB | 0.6% more memory |
+| processor time of one round | 1,633 ms | 1,562 ms | 4% less processor time |
+
+Each row still writes one log record and one undo entry, which is most of what is left of the
+difference from SQLite. An `UPDATE` gains less than a `DELETE` because a row whose new value does
+not fit where the old one lies is still written row by row. In a profile of
+`UPDATE copied SET label = label || '!'` over 100,000 rows, that path was a quarter of the time spent writing rows. `edge.group.high` read 6% slower in this comparison
+and 0.2% faster in an earlier one of the delete change alone; it is a `GROUP BY` that writes
+nothing, and it is recorded here as noise.
+
+### A second hill climb
+
+Release 2.1.2 was still slower than SQLite on 29 of the 82 workloads the two plans run through the
+Connection. A second hill climb, by the same rules, took that to 17. Measured on 4 October 2026,
+ten rounds, two runs of each build in turn, release 2.1.2 against this release:
+
+| Through the Connection | 2.1.2 | This release | Change in inillucent |
+|---|---|---|---|
+| hillclimb plan, 28 train workloads | 44% faster than SQLite | **84% faster** than SQLite | 28% faster |
+| hillclimb plan, 20 test workloads | 20% faster than SQLite | **50% faster** than SQLite | 25% faster |
+| hillclimb plan, all 48 workloads | 34% faster than SQLite | **69% faster** than SQLite | 26% faster |
+| contract plan, 25 train workloads | 88% faster than SQLite | **119% faster** than SQLite | 16% faster |
+| contract plan, 9 test workloads | 67% faster than SQLite | **94% faster** than SQLite | 16% faster |
+| hillclimb plan, peak resident memory of one round | 77.5 MiB, 102% more than SQLite | 60.6 MiB, 58% more than SQLite | 22% less memory |
+| hillclimb plan, processor time of one round | 1,586 ms, 16% less than SQLite | 1,250 ms, 34% less than SQLite | 21% less processor time |
+
+The 2.1.2 column reads faster here than in the table above because it is a different day's run of
+the same build; both builds in this table were run on the same day, in turn.
+
+| Workload | Against SQLite, 2.1.2 | Against SQLite, now | Change in inillucent | What changed |
+|---|---|---|---|---|
+| `correlated.in` | 900% slower | 10% slower | 810% faster | a correlated `IN` over two `NOT NULL` columns is one `EXISTS`, and an `EXISTS` whose `WHERE` is an index equality on the outer row is answered by probing the index |
+| `edge.group.high` | 124% slower | 52% faster | 241% faster | a `GROUP BY` term in the select list is read from the group's key instead of kept from a row, and the groups' keys are kept in one table |
+| `ai.count` | 98% slower | 72% faster | 240% faster | a reader keeps a packed copy of a leaf that took writes once it has read it twice |
+| `edge.update.all` | 367% slower | 56% slower | 199% faster | a leaf whose rows outgrew their slots is repacked once with all its changes |
+| `correlated.exists` | 78% slower | 62% faster | 188% faster | the index probe above |
+| `app.cte.recursive` | 115% slower | 12% faster | 141% faster | a recursive step that reads only its queue is evaluated directly, and a one row pass builds nothing |
+| `extension.json` | 49% slower | 45% faster | 116% faster | a JSON call over literals is answered once |
+| `check.fresh` | 15% slower | 85% faster | 114% faster | the packed copy, and a scan reads only the columns the statement reads |
+| `edge.delete.range` | 108% slower | 4% slower | 100% faster | a bulk delete logs one record per leaf it changes |
+| `ai.group.newest` | 56% slower | 23% faster | 92% faster | the packed copy |
+| `churn.scan` | 27% slower | 36% faster | 73% faster | the column change |
+| `app.json.where` | 93% slower | 19% slower | 62% faster | `json_extract` builds only the part of a document its path reads |
+| `edge.like.contains` | 17% slower | 26% faster | 47% faster | `LIKE '%text%'` searches for the first byte before comparing |
+| `edge.in.long` | 47% slower | 2% slower | 44% faster | the column change |
+| `app.window.rank` | 17% slower | 23% faster | 43% faster | a window computes its values over its rows and moves them, where it copied every row five times |
+
+Of the 17 workloads still slower, five are more than 25% slower. `churn.delete.half` (192% slower)
+merges half empty leaves; leaving them unmerged made the delete 0.84 of SQLite's speed and the
+refill that follows it 0.32. `correlated.scalar.selective` and `correlated.exists.selective` (83%
+and 71% slower) answer four outer rows, and the gate times one execution with its compile: the
+round's warming reads every table but no index, so the four probes read cold index pages. At 50
+executions a sample both are faster than SQLite. `edge.update.all` (56% slower) is 4% faster than
+SQLite when it runs alone; in the plan, SQLite's cache is warm from the inserts before it.
+`check.counters` (35% slower) is one execution of a small aggregate, most of it compile.
+`tasks/task-2183-performance-hillclimb-2.md` lists every change, every measurement and the changes
+that were tried and not kept.
 
 ## What this page does not measure
 
@@ -1010,10 +1137,37 @@ indexes dropped gives what they cost.
 | `CompactLeaf` | 181 | 11.3 KiB | 0.7% |
 | `AllocPage`, `Commit` | 10 | 0.4 KiB | 0.03% |
 
-The indexes are where the time is. The split records are where the log bytes are. A split record
-holds the left page, the right page and the parent in full: 98,384 bytes at a 32 KiB page. A logical
-split record would take 55% off the log's size and about 2% off the workload's time, because the log
-is written and synced once at the commit.
+The indexes are where the time is. The split records were where the log bytes were. A split record
+held the left page, the right page and the parent in full: 98,384 bytes at a 32 KiB page.
+
+A split is now logged as a `SplitLeaf` record: the rows that moved, the key the parent gained, and
+how many rows the leaf kept. `docs/relational-architecture.md` says how recovery rebuilds the three
+pages from it. The same workload, measured on 2026-10-04 with both builds on the same fixture:
+
+| | before | after |
+|---|---:|---:|
+| log written, with both indexes | 1,553.9 KiB | 734.4 KiB, **53% less** |
+| bytes for the 9 splits | 864.7 KiB, 98,384 a split | 45.2 KiB, 5,148 a split |
+| log written, without either index | 1,160.4 KiB | 400.9 KiB, **65% less** |
+| bytes for the 8 splits | 768.6 KiB | 9.0 KiB, 1,157 a split |
+
+The splits without the indexes are rows arriving in key order, so the leaf keeps 95% of its rows and
+the record carries the other 5%. The wall time of this one transaction did not move: 24.50 ms
+against 24.25 ms with the indexes, because the log is written and synced once at the commit.
+
+Where many transactions each write their log, the smaller record is measurable. Three alternating
+pairs of `inillucent-fullgate --plan hillclimb --api connection --rounds 10` on 2026-10-04, with no
+other work loading the processor, scored with `tools/perf-hillclimb/score.mjs`:
+
+| workload | change |
+|---|---:|
+| `ai.build`, 20,000 inserts committed every 500 into a table with two indexes | 11.7% faster |
+| `ai.append` | 14.9% faster |
+| `app.insert.prepare_each` | 11.8% faster |
+| `churn.update.grow` | 52.9% faster |
+| the 28 tuned workloads, geometric mean | 1.4% faster |
+| the 20 held out workloads, geometric mean | 2.9% faster |
+| processor time of one round | 3.8% lower |
 
 `WriteStats::room_nanos` times `make_room`, which compacts or splits a leaf:
 

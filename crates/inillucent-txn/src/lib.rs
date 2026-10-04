@@ -62,7 +62,7 @@ pub mod version;
 pub use engine::{
     Begin, Engine, EngineOptions, EngineStats, RecordingUndo, RefuseUndo, Transaction, UndoSink,
 };
-pub use redo::{Applier, RedoStats, RefuseRows, RowRedo};
+pub use redo::{Applier, LogicalSplit, RedoStats, RefuseRows, RowRedo};
 pub use slot::{SlotStats, WriterGuard, WriterSlot};
 pub use undo::{Undo, UndoBuffer};
 pub use version::{Clock, Cts, Snapshot, TxnId, VersionLog, Visible, FIRST_CTS};

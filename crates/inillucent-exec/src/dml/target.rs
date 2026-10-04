@@ -416,6 +416,7 @@ impl RowSpace {
         for (term, source) in sources.iter().enumerate() {
             stages.push(PreparedStage {
                 functions: Vec::new(),
+                needed: None,
                 root: layout.tree_key,
                 // These stages read no tree: they are row images the caller
                 // already holds. `Materialised` is the kind that says so.
@@ -759,6 +760,27 @@ pub(crate) fn highest_rowid(target: &mut dyn WriteTarget, table: &TableInfo) -> 
         return Ok(0);
     }
     largest_key(tree, database.pool())
+}
+/// Reports whether a rowid table holds no live row.
+///
+/// Walks from the rightmost leaf leftwards and stops at the first leaf that
+/// holds a live row, so a table with rows answers after one leaf. A table
+/// whose rows were all deleted is walked to the end, because a leaf can be
+/// left holding nothing but tombstones and only reading it says so.
+///
+/// @param target - the file and its trees
+/// @param table - the table, which must be keyed by its rowid alone
+pub(crate) fn holds_no_row(target: &mut dyn WriteTarget, table: &TableInfo) -> DbResult<bool> {
+    let (database, trees, _) = target.parts_for(table.root)?;
+    let Some(tree) = trees.get(table.root) else {
+        return Err(missing_tree(table));
+    };
+    let mut found = false;
+    tree.visit_reverse(database.pool(), None, &mut |leaf| {
+        found = largest_in_leaf(leaf)?.is_some();
+        Ok(!found)
+    })?;
+    Ok(!found)
 }
 /// Returns the largest integer key in a tree.
 ///

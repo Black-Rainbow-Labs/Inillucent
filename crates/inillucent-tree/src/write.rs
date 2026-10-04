@@ -40,7 +40,7 @@
 use inillucent_base::error::{corrupt, misuse};
 use inillucent_base::DbResult;
 use inillucent_pool::extent::ExtentRef;
-use inillucent_pool::interior::{InteriorBuilder, InteriorRef};
+use inillucent_pool::interior::InteriorBuilder;
 use inillucent_pool::page;
 use inillucent_pool::{Database, PageId, Pool, Swip};
 use inillucent_wal::record::{Body, Structural};
@@ -49,6 +49,9 @@ use crate::datum::{Datum, OwnedDatum};
 use crate::leaf::{ImageTiming, LeafBuilder, LeafRef, Packed, Rows};
 use crate::mutate::{DeltaOffsets, DeltaPlan, LeafMut};
 use crate::paged::PagedTree;
+
+mod sorted;
+pub use sorted::{Rewrite, UpdateRun};
 
 /// Reports whether a key sorts after a row's key.
 ///
@@ -101,9 +104,9 @@ fn is_above(
 /// @param builder - the packer, at this tree's page size and columns
 /// @param rows - the rows being split, sorted by key
 /// @param fill - how full to prefer the left half
-fn rows_for_the_left_half(
+fn rows_for_the_left_half<'d, R: AsRef<[Datum<'d>]>>(
     builder: &LeafBuilder,
-    rows: &[Vec<Datum<'_>>],
+    rows: &[R],
     fill: f64,
 ) -> DbResult<usize> {
     let most = rows.len().saturating_sub(1);
@@ -141,13 +144,72 @@ enum Fit {
     Compact(Vec<u8>, PageId, u64, bool),
     /// They do not, so the leaf splits and the rows have to outlive the borrow.
     /// The flag says whether the rows are arriving in key order.
-    Split(Vec<Vec<OwnedDatum>>, bool),
+    ///
+    /// **A copy of the page, not of its rows (task-2183).** The rows used to
+    /// leave the borrow as owned values: a vector per row and another per text
+    /// or blob value, five thousand allocations for a leaf of a thousand rows of
+    /// five columns, and then a borrowed vector per row again. A split took 0.4
+    /// to 0.9 ms of which most was those allocations. The page is one copy of
+    /// its bytes, and the rows are read out of it in place.
+    Split(Vec<u8>, bool),
     /// Neither will help, because the leaf holds fewer than two live rows: a
     /// compaction of one row produces the page that is already there, and a
     /// split needs two rows to have something to put on each side. The caller
     /// packs the arriving row into the leaf itself rather than making room for
     /// it in the delta area - see [`Tree::pack_row_into_leaf`].
     Stuck,
+}
+
+/// The refusal a split of fewer than two rows answers with.
+///
+/// **The sentence a caller reads, because the one that was here was
+/// not one (task-1979, section 10, D2).** `misuse` keeps its words
+/// inside the process, so what reached every front end was the
+/// primary code's own text, `bad parameter or other API misuse`, for
+/// a statement that is written correctly.
+///
+/// **What is left here is a narrow case, and it used to be a wide
+/// one.** Until task-1986 the reason a large value stayed inline was
+/// almost always the column's declaration - only a column declared
+/// `TEXT` holding a text or `BLOB` holding bytes could have an
+/// extent - so `CREATE TABLE t (a)` refused 32,680 bytes and this
+/// was the sentence that said why. A value of any class now goes out
+/// of line whatever the column says, so what reaches this is a row
+/// that is too large for a page with every one of its values already
+/// outside it: a key column, which is never spilled because a
+/// descent compares keys, or enough columns just under the spill
+/// threshold to fill a page between them.
+fn row_larger_than_a_page() -> inillucent_base::error::DbError {
+    inillucent_base::error::statement_refusal(
+        "this row is larger than a page even with its large values stored outside it;          a key column is never stored outside the page, so a key this long has to be          shortened, and a row of many values just under the page's eighth has to be          split across tables",
+    )
+}
+
+/// What a leaf split did, for the record that describes it.
+///
+/// Gathered in one place because the two record forms need different parts of
+/// it, and `split_carrying` decides which form after it has done the split.
+struct SplitPages<'s> {
+    /// The page holding the left half.
+    left: PageId,
+    /// The new page holding the right half.
+    right: PageId,
+    /// The interior page the separator went into.
+    parent: PageId,
+    /// The page the right half points at.
+    right_sibling: PageId,
+    /// The commit watermark both halves carry.
+    max_cts: u64,
+    /// The LSN the split leaf carried before the split.
+    from_lsn: u64,
+    /// How many rows the left half keeps.
+    kept: usize,
+    /// The right half's first key, encoded.
+    separator: &'s [u8],
+    /// The left half's page, without its LSN.
+    left_image: &'s [u8],
+    /// The right half's page, without its LSN.
+    right_image: &'s [u8],
 }
 
 /// Reports whether a leaf holds fewer than half the rows it was packed with.
@@ -396,6 +458,56 @@ pub trait TreeLog {
         let _ = (tree, key, before);
         Ok(())
     }
+
+    /// Records what one row looked like before a write changed it, as where it lies in a copy of its leaf.
+    ///
+    /// **The row is read out of the copy only if it is ever needed (task-2183).**
+    /// A statement that deletes forty thousand rows copied every value of
+    /// every one of them into its undo images, a third of the statement, and a
+    /// statement that succeeds never reads one. The write path takes one copy
+    /// of the leaf for a run of rows and names each row's place in it; a log
+    /// that keeps the copy reads the row back with [`row_from_page`] when a
+    /// rollback needs it. This default reads it now and hands it to
+    /// [`TreeLog::undo`], which is what every log did before.
+    ///
+    /// The copy must hold no out-of-line value: the run that frees one has
+    /// read it already and calls [`TreeLog::undo`] instead.
+    ///
+    /// @param tree - the tree the row is in
+    /// @param key - the row's key columns
+    /// @param page - the leaf's bytes before the write
+    /// @param located - where the row lies in them
+    fn undo_from_page(
+        &mut self,
+        tree: u64,
+        key: &[Datum<'_>],
+        page: &std::rc::Rc<[u8]>,
+        located: Located,
+    ) -> DbResult<()> {
+        let row = row_from_page(page, located)?;
+        self.undo(tree, key, Some(row))
+    }
+}
+
+/// Reads one row out of a copy of a leaf.
+///
+/// The reader of [`TreeLog::undo_from_page`]'s copies. The copy holds no
+/// out-of-line value, so every value is on the page.
+///
+/// @param page - the leaf's bytes
+/// @param located - where the row lies in them
+pub fn row_from_page(page: &[u8], located: Located) -> DbResult<Vec<OwnedDatum>> {
+    let leaf = LeafRef::parse(page)?;
+    let mut row = Vec::with_capacity(leaf.column_count());
+    for column in 0..leaf.column_count() {
+        let value = match located {
+            Located::Sorted(at) => leaf.value(at, column)?,
+            Located::Delta(index) => leaf.delta_value(index, column)?,
+            Located::Absent => return Err(corrupt("an undo image names a row that is not there")),
+        };
+        row.push(OwnedDatum::from_datum(&value));
+    }
+    Ok(row)
 }
 
 /// A [`Spill`] that answers with a reference to nowhere.
@@ -1870,18 +1982,8 @@ impl PagedTree {
                 leaf.has_delta_directory() && !splice_allowed,
             ),
             // A split rewrites three pages and needs the rows to outlive the
-            // guard, so this is where they are copied - and a split is the
-            // rarer half by a wide margin.
-            None => Fit::Split(
-                (0..source.len())
-                    .map(|row| {
-                        (0..source.width())
-                            .map(|column| OwnedDatum::from_datum(&source.value(row, column)))
-                            .collect()
-                    })
-                    .collect(),
-                appending,
-            ),
+            // guard, so the page is copied; see `Fit::Split`.
+            None => Fit::Split(leaf.bytes().to_vec(), appending),
         })
     }
 
@@ -1963,11 +2065,18 @@ impl PagedTree {
                 self.compact_into(database, log, page, image, right, max_cts, logical)?;
                 Ok(true)
             }
-            Fit::Split(rows, appending) => {
-                let borrowed: Vec<Vec<Datum<'_>>> = rows
-                    .iter()
-                    .map(|row| row.iter().map(OwnedDatum::borrow).collect())
-                    .collect();
+            Fit::Split(copy, appending) => {
+                // The leaf's comparisons are needed only for the merge below,
+                // and borrowing them from the tree would hold it across the
+                // split that changes it.
+                let collations = self.collations().to_vec();
+                let directions = self.directions().to_vec();
+                let leaf = LeafRef::parse(&copy)?
+                    .with_collations(&collations)
+                    .with_directions(&directions);
+                let source = leaf.live_source()?;
+                let borrowed: Vec<&[Datum<'_>]> =
+                    (0..source.len()).map(|row| source.row(row)).collect();
                 // **An append splits lopsidedly.** Half and half is right when
                 // rows arrive from everywhere: both pages then have room for
                 // the next one wherever it lands. When they arrive in order,
@@ -2060,7 +2169,10 @@ impl PagedTree {
             kept
         } else {
             let fill = if appending { APPEND_FILL } else { SPLIT_FILL };
-            self.split_carrying(database, log, page, path, rows, carried, fill)?
+            // `Some`: these rows were read past the leaf's out of line
+            // values, which a replay reading the page would not see the same
+            // way, so this split is logged with its page images.
+            self.split_carrying(database, log, page, path, rows, Some(carried), fill)?
         };
         for reference in held {
             if kept.contains(&reference) {
@@ -2145,20 +2257,18 @@ impl PagedTree {
     /// @param path - the interior pages above it, root first
     /// @param rows - its live rows, sorted
     /// @param fill - how full to pack the left half
-    fn split(
+    fn split<'d, R: AsRef<[Datum<'d>]>>(
         &mut self,
         database: &mut Database,
         log: &mut dyn TreeLog,
         page: PageId,
         path: &[PageId],
-        rows: &[Vec<Datum<'_>>],
+        rows: &[R],
         fill: f64,
     ) -> DbResult<()> {
         // A leaf with no out-of-line values carries none, and the split then
         // spills nothing because nothing is over the threshold.
-        let carried: Vec<Vec<Option<ExtentRef>>> =
-            rows.iter().map(|row| vec![None; row.len()]).collect();
-        self.split_carrying(database, log, page, path, rows, &carried, fill)?;
+        self.split_carrying(database, log, page, path, rows, None, fill)?;
         Ok(())
     }
 
@@ -2172,43 +2282,28 @@ impl PagedTree {
     /// @param page - the leaf being split
     /// @param path - the interior pages above it, root first
     /// @param rows - its live rows, sorted
-    /// @param carried - the reference each already-out-of-line value is in
+    /// @param carried - the reference each already-out-of-line value is in, or
+    ///   `None` when `rows` are the leaf's live rows as a replay reading the
+    ///   page would see them and none is out of line, which a logical record
+    ///   needs
     /// @param fill - how full to pack the left half
-    fn split_carrying(
+    fn split_carrying<'d, R: AsRef<[Datum<'d>]>>(
         &mut self,
         database: &mut Database,
         log: &mut dyn TreeLog,
         page: PageId,
         path: &[PageId],
-        rows: &[Vec<Datum<'_>>],
-        carried: &[Vec<Option<ExtentRef>>],
+        rows: &[R],
+        carried: Option<&[Vec<Option<ExtentRef>>]>,
         fill: f64,
     ) -> DbResult<Vec<ExtentRef>> {
         if rows.len() < 2 {
-            // **The sentence a caller reads, because the one that was here was
-            // not one (task-1979, section 10, D2).** `misuse` keeps its words
-            // inside the process, so what reached every front end was the
-            // primary code's own text, `bad parameter or other API misuse`, for
-            // a statement that is written correctly.
-            //
-            // **What is left here is a narrow case, and it used to be a wide
-            // one.** Until task-1986 the reason a large value stayed inline was
-            // almost always the column's declaration - only a column declared
-            // `TEXT` holding a text or `BLOB` holding bytes could have an
-            // extent - so `CREATE TABLE t (a)` refused 32,680 bytes and this
-            // was the sentence that said why. A value of any class now goes out
-            // of line whatever the column says, so what reaches this is a row
-            // that is too large for a page with every one of its values already
-            // outside it: a key column, which is never spilled because a
-            // descent compares keys, or enough columns just under the spill
-            // threshold to fill a page between them.
-            return Err(inillucent_base::error::statement_refusal(
-                "this row is larger than a page even with its large values stored outside it; \
-                 a key column is never stored outside the page, so a key this long has to be \
-                 shortened, and a row of many values just under the page's eighth has to be \
-                 split across tables",
-            ));
+            return Err(row_larger_than_a_page());
         }
+        let from_live_rows = carried.is_none();
+        // Nothing carried is an empty table: `Carrying` answers a row it has
+        // no entry for as carrying nothing, so no vector a row is needed.
+        let carried: &[Vec<Option<ExtentRef>>] = carried.unwrap_or(&[]);
         let builder = LeafBuilder::new(
             self.page_size(),
             self.tree_id(),
@@ -2226,7 +2321,7 @@ impl PagedTree {
         // The two halves are encoded with their own slices of the carried table,
         // because the spiller is asked by *position among the rows it is
         // packing* and the right half's first row is row zero to it.
-        let (mut left_image, mut right_image, kept) = {
+        let (mut left_image, mut right_image, kept, moved_nothing) = {
             let mut spiller = crate::paged::Carrying {
                 inner: crate::paged::Extender {
                     database,
@@ -2240,19 +2335,30 @@ impl PagedTree {
             let left = builder.encode_with(left_rows, Some(&mut spiller))?;
             spiller.carried = carried.get(taken..).unwrap_or(&[]).to_vec();
             let right = builder.encode_with(right_rows, Some(&mut spiller))?;
-            (left, right, spiller.used)
+            let moved_nothing = spiller.used.is_empty() && spiller.inner.written.is_empty();
+            (left, right, spiller.used, moved_nothing)
         };
         let separator = {
             let head: Vec<Datum<'_>> = right_rows
                 .first()
-                .map(|row| row.iter().copied().take(self.key_columns()).collect())
+                .map(|row| {
+                    row.as_ref()
+                        .iter()
+                        .copied()
+                        .take(self.key_columns())
+                        .collect()
+                })
                 .unwrap_or_default();
             self.encode_key(&head)
         };
-        let (old_right, max_cts) = {
+        let (old_right, max_cts, from_lsn) = {
             let guard = database.pool().fetch(page)?;
             let leaf = LeafRef::parse(&guard)?;
-            (leaf.right_sibling(), leaf.max_cts())
+            (
+                leaf.right_sibling(),
+                leaf.max_cts(),
+                crate::page::read_u64(&guard, page::header::LSN)?,
+            )
         };
         crate::page::write_u64(&mut left_image, crate::leaf::leaf_header::MAX_CTS, max_cts)?;
         crate::page::write_u64(&mut right_image, crate::leaf::leaf_header::MAX_CTS, max_cts)?;
@@ -2273,28 +2379,35 @@ impl PagedTree {
         };
         page::set_right(&mut left_image, right_page)?;
 
-        // `true`: the `Structural` record logged a few lines below reads this
-        // exact page back and carries it whole as `parent_image`, so neither
-        // branch needs to log it a second time here.
-        let parent = if path.is_empty() {
-            self.build_root(database, log, left_page, &separator, right_page, true)?
+        // `true`: the record logged a few lines below describes this page,
+        // either whole or as the separator it gained, so neither branch needs
+        // to log it a second time here.
+        let (parent, direct) = if path.is_empty() {
+            let root = self.build_root(database, log, left_page, &separator, right_page, true)?;
+            (root, false)
         } else {
             self.insert_separator(database, log, page, path, &separator, right_page, true)?
         };
-        let parent_image = {
-            let guard = database.pool().fetch(parent)?;
-            guard.bytes().to_vec()
-        };
-        let lsn = log.log(Body::Structural {
-            kind: Structural::Split,
-            tree: self.tree_id(),
-            left: left_page.0,
-            right: right_page.0,
-            parent: parent.0,
+        let split = SplitPages {
+            left: left_page,
+            right: right_page,
+            parent,
+            right_sibling: old_right,
+            max_cts,
+            from_lsn,
+            kept: taken,
+            separator: &separator,
             left_image: &left_image,
             right_image: &right_image,
-            parent_image: &parent_image,
-        })?;
+        };
+        // **Logged as what it did whenever a replay can redo each page from
+        // that page alone** - see `Body::SplitLeaf` for the three conditions
+        // and `crate::split_log` for the replay.
+        let lsn = if from_live_rows && moved_nothing && direct {
+            self.log_logical_split(database, log, &split, right_rows)?
+        } else {
+            self.log_split_images(database, log, &split)?
+        };
         page::write_u64(&mut left_image, page::header::LSN, lsn)?;
         page::write_u64(&mut right_image, page::header::LSN, lsn)?;
         database.install(left_page, &left_image)?;
@@ -2311,6 +2424,140 @@ impl PagedTree {
         stats.splits = stats.splits.saturating_add(1);
         self.stats.set(stats);
         Ok(kept)
+    }
+
+    /// Logs a split as its three page images.
+    ///
+    /// The form every split took before `Body::SplitLeaf` existed, and the one
+    /// a split still takes when a replay could not redo each page from that
+    /// page alone: a root split, a parent with no room, and a split that moved
+    /// an out of line value.
+    ///
+    /// @param database - the file, for the parent's bytes as they now are
+    /// @param log - where the record goes
+    /// @param split - the split's pages and facts
+    fn log_split_images(
+        &self,
+        database: &mut Database,
+        log: &mut dyn TreeLog,
+        split: &SplitPages<'_>,
+    ) -> DbResult<u64> {
+        let parent_image = {
+            let guard = database.pool().fetch(split.parent)?;
+            guard.bytes().to_vec()
+        };
+        log.log(Body::Structural {
+            kind: Structural::Split,
+            tree: self.tree_id(),
+            left: split.left.0,
+            right: split.right.0,
+            parent: split.parent.0,
+            left_image: split.left_image,
+            right_image: split.right_image,
+            parent_image: &parent_image,
+        })
+    }
+
+    /// Logs a split as what it did: the rows the left page keeps, the right
+    /// half's rows, and the separator the parent gained.
+    ///
+    /// **The log volume this removes is most of an insert heavy workload's.**
+    /// The image form is three whole pages, 98,304 bytes at a 32 KiB page,
+    /// for every split. This is the right half's rows and about sixty bytes
+    /// more, and a split of rows arriving in key order keeps ninety five
+    /// percent of them on the left.
+    ///
+    /// In a debug build, which is the build every test runs in, the three
+    /// pages a replay would produce are built and compared with the three this
+    /// split installs, so the record and the replay cannot disagree without a
+    /// test that splits a leaf failing.
+    ///
+    /// @param database - the file, for the debug comparison
+    /// @param log - where the record goes
+    /// @param split - the split's pages and facts
+    /// @param right_rows - the right half's rows
+    fn log_logical_split<'d, R: AsRef<[Datum<'d>]>>(
+        &self,
+        database: &mut Database,
+        log: &mut dyn TreeLog,
+        split: &SplitPages<'_>,
+        right_rows: &[R],
+    ) -> DbResult<u64> {
+        let rows = crate::split_log::encode_rows(right_rows);
+        if cfg!(debug_assertions) {
+            self.check_logical_split(database, split, right_rows)?;
+        }
+        log.log(Body::SplitLeaf {
+            tree: self.tree_id(),
+            left: split.left.0,
+            right: split.right.0,
+            parent: split.parent.0,
+            right_sibling: split.right_sibling.0,
+            max_cts: split.max_cts,
+            from_lsn: split.from_lsn,
+            kept: u32::try_from(split.kept)
+                .map_err(|_| corrupt("a split kept more rows than a leaf can hold"))?,
+            separator: split.separator,
+            rows: &rows,
+        })
+    }
+
+    /// Builds the three pages a replay of a logical split would produce and
+    /// fails when any of them differs from the page this split installs.
+    ///
+    /// Run before the left page is replaced, so the left page in the pool is
+    /// still the one the replay would read; the parent has already been
+    /// rewritten, so its replay is checked against the separators it held
+    /// before, which are its current ones with this split's taken out.
+    ///
+    /// @param database - the file
+    /// @param split - the split's pages and facts
+    /// @param right_rows - the right half's rows
+    fn check_logical_split<'d, R: AsRef<[Datum<'d>]>>(
+        &self,
+        database: &mut Database,
+        split: &SplitPages<'_>,
+        right_rows: &[R],
+    ) -> DbResult<()> {
+        let builder = LeafBuilder::new(
+            self.page_size(),
+            self.tree_id(),
+            self.columns().to_vec(),
+            self.key_columns(),
+        )?;
+        let left = {
+            let guard = database.pool().fetch(split.left)?;
+            let leaf = LeafRef::parse(&guard)?
+                .with_collations(self.collations())
+                .with_directions(self.directions());
+            crate::split_log::left_image(&builder, &leaf, split.kept, split.right, split.max_cts)?
+        };
+        let decoded_bytes = crate::split_log::encode_rows(right_rows);
+        let decoded = crate::split_log::decode_rows(&decoded_bytes)?;
+        let right =
+            crate::split_log::right_image(&builder, &decoded, split.right_sibling, split.max_cts)?;
+        let mut wanted_left = split.left_image.to_vec();
+        page::set_right(&mut wanted_left, split.right)?;
+        let mut wanted_right = split.right_image.to_vec();
+        page::set_right(&mut wanted_right, split.right_sibling)?;
+        if left.as_deref() != Some(wanted_left.as_slice()) || right != wanted_right {
+            return Err(corrupt(format!(
+                "a logical split of leaf {} would replay to different pages than it wrote: \
+                 left {}, right {}",
+                split.left.0,
+                if left.as_deref() == Some(wanted_left.as_slice()) {
+                    "same"
+                } else {
+                    "differs"
+                },
+                if right == wanted_right {
+                    "same"
+                } else {
+                    "differs"
+                },
+            )));
+        }
+        Ok(())
     }
 
     /// Rewrites the root page as an interior with two children.
@@ -2394,6 +2641,9 @@ impl PagedTree {
     /// @param separator - the right half's first key, encoded
     /// @param right - the right half's page
     /// @param folded_by_caller - whether the immediate caller logs this page's image itself
+    /// @returns the page the separator landed in, and whether that was the
+    ///   parent itself with room for it, which is the case a logical split
+    ///   record can describe
     fn insert_separator(
         &mut self,
         database: &mut Database,
@@ -2403,28 +2653,24 @@ impl PagedTree {
         separator: &[u8],
         right: PageId,
         folded_by_caller: bool,
-    ) -> DbResult<PageId> {
+    ) -> DbResult<(PageId, bool)> {
         let parent = path
             .last()
             .copied()
             .ok_or_else(|| corrupt("a split with no parent should have grown the root"))?;
         let ancestors = path.get(..path.len().saturating_sub(1)).unwrap_or(&[]);
-        let (mut separators, mut children, level) = self.read_interior(database.pool(), parent)?;
-        let position = children
-            .iter()
-            .position(|page| *page == left)
-            .ok_or_else(|| corrupt("a child is not in the parent that routes to it"))?;
-        separators.insert(position, separator.to_vec());
-        children.insert(position.saturating_add(1), right);
-
-        let builder = InteriorBuilder::new(self.page_size(), self.tree_id(), level)?;
-        let keys: Vec<&[u8]> = separators.iter().map(Vec::as_slice).collect();
-        if builder.fits(&keys) {
-            let swips: Vec<Swip> = children
-                .iter()
-                .map(|page| Swip::unswizzled(*page))
-                .collect();
-            let mut image = builder.build(&keys, &swips)?;
+        // **The page a logical split's replay rebuilds, built by the function
+        // that replay calls.** See `crate::split_log::parent_image`.
+        let fitted = crate::split_log::parent_image(
+            database.pool(),
+            self.page_size(),
+            self.tree_id(),
+            parent,
+            left,
+            separator,
+            right,
+        )?;
+        if let Some(mut image) = fitted {
             if folded_by_caller {
                 // The caller reads this page back and logs it whole inside its
                 // own `Structural` record a few lines after this returns.
@@ -2437,8 +2683,16 @@ impl PagedTree {
                 page::write_u64(&mut image, page::header::LSN, lsn)?;
                 database.install(parent, &image)?;
             }
-            return Ok(parent);
+            return Ok((parent, true));
         }
+        let (mut separators, mut children, level) = self.read_interior(database.pool(), parent)?;
+        let position = children
+            .iter()
+            .position(|page| *page == left)
+            .ok_or_else(|| corrupt("a child is not in the parent that routes to it"))?;
+        separators.insert(position, separator.to_vec());
+        children.insert(position.saturating_add(1), right);
+        let builder = InteriorBuilder::new(self.page_size(), self.tree_id(), level)?;
 
         // The parent is full, so it splits too: the same shape one level up. The
         // middle separator is *promoted* rather than copied, which is what keeps
@@ -2516,12 +2770,12 @@ impl PagedTree {
             // `Structural` record - it is the interior level's own standalone
             // page, and this is the only record that will ever describe it.
             self.build_root(database, log, moved, &promoted, sibling, false)?;
-            return Ok(if landed == parent { moved } else { sibling });
+            return Ok((if landed == parent { moved } else { sibling }, false));
         }
         // Same reasoning as above: propagating a separator past a full
         // interior page has no enclosing `Structural` record to fold into.
         self.insert_separator(database, log, parent, ancestors, &promoted, sibling, false)?;
-        Ok(landed)
+        Ok((landed, false))
     }
 
     /// Returns the parent's contents and this leaf's place in them, when the
@@ -2945,29 +3199,10 @@ impl PagedTree {
         let leaf = LeafRef::parse(&guard)?
             .with_collations(self.collations())
             .with_directions(self.directions());
-        match self.locate_in(&leaf, key)? {
-            Located::Sorted(row) => {
-                // The row's own out-of-line values, not the leaf's: a delete
-                // reads one row out of a leaf that may hold hundreds.
-                let held = self.read_extents_row(pool, &leaf, row)?;
-                let leaf = leaf.with_extents(&held);
-                let mut values = Vec::with_capacity(leaf.column_count());
-                for column in 0..leaf.column_count() {
-                    values.push(OwnedDatum::from_datum(&leaf.value(row, column)?));
-                }
-                Ok(Some(values))
-            }
-            Located::Delta(index) => {
-                let held = self.read_extents_delta(pool, &leaf, index)?;
-                let leaf = leaf.with_extents(&held);
-                let mut values = Vec::with_capacity(leaf.column_count());
-                for column in 0..leaf.column_count() {
-                    values.push(OwnedDatum::from_datum(&leaf.delta_value(index, column)?));
-                }
-                Ok(Some(values))
-            }
-            Located::Absent => Ok(None),
-        }
+        // The row's own out-of-line values, not the leaf's: a delete reads one
+        // row out of a leaf that may hold hundreds.
+        let located = self.locate_in(&leaf, key)?;
+        self.row_in_leaf(pool, &leaf, located)
     }
 
     /// Returns the row a key names in a leaf, copied out, and where it sits.
@@ -2989,28 +3224,9 @@ impl PagedTree {
             .with_collations(self.collations())
             .with_directions(self.directions());
         let located = self.locate_in(&leaf, key)?;
-        let values = match located {
-            Located::Sorted(row) => {
-                let held = self.read_extents_row(pool, &leaf, row)?;
-                let leaf = leaf.with_extents(&held);
-                let mut values = Vec::with_capacity(leaf.column_count());
-                for column in 0..leaf.column_count() {
-                    values.push(OwnedDatum::from_datum(&leaf.value(row, column)?));
-                }
-                values
-            }
-            Located::Delta(index) => {
-                let held = self.read_extents_delta(pool, &leaf, index)?;
-                let leaf = leaf.with_extents(&held);
-                let mut values = Vec::with_capacity(leaf.column_count());
-                for column in 0..leaf.column_count() {
-                    values.push(OwnedDatum::from_datum(&leaf.delta_value(index, column)?));
-                }
-                values
-            }
-            Located::Absent => return Ok(None),
-        };
-        Ok(Some((values, located)))
+        Ok(self
+            .row_in_leaf(pool, &leaf, located)?
+            .map(|values| (values, located)))
     }
 
     /// Returns where a key sits in a leaf already parsed.
@@ -3367,16 +3583,6 @@ impl PagedTree {
         pool: &Pool,
         page: PageId,
     ) -> DbResult<(Vec<Vec<u8>>, Vec<PageId>, u16)> {
-        let guard = pool.fetch(page)?;
-        let interior = InteriorRef::parse(&guard)?;
-        let mut separators = Vec::with_capacity(interior.count());
-        for slot in 0..interior.count() {
-            separators.push(interior.key(slot)?.to_vec());
-        }
-        let mut children = Vec::with_capacity(interior.children());
-        for child in 0..interior.children() {
-            children.push(pool.page_of_swip(interior.swip(child)?)?);
-        }
-        Ok((separators, children, interior.level()))
+        crate::split_log::read_interior(pool, page)
     }
 }

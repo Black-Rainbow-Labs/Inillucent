@@ -5,7 +5,7 @@
 //! written `a=?`, `a>?`, `a<?`, with `<expr>` for a key the index computes.
 
 use super::{AccessPath, AggregationMode, Levers, PhysicalPlan};
-use crate::ast::{BinaryOp, CompoundOp, JoinKind};
+use crate::ast::{BinaryOp, JoinKind};
 use crate::bind::BoundExpr;
 use crate::catalog_view::{TableInfo, TableKind};
 
@@ -103,10 +103,22 @@ pub(super) fn automatic_index_lines(
     shown: &str,
 ) -> Option<Vec<String>> {
     let source = plan.sources.get(position)?;
-    let eligible = position > 0
+    // A derived table is read through an automatic index too, and SQLite
+    // favours one there: the index costs less to build over rows it has just
+    // produced than over a table. It is used even as the first loop, when the
+    // value it is sought by comes from a query enclosing this one.
+    let derived = matches!(
+        source.path,
+        AccessPath::Subquery {
+            correlated: false,
+            ..
+        }
+    );
+    let table = matches!(source.path, AccessPath::TableScan { .. })
+        && source.table.kind == TableKind::Table;
+    let eligible = (position > 0 || derived)
         && plan.levers.has(Levers::AUTOMATIC_INDEX)
-        && matches!(source.path, AccessPath::TableScan { .. })
-        && source.table.kind == TableKind::Table
+        && (table || derived)
         && matches!(
             source.join,
             JoinKind::Inner | JoinKind::Cross | JoinKind::Comma | JoinKind::Left
@@ -118,6 +130,9 @@ pub(super) fn automatic_index_lines(
         .on
         .as_ref()
         .or_else(|| plan.residuals.get(position).and_then(Option::as_ref))?;
+    // The values an index key may come from: the loops before this one, and
+    // anything that is no loop of this plan at all, which is an enclosing query.
+    let local: Vec<usize> = plan.sources.iter().map(|held| held.id).collect();
     let earlier: Vec<usize> = plan
         .sources
         .iter()
@@ -137,8 +152,8 @@ pub(super) fn automatic_index_lines(
             continue;
         };
         match (key_column(left, source.id), key_column(right, source.id)) {
-            (Some(column), None) if reads_only(right, &earlier) => written.push(column),
-            (None, Some(column)) if reads_only(left, &earlier) => flipped.push(column),
+            (Some(column), None) if reads_only(right, &earlier, &local) => written.push(column),
+            (None, Some(column)) if reads_only(left, &earlier, &local) => flipped.push(column),
             _ => {}
         }
     }
@@ -180,29 +195,40 @@ fn key_column(expr: &BoundExpr, id: usize) -> Option<u16> {
     }
 }
 
-/// Reports whether an expression reads columns of the earlier terms alone, and at least one.
+/// Reports whether an expression reads columns of the earlier terms or of an
+/// enclosing query alone, and at least one.
 ///
 /// @param expr - the other side of an equality
 /// @param earlier - the statement-wide numbers of the terms before this one
-fn reads_only(expr: &BoundExpr, earlier: &[usize]) -> bool {
+/// @param local - the statement-wide numbers of every term of this plan
+fn reads_only(expr: &BoundExpr, earlier: &[usize], local: &[usize]) -> bool {
     let mut used = Vec::new();
     expr.sources_used(&mut used);
-    !used.is_empty() && used.iter().all(|source| earlier.contains(source))
+    !used.is_empty()
+        && used
+            .iter()
+            .all(|source| earlier.contains(source) || !local.contains(source))
 }
 
-/// Returns the `EXPLAIN QUERY PLAN` lines a plan renders as.
+/// Returns one line per loop of a plan, in loop order: `SCAN t`, `SEARCH t
+/// USING INDEX ...`, and the two lines of an automatic index.
+///
+/// A derived table is named the way SQLite names it in a loop: its alias, or
+/// `(subquery-N)` when it was written with none.
 ///
 /// @param plan - the plan to describe
-pub(super) fn plan_lines(plan: &PhysicalPlan) -> Vec<String> {
+pub(super) fn loop_lines(plan: &PhysicalPlan) -> Vec<String> {
     let mut lines = Vec::new();
     for (position, source) in plan.sources.iter().enumerate() {
-        let shown = match &source.written_schema {
-            Some(schema) => format!(
+        let bound = plan.select.sources.iter().find(|held| held.id == source.id);
+        let shown = match (&source.written_schema, bound) {
+            (Some(schema), _) => format!(
                 "{}.{}",
                 String::from_utf8_lossy(schema),
                 String::from_utf8_lossy(&source.alias)
             ),
-            None => String::from_utf8_lossy(&source.alias).into_owned(),
+            (None, Some(bound)) => super::tree::loop_name(bound),
+            (None, None) => String::from_utf8_lossy(&source.alias).into_owned(),
         };
         if let Some(automatic) = automatic_index_lines(plan, position, &shown) {
             lines.extend(automatic);
@@ -214,10 +240,15 @@ pub(super) fn plan_lines(plan: &PhysicalPlan) -> Vec<String> {
         }
         lines.push(line);
     }
-    for (op, arm) in &plan.compounds {
-        lines.push(format!("COMPOUND QUERY {}", compound_name(*op)));
-        lines.extend(arm.describe());
-    }
+    lines
+}
+
+/// Returns the sorter lines of a plan: `USE TEMP B-TREE FOR GROUP BY`, `ORDER
+/// BY` and `DISTINCT`, each only when the plan has that sorter.
+///
+/// @param plan - the plan to describe
+pub(super) fn temp_lines(plan: &PhysicalPlan) -> Vec<String> {
+    let mut lines = Vec::new();
     // A temp b-tree is only named when there is one. Grouping and
     // de-duplicating that the walk already delivers build nothing, and a
     // plan that said otherwise would be describing a different program.
@@ -241,18 +272,9 @@ pub(super) fn plan_lines(plan: &PhysicalPlan) -> Vec<String> {
 ///
 /// @param plan - the plan of the query that finds the rows
 pub(super) fn write_lines(plan: &PhysicalPlan) -> Vec<String> {
-    plan_lines(plan)
+    loop_lines(plan)
         .into_iter()
+        .chain(temp_lines(plan))
         .map(|line| line.replace(" USING COVERING INDEX ", " USING INDEX "))
         .collect()
-}
-
-/// Returns the word `EXPLAIN QUERY PLAN` names a compound operator by.
-fn compound_name(op: CompoundOp) -> &'static str {
-    match op {
-        CompoundOp::Union => "UNION",
-        CompoundOp::UnionAll => "UNION ALL",
-        CompoundOp::Intersect => "INTERSECT",
-        CompoundOp::Except => "EXCEPT",
-    }
 }

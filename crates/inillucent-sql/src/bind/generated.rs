@@ -128,6 +128,7 @@ impl Binder<'_> {
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
             written_schema: None,
+            derived: Default::default(),
         });
         let bound = self.generated_value(id, column);
         self.sources.pop();

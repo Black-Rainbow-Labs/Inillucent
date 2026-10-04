@@ -216,7 +216,23 @@ impl<'a> Parser<'a> {
     }
 
     /// Returns the token `ahead` positions from the cursor.
+    ///
+    /// **A token already read is returned without a call (task-2183).** The
+    /// parser asks for the next token many times per token it consumes, one
+    /// keyword test after another, and this was a tenth of compiling a short
+    /// statement as an ordinary call through `fill`.
+    #[inline]
     fn peek_at(&mut self, ahead: usize) -> Result<Token, ParseError> {
+        if let Some(token) = self.buffer.get(ahead) {
+            return Ok(*token);
+        }
+        self.peek_at_unread(ahead)
+    }
+
+    /// [`Parser::peek_at`] for a token the buffer does not hold yet.
+    ///
+    /// @param ahead - how many tokens past the cursor
+    fn peek_at_unread(&mut self, ahead: usize) -> Result<Token, ParseError> {
         self.fill(ahead.saturating_add(1))?;
         Ok(self.buffer.get(ahead).copied().unwrap_or(Token {
             kind: TokenKind::EndOfInput,

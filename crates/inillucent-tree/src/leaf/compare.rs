@@ -267,13 +267,19 @@ impl<'p> LeafRef<'p> {
                     Err(low)
                 });
             }
-            // The guess, in i128 so a span of nearly the whole integer range
-            // cannot overflow the multiply.
-            let span = i128::from(high_value).saturating_sub(i128::from(low_value));
-            let into = i128::from(target).saturating_sub(i128::from(low_value));
-            let width = (high.saturating_sub(low)) as i128;
-            let offset = if span == 0 { 0 } else { into * width / span };
-            let guess = low.saturating_add(offset.max(0).min(width) as usize);
+            // The guess, in 64 bits unless the product needs more, which is
+            // what the bound search does too (task-2183): the 128 bit form
+            // called the compiler's division routine on every guess. Here
+            // `low_value <= target <= high_value` and the two values differ,
+            // so both differences are non-negative and fit a `u64`.
+            let span = high_value.wrapping_sub(low_value) as u64;
+            let into = target.wrapping_sub(low_value) as u64;
+            let width = high.saturating_sub(low) as u64;
+            let offset = match into.checked_mul(width) {
+                Some(product) => product / span.max(1),
+                None => (u128::from(into) * u128::from(width) / u128::from(span.max(1))) as u64,
+            };
+            let guess = low.saturating_add(offset.min(width) as usize);
             let seen = read(guess)?;
             match seen.cmp(&target) {
                 std::cmp::Ordering::Equal => return Ok(Ok(guess)),
@@ -566,11 +572,19 @@ impl IntegerGuide<'_> {
         if self.target >= high_value {
             return Ok(last);
         }
-        let span = i128::from(high_value).saturating_sub(i128::from(low_value));
-        let into = i128::from(self.target).saturating_sub(i128::from(low_value));
-        let width = last.saturating_sub(low) as i128;
-        let offset = if span == 0 { 0 } else { into * width / span };
-        Ok(low.saturating_add(offset.max(0).min(width) as usize))
+        // **In 64 bits unless the product needs more (task-2183).** Here
+        // `low_value < target < high_value`, so both differences are positive
+        // and fit a `u64`, and `into < span`. The `i128` form called the
+        // compiler's 128 bit division routine on every guess, which was 4% of
+        // an index probe per outer row.
+        let span = high_value.wrapping_sub(low_value) as u64;
+        let into = self.target.wrapping_sub(low_value) as u64;
+        let width = last.saturating_sub(low) as u64;
+        let offset = match into.checked_mul(width) {
+            Some(product) => product / span.max(1),
+            None => (u128::from(into) * u128::from(width) / u128::from(span.max(1))) as u64,
+        };
+        Ok(low.saturating_add(offset.min(width) as usize))
     }
 
     /// Reads one row's value from the leading key column.

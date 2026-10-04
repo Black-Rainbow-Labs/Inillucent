@@ -1,4 +1,4 @@
-cut points: 88, acknowledged commits: 89, detected damage: 3, lost to a half written call: 1
+cut points: 80, acknowledged commits: 81, detected damage: 2, lost to a half written call: 1
 1	committed	new
 2	committed	new
 3	committed	new
@@ -53,16 +53,16 @@ cut points: 88, acknowledged commits: 89, detected damage: 3, lost to a half wri
 52	committed	new
 53	committed	new
 54	committed	new
-55	committed	new
-56	committed	new
+55	committed	detected
+56	committed	detected
 57	committed	new
 58	committed	new
 59	committed	new
 60	committed	new
 61	committed	new
-62	committed	detected
-63	committed	detected
-64	committed	detected
+62	committed	new
+63	committed	new
+64	committed	new
 65	committed	new
 66	committed	new
 67	committed	new
@@ -79,12 +79,4 @@ cut points: 88, acknowledged commits: 89, detected damage: 3, lost to a half wri
 78	committed	new
 79	committed	new
 80	committed	new
-81	committed	new
-82	committed	new
-83	committed	new
-84	committed	new
-85	committed	new
-86	committed	new
-87	committed	new
-88	committed	new
-89	acknowledged	new
+81	acknowledged	new

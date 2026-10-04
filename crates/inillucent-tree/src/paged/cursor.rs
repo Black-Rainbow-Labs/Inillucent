@@ -39,6 +39,59 @@ impl PagedTree {
         from: PageId,
         visit: &mut dyn FnMut(&LeafRef<'_>) -> DbResult<bool>,
     ) -> DbResult<()> {
+        self.visit_from_reading(pool, from, Copies::Allowed, true, visit)
+    }
+    /// Visits every leaf as its page holds it, never as a packed copy.
+    ///
+    /// For a caller that looks at how a leaf is laid out rather than at its
+    /// rows - a delta area, a tombstone - which a packed copy does not have.
+    ///
+    /// @param pool - the buffer pool
+    /// @param visit - what to do with each leaf
+    pub fn visit_leaves_as_stored(
+        &self,
+        pool: &Pool,
+        visit: &mut dyn FnMut(&LeafRef<'_>) -> DbResult<bool>,
+    ) -> DbResult<()> {
+        self.visit_from_reading(pool, self.first_leaf, Copies::Refused, true, visit)
+    }
+
+    /// Visits every leaf without reading its out-of-line values first.
+    ///
+    /// **For a scan that may not read the columns those values are in
+    /// (task-2183).** Every walk reads a leaf's out-of-line values before it
+    /// hands the leaf over, and a table whose rows each hold a 4 KiB text read
+    /// all of them to count the rows or test the key: 400 rows of the contract
+    /// fixture's `wide` took 20 us to filter on `id`. A leaf handed over here
+    /// may hold values the visitor cannot read through it; the visitor asks
+    /// [`PagedTree::read_extents`] for them when it needs one.
+    ///
+    /// @param pool - the buffer pool
+    /// @param visit - what to do with each leaf
+    pub fn visit_leaves_unresolved(
+        &self,
+        pool: &Pool,
+        visit: &mut dyn FnMut(&LeafRef<'_>) -> DbResult<bool>,
+    ) -> DbResult<()> {
+        self.visit_from_reading(pool, self.first_leaf, Copies::Allowed, false, visit)
+    }
+    /// [`PagedTree::visit_from`], saying whether a written leaf may be read as a packed copy.
+    ///
+    /// The integrity check reads the pages themselves; see [`Copies`].
+    ///
+    /// @param pool - the buffer pool
+    /// @param from - the first leaf to visit
+    /// @param copies - whether a packed copy of a written leaf may stand in for it
+    /// @param resolve - whether a leaf's out-of-line values are read before it is handed over
+    /// @param visit - what to do with each leaf
+    pub(crate) fn visit_from_reading(
+        &self,
+        pool: &Pool,
+        from: PageId,
+        copies: Copies,
+        resolve: bool,
+        visit: &mut dyn FnMut(&LeafRef<'_>) -> DbResult<bool>,
+    ) -> DbResult<()> {
         let mut page = from;
         let mut seen = 0u64;
         while !page.is_none() {
@@ -53,7 +106,11 @@ impl PagedTree {
             // never on where a value lives. A leaf with none reads nothing and
             // allocates nothing.
             let next = leaf.right_sibling();
-            if !self.with_leaf_extents(pool, leaf, |leaf| visit(leaf))? {
+            let more = match !resolve && leaf.has_extents() {
+                true => visit(&leaf)?,
+                false => self.with_leaf_extents(pool, copies.of(page), leaf, |leaf| visit(leaf))?,
+            };
+            if !more {
                 return Ok(());
             }
             drop(guard);
@@ -120,7 +177,7 @@ impl PagedTree {
                 let leaf = LeafRef::parse(&guard)?
                     .with_collations(&self.collations)
                     .with_directions(&self.directions);
-                if !self.with_leaf_extents(pool, leaf, |leaf| visit(leaf))? {
+                if !self.with_leaf_extents(pool, Some(descent.leaf), leaf, |leaf| visit(leaf))? {
                     return Ok(());
                 }
             }
@@ -221,8 +278,24 @@ impl PagedTree {
             }
             None => self.first_leaf,
         };
+        // **An equality span is one search and a short walk (task-2183).**
+        // `WHERE owner = ?` gives the same key as both bounds, and the two
+        // partition searches below found the same run twice. `equal_run` is
+        // what an index nested loop probe uses for that run: the lower bound
+        // by search, the upper by walking at most eight rows past it.
+        let equal = match (low, high) {
+            (Some(from), Some(to)) if low_inclusive && high_inclusive => {
+                from.len() == to.len()
+                    && crate::leaf::compare_rows(from, to, from.len()) == std::cmp::Ordering::Equal
+            }
+            _ => false,
+        };
         self.visit_from(pool, start_page, &mut |leaf| {
             let rows = leaf.row_count();
+            let run = match (equal, low) {
+                (true, Some(values)) => Some(leaf.equal_run(values, 8)?),
+                _ => None,
+            };
             // The lower bound is applied to *every* leaf, not only the first.
             //
             // A descent lands on the last child whose separator is not above
@@ -244,10 +317,11 @@ impl PagedTree {
             // An *exclusive* lower bound starts past the run equal to it, so
             // it is an upper bound on the same key. `WHERE id > 495` returned
             // `id >= 495` until the physical pass's tests asked it directly.
-            let begin = match low {
-                Some(values) if low_inclusive => lower_bound(leaf, values)?,
-                Some(values) => upper_bound(leaf, values)?,
-                None => 0,
+            let begin = match (run, low) {
+                (Some((begin, _)), _) => begin,
+                (None, Some(values)) if low_inclusive => lower_bound(leaf, values)?,
+                (None, Some(values)) => upper_bound(leaf, values)?,
+                (None, None) => 0,
             };
             // The bound is a *bound*, not a search: a probe shorter than the
             // key matches a run of rows, and `search` lands somewhere inside
@@ -255,15 +329,16 @@ impl PagedTree {
             // one row of a three-row match on the first index nested loop test
             // that exercised a prefix bound, which is how this is written as an
             // explicit partition point instead.
-            let end = match high {
-                Some(values) => {
+            let end = match (run, high) {
+                (Some((_, end)), _) => end,
+                (None, Some(values)) => {
                     if high_inclusive {
                         upper_bound(leaf, values)?
                     } else {
                         lower_bound(leaf, values)?
                     }
                 }
-                None => rows,
+                (None, None) => rows,
             };
             let end = end.min(rows);
             if begin >= end {
@@ -333,7 +408,7 @@ impl PagedTree {
             let leaf = LeafRef::parse(&guard)?
                 .with_collations(&self.collations)
                 .with_directions(&self.directions);
-            match self.with_leaf_extents(pool, leaf, |leaf| {
+            match self.with_leaf_extents(pool, Some(page), leaf, |leaf| {
                 Self::equal_span(leaf, key, RUN_SCAN, visit)
             })? {
                 Some(right) => right,
@@ -341,14 +416,13 @@ impl PagedTree {
             }
         };
         drop(guard);
-        let _ = page;
         let mut seen = 0u64;
         while !next.is_none() {
             let guard = pool.fetch(next)?;
             let leaf = LeafRef::parse(&guard)?
                 .with_collations(&self.collations)
                 .with_directions(&self.directions);
-            match self.with_leaf_extents(pool, leaf, |leaf| {
+            match self.with_leaf_extents(pool, Some(next), leaf, |leaf| {
                 Self::equal_span(leaf, key, RUN_SCAN, visit)
             })? {
                 Some(right) => next = right,

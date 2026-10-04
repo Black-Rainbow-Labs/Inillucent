@@ -81,6 +81,8 @@ pub(super) fn choose_term_path(
             );
         }
         chosen
+    } else if precedes_a_right_join(select, source.id) {
+        choose_path_without_where(level, ids, source, select, terms, consumed, levers)
     } else {
         choose_path(level, ids, source, select, terms, consumed, levers)
     };
@@ -89,6 +91,73 @@ pub(super) fn choose_term_path(
         on_enforced,
         remaining_on,
     }
+}
+
+/// Reports whether a `RIGHT` or `FULL` join comes after a term in the FROM
+/// clause, which makes the term null extendable.
+///
+/// @param select - the bound statement
+/// @param id - the term
+fn precedes_a_right_join(select: &BoundSelect, id: usize) -> bool {
+    let Some(position) = select.sources.iter().position(|source| source.id == id) else {
+        return false;
+    };
+    select
+        .sources
+        .iter()
+        .skip(position.saturating_add(1))
+        .any(|source| matches!(source.join, JoinKind::Right | JoinKind::Full))
+}
+
+/// Chooses the path of a term a later `RIGHT` or `FULL` join null extends,
+/// offering it the inner joins' `ON` terms and none of the `WHERE`.
+///
+/// **The `WHERE` is tested after the null extension.** Turned into a seek, `s
+/// RIGHT JOIN r ON r.a = s.a WHERE s.k = 1` read no row of an empty `s`, the
+/// join null extended every row of `r`, and the consumed term was never tested
+/// again, so the query returned every row of `r` where SQLite returns none. An
+/// inner join's `ON` is tested before the null extension, so it may still seek.
+/// The `WHERE` conjuncts come first in `terms`, which is how they are told apart.
+/// A table valued function's arguments are bound into the `WHERE` but are not
+/// part of it in SQLite, so they are still offered.
+///
+/// @param level - the term's position in the visiting order
+/// @param ids - the source ids in visiting order
+/// @param source - the term to choose a path for
+/// @param select - the bound statement
+/// @param terms - the statement's terms
+/// @param consumed - which terms an access path already enforces; updated
+/// @param levers - which optimizations are on
+fn choose_path_without_where(
+    level: usize,
+    ids: &[usize],
+    source: &BoundSource,
+    select: &BoundSelect,
+    terms: &[BoundExpr],
+    consumed: &mut [bool],
+    levers: Levers,
+) -> AccessPath {
+    let mut filter_terms = Vec::new();
+    if let Some(filter) = &select.filter {
+        split_conjunction(filter, &mut filter_terms);
+    }
+    let withheld: Vec<bool> = filter_terms
+        .iter()
+        .map(|term| !super::flatten::is_table_argument(select, term))
+        .collect();
+    let mut offered = consumed.to_vec();
+    for (slot, held_back) in offered.iter_mut().zip(&withheld) {
+        if *held_back {
+            *slot = true;
+        }
+    }
+    let path = choose_path(level, ids, source, select, terms, &mut offered, levers);
+    for (index, (slot, held)) in consumed.iter_mut().zip(&offered).enumerate() {
+        if !withheld.get(index).copied().unwrap_or(false) {
+            *slot = *held;
+        }
+    }
+    path
 }
 
 /// Moves the unenforced `ON` terms of inner joins into the `RIGHT` or `FULL`

@@ -10,6 +10,92 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**A second performance hill climb through the `Connection`.** On the 48 workloads of
+`inillucent-fullgate --plan hillclimb` this release is 69% faster than SQLite 3.53.4, where 2.1.2 was
+34% faster in the same day's run, with 22% less peak memory and 21% less processor time. On the
+contract plan through the `Connection` its train and test sets are 16% faster than 2.1.2. Of the 82
+workloads the two plans run, 17 are still slower than SQLite, where 29 were. The changes:
+
+- A correlated `EXISTS` whose `WHERE` is an equality on an index is answered by probing the index
+  for each outer row, and a correlated `IN` over two `NOT NULL` columns is lowered to one `EXISTS`.
+  `x IN (SELECT y FROM t WHERE y = x)` went from 900% slower than SQLite to 10% slower.
+- A correlated block's plan and chain are kept with the cached statement, and a statement holding
+  one is kept as a compiled chain like any other.
+- A scan reads only the columns the statement reads, including through a correlated block and on
+  the inner side of an index nested loop join.
+- A reader keeps a packed copy of a leaf that took writes once it has read it twice, until the page
+  changes.
+- A `GROUP BY` term in the select list is read from the group's key. It was also kept as a column
+  of one of the group's rows, which copied every row.
+- A hash `GROUP BY` keeps its keys in one table, and keeps a plain `count(*)` as one number a group.
+  With the change above, a `GROUP BY` over 50,000 groups is 241% faster.
+  A grouping by the outer term's walk streams through inner and left joins.
+- A bulk `DELETE` logs one record per leaf it changes and reads a deleted row only when something
+  needs it. A bulk `UPDATE` whose new value outgrows its slot repacks the leaf once.
+- A recursive CTE step that reads only its queue is evaluated directly, without building a batch
+  for a pass of one row.
+- `json_extract` over distinct documents builds only the part of a document its path reads, and a
+  JSON call over literals is answered once.
+- `LIKE '%text%'` searches for the first byte before comparing.
+- CRC-32 over a long piece runs four streams side by side and joins them, the same answer: 12.2 us
+  to 3.9 us for a 32 KiB page.
+- A window computes its values over its rows and moves them, where it copied every row five times.
+- Compiling a statement no longer copies each table's schema into the plan.
+
+`docs/performance.md` lists the 17 workloads still slower than SQLite and why.
+
+**A `DELETE` or `UPDATE` of many rows changes each leaf once.** When no trigger, foreign key action,
+`RETURNING` or correlated subquery can watch the statement, its rows are taken a leaf at a time: the
+leaf is read once, each row still gets its own log record and undo entry, and the leaf is changed
+once. An `UPDATE` does this for rows where one column outside the key changes and the new value fits
+where the old one lies, and writes every other row as before. Through the `Connection`, deleting
+40,000 rows by a rowid range is 35% faster (181% slower than SQLite 3.53.4 before, 107% after),
+deleting half of a table with two indexes is 13% faster, and updating every row of a table is 13%
+faster. Recovery and rollback read the same records as before. Under `OR FAIL`, `OR IGNORE` or
+`OR REPLACE` an `UPDATE` keeps the order the query found its rows in, so it keeps the same rows as
+before. Removing rows from a leaf's delta area now zeroes the bytes they leave, so a page recovery
+rebuilds is the same as the page the session wrote.
+
+**`INSERT ... SELECT` into an empty table builds the table in one pass.** When the target holds no
+row and the query returns at least 1,024 rows, every row is built and checked first, then the table's
+tree and each of its indexes are packed the way `CREATE INDEX` packs an index, with no page images
+in the log. A copy of 100,000 rows went from 191 ms to 56 ms through the `Connection`, from 352%
+slower than SQLite 3.53.4 to 35% slower, and with a plain and a unique index from about 715 ms to about 110 ms,
+faster than SQLite's 132 ms. One round of the hillclimb plan used 5.3% less peak memory and 11% less
+processor time. A failing statement reports the same error and the same `last_insert_rowid()` as
+before, a rollback or a crash leaves the table empty, and a duplicate in a unique index hands the
+statement back to the row by row insert. `CREATE TABLE ... AS SELECT` gets the same build.
+`docs/relational-architecture.md` lists the shapes that still insert row by row.
+
+**The three issues reported against 2.0.7, investigated.**
+
+- **Damage after SIGTERM with a reader open** (`a reference names slot 5 of a shared page that
+  holds 5`) is not reproduced on this release. A new storm case in the shape of the report rewrites
+  values of 4 to 20 KB in autocommit statements, lets the readers write, and ends with every
+  process killed at the same moment. It passes 12 of 12 rounds here and fails from its first round
+  on 2.0.7, where processes are refused at open and one round met a replay error. Leaving out the
+  log record of a shared page's image makes the case fail with the report's message word for word,
+  which is the class of defect the multi process fixes after 2.0.7 removed.
+- **A commit that finishes a segment merge no longer reads the merged segment and its inputs back.**
+  It reread the accumulator it had just built and every input, only to learn which row ids each
+  held. With the report's script the slowest commits went from 7.5, 7.4 and 6.2 s to 6.3, 6.2 and
+  4.8 s on the development machine.
+- **The 2,000 row publish commit is the fold the 4 MiB log bar triggers.** It writes the 2,384
+  leaves the random rowids touched, and the data file sync is most of it. 2.0.4 did the same fold
+  one publish earlier. Nothing is changed; smaller batches spread it, as the report found.
+
+**A leaf split logs what it did instead of three whole pages.** The new `SplitLeaf` log record
+carries the rows that moved, the key the parent gained and how many rows the leaf kept, and recovery
+rebuilds each of the three pages from that page's own state, so a crash after any one of them
+reached the file still recovers. A split record went from 98,384 bytes at a 32 KiB page to 5,148 on
+average for 2,000 inserts into a table with two indexes, and that workload's log from 1,553.9 KiB to
+734.4 KiB. Over the hillclimb plan through the `Connection`, 20,000 inserts into a table with two
+indexes are 11.7% faster, appended inserts 14.9% faster, and growing updates of existing rows 52.9%
+faster, with the held out workloads 2.9% faster overall and processor time 3.8% lower. A root split,
+a split whose parent is full and a split that moves a value stored outside the page still log the
+pages whole. A build of 2.1.2 or earlier refuses a log holding this record, which only arises when a
+connection stopped without closing.
+
 **Two wrong answers fixed, found by a new performance plan.**
 
 - **`WHERE g = ? ORDER BY c DESC LIMIT n` over an index on `(g, c)` returned rows from the middle
@@ -19,35 +105,74 @@ fails the build when any copy of it disagrees.
 - **`LIMIT n OFFSET <expression over a parameter>` kept the first execution's offset** when the
   statement was prepared once and bound again, so every page after the first repeated it.
 
+**One more wrong answer fixed, and the last SQLite differences in the usage corpus that were
+defects.**
+
+- **A `WHERE` term on the side a `RIGHT` or `FULL` join null extends** became a search on that
+  table, and the term was not tested again after the join: `s RIGHT JOIN r ON r.a = s.a WHERE
+  s.k = 1` over an empty `s` returned every row of `r`. The term is tested after the join now, and
+  a join the `WHERE` keeps from null extending is planned as an inner join, as SQLite plans it.
+- **An FTS5 `MATCH` written after a rowid equality** (`WHERE rowid = 1 AND f MATCH 'x'`) returned
+  no rows, because the module took the rowid lookup and the match was then tested outside it. The
+  module now takes the match wherever it is written, and the rowid is tested against the matches.
+- **`EXPLAIN QUERY PLAN` prints SQLite's tree**: `CO-ROUTINE`, `MATERIALIZE`, `COMPOUND QUERY`,
+  `MERGE`, `LIST SUBQUERY` and the other nodes, with parent ids. Derived tables, views and CTEs are
+  flattened into the query where SQLite flattens them, and a `LEFT JOIN` the `WHERE` makes an inner
+  join is planned as one.
+- **A derived table in a correlated subquery is run again for each outer row** where SQLite runs it
+  as a co-routine, so an `UPDATE` that reads the table it changes sees what SQLite sees.
+- **`sinh`, `cosh`, `tanh`, `asin` and `acos` on Windows** return the last digit SQLite's Windows
+  shell returns.
+- **A sliding window `sum`, `total` or `avg`** stays infinite after an overflow, as in SQLite.
+- **`PRAGMA reverse_unordered_selects`** reverses joined rows and the rows of a subquery.
+- **Date and time functions** follow SQLite for raw numbers, `'subsec'`, out of range days and the
+  `'localtime'` and `'utc'` edge cases.
+- **`generate_series`** converts its own constraint values (`stop IN ('3')`) and tests an `IN` list
+  on its columns as SQLite does.
+- **A `STRICT` table with a generated column** reports a type error before a `NOT NULL` error, in
+  SQLite's order.
+
 **Faster for the statements an application sends.** Measured through the `Connection` API against
 SQLite 3.53.4 with `inillucent-fullgate --plan hillclimb --api connection`, a plan of 48 workloads
 over tables built with `INSERT`, the same tables after updates and deletes, common application
-queries and edge cases (see `docs/performance.md`). Over that plan the geometric mean went from
-0.85x to 1.30x of SQLite's speed on the workloads the changes were tuned on and from 0.67x to 1.15x
-on the held out third. One round's peak memory went from 101 to 83 MiB and its processor time from
-3,906 to 1,750 ms. The contract plan through the `Connection` went from 1.94x to 2.37x.
+queries and edge cases (see `docs/performance.md`). Released in 2.1.2. Against 2.1.1, over that
+plan:
+
+- the 28 workloads the changes were tuned on are 53% faster: 18% slower than SQLite before, 30%
+  faster after;
+- the 20 held out workloads are 71% faster: 49% slower than SQLite before, 15% faster after;
+- one round's peak memory is 18% lower, 100.96 to 82.82 MiB;
+- one round's processor time is 55% lower, 3,906 to 1,750 ms, which is now 7% less than SQLite's;
+- the contract plan through the `Connection` is 22% faster: 94% faster than SQLite before, 137%
+  faster after.
+
+The changes:
 
 - **An insert that lets the engine choose the rowid** read every live row of the last leaf to find
-  the largest one. It reads two values now: 19.0 to 2.6 microseconds for a single row insert.
+  the largest one. It reads two values now: 19.0 to 2.6 microseconds for a single row insert, and 20,000 inserts
+  into a table with two indexes are 246% faster.
 - **An `OR` whose every arm can use the rowid or an index** is one search per arm, read by rowid once
-  each, where it scanned the table: `WHERE key = ?1 OR id = ?1` over 100,000 rows is 664 times
-  faster. `EXPLAIN QUERY PLAN` prints `MULTI-INDEX OR`.
+  each, where it scanned the table: 100 queries of `WHERE key = ?1 OR id = ?1` over 100,000 rows
+  take 0.88 ms where they took 588 ms. SQLite takes 1.38 ms. `EXPLAIN QUERY PLAN` prints `MULTI-INDEX OR`.
 - **`IN` and `NOT IN` over eight or more values**, written out or returned by a subquery, use a
-  binary search: `NOT IN (SELECT ...)` over 25,000 rows is 166 times faster.
+  binary search: two queries of `NOT IN (SELECT ...)` over 25,000 rows take 4.44 ms where they
+  took 958 ms. SQLite takes 5.01 ms.
 - **A query that reads no table** (`SELECT 1`, `SELECT json_extract(?1, '$.a')`) takes no file
-  lock under `locking_mode = normal`, as in SQLite: 28 and 15 times faster through a `Connection`.
-- **A recursive CTE** compiles its step once instead of once per pass: 2.7 times faster on a
+  lock under `locking_mode = normal`, as in SQLite. Through a `Connection`, 4,000 `SELECT 1`
+  statements take 0.82 ms where they took 23.3 ms, and SQLite takes 1.62 ms.
+- **A recursive CTE** compiles its step once instead of once per pass: 211% faster on a
   10,000 pass counter.
 - **A `GROUP BY` with many groups** keeps its accumulators in one vector and each accumulator is
-  144 bytes: 2.1 times faster on 50,000 groups, and a lower peak memory.
+  144 bytes: 89% faster on 50,000 groups, and a lower peak memory.
 - **`LIKE '%text%'`, `'text%'`, `'%text'` and plain text** compare in place without the general
-  matcher: 2.7 times faster on a scan of 100,000 rows.
+  matcher: 160% faster on a scan of 100,000 rows.
 - **Bulk `DELETE` and `UPDATE`** look first in the leaf the last row used, and a scan of a table
-  that took writes fills its columns without a vector per row.
+  that took writes fills its columns without a vector per row: deleting half a table is 56%
+  faster, an `UPDATE` of every row 69% faster, and a counter upsert 145% faster.
 - **`INSERT ... SELECT` no longer copies the query's rows**, which lowered that statement's rise in
-  peak memory from 65 to 46 MiB on 100,000 rows.
+  peak memory from 65 to 46 MiB on 100,000 rows and made it 23% faster.
 - **`json_extract` over a column of distinct documents** stops keeping each document after a few
-  misses in a row.
+  misses in a row, 9% faster.
 
 **A usage corpus of 1,719 application scripts, and the defects it found, fixed.** The new suite
 `differential::usage_corpus` runs the scripts in `compat/corpus/usage` through `inillucent-shell` and

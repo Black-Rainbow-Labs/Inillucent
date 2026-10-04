@@ -775,36 +775,65 @@ pub fn fold_segment(
 }
 
 /// Returns every id dead once a merge's accumulator is finished: everything
-/// any original input ever called live or ever bare-deleted, minus what the
-/// finished accumulator still calls live.
+/// any original input held live or bare-deleted, minus what the finished
+/// accumulator still holds live.
 ///
-/// Reloads nothing itself - `originals` is every input the merge started
-/// with, read back fresh, which is safe because none of them is touched or
-/// removed until the caller (`SearchTable::finish_merge`) swaps the finished
-/// segment into the manifest in their place. Computing this from the
-/// originals, rather than threading a running touched set through every
-/// checkpoint, is what lets a merge resume across several commits without
-/// persisting anything beyond `MergeState` itself.
+/// Computing this from the originals, rather than threading a running touched
+/// set through every checkpoint, is what lets a merge resume across several
+/// commits without persisting anything beyond `MergeState` itself. None of the
+/// originals is touched or removed until the caller
+/// (`SearchTable::finish_merge`) swaps the finished segment into the manifest
+/// in their place, so each one's ids can still be read then.
+///
+/// **What `finish_merge` needs, and all it needs.** The tombstone list is a set
+/// of ids, so an input only has to say which ids it held live. Loading an
+/// input to answer that read its graph, its lexical index and every vector,
+/// and the commit that finished a level one merge of four inputs of 8,000
+/// chunks reloaded all four and the accumulator as well. On the 2.0.7 report's
+/// script, the slowest commits, which are the ones that finish such a merge,
+/// went from 7.5, 7.4 and 6.2 s to 6.3, 6.2 and 4.8 s once they stopped. The
+/// caller now passes the ids of the
+/// inputs it folded in the same commit, which it read while folding them, and
+/// loads only the inputs an earlier commit folded.
 /// @param base - the finished merge's accumulator
-/// @param originals - every input the merge started with, freshly loaded,
-///   paired with the metadata naming each one's own bare-deleted ids
-pub fn touched_and_dead(base: &Index, originals: &[(SegmentMeta, Index)]) -> Vec<i64> {
-    let mut touched: BTreeSet<i64> = BTreeSet::new();
-    for (meta, index) in originals {
-        for (id, _, _) in live_documents_of(index) {
-            touched.insert(id);
-        }
-        for id in &meta.tombstoned {
-            touched.insert(*id);
-        }
+/// @param touched - each input's metadata, with the ids it held live
+pub fn dead_after_merge(base: &Index, touched: &[(SegmentMeta, Vec<i64>)]) -> Vec<i64> {
+    let mut all: BTreeSet<i64> = BTreeSet::new();
+    for (meta, ids) in touched {
+        all.extend(ids.iter().copied());
+        all.extend(meta.tombstoned.iter().copied());
     }
-    let live: BTreeSet<i64> = live_documents_of(base)
-        .into_iter()
-        .map(|(id, _, _)| id)
-        .collect();
-    let mut tombstoned: Vec<i64> = touched.difference(&live).copied().collect();
+    let live: BTreeSet<i64> = live_ids_of(base).into_iter().collect();
+    let mut tombstoned: Vec<i64> = all.difference(&live).copied().collect();
     tombstoned.sort_unstable();
     tombstoned
+}
+
+/// Returns the ids of a segment's live documents, and nothing else about them.
+///
+/// The same selection [`live_documents_of`] makes, without copying each
+/// chunk's text and vector: a caller that only needs to know which ids a
+/// segment holds paid for 3 KiB of vector per row at 768 numbers.
+/// @param index - the segment to read
+pub fn live_ids_of(index: &Index) -> Vec<i64> {
+    let store = index.store();
+    let mut out = Vec::with_capacity(store.n_chunks());
+    for chunk in 0..store.n_chunks() {
+        let chunk = chunk as u32;
+        let Some(record) = store.chunks.get(chunk as usize) else {
+            continue;
+        };
+        let Some(document) = store.documents.get(record.doc as usize) else {
+            continue;
+        };
+        if document.deleted {
+            continue;
+        }
+        if let Ok(id) = store.chunk_external_id(chunk).parse::<i64>() {
+            out.push(id);
+        }
+    }
+    out
 }
 
 /// Returns a segment's own live documents, ready to be replayed onto another

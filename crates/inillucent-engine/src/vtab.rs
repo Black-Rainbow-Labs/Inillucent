@@ -484,6 +484,10 @@ impl ImportedDatabase {
         // **An `IN` list is the statement's own filter to test here**, not an
         // argument: these tables read their argument from an `=` on a hidden
         // column, and an `IN` offered as `=` would be read as its first value.
+        let lists: Vec<&inillucent_sql::plan::VirtualConstraint> = offer
+            .iter()
+            .filter(|held| !held.in_list.is_empty())
+            .collect();
         let offer: Vec<inillucent_sql::plan::VirtualConstraint> = offer
             .iter()
             .enumerate()
@@ -495,9 +499,34 @@ impl ImportedDatabase {
             .filter(|(_, held)| held.spec.usable)
             .map(|(at, held)| with_supplied_value(held, supplied.get(at)))
             .collect();
-        if let Some(answered) = self.eponymous_rows(table, &offer, params, downstream)? {
+        // The planner took any `IN` list out of the statement's filters, and
+        // these tables read none, so their rows are tested against it here.
+        let mut rechecks: Vec<Recheck> = Vec::with_capacity(lists.len());
+        for held in &lists {
+            if let Ok(column) = usize::try_from(held.spec.column) {
+                rechecks.push((
+                    column,
+                    inillucent_sql::vtab::ConstraintOp::Eq,
+                    in_list_items(held, params, self)?,
+                    inillucent_value::collation::Collation::Binary,
+                    None,
+                ));
+            }
+        }
+        let mut tested = InListFilter {
+            rechecks,
+            case_sensitive_like: self.pragmas.case_sensitive_like(),
+            downstream,
+        };
+        let target: &mut dyn inillucent_exec::ops::Sink = if lists.is_empty() {
+            tested.downstream
+        } else {
+            &mut tested
+        };
+        if let Some(answered) = self.eponymous_rows(table, &offer, params, target)? {
             return Ok(answered);
         }
+        let downstream = tested.downstream;
         let reach = ScanReach {
             modules: &self.session_state.virtual_tables,
             registry: &self.session_state.registry,
@@ -622,6 +651,7 @@ pub(crate) fn scan_module(
         let mut ordering = order_by.clone();
         let mut query = IndexQuery::new(specs.clone(), ordering.clone());
         connected.table.best_index(&mut query)?;
+        prefer_the_plan_without_other_tables(connected, offer, &ordering, &mut specs, &mut query);
         // **An order the module promised does not hold across several runs of
         // `filter`.** With an `IN` list to drive, the module is asked again
         // without the ordering, and the statement sorts the rows itself.
@@ -745,6 +775,56 @@ fn advance_counters(lists: &[DrivenList], counters: &mut [usize]) -> bool {
     false
 }
 
+/// Asks a module again with the constraints that read another table taken out,
+/// and keeps that plan unless the one using them costs less.
+///
+/// **SQLite plans first with the constraints that need no other table, and
+/// keeps a plan using the others only when it costs less.** Two plans that
+/// cost the same keep the one with fewer tables before it. `t JOIN
+/// generate_series(1,1) ON x = value` therefore does not hand `x` to the
+/// module, the row is tested instead, and the text `'01'` does not equal the
+/// integer 1, so SQLite counts nothing.
+///
+/// @param connected - the module's connection
+/// @param offer - the constraints the planner offered
+/// @param ordering - the ordering offered
+/// @param specs - the constraints as the module is shown them, narrowed in place
+/// @param query - the module's answer, replaced when the narrower plan is kept
+fn prefer_the_plan_without_other_tables(
+    connected: &Connected,
+    offer: &[inillucent_sql::plan::VirtualConstraint],
+    ordering: &[inillucent_sql::vtab::OrderSpec],
+    specs: &mut Vec<inillucent_sql::vtab::ConstraintSpec>,
+    query: &mut IndexQuery,
+) {
+    let lateral: Vec<usize> = offer
+        .iter()
+        .enumerate()
+        .filter(|(_, held)| {
+            let mut used = Vec::new();
+            held.value.sources_used(&mut used);
+            held.spec.usable && !used.is_empty()
+        })
+        .map(|(at, _)| at)
+        .collect();
+    if lateral.is_empty() {
+        return;
+    }
+    let mut narrowed = specs.clone();
+    for at in &lateral {
+        if let Some(spec) = narrowed.get_mut(*at) {
+            spec.usable = false;
+        }
+    }
+    let mut without = IndexQuery::new(narrowed.clone(), ordering.to_vec());
+    if connected.table.best_index(&mut without).is_ok()
+        && query.estimated_cost >= without.estimated_cost
+    {
+        *specs = narrowed;
+        *query = without;
+    }
+}
+
 /// Returns the offer positions of the `IN` lists the module claimed.
 ///
 /// @param query - what `best_index` answered
@@ -811,10 +891,12 @@ fn in_lists_to_drive(
 
 /// Returns the distinct, non NULL values of one `IN` list as `filter` arguments.
 ///
-/// `None` when a value of a rowid list is not an integer, which a rowid never
-/// equals. Any other column is handed whatever the list holds: a hidden column
-/// of `generate_series` or `json_each` takes its argument from an equality, and
-/// SQLite runs the module once per value of an `IN` on it.
+/// The module is handed whatever the list holds, a rowid list included: a
+/// hidden column of `generate_series` or `json_each` takes its argument from an
+/// equality, SQLite runs the module once per value of an `IN` on it, and the
+/// module converts the value itself. `generate_series` reads `rowid IN (2,
+/// '3')` as 2 and 3. A module that does not promise `omit` has its rows tested
+/// against the list, where the text `'3'` equals no rowid.
 ///
 /// @param held - the constraint carrying the list
 /// @param params - the values bound to `?1`, `?2`, ...
@@ -824,37 +906,11 @@ fn list_values(
     params: &inillucent_exec::physical::Params,
     catalog: &dyn inillucent_exec::physical::TreeCatalog,
 ) -> DbResult<Option<Vec<Value<'static>>>> {
-    let mut candidates: Vec<OwnedDatum> = Vec::with_capacity(held.in_list.len());
-    for item in &held.in_list {
-        match item {
-            // `IN (SELECT ...)`: the rows the statement already folded.
-            inillucent_sql::bind::BoundExpr::Subquery { id, .. } => match params.subquery(*id) {
-                Some(answer) => candidates.extend(answer.column.iter().cloned()),
-                None => return Ok(None),
-            },
-            _ => candidates.push(inillucent_exec::physical::literal_value_in(
-                item,
-                params,
-                Some(catalog),
-            )?),
-        }
-    }
+    let candidates = in_list_items(held, params, catalog)?;
     let mut seen: Vec<OwnedDatum> = Vec::with_capacity(candidates.len());
     for value in candidates {
-        match value {
-            // NULL equals nothing, so it adds no row and needs no filter.
-            OwnedDatum::Null => {}
-            OwnedDatum::Int(_) => {
-                if !seen.contains(&value) {
-                    seen.push(value);
-                }
-            }
-            other if held.spec.column >= 0 => {
-                if !seen.contains(&other) {
-                    seen.push(other);
-                }
-            }
-            _ => return Ok(None),
+        if !seen.contains(&value) {
+            seen.push(value);
         }
     }
     let mut values = Vec::with_capacity(seen.len());
@@ -862,6 +918,77 @@ fn list_values(
         values.push(owned_value(datum)?);
     }
     Ok(Some(values))
+}
+
+/// Passes on only the rows that satisfy every `IN` list an eponymous table was
+/// offered, the rows having every declared column at its own position.
+struct InListFilter<'d> {
+    rechecks: Vec<Recheck>,
+    case_sensitive_like: bool,
+    downstream: &'d mut dyn inillucent_exec::ops::Sink,
+}
+
+impl inillucent_exec::ops::Sink for InListFilter<'_> {
+    /// Tests each row of a batch and passes on the ones that satisfy the lists.
+    fn push(
+        &mut self,
+        batch: &inillucent_exec::batch::Batch<'_>,
+    ) -> DbResult<inillucent_exec::ops::Flow> {
+        let mut kept: Vec<Vec<OwnedDatum>> = Vec::with_capacity(batch.live());
+        for nth in 0..batch.live() {
+            let mut row = Vec::with_capacity(batch.columns.len());
+            for column in 0..batch.columns.len() {
+                row.push(OwnedDatum::from_datum(&batch.value(nth, column)?));
+            }
+            if passes_rechecks(&row, &self.rechecks, self.case_sensitive_like)? {
+                kept.push(row);
+            }
+        }
+        inillucent_exec::ops::emit_rows(&kept, &mut *self.downstream)
+    }
+
+    fn finish(&mut self) -> DbResult<()> {
+        self.downstream.finish()
+    }
+
+    /// Returns everything below to its state before input.
+    fn reset(&mut self) -> DbResult<()> {
+        self.downstream.reset()
+    }
+}
+
+/// Returns the values of one `IN` list, NULLs left out, since NULL equals nothing.
+///
+/// A list written as `IN (SELECT ...)` gives the rows the statement already
+/// folded. A subquery the statement has not answered is refused, because a
+/// list with nothing in it would drop every row instead of testing them.
+///
+/// @param held - the constraint carrying the list
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param catalog - where a value's function calls are folded
+fn in_list_items(
+    held: &inillucent_sql::plan::VirtualConstraint,
+    params: &inillucent_exec::physical::Params,
+    catalog: &dyn inillucent_exec::physical::TreeCatalog,
+) -> DbResult<Vec<OwnedDatum>> {
+    let mut items: Vec<OwnedDatum> = Vec::with_capacity(held.in_list.len());
+    for item in &held.in_list {
+        match item {
+            inillucent_sql::bind::BoundExpr::Subquery { id, .. } => match params.subquery(*id) {
+                Some(answer) => items.extend(answer.column.iter().cloned()),
+                None => return Err(inillucent_base::error::misuse(
+                    "an IN list on a virtual table reads a subquery the statement did not answer",
+                )),
+            },
+            _ => items.push(inillucent_exec::physical::literal_value_in(
+                item,
+                params,
+                Some(catalog),
+            )?),
+        }
+    }
+    items.retain(|value| !matches!(value, OwnedDatum::Null));
+    Ok(items)
 }
 
 impl ImportedDatabase {
@@ -1226,9 +1353,21 @@ fn rechecks_of(
         if promised(query, position) || !constraint.spec.usable {
             continue;
         }
-        // An `IN` list stays among the statement's own filters, which test the
-        // whole list; testing its first value here would drop the rest.
+        // An `IN` list is tested against every one of its values. The planner
+        // took it out of the statement's filters, so nothing else tests it.
         if !constraint.in_list.is_empty() {
+            let collation = match usize::try_from(constraint.spec.column) {
+                Ok(column) => connected.table.collation(column),
+                Err(_) => inillucent_value::collation::Collation::Binary,
+            };
+            let column = usize::try_from(constraint.spec.column).unwrap_or(width);
+            rechecks.push((
+                column,
+                inillucent_sql::vtab::ConstraintOp::Eq,
+                in_list_items(constraint, params, catalog)?,
+                collation,
+                None,
+            ));
             continue;
         }
         // A negative column is the rowid. It is not one of the module's
@@ -1248,7 +1387,9 @@ fn rechecks_of(
         rechecks.push((
             column,
             constraint.spec.op,
-            recheck_value(constraint, position, supplied, params, catalog)?,
+            vec![recheck_value(
+                constraint, position, supplied, params, catalog,
+            )?],
             collation,
             comparison_affinity(&constraint.predicate),
         ));
@@ -1308,10 +1449,14 @@ fn comparison_collation(
 /// One constraint the engine has to test for itself: which column, which
 /// operator, against what, under which collation, and with which affinity
 /// applied to both sides first.
+///
+/// The values are alternatives: a row passes when it satisfies the operator
+/// against any one of them. A comparison has one value and an `IN` list has
+/// one per item, so an `IN` list with no value left, all NULL, passes no row.
 type Recheck = (
     usize,
     inillucent_sql::vtab::ConstraintOp,
-    OwnedDatum,
+    Vec<OwnedDatum>,
     inillucent_value::collation::Collation,
     Option<inillucent_value::affinity::Affinity>,
 );
@@ -1386,7 +1531,14 @@ fn passes_rechecks(
         let Some(held) = row.get(*column) else {
             return Ok(false);
         };
-        if !satisfies(held, *op, wanted, *collation, *affinity, case_sensitive)? {
+        let mut any = false;
+        for value in wanted {
+            if satisfies(held, *op, value, *collation, *affinity, case_sensitive)? {
+                any = true;
+                break;
+            }
+        }
+        if !any {
             return Ok(false);
         }
     }
@@ -1584,7 +1736,10 @@ impl ImportedDatabase {
             rechecks.push((
                 at,
                 constraint.spec.op,
-                inillucent_exec::physical::literal_value(&constraint.value, params)?,
+                vec![inillucent_exec::physical::literal_value(
+                    &constraint.value,
+                    params,
+                )?],
                 inillucent_value::collation::Collation::Binary,
                 comparison_affinity(&constraint.predicate),
             ));

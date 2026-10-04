@@ -440,6 +440,28 @@ impl TreeLog for WalLog<'_> {
                 tree,
                 key,
                 row: before,
+                page: None,
+            });
+        }
+        Ok(())
+    }
+
+    fn undo_from_page(
+        &mut self,
+        tree: u64,
+        _key: &[Datum<'_>],
+        page: &std::rc::Rc<[u8]>,
+        located: inillucent_tree::Located,
+    ) -> DbResult<()> {
+        if let Some(buffer) = self.undo {
+            // The copy is shared by every row of its run; the row is read out
+            // of it only by a rollback. See `TreeLog::undo_from_page`.
+            buffer.borrow_mut().push(Before {
+                schema: self.schema,
+                tree,
+                key: Vec::new(),
+                row: None,
+                page: Some((std::rc::Rc::clone(page), located)),
             });
         }
         Ok(())
@@ -479,6 +501,11 @@ pub(crate) struct Before {
     pub(crate) key: Vec<OwnedDatum>,
     /// The whole row as it was, or `None` when the key was not there.
     pub(crate) row: Option<Vec<OwnedDatum>>,
+    /// The row as a place in a copy of its leaf, read only if a rollback needs it.
+    ///
+    /// Set instead of `row` by a run that removes many rows of one leaf
+    /// (task-2183); see `TreeLog::undo_from_page`.
+    pub(crate) page: Option<(std::rc::Rc<[u8]>, inillucent_tree::Located)>,
 }
 
 /// Puts imported rows into the order the tree they are about to build compares

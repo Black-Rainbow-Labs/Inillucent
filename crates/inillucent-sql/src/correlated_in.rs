@@ -25,10 +25,13 @@
 //! applied before grouping and before a limit, so pushing it past either would
 //! ask a different question.
 
+use std::rc::Rc;
+
 use inillucent_value::{Affinity, Collation};
 
-use crate::ast::BinaryOp;
-use crate::bind::{BoundExpr, BoundSelect, BoundStatement, SubqueryKind};
+use crate::ast::{BinaryOp, JoinKind};
+use crate::bind::{BoundExpr, BoundSelect, BoundStatement, SourceRows, SubqueryKind};
+use crate::catalog_view::{TableInfo, TableKind};
 
 /// Rewrites every correlated `IN` in a statement into `EXISTS` tests.
 ///
@@ -43,15 +46,103 @@ use crate::bind::{BoundExpr, BoundSelect, BoundStatement, SubqueryKind};
 /// statement of its own was lowered and answered.
 pub fn lower(statement: &mut BoundStatement) {
     let mut highest = 0usize;
+    let mut correlated_in = false;
     walk_statement(statement, &mut |expr: &mut BoundExpr| {
-        if let BoundExpr::Subquery { id, .. } = expr {
+        if let BoundExpr::Subquery {
+            id, kind, block, ..
+        } = expr
+        {
             highest = highest.max(*id);
+            correlated_in |= *kind == SubqueryKind::In && !block.correlations.is_empty();
         }
     });
+    // Every statement is lowered, and nearly none holds a correlated `IN`;
+    // the tables are gathered only for one that does.
+    if !correlated_in {
+        return;
+    }
     let mut next = highest.saturating_add(1);
+    let tables = never_null_tables(statement);
     walk_statement(statement, &mut |expr: &mut BoundExpr| {
-        lower_one(expr, &mut next)
+        lower_one(expr, &mut next, &tables)
     });
+}
+
+/// Returns the FROM terms whose `NOT NULL` columns can never read as NULL.
+///
+/// An ordinary table read in a block with no outer join. A term on either side
+/// of a `LEFT`, `RIGHT` or `FULL` join can be null extended, so every term of
+/// such a block is left out, which is the cautious half of the rule. So are
+/// the terms of an `INSERT`, `UPDATE` or `DELETE`, which are not walked.
+///
+/// @param statement - the bound statement
+fn never_null_tables(statement: &mut BoundStatement) -> Vec<(usize, Rc<TableInfo>)> {
+    let mut found = Vec::new();
+    if let BoundStatement::Select(select) = statement {
+        gather_tables(select, &mut found);
+    }
+    walk_statement(statement, &mut |expr: &mut BoundExpr| {
+        if let Some(block) = expr.block_mut() {
+            gather_tables(block, &mut found);
+        }
+    });
+    found
+}
+
+/// Adds one block's ordinary tables, and its derived tables' and arms', to a list.
+///
+/// @param select - the block
+/// @param into - the terms found so far
+fn gather_tables(select: &BoundSelect, into: &mut Vec<(usize, Rc<TableInfo>)>) {
+    let outer = select.sources.iter().any(|source| {
+        matches!(
+            source.join,
+            JoinKind::Left | JoinKind::Right | JoinKind::Full
+        )
+    });
+    for source in &select.sources {
+        match &source.rows {
+            SourceRows::Table if !outer && source.table.kind == TableKind::Table => {
+                into.push((source.id, Rc::clone(&source.table)));
+            }
+            SourceRows::Subquery(block) => gather_tables(block, into),
+            SourceRows::Recursive(body) => {
+                for (_, arm) in body.seeds.iter().chain(body.steps.iter()) {
+                    gather_tables(arm, into);
+                }
+            }
+            _ => {}
+        }
+    }
+    for (_, arm) in &select.compounds {
+        gather_tables(arm, into);
+    }
+}
+
+/// Reports whether an expression is a column that can never be NULL.
+///
+/// A `NOT NULL` column or the rowid of a term [`never_null_tables`] listed.
+///
+/// @param expr - the expression
+/// @param tables - the terms whose declared constraints hold
+fn never_null(expr: &BoundExpr, tables: &[(usize, Rc<TableInfo>)]) -> bool {
+    let table_of = |wanted: usize| {
+        tables
+            .iter()
+            .find(|(id, _)| *id == wanted)
+            .map(|(_, table)| table)
+    };
+    match expr {
+        BoundExpr::Column { source, column, .. } => table_of(*source).is_some_and(|table| {
+            table.rowid_alias == Some(*column)
+                || table
+                    .columns
+                    .get(usize::from(*column))
+                    .is_some_and(|held| held.not_null)
+        }),
+        BoundExpr::Rowid { source } => table_of(*source).is_some_and(|table| !table.without_rowid),
+        _ => false,
+    }
 }
 
 /// Applies a rewrite to a statement and to every trigger body it fires.
@@ -116,8 +207,9 @@ fn walk_triggers(triggers: &mut [crate::dml::BoundTrigger], rewrite: crate::rewr
 /// Replaces one expression when it is a correlated `IN` this can lower.
 ///
 /// @param expr - the expression, replaced in place
-/// @param next - the next free subquery number, advanced by three on a rewrite
-fn lower_one(expr: &mut BoundExpr, next: &mut usize) {
+/// @param next - the next free subquery number, advanced by up to three on a rewrite
+/// @param tables - the terms whose `NOT NULL` columns can never read as NULL
+fn lower_one(expr: &mut BoundExpr, next: &mut usize, tables: &[(usize, Rc<TableInfo>)]) {
     let BoundExpr::Subquery {
         kind: SubqueryKind::In,
         negated,
@@ -139,6 +231,8 @@ fn lower_one(expr: &mut BoundExpr, next: &mut usize) {
     };
     let replacement = lowered(
         &Lowering {
+            operand_never_null: never_null(operand, tables),
+            listed_never_null: never_null(&listed, tables),
             operand: (**operand).clone(),
             listed,
             negated: *negated,
@@ -189,6 +283,10 @@ struct Lowering {
     affinity: Option<Affinity>,
     /// The collation `IN` compares with.
     collation: Collation,
+    /// Whether the operand is a column that can never be NULL.
+    operand_never_null: bool,
+    /// Whether the listed column can never be NULL.
+    listed_never_null: bool,
 }
 
 /// Builds the `CASE` that answers what `IN` answers.
@@ -206,6 +304,14 @@ struct Lowering {
 /// stays NULL, which is what makes `NOT IN` over a list holding a NULL answer
 /// nothing.
 ///
+/// **An arm that cannot fire is left out (task-2183).** The correlation
+/// operator answers every block of a row before the `CASE` reads any of them,
+/// so each arm was a whole `EXISTS` run per outer row whether it decided the
+/// answer or not. The second arm needs a NULL operand and the third a NULL in
+/// the list, and a column declared `NOT NULL` in a block with no outer join
+/// can be neither. `wide.id IN (SELECT owner FROM side_table WHERE owner =
+/// wide.id)` ran three blocks per row and runs one.
+///
 /// @param about - what the `IN` was written as
 /// @param block - the subquery's own select
 /// @param next - the next free subquery number, advanced by three
@@ -221,37 +327,49 @@ fn lowered(about: &Lowering, block: &BoundSelect, next: &mut usize) -> BoundExpr
         }),
         next,
     );
-    let any_row = exists(block, None, next);
-    let any_null = exists(
-        block,
-        Some(BoundExpr::IsNull {
-            negated: false,
-            operand: Box::new(about.listed.clone()),
-        }),
-        next,
-    );
+    // With neither NULL arm left the `CASE` is the `EXISTS` itself, which is
+    // 1 or 0 and never NULL, or its negation for `NOT IN`.
+    if about.operand_never_null && about.listed_never_null {
+        let mut matched = matched;
+        if let BoundExpr::Subquery { negated, .. } = &mut matched {
+            *negated = about.negated;
+        }
+        return matched;
+    }
     let (found, missing) = match about.negated {
         true => (BoundExpr::Integer(0), BoundExpr::Integer(1)),
         false => (BoundExpr::Integer(1), BoundExpr::Integer(0)),
     };
+    let mut branches = vec![(matched, found)];
+    if !about.operand_never_null {
+        let any_row = exists(block, None, next);
+        branches.push((
+            BoundExpr::IsNull {
+                negated: false,
+                operand: Box::new(about.operand.clone()),
+            },
+            BoundExpr::Case {
+                operand: None,
+                branches: vec![(any_row, BoundExpr::Null)],
+                otherwise: Some(Box::new(missing.clone())),
+                comparisons: Vec::new(),
+            },
+        ));
+    }
+    if !about.listed_never_null {
+        let any_null = exists(
+            block,
+            Some(BoundExpr::IsNull {
+                negated: false,
+                operand: Box::new(about.listed.clone()),
+            }),
+            next,
+        );
+        branches.push((any_null, BoundExpr::Null));
+    }
     BoundExpr::Case {
         operand: None,
-        branches: vec![
-            (matched, found),
-            (
-                BoundExpr::IsNull {
-                    negated: false,
-                    operand: Box::new(about.operand.clone()),
-                },
-                BoundExpr::Case {
-                    operand: None,
-                    branches: vec![(any_row, BoundExpr::Null)],
-                    otherwise: Some(Box::new(missing.clone())),
-                    comparisons: Vec::new(),
-                },
-            ),
-            (any_null, BoundExpr::Null),
-        ],
+        branches,
         otherwise: Some(Box::new(missing)),
         comparisons: Vec::new(),
     }
@@ -299,6 +417,16 @@ fn widened(expr: BoundExpr, affinity: Option<Affinity>) -> BoundExpr {
     }
 }
 
+/// Returns the terms of a conjunction, left to right.
+///
+/// @param filter - a `WHERE` clause
+fn conjuncts(filter: &BoundExpr) -> Box<dyn Iterator<Item = &BoundExpr> + '_> {
+    match filter {
+        BoundExpr::And(left, right) => Box::new(conjuncts(left).chain(conjuncts(right))),
+        other => Box::new(std::iter::once(other)),
+    }
+}
+
 /// Returns an `EXISTS` over a copy of the block, with one more `WHERE` term.
 ///
 /// @param block - the subquery's own select
@@ -315,7 +443,15 @@ fn exists(block: &BoundSelect, extra: Option<BoundExpr>, next: &mut usize) -> Bo
         first.origin = None;
     }
     copy.order_by.clear();
-    if let Some(extra) = extra {
+    // **An equality the `WHERE` already holds is not added twice (task-2183).**
+    // `x IN (SELECT y FROM s WHERE y = x)` would test `y = x` twice, and the
+    // second copy is a residual filter the access path does not consume.
+    let held_already = |extra: &BoundExpr| {
+        copy.filter
+            .as_ref()
+            .is_some_and(|filter| conjuncts(filter).any(|term| term == extra))
+    };
+    if let Some(extra) = extra.filter(|extra| !held_already(extra)) {
         copy.filter = Some(match copy.filter.take() {
             Some(held) => BoundExpr::And(Box::new(held), Box::new(extra)),
             None => extra,

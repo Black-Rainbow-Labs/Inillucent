@@ -429,6 +429,7 @@ impl Binder<'_> {
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
             written_schema: None,
+            derived: Default::default(),
         });
         self.outer.uses.push(OuterUse {
             depth,
@@ -632,6 +633,7 @@ impl Binder<'_> {
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
             written_schema: None,
+            derived: Default::default(),
         };
         if let Some(held) = self.sources.get_mut(id) {
             *held = source.clone();
@@ -685,5 +687,6 @@ fn inner_query(
         windows: Vec::new(),
         correlations: correlations.to_vec(),
         shared: None,
+        serial: 0,
     }
 }

@@ -147,6 +147,11 @@ impl Redo for PageStore {
                 format!("delete {}", String::from_utf8_lossy(key)),
                 lsn,
             ),
+            Body::DeleteRows { page, keys, .. } => self.note(
+                page,
+                format!("delete {}", String::from_utf8_lossy(keys)),
+                lsn,
+            ),
             Body::UpdateInPlace {
                 page, key, column, ..
             } => self.note(page, format!("update {column} of {key:?}"), lsn),
@@ -174,6 +179,21 @@ impl Redo for PageStore {
                     if wanted.get(slot).copied().unwrap_or(false) {
                         self.logical.remove(&page);
                         self.put(page, image, lsn);
+                    }
+                }
+            }
+            // A logical split's pages are rebuilt by the tree, which this page
+            // store does not have; it notes each page the record still wanted.
+            Body::SplitLeaf {
+                left,
+                right,
+                parent,
+                kept,
+                ..
+            } => {
+                for (slot, page) in [left, right, parent].into_iter().enumerate() {
+                    if wanted.get(slot).copied().unwrap_or(false) {
+                        self.note(page, format!("split keeping {kept}"), lsn);
                     }
                 }
             }

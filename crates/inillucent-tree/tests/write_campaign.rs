@@ -19,7 +19,7 @@ use inillucent_base::DbResult;
 use inillucent_pool::{Database, Options, PageId};
 use inillucent_tree::datum::{Datum, OwnedDatum};
 use inillucent_tree::types::{ColumnSpec, PhysicalType};
-use inillucent_tree::write::{NoLog, TreeLog};
+use inillucent_tree::write::{NoLog, Rewrite, TreeLog, UpdateRun};
 use inillucent_tree::PagedTree;
 use inillucent_vfs::{DbPath, MemoryVfs};
 use inillucent_wal::record::Body;
@@ -514,7 +514,7 @@ fn every_read_path_agrees_over_a_written_to_tree() {
 
     // Some leaf really does hold writes, or the test proved nothing.
     let mut dirty = 0usize;
-    tree.visit_leaves(database.pool(), &mut |leaf| {
+    tree.visit_leaves_as_stored(database.pool(), &mut |leaf| {
         if leaf.has_writes() {
             dirty += 1;
         }
@@ -639,6 +639,7 @@ struct CountingLog {
     next: u64,
     write_pages: u64,
     structural: u64,
+    logical_splits: u64,
 }
 
 impl TreeLog for CountingLog {
@@ -646,6 +647,7 @@ impl TreeLog for CountingLog {
         match body {
             Body::WritePage { .. } => self.write_pages = self.write_pages.saturating_add(1),
             Body::Structural { .. } => self.structural = self.structural.saturating_add(1),
+            Body::SplitLeaf { .. } => self.logical_splits = self.logical_splits.saturating_add(1),
             _ => {}
         }
         self.next = self.next.saturating_add(8);
@@ -722,9 +724,20 @@ fn a_split_does_not_log_its_parents_image_twice() {
         log.write_pages
     );
     assert_eq!(
-        log.structural, splits,
-        "every split should log exactly one Structural record; {} logged against \
-         {splits} splits",
+        log.structural + log.logical_splits,
+        splits,
+        "every split should log exactly one record; {} Structural and {} SplitLeaf \
+         logged against {splits} splits",
+        log.structural,
+        log.logical_splits
+    );
+    // **Only the root's own split needs its pages.** Every later split here has
+    // a parent with room and moves no out of line value, which are the
+    // conditions `Body::SplitLeaf` is written under, and a split that took the
+    // image form anyway would cost three whole pages of log for nothing.
+    assert_eq!(
+        log.structural, 1,
+        "{} of {splits} splits logged their page images; only the root split should",
         log.structural
     );
     assert_agrees(
@@ -790,5 +803,416 @@ fn the_two_merges_agree(pool: &inillucent_pool::Pool, tree: &PagedTree) {
         // comparison - which is right for the question being asked and wrong
         // for "is this key in the tree". `tree.point` answers that, over
         // every leaf, a few lines up.
+    }
+}
+
+/// A `TreeLog` that keeps the row records a write logs, and each undo image.
+#[derive(Debug, Default)]
+struct RowRecords {
+    /// The last LSN handed out.
+    next: u64,
+    /// Each `DeleteRow`'s tree, and its key as tagged values, in log order.
+    deletes: Vec<(u64, Vec<u8>)>,
+    /// Each `UpdateInPlace`'s key, column and value, in log order.
+    updates: Vec<(Vec<u8>, u32, Vec<u8>)>,
+    /// Each `InsertRow`'s row, in log order.
+    inserts: Vec<Vec<u8>>,
+    /// How many `CompactLeaf` records carried their page.
+    repacks: usize,
+    /// Each undo image, in the order the log was given them.
+    undone: Vec<Option<Vec<OwnedDatum>>>,
+}
+
+impl TreeLog for RowRecords {
+    fn log(&mut self, body: Body<'_>) -> DbResult<u64> {
+        match body {
+            Body::DeleteRow { tree, key, .. } => self.deletes.push((tree, key.to_vec())),
+            // A run's keys, one entry each, so a batched run and the row at a
+            // time path compare key for key.
+            Body::DeleteRows { tree, keys, .. } => {
+                for key in inillucent_wal::record::key_list(keys)? {
+                    self.deletes.push((tree, key.to_vec()));
+                }
+            }
+            Body::UpdateInPlace {
+                key, column, value, ..
+            } => self.updates.push((key.to_vec(), column, value.to_vec())),
+            Body::InsertRow { row, .. } => self.inserts.push(row.to_vec()),
+            Body::CompactLeaf { image, .. } if !image.is_empty() => self.repacks += 1,
+            _ => {}
+        }
+        self.next = self.next.saturating_add(8);
+        Ok(self.next)
+    }
+
+    fn wants_undo(&self) -> bool {
+        true
+    }
+
+    fn undo(
+        &mut self,
+        _tree: u64,
+        _key: &[Datum<'_>],
+        before: Option<Vec<OwnedDatum>>,
+    ) -> DbResult<()> {
+        self.undone.push(before);
+        Ok(())
+    }
+}
+
+/// Writes the same seeded rows into a tree and its model.
+///
+/// Replaces, fresh keys past the bulk built ones, and labels long enough to be
+/// stored out of line, so the leaves hold tombstones, delta rows and extents.
+///
+/// @param database - the file
+/// @param tree - the tree
+/// @param model - what it holds
+/// @param seed - which rows
+fn dirty(database: &mut Database, tree: &mut PagedTree, model: &mut BTreeMap<i64, Row>, seed: u64) {
+    let mut rng = Rng::new(0xD1_7E00 + seed);
+    let mut log = NoLog::default();
+    for round in 0..160u64 {
+        let key = (rng.next_u64() % 360) as i64;
+        let label = match round % 5 {
+            0 => format!("long-{round}-{}", "z".repeat(300)).into_bytes(),
+            _ => format!("d{seed}-{round}").into_bytes(),
+        };
+        let counter = (rng.next_u64() % 1_000) as i64;
+        tree.insert(
+            database,
+            &mut log,
+            &[Datum::Int(key), Datum::Text(&label), Datum::Int(counter)],
+        )
+        .unwrap_or_else(|error| panic!("seed {seed}, round {round}: insert failed: {error:?}"));
+        model.insert(key, Row { label, counter });
+    }
+}
+
+/// Deleting sorted keys a leaf at a time logs and returns what one at a time does.
+///
+/// **The batch changes only the page side (task-2180).** Two trees are built
+/// and written identically. One loses a sorted list of keys through
+/// `delete_sorted`, the other through `delete_near` one key at a time, and the
+/// two must hand back the same rows, log the same `DeleteRow` records and undo
+/// images in the same order, and end holding what the model holds. The keys
+/// include ones neither tree has, and the writes put delta rows and out of line
+/// values in the leaves, so every place a row can be is deleted from.
+///
+/// The batch must also have batched: a quarter as many calls that deleted
+/// something as rows deleted, or the comparison would hold of a
+/// `delete_sorted` that only ever took one key.
+#[test]
+fn deleting_sorted_keys_a_leaf_at_a_time_matches_deleting_one_at_a_time() {
+    for seed in 0..4u64 {
+        let (mut batched_db, mut batched, mut model) = fixture(1_024, 64, 300);
+        let (mut single_db, mut single, _) = fixture(1_024, 64, 300);
+        dirty(&mut batched_db, &mut batched, &mut model, seed);
+        let mut twin = BTreeMap::new();
+        dirty(&mut single_db, &mut single, &mut twin, seed);
+        let mut rng = Rng::new(0xBA7C_0000 + seed);
+        let keys: Vec<i64> = (0..400i64)
+            .filter(|_| !rng.next_u64().is_multiple_of(3))
+            .collect();
+        let probes: Vec<Vec<Datum<'_>>> = keys.iter().map(|key| vec![Datum::Int(*key)]).collect();
+
+        let mut batched_log = RowRecords::default();
+        let mut batched_rows = Vec::new();
+        let (mut at, mut calls, mut near) = (0usize, 0usize, None);
+        while at < probes.len() {
+            let rest = probes.get(at..).unwrap_or(&[]);
+            let held = batched_rows.len();
+            at += batched
+                .delete_sorted(
+                    &mut batched_db,
+                    &mut batched_log,
+                    rest,
+                    &mut near,
+                    &mut |row| {
+                        batched_rows.push(row.to_vec());
+                        Ok(())
+                    },
+                    true,
+                )
+                .unwrap_or_else(|error| panic!("seed {seed}: delete_sorted failed: {error:?}"));
+            // Only a call that deleted something counts: a key the tree does
+            // not hold costs a call of its own, and says nothing about runs.
+            if batched_rows.len() > held {
+                calls += 1;
+            }
+        }
+        let mut single_log = RowRecords::default();
+        let mut single_rows = Vec::new();
+        let mut near = None;
+        for probe in &probes {
+            if let Some(row) = single
+                .delete_near(&mut single_db, &mut single_log, probe, &mut near)
+                .unwrap_or_else(|error| panic!("seed {seed}: delete_near failed: {error:?}"))
+            {
+                single_rows.push(row);
+            }
+        }
+
+        assert_eq!(
+            batched_rows, single_rows,
+            "seed {seed}: the rows handed back differ"
+        );
+        assert_eq!(
+            batched_log.deletes, single_log.deletes,
+            "seed {seed}: the records differ"
+        );
+        assert_eq!(
+            batched_log.undone, single_log.undone,
+            "seed {seed}: the undo images differ"
+        );
+        let deleted = keys
+            .iter()
+            .filter(|key| model.remove(key).is_some())
+            .count();
+        assert_eq!(
+            batched_rows.len(),
+            deleted,
+            "seed {seed}: deleted the wrong number of rows"
+        );
+        assert!(
+            calls < deleted / 4,
+            "seed {seed}: {calls} calls for {deleted} rows is not a leaf at a time"
+        );
+        assert_agrees(
+            &batched_db,
+            &batched,
+            &model,
+            &format!("seed {seed}, batched"),
+        );
+        assert_agrees(
+            &single_db,
+            &single,
+            &model,
+            &format!("seed {seed}, one at a time"),
+        );
+        batched
+            .check(batched_db.pool())
+            .unwrap_or_else(|error| panic!("seed {seed}: integrity failed: {error:?}"));
+        assert_eq!(
+            batched.write_stats().deleted,
+            single.write_stats().deleted,
+            "seed {seed}: the two trees counted different deletes"
+        );
+    }
+}
+
+/// What the rewrite test does to one key: the same rule for both trees.
+///
+/// A fresh longer label for most keys, which fits its slot until the leaf runs
+/// out of room; a new counter for every third, a fixed width value; nothing
+/// for every seventh; and a skip for every eleventh.
+///
+/// @param row - the row as it is
+fn rewrite_rule(row: &[OwnedDatum]) -> Rewrite {
+    let key = match row.first() {
+        Some(OwnedDatum::Int(key)) => *key,
+        _ => return Rewrite::Skip,
+    };
+    if key % 11 == 0 {
+        return Rewrite::Skip;
+    }
+    if key % 7 == 0 {
+        return Rewrite::Unchanged;
+    }
+    if key % 3 == 0 {
+        return Rewrite::Column(2, OwnedDatum::Int(key * 5 + 1));
+    }
+    match row.get(1) {
+        Some(OwnedDatum::Text(label)) => {
+            let mut longer = label.clone();
+            longer.push(b'!');
+            Rewrite::Column(1, OwnedDatum::Text(longer))
+        }
+        _ => Rewrite::Skip,
+    }
+}
+
+/// Returns the row a rewrite asks for: the old row with its one column replaced.
+///
+/// @param before - the row as it is
+/// @param column - which column
+/// @param value - the new value
+fn rewritten(before: &[OwnedDatum], column: usize, value: OwnedDatum) -> Vec<OwnedDatum> {
+    let mut after = before.to_vec();
+    if let Some(cell) = after.get_mut(column) {
+        *cell = value;
+    }
+    after
+}
+
+/// Writes a whole row with `insert`, which replaces the row under its key.
+///
+/// @param database - the file
+/// @param tree - the tree
+/// @param log - where the records go
+/// @param row - the row
+fn write_whole(
+    database: &mut Database,
+    tree: &mut PagedTree,
+    log: &mut RowRecords,
+    row: &[OwnedDatum],
+) {
+    let borrowed: Vec<Datum<'_>> = row.iter().map(OwnedDatum::borrow).collect();
+    tree.insert(database, log, &borrowed)
+        .unwrap_or_else(|error| panic!("a whole row write failed: {error:?}"));
+}
+
+/// Rewrites every key one at a time, the way the row at a time `UPDATE` does.
+///
+/// Returns how many rows it counted: written or unchanged.
+///
+/// @param database - the file
+/// @param tree - the tree
+/// @param log - where the records go
+/// @param keys - the keys, in order
+fn rewrite_one_at_a_time(
+    database: &mut Database,
+    tree: &mut PagedTree,
+    log: &mut RowRecords,
+    keys: &[i64],
+) -> usize {
+    let mut counted = 0usize;
+    for key in keys {
+        let probe = [Datum::Int(*key)];
+        let Some(before) = tree.point(database.pool(), &probe).expect("a probe") else {
+            continue;
+        };
+        match rewrite_rule(&before) {
+            Rewrite::Skip | Rewrite::Row => continue,
+            Rewrite::Unchanged => {}
+            Rewrite::Column(column, value) => {
+                let done = tree
+                    .update_in_place(
+                        database,
+                        log,
+                        &probe,
+                        column,
+                        &value.borrow(),
+                        Some(&before),
+                    )
+                    .expect("an update in place");
+                if !done {
+                    write_whole(database, tree, log, &rewritten(&before, column, value));
+                }
+            }
+        }
+        counted += 1;
+    }
+    counted
+}
+
+/// Rewrites every key a leaf at a time with `update_sorted`, writing what it hands back whole.
+///
+/// Returns how many rows it counted and the most one call counted.
+///
+/// @param database - the file
+/// @param tree - the tree
+/// @param log - where the records go
+/// @param keys - the keys, in order
+fn rewrite_a_leaf_at_a_time(
+    database: &mut Database,
+    tree: &mut PagedTree,
+    log: &mut RowRecords,
+    keys: &[i64],
+) -> (usize, usize) {
+    let probes: Vec<Vec<Datum<'_>>> = keys.iter().map(|key| vec![Datum::Int(*key)]).collect();
+    let (mut at, mut counted, mut largest, mut near) = (0usize, 0usize, 0usize, None);
+    let mut run = UpdateRun::default();
+    while at < probes.len() {
+        let mut asked: Option<(usize, OwnedDatum)> = None;
+        tree.update_sorted(
+            database,
+            log,
+            probes.get(at..).unwrap_or(&[]),
+            &mut near,
+            &mut |row| {
+                let rule = rewrite_rule(row);
+                if let Rewrite::Column(column, value) = &rule {
+                    asked = Some((*column, value.clone()));
+                }
+                Ok(rule)
+            },
+            &mut run,
+        )
+        .expect("update_sorted");
+        counted += run.counted;
+        largest = largest.max(run.counted);
+        at += run.taken;
+        if let Some(before) = run.pending.take() {
+            let (column, value) = asked.expect("a row was handed back with no value decided");
+            write_whole(database, tree, log, &rewritten(&before, column, value));
+            counted += 1;
+            at += 1;
+        }
+    }
+    (counted, largest)
+}
+
+/// Rewriting sorted keys a leaf at a time leaves what one at a time does.
+///
+/// **The `UPDATE` half of the batch (task-2180).** Two trees are written
+/// identically, then one is rewritten through `update_sorted` and the other
+/// through `update_in_place` one key at a time, falling back to a whole row
+/// write when the value does not fit its slot; `update_sorted` repacks the leaf
+/// instead (task-2183). The two must give the same undo images in the same
+/// order, count the same rows, and end holding the same rows. Labels grow by a byte
+/// until leaves run out of room, so both the slot write and the fallback are
+/// reached, and some rows are in the delta area and some out of line.
+#[test]
+fn rewriting_sorted_keys_a_leaf_at_a_time_matches_rewriting_one_at_a_time() {
+    for seed in 0..4u64 {
+        let (mut batched_db, mut batched, mut model) = fixture(1_024, 64, 300);
+        let (mut single_db, mut single, _) = fixture(1_024, 64, 300);
+        dirty(&mut batched_db, &mut batched, &mut model, seed);
+        let mut twin = BTreeMap::new();
+        dirty(&mut single_db, &mut single, &mut twin, seed);
+        let mut rng = Rng::new(0x0FDA_7E00 + seed);
+        let keys: Vec<i64> = (0..400i64)
+            .filter(|_| !rng.next_u64().is_multiple_of(4))
+            .collect();
+        let mut single_log = RowRecords::default();
+        let mut batched_log = RowRecords::default();
+        // Twice over, so the second pass meets leaves the first pass filled.
+        for pass in 0..2 {
+            let one = rewrite_one_at_a_time(&mut single_db, &mut single, &mut single_log, &keys);
+            let (leaf, largest) =
+                rewrite_a_leaf_at_a_time(&mut batched_db, &mut batched, &mut batched_log, &keys);
+            assert_eq!(
+                leaf, one,
+                "seed {seed}, pass {pass}: the two counted different rows"
+            );
+            // A batch that only ever took one row would pass every comparison.
+            assert!(
+                largest >= 4,
+                "seed {seed}, pass {pass}: no call wrote more than {largest} rows"
+            );
+        }
+        // **The records differ by design (task-2183).** A leaf whose rows
+        // outgrew their slots is repacked with every change of its run and
+        // logged as one page, where the row at a time path writes the rows
+        // that do not fit as new rows. What both must agree on is the undo
+        // images, the rows counted and the rows held.
+        assert_eq!(
+            batched_log.undone, single_log.undone,
+            "seed {seed}: the undo images differ"
+        );
+        assert!(batched_log.repacks > 0, "seed {seed}: no leaf was repacked");
+        assert!(
+            !single_log.inserts.is_empty(),
+            "seed {seed}: no row fell back to a whole write one at a time"
+        );
+        assert_eq!(
+            batched.rows(batched_db.pool()).expect("a scan"),
+            single.rows(single_db.pool()).expect("a scan"),
+            "seed {seed}: the two trees hold different rows"
+        );
+        batched
+            .check(batched_db.pool())
+            .unwrap_or_else(|error| panic!("seed {seed}: integrity failed: {error:?}"));
     }
 }

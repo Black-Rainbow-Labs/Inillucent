@@ -759,6 +759,7 @@ impl Binder<'_> {
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
             written_schema: None,
+            derived: Default::default(),
         });
         self.scopes.push(vec![id]);
         // Bound as top-level SQL, not as schema text: a function only direct

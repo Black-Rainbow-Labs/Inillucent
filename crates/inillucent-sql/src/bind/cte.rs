@@ -125,7 +125,17 @@ impl Binder<'_> {
     ///
     /// @param folded - the folded name
     pub(super) fn name_is_used_twice(&self, folded: &[u8]) -> bool {
-        let mut uses = 0usize;
+        self.name_uses(folded) > 1
+    }
+
+    /// Counts the FROM terms of the statement that name a table.
+    ///
+    /// Counted over every FROM term the statement was parsed into, as
+    /// [`Binder::name_is_used_twice`] counts them.
+    ///
+    /// @param folded - the folded name
+    pub(super) fn name_uses(&self, folded: &[u8]) -> u32 {
+        let mut uses = 0u32;
         for at in 0..self.ast.from_term_count() {
             let Some(term) = self.ast.from_term(ast::FromTermId(at as u32)) else {
                 continue;
@@ -141,7 +151,7 @@ impl Binder<'_> {
                 }
             }
         }
-        uses > 1
+        uses
     }
 
     /// Marks the block a CTE reference was just bound to as one that shares its
@@ -312,6 +322,7 @@ impl Binder<'_> {
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
             written_schema: None,
+            derived: Default::default(),
         });
         if let Some(scope) = self.scopes.last_mut() {
             scope.push(id);
@@ -367,6 +378,7 @@ impl Binder<'_> {
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
             written_schema: None,
+            derived: Default::default(),
         });
 
         let seed = self.bind_isolated_arm(first)?;
@@ -447,6 +459,7 @@ impl Binder<'_> {
             suppressed: Vec::new(),
             index_exprs: Vec::new(),
             written_schema: None,
+            derived: Default::default(),
         };
         if let SourceRows::Recursive(body) = &mut source.rows {
             if body.steps.is_empty() {
@@ -523,6 +536,28 @@ impl<'a> Binder<'a> {
             bound
         };
         self.binding_ctes.pop();
+        // A recursive CTE's references to itself, inside its own arms, are the
+        // recursion and not uses of it.
+        let own = match self.ast.select(cte.select) {
+            Some(query) => core::iter::once(query.first)
+                .chain(query.compounds.iter().map(|(_, arm)| *arm))
+                .filter(|arm| self.core_names_cte(*arm, &cte.folded))
+                .count() as u32,
+            None => 0,
+        };
+        let uses = self.name_uses(&cte.folded).saturating_sub(own);
+        // The reference is the term this binding just added to the block's
+        // scope; the sources the body bound come before it.
+        let id = self.scope().last().copied();
+        if let Some(source) = id.and_then(|id| self.sources.get_mut(id)) {
+            source.derived = super::DerivedNote {
+                cte: true,
+                materialized: cte.materialized,
+                uses,
+                name: cte.name.clone(),
+                ..super::DerivedNote::default()
+            };
+        }
         outcome
     }
 

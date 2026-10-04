@@ -151,6 +151,11 @@ pub fn rewrite_select(select: &mut BoundSelect, rewrite: Rewrite<'_>) {
         for argument in &mut aggregate.arguments {
             rewrite_expr(argument, rewrite);
         }
+        // The call's own `FILTER` and `ORDER BY` read the row as its arguments
+        // do. Leaving them out kept a flattened derived table's column in
+        // `count(s.a ORDER BY s.a)`, and the statement was refused as misuse.
+        rewrite_option(aggregate.filter.as_mut(), rewrite);
+        rewrite_order(&mut aggregate.order_by, rewrite);
     }
     for row in &mut select.values {
         for value in row {

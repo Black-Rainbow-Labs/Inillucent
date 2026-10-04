@@ -74,6 +74,12 @@ impl<'a> Binder<'a> {
         let view_database = self.catalog.database_name(database_index).to_vec();
         let mut bound = bound.map_err(|error| qualify_missing_table(error, &view_database))?;
         super::finish_view_columns(&mut bound, &columns, &view_name, span)?;
-        self.push_subquery_source(bound, view_alias, columns, join, span)
+        let id = self.sources.len();
+        self.push_subquery_source(bound, view_alias, columns, join, span)?;
+        if let Some(source) = self.sources.get_mut(id) {
+            source.derived.view = true;
+            source.derived.name = view_name;
+        }
+        Ok(())
     }
 }

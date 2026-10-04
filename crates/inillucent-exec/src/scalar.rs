@@ -376,6 +376,14 @@ pub struct JsonCall {
     /// One lock rather than two, because the two are read together on every
     /// call and a second lock is a second uncontended atomic for nothing.
     extract: std::sync::Mutex<ExtractCache>,
+    /// The answer, kept, when every argument is a literal.
+    ///
+    /// **A JSON function of literals answers the same thing every time
+    /// (task-2183).** The JSON functions are deterministic, so
+    /// `SELECT json_extract('{"b":{"c":"d"}}', '$.b.c')` run four thousand
+    /// times extracted the same value four thousand times. `None` when an
+    /// argument is not a literal; the inner `None` until the first call.
+    constant: Option<std::sync::Mutex<Option<json::Answer>>>,
 }
 
 /// What a repeated `json_extract` does not have to parse again.
@@ -417,6 +425,7 @@ impl JsonCall {
             arguments,
             cached: std::sync::Mutex::new(None),
             extract: std::sync::Mutex::new(ExtractCache::default()),
+            constant: None,
         }
     }
 
@@ -519,12 +528,13 @@ impl JsonCall {
             let Ok(text) = std::str::from_utf8(document) else {
                 return Err(json::malformed());
             };
-            let node = json::parse::parse(text)
-                .map_err(|_| json::malformed())?
-                .node;
             let Some((_, steps)) = held.steps.as_ref() else {
                 return Ok(None);
             };
+            // Only the part of the document the path reads is built.
+            let node = json::parse::parse_pruned(text, steps)
+                .map_err(|_| json::malformed())?
+                .node;
             return Ok(Some(json::extract_parsed(&node, steps, binary)?));
         }
         if held.document.as_ref().map(|(seen, _)| seen.as_slice()) != Some(document) {
@@ -560,6 +570,25 @@ impl JsonCall {
     /// @param batch - the batch being evaluated
     /// @param nth - the position among the batch's live rows
     fn answer(&self, batch: &Batch<'_>, nth: usize) -> DbResult<json::Answer> {
+        let Some(constant) = &self.constant else {
+            return self.computed(batch, nth);
+        };
+        if let Some(kept) = constant.lock().ok().and_then(|held| held.clone()) {
+            return Ok(kept);
+        }
+        // An error is not kept: the next call reports it again.
+        let answer = self.computed(batch, nth)?;
+        if let Ok(mut held) = constant.lock() {
+            *held = Some(answer.clone());
+        }
+        Ok(answer)
+    }
+
+    /// Evaluates the call, keeping the subtype its answer carries.
+    ///
+    /// @param batch - the batch being evaluated
+    /// @param nth - the position among the batch's live rows
+    fn computed(&self, batch: &Batch<'_>, nth: usize) -> DbResult<json::Answer> {
         // The single-path `json_extract` shape, answered from the cache above
         // without parsing or allocating anything a previous row already did.
         // Every other shape falls through to the general path below.
@@ -648,7 +677,24 @@ pub fn compile_json(
             other => JsonOperand::Plain(crate::expr::compile(other, types)?),
         });
     }
-    Ok(JsonCall::over(func, operands))
+    let mut call = JsonCall::over(func, operands);
+    if all_literal(arguments) {
+        call.constant = Some(std::sync::Mutex::new(None));
+    }
+    Ok(call)
+}
+
+/// Reports whether every argument of a JSON call is a literal or a JSON call of literals.
+///
+/// @param arguments - the call's argument expressions
+fn all_literal(arguments: &[crate::expr::Expr]) -> bool {
+    arguments.iter().all(|argument| match argument {
+        crate::expr::Expr::Literal(_) => true,
+        crate::expr::Expr::Json {
+            arguments: nested, ..
+        } => all_literal(nested),
+        _ => false,
+    })
 }
 
 /// A call to one of the math functions.
@@ -719,6 +765,51 @@ impl Eval for GeneralArith {
     fn value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<Computed<'p>> {
         let left = self.left.value(batch, nth)?;
         let right = self.right.value(batch, nth)?;
+        self.apply(left, right)
+    }
+}
+
+impl GeneralArith {
+    /// Applies the operator to two operands already evaluated.
+    ///
+    /// @param left - the left operand's value
+    /// @param right - the right operand's value
+    fn apply<'p>(&self, left: Computed<'p>, right: Computed<'p>) -> DbResult<Computed<'p>> {
+        // **Two integers are answered here (task-2183).** `a.id % 100` over a
+        // scan made each operand an owned value and classified it as a number
+        // again for every row, which was half of a 400 row filter. The answer
+        // is `integer_arithmetic`'s, the rule the general path applies to two
+        // integers first; an overflow still falls through to it.
+        if let (Datum::Int(a), Datum::Int(b)) = (left.get(), right.get()) {
+            // An integer or a NULL is handed back as it is, with no owned value
+            // to build and drop for every row.
+            match eval::integer_arithmetic(self.op, a, b) {
+                Some(Value::Integer(answer)) => return Ok(Computed::Borrowed(Datum::Int(answer))),
+                Some(Value::Null) => return Ok(Computed::Borrowed(Datum::Null)),
+                Some(answer) => return Ok(Computed::Owned(OwnedDatum::from(answer))),
+                None => {}
+            }
+        }
+        // **Two texts are joined here (task-2183).** `note || '!'` over every
+        // row of a table copied both sides into owned values and grew the
+        // answer as it went, which was a fifth of `UPDATE side_table SET note =
+        // note || '!'`. The bytes are joined once, into a list of the final
+        // length, under the same size rules as below.
+        if let (BinaryOp::Concat, Datum::Text(first), Datum::Text(second)) =
+            (self.op, left.get(), right.get())
+        {
+            let wanted = first.len().saturating_add(second.len());
+            if self.length_limit > 0 && wanted as u64 > self.length_limit as u64 {
+                return Err(too_big());
+            }
+            if wanted as u64 >= MATERIALISED_AT {
+                inillucent_base::budget::materialise(wanted as u64)?;
+            }
+            let mut joined = Vec::with_capacity(wanted);
+            joined.extend_from_slice(first);
+            joined.extend_from_slice(second);
+            return Ok(Computed::Owned(OwnedDatum::Text(joined)));
+        }
         let left = Value::from(&left.get()).into_owned()?;
         let right = Value::from(&right.get()).into_owned()?;
         // **Before the concatenation, because the size is the sum of two
@@ -736,6 +827,37 @@ impl Eval for GeneralArith {
         }
         let answer = eval::arithmetic(self.op, &left, &right, ENCODING);
         Ok(Computed::Owned(OwnedDatum::from(answer)))
+    }
+}
+
+/// `x % n` or `x / n` for a constant integer `n` that is neither 0 nor -1.
+///
+/// **Neither can overflow nor be NULL for an integer `x` (task-2183)**, so an
+/// integer is answered with one machine instruction and nothing else. `key %
+/// 50000` over every row of a table went through the general node's operand
+/// checks and its answer conversion: 12% of `GROUP BY key % 50000`. Anything
+/// that is not an integer is handed to the general node.
+pub struct IntByConstant {
+    /// The constant divisor, never 0 or -1.
+    pub divisor: i64,
+    /// The same operator over the same operands, for every other value.
+    pub general: GeneralArith,
+}
+
+impl Eval for IntByConstant {
+    fn value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<Computed<'p>> {
+        let left = self.general.left.value(batch, nth)?;
+        if let Datum::Int(number) = left.get() {
+            let answer = match self.general.op {
+                BinaryOp::Modulo => number.checked_rem(self.divisor),
+                _ => number.checked_div(self.divisor),
+            };
+            if let Some(answer) = answer {
+                return Ok(Computed::Borrowed(Datum::Int(answer)));
+            }
+        }
+        let right = self.general.right.value(batch, nth)?;
+        self.general.apply(left, right)
     }
 }
 
@@ -1143,13 +1265,61 @@ pub(crate) fn like_shape(pattern: &[u8], subject: &[u8], fold: bool) -> Option<b
             .checked_sub(literal.len())
             .and_then(|at| subject.get(at..))
             .is_some_and(|tail| same(literal, tail)),
-        (true, true) => {
-            literal.is_empty()
-                || subject
-                    .windows(literal.len())
-                    .any(|window| same(literal, window))
-        }
+        (true, true) => literal.is_empty() || holds_literal(subject, literal, fold),
     })
+}
+
+/// Reports whether a text holds a literal anywhere, letters compared as `like_shape` compares them.
+///
+/// **The literal's first byte is looked for, and only where it is found is
+/// the rest compared (task-2183).** Comparing the literal at every offset was
+/// most of `label LIKE '%9 lorem%'`; a byte search over the text, two bytes
+/// when a letter matches either case, skips the offsets that cannot start a
+/// match.
+///
+/// @param subject - the text being matched
+/// @param literal - the literal, not empty
+/// @param fold - whether ASCII letters match regardless of case
+fn holds_literal(subject: &[u8], literal: &[u8], fold: bool) -> bool {
+    let Some((&first, rest)) = literal.split_first() else {
+        return true;
+    };
+    let Some(last_start) = subject.len().checked_sub(literal.len()) else {
+        return false;
+    };
+    let (lower, upper) = match fold {
+        true => (first.to_ascii_lowercase(), first.to_ascii_uppercase()),
+        false => (first, first),
+    };
+    let same = |left: &[u8], right: &[u8]| {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(a, b)| a == b || (fold && a.eq_ignore_ascii_case(b)))
+    };
+    let mut at = 0usize;
+    while at <= last_start {
+        let Some(window) = subject.get(at..=last_start) else {
+            return false;
+        };
+        let found = match lower == upper {
+            true => window.iter().position(|byte| *byte == lower),
+            false => window
+                .iter()
+                .position(|byte| *byte == lower || *byte == upper),
+        };
+        let Some(offset) = found else {
+            return false;
+        };
+        let start = at.saturating_add(offset);
+        let tail = subject.get(start.saturating_add(1)..start.saturating_add(literal.len()));
+        if tail.is_some_and(|tail| same(rest, tail)) {
+            return true;
+        }
+        at = start.saturating_add(1);
+    }
+    false
 }
 
 #[cfg(test)]

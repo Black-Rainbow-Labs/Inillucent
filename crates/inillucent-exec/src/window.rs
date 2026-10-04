@@ -180,9 +180,45 @@ impl Sink for Window {
 /// @param rows - the buffered input, already sorted
 /// @param plan - the partition keys and the calls
 pub fn compute(rows: &[Vec<OwnedDatum>], plan: &WindowPlan) -> DbResult<Vec<Vec<OwnedDatum>>> {
+    let calls = plan.calls.len();
+    let extra = compute_values(rows, plan)?;
+    Ok(rows
+        .iter()
+        .enumerate()
+        .map(|(row, held)| {
+            let mut whole = Vec::with_capacity(held.len().saturating_add(calls));
+            whole.extend(held.iter().cloned());
+            let from = row.saturating_mul(calls);
+            whole.extend(
+                extra
+                    .get(from..from.saturating_add(calls))
+                    .unwrap_or(&[])
+                    .iter()
+                    .cloned(),
+            );
+            whole
+        })
+        .collect())
+}
+
+/// Computes every window value for every row, without the rows.
+///
+/// One list, row by row: row `r`'s value for call `c` is at `r * calls + c`.
+///
+/// **The values alone (task-2183).** [`compute`] hands back a copy of every
+/// row with its values appended, and a caller that owns the rows and only
+/// wants the values appended to them paid for that copy and for one small
+/// list per row on the way: `row_number() OVER (ORDER BY key, id)` over 1,560
+/// rows made six thousand allocations.
+///
+/// @param rows - the buffered input, already sorted
+/// @param plan - the partition keys and the calls
+pub fn compute_values(rows: &[Vec<OwnedDatum>], plan: &WindowPlan) -> DbResult<Vec<OwnedDatum>> {
     let total = rows.len();
-    let mut extra: Vec<Vec<OwnedDatum>> = vec![Vec::with_capacity(plan.calls.len()); total];
-    for call in &plan.calls {
+    let calls = plan.calls.len();
+    let mut extra: Vec<OwnedDatum> = vec![OwnedDatum::Null; total.saturating_mul(calls)];
+    for (nth, call) in plan.calls.iter().enumerate() {
+        let slot_of = |row: usize| row.saturating_mul(calls).saturating_add(nth);
         // Every call shares the partition boundaries but brings its own
         // `ORDER BY`, so the peer groups are its own.
         let partitions = frames::partitions(
@@ -192,86 +228,106 @@ pub fn compute(rows: &[Vec<OwnedDatum>], plan: &WindowPlan) -> DbResult<Vec<Vec<
             !call.order.is_empty(),
         );
         for partition in &partitions {
-            let mut stepped_a_real = false;
-            for row in partition.start..partition.end {
-                let mut value = evaluate(rows, call, partition, row)?;
-                if slides_a_sum(call) {
-                    stepped_a_real |= frame_holds_a_real(rows, call, partition, row);
-                    if let (true, OwnedDatum::Int(number)) = (stepped_a_real, &value) {
-                        value = OwnedDatum::Real(*number as f64);
+            if let Some(kind) = slides_a_sum(call) {
+                for (row, value) in
+                    (partition.start..partition.end).zip(sliding_sums(rows, call, partition, kind)?)
+                {
+                    if let Some(slot) = extra.get_mut(slot_of(row)) {
+                        *slot = value;
                     }
                 }
-                if let Some(slot) = extra.get_mut(row) {
-                    slot.push(value);
+                continue;
+            }
+            for row in partition.start..partition.end {
+                let value = evaluate(rows, call, partition, row)?;
+                if let Some(slot) = extra.get_mut(slot_of(row)) {
+                    *slot = value;
                 }
             }
         }
     }
-    Ok(rows
-        .iter()
-        .zip(extra)
-        .map(|(row, appended)| {
-            let mut whole = row.clone();
-            whole.extend(appended);
-            whole
-        })
-        .collect())
+    Ok(extra)
 }
 
-/// Reports whether a call is `sum()` over a frame whose start moves.
+/// Returns the accumulator kind when a call is `sum()`, `total()` or `avg()`
+/// over a frame whose start moves, and `None` for every other call.
 ///
 /// **SQLite computes such a frame by adding the rows that enter it and
 /// removing the rows that leave, with one accumulator for the partition.**
-/// `sum()`'s accumulator records that it has seen a value that is not an
-/// integer, and removing that value does not clear the record, so from then
-/// on every row of the partition answers a real. `sum(a) OVER (ORDER BY a
-/// RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)` over the texts `'0x10'` and
-/// `'10'` is 10.0 on the second row there, although its frame holds only
-/// `'10'`. A frame that starts at `UNBOUNDED PRECEDING` only grows, so the
-/// frame itself already holds every value the accumulator saw. A frame with
-/// an `EXCLUDE` clause is summed afresh for every row in SQLite, so there the
-/// frame's own values decide: `sum(a) OVER (... ROWS BETWEEN CURRENT ROW AND
-/// CURRENT ROW EXCLUDE TIES)` is the integer 5 on a row holding 5 after a row
-/// holding a real.
+/// What the accumulator remembers outlives the rows that caused it. Once a
+/// value that is not an integer was added the total stays a real, so `sum(a)
+/// OVER (ORDER BY a RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)` over the texts
+/// `'0x10'` and `'10'` is 10.0 on the second row although its frame holds only
+/// `'10'`. Once the total reached infinity it stays infinite, so `sum(v) OVER
+/// (ROWS 1 PRECEDING)` over 1e308, 1e308, 3 is Inf on the third row, where the
+/// frame alone sums to 1e308. A frame that starts at `UNBOUNDED PRECEDING`
+/// only grows, so the frame itself already holds every value the accumulator
+/// saw. A frame with an `EXCLUDE` clause, and a `DISTINCT` call, are summed
+/// afresh for every row in SQLite, so there the frame's own values decide.
 ///
 /// @param call - the window call
-fn slides_a_sum(call: &WindowCall) -> bool {
-    matches!(call.func, WindowSlot::Aggregate(AggregateKind::Sum))
-        && !matches!(call.frame.start, FrameEnd::UnboundedPreceding)
+fn slides_a_sum(call: &WindowCall) -> Option<AggregateKind> {
+    let WindowSlot::Aggregate(kind) = &call.func else {
+        return None;
+    };
+    let summed = matches!(
+        kind,
+        AggregateKind::Sum | AggregateKind::Total | AggregateKind::Average
+    );
+    let slides = !matches!(call.frame.start, FrameEnd::UnboundedPreceding)
         && call.frame.exclude == FrameExclude::NoOthers
+        && !call.distinct;
+    (summed && slides).then(|| kind.clone())
 }
 
-/// Reports whether one row's frame holds a value `sum()` adds as a real.
+/// Computes a sliding `sum()`, `total()` or `avg()` for every row of one
+/// partition, the way SQLite steps its accumulator.
 ///
-/// That is every value `sqlite3_value_numeric_type` does not call an
-/// integer: a real, a blob, and text that numeric affinity does not make an
-/// integer. A row the call's `FILTER` drops is never added, and NULL is
-/// skipped.
+/// Between two rows SQLite first takes out the rows that left the frame and
+/// then adds the rows that entered it, each in partition order, and reads the
+/// value. Rows the call's `FILTER` drops are never added and so never taken
+/// out. A frame that is empty for every row, such as `ROWS BETWEEN 1
+/// PRECEDING AND 2 PRECEDING`, adds nothing and reads a fresh accumulator,
+/// which is what SQLite's reset of its frame table gives.
 ///
 /// @param rows - the buffered input
 /// @param call - the window call
-/// @param partition - the row's partition
-/// @param row - the row whose frame is read
-fn frame_holds_a_real(
+/// @param partition - the partition
+/// @param kind - `Sum`, `Total` or `Average`
+fn sliding_sums(
     rows: &[Vec<OwnedDatum>],
     call: &WindowCall,
     partition: &frames::Partition,
-    row: usize,
-) -> bool {
-    let Some(column) = call.arguments.first() else {
-        return false;
+    kind: AggregateKind,
+) -> DbResult<Vec<OwnedDatum>> {
+    let Some(column) = call.arguments.first().copied() else {
+        return Ok(Vec::new());
     };
-    frame_of(rows, call, partition, row)
-        .into_iter()
-        .filter(|member| passes_filter(rows, call, *member))
-        .any(|member| match value_at(rows, member, *column) {
-            Datum::Null | Datum::Int(_) => false,
-            Datum::Real(_) | Datum::Blob(_) => true,
-            text => !matches!(
-                inillucent_value::affinity::apply_numeric_affinity(Value::from(&text), false),
-                Value::Integer(_)
-            ),
-        })
+    let mut accumulator = Accumulator::new(kind);
+    let mut held: Vec<usize> = Vec::new();
+    let mut values = Vec::with_capacity(partition.end.saturating_sub(partition.start));
+    for row in partition.start..partition.end {
+        let mut frame: Vec<usize> = frame_of(rows, call, partition, row)
+            .into_iter()
+            .filter(|member| passes_filter(rows, call, *member))
+            .collect();
+        frame.sort_unstable();
+        for leaving in held
+            .iter()
+            .filter(|member| frame.binary_search(member).is_err())
+        {
+            accumulator.pull(&value_at(rows, *leaving, column));
+        }
+        for entering in frame
+            .iter()
+            .filter(|member| held.binary_search(member).is_err())
+        {
+            accumulator.push(&value_at(rows, *entering, column));
+        }
+        held = frame;
+        values.push(accumulator.finish()?);
+    }
+    Ok(values)
 }
 
 /// Returns one value of one row, or NULL when the column is not there.

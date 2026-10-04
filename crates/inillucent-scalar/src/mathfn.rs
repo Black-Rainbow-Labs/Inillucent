@@ -13,6 +13,59 @@
 use inillucent_sql::function::MathFunc;
 use inillucent_value::{cast, numeric as numeric_syntax, Value};
 
+// Compiled on every platform so its tests run everywhere; only Windows calls it.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod amd;
+
+/// The C library functions SQLite calls for these, as the pinned shell for this platform has them.
+///
+/// The pinned Windows shell links the static C runtime, whose `sinh`, `cosh`, `tanh`, `asin` and
+/// `acos` are AMD's libm and differ in the last bit from the `ucrtbase.dll` Rust's `f64` methods
+/// call. On every other platform the shell calls the system libm, as Rust does. See [`amd`].
+#[cfg(windows)]
+mod platform {
+    pub(super) use super::amd::{acos, asin, cosh, sinh, tanh};
+}
+
+/// See the Windows version of this module.
+#[cfg(not(windows))]
+mod platform {
+    /// `sinh` from the system libm.
+    ///
+    /// @param x - the argument
+    pub(super) fn sinh(x: f64) -> f64 {
+        x.sinh()
+    }
+
+    /// `cosh` from the system libm.
+    ///
+    /// @param x - the argument
+    pub(super) fn cosh(x: f64) -> f64 {
+        x.cosh()
+    }
+
+    /// `tanh` from the system libm.
+    ///
+    /// @param x - the argument
+    pub(super) fn tanh(x: f64) -> f64 {
+        x.tanh()
+    }
+
+    /// `asin` from the system libm.
+    ///
+    /// @param x - the argument
+    pub(super) fn asin(x: f64) -> f64 {
+        x.asin()
+    }
+
+    /// `acos` from the system libm.
+    ///
+    /// @param x - the argument
+    pub(super) fn acos(x: f64) -> f64 {
+        x.acos()
+    }
+}
+
 /// Calls a math function.
 pub fn call(func: MathFunc, arguments: &[Value<'static>]) -> Value<'static> {
     // `pi` takes no argument, so it is answered before anything is read.
@@ -37,8 +90,8 @@ pub fn call(func: MathFunc, arguments: &[Value<'static>]) -> Value<'static> {
     let second = second.map(|second| second.real);
     let answer = match func {
         MathFunc::Pi => return Value::Real(core::f64::consts::PI),
-        MathFunc::Acos => domain(first, -1.0, 1.0, f64::acos),
-        MathFunc::Asin => domain(first, -1.0, 1.0, f64::asin),
+        MathFunc::Acos => domain(first, -1.0, 1.0, platform::acos),
+        MathFunc::Asin => domain(first, -1.0, 1.0, platform::asin),
         MathFunc::Atan => Some(first.atan()),
         MathFunc::Acosh => (first >= 1.0).then(|| reference_acosh(first)),
         MathFunc::Asinh => Some(reference_asinh(first)),
@@ -48,7 +101,7 @@ pub fn call(func: MathFunc, arguments: &[Value<'static>]) -> Value<'static> {
         MathFunc::Atan2 => second.map(|second| first.atan2(second)),
         MathFunc::Ceil => Some(first.ceil()),
         MathFunc::Cos => Some(first.cos()),
-        MathFunc::Cosh => Some(first.cosh()),
+        MathFunc::Cosh => Some(platform::cosh(first)),
         MathFunc::Degrees => Some(first.to_degrees()),
         MathFunc::Exp => Some(first.exp()),
         MathFunc::Floor => Some(first.floor()),
@@ -71,10 +124,10 @@ pub fn call(func: MathFunc, arguments: &[Value<'static>]) -> Value<'static> {
         MathFunc::Pow => second.map(|second| first.powf(second)),
         MathFunc::Radians => Some(first.to_radians()),
         MathFunc::Sin => Some(first.sin()),
-        MathFunc::Sinh => Some(first.sinh()),
+        MathFunc::Sinh => Some(platform::sinh(first)),
         MathFunc::Sqrt => (first >= 0.0).then(|| first.sqrt()),
         MathFunc::Tan => Some(first.tan()),
-        MathFunc::Tanh => Some(first.tanh()),
+        MathFunc::Tanh => Some(platform::tanh(first)),
         MathFunc::Trunc => Some(first.trunc()),
     };
     match answer {

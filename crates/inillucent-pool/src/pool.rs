@@ -190,6 +190,8 @@ struct FrameMeta {
     /// a page id back into *that* is a silent corruption of an unrelated page.
     /// A descent through an eight-frame pool found it by losing a key.
     parent: Option<(u32, PageId, usize)>,
+    /// Which version of its page's bytes the frame holds; see `pool/merged.rs`.
+    generation: u64,
 }
 
 impl FrameMeta {
@@ -201,6 +203,7 @@ impl FrameMeta {
             dirty: false,
             rec_lsn: u64::MAX,
             parent: None,
+            generation: 0,
         }
     }
 }
@@ -549,6 +552,10 @@ pub struct Pool {
     /// file's own last checkpoint), which disables the clamp rather than
     /// asserting a floor nothing has earned.
     retained_lsn: Cell<u64>,
+    /// The last generation handed to a frame; see `FrameMeta::generation`.
+    generations: Cell<u64>,
+    /// Packed copies of written leaves, for readers; see `pool/merged.rs`.
+    merged: RefCell<merged::MergedCache>,
     /// The highest LSN this pool has written into the data file.
     ///
     /// **A page's stamp has to be a position in the stream beside the file, and
@@ -662,6 +669,7 @@ mod eviction;
 mod fold;
 mod journal_gate;
 mod locking;
+mod merged;
 mod spill;
 mod swizzle;
 
@@ -736,6 +744,8 @@ impl Pool {
             // No checkpoint has run yet in this pool's lifetime, so nothing is
             // floored - see the field's own doc comment.
             retained_lsn: Cell::new(u64::MAX),
+            generations: Cell::new(0),
+            merged: RefCell::new(merged::MergedCache::default()),
             // Nothing has been written yet, and zero is what the meta page
             // means by "no high water recorded".
             high_water_lsn: Cell::new(0),
@@ -1069,6 +1079,7 @@ impl Pool {
                 return Err(error);
             }
         };
+        let generation = self.next_generation();
         let mut state = self.state.borrow_mut();
         state.amend(frame, |meta| {
             meta.page = page;
@@ -1076,6 +1087,7 @@ impl Pool {
             meta.dirty = spilled.is_some();
             meta.rec_lsn = spilled.map_or(u64::MAX, |slot| slot.rec_lsn());
             meta.parent = None;
+            meta.generation = generation;
         });
         if let Some(slot) = self.pins.get(frame as usize) {
             slot.set(0);
@@ -1341,8 +1353,12 @@ impl Pool {
                 .map_err(|_| misuse("a frame being installed into is borrowed"))?;
             bytes.copy_from_slice(image);
         }
+        let generation = self.next_generation();
         let mut state = self.state.borrow_mut();
-        state.amend(frame, |meta| meta.dirty = true);
+        state.amend(frame, |meta| {
+            meta.dirty = true;
+            meta.generation = generation;
+        });
         drop(state);
         if page.0 >= self.page_count.get() {
             self.page_count.set(page.0.saturating_add(1));
@@ -1482,6 +1498,7 @@ impl Pool {
     ) -> DbResult<R> {
         let frame = self.resolve(page)?;
         self.note_dirty_from(frame);
+        self.renew_generation(frame);
         let outcome = {
             let mut bytes = self
                 .buffers

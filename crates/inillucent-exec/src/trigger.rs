@@ -455,6 +455,7 @@ fn truth_of(guard: &BoundExpr, target: &dyn WriteTarget, params: &Params) -> DbR
         windows: Vec::new(),
         correlations: Vec::new(),
         shared: None,
+        serial: 0,
     };
     let rows = run_select(&select, target, params)?;
     Ok(rows

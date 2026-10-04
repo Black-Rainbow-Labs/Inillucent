@@ -559,6 +559,63 @@ impl Accumulator {
         self.count = self.count.saturating_add(rows as i64);
     }
 
+    /// Takes one value back out of a `sum`, `total` or `avg`, as SQLite's
+    /// `sumInverse` does when a row leaves a sliding window frame.
+    ///
+    /// **The total is not recomputed from the rows left in the frame.** SQLite
+    /// keeps one accumulator per partition and subtracts each row that leaves,
+    /// so a total that reached infinity stays infinite after the large values
+    /// have left, and a total that left the integers stays a real. The
+    /// subtraction follows `sumInverse`: an exact integer total subtracts
+    /// exactly until that would overflow, and a real total adds the negated
+    /// value through the same compensated step a push uses. `i64::MIN` cannot
+    /// be negated, so it is taken out as `i64::MAX` and then 1.
+    ///
+    /// Does nothing for any other kind of aggregate and for NULL.
+    ///
+    /// @param value - the value of the row leaving the frame
+    pub fn pull(&mut self, value: &Datum<'_>) {
+        if value.is_null()
+            || !matches!(
+                self.kind,
+                AggregateKind::Sum | AggregateKind::Total | AggregateKind::Average
+            )
+        {
+            return;
+        }
+        if let Datum::Text(_) = value {
+            let converted = inillucent_value::affinity::apply_numeric_affinity(
+                inillucent_value::value::Value::from(value),
+                false,
+            );
+            if let inillucent_value::value::Value::Integer(number) = converted {
+                self.pull(&Datum::Int(number));
+                return;
+            }
+        }
+        self.count = self.count.saturating_sub(1);
+        if !self.is_real {
+            // Only integers are pushed while the total is exact, so only
+            // integers come back out here.
+            let Datum::Int(number) = value else {
+                return;
+            };
+            if let Some(total) = self.integer_sum.checked_sub(*number) {
+                self.integer_sum = total;
+                return;
+            }
+            self.seed_real();
+        }
+        match value {
+            Datum::Int(i64::MIN) => {
+                self.add_int(i64::MAX);
+                self.add_int(1);
+            }
+            Datum::Int(number) => self.add_int(-*number),
+            other => self.add_real(-numeric(other)),
+        }
+    }
+
     /// Folds one value in.
     ///
     /// @param value - the argument's value for this row, or NULL for `count(*)`
@@ -939,7 +996,14 @@ impl Accumulator {
     fn seed_real(&mut self) {
         self.overflowed = true;
         self.is_real = true;
-        let low = self.integer_sum % SPLIT_I64;
+        // SQLite's `kahanBabuskaNeumaierInit` splits only a total a double
+        // cannot hold exactly. The compensation term this leaves is what the
+        // next compensated step rounds against, so it is kept the same.
+        let low = if self.integer_sum > -EXACT_IN_DOUBLE && self.integer_sum < EXACT_IN_DOUBLE {
+            0
+        } else {
+            self.integer_sum % SPLIT_I64
+        };
         self.real_sum = (self.integer_sum - low) as f64;
         self.compensation = low as f64;
     }
