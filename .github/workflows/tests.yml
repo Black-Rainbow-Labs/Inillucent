@@ -178,7 +178,7 @@ jobs:
 
       # The whole history, so a pull request can ask what changed against its
       # base branch. A shallow clone has no base to compare with.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
