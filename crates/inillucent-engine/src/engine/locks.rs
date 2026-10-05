@@ -152,8 +152,8 @@ impl ImportedDatabase {
         // followed by `PRAGMA synchronous` read back FULL. It also threw away
         // an attached file's uncommitted pages under a `ROLLBACK` that had
         // already discarded them, which `attach.rs` reads as a row that
-        // survived a rollback. Two page reads and a `file_size` per lock are
-        // the price of not doing that.
+        // survived a rollback. One read of the shadow meta slot's record and a
+        // `file_size` per lock are the price of not doing that (task-2181).
         //
         // **A transaction that held no lock yet is re-derived too.** `batch`
         // opens its transaction before its first statement, so that statement
@@ -456,7 +456,7 @@ impl ImportedDatabase {
         // **The record's own bytes, compared without decoding them, and read
         // once per lock acquisition rather than once per caller**
         // (task-2046). `begin_read` has already asked this question of the
-        // same two slots a few instructions ago, under the same SHARED lock,
+        // same slot a few instructions ago, under the same SHARED lock,
         // which a writer cannot hold at the same time - so the answer is
         // remembered and this costs nothing at all. What it replaced was a
         // second `meta_on_disk`: a buffer one page long allocated and zeroed

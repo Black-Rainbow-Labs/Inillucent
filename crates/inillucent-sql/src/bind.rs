@@ -3978,24 +3978,25 @@ impl<'a> Binder<'a> {
         index: u16,
         span: Span,
     ) -> Result<BoundExpr, ParseError> {
-        let (database_name, table_name, column_name) = {
+        // **The names are lent to the authorizer, not copied for it**
+        // (task-2185). Three vectors per column reference were half of this
+        // function and 4% of compiling a one table aggregate; the source, the
+        // catalog and the authorizer are separate fields, so the borrows do
+        // not overlap.
+        let decision = {
             let Some(bound) = self.sources.get(source) else {
                 return Err(unsupported("unknown source", span));
             };
             let Some(info) = bound.table.column(index) else {
                 return Err(unsupported("unknown column", span));
             };
-            (
-                self.catalog.database_name(bound.table.database).to_vec(),
-                bound.table.name.clone(),
-                info.name.clone(),
-            )
+            self.authorizer.authorize(AuthAction::Read {
+                database: self.catalog.database_name(bound.table.database),
+                table: &bound.table.name,
+                column: &info.name,
+            })
         };
-        match self.authorizer.authorize(AuthAction::Read {
-            database: &database_name,
-            table: &table_name,
-            column: &column_name,
-        }) {
+        match decision {
             Authorization::Allow => {}
             Authorization::Deny => return Err(denied("not authorized", span)),
             Authorization::Ignore => return Ok(BoundExpr::Null),

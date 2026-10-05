@@ -183,10 +183,13 @@ needs the exclusive lock, and the writer kept that lock until it committed: ever
 process waited for the rest of the transaction and then failed with `busy`. An `UPDATE` of 20,000
 rows of 3 KB values was enough, with the default page cache of 128 MiB.
 
-A connection that holds the exclusive lock already, under `locking_mode = exclusive` or with a
-database attached, still writes such a page to the file early. That early write is protected by a
-rollback journal, so a crash before the commit can put the old page back. In `wal` mode the journal
-file is still created for this case.
+A connection that holds the exclusive lock already, under `locking_mode = exclusive`, with a
+database attached, or in the middle of a fold, writes a changed page whose transaction has committed
+to the file early. That early write is protected by a rollback journal, so a crash before the fold
+finishes can put the old page back. In `wal` mode the journal file is still created for this case.
+A page that holds changes of a transaction that has not committed goes to the spill file even under
+the exclusive lock. If the writer were killed with such a page in the database file, other processes
+could read rows of a transaction that will never commit before anybody put the journal back.
 
 The journal never outlives the file lock. Under `locking_mode = normal`, a connection whose journal
 holds old page images folds the log into the file before it releases the lock, and the fold removes
@@ -196,6 +199,14 @@ fold. A second process that opened the file in that window wrote the old images 
 the first connection had committed, and the first connection kept working from pages it believed
 were current. That lost committed rows, and it produced pages of zeros and B+tree levels that did
 not reach every leaf.
+
+Putting a dead process's journal back moves the meta record's generation on. Other processes may
+have read the pages the dead process wrote early before the journal was put back, because putting
+it back needs the RESERVED lock and a live writer may hold it. Every connection compares the meta
+record on each statement, so the new generation makes each of them rebuild its cache from the log
+over the file as it now is. Before version 2.1.5 nothing changed in the meta record or the log when
+a journal was put back, and a connection that had read the newer pages could fold without one of
+them and lose it for good.
 
 ---
 
@@ -230,6 +241,14 @@ since it last looked. If either moved, it drops its cached pages and replays the
 last checkpoint before it reads anything. If a rollback journal is beside the file at that moment,
 a process died while it held the lock, and the connection puts the journal's old pages back before
 it replays, as an open does.
+
+The check costs two reads. The connection reads the 120 bytes of the meta record in the second of
+the file's two meta pages, the shadow copy, and the length of the log segment it appends to. A
+checkpoint writes the same record to both meta pages and always writes the shadow copy first, so a
+checkpoint that has changed either page has changed the shadow copy. On Windows a statement outside
+a transaction makes six system calls for the lock and the check: three to take the shared lock, the
+two reads, and one to release the lock. Version 2.1.4 and earlier read both meta pages, which was a
+seventh call.
 
 Three more moments make the same check:
 
@@ -364,9 +383,10 @@ no `RETURNING`, and, for an `UPDATE`, no `FROM` and no subquery that reads the r
 2. For each leaf, the engine reads the leaf once and finds every row of the statement that the leaf
    holds.
 3. A `DELETE` writes one `DeleteRows` record for all of the leaf's rows, which names the leaf and
-   lists the keys, and one undo entry per row. The undo entry is read from a copy of the leaf, and
-   the row is copied out only when something reads it. An `UPDATE` writes one log record and one
-   undo entry per row, the records the row by row path writes.
+   lists the keys, and one undo entry per row. The undo entry is read from a copy of the leaf. The
+   values the statement needs to remove the row's index entries are read from the same copy, so a
+   row is copied out only when the leaf holds a value stored outside the page. An `UPDATE` writes
+   one log record and one undo entry per row, the records the row by row path writes.
 4. It changes the leaf once and stamps it with the last record's LSN.
 5. A `DELETE` checks once whether the leaf has emptied enough to merge with its neighbour. Then it
    removes each index's entries the same way, in that index's order.

@@ -75,7 +75,7 @@ pub use layout::{
     class_bytes, extent_class_for, extent_datum, fits_frame, from_frame, tombstone_bytes,
     write_frame, Layout,
 };
-pub use read::{LiveOrder, LiveRow, LiveSource, MiniColumn};
+pub use read::{LiveOrder, LiveRow, LiveSource, MiniColumn, RunCursor};
 
 mod delta;
 mod splice;

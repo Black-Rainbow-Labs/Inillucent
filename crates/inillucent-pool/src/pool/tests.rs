@@ -234,6 +234,69 @@ fn an_uncommitted_page_is_written_rather_than_dropped_when_its_frame_goes() {
     );
 }
 
+/// Under EXCLUSIVE, a page an open transaction changed goes to the spill file
+/// and not into the database file, when the pool has a spill file.
+///
+/// A page stolen into the database file stays there if the writer is killed,
+/// until some process puts the journal back, and that needs RESERVED, which a
+/// live writer may hold for a long time. Every process that reads in the
+/// meantime reads rows of a transaction that will never commit. The spill file
+/// is this connection's own, so nobody else can read it. The process storm with
+/// a 64 page pool is where the dead writer's pages were read.
+#[test]
+fn an_uncommitted_page_spills_under_exclusive_rather_than_reaching_the_file() {
+    let vfs = Arc::new(MemoryVfs::new());
+    let path = DbPath::new("spill-under-exclusive.rdb");
+    let pool = pool_beside(&vfs, &path, 512, 2, 12);
+    pool.set_journal(Some(crate::journal::Journal::new(
+        Arc::clone(&vfs) as Arc<dyn Vfs>,
+        &path,
+        crate::journal::JournalMode::Delete,
+        512,
+    )));
+    let spill_vfs = Arc::clone(&vfs);
+    pool.on_spill(std::rc::Rc::new(move || {
+        let spill = DbPath::new("spill-under-exclusive.spill");
+        spill_vfs
+            .open(
+                &spill,
+                OpenOptions::of_kind(inillucent_vfs::FileKind::Transient),
+            )
+            .map_err(|why| why.into_db_error())
+    }));
+    for level in [FileLock::Shared, FileLock::Reserved, FileLock::Exclusive] {
+        pool.lock(level).unwrap();
+    }
+    assert_eq!(pool.lock_level(), FileLock::Exclusive);
+    dirty_under_an_open_transaction(&pool, PageId(5));
+    for page in 6..12u64 {
+        let _ = pool.fetch(PageId(page)).unwrap();
+    }
+    assert!(
+        !pool.is_resident(PageId(5)),
+        "the frame was never evicted, so this proves nothing"
+    );
+    assert_eq!(
+        pool.spilled_pages(),
+        1,
+        "the page did not go to the spill file"
+    );
+    let file = vfs.open(&path, OpenOptions::main_db()).unwrap();
+    let mut on_disk = vec![0u8; 512];
+    file.read_exact_at(5 * 512, &mut on_disk).unwrap();
+    assert_eq!(
+        page::read_u64(&on_disk, 40).unwrap(),
+        0,
+        "the open transaction's change reached the database file"
+    );
+    let guard = pool.fetch(PageId(5)).unwrap();
+    assert_eq!(
+        page::read_u64(&guard, 40).unwrap(),
+        0xABCD,
+        "the change was thrown away with the frame"
+    );
+}
+
 /// With no journal to undo a steal with, the frame is kept instead.
 ///
 /// `memory` and `off` hold no pre-images on disk, so an eviction there has

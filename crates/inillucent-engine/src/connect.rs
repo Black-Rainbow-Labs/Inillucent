@@ -66,7 +66,8 @@ pub struct CacheStats {
     /// `crates/inillucent/tests/budget.rs`'s
     /// `a_statement_outside_a_transaction_rereads_nothing` (task-2046).
     pub meta_reads: u64,
-    /// Reads of the bytes a meta record occupies, without the page around them.
+    /// File reads of the bytes a meta record occupies, without the page around
+    /// them. The check reads the shadow slot alone, so one read is one check.
     pub meta_probes: u64,
 }
 

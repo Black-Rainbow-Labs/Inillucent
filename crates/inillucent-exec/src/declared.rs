@@ -192,6 +192,15 @@ impl<'a> IndexExprs<'a> {
         }
     }
 
+    /// Reports whether no index of the table has a predicate or a computed key.
+    ///
+    /// Then every index holds every row, and every key is a column read out
+    /// of the row, so a caller can build index entries from a row it only
+    /// borrows.
+    pub fn computes_nothing(&self) -> bool {
+        self.compiled.is_empty()
+    }
+
     /// Returns the compiled expressions of one index, when it has any.
     ///
     /// @param position - the index's position in the table's `indexes`

@@ -36,8 +36,8 @@ pub const DEFAULT_FRAMES: usize = 4_096;
 /// [`Database::disk_record_is_as_last_read`] for the check it makes possible.
 #[derive(Clone, Copy, Debug, Default)]
 struct LastReadSlots {
-    /// The record bytes of slot 0 and slot 1, or `None` before either has been
-    /// read in full.
+    /// The record bytes of the shadow slot, or `None` before the slots have
+    /// been read in full.
     ///
     /// **The bytes rather than the decoded record**, because the question is
     /// whether the file changed and not what it now says. Two encodings of the
@@ -45,7 +45,13 @@ struct LastReadSlots {
     /// fixed offsets and zeroes everything else - so comparing bytes answers it
     /// without decoding, and decoding is what costs a crc32 pass over a whole
     /// page.
-    read: Option<[[u8; META_RECORD_BYTES]; 2]>,
+    ///
+    /// **The shadow slot only (task-2181).** Every fold writes the shadow
+    /// before the primary, so the primary cannot change while the shadow stays
+    /// as it was; see `Pool::read_shadow_record`. Keeping the primary's bytes
+    /// as well cost a second read on every statement and answered nothing the
+    /// shadow had not.
+    read: Option<[u8; META_RECORD_BYTES]>,
     /// What the cheap check answered under the lock this connection holds, or
     /// `None` when it has not been asked since the file was last let go.
     ///
@@ -66,7 +72,8 @@ struct LastReadSlots {
 }
 
 impl LastReadSlots {
-    /// Writes down the record bytes of two slots just read in full.
+    /// Writes down the shadow slot's record bytes, from two slots just read in
+    /// full.
     ///
     /// **Only bytes that decoded, and never a short circuit.** Two rules, and
     /// each one is there so that the cheap check cannot answer a question the
@@ -91,7 +98,7 @@ impl LastReadSlots {
     /// @param decoded - whether one of the two slots yielded a record
     fn record(&mut self, primary: &[u8], shadow: &[u8], decoded: bool) {
         self.checked = Some(false);
-        let (Some(first), Some(second)) = (
+        let (Some(_), Some(second)) = (
             primary.get(..META_RECORD_BYTES),
             shadow.get(..META_RECORD_BYTES),
         ) else {
@@ -102,15 +109,9 @@ impl LastReadSlots {
             self.read = None;
             return;
         }
-        let mut records = [[0u8; META_RECORD_BYTES]; 2];
-        let (head, rest) = records.split_at_mut(1);
-        let (Some(slot), Some(other)) = (head.first_mut(), rest.first_mut()) else {
-            self.read = None;
-            return;
-        };
-        slot.copy_from_slice(first);
-        other.copy_from_slice(second);
-        self.read = Some(records);
+        let mut record = [0u8; META_RECORD_BYTES];
+        record.copy_from_slice(second);
+        self.read = Some(record);
     }
 }
 
@@ -186,8 +187,8 @@ pub struct Database {
     /// The whole record is still compared - see `the_meta_moved` for why one field
     /// is not enough.
     disk_meta: Meta,
-    /// The record bytes both slots held the last time this connection read them
-    /// in full, and whether they were still those bytes when it last looked.
+    /// The record bytes the shadow slot held the last time this connection read
+    /// both in full, and whether they were still those bytes when it last looked.
     ///
     /// **The per-statement staleness check, made cheap** (task-2046).
     /// [`Database::meta_on_disk`] allocates and zeroes a buffer one page long
@@ -1297,9 +1298,11 @@ impl Database {
     /// that is four 32 KiB allocations, four 32 KiB reads and four crc32 passes
     /// over 32 KiB, to compare a record 116 bytes long.
     ///
-    /// This reads those 120 bytes from each slot and compares them, and
+    /// This reads those 120 bytes from the shadow slot and compares them, and
     /// remembers the answer for as long as the lock is held, so the second
-    /// caller reads nothing at all.
+    /// caller reads nothing at all. It read the primary slot as well until
+    /// task-2181; see `Pool::read_shadow_record` for why the shadow alone
+    /// answers.
     ///
     /// **`false` is always safe and `true` is the claim.** A difference, a file
     /// too short to read, and a connection that has not yet read the slots in
@@ -1317,9 +1320,9 @@ impl Database {
             self.slots.checked = Some(false);
             return Ok(false);
         };
-        let unchanged = match self.pool.read_meta_records(self.pool.page_size()) {
+        let unchanged = match self.pool.read_shadow_record(self.pool.page_size()) {
             Ok(found) => found == last,
-            // A file too short to hold two slots, or one the operating system
+            // A file too short to hold the shadow slot, or one the operating system
             // refused: the full read that follows reports it with the message
             // the open path uses, which is where a caller can act on it.
             Err(_) => false,

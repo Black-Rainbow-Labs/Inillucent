@@ -1,4 +1,4 @@
-cut points: 80, acknowledged commits: 48, detected damage: 0, lost to a half written call: 0
+cut points: 76, acknowledged commits: 47, detected damage: 0, lost to a half written call: 0
 1	failed	old
 2	failed	old
 3	failed	old
@@ -29,9 +29,9 @@ cut points: 80, acknowledged commits: 48, detected damage: 0, lost to a half wri
 28	failed	old
 29	failed	old
 30	failed	old
-31	failed	old
-32	failed	old
-33	failed	old
+31	committed	new
+32	committed	new
+33	committed	new
 34	committed	new
 35	committed	new
 36	committed	new
@@ -75,8 +75,4 @@ cut points: 80, acknowledged commits: 48, detected damage: 0, lost to a half wri
 74	committed	new
 75	committed	new
 76	committed	new
-77	committed	new
-78	committed	new
-79	committed	new
-80	committed	new
-81	acknowledged	new
+77	acknowledged	new

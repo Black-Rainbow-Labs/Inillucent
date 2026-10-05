@@ -92,9 +92,11 @@ impl Pool {
     /// Reports whether an eviction should spill rather than write the file.
     ///
     /// Only a connection that holds the file but not exclusively spills. One
-    /// holding EXCLUSIVE may write the file and does, with its journal, as before;
-    /// one holding no lock at all is a file nobody else can reach, which is a file
-    /// being created or one opened without the locking protocol.
+    /// holding EXCLUSIVE may write the file and does, with its journal, as before,
+    /// except for a page an open transaction has changed: see
+    /// [`Pool::spills_an_open_transaction`]. One holding no lock at all is a file
+    /// nobody else can reach, which is a file being created or one opened without
+    /// the locking protocol.
     pub(super) fn should_spill(&self) -> bool {
         if self.spill_opener.borrow().is_none() {
             return false;
@@ -103,6 +105,33 @@ impl Pool {
             self.file.lock_level(),
             FileLock::Shared | FileLock::Reserved | FileLock::Pending
         )
+    }
+
+    /// Reports whether an eviction under EXCLUSIVE should spill a page because
+    /// it holds a change no transaction has committed.
+    ///
+    /// **Such a page in the data file can be read by another process.** Writing
+    /// it there was a steal, made safe against a crash by its old image in the
+    /// journal. It was not safe against the other processes. When the writer is
+    /// killed, its locks go with it, and the journal is put back only by a
+    /// process that can take RESERVED. A live writer holding RESERVED stops that,
+    /// and every process that opens or reads in the meantime reads the file as
+    /// the dead writer left it, rows of a transaction that will never commit
+    /// included. The spill file is this connection's own and dies with it, so a
+    /// page in it is never seen by anybody else. The fold that follows a commit
+    /// writes it, as it writes any spilled page.
+    ///
+    /// A committed page still goes to the file. Another process reading it there
+    /// reads what the log already says, and `journal::announce_the_restore` makes
+    /// every connection read again when a journal puts the old image back.
+    ///
+    /// @param frame - the frame being evicted
+    /// @param page - the page it holds
+    pub(super) fn spills_an_open_transaction(&self, frame: u32, page: PageId) -> DbResult<bool> {
+        if self.spill_opener.borrow().is_none() || self.file.lock_level() != FileLock::Exclusive {
+            return Ok(false);
+        }
+        self.holds_uncommitted(frame, page)
     }
 
     /// Writes one dirty frame to the spill file and marks the frame clean.

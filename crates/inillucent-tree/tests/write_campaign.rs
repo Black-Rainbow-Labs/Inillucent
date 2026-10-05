@@ -915,12 +915,13 @@ fn deleting_sorted_keys_a_leaf_at_a_time_matches_deleting_one_at_a_time() {
             .filter(|_| !rng.next_u64().is_multiple_of(3))
             .collect();
         let probes: Vec<Vec<Datum<'_>>> = keys.iter().map(|key| vec![Datum::Int(*key)]).collect();
+        let lent: Vec<&[Datum<'_>]> = probes.iter().map(Vec::as_slice).collect();
 
         let mut batched_log = RowRecords::default();
         let mut batched_rows = Vec::new();
         let (mut at, mut calls, mut near) = (0usize, 0usize, None);
-        while at < probes.len() {
-            let rest = probes.get(at..).unwrap_or(&[]);
+        while at < lent.len() {
+            let rest = lent.get(at..).unwrap_or(&[]);
             let held = batched_rows.len();
             at += batched
                 .delete_sorted(
@@ -929,7 +930,8 @@ fn deleting_sorted_keys_a_leaf_at_a_time_matches_deleting_one_at_a_time() {
                     rest,
                     &mut near,
                     &mut |row| {
-                        batched_rows.push(row.to_vec());
+                        batched_rows
+                            .push(row.iter().map(OwnedDatum::from_datum).collect::<Vec<_>>());
                         Ok(())
                     },
                     true,
@@ -1121,6 +1123,7 @@ fn rewrite_a_leaf_at_a_time(
     keys: &[i64],
 ) -> (usize, usize) {
     let probes: Vec<Vec<Datum<'_>>> = keys.iter().map(|key| vec![Datum::Int(*key)]).collect();
+    let lent: Vec<&[Datum<'_>]> = probes.iter().map(Vec::as_slice).collect();
     let (mut at, mut counted, mut largest, mut near) = (0usize, 0usize, 0usize, None);
     let mut run = UpdateRun::default();
     while at < probes.len() {
@@ -1128,7 +1131,7 @@ fn rewrite_a_leaf_at_a_time(
         tree.update_sorted(
             database,
             log,
-            probes.get(at..).unwrap_or(&[]),
+            lent.get(at..).unwrap_or(&[]),
             &mut near,
             &mut |row| {
                 let rule = rewrite_rule(row);

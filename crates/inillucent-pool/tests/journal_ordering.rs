@@ -458,3 +458,124 @@ fn every_pre_image_is_durable_before_the_first_new_image() {
         );
     }
 }
+
+/// The three ways a fold can be protected, named for the message a failure
+/// prints.
+///
+/// `journal`: a rollback journal holds the pre-images, which is
+/// `journal_mode = delete`. `log`: the redo log holds after images, which is
+/// what the engine sets for `journal_mode = wal`. `none`: neither, which is
+/// `journal_mode = off`.
+const PROTECTIONS: [&str; 3] = ["journal", "log", "none"];
+
+/// Every fold writes the shadow meta slot before the primary one, under every
+/// journal mode.
+///
+/// **What `Pool::read_shadow_record` rests on (task-2181).** A connection
+/// outside a transaction asks on every statement whether another process has
+/// folded, and it asks by reading the shadow slot's record bytes alone. That is
+/// one read of the two it used to make, and it is only sound if no fold can
+/// change the primary while leaving the shadow as it was. A machine crash does
+/// not decide that, because the journal or the second sync handles it. A
+/// writer killed between its two writes does: both are in the page cache
+/// already, and every other process sees whichever one was written. Under the
+/// redo log the shadow always went first; under a rollback journal the primary
+/// did, until this ticket.
+///
+/// The trace is the simulator's own record of every write, so this fails with
+/// both positions when the order turns round, whatever a recovery would do.
+#[test]
+fn every_fold_writes_the_shadow_slot_before_the_primary() {
+    let database_name = path().as_path().display().to_string();
+    for protection in PROTECTIONS {
+        let vfs = built(37);
+        let mut database = opened(&vfs, protection == "journal");
+        database
+            .pool()
+            .set_fold_protected_by_log(protection == "log");
+        let before = vfs.trace().len() as u64;
+        assert!(
+            write_and_checkpoint(&mut database),
+            "under {protection}, the fold did not complete, so there is no order to read"
+        );
+        let first_write_at = |offset: u64| {
+            vfs.trace()
+                .events()
+                .into_iter()
+                .find(|event| {
+                    event.seq > before
+                        && event.kind == "write"
+                        && event.path == database_name
+                        && event.offset == offset
+                })
+                .map(|event| event.seq)
+        };
+        let (Some(shadow), Some(primary)) = (first_write_at(PAGE_SIZE as u64), first_write_at(0))
+        else {
+            panic!("under {protection}, the fold did not write both meta slots");
+        };
+        assert!(
+            shadow < primary,
+            "under {protection}, the fold wrote the primary meta slot at {primary} and the \
+             shadow at {shadow}; a writer killed between the two leaves a change only the \
+             primary shows, and the check every statement makes reads only the shadow"
+        );
+    }
+}
+
+/// A fold that reached the shadow slot and not the primary is seen by the next
+/// reader.
+///
+/// **The state a writer killed between its two meta writes leaves behind**,
+/// made directly: a second handle folds, and then the primary slot is put back
+/// to the bytes it held before. The reader's next lock has to find the fold,
+/// and the shadow is the only slot that shows it.
+///
+/// The control comes first. The same reader takes the lock again with nothing
+/// changed and has to answer that nothing moved, so a check that always
+/// answered "moved" would fail here rather than pass.
+#[test]
+fn a_fold_that_reached_only_the_shadow_slot_is_seen() {
+    let vfs = built(41);
+    let mut reader = opened(&vfs, false);
+    reader.begin_read().expect("the reader takes the lock");
+    reader.end_access().expect("the reader lets it go");
+    assert!(
+        !reader
+            .begin_read()
+            .expect("the reader takes the lock again"),
+        "nothing wrote the file, and the reader still reported that it had moved"
+    );
+    reader.end_access().expect("the reader lets it go");
+    let seen = reader.generation();
+
+    let raw = vfs
+        .open(&path(), inillucent_vfs::OpenOptions::main_db())
+        .expect("the file opens raw");
+    let mut primary_before = vec![0u8; PAGE_SIZE];
+    raw.read_exact_at(0, &mut primary_before)
+        .expect("the primary slot reads");
+    {
+        let mut writer = opened(&vfs, false);
+        assert!(
+            write_and_checkpoint(&mut writer),
+            "the second handle's fold did not complete"
+        );
+    }
+    raw.write_all_at(0, &primary_before)
+        .expect("the primary slot is put back");
+    drop(raw);
+
+    assert!(
+        reader
+            .begin_read()
+            .expect("the reader takes the lock after the fold"),
+        "a fold changed the shadow meta slot and the reader did not see it"
+    );
+    assert!(
+        reader.generation() > seen,
+        "the reader saw the fold but kept generation {}, the one it had before it",
+        reader.generation()
+    );
+    reader.end_access().expect("the reader lets it go");
+}

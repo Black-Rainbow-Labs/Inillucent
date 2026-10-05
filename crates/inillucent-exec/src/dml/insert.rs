@@ -6,6 +6,7 @@
 //! one place rather than in four that drift.
 
 pub mod bulk;
+pub mod cached;
 
 use index::{index_entry, key_of, maintained, unique_indexes, write_index_entry};
 
@@ -108,14 +109,39 @@ pub fn insert_at(
         return insert_into_view(statement, target, params, supplied, depth);
     }
     note_single_row(statement, target, depth);
+    let compiled = compile_insert(statement, target, params)?;
+    let catalog = target.catalog();
+    let rows = rows_to_insert(statement, &compiled.space, params, catalog, supplied)?;
+    insert_rows(statement, target, params, &rows, depth, &compiled)
+}
+
+/// Writes the rows an insert's source produced, through what it compiled.
+///
+/// The body of [`insert_at`] after its compile, shared with
+/// [`cached::insert_cached`], which keeps the compile between executions
+/// (task-2185).
+///
+/// @param statement - the bound insert
+/// @param target - the file and its trees
+/// @param params - the bound parameters
+/// @param rows - one row of supplied values per row to write
+/// @param depth - how many triggers deep this write already is
+/// @param compiled - the plan, the row space, the layout and the declarations
+pub(super) fn insert_rows(
+    statement: &BoundInsert,
+    target: &mut dyn WriteTarget,
+    params: &Params,
+    rows: &[Row],
+    depth: Depth,
+    compiled: &CompiledInsert,
+) -> DbResult<Changes> {
+    let table = &statement.table;
     let CompiledInsert {
         layout,
         space,
         plan,
         declarations,
-    } = compile_insert(statement, target, params)?;
-    let catalog = target.catalog();
-    let rows = rows_to_insert(statement, &space, params, catalog, supplied)?;
+    } = compiled;
 
     // **Found on demand, not up front.** Reading the largest rowid costs a
     // descent, and a statement that supplies its own key needs none - which is
@@ -132,7 +158,7 @@ pub fn insert_at(
         let rowid_before = next_rowid;
         let mut image = plan.build_row(
             supplied_row,
-            &space,
+            space,
             &mut next_rowid,
             &mut TableKeys::over(target, table),
             table.autoincrement.then_some(table),
@@ -153,7 +179,7 @@ pub fn insert_at(
         // A key the statement left out is -1 in a `BEFORE INSERT` body, as in
         // SQLite, which fires it before the key is allocated.
         let unassigned =
-            !statement.triggers.is_empty() && plan.rowid_is_unassigned(supplied_row, &space)?;
+            !statement.triggers.is_empty() && plan.rowid_is_unassigned(supplied_row, space)?;
         let firing = trigger::TriggerFiring {
             rows: trigger::TriggerRows {
                 old: None,
@@ -182,7 +208,7 @@ pub fn insert_at(
         {
             reallocate_key(
                 statement,
-                &space,
+                space,
                 target,
                 &mut next_rowid,
                 &mut sequence_mark,
@@ -200,7 +226,7 @@ pub fn insert_at(
         // **Affinity first, then the constraints.** `NOT NULL`, `STRICT` and
         // `CHECK` all test the value that will actually be stored, and after
         // affinity `'42'` in an `INTEGER` column *is* the integer 42.
-        plan.convert(&declarations, &space, &mut image)?;
+        plan.convert(declarations, space, &mut image)?;
         // **The statement's own `OR` algorithm, not the upsert's arm.** A
         // `NOT NULL` or a `CHECK` is not a key collision, and an
         // `ON CONFLICT ... DO NOTHING` says nothing about one: SQLite raises
@@ -208,27 +234,27 @@ pub fn insert_at(
         // constraint silently not enforced on the ordinary
         // `INSERT ... ON CONFLICT DO NOTHING`.
         let declared = resolution_of(statement.on_conflict);
-        if !declarations_are_met(table, &layout, &declarations, &space, &mut image, declared)? {
+        if !declarations_are_met(table, layout, declarations, space, &mut image, declared)? {
             give_back(table, &mut next_rowid, rowid_before);
             continue;
         }
-        declarations.types_are_met(table, &space, &image)?;
-        if !declarations.checks_are_met(&space, &image, declared == Resolution::Skip)? {
+        declarations.types_are_met(table, space, &image)?;
+        if !declarations.checks_are_met(space, &image, declared == Resolution::Skip)? {
             give_back(table, &mut next_rowid, rowid_before);
             continue;
         }
         let Some(stored) = write_one(
             statement,
-            &space,
-            &plan,
+            space,
+            plan,
             target,
             image,
             WriteRequest {
-                layout: &layout,
+                layout,
                 params,
                 depth,
-                indexes: IndexExprs::new(&declarations, &space),
-                declarations: &declarations,
+                indexes: IndexExprs::new(declarations, space),
+                declarations,
             },
         )?
         else {
@@ -240,7 +266,7 @@ pub fn insert_at(
             // allocated for it is handed back; see `give_back`.
             give_back(table, &mut next_rowid, rowid_before);
         }
-        if let Some(assigned) = record_rowid(&stored, &layout, &mut changes, target, depth) {
+        if let Some(assigned) = record_rowid(&stored, layout, &mut changes, target, depth) {
             // A key the statement supplied raises the mark too: `INSERT INTO t
             // VALUES (50, ...)` makes the next allocated key 51.
             high_water = high_water.max(assigned);
@@ -251,9 +277,8 @@ pub fn insert_at(
             Stored::Updated(_) => &[],
             Stored::Inserted(_) => &statement.triggers,
         };
-        let returned =
-            returned_for_row(statement, &plan, &space, params, target, &stored, &layout)?;
-        if fire_after_insert(after_insert, target, stored.row(), &layout, params, depth)? {
+        let returned = returned_for_row(statement, plan, space, params, target, &stored, layout)?;
+        if fire_after_insert(after_insert, target, stored.row(), layout, params, depth)? {
             continue;
         }
         count_row(&mut changes, target, depth);

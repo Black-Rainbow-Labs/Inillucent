@@ -22,8 +22,8 @@ use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    GetFileInformationByHandle, LockFileEx, UnlockFileEx, BY_HANDLE_FILE_INFORMATION,
-    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    GetFileInformationByHandle, GetFileSizeEx, LockFileEx, UnlockFileEx,
+    BY_HANDLE_FILE_INFORMATION, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
 };
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ, FILE_MAP_WRITE,
@@ -50,6 +50,27 @@ pub fn read_at(file: &File, offset: u64, output: &mut [u8]) -> io::Result<usize>
 /// Writes at an absolute offset.
 pub fn write_at(file: &File, offset: u64, input: &[u8]) -> io::Result<usize> {
     file.seek_write(input, offset)
+}
+
+/// Returns a file's length in bytes.
+///
+/// **`GetFileSizeEx` rather than the standard library's `metadata`**
+/// (task-2185). `metadata` asks for every attribute of the file, and a
+/// connection under `locking_mode = normal` asks the log's length on every
+/// statement, to see whether another process committed: on an autocommit
+/// point read that one call was a third of the statement. The size alone is a
+/// lighter query.
+///
+/// @param file - the open file
+pub fn file_len(file: &File) -> io::Result<u64> {
+    let mut size: i64 = 0;
+    // SAFETY: `size` is an owned, aligned i64, which is the out parameter the
+    // call writes, and the handle is valid for the life of `file`.
+    let ok = unsafe { GetFileSizeEx(file.as_raw_handle() as HANDLE, &mut size) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    u64::try_from(size).map_err(|_| io::Error::other("a file reported a negative length"))
 }
 
 /// Returns the volume serial number and file index that identify a file.

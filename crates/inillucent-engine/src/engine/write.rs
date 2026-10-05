@@ -420,6 +420,12 @@ impl TreeLog for WalLog<'_> {
         self.undo.is_some()
     }
 
+    fn expect_undo(&mut self, rows: usize) {
+        if let Some(buffer) = self.undo {
+            buffer.borrow_mut().reserve(rows);
+        }
+    }
+
     fn undo(
         &mut self,
         tree: u64,

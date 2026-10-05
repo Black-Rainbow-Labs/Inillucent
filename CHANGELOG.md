@@ -10,6 +10,49 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**A third performance hill climb through the `Connection`.** Of the workloads the hillclimb and
+contract plans run, 12 are still slower than SQLite 3.53.4, where 16 were on 2.1.3. Against 2.1.3,
+the hillclimb plan's train set is 16% faster and its test set 18% faster, the contract plan's train
+set 9% faster and its test set 5% faster, and a round of each plan uses 16% and 17% less processor
+time. The changes:
+
+- `length()` counts eight ASCII bytes at a time and finds the terminating NUL in the same pass.
+  Copying and scanning a text column that calls it is about three times as fast.
+- An autocommit statement asks Windows for the log's length with `GetFileSizeEx`. A point select
+  outside a transaction went from 6.79 µs to 5.10 µs.
+- A merge of two leaves packs both straight from their pages, the delta area is searched from the
+  previous key's place, and a bulk `DELETE` reads a deleted row from the copy of its leaf. Deleting
+  half of a table is 26% faster.
+- A prepared `INSERT` keeps its plan, its declarations and its `VALUES` expressions between
+  executions. Refilling a table row by row is 21% faster.
+- A bulk `DELETE` or `UPDATE` keeps its keys as slices of one buffer.
+- A literal `json_extract` path is parsed when the statement is compiled.
+
+`docs/performance.md` lists the 12 workloads still slower than SQLite and why.
+
+**Two ways a process killed while writing could damage a database that other processes had open.**
+Both were found by running eight copies of the process storm with a 64 page pool at the same time,
+where about one storm in sixteen failed. Readers reported `page 156 checksum 00000000`, a shared
+extent slot the page did not hold, or a page that was not a blob extent, and one storm left a file
+that failed `integrity_check` with `page 126 checksum 00000000`.
+
+- A writer holding the file exclusively writes some pages into it before its fold finishes, with
+  their old images in `<database>-journal`. When that writer was killed, other processes went on
+  reading those pages, because the journal is put back only by a process that can take the RESERVED
+  lock and a live writer may hold it. When a process did put the journal back, the file went back
+  under the others, and neither the meta record nor the log had moved, so none of them read the file
+  again. One of them could then fold without a page the journal had taken back, and move the
+  checkpoint past the log records that would have rebuilt it. Putting a journal back now writes the
+  meta record with its generation moved on, so every connection rebuilds its cache from the log on
+  its next statement.
+- An eviction under the exclusive lock wrote a page holding an open transaction's changes into the
+  database file. If that writer was killed, other processes could read those rows before the
+  journal was put back. Such a page now goes to the connection's own spill file, which no other
+  process can read, and reaches the database file at the fold after its transaction commits.
+
+Afterwards 446 of 448 storms passed. The two that failed read a page from before the journal was put
+back in a statement that came after it, and the cause of that is not found yet.
+
 **A second performance hill climb through the `Connection`.** On the 48 workloads of
 `inillucent-fullgate --plan hillclimb` this release is 69% faster than SQLite 3.53.4, where 2.1.2 was
 34% faster in the same day's run, with 22% less peak memory and 21% less processor time. On the
@@ -43,6 +86,15 @@ workloads the two plans run, 17 are still slower than SQLite, where 29 were. The
 - Compiling a statement no longer copies each table's schema into the plan.
 
 `docs/performance.md` lists the 17 workloads still slower than SQLite and why.
+
+**A statement outside a transaction makes one system call fewer.** Under `locking_mode = normal`
+each such statement checks whether another process changed the database. The check read the meta
+record from both meta pages and now reads it from the second page only. A checkpoint writes the
+same record to both pages and now always writes the second page first, under a rollback journal as
+it already did under the write ahead log, so a checkpoint that changed either page changed the
+second one. On Windows the lock and the check are six system calls a statement where they were
+seven. Through the `Connection`, a point select outside a transaction went from 4,866 ns to
+3,967 ns, 23% faster, and the hillclimb plan's train and test sets were 7.5% and 8.6% faster.
 
 **A `DELETE` or `UPDATE` of many rows changes each leaf once.** When no trigger, foreign key action,
 `RETURNING` or correlated subquery can watch the statement, its rows are taken a leaf at a time: the

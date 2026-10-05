@@ -604,18 +604,12 @@ impl Eval for Length {
             // documented definition rather than an accident of C strings:
             // `length(char(0))` is 0 and `length(char(65,0,66))` is 1, while
             // `hex()` of the same values shows every byte is still there.
+            // SQLite's rule, not a decoder's: only a byte of 0xC0 or more
+            // takes the continuation bytes after it, so a lone 0x80 is a
+            // character of its own. The NUL is found by the same pass that
+            // counts (task-2185); searching for it first read every byte twice.
             Datum::Text(bytes) => {
-                let counted = match bytes.iter().position(|byte| *byte == 0) {
-                    Some(at) => bytes.get(..at).unwrap_or(bytes),
-                    None => bytes,
-                };
-                // SQLite's rule, not a decoder's: only a byte of 0xC0 or more
-                // takes the continuation bytes after it, so a lone 0x80 is a
-                // character of its own.
-                Datum::Int(inillucent_value::numeric::character_count(
-                    counted,
-                    inillucent_value::TextEncoding::Utf8,
-                ) as i64)
+                Datum::Int(inillucent_value::encoding::utf8_character_count_to_nul(bytes) as i64)
             }
             Datum::Blob(bytes) => Datum::Int(bytes.len() as i64),
             Datum::Int(number) => Datum::Int(number.to_string().len() as i64),

@@ -491,6 +491,48 @@ SQLite when it runs alone; in the plan, SQLite's cache is warm from the inserts 
 `tasks/task-2183-performance-hillclimb-2.md` lists every change, every measurement and the changes
 that were tried and not kept.
 
+### A third hill climb
+
+A third hill climb by the same rules took the workloads slower than SQLite from 16 to 12. Measured
+on 5 October 2026 through the Connection, ten rounds, three runs of each build in turn on each
+plan, release 2.1.3 against the build that follows it, which was released as 2.1.5. Release 2.1.4
+changed version numbers and a test harness and no engine code, so the 2.1.3 column is also 2.1.4:
+
+| Through the Connection | 2.1.3 | After the third hill climb | Change in inillucent |
+|---|---|---|---|
+| hillclimb plan, 28 train workloads | 87% faster than SQLite | **116% faster** than SQLite | 16% faster |
+| hillclimb plan, 20 test workloads | 50% faster than SQLite | **77% faster** than SQLite | 18% faster |
+| contract plan, 25 train workloads | 121% faster than SQLite | **140% faster** than SQLite | 9% faster |
+| contract plan, 9 test workloads | 97% faster than SQLite | **108% faster** than SQLite | 5% faster |
+| hillclimb plan, processor time of one round | 1,375 ms | 1,156 ms | 16% less processor time |
+| contract plan, processor time of one round | 453 ms | 375 ms | 17% less processor time |
+| hillclimb plan, peak resident memory of one round | 59.16 MiB | 56.91 MiB | 4% less memory |
+| contract plan, peak resident memory of one round | 42.59 MiB | 43.87 MiB | 3% more memory |
+
+The contract plan's memory rose because a prepared `INSERT` now keeps its compiled plan and
+`VALUES` expressions between executions.
+
+| Workload | Against SQLite, 2.1.3 | Against SQLite, now | Change in inillucent | What changed |
+|---|---|---|---|---|
+| `ai.copy.scan` | 11% faster | 250% faster | 216% faster | `length()` counts eight ASCII bytes at a time and finds the terminating NUL in the same pass |
+| `check.copied` | 15% faster | 230% faster | 188% faster | the same |
+| `point.rowid` | 105% faster | 161% faster | 28% faster | an autocommit statement asks the log's length with `GetFileSizeEx`, which asks Windows for the size alone. A point select in autocommit went from 6.79 µs to 5.10 µs |
+| `churn.delete.half` | 200% slower | 139% slower | 26% faster | a merge packs both leaves straight from their pages, the delta area is searched from the previous key's place, and a deleted row is read from the copy of its leaf |
+| `churn.refill` | 36% slower | 12% slower | 21% faster | a prepared `INSERT` keeps its plan, declarations and `VALUES` expressions between executions |
+| `edge.delete.range` | 11% slower | 4% faster | 15% faster | a bulk delete's keys are slices of one buffer |
+| `app.insert.prepare_each` | 23% slower | 11% slower | 11% faster | the kept `INSERT` setup |
+| `app.json.where` | 26% slower | 17% slower | 7% faster | a literal `json_extract` path is parsed when the statement is compiled |
+| `edge.update.all` | 63% slower | 52% slower | 7% faster | a bulk update's keys are slices of one buffer |
+
+Of the 12 still slower, `churn.delete.half` (139% slower) spends a quarter of its time in a
+checkpoint, which runs because the log passes 4 MiB during the statement. Most of a merge is
+logging three whole pages.
+`correlated.scalar.selective` and `correlated.exists.selective` (74% and 64% slower) are one
+execution with its compile, about 38 µs against 22. `edge.update.all` (52% slower) grows every row
+of leaves that a bulk build packed full, so each leaf is packed again and split.
+`tasks/task-2185-performance-hillclimb-3.md` lists every change, every measurement and the changes
+that were tried and not kept.
+
 ## What this page does not measure
 
 - **The API an application uses, in the headline.** The headline calls the engine's `plan`,

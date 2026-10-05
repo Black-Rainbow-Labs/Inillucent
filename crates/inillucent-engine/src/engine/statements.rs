@@ -590,11 +590,11 @@ impl ImportedDatabase {
             | Cached::VirtualInsert(..)
             | Cached::SchemaInsert(_)
             | Cached::Select(..)
-            | Cached::Insert(_, None, _) => Vec::new(),
+            | Cached::Insert(_, None, _, _) => Vec::new(),
             // This harness measures a fresh build on purpose - see the doc
             // comment - so it keeps calling `run_any_prepared` directly
             // rather than `query`'s slot, exactly as it did before Stage 3.
-            Cached::Insert(_, Some(query), _) => {
+            Cached::Insert(_, Some(query), _, _) => {
                 physical::run_any_prepared(&query.plan, self, &query.prepared, params)?.0
             }
             Cached::Update(_, query, _, _) | Cached::Delete(_, query) => {

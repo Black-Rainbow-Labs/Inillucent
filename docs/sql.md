@@ -402,10 +402,12 @@ engine reads the file header and the end of the log again before each statement.
 reads no table, such as `SELECT 1` or `SELECT json_extract(?1, '$.a')`, takes no lock and reads
 neither, which is what SQLite does.
 
-**A large transaction.** Under `wal`, `memory` and `off`, a changed page cannot be written to the
-file before its commit, and it cannot be dropped from memory either. The transaction fails with an
-error that names how many pages it changed. A larger page cache, or the `delete` journal mode, lifts
-the limit.
+**A large transaction.** A transaction on a database file can change more pages than the page cache
+holds, in every journal mode and both locking modes. A changed page the cache cannot keep goes to a
+temporary spill file of the connection's own and is read back from there, and the fold after the
+commit writes it into the database file. Measured with a 64 page cache: one transaction inserting
+3,000 rows of 3,000 bytes commits under `wal`, `memory` and `delete`, with
+`locking_mode` `normal` and `exclusive`.
 
 ### Smaller differences
 

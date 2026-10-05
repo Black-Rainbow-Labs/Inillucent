@@ -491,7 +491,7 @@ impl crate::ImportedDatabase {
             Cached::Select(plan, prepared, slot, names) => {
                 self.execute_select_cached(plan, prepared, slot, names, params)
             }
-            Cached::Insert(statement, source, values_hold_subquery) => {
+            Cached::Insert(statement, source, values_hold_subquery, setup) => {
                 let rows = match source {
                     Some(query) => {
                         let rows = self.run_cached_query(
@@ -517,8 +517,11 @@ impl crate::ImportedDatabase {
                 } else {
                     None
                 };
+                // A folded subquery is true of this execution only, so its
+                // values are compiled fresh rather than kept (task-2185).
+                let cache = folded.is_none().then_some(setup);
                 let params = folded.as_ref().unwrap_or(params);
-                self.insert_rows(statement, params, rows)
+                self.insert_rows(statement, params, rows, cache)
             }
             Cached::Update(statement, query, assignments_hold_subquery, setup) => {
                 self.run_update(statement, query, *assignments_hold_subquery, setup, params)
@@ -917,8 +920,8 @@ impl crate::ImportedDatabase {
                     }
                     inillucent_sql::dml::BoundInsertSource::Values(_) => None,
                 };
-                let holds_subquery = values_hold_subquery(&statement);
-                Ok(Cached::Insert(statement, source, holds_subquery))
+                let holds = values_hold_subquery(&statement);
+                Ok(Cached::Insert(statement, source, holds, Default::default()))
             }
             // **A write to a virtual table is the module's to make**, the same
             // way an insert and a delete already are. `UPDATE f SET body=...`

@@ -180,6 +180,16 @@ pub fn write_at(file: &File, offset: u64, input: &[u8]) -> io::Result<usize> {
     file.write_at(input, offset)
 }
 
+/// Returns a file's length in bytes.
+///
+/// `fstat` is already the light query on a POSIX system; the Windows module
+/// says why it has a function of its own there.
+///
+/// @param file - the open file
+pub fn file_len(file: &File) -> io::Result<u64> {
+    file.metadata().map(|metadata| metadata.len())
+}
+
 /// Returns the device and inode numbers that identify a file.
 pub fn file_identity(file: &File) -> VfsResult<FileIdentity> {
     let metadata = file

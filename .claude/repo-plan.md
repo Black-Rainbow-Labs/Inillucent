@@ -927,3 +927,25 @@ they are touching do not collide; two that have not, do.
   leak into the base binary. The gate binaries look for `.sqlite-ref` under the tree they were
   built from, so junction it into the export as well, and remove that junction with
   `cmd /c rmdir`, never a recursive delete. (task-2180)
+- **A checkpoint lands inside whichever timed workload takes the log past 4 MiB, so a change that
+  writes less log can move 10 to 19 ms from one gate workload to the next.** task-2183 read the
+  refill getting slower as inserts into tombstoned leaves being slow; the refill's inserts cost the
+  same on both builds and the fold had moved into it. Before reading a write workload's change,
+  trace where the folds land (an `eprintln!` in `checkpoint_of` and one per workload in the gate's
+  round). (task-2185)
+- **The gate binaries link `inillucent_alloc::Pooled`.** A change that only removes small
+  allocations measures as nothing on the gate; two of task-2185's reverted candidates were that.
+  `inillucent-hcprobe` runs its iterations in one transaction unless `--autocommit` is passed, which
+  hides the per statement lock and staleness checks (about 4.7 us of an autocommit point select).
+  (task-2185)
+- **The per statement staleness check reads the shadow meta slot only, and that rests on every fold
+  writing the shadow slot first.** If you change `Pool::checkpoint` or anything else that writes the
+  meta pages, write `SHADOW_PAGE` before `META_PAGE`, under the redo log and under a rollback
+  journal. `journal_ordering::every_fold_writes_the_shadow_slot_before_the_primary` reads the
+  simulator's trace and fails otherwise. The options that would remove more of the six system calls
+  an autocommit statement makes on Windows (a shared memory change counter, dropping the meta read)
+  all need a file format bump, because a 2.1.x writer would not maintain them;
+  `tasks/task-2181-cross-process-system-calls.md` section 5 has why. (task-2181)
+- **The gate's hillclimb plan through the Connection arm is about 30 seconds a run at 10 rounds on
+  the medium fixture**, so three interleaved pairs of base and candidate fit in a few minutes of a
+  quiet window. `_agent_output/task-2181/time.sh` is the script. (task-2181)

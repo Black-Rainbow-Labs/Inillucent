@@ -50,6 +50,7 @@ use crate::leaf::{ImageTiming, LeafBuilder, LeafRef, Packed, Rows};
 use crate::mutate::{DeltaOffsets, DeltaPlan, LeafMut};
 use crate::paged::PagedTree;
 
+mod merge;
 mod sorted;
 pub use sorted::{Rewrite, UpdateRun};
 
@@ -432,6 +433,19 @@ pub trait TreeLog {
     /// nothing for the possibility.
     fn wants_undo(&self) -> bool {
         false
+    }
+
+    /// Says that about this many undo images are about to be recorded.
+    ///
+    /// **So a log that keeps them in a vector grows it once** (task-2185). A
+    /// bulk delete records one image per row per tree, and growing the vector
+    /// by doubling moved every image already in it each time: 6% of the
+    /// hillclimb plan's `churn.delete.half`, thirty thousand images. The
+    /// default does nothing, which is right for a log that keeps none.
+    ///
+    /// @param rows - how many images the caller expects to record
+    fn expect_undo(&mut self, rows: usize) {
+        let _ = rows;
     }
 
     /// Records what one row looked like before a write changed it.
@@ -2922,58 +2936,34 @@ impl PagedTree {
             return Ok(());
         };
 
-        let (mut rows, mut carried) = self.rows_to_repack(database.pool(), page)?;
-        let (right_rows, right_carried) = self.rows_to_repack(database.pool(), right)?;
-        rows.extend(right_rows);
-        carried.extend(right_carried);
-        let mut doomed = self.extents_of(database.pool(), page)?;
-        doomed.extend(self.extents_of(database.pool(), right)?);
-        let builder = LeafBuilder::new(
-            self.page_size(),
-            self.tree_id(),
-            self.columns().to_vec(),
-            self.key_columns(),
-        )?;
-        let borrowed: Vec<Vec<Datum<'_>>> = rows
-            .iter()
-            .map(|row| row.iter().map(OwnedDatum::borrow).collect())
-            .collect();
-        // Measured without spilling and then encoded with it, for the reason
-        // `split` gives: a spiller in the measure would write runs the encode
-        // then writes again.
-        let fits = matches!(
-            builder.pack_with(&borrowed, COMPACT_FILL, Some(&mut Measuring))?,
-            Packed::Filled { rows: packed, .. } if packed == borrowed.len()
-        );
-        if !fits {
-            // They do not fit, which is the ordinary answer for two leaves that
-            // are merely a bit empty. Nothing to do.
-            return Ok(());
-        }
-        let (mut merged, kept) = {
-            let mut spiller = crate::paged::Carrying {
-                inner: crate::paged::Extender {
-                    database,
-                    log,
-                    tree_id: self.tree_id(),
-                    written: Vec::new(),
-                },
-                carried: carried.clone(),
-                used: Vec::new(),
-            };
-            let image = builder.encode_with(&borrowed, Some(&mut spiller))?;
-            (image, spiller.used)
-        };
         // A merge that emptied the parent of every separator would leave an
         // interior page with one child, which is legal but pointless, and an
         // interior page with *no* children, which is not. Refusing keeps the
         // tree's shape simple at the cost of one under-filled leaf.
+        //
+        // **Asked before anything is packed.** It is a question about the
+        // parent alone, and it used to be asked after the merged image was
+        // encoded, so a refusal threw the image away - and an image of leaves
+        // with out-of-line values had already written their new runs, which
+        // nothing then freed.
         if separators.len() < 2 && !path.len().eq(&1) {
             return Ok(());
         }
         if separators.is_empty() {
             return Ok(());
         }
+        let Some((mut merged, kept, doomed)) = self.merged_image(database, log, page, right)?
+        else {
+            // They do not fit, which is the ordinary answer for two leaves that
+            // are merely a bit empty. Nothing to do.
+            return Ok(());
+        };
+        let builder = LeafBuilder::new(
+            self.page_size(),
+            self.tree_id(),
+            self.columns().to_vec(),
+            self.key_columns(),
+        )?;
 
         let (far_right, max_cts) = {
             let guard = database.pool().fetch(right)?;

@@ -405,9 +405,7 @@ impl VfsFile for OsFile {
 
     /// Returns the file's length.
     fn file_size(&self) -> VfsResult<u64> {
-        self.file
-            .metadata()
-            .map(|metadata| metadata.len())
+        platform::file_len(&self.file)
             .map_err(|error| VfsError::from_io(VfsOperation::FileSize, &error))
     }
 

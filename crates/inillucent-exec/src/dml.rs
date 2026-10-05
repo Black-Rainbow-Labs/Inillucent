@@ -62,7 +62,7 @@ use crate::physical::SourceLayout;
 mod answers;
 mod conflict;
 mod delete;
-mod insert;
+pub mod insert;
 mod keys;
 mod target;
 mod update;

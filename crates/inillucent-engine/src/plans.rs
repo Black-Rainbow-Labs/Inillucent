@@ -140,6 +140,11 @@ pub(crate) enum Cached {
         Box<inillucent_sql::dml::BoundInsert>,
         Option<CachedQuery>,
         bool,
+        /// The plan, declarations and `VALUES` expressions, kept between
+        /// executions (task-2185). See `dml::InsertSetup`: compiling them was
+        /// a seventh of a prepared single row insert, and none of it depends
+        /// on the values bound.
+        crate::dml::insert::cached::InsertCache,
     ),
     /// An update, with the query that finds the rows it changes.
     ///

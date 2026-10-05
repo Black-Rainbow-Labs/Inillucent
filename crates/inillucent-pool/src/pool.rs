@@ -153,12 +153,11 @@ pub struct PoolStats {
     /// the 132 microseconds `SELECT 1` cost through `Connection`. A statement
     /// that finds the file unchanged now moves this by nothing at all.
     pub meta_reads: u64,
-    /// Reads of the bytes a meta record occupies, without the page around them.
-    ///
-    /// The cheap half of the same check - see
-    /// `Database::disk_record_is_as_last_read`. One per lock acquisition, and
-    /// none at all for a statement inside a transaction, which never lets the
-    /// file go.
+    /// File reads of the bytes a meta record occupies, without the page around
+    /// them: the cheap half of the same check, which reads the shadow slot
+    /// alone - see `Database::disk_record_is_as_last_read`. One per lock
+    /// acquisition, none inside a transaction, which never lets the file go.
+    /// Two per lock means the check reads both slots again (task-2181).
     pub meta_probes: u64,
 }
 
@@ -1148,7 +1147,9 @@ impl Pool {
         // every reader in another process waited for the rest of the transaction.
         // See `pool/spill.rs`. The write ahead rule does not apply to a spill: the
         // spill file is this connection's own and does not survive a crash.
-        if why == Writing::Eviction && self.should_spill() {
+        if why == Writing::Eviction
+            && (self.should_spill() || self.spills_an_open_transaction(frame, page)?)
+        {
             self.spill_frame(frame, page)?;
             return Ok(true);
         }

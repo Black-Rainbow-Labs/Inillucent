@@ -2734,8 +2734,15 @@ const FUNCTION_CEILINGS: [(&str, &str, usize); 52] = [
     // `locate_and_read_previous` and `orphaned_extents`.
     ("crates/inillucent-tree/src/write.rs", "write_row", 137),
     // 205 before task-1962 A9: the `write_one` and `upsert_row` calls pass a
-    // `WriteRequest` and an `Upsert`, written as literals.
-    ("crates/inillucent-exec/src/dml/insert.rs", "insert_at", 211),
+    // `WriteRequest` and an `Upsert`, written as literals. Recorded against
+    // `insert_at` at 211 until task-2185 moved the per row loop, unchanged,
+    // into `insert_rows`, which the kept `INSERT` setup calls too; `insert_at`
+    // is now its compile and that call.
+    (
+        "crates/inillucent-exec/src/dml/insert.rs",
+        "insert_rows",
+        165,
+    ),
     // The group name in front of the fields it reads, from task-1962 A1
     // step 2; the formatter then wraps what it used to fit on one line.
     (

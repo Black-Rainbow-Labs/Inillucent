@@ -43,11 +43,16 @@ fn chaos() -> PathBuf {
 
 /// Returns a directory of this case's own, emptied first.
 ///
+/// `STORM_DIR` names another parent directory, so several copies of one case
+/// can run at once. The intermittent failures here show up when several
+/// storms run side by side, and that is how they are reproduced.
+///
 /// @param name - the case's name, which is also the directory's
 fn area(name: &str) -> PathBuf {
-    let path = workspace_root()
-        .join("_agent_output/process-storm")
-        .join(name);
+    let parent = std::env::var_os("STORM_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("_agent_output/process-storm"));
+    let path = parent.join(name);
     let _ = std::fs::remove_dir_all(&path);
     let _ = std::fs::create_dir_all(&path);
     path

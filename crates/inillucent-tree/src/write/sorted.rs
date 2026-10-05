@@ -118,10 +118,12 @@ impl PagedTree {
     /// removes, in key order, before anything is logged or changed, so a
     /// failure there leaves the leaf and the log as they were.
     ///
-    /// **Shown, not handed (task-2183).** The row then goes into the undo
-    /// image by move. It used to be handed to `deleted` and cloned for the
-    /// undo image, a copy of every value of every deleted row: 7.5% of a
-    /// 40,000 row range delete.
+    /// **Shown, not handed, and borrowed (task-2183, task-2185).** The row is
+    /// read from a copy of the leaf, the copy the undo images name places in,
+    /// and the values borrow from it. A caller that keeps a value copies it.
+    /// The row used to be copied out of the leaf for the caller and moved into
+    /// the undo image, which was 17% of the hillclimb plan's
+    /// `churn.delete.half`; before that it was copied twice.
     ///
     /// @param database - the file, for freeing a page a merge empties
     /// @param log - where the records go
@@ -135,9 +137,9 @@ impl PagedTree {
         &mut self,
         database: &mut Database,
         log: &mut dyn TreeLog,
-        keys: &[Vec<Datum<'_>>],
+        keys: &[&[Datum<'_>]],
         near: &mut Option<PageId>,
-        deleted: &mut dyn FnMut(&[OwnedDatum]) -> DbResult<()>,
+        deleted: &mut dyn FnMut(&[Datum<'_>]) -> DbResult<()>,
         shown: bool,
     ) -> DbResult<usize> {
         let Some(first) = keys.first() else {
@@ -178,9 +180,9 @@ impl PagedTree {
         database: &mut Database,
         log: &mut dyn TreeLog,
         page: PageId,
-        keys: &[Vec<Datum<'_>>],
+        keys: &[&[Datum<'_>]],
         near: &mut Option<PageId>,
-        deleted: &mut dyn FnMut(&[OwnedDatum]) -> DbResult<()>,
+        deleted: &mut dyn FnMut(&[Datum<'_>]) -> DbResult<()>,
         shown: bool,
     ) -> DbResult<usize> {
         let undo = log.wants_undo();
@@ -197,13 +199,12 @@ impl PagedTree {
             // row delete compacts or splits the leaf and tries again, which is
             // rare enough to leave to it, one key at a time.
             if let Some(row) = self.delete_near(database, log, first, near)? {
-                deleted(if shown { &row } else { &[] })?;
+                let borrowed: Vec<Datum<'_>> = row.iter().map(OwnedDatum::borrow).collect();
+                deleted(if shown { &borrowed } else { &[] })?;
             }
             return Ok(1);
         }
-        for held in &run.doomed {
-            deleted(&held.row)?;
-        }
+        self.show_run(&run, shown, deleted)?;
         let located: Vec<Located> = run.doomed.iter().map(|held| held.located).collect();
         let lsn = self.log_run(log, page, keys, run.doomed, run.page.as_ref())?;
         database
@@ -228,6 +229,47 @@ impl PagedTree {
         Ok(taken)
     }
 
+    /// Shows the caller each row a run is about to remove, in key order.
+    ///
+    /// A row is read from the copy of the leaf the run took, as values that
+    /// borrow from it, so showing it allocates nothing; a row copied out of a
+    /// leaf with out-of-line values is shown as it was copied. A caller that
+    /// is not shown the rows gets an empty slice for each.
+    ///
+    /// @param run - the run, as `read_run` found it
+    /// @param shown - whether the caller is shown the rows
+    /// @param deleted - called once for each row
+    fn show_run(
+        &self,
+        run: &Run,
+        shown: bool,
+        deleted: &mut dyn FnMut(&[Datum<'_>]) -> DbResult<()>,
+    ) -> DbResult<()> {
+        let copy = match (&run.page, shown) {
+            (Some(copy), true) => Some(LeafRef::parse(copy)?),
+            _ => None,
+        };
+        let mut values: Vec<Datum<'_>> = Vec::with_capacity(self.columns().len());
+        for held in &run.doomed {
+            values.clear();
+            match (&copy, shown) {
+                (Some(leaf), _) => {
+                    for column in 0..leaf.column_count() {
+                        values.push(match held.located {
+                            Located::Sorted(row) => leaf.value(row, column)?,
+                            Located::Delta(index) => leaf.delta_value(index, column)?,
+                            Located::Absent => Datum::Null,
+                        });
+                    }
+                }
+                (None, true) => values.extend(held.row.iter().map(OwnedDatum::borrow)),
+                (None, false) => {}
+            }
+            deleted(&values)?;
+        }
+        Ok(())
+    }
+
     /// Reads the rows of the leading keys one leaf holds, with one parse.
     ///
     /// Stops at the first key the leaf does not hold: that key may be in the
@@ -242,7 +284,7 @@ impl PagedTree {
         &self,
         pool: &Pool,
         page: PageId,
-        keys: &[Vec<Datum<'_>>],
+        keys: &[&[Datum<'_>]],
         shown: bool,
         undo: bool,
     ) -> DbResult<Run> {
@@ -250,22 +292,23 @@ impl PagedTree {
         let leaf = LeafRef::parse(&guard)?
             .with_collations(self.collations())
             .with_directions(self.directions());
-        // A row is copied out when the caller looks at it, or for an undo
-        // image when the leaf holds an out-of-line value a copy of the page
-        // would not. Otherwise the undo images read a copy of the page.
-        let copied = shown || (undo && leaf.has_extents());
+        // A row is copied out only when the leaf holds an out-of-line value,
+        // which a copy of the page would not. Otherwise the undo images and the
+        // caller both read a copy of the page (task-2185): copying each row
+        // out for the caller was a vector and a string per row, 17% of the
+        // hillclimb plan's `churn.delete.half`, where the copy of the page is
+        // one per leaf.
+        let copied = leaf.has_extents() && (shown || undo);
         let snapshot: Option<std::rc::Rc<[u8]>> =
-            (undo && !copied).then(|| std::rc::Rc::from(leaf.bytes()));
+            ((undo || shown) && !copied).then(|| std::rc::Rc::from(leaf.bytes()));
         let mut doomed: Vec<Doomed> = Vec::new();
         let mut orphaned = Vec::new();
         // The keys are in the tree's order, so each is searched for from the
-        // sorted row past the last one found.
-        let mut from = 0usize;
+        // sorted row past the last one found, and from the delta position the
+        // last one was answered with.
+        let mut from = crate::leaf::RunCursor::default();
         for key in keys {
-            let located = leaf.locate_from(key, self.key_columns(), from)?;
-            if let Located::Sorted(row) = located {
-                from = row.saturating_add(1);
-            }
+            let located = leaf.locate_from(key, self.key_columns(), &mut from)?;
             // A repeat would name the same row twice and log a record that
             // finds nothing on replay. The caller removes repeats; this stops
             // rather than trusting it.
@@ -322,15 +365,18 @@ impl PagedTree {
         &self,
         log: &mut dyn TreeLog,
         page: PageId,
-        keys: &[Vec<Datum<'_>>],
+        keys: &[&[Datum<'_>]],
         doomed: Vec<Doomed>,
         snapshot: Option<&std::rc::Rc<[u8]>>,
     ) -> DbResult<u64> {
         let wants_undo = log.wants_undo();
         let run = doomed.len();
         // Tagged values, not the comparison encoding, for the reason
-        // `delete_near` gives.
-        let mut tagged: Vec<Vec<u8>> = Vec::with_capacity(run);
+        // `delete_near` gives. **Every key in one buffer**, each named by where
+        // it ends: a vector per key was two or three reallocations a key, 4% of
+        // a bulk delete.
+        let mut bytes: Vec<u8> = Vec::with_capacity(run.saturating_mul(16));
+        let mut ends: Vec<usize> = Vec::with_capacity(run);
         for (key, held) in keys.iter().zip(doomed) {
             if wants_undo {
                 match snapshot {
@@ -338,21 +384,28 @@ impl PagedTree {
                     None => log.undo(self.tree_id(), key, Some(held.row))?,
                 }
             }
-            let mut bytes = Vec::new();
             for value in key.iter().take(self.key_columns()) {
                 value.encode_tagged(&mut bytes);
             }
-            tagged.push(bytes);
+            ends.push(bytes.len());
         }
-        if let [only] = tagged.as_slice() {
+        let tagged = (0..ends.len()).map(|at| {
+            let start = match at.checked_sub(1) {
+                Some(before) => ends.get(before).copied().unwrap_or(0),
+                None => 0,
+            };
+            let end = ends.get(at).copied().unwrap_or(start);
+            bytes.get(start..end).unwrap_or(&[])
+        });
+        if let [only] = ends.as_slice() {
             return log.log(Body::DeleteRow {
                 tree: self.tree_id(),
                 page: page.0,
-                key: only,
+                key: bytes.get(..*only).unwrap_or(&[]),
             });
         }
-        let mut list = Vec::new();
-        inillucent_wal::record::put_key_list(&mut list, tagged.iter().map(Vec::as_slice));
+        let mut list = Vec::with_capacity(bytes.len().saturating_add(ends.len() * 4));
+        inillucent_wal::record::put_key_list(&mut list, tagged);
         log.log(Body::DeleteRows {
             tree: self.tree_id(),
             page: page.0,
@@ -452,7 +505,7 @@ impl PagedTree {
         &mut self,
         database: &mut Database,
         log: &mut dyn TreeLog,
-        keys: &[Vec<Datum<'_>>],
+        keys: &[&[Datum<'_>]],
         near: &mut Option<PageId>,
         rewrite: &mut dyn FnMut(&[OwnedDatum]) -> DbResult<Rewrite>,
         run: &mut UpdateRun,
@@ -494,7 +547,7 @@ impl PagedTree {
         database: &mut Database,
         log: &mut dyn TreeLog,
         page: PageId,
-        keys: &[Vec<Datum<'_>>],
+        keys: &[&[Datum<'_>]],
         rewrite: &mut dyn FnMut(&[OwnedDatum]) -> DbResult<Rewrite>,
         run: &mut UpdateRun,
     ) -> DbResult<bool> {
@@ -551,7 +604,7 @@ impl PagedTree {
         &self,
         pool: &Pool,
         page: PageId,
-        keys: &[Vec<Datum<'_>>],
+        keys: &[&[Datum<'_>]],
         rewrite: &mut dyn FnMut(&[OwnedDatum]) -> DbResult<Rewrite>,
         run: &mut UpdateRun,
         asked: &mut Asked,
@@ -689,7 +742,7 @@ impl PagedTree {
         database: &mut Database,
         log: &mut dyn TreeLog,
         page: PageId,
-        keys: &[Vec<Datum<'_>>],
+        keys: &[&[Datum<'_>]],
         original: &[u8],
         changes: &mut [Slotted],
     ) -> DbResult<bool> {
@@ -720,7 +773,7 @@ impl PagedTree {
         let packed =
             crate::write::compact_image(&builder, &crate::leaf::RowSlice(rows.as_slice()))?;
         let first_key = match changes.first().and_then(|change| keys.get(change.key)) {
-            Some(key) => key.clone(),
+            Some(key) => *key,
             None => return Err(corrupt("a repack names a key the run was not given")),
         };
         let fits = match packed {
@@ -747,7 +800,7 @@ impl PagedTree {
         let path = match packed {
             Some(_) => Vec::new(),
             None => {
-                self.leaf_for(database.pool(), &self.encode_key(&first_key))?
+                self.leaf_for(database.pool(), &self.encode_key(first_key))?
                     .1
             }
         };
@@ -817,7 +870,7 @@ impl PagedTree {
         &self,
         log: &mut dyn TreeLog,
         page: PageId,
-        keys: &[Vec<Datum<'_>>],
+        keys: &[&[Datum<'_>]],
         slotted: Vec<Slotted>,
     ) -> DbResult<u64> {
         let mut lsn = 0;

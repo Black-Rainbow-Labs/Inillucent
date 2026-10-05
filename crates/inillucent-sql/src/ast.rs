@@ -1274,6 +1274,14 @@ pub enum TransactionBehaviour {
 /// holding it on a connection that will never name that many again.
 const SPARE_NAME_BUFFERS: usize = 64;
 
+/// How many names an arena searches one by one before it files them by hash.
+///
+/// A lookup in `Ast::interned` hashes the name with the arena's seeded hasher
+/// and the map hashes that again, which cost more than comparing the name
+/// against a dozen others. Past this many names the map is used, so the
+/// parse of a statement with thousands of names stays linear (task-2185).
+const LINEAR_NAMES: usize = 16;
+
 /// The largest name buffer [`Ast::clear`] keeps, in bytes of capacity.
 ///
 /// A held buffer is memory the connection does not give back, so a long name -
@@ -1337,6 +1345,11 @@ pub struct Ast {
     /// See [`SPARE_NAME_BUFFERS`]. Empty on a fresh arena, so the first parse
     /// pays what it always did and every parse after it does not.
     spare: Vec<Vec<u8>>,
+    /// How many of `names`, from the first, are filed in `interned`.
+    ///
+    /// None while the arena holds fewer than [`LINEAR_NAMES`], which are
+    /// searched; all of them from the first lookup past it (task-2185).
+    filed: usize,
     exprs: Vec<Expr>,
     expr_spans: Vec<Span>,
     /// How deep each expression's own subtree is, one entry per node.
@@ -1382,6 +1395,7 @@ impl PartialEq for Ast {
             names,
             interned: _,
             spare: _,
+            filed: _,
             exprs,
             expr_spans,
             expr_depths,
@@ -1434,6 +1448,7 @@ impl Ast {
     pub fn clear(&mut self) {
         self.recycle_names();
         self.interned.clear();
+        self.filed = 0;
         self.exprs.clear();
         self.expr_spans.clear();
         self.expr_depths.clear();
@@ -1495,10 +1510,31 @@ impl Ast {
     ///   string
     /// @param span - where this occurrence came from
     pub fn intern_bytes(&mut self, text: &[u8], quote: QuoteForm, span: Span) -> NameId {
-        let hash = self.hash_of(text, quote);
-        if let Some(index) = self.find_interned(hash, text, quote) {
-            return NameId(index);
-        }
+        // **A short statement's names are searched, not hashed** (task-2185).
+        // Below `LINEAR_NAMES` a comparison per name is cheaper than the two
+        // seeded hashes a lookup costs, which were 8% of compiling a one table
+        // aggregate. Past it every name is filed under its hash once, so a
+        // statement with thousands of names is still not quadratic.
+        let hash = match self.names.len() < LINEAR_NAMES {
+            true => {
+                if let Some(index) = self
+                    .names
+                    .iter()
+                    .position(|name| name.quote == quote && name.text == text)
+                {
+                    return NameId(index as u32);
+                }
+                None
+            }
+            false => {
+                self.file_every_name();
+                let hash = self.hash_of(text, quote);
+                if let Some(index) = self.find_interned(hash, text, quote) {
+                    return NameId(index);
+                }
+                Some(hash)
+            }
+        };
         let mut folded = Ast::take_buffer(&mut self.spare);
         folded.extend(text.iter().map(|byte| byte.to_ascii_lowercase()));
         let mut spelling = Ast::take_buffer(&mut self.spare);
@@ -1516,8 +1552,30 @@ impl Ast {
             quote,
             span,
         });
-        self.remember_interned(hash, index);
+        if let Some(hash) = hash {
+            self.remember_interned(hash, index);
+            self.filed = self.names.len();
+        }
         NameId(index)
+    }
+
+    /// Files every name not yet filed under its hash.
+    ///
+    /// The names interned below [`LINEAR_NAMES`] were searched and never
+    /// filed, so the first lookup past it files all of them at once; after
+    /// that each new name is filed as it is interned and this files nothing.
+    fn file_every_name(&mut self) {
+        let hashes: Vec<(u64, u32)> = self
+            .names
+            .iter()
+            .enumerate()
+            .skip(self.filed)
+            .map(|(index, name)| (self.hash_of(&name.text, name.quote), index as u32))
+            .collect();
+        for (hash, index) in hashes {
+            self.remember_interned(hash, index);
+        }
+        self.filed = self.names.len();
     }
 
     /// Returns the hash an identifier is filed under.
@@ -1940,6 +1998,15 @@ mod tests {
     #[test]
     fn a_name_filed_under_another_names_hash_gets_its_own_id() {
         let mut ast = Ast::new();
+        // Enough names first that every lookup below goes through the map;
+        // fewer than `LINEAR_NAMES` are searched one by one (task-2185).
+        for at in 0..LINEAR_NAMES {
+            ast.intern_bytes(
+                format!("filler{at}").as_bytes(),
+                QuoteForm::Bare,
+                Span::default(),
+            );
+        }
         let alpha = ast.intern_bytes(b"alpha", QuoteForm::Bare, Span::default());
         let stolen = ast.hash_of(b"gamma", QuoteForm::Bare);
         ast.remember_interned(stolen, alpha.0);
@@ -1958,7 +2025,52 @@ mod tests {
             ast.intern_bytes(b"alpha", QuoteForm::Bare, Span::default()),
             alpha
         );
-        assert_eq!(ast.name_count(), 2);
+        assert_eq!(ast.name_count(), LINEAR_NAMES + 2);
+    }
+
+    /// A name interned while the arena searched its names is found again once
+    /// it files them by hash, and so is one interned after (task-2185).
+    ///
+    /// The names below `LINEAR_NAMES` are never put in the map as they come,
+    /// so a filing step that missed them would give a repeated name a second
+    /// id, which the binder reads as a different name.
+    #[test]
+    fn names_from_before_the_map_are_found_through_it() {
+        let mut ast = Ast::new();
+        let early: Vec<NameId> = (0..LINEAR_NAMES)
+            .map(|at| {
+                ast.intern_bytes(
+                    format!("n{at}").as_bytes(),
+                    QuoteForm::Bare,
+                    Span::default(),
+                )
+            })
+            .collect();
+        let late: Vec<NameId> = (LINEAR_NAMES..LINEAR_NAMES * 3)
+            .map(|at| {
+                ast.intern_bytes(
+                    format!("n{at}").as_bytes(),
+                    QuoteForm::Bare,
+                    Span::default(),
+                )
+            })
+            .collect();
+        for (at, id) in early.iter().chain(late.iter()).enumerate() {
+            assert_eq!(
+                ast.intern_bytes(
+                    format!("n{at}").as_bytes(),
+                    QuoteForm::Bare,
+                    Span::default()
+                ),
+                *id
+            );
+        }
+        assert_eq!(ast.name_count(), LINEAR_NAMES * 3);
+        // A cleared arena searches again, and finds nothing from before.
+        ast.clear();
+        let again = ast.intern_bytes(b"n0", QuoteForm::Bare, Span::default());
+        assert_eq!(ast.name_count(), 1);
+        assert_eq!(ast.text(again), b"n0");
     }
 
     /// Two hundred names all reach their own id and find it again.

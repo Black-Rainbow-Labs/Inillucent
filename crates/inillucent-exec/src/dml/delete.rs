@@ -9,7 +9,7 @@
 //! see `delete_unwatched`), and a statement that fails part way is undone
 //! whole.
 
-use index::{index_entry, maintained, write_index_entry};
+use index::{index_entry, maintained, plain_index_entry, write_index_entry};
 
 use inillucent_base::DbResult;
 use inillucent_sql::ast::TriggerTime;
@@ -247,15 +247,25 @@ pub(super) fn sorted_by_tree<'k>(
         }
         return Ok(tuples);
     }
-    let mut encoded: Vec<(Vec<u8>, &'k [OwnedDatum])> = tuples
-        .into_iter()
-        .map(|tuple| {
-            let borrowed: Vec<Datum<'_>> = tuple.iter().map(OwnedDatum::borrow).collect();
-            (tree.encode_key(&borrowed), tuple)
-        })
-        .collect();
-    encoded.sort_by(|left, right| left.0.cmp(&right.0));
-    encoded.dedup_by(|later, earlier| later.0 == earlier.0);
+    // **Every key encoded into one buffer** (task-2185), each named by its
+    // range. A vector per key and a second one for its borrowed values were
+    // three allocations a key and their regrowth, 3.4% of the hillclimb plan's
+    // `churn.delete.half`, whose two index trees take this branch.
+    let encoding = tree.key_encoding();
+    let mut bytes: Vec<u8> = Vec::with_capacity(tuples.len().saturating_mul(24));
+    let mut borrowed: Vec<Datum<'_>> = Vec::new();
+    let mut encoded: Vec<(std::ops::Range<usize>, &'k [OwnedDatum])> =
+        Vec::with_capacity(tuples.len());
+    for tuple in tuples {
+        borrowed.clear();
+        borrowed.extend(tuple.iter().map(OwnedDatum::borrow));
+        let start = bytes.len();
+        encoding.encode_into(&borrowed, tree.collations(), tree.directions(), &mut bytes);
+        encoded.push((start..bytes.len(), tuple));
+    }
+    let key = |range: &std::ops::Range<usize>| bytes.get(range.clone()).unwrap_or(&[]);
+    encoded.sort_by(|left, right| key(&left.0).cmp(key(&right.0)));
+    encoded.dedup_by(|later, earlier| key(&later.0) == key(&earlier.0));
     Ok(encoded.into_iter().map(|(_, tuple)| tuple).collect())
 }
 /// Deletes rows nothing can watch go, visiting each tree in its own order.
@@ -309,15 +319,23 @@ fn delete_unwatched(
     let mut entries: Vec<Vec<Row>> = maintained(table).map(|_| Vec::new()).collect();
     let has_maintained = !entries.is_empty();
     let mut changes = Changes::default();
-    let borrowed: Vec<Vec<Datum<'_>>> = keys
+    // **One buffer of values, and a slice of it per key** (task-2185). A vector
+    // per key was 40,000 allocations for `edge.delete.range`, and dropping
+    // them was 8% of the statement.
+    let values: Vec<Datum<'_>> = keys
         .iter()
-        .map(|key| key.iter().map(OwnedDatum::borrow).collect())
+        .flat_map(|key| key.iter().map(OwnedDatum::borrow))
         .collect();
+    let borrowed = key_slices(&values, keys.iter().map(|key| key.len()));
     // The leaf the last run used, per tree: the keys arrive in each tree's
     // order, so the next run nearly always starts there (task-2175). Each call
     // deletes the keys one leaf holds with one change to it (task-2180), and
     // the rows are counted after each, so a failure part way leaves the count
     // at the rows that went. See `PagedTree::delete_sorted`.
+    // One undo image per row for the table and one for each index entry, so
+    // a log that keeps them sizes its buffer once (task-2185).
+    let images = keys.len().saturating_mul(entries.len().saturating_add(1));
+    target.parts_for(table.root)?.2.expect_undo(images);
     let mut near = None;
     let mut at = 0usize;
     while let Some(rest) = borrowed.get(at..).filter(|rest| !rest.is_empty()) {
@@ -335,9 +353,20 @@ fn delete_unwatched(
             &mut near,
             &mut |row| {
                 removed = removed.saturating_add(1);
+                // The row borrows from a copy of its leaf (task-2185). An
+                // index that computes nothing takes the values it keeps; one
+                // with a predicate or a computed key is evaluated over an owned
+                // copy of the row, which is what its expressions read.
+                if indexes.computes_nothing() {
+                    for ((_, index), held) in maintained(table).zip(entries.iter_mut()) {
+                        held.push(plain_index_entry(index, layout, row)?);
+                    }
+                    return Ok(());
+                }
+                let owned: Vec<OwnedDatum> = row.iter().map(OwnedDatum::from_datum).collect();
                 for ((position, index), held) in maintained(table).zip(entries.iter_mut()) {
-                    if indexes.holds(position, row)? {
-                        held.push(index_entry(position, index, layout, row, indexes)?);
+                    if indexes.holds(position, &owned)? {
+                        held.push(index_entry(position, index, layout, &owned, indexes)?);
                     }
                 }
                 Ok(())
@@ -349,11 +378,12 @@ fn delete_unwatched(
         }
     }
     for ((_, index), held) in maintained(table).zip(entries.iter()) {
-        let sorted: Vec<Vec<Datum<'_>>> =
-            sorted_by_tree(target, index.root, held.iter().map(Vec::as_slice).collect())?
-                .into_iter()
-                .map(|entry| entry.iter().map(OwnedDatum::borrow).collect())
-                .collect();
+        let ordered = sorted_by_tree(target, index.root, held.iter().map(Vec::as_slice).collect())?;
+        let values: Vec<Datum<'_>> = ordered
+            .iter()
+            .flat_map(|entry| entry.iter().map(OwnedDatum::borrow))
+            .collect();
+        let sorted = key_slices(&values, ordered.iter().map(|entry| entry.len()));
         let mut near = None;
         let mut at = 0usize;
         while let Some(rest) = sorted.get(at..).filter(|rest| !rest.is_empty()) {
@@ -372,6 +402,24 @@ fn delete_unwatched(
         }
     }
     Ok(changes)
+}
+/// Cuts a buffer of key values into one slice per key.
+///
+/// @param values - every key's values, one key after another
+/// @param lengths - how many values each key has, in the same order
+pub(super) fn key_slices<'v, 'd>(
+    values: &'v [Datum<'d>],
+    lengths: impl Iterator<Item = usize>,
+) -> Vec<&'v [Datum<'d>]> {
+    let mut start = 0usize;
+    lengths
+        .map(|length| {
+            let end = start.saturating_add(length);
+            let key = values.get(start..end).unwrap_or(&[]);
+            start = end;
+            key
+        })
+        .collect()
 }
 /// Removes one row, firing the `BEFORE` and `AFTER` triggers around it.
 ///

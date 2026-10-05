@@ -199,14 +199,18 @@ fn allocations(body: impl FnOnce()) -> u64 {
 /// to the full read, and the only reason to is that the file moved.
 const META_READS_PER_UNCHANGED_STATEMENT: u64 = 0;
 
-/// How many times a statement run outside a transaction may read the record's
-/// own bytes.
+/// How many file reads a statement run outside a transaction may make of the
+/// record's own bytes.
 ///
 /// One per statement, because one lock acquisition is one chance for another
-/// process to have written. Two means the two callers that ask - the pool's
-/// `begin_read` and the engine's `the_meta_moved` - have stopped sharing the
-/// answer they both make under the same SHARED lock, which no writer can hold
-/// at the same time.
+/// process to have written. Two means one of two things went back. Either the
+/// two callers that ask - the pool's `begin_read` and the engine's
+/// `the_meta_moved` - have stopped sharing the answer they both make under the
+/// same SHARED lock, which no writer can hold at the same time. Or the check
+/// reads both slots again: it reads the shadow slot alone since task-2181,
+/// because every fold writes the shadow before the primary, and the primary
+/// read it dropped was one `ReadFile` of the seven system calls such a
+/// statement made on Windows.
 const META_PROBES_PER_UNCHANGED_STATEMENT: u64 = 1;
 
 /// How many statements each arm of

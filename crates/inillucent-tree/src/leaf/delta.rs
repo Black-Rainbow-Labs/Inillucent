@@ -502,6 +502,78 @@ impl<'p> LeafRef<'p> {
         Ok(Err(low))
     }
 
+    /// [`LeafRef::delta_search`] for a probe known to sort at or past directory
+    /// position `start`.
+    ///
+    /// **For a run of probes in key order.** A bulk delete looks up every key
+    /// of a leaf in turn, and each one's place in the delta area is at or past
+    /// the place of the key before it. A binary search from scratch decodes a
+    /// delta key per halving, so on the hillclimb plan's `churn.delete.half`,
+    /// whose leaves still hold the rows twenty thousand single inserts left in
+    /// their delta areas, the delta search was a sixth of the delete. Galloping
+    /// out from `start` decodes one or two keys for a probe whose place is next
+    /// to the last one's, and a binary search's worth for one far away.
+    ///
+    /// The contract is the caller's: every entry before `start` sorts below
+    /// the probe. Position 0 asks nothing, so it is always a safe `start`, and
+    /// so is the position the previous, smaller probe was answered with,
+    /// `Ok` or `Err`. A format 1 area has no order and is searched as
+    /// `delta_search` searches it.
+    ///
+    /// @param probe - the key, one value per column it names
+    /// @param start - a directory position every entry before which sorts below the probe
+    pub fn delta_search_from(
+        &self,
+        probe: &[Datum<'_>],
+        start: usize,
+    ) -> DbResult<Result<usize, usize>> {
+        if !self.has_delta_directory() || start == 0 {
+            return self.delta_search(probe);
+        }
+        let count = self.delta_count;
+        // Gallop: find `high`, the first position known to sort at or past the
+        // probe, doubling the step; everything before `low` sorts below it.
+        // `at_high` is how the entry at `high` compared, once it has been, so
+        // the answer is not decoded twice: a probe whose place is the cursor
+        // itself, the common case, costs one comparison.
+        let mut low = start;
+        let mut high = start;
+        let mut step = 1usize;
+        let mut at_high = None;
+        while high < count {
+            let order = self.compare_delta_key(high, probe)?;
+            if order != std::cmp::Ordering::Less {
+                at_high = Some(order);
+                break;
+            }
+            low = high.saturating_add(1);
+            high = high.saturating_add(step);
+            step = step.saturating_mul(2);
+        }
+        let mut high = high.min(count);
+        while low < high {
+            let middle = low.saturating_add(high.saturating_sub(low) / 2);
+            match self.compare_delta_key(middle, probe)? {
+                std::cmp::Ordering::Less => low = middle.saturating_add(1),
+                order => {
+                    high = middle;
+                    at_high = Some(order);
+                }
+            }
+        }
+        if low >= count {
+            return Ok(Err(low));
+        }
+        let order = match at_high {
+            Some(order) => order,
+            None => self.compare_delta_key(low, probe)?,
+        };
+        match order {
+            std::cmp::Ordering::Equal => Ok(Ok(low)),
+            _ => Ok(Err(low)),
+        }
+    }
+
     /// Returns the delta rows whose key begins with a probe, in key order.
     ///
     /// For a leaf with a directory that is a run of it, found by two binary

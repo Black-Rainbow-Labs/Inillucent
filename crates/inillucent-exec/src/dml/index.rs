@@ -89,37 +89,110 @@ pub(super) fn index_entry(
     row: &[OwnedDatum],
     indexes: IndexExprs<'_>,
 ) -> DbResult<Row> {
+    // A key the index computes is evaluated over the row; a key that is a
+    // column is read out of it. `key` answers `None` for every index that
+    // computes nothing, which is every index the gate measures.
+    entry_from(
+        index,
+        layout,
+        |slot| row.get(slot).cloned(),
+        |key| indexes.key(position, key, row),
+    )
+}
+
+/// Builds one index entry from a table row the caller only borrows, for a
+/// table whose indexes compute nothing (see [`IndexExprs::computes_nothing`]).
+///
+/// **Only the entry's own values are copied** (task-2185). A bulk delete
+/// shows each removed row as values borrowing from a copy of its leaf, and
+/// copying the whole row to call [`index_entry`] was the copy the tree had
+/// just stopped making.
+///
+/// @param index - the index
+/// @param layout - the table tree's layout
+/// @param row - the table row, in tree-column order
+pub(super) fn plain_index_entry(
+    index: &IndexInfo,
+    layout: &SourceLayout,
+    row: &[Datum<'_>],
+) -> DbResult<Row> {
+    entry_from(
+        index,
+        layout,
+        |slot| row.get(slot).map(OwnedDatum::from_datum),
+        |_| Ok(None),
+    )
+}
+
+/// Builds one index entry: the indexed columns, then what identifies the row.
+///
+/// @param index - the index
+/// @param layout - the table tree's layout
+/// @param value_at - the row's value in a tree slot, when the row has the slot
+/// @param computed - a computed key column's value, or `None` for a column key
+fn entry_from(
+    index: &IndexInfo,
+    layout: &SourceLayout,
+    value_at: impl Fn(usize) -> Option<OwnedDatum>,
+    mut computed: impl FnMut(usize) -> DbResult<Option<OwnedDatum>>,
+) -> DbResult<Row> {
     let trailing = layout.identity.len().max(1);
     let mut entry = Vec::with_capacity(index.columns.len().saturating_add(trailing));
-    for (key, column) in index.columns.iter().enumerate() {
-        // A key the index computes is evaluated over the row; a key that is a
-        // column is read out of it. `key` answers `None` for every index that
-        // computes nothing, which is every index the gate measures.
-        if let Some(computed) = indexes.key(position, key, row)? {
-            entry.push(computed);
-            continue;
+    for (at, slot) in entry_slots(index, layout).enumerate() {
+        if at < index.columns.len() {
+            if let Some(value) = computed(at)? {
+                entry.push(value);
+                continue;
+            }
         }
-        entry.push(
-            column
-                .column
-                .and_then(|declared| layout.slots.get(usize::from(declared)).copied().flatten())
-                .and_then(|slot| row.get(slot).cloned())
-                .unwrap_or(OwnedDatum::Null),
-        );
-    }
-    if layout.identity.is_empty() {
-        entry.push(
-            layout
-                .rowid
-                .and_then(|slot| row.get(slot).cloned())
-                .unwrap_or(OwnedDatum::Null),
-        );
-        return Ok(entry);
-    }
-    for slot in &layout.identity {
-        entry.push(row.get(*slot).cloned().unwrap_or(OwnedDatum::Null));
+        entry.push(slot.and_then(&value_at).unwrap_or(OwnedDatum::Null));
     }
     Ok(entry)
+}
+
+/// Returns the tree slot each value of an index entry is read from, in entry
+/// order: the indexed columns, then what identifies the row.
+///
+/// `None` for a key no column of the table holds, which an entry stores as
+/// NULL unless the index computes it.
+///
+/// @param index - the index
+/// @param layout - the table tree's layout
+fn entry_slots<'a>(
+    index: &'a IndexInfo,
+    layout: &'a SourceLayout,
+) -> impl Iterator<Item = Option<usize>> + 'a {
+    let keys = index.columns.iter().map(move |column| {
+        column
+            .column
+            .and_then(|declared| layout.slots.get(usize::from(declared)).copied().flatten())
+    });
+    let rowid = layout.identity.is_empty().then_some(layout.rowid);
+    let identity = layout.identity.iter().map(|slot| Some(*slot));
+    keys.chain(rowid).chain(identity)
+}
+
+/// Reports whether a row's entry in an index that computes nothing is the
+/// same before and after a change.
+///
+/// **The entry's own slots compared, not two entries built** (task-2185). An
+/// `UPDATE` asks this of every index for every row it writes, to know whether
+/// the row can be rewritten where it lies; building both entries was four
+/// vectors and a copy of every key value a row. Only for a table whose
+/// indexes compute nothing (see [`IndexExprs::computes_nothing`]); an entry
+/// with a computed key has to be evaluated.
+///
+/// @param index - the index
+/// @param layout - the table tree's layout
+/// @param before - the row as it is
+/// @param after - the row as it will be
+pub(super) fn plain_entry_unchanged(
+    index: &IndexInfo,
+    layout: &SourceLayout,
+    before: &[OwnedDatum],
+    after: &[OwnedDatum],
+) -> bool {
+    entry_slots(index, layout).all(|slot| slot.is_none_or(|at| before.get(at) == after.get(at)))
 }
 
 /// Returns the unique indexes of a table that are trees of their own.

@@ -85,10 +85,17 @@ const FLOORS: [Floor; 19] = [
     // acknowledged, which in this workload are the checkpoint's: the calls
     // before the commit are the same 33. Every cut point still recovers to a
     // state the campaign accepts.
+    // **Fewer since the staleness check reads only the shadow meta slot
+    // (task-2181).** Each lock a statement takes outside a transaction made
+    // two reads of the meta record and now makes one, and every read is a
+    // cut point. Measured by putting the primary slot's read back, discarded,
+    // and running the campaign again: 80 cut points became 76 without it and returned
+    // exactly to the old count with it. Every cut point still recovers to a
+    // state the campaign accepts.
     Floor {
         name: "delete-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 78,
+        least: 76,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -97,11 +104,18 @@ const FLOORS: [Floor; 19] = [
     // `delete-full-crash.txt` all eight were calls made after the commit was
     // acknowledged, which in this workload are the checkpoint's: the calls
     // before the commit are the same 33. Every cut point still recovers to a
+    // state the campaign accepts.
+    // **Fewer since the staleness check reads only the shadow meta slot
+    // (task-2181).** Each lock a statement takes outside a transaction made
+    // two reads of the meta record and now makes one, and every read is a
+    // cut point. Measured by putting the primary slot's read back, discarded,
+    // and running the campaign again: 80 cut points became 76 without it and returned
+    // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
     Floor {
         name: "delete-full-disk-full.txt",
         shape: Shape::CutPoints,
-        least: 78,
+        least: 76,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -110,11 +124,18 @@ const FLOORS: [Floor; 19] = [
     // `delete-full-crash.txt` all eight were calls made after the commit was
     // acknowledged, which in this workload are the checkpoint's: the calls
     // before the commit are the same 33. Every cut point still recovers to a
+    // state the campaign accepts.
+    // **Fewer since the staleness check reads only the shadow meta slot
+    // (task-2181).** Each lock a statement takes outside a transaction made
+    // two reads of the meta record and now makes one, and every read is a
+    // cut point. Measured by putting the primary slot's read back, discarded,
+    // and running the campaign again: 80 cut points became 76 without it and returned
+    // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
     Floor {
         name: "delete-full-io-error.txt",
         shape: Shape::CutPoints,
-        least: 78,
+        least: 76,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -124,30 +145,51 @@ const FLOORS: [Floor; 19] = [
     // acknowledged, which in this workload are the checkpoint's: the calls
     // before the commit are the same 33. Every cut point still recovers to a
     // state the campaign accepts.
+    // **Fewer since the staleness check reads only the shadow meta slot
+    // (task-2181).** Each lock a statement takes outside a transaction made
+    // two reads of the meta record and now makes one, and every read is a
+    // cut point. Measured by putting the primary slot's read back, discarded,
+    // and running the campaign again: 80 cut points became 76 without it and returned
+    // exactly to the old count with it. Every cut point still recovers to a
+    // state the campaign accepts.
     Floor {
         name: "delete-full-short-write.txt",
         shape: Shape::CutPoints,
-        least: 78,
+        least: 76,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** 161 cut points became 153 over the same
     // commits that took eight from `delete-full-crash.txt`, where the eight
     // were traced to that change by running the campaign before and after it.
     // Every cut point still recovers to a state the campaign accepts.
+    // **Fewer since the staleness check reads only the shadow meta slot
+    // (task-2181).** Each lock a statement takes outside a transaction made
+    // two reads of the meta record and now makes one, and every read is a
+    // cut point. Measured by putting the primary slot's read back, discarded,
+    // and running the campaign again: 153 cut points became 149 without it and returned
+    // exactly to the old count with it. Every cut point still recovers to a
+    // state the campaign accepts.
     Floor {
         name: "truncate-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 151,
+        least: 149,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** 161 cut points became 153 over the same
     // commits that took eight from `delete-full-crash.txt`, where the eight
     // were traced to that change by running the campaign before and after it.
     // Every cut point still recovers to a state the campaign accepts.
+    // **Fewer since the staleness check reads only the shadow meta slot
+    // (task-2181).** Each lock a statement takes outside a transaction made
+    // two reads of the meta record and now makes one, and every read is a
+    // cut point. Measured by putting the primary slot's read back, discarded,
+    // and running the campaign again: 153 cut points became 149 without it and returned
+    // exactly to the old count with it. Every cut point still recovers to a
+    // state the campaign accepts.
     Floor {
         name: "persist-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 151,
+        least: 149,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -156,11 +198,18 @@ const FLOORS: [Floor; 19] = [
     // `delete-full-crash.txt` all eight were calls made after the commit was
     // acknowledged, which in this workload are the checkpoint's: the calls
     // before the commit are the same 33. Every cut point still recovers to a
+    // state the campaign accepts.
+    // **Fewer since the staleness check reads only the shadow meta slot
+    // (task-2181).** Each lock a statement takes outside a transaction made
+    // two reads of the meta record and now makes one, and every read is a
+    // cut point. Measured by putting the primary slot's read back, discarded,
+    // and running the campaign again: 47 cut points became 46 without it and returned
+    // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
     Floor {
         name: "delete-full-checkpoint-crash.txt",
         shape: Shape::CutPoints,
-        least: 47,
+        least: 46,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -169,11 +218,18 @@ const FLOORS: [Floor; 19] = [
     // `delete-full-crash.txt` all eight were calls made after the commit was
     // acknowledged, which in this workload are the checkpoint's: the calls
     // before the commit are the same 33. Every cut point still recovers to a
+    // state the campaign accepts.
+    // **Fewer since the staleness check reads only the shadow meta slot
+    // (task-2181).** Each lock a statement takes outside a transaction made
+    // two reads of the meta record and now makes one, and every read is a
+    // cut point. Measured by putting the primary slot's read back, discarded,
+    // and running the campaign again: 47 cut points became 46 without it and returned
+    // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
     Floor {
         name: "delete-full-checkpoint-disk-full.txt",
         shape: Shape::CutPoints,
-        least: 47,
+        least: 46,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -183,10 +239,17 @@ const FLOORS: [Floor; 19] = [
     // acknowledged, which in this workload are the checkpoint's: the calls
     // before the commit are the same 33. Every cut point still recovers to a
     // state the campaign accepts.
+    // **Fewer since the staleness check reads only the shadow meta slot
+    // (task-2181).** Each lock a statement takes outside a transaction made
+    // two reads of the meta record and now makes one, and every read is a
+    // cut point. Measured by putting the primary slot's read back, discarded,
+    // and running the campaign again: 47 cut points became 46 without it and returned
+    // exactly to the old count with it. Every cut point still recovers to a
+    // state the campaign accepts.
     Floor {
         name: "delete-full-checkpoint-io-error.txt",
         shape: Shape::CutPoints,
-        least: 47,
+        least: 46,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -195,11 +258,18 @@ const FLOORS: [Floor; 19] = [
     // `delete-full-crash.txt` all eight were calls made after the commit was
     // acknowledged, which in this workload are the checkpoint's: the calls
     // before the commit are the same 33. Every cut point still recovers to a
+    // state the campaign accepts.
+    // **Fewer since the staleness check reads only the shadow meta slot
+    // (task-2181).** Each lock a statement takes outside a transaction made
+    // two reads of the meta record and now makes one, and every read is a
+    // cut point. Measured by putting the primary slot's read back, discarded,
+    // and running the campaign again: 46 cut points became 45 without it and returned
+    // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
     Floor {
         name: "truncate-full-checkpoint-crash.txt",
         shape: Shape::CutPoints,
-        least: 46,
+        least: 45,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -209,10 +279,17 @@ const FLOORS: [Floor; 19] = [
     // acknowledged, which in this workload are the checkpoint's: the calls
     // before the commit are the same 33. Every cut point still recovers to a
     // state the campaign accepts.
+    // **Fewer since the staleness check reads only the shadow meta slot
+    // (task-2181).** Each lock a statement takes outside a transaction made
+    // two reads of the meta record and now makes one, and every read is a
+    // cut point. Measured by putting the primary slot's read back, discarded,
+    // and running the campaign again: 46 cut points became 45 without it and returned
+    // exactly to the old count with it. Every cut point still recovers to a
+    // state the campaign accepts.
     Floor {
         name: "persist-full-checkpoint-crash.txt",
         shape: Shape::CutPoints,
-        least: 46,
+        least: 45,
     },
     // **Three fewer since `BEGIN` became deferred (task-2173).** The
     // workload opens with `BEGIN`, which took the write lock itself before
@@ -253,10 +330,17 @@ const FLOORS: [Floor; 19] = [
     // three cut points, all of them `old`: the report
     // went from 24 old and 3 new to 21 old and 3 new. Every cut that lands
     // after the first write is still made.
+    // **Fewer since the staleness check reads only the shadow meta slot
+    // (task-2181).** Each lock a statement takes outside a transaction made
+    // two reads of the meta record and now makes one, and every read is a
+    // cut point. Measured by putting the primary slot's read back, discarded,
+    // and running the campaign again: 55 cuts became 53 without it and returned
+    // exactly to the old count with it. Every cut point still recovers to a
+    // state the campaign accepts.
     Floor {
         name: "wal-checkpoint.tsv",
         shape: Shape::HashCuts,
-        least: 54,
+        least: 53,
     },
     Floor {
         name: "multi-database-commit.tsv",

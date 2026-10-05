@@ -1250,3 +1250,86 @@ fn a_statement_refuses_a_run_under_different_settings() {
         .expect("the settings match again");
     assert_eq!(rows.borrow().len(), 4, "ids 10, 20, 30 and 40");
 }
+
+/// A prepared `INSERT` keeps its compiled plan and `VALUES` between
+/// executions and still writes what a fresh compile writes (task-2185).
+///
+/// Each execution binds different values, one value reads
+/// `last_insert_rowid()`, which is true of one execution only and so must not
+/// be kept, and between executions a column is added and an index is created,
+/// each of which changes the layout a kept setup was built for. The
+/// connection that keeps its setup and the one that compiles every time must
+/// hold the same rows and report the same counters after every step.
+#[test]
+fn a_kept_insert_setup_writes_what_a_fresh_compile_writes() {
+    let (mut cached, mut fresh) = cached_and_fresh_pair("insert-setup");
+    exec_both(
+        &mut cached,
+        &mut fresh,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b INTEGER, prev INTEGER)",
+    );
+    // No value here reads anything but a parameter, so the setup is kept.
+    let insert = "INSERT INTO t (a, b) VALUES ('user ' || ?1, ?2 % 7)";
+    let check = "SELECT * FROM t ORDER BY id";
+    let bind = |at: i64| {
+        Params::from_values(vec![
+            OwnedDatum::Text(format!("n{at}").into_bytes()),
+            OwnedDatum::Int(at * 3),
+        ])
+    };
+    for at in 0..4 {
+        exec_both_with(&mut cached, &mut fresh, insert, &bind(at));
+        assert_databases_agree(&mut cached, &mut fresh, check, &format!("insert {at}"));
+    }
+    exec_both(
+        &mut cached,
+        &mut fresh,
+        "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 5",
+    );
+    for at in 4..7 {
+        exec_both_with(&mut cached, &mut fresh, insert, &bind(at));
+        assert_databases_agree(
+            &mut cached,
+            &mut fresh,
+            check,
+            &format!("insert {at}, after ADD COLUMN"),
+        );
+    }
+    exec_both(&mut cached, &mut fresh, "CREATE UNIQUE INDEX t_a ON t(a)");
+    for at in 7..10 {
+        exec_both_with(&mut cached, &mut fresh, insert, &bind(at));
+        assert_databases_agree(
+            &mut cached,
+            &mut fresh,
+            check,
+            &format!("insert {at}, after CREATE INDEX"),
+        );
+    }
+    // The unique index refuses a repeat through the kept setup as it does
+    // through a fresh one.
+    assert!(cached.execute_any(insert, &bind(8)).is_err());
+    assert!(fresh.execute_any(insert, &bind(8)).is_err());
+    assert_databases_agree(&mut cached, &mut fresh, check, "after a refused repeat");
+    // A value that reads last_insert_rowid() is true of one execution only.
+    let reading = "INSERT INTO t (a, b, prev) VALUES ('r' || ?1, ?2, last_insert_rowid())";
+    for at in 20..23 {
+        exec_both_with(&mut cached, &mut fresh, reading, &bind(at));
+    }
+    assert_databases_agree(&mut cached, &mut fresh, check, "after last_insert_rowid()");
+    let prev: Vec<Vec<OwnedDatum>> = cached
+        .run_with(
+            "SELECT prev FROM t WHERE prev IS NOT NULL ORDER BY id",
+            &Params::new(),
+        )
+        .expect("the rows read")
+        .0;
+    assert_eq!(
+        prev,
+        vec![
+            vec![OwnedDatum::Int(10)],
+            vec![OwnedDatum::Int(11)],
+            vec![OwnedDatum::Int(12)]
+        ],
+        "last_insert_rowid() is read per execution, not kept from the first"
+    );
+}

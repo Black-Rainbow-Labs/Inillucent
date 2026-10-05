@@ -384,6 +384,17 @@ pub struct JsonCall {
     /// times extracted the same value four thousand times. `None` when an
     /// argument is not a literal; the inner `None` until the first call.
     constant: Option<std::sync::Mutex<Option<json::Answer>>>,
+    /// The steps of a single path written as a literal, parsed when the call
+    /// was compiled.
+    ///
+    /// **A literal path is the same on every row** (task-2185). It was
+    /// evaluated, which copies the literal, and compared against the cached
+    /// path on every row: `json_extract(body, '$.k')` over 5,000 documents
+    /// spent 5% of its time copying `'$.k'`. `None` for a path that is not a
+    /// literal, and for a literal that does not parse, which is reported when
+    /// a row is evaluated, as SQLite reports it, and not when the statement is
+    /// prepared.
+    literal_steps: Option<Vec<json::path::Step>>,
 }
 
 /// What a repeated `json_extract` does not have to parse again.
@@ -426,6 +437,7 @@ impl JsonCall {
             cached: std::sync::Mutex::new(None),
             extract: std::sync::Mutex::new(ExtractCache::default()),
             constant: None,
+            literal_steps: None,
         }
     }
 
@@ -498,10 +510,6 @@ impl JsonCall {
         // calls is four thousand copies of a document the cache already holds.
         // The copy now happens only on a miss, where it has to.
         let left = left.value(batch, nth)?;
-        let right = right.value(batch, nth)?;
-        let Datum::Text(path) = right.get() else {
-            return Ok(None);
-        };
         let (document, blob) = match left.get() {
             Datum::Text(bytes) => (bytes, false),
             Datum::Blob(bytes) => (bytes, true),
@@ -510,11 +518,18 @@ impl JsonCall {
         let Ok(mut held) = self.extract.lock() else {
             return Ok(None);
         };
-        if held.steps.as_ref().map(|(seen, _)| seen.as_slice()) != Some(path) {
-            let Ok(text) = std::str::from_utf8(path) else {
+        // The path is read only when it is not a literal parsed already.
+        if self.literal_steps.is_none() {
+            let right = right.value(batch, nth)?;
+            let Datum::Text(path) = right.get() else {
                 return Ok(None);
             };
-            held.steps = Some((path.to_vec(), json::path::parse(text)?));
+            if held.steps.as_ref().map(|(seen, _)| seen.as_slice()) != Some(path) {
+                let Ok(text) = std::str::from_utf8(path) else {
+                    return Ok(None);
+                };
+                held.steps = Some((path.to_vec(), json::path::parse(text)?));
+            }
         }
         if held.document.as_ref().map(|(seen, _)| seen.as_slice()) == Some(document) {
             held.misses = 0;
@@ -528,7 +543,7 @@ impl JsonCall {
             let Ok(text) = std::str::from_utf8(document) else {
                 return Err(json::malformed());
             };
-            let Some((_, steps)) = held.steps.as_ref() else {
+            let Some(steps) = self.steps_of(&held) else {
                 return Ok(None);
             };
             // Only the part of the document the path reads is built.
@@ -558,11 +573,21 @@ impl JsonCall {
             };
             held.document = Some((document.to_vec(), node));
         }
-        let (Some((_, node)), Some((_, steps))) = (held.document.as_ref(), held.steps.as_ref())
-        else {
+        let (Some((_, node)), Some(steps)) = (held.document.as_ref(), self.steps_of(&held)) else {
             return Ok(None);
         };
         Ok(Some(json::extract_parsed(node, steps, binary)?))
+    }
+
+    /// Returns the path's steps: the literal's, parsed at compile time, or the
+    /// ones the cache holds for the path the last row gave.
+    ///
+    /// @param held - the cache, locked
+    fn steps_of<'s>(&'s self, held: &'s ExtractCache) -> Option<&'s [json::path::Step]> {
+        match &self.literal_steps {
+            Some(steps) => Some(steps),
+            None => held.steps.as_ref().map(|(_, steps)| steps.as_slice()),
+        }
     }
 
     /// Evaluates the call, keeping the subtype its answer carries.
@@ -681,7 +706,26 @@ pub fn compile_json(
     if all_literal(arguments) {
         call.constant = Some(std::sync::Mutex::new(None));
     }
+    call.literal_steps = literal_path(func, arguments);
     Ok(call)
+}
+
+/// Returns the parsed steps of a single path `json_extract` is given as a
+/// literal, or `None`.
+///
+/// `None` as well for a literal that is not text or does not parse, so the
+/// failure is reported by the row that reads it, as SQLite reports it.
+///
+/// @param func - which JSON function
+/// @param arguments - the call's argument expressions
+fn literal_path(func: JsonFunc, arguments: &[crate::expr::Expr]) -> Option<Vec<json::path::Step>> {
+    if !matches!(func, JsonFunc::Extract | JsonFunc::ExtractB) || arguments.len() != 2 {
+        return None;
+    }
+    let Some(crate::expr::Expr::Literal(OwnedDatum::Text(path))) = arguments.get(1) else {
+        return None;
+    };
+    json::path::parse(std::str::from_utf8(path).ok()?).ok()
 }
 
 /// Reports whether every argument of a JSON call is a literal or a JSON call of literals.

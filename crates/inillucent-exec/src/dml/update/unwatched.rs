@@ -43,7 +43,7 @@ use inillucent_tree::datum::Datum;
 use inillucent_tree::write::{Rewrite, UpdateRun};
 
 use super::*;
-use crate::dml::index::{index_entry, maintained};
+use crate::dml::index::{index_entry, maintained, plain_entry_unchanged};
 
 /// What the decision for the last row asked about holds back for the row at a time path.
 enum Held {
@@ -85,11 +85,18 @@ pub(super) fn update_unwatched(
     let Some(ordered) = in_tree_order(statement, target, prefixes)? else {
         return Ok(None);
     };
-    let borrowed: Vec<Vec<Datum<'_>>> = ordered
-        .into_iter()
-        .map(|key| key.iter().map(OwnedDatum::borrow).collect())
+    // One buffer of values and a slice per key, as the bulk delete builds
+    // them (task-2185), rather than a vector per key.
+    let values: Vec<Datum<'_>> = ordered
+        .iter()
+        .flat_map(|key| key.iter().map(OwnedDatum::borrow))
         .collect();
+    let borrowed = crate::dml::delete::key_slices(&values, ordered.iter().map(|key| key.len()));
     let mut changes = Changes::default();
+    // One undo image per row, so a log that keeps them sizes its buffer once
+    // (task-2185): growing it was 3.5% of `UPDATE side_table SET note = note
+    // || '!'` over 25,000 rows.
+    target.parts_for(table.root)?.2.expect_undo(borrowed.len());
     let mut near = None;
     let mut at = 0usize;
     let mut run = UpdateRun::default();
@@ -291,6 +298,12 @@ fn entries_move(
     after: &[OwnedDatum],
 ) -> DbResult<bool> {
     let indexes = IndexExprs::new(&setup.declarations, &setup.space);
+    // Every index holds every row and reads its keys out of the row, so an
+    // entry moves exactly when one of its slots changed (task-2185).
+    if indexes.computes_nothing() {
+        return Ok(!maintained(table)
+            .all(|(_, index)| plain_entry_unchanged(index, layout, before, after)));
+    }
     for (position, index) in maintained(table) {
         let entry = |row: &[OwnedDatum]| -> DbResult<Option<Row>> {
             match indexes.holds(position, row)? {

@@ -269,8 +269,17 @@ impl Pool {
             }
             // Under a rollback journal the pre-images are what makes the write
             // undoable, so the order `journal_mode = delete` was measured on is
-            // kept exactly: the pages synced on their own, both slots journaled
-            // and sealed, both written, one sync behind them.
+            // kept: the pages synced on their own, both slots journaled and
+            // sealed, both written, one sync behind them.
+            //
+            // **The shadow is written first here too (task-2181).** The journal
+            // makes the order irrelevant to a crash of the machine, because it
+            // puts both slots back. It is not irrelevant to another process:
+            // a writer killed between the two writes leaves one slot changed in
+            // the page cache, which every other process sees at once, and
+            // `Pool::read_shadow_record` reads only the shadow on every
+            // statement. With the primary first, that reader saw nothing and
+            // went on without looking for the journal the dead writer left.
             false => {
                 self.file
                     .sync(SyncMode::Normal)
@@ -279,7 +288,7 @@ impl Pool {
                 self.journal_page(META_PAGE)?;
                 self.journal_page(SHADOW_PAGE)?;
                 self.seal_journal()?;
-                for slot in [META_PAGE, SHADOW_PAGE] {
+                for slot in [SHADOW_PAGE, META_PAGE] {
                     self.file
                         .write_all_at(slot.0.saturating_mul(self.page_size as u64), &image)
                         .map_err(|error| error.into_db_error())?;
@@ -350,46 +359,45 @@ impl Pool {
         Ok((primary, shadow))
     }
 
-    /// Reads the bytes a meta record occupies from both slots, without the page
-    /// around them.
+    /// Reads the bytes a meta record occupies in the shadow slot, without the
+    /// page around it.
     ///
     /// **The cheap half of the staleness check the multi-process protocol makes
     /// on every statement** (task-2046). A record ends at
     /// [`crate::meta::META_RECORD_BYTES`] and [`crate::meta::Meta::encode`]
-    /// zeroes the rest of the page, so two slots whose record bytes agree
-    /// describe the same database - and a connection asking whether another
-    /// process has folded can answer from 232 bytes rather than from two whole
-    /// pages. At the 32 KiB default page size [`Pool::read_meta_slots`] costs
-    /// a buffer one page long allocated and zeroed for each slot, a whole page
-    /// read into each and, through
-    /// `Meta::choose`, two crc32 passes over a whole page; this costs two
-    /// reads of 120 bytes into the stack.
+    /// zeroes the rest of the page, so a slot whose record bytes agree with the
+    /// ones last read holds the same record - and a connection asking whether
+    /// another process has folded can answer from 120 bytes rather than from a
+    /// whole page. At the 32 KiB default page size [`Pool::read_meta_slots`]
+    /// costs a buffer one page long allocated and zeroed for each slot, a whole
+    /// page read into each and, through `Meta::choose`, two crc32 passes over a
+    /// whole page; this costs one read of 120 bytes into the stack.
+    ///
+    /// **The shadow slot alone, because every fold writes it first**
+    /// (task-2181). [`Pool::checkpoint`] gives both slots the same image, and
+    /// under either journal mode the shadow is the first of the two it writes.
+    /// So a fold that has reached the meta record at all has changed the
+    /// shadow, and one that has not reached it has changed neither slot. The
+    /// primary is written second, so reading it as well could only ever find a
+    /// change the shadow had already shown. This read was the second of two,
+    /// one `ReadFile` of the seven system calls an autocommit statement made
+    /// under `locking_mode = normal`.
     ///
     /// It decides nothing on its own. A caller that finds the bytes changed
     /// reads the slots in full and checksums them, which is the only path that
     /// says what the record now is.
     ///
-    /// @param page_size - the page size, which is where the second slot starts
-    pub fn read_meta_records(
+    /// @param page_size - the page size, which is where the shadow slot starts
+    pub fn read_shadow_record(
         &self,
         page_size: usize,
-    ) -> DbResult<[[u8; crate::meta::META_RECORD_BYTES]; 2]> {
-        let mut records = [[0u8; crate::meta::META_RECORD_BYTES]; 2];
-        let (primary, rest) = records.split_at_mut(1);
-        let Some(primary) = primary.first_mut() else {
-            return Err(misuse("the meta record buffer has no primary slot"));
-        };
-        let Some(shadow) = rest.first_mut() else {
-            return Err(misuse("the meta record buffer has no shadow slot"));
-        };
+    ) -> DbResult<[u8; crate::meta::META_RECORD_BYTES]> {
+        let mut record = [0u8; crate::meta::META_RECORD_BYTES];
         self.file
-            .read_exact_at(0, primary)
-            .map_err(|error| error.into_db_error())?;
-        self.file
-            .read_exact_at(page_size as u64, shadow)
+            .read_exact_at(page_size as u64, &mut record)
             .map_err(|error| error.into_db_error())?;
         Counters::add(&self.counters.meta_probes, 1);
-        Ok(records)
+        Ok(record)
     }
 
     /// Writes one of the two meta pages straight to the file.

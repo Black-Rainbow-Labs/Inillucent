@@ -384,7 +384,7 @@ fn update_setup(
 ///
 /// @param bindings - the cell the compiled pieces read
 /// @param params - the values bound for this execution
-fn adopt_bindings(bindings: &crate::physical::Bindings, params: &Params) {
+pub(super) fn adopt_bindings(bindings: &crate::physical::Bindings, params: &Params) {
     let source = params.bindings();
     // **The same cell needs no copy, and locking it twice would deadlock.** A
     // setup used by the execution that built it holds exactly this `Arc`.

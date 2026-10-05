@@ -375,25 +375,43 @@ impl<'p> LeafRef<'p> {
     /// the search gallops out from there instead of bisecting the whole region
     /// again: a delete of every other row of a leaf of five thousand index
     /// entries spent a sixth of the statement bisecting. The delta area is
-    /// searched as [`LeafRef::locate`] searches it, and the answer is the one
-    /// `locate` gives for a key at or past `from`.
+    /// searched the same way, from the delta position the key before it was
+    /// answered with (see [`LeafRef::delta_search_from`]), and the answer is
+    /// the one `locate` gives for a key at or past the cursor.
     ///
     /// @param key - the key, one value per key column
     /// @param key_columns - how many leading columns form the key
-    /// @param from - the first sorted row the key can be at
+    /// @param from - where the search starts in each region; moved past this key
     pub fn locate_from(
         &self,
         key: &[Datum<'_>],
         key_columns: usize,
-        from: usize,
+        from: &mut RunCursor,
     ) -> DbResult<crate::write::Located> {
-        if let Ok(index) = self.delta_index_of(key, key_columns)? {
+        // A key shorter than the tree's is padded by `delta_index_of`, and its
+        // place says nothing certain about where the next key's is, so it
+        // leaves the cursor where it was.
+        let in_delta = match key.len() >= key_columns {
+            true => {
+                let found =
+                    self.delta_search_from(key.get(..key_columns).unwrap_or(key), from.delta)?;
+                from.delta = match found {
+                    Ok(index) | Err(index) => index,
+                };
+                found
+            }
+            false => self.delta_index_of(key, key_columns)?,
+        };
+        if let Ok(index) = in_delta {
             return Ok(crate::write::Located::Delta(index));
         }
         let view = self.key_view()?;
         let probe = key.get(..key_columns).unwrap_or(key);
-        match self.gallop_from(&view, probe, from.min(self.row_count))? {
-            Ok(row) if !self.is_tombstoned(row)? => Ok(crate::write::Located::Sorted(row)),
+        match self.gallop_from(&view, probe, from.sorted.min(self.row_count))? {
+            Ok(row) if !self.is_tombstoned(row)? => {
+                from.sorted = row.saturating_add(1);
+                Ok(crate::write::Located::Sorted(row))
+            }
             _ => Ok(crate::write::Located::Absent),
         }
     }
@@ -1233,6 +1251,20 @@ pub struct LiveOrder<'p> {
     order: Vec<LiveRow>,
     /// How many columns each row has.
     width: usize,
+}
+
+/// Where [`LeafRef::locate_from`] starts searching each region of a leaf, for
+/// a run of keys in the tree's order.
+///
+/// Every row before `sorted` and every delta entry before `delta` sorts below
+/// the next key of the run. The zero cursor claims nothing, so it is where a
+/// run starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunCursor {
+    /// The first sorted row the next key can be at.
+    pub sorted: usize,
+    /// The first delta directory position the next key can be at.
+    pub delta: usize,
 }
 
 impl<'p> LiveOrder<'p> {

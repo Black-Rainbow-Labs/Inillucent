@@ -183,10 +183,62 @@ pub fn read_utf8_sqlite(bytes: &[u8]) -> Option<u32> {
 /// SQLite's `SQLITE_SKIP_UTF8`: every byte starts a character, and only a byte
 /// of 0xC0 or more takes the continuation bytes (0x80 to 0xBF) after it along
 /// with it. So a lone 0x80 is one character and `x'AB' || 'text'` is five.
+///
+/// **Eight bytes at a time while they are ASCII** (task-2185). A byte below
+/// 0x80 is one character by the rule above, so a word of eight with no high
+/// bit set is eight characters. The word is only read at a character
+/// boundary, after the continuation bytes of the character before it, so the
+/// rule decides every byte the word test does not. `length(label)` over the
+/// hillclimb plan's `copied` spent 37% of `ai.copy.scan` here one byte at a
+/// time.
 pub fn utf8_character_count(bytes: &[u8]) -> usize {
+    count_characters(bytes, false)
+}
+
+/// [`utf8_character_count`] of the bytes before the first NUL, which is what
+/// SQLite's `length()` counts in text.
+///
+/// One pass rather than a search for the NUL and then a count: the word test
+/// stops at a word holding a zero byte as it stops at one holding a high bit,
+/// and the byte rule stops at the zero itself.
+pub fn utf8_character_count_to_nul(bytes: &[u8]) -> usize {
+    count_characters(bytes, true)
+}
+
+/// Counts characters by SQLite's rule, eight ASCII bytes at a time, stopping at
+/// a NUL when asked to.
+///
+/// @param bytes - the text, as UTF-8
+/// @param stop_at_nul - whether the count ends at the first zero byte
+fn count_characters(bytes: &[u8], stop_at_nul: bool) -> usize {
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    const ONES: u64 = 0x0101_0101_0101_0101;
     let mut offset = 0usize;
     let mut count = 0usize;
-    while let Some(lead) = bytes.get(offset).copied() {
+    loop {
+        while let Some(word) = bytes
+            .get(offset..offset.saturating_add(8))
+            .and_then(|chunk| <[u8; 8]>::try_from(chunk).ok())
+        {
+            let word = u64::from_le_bytes(word);
+            // A word with a zero byte sets a high bit here; it can also set one
+            // for a byte of 0x80 or more, which the first test stops at anyway.
+            let zero = match stop_at_nul {
+                true => word.wrapping_sub(ONES) & !word & HIGH,
+                false => 0,
+            };
+            if (word & HIGH) | zero != 0 {
+                break;
+            }
+            offset = offset.saturating_add(8);
+            count = count.saturating_add(8);
+        }
+        let Some(lead) = bytes.get(offset).copied() else {
+            break;
+        };
+        if stop_at_nul && lead == 0 {
+            break;
+        }
         offset = offset.saturating_add(1);
         if lead >= 0xc0 {
             while bytes.get(offset).is_some_and(|byte| byte & 0xc0 == 0x80) {
@@ -293,6 +345,61 @@ fn push_unit(output: &mut Vec<u8>, unit: u16, big_endian: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The byte at a time rule `utf8_character_count` follows, kept here as
+    /// the reference its eight byte path is checked against.
+    fn character_count_byte_by_byte(bytes: &[u8]) -> usize {
+        let mut offset = 0usize;
+        let mut count = 0usize;
+        while let Some(lead) = bytes.get(offset).copied() {
+            offset += 1;
+            if lead >= 0xc0 {
+                while bytes.get(offset).is_some_and(|byte| byte & 0xc0 == 0x80) {
+                    offset += 1;
+                }
+            }
+            count += 1;
+        }
+        count
+    }
+
+    /// The eight byte ASCII path counts what the byte rule counts, for text
+    /// that mixes ASCII runs with lead bytes, continuation bytes with no lead,
+    /// and characters that straddle an eight byte boundary.
+    #[test]
+    fn the_word_at_a_time_count_agrees_with_the_byte_rule() {
+        let alphabet: [u8; 9] = [b'a', b' ', 0x7f, 0x80, 0xbf, 0xc3, 0xe2, 0xf0, 0x00];
+        let mut rng = inillucent_base::rng::Rng::new(2185);
+        for _ in 0..20_000 {
+            let length = rng.below(40) as usize;
+            let mut bytes = Vec::with_capacity(length);
+            for _ in 0..length {
+                // Mostly ASCII, so the eight byte path runs as well as the rule.
+                let byte = if rng.below(4) == 0 {
+                    alphabet[rng.below(9) as usize]
+                } else {
+                    b'a' + rng.below(26) as u8
+                };
+                bytes.push(byte);
+            }
+            assert_eq!(
+                utf8_character_count(&bytes),
+                character_count_byte_by_byte(&bytes),
+                "{bytes:?}"
+            );
+            let before_nul = match bytes.iter().position(|byte| *byte == 0) {
+                Some(at) => &bytes[..at],
+                None => &bytes[..],
+            };
+            assert_eq!(
+                utf8_character_count_to_nul(&bytes),
+                character_count_byte_by_byte(before_nul),
+                "{bytes:?}"
+            );
+        }
+        assert_eq!(utf8_character_count("héllo wörld, ça va?".as_bytes()), 19);
+        assert_eq!(utf8_character_count(&[0x80, b'a', b'b']), 3);
+    }
 
     /// The header codes are part of the file format and cannot drift.
     #[test]

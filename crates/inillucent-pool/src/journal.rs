@@ -866,6 +866,9 @@ pub fn replay_hot_journal(vfs: &dyn Vfs, database: &DbPath) -> DbResult<bool> {
     target
         .sync(SyncMode::Full)
         .map_err(|error| error.into_db_error())?;
+    if restored > 0 {
+        announce_the_restore(target.as_ref(), page_size)?;
+    }
     // Released before the journal goes, not after: a process waiting on this
     // same EXCLUSIVE request is waiting to do its own work, not to see this
     // journal deleted, and holding the lock one statement longer than
@@ -875,6 +878,69 @@ pub fn replay_hot_journal(vfs: &dyn Vfs, database: &DbPath) -> DbResult<bool> {
     drop(journal);
     let _ = vfs.delete(&path, false);
     Ok(restored > 0)
+}
+
+/// Moves the meta record's generation on after a journal's pages were put
+/// back, so every other connection rebuilds its cache before it reads again.
+///
+/// **Putting pages back changes the file under connections that have already
+/// read it.** A writer that dies holding EXCLUSIVE leaves pages it wrote early,
+/// by a fold or by an eviction, with their old images in the journal. Another
+/// process can read those pages before anybody replays the journal, because
+/// the replay needs RESERVED and a live writer may be holding it. Those pages
+/// are committed content and agree with the log, so reading them is correct.
+/// The replay then writes the old images back. If the dead writer had not
+/// reached the meta record, the meta record and the log are both unchanged by
+/// that, so a connection that read the newer pages has no reason to look again.
+/// It keeps answering from what it read, and its next fold trusts the file to
+/// hold a page the replay just took away, then moves the checkpoint past the
+/// log records that would have rebuilt it.
+///
+/// That is what the process storm with a 64 page pool measured. Page 126 of
+/// the `ledger` table was written by an eviction in a writer that was then
+/// killed. A worker that opened next read page 126 as the writer had left it.
+/// A third process put the journal back, which wrote zeros over page 126. The
+/// worker folded a second later without page 126 in its pool, and the file
+/// failed `integrity_check` with `page 126 checksum 00000000`. Readers in the
+/// same runs reported a shared extent slot the page did not hold, and a page
+/// that was not a blob extent, from the same sequence.
+///
+/// Every connection reads the shadow slot's record bytes on each statement
+/// (`Pool::read_shadow_record`), so a new generation there is what makes each
+/// of them throw its pages away and replay the log over the file as it now is.
+/// Nothing else in the record changes. The shadow slot is written and synced
+/// before the primary, the order a fold uses, so one slot holds a whole record
+/// at every moment and `Meta::choose` takes the newer of the two.
+///
+/// @param target - the database file, held EXCLUSIVE by the caller
+/// @param page_size - the page size the journal was written at
+fn announce_the_restore(target: &dyn VfsFile, page_size: usize) -> DbResult<()> {
+    let mut primary = vec![0u8; page_size];
+    let mut shadow = vec![0u8; page_size];
+    target
+        .read_exact_at(0, &mut primary)
+        .map_err(|error| error.into_db_error())?;
+    target
+        .read_exact_at(page_size as u64, &mut shadow)
+        .map_err(|error| error.into_db_error())?;
+    // A file with no meta record that decodes has no connection holding a
+    // cache of it: the open refuses it with its own message. There is nothing
+    // to move on, and the pages this replay put back are all it can do.
+    let Ok(mut meta) = crate::meta::Meta::choose(&primary, &shadow) else {
+        return Ok(());
+    };
+    meta.generation = meta.generation.saturating_add(1);
+    let mut image = vec![0u8; page_size];
+    meta.encode(&mut image)?;
+    for slot in [crate::meta::SHADOW_PAGE, crate::meta::META_PAGE] {
+        target
+            .write_all_at(slot.0.saturating_mul(page_size as u64), &image)
+            .map_err(|error| error.into_db_error())?;
+        target
+            .sync(SyncMode::Full)
+            .map_err(|error| error.into_db_error())?;
+    }
+    Ok(())
 }
 
 /// Reads a little-endian `u32`, answering zero for a slice that is too short.
@@ -991,6 +1057,76 @@ mod tests {
         assert!(image.iter().all(|byte| *byte == 0xff));
         // And the journal is gone, so a second open does not replay it again.
         assert!(!replay_hot_journal(vfs.as_ref(), &path).expect("the replay runs"));
+    }
+
+    /// A journal put back moves the meta record's generation on, and changes
+    /// nothing else in the record.
+    ///
+    /// The generation is what every other connection compares on each
+    /// statement, so this is the step that makes them read the file again. A
+    /// dead writer's journal that names only data pages leaves both meta slots
+    /// as they were, and without this no connection that had read the newer
+    /// pages could tell the file had gone back. The process storm with a 64
+    /// page pool lost page 126 of a table that way.
+    #[test]
+    fn a_hot_journal_put_back_moves_the_generation_on() {
+        use crate::meta::{Meta, META_PAGE, SHADOW_PAGE};
+        use inillucent_vfs::{MemoryVfs, OpenOptions};
+        let vfs: std::sync::Arc<dyn Vfs> = std::sync::Arc::new(MemoryVfs::new());
+        let path = DbPath::new("/moved.db");
+        let page_size = 4096usize;
+        let mut before = Meta::fresh(page_size as u32, 7);
+        before.page_count = 3;
+        before.checkpoint_lsn = 4242;
+        let mut record = vec![0u8; page_size];
+        before.encode(&mut record).expect("the record encodes");
+        let file = vfs
+            .open(&path, OpenOptions::main_db())
+            .expect("the file opens");
+        for slot in [META_PAGE, SHADOW_PAGE] {
+            file.write_all_at(slot.0 * page_size as u64, &record)
+                .expect("the meta slot is written");
+        }
+        file.write_all_at(2 * page_size as u64, &vec![3u8; page_size])
+            .expect("the data page is written");
+        drop(file);
+
+        // A writer saves page 2, overwrites it, and dies before the meta record.
+        let mut journal = Journal::new(
+            std::sync::Arc::clone(&vfs),
+            &path,
+            JournalMode::Delete,
+            page_size,
+        );
+        journal
+            .save(PageId(2), &vec![3u8; page_size])
+            .expect("the pre-image is saved");
+        journal.seal().expect("the journal syncs");
+        let file = vfs
+            .open(&path, OpenOptions::main_db())
+            .expect("the file opens");
+        file.write_all_at(2 * page_size as u64, &vec![9u8; page_size])
+            .expect("the page is overwritten");
+        drop(file);
+        drop(journal);
+
+        assert!(replay_hot_journal(vfs.as_ref(), &path).expect("the replay runs"));
+        let file = vfs
+            .open(&path, OpenOptions::main_db())
+            .expect("the file opens");
+        let mut primary = vec![0u8; page_size];
+        let mut shadow = vec![0u8; page_size];
+        file.read_exact_at(0, &mut primary)
+            .expect("the primary reads");
+        file.read_exact_at(page_size as u64, &mut shadow)
+            .expect("the shadow reads");
+        let mut expected = before;
+        expected.generation = before.generation + 1;
+        assert_eq!(Meta::decode(&shadow).expect("the shadow decodes"), expected);
+        assert_eq!(
+            Meta::decode(&primary).expect("the primary decodes"),
+            expected
+        );
     }
 
     /// A journal that was finished is not replayed, whatever is still in it.

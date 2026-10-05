@@ -113,11 +113,14 @@ impl ImportedDatabase {
     /// @param statement - the bound insert
     /// @param params - the bound parameters
     /// @param rows - the rows a `SELECT` source produced, empty for `VALUES`
+    /// @param cache - where the insert's setup is kept between executions, or
+    ///   `None` when this execution's parameters were folded and are its own
     pub(crate) fn insert_rows(
         &mut self,
         statement: &BoundInsert,
         params: &Params,
         rows: Vec<Row>,
+        cache: Option<&dml::insert::cached::InsertCache>,
     ) -> DbResult<Outcome> {
         let rows = match self.insert_in_bulk(statement, params, rows)? {
             Bulk::Done(outcome) => return Ok(outcome),
@@ -126,7 +129,12 @@ impl ImportedDatabase {
         self.write(
             params,
             returning_names(&statement.returning),
-            |target, params| dml::insert(statement, target, params, &rows),
+            |target, params| match cache {
+                Some(cache) => {
+                    dml::insert::cached::insert_cached(statement, target, params, &rows, cache)
+                }
+                None => dml::insert(statement, target, params, &rows),
+            },
         )
     }
 
