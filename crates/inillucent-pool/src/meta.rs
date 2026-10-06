@@ -378,13 +378,30 @@ impl Meta {
     /// @param primary - page 0's bytes
     /// @param shadow - page 1's bytes
     pub fn choose(primary: &[u8], shadow: &[u8]) -> DbResult<Meta> {
-        let first = Meta::decode(primary);
-        let second = Meta::decode(shadow);
-        match (first, second) {
-            (Ok(a), Ok(b)) => Ok(if b.generation > a.generation { b } else { a }),
-            (Ok(a), Err(_)) => Ok(a),
-            (Err(_), Ok(b)) => Ok(b),
-            (Err(reason), Err(_)) => Err(reason),
+        // **The newer copy is checked first, and the older only when the newer
+        // fails** (task-2191). Checking a copy is a checksum over the whole
+        // page, 32 KiB at the default size, and an open checked both. The
+        // generations are read unchecked only to decide the order: a copy that
+        // checks is believed for its generation, and a valid newer copy is the
+        // one the rule above picks whatever the older one holds, because the
+        // older one's generation is no higher than the newer one's. A tie
+        // orders the primary first, which is the primary the rule picks.
+        let unchecked = |page: &[u8]| u64v(page, at::GENERATION).unwrap_or(0);
+        let shadow_first = unchecked(shadow) > unchecked(primary);
+        let (newer, older) = match shadow_first {
+            true => (shadow, primary),
+            false => (primary, shadow),
+        };
+        match Meta::decode(newer) {
+            Ok(meta) => Ok(meta),
+            Err(newer_reason) => match Meta::decode(older) {
+                Ok(meta) => Ok(meta),
+                // Neither checks: the primary's reason, as before.
+                Err(older_reason) => Err(match shadow_first {
+                    true => older_reason,
+                    false => newer_reason,
+                }),
+            },
         }
     }
 }

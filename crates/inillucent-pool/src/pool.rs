@@ -282,7 +282,7 @@ struct State {
     /// Which frame holds which page.
     table: HashMap<PageId, u32, PageHashing>,
     /// Frames holding nothing.
-    free: Vec<u32>,
+    free: chunked::FreeFrames,
     /// Frames queued for eviction, coldest first.
     cooling: VecDeque<u32>,
     /// The clock's position, so successive sweeps do not resample the same
@@ -291,6 +291,20 @@ struct State {
 }
 
 impl State {
+    /// Takes a free frame, and makes sure a frame record exists for it.
+    ///
+    /// The records are built as frames are first used rather than all at
+    /// open; see `chunked`. Every caller that takes a frame comes through here,
+    /// so a frame handed out always has one.
+    fn pop_free(&mut self) -> Option<u32> {
+        let frame = self.free.pop()?;
+        let wanted = (frame as usize).saturating_add(1);
+        if self.frames.len() < wanted {
+            self.frames.resize(wanted, FrameMeta::empty());
+        }
+        Some(frame)
+    }
+
     /// Changes one frame's bookkeeping, keeping the dirty count in step.
     ///
     /// **The one way the dirty bit moves, and the reason the count can be
@@ -431,7 +445,7 @@ pub struct Pool {
     /// touched a quarter of it. SQLite grows into its cache and so does this
     /// now. A frame is sized once, in `claim_frame`, and an evicted frame keeps
     /// its buffer for the next page, so the steady state costs nothing.
-    buffers: Vec<RefCell<Vec<u8>>>,
+    buffers: chunked::Chunked<RefCell<Vec<u8>>>,
     /// One version latch per frame, so a descent can read optimistically.
     ///
     /// Phase 2 reads single-threaded and never fails a validation, which is
@@ -441,7 +455,7 @@ pub struct Pool {
     /// every eviction takes it exclusively, so the version genuinely moves when
     /// a frame's contents change - which is what makes the descent's validation
     /// a real check rather than a formality that would pass regardless.
-    latches: Vec<VersionLatch>,
+    latches: chunked::Chunked<VersionLatch>,
     /// How many guards are outstanding on each frame.
     ///
     /// **Held apart from [`State`], which is a measurement.** A pin and an
@@ -452,7 +466,7 @@ pub struct Pool {
     /// 74 ns, where the search inside it is four comparisons; most of the rest
     /// was this. A `Cell` per frame is the same single-threaded discipline with
     /// none of the sharing.
-    pins: Vec<Cell<u32>>,
+    pins: chunked::Chunked<Cell<u32>>,
     /// The bookkeeping.
     state: RefCell<State>,
     /// Where pages come from and go.
@@ -664,11 +678,13 @@ impl Counters {
 // child modules rather than siblings so that each stays an `impl Pool` block
 // reading the same private state: privacy in Rust reaches a module's
 // descendants, so the move needed no field to become `pub(crate)`.
+mod chunked;
 mod eviction;
 mod fold;
 mod journal_gate;
 mod locking;
 mod merged;
+mod meta_write;
 mod spill;
 mod swizzle;
 
@@ -697,34 +713,28 @@ impl Pool {
         if page_size == 0 {
             return Err(misuse("a buffer pool needs a page size"));
         }
-        let mut buffers = Vec::new();
-        buffers
-            .try_reserve(frames)
-            .map_err(|_| no_mem(format!("{frames} frames of {page_size} bytes")))?;
-        let mut latches = Vec::new();
-        latches
-            .try_reserve(frames)
-            .map_err(|_| no_mem(format!("{frames} frame latches")))?;
-        let mut pins = Vec::new();
-        pins.try_reserve(frames)
-            .map_err(|_| no_mem(format!("{frames} pin counters")))?;
-        for _ in 0..frames {
-            // Empty: `claim_frame` gives a frame its page-sized buffer the
-            // first time the frame is used. See the field's own note.
-            buffers.push(RefCell::new(Vec::new()));
-            latches.push(VersionLatch::new());
-            pins.push(Cell::new(0));
-        }
+        let frame_count = u32::try_from(frames)
+            .map_err(|_| no_mem(format!("{frames} frames are more than a pool can number")))?;
+        // **Nothing per frame is built here** (task-2191). Each table builds a
+        // chunk the first time one of its frames is used, and the free set
+        // counts the frames never used rather than listing them; see `chunked`.
+        // An empty buffer is still what a frame starts with: `claim_frame`
+        // gives it its page-sized buffer the first time it holds a page.
+        let buffers = chunked::Chunked::new(frames, || RefCell::new(Vec::new()));
+        let latches = chunked::Chunked::new(frames, VersionLatch::new);
+        let pins = chunked::Chunked::new(frames, || Cell::new(0));
         Ok(Pool {
             page_size,
             buffers,
             latches,
             pins,
             state: RefCell::new(State {
-                frames: vec![FrameMeta::empty(); frames],
+                frames: Vec::new(),
                 dirty: 0,
-                table: HashMap::with_capacity_and_hasher(frames, PageHashing::default()),
-                free: (0..frames as u32).rev().collect(),
+                // Sized for a short connection and grown as pages arrive;
+                // sizing it for every frame wrote 64 KB at every open.
+                table: HashMap::with_capacity_and_hasher(frames.min(256), PageHashing::default()),
+                free: chunked::FreeFrames::new(frame_count),
                 cooling: VecDeque::new(),
                 clock: Rng::new(0x5EED_0B0F_C0FF_EE01),
             }),
@@ -870,45 +880,26 @@ impl Pool {
             return Ok(());
         }
         let more = frames.saturating_sub(held);
+        let frame_count = u32::try_from(frames)
+            .map_err(|_| no_mem(format!("{frames} frames are more than a pool can number")))?;
+        // **`try_reserve` throughout** (task-2066 §4.1.8): a growth the platform
+        // cannot satisfy is answered, not an abort. Only the chunk headers are
+        // reserved here; the entries are built as frames are used.
         self.buffers
-            .try_reserve(more)
+            .grow(frames)
             .map_err(|_| no_mem(format!("{more} more frames of {} bytes", self.page_size)))?;
         self.latches
-            .try_reserve(more)
+            .grow(frames)
             .map_err(|_| no_mem(format!("{more} more frame latches")))?;
         self.pins
-            .try_reserve(more)
+            .grow(frames)
             .map_err(|_| no_mem(format!("{more} more pin counters")))?;
-        for _ in 0..more {
-            self.buffers.push(RefCell::new(Vec::new()));
-            self.latches.push(VersionLatch::new());
-            self.pins.push(Cell::new(0));
-        }
         {
             let mut state = self.state.borrow_mut();
-            // **`try_reserve` here too** (task-2066 §4.1.8). The three vectors
-            // above reserve fallibly and this one did not, so a growth the
-            // platform could not satisfy aborted the process rather than
-            // answering the caller - which is the one outcome a pool that
-            // refuses to grow is supposed to avoid.
-            let short_by = frames.saturating_sub(state.frames.len());
-            state
-                .frames
-                .try_reserve(short_by)
-                .map_err(|_| no_mem(format!("{more} more frame records")))?;
-            state
-                .free
-                .try_reserve(more)
-                .map_err(|_| no_mem(format!("{more} more entries in the free frame list")))?;
-            // A frame dropped by shrinking takes its contribution with it,
-            // and one added by growing is free and contributes nothing.
-            state.frames.resize(frames, FrameMeta::empty());
+            // The new frames are unused, so they join the free set as a higher
+            // limit: the next claim of an unused frame takes the lowest one.
+            state.free.grow(frame_count);
             state.dirty = state.dirty_by_walking();
-            // Pushed in reverse, the way `new` builds the list, so the next
-            // claim takes the lowest new index.
-            for index in (held..frames).rev() {
-                state.free.push(index as u32);
-            }
         }
         Ok(())
     }
@@ -1042,7 +1033,10 @@ impl Pool {
     ///
     /// @param page - the page to read
     fn load(&self, page: PageId) -> DbResult<u32> {
-        let frame = self.claim_frame()?;
+        // `take_frame`, not `claim_frame`: a frame used for the first time has
+        // no buffer yet, and the read below sizes it without zero filling 32 KiB
+        // it is about to overwrite. See `Pool::frame_for_a_read`.
+        let frame = self.take_frame()?;
         // The frame's contents are about to change, so its version moves. A
         // descent holding an observation of this frame is reading a page that
         // is no longer there, and the bump is what tells it so.
@@ -1112,16 +1106,12 @@ impl Pool {
     /// @param frame - the claimed frame
     /// @param page - the page to read into it
     fn fill_frame(&self, frame: u32, page: PageId) -> DbResult<()> {
-        let mut bytes = self
-            .buffers
-            .get(frame as usize)
-            .ok_or_else(|| misuse("frame index out of range"))?
-            .try_borrow_mut()
-            .map_err(|_| misuse("a frame chosen for loading was still borrowed"))?;
+        let mut bytes = self.frame_for_a_read(frame)?;
         self.file
-            .read_exact_at(
+            .read_exact_into(
                 page.0.saturating_mul(self.page_size as u64),
-                bytes.as_mut_slice(),
+                &mut bytes,
+                self.page_size,
             )
             .map_err(|error| error.into_db_error())?;
         page::verify_checksum(&bytes, page)

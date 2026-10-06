@@ -68,6 +68,7 @@ pub mod introspect;
 pub mod rows;
 pub mod shared;
 pub mod value;
+pub mod wire;
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -129,6 +130,13 @@ pub use inillucent_engine::ext::vtab;
 /// caused rather than the answer it gave.
 pub use inillucent_engine::connect::CacheStats;
 
+/// Lifts the literal values out of a single row `INSERT ... VALUES`.
+///
+/// Re-exported for the shell, which holds a run of inserts of one shape and
+/// runs them as one statement (task-2191), and tells which statements share a
+/// shape by this text. See `inillucent_engine::connect::lifted_insert`.
+pub use inillucent_engine::connect::lifted_insert;
+
 /// How many bytes at the front of a script are whitespace and semicolons.
 ///
 /// A front end that has asked [`Connection::statement_length`] where one
@@ -178,7 +186,9 @@ pub use inillucent_engine::DEFAULT_FRAMES;
 /// what a segment is *called* and what its header holds belong to
 /// `inillucent-wal`, and these are its own answers.
 pub mod log {
-    pub use inillucent_engine::recovery::{first_lsn_of, sequence_of_segment_name};
+    pub use inillucent_engine::recovery::{
+        first_lsn_of, names_starting_with, sequence_of_segment_name,
+    };
 }
 
 /// Arming a statement budget, for a front end that runs statements itself.
@@ -431,7 +441,7 @@ impl Database {
     /// @param options - how to open it
     pub fn open_with(path: impl AsRef<Path>, options: OpenOptions) -> Result<Database> {
         let path = path.as_ref().to_path_buf();
-        if !options.create && !path.is_file() {
+        if !options.create && !inillucent_engine::connect::is_a_file(&path) {
             return Err(Error::said(
                 Status::NotFound,
                 format!("there is no database at {}.", path.display()),
@@ -652,6 +662,18 @@ impl Database {
     pub fn checkpoint(&self) -> Result<()> {
         self.engine
             .checkpoint()
+            .map_err(|error| self.classify(&error))
+    }
+
+    /// Folds the log into the file when this database holds something the
+    /// file does not, which is what closing it owes.
+    ///
+    /// A database that only read has nothing to fold, so this costs it
+    /// nothing. [`Database::checkpoint`] folds whether or not anything is
+    /// owed, which syncs the file and starts a new log segment.
+    pub fn fold_if_owed(&self) -> Result<()> {
+        self.engine
+            .fold_if_owed()
             .map_err(|error| self.classify(&error))
     }
 
@@ -1704,6 +1726,106 @@ impl Statement<'_> {
             .map_err(|error| self.connection.database.classify(&error))
     }
 
+    /// Runs the statement once for each list of values, adding the rows each
+    /// changed to `total`.
+    ///
+    /// **One statement for all of them when the engine allows it** (task-2191):
+    /// a single row `INSERT` of its parameters, inside a transaction. See
+    /// `inillucent_engine::connect::Statement::run_rows_at_once`. When it does
+    /// not, or when the one statement fails, the rows run one at a time as
+    /// they always did, so the first failing row is the one reported and the
+    /// rows before it are kept.
+    ///
+    /// @param rows - the values for each execution
+    /// @param total - where the rows changed are added, including those before
+    ///   a failure
+    pub fn execute_many(&mut self, rows: &[Vec<Value>], total: &mut u64) -> Result<()> {
+        let connection = self.connection;
+        let classify = |error: &inillucent_engine::DbError| connection.database.classify(error);
+        if self.runs_at_once(rows)? {
+            let engine_rows = rows
+                .iter()
+                .map(|row| row.iter().map(Value::to_engine).collect())
+                .collect();
+            if let Some(changed) = self
+                .engine
+                .run_rows_at_once(engine_rows)
+                .map_err(|error| classify(&error))?
+            {
+                *total = total.saturating_add(changed as u64);
+                return Ok(());
+            }
+        }
+        self.one_at_a_time(rows, total)
+    }
+
+    /// [`Statement::execute_many`] over rows the caller hands over, which move
+    /// into the engine instead of being copied.
+    ///
+    /// **Moved, so a failure has to read them again** (task-2191). Copying
+    /// each text and each row into the engine's values was about 4% of
+    /// 10,000 inserts from Python into a table with two indexes, and dropping
+    /// both copies about 2% more. The one statement consumes the rows, and
+    /// when it fails it has written nothing and the rows run one at a time to
+    /// find the failing one, so `again` reads them from where they came from.
+    /// It is called only then.
+    ///
+    /// @param rows - the values for each execution, taken
+    /// @param again - reads the same rows again, after the one statement failed
+    /// @param total - where the rows changed are added, including those before
+    ///   a failure
+    pub fn execute_many_owned(
+        &mut self,
+        rows: Vec<Vec<Value>>,
+        again: impl FnOnce() -> Result<Vec<Vec<Value>>>,
+        total: &mut u64,
+    ) -> Result<()> {
+        if !self.runs_at_once(&rows)? {
+            return self.one_at_a_time(&rows, total);
+        }
+        let connection = self.connection;
+        let engine_rows = rows
+            .into_iter()
+            .map(|row| row.into_iter().map(Value::into_engine).collect())
+            .collect();
+        if let Some(changed) = self
+            .engine
+            .run_rows_at_once(engine_rows)
+            .map_err(|error| connection.database.classify(&error))?
+        {
+            *total = total.saturating_add(changed as u64);
+            return Ok(());
+        }
+        self.one_at_a_time(&again()?, total)
+    }
+
+    /// Whether these rows can run as one statement: more than one, all the
+    /// same width, and a statement the engine can run that way.
+    ///
+    /// @param rows - the values for each execution
+    fn runs_at_once(&mut self, rows: &[Vec<Value>]) -> Result<bool> {
+        let connection = self.connection;
+        let width = rows.first().map_or(0, Vec::len);
+        Ok(rows.len() > 1
+            && rows.iter().all(|row| row.len() == width)
+            && self
+                .engine
+                .can_run_rows_at_once()
+                .map_err(|error| connection.database.classify(&error))?)
+    }
+
+    /// Runs the statement once for each row, stopping at the first failure.
+    ///
+    /// @param rows - the values for each execution
+    /// @param total - where the rows changed are added
+    fn one_at_a_time(&mut self, rows: &[Vec<Value>], total: &mut u64) -> Result<()> {
+        for row in rows {
+            let done = self.query(row, 0)?;
+            *total = total.saturating_add(done.affected.unwrap_or(0));
+        }
+        Ok(())
+    }
+
     /// Returns the statement this was compiled from.
     pub fn sql(&self) -> &str {
         &self.sql
@@ -1776,7 +1898,15 @@ fn collect(
     while statement.step()? {
         total = total.saturating_add(1);
         if kept.len() < limit {
-            kept.push(statement.row().iter().map(Value::from_engine).collect());
+            // Taken rather than copied: the statement does not read the row
+            // again, and every text and blob would otherwise be copied twice.
+            kept.push(
+                statement
+                    .take_row()
+                    .into_iter()
+                    .map(Value::from_engine_owned)
+                    .collect(),
+            );
         }
     }
     let columns: Vec<Column> = statement

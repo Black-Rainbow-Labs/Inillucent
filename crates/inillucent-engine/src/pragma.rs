@@ -716,17 +716,83 @@ fn pragma_function_list(registry: &inillucent_ext::registry::Registry) -> Outcom
     }
     Outcome {
         rows,
-        names: std::rc::Rc::new(vec![
-            "name".into(),
-            "builtin".into(),
-            "type".into(),
-            "enc".into(),
-            "narg".into(),
-            "flags".into(),
-        ]),
+        names: std::rc::Rc::new(
+            FUNCTION_LIST_COLUMNS
+                .iter()
+                .map(|held| (*held).into())
+                .collect(),
+        ),
         changes: Default::default(),
     }
 }
+
+/// The columns `PRAGMA function_list` answers with.
+///
+/// Named once so `pragma_function_list`'s eponymous table can be declared
+/// without running the pragma. Running it built a row for every function the
+/// registry holds at every open, which was 9% of opening a database through
+/// the C library (task-2191).
+pub(crate) const FUNCTION_LIST_COLUMNS: [&str; 6] =
+    ["name", "builtin", "type", "enc", "narg", "flags"];
+
+/// The columns of the pragmas that answer a list, for their eponymous tables.
+///
+/// **Written down so an open does not run them** (task-2191). Each
+/// `pragma_*` table function needs its columns when the catalog is built, and
+/// the list pragmas only said what their columns were by running: listing every
+/// collation, module, database and pragma at every open. That was 66 us of a
+/// 1.2 ms open. `the_written_down_columns_are_what_the_pragmas_answer` runs each
+/// one and fails if a column here is wrong, so this cannot drift from the code
+/// that answers the pragma.
+pub(crate) const LIST_PRAGMA_COLUMNS: &[(&str, &[&str])] = &[
+    ("collation_list", &["seq", "name"]),
+    ("compile_options", &["compile_options"]),
+    ("database_list", &["seq", "name", "file"]),
+    (
+        "foreign_key_list",
+        &[
+            "id",
+            "seq",
+            "table",
+            "from",
+            "to",
+            "on_update",
+            "on_delete",
+            "match",
+        ],
+    ),
+    ("index_info", &["seqno", "cid", "name"]),
+    (
+        "index_list",
+        &["seq", "name", "unique", "origin", "partial"],
+    ),
+    (
+        "index_xinfo",
+        &["seqno", "cid", "name", "desc", "coll", "key"],
+    ),
+    ("module_list", &["name"]),
+    ("pragma_list", &["name"]),
+    (
+        "table_info",
+        &["cid", "name", "type", "notnull", "dflt_value", "pk"],
+    ),
+    (
+        "table_list",
+        &["schema", "name", "type", "ncol", "wr", "strict"],
+    ),
+    (
+        "table_xinfo",
+        &[
+            "cid",
+            "name",
+            "type",
+            "notnull",
+            "dflt_value",
+            "pk",
+            "hidden",
+        ],
+    ),
+];
 
 /// Builds one `PRAGMA function_list` row.
 ///
@@ -808,3 +874,28 @@ const ENGINE_MODULES: &[&str] = &[
     "sqlite_stmt",
     "tables_used",
 ];
+
+#[cfg(test)]
+mod tests {
+    use crate::ImportedDatabase;
+
+    /// The columns written down for each list pragma are the columns running it
+    /// answers with, so an open that reads the table builds the same eponymous
+    /// table it would have built by running the pragma.
+    #[test]
+    fn the_written_down_columns_are_what_the_pragmas_answer() {
+        let vfs: std::sync::Arc<dyn inillucent_vfs::Vfs> =
+            std::sync::Arc::new(inillucent_vfs::MemoryVfs::new());
+        let engine =
+            ImportedDatabase::create_on(vfs, std::path::PathBuf::from("written.db"), 32_768, 64)
+                .expect("a memory database opens");
+        for (pragma, written) in super::LIST_PRAGMA_COLUMNS {
+            let ran = engine
+                .pragma_rows(pragma.as_bytes(), None)
+                .expect("the pragma runs")
+                .expect("the pragma answers rows");
+            let ran: Vec<&str> = ran.names.iter().map(String::as_str).collect();
+            assert_eq!(&ran, written, "PRAGMA {pragma} answers different columns");
+        }
+    }
+}

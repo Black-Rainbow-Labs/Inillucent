@@ -217,6 +217,12 @@ struct Inner {
     unsynced: u64,
     /// Bytes appended since the last checkpoint record.
     since_checkpoint: u64,
+    /// `since_checkpoint` as it stood when the last fold finished.
+    ///
+    /// A fold that does not reclaim the log writes no checkpoint record, so
+    /// `since_checkpoint` keeps counting through it, including the records
+    /// the fold appends itself. See [`Wal::since_fold`].
+    folded_at: u64,
     /// True while one thread is doing the write and the sync for everybody.
     draining: bool,
     /// The first failure, which every later call repeats.
@@ -233,6 +239,14 @@ struct Shared {
     /// The open segment, behind its own lock so a leader can do its I/O
     /// without holding the bookkeeping lock that followers are appending under.
     io: Mutex<OpenSegment>,
+    /// The open segment's first LSN, the same number `io` holds.
+    ///
+    /// **Kept beside the lock so an append can ask it without the lock**
+    /// (task-2191). Every append asked whether the segment was full, which took
+    /// the bookkeeping lock and the segment lock to compare two numbers, and
+    /// then took the bookkeeping lock again to append: three locks a record.
+    /// It changes only when the segment does, under `io`.
+    segment_first: AtomicU64,
     vfs: Arc<dyn Vfs>,
     base: String,
     directory: Option<std::path::PathBuf>,
@@ -311,8 +325,36 @@ impl Wal {
         sequence: u64,
         options: WalOptions,
     ) -> DbResult<Wal> {
+        Wal::open_with(vfs, base, uuid, first_lsn, sequence, options, None)
+    }
+
+    /// [`Wal::open`], appending through a segment recovery already has open.
+    ///
+    /// The handle is used when it is the segment this log resumes in and was
+    /// opened so it can be written; otherwise the segment is opened as
+    /// [`Wal::open`] opens it. See `crate::recover::KeptSegment`.
+    ///
+    /// @param vfs - the file system
+    /// @param base - the database file's path
+    /// @param uuid - the database's identity
+    /// @param first_lsn - where the next record goes
+    /// @param sequence - the segment to append to
+    /// @param options - the log's settings
+    /// @param kept - the segment recovery read last, still open
+    pub fn open_with(
+        vfs: Arc<dyn Vfs>,
+        base: &DbPath,
+        uuid: u128,
+        first_lsn: u64,
+        sequence: u64,
+        options: WalOptions,
+        kept: Option<crate::recover::KeptSegment>,
+    ) -> DbResult<Wal> {
         let name = base.as_path().to_string_lossy().to_string();
         let directory = base.as_path().parent().map(std::path::Path::to_path_buf);
+        let reused = kept
+            .filter(|kept| kept.writable && kept.sequence == sequence)
+            .map(|kept| kept.file);
         let segment = open_segment(
             vfs.as_ref(),
             &name,
@@ -320,6 +362,7 @@ impl Wal {
             uuid,
             sequence,
             first_lsn,
+            reused,
         )?;
         let shared = Shared {
             inner: Mutex::new(Inner {
@@ -330,6 +373,7 @@ impl Wal {
                 durable_end: first_lsn,
                 unsynced: 0,
                 since_checkpoint: 0,
+                folded_at: 0,
                 draining: false,
                 poisoned: None,
                 stats: WalStats {
@@ -338,6 +382,7 @@ impl Wal {
                 },
             }),
             gate: Condvar::new(),
+            segment_first: AtomicU64::new(segment.first_lsn),
             io: Mutex::new(segment),
             vfs,
             base: name,
@@ -411,6 +456,25 @@ impl Wal {
         self.with_inner(|inner| inner.since_checkpoint)
     }
 
+    /// Returns how many bytes have been appended since the last fold finished.
+    ///
+    /// **What a close asks to learn whether this connection's records are all
+    /// in the file** (task-2191). [`Wal::since_checkpoint`] answered that and
+    /// got it wrong after a fold that did not reclaim the log: such a fold
+    /// writes no checkpoint record, so the count still held every byte before
+    /// it and the free map images it appended, and the close folded a second
+    /// time. Through the C library, closing a database after a 10,000 row
+    /// table build folded once in `inillucent_close` and again when the
+    /// handle was dropped, 8.4 ms of nothing.
+    pub fn since_fold(&self) -> u64 {
+        self.with_inner(|inner| inner.since_checkpoint.saturating_sub(inner.folded_at))
+    }
+
+    /// Records that a fold finished, so [`Wal::since_fold`] counts from here.
+    pub fn note_folded(&self) {
+        self.with_inner_mut(|inner| inner.folded_at = inner.since_checkpoint);
+    }
+
     /// Returns the counters.
     pub fn stats(&self) -> WalStats {
         self.with_inner(|inner| inner.stats)
@@ -425,6 +489,20 @@ impl Wal {
     /// exposed it outside the crate.
     pub fn uuid(&self) -> u128 {
         self.shared.uuid
+    }
+
+    /// Returns how many bytes of the log the open segment holds.
+    ///
+    /// Counted from the segment's first record to the next one, so it includes
+    /// what other processes appended to the same segment before this handle
+    /// opened it. A close that skips the log's housekeeping asks this, so that
+    /// a run of short processes still shrinks the log once it has grown.
+    pub fn open_segment_bytes(&self) -> u64 {
+        let first = match self.shared.io.lock() {
+            Ok(segment) => segment.first_lsn,
+            Err(poisoned) => poisoned.into_inner().first_lsn,
+        };
+        self.next_lsn().saturating_sub(first)
     }
 
     /// Returns the sequence number of the segment being written.
@@ -530,8 +608,20 @@ impl Wal {
     /// @param txn - the transaction the record belongs to, or zero
     /// @param body - what happened
     pub fn append(&self, txn: u64, body: Body<'_>) -> DbResult<u64> {
-        self.roll_if_full()?;
         let mut inner = self.lock()?;
+        // The full segment check under the lock this append takes anyway; see
+        // `Shared::segment_first`. A roll lets the lock go, because rolling
+        // drives the buffer out under it. The decision is made on the position
+        // of the next record rather than on its length, so a segment overshoots
+        // by at most one record and nothing has to know a record's length
+        // before it is encoded.
+        let first = self.shared.segment_first.load(Ordering::Acquire);
+        if inner.next_lsn.saturating_sub(first) >= self.shared.segment_bytes {
+            let next = inner.next_lsn;
+            drop(inner);
+            self.roll_now(next)?;
+            inner = self.lock()?;
+        }
         Wal::check_poison(&inner)?;
         let lsn = inner.next_lsn;
         let record = Record {
@@ -714,7 +804,10 @@ impl Wal {
             },
         )?;
         self.sync()?;
-        self.with_inner_mut(|inner| inner.since_checkpoint = 0);
+        self.with_inner_mut(|inner| {
+            inner.since_checkpoint = 0;
+            inner.folded_at = 0;
+        });
         Ok(lsn)
     }
 
@@ -831,28 +924,6 @@ impl Wal {
         SegmentHeader::decode(&header).ok().map(|it| it.first_lsn)
     }
 
-    /// Rolls to the next segment when the current one is full.
-    ///
-    /// The decision is made on the position of the *next* record rather than on
-    /// its length, so a segment overshoots by at most one record and no caller
-    /// has to know how long a record will be before it writes one. Computing
-    /// that length in advance would mean a second implementation of the
-    /// encoder, which is the duplicate this codebase has already paid for once.
-    fn roll_if_full(&self) -> DbResult<()> {
-        let (needed, next) = {
-            let inner = self.lock()?;
-            let first = self.segment_first_lsn();
-            (
-                inner.next_lsn.saturating_sub(first) >= self.shared.segment_bytes,
-                inner.next_lsn,
-            )
-        };
-        if !needed {
-            return Ok(());
-        }
-        self.roll_now(next)
-    }
-
     /// Closes the current segment and opens the next one, whatever its size.
     ///
     /// **What makes a checkpoint able to reclaim the log.**
@@ -900,7 +971,11 @@ impl Wal {
             self.shared.uuid,
             sequence,
             next,
+            None,
         )?;
+        self.shared
+            .segment_first
+            .store(opened.first_lsn, Ordering::Release);
         *segment = opened;
         drop(segment);
         self.with_inner_mut(|inner| {
@@ -1257,6 +1332,7 @@ fn read_tail(vfs: &dyn Vfs, path: &DbPath, uuid: u128) -> DbResult<Option<LogTai
 /// @param uuid - the database's identity
 /// @param sequence - which segment
 /// @param first_lsn - the stream position of the segment's first record
+/// @param reused - the segment already open for writing, when the caller has it
 fn open_segment(
     vfs: &dyn Vfs,
     base: &str,
@@ -1264,11 +1340,15 @@ fn open_segment(
     uuid: u128,
     sequence: u64,
     first_lsn: u64,
+    reused: Option<Box<dyn VfsFile>>,
 ) -> DbResult<OpenSegment> {
     let path = segment_path(base, directory, sequence);
-    let file = vfs
-        .open(&path, OpenOptions::of_kind(FileKind::Wal))
-        .map_err(inillucent_vfs::VfsError::into_db_error)?;
+    let file = match reused {
+        Some(file) => file,
+        None => vfs
+            .open(&path, OpenOptions::of_kind(FileKind::Wal))
+            .map_err(inillucent_vfs::VfsError::into_db_error)?,
+    };
     let existing = file
         .file_size()
         .map_err(inillucent_vfs::VfsError::into_db_error)?;
@@ -1343,9 +1423,13 @@ fn open_segment(
     };
     let mut image = vec![0u8; segment::HEADER_BYTES];
     header.encode(&mut image)?;
+    // **Written and not synced (task-2191).** Every record appended here is
+    // made durable by a sync of this same file, a commit's or a checkpoint's,
+    // and that sync carries the header with it. Before one, the segment holds
+    // nothing anybody was told is durable, and recovery already ends the chain
+    // at a segment whose header does not decode and replaces it when the
+    // writer opens it. The sync here was 2.3 ms of creating a database.
     file.write_all_at(0, &image)
-        .map_err(inillucent_vfs::VfsError::into_db_error)?;
-    file.sync(SyncMode::Normal)
         .map_err(inillucent_vfs::VfsError::into_db_error)?;
     Ok(OpenSegment {
         file,

@@ -158,7 +158,7 @@ impl ImportedDatabase {
         params: &Params,
         rows: Vec<Row>,
     ) -> DbResult<Bulk> {
-        if rows.len() < BULK_FLOOR || !dml::bulk::bulk_shape(statement) {
+        if rows.len() < BULK_FLOOR || !dml::bulk::bulk_shape_with(statement, !rows.is_empty()) {
             return Ok(Bulk::Declined(rows));
         }
         let txn = self.current_txn();

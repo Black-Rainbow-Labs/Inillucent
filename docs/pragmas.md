@@ -100,10 +100,10 @@ file, a statement waits up to this long and then fails with `busy`. Set
 `busy_timeout` to 0 to make the statement fail at once. `busy_timeout` applies to
 waits between processes and to waits inside one process.
 
-Opening a file also waits when another process holds it for writing, because the
-open reads the file under a lock. `PRAGMA busy_timeout` cannot set that wait: no
-connection exists until the open has finished. Three things set it, and the
-database then starts with the same value as its `busy_timeout`:
+Opening a file does not wait for another process. The open reads the meta record
+without a lock, and the first statement takes the lock and waits if it has to.
+`PRAGMA busy_timeout` cannot be run before the open has finished, so three things
+set the value a database starts with as its `busy_timeout`:
 
 | Where | How |
 |---|---|
@@ -112,7 +112,9 @@ database then starts with the same value as its `busy_timeout`:
 | the C library | `inillucent_open_with_timeout(path, flags, 60000, &db, &error)` |
 | the Python binding | `Database(path, busy_timeout_ms=60000)` |
 
-With none of them, the open waits 5000 milliseconds.
+With none of them, the first statement waits 5000 milliseconds. The open itself
+waits, for the same time, only when it has to read the file again under the lock,
+which it does for a file another process is still creating.
 
 `locking_mode` starts at **normal**, which is also SQLite's default. In normal
 mode the file lock is released between statements, so a second process can open

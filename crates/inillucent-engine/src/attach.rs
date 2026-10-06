@@ -36,8 +36,8 @@ use inillucent_vfs::{DbPath, Vfs};
 
 use super::recovery::{open_file, OpenedFile};
 use super::{
-    load_schema, write_catalog, Attached, ImportedDatabase, LoadedSchema, FIRST_ATTACHED,
-    FIRST_CREATED_ROOT, MAIN, MAX_ATTACHED,
+    load_schema, Attached, ImportedDatabase, LoadedSchema, FIRST_ATTACHED, FIRST_CREATED_ROOT,
+    MAIN, MAX_ATTACHED,
 };
 
 /// The name a caller writes to ask for a database with no file behind it.
@@ -191,8 +191,8 @@ impl ImportedDatabase {
                 .with_page_size(self.storage.page_size)
                 .with_frames(self.storage.frames.max(64)),
         )?;
-        let _ = write_catalog(&mut fresh, &[])?;
-        fresh.checkpoint()?;
+        let _ = inillucent_catalog::paged::write_new_catalog(&mut fresh)?;
+        fresh.finish_new_file()?;
         drop(fresh);
         Ok(())
     }

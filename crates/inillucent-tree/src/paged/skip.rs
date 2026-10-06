@@ -54,7 +54,7 @@ impl PagedTree {
                 self.key_columns
             )));
         }
-        let mut page = self.first_leaf;
+        let mut page = self.first_leaf(pool)?;
         let mut row = 0usize;
         // The leaf the position refers to, still pinned when the last step left
         // it open.

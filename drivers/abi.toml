@@ -24,7 +24,7 @@
 # decision somebody made rather than a line somebody edited.
 
 schema_version = 1
-abi_version = "1.2.0"
+abi_version = "1.3.0"
 
 [[symbol]]
 name = "inillucent_abi_version"
@@ -177,6 +177,66 @@ since = "1.1.0"
 name = "inillucent_open_with_timeout"
 stability = "stable"
 since = "1.2.0"
+
+# The three below carry a whole result or a whole list of parameters as one JSON
+# text, for a binding whose every foreign call is expensive (task-2191).
+# Provisional until a second binding has used them.
+[[symbol]]
+name = "inillucent_bind_json"
+stability = "provisional"
+since = "1.3.0"
+
+[[symbol]]
+name = "inillucent_stmt_execute_many"
+stability = "provisional"
+since = "1.3.0"
+
+[[symbol]]
+name = "inillucent_rows_json"
+stability = "provisional"
+since = "1.3.0"
+
+# A result built as Python objects with CPython's own constructors, whose
+# addresses the binding passes in (task-2191). Provisional with the other three.
+[[symbol]]
+name = "inillucent_py_init"
+stability = "provisional"
+since = "1.3.0"
+
+[[symbol]]
+name = "inillucent_rows_py"
+stability = "provisional"
+since = "1.3.0"
+
+# Parameters for many executions read out of Python objects, with the
+# addresses of CPython's own readers (task-2191). Provisional with the rest of
+# 1.3.0.
+[[symbol]]
+name = "inillucent_py_init_params"
+stability = "provisional"
+since = "1.3.0"
+
+[[symbol]]
+name = "inillucent_py_params"
+stability = "provisional"
+since = "1.3.0"
+
+[[symbol]]
+name = "inillucent_stmt_execute_params"
+stability = "provisional"
+since = "1.3.0"
+
+[[symbol]]
+name = "inillucent_params_free"
+stability = "provisional"
+since = "1.3.0"
+
+# The Node addon's entry point, which Node calls when it loads the library
+# (task-2191). Provisional with the rest of 1.3.0.
+[[symbol]]
+name = "napi_register_module_v1"
+stability = "provisional"
+since = "1.3.0"
 
 [[symbol]]
 name = "inillucent_path"

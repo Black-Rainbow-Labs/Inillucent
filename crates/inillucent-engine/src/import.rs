@@ -414,7 +414,7 @@ pub(crate) fn write_schema(database: &mut Database, carried: &Carried) -> DbResu
         root: catalog_tree.root(),
         columns: schema_layout(),
         key_columns: 1,
-        first_leaf: catalog_tree.first_leaf(),
+        first_leaf: catalog_tree.first_leaf(database.pool())?,
         leaf_count: catalog_tree.leaf_count(),
         row_count: catalog_tree.row_count(),
     };

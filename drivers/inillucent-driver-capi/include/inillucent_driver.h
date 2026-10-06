@@ -98,6 +98,7 @@ typedef struct inillucent_stmt  inillucent_stmt;  /* a statement + bindings */
 typedef struct inillucent_rows  inillucent_rows;  /* what a statement said  */
 typedef struct inillucent_txn   inillucent_txn;   /* an open transaction    */
 typedef struct inillucent_error inillucent_error; /* one failure            */
+typedef struct inillucent_params inillucent_params; /* rows of values to run */
 
 /* ------------------------------------------------------------------ */
 /* Status codes. Frozen at 1.0; a new one takes the next number.       */
@@ -200,8 +201,10 @@ int32_t inillucent_open_with_timeout(const char *path, uint32_t flags,
                                      inillucent_db **out,
                                      inillucent_error **error);
 
-/* Checkpoints and closes. Refuses with INILLUCENT_INVALID_STATE while any
- * connection on it is still open, rather than leaving them dangling. */
+/* Folds the log into the file when this database wrote something, then
+ * closes. A database that only read leaves the file as it was. Refuses with
+ * INILLUCENT_INVALID_STATE while any connection on it is still open, rather
+ * than leaving them dangling. */
 int32_t inillucent_close(inillucent_db *db, inillucent_error **error);
 
 /* Makes everything written so far durable in the file. */
@@ -295,6 +298,26 @@ void inillucent_clear_bindings(inillucent_stmt *stmt);
 int32_t inillucent_stmt_execute(inillucent_stmt *stmt, uint64_t limit,
                                 inillucent_rows **out, inillucent_error **error);
 
+/* Binds every parameter of the next execution from one JSON array, replacing
+ * what was bound. A value is null, true or false (bound as 1 and 0), an
+ * integer, a real, a string, {"blob": "<hex>"} or {"real": "Infinity"}; the
+ * bare words Infinity, -Infinity and NaN are read as reals too. One call where
+ * binding each value is one call a value, which is what a binding with an
+ * expensive foreign call wants. Since ABI 1.3.0. */
+int32_t inillucent_bind_json(inillucent_stmt *stmt, const char *json, size_t len,
+                             inillucent_error **error);
+
+/* Runs the statement once for each array in a JSON array of arrays of values,
+ * each read the way inillucent_bind_json reads one, and writes the rows the
+ * executions changed in all to *changed. Opens no transaction: outside one,
+ * each execution commits by itself. A row longer than the statement's
+ * parameters is refused before any row runs; otherwise the first failure
+ * stops the run and is reported, and the executions before it stand. What
+ * inillucent_bind_* bound is left as it was. Since ABI 1.3.0. */
+int32_t inillucent_stmt_execute_many(inillucent_stmt *stmt, const char *json,
+                                     size_t len, uint64_t *changed,
+                                     inillucent_error **error);
+
 /* ------------------------------------------------------------------ */
 /* A result. Materialised, so every pointer below is stable until free. */
 /* ------------------------------------------------------------------ */
@@ -341,6 +364,64 @@ double  inillucent_value_real(const inillucent_rows *rows, size_t row, size_t co
  * is not there. */
 const uint8_t *inillucent_value_bytes(const inillucent_rows *rows, size_t row,
                                       size_t column, size_t *len);
+
+/* The whole result as one JSON object, NUL terminated, with its length in
+ * bytes written to *len. It holds "columns", "types", "rows" (an array of
+ * arrays of values), "total", "more", "affected" (null for a query),
+ * "elapsed_us" and "tag". A value is null, an integer, a real that always has
+ * a fraction or an exponent, a string, {"blob": "<hex>"}, or for an infinity
+ * or NaN {"real": "Infinity"}, {"real": "-Infinity"} or {"real": "NaN"}.
+ * Valid until the result is freed. One call for the whole result, where the
+ * accessors above take two a cell. Since ABI 1.3.0. */
+const char *inillucent_rows_json(const inillucent_rows *rows, size_t *len);
+
+/* For a binding running inside CPython. inillucent_py_init takes the addresses
+ * of PyList_New, PyList_SetItem, PyLong_FromLongLong, PyFloat_FromDouble,
+ * PyUnicode_FromStringAndSize, PyBytes_FromStringAndSize, Py_IncRef,
+ * Py_DecRef, PyErr_SetString, the None object and the exception type to raise
+ * on a misuse, in that order (count 11), from the CPython that loaded the
+ * library. inillucent_rows_py then returns a new reference to a list: column
+ * names, declared types, the rows as lists of values, total, more (0 or 1),
+ * affected or None, elapsed_us and the tag. Call it with the interpreter lock
+ * held (ctypes.PyDLL). On a failure it returns NULL with a Python exception
+ * set. No CPython is linked. Since ABI 1.3.0. */
+int32_t inillucent_py_init(const void *const *api, size_t count);
+void   *inillucent_rows_py(const inillucent_rows *rows);
+
+/* Parameters for many executions, read out of Python objects.
+ * inillucent_py_init_params takes the addresses of PyList_Size,
+ * PyList_GetItem, PyTuple_Size, PyTuple_GetItem, PyLong_AsLongLong,
+ * PyFloat_AsDouble, PyUnicode_AsUTF8AndSize, PyBytes_AsStringAndSize,
+ * PyErr_Clear, PyErr_Occurred, the types list, tuple, int, bool, float, str,
+ * bytes and type(None), PyGILState_Ensure and PyGILState_Release, and the
+ * None object, in that order (count 21), and
+ * refuses a CPython whose objects keep their type anywhere but the word after
+ * the reference count. inillucent_py_params reads a list or tuple of rows,
+ * each a list or tuple of None, int, bool, float, str or bytes, and returns
+ * NULL with no exception set for anything else, an integer wider than 64 bits
+ * included, so the caller can send those rows as JSON instead. Call it with the
+ * interpreter lock held (ctypes.PyDLL). inillucent_stmt_execute_params runs
+ * the statement once for each row, as inillucent_stmt_execute_many does, and
+ * frees the parameters whatever happens; call it without the lock, and keep
+ * the rows alive until it returns. The rows move into the engine, so when the
+ * one statement they run as fails, it takes the lock with PyGILState_Ensure
+ * and reads them again to run them one at a time. inillucent_params_free
+ * frees parameters nothing ran.
+ * Since ABI 1.3.0. */
+int32_t inillucent_py_init_params(const void *const *api, size_t count);
+inillucent_params *inillucent_py_params(void *rows);
+int32_t inillucent_stmt_execute_params(inillucent_stmt *stmt,
+                                       inillucent_params *params,
+                                       uint64_t *changed,
+                                       inillucent_error **error);
+void    inillucent_params_free(inillucent_params *params);
+
+/* For Node. The library is also a Node addon: process.dlopen() calls this,
+ * and it fills exports with open, connect, query, batch, disconnect and
+ * close. Node's napi_* functions are looked up in the host process when it is
+ * called, so no Node is linked, and a host that is not Node gets exports back
+ * unchanged. A C caller has no reason to call it. Since ABI 1.3.0. */
+void   *napi_register_module_v1(void *env, void *exports);
 
 /* ------------------------------------------------------------------ */
 /* A transaction.                                                      */

@@ -171,6 +171,15 @@ impl OpenOptions {
         self.create = false;
         self
     }
+
+    /// Returns the same options for a file that must already exist.
+    ///
+    /// A missing file is refused rather than made, and the open does not
+    /// first ask whether it is about to make one.
+    pub fn existing(mut self) -> OpenOptions {
+        self.create = false;
+        self
+    }
 }
 
 /// What the storage device underneath a file guarantees.
@@ -290,6 +299,27 @@ pub trait VfsFile: Send + Sync + Debug {
     /// reports `SQLITE_IOERR_SHORT_READ`, which is the distinction the pager
     /// relies on to tell a truncated file from an unreadable one.
     fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> VfsResult<()>;
+
+    /// Reads exactly `len` bytes at `offset` into `buffer`, which ends up
+    /// `len` bytes long.
+    ///
+    /// **For a buffer that does not hold `len` bytes yet, such as a buffer
+    /// pool frame used for the first time.** `read_exact_at` needs initialised
+    /// bytes to read over, so a new 32 KiB frame was zero filled and then
+    /// overwritten by the read. A cold query of 100 rows from the command line
+    /// reads about 65 such pages. The operating system's file reads into the
+    /// buffer's reserved space instead; every other file keeps this default,
+    /// which sizes the buffer and calls `read_exact_at`. A short read behaves
+    /// as `read_exact_at`'s does: the rest is zero filled and the error is
+    /// `SQLITE_IOERR_SHORT_READ`.
+    ///
+    /// @param offset - where to read from
+    /// @param buffer - the buffer to fill; what it held before is replaced
+    /// @param len - how many bytes to read
+    fn read_exact_into(&self, offset: u64, buffer: &mut Vec<u8>, len: usize) -> VfsResult<()> {
+        buffer.resize(len, 0);
+        self.read_exact_at(offset, buffer)
+    }
 
     /// Writes all of `input` at `offset`.
     fn write_all_at(&self, offset: u64, input: &[u8]) -> VfsResult<()>;

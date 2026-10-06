@@ -23,6 +23,11 @@ pub struct inillucent_rows {
     types: Vec<CString>,
     /// The completion tag as a C string.
     tag: CString,
+    /// The whole result as JSON, written the first time it is asked for.
+    ///
+    /// Kept here for the reason the names are: the header promises a pointer
+    /// valid until the result is freed.
+    json: std::cell::OnceCell<CString>,
 }
 /// Turns a driver result into the handle, with its strings in C form.
 ///
@@ -45,6 +50,7 @@ pub(crate) fn built(rows: Rows) -> inillucent_rows {
         names,
         types,
         tag,
+        json: std::cell::OnceCell::new(),
     }
 }
 /// Turns a C caller's `uint64_t` limit into a `usize`, saturating.
@@ -332,6 +338,63 @@ pub unsafe extern "C" fn inillucent_value_bytes(
         },
         std::ptr::null(),
     )
+}
+
+/// Returns the whole result as one JSON text, and its length in bytes.
+///
+/// **One call for the whole result, for a binding that pays for every call.**
+/// Python's `ctypes` costs about half a microsecond a call and the cell
+/// accessors take two calls a cell, so a result of 20,000 rows of five columns
+/// took 170 ms to read through them while the engine produced it in 12 ms
+/// (task-2191). The text is parsed by the host's own JSON reader instead.
+///
+/// The object holds `columns`, `types`, `rows`, `total`, `more`, `affected`,
+/// `elapsed_us` and `tag`. A value is `null`, an integer, a real that always
+/// has a fraction or an exponent, a string, `{"blob": "<hex>"}`, or for a real
+/// JSON cannot spell, `{"real": "Infinity"}`, `{"real": "-Infinity"}` or
+/// `{"real": "NaN"}`. The text is NUL terminated and holds no other NUL,
+/// because JSON escapes one inside a string.
+///
+/// @param rows - the result
+/// @param len - where the length in bytes goes, not counting the NUL, or null
+///
+/// # Safety
+///
+/// `rows` must be null or a live handle and `len` must be null or writable.
+#[no_mangle]
+pub unsafe extern "C" fn inillucent_rows_json(
+    rows: *const inillucent_rows,
+    len: *mut usize,
+) -> *const c_char {
+    guarded_value(
+        || {
+            let Some(held) = held(rows) else {
+                if !len.is_null() {
+                    *len = 0;
+                }
+                return std::ptr::null();
+            };
+            // Taken by value, so the text is not copied a second time. JSON has
+            // no raw NUL, so the refusal is unreachable; `null` keeps the
+            // promise of a parseable text if it ever were reached.
+            let text = held.json.get_or_init(|| {
+                CString::new(inillucent_driver::wire::rows_to_json(&held.rows))
+                    .unwrap_or_else(|_| c"null".to_owned())
+            });
+            if !len.is_null() {
+                *len = text.as_bytes().len();
+            }
+            text.as_ptr()
+        },
+        std::ptr::null(),
+    )
+}
+
+impl inillucent_rows {
+    /// Returns the driver's result this handle holds.
+    pub(crate) fn result(&self) -> &Rows {
+        &self.rows
+    }
 }
 
 impl Handle for inillucent_rows {

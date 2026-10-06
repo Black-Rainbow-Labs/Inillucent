@@ -41,7 +41,7 @@
 /// measured at 59% of a trivial compile, and this size-classed free list at
 /// 17% overall, which is why Phase 3's Part E names it the cheapest first move.
 #[global_allocator]
-static ALLOCATOR: inillucent_alloc::Pooled = inillucent_alloc::Pooled;
+static ALLOCATOR: inillucent_alloc::Carved = inillucent_alloc::Carved;
 
 use inillucent_cli::shell::{drive, Shell};
 use inillucent_cli::{commands, dot};

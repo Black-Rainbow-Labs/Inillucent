@@ -68,7 +68,7 @@ pub mod pool;
 pub mod swip;
 
 pub use extent::{ExtentRef, EXTENT_REF_BYTES};
-pub use file::{Database, Options};
+pub use file::{Database, MetaRead, Options};
 pub use freemap::FreeMap;
 pub use interior::{InteriorBuilder, InteriorRef};
 pub use latch::{LatchState, VersionLatch, OPTIMISTIC_RETRIES};

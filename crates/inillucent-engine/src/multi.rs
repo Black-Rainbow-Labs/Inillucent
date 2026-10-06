@@ -71,6 +71,13 @@ pub fn marker_path(database: &std::path::Path) -> std::path::PathBuf {
 /// @param database - the database file the marker sits beside
 pub fn doubtful_transactions(database: &std::path::Path) -> DbResult<BTreeSet<u64>> {
     let marker = marker_path(database);
+    // **Asked with a stat first** (task-2191). The marker is absent for every
+    // database that was never part of a commit across files, and a failed
+    // open of it cost a whole `CreateFileW` at every open on Windows, where
+    // the stat does not open the file.
+    if !matches!(inillucent_vfs::os::path_state(&marker), Ok(Some(_))) {
+        return Ok(BTreeSet::new());
+    }
     let Ok(text) = std::fs::read_to_string(&marker) else {
         return Ok(BTreeSet::new());
     };

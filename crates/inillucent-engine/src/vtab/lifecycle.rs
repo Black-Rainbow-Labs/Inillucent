@@ -42,6 +42,13 @@ impl crate::ImportedDatabase {
             .entries
             .iter()
             .filter(|recorded| recorded.entry.kind == ObjectKind::Table)
+            // **Only a statement that can declare a virtual table is parsed**
+            // (task-2191). Every table's `CREATE` was parsed at every open to
+            // find the virtual ones. A `CREATE VIRTUAL TABLE` holds the word
+            // `virtual` wherever comments put it, so a text without it cannot
+            // be one, and a text that has it for another reason is parsed and
+            // skipped below as before.
+            .filter(|recorded| names_virtual(&recorded.entry.sql))
             .map(|recorded| recorded.entry.sql.clone())
             .collect();
         for sql in declarations {
@@ -899,4 +906,13 @@ fn module_replaces(
     named
         && statement.on_conflict == Some(inillucent_sql::ast::ConflictAction::Replace)
         && error.code() == inillucent_base::error::PrimaryCode::Constraint
+}
+
+/// Reports whether a statement's text holds the word `virtual`, in any case,
+/// which every `CREATE VIRTUAL TABLE` does.
+///
+/// @param sql - the statement the catalog recorded
+fn names_virtual(sql: &[u8]) -> bool {
+    sql.windows(b"virtual".len())
+        .any(|window| window.eq_ignore_ascii_case(b"virtual"))
 }

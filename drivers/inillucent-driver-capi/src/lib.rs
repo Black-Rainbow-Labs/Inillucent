@@ -58,6 +58,17 @@
 
 use std::ffi::{c_char, CStr, CString};
 
+/// The library's allocator: size classed free lists shared by every thread.
+///
+/// **Installed here because the host's heap was a sixth of an insert**
+/// (task-2191). A single row insert into an indexed table through Python spent
+/// about 15% of its time in the Windows heap. The command line programs install
+/// the per thread [`inillucent_alloc::Pooled`]; a library cannot, because the
+/// host owns its threads and every thread that ended would leave its lists
+/// behind. [`inillucent_alloc::Shared`] keeps them for the process instead.
+#[global_allocator]
+static ALLOCATOR: inillucent_alloc::Shared = inillucent_alloc::Shared;
+
 use inillucent_driver::capability::{Support, CAPABILITIES};
 use inillucent_driver::Value;
 
@@ -71,6 +82,9 @@ use inillucent_driver::Value;
 mod capi;
 pub use capi::db::*;
 pub use capi::error::*;
+pub use capi::node::*;
+pub use capi::params::*;
+pub use capi::python::*;
 pub use capi::stmt::*;
 pub use capi::value::*;
 
@@ -79,10 +93,12 @@ pub use capi::value::*;
 /// The encoding is ADBC's, because a binding author who has met one of these
 /// before has met that one.
 ///
-/// 1.1.0 added `inillucent_open_with_key`, and 1.2.0 added
-/// `inillucent_open_with_timeout`. A new symbol is a minor version: a binding
-/// written against 1.0.0 still finds every symbol it calls.
-pub const ABI_VERSION: u32 = 1_002_000;
+/// 1.1.0 added `inillucent_open_with_key`, 1.2.0 added
+/// `inillucent_open_with_timeout`, and 1.3.0 added `inillucent_rows_json`,
+/// `inillucent_bind_json` and `inillucent_stmt_execute_many`. A new symbol is a
+/// minor version: a binding written against 1.0.0 still finds every symbol it
+/// calls.
+pub const ABI_VERSION: u32 = 1_003_000;
 
 // —— status codes, which the header freezes ————————————————————————
 
@@ -569,6 +585,159 @@ mod tests {
             "the connection is usable after the cancel"
         );
         unsafe { inillucent_rows_free(after) };
+        unsafe { inillucent_conn_free(conn) };
+        assert_eq!(unsafe { inillucent_close(db, none) }, INILLUCENT_OK);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// A result read as JSON and a value bound from JSON are the values the cell accessors
+    /// and the typed binds give, and `inillucent_stmt_execute_many` runs every row.
+    ///
+    /// **The three calls a binding uses to cross once instead of once a cell** (task-2191).
+    /// Each kind of value goes in through `inillucent_bind_json`, comes back out of
+    /// `inillucent_rows_json`, and is compared with what the accessors say about the same
+    /// cell, so a JSON writer that typed a real as an integer, or lost a blob's bytes, fails
+    /// here. A count above the statement's parameters, malformed text and a 65 bit integer
+    /// are refused, and a batch holding a row too long for the statement runs none of its rows.
+    #[test]
+    fn json_reads_and_binds_the_values_the_accessors_do() {
+        let file =
+            std::env::temp_dir().join(format!("inillucent-capi-json-{}.rdb", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = CString::new(file.display().to_string()).unwrap();
+        let mut db: *mut inillucent_db = std::ptr::null_mut();
+        let mut conn: *mut inillucent_conn = std::ptr::null_mut();
+        let none: *mut *mut inillucent_error = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { inillucent_open(path.as_ptr(), INILLUCENT_OPEN_CREATE, &mut db, none) },
+            INILLUCENT_OK
+        );
+        assert_eq!(
+            unsafe { inillucent_connect(db, &mut conn, none) },
+            INILLUCENT_OK
+        );
+        let create = CString::new("CREATE TABLE v (id INTEGER PRIMARY KEY, x, y)").unwrap();
+        assert_eq!(
+            unsafe { inillucent_execute_batch(conn, create.as_ptr(), none) },
+            INILLUCENT_OK
+        );
+
+        let insert = CString::new("INSERT INTO v (x, y) VALUES (?1, ?2)").unwrap();
+        let mut stmt: *mut inillucent_stmt = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { inillucent_prepare(conn, insert.as_ptr(), &mut stmt, none) },
+            INILLUCENT_OK
+        );
+        let rows = r#"[[null, 7], [-9223372036854775808, 1.0], [1e300, "quote \" é"],
+            [{"blob": "00ff"}, {"real": "-Infinity"}], [true, -0.0]]"#;
+        let mut changed = 0u64;
+        let status = unsafe {
+            inillucent_stmt_execute_many(stmt, rows.as_ptr().cast(), rows.len(), &mut changed, none)
+        };
+        assert_eq!(status, INILLUCENT_OK);
+        assert_eq!(
+            changed, 5,
+            "execute_many reported the wrong number of rows changed"
+        );
+
+        for (bad, wanted) in [
+            ("[1, 2, 3]", INILLUCENT_INVALID_STATE),
+            ("[1,", INILLUCENT_INVALID_STATE),
+            (
+                "[9223372036854775808, 1]",
+                inillucent_driver::Status::TooBig as i32,
+            ),
+        ] {
+            let got = unsafe { inillucent_bind_json(stmt, bad.as_ptr().cast(), bad.len(), none) };
+            assert_eq!(
+                got, wanted,
+                "{bad} was bound or refused with the wrong status"
+            );
+        }
+        let stopping = "[[1, 1], [2, 2, 2], [3, 3]]";
+        let status = unsafe {
+            inillucent_stmt_execute_many(
+                stmt,
+                stopping.as_ptr().cast(),
+                stopping.len(),
+                &mut changed,
+                none,
+            )
+        };
+        assert_eq!(
+            status, INILLUCENT_INVALID_STATE,
+            "a row too long for the statement was not refused"
+        );
+        unsafe { inillucent_stmt_free(stmt) };
+
+        let select = CString::new("SELECT x, y FROM v ORDER BY id").unwrap();
+        let mut stmt: *mut inillucent_stmt = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { inillucent_prepare(conn, select.as_ptr(), &mut stmt, none) },
+            INILLUCENT_OK
+        );
+        let mut result: *mut inillucent_rows = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { inillucent_stmt_execute(stmt, u64::MAX, &mut result, none) },
+            INILLUCENT_OK
+        );
+        let mut length = 0usize;
+        let text = unsafe { inillucent_rows_json(result, &mut length) };
+        assert!(!text.is_null());
+        let json = unsafe { std::ffi::CStr::from_ptr(text) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(json.len(), length, "the length is not the text's length");
+        assert!(
+            json.contains(
+                r#""rows":[[null,7],[-9223372036854775808,1.0],[1e300,"quote \" é"],[{"blob":"00ff"},{"real":"-Infinity"}],[1,-0.0]]"#
+            ),
+            "the result read as {json}"
+        );
+        assert_eq!(
+            unsafe { inillucent_value_type(result, 1, 1) },
+            inillucent_driver::ValueKind::Real as i32
+        );
+        assert_eq!(
+            unsafe { inillucent_value_type(result, 3, 0) },
+            inillucent_driver::ValueKind::Blob as i32
+        );
+        assert_eq!(
+            unsafe { inillucent_value_real(result, 3, 1) },
+            f64::NEG_INFINITY
+        );
+        assert!(json.contains(r#""columns":["x","y"]"#), "{json}");
+        assert!(
+            json.contains(r#""total":5,"more":false,"affected":null"#),
+            "{json}"
+        );
+        unsafe { inillucent_rows_free(result) };
+
+        let bound = r#"[{"blob": "00ff"}]"#;
+        let filter = CString::new("SELECT count(*) FROM v WHERE x = ?1").unwrap();
+        let mut stmt2: *mut inillucent_stmt = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { inillucent_prepare(conn, filter.as_ptr(), &mut stmt2, none) },
+            INILLUCENT_OK
+        );
+        assert_eq!(
+            unsafe { inillucent_bind_json(stmt2, bound.as_ptr().cast(), bound.len(), none) },
+            INILLUCENT_OK
+        );
+        let mut counted: *mut inillucent_rows = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { inillucent_stmt_execute(stmt2, 1, &mut counted, none) },
+            INILLUCENT_OK
+        );
+        assert_eq!(
+            unsafe { inillucent_value_int(counted, 0, 0) },
+            1,
+            "a blob bound from JSON did not match the blob stored from JSON"
+        );
+        unsafe { inillucent_rows_free(counted) };
+        unsafe { inillucent_stmt_free(stmt2) };
+        unsafe { inillucent_stmt_free(stmt) };
         unsafe { inillucent_conn_free(conn) };
         assert_eq!(unsafe { inillucent_close(db, none) }, INILLUCENT_OK);
         let _ = std::fs::remove_file(&file);

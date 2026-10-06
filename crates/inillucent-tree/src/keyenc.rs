@@ -78,7 +78,15 @@ impl KeyEncoding {
         collations: &[Collation],
         descending: &[bool],
     ) -> Vec<u8> {
-        let mut out = Vec::new();
+        // Sized from the values rather than grown: a number encodes to 18
+        // bytes and a text to its length and a few more, so this is enough for
+        // nearly every key, and growing it was 3% of an indexed insert
+        // (task-2191).
+        let wanted = values
+            .iter()
+            .map(|value| value.tagged_len().saturating_add(10))
+            .sum();
+        let mut out = Vec::with_capacity(wanted);
         self.encode_into(values, collations, descending, &mut out);
         out
     }

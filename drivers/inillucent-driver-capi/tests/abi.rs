@@ -50,8 +50,10 @@ fn declared(header: &str) -> BTreeSet<String> {
             continue;
         }
         // A name followed by `(` is a call or a declaration; a name followed by
-        // anything else is a type or a mention.
-        if word.starts_with("inillucent_") && *character == '(' {
+        // anything else is a type or a mention. `napi_register_module_v1` is
+        // the one export with a name Node chose rather than this library.
+        let ours = word.starts_with("inillucent_") || word == "napi_register_module_v1";
+        if ours && *character == '(' {
             names.insert(word.clone());
         }
         let _ = at;
@@ -309,9 +311,23 @@ fn every_stability_is_one_of_the_two_that_mean_something() {
         .filter(|(_, stability)| stability.as_str() == "provisional")
         .map(|(name, _)| name)
         .collect();
+    // The three JSON calls arrived in 1.3.0 and stay provisional until a second
+    // binding has used them (task-2191).
     assert_eq!(
         provisional,
-        vec!["inillucent_cancel"],
+        vec![
+            "inillucent_bind_json",
+            "inillucent_cancel",
+            "inillucent_params_free",
+            "inillucent_py_init",
+            "inillucent_py_init_params",
+            "inillucent_py_params",
+            "inillucent_rows_json",
+            "inillucent_rows_py",
+            "inillucent_stmt_execute_many",
+            "inillucent_stmt_execute_params",
+            "napi_register_module_v1"
+        ],
         "the provisional set changed. That is allowed, but it is a decision: a symbol moving \
          from stable to provisional is a promise being taken back."
     );

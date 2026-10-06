@@ -475,10 +475,18 @@ impl Context {
         // `sqlite3 new.db "CREATE TABLE ..."` does and what every script that
         // sets a database up in one line expects. `Command::writes` is the same
         // flag `--readonly` refuses on, so the two questions have one answer.
+        //
+        // **Asked by name (task-2191).** `Path::exists` on Windows opens the
+        // file and closes it again to ask, which is a second open of a file the
+        // database's own open is about to make. `path_state` asks without a
+        // handle.
         if !may_create
             && !opened.is_empty()
             && opened != ":memory:"
-            && !std::path::Path::new(&opened).exists()
+            && !matches!(
+                inillucent_driver::vfs::os::path_state(std::path::Path::new(&opened)),
+                Ok(Some(_))
+            )
         {
             return Err(Failed::said(
                 Status::NotFound,
@@ -606,15 +614,15 @@ impl Context {
             return Vec::new();
         };
         let stem = stem.to_string_lossy().into_owned();
-        let Ok(entries) = std::fs::read_dir(directory) else {
+        // Only the names that start with the database's own, which the file
+        // system filters where it can (task-2191): reading every name in a
+        // large directory was a tenth of a one row query from the command line.
+        let Ok(names) = inillucent_driver::log::names_starting_with(directory, &stem) else {
             return Vec::new();
         };
-        let mut present: Vec<u64> = entries
-            .flatten()
-            .filter_map(|entry| {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                inillucent_driver::log::sequence_of_segment_name(&stem, &name)
-            })
+        let mut present: Vec<u64> = names
+            .iter()
+            .filter_map(|name| inillucent_driver::log::sequence_of_segment_name(&stem, name))
             .collect();
         present.sort_unstable();
         // **Above the chain's end AND holding positions it has already passed.**

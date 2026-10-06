@@ -77,6 +77,7 @@ mod storage;
 mod subquery_values;
 mod tlp_differential;
 mod torn_page_with_image;
+mod usage_paths;
 mod vacuum_on_vfs;
 mod vector;
 mod vector_metric;

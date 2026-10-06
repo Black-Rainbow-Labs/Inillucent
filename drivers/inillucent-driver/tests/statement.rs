@@ -343,3 +343,70 @@ fn the_default_ceiling_is_the_engines() {
         "the default ceiling moved; the note on `OpenOptions::statement_cache` has to move          with it"
     );
 }
+
+/// `execute_many` keeps the rows before a failing one and reports that row's
+/// error, inside a transaction and outside one.
+///
+/// Inside a transaction the rows may run as one statement (task-2191), and a
+/// failure there writes nothing and runs them again one at a time. Outside one
+/// they always run one at a time. The two have to leave the same rows, count
+/// the same changes and fail with the same message.
+#[test]
+fn execute_many_keeps_the_rows_before_a_failure() {
+    for in_a_transaction in [false, true] {
+        let database = peopled(&format!("many-{in_a_transaction}"));
+        let connection = database.session();
+        let mut statement = connection
+            .prepare("INSERT INTO people VALUES (?1, ?2, ?3)")
+            .expect("prepared");
+        let rows: Vec<Vec<Value>> = (10..20)
+            .chain([2, 30])
+            .map(|id| {
+                vec![
+                    Value::Integer(id),
+                    Value::Text(format!("person {id}")),
+                    Value::Integer(20 + id),
+                ]
+            })
+            .collect();
+        if in_a_transaction {
+            connection.execute_batch("BEGIN").expect("begin");
+        }
+        let mut total = 0u64;
+        let failed = statement
+            .execute_many(&rows, &mut total)
+            .expect_err("row 2 is taken");
+        assert_eq!(total, 10, "the rows before the failure were not counted");
+        assert!(
+            failed.to_string().contains("UNIQUE") || failed.to_string().contains("PRIMARY"),
+            "the error was {failed}"
+        );
+        if in_a_transaction {
+            connection.execute_batch("COMMIT").expect("commit");
+        }
+        let kept = connection
+            .query_all("SELECT count(*) FROM people WHERE id >= 10", &[])
+            .expect("counted");
+        assert_eq!(
+            kept.rows,
+            vec![vec![Value::Integer(10)]],
+            "in a transaction: {in_a_transaction}"
+        );
+
+        // And the same statement with no failure counts every row.
+        if in_a_transaction {
+            connection.execute_batch("BEGIN").expect("begin");
+        }
+        let fresh: Vec<Vec<Value>> = (100..150)
+            .map(|id| vec![Value::Integer(id), Value::Text("x".into()), Value::Null])
+            .collect();
+        let mut total = 0u64;
+        statement
+            .execute_many(&fresh, &mut total)
+            .expect("the rows go in");
+        assert_eq!(total, 50);
+        if in_a_transaction {
+            connection.execute_batch("COMMIT").expect("commit");
+        }
+    }
+}

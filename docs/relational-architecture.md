@@ -254,7 +254,12 @@ Three more moments make the same check:
 
 - **The end of an open.** An open replays the log under the shared lock and then releases the lock,
   so the first statement takes its own lock and sees what other processes committed during the
-  open. The open writes the file itself only when the log still ends where its replay ended.
+  open. Through `connect::Database` and every driver, the replay is the first statement's: the open
+  itself reads the meta record without taking the shared lock, and the first statement takes the
+  lock and replays. A meta record read while a checkpoint rewrites it may be the older of the two
+  copies, and the first statement's check then finds the shadow copy changed and reads the record
+  again. When neither copy the open read checks out, the open reads them again under the lock and
+  reports what that read finds. The open writes the file itself only when the log still ends where its replay ended.
   Before version 2.0.8 an open kept its lock, and a commit by its first statement could be appended
   at the end of the log as the open had read it, over another process's committed records.
 - **A transaction's number.** A deferred `BEGIN` numbers its transaction before any lock is taken,
@@ -475,8 +480,16 @@ flowchart TB
     I --> J["Read the catalog and<br/>accept statements"]
 ```
 
-Recovery runs on every open, before anything reads a page. It runs the same way for the main
-database and for every file `ATTACH` opens. When the log held committed transactions that the file
+Recovery runs before anything reads a page of a table. It runs the same way for the main database
+and for every file `ATTACH` opens.
+
+An open through `connect::Database`, which is what the command line, the shell and every driver
+use, runs in two halves, the way `sqlite3_open_v2` does. The open itself puts a journal back when
+one is left, opens the file, checks its format and reads the meta record, so a file that is not a
+database, has a newer format, needs a key or has a torn meta record is refused by the open. The
+rest of the chart, from the log scan on, runs at the first statement, as SQLite reads its schema
+at the first statement. A damaged log is therefore reported by the first statement, and an open
+that is closed again without a statement reads nothing past the meta record and writes nothing. When the log held committed transactions that the file
 did not have yet, the command line prints a line such as this one:
 
 ```text
@@ -726,7 +739,7 @@ statement leaves such a page behind: a dropped table, a `CREATE` that rolled bac
 all give their pages back.
 
 Both checks read and never repair. Neither proves the database opens, because damage in the log is
-outside the file they read. To check a database before you rely on it, open it.
+outside the file they read. To check a database before you rely on it, open it and run a statement.
 
 ---
 

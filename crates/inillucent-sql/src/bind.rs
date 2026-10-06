@@ -42,7 +42,7 @@ pub use column_use::ColumnUse;
 mod derived_note;
 mod having;
 mod json_subtype;
-mod literal;
+pub(crate) mod literal;
 mod matching;
 mod nested_names;
 mod order_alias;

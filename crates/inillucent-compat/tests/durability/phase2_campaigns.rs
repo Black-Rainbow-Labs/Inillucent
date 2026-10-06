@@ -417,7 +417,10 @@ fn a_sixty_four_frame_pool_answers_what_a_large_one_does() {
 #[test]
 fn a_descent_survives_a_pool_that_can_barely_hold_it() {
     let fixture = fixture(20_000, 512, 8);
-    assert!(fixture.table.height() >= 2, "the tree must be deep enough");
+    assert!(
+        fixture.table.height(fixture.pool()).expect("the height") >= 2,
+        "the tree must be deep enough"
+    );
     for key in (0..20_000i64).step_by(211) {
         let found = fixture
             .table
@@ -445,7 +448,9 @@ fn corrupt_pages_never_panic() {
     // One leaf and one interior page, taken out of a real tree so that they
     // are well formed before they are damaged.
     let leaf_page = {
-        let guard = pool.fetch(fixture.table.first_leaf()).expect("a leaf");
+        let guard = pool
+            .fetch(fixture.table.first_leaf(pool).expect("the leftmost leaf"))
+            .expect("a leaf");
         guard.bytes().to_vec()
     };
     let interior_page = {

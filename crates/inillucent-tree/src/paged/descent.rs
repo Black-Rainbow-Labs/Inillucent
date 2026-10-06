@@ -47,8 +47,10 @@ impl PagedTree {
     }
 
     /// Returns the leftmost leaf, where a full scan starts.
-    pub fn first_leaf(&self) -> PageId {
-        self.first_leaf
+    ///
+    /// @param pool - the buffer pool, read the first time it is asked
+    pub fn first_leaf(&self, pool: &Pool) -> DbResult<PageId> {
+        self.shape(pool).map(|(_, leaf)| leaf)
     }
     /// Descends to the leaf whose range holds a key, returning the pinned leaf.
     ///
@@ -112,7 +114,8 @@ impl PagedTree {
     /// @param pool - the buffer pool
     /// @param key - the encoded key being looked for
     pub fn descend(&self, pool: &Pool, key: &[u8]) -> DbResult<Descent> {
-        let mut steps = Vec::with_capacity(self.height as usize);
+        let mut steps =
+            Vec::with_capacity(self.shape.get().map_or(4, |(height, _)| height as usize));
         let mut page = self.root;
         loop {
             let child = {
@@ -121,6 +124,51 @@ impl PagedTree {
                     return Ok(Descent { steps, leaf: page });
                 }
                 InteriorRef::parse(&guard)?.child_for(key)?.0
+            };
+            steps.push((page, child));
+            page = self.take_child(pool, page, child)?;
+            if steps.len() > 64 {
+                return Err(corrupt("a descent walked more than 64 levels"));
+            }
+        }
+    }
+    /// [`PagedTree::descend`], also answering the leaf's fences: the separator
+    /// below it, which is the lowest key that belongs in it, and the separator
+    /// above it, which is the first key that does not. `None` is an edge of the
+    /// tree.
+    ///
+    /// The descent already reads both, because they are what chose the child at
+    /// every level. A separator is the first key of the child to its right, so
+    /// child `c` holds the keys from separator `c - 1` up to but not including
+    /// separator `c`, and a deeper level only narrows what a higher one said.
+    ///
+    /// @param pool - the buffer pool
+    /// @param key - the encoded key being looked for
+    pub(crate) fn descend_fenced(
+        &self,
+        pool: &Pool,
+        key: &[u8],
+    ) -> DbResult<(Descent, Option<Vec<u8>>, Option<Vec<u8>>)> {
+        let mut steps =
+            Vec::with_capacity(self.shape.get().map_or(4, |(height, _)| height as usize));
+        let mut low: Option<Vec<u8>> = None;
+        let mut high: Option<Vec<u8>> = None;
+        let mut page = self.root;
+        loop {
+            let child = {
+                let guard = pool.fetch(page)?;
+                if page::kind_of(&guard)? == PageKind::Leaf {
+                    return Ok((Descent { steps, leaf: page }, low, high));
+                }
+                let interior = InteriorRef::parse(&guard)?;
+                let child = interior.child_for(key)?.0;
+                if let Some(below) = child.checked_sub(1) {
+                    low = Some(interior.key(below)?.to_vec());
+                }
+                if child < interior.count() {
+                    high = Some(interior.key(child)?.to_vec());
+                }
+                child
             };
             steps.push((page, child));
             page = self.take_child(pool, page, child)?;

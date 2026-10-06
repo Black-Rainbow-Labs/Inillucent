@@ -892,17 +892,31 @@ impl ImportedDatabase {
         // `since_checkpoint` counts only what this connection appended, so a
         // read-only session still releases without taking the file exclusively.
         let holding = self.holds_what_the_file_does_not(&self.storage.database)
-            || self.storage.wal.since_checkpoint() > 0
+            || self.storage.wal.since_fold() > 0
             || self.session_state.attached.iter().any(|held| {
                 held.path.is_some()
                     && (self.holds_what_the_file_does_not(&held.database)
-                        || held.wal.since_checkpoint() > 0)
+                        || held.wal.since_fold() > 0)
             });
         if !holding {
             return Ok(());
         }
         self.enter(true)?;
-        let folded = self.checkpoint();
+        // **The fold, and the log's housekeeping only when the log has grown**
+        // (task-2191). The flush and the meta record are what make the closed
+        // file hold every statement, so a copy of it alone is complete. Rolling
+        // a segment, writing a checkpoint record and deleting the old segments
+        // only shrink the log, and they were most of a close: after a one row
+        // `inillucent exec`, closing took 12.0 ms. The same split
+        // `checkpoint_of` already makes for a fold a statement takes on its way
+        // out applies here, with one difference. A process appends a little and
+        // exits, so its own `since_checkpoint` never reaches the bar; the open
+        // segment's size counts every process that appended to it, and a roll
+        // during this connection means a full segment is waiting to go. The
+        // count starts at one, for the segment the log opened with.
+        let housekeeping = self.storage.wal.stats().segments > 1
+            || self.storage.wal.open_segment_bytes() >= crate::checkpoint::CLOSE_RECLAIM_BYTES;
+        let folded = self.checkpoint_of(housekeeping);
         let left = self.leave();
         folded.and(left)
     }

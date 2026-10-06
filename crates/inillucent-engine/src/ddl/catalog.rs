@@ -144,10 +144,23 @@ impl crate::ImportedDatabase {
         // `no such table`. They go on last, so a real table of the
         // same name shadows the module.
         if self.session_state.eponymous.is_empty() {
-            self.session_state.eponymous = self.eponymous_tables();
+            self.session_state.eponymous = match self.session_state.only_builtin_modules {
+                // **Built once per thread** (task-2191). The list is a function
+                // of the registry, and every connection starts with the same
+                // built-in registry, so a process that opens many connections
+                // built the same hundred tables at every open: half of a
+                // catalog refresh. Only a connection that registered a module
+                // of its own builds its list by itself.
+                true => BUILTIN_EPONYMOUS
+                    .with(|built| built.get_or_init(|| self.eponymous_tables()).clone()),
+                false => self.eponymous_tables(),
+            };
         }
+        // Shared rather than cloned: a refresh runs at every open and after
+        // every schema change, and cloning each of the eponymous tables was 5%
+        // of an open (task-2191).
         for table in &self.session_state.eponymous {
-            catalog = catalog.with_eponymous(table.clone());
+            catalog = catalog.with_shared_eponymous(std::rc::Rc::clone(table));
         }
         self.schema.catalog = catalog;
         self.forget_compiled_statements();
@@ -166,34 +179,67 @@ impl crate::ImportedDatabase {
     /// A module whose `connect` fails with no arguments is skipped rather than
     /// reported: it is a module that cannot be used eponymously, which is not
     /// an error in the schema this is refreshing.
-    fn eponymous_tables(&self) -> Vec<inillucent_sql::catalog_view::TableInfo> {
+    /// Returns one registered module's eponymous table, or `None` when the
+    /// module cannot be used eponymously.
+    ///
+    /// @param name - the module's name, as the registry keys it
+    fn module_eponymous_table(
+        &self,
+        name: &str,
+    ) -> Option<inillucent_sql::catalog_view::TableInfo> {
+        let module = self.session_state.registry.eponymous(name.as_bytes())?;
+        let arguments = inillucent_sql::vtab::ModuleArguments {
+            database: 0,
+            schema: b"main".to_vec(),
+            table: name.as_bytes().to_vec(),
+            module: name.as_bytes().to_vec(),
+            arguments: Vec::new(),
+            shadows: Vec::new(),
+        };
+        let connected = module.connect(&arguments, false).ok()?;
+        let declaration = connected.declaration();
+        Some(inillucent_sql::catalog_view::TableInfo::eponymous(
+            name.as_bytes().to_vec(),
+            inillucent_sql::declare::declared_columns(declaration),
+            inillucent_sql::vtab::ModuleRef {
+                name: name.as_bytes().to_vec(),
+                folded: name.to_ascii_lowercase().into_bytes(),
+                arguments: Vec::new(),
+            },
+            declaration.without_rowid,
+        ))
+    }
+
+    /// Puts one newly registered module's eponymous table into the list this
+    /// connection already holds, replacing a table of the same name.
+    ///
+    /// **One table, not the whole list again** (task-2191). Registering a
+    /// module used to empty the list, so the next refresh connected every
+    /// module and built every `pragma_*` table again; the shell registers two
+    /// modules at every open, so a command line call built the list three
+    /// times. An empty list is left empty, for the next refresh to build whole.
+    ///
+    /// @param name - the module's name
+    pub(crate) fn add_module_eponymous_table(&mut self, name: &str) {
+        if self.session_state.eponymous.is_empty() {
+            return;
+        }
+        let folded = name.to_ascii_lowercase().into_bytes();
+        let mut tables = std::mem::take(&mut self.session_state.eponymous);
+        tables.retain(|table| table.folded != folded);
+        if let Some(table) = self.module_eponymous_table(&name.to_ascii_lowercase()) {
+            tables.push(std::rc::Rc::new(table));
+        }
+        tables.sort_by(|left, right| left.folded.cmp(&right.folded));
+        self.session_state.eponymous = tables;
+    }
+
+    fn eponymous_tables(&self) -> Vec<std::rc::Rc<inillucent_sql::catalog_view::TableInfo>> {
         let mut tables = Vec::new();
         for name in self.session_state.registry.module_names() {
-            let Some(module) = self.session_state.registry.eponymous(name.as_bytes()) else {
-                continue;
-            };
-            let arguments = inillucent_sql::vtab::ModuleArguments {
-                database: 0,
-                schema: b"main".to_vec(),
-                table: name.as_bytes().to_vec(),
-                module: name.as_bytes().to_vec(),
-                arguments: Vec::new(),
-                shadows: Vec::new(),
-            };
-            let Ok(connected) = module.connect(&arguments, false) else {
-                continue;
-            };
-            let declaration = connected.declaration();
-            tables.push(inillucent_sql::catalog_view::TableInfo::eponymous(
-                name.as_bytes().to_vec(),
-                inillucent_sql::declare::declared_columns(declaration),
-                inillucent_sql::vtab::ModuleRef {
-                    name: name.as_bytes().to_vec(),
-                    folded: name.to_ascii_lowercase().into_bytes(),
-                    arguments: Vec::new(),
-                },
-                declaration.without_rowid,
-            ));
+            if let Some(table) = self.module_eponymous_table(&name) {
+                tables.push(table);
+            }
         }
         // **The `pragma_*` functions are the same mechanism over the pragma
         // set.** They are not registry modules - a module reaches its rows
@@ -279,7 +325,7 @@ impl crate::ImportedDatabase {
             ));
         }
         tables.sort_by(|left, right| left.folded.cmp(&right.folded));
-        tables
+        tables.into_iter().map(std::rc::Rc::new).collect()
     }
     /// Returns the eponymous table one `pragma_*` function presents.
     ///
@@ -303,6 +349,17 @@ impl crate::ImportedDatabase {
                 (vec![pragma.to_string()], true, true)
             } else if pragma == "optimize" {
                 (vec![pragma.to_string()], true, false)
+            } else if pragma == "function_list" {
+                // Written down for the reason the settings are: running it
+                // lists every function at every open (task-2191).
+                (
+                    crate::pragma::FUNCTION_LIST_COLUMNS
+                        .iter()
+                        .map(|held| (*held).to_string())
+                        .collect(),
+                    true,
+                    true,
+                )
             } else if pragma == "foreign_key_check" {
                 // Reading it to learn the columns would check every foreign key
                 // of the database at every open.
@@ -311,6 +368,16 @@ impl crate::ImportedDatabase {
                         .iter()
                         .map(|held| (*held).to_string())
                         .collect(),
+                    true,
+                    true,
+                )
+            } else if let Some((_, written)) = crate::pragma::LIST_PRAGMA_COLUMNS
+                .iter()
+                .find(|(listed, _)| *listed == pragma)
+            {
+                // Written down rather than run; see `LIST_PRAGMA_COLUMNS`.
+                (
+                    written.iter().map(|held| (*held).to_string()).collect(),
                     true,
                     true,
                 )
@@ -439,7 +506,10 @@ impl crate::ImportedDatabase {
     pub(crate) fn tree_stats(&self, root: u32) -> inillucent_catalog::paged::TreeStats {
         match self.schema.trees.get(&root) {
             Some(tree) => inillucent_catalog::paged::TreeStats {
-                first_leaf: tree.first_leaf(),
+                first_leaf: self
+                    .pool_of(root)
+                    .and_then(|pool| tree.first_leaf(pool))
+                    .unwrap_or(inillucent_pool::PageId::NONE),
                 leaf_count: tree.leaf_count(),
                 row_count: tree.row_count(),
             },
@@ -803,4 +873,12 @@ fn empty_temp_schema() -> Vec<inillucent_sql::catalog_view::TableInfo> {
         });
     }
     tables
+}
+
+thread_local! {
+    /// The eponymous tables of a connection holding only the built-in modules,
+    /// built by the first such connection on this thread; see
+    /// `SessionState::only_builtin_modules`.
+    static BUILTIN_EPONYMOUS: std::cell::OnceCell<Vec<std::rc::Rc<inillucent_sql::catalog_view::TableInfo>>> =
+        const { std::cell::OnceCell::new() };
 }

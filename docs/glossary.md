@@ -45,7 +45,7 @@ If a word on another page is not here and should be, add it.
 | Term | What it means |
 |---|---|
 | **Busy** | The error a statement gets when another connection holds the lock it needs and `PRAGMA busy_timeout` has run out. Its status name is `busy`. |
-| **`busy_timeout`** | The pragma that sets how long a connection waits for a lock before it fails with `busy`. The default is 5000 milliseconds. Opening a file waits too, and `INILLUCENT_BUSY_TIMEOUT` sets that wait. |
+| **`busy_timeout`** | The pragma that sets how long a connection waits for a lock before it fails with `busy`. The default is 5000 milliseconds. `INILLUCENT_BUSY_TIMEOUT` sets the value a connection starts with, before any statement can set it. |
 | **Checkpoint** | Copying the changes recorded in the write ahead log into the database file, and then deleting the part of the log that is no longer needed. After a checkpoint, recovery has less log to read. The `inillucent checkpoint` command runs one. |
 | **Commit timestamp** | The number a transaction receives when it commits. It decides which version of a row a snapshot sees. |
 | **Durability** | The promise that a committed transaction survives a crash of the process, the operating system or the machine. |

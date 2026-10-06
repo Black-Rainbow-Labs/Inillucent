@@ -19,6 +19,10 @@
 //! through a script that passed no options, so the one caller that always
 //! passes one was the only caller that never worked.
 
+use std::borrow::Cow;
+
+use inillucent_engine::connect::{Connection, Statement};
+
 use crate::render::Mode;
 use crate::shell::Shell;
 
@@ -229,7 +233,7 @@ pub fn import(shell: &mut Shell, arguments: &[&str]) {
 /// the obvious way to write this and it is the wrong one: the statement is
 /// identical every time, and preparing it five thousand times is five thousand
 /// compilations of the same text.
-fn insert(shell: &mut Shell, table: &str, rows: &[Vec<String>], path: &str) {
+fn insert(shell: &mut Shell, table: &str, rows: &[Vec<Cow<'_, str>>], path: &str) {
     let width = rows.first().map_or(0, Vec::len);
     if width == 0 {
         return;
@@ -264,14 +268,17 @@ fn insert(shell: &mut Shell, table: &str, rows: &[Vec<String>], path: &str) {
 /// than complains: the shell cannot be borrowed mutably while a statement it
 /// prepared is alive.
 fn fill(
-    connection: &inillucent_engine::connect::Connection<'_>,
+    connection: &Connection<'_>,
     sql: &str,
-    rows: &[Vec<String>],
+    rows: &[Vec<Cow<'_, str>>],
 ) -> Option<(usize, String)> {
     let mut statement = match connection.prepare(sql) {
         Ok(statement) => statement,
         Err(error) => return Some((0, error.message().to_string())),
     };
+    if all_at_once(&mut statement, rows) {
+        return None;
+    }
     for (index, row) in rows.iter().enumerate() {
         // Every row starts from nothing bound, so a row shorter than the one
         // before it does not inherit the tail of that one.
@@ -295,6 +302,43 @@ fn fill(
     None
 }
 
+/// Inserts every row as one statement, when the engine allows it, and reports
+/// whether it did.
+///
+/// **One statement for the file instead of one a row** (task-2191). The rows
+/// are what `fill` would bind: each field as text, and a row shorter than the
+/// first one NULL in the rest, which is what an unbound parameter is. When the
+/// one statement fails it has written nothing, and `fill` runs the rows one at
+/// a time to find the first line that will not go in, as it always did. A row
+/// longer than the first one is left to `fill` too, because binding its extra
+/// field is the error it reports.
+///
+/// @param statement - the prepared insert, inside the import's transaction
+/// @param rows - the parsed rows
+fn all_at_once(statement: &mut Statement<'_>, rows: &[Vec<Cow<'_, str>>]) -> bool {
+    let width = rows.first().map_or(0, Vec::len);
+    if rows.len() < 2 || rows.iter().any(|row| row.len() > width) {
+        return false;
+    }
+    if !statement.can_run_rows_at_once().unwrap_or(false) {
+        return false;
+    }
+    let values: Vec<Vec<inillucent_tree::datum::OwnedDatum>> = rows
+        .iter()
+        .map(|row| {
+            (0..width)
+                .map(|at| match row.get(at) {
+                    Some(field) => {
+                        inillucent_tree::datum::OwnedDatum::Text(field.as_bytes().to_vec())
+                    }
+                    None => inillucent_tree::datum::OwnedDatum::Null,
+                })
+                .collect()
+        })
+        .collect();
+    matches!(statement.run_rows_at_once(values), Ok(Some(_)))
+}
+
 /// Reports whether a table is already there.
 fn table_exists(shell: &Shell, table: &str) -> bool {
     let sql = format!(
@@ -309,59 +353,93 @@ fn table_exists(shell: &Shell, table: &str) -> bool {
 /// A quoted field may hold newlines, so this walks the whole text rather than
 /// splitting on lines first - which is the bug in every import that splits on
 /// `\n` and then on the separator.
-fn parse(text: &str, separator: char, quoted: bool, row_separator: char) -> Vec<Vec<String>> {
+///
+/// **Characters are copied a run at a time.** `run` is where the characters
+/// that go into the field unchanged began, and they are copied in one piece when
+/// a separator, a quote or a dropped carriage return ends them. Pushing each
+/// character grew every field's string from nothing, and the growing was 13% of
+/// importing a 300,000 row file (task-2191).
+fn parse(text: &str, separator: char, quoted: bool, row_separator: char) -> Vec<Vec<Cow<'_, str>>> {
     let mut rows = Vec::new();
-    let mut row = Vec::new();
+    let mut row: Vec<Cow<'_, str>> = Vec::new();
     let mut field = String::new();
     let mut inside = false;
-    let mut characters = text.chars().peekable();
+    let mut characters = text.char_indices().peekable();
     let mut anything = false;
-    while let Some(character) = characters.next() {
+    let mut run = 0usize;
+    while let Some((at, character)) = characters.next() {
         if inside {
             if character == '"' {
-                if characters.peek() == Some(&'"') {
+                field.push_str(text.get(run..at).unwrap_or_default());
+                if characters.peek().map(|&(_, next)| next) == Some('"') {
                     characters.next();
                     field.push('"');
+                    run = at + 2;
                 } else {
                     inside = false;
+                    run = at + 1;
                 }
-            } else {
-                field.push(character);
             }
             continue;
         }
         match character {
-            '"' if quoted && field.is_empty() => {
+            '"' if quoted && field.is_empty() && run == at => {
                 inside = true;
                 anything = true;
+                run = at + 1;
             }
             _ if character == separator => {
-                row.push(core::mem::take(&mut field));
+                row.push(finished(&mut field, text, run, at));
                 anything = true;
+                run = at + character.len_utf8();
             }
             // A carriage return before a newline is the other half of a
             // Windows line ending and is not data. It only means that when the
             // newline is what ends a row: under `--rowsep` it is an ordinary
             // character, and dropping it would eat part of a field.
-            '\r' if row_separator == '\n' => continue,
+            '\r' if row_separator == '\n' => {
+                field.push_str(text.get(run..at).unwrap_or_default());
+                run = at + 1;
+            }
             _ if character == row_separator => {
-                if anything || !field.is_empty() || !row.is_empty() {
-                    row.push(core::mem::take(&mut field));
-                    rows.push(core::mem::take(&mut row));
+                let last = finished(&mut field, text, run, at);
+                if anything || !last.is_empty() || !row.is_empty() {
+                    row.push(last);
+                    let width = row.len();
+                    rows.push(core::mem::replace(&mut row, Vec::with_capacity(width)));
                 }
                 anything = false;
+                run = at + character.len_utf8();
             }
-            other => {
-                field.push(other);
-                anything = true;
-            }
+            _ => anything = true,
         }
     }
-    if anything || !field.is_empty() || !row.is_empty() {
-        row.push(field);
+    let last = finished(&mut field, text, run, text.len());
+    if anything || !last.is_empty() || !row.is_empty() {
+        row.push(last);
         rows.push(row);
     }
     rows
+}
+
+/// Ends a field: the run of text it holds, borrowed from the file when nothing
+/// was copied into the field before it, or the copied text with the run added.
+///
+/// **Most fields are borrowed.** Only a quoted field or one a dropped carriage
+/// return split needs a string of its own; giving every field one was an
+/// allocation a field, 7% of importing a 300,000 row file (task-2191).
+///
+/// @param field - the text copied so far, emptied by this
+/// @param text - the whole file
+/// @param run - where the run of characters not yet copied began
+/// @param at - where the field ends
+fn finished<'a>(field: &mut String, text: &'a str, run: usize, at: usize) -> Cow<'a, str> {
+    let tail = text.get(run..at).unwrap_or_default();
+    if field.is_empty() {
+        return Cow::Borrowed(tail);
+    }
+    field.push_str(tail);
+    Cow::Owned(core::mem::take(field))
 }
 
 /// Returns an identifier quoted the way SQL wants it.
@@ -392,6 +470,14 @@ mod tests {
     fn a_doubled_quote_is_one_quote() {
         let rows = parse("\"say \"\"hi\"\"\",x\n", ',', true, '\n');
         assert_eq!(rows, vec![vec!["say \"hi\"", "x"]]);
+    }
+
+    /// A carriage return is dropped wherever it is when rows end at a newline,
+    /// and text after a closing quote joins the field.
+    #[test]
+    fn carriage_returns_go_and_text_after_a_quote_stays() {
+        let rows = parse("a\r,b\r\n\"q\"x,\"\"\r\n\"open", ',', true, '\n');
+        assert_eq!(rows, vec![vec!["a", "b"], vec!["qx", ""], vec!["open"]]);
     }
 
     /// A last line with no newline is still a row.

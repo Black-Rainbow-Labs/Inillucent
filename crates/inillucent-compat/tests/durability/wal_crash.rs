@@ -265,7 +265,14 @@ fn campaign(
         );
         report.push_str(&format!("{nth}\t{verdict}\t{committed}\n"));
     }
-    assert!(cuts > 20, "{name}: only {cuts} cut points were reached");
+    // More than seventeen, from more than twenty (task-2191). Opening a file
+    // now reuses the meta slots the bootstrap already read, and a new log
+    // segment's header is not synced on its own, so the workload makes fewer
+    // reads and syncs, and every one is a cut point. Measured through
+    // `inillucent-testrun` by putting each change back in turn: the commit
+    // campaign reached 23 cut points before both, 20 with the meta slots change
+    // alone, 23 with the header change alone, and 20 with both.
+    assert!(cuts > 17, "{name}: only {cuts} cut points were reached");
     // **Not asserted for a short write.** Every commit now pads its own tail
     // to the next device sector boundary, in the same write and the same
     // sync as the commit record itself - see `inillucent_wal::writer`'s

@@ -92,10 +92,51 @@ const FLOORS: [Floor; 19] = [
     // and running the campaign again: 80 cut points became 76 without it and returned
     // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
+    // **Fewer since a close shrinks the log only once the open segment holds a
+    // mebibyte (task-2191).** A close still folds, and stopped rolling a new
+    // segment, writing a checkpoint record and deleting the old segments every
+    // time. Those calls came after the last commit was acknowledged. Measured by
+    // making the close do the housekeeping again and running the campaign: 76
+    // cut points, and 63 without it. Every cut point still recovers to a state
+    // the campaign accepts.
+    // **Four fewer since an open reads the file's first pages once and opens
+    // the log segment once (task-2191).** The open read the 100 byte header
+    // three times, to look for a SQLite file, a foreign format and the page
+    // size, then read each meta page on its own: five reads, now one read of
+    // the header and one of both meta pages. Recovery opened the last log
+    // segment to read it and the writer opened it again to append; the
+    // writer now appends through the handle recovery read with. Every read
+    // and every open is a cut point. Measured by tracing every call the
+    // unarmed run makes, on the commit before and on this one, and comparing
+    // the two lists: 63 calls became 59. The four missing are three
+    // of those five reads and the second open of the segment. Every cut
+    // point still recovers to a state the campaign accepts.
+    // **Two fewer since a fold under a rollback journal syncs once
+    // (task-2191).** A fold synced the data file after its pages, then
+    // journaled the two meta slots, synced the journal again, wrote the
+    // slots and synced the data file a second time. The slots' pre-images
+    // now go into the journal with the pages', so one journal sync and one
+    // data file sync cover both, and each was a cut point. This workload
+    // folds once. Measured by putting the previous `pool/fold.rs` back
+    // and running the campaign again: 57 cut points became 59, and
+    // 57 with this change. Every cut point still recovers to a state the
+    // campaign accepts.
+    // **Three fewer since an open reuses the meta slots its bootstrap read and
+    // a new log segment's header is not synced on its own (task-2191).** Every
+    // read and every sync is a cut point. Measured through `inillucent-testrun`
+    // by putting each change back in turn: 57 cut points before both, 54 with
+    // the meta slots change alone, 57 with the header change alone, and 54 with
+    // both. Every cut point still recovers to a state the campaign accepts.
+    // **One fewer since a rollback journal is synced before it is deleted only
+    // when something was saved after its seal (task-2191).** The seal's sync
+    // already covered every pre-image, so the second sync flushed nothing, and
+    // every sync is a cut point. Measured through `inillucent-testrun` by
+    // putting the sync back: 54 cut points with it and 53 without. Every cut
+    // point still recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 76,
+        least: 53,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -112,10 +153,53 @@ const FLOORS: [Floor; 19] = [
     // and running the campaign again: 80 cut points became 76 without it and returned
     // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
+    // **Fewer since a close shrinks the log only once the open segment holds a
+    // mebibyte (task-2191).** A close still folds, and stopped rolling a new
+    // segment, writing a checkpoint record and deleting the old segments every
+    // time. Those calls came after the last commit was acknowledged. Measured by
+    // making the close do the housekeeping again and running the campaign: 76
+    // cut points, and 63 without it. Every cut point still recovers to a state
+    // the campaign accepts.
+    // **Four fewer since an open reads the file's first pages once and opens
+    // the log segment once (task-2191).** The open read the 100 byte header
+    // three times, to look for a SQLite file, a foreign format and the page
+    // size, then read each meta page on its own: five reads, now one read of
+    // the header and one of both meta pages. Recovery opened the last log
+    // segment to read it and the writer opened it again to append; the
+    // writer now appends through the handle recovery read with. Every read
+    // and every open is a cut point. Measured by tracing every call the
+    // unarmed run makes, on the commit before and on this one, and comparing
+    // the two lists: 63 calls became 59. The four missing are three
+    // of those five reads and the second open of the segment. Every cut
+    // point still recovers to a state the campaign accepts.
+    // **Two fewer since a fold under a rollback journal syncs once
+    // (task-2191).** A fold synced the data file after its pages, then
+    // journaled the two meta slots, synced the journal again, wrote the
+    // slots and synced the data file a second time. The slots' pre-images
+    // now go into the journal with the pages', so one journal sync and one
+    // data file sync cover both, and each was a cut point. This workload
+    // folds once. Measured by putting the previous `pool/fold.rs` back
+    // and running the campaign again: 57 cut points became 59, and
+    // 57 with this change. Every cut point still recovers to a state the
+    // campaign accepts.
+    // **Three fewer since an open reuses the meta slots its bootstrap read and
+    // a new log segment's header is not synced on its own (task-2191).** Every
+    // read and every sync is a cut point. Measured through `inillucent-testrun`
+    // on `delete-full-crash.txt`, which runs the same workload, by putting each
+    // change back in turn: 57 cut points before both, 54 with the meta slots
+    // change alone, 57 with the header change alone, and 54 with both. Every
+    // cut point still recovers to a state the campaign accepts.
+    // **One fewer since a rollback journal is synced before it is deleted only
+    // when something was saved after its seal (task-2191).** The seal's sync
+    // already covered every pre-image, so the second sync flushed nothing, and
+    // every sync is a cut point. Measured through `inillucent-testrun` on
+    // `delete-full-crash.txt`, which runs the same workload, by putting the
+    // sync back: 54 cut points with it and 53 without. Every cut point still
+    // recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-disk-full.txt",
         shape: Shape::CutPoints,
-        least: 76,
+        least: 53,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -132,10 +216,53 @@ const FLOORS: [Floor; 19] = [
     // and running the campaign again: 80 cut points became 76 without it and returned
     // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
+    // **Fewer since a close shrinks the log only once the open segment holds a
+    // mebibyte (task-2191).** A close still folds, and stopped rolling a new
+    // segment, writing a checkpoint record and deleting the old segments every
+    // time. Those calls came after the last commit was acknowledged. Measured by
+    // making the close do the housekeeping again and running the campaign: 76
+    // cut points, and 63 without it. Every cut point still recovers to a state
+    // the campaign accepts.
+    // **Four fewer since an open reads the file's first pages once and opens
+    // the log segment once (task-2191).** The open read the 100 byte header
+    // three times, to look for a SQLite file, a foreign format and the page
+    // size, then read each meta page on its own: five reads, now one read of
+    // the header and one of both meta pages. Recovery opened the last log
+    // segment to read it and the writer opened it again to append; the
+    // writer now appends through the handle recovery read with. Every read
+    // and every open is a cut point. Measured by tracing every call the
+    // unarmed run makes, on the commit before and on this one, and comparing
+    // the two lists: 63 calls became 59. The four missing are three
+    // of those five reads and the second open of the segment. Every cut
+    // point still recovers to a state the campaign accepts.
+    // **Two fewer since a fold under a rollback journal syncs once
+    // (task-2191).** A fold synced the data file after its pages, then
+    // journaled the two meta slots, synced the journal again, wrote the
+    // slots and synced the data file a second time. The slots' pre-images
+    // now go into the journal with the pages', so one journal sync and one
+    // data file sync cover both, and each was a cut point. This workload
+    // folds once. Measured by putting the previous `pool/fold.rs` back
+    // and running the campaign again: 57 cut points became 59, and
+    // 57 with this change. Every cut point still recovers to a state the
+    // campaign accepts.
+    // **Three fewer since an open reuses the meta slots its bootstrap read and
+    // a new log segment's header is not synced on its own (task-2191).** Every
+    // read and every sync is a cut point. Measured through `inillucent-testrun`
+    // on `delete-full-crash.txt`, which runs the same workload, by putting each
+    // change back in turn: 57 cut points before both, 54 with the meta slots
+    // change alone, 57 with the header change alone, and 54 with both. Every
+    // cut point still recovers to a state the campaign accepts.
+    // **One fewer since a rollback journal is synced before it is deleted only
+    // when something was saved after its seal (task-2191).** The seal's sync
+    // already covered every pre-image, so the second sync flushed nothing, and
+    // every sync is a cut point. Measured through `inillucent-testrun` on
+    // `delete-full-crash.txt`, which runs the same workload, by putting the
+    // sync back: 54 cut points with it and 53 without. Every cut point still
+    // recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-io-error.txt",
         shape: Shape::CutPoints,
-        least: 76,
+        least: 53,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -152,10 +279,53 @@ const FLOORS: [Floor; 19] = [
     // and running the campaign again: 80 cut points became 76 without it and returned
     // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
+    // **Fewer since a close shrinks the log only once the open segment holds a
+    // mebibyte (task-2191).** A close still folds, and stopped rolling a new
+    // segment, writing a checkpoint record and deleting the old segments every
+    // time. Those calls came after the last commit was acknowledged. Measured by
+    // making the close do the housekeeping again and running the campaign: 76
+    // cut points, and 63 without it. Every cut point still recovers to a state
+    // the campaign accepts.
+    // **Four fewer since an open reads the file's first pages once and opens
+    // the log segment once (task-2191).** The open read the 100 byte header
+    // three times, to look for a SQLite file, a foreign format and the page
+    // size, then read each meta page on its own: five reads, now one read of
+    // the header and one of both meta pages. Recovery opened the last log
+    // segment to read it and the writer opened it again to append; the
+    // writer now appends through the handle recovery read with. Every read
+    // and every open is a cut point. Measured by tracing every call the
+    // unarmed run makes, on the commit before and on this one, and comparing
+    // the two lists: 63 calls became 59. The four missing are three
+    // of those five reads and the second open of the segment. Every cut
+    // point still recovers to a state the campaign accepts.
+    // **Two fewer since a fold under a rollback journal syncs once
+    // (task-2191).** A fold synced the data file after its pages, then
+    // journaled the two meta slots, synced the journal again, wrote the
+    // slots and synced the data file a second time. The slots' pre-images
+    // now go into the journal with the pages', so one journal sync and one
+    // data file sync cover both, and each was a cut point. This workload
+    // folds once. Measured by putting the previous `pool/fold.rs` back
+    // and running the campaign again: 57 cut points became 59, and
+    // 57 with this change. Every cut point still recovers to a state the
+    // campaign accepts.
+    // **Three fewer since an open reuses the meta slots its bootstrap read and
+    // a new log segment's header is not synced on its own (task-2191).** Every
+    // read and every sync is a cut point. Measured through `inillucent-testrun`
+    // on `delete-full-crash.txt`, which runs the same workload, by putting each
+    // change back in turn: 57 cut points before both, 54 with the meta slots
+    // change alone, 57 with the header change alone, and 54 with both. Every
+    // cut point still recovers to a state the campaign accepts.
+    // **One fewer since a rollback journal is synced before it is deleted only
+    // when something was saved after its seal (task-2191).** The seal's sync
+    // already covered every pre-image, so the second sync flushed nothing, and
+    // every sync is a cut point. Measured through `inillucent-testrun` on
+    // `delete-full-crash.txt`, which runs the same workload, by putting the
+    // sync back: 54 cut points with it and 53 without. Every cut point still
+    // recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-short-write.txt",
         shape: Shape::CutPoints,
-        least: 76,
+        least: 53,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** 161 cut points became 153 over the same
@@ -169,10 +339,45 @@ const FLOORS: [Floor; 19] = [
     // and running the campaign again: 153 cut points became 149 without it and returned
     // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
+    // **Four fewer since an open reads the file's first pages once and opens
+    // the log segment once (task-2191).** The open read the 100 byte header
+    // three times, to look for a SQLite file, a foreign format and the page
+    // size, then read each meta page on its own: five reads, now one read of
+    // the header and one of both meta pages. Recovery opened the last log
+    // segment to read it and the writer opened it again to append; the
+    // writer now appends through the handle recovery read with. Every read
+    // and every open is a cut point. Measured by tracing every call the
+    // unarmed run makes, on the commit before and on this one, and comparing
+    // the two lists: 149 calls became 145. The four missing are three
+    // of those five reads and the second open of the segment. Every cut
+    // point still recovers to a state the campaign accepts.
+    // **Four fewer since a fold under a rollback journal syncs once
+    // (task-2191).** A fold synced the data file after its pages, then
+    // journaled the two meta slots, synced the journal again, wrote the
+    // slots and synced the data file a second time. The slots' pre-images
+    // now go into the journal with the pages', so one journal sync and one
+    // data file sync cover both, and each was a cut point. This workload
+    // folds twice. Measured by putting the previous `pool/fold.rs` back
+    // and running the campaign again: 141 cut points became 145, and
+    // 141 with this change. Every cut point still recovers to a state the
+    // campaign accepts.
+    // **Six fewer since an open reuses the meta slots its bootstrap read and a
+    // new log segment's header is not synced on its own (task-2191).** Every
+    // read and every sync is a cut point. Measured through `inillucent-testrun`
+    // by putting each change back in turn: 141 cut points before both, 138 with
+    // the meta slots change alone, 138 with the header change alone, and 135
+    // with both. Every cut point still recovers to a state the campaign
+    // accepts.
+    // **Two fewer since a rollback journal is synced before it is deleted only
+    // when something was saved after its seal (task-2191).** The seal's sync
+    // already covered every pre-image, so the second sync flushed nothing, and
+    // every sync is a cut point. Measured through `inillucent-testrun` by
+    // putting the sync back: 135 cut points with it and 133 without. Every cut
+    // point still recovers to a state the campaign accepts.
     Floor {
         name: "truncate-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 149,
+        least: 133,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** 161 cut points became 153 over the same
@@ -186,10 +391,45 @@ const FLOORS: [Floor; 19] = [
     // and running the campaign again: 153 cut points became 149 without it and returned
     // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
+    // **Four fewer since an open reads the file's first pages once and opens
+    // the log segment once (task-2191).** The open read the 100 byte header
+    // three times, to look for a SQLite file, a foreign format and the page
+    // size, then read each meta page on its own: five reads, now one read of
+    // the header and one of both meta pages. Recovery opened the last log
+    // segment to read it and the writer opened it again to append; the
+    // writer now appends through the handle recovery read with. Every read
+    // and every open is a cut point. Measured by tracing every call the
+    // unarmed run makes, on the commit before and on this one, and comparing
+    // the two lists: 149 calls became 145. The four missing are three
+    // of those five reads and the second open of the segment. Every cut
+    // point still recovers to a state the campaign accepts.
+    // **Four fewer since a fold under a rollback journal syncs once
+    // (task-2191).** A fold synced the data file after its pages, then
+    // journaled the two meta slots, synced the journal again, wrote the
+    // slots and synced the data file a second time. The slots' pre-images
+    // now go into the journal with the pages', so one journal sync and one
+    // data file sync cover both, and each was a cut point. This workload
+    // folds twice. Measured by putting the previous `pool/fold.rs` back
+    // and running the campaign again: 141 cut points became 145, and
+    // 141 with this change. Every cut point still recovers to a state the
+    // campaign accepts.
+    // **Six fewer since an open reuses the meta slots its bootstrap read and a
+    // new log segment's header is not synced on its own (task-2191).** Every
+    // read and every sync is a cut point. Measured through `inillucent-testrun`
+    // by putting each change back in turn: 141 cut points before both, 138 with
+    // the meta slots change alone, 138 with the header change alone, and 135
+    // with both. Every cut point still recovers to a state the campaign
+    // accepts.
+    // **Two fewer since a rollback journal is synced before it is deleted only
+    // when something was saved after its seal (task-2191).** The seal's sync
+    // already covered every pre-image, so the second sync flushed nothing, and
+    // every sync is a cut point. Measured through `inillucent-testrun` by
+    // putting the sync back: 135 cut points with it and 133 without. Every cut
+    // point still recovers to a state the campaign accepts.
     Floor {
         name: "persist-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 149,
+        least: 133,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -206,10 +446,39 @@ const FLOORS: [Floor; 19] = [
     // and running the campaign again: 47 cut points became 46 without it and returned
     // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
+    // **Fewer since a close shrinks the log only once the open segment holds a
+    // mebibyte (task-2191).** A close still folds, and stopped rolling a new
+    // segment, writing a checkpoint record and deleting the old segments every
+    // time. Those calls came after the last commit was acknowledged. Measured by
+    // making the close do the housekeeping again and running the campaign: 46
+    // cut points, and 45 without it. Every cut point still recovers to a state
+    // the campaign accepts.
+    // **Two fewer since a fold under a rollback journal syncs once
+    // (task-2191).** A fold synced the data file after its pages, then
+    // journaled the two meta slots, synced the journal again, wrote the
+    // slots and synced the data file a second time. The slots' pre-images
+    // now go into the journal with the pages', so one journal sync and one
+    // data file sync cover both, and each was a cut point. This workload
+    // folds once. Measured by putting the previous `pool/fold.rs` back
+    // and running the campaign again: 43 cut points became 45, and
+    // 43 with this change. Every cut point still recovers to a state the
+    // campaign accepts.
+    // **One fewer since an open reuses the meta slots its bootstrap read and a
+    // new log segment's header is not synced on its own (task-2191).** Every
+    // read and every sync is a cut point. Measured through `inillucent-testrun`
+    // by putting each change back in turn: 43 cut points before both, 43 with
+    // the meta slots change alone, 42 with the header change alone, and 42 with
+    // both. Every cut point still recovers to a state the campaign accepts.
+    // **One fewer since a rollback journal is synced before it is deleted only
+    // when something was saved after its seal (task-2191).** The seal's sync
+    // already covered every pre-image, so the second sync flushed nothing, and
+    // every sync is a cut point. Measured through `inillucent-testrun` by
+    // putting the sync back: 42 cut points with it and 41 without. Every cut
+    // point still recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-checkpoint-crash.txt",
         shape: Shape::CutPoints,
-        least: 46,
+        least: 41,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -226,10 +495,41 @@ const FLOORS: [Floor; 19] = [
     // and running the campaign again: 47 cut points became 46 without it and returned
     // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
+    // **Fewer since a close shrinks the log only once the open segment holds a
+    // mebibyte (task-2191).** A close still folds, and stopped rolling a new
+    // segment, writing a checkpoint record and deleting the old segments every
+    // time. Those calls came after the last commit was acknowledged. Measured by
+    // making the close do the housekeeping again and running the campaign: 46
+    // cut points, and 45 without it. Every cut point still recovers to a state
+    // the campaign accepts.
+    // **Two fewer since a fold under a rollback journal syncs once
+    // (task-2191).** A fold synced the data file after its pages, then
+    // journaled the two meta slots, synced the journal again, wrote the
+    // slots and synced the data file a second time. The slots' pre-images
+    // now go into the journal with the pages', so one journal sync and one
+    // data file sync cover both, and each was a cut point. This workload
+    // folds once. Measured by putting the previous `pool/fold.rs` back
+    // and running the campaign again: 43 cut points became 45, and
+    // 43 with this change. Every cut point still recovers to a state the
+    // campaign accepts.
+    // **One fewer since an open reuses the meta slots its bootstrap read and a
+    // new log segment's header is not synced on its own (task-2191).** Every
+    // read and every sync is a cut point. Measured through `inillucent-testrun`
+    // on `delete-full-checkpoint-crash.txt`, which runs the same workload, by
+    // putting each change back in turn: 43 cut points before both, 43 with the
+    // meta slots change alone, 42 with the header change alone, and 42 with
+    // both. Every cut point still recovers to a state the campaign accepts.
+    // **One fewer since a rollback journal is synced before it is deleted only
+    // when something was saved after its seal (task-2191).** The seal's sync
+    // already covered every pre-image, so the second sync flushed nothing, and
+    // every sync is a cut point. Measured through `inillucent-testrun` on
+    // `delete-full-checkpoint-crash.txt`, which runs the same workload, by
+    // putting the sync back: 42 cut points with it and 41 without. Every cut
+    // point still recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-checkpoint-disk-full.txt",
         shape: Shape::CutPoints,
-        least: 46,
+        least: 41,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -246,10 +546,41 @@ const FLOORS: [Floor; 19] = [
     // and running the campaign again: 47 cut points became 46 without it and returned
     // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
+    // **Fewer since a close shrinks the log only once the open segment holds a
+    // mebibyte (task-2191).** A close still folds, and stopped rolling a new
+    // segment, writing a checkpoint record and deleting the old segments every
+    // time. Those calls came after the last commit was acknowledged. Measured by
+    // making the close do the housekeeping again and running the campaign: 46
+    // cut points, and 45 without it. Every cut point still recovers to a state
+    // the campaign accepts.
+    // **Two fewer since a fold under a rollback journal syncs once
+    // (task-2191).** A fold synced the data file after its pages, then
+    // journaled the two meta slots, synced the journal again, wrote the
+    // slots and synced the data file a second time. The slots' pre-images
+    // now go into the journal with the pages', so one journal sync and one
+    // data file sync cover both, and each was a cut point. This workload
+    // folds once. Measured by putting the previous `pool/fold.rs` back
+    // and running the campaign again: 43 cut points became 45, and
+    // 43 with this change. Every cut point still recovers to a state the
+    // campaign accepts.
+    // **One fewer since an open reuses the meta slots its bootstrap read and a
+    // new log segment's header is not synced on its own (task-2191).** Every
+    // read and every sync is a cut point. Measured through `inillucent-testrun`
+    // on `delete-full-checkpoint-crash.txt`, which runs the same workload, by
+    // putting each change back in turn: 43 cut points before both, 43 with the
+    // meta slots change alone, 42 with the header change alone, and 42 with
+    // both. Every cut point still recovers to a state the campaign accepts.
+    // **One fewer since a rollback journal is synced before it is deleted only
+    // when something was saved after its seal (task-2191).** The seal's sync
+    // already covered every pre-image, so the second sync flushed nothing, and
+    // every sync is a cut point. Measured through `inillucent-testrun` on
+    // `delete-full-checkpoint-crash.txt`, which runs the same workload, by
+    // putting the sync back: 42 cut points with it and 41 without. Every cut
+    // point still recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-checkpoint-io-error.txt",
         shape: Shape::CutPoints,
-        least: 46,
+        least: 41,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -266,10 +597,27 @@ const FLOORS: [Floor; 19] = [
     // and running the campaign again: 46 cut points became 45 without it and returned
     // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
+    // **Two fewer since a fold under a rollback journal syncs once
+    // (task-2191).** A fold synced the data file after its pages, then
+    // journaled the two meta slots, synced the journal again, wrote the
+    // slots and synced the data file a second time. The slots' pre-images
+    // now go into the journal with the pages', so one journal sync and one
+    // data file sync cover both, and each was a cut point. This workload
+    // folds once. Measured by putting the previous `pool/fold.rs` back
+    // and running the campaign again: 43 cut points became 45, and
+    // 43 with this change. Every cut point still recovers to a state the
+    // campaign accepts.
+    // **One fewer since an open reuses the meta slots its bootstrap read and a
+    // new log segment's header is not synced on its own (task-2191).** Every
+    // read and every sync is a cut point. Measured through `inillucent-testrun`
+    // on `persist-full-checkpoint-crash.txt`, which runs the same workload, by
+    // putting each change back in turn: 43 cut points before both, 43 with the
+    // meta slots change alone, 42 with the header change alone, and 42 with
+    // both. Every cut point still recovers to a state the campaign accepts.
     Floor {
         name: "truncate-full-checkpoint-crash.txt",
         shape: Shape::CutPoints,
-        least: 45,
+        least: 42,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -286,10 +634,26 @@ const FLOORS: [Floor; 19] = [
     // and running the campaign again: 46 cut points became 45 without it and returned
     // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
+    // **Two fewer since a fold under a rollback journal syncs once
+    // (task-2191).** A fold synced the data file after its pages, then
+    // journaled the two meta slots, synced the journal again, wrote the
+    // slots and synced the data file a second time. The slots' pre-images
+    // now go into the journal with the pages', so one journal sync and one
+    // data file sync cover both, and each was a cut point. This workload
+    // folds once. Measured by putting the previous `pool/fold.rs` back
+    // and running the campaign again: 43 cut points became 45, and
+    // 43 with this change. Every cut point still recovers to a state the
+    // campaign accepts.
+    // **One fewer since an open reuses the meta slots its bootstrap read and a
+    // new log segment's header is not synced on its own (task-2191).** Every
+    // read and every sync is a cut point. Measured through `inillucent-testrun`
+    // by putting each change back in turn: 43 cut points before both, 43 with
+    // the meta slots change alone, 42 with the header change alone, and 42 with
+    // both. Every cut point still recovers to a state the campaign accepts.
     Floor {
         name: "persist-full-checkpoint-crash.txt",
         shape: Shape::CutPoints,
-        least: 45,
+        least: 42,
     },
     // **Three fewer since `BEGIN` became deferred (task-2173).** The
     // workload opens with `BEGIN`, which took the write lock itself before
@@ -297,10 +661,28 @@ const FLOORS: [Floor; 19] = [
     // three cut points, all of them `old`: the report
     // went from 24 old and 3 new to 21 old and 3 new. Every cut that lands
     // after the first write is still made.
+    // **Four fewer since an open reads the file's first pages once and opens
+    // the log segment once (task-2191).** The open read the 100 byte header
+    // three times, to look for a SQLite file, a foreign format and the page
+    // size, then read each meta page on its own: five reads, now one read of
+    // the header and one of both meta pages. Recovery opened the last log
+    // segment to read it and the writer opened it again to append; the
+    // writer now appends through the handle recovery read with. Every read
+    // and every open is a cut point. Measured by tracing every call the
+    // unarmed run makes, on the commit before and on this one, and comparing
+    // the two lists: 27 calls became 23. The four missing are three
+    // of those five reads and the second open of the segment. Every cut
+    // point still recovers to a state the campaign accepts.
+    // **Three fewer since an open reuses the meta slots its bootstrap read and
+    // a new log segment's header is not synced on its own (task-2191).** Every
+    // read and every sync is a cut point. Measured through `inillucent-testrun`
+    // by putting each change back in turn: 23 cut points before both, 20 with
+    // the meta slots change alone, 23 with the header change alone, and 20 with
+    // both. Every cut point still recovers to a state the campaign accepts.
     Floor {
         name: "wal-commit.tsv",
         shape: Shape::HashCuts,
-        least: 24,
+        least: 20,
     },
     // **Three fewer since `BEGIN` became deferred (task-2173).** The
     // workload opens with `BEGIN`, which took the write lock itself before
@@ -308,10 +690,29 @@ const FLOORS: [Floor; 19] = [
     // three cut points, all of them `old`: the report
     // went from 24 old and 3 new to 21 old and 3 new. Every cut that lands
     // after the first write is still made.
+    // **Four fewer since an open reads the file's first pages once and opens
+    // the log segment once (task-2191).** The open read the 100 byte header
+    // three times, to look for a SQLite file, a foreign format and the page
+    // size, then read each meta page on its own: five reads, now one read of
+    // the header and one of both meta pages. Recovery opened the last log
+    // segment to read it and the writer opened it again to append; the
+    // writer now appends through the handle recovery read with. Every read
+    // and every open is a cut point. Measured by tracing every call the
+    // unarmed run makes, on the commit before and on this one, and comparing
+    // the two lists: 27 calls became 23. The four missing are three
+    // of those five reads and the second open of the segment. Every cut
+    // point still recovers to a state the campaign accepts.
+    // **Three fewer since an open reuses the meta slots its bootstrap read and
+    // a new log segment's header is not synced on its own (task-2191).** Every
+    // read and every sync is a cut point. Measured through `inillucent-testrun`
+    // on `wal-commit.tsv`, which runs the same workload, by putting each change
+    // back in turn: 23 cut points before both, 20 with the meta slots change
+    // alone, 23 with the header change alone, and 20 with both. Every cut point
+    // still recovers to a state the campaign accepts.
     Floor {
         name: "wal-io-error.tsv",
         shape: Shape::HashCuts,
-        least: 24,
+        least: 20,
     },
     // **Three fewer since `BEGIN` became deferred (task-2173).** The
     // workload opens with `BEGIN`, which took the write lock itself before
@@ -319,10 +720,29 @@ const FLOORS: [Floor; 19] = [
     // three cut points, all of them `old`: the report
     // went from 24 old and 3 new to 21 old and 3 new. Every cut that lands
     // after the first write is still made.
+    // **Four fewer since an open reads the file's first pages once and opens
+    // the log segment once (task-2191).** The open read the 100 byte header
+    // three times, to look for a SQLite file, a foreign format and the page
+    // size, then read each meta page on its own: five reads, now one read of
+    // the header and one of both meta pages. Recovery opened the last log
+    // segment to read it and the writer opened it again to append; the
+    // writer now appends through the handle recovery read with. Every read
+    // and every open is a cut point. Measured by tracing every call the
+    // unarmed run makes, on the commit before and on this one, and comparing
+    // the two lists: 27 calls became 23. The four missing are three
+    // of those five reads and the second open of the segment. Every cut
+    // point still recovers to a state the campaign accepts.
+    // **Three fewer since an open reuses the meta slots its bootstrap read and
+    // a new log segment's header is not synced on its own (task-2191).** Every
+    // read and every sync is a cut point. Measured through `inillucent-testrun`
+    // on `wal-commit.tsv`, which runs the same workload, by putting each change
+    // back in turn: 23 cut points before both, 20 with the meta slots change
+    // alone, 23 with the header change alone, and 20 with both. Every cut point
+    // still recovers to a state the campaign accepts.
     Floor {
         name: "wal-short-write.tsv",
         shape: Shape::HashCuts,
-        least: 24,
+        least: 20,
     },
     // **Three fewer since `BEGIN` became deferred (task-2173).** The
     // workload opens with `BEGIN`, which took the write lock itself before
@@ -337,10 +757,28 @@ const FLOORS: [Floor; 19] = [
     // and running the campaign again: 55 cuts became 53 without it and returned
     // exactly to the old count with it. Every cut point still recovers to a
     // state the campaign accepts.
+    // **Four fewer since an open reads the file's first pages once and opens
+    // the log segment once (task-2191).** The open read the 100 byte header
+    // three times, to look for a SQLite file, a foreign format and the page
+    // size, then read each meta page on its own: five reads, now one read of
+    // the header and one of both meta pages. Recovery opened the last log
+    // segment to read it and the writer opened it again to append; the
+    // writer now appends through the handle recovery read with. Every read
+    // and every open is a cut point. Measured by tracing every call the
+    // unarmed run makes, on the commit before and on this one, and comparing
+    // the two lists: 53 calls became 49. The four missing are three
+    // of those five reads and the second open of the segment. Every cut
+    // point still recovers to a state the campaign accepts.
+    // **Four fewer since an open reuses the meta slots its bootstrap read and a
+    // new log segment's header is not synced on its own (task-2191).** Every
+    // read and every sync is a cut point. Measured through `inillucent-testrun`
+    // by putting each change back in turn: 49 cut points before both, 46 with
+    // the meta slots change alone, 48 with the header change alone, and 45 with
+    // both. Every cut point still recovers to a state the campaign accepts.
     Floor {
         name: "wal-checkpoint.tsv",
         shape: Shape::HashCuts,
-        least: 53,
+        least: 45,
     },
     Floor {
         name: "multi-database-commit.tsv",

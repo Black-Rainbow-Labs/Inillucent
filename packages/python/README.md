@@ -6,7 +6,8 @@ keyword search and vector search built in. One `.rdb` file holds the tables and 
 This package gives Python two ways to use it:
 
 - **The driver**: `Database`, `Connection` and `Rows`. It calls the inillucent C library inside your
-  Python process through `ctypes`. Use the driver in an application.
+  Python process through `ctypes`. Under CPython the library builds each result's rows as Python
+  objects, the way Python's own `sqlite3` module does. Use the driver in an application.
 - **The command line helpers**: `run()` and `query()`. Each call starts the `inillucent` program and
   reads the JSON it prints. Use them in scripts, for commands the driver has no method for.
 
@@ -212,14 +213,15 @@ reads this table and fails if a name in the first column is not declared in the 
 
 | what | one line |
 |---|---|
-| `Database(path, create=True, read_only=False, diagnostics=False)` | opens a database file. `create=True` makes the file when it is missing. |
+| `Database(path, create=True, read_only=False, diagnostics=False)` | opens a database file. `create=True` makes the file when it is missing. A file that is not a database, has a newer format or needs a key is refused here; a damaged log is reported by the first statement, which is when the log is read. |
 | `Database.connect()` | returns a new `Connection`. Each connection is its own session, and `temp.` tables and `ATTACH` belong to one session. |
 | `Database.path` | a property: the path of the database file. |
 | `Database.checkpoint()` | copies everything written so far into the database file. |
 | `Database.integrity_check()` | checks every table and index, and raises on the first problem. |
 | `Database.backup_to(path)` | copies the database to `path`, then opens and checks the copy. |
 | `Database.close()` | closes every connection, writes everything to the file and closes it. Leaving a `with` block calls it. |
-| `Connection.execute(sql, params, limit)` | runs one statement and returns `Rows`. |
+| `Connection.execute(sql, params, limit)` | runs one statement and returns `Rows`. A statement with parameters is prepared once and kept, up to 128 of them, the way Python's `sqlite3` keeps its statements. |
+| `Connection.execute_many(sql, rows)` | runs one statement once for each list of parameters, in one call to the library, and returns the rows changed in all. It opens no transaction; wrap it in one to write the rows together. Under CPython the library reads a list or tuple of rows of `None`, `int`, `bool`, `float`, `str` and `bytes` straight from the Python objects; any other batch crosses as JSON. |
 | `Connection.execute_batch(sql)` | runs several statements separated by semicolons, for their effect. |
 | `Connection.prepare(sql)` | compiles a statement and returns a `Statement` you can run many times. |
 | `Connection.transaction()` | begins a transaction and returns a `Transaction`. |
@@ -230,6 +232,7 @@ reads this table and fails if a name in the first column is not declared in the 
 | `Connection.cancel()` | asks the running statement to stop, from another thread. It stops at the next check, so the stop is not instant. |
 | `Connection.close()` | closes the connection. |
 | `Statement.execute(params, limit)` | binds the values, runs the statement and returns `Rows`. |
+| `Statement.execute_many(rows)` | runs the statement once for each list of parameters and returns the rows changed in all. |
 | `Statement.close()` | frees the compiled statement. |
 | `Transaction.execute(sql)` | runs one statement inside the transaction and returns the number of rows it changed. |
 | `Transaction.commit()` | commits the transaction. |

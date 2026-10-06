@@ -224,8 +224,8 @@ pub struct BoundTrigger {
 /// A bound `INSERT`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundInsert {
-    /// The table being written.
-    pub table: TableInfo,
+    /// The table being written, shared with the catalog it came from.
+    pub table: std::rc::Rc<TableInfo>,
     /// The statement-wide number of the FROM term being written.
     ///
     /// It used to be implicitly zero, because a DML statement had exactly one
@@ -337,8 +337,8 @@ pub struct BoundAssignment {
 /// A bound `UPDATE`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundUpdate {
-    /// The table being written.
-    pub table: TableInfo,
+    /// The table being written, shared with the catalog it came from.
+    pub table: std::rc::Rc<TableInfo>,
     /// The schema the statement wrote before the target's name, when it wrote one and no alias.
     /// `EXPLAIN QUERY PLAN` repeats it.
     pub written_schema: Option<Vec<u8>>,
@@ -426,8 +426,8 @@ pub struct BoundUpdate {
 /// A bound `DELETE`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundDelete {
-    /// The table being written.
-    pub table: TableInfo,
+    /// The table being written, shared with the catalog it came from.
+    pub table: std::rc::Rc<TableInfo>,
     /// The schema the statement wrote before the target's name, when it wrote one and no alias.
     /// `EXPLAIN QUERY PLAN` repeats it.
     pub written_schema: Option<Vec<u8>>,
@@ -730,7 +730,7 @@ impl<'a> Binder<'a> {
             Some(alias) => self.ast.text(alias).to_vec(),
             None => table.name.clone(),
         };
-        let target_source = self.push_write_source(table.clone(), alias);
+        let target_source = self.push_write_source(std::rc::Rc::clone(&table), alias);
         // `DEFAULT VALUES` supplies nothing, so every column takes its default
         // - which is what an empty target list means here. The grammar does
         // not allow a column list with it, so there is none to honour.
@@ -1457,14 +1457,14 @@ impl<'a> Binder<'a> {
         name: ast::NameId,
         span: Span,
         event: &TriggerEventInfo,
-    ) -> Result<TableInfo, ParseError> {
+    ) -> Result<std::rc::Rc<TableInfo>, ParseError> {
         let qualifier = database.map(|id| self.ast.folded(id).to_vec());
         let folded = self.ast.folded(name).to_vec();
-        let Some(table) = self
-            .catalog
-            .find_table(qualifier.as_deref(), &folded)
-            .cloned()
-        else {
+        // Shared with the catalog rather than cloned. A clone of a `TableInfo`
+        // copies every column, index and the `CREATE` text, and an `INSERT` took
+        // two of them: 8.6% of a script of single row inserts run through the
+        // shell (task-2191). `shared_table` is what the `SELECT` path uses.
+        let Some(table) = self.catalog.shared_table(qualifier.as_deref(), &folded) else {
             let written = match database {
                 Some(schema) => {
                     [self.ast.text(schema), b".".as_slice(), self.ast.text(name)].concat()
@@ -1483,7 +1483,7 @@ impl<'a> Binder<'a> {
                 }
                 let expanded = self.expanded_view(&table, span)?;
                 self.record_write_dependency(table.database);
-                return Ok(expanded);
+                return Ok(std::rc::Rc::new(expanded));
             }
             TableKind::Virtual => {
                 // A module decides whether it can be written; a module that
@@ -1518,7 +1518,7 @@ impl<'a> Binder<'a> {
         &mut self,
         id: ast::FromTermId,
         event: &TriggerEventInfo,
-    ) -> Result<(TableInfo, usize), ParseError> {
+    ) -> Result<(std::rc::Rc<TableInfo>, usize), ParseError> {
         let Some(term) = self.ast.from_term(id) else {
             return Err(unsupported("missing target", Span::default()));
         };
@@ -1556,7 +1556,7 @@ impl<'a> Binder<'a> {
                 index_hint: crate::bind::IndexChoice::Any,
                 id: self.sources.len(),
                 rows: crate::bind::SourceRows::Subquery(Box::new(inner)),
-                table: std::rc::Rc::new(table.clone()),
+                table: std::rc::Rc::clone(&table),
                 alias,
                 join: ast::JoinKind::Comma,
                 constraint: None,
@@ -1571,7 +1571,7 @@ impl<'a> Binder<'a> {
             self.scopes.push(vec![scope]);
             return Ok((table, scope));
         }
-        let scope = self.push_write_source(table.clone(), alias);
+        let scope = self.push_write_source(std::rc::Rc::clone(&table), alias);
         let choice = self.index_choice(indexed_by);
         let written_schema = match (term.alias, database) {
             (None, Some(schema)) => Some(self.ast.text(schema).to_vec()),
@@ -1716,13 +1716,13 @@ impl<'a> Binder<'a> {
     /// It opens a scope holding just the target, so every name in the
     /// statement's `SET`, `WHERE` and `RETURNING` resolves against the table
     /// being written and nothing else.
-    fn push_write_source(&mut self, table: TableInfo, alias: Vec<u8>) -> usize {
+    fn push_write_source(&mut self, table: std::rc::Rc<TableInfo>, alias: Vec<u8>) -> usize {
         let id = self.sources.len();
         self.sources.push(BoundSource {
             index_hint: crate::bind::IndexChoice::Any,
             id,
             rows: crate::bind::SourceRows::Table,
-            table: std::rc::Rc::new(table),
+            table,
             alias,
             join: ast::JoinKind::Comma,
             constraint: None,

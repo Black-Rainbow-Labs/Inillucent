@@ -188,7 +188,7 @@ impl crate::ImportedDatabase {
                     tree.put(database, &mut log, &values)?;
                 }
                 None => {
-                    let key: Vec<Datum<'_>> = entry.key.iter().map(OwnedDatum::borrow).collect();
+                    let key = entry.key.values();
                     tree.delete(database, &mut log, &key)?;
                 }
             }

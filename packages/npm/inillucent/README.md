@@ -79,19 +79,52 @@ const described = await inillucent('describe', { db: 'app.rdb', table: 'notes' }
 console.log(described.ddl, described.indexes, described.row_count_in_table);
 ```
 
-Each call starts one `inillucent` process with `--output json` and parses the object it prints.
-`params` travels to the process on standard input, so a large value does not hit the operating
-system's limit on command line length.
+`query()`, and `inillucent()` with the `query`, `exec` and `batch` commands, run in this process
+when the platform package carries the C library, which it does on every supported platform. The
+library is loaded as a Node addon, so a call opens the file, runs the statement and closes the file
+without starting anything.
 
-Starting a process costs time on every call. This package suits a build script or a tool wrapper
-that makes a dozen calls. It does not suit a loop over a million rows. For that, write a binding over
-the C library in the platform package. The
-[driver guide](https://github.com/Black-Rainbow-Labs/Inillucent/blob/main/drivers/README.md)
-explains how.
+A call whose statement starts with `SELECT`, `WITH` or `VALUES` keeps the file open for the next
+such call on the same file, and the file closes one second after the last of them. Opening the file
+is most of the cost of a single read, so a lookup by key that took 0.42 ms takes 0.04 ms, against
+0.09 ms for `node:sqlite` opening the file, reading and closing it. Nothing a caller sees changes.
+An open file holds no lock between statements, every statement checks whether another connection
+or process has written since the last one, and a file deleted and made again at the same path is
+opened afresh. Every other statement still opens and closes the file, so a transaction or a
+setting it leaves on its connection does not reach the next call.
 
-Because each call is its own process, this package has no connection object and no transaction that
-spans two calls. To run several statements as one transaction, use the `batch` command:
-`inillucent('batch', { db, sql: 'INSERT ...; UPDATE ...' })`.
+Every other command, and every call that passes `key` or `root`, starts one `inillucent` process
+with `--output json` and parses the object it prints. `params` travels to the process on standard
+input, so a large value does not hit the operating system's limit on command line length. Starting
+a process costs about 18 ms on Windows. Set `INILLUCENT_NO_ADDON=1` to send every call through a
+process.
+
+### Many calls: a session
+
+```js
+import { open } from 'inillucent';
+
+const session = await open('app.rdb');
+for (const id of ids) {
+  const rows = await session.query('SELECT body FROM notes WHERE id = ?1', { params: [id] });
+}
+await session.close();
+```
+
+`open()` keeps the file open in this process through the C library, so a call costs what the
+statement costs: 0.007 ms for a lookup by key on Windows, against 0.014 ms for Node's own
+`node:sqlite`. `session.inillucent(command, options)` and `session.query(sql, options)` return
+what `inillucent()` and `query()` return. A command the library does not run, such as `describe`,
+goes to an `inillucent-mcp` process the session starts the first time it needs one. `open()` makes
+the file when it is missing, unless you pass `create: false`. It also takes `key`, `readonly` and
+`root`; with `key` or `root`, the whole session runs through one `inillucent-mcp` process, as it
+does where the library is missing.
+
+A handle from `open()` belongs to the thread that opened it. A worker thread opens its own.
+
+A call through `inillucent()` is its own process, and a call through a session is its own
+statement, so neither has a transaction that spans two calls. To run several statements as one
+transaction, use the `batch` command: `inillucent('batch', { db, sql: 'INSERT ...; UPDATE ...' })`.
 
 ### Values
 
@@ -104,7 +137,8 @@ spans two calls. To run several statements as one transaction, use the `batch` c
 | a `Uint8Array` | `BLOB` |
 
 `query()` returns a BLOB column as a `Uint8Array`, so bytes read by one query can be bound into the
-next.
+next. Through the C library an integer beyond 2^53 comes back as a `BigInt`, so it is exact; through
+a process it is a number, which JSON rounds.
 
 ## Encrypted databases
 
@@ -177,12 +211,17 @@ first column is not declared in `index.mjs` or `resolve.mjs`.
 |---|---|
 | `inillucent(command, options)` | runs one command and resolves to its parsed JSON result. `options.db` names the file. Every other key becomes a flag: `{ table: 'notes' }` is `--table notes`, `true` is a bare flag. |
 | `query(sql, options)` | runs one query and resolves to its rows as objects keyed by column name. `options` takes `db`, `params` and `limit`. Throws on a refusal. |
+| `open(db, options)` | opens the file in this process through the C library, or starts one `inillucent-mcp` process over it when the library is missing or `key` or `root` is given, and resolves to a session. `options` takes `key`, `readonly`, `root` and `create`. |
+| `Session` | a session over one `inillucent-mcp` process: `inillucent(command, options)` and `query(sql, options)` work as the functions above without `db`, and `close()` stops the process. |
+| `NativeSession` | a session in this process through the C library, with the same three methods. |
 | `resolveBinary(program)` | returns the path to one of the four programs on this machine. `INILLUCENT_BIN` overrides it. |
+| `resolveLibrary()` | returns the path to the C library on this machine, or `null` when there is none. With `INILLUCENT_BIN` set, it is looked for beside that binary. |
 | `platformPackage()` | returns the platform package this machine needs, or `null` when there is none. |
 | `PROGRAMS` | an object naming the four programs. |
 
 A result object from `inillucent()` has these fields on success: `ok`, `command`, `columns`, `rows`,
-`row_count`, `total`, `more`, `changes`, `last_insert_rowid`, `elapsed_ms` and `text`. Some commands
+`row_count`, `total`, `more`, `changes`, `last_insert_rowid`, `elapsed_ms` and, from a process,
+`text`. Some commands
 add their own, such as `ddl` and `indexes` from `describe`. `total` counts every row the statement
 produced, even when `limit` cut the rows returned.
 

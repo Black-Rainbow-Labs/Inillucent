@@ -22,7 +22,7 @@ use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    GetFileInformationByHandle, GetFileSizeEx, LockFileEx, UnlockFileEx,
+    GetFileInformationByHandle, GetFileSizeEx, LockFileEx, ReadFile, UnlockFileEx,
     BY_HANDLE_FILE_INFORMATION, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
 };
 use windows_sys::Win32::System::Memory::{
@@ -45,6 +45,48 @@ pub const VFS_NAME: &str = "win32";
 /// Reads at an absolute offset without disturbing logical file position use.
 pub fn read_at(file: &File, offset: u64, output: &mut [u8]) -> io::Result<usize> {
     file.seek_read(output, offset)
+}
+
+/// Reads at an absolute offset into memory that has not been initialised.
+///
+/// `ReadFile` only writes to the buffer, so it needs no initialised bytes to
+/// read over; see `VfsFile::read_exact_into` for why that matters. The end of
+/// the file is `Ok(0)`, as `read_at` reports it.
+///
+/// @param file - the open file
+/// @param offset - where to read from
+/// @param output - where the bytes go
+pub fn read_at_spare(
+    file: &File,
+    offset: u64,
+    output: &mut [std::mem::MaybeUninit<u8>],
+) -> io::Result<usize> {
+    let wanted = u32::try_from(output.len()).unwrap_or(u32::MAX);
+    let mut overlapped = overlapped_at(offset);
+    let mut read: u32 = 0;
+    // SAFETY: the pointer and `wanted` describe memory `output` owns for the
+    // whole call, `ReadFile` writes at most `wanted` bytes to it and reads none,
+    // the handle is valid for the life of `file`, and `overlapped` and `read`
+    // are owned locals the synchronous call finishes with before it returns.
+    let ok = unsafe {
+        ReadFile(
+            file.as_raw_handle() as HANDLE,
+            output.as_mut_ptr().cast(),
+            wanted,
+            &mut read,
+            &mut overlapped,
+        )
+    };
+    if ok == 0 {
+        let failure = io::Error::last_os_error();
+        // A read that starts at or past the end of the file fails with
+        // ERROR_HANDLE_EOF (38) on a handle given an offset this way.
+        if failure.raw_os_error() == Some(38) {
+            return Ok(0);
+        }
+        return Err(failure);
+    }
+    Ok(read as usize)
 }
 
 /// Writes at an absolute offset.
@@ -71,6 +113,248 @@ pub fn file_len(file: &File) -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
     u64::try_from(size).map_err(|_| io::Error::other("a file reported a negative length"))
+}
+
+/// Reports whether a path names something, and what.
+///
+/// `None` when nothing is there.
+///
+/// **`GetFileAttributesW` rather than the standard library's `metadata`**
+/// (task-2191). On Windows `metadata` opens a handle to the file, asks for its
+/// information and closes it again, which is three system calls and the file
+/// system filter's work for each. An open of a database asks this several
+/// times, for the file, its journal and its log segments, and the calls were
+/// a sixth of opening a small database from Python. The attributes answer both
+/// questions asked here in one call that opens nothing.
+///
+/// A path too long for the call without the long path prefix is asked the
+/// standard library's way, which adds the prefix itself.
+///
+/// @param path - the path to ask about
+pub fn path_state(path: &std::path::Path) -> io::Result<Option<crate::os::PathState>> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{
+        GetLastError, ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME, ERROR_PATH_NOT_FOUND,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
+        INVALID_FILE_ATTRIBUTES,
+    };
+    /// The longest path the call takes without the long path prefix.
+    const SHORT_PATH: usize = 259;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.len() > SHORT_PATH || wide.contains(&0) {
+        return match std::fs::metadata(path) {
+            Ok(metadata) => Ok(Some(crate::os::PathState::of(&metadata))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        };
+    }
+    wide.push(0);
+    if let Some(by_name) = file_information_by_name() {
+        let mut stat = FileStatInformation::default();
+        // SAFETY: `wide` is a NUL terminated UTF-16 string and `stat` is a
+        // writable buffer of the size passed, both alive across the call,
+        // which keeps neither. Class 0 is `FileStatByNameInfo`, whose layout
+        // `FileStatInformation` repeats.
+        let ok = unsafe {
+            by_name(
+                wide.as_ptr(),
+                0,
+                (&mut stat as *mut FileStatInformation).cast(),
+                std::mem::size_of::<FileStatInformation>() as u32,
+            )
+        };
+        if ok != 0 {
+            return Ok(Some(crate::os::PathState {
+                read_only: stat.file_attributes & FILE_ATTRIBUTE_READONLY != 0,
+                file: stat.file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0,
+            }));
+        }
+        // **"Not found" is an answer, and asking again is a second system call
+        // for it** (task-2191). Every open asks whether a rollback journal is
+        // beside the database, and there normally is none: the older call
+        // after this one was 7% of a Python open and close. Any other failure
+        // falls through to the older call, which answers every case this one
+        // can refuse, such as a file system that does not support it.
+        // SAFETY: reads the calling thread's last error, which the call above set.
+        let code = unsafe { GetLastError() };
+        if matches!(code, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
+            return Ok(None);
+        }
+    }
+    // SAFETY: `wide` is a NUL terminated UTF-16 string that lives across the
+    // call, and the call reads it and keeps nothing.
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes != INVALID_FILE_ATTRIBUTES {
+        return Ok(Some(crate::os::PathState {
+            read_only: attributes & FILE_ATTRIBUTE_READONLY != 0,
+            file: attributes & FILE_ATTRIBUTE_DIRECTORY == 0,
+        }));
+    }
+    // SAFETY: reads the calling thread's last error, which the call above set.
+    let code = unsafe { GetLastError() };
+    match code {
+        ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_INVALID_NAME => Ok(None),
+        other => Err(io::Error::from_raw_os_error(other as i32)),
+    }
+}
+
+/// Returns the names in a directory that start with a prefix.
+///
+/// **`FindFirstFileExW` with the prefix as its pattern** (task-2191). The
+/// standard library's `read_dir` lists every name in the directory and the
+/// caller then filters them, so a check for a database's few log segments in a
+/// directory of a thousand files read a thousand names, at every command line
+/// call. The pattern makes the file system do the filtering. `*` and `?` in
+/// the prefix are refused, so it cannot widen what is matched.
+///
+/// @param directory - the directory to list
+/// @param prefix - what every returned name starts with
+pub fn names_starting_with(directory: &std::path::Path, prefix: &str) -> io::Result<Vec<String>> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Foundation::{
+        GetLastError, ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW,
+        FIND_FIRST_EX_LARGE_FETCH, WIN32_FIND_DATAW,
+    };
+    if prefix.contains(['*', '?']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a prefix cannot hold a wildcard",
+        ));
+    }
+    let mut pattern: Vec<u16> = directory
+        .join(format!("{prefix}*"))
+        .as_os_str()
+        .encode_wide()
+        .collect();
+    pattern.push(0);
+    // SAFETY: the structure is plain data the call fills, so zero is a valid start.
+    let mut found: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    // SAFETY: `pattern` is NUL terminated and `found` is writable, both alive
+    // across the call; the handle it answers is closed below.
+    let handle = unsafe {
+        FindFirstFileExW(
+            pattern.as_ptr(),
+            FindExInfoBasic,
+            (&mut found as *mut WIN32_FIND_DATAW).cast(),
+            FindExSearchNameMatch,
+            std::ptr::null(),
+            FIND_FIRST_EX_LARGE_FETCH,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        // SAFETY: reads the calling thread's last error, which the call set.
+        return match unsafe { GetLastError() } {
+            ERROR_FILE_NOT_FOUND => Ok(Vec::new()),
+            other => Err(io::Error::from_raw_os_error(other as i32)),
+        };
+    }
+    let mut names = Vec::new();
+    loop {
+        let length = found
+            .cFileName
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(found.cFileName.len());
+        let name = std::ffi::OsString::from_wide(found.cFileName.get(..length).unwrap_or(&[]));
+        names.push(name.to_string_lossy().into_owned());
+        // SAFETY: the handle is the open search above and `found` is writable.
+        if unsafe { FindNextFileW(handle, &mut found) } == 0 {
+            break;
+        }
+    }
+    // SAFETY: the handle is the open search above, closed once.
+    unsafe { FindClose(handle) };
+    Ok(names)
+}
+
+/// `FILE_STAT_INFORMATION`, which `GetFileInformationByName` fills for
+/// `FileStatByNameInfo`.
+#[repr(C)]
+#[derive(Default)]
+struct FileStatInformation {
+    file_id: i64,
+    creation_time: i64,
+    last_access_time: i64,
+    last_write_time: i64,
+    change_time: i64,
+    allocation_size: i64,
+    end_of_file: i64,
+    file_attributes: u32,
+    reparse_tag: u32,
+    number_of_links: u32,
+    effective_access: u32,
+}
+
+/// `GetFileInformationByName`'s signature.
+// SAFETY: a function pointer type and not a call; the one call through it
+// states its own argument where it is made.
+type FileInformationByName =
+    unsafe extern "system" fn(*const u16, i32, *mut core::ffi::c_void, u32) -> i32;
+
+/// Returns `GetFileInformationByName` when this Windows has it.
+///
+/// **Looked up at run time, once** (task-2191). It asks a path's attributes
+/// without opening the file, in about 3 us here against 7 to 11 for the
+/// attribute calls. It arrived in Windows 11 24H2, so linking it would stop
+/// the library from loading on anything older; an older Windows gets `None`
+/// and the caller uses `GetFileAttributesW`.
+fn file_information_by_name() -> Option<FileInformationByName> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut core::ffi::c_void;
+        fn GetProcAddress(
+            module: *mut core::ffi::c_void,
+            name: *const core::ffi::c_char,
+        ) -> *mut core::ffi::c_void;
+    }
+    static FOUND: std::sync::OnceLock<Option<FileInformationByName>> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        let library: Vec<u16> = "api-ms-win-core-file-l2-1-4.dll\0".encode_utf16().collect();
+        // SAFETY: the name is NUL terminated and lives across the call. A
+        // library that is not there answers null, which is checked.
+        let module = unsafe { LoadLibraryW(library.as_ptr()) };
+        if module.is_null() {
+            return None;
+        }
+        // SAFETY: the module is loaded and stays loaded, since nothing frees
+        // it, and the symbol name is a NUL terminated constant.
+        let address = unsafe { GetProcAddress(module, c"GetFileInformationByName".as_ptr()) };
+        if address.is_null() {
+            return None;
+        }
+        // SAFETY: the address is the export of that name, whose signature is
+        // the one `FileInformationByName` states.
+        Some(unsafe {
+            std::mem::transmute::<*mut core::ffi::c_void, FileInformationByName>(address)
+        })
+    })
+}
+
+/// Builds a new handle's lock state, without the file's identity.
+///
+/// **The identity is not read at the open here** (task-2191). Windows keeps
+/// byte range locks per handle, so [`LockState`] has no use for it, and
+/// nothing on the engine's path asks for it. `GetFileInformationByHandle` was
+/// 4.5% of a Python open and close. `OsFile::file_identity` reads it the first
+/// time it is asked.
+///
+/// @param _file - the open file
+/// @param _handle - this handle's number in the process
+pub fn lock_state(
+    _file: &Arc<File>,
+    _handle: HandleId,
+) -> VfsResult<(LockState, Option<FileIdentity>)> {
+    Ok((
+        LockState {
+            level: Mutex::new(FileLock::None),
+        },
+        None,
+    ))
 }
 
 /// Returns the volume serial number and file index that identify a file.
@@ -410,18 +694,6 @@ pub struct LockState {
 }
 
 impl LockState {
-    /// Creates the state for a freshly opened handle.
-    ///
-    /// The identity, handle number, and descriptor are unused on Windows
-    /// because the kernel already distinguishes handles and closing one does
-    /// not disturb another's locks; they are taken so that both platforms
-    /// present the same constructor to `os::mod`.
-    pub fn new(_identity: FileIdentity, _handle: HandleId, _descriptor: Arc<File>) -> LockState {
-        LockState {
-            level: Mutex::new(FileLock::None),
-        }
-    }
-
     /// Returns the level this handle holds.
     pub fn level(&self) -> FileLock {
         *guard(&self.level)

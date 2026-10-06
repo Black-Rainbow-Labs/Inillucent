@@ -26,7 +26,7 @@ impl PagedTree {
         pool: &Pool,
         visit: &mut dyn FnMut(&LeafRef<'_>) -> DbResult<bool>,
     ) -> DbResult<()> {
-        self.visit_from(pool, self.first_leaf, visit)
+        self.visit_from(pool, self.first_leaf(pool)?, visit)
     }
     /// Visits leaves from a starting page rightwards.
     ///
@@ -53,7 +53,7 @@ impl PagedTree {
         pool: &Pool,
         visit: &mut dyn FnMut(&LeafRef<'_>) -> DbResult<bool>,
     ) -> DbResult<()> {
-        self.visit_from_reading(pool, self.first_leaf, Copies::Refused, true, visit)
+        self.visit_from_reading(pool, self.first_leaf(pool)?, Copies::Refused, true, visit)
     }
 
     /// Visits every leaf without reading its out-of-line values first.
@@ -73,7 +73,7 @@ impl PagedTree {
         pool: &Pool,
         visit: &mut dyn FnMut(&LeafRef<'_>) -> DbResult<bool>,
     ) -> DbResult<()> {
-        self.visit_from_reading(pool, self.first_leaf, Copies::Allowed, false, visit)
+        self.visit_from_reading(pool, self.first_leaf(pool)?, Copies::Allowed, false, visit)
     }
     /// [`PagedTree::visit_from`], saying whether a written leaf may be read as a packed copy.
     ///
@@ -276,7 +276,7 @@ impl PagedTree {
                 drop(guard);
                 page
             }
-            None => self.first_leaf,
+            None => self.first_leaf(pool)?,
         };
         // **An equality span is one search and a short walk (task-2183).**
         // `WHERE owner = ?` gives the same key as both bounds, and the two

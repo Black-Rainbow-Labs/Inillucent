@@ -284,29 +284,17 @@ impl<'p> LeafMut<'p> {
     ///
     /// @param encoded_len - how many bytes the row's tagged form occupies
     pub fn room_for_row_and_tombstone(&self, encoded_len: usize) -> DbResult<Option<DeltaOffsets>> {
-        let shape = self.delta_shape()?;
-        let floor = self.columns_end()?;
-        let Some(offsets) = self.offsets_within(shape, floor, encoded_len)? else {
-            return Ok(None);
-        };
-        // The bitmap charged whether or not the page has one, which is the
-        // paragraph above and task-2033's fix. `offsets_within` charges the
-        // bitmap the page actually carries, because it describes where the row
-        // lands rather than what the write has to reserve; this is the
-        // reservation, and it is the stricter of the two.
-        if offsets
-            .new_delta_start
-            .saturating_sub(tombstone_bytes(shape.row_count))
-            < floor
-        {
-            return Ok(None);
-        }
-        Ok(Some(offsets))
+        room_for_row_and_tombstone_in(&LeafRef::parse(self.page)?, encoded_len)
     }
 
     fn columns_end(&self) -> DbResult<usize> {
         columns_end(self.page)
     }
+    // The bitmap charged whether or not the page has one, which is the
+    // paragraph above and task-2033's fix. `offsets_within` charges the
+    // bitmap the page actually carries, because it describes where the row
+    // lands rather than what the write has to reserve; this is the
+    // reservation, and it is the stricter of the two.
 
     /// Inserts a row into the delta area, at its place in key order.
     ///
@@ -418,15 +406,7 @@ impl<'p> LeafMut<'p> {
     /// (task-2034). The view is copied out and dropped rather than held,
     /// because the writes that follow take a mutable borrow of the same bytes.
     fn delta_shape(&self) -> DbResult<DeltaShape> {
-        let leaf = LeafRef::parse(self.page)?;
-        Ok(DeltaShape {
-            delta_count: leaf.delta_count(),
-            delta_start: leaf.delta_start(),
-            row_count: leaf.row_count(),
-            has_tombstones: leaf.has_tombstones(),
-            heap_start: leaf.heap_start(),
-            format_one: !leaf.has_delta_directory(),
-        })
+        Ok(shape_of(&LeafRef::parse(self.page)?))
     }
 
     /// Returns where a row of this size lands in a leaf of this shape.
@@ -456,38 +436,7 @@ impl<'p> LeafMut<'p> {
         floor: usize,
         encoded_len: usize,
     ) -> DbResult<Option<DeltaOffsets>> {
-        if shape.delta_count >= u16::MAX as usize {
-            return Ok(None);
-        }
-        // Format 1's own limit, which its writer enforced and a replay of its
-        // log has to enforce the same way.
-        if shape.format_one && shape.delta_count >= FORMAT_ONE_DELTA_LIMIT {
-            return Ok(None);
-        }
-        if encoded_len > u16::MAX as usize {
-            return Ok(None);
-        }
-        let bitmap = if shape.has_tombstones {
-            tombstone_bytes(shape.row_count)
-        } else {
-            0
-        };
-        let directory = if shape.format_one { 0 } else { DELTA_ENTRY };
-        let entry = encoded_len.saturating_add(2).saturating_add(directory);
-        let Some(new_delta_start) = shape.delta_start.checked_sub(entry) else {
-            return Ok(None);
-        };
-        if new_delta_start.saturating_sub(bitmap) < floor {
-            return Ok(None);
-        }
-        Ok(Some(DeltaOffsets {
-            new_delta_start,
-            old_delta_start: shape.delta_start,
-            bitmap,
-            delta_count: shape.delta_count,
-            heap_start: shape.heap_start,
-            format_one: shape.format_one,
-        }))
+        offsets_for(shape, floor, encoded_len)
     }
 
     /// Performs a delta insert that [`LeafMut::plan_delta`] costed.
@@ -1157,6 +1106,95 @@ fn align8(at: usize) -> usize {
     at.saturating_add(7) & !7
 }
 
+/// Returns where a row of this size lands in a leaf of this shape: the body of
+/// [`LeafMut::offsets_within`], as a free function so a caller holding only a
+/// read view can ask it.
+///
+/// @param shape - the header fields, from [`shape_of`]
+/// @param floor - where the mini-columns end, from `columns_end`
+/// @param encoded_len - how many bytes the row's tagged form occupies
+fn offsets_for(
+    shape: DeltaShape,
+    floor: usize,
+    encoded_len: usize,
+) -> DbResult<Option<DeltaOffsets>> {
+    if shape.delta_count >= u16::MAX as usize {
+        return Ok(None);
+    }
+    // Format 1's own limit, which its writer enforced and a replay of its
+    // log has to enforce the same way.
+    if shape.format_one && shape.delta_count >= FORMAT_ONE_DELTA_LIMIT {
+        return Ok(None);
+    }
+    if encoded_len > u16::MAX as usize {
+        return Ok(None);
+    }
+    let bitmap = if shape.has_tombstones {
+        tombstone_bytes(shape.row_count)
+    } else {
+        0
+    };
+    let directory = if shape.format_one { 0 } else { DELTA_ENTRY };
+    let entry = encoded_len.saturating_add(2).saturating_add(directory);
+    let Some(new_delta_start) = shape.delta_start.checked_sub(entry) else {
+        return Ok(None);
+    };
+    if new_delta_start.saturating_sub(bitmap) < floor {
+        return Ok(None);
+    }
+    Ok(Some(DeltaOffsets {
+        new_delta_start,
+        old_delta_start: shape.delta_start,
+        bitmap,
+        delta_count: shape.delta_count,
+        heap_start: shape.heap_start,
+        format_one: shape.format_one,
+    }))
+}
+
+/// Reads the header fields every delta arithmetic needs out of a parsed leaf.
+///
+/// @param leaf - the leaf
+fn shape_of(leaf: &LeafRef<'_>) -> DeltaShape {
+    DeltaShape {
+        delta_count: leaf.delta_count(),
+        delta_start: leaf.delta_start(),
+        row_count: leaf.row_count(),
+        has_tombstones: leaf.has_tombstones(),
+        heap_start: leaf.heap_start(),
+        format_one: !leaf.has_delta_directory(),
+    }
+}
+
+/// [`LeafMut::room_for_row_and_tombstone`] over a leaf the caller has already
+/// parsed for reading.
+///
+/// **So the write path parses the page once** (task-2191). The room check
+/// took the page through `Pool::modify`, which counts as a write and marks the
+/// page dirty, for a question that only reads, and parsed it three more times
+/// on the way. The write path's locate already holds the parse.
+///
+/// @param leaf - the leaf, parsed
+/// @param encoded_len - how many bytes the row's tagged form occupies
+pub fn room_for_row_and_tombstone_in(
+    leaf: &LeafRef<'_>,
+    encoded_len: usize,
+) -> DbResult<Option<DeltaOffsets>> {
+    let shape = shape_of(leaf);
+    let floor = columns_end_of(leaf)?;
+    let Some(offsets) = offsets_for(shape, floor, encoded_len)? else {
+        return Ok(None);
+    };
+    if offsets
+        .new_delta_start
+        .saturating_sub(tombstone_bytes(shape.row_count))
+        < floor
+    {
+        return Ok(None);
+    }
+    Ok(Some(offsets))
+}
+
 /// Returns where the mini-columns end, which is the floor for everything that
 /// grows downwards.
 ///
@@ -1166,7 +1204,14 @@ fn align8(at: usize) -> usize {
 ///
 /// @param page - the page bytes, exactly one page long
 fn columns_end(page: &[u8]) -> DbResult<usize> {
-    let leaf = LeafRef::parse(page)?;
+    columns_end_of(&LeafRef::parse(page)?)
+}
+
+/// [`columns_end`] over a leaf already parsed.
+///
+/// @param leaf - the leaf
+fn columns_end_of(leaf: &LeafRef<'_>) -> DbResult<usize> {
+    let page = leaf.bytes();
     let stride = leaf.directory_entry_size();
     let mut end = leaf_header::DIRECTORY.saturating_add(leaf.column_count().saturating_mul(stride));
     for index in 0..leaf.column_count() {

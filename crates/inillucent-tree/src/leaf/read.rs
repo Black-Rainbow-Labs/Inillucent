@@ -461,6 +461,25 @@ impl<'p> LeafRef<'p> {
         }
         Ok((crate::write::Located::Absent, slot))
     }
+    /// [`LeafRef::locate_slot`] for a key the caller knows is not live in the
+    /// sorted region, which searches the delta directory only.
+    ///
+    /// See `PagedTree::put_new_key` for which keys those are. A key the
+    /// directory holds is reported where it is, as `locate_slot` reports it.
+    ///
+    /// @param key - the key, one value per key column
+    /// @param key_columns - how many leading columns form the key
+    pub fn locate_new_key_slot(
+        &self,
+        key: &[Datum<'_>],
+        key_columns: usize,
+    ) -> DbResult<(crate::write::Located, usize)> {
+        Ok(match self.delta_index_of(key, key_columns)? {
+            Ok(index) => (crate::write::Located::Delta(index), index),
+            Err(slot) => (crate::write::Located::Absent, slot),
+        })
+    }
+
     /// Returns the leaf's live rows in key order, as a source the builder reads
     /// through.
     ///

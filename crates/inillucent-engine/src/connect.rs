@@ -103,7 +103,7 @@ pub struct Database {
     /// The engine, behind a cell because a statement takes `&mut` and a caller
     /// holds the database by shared reference - which is the same arrangement
     /// `inillucent-session` uses and for the same reason.
-    engine: RefCell<ImportedDatabase>,
+    engine: RefCell<Slot>,
     /// The file, kept so it can be reported.
     path: PathBuf,
     /// How many rows the last statement changed.
@@ -120,6 +120,16 @@ pub struct Database {
     /// the process. A counter is the database's own bookkeeping; the engine
     /// learns the number on the first statement that runs under it.
     next_session: std::cell::Cell<u64>,
+    /// Modules registered while the open was still waiting for its first
+    /// statement, added when it finishes.
+    ///
+    /// **A registration does not finish the open (task-2191).** The shell
+    /// registers `fsdir` and `zipfile` on every database it opens, and each
+    /// registration used to run the deferred half of the open - recovery, the
+    /// schema, the catalog - and refresh the catalog again, so every command
+    /// line verb paid all of it inside the open and `refresh_catalog` ran three
+    /// times. They wait here, and the open adds them with one refresh.
+    modules_waiting: RefCell<Vec<std::sync::Arc<dyn inillucent_ext::vtab::Module>>>,
     /// The same writer the engine holds.
     ///
     /// **A second handle on one group, not a second group (task-1962, A1
@@ -187,19 +197,32 @@ fn is_memory(path: &Path) -> bool {
 ///
 /// @param path - the path a caller opened with
 fn there_is_a_database_at(path: &Path) -> DbResult<bool> {
-    match std::fs::metadata(path) {
-        Ok(found) if found.is_file() => Ok(true),
-        Ok(_) => Err(inillucent_base::error::refusal(format!(
+    // `path_state` rather than `std::fs::metadata`, which on Windows opens the
+    // file to ask (task-2191). See `inillucent_vfs::os::path_state`.
+    match inillucent_vfs::os::path_state(path) {
+        Ok(Some(found)) if found.file => Ok(true),
+        Ok(None) => Ok(false),
+        Ok(Some(_)) => Err(inillucent_base::error::refusal(format!(
             "{} is not a file, so it is neither a database to open nor a path to create one at",
             path.display()
         ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(inillucent_base::error::refusal(format!(
             "cannot tell whether there is a database at {}: {error}. Refusing rather than \
              creating one, because creating one deletes whatever is there",
             path.display()
         ))),
     }
+}
+
+/// Reports whether a path names a file, asking the file system the light way.
+///
+/// **For a caller that checks before it opens** (task-2191). The driver asks
+/// this of every open that may not create, and `Path::is_file` on Windows opens
+/// the file to ask, which cost as much as the open that follows.
+///
+/// @param path - the path to ask about
+pub fn is_a_file(path: &Path) -> bool {
+    matches!(inillucent_vfs::os::path_state(path), Ok(Some(state)) if state.file)
 }
 
 /// Opens a database read only after an open for writing was refused permission,
@@ -246,6 +269,43 @@ fn opened_read_only_instead(
 /// @param open - the open to run, such as `|| Database::open(path)`
 pub fn with_open_busy_timeout<T>(millis: u64, open: impl FnOnce() -> T) -> T {
     inillucent_pool::file::with_open_busy_millis(millis, open)
+}
+
+/// The engine behind a [`Database`]: ready, or opened as far as the open's own
+/// checks and waiting for its first statement.
+///
+/// **The SQLite split** (task-2191). `sqlite3_open_v2` opens the file and
+/// reads its header, and the schema waits for the first statement that needs
+/// it. An open here did recovery, opened the log twice and read the catalog
+/// three times before it returned, which made an open and a close from Python
+/// four times SQLite's. What stays at the open is what a caller must hear about
+/// before any statement: no such file, not a database, a newer format, a wrong
+/// key, a torn meta record, a refused permission. What moves to the first
+/// statement is what SQLite moves there too: a damaged log or catalog.
+enum Slot {
+    /// The first half of the open has run; see `ImportedDatabase::begin_open`.
+    Pending(
+        Box<crate::engine::open::PendingOpen>,
+        crate::engine::open::SharedState,
+    ),
+    /// The engine, open.
+    Ready(Box<ImportedDatabase>),
+    /// The second half of the open failed, with this error.
+    Failed(inillucent_base::error::DbError),
+}
+
+impl Slot {
+    /// Makes a pending slot from the first half of an open, giving up the lock
+    /// that half took.
+    ///
+    /// @param pending - what `ImportedDatabase::begin_open` did
+    fn pending(mut pending: crate::engine::open::PendingOpen) -> DbResult<Slot> {
+        pending.let_go()?;
+        Ok(Slot::Pending(
+            Box::new(pending),
+            crate::engine::open::SharedState::fresh(),
+        ))
+    }
 }
 
 impl Database {
@@ -341,7 +401,8 @@ impl Database {
         read_only: bool,
         key: Option<crate::EncryptionKey>,
     ) -> DbResult<Database> {
-        Database::open_on_key(path.as_ref(), page_size, frames, read_only, key)
+        let r = Database::open_on_key(path.as_ref(), page_size, frames, read_only, key);
+        r
     }
 
     /// [`Database::open_with`], with the caller saying whether this connection
@@ -393,56 +454,175 @@ impl Database {
                 settings: std::rc::Rc::clone(&engine.pragmas),
                 plans: std::rc::Rc::clone(&engine.compiled),
                 counters: std::rc::Rc::clone(&engine.counters),
-                engine: RefCell::new(engine),
+                engine: RefCell::new(Slot::Ready(Box::new(engine))),
                 path,
                 changes: std::cell::Cell::new(0),
                 next_session: std::cell::Cell::new(1),
+                modules_waiting: RefCell::new(Vec::new()),
             });
         }
-        let exists = there_is_a_database_at(&path)?;
         let keyed = key.is_some();
-        if exists {
+        // **The open is tried before the file system is asked whether the file
+        // is there** (task-2191). The open of an existing file answers that
+        // question itself, and asking first was one of the two name queries in
+        // every open, 7% of a Python open and close. Only a failure asks, to
+        // tell a missing file, which is created, from a directory or a file
+        // that will not open, which are refused as before. A keyed open and a
+        // read only one keep asking first: the key check reads the file before
+        // the open does, and a read only open of a missing file is refused
+        // before anything looks for a journal beside it.
+        let first_try = match keyed || read_only {
+            true => None,
+            false => {
+                let vfs = crate::encryption::file_system(None, page_size)?;
+                match ImportedDatabase::begin_open(vfs, path.clone(), page_size, frames, false) {
+                    Ok(pending) => return Ok(Database::over(Slot::pending(pending)?, path)),
+                    Err(error) => Some(error),
+                }
+            }
+        };
+        let exists = there_is_a_database_at(&path)?;
+        // **Asked before the open only when a key was given** (task-2191). The
+        // probe opens the file a second time to read its first bytes, and an
+        // open without a key of a file that is not encrypted, which is nearly
+        // every open, learns nothing from it. An open without a key of a file
+        // that is encrypted fails reading the meta pages, before it writes
+        // anything, and is asked below so it still says why.
+        if exists && keyed {
             crate::encryption::check_the_file_matches_the_key(&path, keyed)?;
         }
         let vfs = crate::encryption::file_system(key, page_size)?;
         let explain = |error| crate::encryption::explain_a_wrong_key(error, keyed);
-        let engine = match (exists, read_only) {
-            (true, false) => {
-                match ImportedDatabase::open_on(
+        let opened = match (exists, read_only, first_try) {
+            // The open above failed on a file that is there, so it is not tried
+            // again; a refusal of permission still falls back to reading.
+            (true, false, Some(error)) => {
+                opened_read_only_instead(error, vfs, &path, page_size, frames)
+                    .map(|engine| Slot::Ready(Box::new(engine)))
+                    .map_err(explain)
+            }
+            // **The open stops after the file's own checks** (task-2191). The
+            // rest runs at the first statement; see `Slot::Pending`.
+            (true, false, None) => {
+                match ImportedDatabase::begin_open(
                     std::sync::Arc::clone(&vfs),
                     path.clone(),
                     page_size,
                     frames,
+                    false,
                 ) {
-                    Ok(engine) => engine,
+                    Ok(pending) => Ok(Slot::pending(pending)?),
                     Err(error) => opened_read_only_instead(error, vfs, &path, page_size, frames)
-                        .map_err(explain)?,
+                        .map(|engine| Slot::Ready(Box::new(engine)))
+                        .map_err(explain),
                 }
             }
-            (true, true) => ImportedDatabase::open_as(vfs, path.clone(), page_size, frames, true)
-                .map_err(explain)?,
+            (true, true, _) => {
+                ImportedDatabase::begin_open(vfs, path.clone(), page_size, frames, true)
+                    .and_then(Slot::pending)
+                    .map_err(explain)
+            }
             // **A read only connection does not create the file it was given.**
             // Creating one would answer a caller who asked to read an existing
             // database with an empty one, and would write - see task-1979's E2,
             // which is the same mistake on the read verbs.
-            (false, true) => {
+            (false, true, _) => {
                 return Err(inillucent_base::error::refusal(
                     "there is no database at that path, and a read only connection does not \
                      create one",
                 ))
             }
-            (false, false) => ImportedDatabase::create_on(vfs, path.clone(), page_size, frames)?,
+            (false, false, _) => ImportedDatabase::create_on(vfs, path.clone(), page_size, frames)
+                .map(|engine| Slot::Ready(Box::new(engine))),
         };
-        Ok(Database {
-            writer: std::rc::Rc::clone(&engine.writing),
-            settings: std::rc::Rc::clone(&engine.pragmas),
-            plans: std::rc::Rc::clone(&engine.compiled),
-            counters: std::rc::Rc::clone(&engine.counters),
-            engine: RefCell::new(engine),
+        let slot = match opened {
+            Ok(slot) => slot,
+            Err(error) => {
+                if exists && !keyed {
+                    crate::encryption::check_the_file_matches_the_key(&path, false)?;
+                }
+                return Err(error);
+            }
+        };
+        Ok(Database::over(slot, path))
+    }
+
+    /// Wraps an engine, opened or pending, in the handle a caller holds.
+    ///
+    /// @param slot - the engine
+    /// @param path - the database file
+    fn over(slot: Slot, path: PathBuf) -> Database {
+        let shared = match &slot {
+            Slot::Ready(engine) => crate::engine::open::SharedState {
+                counters: std::rc::Rc::clone(&engine.counters),
+                compiled: std::rc::Rc::clone(&engine.compiled),
+                writing: std::rc::Rc::clone(&engine.writing),
+                pragmas: std::rc::Rc::clone(&engine.pragmas),
+            },
+            Slot::Pending(_, shared) => crate::engine::open::SharedState {
+                counters: std::rc::Rc::clone(&shared.counters),
+                compiled: std::rc::Rc::clone(&shared.compiled),
+                writing: std::rc::Rc::clone(&shared.writing),
+                pragmas: std::rc::Rc::clone(&shared.pragmas),
+            },
+            Slot::Failed(_) => crate::engine::open::SharedState::fresh(),
+        };
+        Database {
+            writer: shared.writing,
+            settings: shared.pragmas,
+            plans: shared.compiled,
+            counters: shared.counters,
+            engine: RefCell::new(slot),
             path,
             changes: std::cell::Cell::new(0),
             next_session: std::cell::Cell::new(1),
+            modules_waiting: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Returns the engine, finishing a deferred open first.
+    ///
+    /// **An error rather than an abort when the engine is already in use**
+    /// (task-1962, A11): see [`Connection::engine_mut`]. A deferred open that
+    /// fails is remembered, and every later call answers the same error, as an
+    /// open that failed at once would have answered it.
+    fn ready(&self) -> DbResult<std::cell::RefMut<'_, ImportedDatabase>> {
+        let mut slot = self.engine.try_borrow_mut().map_err(|_| {
+            misuse(
+                "this connection is already running a statement; a function registered on a \
+                 connection cannot call back into it",
+            )
+        })?;
+        if matches!(&*slot, Slot::Pending(..)) {
+            let taken = std::mem::replace(&mut *slot, Slot::Failed(misuse("an open is finishing")));
+            if let Slot::Pending(pending, shared) = taken {
+                let waiting = self
+                    .modules_waiting
+                    .try_borrow_mut()
+                    .map(|mut held| std::mem::take(&mut *held))
+                    .unwrap_or_default();
+                *slot = match ImportedDatabase::finish_open(*pending, shared) {
+                    Ok(mut engine) => {
+                        engine.register_modules(waiting);
+                        Slot::Ready(Box::new(engine))
+                    }
+                    Err(error) => Slot::Failed(error),
+                };
+            }
+        }
+        std::cell::RefMut::filter_map(slot, |slot| match slot {
+            Slot::Ready(engine) => Some(engine.as_mut()),
+            _ => None,
         })
+        .map_err(|slot| match &*slot {
+            Slot::Failed(error) => error.clone(),
+            _ => misuse("the database's open did not finish"),
+        })
+    }
+
+    /// Reports whether the open is still waiting for its first statement.
+    fn pending(&self) -> bool {
+        matches!(self.engine.try_borrow().as_deref(), Ok(Slot::Pending(..)))
     }
 
     /// Imports a SQLite file into a new database beside it, and opens that.
@@ -494,10 +674,11 @@ impl Database {
             settings: std::rc::Rc::clone(&engine.pragmas),
             plans: std::rc::Rc::clone(&engine.compiled),
             counters: std::rc::Rc::clone(&engine.counters),
-            engine: RefCell::new(engine),
+            engine: RefCell::new(Slot::Ready(Box::new(engine))),
             path: target,
             changes: std::cell::Cell::new(0),
             next_session: std::cell::Cell::new(1),
+            modules_waiting: RefCell::new(Vec::new()),
         })
     }
 
@@ -590,7 +771,9 @@ impl Database {
     ///
     /// See [`ImportedDatabase::log_sequence`].
     pub fn log_sequence(&self) -> u64 {
-        self.engine.borrow().log_sequence()
+        self.ready()
+            .map(|engine| engine.log_sequence())
+            .unwrap_or(0)
     }
 
     /// Returns what opening this database did to it.
@@ -599,7 +782,9 @@ impl Database {
     /// because the engine is behind a cell and a caller holding a borrow across
     /// a statement would take the cell the statement needs.
     pub fn recovery_report(&self) -> crate::recovery::RecoveryReport {
-        self.engine.borrow().recovery_report().clone()
+        self.ready()
+            .map(|engine| engine.recovery_report().clone())
+            .unwrap_or_default()
     }
 
     /// Makes everything written so far durable in the file.
@@ -607,7 +792,25 @@ impl Database {
     /// A database that is dropped without this is not lost - `open` replays the
     /// log - but a checkpoint is what makes the next open cheap.
     pub fn checkpoint(&self) -> DbResult<()> {
-        self.engine.borrow_mut().checkpoint()
+        self.ready()?.checkpoint()
+    }
+
+    /// Folds the log into the file only when this connection holds something
+    /// the file does not, and reports a failure.
+    ///
+    /// This is the fold `Drop` performs, offered to a caller that wants the
+    /// error. A close that called [`Database::checkpoint`] instead folded on
+    /// every close, including a connection that only read: it wrote the meta
+    /// record, synced the file and started a new log segment each time. That
+    /// was 9.3 ms of the 12 ms an open and close cost through the C library
+    /// on Windows, against 0.07 ms for SQLite (task-2191).
+    pub fn fold_if_owed(&self) -> DbResult<()> {
+        // An open that never finished read nothing and wrote nothing, so it
+        // owes nothing.
+        if self.pending() {
+            return Ok(());
+        }
+        self.ready()?.fold_on_close()
     }
 
     /// Adds one virtual-table module to this connection.
@@ -627,7 +830,13 @@ impl Database {
         &self,
         module: std::sync::Arc<dyn inillucent_ext::vtab::Module>,
     ) -> DbResult<()> {
-        self.engine.borrow_mut().register_module(module)
+        if self.pending() {
+            if let Ok(mut waiting) = self.modules_waiting.try_borrow_mut() {
+                waiting.push(module);
+                return Ok(());
+            }
+        }
+        self.ready()?.register_module(module)
     }
 
     /// Returns how many compiled statements this database is holding.
@@ -664,11 +873,22 @@ impl Database {
 
     /// Sets one run-time limit, and returns what it was before.
     ///
+    /// **The compiled statements are forgotten when the value changes**
+    /// (task-2191). The binder checks some limits while it compiles, such as
+    /// how deep triggers may fire, so a plan compiled under the old value
+    /// would run under it. A statement whose text had been compiled before
+    /// was run from the plan cache and kept the old limit, and since inserts
+    /// that differ only in their literals share one plan, so did those.
+    ///
     /// @param limit - which limit
     /// @param requested - the value asked for
     /// @returns the value that was in force before this call
     pub fn set_limit(&self, limit: inillucent_base::limits::Limit, requested: i64) -> i64 {
-        self.settings.limits().borrow_mut().set(limit, requested)
+        let before = self.settings.limits().borrow_mut().set(limit, requested);
+        if self.limit(limit) != before {
+            self.plans.forget_all();
+        }
+        before
     }
 
     /// Returns what the page cache has been asked to do.
@@ -677,7 +897,10 @@ impl Database {
     /// answer it gave. The shape is the engine's own rather than the pool's, so
     /// a caller reading it does not have to name the crate the pool lives in.
     pub fn cache_stats(&self) -> CacheStats {
-        let held = self.engine.borrow().pool_stats();
+        let Ok(engine) = self.ready() else {
+            return CacheStats::default();
+        };
+        let held = engine.pool_stats();
         CacheStats {
             hits: held.hits,
             misses: held.misses,
@@ -699,7 +922,10 @@ impl Database {
     /// budget guard to assert on: it is a count of work rather than a reading of
     /// the clock, so it does not change when the machine is busy.
     pub fn log_stats(&self) -> LogStats {
-        let held = self.engine.borrow().wal().stats();
+        let Ok(engine) = self.ready() else {
+            return LogStats::default();
+        };
+        let held = engine.wal().stats();
         LogStats {
             records: held.records,
             writes: held.writes,
@@ -715,17 +941,19 @@ impl Database {
     /// slower; the compactions, the splits and the nanoseconds spent making room
     /// say which tree paid for it and in which stage.
     pub fn write_stats(&self) -> inillucent_tree::write::WriteStats {
-        self.engine.borrow().write_stats()
+        self.ready()
+            .map(|engine| engine.write_stats())
+            .unwrap_or_default()
     }
 
     /// Returns how many bytes the page cache is holding.
     pub fn pool_bytes(&self) -> usize {
-        self.engine.borrow().pool_bytes()
+        self.ready().map(|engine| engine.pool_bytes()).unwrap_or(0)
     }
 
     /// Checks every tree's structure.
     pub fn check(&self) -> DbResult<()> {
-        self.engine.borrow().check_trees()
+        self.ready()?.check_trees()
     }
 
     /// Copies this database into a file, and checks the copy.
@@ -756,14 +984,16 @@ impl Database {
         // **The copy is opened with the key this database was.** It is the
         // same bytes, so it is encrypted the same way, and the check below
         // has to be able to read it.
-        let key = self.engine.borrow().encryption_key()?;
+        let key = self.ready()?.encryption_key()?;
         let copy = Database::open_keyed(path, PAGE_SIZE, DEFAULT_FRAMES, false, key)?;
         copy.check()
     }
 
     /// Reports whether this database is encrypted.
     pub fn is_encrypted(&self) -> bool {
-        self.engine.borrow().is_encrypted()
+        self.ready()
+            .map(|engine| engine.is_encrypted())
+            .unwrap_or(false)
     }
 
     /// Changes the key this encrypted database is encrypted with. See
@@ -771,7 +1001,7 @@ impl Database {
     ///
     /// @param key - the new key
     pub fn rekey(&self, key: crate::EncryptionKey) -> DbResult<()> {
-        self.engine.borrow_mut().rekey(key)
+        self.ready()?.rekey(key)
     }
 
     /// Writes a copy of this database to a new file, encrypted with `key`,
@@ -790,7 +1020,7 @@ impl Database {
         path: impl AsRef<Path>,
         key: Option<crate::EncryptionKey>,
     ) -> DbResult<()> {
-        self.engine.borrow_mut().export_to(path.as_ref(), key)
+        self.ready()?.export_to(path.as_ref(), key)
     }
 }
 
@@ -861,12 +1091,7 @@ impl<'d> Connection<'d> {
     /// one `RefCell` holds the whole engine. A1 step 3 splits that cell into
     /// three and most of this goes with it.
     fn engine_mut(&self) -> DbResult<std::cell::RefMut<'_, ImportedDatabase>> {
-        let mut held = self.database.engine.try_borrow_mut().map_err(|_| {
-            misuse(
-                "this connection is already running a statement; a function registered on a \
-                 connection cannot call back into it",
-            )
-        })?;
+        let mut held = self.database.ready()?;
         held.use_session(self.session);
         Ok(held)
     }
@@ -1088,6 +1313,24 @@ impl<'d> Connection<'d> {
         Ok(())
     }
 
+    /// Sets whether a schema is trusted to call functions with side effects,
+    /// as `PRAGMA trusted_schema` does, without compiling the pragma.
+    ///
+    /// The shell turns it off at every open, and running the pragma through
+    /// the compiler was 187 us of a command line call (task-2191).
+    ///
+    /// @param on - whether the schema is trusted
+    pub fn set_trusted_schema(&self, on: bool) -> DbResult<()> {
+        let mut held = self.engine_mut()?;
+        if held.session_state.registry.policy().trusted_schema != on {
+            // The same as the pragma: a compiled statement was bound under the
+            // old setting.
+            held.forget_compiled_statements();
+            held.session_state.registry.policy_mut().trusted_schema = on;
+        }
+        Ok(())
+    }
+
     /// Installs the authorizer every later statement is bound under.
     ///
     /// `sqlite3_set_authorizer`: the callback is consulted before a read, a
@@ -1133,7 +1376,7 @@ impl<'d> Connection<'d> {
     ///
     /// @param sql - the statement text
     pub fn parameter_count(&self, sql: &str) -> DbResult<u32> {
-        self.database.engine.borrow().parameter_count(sql)
+        self.database.ready()?.parameter_count(sql)
     }
 
     /// Returns the named parameters one statement declares, with their indexes.
@@ -1143,7 +1386,7 @@ impl<'d> Connection<'d> {
     ///
     /// @param sql - the statement text
     pub fn parameter_names(&self, sql: &str) -> DbResult<Vec<(Vec<u8>, u32)>> {
-        self.database.engine.borrow().parameter_names(sql)
+        self.database.ready()?.parameter_names(sql)
     }
 
     /// Compiles a statement to be bound and stepped.
@@ -1490,7 +1733,7 @@ impl Statement<'_> {
     /// `sqlite3_step` does the equivalent automatic reprepare.
     pub fn step(&mut self) -> DbResult<bool> {
         if !self.run {
-            let mut held = self.database.engine.borrow_mut();
+            let mut held = self.database.ready()?;
             // The statement runs on the connection that compiled it, because
             // `temp` means that connection's temporary database and the plan was
             // bound against it.
@@ -1556,6 +1799,26 @@ impl Statement<'_> {
         }
     }
 
+    /// Takes the row the last `step` produced out of the statement, and leaves
+    /// an empty row in its place.
+    ///
+    /// **For a caller that keeps every row.** The statement already holds the
+    /// rows it produced, so a caller that copied each one out with
+    /// [`Statement::row`] made a second copy of every text and blob. Taking it
+    /// moves the values instead: a driver collecting a full scan of 10,000 rows
+    /// spent 15% of the scan allocating those copies (task-2191). After this,
+    /// [`Statement::row`] answers the empty row until the next `step`.
+    pub fn take_row(&mut self) -> Vec<OwnedDatum> {
+        match self
+            .at
+            .checked_sub(1)
+            .and_then(|nth| self.rows.get_mut(nth))
+        {
+            Some(row) => std::mem::take(row),
+            None => Vec::new(),
+        }
+    }
+
     /// Returns the result column names, once the statement has been stepped.
     ///
     /// **Empty before the first `step`**, which is where this differs from
@@ -1574,12 +1837,76 @@ impl Statement<'_> {
         self.changed
     }
 
+    /// Reports whether [`Statement::run_rows_at_once`] can run this statement.
+    ///
+    /// See `ImportedDatabase::runs_rows_at_once`: a single row `INSERT` of its
+    /// parameters into a plain table, inside a transaction the caller opened.
+    pub fn can_run_rows_at_once(&mut self) -> DbResult<bool> {
+        let mut held = self.database.ready()?;
+        held.use_session(self.session);
+        if held.schema_generation() != self.generation {
+            self.compiled = held.prepare_statement(&self.sql)?;
+            self.generation = held.schema_generation();
+        }
+        held.runs_rows_at_once(&self.compiled)
+    }
+
+    /// Runs the statement once over many rows of parameters, as one statement.
+    ///
+    /// Returns how many rows it changed, or `None` when it failed and wrote
+    /// nothing, in which case the caller runs the rows one at a time to learn
+    /// which row fails and why. Ask [`Statement::can_run_rows_at_once`] first.
+    ///
+    /// **What `changes()` reports afterwards is the last row's**, one, because
+    /// that is what running the rows one at a time leaves it at; the total is
+    /// returned here and is what `total_changes()` adds.
+    ///
+    /// @param rows - the rows, each one value per parameter
+    pub fn run_rows_at_once(&mut self, rows: Vec<Vec<OwnedDatum>>) -> DbResult<Option<usize>> {
+        let mut held = self.database.ready()?;
+        held.use_session(self.session);
+        let Some(outcome) = held.execute_rows_at_once(&self.compiled, rows)? else {
+            return Ok(None);
+        };
+        self.changed = 1;
+        self.database.changes.set(1);
+        self.rows = Vec::new();
+        self.at = 0;
+        self.run = true;
+        Ok(Some(outcome.changes.rows))
+    }
+
     /// Runs the statement again with the parameters bound since the last run.
     pub fn reset(&mut self) {
         self.run = false;
         self.pending = None;
         self.at = 0;
     }
+}
+
+/// Lifts the literal values out of a single row `INSERT ... VALUES`, and returns
+/// the text with `?1`, `?2` in their place and the values in order.
+///
+/// `None` for anything else, including an insert of several rows. A caller
+/// that holds statements to run as one uses the text to tell which statements
+/// share a shape; see the shell's `deferred` module.
+///
+/// @param sql - the statement
+pub fn lifted_insert(sql: &str) -> Option<(String, Vec<OwnedDatum>)> {
+    let lifted = inillucent_sql::lift::lift_insert_literals(sql)?;
+    if lifted.row_width.is_some() {
+        return None;
+    }
+    let values = lifted
+        .values
+        .into_iter()
+        .map(|value| match value {
+            inillucent_sql::lift::LiftedValue::Integer(value) => OwnedDatum::Int(value),
+            inillucent_sql::lift::LiftedValue::Real(value) => OwnedDatum::Real(value),
+            inillucent_sql::lift::LiftedValue::Text(text) => OwnedDatum::Text(text),
+        })
+        .collect();
+    Some((lifted.text, values))
 }
 
 /// Returns how many bytes at the front of a script are not part of a statement.

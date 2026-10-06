@@ -66,11 +66,14 @@ pub fn insert_cached(
         return insert(statement, target, params, supplied);
     }
     let depth = Depth::outermost(statement.on_conflict);
-    note_single_row(statement, target, depth);
+    note_single_row(statement, target, depth, supplied);
     let written = insert_setup(cache, statement, target, params).and_then(|setup| {
-        let rows: std::borrow::Cow<'_, [Row]> = match &setup.values {
-            Some(values) => std::borrow::Cow::Owned(evaluate_values(values, &setup)?),
-            None => std::borrow::Cow::Borrowed(supplied),
+        // Rows handed in are written as they are, whether the source is a
+        // `SELECT` or a `VALUES` row of parameters run over several rows of
+        // literals (task-2191).
+        let rows: std::borrow::Cow<'_, [Row]> = match (&setup.values, supplied.is_empty()) {
+            (Some(values), true) => std::borrow::Cow::Owned(evaluate_values(values, &setup)?),
+            _ => std::borrow::Cow::Borrowed(supplied),
         };
         insert_rows(statement, target, params, &rows, depth, &setup.compiled)
     });
@@ -154,11 +157,7 @@ fn build_insert_setup(
 fn evaluate_values(values: &[Vec<Box<dyn Eval>>], setup: &InsertSetup) -> DbResult<Vec<Row>> {
     let mut built = Vec::with_capacity(values.len());
     for row in values {
-        let mut cells = Vec::with_capacity(row.len());
-        for eval in row {
-            cells.push(setup.compiled.space.evaluate(eval.as_ref(), &[])?);
-        }
-        built.push(cells);
+        built.push(setup.compiled.space.evaluate_row(row)?);
     }
     Ok(built)
 }

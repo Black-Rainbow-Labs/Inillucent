@@ -162,7 +162,10 @@ impl Pool {
     /// The order is the durability order: data first, then the record that says
     /// the data is there. A crash between them leaves the previous meta page
     /// describing a file whose pages are a superset of what it claims, which is
-    /// exactly what a checkpoint is allowed to leave behind.
+    /// exactly what a checkpoint is allowed to leave behind. Under a rollback
+    /// journal on the disk the two share one sync instead, because the journal
+    /// holds the pre-images of both and puts them back together; see
+    /// `MetaRoute`.
     ///
     /// The record is taken mutably because one of its fields is only knowable
     /// **after** the flush: the high water is the highest stamp any page in the
@@ -186,6 +189,13 @@ impl Pool {
         // writes the meta record, which every reader holding SHARED reads.
         self.hold_for_writing()?;
         self.seal_journal()?;
+        let route = self.meta_route();
+        // Under a rollback journal on the disk the meta slots' pre-images go in
+        // with the pages', so the one seal `flush` makes covers all of them.
+        if route == super::meta_write::MetaRoute::OneSync {
+            self.journal_page(META_PAGE)?;
+            self.journal_page(SHADOW_PAGE)?;
+        }
         self.flush()?;
         // Every page this checkpoint wrote has now raised the high water, so
         // the number recorded here bounds the stamps the file actually holds
@@ -194,111 +204,7 @@ impl Pool {
         meta.high_water_lsn = meta.high_water_lsn.max(self.high_water_lsn.get());
         let mut image = vec![0u8; self.page_size];
         meta.encode(&mut image)?;
-        // **The meta pages are journaled too, and they were the last pages that
-        // were not.** A rollback journal has to hold a pre-image of every page
-        // the checkpoint overwrites, and these two are pages the checkpoint
-        // overwrites. Leaving them out left a crash here able to produce a file
-        // whose data pages the journal put back to before the checkpoint and
-        // whose meta record says the checkpoint finished: the recorded
-        // `checkpoint_lsn` then tells redo that everything up to it is already
-        // in the file, so the records that would have re-applied the pages the
-        // journal just undid are skipped, and the database comes back as
-        // neither its old self nor its new one. It came back with no tables at
-        // all, because the catalog's own page is one of the pages the journal
-        // put back.
-        //
-        // The shadow page does not cover this **under a journal**. Both slots take
-        // the same image, so the second one is not an older copy to fall back on -
-        // it is a second chance for the *new* record to survive, and `Meta::choose`
-        // believing either of them is the failure. What makes the checkpoint
-        // undoable there is the previous record being on the disk in the journal,
-        // which is the same thing that makes every other page undoable.
-        //
-        // Without a journal the same two slots are what protects the record, and the
-        // sync between them is what makes them two states rather than one - which is
-        // the next paragraph.
-        //
-        // **The shadow slot goes first and takes the pages' own sync with it; the
-        // primary follows and takes the second.** Two syncs of the data file, and
-        // one complete meta record on the disk at every instant.
-        //
-        // **Why the order is what it is** (task-2000, design 1a). Without a
-        // rollback journal, nothing else can put the old meta record back, so the
-        // two slots may not be written into one unsynced batch: a crash there can
-        // tear both, and then neither decodes and the file does not open at all.
-        // Splitting the sync between them closes it:
-        //
-        // - a crash before the first sync leaves the primary holding the previous
-        //   record, whole, whatever the shadow's bytes look like. Recovery starts
-        //   from that record's own `checkpoint_lsn` and the after images the fold
-        //   appended before it wrote anything repair every page it had reached.
-        // - a crash between the syncs leaves the shadow holding this record,
-        //   whole, and `Meta::choose` takes it because its generation is higher.
-        //   The first sync covered the pages **and** the shadow together, so a
-        //   shadow that is durable cannot describe a page that is not.
-        // - a crash after the second leaves both, identical.
-        //
-        // **Writing to one slot a fold, alternating by generation, was tried first
-        // and is wrong with two processes.** It looks like the arrangement the two
-        // slots were shaped for, and it saves a write: the new record goes to the
-        // slot not holding the current one, so a torn write always leaves the other
-        // intact. What it misses is that each connection bumps *its own* copy of
-        // the generation. Two processes sharing a file can therefore write records
-        // of the same generation to the same slot, or leave one process's newer
-        // record in the slot `Meta::choose` does not pick - and then that process's
-        // fold is invisible: `checkpoint_lsn`, `page_count` and `free_map` all stay
-        // at the other process's older record, and `the_meta_moved` answers no
-        // because `choose` returns what the asking connection already had. Measured
-        // on two processes each inserting sixty rows into one `ATTACH`ed file: a
-        // hundred and twenty acknowledged, **one** in the file, `ANALYZE`
-        // afterwards reporting the table empty, and every process exit zero. Both
-        // slots taking the same image is what makes a meta record a fact about the
-        // file rather than about the connection that wrote it.
-        //
-        // Under a rollback journal the pre-images are what makes the write
-        // undoable, so both slots are journaled first and written together, exactly
-        // as before - that is the path `journal_mode = delete` is measured on.
-        match self.fold_protected_by_log.get() {
-            // The redo log protects the fold, so the split sync above is what
-            // keeps one record whole. Three writes and two syncs of the data
-            // file: the pages, the shadow slot, one sync; the primary slot, one
-            // sync.
-            true => {
-                self.write_slot_and_sync(SHADOW_PAGE, &image)?;
-                self.write_slot_and_sync(META_PAGE, &image)?;
-            }
-            // Under a rollback journal the pre-images are what makes the write
-            // undoable, so the order `journal_mode = delete` was measured on is
-            // kept: the pages synced on their own, both slots journaled and
-            // sealed, both written, one sync behind them.
-            //
-            // **The shadow is written first here too (task-2181).** The journal
-            // makes the order irrelevant to a crash of the machine, because it
-            // puts both slots back. It is not irrelevant to another process:
-            // a writer killed between the two writes leaves one slot changed in
-            // the page cache, which every other process sees at once, and
-            // `Pool::read_shadow_record` reads only the shadow on every
-            // statement. With the primary first, that reader saw nothing and
-            // went on without looking for the journal the dead writer left.
-            false => {
-                self.file
-                    .sync(SyncMode::Normal)
-                    .map_err(|error| error.into_db_error())?;
-                Counters::add(&self.counters.file_syncs, 1);
-                self.journal_page(META_PAGE)?;
-                self.journal_page(SHADOW_PAGE)?;
-                self.seal_journal()?;
-                for slot in [SHADOW_PAGE, META_PAGE] {
-                    self.file
-                        .write_all_at(slot.0.saturating_mul(self.page_size as u64), &image)
-                        .map_err(|error| error.into_db_error())?;
-                }
-                self.file
-                    .sync(SyncMode::Normal)
-                    .map_err(|error| error.into_db_error())?;
-                Counters::add(&self.counters.file_syncs, 1);
-            }
-        }
+        self.write_meta_record(route, &image)?;
         Counters::add(&self.counters.folds, 1);
         Counters::add(&self.counters.writes, 2);
         // **And disposed of after the meta record is durable**, which is the
@@ -328,7 +234,7 @@ impl Pool {
     ///
     /// @param slot - `META_PAGE` or `SHADOW_PAGE`
     /// @param image - the encoded record, one page long
-    fn write_slot_and_sync(&self, slot: PageId, image: &[u8]) -> DbResult<()> {
+    pub(super) fn write_slot_and_sync(&self, slot: PageId, image: &[u8]) -> DbResult<()> {
         self.file
             .write_all_at(slot.0.saturating_mul(self.page_size as u64), image)
             .map_err(|error| error.into_db_error())?;

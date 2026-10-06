@@ -51,6 +51,11 @@
     Compile and stop: no staging, no signing, no archives. For measuring the
     build.
 
+.PARAMETER NoProfile
+    Build the Windows target with one plain cargo build, the way every release
+    before the profile guided build was made. For iterating on the packaging;
+    a release built this way is slower than one built with the profile.
+
 .NOTES
     THE FIVE BUILDS RUN AT ONCE
 
@@ -65,6 +70,14 @@
     The release profile does not change: fat LTO and one codegen unit are the
     fairness contract every published ratio was measured under.
 
+    THE WINDOWS BUILD IS PROFILE GUIDED
+
+    packaging/pgo/build-windows.ps1 builds it instrumented, runs
+    packaging/pgo/train.mjs against that build, and builds it again with the
+    counts the training wrote. It is started as one process, like the cargo
+    builds, so it still runs beside them. That script says what the profile
+    is worth and why only this target has one.
+
 .EXAMPLE
     pwsh packaging/release-all.ps1
     pwsh packaging/release-all.ps1 -Targets linux
@@ -77,7 +90,8 @@ param(
     [switch] $SkipBuild,
     [switch] $SkipNotarize,
     [switch] $Serial,
-    [switch] $BuildOnly
+    [switch] $BuildOnly,
+    [switch] $NoProfile
 )
 
 $ErrorActionPreference = 'Stop'
@@ -119,6 +133,29 @@ $packages = @(
 # that switching targets does not invalidate the host build.
 $appleLinkArgs = 'target.{0}.rustflags=["-C","link-arg=-Wl,-headerpad_max_install_names"]'
 
+# **What a Windows program loads before `main`, cut to what SQLite's shell loads**
+# (task-2191). A dynamically linked C runtime is VCRUNTIME140 and five
+# api-ms-win-crt sets, and the TLS client `inillucent-remote` uses for a
+# PostgreSQL or MySQL migration imports crypt32, secur32 and ws2_32. Windows
+# loads all of them at every start, and every command line call is a start:
+# `inillucent --version` took 16.54 ms against 15.34 ms for sqlite3.exe, which
+# imports kernel32 alone. A static C runtime and those three loaded on first use
+# made it 15.42 ms, median of 300 starts each. Applied per target, like the
+# Apple padding, so it reaches only the Windows build.
+#
+# `bcrypt.dll` is loaded on first use as well. The file system layer asks it for
+# random bytes only when it creates a database or writes a rollback journal, so
+# a command that reads never loads it. `--version` went from 15.57 ms to
+# 15.26 ms, median of 80 starts each. So is `bcryptprimitives.dll`, which the
+# standard library calls only to seed a hash map: `--version` went from
+# 15.31 ms to 14.98 ms, median of 100 starts each, against 14.95 ms for
+# sqlite3.exe, and a query that does load it was 17.39 ms and 17.35 ms.
+#
+# `/STACK` gives a program's main thread the 64 MiB reserve its statements are
+# sized against, so `on_a_sized_stack` runs the program where it is instead of
+# starting and joining a thread for every call. A library ignores the setting.
+$windowsStartArgs = 'target.{0}.rustflags=["-C","target-feature=+crt-static","-C","link-arg=/DELAYLOAD:crypt32.dll","-C","link-arg=/DELAYLOAD:secur32.dll","-C","link-arg=/DELAYLOAD:ws2_32.dll","-C","link-arg=/DELAYLOAD:bcrypt.dll","-C","link-arg=/DELAYLOAD:bcryptprimitives.dll","-C","link-arg=delayimp.lib","-C","link-arg=/STACK:67108864"]'
+
 function Invoke-CargoZigbuild {
     <#
     .SYNOPSIS
@@ -157,8 +194,38 @@ function Invoke-CargoNative {
     param([string] $Target)
     # onig_sys compiles oniguruma with cl.exe, which needs INCLUDE and LIB from vcvars64.
     Import-MsvcEnvironment
-    & cargo build --manifest-path (Join-Path $root 'Cargo.toml') --release --locked --target $Target @packages
+    if (-not $NoProfile) {
+        $profileArguments = Get-ProfileBuildArguments -Target $Target -Directory $targetDir
+        & (Join-Path $PSScriptRoot 'pgo/build-windows.ps1') -TargetDir $profileArguments[3] `
+            -CargoArgs $profileArguments[5] -RustFlags $profileArguments[7]
+        return
+    }
+    & cargo build --manifest-path (Join-Path $root 'Cargo.toml') --release --locked --target $Target `
+        --config ($windowsStartArgs -f $Target) @packages
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed for $Target with $LASTEXITCODE" }
+}
+
+function Get-ProfileBuildArguments {
+    <#
+    .SYNOPSIS
+        The arguments that start packaging/pgo/build-windows.ps1 for one target directory.
+
+    .DESCRIPTION
+        The cargo arguments and the rustflags go as base64, because `pwsh -File` passes an array as
+        one string and a quote inside an argument is read differently by each layer it crosses.
+
+    .PARAMETER Target
+        The triple.
+
+    .PARAMETER Directory
+        The target directory of the final build.
+    #>
+    param([string] $Target, [string] $Directory)
+    $cargoArguments = @('--manifest-path', (Join-Path $root 'Cargo.toml'), '--release', '--locked', '--target', $Target) + $packages
+    $encode = { param($text) [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($text)) }
+    return @('-File', (Join-Path $PSScriptRoot 'pgo/build-windows.ps1'), '-TargetDir', $Directory,
+        '-CargoArgs', (& $encode (ConvertTo-Json -Compress -InputObject $cargoArguments)),
+        '-RustFlags', (& $encode ($windowsStartArgs -f $Target)))
 }
 
 function Start-ReleaseBuild {
@@ -173,13 +240,18 @@ function Start-ReleaseBuild {
         cargo or cargo-zigbuild.
 
     .PARAMETER Arguments
-        Everything after the program.
+        Everything after the program. With -TargetDirGiven they already name the target directory,
+        which is <parallel root>/<Name>.
+
+    .PARAMETER TargetDirGiven
+        The arguments name the target directory themselves, so `--target-dir` is not added.
     #>
-    param([string] $Name, [string] $Program, [string[]] $Arguments)
+    param([string] $Name, [string] $Program, [string[]] $Arguments, [switch] $TargetDirGiven)
     $directory = Join-Path $parallelRoot $Name
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
     $log = Join-Path $parallelRoot "$Name.log"
-    $quoted = @($Arguments + @('--target-dir', $directory)) | ForEach-Object {
+    $all = if ($TargetDirGiven) { $Arguments } else { @($Arguments + @('--target-dir', $directory)) }
+    $quoted = @($all) | ForEach-Object {
         if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
     }
     $process = Start-Process -FilePath $Program -ArgumentList ($quoted -join ' ') -NoNewWindow -PassThru `
@@ -207,9 +279,13 @@ function Invoke-ParallelBuilds {
     $manifest = @('--manifest-path', (Join-Path $root 'Cargo.toml'))
     $builds = @()
     try {
-        if ($wantWindows) {
+        if ($wantWindows -and -not $NoProfile) {
+            $triple = 'x86_64-pc-windows-msvc'
+            $builds += Start-ReleaseBuild -Name $triple -Program 'pwsh' -TargetDirGiven `
+                -Arguments (@('-NoProfile') + (Get-ProfileBuildArguments -Target $triple -Directory (Join-Path $parallelRoot $triple)))
+        } elseif ($wantWindows) {
             $builds += Start-ReleaseBuild -Name 'x86_64-pc-windows-msvc' -Program 'cargo' `
-                -Arguments (@('build') + $manifest + @('--release', '--locked', '--target', 'x86_64-pc-windows-msvc') + $packages)
+                -Arguments (@('build') + $manifest + @('--release', '--locked', '--target', 'x86_64-pc-windows-msvc', '--config', ($windowsStartArgs -f 'x86_64-pc-windows-msvc')) + $packages)
         }
         if ($wantLinux) {
             foreach ($triple in @('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu')) {

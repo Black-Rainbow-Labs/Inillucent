@@ -56,6 +56,9 @@ mod copies;
 mod cursor;
 mod descent;
 mod occupancy;
+mod shape;
+
+pub(crate) use shape::{LeafHint, LEAF_HINTS};
 mod skip;
 
 pub(crate) use copies::Copies;
@@ -510,8 +513,17 @@ pub struct PagedTree {
     tree_id: u64,
     /// The root page; a one-leaf tree's root is that leaf.
     root: PageId,
-    /// How many interior levels sit above the leaves.
-    height: u16,
+    /// How many interior levels sit above the leaves, and the leftmost leaf,
+    /// once something has asked.
+    ///
+    /// **Read from the file the first time they are wanted, not at attach**
+    /// (task-2191). Both are facts the pages hold, and finding them is a read
+    /// of the root and a descent to the leftmost leaf. An open attaches every
+    /// tree in the file, and those two reads per tree were most of loading the
+    /// schema, for trees the connection then never scanned. `None` means not
+    /// read yet; a split that moves either one updates a value that is known
+    /// and leaves an unknown one for the pages to answer.
+    pub(crate) shape: std::cell::Cell<Option<(u16, PageId)>>,
     /// The column directory.
     columns: Vec<ColumnSpec>,
     /// How many leading columns form the key.
@@ -534,8 +546,6 @@ pub struct PagedTree {
     /// stored in that order rather than stored ascending and reversed on the
     /// way out. See `ColumnSpec::descending`.
     directions: Vec<bool>,
-    /// The leftmost leaf, so a full scan needs no descent.
-    first_leaf: PageId,
     /// How many leaves the tree holds.
     leaf_count: u64,
     /// How many rows the tree holds.
@@ -587,13 +597,14 @@ pub struct PagedTree {
     /// table carrying two secondary indexes, and the two index keys arrive in no
     /// order at all: one hint in three hit, and the other two paid twice.
     ///
-    /// The bytes are the lowest probe this connection has seen descend into the
-    /// hinted leaf, in [`PagedTree::key_encoding`]'s comparable form. A probe that
-    /// descended into a leaf is at or above that leaf's low fence by construction,
-    /// and a rightmost leaf's fence range runs from its low fence to positive
-    /// infinity, so **any key at or above those bytes belongs in the hinted leaf** -
-    /// for as long as the fence has not moved. `memcmp` order is the descent's order
-    /// because that is what the encoding is for.
+    /// The bytes are the hinted leaf's two fences, in [`PagedTree::key_encoding`]'s
+    /// comparable form, read off the interior pages by the descent that reached it:
+    /// the separator below it and the separator above it. **Any key at or above the
+    /// low fence and below the high fence belongs in the hinted leaf** - for as long
+    /// as the fences have not moved. A rightmost leaf has no high fence and a
+    /// leftmost one no low fence. `memcmp` order is the descent's order because that
+    /// is what the encoding is for. Until task-2191 the window was the lowest and
+    /// highest probes seen to land in the leaf, which is a part of the same range.
     ///
     /// Two things keep the fence still, and the hint needs both:
     ///
@@ -675,6 +686,9 @@ pub struct PagedTree {
     /// counters say is not in doubt: 2,074 descents of a root and its interior levels are
     /// not made. What that is worth is a question for the gate.
     pub(crate) leaf_hints: std::cell::RefCell<Vec<LeafHint>>,
+    /// Whether the write in progress adds a key the tree did not hold, which
+    /// is what lets a compaction leave a gap; see `gap_for_growth`.
+    pub(crate) growing: bool,
     /// Which entry of `leaf_hints` the next unknown leaf overwrites, round robin.
     ///
     /// Round robin rather than least recently used: the set is small enough that finding
@@ -682,41 +696,21 @@ pub struct PagedTree {
     /// secondary index walks its leaves in a cycle, which is the case both policies get
     /// right. It is an index into a full set and means nothing until the set is full.
     pub(crate) hint_victim: std::cell::Cell<usize>,
-}
-
-/// How many leaves one connection remembers per tree for its next write.
-///
-/// Eight, because the miss path is what a larger set costs: every entry is two
-/// comparisons against bytes the caller already has, and they are paid in full by a key
-/// that is in none of the windows. Eight covers a secondary index whose rows arrive in
-/// another index's order while leaving that miss at a handful of `memcmp`s.
-pub(crate) const LEAF_HINTS: usize = 8;
-
-/// The leaf a write is likely to want next, and the keys that prove it.
-///
-/// See [`PagedTree::leaf_hint`] for the argument. Held rather than derived because
-/// the proof is two comparisons and deriving it is a descent.
-#[derive(Clone, Debug)]
-pub(crate) struct LeafHint {
-    /// The leaf.
-    pub(crate) page: PageId,
-    /// The lowest probe seen to descend into it, in comparable bytes.
-    pub(crate) low: Vec<u8>,
-    /// The highest probe seen to descend into it.
-    pub(crate) high: Vec<u8>,
-    /// The right sibling it had when it was recorded.
+    /// The largest integer key, the rightmost leaf it was read from, and that
+    /// leaf's log position when it was read.
     ///
-    /// Two jobs. `PageId::NONE` means the leaf was the rightmost one, whose range runs
-    /// to positive infinity, so the high end of the window is unnecessary for it - an
-    /// append is above every probe seen so far and a window would reject it.
-    ///
-    /// And it is **how a split by anybody is detected**. A split of this leaf points it
-    /// at the new page, and a merge changes it too, so a sibling that still matches is
-    /// a leaf whose fence range has not moved since the window was proved. That covers
-    /// the one case the window's own argument cannot: another process splitting this
-    /// leaf between two of our statements. It costs nothing, because the hit path
-    /// already reads this page's header to check the page is still a leaf of this tree.
-    pub(crate) right: PageId,
+    /// **So an insert that numbers its own row does not look for the largest
+    /// key every time** (task-2191). An `INSERT` that leaves the rowid out
+    /// takes one past the largest, and finding it is a descent to the rightmost
+    /// leaf and a read of its keys, per row: 7% of a script of single row
+    /// inserts. The answer only changes when the rightmost leaf does, and every
+    /// change to a page writes the log position of the record that made it
+    /// into the page, so a leaf that is still the rightmost leaf of this tree
+    /// and still carries the position it had is a leaf whose keys are the ones
+    /// that were read. A rollback that puts an older image back puts an older
+    /// position back with it, and another process's write carries its own
+    /// position. See [`PagedTree::hinted_largest_key`].
+    pub(crate) largest_hint: std::cell::Cell<Option<shape::LargestHint>>,
 }
 
 /// How many key-prefix columns a skip scan borrows on the stack.
@@ -780,13 +774,6 @@ impl PagedTree {
         leaf_count: u64,
         row_count: u64,
     ) -> DbResult<PagedTree> {
-        let guard = pool.fetch(root)?;
-        let height = match page::kind_of(&guard)? {
-            PageKind::Leaf => 0,
-            PageKind::Interior => page::level_of(&guard)?,
-            other => return Err(corrupt(format!("a tree root cannot be {other:?}"))),
-        };
-        drop(guard);
         // **The leftmost leaf is read out of the file, never taken on trust.**
         // The height above already is, and the first leaf is the same kind of
         // fact: the file knows it and a recorded copy can be stale.
@@ -802,26 +789,26 @@ impl PagedTree {
         // reopened with `first_leaf` naming the root, which is now an interior,
         // and every read of it failed with "page is not a leaf". Fifty rows was
         // enough. Deriving it costs one descent per tree per open.
-        let first_leaf = PagedTree::leftmost_leaf(pool, root)?;
         let encoding = KeyEncoding::choose(&columns, key_columns);
         let collations = collations_of(&columns, key_columns);
         let directions = directions_of(&columns, key_columns);
         Ok(PagedTree {
             tree_id,
             root,
-            height,
+            shape: std::cell::Cell::new(None),
             columns,
             key_columns,
             page_size: pool.page_size(),
             encoding,
             collations,
             directions,
-            first_leaf,
             leaf_count,
             row_count,
             scratch: RefCell::new(Vec::new()),
             leaf_hints: std::cell::RefCell::new(Vec::new()),
+            growing: false,
             hint_victim: std::cell::Cell::new(0),
+            largest_hint: std::cell::Cell::new(None),
             stats: std::cell::Cell::new(crate::write::WriteStats::default()),
             last_leaf: std::cell::Cell::new(None),
         })
@@ -838,8 +825,10 @@ impl PagedTree {
     }
 
     /// Returns how many interior levels sit above the leaves.
-    pub fn height(&self) -> u16 {
-        self.height
+    ///
+    /// @param pool - the buffer pool, read the first time it is asked
+    pub fn height(&self, pool: &Pool) -> DbResult<u16> {
+        self.shape(pool).map(|(height, _)| height)
     }
 
     /// Returns the column directory.
@@ -877,14 +866,18 @@ impl PagedTree {
     ///
     /// @param leaf - the new leftmost leaf
     pub(crate) fn note_first_leaf(&mut self, leaf: PageId) {
-        self.first_leaf = leaf;
+        if let Some((height, _)) = self.shape.get() {
+            self.shape.set(Some((height, leaf)));
+        }
     }
 
     /// Records that the tree got taller.
     ///
     /// @param height - the new height
     pub(crate) fn note_height(&mut self, height: u16) {
-        self.height = height;
+        if let Some((_, leaf)) = self.shape.get() {
+            self.shape.set(Some((height, leaf)));
+        }
     }
 
     /// Adjusts the leaf count by a signed amount.
@@ -1009,9 +1002,10 @@ impl PagedTree {
         let mut chain = 0u64;
         // The message names both leaves (task-2150); the visitor is not told its
         // page, so the walk is followed here by the sibling links it takes.
-        let mut at = self.first_leaf;
+        let (height, first_leaf) = self.shape(pool)?;
+        let mut at = first_leaf;
         let mut previous_leaf = PageId::NONE;
-        self.visit_from_reading(pool, self.first_leaf, Copies::Refused, true, &mut |leaf| {
+        self.visit_from_reading(pool, first_leaf, Copies::Refused, true, &mut |leaf| {
             leaf.integrity()?;
             chain = chain.saturating_add(1);
             for row in leaf.live()? {
@@ -1051,7 +1045,7 @@ impl PagedTree {
                 "the sibling chain visits {chain} leaves and the interior levels reach {reachable}"
             )));
         }
-        self.check_subtree(pool, self.root, self.height)?;
+        self.check_subtree(pool, self.root, height)?;
         Ok(())
     }
 
@@ -1481,7 +1475,11 @@ mod tests {
     #[test]
     fn a_multi_level_tree_scans_in_order() {
         let (database, tree, rows) = build(4_000, 512);
-        assert!(tree.height() >= 2, "height is {}", tree.height());
+        assert!(
+            tree.height(database.pool()).unwrap() >= 2,
+            "height is {}",
+            tree.height(database.pool()).unwrap()
+        );
         assert!(tree.leaf_count() > 100);
         tree.check(database.pool()).unwrap();
         let scanned = tree.rows(database.pool()).unwrap();
@@ -1630,7 +1628,7 @@ mod tests {
             .collect();
         let tree = PagedTree::bulk_build(&mut database, 11, columns, 2, &borrowed).unwrap();
         assert_eq!(tree.key_encoding(), KeyEncoding::General);
-        assert!(tree.height() >= 1);
+        assert!(tree.height(database.pool()).unwrap() >= 1);
         tree.check(database.pool()).unwrap();
         for index in (0..owned.len()).step_by(11) {
             let probe: Vec<Datum<'_>> = owned[index].iter().map(OwnedDatum::borrow).collect();
@@ -2033,9 +2031,9 @@ mod tests {
         assert_eq!(distinct.len(), 64, "one row read per distinct value");
         let fetches = database.pool().stats().hits + database.pool().stats().misses;
         assert!(
-            fetches < 64 * u64::from(tree.height() + 3),
+            fetches < 64 * u64::from(tree.height(database.pool()).unwrap() + 3),
             "a skip scan made {fetches} fetches for 64 seeks down {} levels",
-            tree.height()
+            tree.height(database.pool()).unwrap()
         );
         // Stopping early stops.
         let mut count = 0usize;
@@ -2072,9 +2070,9 @@ mod tests {
     #[test]
     fn a_single_leaf_tree_is_its_own_root() {
         let (database, tree, _) = build(3, 8_192);
-        assert_eq!(tree.height(), 0);
+        assert_eq!(tree.height(database.pool()).unwrap(), 0);
         assert_eq!(tree.leaf_count(), 1);
-        assert_eq!(tree.root(), tree.first_leaf());
+        assert_eq!(tree.root(), tree.first_leaf(database.pool()).unwrap());
         tree.check(database.pool()).unwrap();
         assert!(tree
             .point(database.pool(), &[Datum::Int(1)])
@@ -2278,7 +2276,9 @@ mod tests {
         assert!(tree.check(pool).is_err(), "the checker missed it");
     }
 
-    /// The attach path refuses a root that is not a tree page.
+    /// A root that is not a tree page is refused the first time the tree is
+    /// read. Attach reads no page since the tree's shape became lazy
+    /// (task-2191), so the refusal comes from the first read of the root.
     #[test]
     fn attaching_to_a_page_that_is_not_a_root_is_refused() {
         let vfs = MemoryVfs::new();
@@ -2289,6 +2289,8 @@ mod tests {
         let mut image = vec![0u8; 512];
         page::write_common(&mut image, PageKind::BlobExtent, 0, 1).unwrap();
         database.install(page, &image).unwrap();
-        assert!(PagedTree::attach(database.pool(), 1, page, rowid_columns(), 1, 0, 0).is_err());
+        let tree = PagedTree::attach(database.pool(), 1, page, rowid_columns(), 1, 0, 0).unwrap();
+        assert!(tree.first_leaf(database.pool()).is_err());
+        assert!(tree.height(database.pool()).is_err());
     }
 }

@@ -524,11 +524,14 @@ may_depend_on = ["inillucent-engine"]
 # the workspace with `unsafe` in it, and it must be able to depend on nothing
 # but the driver so that a marshalling layer cannot quietly start deciding
 # something. Every language that is not Rust reaches the engine through this.
+# `inillucent-alloc` is the one other edge: the library installs its shared
+# allocator, and that crate depends on nothing, so the edge reaches no engine
+# code.
 [[crate]]
 name = "inillucent-driver-capi"
 kind = "production"
 layer = 10
-may_depend_on = ["inillucent-driver"]
+may_depend_on = ["inillucent-driver", "inillucent-alloc"]
 
 # The command surface: the sqlite3-shaped shell, the verb-shaped `inillucent`
 # binary and the MCP server, which are three front ends over one command table.

@@ -253,7 +253,9 @@ fn run(fold: bool) -> Run {
     let mut tree = attach(&engine, root);
     // Height counts interior levels, so one is a root above the leaves.
     assert_eq!(
-        tree.height(),
+        engine
+            .with_pool(|pool| tree.height(pool))
+            .expect("the height"),
         1,
         "the tree is not two levels, so no parent fits"
     );

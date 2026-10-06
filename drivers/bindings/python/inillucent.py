@@ -33,6 +33,7 @@ call on it yourself. There is no lock inside.
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import sys
 from ctypes import (
@@ -348,6 +349,34 @@ def _declare(lib: ctypes.CDLL) -> None:
     lib.inillucent_error_free.argtypes = [c_void_p]
     lib.inillucent_error_free.restype = None
 
+    # ABI 1.3.0: a whole result, or a whole list of parameters, as one JSON
+    # text. A library older than that has none of the three, and the binding
+    # then reads cell by cell and binds value by value, as it always did.
+    if hasattr(lib, "inillucent_rows_json"):
+        lib.inillucent_rows_json.argtypes = [c_void_p, POINTER(c_size_t)]
+        lib.inillucent_rows_json.restype = c_void_p
+        lib.inillucent_bind_json.argtypes = [c_void_p, c_char_p, c_size_t, POINTER(c_void_p)]
+        lib.inillucent_bind_json.restype = c_int32
+        lib.inillucent_stmt_execute_many.argtypes = [
+            c_void_p,
+            c_char_p,
+            c_size_t,
+            POINTER(c_uint64),
+            POINTER(c_void_p),
+        ]
+        lib.inillucent_stmt_execute_many.restype = c_int32
+    if hasattr(lib, "inillucent_py_init"):
+        lib.inillucent_py_init.argtypes = [POINTER(c_void_p), c_size_t]
+        lib.inillucent_py_init.restype = c_int32
+    if hasattr(lib, "inillucent_stmt_execute_params"):
+        lib.inillucent_stmt_execute_params.argtypes = [
+            c_void_p,
+            c_void_p,
+            POINTER(c_uint64),
+            POINTER(c_void_p),
+        ]
+        lib.inillucent_stmt_execute_params.restype = c_int32
+
 
 def _load() -> ctypes.CDLL:
     """Load the library and refuse an ABI whose major is not ours.
@@ -369,6 +398,203 @@ def _load() -> ctypes.CDLL:
 
 
 _LIB = _load()
+
+# Whether the library reads and binds whole results as JSON (ABI 1.3.0).
+_JSON = hasattr(_LIB, "inillucent_rows_json")
+
+# The CPython functions `inillucent_rows_py` builds a result with, in the order
+# `inillucent_py_init` takes them.
+_PY_API = (
+    "PyList_New",
+    "PyList_SetItem",
+    "PyLong_FromLongLong",
+    "PyFloat_FromDouble",
+    "PyUnicode_FromStringAndSize",
+    "PyBytes_FromStringAndSize",
+    "Py_IncRef",
+    "Py_DecRef",
+    "PyErr_SetString",
+)
+
+
+def _python_objects() -> "Optional[ctypes.PyDLL]":
+    """Let the library build results as Python objects, when it can.
+
+    **The fastest way a result crosses** (task-2191). The library builds each
+    value with CPython's own constructors, the way Python's ``sqlite3`` module
+    does, so there is no text to write and parse. It needs the constructors'
+    addresses, which ``ctypes.pythonapi`` has in CPython and nowhere else, and it
+    has to be called through ``ctypes.PyDLL`` so the interpreter lock is held
+    while it runs. Under another Python, or an older library, this answers
+    ``None`` and results cross as JSON.
+    """
+    if not hasattr(_LIB, "inillucent_rows_py") or sys.implementation.name != "cpython":
+        return None
+    try:
+        api = ctypes.pythonapi
+        addresses = [ctypes.cast(getattr(api, name), c_void_p).value for name in _PY_API]
+        # The two objects through the interpreter's exported symbols, which is
+        # how the limited API names them, rather than through `id`, which is an
+        # address only by CPython's own choice.
+        none = ctypes.addressof(c_void_p.in_dll(api, "_Py_NoneStruct"))
+        error_type = c_void_p.in_dll(api, "PyExc_RuntimeError").value
+    except (AttributeError, ValueError):
+        return None
+    if none != id(None) or error_type != id(RuntimeError):
+        return None
+    addresses += [none, error_type]
+    table = (c_void_p * len(addresses))(*addresses)
+    if _LIB.inillucent_py_init(table, len(addresses)) != OK:
+        return None
+    holding = ctypes.PyDLL(_LIB._name)
+    holding.inillucent_rows_py.argtypes = [c_void_p]
+    holding.inillucent_rows_py.restype = ctypes.py_object
+    return holding
+
+
+_PY = _python_objects()
+
+# The CPython readers `inillucent_py_init_params` takes, in its order. The
+# types and `None` follow, from the interpreter's exported symbols.
+_PY_READ_API = (
+    "PyList_Size",
+    "PyList_GetItem",
+    "PyTuple_Size",
+    "PyTuple_GetItem",
+    "PyLong_AsLongLong",
+    "PyFloat_AsDouble",
+    "PyUnicode_AsUTF8AndSize",
+    "PyBytes_AsStringAndSize",
+    "PyErr_Clear",
+    "PyErr_Occurred",
+)
+
+# The types those readers are used on, by exported symbol, with the object each
+# one has to be, so a symbol that is not the type it names is caught here.
+_PY_READ_TYPES = (
+    ("PyList_Type", list),
+    ("PyTuple_Type", tuple),
+    ("PyLong_Type", int),
+    ("PyBool_Type", bool),
+    ("PyFloat_Type", float),
+    ("PyUnicode_Type", str),
+    ("PyBytes_Type", bytes),
+    ("_PyNone_Type", type(None)),
+)
+
+
+def _python_params() -> "Optional[ctypes.PyDLL]":
+    """Let the library read ``execute_many``'s rows out of Python objects,
+    when it can.
+
+    **Rows cross without JSON** (task-2191). ``json.dumps`` of 10,000 rows and
+    the library's parse of it were about 5 ms of a 22 ms ``execute_many``; the
+    library now reads each value with CPython's own readers, the way Python's
+    ``sqlite3`` module binds. A batch it cannot read, such as one holding
+    ``bytearray`` or an integer wider than 64 bits, still crosses as JSON, so
+    every refusal is the one it was. Under another Python, or an older library,
+    this answers ``None`` and every batch crosses as JSON.
+    """
+    if not hasattr(_LIB, "inillucent_py_params") or sys.implementation.name != "cpython":
+        return None
+    try:
+        api = ctypes.pythonapi
+        addresses = [ctypes.cast(getattr(api, name), c_void_p).value for name in _PY_READ_API]
+        for symbol, kind in _PY_READ_TYPES:
+            address = ctypes.addressof(c_void_p.in_dll(api, symbol))
+            if address != id(kind):
+                return None
+            addresses.append(address)
+        # The library takes the interpreter lock back with these when a batch's
+        # one statement fails and it reads the rows a second time to run them
+        # one at a time; it runs them without the lock.
+        addresses += [ctypes.cast(api.PyGILState_Ensure, c_void_p).value]
+        addresses += [ctypes.cast(api.PyGILState_Release, c_void_p).value]
+        none = ctypes.addressof(c_void_p.in_dll(api, "_Py_NoneStruct"))
+    except (AttributeError, ValueError):
+        return None
+    if none != id(None):
+        return None
+    addresses.append(none)
+    holding = ctypes.PyDLL(_LIB._name)
+    holding.inillucent_py_init_params.argtypes = [POINTER(c_void_p), c_size_t]
+    holding.inillucent_py_init_params.restype = c_int32
+    table = (c_void_p * len(addresses))(*addresses)
+    if holding.inillucent_py_init_params(table, len(addresses)) != OK:
+        return None
+    holding.inillucent_py_params.argtypes = [ctypes.py_object]
+    holding.inillucent_py_params.restype = c_void_p
+    return holding
+
+
+_PARAMS = _python_params()
+
+# The Python types a parameter may be, which `json.dumps` writes as the JSON the
+# library reads. Anything else is refused by `_bind`'s rule, before it is sent.
+_PLAIN = (type(None), bool, int, float, str)
+
+# The same types as a set, for the check `_rows_to_wire` makes of a whole batch
+# at once. Exact types only: a subclass of `int` takes the slower path, where
+# `isinstance` admits it.
+_PLAIN_TYPES = frozenset(_PLAIN)
+
+
+def _from_wire(held: dict) -> Any:
+    """Turn the one object form a result value has back into the value.
+
+    ``{"blob": "<hex>"}`` is bytes and ``{"real": "Infinity"}`` is a float JSON
+    cannot spell. ``json.loads`` calls this for every object, which is one for
+    the result itself and one for each blob or infinity in it; the result has
+    eight keys, so it is handed back as it is.
+    """
+    if len(held) == 1:
+        if "blob" in held:
+            return bytes.fromhex(held["blob"])
+        if "real" in held:
+            return float(held["real"])
+    return held
+
+
+def _to_wire(params: Sequence[Any]) -> bytes:
+    """Write one execution's parameters as the JSON array the library binds.
+
+    A value of a type the driver has no rule for is refused with the same
+    ``TypeError`` binding it one at a time raises, because ``json.dumps`` would
+    otherwise write a list or a dict as JSON and send a structure where a value
+    was meant.
+    """
+    values = list(params)
+    for nth, value in enumerate(values):
+        if not isinstance(value, _PLAIN):
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                values[nth] = {"blob": bytes(value).hex()}
+            else:
+                _refuse_type(value)
+    return json.dumps(values, ensure_ascii=False).encode("utf-8")
+
+
+def _rows_to_wire(rows: Sequence[Sequence[Any]]) -> bytes:
+    """Write many executions' parameters as one JSON array of arrays.
+
+    **One ``json.dumps`` for the batch when every value is a plain type**, which
+    is the usual case and is decided by a set of the types rather than a Python
+    loop over the values. Encoding each row by itself was a third of the time an
+    ``execute_many`` of 10,000 inserts spent (task-2191). A batch holding bytes
+    or anything else takes the row by row path, which converts the bytes and
+    refuses the rest.
+    """
+    if {type(value) for row in rows for value in row} <= _PLAIN_TYPES:
+        return json.dumps(rows, ensure_ascii=False).encode("utf-8")
+    return b"[" + b",".join(_to_wire(row) for row in rows) + b"]"
+
+
+def _refuse_type(value: Any) -> None:
+    """Raise the error for a parameter of a type the driver cannot bind."""
+    raise TypeError(
+        f"cannot bind a {type(value).__name__}; the driver has NULL, integers, "
+        "floats, text and bytes, and converting anything else would be this "
+        "binding deciding what your value means"
+    )
 
 
 def _raise(error: c_void_p) -> None:
@@ -473,6 +699,12 @@ class Rows:
     """
 
     def __init__(self, handle: c_void_p) -> None:
+        if _PY is not None:
+            self._read_python(handle)
+            return
+        if _JSON:
+            self._read_json(handle)
+            return
         try:
             count = _LIB.inillucent_rows_column_count(handle)
             self.columns = [
@@ -494,6 +726,48 @@ class Rows:
         finally:
             _LIB.inillucent_rows_free(handle)
 
+    def _read_python(self, handle: c_void_p) -> None:
+        """Read the whole result in one call, built as Python objects."""
+        try:
+            whole = _PY.inillucent_rows_py(handle)
+        finally:
+            _LIB.inillucent_rows_free(handle)
+        (
+            self.columns,
+            self.column_types,
+            self.rows,
+            self.total,
+            more,
+            self.affected,
+            self.elapsed_us,
+            self.tag,
+        ) = whole
+        self.more = bool(more)
+
+    def _read_json(self, handle: c_void_p) -> None:
+        """Read the whole result in one call, as JSON.
+
+        Two foreign calls a cell took 170 ms for 20,000 rows of five columns
+        where the engine took 12 ms (task-2191). ``json.loads`` is written in C,
+        so the result crosses in one call and is parsed at C speed.
+        """
+        try:
+            length = c_size_t()
+            pointer = _LIB.inillucent_rows_json(handle, ctypes.byref(length))
+            if not pointer:
+                raise DriverError(INTERNAL, "the library returned no JSON for a result")
+            whole = json.loads(ctypes.string_at(pointer, length.value), object_hook=_from_wire)
+        finally:
+            _LIB.inillucent_rows_free(handle)
+        self.columns = whole["columns"]
+        self.column_types = whole["types"]
+        self.rows = whole["rows"]
+        self.total = whole["total"]
+        self.more = whole["more"]
+        self.affected = whole["affected"]
+        self.elapsed_us = whole["elapsed_us"]
+        self.tag = whole["tag"]
+
     @staticmethod
     def _value(handle: c_void_p, row: int, column: int) -> Any:
         """Read one cell, as the kind it actually is."""
@@ -508,7 +782,7 @@ class Rows:
         pointer = _LIB.inillucent_value_bytes(handle, row, column, ctypes.byref(length))
         if not pointer:
             return None
-        raw = bytes(bytearray(pointer[: length.value]))
+        raw = ctypes.string_at(pointer, length.value)
         # Text is NOT NUL-terminated and may contain a NUL byte, which is why
         # the length is read rather than the string scanned.
         return raw.decode("utf-8") if kind == TEXT else raw
@@ -596,9 +870,51 @@ class Connection:
     one of those orders frees a database with a live connection on it.
     """
 
+    # How many prepared statements `execute` keeps, by their text. Python's own
+    # sqlite3 module keeps 128 by default; a connection that runs the same few
+    # statements in a loop is the case both serve.
+    STATEMENT_CACHE = 128
+
     def __init__(self, database: "Database", handle: c_void_p) -> None:
         self._database = database
         self._handle = handle
+        self._statements: "dict[str, Statement]" = {}
+
+    def _cached(self, sql: str) -> "Statement":
+        """Return a prepared statement for this text, preparing it once.
+
+        **The statement is kept, not prepared and freed for every call.** That
+        was three foreign calls a statement on top of the execution, and an
+        ``execute`` with parameters in a loop is what an application does most.
+        The engine already keeps the compiled plan by its text, so a kept handle
+        is only the binding's half of the same saving. When the cache is full it
+        is emptied, which is the rule the engine's own plan cache follows: a
+        recompile is the cost of being wrong, and tracking which statement was
+        used last would be a cost on every call.
+        """
+        statement = self._statements.get(sql)
+        if statement is None:
+            if len(self._statements) >= self.STATEMENT_CACHE:
+                self._drop_statements()
+            statement = self.prepare(sql)
+            self._statements[sql] = statement
+        return statement
+
+    def _drop_statements(self) -> None:
+        """Free every statement `execute` kept."""
+        for statement in self._statements.values():
+            statement.close()
+        self._statements.clear()
+
+    def execute_many(self, sql: str, rows: Sequence[Sequence[Any]]) -> int:
+        """Run one statement once for each list of parameters, and return the
+        rows changed in all.
+
+        Python's ``executemany``. Nothing is wrapped in a transaction the caller
+        did not open, so outside one each execution commits by itself; open a
+        :meth:`transaction` around it to write them together.
+        """
+        return self._cached(sql).execute_many(rows)
 
     def execute(self, sql: str, params: Sequence[Any] = (), limit: Optional[int] = None) -> Rows:
         """Run one statement and return everything it produced.
@@ -616,11 +932,7 @@ class Connection:
             )
             _check(status, error)
             return Rows(rows)
-        statement = self.prepare(sql)
-        try:
-            return statement.execute(params, limit)
-        finally:
-            statement.close()
+        return self._cached(sql).execute(params, limit)
 
     def execute_batch(self, sql: str) -> None:
         """Run several statements separated by semicolons, for their effect."""
@@ -677,6 +989,9 @@ class Connection:
 
     def close(self) -> None:
         if self._handle:
+            # The statements first: each holds the connection's session, and a
+            # statement freed after its connection would be the dangling one.
+            self._drop_statements()
             _LIB.inillucent_conn_free(self._handle)
             self._handle = None
 
@@ -700,9 +1015,14 @@ class Statement:
 
     def execute(self, params: Sequence[Any] = (), limit: Optional[int] = None) -> Rows:
         """Bind these values and run it."""
-        _LIB.inillucent_clear_bindings(self._handle)
-        for nth, value in enumerate(params, start=1):
-            self._bind(nth, value)
+        if _JSON:
+            wire = _to_wire(params)
+            error = c_void_p()
+            _check(_LIB.inillucent_bind_json(self._handle, wire, len(wire), ctypes.byref(error)), error)
+        else:
+            _LIB.inillucent_clear_bindings(self._handle)
+            for nth, value in enumerate(params, start=1):
+                self._bind(nth, value)
         capped = (1 << 64) - 1 if limit is None else limit
         rows = c_void_p()
         error = c_void_p()
@@ -711,6 +1031,40 @@ class Statement:
         )
         _check(status, error)
         return Rows(rows)
+
+    def execute_many(self, rows: Sequence[Sequence[Any]]) -> int:
+        """Run it once for each list of parameters, and return the rows changed
+        in all.
+
+        One foreign call for every execution when the library has
+        ``inillucent_stmt_execute_many`` (ABI 1.3.0), where binding and running
+        each one was a call a value and two more a row. No transaction is opened.
+        """
+        if not _JSON:
+            changed = 0
+            for row in rows:
+                changed += self.execute(row, 0).affected or 0
+            return changed
+        if _PARAMS is not None:
+            # Read with the interpreter lock held, run without it. Null means
+            # the rows hold something only the JSON path reads.
+            params = _PARAMS.inillucent_py_params(rows)
+            if params:
+                changed = c_uint64()
+                error = c_void_p()
+                status = _LIB.inillucent_stmt_execute_params(
+                    self._handle, params, ctypes.byref(changed), ctypes.byref(error)
+                )
+                _check(status, error)
+                return changed.value
+        wire = _rows_to_wire(rows)
+        changed = c_uint64()
+        error = c_void_p()
+        status = _LIB.inillucent_stmt_execute_many(
+            self._handle, wire, len(wire), ctypes.byref(changed), ctypes.byref(error)
+        )
+        _check(status, error)
+        return changed.value
 
     def _bind(self, index: int, value: Any) -> None:
         """Bind one value, choosing the call by the Python type.
@@ -734,11 +1088,7 @@ class Statement:
             buffer = (c_uint8 * len(raw)).from_buffer_copy(raw) if raw else (c_uint8 * 0)()
             _LIB.inillucent_bind_blob(self._handle, index, buffer, len(raw))
         else:
-            raise TypeError(
-                f"cannot bind a {type(value).__name__}; the driver has NULL, integers, "
-                "floats, text and bytes, and converting anything else would be this "
-                "binding deciding what your value means"
-            )
+            _refuse_type(value)
 
     def close(self) -> None:
         if self._handle:

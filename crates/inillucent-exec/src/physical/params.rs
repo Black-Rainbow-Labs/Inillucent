@@ -224,6 +224,14 @@ pub struct Params {
     /// and `new` runs on every prepare, so allocating it there cost every
     /// compile one allocation (the compile budget test counts them).
     shared_rows: std::cell::OnceCell<std::rc::Rc<std::cell::RefCell<SharedRows>>>,
+    /// Rows an `INSERT ... VALUES` takes in place of evaluating its one row.
+    ///
+    /// **Several rows of literals run through a one row template** (task-2191).
+    /// The engine compiles `VALUES (?1, ..., ?N)` once and hands the rows the
+    /// caller wrote here; see `inillucent_sql::lift`. A copy of the set starts
+    /// with none, because the rows belong to the one execution they were
+    /// supplied for.
+    supplied_rows: std::cell::RefCell<Option<Vec<Vec<OwnedDatum>>>>,
 }
 
 /// The rows of the common table expressions an execution has evaluated.
@@ -259,6 +267,7 @@ impl Clone for Params {
             keeps_types: self.keeps_types.clone(),
             subqueries: self.subqueries.clone(),
             shared_rows: self.copy_of_shared_rows(),
+            supplied_rows: std::cell::RefCell::new(None),
         }
     }
 }
@@ -274,6 +283,7 @@ impl Params {
             keeps_types: std::cell::Cell::new(false),
             subqueries: Vec::new(),
             shared_rows: std::cell::OnceCell::new(),
+            supplied_rows: std::cell::RefCell::new(None),
         }
     }
 
@@ -290,6 +300,7 @@ impl Params {
             keeps_types: std::cell::Cell::new(false),
             subqueries: Vec::new(),
             shared_rows: std::cell::OnceCell::new(),
+            supplied_rows: std::cell::RefCell::new(None),
         }
     }
 
@@ -309,6 +320,7 @@ impl Params {
             keeps_types: self.keeps_types.clone(),
             subqueries,
             shared_rows: self.copy_of_shared_rows(),
+            supplied_rows: std::cell::RefCell::new(None),
         }
     }
 
@@ -334,6 +346,7 @@ impl Params {
             keeps_types: self.keeps_types.clone(),
             subqueries: Vec::new(),
             shared_rows: self.copy_of_shared_rows(),
+            supplied_rows: std::cell::RefCell::new(None),
         }
     }
 
@@ -373,6 +386,19 @@ impl Params {
     /// applying the columns' affinity.
     pub fn keeps_supplied_types(&self) -> bool {
         self.keeps_types.get()
+    }
+
+    /// Hands an `INSERT ... VALUES` the rows it writes, in place of evaluating
+    /// its one row of parameters. See the field.
+    ///
+    /// @param rows - the rows, each as wide as the statement's `VALUES` row
+    pub fn supply_rows(&self, rows: Vec<Vec<OwnedDatum>>) {
+        *self.supplied_rows.borrow_mut() = Some(rows);
+    }
+
+    /// Takes the rows [`Params::supply_rows`] handed over, if any.
+    pub fn take_supplied_rows(&self) -> Option<Vec<Vec<OwnedDatum>>> {
+        self.supplied_rows.borrow_mut().take()
     }
 
     /// Returns the rows a shared common table expression already produced in

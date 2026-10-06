@@ -24,6 +24,50 @@ mod platform;
 
 pub use platform::system_randomness;
 
+/// What a path names, as [`path_state`] answers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PathState {
+    /// Whether it may not be written.
+    pub read_only: bool,
+    /// Whether it is a file rather than a directory.
+    pub file: bool,
+}
+
+impl PathState {
+    /// Reads the two answers out of the standard library's metadata.
+    ///
+    /// @param metadata - what the standard library found
+    pub(crate) fn of(metadata: &std::fs::Metadata) -> PathState {
+        PathState {
+            read_only: metadata.permissions().readonly(),
+            file: metadata.is_file(),
+        }
+    }
+}
+
+/// Reports whether a path names something, and what, or `None` when nothing
+/// is there.
+///
+/// The light query each platform has: see the Windows module for why it is not
+/// `std::fs::metadata` there.
+///
+/// @param path - the path to ask about
+pub fn path_state(path: &std::path::Path) -> std::io::Result<Option<PathState>> {
+    platform::path_state(path)
+}
+
+/// Returns the names in a directory that start with a prefix, asking the file
+/// system for only those where the platform can.
+///
+/// @param directory - the directory to list
+/// @param prefix - what every returned name starts with
+pub fn names_starting_with(
+    directory: &std::path::Path,
+    prefix: &str,
+) -> std::io::Result<Vec<String>> {
+    platform::names_starting_with(directory, prefix)
+}
+
 /// Returns the units, laid out `stride` bytes apart from `base`, that hold any
 /// byte the locking protocol locks.
 ///
@@ -168,7 +212,7 @@ impl Vfs for OsVfs {
         let creating = !options.read_only
             && (options.create || options.exclusive)
             && options.kind.survives_a_restart()
-            && !path.as_path().exists();
+            && !matches!(platform::path_state(path.as_path()), Ok(Some(_)));
         let file = fs_options
             .open(path.as_path())
             .map_err(|error| VfsError::from_io(VfsOperation::Open, &error).about(path.as_path()))?;
@@ -183,10 +227,14 @@ impl Vfs for OsVfs {
         if creating {
             self.force_the_directory_entry(path)?;
         }
-        let identity = platform::file_identity(&file)?;
         let file = Arc::new(file);
+        let (locks, known) = platform::lock_state(&file, next_handle())?;
+        let identity = std::sync::OnceLock::new();
+        if let Some(known) = known {
+            let _ = identity.set(known);
+        }
         Ok(Box::new(OsFile {
-            locks: platform::LockState::new(identity.clone(), next_handle(), Arc::clone(&file)),
+            locks,
             file,
             path: path.clone(),
             options,
@@ -233,16 +281,16 @@ impl Vfs for OsVfs {
         if crate::confine::authorize(path).is_err() {
             return Ok(false);
         }
-        let metadata = match std::fs::metadata(path.as_path()) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        let read_only = match platform::path_state(path.as_path()) {
+            Ok(Some(state)) => state.read_only,
+            Ok(None) => return Ok(false),
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(false),
             Err(error) => return Err(VfsError::from_io(VfsOperation::Access, &error)),
         };
         Ok(match mode {
             AccessMode::Exists => true,
             AccessMode::ReadOnly => true,
-            AccessMode::ReadWrite => !metadata.permissions().readonly(),
+            AccessMode::ReadWrite => !read_only,
         })
     }
 
@@ -329,7 +377,10 @@ pub struct OsFile {
     file: Arc<File>,
     path: DbPath,
     options: OpenOptions,
-    identity: FileIdentity,
+    /// Read at the open where the platform's locks are keyed by it, and at
+    /// the first `file_identity` call where they are not; see
+    /// `platform::lock_state`.
+    identity: std::sync::OnceLock<FileIdentity>,
     locks: platform::LockState,
     shm: Mutex<Option<Arc<dyn SharedMemory>>>,
 }
@@ -372,6 +423,58 @@ impl VfsFile for OsFile {
             return Err(error::short_read(format!(
                 "read {filled} of {} bytes at {offset}",
                 output.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reads exactly `len` bytes at `offset` into `buffer`'s reserved space
+    /// when it does not already hold them, so a new buffer is not zero filled
+    /// only to be read over. See [`VfsFile::read_exact_into`].
+    ///
+    /// @param offset - where to read from
+    /// @param buffer - the buffer to fill
+    /// @param len - how many bytes to read
+    fn read_exact_into(&self, offset: u64, buffer: &mut Vec<u8>, len: usize) -> VfsResult<()> {
+        if buffer.len() >= len {
+            buffer.truncate(len);
+            return self.read_exact_at(offset, buffer);
+        }
+        buffer.clear();
+        buffer.reserve_exact(len);
+        if buffer.capacity() < len {
+            return Err(VfsError::new(
+                VfsOperation::Read.extended_code(),
+                "a read buffer smaller than its reservation",
+            ));
+        }
+        let mut filled = 0usize;
+        while filled < len {
+            let Some(target) = buffer.spare_capacity_mut().get_mut(filled..len) else {
+                break;
+            };
+            let at = offset.checked_add(filled as u64).ok_or_else(|| {
+                VfsError::new(VfsOperation::Read.extended_code(), "read offset overflowed")
+            })?;
+            match platform::read_at_spare(&self.file, at, target) {
+                Ok(0) => break,
+                Ok(count) => filled = filled.saturating_add(count).min(len),
+                Err(io) if io.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(io) => return Err(VfsError::from_io(VfsOperation::Read, &io)),
+            }
+        }
+        if let Some(rest) = buffer.spare_capacity_mut().get_mut(filled..len) {
+            for slot in rest {
+                slot.write(0);
+            }
+        }
+        // SAFETY: `reserve_exact` made room for `len` bytes. The reads above
+        // wrote the first `filled` of them and the loop just above wrote zeros
+        // over the rest, so every byte up to `len` is initialised.
+        unsafe { buffer.set_len(len) };
+        if filled < len {
+            return Err(error::short_read(format!(
+                "read {filled} of {len} bytes at {offset}"
             )));
         }
         Ok(())
@@ -488,9 +591,14 @@ impl VfsFile for OsFile {
         Ok(Some(opened))
     }
 
-    /// Returns the volume and file numbers that identify this file.
+    /// Returns the volume and file numbers that identify this file, asking
+    /// the file system the first time.
     fn file_identity(&self) -> VfsResult<FileIdentity> {
-        Ok(self.identity.clone())
+        if let Some(known) = self.identity.get() {
+            return Ok(known.clone());
+        }
+        let found = platform::file_identity(&self.file)?;
+        Ok(self.identity.get_or_init(|| found).clone())
     }
 }
 

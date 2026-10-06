@@ -527,17 +527,20 @@ fn release(mut holder: Fed) {
     holder.finish();
 }
 
-/// **An open waits as long as its caller says, before any connection exists.**
+/// **An open's budget is how long its first statement waits.**
 ///
 /// In 2.0.3 a process that opened a file while another held a write failed
-/// after five seconds, and nothing it could set changed that: the open reads
+/// after five seconds, and nothing it could set changed that: the open read
 /// the file under a lock, and `PRAGMA busy_timeout` belongs to a connection
 /// that does not exist until the open has finished. A service restarted during
-/// a long compaction could not start. Three ways to set the open's wait are
-/// checked here, each by a value: a refusal that names the budget it was given,
-/// or a row that is only there because the open waited for the holder to commit.
+/// a long compaction could not start. The open now reads the meta record
+/// without the lock (task-2191), so it does not wait at all, as SQLite's does
+/// not; the wait is the first statement's, and the connection starts with the
+/// open's budget as its `busy_timeout`. Three ways to set it are checked here,
+/// each by a value: a refusal that names the budget it was given, or a row
+/// that is only there because the statement waited for the holder to commit.
 #[test]
-fn an_open_waits_as_long_as_its_caller_says() {
+fn the_open_budget_is_how_long_the_first_statement_waits() {
     let (binary, shell) = (program("inillucent"), program("inillucent-shell"));
     let directory = area("open-waits");
     let database = prepared(&binary, &directory);
@@ -572,16 +575,23 @@ fn an_open_waits_as_long_as_its_caller_says() {
     );
     release(holder);
 
-    // The driver's option, short: refused, naming its own budget.
+    // The driver's option, short: the open goes ahead, and its first
+    // statement is refused, naming the open's budget.
     let holder = holding(&shell, &database);
     let short = inillucent_driver::OpenOptions {
         busy_timeout: Some(Duration::from_millis(150)),
         ..inillucent_driver::OpenOptions::default()
     };
-    let refusal = match inillucent_driver::Database::open_with(&database, short) {
-        Ok(_) => panic!("an open with a 150 ms budget did not wait for the holder"),
+    let opened_short = inillucent_driver::Database::open_with(&database, short)
+        .unwrap_or_else(|error| panic!("an open with a 150 ms budget was refused: {error}"));
+    let refusal = match opened_short
+        .session()
+        .query_all("SELECT count(*) FROM note", &[])
+    {
+        Ok(_) => panic!("a statement with a 150 ms budget did not wait for the holder"),
         Err(error) => error.to_string(),
     };
+    drop(opened_short);
     assert!(
         refusal.contains("of the 150 ms"),
         "the refusal does not name the option's budget:\n{refusal}"

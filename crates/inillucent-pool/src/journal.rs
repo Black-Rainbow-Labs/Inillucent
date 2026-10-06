@@ -449,7 +449,14 @@ impl Journal {
                 // recovery. Syncing this file's own bytes first, and syncing
                 // the directory on the way out, is what `DELETE` mode's name
                 // promises: gone, not "gone unless the power goes now".
-                if let Some(file) = &self.file {
+                //
+                // **Only when something was saved after the seal (task-2191).**
+                // `save` sets `unsealed` for every pre-image it writes and
+                // `seal` clears it after its sync, so a journal whose last
+                // write was sealed has nothing in the write-behind cache, and a
+                // second sync of it flushed nothing. A one row `exec` made it
+                // after every fold.
+                if let (Some(file), true) = (&self.file, self.unsealed.get()) {
                     file.sync(SyncMode::Full)
                         .map_err(|error| error.into_db_error())?;
                 }

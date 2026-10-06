@@ -29,7 +29,8 @@ flowchart TB
     PY["Python: the Database class"] --> CAPI
     CAPI --> DRV["The Rust driver: inillucent-driver"]
     RUST["A Rust program"] --> DRV
-    NODE["Node"] --> CLI["The inillucent program with --output json"]
+    NODE["Node"] --> CAPI
+    NODE --> CLI["The inillucent program with --output json"]
     GO["Go"] --> CLI
     PHP["PHP"] --> CLI
     PYRUN["Python: run and query"] --> CLI
@@ -42,7 +43,8 @@ flowchart TB
 | Rust | It calls the driver directly. |
 | C and C++ | They call the C library. |
 | Python | Both ways. The `Database` class calls the C library. The functions `run` and `query` at the top of the module start the `inillucent` program. |
-| Node, Go, PHP | They start `inillucent --output json` and parse the JSON it prints. |
+| Node | Both ways. The C library is also a Node addon, and the npm package loads it in process for `open()` and for `query`, `exec` and `batch` when no key or root is given. Without the addon, `open()` starts one `inillucent-mcp` process and sends every call to it, and the other calls start `inillucent --output json`. |
+| Go, PHP | They start `inillucent --output json` and parse the JSON it prints. |
 
 The two routes return values in different forms.
 
@@ -50,8 +52,8 @@ The two routes return values in different forms.
 - A binding that starts the program gets a JSON document. JSON has no byte string, and many JSON
   parsers store every number as a 64 bit float.
 
-So on Node, Go, PHP and the Python `run` and `query` functions, a value is whatever
-`--output json` prints and the language's JSON parser reads:
+So on Go, PHP, the Python `run` and `query` functions and Node without the addon, a value is
+whatever `--output json` prints and the language's JSON parser reads:
 
 - **A blob is `{"blob": "<hex>"}`** in both directions. `SELECT x'00ff'` prints
   `{"blob": "00ff"}`.
@@ -362,19 +364,77 @@ Without `session_as`, every call is a new session. A `CREATE TEMP TABLE` typed i
 is then gone by the next statement. The conformance case `a_temp_table_survives_a_connection_per_call`
 tests this. It is the one case that sets `"connection": "per_call"`.
 
+### Reading and binding in one call
+
+A foreign call costs something in every language, and in Python's `ctypes` it costs about half a
+microsecond. The value accessors take two calls for each cell, so reading 20,000 rows of five
+columns through them took 170 ms in Python, while the engine produced the result in 12 ms. Three
+calls carry a whole result or a whole list of parameters as one JSON text instead:
+
+| Call | What it does |
+|---|---|
+| `inillucent_rows_json` | Returns the whole result as one JSON object: `columns`, `types`, `rows`, `total`, `more`, `affected`, `elapsed_us` and `tag`. |
+| `inillucent_bind_json` | Binds every parameter of the next execution from one JSON array, and replaces what was bound. |
+| `inillucent_stmt_execute_many` | Runs a statement once for each array in a JSON array of arrays, and reports the rows changed in all. It opens no transaction. |
+
+The values are written the same way in both directions, so a value read from one result binds into
+the next statement unchanged:
+
+| Value | JSON |
+|---|---|
+| NULL | `null` |
+| integer | an integer, such as `42` |
+| real | a number that always has a fraction or an exponent, such as `1.0` or `1e300` |
+| text | a string |
+| blob | `{"blob": "<hex>"}`, which is also what the command line writes |
+| an infinity or NaN | `{"real": "Infinity"}`, `{"real": "-Infinity"}` or `{"real": "NaN"}` |
+
+When binding, `true` and `false` bind as 1 and 0, and the bare words `Infinity`, `-Infinity` and
+`NaN` are read as reals, because Python's `json.dumps` writes them that way. An integer that does
+not fit in 64 bits is refused with `INILLUCENT_TOO_BIG`.
+
+The Python binding uses all three when the library has them, and falls back to the value
+accessors on a library older than ABI 1.3.0.
+
+### Python objects and the Node addon
+
+More ways for a result, and for the rows of many executions, to cross, for a binding in the same
+process as the library:
+
+| Call | What it does |
+|---|---|
+| `inillucent_py_init` | Takes the addresses of nine CPython functions, `None` and the exception type to raise, from the interpreter that loaded the library. The Python binding takes them from `ctypes.pythonapi` |
+| `inillucent_rows_py` | Returns a result as one Python list: column names, declared types, the rows as lists, `total`, `more`, `affected` or `None`, `elapsed_us` and the tag. Call it through `ctypes.PyDLL`, which holds the interpreter lock |
+| `inillucent_py_init_params` | Takes the addresses of ten CPython functions that read objects, the types `list`, `tuple`, `int`, `bool`, `float`, `str`, `bytes` and `type(None)`, `PyGILState_Ensure` and `PyGILState_Release`, and `None`. It refuses an interpreter whose objects do not keep their type in the word after the reference count, as the free threaded build does not |
+| `inillucent_py_params` | Reads a list or tuple of rows, each a list or tuple of `None`, `int`, `bool`, `float`, `str` or `bytes`, into parameters. Anything else, an integer wider than 64 bits included, answers null with no exception set, and the binding sends those rows as JSON instead. Call it through `ctypes.PyDLL` |
+| `inillucent_stmt_execute_params` | Runs a statement once for each row of those parameters, as `inillucent_stmt_execute_many` does, and frees them. Call it through `ctypes.CDLL`, which lets other threads run while the statement does, and keep the rows alive until it returns. The rows move into the engine, so when the one statement they run as fails, it takes the interpreter lock and reads them again to run them one at a time |
+| `inillucent_params_free` | Frees parameters nothing ran |
+| `napi_register_module_v1` | The entry point Node calls when `process.dlopen` loads the library. It registers `open`, `connect`, `query`, `batch`, `disconnect` and `close` |
+
+No CPython and no Node is linked. The Node functions are looked up in the host process when Node
+loads the library, and a host that is not Node gets its exports back unchanged. A Node handle is
+accepted only on the thread that opened it, and a thread's environment closes the databases it left
+open when Node tears it down. An integer beyond 2^53 reaches JavaScript as a `BigInt` and a blob as a
+`Buffer`.
+
+The npm package's `query()` keeps the file open between calls whose statement starts with
+`SELECT`, `WITH` or `VALUES`, and closes it one second after the last one. It checks the file's id
+on every call, so a file made again at the same path is opened afresh. An open connection holds no
+lock between statements, so another process can write, and the next statement sees the write.
+
 ### Libraries to start from
 
 | Language | Library |
 |---|---|
 | Python | `ctypes` from the standard library. `bindings/python/inillucent.py` is the reference binding. |
-| Node | `koffi`, or N-API if a compiled addon is acceptable. |
+| Node | The library itself, loaded with `process.dlopen`; see "Python objects and the Node addon". `packages/npm/inillucent/index.mjs` does this. |
 | Go | `cgo`, or `purego` to avoid cgo. |
 | Java | The Foreign Function and Memory API on Java 22 and later, and JNI before that. |
 | C# | `DllImport` with `SafeHandle` subclasses, which follow the lifetime rule above. |
 
 ## ABI stability
 
-`abi.toml` gives each of the 55 symbols in the header a stability and a `since` version.
+`abi.toml` gives each of the 65 symbols in the header a stability and a `since` version.
 `inillucent-driver-capi/tests/abi.rs` checks that the header, `abi.toml` and the Rust code name the
 same symbols. It also checks that every numeric constant in the header equals the driver's own enum
 value. A status renumbered in Rust without the header changing would make every binding read every
@@ -383,10 +443,13 @@ error wrongly, and both sides would still compile.
 | Stability | Promise |
 |---|---|
 | stable | The signature will not change, and the symbol will not be removed. |
-| provisional | The symbol exists and may change in a minor version. `inillucent_cancel` is the only provisional symbol. It asks a running statement to stop, and the statement then fails with `INILLUCENT_INTERRUPTED`. |
+| provisional | The symbol exists and may change in a minor version. Eleven symbols are provisional. `inillucent_cancel` asks a running statement to stop, and the statement then fails with `INILLUCENT_INTERRUPTED`. `inillucent_rows_json`, `inillucent_bind_json` and `inillucent_stmt_execute_many` are described under "Reading and binding in one call", and `inillucent_py_init`, `inillucent_rows_py`, `inillucent_py_init_params`, `inillucent_py_params`, `inillucent_stmt_execute_params`, `inillucent_params_free` and `napi_register_module_v1` under "Python objects and the Node addon". |
 
-The ABI version is 1.2.0, and `inillucent_abi_version()` returns 1002000. Version 1.1.0 added
-`inillucent_open_with_key`, and version 1.2.0 added `inillucent_open_with_timeout`. A binding
+The ABI version is 1.3.0, and `inillucent_abi_version()` returns 1003000. Version 1.1.0 added
+`inillucent_open_with_key`, version 1.2.0 added `inillucent_open_with_timeout`, and version 1.3.0
+added `inillucent_rows_json`, `inillucent_bind_json`, `inillucent_stmt_execute_many`,
+`inillucent_py_init`, `inillucent_rows_py`, `inillucent_py_init_params`, `inillucent_py_params`,
+`inillucent_stmt_execute_params`, `inillucent_params_free` and `napi_register_module_v1`. A binding
 written against 1.0.0 finds every symbol it calls.
 
 ## Building the C library

@@ -20,6 +20,8 @@ use inillucent_value::Value;
 
 use crate::render::{render, Layout, Mode};
 
+mod deferred;
+
 /// Everything the shell remembers between lines.
 /// One open database and the session statements on it belong to.
 pub struct Opened {
@@ -262,6 +264,20 @@ pub struct Shell {
     /// Ordered by key, which is the order `.parameter list` prints and the
     /// order the reference prints.
     pub parameters: std::collections::BTreeMap<String, Value<'static>>,
+    /// The single row inserts held to run as one statement; see the
+    /// `deferred` module.
+    deferred: Option<deferred::Deferred>,
+    /// Which line of input is being run, counted up by each one, so a held
+    /// statement knows whether the line it came from has ended.
+    chunk_number: u64,
+}
+
+impl Drop for Shell {
+    /// Runs whatever is held, so no statement the shell accepted is lost
+    /// when it goes away without reaching the end of its input.
+    fn drop(&mut self) {
+        self.run_held();
+    }
 }
 
 /// Returns an error as a sentence, with its detail when it carries one.
@@ -358,9 +374,7 @@ impl Shell {
         // `trusted_schema off` on a connection whose library default was on.
         // A shell is a program that opens files it did not write, which is the
         // case the flag exists for.
-        let _ = database
-            .session_as(session)
-            .execute_batch("PRAGMA trusted_schema = OFF;");
+        let _ = database.session_as(session).set_trusted_schema(false);
         Ok(Opened {
             database,
             session,
@@ -446,6 +460,8 @@ impl Shell {
             sink: None,
             rows_since_redirect: 0,
             line: 1,
+            deferred: None,
+            chunk_number: 0,
         })
     }
 
@@ -812,7 +828,28 @@ impl Shell {
     }
 
     /// Runs one complete statement and prints whatever it produced.
+    ///
+    /// **A single row `INSERT` may be held and run with the ones after it**
+    /// (task-2191), as one statement, before anything that could see it; see
+    /// the `deferred` module for when and why the output is the same.
     pub fn run(&mut self, sql: &str) {
+        if self.hold_if_it_joins(sql) {
+            return;
+        }
+        let failed_before = self.failed;
+        self.run_held();
+        // A held statement that failed stops what follows it the way it would
+        // have stopped it had it run when it arrived.
+        if self.chunk_stop || (self.bail && self.failed && !failed_before) {
+            return;
+        }
+        self.run_as_written(sql);
+    }
+
+    /// Runs one complete statement now and prints whatever it produced.
+    ///
+    /// @param sql - the statement
+    fn run_as_written(&mut self, sql: &str) {
         if self.readonly && self.writes(sql) {
             self.complain("Error: attempt to write a readonly database");
             return;
@@ -856,11 +893,16 @@ impl Shell {
                 // the eight formats and silently zero for a plan is the kind
                 // of number a caller stops checking.
                 self.rows_since_redirect = self.rows_since_redirect.saturating_add(rows.len());
+                // **A statement with no result columns has nothing to draw**
+                // (task-2191): an `INSERT` asked whether it was a plan, an
+                // `EXPLAIN` and a table layout, and built the layout, for every
+                // statement of a script.
+                let nothing_to_draw = columns.is_empty() && rows.is_empty();
                 // **`EXPLAIN QUERY PLAN` is drawn, not listed.** Its four
                 // columns are a tree, and the reference's shell renders them as
                 // one; printing `0|0|0|SCAN t` is the raw result of a statement
                 // nobody writes for the raw result.
-                if is_query_plan(sql) {
+                if !nothing_to_draw && is_query_plan(sql) {
                     for line in plan_tree(&rows) {
                         self.say(&line);
                     }
@@ -872,11 +914,12 @@ impl Shell {
                 // `EXPLAIN` whatever `.mode` says, because eight columns of
                 // opcode printed as `0|Init|0|1|0||0|Start at 1` is unreadable.
                 // The widths are the reference's own.
-                let as_table = match self.explain_mode {
-                    crate::commands::ExplainMode::Auto => is_bytecode_explain(sql),
-                    crate::commands::ExplainMode::On => true,
-                    crate::commands::ExplainMode::Off => false,
-                };
+                let as_table = !nothing_to_draw
+                    && match self.explain_mode {
+                        crate::commands::ExplainMode::Auto => is_bytecode_explain(sql),
+                        crate::commands::ExplainMode::On => true,
+                        crate::commands::ExplainMode::Off => false,
+                    };
                 if as_table && columns.len() == EXPLAIN_WIDTHS.len() {
                     for line in explain_table(&columns, &rows) {
                         self.say(&line);
@@ -884,7 +927,6 @@ impl Shell {
                     self.finish_once();
                     return;
                 }
-                let layout = self.rendering_layout();
                 // A statement that returned no rows prints nothing, headers
                 // included: SQLite's shell prints the header from its per-row
                 // callback. Printing it here put an empty line after every
@@ -893,6 +935,7 @@ impl Shell {
                 let lines = if rows.is_empty() && !self.header_when_empty {
                     Vec::new()
                 } else {
+                    let layout = self.rendering_layout();
                     render(&layout, &columns, &rows)
                 };
                 for line in lines {
@@ -1172,6 +1215,16 @@ impl Shell {
 /// half-typed: `.` inside a `CREATE TRIGGER` body is part of the statement, and
 /// treating it as a command there is the bug every naive shell has.
 pub fn drive(shell: &mut Shell, input: impl Iterator<Item = String>) {
+    drive_lines(shell, input);
+    // Nothing held outlives the input it came from.
+    shell.run_held();
+}
+
+/// The body of [`drive`], which runs what is still held when it returns.
+///
+/// @param shell - the shell
+/// @param input - the lines
+fn drive_lines(shell: &mut Shell, input: impl Iterator<Item = String>) {
     let mut pending = String::new();
     let mut number = 0usize;
     let mut started = 1usize;
@@ -1201,8 +1254,23 @@ pub fn drive(shell: &mut Shell, input: impl Iterator<Item = String>) {
         }
         pending.push_str(&line);
         pending.push('\n');
-        if ends_in_complete_statement(shell, &pending) {
-            run_chunk(shell, &std::mem::take(&mut pending));
+        // **Only a line that could end a statement is checked.** The check scans
+        // everything accumulated, so asking it after every line was quadratic in
+        // a statement's length: one `INSERT` of 20,000 rows written a row to a
+        // line rescanned the whole statement 20,000 times (task-2191). A statement
+        // ends at a semicolon, and text that held one already can only become
+        // complete when a block comment after it closes, so a line with neither
+        // cannot change the answer. SQLite's shell skips the same lines.
+        if !(line.contains(';') || line.contains("*/")) {
+            continue;
+        }
+        // **The first statement's end comes back from the check, and the buffer
+        // keeps its capacity** (task-2191). The chunk was scanned here and again
+        // by `run_chunk`, and `std::mem::take` handed the buffer away so the
+        // next statement grew a new one from nothing.
+        if let Some(first_end) = ends_in_complete_statement(shell, &pending) {
+            run_chunk_from(shell, &pending, Some(first_end));
+            pending.clear();
             if shell.done || (shell.failed && shell.bail) {
                 return;
             }
@@ -1216,7 +1284,8 @@ pub fn drive(shell: &mut Shell, input: impl Iterator<Item = String>) {
     }
 }
 
-/// Reports whether the text read so far ends at the end of a statement.
+/// Reports whether the text read so far ends at the end of a statement, by
+/// returning where its first statement ends, or `None` when it does not end.
 ///
 /// This is `sqlite3_complete` applied to everything the shell has accumulated, which is
 /// what decides when the reference's shell runs its input: when a line makes the whole
@@ -1224,15 +1293,17 @@ pub fn drive(shell: &mut Shell, input: impl Iterator<Item = String>) {
 ///
 /// @param shell - the shell
 /// @param text - the lines read since the last chunk ran
-fn ends_in_complete_statement(shell: &Shell, text: &str) -> bool {
+fn ends_in_complete_statement(shell: &Shell, text: &str) -> Option<usize> {
     let mut rest = text;
+    let mut first: Option<usize> = None;
     while let Some(consumed) = complete_statement(shell, rest) {
+        first.get_or_insert(consumed);
         rest = rest.get(consumed..).unwrap_or_default();
         if only_whitespace_and_comments(rest) {
-            return true;
+            return first;
         }
     }
-    false
+    None
 }
 
 /// Reports whether text holds nothing but whitespace and comments.
@@ -1266,26 +1337,53 @@ fn only_whitespace_and_comments(text: &str) -> bool {
 /// @param shell - the shell
 /// @param chunk - the text, which may hold several statements
 fn run_chunk(shell: &mut Shell, chunk: &str) {
+    run_chunk_from(shell, chunk, None);
+}
+
+/// [`run_chunk`], told where the first statement ends when the caller has
+/// already found it.
+///
+/// @param shell - the shell
+/// @param chunk - the text, which may hold several statements
+/// @param first_end - how many bytes the first statement takes, when known
+fn run_chunk_from(shell: &mut Shell, chunk: &str, first_end: Option<usize>) {
+    shell.chunk_number = shell.chunk_number.wrapping_add(1);
     shell.holding = true;
     shell.chunk_stop = false;
     shell.held_error = None;
-    let mut rest = chunk.to_string();
+    // **Slices of the chunk, not copies of it** (task-2191). Each statement
+    // used to copy the rest of the chunk twice, once to split it and once to
+    // build the excerpt, which was 2% of a script of single row inserts.
+    let mut at = 0usize;
+    let mut known = first_end;
     loop {
-        let (statement, remainder) = match complete_statement(shell, &rest) {
-            Some(consumed) => {
-                let remainder = rest.split_off(consumed);
-                (std::mem::take(&mut rest), remainder)
-            }
-            None => (std::mem::take(&mut rest), String::new()),
+        let rest = chunk.get(at..).unwrap_or("");
+        let consumed = match known.take() {
+            Some(consumed) => consumed,
+            None => complete_statement(shell, rest).unwrap_or(rest.len()),
         };
+        let statement = rest.get(..consumed).unwrap_or(rest);
+        let remainder = rest.get(consumed..).unwrap_or("");
         if !statement.trim().is_empty() {
-            // The excerpt under an error runs on into the statements after this one.
-            let tail = format!("{}{remainder}", statement.trim_start());
-            shell.excerpt = Some(tail.trim_end().to_string());
+            // The excerpt under an error runs on into the statements after this
+            // one. With nothing after it, the excerpt is the statement itself,
+            // which is what `report` shows when there is no excerpt.
+            shell.excerpt = if remainder.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    format!("{}{remainder}", statement.trim_start())
+                        .trim_end()
+                        .to_string(),
+                )
+            };
             shell.run(statement.trim());
         }
-        rest = remainder;
-        if shell.done || shell.chunk_stop || (shell.failed && shell.bail) || rest.trim().is_empty()
+        at = at.saturating_add(consumed);
+        if shell.done
+            || shell.chunk_stop
+            || (shell.failed && shell.bail)
+            || remainder.trim().is_empty()
         {
             break;
         }
@@ -1311,6 +1409,17 @@ fn complete_statement(_shell: &Shell, text: &str) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut at = 0usize;
     while at < bytes.len() {
+        // **In a plain statement only quotes, comments and semicolons matter**
+        // (task-2191). No word changes `State::Plain` and nothing else does
+        // either, so the bytes between those are skipped in one pass rather
+        // than each word being upper cased and compared. The scan ran twice
+        // per statement of a script of single row inserts and was 9% of it.
+        if state == State::Plain {
+            at = bytes
+                .get(at..)
+                .and_then(|rest| rest.iter().position(|byte| matters_in_plain(*byte)))
+                .map_or(bytes.len(), |offset| at.saturating_add(offset));
+        }
         let Some(byte) = bytes.get(at).copied() else {
             break;
         };
@@ -1339,8 +1448,22 @@ fn complete_statement(_shell: &Shell, text: &str) -> Option<usize> {
             }
             _ if byte.is_ascii_alphabetic() || byte == b'_' => {
                 let end = word_end(bytes, at);
-                let word = bytes.get(at..end).unwrap_or(&[]).to_ascii_uppercase();
-                state = state.after_word(&word);
+                // Upper cased into a buffer on the stack. `to_ascii_uppercase`
+                // allocated a vector for every word of every statement, which
+                // was 2.1% of a script of single row inserts (task-2191). A word
+                // longer than the buffer is no keyword `after_word` knows, so it
+                // is passed as the empty word, which no keyword matches either.
+                let mut folded = [0u8; KEYWORD_LONGEST];
+                let word = bytes.get(at..end).unwrap_or(&[]);
+                let word = match folded.get_mut(..word.len()) {
+                    Some(into) => {
+                        into.copy_from_slice(word);
+                        into.make_ascii_uppercase();
+                        &*into
+                    }
+                    None => &[],
+                };
+                state = state.after_word(word);
                 at = end;
             }
             _ if byte.is_ascii_whitespace() => at += 1,
@@ -1352,6 +1475,17 @@ fn complete_statement(_shell: &Shell, text: &str) -> Option<usize> {
     }
     None
 }
+
+/// Reports whether a byte can change what a semicolon means in a plain
+/// statement: a quote, the start of a comment, or a semicolon.
+///
+/// @param byte - the byte
+fn matters_in_plain(byte: u8) -> bool {
+    matches!(byte, b';' | b'\'' | b'"' | b'`' | b'[' | b'-' | b'/')
+}
+
+/// The longest word `State::after_word` compares against: `TEMPORARY`.
+const KEYWORD_LONGEST: usize = 9;
 
 /// Where the scan is, in terms of what a semicolon would mean.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1851,5 +1985,74 @@ CREATE TABLE b (id INTEGER PRIMARY KEY)",
         assert_eq!(held.trailing_statement("SELEKT 1"), None);
         assert_eq!(held.trailing_statement(""), None);
         assert_eq!(held.trailing_statement("-- only a comment"), None);
+    }
+
+    /// Single row inserts inside a transaction are held and run together before
+    /// the statement that ends the transaction, and none are held outside one.
+    ///
+    /// `held_inserts` in the e2e tier checks that what a script prints is the
+    /// same either way; this checks that the inserts were in fact held, which
+    /// that comparison alone cannot tell.
+    #[test]
+    fn inserts_in_a_transaction_are_held_until_the_next_statement() {
+        let mut held = shell();
+        held.run("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)");
+        held.run("INSERT INTO t VALUES (1, 'outside')");
+        assert_eq!(
+            held.held_count(),
+            0,
+            "an insert outside a transaction was held"
+        );
+        held.run("BEGIN");
+        for id in 2..=6 {
+            held.run(&format!("INSERT INTO t VALUES ({id}, 'v{id}')"));
+        }
+        assert_eq!(held.held_count(), 5, "the inserts were not held");
+        held.run("COMMIT");
+        assert_eq!(held.held_count(), 0);
+        assert_eq!(
+            held.scalar("SELECT count(*) || ',' || max(id) FROM t")
+                .as_deref(),
+            Some("6,6")
+        );
+    }
+
+    /// A statement spread over many lines runs once, when the line that ends it is read.
+    ///
+    /// `drive` asks whether the text read so far is complete only on a line holding a `;` or
+    /// a `*/` (task-2191). Asking after every line rescanned the whole statement each time, and
+    /// one `INSERT` of 20,000 rows written a row to a line took 5.8 s against 41 ms for
+    /// SQLite's shell. These are the cases the narrower question must still answer: the rows
+    /// all arrive, a block comment closed on a line with no semicolon still lets the statement
+    /// before it run, and a trigger whose body spans lines ends at its own `END;`.
+    #[test]
+    fn a_statement_over_many_lines_runs_once_it_ends() {
+        let mut held = shell();
+        let mut lines = vec![
+            "CREATE TABLE m (id INTEGER PRIMARY KEY, a TEXT);".to_string(),
+            "INSERT INTO m VALUES".to_string(),
+        ];
+        for id in 1..=2_000 {
+            let tail = if id == 2_000 { ";" } else { "," };
+            lines.push(format!("({id}, 'row {id}'){tail}"));
+        }
+        lines.push("INSERT INTO m VALUES (2001, 'commented'); /* a note".to_string());
+        lines.push("that ends here */".to_string());
+        lines.push("CREATE TABLE seen (n INTEGER);".to_string());
+        lines.push("CREATE TRIGGER count_m AFTER INSERT ON m BEGIN".to_string());
+        lines.push("  INSERT INTO seen VALUES (NEW.id);".to_string());
+        lines.push("END;".to_string());
+        lines.push("INSERT INTO m VALUES (2002, 'after the trigger');".to_string());
+        super::drive(&mut held, lines.into_iter());
+        assert_eq!(
+            held.scalar("SELECT count(*) FROM m").as_deref(),
+            Some("2002"),
+            "a row of the long statement, the commented one or the last one is missing"
+        );
+        assert_eq!(
+            held.scalar("SELECT group_concat(n) FROM seen").as_deref(),
+            Some("2002"),
+            "the trigger did not end where its END; is, or ran for the wrong rows"
+        );
     }
 }

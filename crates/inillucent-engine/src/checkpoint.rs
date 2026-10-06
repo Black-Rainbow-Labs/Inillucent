@@ -159,6 +159,22 @@ use crate::ImportedDatabase;
 /// would make what a suite sees depend on how long it took to get there.
 pub(crate) const RECLAIM_BYTES: u64 = 4 << 20;
 
+/// How large the open log segment grows before closing a connection also
+/// shrinks the log.
+///
+/// **Lower than [`RECLAIM_BYTES`], because it counts other processes too.**
+/// A close folds every time, which is what keeps a closed file complete, and
+/// it does the log's housekeeping (a new segment, a checkpoint record, the
+/// old segments deleted) only once the open segment holds this much. Doing
+/// it at every close made a one row `inillucent exec` spend 12 ms closing.
+/// Measured as the mean of 300 cycles of open, one insert and close through
+/// the C library, a cycle took 20.0 to 23.4 ms with it and 13.1 to 16.5 ms
+/// without it (task-2191). An open reads the open segment to
+/// find its end: 0.7 ms with 20 KB in it and 0.8 ms with 215 KB, so a
+/// mebibyte keeps that small. A single row insert logs about 730 bytes, so
+/// the housekeeping comes about once every 1,400 such processes.
+pub(crate) const CLOSE_RECLAIM_BYTES: u64 = 1 << 20;
+
 /// How long a fold on the way out of a statement waits for readers to leave.
 ///
 /// A writer holding RESERVED folds only when it can take EXCLUSIVE, and readers
@@ -511,6 +527,7 @@ impl ImportedDatabase {
             .database
             .pool()
             .set_durable_lsn(self.storage.wal.write_ahead_point());
+        self.storage.wal.note_folded();
         // Every attached database too, because a log is per file and a
         // connection closed after a checkpoint should leave databases rather
         // than databases and logs nobody will open again.
@@ -678,6 +695,7 @@ impl ImportedDatabase {
             held.database
                 .pool()
                 .set_durable_lsn(held.wal.write_ahead_point());
+            held.wal.note_folded();
         }
         Ok(())
     }

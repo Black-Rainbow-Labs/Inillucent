@@ -533,8 +533,246 @@ of leaves that a bulk build packed full, so each leaf is packed again and split.
 `tasks/task-2185-performance-hillclimb-3.md` lists every change, every measurement and the changes
 that were tried and not kept.
 
+## Through the command line, the shell, Python and Node
+
+Every number above times statements inside one process. Most people call inillucent another way: one
+`inillucent` process per command, a SQL script piped into `inillucent-shell`, the Python driver, or
+the npm package. A fourth hill climb measured those against the same use of SQLite and fixed what it
+found. Measured on 5 October 2026, ten rounds, release 2.1.5 against the build after the fourth hill
+climb, with no other work running. A second run of six rounds gave the same results to within a few
+percent.
+
+| How it was called | SQLite measured as | 2.1.5 against SQLite | Now against SQLite | Change in inillucent |
+|---|---|---|---|---|
+| the command line, one process a command, 8 workloads | the `sqlite3` 3.53.4 shell, one process a command | 20% slower | **10% slower** | 9% faster |
+| a SQL script into the shell, 6 workloads | the same scripts into `sqlite3` | 218% slower | **44% slower** | 121% faster |
+| the Python driver, 9 workloads | Python's `sqlite3` module | 173% slower | **2% slower** | 168% faster |
+| the npm package, 2 workloads | Node's `node:sqlite` | 29,270% slower | **2,223% slower** | 1,164% faster |
+| all 25 | | 216% slower | **46% slower** | 118% faster |
+
+Each group is the geometric mean of its workloads. Every engine ran with its own default settings,
+because the defaults are what this kind of use gets. Both engines write the same rows; the answers
+were not hashed and compared here the way the gate compares them.
+
+| Workload | 2.1.5 | Now | SQLite | Change in inillucent |
+|---|---:|---:|---:|---|
+| `inillucent --db f query` of one row as JSON | 19.95 ms | 18.53 ms | 16.73 ms | 8% faster |
+| `inillucent --db f exec` of a one row `INSERT` | 30.15 ms | 22.50 ms | 19.29 ms | 34% faster |
+| `inillucent --version` | 16.82 ms | 16.32 ms | 15.92 ms | 3% faster |
+| one `INSERT` of 20,000 rows, a row to a line, into the shell | 5,348.91 ms | 81.81 ms | 34.51 ms | 6,438% faster |
+| 10,000 `INSERT` statements in a transaction into the shell | 98.88 ms | 77.69 ms | 33.52 ms | 27% faster |
+| `.import --csv` of 50,000 rows | 163.62 ms | 153.54 ms | 55.97 ms | 7% faster |
+| Python, read 10,000 rows | 92.64 ms | 13.55 ms | 7.78 ms | 584% faster |
+| Python, 200 range queries of 200 rows | 159.48 ms | 38.28 ms | 35.77 ms | 317% faster |
+| Python, 5,000 lookups by key | 96.11 ms | 74.93 ms | 85.17 ms | 28% faster, now faster than SQLite |
+| Python, 10,000 inserts in a transaction | 142.41 ms | 67.09 ms | 25.67 ms | 112% faster |
+| Python, 100 opens and closes | 1,672.61 ms | 100.14 ms | 7.73 ms | 1,570% faster |
+| Node, a lookup by key through a session | 10.35 ms | 0.076 ms | 0.014 ms | 13,599% faster |
+
+What changed:
+
+- **Closing a database through the C library no longer checkpoints a file it only read.** That was
+  9.3 ms of the 12 ms an open and close took from Python.
+- **A close does the log's housekeeping only once the open log segment holds a mebibyte.** It still
+  folds every time, so a closed file is complete without its log. Rolling a segment, writing a
+  checkpoint record and deleting old segments at every close made a one row `exec` spend 12 ms
+  closing.
+- **The shell checks for the end of a statement only on a line holding `;` or `*/`.** Checking after
+  every line made a statement spread over many lines quadratic.
+- **The Python driver reads a result and binds a list of parameters in one call each**, through
+  three new C library calls that carry them as JSON, and keeps its prepared statements. It took two
+  foreign calls a cell before. `Connection.execute_many` is new.
+- **The npm package has `open()`**, a session over one `inillucent-mcp` process, so a call no longer
+  starts a program.
+- **Windows builds link the C runtime statically and load the TLS client's three DLLs on first
+  use**, which is what `sqlite3.exe` loads at start.
+- Smaller changes to the write path's binding, the CSV parser, the JSON escaper and an open.
+
+What is still slower, and why:
+
+- **Single row inserts** (the shell scripts, `.import`, Python inserts): 2.3 to 2.8 times SQLite's
+  time. The engine's own insert of a row into a tree with an index is the cost now, and it is the
+  same path the gate's `churn.refill` and `app.insert.prepare_each` measure.
+- **Python opens**: 1.0 ms against 0.08 ms. An open reads the meta record, opens the log and loads
+  the schema; SQLite reads nothing until the first statement.
+- **Node**: a session is a pipe to another process, about 0.08 ms a call against 0.014 ms for
+  `node:sqlite` in process. Matching it needs a native binding over the C library.
+- **The command line**: 1 to 2 ms a process, half of it the open.
+
+`tasks/task-2191-performance-hillclimb-4.md` has every change, every measurement and the changes
+that were tried and not kept.
+
+### A second round of the same comparison
+
+A second round measured the same 25 workloads again and fixed what it found. Measured on 5 October
+2026, ten rounds, the build at the end of the first round against the build at the end of the
+second, with no other work running.
+
+| How it was called | After the first round, against SQLite | Now against SQLite |
+|---|---|---|
+| the command line, one process a command, 8 workloads | 11% slower | **1% slower** |
+| a SQL script into the shell, 6 workloads | 42% slower | **35% faster** |
+| the Python driver, 9 workloads | 9% slower | **77% faster** |
+| the npm package, 2 workloads | 2,603% slower | **102% faster** |
+| all 25 | 51% slower | **39% faster** |
+
+The first round's own measurement of the same build, made earlier the same day, put the four
+groups at 10%, 44%, 2% and 2,223% slower.
+
+| Workload | After the first round | Now | SQLite | Now against SQLite |
+|---|---:|---:|---:|---|
+| `inillucent --version` | 16.37 ms | 16.56 ms | 15.85 ms | 4% slower |
+| `query` of one row as JSON | 19.47 ms | 18.40 ms | 18.12 ms | 2% slower |
+| `query` of one row as text | 20.18 ms | 17.34 ms | 18.38 ms | 6% faster |
+| `query` of 100 rows by an index, sorted, as JSON | 21.49 ms | 19.88 ms | 18.22 ms | 9% slower |
+| `query` of `count(*)` and `max` over 10,000 rows | 19.74 ms | 18.33 ms | 18.20 ms | 1% slower |
+| `exec` of a one row `INSERT` | 27.40 ms | 24.39 ms | 22.09 ms | 10% slower |
+| `tables` | 19.23 ms | 17.61 ms | 17.21 ms | 2% slower |
+| `dump` | 36.97 ms | 31.49 ms | 34.83 ms | 11% faster |
+| 1,000 lookups by key in a script | 40.19 ms | 35.49 ms | 40.93 ms | 15% faster |
+| 200 single row inserts, each its own transaction | 290 ms | 272 ms | 912 ms | 235% faster |
+| 10,000 `INSERT` statements in a transaction | 96.10 ms | 39.51 ms | 42.27 ms | 7% faster |
+| one `INSERT` of 20,000 rows | 103 ms | 41.42 ms | 43.88 ms | 6% faster |
+| `.import --csv` of 50,000 rows | 170 ms | 62.06 ms | 67.90 ms | 9% faster |
+| a 10,000 row table and two indexes, from a script | 137 ms | 55.07 ms | 69.87 ms | 27% faster |
+| Python, a 10,000 row table and two indexes | 110 ms | 44.66 ms | 45.58 ms | 2% faster |
+| Python, 5,000 lookups by key | 75.15 ms | 54.84 ms | 86.16 ms | 57% faster |
+| Python, read 10,000 rows | 13.43 ms | 5.82 ms | 8.00 ms | 38% faster |
+| Python, 200 range queries of 200 rows | 36.74 ms | 22.61 ms | 36.80 ms | 63% faster |
+| Python, 200 `GROUP BY` queries | 127 ms | 119 ms | 520 ms | 338% faster |
+| Python, 10,000 inserts in a transaction into a table with two indexes | 68.56 ms | 36.45 ms | 29.80 ms | 22% slower |
+| Python, 100 single row inserts | 126 ms | 121 ms | 436 ms | 261% faster |
+| Python, 1,000 single row updates | 1,344 ms | 1,250 ms | 4,882 ms | 290% faster |
+| Python, 100 opens and closes | 99.17 ms | 7.58 ms | 7.25 ms | 5% slower |
+| Node, a lookup by key with `query()` | 9.16 ms | 0.046 ms | 0.093 ms | 103% faster |
+| Node, a lookup by key through a session | 0.108 ms | 0.007 ms | 0.014 ms | 101% faster |
+
+What changed:
+
+- **The C library is a Node addon, and the npm package runs `query`, `exec` and `batch` in the
+  Node process.** A call started an `inillucent` program before. `query()` keeps a file open for
+  the next read of the same file and closes it one second after the last one, so a lookup by key
+  costs what the statement costs.
+- **The Python driver gets results as Python objects and sends `execute_many`'s rows as Python
+  objects.** The C library builds and reads them with CPython's own functions, whose addresses the
+  driver hands over, so no JSON is written or parsed on the way.
+- **A database is opened from the handle that created it.** Creating a file closed it and opened
+  it again, and on Windows the second open waited for the virus scanner, which reads a file on its
+  first open after a handle that wrote it closes. Every script and program that created a database
+  paid about 6 ms for it.
+- **An `INSERT` of many rows of literals, a prepared `INSERT` run many times, a run of single row
+  inserts in the shell and `.import` each insert their rows as one statement**, with an exact
+  fallback to one row at a time when any row fails.
+- **An index entry for a new row searches only the rows added since the leaf was last packed, and
+  the leaf hint covers the leaf's whole key range.** Of the 30,000 entries the Python insert makes,
+  29,982 now find their leaf without a descent from the root, against 18,759 before.
+- **An open reads the file's first pages once, opens the log segment once and reads the schema at
+  the first statement**, which is when SQLite reads its schema too.
+- **A fold under a rollback journal syncs the data file once, and a new file is written with one
+  sync.**
+- **The allocators keep blocks under 8 bytes and from 4 KiB to 64 KiB**, which went to the system
+  heap one allocation and one free at a time.
+
+What is still slower, and why:
+
+- **Python inserts into a table with indexes**: 36.5 ms against 29.8 ms for 10,000 rows. The time
+  is the engine's own work for each row and each index entry: making room in a full 32 KiB leaf, a
+  log record for every row and every entry, and an undo record for each. No single part of it is
+  more than a fifth.
+- **A one row `exec`**: 24.4 ms against 22.1 ms. The commit syncs the log, and the fold when the
+  program closes syncs the rollback journal and the data file: three syncs where SQLite makes two.
+- **A query reading rows scattered over a table**: 19.9 ms against 18.2 ms. A cold read of 200 rows
+  by an index reads about 65 pages of 32 KiB, where SQLite reads about 180 pages of 4 KiB, which is
+  less than a third of the bytes.
+- **The other command line workloads** are within 1% to 4% of SQLite, which is about the
+  difference between two runs of the same build. Most of a call is starting the process, 15 ms for
+  either program.
+
+### A third round of the same comparison
+
+A third round measured the same 25 workloads again. Measured on 6 October 2026, fifteen rounds,
+the build at the end of the second round against the Windows release build of commit 90fa96c4,
+with no other work running. The third round's build is the one a release ships: profile guided,
+with the embedding feature, as `packaging/release-all.ps1` makes it.
+
+| How it was called | After the second round, against SQLite | Now against SQLite |
+|---|---|---|
+| the command line, one process a command, 8 workloads | 1% slower | **within 1%** |
+| a SQL script into the shell, 6 workloads | 34% faster | **39% faster** |
+| the Python driver, 9 workloads | 80% faster | **105% faster** |
+| the npm package, 2 workloads | 108% faster | **69% faster** |
+| all 25 | 40% faster | **46% faster** |
+
+19 of the 25 workloads are faster than SQLite, and all nine Python workloads are. Five of the six
+that are not are command line reads within 1% to 3% of SQLite, and they move by about that much
+between runs: a ten round run of the build one commit earlier had three of them faster. The npm
+group's change is the scheduling of the Node process, not the code: two of the four samples of
+`query()` ran at about 0.065 ms in each build that measured them, and three direct runs of this build
+measured 0.071, 0.037 and 0.038 ms.
+
+| Workload | After the second round | Now | SQLite | Now against SQLite |
+|---|---:|---:|---:|---|
+| `inillucent --version` | 15.30 ms | 15.11 ms | 15.48 ms | 2% faster |
+| `query` of one row as JSON | 16.96 ms | 17.00 ms | 16.82 ms | 1% slower |
+| `query` of one row as text | 17.29 ms | 17.08 ms | 16.64 ms | 3% slower |
+| `query` of 100 rows by an index, sorted, as JSON | 19.24 ms | 19.18 ms | 18.60 ms | 3% slower |
+| `query` of `count(*)` and `max` over 10,000 rows | 17.79 ms | 17.71 ms | 17.38 ms | 2% slower |
+| `exec` of a one row `INSERT` | 23.36 ms | 23.63 ms | 22.25 ms | 6% slower |
+| `tables` | 17.41 ms | 17.33 ms | 17.06 ms | 2% slower |
+| `dump` | 30.93 ms | 29.38 ms | 33.24 ms | 13% faster |
+| 1,000 lookups by key in a script | 32.35 ms | 30.91 ms | 37.95 ms | 23% faster |
+| 200 single row inserts, each its own transaction | 268 ms | 267 ms | 871 ms | 226% faster |
+| 10,000 `INSERT` statements in a transaction | 38.42 ms | 37.54 ms | 41.60 ms | 11% faster |
+| one `INSERT` of 20,000 rows | 42.06 ms | 39.76 ms | 42.59 ms | 7% faster |
+| `.import --csv` of 50,000 rows | 59.50 ms | 55.96 ms | 66.15 ms | 18% faster |
+| a 10,000 row table and two indexes, from a script | 53.92 ms | 53.57 ms | 68.42 ms | 28% faster |
+| Python, a 10,000 row table and two indexes | 46.17 ms | 36.87 ms | 48.87 ms | 33% faster |
+| Python, 5,000 lookups by key | 55.85 ms | 52.25 ms | 84.91 ms | 63% faster |
+| Python, read 10,000 rows | 6.14 ms | 5.75 ms | 7.74 ms | 35% faster |
+| Python, 200 range queries of 200 rows | 22.20 ms | 20.24 ms | 35.20 ms | 74% faster |
+| Python, 200 `GROUP BY` queries | 119 ms | 91 ms | 512 ms | 463% faster |
+| Python, 10,000 inserts in a transaction into a table with two indexes | 36.26 ms | 25.85 ms | 26.80 ms | 4% faster |
+| Python, 100 single row inserts | 122 ms | 123 ms | 426 ms | 246% faster |
+| Python, 1,000 single row updates | 1,226 ms | 1,238 ms | 6,985 ms | 464% faster |
+| Python, 100 opens and closes | 7.45 ms | 6.76 ms | 7.37 ms | 9% faster |
+| Node, a lookup by key with `query()` | 0.043 ms | 0.066 ms | 0.091 ms | 38% faster |
+| Node, a lookup by key through a session | 0.007 ms | 0.007 ms | 0.014 ms | 107% faster |
+
+What changed:
+
+- **The Windows release is built with profile guided optimisation.** `packaging/release-all.ps1`
+  builds the programs with counters, runs `packaging/pgo/train.mjs` against them, and builds them
+  again with the counts. Against the same commit built without a profile, Python inserts of 10,000
+  rows were 20% faster and 200 grouped aggregates 28% faster.
+- **An append into a full leaf splits at once**, and packs the left page once.
+- **A compaction leaves an eighth of the page free when the write adds a key**, so an insert into
+  the middle of an index rewrites its leaf about half as often.
+- **Python's `execute_many` moves its rows into the engine** instead of copying each row and each
+  text.
+- **A page read into a buffer pool frame used for the first time is read into the frame's
+  reserved memory**, instead of into 32 KiB of zeros written first.
+- **An open asks the file system fewer questions and takes no lock.** It tries the open before
+  asking whether the file is there, takes "not found" for the rollback journal from the first query
+  that answers it, and reads the meta record without the shared lock, which the first statement
+  takes. On Windows the file's identity is read only when something asks for it.
+- **The shell's `fsdir` and `zipfile` wait for the open**, so a command line verb that runs nothing
+  does not run recovery or read the schema, and the catalog is refreshed once.
+
+What is still slower, and why:
+
+- **A cold query that reads pages from the command line**: one row as JSON or as text, 100 rows by
+  an index, `count(*)`, `tables`. A sampled loop of the 100 row query found 38% of its time in the
+  kernel's copy of 65 pages of 32 KiB into fresh memory and 20% in the CRC each page is checked
+  with. SQLite reads about 180 pages of 4 KiB and checks none.
+- **A one row `exec`**: the change is written twice, to the log at the commit and to the data file
+  by the fold when the program closes. Both engines make three syncs: the log, the rollback
+  journal and the data file here, and the journal twice and the data file in SQLite.
+
 ## What this page does not measure
 
+- **A process per command, a script, or a language package, in the headline.**
+  [Through the command line, the shell, Python and Node](#through-the-command-line-the-shell-python-and-node)
+  measures those, and they are slower than SQLite where the headline is faster.
 - **The API an application uses, in the headline.** The headline calls the engine's `plan`,
   `prepare` and `pipeline` functions directly. It never calls `Database::open`, never opens a
   `Connection` and never steps a `Statement`. So no headline figure includes the plan cache lookup,

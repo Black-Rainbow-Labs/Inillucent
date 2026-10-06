@@ -83,6 +83,15 @@ fn refused_by_safe_mode(shell: &mut Shell, name: &str) -> bool {
 
 /// Runs one dot command.
 pub fn run(shell: &mut Shell, line: &str) {
+    // What the shell is holding runs first, because a command can read or
+    // change what it would have written (task-2191). A held statement that
+    // failed under `.bail` stops the command, as it would have stopped the
+    // input before the command was read.
+    let failed_before = shell.failed;
+    shell.run_held();
+    if shell.bail && shell.failed && !failed_before {
+        return;
+    }
     let words = split(without_terminator(line));
     let Some(name) = words
         .first()

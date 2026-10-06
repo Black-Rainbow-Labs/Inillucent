@@ -15,10 +15,11 @@ use super::*;
 impl Pool {
     /// Returns a frame holding nothing, cooling and evicting to get one.
     ///
-    /// The one place a frame is handed out for a page it does not yet hold, and
-    /// therefore the one place its buffer has to exist by. Every caller - the
-    /// read path through `fill_frame`, and `install` for a page built in memory
-    /// - comes through here.
+    /// The place a frame is handed out for a page built in memory, such as
+    /// `install`'s, and therefore where its buffer has to exist by. The read
+    /// path takes a frame with `take_frame` instead, and `frame_for_a_read`
+    /// reserves its buffer, because the read fills it and zeros would only be
+    /// overwritten.
     pub(super) fn claim_frame(&self) -> DbResult<u32> {
         let frame = self.take_frame()?;
         self.give_the_frame_a_buffer(frame)?;
@@ -44,7 +45,7 @@ impl Pool {
             let mut state = self.state.borrow_mut();
             let resident = self.buffers.len().saturating_sub(state.free.len());
             if resident < budget {
-                if let Some(frame) = state.free.pop() {
+                if let Some(frame) = state.pop_free() {
                     return Ok(frame);
                 }
             }
@@ -57,7 +58,7 @@ impl Pool {
         // The budget is a ceiling on caching, not a wall the statement runs
         // into, so a frame the pool owns and is not using is better than a
         // refusal.
-        if let Some(frame) = self.state.borrow_mut().free.pop() {
+        if let Some(frame) = self.state.borrow_mut().pop_free() {
             return Ok(frame);
         }
         // Nothing is evictable, and the two reasons for that are different
@@ -139,6 +140,32 @@ impl Pool {
             .map_err(|_| no_mem(format!("a frame of {} bytes", self.page_size)))?;
         bytes.resize(self.page_size, 0);
         Ok(())
+    }
+
+    /// Borrows a frame's buffer for a read that fills all of it, with room
+    /// reserved for a page.
+    ///
+    /// **Reserved, not zero filled.** A frame used for the first time has an
+    /// empty buffer. `claim_frame` sizes it with zeros, which a read then
+    /// overwrites, and a cold query reading 65 pages of 32 KiB spent about
+    /// 2 MB of writes on zeros nobody read. `VfsFile::read_exact_into` reads
+    /// into the reservation instead. `try_reserve_exact` is here, where an
+    /// allocation failure can be the pool's own error, so the read itself
+    /// never allocates.
+    ///
+    /// @param frame - the frame being loaded
+    pub(super) fn frame_for_a_read(&self, frame: u32) -> DbResult<std::cell::RefMut<'_, Vec<u8>>> {
+        let mut bytes = self
+            .buffers
+            .get(frame as usize)
+            .ok_or_else(|| misuse("frame index out of range"))?
+            .try_borrow_mut()
+            .map_err(|_| misuse("a frame chosen for loading was still borrowed"))?;
+        let wanted = self.page_size.saturating_sub(bytes.len());
+        bytes
+            .try_reserve_exact(wanted)
+            .map_err(|_| no_mem(format!("a frame of {} bytes", self.page_size)))?;
+        Ok(bytes)
     }
 
     /// Moves a share of the pool into the cooling FIFO.

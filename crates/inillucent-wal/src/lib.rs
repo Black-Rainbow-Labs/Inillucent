@@ -67,7 +67,9 @@ pub mod segment;
 pub mod writer;
 
 pub use record::{Body, PageList, Record, Structural, MAX_RECORD_BYTES};
-pub use recover::{recover, truncate_after, DryRun, Recovered, RecoveryStart, Redo};
+pub use recover::{
+    recover, recover_keeping, truncate_after, DryRun, KeptSegment, Recovered, RecoveryStart, Redo,
+};
 pub use segment::{first_lsn_of, sequence_of_segment_name};
 pub use segment::{SegmentHeader, SEGMENT_BYTES};
 pub use writer::{tail_on_disk, LogTail, Synchronous, Wal, WalOptions, WalStats, FIRST_LSN};

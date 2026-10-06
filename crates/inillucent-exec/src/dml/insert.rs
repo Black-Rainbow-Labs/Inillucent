@@ -8,7 +8,9 @@
 pub mod bulk;
 pub mod cached;
 
-use index::{index_entry, key_of, maintained, unique_indexes, write_index_entry};
+use index::{
+    add_new_row_entry, index_entry, key_of, maintained, unique_indexes, write_index_entry,
+};
 
 use inillucent_base::error::misuse;
 use inillucent_base::{DbError, DbResult, ExtendedCode};
@@ -108,7 +110,7 @@ pub fn insert_at(
     if table.kind == TableKind::View {
         return insert_into_view(statement, target, params, supplied, depth);
     }
-    note_single_row(statement, target, depth);
+    note_single_row(statement, target, depth, supplied);
     let compiled = compile_insert(statement, target, params)?;
     let catalog = target.catalog();
     let rows = rows_to_insert(statement, &compiled.space, params, catalog, supplied)?;
@@ -473,14 +475,28 @@ fn close_sequence(
 /// See `WriteTarget::defer_key_check`: a single row insert with no trigger of
 /// its own checks an immediate foreign key at the row, as SQLite does.
 ///
+/// The rows counted are the ones the statement writes: its `VALUES` rows, or
+/// the rows handed in for a `VALUES` row of parameters run over several rows
+/// (task-2191), which a one row template would otherwise count as one.
+///
 /// @param statement - the bound insert
 /// @param target - the file and its trees
 /// @param depth - how many triggers deep the insert is
-fn note_single_row(statement: &BoundInsert, target: &dyn WriteTarget, depth: Depth) {
+/// @param supplied - the rows handed in, empty when the statement's own are used
+pub(super) fn note_single_row(
+    statement: &BoundInsert,
+    target: &dyn WriteTarget,
+    depth: Depth,
+    supplied: &[Row],
+) {
     if depth.0 != 0 {
         return;
     }
-    let one_row = matches!(&statement.source, BoundInsertSource::Values(rows) if rows.len() == 1);
+    let one_row = match &statement.source {
+        BoundInsertSource::Values(rows) if supplied.is_empty() => rows.len() == 1,
+        BoundInsertSource::Values(_) => supplied.len() == 1,
+        BoundInsertSource::Select(_) => false,
+    };
     target.write_is_single_row(
         one_row && statement.triggers.iter().all(|trigger| trigger.foreign_key),
     );
@@ -508,6 +524,10 @@ fn rows_to_insert<'s>(
     let BoundInsertSource::Values(values) = &statement.source else {
         return Ok(std::borrow::Cow::Borrowed(supplied));
     };
+    // Rows handed in for a `VALUES` row of parameters; see `note_single_row`.
+    if !supplied.is_empty() {
+        return Ok(std::borrow::Cow::Borrowed(supplied));
+    }
     let mut built = Vec::with_capacity(values.len());
     for row in values {
         let mut cells = Vec::with_capacity(row.len());
@@ -947,12 +967,14 @@ fn place_row_absent(
     if !placed {
         return Ok(false);
     }
+    // The row's key was free, and this path is taken only for a table with no
+    // `UNIQUE` index, so every entry here is a new key in a non unique index.
     for (position, index) in maintained(table) {
         if !indexes.holds(position, row)? {
             continue;
         }
         let entry = index_entry(position, index, layout, row, indexes)?;
-        write_index_entry(index, target, &entry, true)?;
+        add_new_row_entry(index, target, &entry)?;
     }
     Ok(true)
 }

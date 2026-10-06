@@ -69,6 +69,13 @@ pwsh packaging/sign-sums.ps1
 - `release-all.ps1` builds Windows natively and cross compiles Linux and macOS with zig and
   `cargo-zigbuild`. The five Rust targets are listed in `rust-toolchain.toml`, so `rustup` installs
   them. The macOS half is `macos/release-macos.ps1`, which signs, builds the `.pkg` and notarises.
+- The Windows build is profile guided. `pgo/build-windows.ps1` builds the programs instrumented,
+  runs `pgo/train.mjs` against them, and builds them again with the counts the training wrote. The
+  training runs the usage workloads in `docs/performance.md`, every script in
+  `compat/corpus/usage/`, search, a migration and the Python binding, so it needs `node` and
+  `python` on the `PATH`. Measured against the same commit built without a profile, Python inserts
+  were 20% faster and no workload was slower. Only Windows has a profile, because the training has
+  to run the programs it trains.
   [`macos/README.md`](macos/README.md) has the Apple credentials it needs.
 - `tools/cross/bin` is not in git. A worktree uses the main checkout's copy.
   `INILLUCENT_CROSS_BIN` points every script at a different folder.

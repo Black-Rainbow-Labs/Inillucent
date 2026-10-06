@@ -292,7 +292,8 @@ unsafe fn open_database(
         }
     }
 }
-/// Checkpoints and closes a database.
+/// Folds the log into the file when this database wrote something, and closes
+/// it.
 ///
 /// Refuses while a connection is open on it, because freeing it then would
 /// leave every connection pointing at freed memory - and a use-after-free in a
@@ -328,7 +329,10 @@ pub unsafe extern "C" fn inillucent_close(
             );
             return INILLUCENT_INVALID_STATE;
         }
-        let outcome = database.database.checkpoint();
+        // Only what this database holds that the file does not is folded. A
+        // database that only read leaves the file and its log as they were,
+        // which is what closing it after a read costs in SQLite too.
+        let outcome = database.database.fold_if_owed();
         // The handle goes whether or not the checkpoint worked: a caller told
         // "close failed" would have no way to try again, and the log is
         // replayed on the next open regardless.

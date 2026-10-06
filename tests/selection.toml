@@ -2479,6 +2479,17 @@ tier = "e2e"
 package = "inillucent-compat"
 kind = "test"
 name = "e2e"
+module = "held_inserts"
+tier = "e2e"
+covers = ["inillucent-cli", "inillucent-engine"]
+# Scripts run through the built shell with its single row inserts held and
+# run as one statement, and again with nothing held, which must print the same
+# to the byte (task-2191).
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "e2e"
 module = "cli_commands"
 tier = "e2e"
 covers = ["inillucent-cli"]
@@ -2584,6 +2595,17 @@ covers = ["inillucent-engine", "inillucent-sql"]
 # The two lists a read only connection decides a pragma by have to cover the
 # pragma register exactly: one in neither is decided by whichever branch the
 # filter falls through to (task-1979, section 5.2).
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "usage_paths"
+tier = "engine"
+covers = ["inillucent-sql", "inillucent-tree", "inillucent-exec", "inillucent-engine"]
+# Inserts that differ only in their literals share one plan and store what the
+# literals denote; an open that runs nothing writes nothing; the remembered
+# largest rowid answers what a fresh look would (task-2191).
 
 [[target]]
 package = "inillucent-compat"

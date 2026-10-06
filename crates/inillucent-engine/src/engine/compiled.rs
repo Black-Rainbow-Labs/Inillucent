@@ -502,7 +502,9 @@ impl crate::ImportedDatabase {
                         );
                         self.before_write(rows)?
                     }
-                    None => Vec::new(),
+                    // Rows a lifted statement hands in (task-2191); none for
+                    // an ordinary `VALUES` list.
+                    None => params.take_supplied_rows().unwrap_or_default(),
                 };
                 // A `VALUES` list has expressions and no plan, so the
                 // plan-shaped fold never sees it. Folded here instead, or a

@@ -162,19 +162,22 @@ pub fn pragma_page() -> String {
         "`busy_timeout` to 0 to make the statement fail at once. `busy_timeout` applies to\n",
     );
     out.push_str("waits between processes and to waits inside one process.\n\n");
-    // The open's wait, which the pragma cannot reach, and the three ways to set it.
+    // The value a connection starts with, which the pragma cannot set before the
+    // open, and the three ways to set it.
     out.push_str(
-        "Opening a file also waits when another process holds it for writing, because the\n\
-         open reads the file under a lock. `PRAGMA busy_timeout` cannot set that wait: no\n\
-         connection exists until the open has finished. Three things set it, and the\n\
-         database then starts with the same value as its `busy_timeout`:\n\n\
+        "Opening a file does not wait for another process. The open reads the meta record\n\
+         without a lock, and the first statement takes the lock and waits if it has to.\n\
+         `PRAGMA busy_timeout` cannot be run before the open has finished, so three things\n\
+         set the value a database starts with as its `busy_timeout`:\n\n\
          | Where | How |\n\
          |---|---|\n\
          | any program, any language | the environment variable `INILLUCENT_BUSY_TIMEOUT`, in milliseconds |\n\
          | the Rust driver | `OpenOptions { busy_timeout: Some(Duration::from_secs(60)), .. }` |\n\
          | the C library | `inillucent_open_with_timeout(path, flags, 60000, &db, &error)` |\n\
          | the Python binding | `Database(path, busy_timeout_ms=60000)` |\n\n\
-         With none of them, the open waits 5000 milliseconds.\n\n",
+         With none of them, the first statement waits 5000 milliseconds. The open itself\n\
+         waits, for the same time, only when it has to read the file again under the lock,\n\
+         which it does for a file another process is still creating.\n\n",
     );
     out.push_str(
         "`locking_mode` starts at **normal**, which is also SQLite's default. In normal\n",

@@ -17,12 +17,13 @@
 // has never built the workspace.
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { inillucent, query, resolveBinary } from './index.mjs';
+import { inillucent, open, query, resolveBinary } from './index.mjs';
 
 /** Whether a binary can be found at all, decided once. */
 let available = true;
@@ -201,4 +202,89 @@ withDatabase('an encrypted database opens with its key and not without it', asyn
 
   const bytes = readFileSync(db);
   assert.equal(bytes.includes(Buffer.from(secret)), false, 'the row text is in the file');
+});
+
+withDatabase('a session runs many calls through one process and gives the same answers', async (db) => {
+  // `open()` keeps one inillucent-mcp process for every call (task-2191), so this
+  // checks what has to be the same as a call through `inillucent()`: rows, a
+  // bound blob, a classified failure, and a write a second process can read
+  // once the session is closed.
+  const session = await open(db);
+  try {
+    const made = await session.inillucent('batch', {
+      sql: 'CREATE TABLE note (id INTEGER PRIMARY KEY, body TEXT, raw BLOB)',
+    });
+    assert.equal(made.ok, true, made.message);
+    for (let id = 1; id <= 50; id++) {
+      const written = await session.inillucent('exec', {
+        sql: 'INSERT INTO note VALUES (?1, ?2, ?3)',
+        params: [id, `note ${id}`, new Uint8Array([id, 255])],
+      });
+      assert.equal(written.ok, true, written.message);
+    }
+    const rows = await session.query('SELECT body, raw FROM note WHERE id = ?1', { params: [7] });
+    assert.equal(rows[0].body, 'note 7');
+    assert.deepEqual([...rows[0].raw], [7, 255], 'the blob did not survive the session');
+    const missing = await session.inillucent('query', { sql: 'SELECT * FROM absent' });
+    assert.equal(missing.ok, false);
+    assert.equal(missing.status, 'not_found');
+  } finally {
+    await session.close();
+  }
+  const counted = await query('SELECT count(*) AS n FROM note', { db });
+  assert.equal(counted[0].n, 50, 'a write through the session is not in the file after close');
+});
+
+withDatabase('a one shot read sees what another process wrote since the last one', async (db) => {
+  // `query()` keeps the database it read open for the next read of the same
+  // file. A row another process commits in between has to be in the next
+  // answer, as it was when every call opened the file afresh.
+  const made = await inillucent('batch', {
+    db,
+    sql: "CREATE TABLE note (id INTEGER PRIMARY KEY, body TEXT); INSERT INTO note VALUES (1, 'one')",
+  });
+  assert.equal(made.ok, true, made.message);
+  assert.equal((await query('SELECT count(*) AS n FROM note', { db }))[0].n, 1);
+
+  execFileSync(resolveBinary('inillucent'), ['--db', db, 'exec', "INSERT INTO note VALUES (2, 'two')"]);
+  assert.equal(
+    (await query('SELECT count(*) AS n FROM note', { db }))[0].n,
+    2,
+    'the second read answered from the file as it was before the other process wrote',
+  );
+});
+
+withDatabase('a one shot read of a file made again at the same path reads the new file', async (db) => {
+  // A database deleted and created again keeps its path and gets a new file.
+  // The kept database is the old file, so it has to be closed, not reused.
+  await inillucent('batch', { db, sql: "CREATE TABLE note (body TEXT); INSERT INTO note VALUES ('old')" });
+  assert.deepEqual(await query('SELECT body FROM note', { db }), [{ body: 'old' }]);
+
+  const directory = join(db, '..');
+  rmSync(directory, { recursive: true, force: true });
+  mkdirSync(directory);
+  await inillucent('batch', { db, sql: "CREATE TABLE note (body TEXT); INSERT INTO note VALUES ('new')" });
+  assert.deepEqual(
+    await query('SELECT body FROM note', { db }),
+    [{ body: 'new' }],
+    'the read answered from the file that was deleted',
+  );
+});
+
+withDatabase('a one shot statement that is not a read leaves nothing on a kept connection', async (db) => {
+  // A connection remembers what ran on it: the last rowid inserted, a
+  // transaction begun, a setting. One shot calls each had a connection of
+  // their own, so none of that reached the next call. A write still does: it
+  // runs on a connection that closes with the call, and only reads run on the
+  // kept one. Were the insert run on the kept connection, the read after it
+  // would answer its rowid instead of zero.
+  await inillucent('batch', { db, sql: 'CREATE TABLE note (id INTEGER PRIMARY KEY)' });
+  await query('SELECT count(*) AS n FROM note', { db });
+  const written = await inillucent('exec', { db, sql: 'INSERT INTO note VALUES (7)' });
+  assert.equal(written.ok, true, written.message);
+  assert.equal(
+    (await query('SELECT last_insert_rowid() AS id', { db }))[0].id,
+    0,
+    'the insert ran on the connection the next read used',
+  );
 });

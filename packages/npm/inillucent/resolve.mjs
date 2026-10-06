@@ -120,3 +120,40 @@ export function resolveBinary(program) {
   }
   return path;
 }
+
+/** The C library's file name on each platform. */
+const LIBRARY = {
+  win32: 'inillucent_driver_capi.dll',
+  darwin: 'libinillucent_driver_capi.dylib',
+  linux: 'libinillucent_driver_capi.so',
+};
+
+/**
+ * Returns the path of the C library on this machine, or null when there is none.
+ *
+ * The library is also a Node addon (see `open()` in index.mjs), and the
+ * platform package ships it under `lib/`. `INILLUCENT_BIN` wins here too: the
+ * library is looked for beside the named binary, which is where a workspace
+ * build puts both. Unlike the programs, a missing library is not an error,
+ * because every call it would serve has a route through a program as well.
+ */
+export function resolveLibrary() {
+  const file = LIBRARY[process.platform];
+  if (!file) {
+    return null;
+  }
+  const named = process.env.INILLUCENT_BIN;
+  if (named) {
+    const beside = join(dirname(named), file);
+    return existsSync(beside) ? beside : null;
+  }
+  const name = platformPackage();
+  if (!name) {
+    return null;
+  }
+  try {
+    return require.resolve(`${name}/lib/${file}`);
+  } catch {
+    return null;
+  }
+}

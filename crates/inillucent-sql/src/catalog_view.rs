@@ -891,6 +891,20 @@ impl StaticCatalog {
         self
     }
 
+    /// Adds an eponymous virtual table its caller already shares, returning the
+    /// catalog.
+    ///
+    /// The engine keeps one list of its eponymous tables per session and builds
+    /// a new catalog from it at every open and every schema change, so a
+    /// shared table is one count added where [`StaticCatalog::with_eponymous`]
+    /// would copy every column.
+    ///
+    /// @param table - the module's table
+    pub fn with_shared_eponymous(mut self, table: std::rc::Rc<TableInfo>) -> StaticCatalog {
+        self.eponymous.push(table);
+        self
+    }
+
     /// Adds a table, returning the catalog, for building fixtures.
     /// Returns one table by folded name, searching every database.
     ///

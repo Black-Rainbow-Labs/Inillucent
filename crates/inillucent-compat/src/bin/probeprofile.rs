@@ -145,7 +145,7 @@ fn index_probe_stages(database: &ImportedDatabase) -> Result<(), String> {
     println!(
         "side_owner: root page {:?}, height {}, {} leaves, {} rows, key columns {}",
         tree.root(),
-        tree.height(),
+        tree.height(pool).map_err(|error| error.to_string())?,
         tree.leaf_count(),
         tree.row_count(),
         tree.key_columns()
@@ -377,7 +377,7 @@ fn probe_stages(database: &ImportedDatabase, rows: u32) -> Result<(), String> {
     println!(
         "main_table: root page {:?}, height {}, {} leaves, {} rows",
         tree.root(),
-        tree.height(),
+        tree.height(pool).map_err(|error| error.to_string())?,
         tree.leaf_count(),
         tree.row_count()
     );

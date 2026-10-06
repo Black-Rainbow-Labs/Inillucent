@@ -354,7 +354,7 @@ fn a_tree_grown_by_inserts_splits_under_an_evicting_pool() {
     let (mut database, mut tree, mut model) = fixture(512, 16, 40);
     let mut log = NoLog::default();
     let before_leaves = tree.leaf_count();
-    let before_height = tree.height();
+    let before_height = tree.height(database.pool()).unwrap();
 
     let labels: Vec<Vec<u8>> = (0..600)
         .map(|key| format!("a much longer label so pages fill up, number {key:06}").into_bytes())
@@ -386,9 +386,9 @@ fn a_tree_grown_by_inserts_splits_under_an_evicting_pool() {
         tree.write_stats()
     );
     assert!(
-        tree.height() > before_height,
+        tree.height(database.pool()).unwrap() > before_height,
         "the tree did not get taller: height {} from {before_height}",
-        tree.height()
+        tree.height(database.pool()).unwrap()
     );
     assert!(
         database.pool().stats().evicted > 0,
@@ -682,7 +682,7 @@ fn a_split_does_not_log_its_parents_image_twice() {
     // either.
     let (mut database, mut tree, mut model) = fixture(4_096, 16, 40);
     let mut log = CountingLog::default();
-    let before_height = tree.height();
+    let before_height = tree.height(database.pool()).unwrap();
 
     let labels: Vec<Vec<u8>> = (0..300)
         .map(|key| format!("a much longer label so pages fill up, number {key:06}").into_bytes())
@@ -705,7 +705,7 @@ fn a_split_does_not_log_its_parents_image_twice() {
         );
     }
     assert!(
-        tree.height() > before_height,
+        tree.height(database.pool()).unwrap() > before_height,
         "the tree did not grow an interior level, so this campaign never reached \
          insert_separator's \"the parent has room\" branch at all"
     );

@@ -598,7 +598,11 @@ pub(crate) struct SessionState {
     /// re-deriving them per refresh was work with no input that had changed,
     /// on the path the gate's `schema.index` measures. Rebuilt only when a
     /// module or a pragma is registered, which is at open and nowhere else.
-    pub(crate) eponymous: Vec<inillucent_sql::catalog_view::TableInfo>,
+    pub(crate) eponymous: Vec<std::rc::Rc<inillucent_sql::catalog_view::TableInfo>>,
+    /// Whether the registry holds only the modules every connection starts
+    /// with, so its eponymous tables are the ones any such connection on this
+    /// thread already built. False once a module is registered.
+    pub(crate) only_builtin_modules: bool,
     /// The virtual tables that have been connected, by folded name.
     pub(crate) virtual_tables: HashMap<Vec<u8>, vtab::Connected>,
     /// The indexes a module owns, by the root page of the table they index.
@@ -1434,6 +1438,16 @@ impl Writing {
             running: std::cell::Cell::new(0),
             settling: std::cell::Cell::new(false),
         }
+    }
+
+    /// Sets the first transaction number this database will hand out.
+    ///
+    /// For an open that made its handle before recovery said where the numbers
+    /// stand (task-2191); see `ImportedDatabase::finish_open`.
+    ///
+    /// @param next_txn - the first transaction number this database will hand out
+    pub(crate) fn start_at(&self, next_txn: u64) {
+        self.next_txn.set(next_txn);
     }
 
     /// Sets touched and returns what it was.

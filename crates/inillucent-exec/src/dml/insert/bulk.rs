@@ -32,6 +32,7 @@ use std::collections::HashSet;
 
 use inillucent_base::{DbError, DbResult, ExtendedCode};
 use inillucent_sql::ast::ConflictAction;
+use inillucent_sql::bind::BoundExpr;
 use inillucent_sql::catalog_view::{IndexInfo, TableInfo, TableKind};
 use inillucent_sql::dml::{rowid_message, BoundInsert, BoundInsertSource};
 use inillucent_tree::datum::OwnedDatum;
@@ -41,7 +42,7 @@ use crate::declared::IndexExprs;
 use crate::dml::index::{index_entry, maintained};
 use crate::dml::target::holds_no_row;
 use crate::dml::*;
-use crate::insert_plan::RowidKeys;
+use crate::insert_plan::{RowSource, RowidKeys};
 use crate::physical::Params;
 
 /// The rows a bulk build writes, already checked and in key order.
@@ -93,6 +94,18 @@ pub struct BulkFailure {
 ///
 /// @param statement - the bound insert
 pub fn bulk_shape(statement: &BoundInsert) -> bool {
+    bulk_shape_with(statement, false)
+}
+
+/// [`bulk_shape`], for a statement whose rows were handed in.
+///
+/// A `VALUES` row of parameters run over rows of literals (task-2191) writes
+/// rows that are already values, as a `SELECT`'s are, so it may take the same
+/// path.
+///
+/// @param statement - the bound insert
+/// @param rows_handed_in - whether the rows were handed in rather than its own
+pub fn bulk_shape_with(statement: &BoundInsert, rows_handed_in: bool) -> bool {
     let table = &statement.table;
     let plain_clause =
         |action: Option<ConflictAction>| matches!(action, None | Some(ConflictAction::Abort));
@@ -102,7 +115,11 @@ pub fn bulk_shape(statement: &BoundInsert) -> bool {
             Some(ConflictAction::Fail | ConflictAction::Rollback)
         ) && plain_clause(column.primary_key_conflict)
     });
-    matches!(statement.source, BoundInsertSource::Select(_))
+    let source_is_rows = match &statement.source {
+        BoundInsertSource::Select(_) => true,
+        BoundInsertSource::Values(_) => rows_handed_in,
+    };
+    source_is_rows
         && table.kind == TableKind::Table
         && !table.without_rowid
         && !table.autoincrement
@@ -112,6 +129,67 @@ pub fn bulk_shape(statement: &BoundInsert) -> bool {
         && plain_clause(statement.on_conflict)
         && plain_clause(rowid_conflict(table))
         && column_clauses_allowed
+        && table.foreign_keys.is_empty()
+        && table.foreign_key_triggers.is_empty()
+}
+
+/// Reports whether a prepared single row `INSERT` can be run once over many
+/// rows of parameters, as one statement, in place of once per row.
+///
+/// **One statement where a driver would run thousands** (task-2191). Python's
+/// `executemany` of 10,000 rows ran the prepared insert 10,000 times, and each
+/// run paid for a statement: the lock check, the counters, the undo mark and
+/// the write view. Run once over all the rows, it pays once, and an empty table
+/// takes the bulk build.
+///
+/// The caller runs the rows one at a time again whenever the statement fails,
+/// and it fails having written nothing, so the one statement has to be
+/// indistinguishable from the rows run one after another whenever it
+/// succeeds. That is what each condition is for:
+///
+/// - the `VALUES` row is `?1`, `?2` and so on, exactly the statement's
+///   parameters in order, so a row handed in is the row the values would
+///   have built;
+/// - no trigger, `RETURNING`, upsert or foreign key, each of which acts per
+///   statement or reads the rows that came before;
+/// - no conflict clause but `ABORT`, on the statement, a column or an index.
+///   `IGNORE` and `REPLACE` change what one row writes, `FAIL` keeps a failed
+///   statement's earlier rows, and `ROLLBACK` ends the transaction the caller
+///   needs to try again in.
+///
+/// @param statement - the bound insert
+pub fn runs_rows_at_once(statement: &BoundInsert) -> bool {
+    let table = &statement.table;
+    let plain_clause =
+        |action: Option<ConflictAction>| matches!(action, None | Some(ConflictAction::Abort));
+    let parameters_in_order = match &statement.source {
+        BoundInsertSource::Values(rows) => match rows.as_slice() {
+            [row] => {
+                row.len() == statement.arity
+                    && row.iter().enumerate().all(|(nth, value)| {
+                        matches!(value, BoundExpr::Parameter(index)
+                            if usize::try_from(*index).ok() == Some(nth.saturating_add(1)))
+                    })
+            }
+            _ => false,
+        },
+        BoundInsertSource::Select(_) => false,
+    };
+    parameters_in_order
+        && table.kind == TableKind::Table
+        && statement.triggers.is_empty()
+        && statement.replace_triggers.is_empty()
+        && statement.upsert.is_empty()
+        && statement.returning.is_empty()
+        && plain_clause(statement.on_conflict)
+        && plain_clause(rowid_conflict(table))
+        && table.columns.iter().all(|column| {
+            plain_clause(column.not_null_conflict) && plain_clause(column.primary_key_conflict)
+        })
+        && table
+            .indexes
+            .iter()
+            .all(|index| plain_clause(index.conflict))
         && table.foreign_keys.is_empty()
         && table.foreign_key_triggers.is_empty()
 }
@@ -178,7 +256,7 @@ pub fn bulk_target_ready(statement: &BoundInsert, target: &mut dyn WriteTarget) 
 /// @param target - the file and its trees, which `bulk_target_ready` accepted
 /// @param params - the bound parameters
 /// @param supplied - the rows the `SELECT` produced, in order
-pub fn bulk_rows<S: AsRef<[OwnedDatum]>>(
+pub fn bulk_rows<'r, S: Into<RowSource<'r>>>(
     statement: &BoundInsert,
     target: &mut dyn WriteTarget,
     params: &Params,
@@ -196,7 +274,7 @@ pub fn bulk_rows<S: AsRef<[OwnedDatum]>>(
     for source in supplied {
         let last = built.kept.last();
         built
-            .add(statement, &compiled, source.as_ref())
+            .add(statement, &compiled, source.into())
             .map_err(|error| fail(error, last))?;
     }
     let last_rowid = built.kept.last();
@@ -248,12 +326,12 @@ impl Building {
     ///
     /// @param statement - the bound insert
     /// @param compiled - the plan and the declarations
-    /// @param source - one row the `SELECT` produced
+    /// @param source - one row the `SELECT` produced, lent or handed over
     fn add(
         &mut self,
         statement: &BoundInsert,
         compiled: &CompiledInsert,
-        source: &[OwnedDatum],
+        source: RowSource<'_>,
     ) -> DbResult<()> {
         let table = &statement.table;
         let CompiledInsert {
@@ -264,7 +342,8 @@ impl Building {
         } = compiled;
         let before = self.next_rowid;
         let mut keys = BulkKeys { kept: &self.kept };
-        let mut image = plan.build_row(source, space, &mut self.next_rowid, &mut keys, None)?;
+        let mut image =
+            plan.build_row_from(source, space, &mut self.next_rowid, &mut keys, None)?;
         plan.convert(declarations, space, &mut image)?;
         let declared = resolution_of(statement.on_conflict);
         let met = declarations_are_met(table, layout, declarations, space, &mut image, declared)?;

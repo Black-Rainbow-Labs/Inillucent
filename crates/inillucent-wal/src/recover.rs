@@ -211,7 +211,44 @@ pub fn recover(
     start: RecoveryStart,
     redo: &mut dyn Redo,
 ) -> DbResult<Recovered> {
-    let chain = read_chain(vfs, base, &start)?;
+    recover_keeping(vfs, base, start, redo, false).map(|(outcome, _)| outcome)
+}
+
+/// A log segment recovery read, still open, for the writer to append through.
+///
+/// **One handle on the segment instead of two** (task-2191). Recovery opened
+/// the last segment to read it and closed it, and `Wal::open` then opened the
+/// same file again to append. On Windows an open and a close of a handle that
+/// may write cost 30 to 40 us, which was a tenth of opening a small database.
+/// The segment carries no ownership of its own: the writer is whoever holds
+/// RESERVED on the database file, so which handle the appends go through
+/// changes nothing about who may append.
+pub struct KeptSegment {
+    /// The segment's sequence number.
+    pub sequence: u64,
+    /// The open file.
+    pub file: Box<dyn inillucent_vfs::VfsFile>,
+    /// Whether the file was opened so it can be written.
+    pub writable: bool,
+}
+
+/// [`recover`], keeping the last segment it read open.
+///
+/// @param vfs - the file system
+/// @param base - the database file's path
+/// @param start - where to start
+/// @param redo - what applies each record
+/// @param writable - whether to open the segments so they can be written,
+///   which a connection that may write asks for so its writer can reuse the
+///   handle; a refused permission falls back to reading
+pub fn recover_keeping(
+    vfs: &dyn Vfs,
+    base: &DbPath,
+    start: RecoveryStart,
+    redo: &mut dyn Redo,
+    writable: bool,
+) -> DbResult<(Recovered, Option<KeptSegment>)> {
+    let (chain, kept) = read_chain(vfs, base, &start, writable)?;
     let analysis = analyse(&chain, &start)?;
     let mut outcome = Recovered {
         // Filled by the caller after the replay, from the applier - this loop
@@ -231,7 +268,7 @@ pub fn recover(
         highest_txn: analysis.highest_txn,
     };
     replay(&chain, &start, &analysis, redo, &mut outcome)?;
-    Ok(outcome)
+    Ok((outcome, kept))
 }
 
 /// Truncates the log to the recovered prefix and removes what is past it.
@@ -276,10 +313,15 @@ pub fn truncate_after(vfs: &dyn Vfs, base: &DbPath, outcome: &Recovered) -> DbRe
     Ok(())
 }
 
-/// One segment's bytes and what its header said.
+/// One segment's record bytes from where the scan starts, and what its header
+/// said.
 struct LoadedSegment {
     header: SegmentHeader,
-    bytes: Vec<u8>,
+    /// The records, from `body_first_lsn` to the end of the file.
+    body: Vec<u8>,
+    /// The stream position of `body`'s first byte: the segment's first LSN,
+    /// or the checkpoint when the checkpoint lies inside this segment.
+    body_first_lsn: u64,
 }
 
 /// The segments the scan will read, in sequence order.
@@ -294,17 +336,18 @@ impl Chain {
     fn body(&self, index: usize) -> &[u8] {
         self.segments
             .get(index)
-            .and_then(|segment| segment.bytes.get(segment::HEADER_BYTES..))
+            .map(|segment| segment.body.as_slice())
             .unwrap_or(&[])
     }
 
-    /// Returns one segment's first LSN.
+    /// Returns the stream position of the first byte of one segment's
+    /// [`Chain::body`].
     ///
     /// @param index - the segment's position in the chain
     fn first_lsn(&self, index: usize) -> u64 {
         self.segments
             .get(index)
-            .map(|segment| segment.header.first_lsn)
+            .map(|segment| segment.body_first_lsn)
             .unwrap_or(FIRST_LSN)
     }
 
@@ -344,10 +387,17 @@ impl Chain {
 /// @param vfs - the file system
 /// @param base - the database file's path
 /// @param start - where to start
-fn read_chain(vfs: &dyn Vfs, base: &DbPath, start: &RecoveryStart) -> DbResult<Chain> {
+/// @param writable - whether to open each segment so it can be written
+fn read_chain(
+    vfs: &dyn Vfs,
+    base: &DbPath,
+    start: &RecoveryStart,
+    writable: bool,
+) -> DbResult<(Chain, Option<KeptSegment>)> {
     let name = base.as_path().to_string_lossy().to_string();
     let directory = base.as_path().parent().map(std::path::Path::to_path_buf);
     let mut segments = Vec::new();
+    let mut kept: Option<KeptSegment> = None;
     let mut sequence = start.sequence.max(1);
     loop {
         let path = segment_path(&name, directory.as_deref(), sequence);
@@ -358,8 +408,8 @@ fn read_chain(vfs: &dyn Vfs, base: &DbPath, start: &RecoveryStart) -> DbResult<C
             // new since `access` never used to be an injectable failpoint site.
             Ok(false) | Err(_) => break,
         }
-        let file = match vfs.open(&path, OpenOptions::of_kind(FileKind::Wal).read_only()) {
-            Ok(file) => file,
+        let (file, opened_writable) = match open_segment_for_reading(vfs, &path, writable) {
+            Ok(opened) => opened,
             Err(error) => return Err(error.into_db_error()),
         };
         let size = file
@@ -370,8 +420,33 @@ fn read_chain(vfs: &dyn Vfs, base: &DbPath, start: &RecoveryStart) -> DbResult<C
             // was cut short. It ends the chain; it does not fail the open.
             break;
         }
-        let mut bytes = vec![0u8; size as usize];
-        if let Err(error) = file.read_exact_at(0, &mut bytes) {
+        let mut head = vec![0u8; segment::HEADER_BYTES];
+        if let Err(error) = file.read_exact_at(0, &mut head) {
+            if error.extended() != inillucent_base::error::ExtendedCode::IO_ERR_SHORT_READ {
+                return Err(error.into_db_error());
+            }
+            break;
+        }
+        let header = match SegmentHeader::decode(&head) {
+            Ok(header) => header,
+            Err(_) => break,
+        };
+        if header.belongs_to(start.uuid, sequence).is_err() {
+            break;
+        }
+        // **Only the records from the checkpoint on are read** (task-2191).
+        // The scan and the replay below both start at the checkpoint, and a
+        // close folds without starting a new segment until the segment holds a
+        // mebibyte, so the records before the checkpoint can be most of the
+        // file. Reading them was most of what an open spent on the log.
+        let body_len = size.saturating_sub(segment::HEADER_BYTES as u64);
+        let skip = start
+            .checkpoint_lsn
+            .saturating_sub(header.first_lsn)
+            .min(body_len);
+        let mut bytes = vec![0u8; body_len.saturating_sub(skip) as usize];
+        let from = (segment::HEADER_BYTES as u64).saturating_add(skip);
+        if let Err(error) = file.read_exact_at(from, &mut bytes) {
             if error.extended() != inillucent_base::error::ExtendedCode::IO_ERR_SHORT_READ {
                 // Not the media model's torn-tail signal, so this is an
                 // operational failure reading a segment `access` just said was
@@ -384,29 +459,50 @@ fn read_chain(vfs: &dyn Vfs, base: &DbPath, start: &RecoveryStart) -> DbResult<C
             // stops, and everything above is discarded.
             break;
         }
-        let header = match SegmentHeader::decode(&bytes) {
-            Ok(header) => header,
-            Err(_) => break,
-        };
-        if header.belongs_to(start.uuid, sequence).is_err() {
-            break;
-        }
         if let Some(previous) = segments.last() {
             let previous: &LoadedSegment = previous;
             let expected = previous
-                .header
-                .first_lsn
-                .saturating_add(previous.bytes.len().saturating_sub(segment::HEADER_BYTES) as u64);
+                .body_first_lsn
+                .saturating_add(previous.body.len() as u64);
             if header.first_lsn > expected {
                 // A gap: the previous segment's records stop before this one
                 // starts, so the stream is not continuous and the chain ends.
                 break;
             }
         }
-        segments.push(LoadedSegment { header, bytes });
+        segments.push(LoadedSegment {
+            header,
+            body: bytes,
+            body_first_lsn: header.first_lsn.saturating_add(skip),
+        });
+        kept = Some(KeptSegment {
+            sequence,
+            file,
+            writable: opened_writable,
+        });
         sequence = sequence.saturating_add(1);
     }
-    Ok(Chain { segments })
+    Ok((Chain { segments }, kept))
+}
+
+/// Opens one segment the chain is reading, for writing as well when asked and
+/// allowed.
+///
+/// @param vfs - the file system
+/// @param path - the segment
+/// @param writable - whether to try to open it so it can be written
+fn open_segment_for_reading(
+    vfs: &dyn Vfs,
+    path: &DbPath,
+    writable: bool,
+) -> Result<(Box<dyn inillucent_vfs::VfsFile>, bool), inillucent_vfs::VfsError> {
+    if writable {
+        if let Ok(file) = vfs.open(path, OpenOptions::of_kind(FileKind::Wal)) {
+            return Ok((file, true));
+        }
+    }
+    vfs.open(path, OpenOptions::of_kind(FileKind::Wal).read_only())
+        .map(|file| (file, false))
 }
 
 /// What the first pass learned.

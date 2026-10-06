@@ -428,7 +428,8 @@ fn build_and_close(path: &Path) {
     database.checkpoint().expect("the file is checkpointed");
 }
 
-/// A page stamped above the log's end refuses the open instead of losing the write.
+/// A page stamped above the log's end refuses the open, or the first statement
+/// after it, instead of losing the write.
 ///
 /// **This is the reduction the module comment above says does not exist.** The
 /// earlier attempt tried to reproduce the *conditions* that set the distance
@@ -456,14 +457,20 @@ fn a_page_stamped_above_the_logs_end_refuses_the_open() {
     // A committed write into that page, with the log left unfolded.
     write_and_abandon(&path, "CREATE TABLE later(a TEXT);");
 
+    // **Refused by the open or by the first statement after it** (task-2191).
+    // An open checks the file's format and meta record and leaves recovery to
+    // the first statement, which is where SQLite reads its log too, so the
+    // refusal arrives there. What may not happen is either one succeeding.
     let error = match Database::open(&path) {
         Ok(database) => {
             let connection = database.session().expect("the connection opens");
-            let rows = connection.query("SELECT count(*) FROM later");
-            panic!(
-                "the open accepted a file stamped by a stream it does not have, and the \
-                 committed CREATE TABLE read back as {rows:?} - which is the silent loss"
-            );
+            match connection.query("SELECT count(*) FROM later") {
+                Err(error) => error,
+                Ok(rows) => panic!(
+                    "the open accepted a file stamped by a stream it does not have, and the \
+                     committed CREATE TABLE read back as {rows:?} - which is the silent loss"
+                ),
+            }
         }
         Err(error) => error,
     };

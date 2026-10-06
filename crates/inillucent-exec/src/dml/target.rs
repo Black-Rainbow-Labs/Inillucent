@@ -509,6 +509,31 @@ impl RowSpace {
         self.evaluate_with(eval, images, &[])
     }
 
+    /// Evaluates several compiled expressions against no row images, as the
+    /// elements of one `VALUES` row are.
+    ///
+    /// **One batch for the row** (task-2191). [`RowSpace::evaluate`] builds a
+    /// batch of NULL cells and its vectors for every expression, which was two
+    /// allocations for every value of every inserted row; the elements of a
+    /// row all read the same batch, so it is built once.
+    ///
+    /// @param evals - the compiled expressions, in order
+    pub fn evaluate_row(&self, evals: &[Box<dyn Eval>]) -> DbResult<Vec<OwnedDatum>> {
+        let cells: Vec<[Datum<'_>; 1]> = (0..self.stages.len().saturating_mul(self.width))
+            .map(|_| [Datum::Null])
+            .collect();
+        let vectors: Vec<Vector<'_>> = cells
+            .iter()
+            .map(|cell| Vector::Values(cell.as_slice()))
+            .collect();
+        let batch = Batch::new(1, vectors);
+        let mut values = Vec::with_capacity(evals.len());
+        for eval in evals {
+            values.push(OwnedDatum::from_datum(&eval.value(&batch, 0)?.get()));
+        }
+        Ok(values)
+    }
+
     /// Evaluates a compiled expression with the correlated answers beside it.
     ///
     /// @param eval - the compiled expression
@@ -810,12 +835,16 @@ pub(crate) fn holds_no_row(target: &mut dyn WriteTarget, table: &TableInfo) -> D
 /// @param tree - the tree
 /// @param pool - the buffer pool
 fn largest_key(tree: &PagedTree, pool: &Pool) -> DbResult<i64> {
+    if let Some(largest) = tree.hinted_largest_key(pool) {
+        return Ok(largest);
+    }
     let key = tree.encode_key(&[Datum::Int(i64::MAX)]);
-    let (guard, _) = tree.descend_guard(pool, &key)?;
+    let (guard, page) = tree.descend_guard(pool, &key)?;
     let leaf = LeafRef::parse(&guard)?
         .with_collations(tree.collations())
         .with_directions(tree.directions());
     if let Some(largest) = largest_in_leaf(&leaf)? {
+        tree.note_largest_key(page, &guard, largest);
         return Ok(largest);
     }
     drop(guard);

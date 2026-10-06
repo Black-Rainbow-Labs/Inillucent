@@ -175,6 +175,35 @@ pub fn read_at(file: &File, offset: u64, output: &mut [u8]) -> io::Result<usize>
     file.read_at(output, offset)
 }
 
+/// Reads at an absolute offset into memory that has not been initialised.
+///
+/// `pread` only writes to the buffer, so it needs no initialised bytes to read
+/// over; see `VfsFile::read_exact_into` for why that matters.
+///
+/// @param file - the open file
+/// @param offset - where to read from
+/// @param output - where the bytes go
+pub fn read_at_spare(
+    file: &File,
+    offset: u64,
+    output: &mut [std::mem::MaybeUninit<u8>],
+) -> io::Result<usize> {
+    let at = libc::off_t::try_from(offset)
+        .map_err(|_| io::Error::other("a read offset past what off_t holds"))?;
+    // SAFETY: the pointer and length describe memory `output` owns for the
+    // whole call, `pread` writes at most that many bytes to it and reads none,
+    // and the descriptor is valid for the life of `file`.
+    let read = unsafe {
+        libc::pread(
+            file.as_raw_fd(),
+            output.as_mut_ptr().cast(),
+            output.len(),
+            at,
+        )
+    };
+    usize::try_from(read).map_err(|_| io::Error::last_os_error())
+}
+
 /// Writes at an absolute offset.
 pub fn write_at(file: &File, offset: u64, input: &[u8]) -> io::Result<usize> {
     file.write_at(input, offset)
@@ -188,6 +217,56 @@ pub fn write_at(file: &File, offset: u64, input: &[u8]) -> io::Result<usize> {
 /// @param file - the open file
 pub fn file_len(file: &File) -> io::Result<u64> {
     file.metadata().map(|metadata| metadata.len())
+}
+
+/// Reports whether a path names something, and what.
+///
+/// `None` when nothing is there. `stat` is already the light query on a POSIX
+/// system; the Windows module says why it has a function of its own there.
+///
+/// @param path - the path to ask about
+pub fn path_state(path: &std::path::Path) -> io::Result<Option<crate::os::PathState>> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some(crate::os::PathState::of(&metadata))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Returns the names in a directory that start with a prefix.
+///
+/// The Windows module says why it does not list every name there; a POSIX
+/// directory has no pattern to ask with, so this filters a listing.
+///
+/// @param directory - the directory to list
+/// @param prefix - what every returned name starts with
+pub fn names_starting_with(directory: &std::path::Path, prefix: &str) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if name.starts_with(prefix) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// Builds a new handle's lock state, and the file's identity it is keyed by.
+///
+/// POSIX record locks belong to the process, not the handle, so the
+/// in-process registry that keeps one handle's unlock from dropping
+/// another's locks is keyed by the device and inode. That is read here, at
+/// the open, and kept as the file's identity.
+///
+/// @param file - the open file
+/// @param handle - this handle's number in the process
+pub fn lock_state(
+    file: &Arc<File>,
+    handle: HandleId,
+) -> VfsResult<(LockState, Option<FileIdentity>)> {
+    let identity = file_identity(file)?;
+    let locks = LockState::new(identity.clone(), handle, Arc::clone(file));
+    Ok((locks, Some(identity)))
 }
 
 /// Returns the device and inode numbers that identify a file.

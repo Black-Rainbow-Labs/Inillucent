@@ -238,7 +238,8 @@ tagged and left half published for four days, with its GitHub release still a dr
 | Script | What it does |
 |---|---|
 | `ship.ps1` | The whole release |
-| `release-all.ps1` | Builds every target, all five at once, each in its own target directory. `-Targets windows`, `linux` or `macos` builds one family. `-Serial` builds them one after another. `-BuildOnly` stops after the build |
+| `release-all.ps1` | Builds every target, all five at once, each in its own target directory. `-Targets windows`, `linux` or `macos` builds one family. `-Serial` builds them one after another. `-BuildOnly` stops after the build. The Windows build is profile guided, through `pgo/build-windows.ps1`; `-NoProfile` builds it with one cargo build and no profile |
+| `pgo/build-windows.ps1` | The Windows build: an instrumented build, a training run of `pgo/train.mjs` and `pgo/train.py` against it, and a build with the counts the training wrote. Needs `node` and `python` on the `PATH` and the `llvm-tools` component, which `rust-toolchain.toml` installs |
 | `nightly.ps1` | The nightly: every tier, the release build, the gates, the rolling `nightly` pre release, the timings committed, `latest.json`, and a ticket when red. `-WhatIf` prints the plan |
 | `register-nightly.ps1` | Registers `nightly.ps1` as the scheduled task `inillucent nightly` at 02:00. `-Unregister` removes it |
 | `nightly-evidence.ps1` | The functions `nightly.ps1` writes `latest.json` with and `ship.ps1` reads it with. `tests/ship-evidence.Tests.ps1` tests them |

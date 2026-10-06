@@ -110,7 +110,7 @@ const UNSAFE_CRATES: [&str; 1] = ["inillucent-driver-capi"];
 // are FFI. Each call installs a handler and reads nothing back; each handler
 // stores `true` into an already-allocated `AtomicBool` and returns, which is
 // the whole of what a handler is allowed to do.
-const UNSAFE_ALLOWED: [&str; 20] = [
+const UNSAFE_ALLOWED: [&str; 22] = [
     // **The AVX2 dot product, added by task-2000's design 9.** It is the one place
     // in the engine where safe Rust cannot express the thing that has to happen: a
     // 256-bit fused multiply-add is an intrinsic, every intrinsic in
@@ -138,6 +138,12 @@ const UNSAFE_ALLOWED: [&str; 20] = [
     // and the handler catches every panic so none can unwind into the C runtime.
     "crates/inillucent-core/src/exit_hook.rs",
     "crates/inillucent-cli/src/interrupt.rs",
+    // **How much stack the running thread has, added by task-2191.** The
+    // standard library cannot say, and `on_a_sized_stack` needs to know whether
+    // the main thread was linked with the reserve before it starts a thread to
+    // get one. One call, `GetCurrentThreadStackLimits`, which writes two
+    // integers on the caller's frame and keeps nothing.
+    "crates/inillucent-cli/src/stack.rs",
     // The allocator's own concurrency suite, added in task-1932 (H9). It
     // allocates on one thread and frees on another through `GlobalAlloc`, which
     // is an unsafe trait - the boundary is what the suite exists to cross, and
@@ -162,6 +168,14 @@ const UNSAFE_ALLOWED: [&str; 20] = [
     "crates/inillucent-remote/src/tls/windows.rs",
     "crates/inillucent-vfs/src/os/windows.rs",
     "crates/inillucent-vfs/src/os/unix.rs",
+    // **The read into a buffer's reserved space, added by task-2191.**
+    // `VfsFile::read_exact_into` reads a page into a frame's spare capacity, so
+    // a frame used for the first time is not zero filled only to be read over;
+    // a cold query of 100 rows read 65 such pages. The read itself is the
+    // platform call in the two files above. This file holds the one `set_len`
+    // after it, and its SAFETY note says why every byte up to the new length
+    // was written: by the read, or by the zeros written after a short one.
+    "crates/inillucent-vfs/src/os/mod.rs",
     // The local time zone, added in task-1981 and admitted here by task-1987,
     // which found it refused. It is the same operating-system boundary the two
     // files above stand on and it is reached the same way: `localtime_r` on

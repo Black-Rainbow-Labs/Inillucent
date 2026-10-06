@@ -261,6 +261,8 @@ def main():
         "different things, and one of them is a checked absence"
     )
     check_encryption()
+    check_execute_many()
+    check_execute_many_failure()
     return 0
 
 
@@ -297,6 +299,124 @@ def check_encryption():
         print("  ok    an encrypted database opens only with its key")
     finally:
         remove_database(path)
+
+
+
+def stored_by(rows, through_objects):
+    """Insert rows with ``execute_many`` through one of the two paths, and
+    return what the table then holds, or the failure as (type, status).
+
+    @param rows - the batch
+    @param through_objects - whether the library reads the Python objects
+        itself, or the rows cross as JSON
+    """
+    kept = inillucent._PARAMS
+    if not through_objects:
+        inillucent._PARAMS = None
+    path = scratch("execute_many")
+    database = inillucent.Database(path)
+    try:
+        connection = database.connect()
+        connection.execute("CREATE TABLE batch (n INTEGER PRIMARY KEY, a, b)")
+        try:
+            connection.execute_many("INSERT INTO batch (a, b) VALUES (?1, ?2)", rows)
+        except inillucent.DriverError as why:
+            return ("failed", why.status)
+        return [tuple(row) for row in connection.execute("SELECT a, b, typeof(a) FROM batch ORDER BY n")]
+    finally:
+        inillucent._PARAMS = kept
+        database.close()
+        remove_database(path)
+
+
+def check_execute_many():
+    """``execute_many`` stores the same rows whether the library reads the
+    Python objects itself or they cross as JSON, and a batch only JSON can
+    carry still crosses that way.
+
+    Outside the suite because the suite binds one execution at a time, and the
+    question here is the batch call's two ways in.
+    """
+    if inillucent._PARAMS is None:
+        print("  skip  execute_many through Python objects: not available under this Python")
+        return
+    plain = [
+        (None, 0),
+        (-1, 2**63 - 1),
+        (-(2**63), True),
+        (False, 1.5),
+        (-0.0, float("inf")),
+        ("", "\u00e9t\u00e9 \U0001f600"),
+        (b"", b"\x00\xff"),
+    ]
+    for shape, rows in [
+        ("a list of tuples", plain),
+        ("a list of lists", [list(row) for row in plain]),
+        ("a tuple of tuples", tuple(plain)),
+    ]:
+        assert inillucent._PARAMS.inillucent_py_params(rows), f"{shape} was not read directly"
+        direct, json_path = stored_by(rows, True), stored_by(rows, False)
+        assert direct == json_path, f"{shape}: {direct!r} through objects, {json_path!r} as JSON"
+    assert stored_by(plain, True)[1][1] == 2**63 - 1
+    # Neither of these can be read directly, so both cross as JSON and come
+    # out the way they did before there was a second path.
+    for name, rows in [
+        ("an integer wider than 64 bits", [(2**64, 0)]),
+        ("a bytearray", [(bytearray(b"ab"), 0)]),
+    ]:
+        assert not inillucent._PARAMS.inillucent_py_params(rows), f"{name} was read directly"
+        assert stored_by(rows, True) == stored_by(rows, False), f"{name} differs between the paths"
+    print("  ok    execute_many stores the same rows through Python objects and through JSON")
+
+
+def kept_after_failure(rows, through_objects):
+    """Run a batch that fails part way inside a transaction, commit what is
+    left, and return the failure's status and what the table then holds.
+
+    @param rows - the batch, with a duplicate key in it
+    @param through_objects - whether the library reads the Python objects
+        itself, or the rows cross as JSON
+    """
+    kept = inillucent._PARAMS
+    if not through_objects:
+        inillucent._PARAMS = None
+    path = scratch("execute_many_failure")
+    database = inillucent.Database(path)
+    try:
+        connection = database.connect()
+        connection.execute("CREATE TABLE batch (n INTEGER PRIMARY KEY, a TEXT)")
+        connection.execute("BEGIN")
+        status = None
+        try:
+            connection.execute_many("INSERT INTO batch (n, a) VALUES (?1, ?2)", rows)
+        except inillucent.DriverError as why:
+            status = why.status
+        connection.execute("COMMIT")
+        return status, [tuple(row) for row in connection.execute("SELECT n, a FROM batch ORDER BY n")]
+    finally:
+        inillucent._PARAMS = kept
+        database.close()
+        remove_database(path)
+
+
+def check_execute_many_failure():
+    """A batch whose one statement fails reports the failing row and keeps
+    the rows before it, through Python objects as through JSON.
+
+    The rows read from Python objects move into the engine, so when their one
+    statement fails the library reads them from the list again to run them one
+    at a time. A second read that came back empty or short would lose the rows
+    before the duplicate, which is what this asks about.
+    """
+    if inillucent._PARAMS is None:
+        print("  skip  a failing execute_many through Python objects: not available under this Python")
+        return
+    rows = [(1, "one"), (2, "two"), (2, "again"), (3, "three")]
+    direct, json_path = kept_after_failure(rows, True), kept_after_failure(rows, False)
+    assert direct == json_path, f"{direct!r} through objects, {json_path!r} as JSON"
+    assert direct[0] is not None, "the duplicate key did not fail the batch"
+    assert direct[1] == [(1, "one"), (2, "two")], f"kept {direct[1]!r}"
+    print("  ok    a failing execute_many keeps the rows before the failing one, both ways")
 
 
 if __name__ == "__main__":

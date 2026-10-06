@@ -438,8 +438,8 @@ impl TreeLog for WalLog<'_> {
             // out of the row itself; copying them a second time allocated a
             // vector per write and threw it away on every update and delete.
             let key = match before {
-                Some(_) => Vec::new(),
-                None => key.iter().map(OwnedDatum::from_datum).collect(),
+                Some(_) => KeyCopy::Empty,
+                None => KeyCopy::of(key),
             };
             buffer.borrow_mut().push(Before {
                 schema: self.schema,
@@ -465,7 +465,7 @@ impl TreeLog for WalLog<'_> {
             buffer.borrow_mut().push(Before {
                 schema: self.schema,
                 tree,
-                key: Vec::new(),
+                key: KeyCopy::Empty,
                 row: None,
                 page: Some((std::rc::Rc::clone(page), located)),
             });
@@ -504,7 +504,7 @@ pub(crate) struct Before {
     /// A restore with a row to write back finds the key inside it, so the copy
     /// is made only for the case that needs one: a key that was not there, put
     /// back by deleting it again.
-    pub(crate) key: Vec<OwnedDatum>,
+    pub(crate) key: KeyCopy,
     /// The whole row as it was, or `None` when the key was not there.
     pub(crate) row: Option<Vec<OwnedDatum>>,
     /// The row as a place in a copy of its leaf, read only if a rollback needs it.
@@ -512,6 +512,53 @@ pub(crate) struct Before {
     /// Set instead of `row` by a run that removes many rows of one leaf
     /// (task-2183); see `TreeLog::undo_from_page`.
     pub(crate) page: Option<(std::rc::Rc<[u8]>, inillucent_tree::Located)>,
+}
+
+/// The key an undo record keeps, held without a vector when it is one value or two.
+///
+/// **One record for every row an insert writes, and one for every index entry
+/// (task-2191).** A key was a `Vec<OwnedDatum>` of its own, kept until the
+/// statement ends: three allocations a row for a table with two indexes, which
+/// is a rowid for the table and a value and a rowid for each index. Ten thousand
+/// rows held thirty thousand of them, and freed them all at once, past what the
+/// allocator's lists keep.
+#[derive(Clone, Debug)]
+pub(crate) enum KeyCopy {
+    /// No key, because the record's row carries it.
+    Empty,
+    /// A key of one value.
+    One(OwnedDatum),
+    /// A key of two values.
+    Two(OwnedDatum, OwnedDatum),
+    /// A longer key.
+    Many(Vec<OwnedDatum>),
+}
+
+impl KeyCopy {
+    /// Copies a key.
+    ///
+    /// @param key - the key, one value per key column
+    fn of(key: &[Datum<'_>]) -> KeyCopy {
+        match key {
+            [] => KeyCopy::Empty,
+            [only] => KeyCopy::One(OwnedDatum::from_datum(only)),
+            [first, second] => KeyCopy::Two(
+                OwnedDatum::from_datum(first),
+                OwnedDatum::from_datum(second),
+            ),
+            longer => KeyCopy::Many(longer.iter().map(OwnedDatum::from_datum).collect()),
+        }
+    }
+
+    /// Borrows the key's values, in key column order.
+    pub(crate) fn values(&self) -> Vec<Datum<'_>> {
+        match self {
+            KeyCopy::Empty => Vec::new(),
+            KeyCopy::One(only) => vec![only.borrow()],
+            KeyCopy::Two(first, second) => vec![first.borrow(), second.borrow()],
+            KeyCopy::Many(values) => values.iter().map(OwnedDatum::borrow).collect(),
+        }
+    }
 }
 
 /// Puts imported rows into the order the tree they are about to build compares

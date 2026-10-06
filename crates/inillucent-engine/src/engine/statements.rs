@@ -484,6 +484,16 @@ impl ImportedDatabase {
     /// @param params - the values bound to `?1`, `?2`, ...
     pub fn execute_any(&mut self, sql: &str, params: &Params) -> DbResult<Outcome> {
         self.refuse_a_write_on_a_read_only_file(sql)?;
+        // The same plan for statements that differ only in their literals, as
+        // `prepare_statement` gives (task-2191). Only when nothing was bound:
+        // the lift refuses a statement that has parameters of its own.
+        if params.is_empty() {
+            if let Some((cached, _, lifted)) = self.compiled_with_lifted_literals(sql) {
+                if let Some(with_values) = lifted.bound_onto(params) {
+                    return self.execute_compiled(&cached, &with_values);
+                }
+            }
+        }
         let cached = self.compiled(sql)?;
         self.execute_compiled(&cached, params)
     }
@@ -512,12 +522,33 @@ impl ImportedDatabase {
     ///
     /// @param sql - the statement text
     pub fn prepare_statement(&self, sql: &str) -> DbResult<Statement> {
+        if let Some((cached, text, values)) = self.compiled_with_lifted_literals(sql) {
+            // The caller wrote no parameters, so the statement declares none,
+            // and the lifted values are bound at every execution. Rows are
+            // handed over by the first execution, so the caller's text is
+            // kept to lift them again for a second one.
+            let values = match values {
+                Lifted::Rows { rows, .. } => Lifted::Rows {
+                    rows,
+                    written: Some(sql.to_string()),
+                },
+                bind => bind,
+            };
+            return Ok(Statement {
+                cached: std::cell::RefCell::new(cached),
+                sql: text,
+                generation: std::cell::Cell::new(self.schema_generation()),
+                parameters: 0,
+                lifted: Some(values),
+            });
+        }
         let (cached, parameters) = self.compiled_with_parameters(sql)?;
         Ok(Statement {
             cached: std::cell::RefCell::new(cached),
             sql: sql.to_string(),
             generation: std::cell::Cell::new(self.schema_generation()),
             parameters,
+            lifted: None,
         })
     }
 
@@ -542,7 +573,91 @@ impl ImportedDatabase {
     ) -> DbResult<Outcome> {
         self.refuse_a_write_on_a_read_only_file(&statement.sql)?;
         let held = self.current_plan(statement)?;
-        self.execute_compiled(&held, params)
+        match &statement.lifted {
+            Some(lifted) => {
+                let bound = match lifted.bound_onto(params) {
+                    Some(bound) => bound,
+                    None => self.lifted_again(lifted, params)?,
+                };
+                self.execute_compiled(&held, &bound)
+            }
+            None => self.execute_compiled(&held, params),
+        }
+    }
+
+    /// Reports whether a prepared statement can run many rows of parameters as
+    /// one statement. See `inillucent_exec::dml::bulk::runs_rows_at_once` for
+    /// what the statement has to be.
+    ///
+    /// **Only inside a transaction the caller opened.** Outside one every
+    /// execution is its own transaction and commits, and one statement would
+    /// commit all of the rows or none of them, which a crash part way through
+    /// would show.
+    ///
+    /// @param statement - the handle
+    pub fn runs_rows_at_once(&self, statement: &Statement) -> DbResult<bool> {
+        if self.writing.batch().is_none() || statement.lifted.is_some() {
+            return Ok(false);
+        }
+        let held = self.current_plan(statement)?;
+        Ok(matches!(
+            &*held,
+            Cached::Insert(insert, None, false, _)
+                if inillucent_exec::dml::bulk::runs_rows_at_once(insert)
+        ))
+    }
+
+    /// Runs a prepared statement once over many rows of parameters, for a
+    /// statement [`ImportedDatabase::runs_rows_at_once`] admitted.
+    ///
+    /// `None` when the statement failed. It has then written nothing and the
+    /// transaction is still open, so the caller runs the rows one at a time
+    /// and reports what that reports: the first failing row's own error, after
+    /// the rows before it. A failure that ended the transaction is returned.
+    ///
+    /// @param statement - the handle
+    /// @param rows - the rows, each one value per parameter
+    pub fn execute_rows_at_once(
+        &mut self,
+        statement: &Statement,
+        rows: Vec<Vec<OwnedDatum>>,
+    ) -> DbResult<Option<Outcome>> {
+        self.refuse_a_write_on_a_read_only_file(&statement.sql)?;
+        let held = self.current_plan(statement)?;
+        let params = Params::new();
+        params.supply_rows(rows);
+        match self.execute_compiled(&held, &params) {
+            Ok(outcome) => {
+                // `changes()` answers for the last statement, and run one at a
+                // time the last statement was the last row's, which wrote one.
+                self.counters.last_changes.set(1);
+                Ok(Some(outcome))
+            }
+            Err(_) if self.writing.batch().is_some() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Lifts a statement's rows out of the caller's text again, for an
+    /// execution after the first, which took them.
+    ///
+    /// @param lifted - the statement's lifted values, whose rows were taken
+    /// @param params - what the caller bound, which is nothing
+    fn lifted_again(&self, lifted: &Lifted, params: &Params) -> DbResult<Params> {
+        let again = match lifted {
+            Lifted::Rows {
+                written: Some(written),
+                ..
+            } => self.compiled_with_lifted_literals(written),
+            _ => None,
+        };
+        again
+            .and_then(|(_, _, values)| values.bound_onto(params))
+            .ok_or_else(|| {
+                inillucent_base::error::misuse(
+                    "a statement's lifted rows could not be lifted again",
+                )
+            })
     }
 
     /// Returns a statement's plan, compiling it again if the schema has moved.
@@ -735,6 +850,46 @@ pub struct Statement {
     /// plan. It does not move when the schema does: `?1` is `?1` whatever the
     /// catalog says, so a reprepare leaves it alone.
     pub(crate) parameters: u32,
+    /// The literal values taken out of the caller's text, when `sql` is the
+    /// rewritten text with `?1`, `?2` in their place. See
+    /// `ImportedDatabase::compiled_with_lifted_literals`.
+    pub(crate) lifted: Option<Lifted>,
+}
+
+/// The literal values a rewritten statement runs with; see
+/// `ImportedDatabase::compiled_with_lifted_literals`.
+pub(crate) enum Lifted {
+    /// One set of values, bound to `?1`, `?2` and so on.
+    Bind(Vec<OwnedDatum>),
+    /// Rows an `INSERT ... VALUES (?1, ...)` writes, one execution of the
+    /// statement for all of them.
+    ///
+    /// **Handed over rather than copied** (task-2191). An `INSERT` of 20,000
+    /// rows copied every value once to cut the values into rows and again to
+    /// bind them, and the two copies were a tenth of the statement's time
+    /// through the shell. The first execution takes the rows; `written` is
+    /// the caller's text, kept by a prepared statement so a second execution
+    /// can lift them again, and `None` for a statement run once.
+    Rows {
+        rows: std::cell::RefCell<Option<Vec<Vec<OwnedDatum>>>>,
+        written: Option<String>,
+    },
+}
+
+impl Lifted {
+    /// Returns a parameter set carrying these values, or `None` when they are
+    /// rows an earlier execution already took.
+    ///
+    /// @param params - what the caller bound, which is nothing for a lifted
+    ///   statement
+    pub(crate) fn bound_onto(&self, params: &Params) -> Option<Params> {
+        let mut with_values = params.clone();
+        match self {
+            Lifted::Bind(values) => with_values.refill(values.iter().cloned()),
+            Lifted::Rows { rows, .. } => with_values.supply_rows(rows.borrow_mut().take()?),
+        }
+        Some(with_values)
+    }
 }
 
 impl Statement {

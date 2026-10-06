@@ -10,6 +10,43 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**Faster than SQLite in 19 of 25 workloads called the way most programs call it.** Measured on 25
+workloads (one `inillucent` process per command, a SQL script piped into `inillucent-shell`, the
+Python driver and the npm package) against the same use of SQLite 3.53.4, the build after 2.1.5's
+changes was 51% slower and this one is 46% faster. `docs/performance.md` has every workload. The
+changes:
+
+- The C library is a Node addon, and the npm package runs `query`, `exec` and `batch` in the Node
+  process. `query()` keeps a file open for the next read of the same file and closes it one second
+  after the last.
+- The Python driver gets results as Python objects and sends `execute_many`'s rows as Python
+  objects, through four new provisional C calls, `inillucent_py_init_params`,
+  `inillucent_py_params`, `inillucent_stmt_execute_params` and `inillucent_params_free`. ABI 1.3.0.
+- A database is opened from the handle that created it. On Windows the second open waited for the
+  virus scanner, about 6 ms of every program that created a database.
+- An `INSERT` of many rows of literals, a prepared `INSERT` run many times, a run of single row
+  inserts in the shell and `.import` insert their rows as one statement, with an exact fallback to
+  one row at a time when a row fails.
+- An open reads the file's first pages once, opens the log segment once and reads the schema at
+  the first statement. A new file is written with one sync, and a fold under a rollback journal
+  syncs the data file once.
+- An index entry for a new row searches only the rows added since its leaf was packed, and the leaf
+  hint covers the leaf's whole key range.
+- The allocators keep blocks under 8 bytes and from 4 KiB to 64 KiB, and the Windows programs load
+  `bcrypt.dll` on first use.
+- The Windows release is built with profile guided optimisation. `packaging/release-all.ps1` builds
+  it instrumented, runs `packaging/pgo/train.mjs` against it and builds it again with the counts.
+  Against the same commit built without a profile, Python inserts of 10,000 rows were 20% faster
+  and 200 grouped aggregates 28% faster. `-NoProfile` builds it the old way.
+- A page read into a buffer pool frame used for the first time is read into the frame's reserved
+  memory, instead of into 32 KiB of zeros written first.
+- An open asks the file system once whether a rollback journal is there. When the newer by name
+  query answered that it was not, the older query was asked the same question again.
+- An open reads the meta record without taking the shared lock, and reads it again under the lock
+  only when the copy it read does not check out. The first statement takes the lock and checks the
+  record as it did. On Windows the file's identity is read when something asks for it, not at every
+  open. A Python open and close went from 40 us to 29 us.
+
 **A third performance hill climb through the `Connection`.** Of the workloads the hillclimb and
 contract plans run, 12 are still slower than SQLite 3.53.4, where 16 were on 2.1.3. Against 2.1.3,
 the hillclimb plan's train set is 16% faster and its test set 18% faster, the contract plan's train

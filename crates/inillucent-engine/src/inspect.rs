@@ -63,7 +63,9 @@ impl ImportedDatabase {
                 continue;
             };
             let page_size = tree.page_size() as i64;
-            let mut page = tree.first_leaf();
+            let Ok(mut page) = tree.first_leaf(pool) else {
+                continue;
+            };
             let mut ordinal = 0usize;
             // A bound on the walk, because a damaged sibling chain that loops
             // would otherwise loop here too - and this is the command someone

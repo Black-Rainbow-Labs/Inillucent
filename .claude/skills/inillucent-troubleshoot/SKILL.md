@@ -152,10 +152,12 @@ and run it again, or start it with `BEGIN IMMEDIATE`, which takes the write lock
 before it, every `BEGIN` took the write lock and failed with `busy` beside any open write
 transaction.
 
-When the message starts `could not open`, the wait was the open's, and `PRAGMA busy_timeout` cannot
-reach it. Set `INILLUCENT_BUSY_TIMEOUT=<milliseconds>` in the environment of the process that
-opens, or pass the wait to the open: `OpenOptions::busy_timeout` in Rust,
-`inillucent_open_with_timeout` in C, `busy_timeout_ms` in Python.
+To set the wait before a connection exists, set `INILLUCENT_BUSY_TIMEOUT=<milliseconds>` in the
+environment of the process that opens, or pass the wait to the open: `OpenOptions::busy_timeout` in
+Rust, `inillucent_open_with_timeout` in C, `busy_timeout_ms` in Python. The connection starts with
+that value as its `busy_timeout`. An open does not wait for a writer; its first statement does. A
+message that starts `could not open` means the open itself waited, which it does only for a file
+another process is still creating.
 
 Inside one Rust program, a `Database` from `inillucent-driver` is neither `Send` nor `Sync`, so it
 cannot move between threads. To use one database from several threads, open a `SharedDatabase`.

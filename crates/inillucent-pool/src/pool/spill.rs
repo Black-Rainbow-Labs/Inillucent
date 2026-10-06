@@ -249,15 +249,10 @@ impl Pool {
             return Ok(None);
         };
         {
-            let mut bytes = self
-                .buffers
-                .get(frame as usize)
-                .ok_or_else(|| misuse("frame index out of range"))?
-                .try_borrow_mut()
-                .map_err(|_| misuse("a frame chosen for loading was still borrowed"))?;
+            let mut bytes = self.frame_for_a_read(frame)?;
             spill
                 .file
-                .read_exact_at(slot.offset, bytes.as_mut_slice())
+                .read_exact_into(slot.offset, &mut bytes, self.page_size)
                 .map_err(|error| error.into_db_error())?;
             page::verify_checksum(&bytes, page)?;
         }

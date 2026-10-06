@@ -72,6 +72,30 @@ pub(super) fn write_index_entry(
     Ok(())
 }
 
+/// Adds the entry a non unique index takes for a table row that was just
+/// written under a key no live row had.
+///
+/// The entry's key ends in that row's key, so it cannot be live in the index,
+/// and the tree searches only its delta directory for it. See
+/// `PagedTree::put_new_key`. A unique index keys its entries on the indexed
+/// values alone, so it must not come here.
+///
+/// @param index - a non unique index of the table
+/// @param target - the file and its trees
+/// @param entry - the entry, the indexed values then the row's key
+pub(super) fn add_new_row_entry(
+    index: &IndexInfo,
+    target: &mut dyn WriteTarget,
+    entry: &[OwnedDatum],
+) -> DbResult<()> {
+    let (database, trees, log) = target.parts_for(index.root)?;
+    let Some(tree) = trees.get_mut(index.root) else {
+        return Ok(());
+    };
+    let borrowed: Vec<Datum<'_>> = entry.iter().map(OwnedDatum::borrow).collect();
+    tree.put_new_key(database, log, &borrowed)
+}
+
 /// Builds one index entry from a table row.
 ///
 /// An index entry is the indexed columns followed by whatever identifies the

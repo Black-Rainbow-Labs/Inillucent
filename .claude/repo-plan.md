@@ -949,3 +949,14 @@ they are touching do not collide; two that have not, do.
 - **The gate's hillclimb plan through the Connection arm is about 30 seconds a run at 10 rounds on
   the medium fixture**, so three interleaved pairs of base and candidate fit in a few minutes of a
   quiet window. `_agent_output/task-2181/time.sh` is the script. (task-2181)
+- **The gate does not measure how people call inillucent, and the two disagree.** The gate times
+  statements inside one process; a command line call, a script piped into the shell, the Python
+  driver and the npm package pay for process start, open, close and the binding as well. On
+  2026-10-05 release 2.1.5 was 216% slower than SQLite across 25 such workloads while the gate said
+  it was faster. `tasks/task-2191-performance-hillclimb-4.md` has the benchmark and how to run it.
+  Time a change to the close, the open, the shell or a binding with it, not only with the gate.
+  (task-2191)
+- **A close does the log's housekeeping only once the open segment holds `CLOSE_RECLAIM_BYTES`.**
+  So the DELETE crash campaigns have 13 fewer cut points after the commit than before, and their
+  floors in `crash_reports.rs` say so. A change that makes the close roll or delete segments again
+  will raise those counts, which is not a defect in the campaign. (task-2191)

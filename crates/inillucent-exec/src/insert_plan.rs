@@ -45,6 +45,58 @@ pub(crate) struct InsertPlan {
     pub(crate) correlated: Vec<Correlation>,
     /// How many of `correlated` belong to the `RETURNING` clause.
     pub(crate) returned: usize,
+    /// For each position of the supplied row, whether the plan reads it once.
+    ///
+    /// A value read once can be moved out of a row the caller hands over, and
+    /// one read twice (a rowid alias, which is both a column and the key) is
+    /// copied. See [`RowSource`].
+    read_once: Vec<bool>,
+}
+
+/// A supplied row, lent or handed over.
+///
+/// **Handed over, its values are moved into the row image rather than copied
+/// (task-2191).** `.import` of 50,000 rows and an `executemany` into an empty
+/// table build every image from a row nothing reads afterwards, and copying a
+/// text to build the image and then dropping the original was an allocation
+/// and a free per value: the Windows heap was over a third of an import.
+pub enum RowSource<'a> {
+    /// A row the caller keeps.
+    Lent(&'a [OwnedDatum]),
+    /// A row the caller gives up.
+    Given(Vec<OwnedDatum>),
+}
+
+impl<'a> From<&'a Vec<OwnedDatum>> for RowSource<'a> {
+    /// Lends a row the caller keeps.
+    fn from(row: &'a Vec<OwnedDatum>) -> RowSource<'a> {
+        RowSource::Lent(row)
+    }
+}
+
+impl From<Vec<OwnedDatum>> for RowSource<'_> {
+    /// Hands over a row the caller is done with.
+    fn from(row: Vec<OwnedDatum>) -> Self {
+        RowSource::Given(row)
+    }
+}
+
+impl RowSource<'_> {
+    /// Returns the value at a position, moving it out when the row was given
+    /// and the plan reads the position once.
+    ///
+    /// @param at - the position in the supplied row
+    /// @param read_once - whether the plan reads that position once
+    fn value(&mut self, at: usize, read_once: bool) -> OwnedDatum {
+        match self {
+            RowSource::Lent(row) => row.get(at).cloned().unwrap_or(OwnedDatum::Null),
+            RowSource::Given(row) => match (read_once, row.get_mut(at)) {
+                (true, Some(value)) => std::mem::replace(value, OwnedDatum::Null),
+                (false, Some(value)) => value.clone(),
+                (_, None) => OwnedDatum::Null,
+            },
+        }
+    }
 }
 
 /// Where one table column's value comes from, resolved to a tree column.
@@ -63,6 +115,32 @@ enum PlannedValue {
     Constant(Box<dyn Eval>),
     /// An expression that reads the rest of the row, computed last.
     Generated(Box<dyn Eval>),
+}
+
+/// Returns, for each position of the supplied row, whether the plan reads it
+/// once.
+///
+/// @param columns - where each column's value comes from
+/// @param rowid - where the rowid comes from
+fn read_once(columns: &[PlannedColumn], rowid: Option<&PlannedRowid>) -> Vec<bool> {
+    let mut reads: Vec<u32> = Vec::new();
+    let mut count = |index: usize| {
+        if reads.len() <= index {
+            reads.resize(index.saturating_add(1), 0);
+        }
+        if let Some(seen) = reads.get_mut(index) {
+            *seen = seen.saturating_add(1);
+        }
+    };
+    for column in columns {
+        if let (Some(_), PlannedValue::Supplied(index)) = (column.slot, &column.from) {
+            count(*index);
+        }
+    }
+    if let Some(PlannedRowid::Supplied(index)) = rowid {
+        count(*index);
+    }
+    reads.iter().map(|seen| *seen == 1).collect()
 }
 
 /// What an insert asks about a table's existing keys.
@@ -244,6 +322,7 @@ impl InsertPlan {
         for column in &statement.returning {
             returning.push(space.compile(&column.expr, params, catalog)?);
         }
+        let read_once = read_once(&columns, rowid.as_ref());
         Ok(InsertPlan {
             columns,
             rowid,
@@ -251,6 +330,7 @@ impl InsertPlan {
             returning,
             correlated: subqueries.0,
             returned: subqueries.1,
+            read_once,
         })
     }
 
@@ -362,12 +442,38 @@ impl InsertPlan {
         keys: &mut dyn RowidKeys,
         autoincrement: Option<&TableInfo>,
     ) -> DbResult<Row> {
+        self.build_row_from(
+            RowSource::Lent(supplied),
+            space,
+            next_rowid,
+            keys,
+            autoincrement,
+        )
+    }
+
+    /// [`InsertPlan::build_row`], from a row that may be handed over.
+    ///
+    /// @param supplied - the values the statement's source produced
+    /// @param space - the row space the expressions read
+    /// @param next_rowid - the largest rowid handed out so far, advanced here
+    /// @param keys - what the table already holds, asked only when a rowid has
+    ///   to be made
+    /// @param autoincrement - the table, when it never reuses a key
+    pub(crate) fn build_row_from(
+        &self,
+        mut supplied: RowSource<'_>,
+        space: &RowSpace,
+        next_rowid: &mut Option<i64>,
+        keys: &mut dyn RowidKeys,
+        autoincrement: Option<&TableInfo>,
+    ) -> DbResult<Row> {
         let mut row: Row = vec![OwnedDatum::Null; space.width];
         for planned in &self.columns {
             let Some(slot) = planned.slot else { continue };
             let value = match &planned.from {
                 PlannedValue::Supplied(index) => {
-                    supplied.get(*index).cloned().unwrap_or(OwnedDatum::Null)
+                    let once = self.read_once.get(*index).copied().unwrap_or(false);
+                    supplied.value(*index, once)
                 }
                 PlannedValue::Constant(eval) => space.evaluate(eval.as_ref(), &[])?,
                 PlannedValue::Generated(_) => continue,
@@ -378,7 +484,8 @@ impl InsertPlan {
         }
         let supplied_key = match &self.rowid {
             Some(PlannedRowid::Supplied(index)) => {
-                supplied.get(*index).cloned().unwrap_or(OwnedDatum::Null)
+                let once = self.read_once.get(*index).copied().unwrap_or(false);
+                supplied.value(*index, once)
             }
             Some(PlannedRowid::Expr(eval)) => space.evaluate(eval.as_ref(), &[])?,
             None => OwnedDatum::Null,

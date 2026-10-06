@@ -586,6 +586,16 @@ pub enum Located {
     Absent,
 }
 
+/// What [`Tree::locate_and_read_previous`] found: where the key sits, the
+/// directory slot a new row takes, the row that was there, and the room the
+/// row has, or `None` when the leaf has to make room first.
+type Located2 = (
+    Located,
+    usize,
+    Option<Vec<OwnedDatum>>,
+    Option<crate::mutate::DeltaOffsets>,
+);
+
 /// Where a write's key sits in its leaf, and where its row will go.
 ///
 /// The two answers one search of the leaf gives, carried together from the
@@ -734,7 +744,7 @@ impl PagedTree {
         log: &mut dyn TreeLog,
         row: &[Datum<'_>],
     ) -> DbResult<Option<Vec<OwnedDatum>>> {
-        self.write_row(database, log, row, true, true)
+        self.write_row(database, log, row, true, true, false)
     }
 
     /// Inserts or replaces one row without copying out what was there.
@@ -758,7 +768,38 @@ impl PagedTree {
         log: &mut dyn TreeLog,
         row: &[Datum<'_>],
     ) -> DbResult<bool> {
-        Ok(self.write_row(database, log, row, false, true)?.is_some())
+        Ok(self
+            .write_row(database, log, row, false, true, false)?
+            .is_some())
+    }
+
+    /// Inserts one row whose key the caller knows is not live in the tree.
+    ///
+    /// **One binary search where a put makes two** (task-2191). A put asks the
+    /// delta directory and then the sorted region, because a key can be live in
+    /// either. The executor knows more than that for one kind of write: the
+    /// entry a non unique index takes for a table row just written under a new
+    /// key. That entry's key ends in the row's own key, which no live row of the
+    /// table had a moment ago, so no live entry of the index can have it either.
+    /// A tombstoned copy in the sorted region is possible, and it is already
+    /// what a put treats as absent. So only the delta directory is searched, for
+    /// the slot the row takes, and a key the directory does hold is replaced as
+    /// a put would replace it.
+    ///
+    /// The sorted region's search was 7.5% of 10,000 inserts into a table with
+    /// two indexes, measured by the `statsprobe` harness under task-2191.
+    ///
+    /// @param database - the file, for allocating pages a split needs
+    /// @param log - where the record goes
+    /// @param row - the row, one value per column, key columns first
+    pub fn put_new_key(
+        &mut self,
+        database: &mut Database,
+        log: &mut dyn TreeLog,
+        row: &[Datum<'_>],
+    ) -> DbResult<()> {
+        self.write_row(database, log, row, false, true, true)
+            .map(|_| ())
     }
 
     /// Inserts one row only if its key is not already there.
@@ -785,7 +826,22 @@ impl PagedTree {
         log: &mut dyn TreeLog,
         row: &[Datum<'_>],
     ) -> DbResult<bool> {
-        Ok(self.write_row(database, log, row, false, false)?.is_none())
+        // An append above the remembered largest key keeps the memory true
+        // (task-2191). See `PagedTree::largest_hint`.
+        let appending = match (self.key_columns(), row.first()) {
+            (1, Some(Datum::Int(key))) => self
+                .hinted_largest_key(database.pool())
+                .filter(|largest| key > largest)
+                .map(|_| *key),
+            _ => None,
+        };
+        let placed = self
+            .write_row(database, log, row, false, false, false)?
+            .is_none();
+        if let (true, Some(key)) = (placed, appending) {
+            self.note_appended_key(database.pool(), key);
+        }
+        Ok(placed)
     }
 
     /// The body of `insert` and `put`.
@@ -835,7 +891,9 @@ impl PagedTree {
         row: &[Datum<'_>],
     ) -> DbResult<(Vec<u8>, bool, Vec<Option<ExtentRef>>)> {
         let mut spilled = false;
-        let mut encoded_row = Vec::new();
+        // Sized once from the values: growing it a value at a time was a
+        // reallocation or two a row, 4% of an indexed insert (task-2191).
+        let mut encoded_row = Vec::with_capacity(row.iter().map(Datum::tagged_len).sum());
         let mut runs: Vec<Option<ExtentRef>> = vec![None; row.len()];
         for (column, value) in row.iter().enumerate() {
             match self.out_of_line(column, value) {
@@ -879,26 +937,64 @@ impl PagedTree {
     ///
     /// Nothing between this and the mutation changes the page: the room check
     /// only reads, and the log append does not touch pages at all. A `make_room`
-    /// restarts the attempt, which re-locates.
+    /// restarts the attempt, which re-locates. So the room is asked of this
+    /// parse too (task-2191), where it used to take the page through
+    /// `Pool::modify` and parse it three more times.
     ///
     /// The guard is dropped before this returns, because the write that follows
     /// needs the page mutably.
     ///
     /// @param database - the open database
     /// @param page - the leaf the key belongs on
-    /// @param key - the key columns of the row being written
+    /// @param key - the key columns of the row being written, and whether the
+    ///   caller knows the key is not live; see [`Tree::put_new_key`]
     /// @param want_previous - whether the row that was there has to be read
+    /// @param encoded_len - how many bytes the row's tagged form occupies
     /// @param timing - where this write's nanoseconds are collected, all zero unless a harness asked
     /// @returns where the key sits, the delta directory position a row for it
-    ///   takes, and the row that was there
+    ///   takes, the row that was there, and the room the row has
     fn locate_and_read_previous(
         &self,
         database: &mut Database,
         page: PageId,
-        key: &[Datum<'_>],
+        key: (&[Datum<'_>], bool),
         want_previous: bool,
+        encoded_len: usize,
         timing: &mut crate::stages::PutStages,
-    ) -> DbResult<(Located, usize, Option<Vec<OwnedDatum>>)> {
+    ) -> DbResult<Located2> {
+        let locating = crate::stages::clock();
+        let found = self.locate_and_read_previous_untimed(
+            database,
+            page,
+            key,
+            want_previous,
+            encoded_len,
+            timing,
+        );
+        timing.locate = timing
+            .locate
+            .saturating_add(crate::stages::elapsed(locating));
+        found
+    }
+
+    /// The body of [`Tree::locate_and_read_previous`], which times it.
+    ///
+    /// @param database - the open database
+    /// @param page - the leaf the key belongs on
+    /// @param key - the key columns of the row being written, and whether the
+    ///   caller knows the key is not live
+    /// @param want_previous - whether the row that was there has to be read
+    /// @param encoded_len - how many bytes the row's tagged form occupies
+    /// @param timing - where this write's nanoseconds are collected
+    fn locate_and_read_previous_untimed(
+        &self,
+        database: &mut Database,
+        page: PageId,
+        key: (&[Datum<'_>], bool),
+        want_previous: bool,
+        encoded_len: usize,
+        timing: &mut crate::stages::PutStages,
+    ) -> DbResult<Located2> {
         let fetching = crate::stages::clock();
         let guard = database.pool().fetch(page)?;
         let leaf = LeafRef::parse(&guard)?
@@ -907,7 +1003,17 @@ impl PagedTree {
         timing.fetch = timing
             .fetch
             .saturating_add(crate::stages::elapsed(fetching));
-        let (located, slot) = leaf.locate_slot(key, self.key_columns())?;
+        let (key, new_key) = key;
+        let (located, slot) = match new_key {
+            true => leaf.locate_new_key_slot(key, self.key_columns())?,
+            false => leaf.locate_slot(key, self.key_columns())?,
+        };
+        // **The room is asked of this parse** (task-2191). It was its own
+        // `Pool::modify` and three more parses of the same page; nothing
+        // between here and the mutation changes the page.
+        let asking = crate::stages::clock();
+        let costed = crate::mutate::room_for_row_and_tombstone_in(&leaf, encoded_len)?;
+        timing.room = timing.room.saturating_add(crate::stages::elapsed(asking));
         // One row's out-of-line values, and only when the caller wants
         // the row it is replacing. Locating reads key columns, which are
         // never out of line, so this comes after.
@@ -941,7 +1047,7 @@ impl PagedTree {
                 Some(values)
             }
         };
-        Ok((located, slot, previous))
+        Ok((located, slot, previous, costed))
     }
 
     /// Returns the out-of-line pages a delta row about to be removed owns.
@@ -1148,37 +1254,6 @@ impl PagedTree {
         Ok(found)
     }
 
-    /// Returns where a row of this size would land in a leaf, or nothing when it would not.
-    ///
-    /// **The offsets rather than a yes or no, because the write needs them and
-    /// was computing them again** (task-2034). See
-    /// [`crate::mutate::LeafMut::room_for_row_and_tombstone`], which carries the
-    /// measurement.
-    ///
-    /// @param database - the open database
-    /// @param page - the leaf
-    /// @param encoded_len - how many bytes the row's tagged form occupies
-    /// @param timing - where the nanoseconds go, all zero unless a harness asked
-    fn room_for_write(
-        &self,
-        database: &mut Database,
-        page: PageId,
-        encoded_len: usize,
-        timing: &mut crate::stages::PutStages,
-    ) -> DbResult<Option<crate::mutate::DeltaOffsets>> {
-        let asking = crate::stages::clock();
-        let mut working = 0u128;
-        let costed = database.pool().modify(page, |bytes| {
-            let started = crate::stages::clock();
-            let costed = LeafMut::new(bytes)?.room_for_row_and_tombstone(encoded_len);
-            working = crate::stages::elapsed(started);
-            costed
-        })?;
-        timing.roomwork = timing.roomwork.saturating_add(working);
-        timing.room = timing.room.saturating_add(crate::stages::elapsed(asking));
-        Ok(costed)
-    }
-
     /// Compacts or splits a full leaf so the write's next attempt will fit.
     ///
     /// The path is descended for here when the hint produced none, because a
@@ -1247,6 +1322,7 @@ impl PagedTree {
         row: &[Datum<'_>],
         want_previous: bool,
         replace: bool,
+        new_key: bool,
     ) -> DbResult<Option<Vec<OwnedDatum>>> {
         // **Where one write's time goes, behind a switch** (task-2034). The
         // stage above this one has been measured twice and each time the
@@ -1260,6 +1336,7 @@ impl PagedTree {
         // of this path in task-2006.
         let entered = crate::stages::clock();
         let mut timing = crate::stages::PutStages::default();
+        self.growing = new_key;
         // A log collecting before-images needs the row that was there, so the
         // read the caller did not ask for happens anyway. That is the whole
         // cost of being able to abandon a transaction, and it is paid only
@@ -1273,8 +1350,14 @@ impl PagedTree {
                 self.columns().len()
             )));
         }
-        let key: Vec<Datum<'_>> = row.iter().copied().take(self.key_columns()).collect();
-        let encoded_key = self.encode_key(&key);
+        // **Borrowed from the row and encoded inline (task-2191).** Collecting the
+        // key and encoding it with `encode_key` were two allocations on every
+        // put, three puts a row for a table with two indexes; the row already
+        // holds the key columns first, and `encode_key_small` keeps a key of up
+        // to 24 bytes on the stack.
+        let key: &[Datum<'_>] = row.get(..self.key_columns()).unwrap_or(row);
+        let encoded_key = self.encode_key_small(key);
+        let encoded_key = encoded_key.as_slice();
         // Outside the loop, because a retry after a compaction must reuse the
         // run rather than write a second and leak the first. Why a wide value
         // is spilled before the row is placed rather than instead of placing it
@@ -1300,32 +1383,23 @@ impl PagedTree {
         // delta area will not hold at any fill - the write is packed instead.
         for attempt in 0..2 {
             let (page, mut path, hinted) =
-                self.leaf_for_attempt(database.pool(), &encoded_key, attempt, &mut timing)?;
+                self.leaf_for_attempt(database.pool(), encoded_key, attempt, &mut timing)?;
             from_hint = from_hint || hinted;
-            // **The key is found once.** Where it sits decides four things -
-            // whether it was there, what the caller gets back, what the
-            // mutation below has to displace, and where in the delta directory
-            // the row goes - and the first version asked the page three times.
-            // A locate is a page parse and two binary searches, one of the
-            // delta directory and one of the sorted region; on the gate's
-            // `write.insert.batch` the two indexes cost 8.4 us of a 19 us
-            // insert, and half of that was asking twice.
-            //
-            // Nothing between here and the mutation changes the page: the
-            // room check only reads, and the log append does not touch pages
-            // at all. A `make_room` restarts the attempt, which re-locates.
-            let locating = crate::stages::clock();
-            let (located, slot, mut previous) =
-                self.locate_and_read_previous(database, page, &key, want_previous, &mut timing)?;
-            timing.locate = timing
-                .locate
-                .saturating_add(crate::stages::elapsed(locating));
+            // The key is found once, and the room asked of the same parse; see
+            // `Tree::locate_and_read_previous` for why both.
+            let (located, slot, mut previous, costed) = self.locate_and_read_previous(
+                database,
+                page,
+                (key, new_key),
+                want_previous,
+                encoded_row.len(),
+                &mut timing,
+            )?;
             // A caller that refuses a duplicate is told so before anything is
             // written, which is the whole point of asking.
             if !replace && previous.is_some() {
                 return Ok(previous);
             }
-            let costed = self.room_for_write(database, page, encoded_row.len(), &mut timing)?;
             let Some(costed) = costed else {
                 // Attempt 1 has already had room made for it and a `Stuck`
                 // leaf never will: the delta area is not how this row gets in.
@@ -1335,7 +1409,7 @@ impl PagedTree {
                         log,
                         page,
                         &mut path,
-                        &key,
+                        key,
                         encoded_row.len(),
                         &mut timing,
                     )?;
@@ -1352,7 +1426,7 @@ impl PagedTree {
                 continue;
             };
             let undoing = crate::stages::clock();
-            self.record_undo(log, &key, &mut previous, caller_wants_previous)?;
+            self.record_undo(log, key, &mut previous, caller_wants_previous)?;
             timing.undo = crate::stages::elapsed(undoing);
             let applying = crate::stages::clock();
             self.apply_row(
@@ -1858,6 +1932,20 @@ impl PagedTree {
             // without one.
             return Ok(Fit::Repack(appending));
         }
+        // **An append splits at once, and packs the leaf a single time
+        // (task-2191).** A splice or a repack here frees the room the rows in
+        // the delta area took beyond their packed size, the next appends fill
+        // it, and the leaf is packed again: about twenty splices and five
+        // repacks per leaf of the Python benchmark's table before the split
+        // that always came. Rows that arrive in key order never come back to
+        // this leaf, so the split's left half, packed at `APPEND_FILL` from
+        // every row but the last, is the pack the leaf will keep, and the
+        // right half starts with the whole page free for the delta area. This
+        // is SQLite's `balance_quick` with one pass added, the one that packs
+        // the delta rows into the sorted region.
+        if appending {
+            return Ok(Fit::Split(leaf.bytes().to_vec(), true));
+        }
         // **A splice first, when the page allows one** (task-2074). It keeps
         // the page's widths and heap and writes only the delta rows' values,
         // so it skips the sizing pass, the materialising pass and most of the
@@ -1867,7 +1955,7 @@ impl PagedTree {
         let spliced = self.timed_splice(&leaf, &order)?;
         let splice_allowed = spliced.is_some();
         if let Some(mut image) = spliced {
-            if LeafMut::new(&mut image)?.room_for(needed)? {
+            if LeafMut::new(&mut image)?.room_for(needed.saturating_add(self.gap_for_growth()))? {
                 return Ok(Fit::Compact(
                     image,
                     leaf.right_sibling(),
@@ -1982,7 +2070,7 @@ impl PagedTree {
         // arriving row is therefore not a tighter compaction, it is a split.
         let mut compacted = self.timed_compact_image(&builder, &source)?;
         if let Some(image) = compacted.as_mut() {
-            if !LeafMut::new(image)?.room_for(needed)? {
+            if !LeafMut::new(image)?.room_for(needed.saturating_add(self.gap_for_growth()))? {
                 compacted = None;
             }
         }
@@ -2314,6 +2402,10 @@ impl PagedTree {
         if rows.len() < 2 {
             return Err(row_larger_than_a_page());
         }
+        // The tree's height and leftmost leaf are read before the split moves
+        // either, while the pages still describe the tree as it was; a split
+        // then updates the values it knows (task-2191). See `PagedTree::shape`.
+        self.shape(database.pool())?;
         let from_live_rows = carried.is_none();
         // Nothing carried is an empty table: `Carrying` answers a row it has
         // no entry for as carrying nothing, so no vector a row is needed.
@@ -2430,7 +2522,7 @@ impl PagedTree {
             page::write_u64(bytes, page::header::LSN, lsn)
         })?;
 
-        if page == self.first_leaf() {
+        if self.known_first_leaf() == Some(page) {
             self.note_first_leaf(left_page);
         }
         self.note_leaves(1);
@@ -2609,7 +2701,16 @@ impl PagedTree {
         right: PageId,
         folded_by_caller: bool,
     ) -> DbResult<PageId> {
-        let level = self.height().saturating_add(1);
+        // Read at the start of the split, in `split_carrying`, before any page
+        // of it was written.
+        let level = match self.shape.get() {
+            Some((height, _)) => height.saturating_add(1),
+            None => {
+                return Err(inillucent_base::error::misuse(
+                    "a root split began before the tree's height was read",
+                ))
+            }
+        };
         let builder = InteriorBuilder::new(self.page_size(), self.tree_id(), level)?;
         let mut image = builder.build(
             &[separator],
@@ -3025,14 +3126,39 @@ impl PagedTree {
         Ok(())
     }
 
+    /// How much of the page a splice or a compaction has to leave free beyond
+    /// the row that asked for room, or the leaf splits instead.
+    ///
+    /// **An eighth of the page, and only for a write that adds a key
+    /// (task-2191).** The cost of an insert into the middle of a tree is the
+    /// leaf's rows over the rows that arrive between two compactions, and the
+    /// second number is what the room after a compaction holds. `TIGHT_FILL`
+    /// left about 5% of a 32 KiB page, about 78 entries of a text index, so a
+    /// leaf of about 1,500 entries was rewritten every 78 inserts. Counted in
+    /// the Python benchmark's 10,000 inserts into a table with two indexes, the
+    /// first round made 47 compactions with no gap and 24 with an eighth, for
+    /// 22 and 26 splits.
+    ///
+    /// Not for every write: a write that replaces a row adds nothing, and a
+    /// leaf a bulk build packed full would split on it and stay half empty.
+    /// That is the case `TIGHT_FILL` exists for, and the first version of this
+    /// gap, applied to every write, doubled such a tree from 17 leaves to 33.
+    /// Appends do not reach this; `choose_fit` splits them at once.
+    fn gap_for_growth(&self) -> usize {
+        match self.growing {
+            true => self.page_size() / 8,
+            false => 0,
+        }
+    }
+
     /// Returns the leaf a key belongs in.
     ///
     /// @param pool - the buffer pool
     /// @param encoded_key - the key's comparable bytes
     fn leaf_for(&self, pool: &Pool, encoded_key: &[u8]) -> DbResult<(PageId, Vec<PageId>)> {
-        let descent = self.descend(pool, encoded_key)?;
+        let (descent, low, high) = self.descend_fenced(pool, encoded_key)?;
         let path: Vec<PageId> = descent.steps.iter().map(|step| step.0).collect();
-        self.note_leaf_hint(pool, descent.leaf, encoded_key);
+        self.note_leaf_hint(pool, descent.leaf, low, high);
         Ok((descent.leaf, path))
     }
 
@@ -3059,7 +3185,7 @@ impl PagedTree {
             let hints = self.leaf_hints.try_borrow().ok()?;
             let at = hints.iter().position(|hint| {
                 encoded_key >= hint.low.as_slice()
-                    && (hint.right.is_none() || encoded_key <= hint.high.as_slice())
+                    && (!hint.bounded || encoded_key < hint.high.as_slice())
             })?;
             let hint = hints.get(at)?;
             (at, hint.page, hint.right)
@@ -3084,20 +3210,32 @@ impl PagedTree {
         Some(page)
     }
 
-    /// Records the leaf a descent reached and widens the window that proves it.
+    /// Records the leaf a descent reached and the fences that prove a key belongs in it.
     ///
-    /// The window is the lowest and highest probes seen to land in this leaf, so a hit
-    /// is every key between them. A descent into the leaf already hinted widens the
-    /// window by one end at most; a descent into a different leaf starts a new window
-    /// at that probe.
+    /// **The fences, not the probes seen (task-2191).** The window was the lowest and
+    /// highest probes that had landed in the leaf, so a key past the highest one
+    /// descended even when it belonged in the same leaf. That is every entry an index
+    /// takes for a new row: the row key is the largest the table has, so the entry sorts
+    /// last among those with its indexed value, past every probe the leaf has seen. The
+    /// descent reads the leaf's two fences anyway, and they are exactly its range, so
+    /// every key in it is a hit. Of the 30,000 puts the Python benchmark's 10,000 rows
+    /// make into a table with two indexes, the hint answered 18,759 with the probes and
+    /// 29,982 with the fences.
     ///
-    /// One header read off a page the descent has just fetched, and a key copy only
-    /// when an end of the window moves. See [`PagedTree::leaf_hint`].
+    /// One header read off a page the descent has just fetched. See
+    /// [`PagedTree::leaf_hint`].
     ///
     /// @param pool - the buffer pool
     /// @param leaf - the leaf the descent reached
-    /// @param encoded_key - the probe the descent used, in comparable bytes
-    fn note_leaf_hint(&self, pool: &Pool, leaf: PageId, encoded_key: &[u8]) {
+    /// @param low - its low fence, or `None` for the leftmost leaf
+    /// @param high - its high fence, or `None` for the rightmost leaf
+    fn note_leaf_hint(
+        &self,
+        pool: &Pool,
+        leaf: PageId,
+        low: Option<Vec<u8>>,
+        high: Option<Vec<u8>>,
+    ) {
         let Some(right) = pool
             .fetch(leaf)
             .ok()
@@ -3108,40 +3246,27 @@ impl PagedTree {
         let Ok(mut hints) = self.leaf_hints.try_borrow_mut() else {
             return;
         };
+        let bounded = high.is_some();
+        let hint = crate::paged::LeafHint {
+            page: leaf,
+            low: low.unwrap_or_default(),
+            high: high.unwrap_or_default(),
+            bounded,
+            right,
+        };
         if let Some(held) = hints.iter_mut().find(|hint| hint.page == leaf) {
-            held.right = right;
-            if encoded_key < held.low.as_slice() {
-                held.low.clear();
-                held.low.extend_from_slice(encoded_key);
-            }
-            if encoded_key > held.high.as_slice() {
-                held.high.clear();
-                held.high.extend_from_slice(encoded_key);
-            }
+            *held = hint;
             return;
         }
         if hints.len() < crate::paged::LEAF_HINTS {
-            hints.push(crate::paged::LeafHint {
-                page: leaf,
-                low: encoded_key.to_vec(),
-                high: encoded_key.to_vec(),
-                right,
-            });
+            hints.push(hint);
             return;
         }
-        // The victim's two key buffers are written over rather than freed and allocated
-        // again, which is why this replaces an entry in place instead of removing one and
-        // pushing another.
         let at = self.hint_victim.get() % crate::paged::LEAF_HINTS;
         self.hint_victim
             .set(at.saturating_add(1) % crate::paged::LEAF_HINTS);
         if let Some(slot) = hints.get_mut(at) {
-            slot.page = leaf;
-            slot.right = right;
-            slot.low.clear();
-            slot.low.extend_from_slice(encoded_key);
-            slot.high.clear();
-            slot.high.extend_from_slice(encoded_key);
+            *slot = hint;
         }
     }
 

@@ -30,6 +30,8 @@
 // other file in this crate is still refused the word, `interrupt.rs` is
 // named in `policy.rs`'s `UNSAFE_ALLOWED`, and both of its `unsafe` blocks
 // carry their own SAFETY note.
+// `stack.rs` is the second, added by task-2191 to read the running thread's
+// stack reserve, which the standard library cannot report either.
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(clippy::indexing_slicing)]
@@ -89,6 +91,11 @@ pub const STATEMENT_STACK: usize = 64 << 20;
 ///
 /// @param body - what to run
 pub fn on_a_sized_stack<R: Send + 'static>(body: fn() -> R) -> R {
+    // A main thread linked with the reserve already has it, and starting a
+    // thread to get it again cost tens of microseconds a call (task-2191).
+    if stack::main_thread_has(STATEMENT_STACK) {
+        return body();
+    }
     match std::thread::Builder::new()
         .stack_size(STATEMENT_STACK)
         .spawn(body)
@@ -127,3 +134,6 @@ pub mod mcp;
 pub mod render;
 pub mod setup;
 pub mod shell;
+// The second file allowed `unsafe`; see its module comment and `policy.rs`.
+#[allow(unsafe_code)]
+mod stack;

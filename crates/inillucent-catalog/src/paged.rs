@@ -218,6 +218,21 @@ pub fn write_catalog(database: &mut Database, entries: &[SchemaEntry]) -> DbResu
     Ok(tree)
 }
 
+/// Writes the empty catalog of a file being created.
+///
+/// The tree [`write_catalog`] writes for no entries, without the bulk build's
+/// own sync; the caller syncs once when the file is complete. See
+/// `PagedTree::bulk_build_for_a_new_file`.
+///
+/// @param database - the file being created
+pub fn write_new_catalog(database: &mut Database) -> DbResult<PagedTree> {
+    let rows: Vec<Vec<Datum<'_>>> = Vec::new();
+    let tree =
+        PagedTree::bulk_build_for_a_new_file(database, SCHEMA_TREE_ID, schema_layout(), 1, &rows)?;
+    database.set_catalog_root(tree.root());
+    Ok(tree)
+}
+
 /// Attaches to a catalog tree already in the file.
 ///
 /// @param pool - the buffer pool the file is open through

@@ -1149,12 +1149,33 @@ impl ImportedDatabase {
         &mut self,
         module: std::sync::Arc<dyn inillucent_ext::vtab::Module>,
     ) -> DbResult<()> {
-        self.session_state.registry.register_module(module);
-        // The eponymous list is cached because building it connects every
-        // module; a new module invalidates it, and nothing else does.
-        self.session_state.eponymous.clear();
-        self.refresh_catalog();
+        self.register_modules(vec![module]);
         Ok(())
+    }
+
+    /// Adds virtual-table modules to this connection, and refreshes the catalog
+    /// once for all of them.
+    ///
+    /// @param modules - the modules to add
+    pub(crate) fn register_modules(
+        &mut self,
+        modules: Vec<std::sync::Arc<dyn inillucent_ext::vtab::Module>>,
+    ) {
+        if modules.is_empty() {
+            return;
+        }
+        for module in modules {
+            let name = module.name().to_string();
+            self.session_state.registry.register_module(module);
+            // The eponymous list is cached because building it connects every
+            // module; a new module changes it, and nothing else does. The list
+            // this connection holds from now on is its own, not the one shared
+            // by connections holding only the built-in modules, and the new
+            // module's table goes into it alone (task-2191).
+            self.session_state.only_builtin_modules = false;
+            self.add_module_eponymous_table(&name);
+        }
+        self.refresh_catalog();
     }
 
     /// Rebuilds this database into a file that holds nothing spare.

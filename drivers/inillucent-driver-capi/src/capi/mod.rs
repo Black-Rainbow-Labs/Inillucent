@@ -7,5 +7,8 @@
 
 pub(crate) mod db;
 pub(crate) mod error;
+pub(crate) mod node;
+pub(crate) mod params;
+pub(crate) mod python;
 pub(crate) mod stmt;
 pub(crate) mod value;

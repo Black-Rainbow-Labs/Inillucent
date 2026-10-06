@@ -351,3 +351,131 @@ fn a_closed_file_is_self_contained() {
         "the row the last statement inserted is not in the reopened file"
     );
 }
+
+/// Returns the distinct log segments a trace opened or deleted after a mark.
+///
+/// @param vfs - the simulated file system
+/// @param from - the trace position to start at
+/// @param kind - `open` or `delete`
+fn log_paths_since(vfs: &SimVfs, from: usize, kind: &str) -> std::collections::BTreeSet<String> {
+    vfs.trace()
+        .events()
+        .into_iter()
+        .skip(from)
+        .filter(|event| event.kind == kind && is_log(&event.path))
+        .map(|event| event.path.clone())
+        .collect()
+}
+
+/// Returns how many bytes were written to the log since a segment was last
+/// deleted, which is what a close is owed housekeeping for.
+///
+/// @param vfs - the simulated file system
+fn log_waiting(vfs: &SimVfs) -> u64 {
+    let events = vfs.trace().events();
+    let last_delete = events
+        .iter()
+        .rposition(|event| event.kind == "delete" && is_log(&event.path))
+        .map_or(0, |at| at + 1);
+    events
+        .iter()
+        .skip(last_delete)
+        .filter(|event| event.kind == "write" && is_log(&event.path))
+        .map(|event| event.length)
+        .sum()
+}
+
+/// A close folds, and shrinks the log only once the open segment has grown.
+///
+/// **The housekeeping at close is what task-2191 took off the common path.** A
+/// close used to roll a new segment, write a checkpoint record and delete the
+/// old segments every time, and after a one row `inillucent exec` that was
+/// most of a 12 ms close. It now does that once the open segment holds
+/// `CLOSE_RECLAIM_BYTES`, one mebibyte. So this asserts both halves: a close
+/// after one small row deletes no segment and leaves a file a reopen does not
+/// have to replay into, and a close after more than a mebibyte of log does
+/// delete the segment it was writing, so a run of short processes cannot grow
+/// the log without bound.
+#[test]
+fn a_close_shrinks_the_log_only_once_it_has_grown() {
+    let vfs = simulator(9_004);
+    {
+        let mut engine = ImportedDatabase::create_on(
+            Arc::clone(&vfs) as Arc<dyn Vfs>,
+            path(),
+            PAGE_SIZE,
+            FRAMES,
+        )
+        .expect("the connection opens");
+        run(&mut engine, SCHEMA);
+    }
+    {
+        // A session of its own, because building the schema rolls segments, and a
+        // roll during the connection is a reason for the close to shrink the log.
+        let mut engine =
+            ImportedDatabase::open_on(Arc::clone(&vfs) as Arc<dyn Vfs>, path(), PAGE_SIZE, FRAMES)
+                .expect("the connection opens");
+        run(&mut engine, "INSERT INTO t VALUES(4, 'four', 40);");
+        let mark = vfs.trace().events().len();
+        drop(engine);
+        let deleted = log_paths_since(&vfs, mark, "delete");
+        assert!(
+            deleted.is_empty(),
+            "a close after one small row deleted a log segment, so it did the housekeeping: {deleted:?}, opened {:?}",
+            log_paths_since(&vfs, 0, "open")
+        );
+    }
+    let written: i64 = {
+        let mut reopened =
+            ImportedDatabase::open_on(Arc::clone(&vfs) as Arc<dyn Vfs>, path(), PAGE_SIZE, FRAMES)
+                .expect("the connection opens");
+        assert_eq!(
+            reopened.dirty_pages(),
+            0,
+            "the reopen had to replay records into pages, so the close did not fold"
+        );
+        let wide = "x".repeat(8_000);
+        // Rows go in one statement at a time until a mebibyte of log is waiting
+        // since the last segment was deleted. A fold a statement takes on its
+        // way out shrinks the log at four mebibytes, so the count starts again
+        // when one does, and the loop stops on the first close owed the work.
+        let mut id = 5;
+        let mut waiting = 0u64;
+        while waiting < 1 << 20 && id < 2_000 {
+            run(
+                &mut reopened,
+                &format!("INSERT INTO t VALUES({id}, '{wide}{id}', {id});"),
+            );
+            id += 1;
+            waiting = log_waiting(&vfs);
+        }
+        let before = log_paths_since(&vfs, 0, "open");
+        let mark = vfs.trace().events().len();
+        assert!(
+            waiting >= 1 << 20,
+            "only {waiting} bytes of log were waiting at the close, so it owed no housekeeping"
+        );
+        drop(reopened);
+        let deleted = log_paths_since(&vfs, mark, "delete");
+        assert!(
+            deleted.iter().any(|segment| before.contains(segment)),
+            "a close after more than a mebibyte of log deleted none of the segments it wrote: {deleted:?}"
+        );
+        id - 1
+    };
+    let mut last =
+        ImportedDatabase::open_on(Arc::clone(&vfs) as Arc<dyn Vfs>, path(), PAGE_SIZE, FRAMES)
+            .expect("the connection opens");
+    assert_eq!(last.dirty_pages(), 0, "the last close did not fold");
+    let rows = last
+        .execute_any("SELECT count(*) FROM t", &Params::new())
+        .expect("the query runs");
+    assert_eq!(
+        format!("{:?}", rows.rows),
+        format!(
+            "{:?}",
+            vec![vec![inillucent_tree::datum::OwnedDatum::Int(written)]]
+        ),
+        "a row written before a close is missing after it"
+    );
+}

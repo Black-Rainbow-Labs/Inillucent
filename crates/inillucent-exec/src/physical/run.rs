@@ -538,7 +538,7 @@ fn leaf_boundaries(
 ) -> DbResult<Vec<(i64, i64)>> {
     let page_size = tree.page_size() as i64;
     let mut boundaries: Vec<(i64, i64)> = Vec::new();
-    let mut page = tree.first_leaf();
+    let mut page = tree.first_leaf(pool)?;
     let mut seen = 0u64;
     while !page.is_none() {
         let guard = pool.fetch(page)?;

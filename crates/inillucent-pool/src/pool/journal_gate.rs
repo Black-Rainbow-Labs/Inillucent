@@ -229,6 +229,25 @@ impl Pool {
         self.file
             .read_exact_at(offset, &mut before)
             .map_err(|error| error.into_db_error())?;
+        // **A page of zeros is a page the file never held, and it has no
+        // pre-image either (task-2191).** The file's length is not the only
+        // way a page can be inside it without ever having been written: a bulk
+        // build writes its pages straight into the file, past pages the pool
+        // still holds dirty, and the file grows over them as a run of zeros.
+        // Every one of those was read here, saved, synced and deleted again at
+        // the next fold. The fold after a 10,000 row table build and two
+        // `CREATE INDEX` statements took 26.0 ms with them saved and 21.4 ms
+        // without, the median of five runs of each.
+        //
+        // Nothing the meta record on the disk describes can be on such a page.
+        // A meta page starts with the format's magic, every other page in use
+        // carries a kind byte from 1 to 6 in its header, and a page gets
+        // either only when something writes it. So a page of zeros is
+        // what a page past the end is: the old database never had it, and
+        // redo rebuilds it from the log.
+        if before.iter().all(|byte| *byte == 0) {
+            return Ok(false);
+        }
         journal.save(page, &before)?;
         Ok(true)
     }

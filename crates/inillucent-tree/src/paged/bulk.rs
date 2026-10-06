@@ -436,11 +436,66 @@ impl PagedTree {
     /// @param rows - the rows, already sorted by the key columns
     pub fn bulk_build_rows<'d>(
         database: &mut Database,
+        log: Option<&mut dyn crate::write::TreeLog>,
+        tree_id: u64,
+        columns: Vec<ColumnSpec>,
+        key_columns: usize,
+        rows: &dyn crate::leaf::Rows<'d>,
+    ) -> DbResult<PagedTree> {
+        PagedTree::bulk_build_rows_syncing(database, log, tree_id, columns, key_columns, rows, true)
+    }
+
+    /// Builds a tree into a file that is being created, without the sync a
+    /// bulk build makes for itself.
+    ///
+    /// **Only for a file nothing has seen yet** (task-2191). A bulk build syncs
+    /// because its pages reach the file with no log record behind them, so a
+    /// commit after it must not get ahead of them. A file being created has no
+    /// commit yet, and the one creating it syncs once when every page and the
+    /// meta record are written; see `Database::finish_new_file`. Creating a
+    /// database synced three times and now syncs once.
+    ///
+    /// @param database - the file being created
+    /// @param tree_id - the tree's identifier
+    /// @param columns - the column directory
+    /// @param key_columns - how many leading columns form the key
+    /// @param rows - the rows, already sorted by the key columns
+    pub fn bulk_build_for_a_new_file<'d, R: AsRef<[Datum<'d>]>>(
+        database: &mut Database,
+        tree_id: u64,
+        columns: Vec<ColumnSpec>,
+        key_columns: usize,
+        rows: &[R],
+    ) -> DbResult<PagedTree> {
+        PagedTree::bulk_build_rows_syncing(
+            database,
+            None,
+            tree_id,
+            columns,
+            key_columns,
+            &crate::leaf::RowSlice(rows),
+            false,
+        )
+    }
+
+    /// [`PagedTree::bulk_build_rows`], syncing the data file after the pages or
+    /// not.
+    ///
+    /// @param database - the file
+    /// @param log - where the build's record goes, when it is logged
+    /// @param tree_id - the tree's identifier
+    /// @param columns - the column directory
+    /// @param key_columns - how many leading columns form the key
+    /// @param rows - the rows, already sorted by the key columns
+    /// @param sync - whether to sync the data file once the pages are written
+    fn bulk_build_rows_syncing<'d>(
+        database: &mut Database,
         mut log: Option<&mut dyn crate::write::TreeLog>,
         tree_id: u64,
         columns: Vec<ColumnSpec>,
         key_columns: usize,
         rows: &dyn crate::leaf::Rows<'d>,
+        sync: bool,
     ) -> DbResult<PagedTree> {
         let page_size = database.page_size();
         let encoding = KeyEncoding::choose(&columns, key_columns);
@@ -480,7 +535,9 @@ impl PagedTree {
         // transaction, which are not replayed - so the pages are still free. A
         // crash after it leaves pages that were durable first. A torn page cannot
         // exist at the commit point, because this sync preceded it.
-        database.pool().sync_data_file()?;
+        if sync {
+            database.pool().sync_data_file()?;
+        }
         // And one record naming what happened, which recovery applies nothing for.
         // Without it the log holds `AllocPage` records for a run of pages whose
         // contents no record describes, which a reader cannot tell from a gap. See
@@ -497,19 +554,20 @@ impl PagedTree {
         Ok(PagedTree {
             tree_id,
             root,
-            height,
+            shape: std::cell::Cell::new(Some((height, *leaves.first().unwrap_or(&PageId::NONE)))),
             columns,
             key_columns,
             page_size,
             encoding,
             collations,
             directions,
-            first_leaf: *leaves.first().unwrap_or(&PageId::NONE),
             leaf_count: leaves.len() as u64,
             row_count,
             scratch: RefCell::new(Vec::new()),
             leaf_hints: std::cell::RefCell::new(Vec::new()),
+            growing: false,
             hint_victim: std::cell::Cell::new(0),
+            largest_hint: std::cell::Cell::new(None),
             stats: std::cell::Cell::new(crate::write::WriteStats::default()),
             last_leaf: std::cell::Cell::new(None),
         })

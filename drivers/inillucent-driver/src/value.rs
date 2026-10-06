@@ -135,6 +135,26 @@ impl Value {
         }
     }
 
+    /// Takes a value coming out of the engine, without copying its bytes.
+    ///
+    /// The same rule as [`Value::from_engine`]: text that is not UTF-8 becomes
+    /// a blob. Text that is UTF-8 keeps the engine's buffer, so collecting a
+    /// result costs a check of each text rather than a copy of it.
+    ///
+    /// @param value - the engine's value, which this consumes
+    pub fn from_engine_owned(value: EngineValue) -> Value {
+        match value {
+            EngineValue::Null => Value::Null,
+            EngineValue::Int(number) => Value::Integer(number),
+            EngineValue::Real(number) => Value::Real(number),
+            EngineValue::Text(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => Value::Text(text),
+                Err(refused) => Value::Blob(refused.into_bytes()),
+            },
+            EngineValue::Blob(bytes) => Value::Blob(bytes),
+        }
+    }
+
     /// Copies a value going into the engine.
     pub fn to_engine(&self) -> EngineValue {
         match self {
@@ -143,6 +163,20 @@ impl Value {
             Value::Real(number) => EngineValue::Real(*number),
             Value::Text(text) => EngineValue::Text(text.as_bytes().to_vec()),
             Value::Blob(bytes) => EngineValue::Blob(bytes.clone()),
+        }
+    }
+
+    /// Moves a value into the engine, keeping its buffer.
+    ///
+    /// The owning form of [`Value::to_engine`], for rows the caller is done
+    /// with: a text's bytes and a blob move instead of being copied.
+    pub fn into_engine(self) -> EngineValue {
+        match self {
+            Value::Null => EngineValue::Null,
+            Value::Integer(number) => EngineValue::Int(number),
+            Value::Real(number) => EngineValue::Real(number),
+            Value::Text(text) => EngineValue::Text(text.into_bytes()),
+            Value::Blob(bytes) => EngineValue::Blob(bytes),
         }
     }
 }

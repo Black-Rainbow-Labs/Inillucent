@@ -55,6 +55,7 @@ pub mod foreign_key;
 pub mod function;
 pub mod keyword;
 pub mod lexer;
+pub mod lift;
 pub mod parser;
 pub mod plan;
 pub mod pragma_register;

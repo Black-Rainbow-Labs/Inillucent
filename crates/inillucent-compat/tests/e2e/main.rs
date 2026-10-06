@@ -22,6 +22,7 @@ mod cli_batch;
 mod cli_commands;
 mod confinement;
 mod dot_commands;
+mod held_inserts;
 mod mcp_cancel;
 mod mcp_replay;
 mod mcp_session;

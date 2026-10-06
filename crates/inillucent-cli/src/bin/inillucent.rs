@@ -48,7 +48,7 @@ use inillucent_cli::mcp;
 /// allocator is being measured on a build configuration rather than on an
 /// engine, and every binary this repository ships is built the same way.
 #[global_allocator]
-static ALLOCATOR: inillucent_alloc::Pooled = inillucent_alloc::Pooled;
+static ALLOCATOR: inillucent_alloc::Carved = inillucent_alloc::Carved;
 
 /// What the command line asked for, once the shared options are out of it.
 struct Invocation {

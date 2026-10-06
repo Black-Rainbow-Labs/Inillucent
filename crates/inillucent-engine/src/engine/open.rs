@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use inillucent_base::DbResult;
 use inillucent_catalog::load::table_from_create_sql;
-use inillucent_catalog::paged::{schema_create_sql, write_catalog};
+use inillucent_catalog::paged::{schema_create_sql, write_new_catalog};
 use inillucent_exec::physical::SourceLayout;
 use inillucent_exec::StaticType;
 use inillucent_pool::{Database, Options};
@@ -268,6 +268,7 @@ impl crate::ImportedDatabase {
                 collations: Vec::new(),
                 registry: modules(),
                 eponymous: Vec::new(),
+                only_builtin_modules: true,
                 virtual_tables: HashMap::new(),
                 vector_indexes: HashMap::new(),
                 attached: Vec::new(),
@@ -376,6 +377,11 @@ impl crate::ImportedDatabase {
     ) -> DbResult<ImportedDatabase> {
         let db_path = DbPath::new(path.to_string_lossy().as_ref());
         let _ = vfs.delete(&db_path, false);
+        // A rollback journal beside a file that is not there belongs to the
+        // file this one replaces. It is settled before the create, whose
+        // truncation then discards whatever it put back, rather than replayed
+        // onto the new file as the second open below used to do.
+        settle_a_hot_journal(vfs.as_ref(), &db_path, false)?;
         let mut database = Database::create(
             vfs.as_ref(),
             &db_path,
@@ -387,10 +393,26 @@ impl crate::ImportedDatabase {
         // one: every later DDL statement inserts into it, and a database whose
         // catalog root pointed nowhere would be one no `CREATE TABLE` could
         // start from.
-        let _ = write_catalog(&mut database, &[])?;
-        database.checkpoint()?;
-        drop(database);
-        ImportedDatabase::open_on(vfs, path, page_size, frames)
+        let _ = write_new_catalog(&mut database)?;
+        database.finish_new_file()?;
+        // **The rest of the open runs on the handle that created the file
+        // (task-2191).** It used to be dropped and the file opened again. The
+        // second open waited for the virus scanner, which reads a file on the
+        // first open after a handle that wrote it closes: 4.0 ms of the 8.3 ms
+        // of file calls a shell made creating an empty database, traced call by
+        // call. The handle holds what a fresh open would read back: the meta
+        // record it just wrote, the catalog's pages and the free map.
+        let database = crate::recovery::ready_a_created_file(&vfs, database)?;
+        let pending = PendingOpen {
+            vfs,
+            path,
+            db_path,
+            page_size,
+            frames,
+            read_only: false,
+            database,
+        };
+        ImportedDatabase::finish_open(pending, SharedState::fresh())
     }
 
     /// Opens a database this engine wrote, reading its schema from the file.
@@ -480,11 +502,37 @@ impl crate::ImportedDatabase {
         frames: usize,
         read_only: bool,
     ) -> DbResult<ImportedDatabase> {
+        let pending = ImportedDatabase::begin_open(vfs, path, page_size, frames, read_only)?;
+        ImportedDatabase::finish_open(pending, SharedState::fresh())
+    }
+
+    /// The part of an open whose failures are the open's own: a hot journal
+    /// put back, the file opened, its format checked and its meta record read.
+    ///
+    /// **An open in two halves** (task-2191). This half is what makes a file
+    /// that is not a database, has a newer format, has a torn meta record or
+    /// needs a key an error of the open. [`ImportedDatabase::finish_open`] is
+    /// the rest: the marker check, recovery, the log and the schema. An open
+    /// through `connect::Database` runs the second half at the first
+    /// statement, which is when SQLite reads its schema too, so an open and
+    /// close that runs nothing opens one file and reads two pages.
+    ///
+    /// The SHARED lock the reads took is still held when this returns; see
+    /// [`PendingOpen::let_go`].
+    ///
+    /// @param vfs - the file system
+    /// @param path - the database file
+    /// @param page_size - the page size the caller asked for
+    /// @param frames - how many frames the buffer pool holds
+    /// @param read_only - whether this connection may write the file
+    pub(crate) fn begin_open(
+        vfs: std::sync::Arc<dyn inillucent_vfs::Vfs>,
+        path: PathBuf,
+        page_size: usize,
+        frames: usize,
+        read_only: bool,
+    ) -> DbResult<PendingOpen> {
         let db_path = DbPath::new(path.to_string_lossy().as_ref());
-        // **A file opened as `main` asks the same question an attached one
-        // does.** A database this connection is opened on may have been the
-        // participant of a cross-file commit that a crash caught undecided, and
-        // there is nothing about being `main` that settles it.
         // **A hot rollback journal is replayed before anything reads a page.**
         // It describes a file that is halfway through a transaction, and every
         // page it names has to go back before the meta record is even read -
@@ -495,9 +543,56 @@ impl crate::ImportedDatabase {
         // A read only connection cannot do it and refuses instead - see
         // `settle_a_hot_journal`.
         settle_a_hot_journal(vfs.as_ref(), &db_path, read_only)?;
+        let database = crate::recovery::open_file_before_recovery(
+            &vfs,
+            &db_path,
+            frames,
+            read_only,
+            // The pending open lets the lock go straight after; see
+            // `inillucent_pool::file::meta_without_a_lock`.
+            inillucent_pool::MetaRead::UnlockedFirst,
+        )?;
+        Ok(PendingOpen {
+            vfs,
+            path,
+            db_path,
+            page_size,
+            frames,
+            read_only,
+            database,
+        })
+    }
+
+    /// The rest of an open: the marker check, recovery, the log and the schema.
+    ///
+    /// Takes SHARED again when [`PendingOpen::let_go`] gave it up, and catches
+    /// up with the file if another process moved it in between, which is what
+    /// every statement does on its way in.
+    ///
+    /// @param pending - what [`ImportedDatabase::begin_open`] did
+    /// @param shared - the counters, plans, writer and settings the caller's
+    ///   handle already holds
+    pub(crate) fn finish_open(
+        pending: PendingOpen,
+        shared: SharedState,
+    ) -> DbResult<ImportedDatabase> {
+        let PendingOpen {
+            vfs,
+            path,
+            db_path,
+            page_size,
+            frames,
+            read_only,
+            mut database,
+        } = pending;
+        database.begin_read()?;
+        // **A file opened as `main` asks the same question an attached one
+        // does.** A database this connection is opened on may have been the
+        // participant of a cross-file commit that a crash caught undecided, and
+        // there is nothing about being `main` that settles it.
         let doubtful = multi::doubtful_transactions(&path)?;
         let opened_file =
-            crate::recovery::open_file_as(&vfs, &db_path, frames, &doubtful, read_only)?;
+            crate::recovery::recover_the_open_file(&vfs, &db_path, database, &doubtful, read_only)?;
         let OpenedFile {
             database,
             wal,
@@ -540,26 +635,13 @@ impl crate::ImportedDatabase {
         catalog = catalog.with_table(schema_info.clone());
         catalog = catalog.with_table(schema_alias_of(&schema_info));
 
+        // Above every number the log still holds, so that this run cannot
+        // call something by a name a crashed one already used.
+        shared.writing.start_at(highest_txn.saturating_add(1));
         let mut opened = ImportedDatabase {
-            // Above every number the log still holds, so that this run cannot
-            // call something by a name a crashed one already used.
-            counters: std::rc::Rc::new(Counters {
-                last_rowid: std::cell::Cell::new(0),
-                last_changes: std::cell::Cell::new(0),
-                seed: std::cell::Cell::new(fresh_seed()),
-                changed_ever: std::cell::Cell::new(0),
-                total_changes: std::cell::Cell::new(0),
-                sessions: session_changes::SessionChanges::default(),
-            }),
-            compiled: std::rc::Rc::new(Compiled {
-                statements: std::cell::RefCell::new(HashMap::new()),
-                statement_cache_limit: std::cell::Cell::new(plans::DEFAULT_STATEMENT_CACHE),
-                compiles: std::cell::Cell::new(0),
-                scratch_ast: std::cell::RefCell::new(None),
-                scratch_binder: std::cell::RefCell::new(None),
-                index_stages: std::cell::Cell::new(StageTimings::default()),
-            }),
-            writing: std::rc::Rc::new(Writing::starting_at(highest_txn.saturating_add(1))),
+            counters: shared.counters,
+            compiled: shared.compiled,
+            writing: shared.writing,
             storage: Storage {
                 database,
                 page_size,
@@ -586,7 +668,7 @@ impl crate::ImportedDatabase {
                 imposters: Vec::new(),
                 catalog_generation: 0,
             },
-            pragmas: std::rc::Rc::new(Pragmas::fresh()),
+            pragmas: shared.pragmas,
             session_state: SessionState {
                 sessions_read: std::cell::RefCell::new(std::collections::HashSet::new()),
                 nesting: std::cell::Cell::new(0),
@@ -600,6 +682,7 @@ impl crate::ImportedDatabase {
                 collations: Vec::new(),
                 registry: modules(),
                 eponymous: Vec::new(),
+                only_builtin_modules: true,
                 virtual_tables: HashMap::new(),
                 vector_indexes: HashMap::new(),
             },
@@ -612,8 +695,13 @@ impl crate::ImportedDatabase {
         // them. Nothing did this before, so a reopened database holding a
         // search table answered "no such table" for it.
         opened.reconnect_modules()?;
-        opened.rebuild_tables()?;
-        opened.refresh_catalog();
+        // Again only when a module was connected, because a connected module is
+        // what changes the tables the first pass built. Without one the second
+        // pass rebuilt the same catalog, at every open (task-2191).
+        if !opened.session_state.virtual_tables.is_empty() {
+            opened.rebuild_tables()?;
+            opened.refresh_catalog();
+        }
         opened.finish_the_open(read_only)?;
         Ok(opened)
     }
@@ -628,6 +716,7 @@ impl crate::ImportedDatabase {
     fn finish_the_open(&mut self, read_only: bool) -> DbResult<()> {
         if !read_only
             && header_accounts_for_every_object(&self.schema.entries, &self.storage.database)
+            && self.storage.database.has_an_unclaimed_tail()?
             && self.may_write_what_the_open_read()?
         {
             self.storage.database.give_back_the_unclaimed_tail()?;
@@ -866,6 +955,80 @@ pub(crate) fn let_the_pool_spill(pool: &Pool, vfs: &std::sync::Arc<dyn inillucen
         )
         .map_err(|why| why.into_db_error())
     }));
+}
+
+/// An open whose first half has run: the file is open and its meta record
+/// read, and recovery, the log and the schema have not been done yet.
+///
+/// See [`ImportedDatabase::begin_open`].
+pub(crate) struct PendingOpen {
+    /// The file system.
+    vfs: std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    /// The database file.
+    path: PathBuf,
+    /// The same path, as the file system names it.
+    db_path: DbPath,
+    /// The page size the caller asked for.
+    page_size: usize,
+    /// How many frames the buffer pool holds.
+    frames: usize,
+    /// Whether this connection may write the file.
+    read_only: bool,
+    /// The file, with its format checked and its meta record read.
+    database: Database,
+}
+
+impl PendingOpen {
+    /// Gives up the SHARED lock the first half took, so a connection that has
+    /// not run a statement holds no lock, as SQLite's does not.
+    ///
+    /// [`ImportedDatabase::finish_open`] takes it again and rereads the meta
+    /// record if another process moved it in between.
+    pub(crate) fn let_go(&mut self) -> DbResult<()> {
+        self.database.end_access()
+    }
+}
+
+/// The state a database shares with the handle a caller holds: the counters,
+/// the compiled statements, the writer and the settings.
+///
+/// Made before the file is read, so a handle can exist before its open has
+/// finished. See [`ImportedDatabase::finish_open`].
+pub(crate) struct SharedState {
+    /// `changes()`, `last_insert_rowid()` and the rest.
+    pub(crate) counters: std::rc::Rc<Counters>,
+    /// The compiled statements.
+    pub(crate) compiled: std::rc::Rc<Compiled>,
+    /// The writer, whose first transaction number recovery sets.
+    pub(crate) writing: std::rc::Rc<Writing>,
+    /// The pragmas, the planner levers and the limits.
+    pub(crate) pragmas: std::rc::Rc<Pragmas>,
+}
+
+impl SharedState {
+    /// Returns the state of a database nothing has run on yet.
+    pub(crate) fn fresh() -> SharedState {
+        SharedState {
+            counters: std::rc::Rc::new(Counters {
+                last_rowid: std::cell::Cell::new(0),
+                last_changes: std::cell::Cell::new(0),
+                seed: std::cell::Cell::new(fresh_seed()),
+                changed_ever: std::cell::Cell::new(0),
+                total_changes: std::cell::Cell::new(0),
+                sessions: session_changes::SessionChanges::default(),
+            }),
+            compiled: std::rc::Rc::new(Compiled {
+                statements: std::cell::RefCell::new(HashMap::new()),
+                statement_cache_limit: std::cell::Cell::new(plans::DEFAULT_STATEMENT_CACHE),
+                compiles: std::cell::Cell::new(0),
+                scratch_ast: std::cell::RefCell::new(None),
+                scratch_binder: std::cell::RefCell::new(None),
+                index_stages: std::cell::Cell::new(StageTimings::default()),
+            }),
+            writing: std::rc::Rc::new(Writing::starting_at(1)),
+            pragmas: std::rc::Rc::new(Pragmas::fresh()),
+        }
+    }
 }
 
 /// Replays a rollback journal left by an interrupted write, or refuses.

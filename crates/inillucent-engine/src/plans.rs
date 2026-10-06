@@ -270,6 +270,87 @@ impl ImportedDatabase {
         }
     }
 
+    /// Compiles an `INSERT ... VALUES` with its literal values lifted out as
+    /// parameters, or answers `None` when the statement is not one or the
+    /// rewritten text does not compile.
+    ///
+    /// **Statements that differ only in their values share one plan**
+    /// (task-2191). See `inillucent_sql::lift`. Only when the plan cache is in
+    /// use: with it off, or with an authorizer that could refuse, every
+    /// statement is meant to be compiled as written. A rewritten text that does
+    /// not compile answers `None`, so the original is compiled and reports its
+    /// own error, with offsets into the text the caller wrote.
+    ///
+    /// Returns the plan, the rewritten text and the lifted values, `?1` first.
+    ///
+    /// @param sql - the statement text
+    pub(crate) fn compiled_with_lifted_literals(
+        &self,
+        sql: &str,
+    ) -> Option<(
+        std::rc::Rc<Cached>,
+        String,
+        crate::engine::statements::Lifted,
+    )> {
+        if !self.cacheable()
+            || !self.pragmas.levers().has(Levers::PLAN_CACHE)
+            || self.compiled.statement_cache_limit.get() == 0
+        {
+            return None;
+        }
+        let lifted = inillucent_sql::lift::lift_insert_literals(sql)?;
+        let (plan, parameters) = self.compiled_with_parameters(&lifted.text).ok()?;
+        let per_execution = lifted.row_width.unwrap_or(lifted.values.len());
+        if parameters as usize != per_execution {
+            return None;
+        }
+        // Several rows run through the one row template only into a table's
+        // own tree: a view's `INSTEAD OF` and a module write their rows their
+        // own way, and they keep the statement as written.
+        if lifted.row_width.is_some() {
+            let into_a_table = matches!(
+                &*plan,
+                Cached::Insert(statement, None, false, _)
+                    if statement.table.kind == inillucent_sql::catalog_view::TableKind::Table
+            );
+            if !into_a_table {
+                return None;
+            }
+        }
+        let values: Vec<inillucent_tree::datum::OwnedDatum> = lifted
+            .values
+            .into_iter()
+            .map(|value| match value {
+                inillucent_sql::lift::LiftedValue::Integer(value) => {
+                    inillucent_tree::datum::OwnedDatum::Int(value)
+                }
+                inillucent_sql::lift::LiftedValue::Real(value) => {
+                    inillucent_tree::datum::OwnedDatum::Real(value)
+                }
+                inillucent_sql::lift::LiftedValue::Text(text) => {
+                    inillucent_tree::datum::OwnedDatum::Text(text)
+                }
+            })
+            .collect();
+        let lifted_values = match lifted.row_width {
+            // The values are moved into their rows, not copied; see `Lifted::Rows`.
+            Some(width) => {
+                let width = width.max(1);
+                let count = values.len() / width;
+                let mut values = values.into_iter();
+                let rows = (0..count)
+                    .map(|_| values.by_ref().take(width).collect())
+                    .collect();
+                crate::engine::statements::Lifted::Rows {
+                    rows: std::cell::RefCell::new(Some(rows)),
+                    written: None,
+                }
+            }
+            None => crate::engine::statements::Lifted::Bind(values),
+        };
+        Some((plan, lifted.text, lifted_values))
+    }
+
     /// Returns one statement compiled, from the cache or by compiling it.
     ///
     /// Everything that does not depend on the bound parameters happens here and

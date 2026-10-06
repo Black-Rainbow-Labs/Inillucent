@@ -43,29 +43,58 @@
 /// @param text - the text to escape into it
 pub fn escape_into(out: &mut String, text: &str) {
     out.reserve(text.len());
-    for character in text.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            other if (other as u32) < 0x20 || other == '\u{7f}' => {
-                out.push_str("\\u");
-                // Four lower-case hexadecimal digits, written by hand rather
-                // than through `format!`, because this is the inner loop of
-                // every JSON result the engine produces and a `format!` here
-                // allocates once per control character.
-                let code = other as u32;
-                for shift in [12u32, 8, 4, 0] {
-                    let digit = (code >> shift) & 0xf;
-                    out.push(char::from_digit(digit, 16).unwrap_or('0'));
-                }
+    // **Runs that need no escape are copied whole** (task-2191). Every byte
+    // this function escapes is ASCII, and an ASCII byte never occurs inside a
+    // multi-byte UTF-8 sequence, so a byte scan finds exactly the characters
+    // the per-character loop below would change, and the text between them is
+    // appended in one copy. Almost all text is such runs: it was a push per
+    // character for every value of every JSON result.
+    let mut rest = text;
+    while let Some(at) = rest.bytes().position(needs_escape) {
+        let (plain, tail) = rest.split_at(at);
+        out.push_str(plain);
+        let Some(character) = tail.chars().next() else {
+            break;
+        };
+        escape_char_into(out, character);
+        rest = tail.get(character.len_utf8()..).unwrap_or_default();
+    }
+    out.push_str(rest);
+}
+
+/// Reports whether one byte is a character `escape_into` writes escaped.
+///
+/// @param byte - the byte
+fn needs_escape(byte: u8) -> bool {
+    byte == b'"' || byte == b'\\' || byte < 0x20 || byte == 0x7f
+}
+
+/// Appends one character the way `escape_into` writes it.
+///
+/// @param out - the string being built, appended to
+/// @param character - the character
+fn escape_char_into(out: &mut String, character: char) {
+    match character {
+        '"' => out.push_str("\\\""),
+        '\\' => out.push_str("\\\\"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        '\u{8}' => out.push_str("\\b"),
+        '\u{c}' => out.push_str("\\f"),
+        other if (other as u32) < 0x20 || other == '\u{7f}' => {
+            out.push_str("\\u");
+            // Four lower-case hexadecimal digits, written by hand rather
+            // than through `format!`, because this is the inner loop of
+            // every JSON result the engine produces and a `format!` here
+            // allocates once per control character.
+            let code = other as u32;
+            for shift in [12u32, 8, 4, 0] {
+                let digit = (code >> shift) & 0xf;
+                out.push(char::from_digit(digit, 16).unwrap_or('0'));
             }
-            other => out.push(other),
         }
+        other => out.push(other),
     }
 }
 

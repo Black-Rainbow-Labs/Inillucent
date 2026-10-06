@@ -34,6 +34,7 @@ use inillucent_txn::redo::{LogicalSplit, RowRedo, TreeRows};
 /// string function. What a segment is called is
 /// `inillucent_wal::segment::segment_name`, and this is its inverse, so the two
 /// stay in one crate rather than in two that agree today.
+pub use inillucent_vfs::os::names_starting_with;
 pub use inillucent_wal::{first_lsn_of, sequence_of_segment_name};
 
 /// What opening one file did to it, for a caller that has to say so.
@@ -357,6 +358,7 @@ fn replay(
     start: inillucent_wal::RecoveryStart,
     checkpointed: &[SchemaEntry],
     tolerant: bool,
+    keep: &mut Keep,
 ) -> DbResult<(
     inillucent_wal::recover::Recovered,
     Vec<inillucent_txn::redo::FreeMapChange>,
@@ -366,12 +368,18 @@ fn replay(
             database,
             LearningRows::new_with_tolerance(checkpointed, tolerant),
         );
-        let outcome = inillucent_wal::recover(vfs.as_ref(), db_path, start, &mut applier).map_err(
-            |error| {
-                let said = error.detail().unwrap_or_default().to_string();
-                error.with_detail(format!("replaying the log: {said}"))
-            },
-        )?;
+        let (outcome, kept) = inillucent_wal::recover_keeping(
+            vfs.as_ref(),
+            db_path,
+            start,
+            &mut applier,
+            keep.writable,
+        )
+        .map_err(|error| {
+            let said = error.detail().unwrap_or_default().to_string();
+            error.with_detail(format!("replaying the log: {said}"))
+        })?;
+        keep.segment = kept;
         let mut outcome = outcome;
         // **The applier is the only thing that knows** (task-2066 §4.1.10).
         // `inillucent_wal::recover` counts an `Ok` from `redo` as an applied
@@ -405,6 +413,7 @@ fn replay(
 /// @param start - where in the log to replay from
 /// @param checkpointed - the catalog the row decoder is seeded with
 /// @param tolerant - whether a record naming an unknown tree is skipped
+/// @param keep - whether to keep the last segment open, and where it goes
 fn replay_with_repair(
     database: &mut Database,
     vfs: &std::sync::Arc<dyn inillucent_vfs::Vfs>,
@@ -412,6 +421,7 @@ fn replay_with_repair(
     start: inillucent_wal::RecoveryStart,
     checkpointed: &[SchemaEntry],
     tolerant: bool,
+    keep: &mut Keep,
 ) -> DbResult<(
     inillucent_wal::recover::Recovered,
     Vec<inillucent_txn::redo::FreeMapChange>,
@@ -444,6 +454,7 @@ fn replay_with_repair(
         start.clone(),
         checkpointed,
         tolerant,
+        keep,
     ) {
         Ok(replayed) => Ok(replayed),
         // **A page the log holds whole, torn, and read by a record that is
@@ -479,10 +490,20 @@ fn replay_with_repair(
                         why.with_detail(format!("applying the log's page images: {said}"))
                     })?;
             }
-            replay(database, vfs, db_path, start, checkpointed, tolerant)
+            replay(database, vfs, db_path, start, checkpointed, tolerant, keep)
         }
         Err(error) => Err(error),
     }
+}
+
+/// Whether recovery keeps the last log segment it read open, and the segment
+/// once it has. See `inillucent_wal::KeptSegment`.
+#[derive(Default)]
+pub(crate) struct Keep {
+    /// Whether to open the segments so they can be written.
+    pub(crate) writable: bool,
+    /// The last segment the replay read, still open.
+    pub(crate) segment: Option<inillucent_wal::KeptSegment>,
 }
 
 /// Folds what an open's replay added to the file, when that is safe now.
@@ -662,8 +683,15 @@ pub(crate) fn resync_file(
             read_checkpointed_catalog(database)?
         }
     };
-    let (outcome, free_map) =
-        replay_with_repair(database, vfs, db_path, start, &checkpointed, repaired)?;
+    let (outcome, free_map) = replay_with_repair(
+        database,
+        vfs,
+        db_path,
+        start,
+        &checkpointed,
+        repaired,
+        &mut Keep::default(),
+    )?;
     for change in &free_map {
         match change.allocated {
             true => database.claim(change.page)?,
@@ -797,9 +825,40 @@ pub(crate) fn open_file_as(
     doubtful: &std::collections::BTreeSet<u64>,
     read_only: bool,
 ) -> DbResult<OpenedFile> {
+    let database = open_file_before_recovery(
+        vfs,
+        db_path,
+        frames,
+        read_only,
+        inillucent_pool::MetaRead::Locked,
+    )?;
+    recover_the_open_file(vfs, db_path, database, doubtful, read_only)
+}
+
+/// The first half of [`open_file_as`]: the file, its format and its meta
+/// record, which is what makes a file that is not a database, has a newer
+/// format or a wrong key an error of the open itself.
+///
+/// With [`inillucent_pool::MetaRead::Locked`] the SHARED lock the reads took
+/// is still held when this returns. With `UnlockedFirst` it is held only if
+/// the record had to be read again under it, and the caller lets it go either
+/// way.
+///
+/// @param vfs - the file system the file and its log live on
+/// @param db_path - the database file
+/// @param frames - how many frames the buffer pool holds
+/// @param read_only - whether this connection may write the file
+/// @param how - whether the meta record may be read before the lock
+pub(crate) fn open_file_before_recovery(
+    vfs: &std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    db_path: &DbPath,
+    frames: usize,
+    read_only: bool,
+    how: inillucent_pool::MetaRead,
+) -> DbResult<Database> {
     let database = match read_only {
-        true => Database::open_read_only(vfs.as_ref(), db_path, frames.max(64)),
-        false => Database::open_before_recovery(vfs.as_ref(), db_path, frames.max(64)),
+        true => Database::open_read_only(vfs.as_ref(), db_path, frames.max(64), how),
+        false => Database::open_before_recovery(vfs.as_ref(), db_path, frames.max(64), how),
     }
     .map_err(|error| {
         let said = error.detail().unwrap_or_default().to_string();
@@ -811,7 +870,42 @@ pub(crate) fn open_file_as(
     // into the database file, which needs the EXCLUSIVE lock a writer in
     // another process can refuse. See `let_the_pool_spill`.
     let_the_pool_spill(database.pool(), vfs);
+    Ok(database)
+}
 
+/// Makes a file this connection has just created ready for the rest of an
+/// open, as [`open_file_before_recovery`] makes a file it opened.
+///
+/// The file lock is let go, as an opened file's is before the first
+/// statement, and the same two checks run on the page count and the pool.
+///
+/// @param vfs - the file system the file lives on
+/// @param database - the file, as `Database::create` and its first catalog left it
+pub(crate) fn ready_a_created_file(
+    vfs: &std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    mut database: Database,
+) -> DbResult<Database> {
+    database.end_access()?;
+    database.refuse_a_page_count_that_cannot_be_addressed()?;
+    let_the_pool_spill(database.pool(), vfs);
+    Ok(database)
+}
+
+/// The second half of [`open_file_as`]: recovery, the log and the catalog,
+/// under the SHARED lock the caller holds.
+///
+/// @param vfs - the file system the file and its log live on
+/// @param db_path - the database file
+/// @param database - the file, opened by [`open_file_before_recovery`]
+/// @param doubtful - transactions whose `Commit` record is not the decision
+/// @param read_only - whether this connection may write the file
+pub(crate) fn recover_the_open_file(
+    vfs: &std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    db_path: &DbPath,
+    database: Database,
+    doubtful: &std::collections::BTreeSet<u64>,
+    read_only: bool,
+) -> DbResult<OpenedFile> {
     // **Recovery.** The log is replayed into the file before anything is read
     // out of it, which is what makes this an open rather than a reader of
     // whatever the last checkpoint happened to leave behind.
@@ -834,8 +928,19 @@ pub(crate) fn open_file_as(
     let start = where_recovery_starts(&database, doubtful);
     let mut database = database;
     let (checkpointed, repaired) = catalog_before_redo(&mut database, vfs, db_path, &start)?;
-    let (outcome, free_map) =
-        replay_with_repair(&mut database, vfs, db_path, start, &checkpointed, repaired)?;
+    let mut keep = Keep {
+        writable: !read_only,
+        segment: None,
+    };
+    let (outcome, free_map) = replay_with_repair(
+        &mut database,
+        vfs,
+        db_path,
+        start,
+        &checkpointed,
+        repaired,
+        &mut keep,
+    )?;
     // The free map is rebuilt after the scan rather than inside it: the map and
     // every page write are both behind `&mut Database`, and one record cannot
     // hold two mutable borrows of the same object.
@@ -876,13 +981,16 @@ pub(crate) fn open_file_as(
     };
     let wal = match read_only {
         true => scratch_log(db_path, database.uuid(), next_lsn, sequence)?,
-        false => std::rc::Rc::new(Wal::open(
+        // The segment the replay read last, when it is the one the log
+        // resumes in, so it is opened once. See `inillucent_wal::KeptSegment`.
+        false => std::rc::Rc::new(Wal::open_with(
             std::sync::Arc::clone(vfs),
             db_path,
             database.uuid(),
             next_lsn,
             sequence,
             WalOptions::default(),
+            keep.segment.take(),
         )?),
     };
     database.pool().set_durable_lsn(wal.write_ahead_point());
@@ -997,6 +1105,14 @@ pub(crate) fn open_file_as(
 struct LearningRows {
     /// The applier this delegates to, gaining trees as it goes.
     rows: TreeRows,
+    /// Whether `rows` holds a shape for every tree `seen` names.
+    ///
+    /// **Derived when the first record needs one, not at the start**
+    /// (task-2191). Deriving parses the `CREATE` statement of every table and
+    /// index in the catalog, and an open of a file whose log holds nothing past
+    /// its checkpoint, which is nearly every open, applies no record at all.
+    /// That parse was a tenth of opening a small database.
+    shapes_known: bool,
     /// The catalog as it now stands: at most one entry per object.
     seen: Vec<SchemaEntry>,
     /// How many records this pass dropped because it had no shape for the
@@ -1055,7 +1171,7 @@ impl LearningRows {
     /// @param checkpointed - the catalog the pass starts from
     /// @param tolerant - whether an unknown tree is skipped rather than refused
     pub(crate) fn new_with_tolerance(checkpointed: &[SchemaEntry], tolerant: bool) -> LearningRows {
-        let mut learning = LearningRows {
+        LearningRows {
             dropped: 0,
             rows: TreeRows::new().with_tree(
                 inillucent_catalog::paged::SCHEMA_TREE_ID,
@@ -1065,9 +1181,17 @@ impl LearningRows {
             seen: checkpointed.to_vec(),
             refreshed_for: Vec::new(),
             tolerant,
-        };
-        learning.derive_every_shape();
-        learning
+            shapes_known: false,
+        }
+    }
+
+    /// Derives every tree's shape the first time a record needs one, and
+    /// again after the catalog this pass has seen changed.
+    fn know_the_shapes(&mut self) {
+        if !self.shapes_known {
+            self.derive_every_shape();
+            self.shapes_known = true;
+        }
     }
 
     /// Learns a tree's shape from a catalog row the replay is about to apply.
@@ -1085,7 +1209,7 @@ impl LearningRows {
             return;
         };
         self.remember(entry);
-        self.derive_every_shape();
+        self.shapes_known = false;
     }
 
     /// Puts one catalog entry in place of the one it supersedes.
@@ -1155,6 +1279,7 @@ impl RowRedo for LearningRows {
         if tree == inillucent_catalog::paged::SCHEMA_TREE_ID {
             self.learn(row);
         }
+        self.know_the_shapes();
         let result = self.rows.insert_row(database, tree, page, row, lsn);
         self.retry_after_reading_the_catalog(database, tree, result, |rows, database| {
             rows.insert_row(database, tree, page, row, lsn)
@@ -1169,6 +1294,7 @@ impl RowRedo for LearningRows {
         key: &[u8],
         lsn: u64,
     ) -> DbResult<()> {
+        self.know_the_shapes();
         let result = self.rows.delete_row(database, tree, page, key, lsn);
         self.retry_after_reading_the_catalog(database, tree, result, |rows, database| {
             rows.delete_row(database, tree, page, key, lsn)
@@ -1185,6 +1311,7 @@ impl RowRedo for LearningRows {
         value: &[u8],
         lsn: u64,
     ) -> DbResult<()> {
+        self.know_the_shapes();
         let result = self
             .rows
             .update_in_place(database, tree, page, key, column, value, lsn);
@@ -1201,6 +1328,7 @@ impl RowRedo for LearningRows {
         lsn: u64,
         from_lsn: u64,
     ) -> DbResult<()> {
+        self.know_the_shapes();
         let result = self.rows.compact_leaf(database, tree, page, lsn, from_lsn);
         self.retry_after_reading_the_catalog(database, tree, result, |rows, database| {
             rows.compact_leaf(database, tree, page, lsn, from_lsn)
@@ -1208,6 +1336,7 @@ impl RowRedo for LearningRows {
     }
 
     fn split_leaf(&mut self, database: &mut Database, split: &LogicalSplit<'_>) -> DbResult<()> {
+        self.know_the_shapes();
         let result = self.rows.split_leaf(database, split);
         self.retry_after_reading_the_catalog(database, split.tree, result, |rows, database| {
             rows.split_leaf(database, split)

@@ -363,7 +363,7 @@ impl crate::ImportedDatabase {
                 let width = index.columns.len();
                 let mut implied: Vec<Vec<OwnedDatum>> = Vec::new();
                 if !computed {
-                    let mut page = table_tree.first_leaf();
+                    let mut page = table_tree.first_leaf(file.pool())?;
                     while !page.is_none() {
                         let mut next = inillucent_pool::PageId::NONE;
                         table_tree.visit_from(file.pool(), page, &mut |leaf| {

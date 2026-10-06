@@ -368,13 +368,13 @@ impl Database {
     /// @param path - the database file
     /// @param frames - how many frames the pool holds
     pub fn open(vfs: &dyn Vfs, path: &DbPath, frames: usize) -> DbResult<Database> {
-        let (pool, meta) = Self::open_bootstrap(vfs, path, frames)?;
+        let (pool, meta, slots) = Self::open_bootstrap(vfs, path, frames)?;
         let free = read_free_map(&pool, meta.free_map)?;
         Ok(Database {
             pool,
             meta,
             disk_meta: meta,
-            slots: LastReadSlots::default(),
+            slots,
             free,
             shared_extent: None,
             busy_millis: default_busy_millis(),
@@ -399,15 +399,21 @@ impl Database {
     /// @param vfs - the file system to read from
     /// @param path - the database file
     /// @param frames - how many frames the pool holds
-    pub fn open_read_only(vfs: &dyn Vfs, path: &DbPath, frames: usize) -> DbResult<Database> {
-        let (pool, meta) = Self::open_bootstrap_with(vfs, path, frames, true)?;
+    /// @param how - whether the meta record may be read before the lock
+    pub fn open_read_only(
+        vfs: &dyn Vfs,
+        path: &DbPath,
+        frames: usize,
+        how: MetaRead,
+    ) -> DbResult<Database> {
+        let (pool, meta, slots) = Self::open_bootstrap_with(vfs, path, frames, true, how)?;
         pool.forbid_writing();
         let free = pool.new_free_map();
         Ok(Database {
             pool,
             meta,
             disk_meta: meta,
-            slots: LastReadSlots::default(),
+            slots,
             free,
             shared_extent: None,
             busy_millis: default_busy_millis(),
@@ -445,14 +451,20 @@ impl Database {
     /// @param vfs - the file system to read from
     /// @param path - the database file
     /// @param frames - how many frames the pool holds
-    pub fn open_before_recovery(vfs: &dyn Vfs, path: &DbPath, frames: usize) -> DbResult<Database> {
-        let (pool, meta) = Self::open_bootstrap(vfs, path, frames)?;
+    /// @param how - whether the meta record may be read before the lock
+    pub fn open_before_recovery(
+        vfs: &dyn Vfs,
+        path: &DbPath,
+        frames: usize,
+        how: MetaRead,
+    ) -> DbResult<Database> {
+        let (pool, meta, slots) = Self::open_bootstrap_with(vfs, path, frames, false, how)?;
         let free = pool.new_free_map();
         Ok(Database {
             pool,
             meta,
             disk_meta: meta,
-            slots: LastReadSlots::default(),
+            slots,
             free,
             shared_extent: None,
             busy_millis: default_busy_millis(),
@@ -481,8 +493,12 @@ impl Database {
     /// @param vfs - the file system to read from
     /// @param path - the database file
     /// @param frames - how many frames the pool holds
-    fn open_bootstrap(vfs: &dyn Vfs, path: &DbPath, frames: usize) -> DbResult<(Pool, Meta)> {
-        Self::open_bootstrap_with(vfs, path, frames, false)
+    fn open_bootstrap(
+        vfs: &dyn Vfs,
+        path: &DbPath,
+        frames: usize,
+    ) -> DbResult<(Pool, Meta, LastReadSlots)> {
+        Self::open_bootstrap_with(vfs, path, frames, false, MetaRead::Locked)
     }
 
     /// [`Database::open_bootstrap`], with the caller saying whether the handle
@@ -492,19 +508,32 @@ impl Database {
     /// @param path - the database file
     /// @param frames - how many frames the pool holds
     /// @param read_only - whether the file handle refuses writes
+    /// @param how - whether the meta record may be read before the lock
     fn open_bootstrap_with(
         vfs: &dyn Vfs,
         path: &DbPath,
         frames: usize,
         read_only: bool,
-    ) -> DbResult<(Pool, Meta)> {
+        how: MetaRead,
+    ) -> DbResult<(Pool, Meta, LastReadSlots)> {
+        // **Opened, never created** (task-2191). Every caller reads the meta
+        // record next, so a file that is not there has nothing to read, and
+        // asking the open to create it made the file system check first
+        // whether it existed, at every open.
         let options = match read_only {
             true => OpenOptions::main_db().read_only(),
-            false => OpenOptions::main_db(),
+            false => OpenOptions::main_db().existing(),
         };
         let file = vfs
             .open(path, options)
             .map_err(|error| error.into_db_error())?;
+        if how == MetaRead::UnlockedFirst {
+            if let Some((page_size, meta, slots)) = meta_without_a_lock(file.as_ref()) {
+                let pool = Pool::new(file, page_size, frames, meta.page_count)?;
+                pool.note_high_water_lsn(meta.high_water_lsn);
+                return Ok((pool, meta, slots));
+            }
+        }
         // The page size lives in the meta page, and the meta page cannot be
         // read without it. The first sixteen bytes are readable at any size -
         // magic, format, page size - so they are read first and the whole page
@@ -530,7 +559,11 @@ impl Database {
         // the whole busy budget and then reported `neither meta page is
         // readable` - corruption, for a file with nothing wrong with it
         // (task-1979, E3).
-        if let Some(found) = foreign_format_version(file.as_ref()) {
+        // **The header is read once for the three questions below** (task-2191).
+        // Each of them read the same sixteen bytes again.
+        let mut head = [0u8; 16];
+        let head = file.read_exact_at(0, &mut head).ok().map(|()| head);
+        if let Some(found) = head.as_ref().and_then(foreign_format_in) {
             return Err(crate::meta::wrong_format(found));
         }
         // **A SQLite file says so rather than reading as damage (task-1979,
@@ -540,7 +573,10 @@ impl Database {
         // another engine's. `docs/sql.md` has always said a SQLite file is
         // imported rather than opened in place; this is that sentence, at the
         // moment it is needed.
-        if is_a_sqlite_file(file.as_ref()) {
+        if head
+            .as_ref()
+            .is_some_and(|head| head == b"SQLite format 3\0")
+        {
             return Err(inillucent_base::error::refusal(
                 "this is a SQLite database, and this engine writes its own format; \
                  `inillucent migrate <file> --destination <new.rdb>` reads it and writes one",
@@ -549,8 +585,12 @@ impl Database {
         }
         let mut waited = 0u64;
         let budget = default_busy_millis();
+        let mut declared = head.as_ref().and_then(declared_page_size_in);
         let page_size = loop {
-            if let Some(size) = declared_page_size(file.as_ref()) {
+            if let Some(size) = declared
+                .take()
+                .or_else(|| declared_page_size(file.as_ref()))
+            {
                 break size;
             }
             if let Some(size) = discover_page_size(file.as_ref()) {
@@ -566,13 +606,20 @@ impl Database {
             waited = waited.saturating_add(5);
             wait_for_lock(file.as_ref(), FileLock::Shared)?;
         };
-        let mut primary = vec![0u8; page_size];
-        let mut shadow = vec![0u8; page_size];
-        file.read_exact_at(0, &mut primary)
+        // Both meta pages in one read; they are the first two pages.
+        let mut both = vec![0u8; page_size.saturating_mul(2)];
+        file.read_exact_at(0, &mut both)
             .map_err(|error| error.into_db_error())?;
-        file.read_exact_at(page_size as u64, &mut shadow)
-            .map_err(|error| error.into_db_error())?;
-        let meta = Meta::choose(&primary, &shadow)?;
+        let (primary, shadow) = both.split_at(page_size);
+        let meta = Meta::choose(primary, shadow)?;
+        // **The slots are written down here, from the read the open already
+        // made** (task-2191). Without them the next two checks of whether the
+        // file moved, the one that finishes the open at the first statement
+        // and the first statement's own, each read both meta pages in full and
+        // decoded them, where with them each reads the shadow slot's record and
+        // compares bytes. See `LastReadSlots::record`.
+        let mut slots = LastReadSlots::default();
+        slots.record(primary, shadow, true);
         if meta.page_size as usize != page_size {
             return Err(corrupt("the meta pages disagree about the page size"));
         }
@@ -583,7 +630,26 @@ impl Database {
         // than the run before it, and the next open would resume the log below
         // a stamp that is still in the file.
         pool.note_high_water_lsn(meta.high_water_lsn);
-        Ok((pool, meta))
+        Ok((pool, meta, slots))
+    }
+
+    /// Reports whether the file is longer than the pages the meta record
+    /// counts, which is what [`Database::give_back_the_unclaimed_tail`] trims.
+    ///
+    /// One length query, with no lock: asked first, so that an open of a file
+    /// with no unclaimed tail, which is nearly every open, does not take the
+    /// write lock and read the meta again to find nothing to trim (task-2191).
+    pub fn has_an_unclaimed_tail(&self) -> DbResult<bool> {
+        let wanted = self
+            .pool
+            .page_count()
+            .saturating_mul(self.pool.page_size() as u64);
+        let there = self
+            .pool
+            .file()
+            .file_size()
+            .map_err(inillucent_vfs::VfsError::into_db_error)?;
+        Ok(there > wanted)
     }
 
     /// Gives back the tail of the file that the meta record does not describe.
@@ -1508,6 +1574,27 @@ impl Database {
         self.checkpoint_after_free_map()
     }
 
+    /// Writes everything a file being created holds, and its meta record, and
+    /// syncs once.
+    ///
+    /// **One sync for a file nothing has seen** (task-2191). A checkpoint syncs
+    /// the pages and then the meta record, because a crash between them must
+    /// leave the previous record whole; a file being created has no previous
+    /// record anybody relies on, and a crash before this sync leaves a file
+    /// that was never finished, as it always could. Creating a database made
+    /// three syncs of the data file and now makes this one.
+    pub fn finish_new_file(&mut self) -> DbResult<()> {
+        self.write_free_map()?;
+        self.meta.page_count = self.pool.page_count();
+        self.meta.free_map = self.free.first();
+        self.meta.generation = self.meta.generation.saturating_add(1);
+        let mut meta = self.meta;
+        self.pool.finish_new_file(&mut meta)?;
+        self.meta = meta;
+        self.disk_meta = meta;
+        Ok(())
+    }
+
     /// Finishes a checkpoint whose free-map pages are already installed.
     ///
     /// **The other half of [`Database::checkpoint`], for a caller that
@@ -1745,6 +1832,13 @@ fn file_is_busy(
 fn declared_page_size(file: &dyn inillucent_vfs::VfsFile) -> Option<usize> {
     let mut head = [0u8; 16];
     file.read_exact_at(0, &mut head).ok()?;
+    declared_page_size_in(&head)
+}
+
+/// [`declared_page_size`] over the header bytes already read.
+///
+/// @param head - the file's first sixteen bytes
+fn declared_page_size_in(head: &[u8; 16]) -> Option<usize> {
     if head.get(0..8)? != crate::meta::MAGIC {
         return None;
     }
@@ -1762,19 +1856,51 @@ fn declared_page_size(file: &dyn inillucent_vfs::VfsFile) -> Option<usize> {
     Some(size)
 }
 
-/// Returns whether a file begins with SQLite's own header.
+/// Whether an open reads the meta record before it takes the shared lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetaRead {
+    /// Under the shared lock, for an open that goes on to read pages.
+    Locked,
+    /// Without it first, for an open that lets the lock go straight after.
+    UnlockedFirst,
+}
+
+/// Reads the meta record without the shared lock, or answers `None` for the
+/// locked read to do it instead.
 ///
-/// The sixteen bytes `SQLite format 3` and a NUL, which every SQLite database
-/// starts with and which no inillucent file can, because ours starts with
-/// `RDB2`.
+/// **For an open that runs nothing under the lock it took** (task-2191). The
+/// deferred open reads the meta record to refuse a file that is not a
+/// database, has a newer format or a wrong key, and then lets the lock go; the
+/// first statement takes it again and checks the record. Taking and dropping
+/// the lock was three lock calls and an unlock at every open, about 4% of a
+/// Python open and close. A writer in another process may be rewriting a meta
+/// page while this reads it, so this answers only a record that checks out
+/// whole: `Meta::choose` takes a copy whose checksum holds, which may be the
+/// older of the two. The first statement compares the shadow slot with what
+/// was read here and adopts the file's record when they differ, which is the
+/// same check a record read under the lock gets after any later commit.
+/// Anything else, a short file, a header this does not read, a torn pair,
+/// answers `None`, and the locked read reports it with the message it always
+/// gave.
 ///
-/// @param file - the open data file
-fn is_a_sqlite_file(file: &dyn inillucent_vfs::VfsFile) -> bool {
+/// @param file - the database file, opened
+fn meta_without_a_lock(file: &dyn inillucent_vfs::VfsFile) -> Option<(usize, Meta, LastReadSlots)> {
     let mut head = [0u8; 16];
-    if file.read_exact_at(0, &mut head).is_err() {
-        return false;
+    file.read_exact_at(0, &mut head).ok()?;
+    if foreign_format_in(&head).is_some() {
+        return None;
     }
-    head == *b"SQLite format 3\0"
+    let page_size = declared_page_size_in(&head)?;
+    let mut both = vec![0u8; page_size.checked_mul(2)?];
+    file.read_exact_at(0, &mut both).ok()?;
+    let (primary, shadow) = both.split_at(page_size);
+    let meta = Meta::choose(primary, shadow).ok()?;
+    if meta.page_size as usize != page_size {
+        return None;
+    }
+    let mut slots = LastReadSlots::default();
+    slots.record(primary, shadow, true);
+    Some((page_size, meta, slots))
 }
 
 /// Returns the format version a file carries when this build does not read it.
@@ -1783,10 +1909,11 @@ fn is_a_sqlite_file(file: &dyn inillucent_vfs::VfsFile) -> bool {
 /// inillucent database at all - the second is the caller's "neither meta page is
 /// readable", which is the right answer for a file whose magic is missing.
 ///
-/// @param file - the open data file
-fn foreign_format_version(file: &dyn inillucent_vfs::VfsFile) -> Option<u32> {
-    let mut head = [0u8; 12];
-    file.read_exact_at(0, &mut head).ok()?;
+/// A file that begins with SQLite's own sixteen bytes, `SQLite format 3` and a
+/// NUL, is told apart by the caller from the same header bytes.
+///
+/// @param head - the file's first sixteen bytes
+fn foreign_format_in(head: &[u8; 16]) -> Option<u32> {
     if head.get(0..8)? != crate::meta::MAGIC {
         return None;
     }
