@@ -117,15 +117,24 @@ fn run_script(
 /// than unwrapped - `open()` folds it into the same `Err` its caller already
 /// treats as "this attempt never got to run the workload".
 ///
+/// `fold` is not a `PRAGMA synchronous` value: it is `full` with the engine's
+/// commits held for the fold that follows each statement, which is what the
+/// command line's `exec` runs under (see `ImportedDatabase::hold_commits_for_the_fold`).
+///
 /// @param engine - the database
 /// @param mode - `delete`, `truncate` or `persist`
-/// @param synchronous - `full` or another `PRAGMA synchronous` spelling
+/// @param synchronous - `full` or another `PRAGMA synchronous` spelling, or `fold`
 fn set_journal(
     engine: &mut ImportedDatabase,
     mode: &str,
     synchronous: &str,
 ) -> Result<(), inillucent_base::DbError> {
     exec(engine, &format!("PRAGMA journal_mode = {mode}"))?;
+    if synchronous == "fold" {
+        exec(engine, "PRAGMA synchronous = full")?;
+        engine.hold_commits_for_the_fold();
+        return Ok(());
+    }
     exec(engine, &format!("PRAGMA synchronous = {synchronous}"))?;
     Ok(())
 }
@@ -922,6 +931,29 @@ fn power_loss_at_every_cut_point_of_a_full_commit() {
     };
     let report = campaign(journal, Failure::Crash, 220, false);
     record("delete-full-crash.txt", &report);
+}
+
+/// A power loss at every cut point of a commit whose log sync is left to the
+/// fold that follows it leaves the old database or the new one, and once the
+/// statement has returned, the new one.
+///
+/// **What the command line's `exec` runs under** (task-2191). The commit
+/// appends its records without a sync, the statement keeps its lock and folds
+/// before it returns, and the fold hands the log to the file system without
+/// syncing it either, so the only syncs are the rollback journal's and the data
+/// file's. The cut points cover the unsynced log, the journal's pre images and
+/// seal, the page and meta writes and the journal's delete. The unarmed run
+/// cuts the power after the last call, when the log's tail may never have
+/// reached the disk, and asserts the new state: the data file and its meta
+/// record hold it alone.
+#[test]
+fn power_loss_at_every_cut_point_of_a_commit_the_fold_holds() {
+    let journal = Journal {
+        mode: "delete",
+        synchronous: "fold",
+    };
+    let report = campaign(journal, Failure::Crash, 220, false);
+    record("delete-fold-crash.txt", &report);
 }
 
 /// TRUNCATE mode has a different commit point - the truncation rather than the

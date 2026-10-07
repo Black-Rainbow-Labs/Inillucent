@@ -81,8 +81,8 @@ with both engines reading the same vectors.
 | Result | Detail | Source |
 |---|---|---|
 | **419% faster than SQLite 3.53.4** | 5.19x, weighted over ten workload families | [Performance](performance.md) |
-| **137% faster than SQLite through the `Connection`** | 2.37x on the same ten families, through `Connection::prepare` and `Statement::step`, on 2026-10-03 with release 2.1.2 | [Performance](performance.md#through-the-connection-on-common-and-edge-case-workloads) |
-| **69% faster on 48 common and edge case workloads** | the hillclimb plan through the `Connection`, where release 2.1.2 was 34% faster and 2.1.1 was 30% slower | [Performance](performance.md#a-second-hill-climb) |
+| **484% faster than SQLite in the newest run** | 5.84x weighted, on 2026-10-07 with the build released as 2.3.0. Not graded: SQLite ran 7% slower than its idle reference, which makes this figure read high | [Performance](performance.md) |
+| **64% faster than SQLite called the way programs call it** | 25 workloads on 2026-10-06: 136% faster from Python, 207% from Node, 46% through scripts into the shell and 3% from the command line | [Performance](performance.md#how-programs-call-it) |
 | **67% less processor time** | 344 ms against 1,043 ms for one round of the same plan | [Performance](performance.md) |
 | **11.5% more memory** | 41.48 MiB against 37.21 MiB peak, with the same 128 MiB cache. SQLite uses less | [Performance](performance.md#memory) |
 | **A file 3.6% larger** | 17,432,576 bytes against 16,830,464 bytes for the same imported data | [Performance](performance.md#disk) |
@@ -91,11 +91,11 @@ with both engines reading the same vectors.
 | **174% faster than pgvector without a filter** | median 0.8462 ms against 2.315 ms | [Retrieval quality](retrieval-quality.md#latency) |
 | **6,169% faster than pgvector with a filter** | median 0.5820 ms against 36.486 ms, for `source = slack` | [Retrieval quality](retrieval-quality.md#latency) |
 
-Six of the thirty weighted workloads are slower than SQLite. Four correlated subquery workloads,
-which the performance contract does not weight, are far slower: a correlated `EXISTS` over 400
-outer rows took 59.69 ms against 0.29 ms for SQLite in the graded run.
-[The workloads that are slower](performance.md#the-workloads-that-are-slower) lists each one and the
-reason.
+In the newest run one of the thirty weighted workloads is slower than SQLite: compiling `SELECT 1`
+on every call, 72% slower. One more, an autocommit insert, is level with it. The four correlated
+subquery workloads, which the performance contract does not weight, are all faster.
+[The workloads that are slower](performance.md#the-workloads-that-are-slower) gives the reason for
+each.
 
 ## inillucent compared with PostgreSQL and pgvector
 
@@ -150,8 +150,8 @@ the process serving it holds 1,216 MiB of memory. The pgvector database for the 
   [Keeping a vector index current](relational-architecture.md#10-keeping-a-vector-index-current)
   explains how to choose `N`, and [Closed items](closed-items.md#a-generation-is-one-blob) has the
   measurements.
-- **Six of the thirty weighted workloads are slower than SQLite.**
-  [Performance](performance.md#the-workloads-that-are-slower) lists them.
+- **One of the thirty weighted workloads is slower than SQLite**, compiling `SELECT 1` on every
+  call. [Performance](performance.md#the-workloads-that-are-slower) gives the reason.
 
 ## Where to go next
 

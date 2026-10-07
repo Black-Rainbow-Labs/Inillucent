@@ -21,6 +21,7 @@ use inillucent_value::Value;
 use crate::render::{render, Layout, Mode};
 
 mod deferred;
+pub mod output;
 
 /// Everything the shell remembers between lines.
 /// One open database and the session statements on it belong to.
@@ -474,6 +475,14 @@ impl Shell {
         held.database.session_as(held.session)
     }
 
+    /// Makes the open database's commits durable by the fold that follows each
+    /// statement, for a program that runs one statement and exits.
+    ///
+    /// See the engine's `hold_commits_for_the_fold` on its `Database`.
+    pub fn hold_commits_for_the_fold(&self) -> inillucent_base::DbResult<()> {
+        self.open_slot().database.hold_commits_for_the_fold()
+    }
+
     /// Returns what one run-time limit is set to on the open database.
     ///
     /// @param limit - which limit
@@ -742,8 +751,7 @@ impl Shell {
             sink.push('\n');
             return;
         }
-        let mut out = std::io::stdout();
-        let _ = write!(out, "{line}{ending}");
+        output::write_line(line, ending);
     }
 
     /// Prints an error, which always goes to standard error.
@@ -758,7 +766,12 @@ impl Shell {
                 sink.push_str(message);
                 sink.push('\n');
             }
-            None => eprintln!("{message}"),
+            None => {
+                // Everything printed before the error reaches the terminal or
+                // the pipe before it, as it did when every line was flushed.
+                output::flush();
+                eprintln!("{message}");
+            }
         }
         self.failed = true;
     }

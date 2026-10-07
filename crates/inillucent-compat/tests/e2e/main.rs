@@ -30,3 +30,4 @@ mod mcp_wire;
 mod migrate_realistic;
 mod release_format;
 mod setup_embeddings;
+mod shell_output;

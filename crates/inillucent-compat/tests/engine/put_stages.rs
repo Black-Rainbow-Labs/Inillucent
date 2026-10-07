@@ -149,7 +149,6 @@ fn the_recorded_stages_nest_the_way_the_calls_do() {
                 .encode
                 .saturating_add(stages.find)
                 .saturating_add(stages.locate)
-                .saturating_add(stages.room)
                 .saturating_add(stages.undo)
                 .saturating_add(stages.apply)
                 .saturating_add(stages.making),

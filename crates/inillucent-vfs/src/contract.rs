@@ -431,6 +431,27 @@ pub trait Vfs: Send + Sync + Debug {
     /// Reports whether a path exists or is accessible in the requested mode.
     fn access(&self, path: &DbPath, mode: AccessMode) -> VfsResult<bool>;
 
+    /// Returns a file's length, or `None` when nothing is there.
+    ///
+    /// **For a question asked without wanting the file open** (task-2191): a
+    /// first statement asks the log segment's length to learn that there is
+    /// nothing to replay, and on Windows the first open of a file another
+    /// process wrote waits for the virus scanner. The operating system's VFS
+    /// asks by name. This default opens the file to ask, which is correct for
+    /// every VFS and is what a simulated or encrypting one does.
+    ///
+    /// @param path - the file
+    fn size_by_name(&self, path: &DbPath) -> VfsResult<Option<u64>> {
+        if !self.access(path, AccessMode::Exists)? {
+            return Ok(None);
+        }
+        let options = OpenOptions {
+            read_only: true,
+            ..OpenOptions::of_kind(FileKind::Wal)
+        };
+        self.open(path, options)?.file_size().map(Some)
+    }
+
     /// Resolves a path to the canonical absolute form the VFS will use.
     fn full_pathname(&self, path: &DbPath) -> VfsResult<DbPath>;
 

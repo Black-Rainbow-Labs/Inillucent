@@ -288,6 +288,9 @@ pub struct Database {
     /// across attached files and an exclusive connection keep the stronger lock
     /// they were built on.
     reserved_writes: bool,
+    /// When this connection last took SHARED the ordinary way, for as long as
+    /// it holds the file; see [`crate::lease::MOST`].
+    held_since: Option<std::time::Instant>,
 }
 
 impl Database {
@@ -337,6 +340,7 @@ impl Database {
             replayed_by_its_owner: false,
             trusted: false,
             reserved_writes: false,
+            held_since: None,
         };
         let mut next = FIRST_DATA_PAGE.0;
         let created = database.free.ensure(FIRST_DATA_PAGE.0, &mut next)?;
@@ -382,6 +386,7 @@ impl Database {
             replayed_by_its_owner: false,
             trusted: false,
             reserved_writes: false,
+            held_since: None,
         })
     }
 
@@ -421,6 +426,7 @@ impl Database {
             replayed_by_its_owner: false,
             trusted: false,
             reserved_writes: false,
+            held_since: None,
         })
     }
 
@@ -472,6 +478,7 @@ impl Database {
             replayed_by_its_owner: false,
             trusted: false,
             reserved_writes: false,
+            held_since: None,
         })
     }
 
@@ -916,10 +923,26 @@ impl Database {
     /// @param checkpoint_lsn - where recovery must start
     /// @param cts_watermark - the newest commit timestamp at the checkpoint
     /// @param wal_sequence - the segment `checkpoint_lsn` lives in
+    ///
+    /// Clears the segment length the meta record keeps for a first statement
+    /// (`Meta::log_end_at_checkpoint`): a new position describes a log that
+    /// length was not measured on, and only a caller that measured it may set it
+    /// again, with [`Database::set_log_end_at_checkpoint`].
     pub fn set_log_position(&mut self, checkpoint_lsn: u64, cts_watermark: u64, wal_sequence: u64) {
         self.meta.checkpoint_lsn = checkpoint_lsn;
         self.meta.cts_watermark = cts_watermark;
         self.meta.wal_sequence = wal_sequence;
+        self.meta.log_end_at_checkpoint = 0;
+    }
+
+    /// Records the length of segment `wal_sequence` for a checkpoint that left
+    /// nothing after itself to replay, to be written with the next meta record.
+    ///
+    /// See `crate::meta::at::LOG_END_AT_CHECKPOINT` for what reads it.
+    ///
+    /// @param bytes - the segment's length in bytes, header included
+    pub fn set_log_end_at_checkpoint(&mut self, bytes: u64) {
+        self.meta.log_end_at_checkpoint = bytes;
     }
 
     /// Returns the database's identity, which stamps every WAL segment.
@@ -1005,6 +1028,7 @@ impl Database {
     ///
     /// Returns whether the cache was thrown away, which the caller reports.
     pub fn begin_read(&mut self) -> DbResult<bool> {
+        self.take_back_lease();
         // **Already holding the file means nothing has changed under it.**
         // Another process can only have written while this one held no lock, so
         // a connection that has kept one - every statement inside a transaction,
@@ -1032,6 +1056,7 @@ impl Database {
         // the holder is doing, what this caller wanted, and which pragma
         // changes the answer.
         wait_for_lock_within(self.pool.file(), FileLock::Shared, self.busy_millis)?;
+        self.held_since = Some(std::time::Instant::now());
         self.reload_if_moved()
     }
 
@@ -1064,6 +1089,7 @@ impl Database {
     ///
     /// @param may_release - whether the shared lock may be dropped to retry
     pub fn begin_write_within(&mut self, may_release: bool) -> DbResult<bool> {
+        self.take_back_lease();
         // **A read only connection never raises past SHARED.** It has nothing
         // to protect from a reader and nothing to write, and raising is what
         // made `--readonly` wait out the busy budget against a live writer and
@@ -1096,6 +1122,9 @@ impl Database {
                     break;
                 }
                 wait_for_lock_within(self.pool.file(), level, self.busy_millis)?;
+            }
+            if self.held_since.is_none() {
+                self.held_since = Some(std::time::Instant::now());
             }
             if held {
                 return Ok(false);
@@ -1167,6 +1196,7 @@ impl Database {
         if self.write_lock() == FileLock::Exclusive {
             self.pool.lock_within(FileLock::Exclusive, 0)?;
         }
+        self.held_since = Some(std::time::Instant::now());
         // **Read after the lock that excludes a writer, not before it**
         // (task-1979, section 4; measured again in task-1980). This asked the
         // file what had changed while it held SHARED, which two processes hold
@@ -1271,7 +1301,61 @@ impl Database {
         // The check is only true for as long as the lock it was made under is
         // held. See [`Database::slots`].
         self.slots.checked = None;
-        self.pool.unlock(FileLock::None)
+        self.held_since = None;
+        let unlocked = self.pool.unlock(FileLock::None);
+        // A lease that ended before this is the same outcome as this release.
+        self.pool.lease_was_released();
+        unlocked
+    }
+
+    /// Ends a statement that only read, keeping SHARED for a moment so the
+    /// next statement does not take it again; see [`crate::lease`].
+    ///
+    /// **What stays true while SHARED is kept**, and what does not. A fold
+    /// needs EXCLUSIVE, so the file and its meta record cannot change: the
+    /// slot comparison this connection made under the lock is still the
+    /// answer, and is kept as `true` so the next statement reads nothing to
+    /// make it again. A writer appends to the log under RESERVED beside a
+    /// reader, so the log can move: `trusted` goes false exactly as it does at
+    /// a release, and the next statement asks the log its length as every
+    /// statement after a release does.
+    ///
+    /// Falls back to [`Database::end_access`] when the lock is not exactly
+    /// SHARED or has been kept as long as [`crate::lease::MOST`] allows.
+    pub fn end_access_leased(&mut self) -> DbResult<()> {
+        let since = self.held_since.unwrap_or_else(std::time::Instant::now);
+        if self.pool.lock_level() != FileLock::Shared || !self.pool.lease_shared(since) {
+            return self.end_access();
+        }
+        self.held_since = Some(since);
+        self.trusted = false;
+        self.slots.checked = self.slots.read.map(|_| true);
+        Ok(())
+    }
+
+    /// Takes the lock back from a lease, or learns that the lease let it go,
+    /// before anything derived under it is used.
+    ///
+    /// A lease that let the lock go leaves this connection exactly where
+    /// [`Database::end_access`] leaves it: nothing it derived is trusted, and
+    /// the slot comparison is asked again.
+    fn take_back_lease(&mut self) {
+        // Ends the lease: the lock is held the ordinary way, or it is gone.
+        self.pool.claim_lease();
+        self.forget_what_a_released_lease_held();
+    }
+
+    /// Learns whether a lease ended by letting the lock go, without ending one
+    /// that is still held.
+    ///
+    /// The slot comparison is only true while the lock it was made under is
+    /// held, so a lease that let the lock go leaves it to be made again.
+    fn forget_what_a_released_lease_held(&mut self) {
+        if self.pool.lease_was_released() {
+            self.trusted = false;
+            self.slots.checked = None;
+            self.held_since = None;
+        }
     }
 
     /// Reports whether what this connection holds was derived under the lock it
@@ -1379,6 +1463,7 @@ impl Database {
     /// short circuit already rests on: a writer takes EXCLUSIVE, so nothing can
     /// have changed while this connection held SHARED.
     pub fn disk_record_is_as_last_read(&mut self) -> DbResult<bool> {
+        self.forget_what_a_released_lease_held();
         if let Some(checked) = self.slots.checked {
             return Ok(checked);
         }
@@ -1772,12 +1857,14 @@ fn wait_for_lock_within(
     let mut waited = 0u64;
     let mut pause = 1u64;
     loop {
-        match file.lock(level) {
-            Ok(()) => return Ok(()),
-            Err(_) if waited >= budget_millis => {
-                return Err(file_is_busy(file, level, waited, budget_millis))
-            }
-            Err(_) => {}
+        if file.lock(level).is_ok() {
+            return Ok(());
+        }
+        if waited == 0 && crate::lease::retry_after_yield(file, level) {
+            return Ok(());
+        }
+        if waited >= budget_millis {
+            return Err(file_is_busy(file, level, waited, budget_millis));
         }
         std::thread::sleep(std::time::Duration::from_millis(pause));
         waited = waited.saturating_add(pause);

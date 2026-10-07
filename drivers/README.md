@@ -409,6 +409,9 @@ process as the library:
 | `inillucent_py_params` | Reads a list or tuple of rows, each a list or tuple of `None`, `int`, `bool`, `float`, `str` or `bytes`, into parameters. Anything else, an integer wider than 64 bits included, answers null with no exception set, and the binding sends those rows as JSON instead. Call it through `ctypes.PyDLL` |
 | `inillucent_stmt_execute_params` | Runs a statement once for each row of those parameters, as `inillucent_stmt_execute_many` does, and frees them. Call it through `ctypes.CDLL`, which lets other threads run while the statement does, and keep the rows alive until it returns. The rows move into the engine, so when the one statement they run as fails, it takes the interpreter lock and reads them again to run them one at a time |
 | `inillucent_params_free` | Frees parameters nothing ran |
+| `inillucent_py_init_threads` | Takes the addresses of `PyEval_SaveThread` and `PyEval_RestoreThread`, which the next two use to let the interpreter lock go while a statement runs |
+| `inillucent_py_stmt_execute` | Binds a list or tuple of values, runs the statement and returns its result as `inillucent_rows_py` builds it, in one call. A failure comes back as an `int`, the address of the `inillucent_error` to raise from and free, and a value it does not read comes back as `None`, so the binding binds that execution as JSON. Call it through `ctypes.PyDLL`. A point query from Python went from 17.25 us to 6.25 us a call with it |
+| `inillucent_py_execute` | The same for a statement with no parameters, given as a `str` |
 | `napi_register_module_v1` | The entry point Node calls when `process.dlopen` loads the library. It registers `open`, `connect`, `query`, `batch`, `disconnect` and `close` |
 
 No CPython and no Node is linked. The Node functions are looked up in the host process when Node
@@ -419,8 +422,9 @@ open when Node tears it down. An integer beyond 2^53 reaches JavaScript as a `Bi
 
 The npm package's `query()` keeps the file open between calls whose statement starts with
 `SELECT`, `WITH` or `VALUES`, and closes it one second after the last one. It checks the file's id
-on every call, so a file made again at the same path is opened afresh. An open connection holds no
-lock between statements, so another process can write, and the next statement sees the write.
+on every call, so a file made again at the same path is opened afresh. An open connection keeps
+its read lock for at most a millisecond after a statement that only read, and lets it go then, so
+another process can write, and the next statement sees the write.
 
 ### Libraries to start from
 
@@ -443,14 +447,15 @@ error wrongly, and both sides would still compile.
 | Stability | Promise |
 |---|---|
 | stable | The signature will not change, and the symbol will not be removed. |
-| provisional | The symbol exists and may change in a minor version. Eleven symbols are provisional. `inillucent_cancel` asks a running statement to stop, and the statement then fails with `INILLUCENT_INTERRUPTED`. `inillucent_rows_json`, `inillucent_bind_json` and `inillucent_stmt_execute_many` are described under "Reading and binding in one call", and `inillucent_py_init`, `inillucent_rows_py`, `inillucent_py_init_params`, `inillucent_py_params`, `inillucent_stmt_execute_params`, `inillucent_params_free` and `napi_register_module_v1` under "Python objects and the Node addon". |
+| provisional | The symbol exists and may change in a minor version. Fourteen symbols are provisional. `inillucent_cancel` asks a running statement to stop, and the statement then fails with `INILLUCENT_INTERRUPTED`. `inillucent_rows_json`, `inillucent_bind_json` and `inillucent_stmt_execute_many` are described under "Reading and binding in one call", and `inillucent_py_init`, `inillucent_rows_py`, `inillucent_py_init_params`, `inillucent_py_params`, `inillucent_stmt_execute_params`, `inillucent_params_free`, `inillucent_py_init_threads`, `inillucent_py_stmt_execute`, `inillucent_py_execute` and `napi_register_module_v1` under "Python objects and the Node addon". |
 
-The ABI version is 1.3.0, and `inillucent_abi_version()` returns 1003000. Version 1.1.0 added
-`inillucent_open_with_key`, version 1.2.0 added `inillucent_open_with_timeout`, and version 1.3.0
+The ABI version is 1.4.0, and `inillucent_abi_version()` returns 1004000. Version 1.1.0 added
+`inillucent_open_with_key`, version 1.2.0 added `inillucent_open_with_timeout`, version 1.3.0
 added `inillucent_rows_json`, `inillucent_bind_json`, `inillucent_stmt_execute_many`,
 `inillucent_py_init`, `inillucent_rows_py`, `inillucent_py_init_params`, `inillucent_py_params`,
-`inillucent_stmt_execute_params`, `inillucent_params_free` and `napi_register_module_v1`. A binding
-written against 1.0.0 finds every symbol it calls.
+`inillucent_stmt_execute_params`, `inillucent_params_free` and `napi_register_module_v1`, and
+version 1.4.0 added `inillucent_py_init_threads`, `inillucent_py_stmt_execute` and
+`inillucent_py_execute`. A binding written against 1.0.0 finds every symbol it calls.
 
 ## Building the C library
 

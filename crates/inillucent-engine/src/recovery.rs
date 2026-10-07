@@ -171,6 +171,152 @@ fn resume_above_every_stamp(
     Ok((resumed, rolled))
 }
 
+/// Returns the length of the segment the meta record names when it, asked by
+/// name, says the log holds nothing after the checkpoint, or `None` when the
+/// log has to be read.
+///
+/// **What lets a first statement leave the log closed** (task-2191, decision
+/// D3). The fold that wrote the meta record measured the segment when it left
+/// nothing after itself (`Meta::log_end_at_checkpoint`). The segment still
+/// that long, and no segment after it, means no record was appended since:
+/// appends only grow a segment, and a transaction that fills one rolls to the
+/// next number, which is why that one is asked for too. Asking by name does
+/// not open either file, and on Windows the first open of a file another
+/// process wrote waits for the virus scanner. A cross file transaction in
+/// doubt, a length the meta record does not have, or any difference sends the
+/// open down the path that reads the log.
+///
+/// @param vfs - the file system the log lives on
+/// @param db_path - the database file the segments are named after
+/// @param database - the file, opened up to its meta record
+/// @param doubtful - cross file transactions whose decision is elsewhere
+fn nothing_after_the_checkpoint(
+    vfs: &std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    db_path: &DbPath,
+    database: &Database,
+    doubtful: &std::collections::BTreeSet<u64>,
+) -> DbResult<Option<u64>> {
+    let meta = database.meta();
+    let header = inillucent_wal::segment::HEADER_BYTES as u64;
+    let length = meta.log_end_at_checkpoint;
+    if length < header
+        || !doubtful.is_empty()
+        || meta.checkpoint_lsn < length.saturating_sub(header)
+    {
+        return Ok(None);
+    }
+    let name = db_path.as_path().to_string_lossy().to_string();
+    let directory = db_path.as_path().parent().map(std::path::Path::to_path_buf);
+    let segment =
+        |sequence: u64| inillucent_wal::writer::segment_path(&name, directory.as_deref(), sequence);
+    let sized = |path: &DbPath| {
+        vfs.size_by_name(path)
+            .map_err(inillucent_vfs::VfsError::into_db_error)
+    };
+    if sized(&segment(meta.wal_sequence))? != Some(length) {
+        return Ok(None);
+    }
+    if sized(&segment(meta.wal_sequence.saturating_add(1)))?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(length))
+}
+
+/// Finishes an open whose log holds nothing after the checkpoint, without
+/// reading it.
+///
+/// What the reading path does after its replay, for a replay that found
+/// nothing: the free map is loaded, the log resumes at the checkpoint above
+/// every stamp the file carries, and the catalog is attached. A writable
+/// connection's log is [`Wal::open_deferred`], which opens its segment at the
+/// first write or the second check of its tail; a read only one keeps the
+/// scratch log it always has. When the stamps sit above the checkpoint, which
+/// `resume_above_every_stamp` answers by checkpointing into a new segment, the
+/// segment is opened as the reading path opens it.
+///
+/// @param vfs - the file system the log lives on
+/// @param db_path - the database file
+/// @param database - the file, opened up to its meta record
+/// @param read_only - whether this connection may write the file
+/// @param length - the segment's length, which `nothing_after_the_checkpoint` checked
+fn open_with_nothing_to_replay(
+    vfs: &std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    db_path: &DbPath,
+    mut database: Database,
+    read_only: bool,
+    length: u64,
+) -> DbResult<OpenedFile> {
+    database.load_free_map()?;
+    let meta = *database.meta();
+    let checkpoint = meta.checkpoint_lsn.max(FIRST_LSN);
+    let sequence = meta.wal_sequence.max(1);
+    let (next_lsn, sequence) = match read_only {
+        true => (checkpoint, sequence),
+        false => {
+            let high_water = database.pool().high_water_lsn();
+            match high_water < checkpoint {
+                true => (checkpoint, sequence),
+                false => {
+                    let resumed = high_water.saturating_add(1);
+                    let rolled = sequence.saturating_add(1);
+                    database.set_log_position(resumed, meta.cts_watermark, rolled);
+                    database.checkpoint()?;
+                    (resumed, rolled)
+                }
+            }
+        }
+    };
+    let header = inillucent_wal::segment::HEADER_BYTES as u64;
+    let wal = match (read_only, next_lsn == checkpoint) {
+        (true, _) => scratch_log(db_path, database.uuid(), next_lsn, sequence)?,
+        (false, true) => std::rc::Rc::new(Wal::open_deferred(
+            std::sync::Arc::clone(vfs),
+            db_path,
+            database.uuid(),
+            next_lsn,
+            sequence,
+            next_lsn.saturating_sub(length.saturating_sub(header)),
+            WalOptions::default(),
+        )),
+        (false, false) => std::rc::Rc::new(Wal::open(
+            std::sync::Arc::clone(vfs),
+            db_path,
+            database.uuid(),
+            next_lsn,
+            sequence,
+            WalOptions::default(),
+        )?),
+    };
+    database.pool().set_durable_lsn(wal.write_ahead_point());
+    database
+        .pool()
+        .set_retained_lsn(database.meta().checkpoint_lsn);
+    let_the_pool_ask_the_log(database.pool(), &wal);
+    let_the_pool_spill(database.pool(), vfs);
+    let catalog_tree =
+        attach_catalog(database.pool(), database.catalog_root()).map_err(|error| {
+            let said = error.detail().unwrap_or_default().to_string();
+            error.with_detail(format!("attaching the catalog: {said}"))
+        })?;
+    let recovery = RecoveryReport {
+        recovered: false,
+        scanned: 0,
+        applied: 0,
+        dropped: 0,
+        committed: 0,
+        losers: 0,
+        last_sequence: sequence,
+        last_lsn: next_lsn,
+    };
+    Ok(OpenedFile {
+        database,
+        wal,
+        catalog_tree,
+        recovery,
+        highest_txn: 0,
+    })
+}
+
 /// Puts the free map's own changes back, in log order.
 ///
 /// **In log order.** Claiming every allocation and then releasing every free
@@ -925,6 +1071,9 @@ pub(crate) fn recover_the_open_file(
     // super-journal outside both, so a `Commit` record for one of those
     // transactions is a vote rather than the decision - see
     // `super_journal_doubt`.
+    if let Some(length) = nothing_after_the_checkpoint(vfs, db_path, &database, doubtful)? {
+        return open_with_nothing_to_replay(vfs, db_path, database, read_only, length);
+    }
     let start = where_recovery_starts(&database, doubtful);
     let mut database = database;
     let (checkpointed, repaired) = catalog_before_redo(&mut database, vfs, db_path, &start)?;

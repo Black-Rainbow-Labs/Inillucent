@@ -135,6 +135,13 @@ const HEADER: usize = 40;
 /// aligned to sixteen.
 const RECORD_PREFIX: usize = 16;
 
+/// How many bytes of records a journal holds in memory before it writes them.
+///
+/// A checkpoint saves every pre-image it needs before it writes its first
+/// page, so the records of a large one are written in 1 MiB pieces and the
+/// memory they take stays bounded.
+const PENDING_BYTES: usize = 1 << 20;
+
 /// How the pre-commit state is protected.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum JournalMode {
@@ -243,7 +250,25 @@ pub struct Journal {
     /// has to differ. This is the same source `Database::create` takes the
     /// file's uuid from, so a simulator still reproduces a run from its seed.
     nonce: u64,
-    /// Whether a pre-image has been written since the last sync.
+    /// Records saved and not yet written, in the order they go into the file.
+    ///
+    /// **Written by `seal`, all of them and the header in one call (task-2191).**
+    /// Each record used to be written as it was saved and the header rewritten
+    /// after it, so a one row `exec`, which journals five 32 KiB pages, made
+    /// eleven writes into a file each of them extended. Nothing reads the
+    /// journal before `seal` has synced it, because no page reaches the
+    /// database before its pre-image is sealed, so a record held here until
+    /// then protects exactly what a record written at once protected.
+    pending: Vec<u8>,
+    /// How many records are in the file, not counting `pending`.
+    written: usize,
+    /// Whether the file holds bytes written since its last sync.
+    ///
+    /// `finish` asks it in `delete` mode: such bytes have to reach the disk
+    /// before the file that holds them is removed. Records still in `pending`
+    /// are not among them, because they never reach the file at all.
+    unsynced: std::cell::Cell<bool>,
+    /// Whether a pre-image has been saved since the last sync.
     ///
     /// **This is what makes `seal` safe to call per page without costing a
     /// sync per page.** The ordering the journal exists to enforce is that no
@@ -283,6 +308,9 @@ impl Journal {
             // never writes a record never needs a nonce, and `new` is on the
             // path of every connection whether it writes or not.
             nonce: 0,
+            pending: Vec::new(),
+            written: 0,
+            unsynced: std::cell::Cell::new(false),
             unsealed: std::cell::Cell::new(false),
         }
     }
@@ -347,36 +375,75 @@ impl Journal {
         if self.saved.len() == 1 {
             self.take_nonce();
         }
-        // The header is rewritten with the running count each time, so a
-        // journal a crash caught mid-write has a count naming only the pages
-        // that are actually there - and each record carries a checksum, so
-        // recovery stops at the first one whose bytes are not the bytes that
-        // were written rather than at the first one it cannot read at all.
-        let count = self.saved.len();
+        // Each record carries a checksum, so recovery stops at the first one
+        // whose bytes are not the bytes that were written rather than at the
+        // first one it cannot read at all.
         let record_size = self.page_size.saturating_add(RECORD_PREFIX);
-        let offset =
-            HEADER.saturating_add(count.saturating_sub(1).saturating_mul(record_size)) as u64;
-        let page_size = self.page_size;
-        let nonce = self.nonce;
-        let mut record = vec![0u8; record_size];
-        if let Some(slot) = record.get_mut(..8) {
-            slot.copy_from_slice(&page.0.to_le_bytes());
+        // **Reserved once, at its largest.** Grown by doubling, the buffer
+        // copied itself into fresh memory at every step, and a one row `exec`
+        // touched about 480 KiB of new pages to hold 160 KiB of records. Memory
+        // reserved and not yet written costs no page fault.
+        if self.pending.capacity() == 0 {
+            self.pending
+                .reserve_exact(PENDING_BYTES.saturating_add(record_size));
         }
-        if let Some(slot) = record.get_mut(RECORD_PREFIX..) {
-            let width = slot.len().min(before.len());
-            if let (Some(target), Some(source)) = (slot.get_mut(..width), before.get(..width)) {
-                target.copy_from_slice(source);
+        let start = self.pending.len();
+        self.pending.resize(start.saturating_add(record_size), 0);
+        let nonce = self.nonce;
+        if let Some(record) = self.pending.get_mut(start..) {
+            if let Some(slot) = record.get_mut(..8) {
+                slot.copy_from_slice(&page.0.to_le_bytes());
+            }
+            if let Some(slot) = record.get_mut(RECORD_PREFIX..) {
+                let width = slot.len().min(before.len());
+                if let (Some(target), Some(source)) = (slot.get_mut(..width), before.get(..width)) {
+                    target.copy_from_slice(source);
+                }
+            }
+            let checksum =
+                record_checksum(nonce, page.0, record.get(RECORD_PREFIX..).unwrap_or(&[]));
+            if let Some(slot) = record.get_mut(8..12) {
+                slot.copy_from_slice(&checksum.to_le_bytes());
             }
         }
-        let checksum = record_checksum(nonce, page.0, record.get(RECORD_PREFIX..).unwrap_or(&[]));
-        if let Some(slot) = record.get_mut(8..12) {
-            slot.copy_from_slice(&checksum.to_le_bytes());
-        }
-        let file = self.opened()?;
-        file.write_all_at(offset, &record)
-            .map_err(|error| error.into_db_error())?;
-        write_header(file, page_size, count, nonce)?;
         self.unsealed.set(true);
+        if self.pending.len() >= PENDING_BYTES {
+            self.write_pending()?;
+        }
+        Ok(())
+    }
+
+    /// Writes the records held in memory, and the header with the count that
+    /// includes them.
+    ///
+    /// **The header goes in the same call as the records when the file has
+    /// none yet**, which is the whole journal of a small checkpoint in one
+    /// write. Otherwise the records go first and the header after, so a crash
+    /// between the two leaves a count naming only records that are there.
+    fn write_pending(&mut self) -> DbResult<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let record_size = self.page_size.saturating_add(RECORD_PREFIX);
+        let adding = self.pending.len() / record_size.max(1);
+        let count = self.written.saturating_add(adding);
+        let (page_size, nonce, written) = (self.page_size, self.nonce, self.written);
+        let pending = std::mem::take(&mut self.pending);
+        let file = self.opened()?;
+        if written == 0 {
+            let mut whole = Vec::with_capacity(HEADER.saturating_add(pending.len()));
+            whole.extend_from_slice(&header_bytes(page_size, count, nonce));
+            whole.extend_from_slice(&pending);
+            file.write_all_at(0, &whole)
+                .map_err(|error| error.into_db_error())?;
+        } else {
+            let offset = HEADER.saturating_add(written.saturating_mul(record_size)) as u64;
+            file.write_all_at(offset, &pending)
+                .map_err(|error| error.into_db_error())?;
+            write_header(file, page_size, count, nonce)?;
+        }
+        self.written = count;
+        self.unsynced.set(true);
         Ok(())
     }
 
@@ -399,16 +466,18 @@ impl Journal {
     /// So it is called per page now, and `unsealed` is what stops that costing
     /// a sync per page: the checkpoint saves every pre-image it needs before it
     /// writes anything, so only the first call finds work to do.
-    pub fn seal(&self) -> DbResult<()> {
+    pub fn seal(&mut self) -> DbResult<()> {
         if !self.mode.is_durable() || !self.unsealed.get() {
             return Ok(());
         }
+        self.write_pending()?;
         let Some(file) = &self.file else {
             self.unsealed.set(false);
             return Ok(());
         };
         file.sync(SyncMode::Full)
             .map_err(|error| error.into_db_error())?;
+        self.unsynced.set(false);
         self.unsealed.set(false);
         Ok(())
     }
@@ -450,13 +519,14 @@ impl Journal {
                 // the directory on the way out, is what `DELETE` mode's name
                 // promises: gone, not "gone unless the power goes now".
                 //
-                // **Only when something was saved after the seal (task-2191).**
-                // `save` sets `unsealed` for every pre-image it writes and
-                // `seal` clears it after its sync, so a journal whose last
-                // write was sealed has nothing in the write-behind cache, and a
-                // second sync of it flushed nothing. A one row `exec` made it
-                // after every fold.
-                if let (Some(file), true) = (&self.file, self.unsealed.get()) {
+                // **Only when something was written after the seal (task-2191).**
+                // `write_pending` sets `unsynced` and `seal` clears it after
+                // its sync, so a journal whose last write was sealed has
+                // nothing in the write-behind cache, and a second sync of it
+                // flushed nothing. A one row `exec` made it after every fold.
+                // Records still held in memory were never written, and no page
+                // they describe was either, so they are dropped below.
+                if let (Some(file), true) = (&self.file, self.unsynced.get()) {
                     file.sync(SyncMode::Full)
                         .map_err(|error| error.into_db_error())?;
                 }
@@ -509,6 +579,9 @@ impl Journal {
         }
         self.saved.clear();
         self.held.clear();
+        self.pending.clear();
+        self.written = 0;
+        self.unsynced.set(false);
         self.unsealed.set(false);
         Ok(())
     }
@@ -563,16 +636,14 @@ impl Journal {
         &self.held
     }
 
-    /// Opens the journal file, creating it the first time anything is saved.
-    ///
-    /// @param vfs - where the file is opened
+    /// Opens the journal file, creating it the first time records are
+    /// written. The caller writes the header.
     fn opened(&mut self) -> DbResult<&dyn VfsFile> {
         if self.file.is_none() {
             let file = self
                 .vfs
                 .open(&self.path, OpenOptions::of_kind(FileKind::MainJournal))
                 .map_err(|error| error.into_db_error())?;
-            write_header(file.as_ref(), self.page_size, 0, self.nonce)?;
             self.file = Some(file);
         }
         self.file
@@ -602,8 +673,9 @@ fn record_checksum(nonce: u64, page: u64, image: &[u8]) -> u32 {
 /// nonce, and a checksum over the four.
 ///
 /// **The header is checksummed for the same reason the records are.** It is
-/// rewritten on every `save`, so a crash can catch it mid-write and leave a
-/// page size or a count that was never written by anything. Recovery reads
+/// rewritten whenever records are written after the first ones, so a crash
+/// can catch it mid-write and leave a page size or a count that was never
+/// written by anything. Recovery reads
 /// those two numbers to decide how many bytes to put back where, so believing
 /// a torn one is how a recovery writes over pages that the transaction never
 /// touched.
@@ -613,6 +685,17 @@ fn record_checksum(nonce: u64, page: u64, image: &[u8]) -> u32 {
 /// @param count - how many pre-images are in the file
 /// @param nonce - what this transaction's records are checksummed against
 fn write_header(file: &dyn VfsFile, page_size: usize, count: usize, nonce: u64) -> DbResult<()> {
+    file.write_all_at(0, &header_bytes(page_size, count, nonce))
+        .map_err(|error| error.into_db_error())
+}
+
+/// Encodes the journal's header: the magic, the page size, the page count, the
+/// nonce, and a checksum over the four.
+///
+/// @param page_size - how big a page is
+/// @param count - how many pre-images are in the file
+/// @param nonce - what this transaction's records are checksummed against
+fn header_bytes(page_size: usize, count: usize, nonce: u64) -> [u8; HEADER] {
     let mut header = [0u8; HEADER];
     if let Some(slot) = header.get_mut(..8) {
         slot.copy_from_slice(&MAGIC);
@@ -630,8 +713,7 @@ fn write_header(file: &dyn VfsFile, page_size: usize, count: usize, nonce: u64) 
     if let Some(slot) = header.get_mut(32..36) {
         slot.copy_from_slice(&checksum.to_le_bytes());
     }
-    file.write_all_at(0, &header)
-        .map_err(|error| error.into_db_error())
+    header
 }
 
 /// Reports whether a journal with pre-images in it is beside a database.

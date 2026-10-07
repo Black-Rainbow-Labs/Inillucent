@@ -62,6 +62,7 @@ pub mod freemap;
 pub mod interior;
 pub mod journal;
 pub mod latch;
+pub mod lease;
 pub mod meta;
 pub mod page;
 pub mod pool;

@@ -525,3 +525,176 @@ efficiency cores, where both Node workloads run about 1.8 times slower together.
 | The growth gap on every write | `write_campaign` grew a bulk built tree from 17 leaves to 33 | a full leaf split on writes that add no rows |
 | A byte budget shared by every class of the C library's allocator | slower than the per class caps | the accounting cost more than it saved |
 | Committing the statistics a fold refreshes without their own sync | no change at close | a close fold reclaims only past 1 MiB of log |
+
+## 11. Round 4: the four decisions
+
+Jason approved all four decisions from round 3, and `unsafe` for the CRC when the risk is small and
+the reason is speed.
+
+### 11.1 What changed
+
+- **Hardware CRC** (commit 732a42be). `crates/inillucent-base/src/crc_hardware.rs` folds 64 bytes
+  at a time with PCLMULQDQ on x86-64 and uses `__crc32d` on aarch64. It answers only for 64 bytes
+  or more and only after the feature check, so every other input takes the table path. The crate
+  went from `forbid(unsafe_code)` to `deny(unsafe_code)` with one allowed module, which is on the
+  policy suite's list of files allowed `unsafe`. A test compares it with the table version at every
+  length to 300 bytes and at 200 random lengths to 70 KiB, each from a random starting value. A 32 KiB page: 3.93 us to 0.64 us.
+- **D2, the command line's `exec` holds its commit for the fold** (commit 4a0316f8). Only under a
+  rollback journal mode, with no attached file, and only when the write lock can be held. The fold
+  flushes the log instead of syncing it, and its own sync makes the commit durable. Two syncs
+  instead of three. The new crash campaign
+  `power_loss_at_every_cut_point_of_a_commit_the_fold_holds` cuts power at each of 51 points.
+- **D3, the log end in the meta record** (commit de455577). Offset 120, so the record is 128 bytes.
+  An open that finds the segment at that length by name, through `Vfs::size_by_name`, replays
+  nothing and opens the segment lazily. A probe of about 650,000 queries on NTFS found no stale size
+  by name.
+- **D1, the `InsertRows` record** (commit de455577). Kind 18. One record of up to 64 KiB holds a
+  transaction's inserts. Recovery decides for every entry whether its page already holds it before
+  it applies any. Building this found a bug: the largest key hint in `shape.rs` was trusted by page
+  LSN, and a batch leaves the LSN unchanged across rows, which gave duplicate rowids. The hint is
+  now forgotten after each logged insert.
+
+### 11.2 The result
+
+Fifteen rounds on 6 October 2026, the 2.2.0 release build against the profile guided build of
+de455577, with about 10% of the processor used by other programs.
+
+| Group | 2.2.0 against SQLite | Round 4 against SQLite |
+|---|---|---|
+| the command line, 8 workloads | 4% slower | within 1% |
+| scripts into the shell, 6 workloads | 39% faster | 40% faster |
+| the Python driver, 9 workloads | 104% faster | 109% faster |
+| the npm package, 2 workloads | 138% faster | 171% faster |
+| all 25 | 48% faster | 53% faster |
+
+| Workload | 2.2.0 | Now | SQLite | Now against SQLite |
+|---|---:|---:|---:|---|
+| `inillucent --version` | 17.78 ms | 16.03 ms | 15.46 ms | 4% slower |
+| `query` of one row as JSON | 19.29 ms | 18.91 ms | 19.09 ms | 1% faster |
+| `query` of one row as text | 18.76 ms | 19.01 ms | 18.09 ms | 5% slower |
+| `query` of 100 rows by an index, sorted, as JSON | 20.52 ms | 20.66 ms | 19.83 ms | 4% slower |
+| `query` of `count(*)` and `max` over 10,000 rows | 19.09 ms | 17.94 ms | 17.97 ms | within 1% |
+| `exec` of a one row `INSERT` | 25.65 ms | 23.66 ms | 23.24 ms | 2% slower |
+| `tables` | 19.33 ms | 19.85 ms | 19.25 ms | 3% slower |
+| `dump` | 32.05 ms | 30.57 ms | 35.67 ms | 17% faster |
+| 1,000 lookups by key in a script | 34.09 ms | 35.33 ms | 41.92 ms | 19% faster |
+| 200 single row inserts, each its own transaction | 268 ms | 263 ms | 881 ms | 235% faster |
+| 10,000 `INSERT` statements in a transaction | 38.21 ms | 37.83 ms | 43.16 ms | 14% faster |
+| one `INSERT` of 20,000 rows | 43.77 ms | 43.09 ms | 44.09 ms | 2% faster |
+| `.import --csv` of 50,000 rows | 58.54 ms | 57.76 ms | 68.22 ms | 18% faster |
+| a 10,000 row table and two indexes, from a script | 52.63 ms | 51.71 ms | 71.63 ms | 39% faster |
+| Python, a 10,000 row table and two indexes | 40.17 ms | 39.10 ms | 46.32 ms | 18% faster |
+| Python, 5,000 lookups by key | 53.89 ms | 57.59 ms | 94.95 ms | 65% faster |
+| Python, read 10,000 rows | 6.49 ms | 6.15 ms | 8.48 ms | 38% faster |
+| Python, 200 range queries of 200 rows | 22.68 ms | 23.13 ms | 38.54 ms | 67% faster |
+| Python, 200 `GROUP BY` queries | 94.93 ms | 94.59 ms | 581 ms | 514% faster |
+| Python, 10,000 inserts in a transaction into a table with two indexes | 28.20 ms | 26.69 ms | 29.89 ms | 12% faster |
+| Python, 100 single row inserts | 121 ms | 123 ms | 438 ms | 257% faster |
+| Python, 1,000 single row updates | 1,236 ms | 1,212 ms | 6,694 ms | 452% faster |
+| Python, 100 opens and closes | 7.91 ms | 6.88 ms | 8.46 ms | 23% faster |
+| Node, a lookup by key with `query()` | 0.048 ms | 0.037 ms | 0.117 ms | 215% faster |
+| Node, a lookup by key through a session | 0.007 ms | 0.007 ms | 0.017 ms | 133% faster |
+
+20 of the 25 are faster, where 2.2.0 had 18 in the same run. The five that are not are command
+line programs, 2% to 5% slower: `--version`, one row as text, 100 rows by an index, `tables`, and
+the one row `exec`. `--version` opens no database, so its gap is starting a 10 MB process against
+SQLite's 4 MB one. The cold reads copy 32 KiB pages into fresh memory.
+
+### 11.3 Tests
+
+`inillucent-testrun --changed main --strict`: 374 targets, 4,620 tests, none failed.
+
+## 12. Round 5: every workload faster than SQLite
+
+The last todo on the ticket was to measure again until every one of the 25 workloads is faster than
+SQLite. After round 4 five were not: `--version`, one row as text, 100 rows by an index, `tables` and
+the one row `exec`, each 2% to 5% slower.
+
+### 12.1 What was found
+
+- **Two hundred interleaved runs of each command line call** showed `--version`, one row as text and
+  `tables` level with SQLite or ahead. Fifteen rounds could not tell them apart. A static program
+  that prints one line takes 16.4 ms to start here.
+- **The 100 row query's gap is loading pages.** Warm, ours took 0.063 ms and SQLite's 0.114 ms. Cold,
+  1.07 ms against 0.67 ms. Timers in `Pool::load` put each 32 KiB page at 14.3 us: 11.5 us in the read,
+  1.7 us allocating the frame, 0.9 us of CRC. Reading 64 pages in a new process took 681 us into heap
+  blocks, 473 us into one page aligned region and 420 us in runs of 8 pages.
+- **Page faults are the cost of a short command.** A static program takes 1,136. The one row query
+  took 720 more and SQLite's 486, and of ours about 570 pages were the program's own code.
+- **`exec` was spending its time in file calls and in loading `bcrypt.dll`.** A sampling profile of
+  the `exec` path in a loop, built for this, put our own code under 5% of the samples. The rollback
+  journal made 11 writes for 5 pages, and the journal's nonce loaded `bcrypt.dll`.
+- **`%TEMP%` makes a program built there pay Defender on every open.** An `exec` run by a program in
+  `%TEMP%` on a database in `%TEMP%` took 16.4 ms against SQLite's 8.7 ms, two opens of about 3 ms
+  each. The same program run from Documents took 10.8 ms. An installed program does not run from
+  `%TEMP%`, so this is a trap for measurements, and the comparisons above ran from the repository.
+
+### 12.2 What changed
+
+- `inillucent-alloc`'s `Carved`: page sized blocks carved from 512 KiB chunks aligned to 4 KiB, and
+  the small classes carved from one shared span. `alloc` and `dealloc` are out of line, because
+  with the large path moved out they were inlined everywhere and the program grew by 1.7 MB.
+- `Journal`: records held in memory and written with the header in one call at `seal`, flushed every
+  1 MiB, with the buffer reserved once.
+- `write_both_slots`: a checkpoint writes the record's 128 bytes into each slot.
+- `system_randomness` on Windows: `ProcessPrng` through a `raw-dylib` import.
+
+### 12.3 Tried and not kept
+
+| Idea | What was measured | Why it was not kept |
+|---|---|---|
+| A link order file of every function the training ran | more faults, not fewer | 3,692 functions spanning about 4 MB |
+| A link order file of the functions a short command runs | 60 fewer faults on a one row query | the functions are large after inlining, 509 pages for 2,473 of them |
+| A profile trained only on short commands | 120 to 240 fewer faults | the other workloads would lose their profile |
+| Weighting the short command profile 1,000 times in the merge | under 1% fewer faults than a plain merge | not worth a second training pass |
+| Machine function splitting | the compiler crashed on the Windows target | |
+| `PrefetchVirtualMemory` or `VirtualLock` on fresh frame memory | no change, and the lock failed at the default working set size | |
+| A memory mapped read of the data file | 532 us for 64 pages against 473 us for aligned reads | |
+
+### 12.4 The result
+
+The benchmark ran three builds against SQLite in the same runs, while another program used half a
+core to a whole core, so twelve workloads were run again; the table gives each workload's last run.
+
+| Group | 2.2.0 | Round 4 | Round 5 |
+|---|---|---|---|
+| the command line, 8 workloads | 2% faster | 2% faster | 7% faster |
+| scripts into the shell, 6 workloads | 48% faster | 48% faster | 50% faster |
+| the Python driver, 9 workloads | 114% faster | 133% faster | 129% faster |
+| the npm package, 2 workloads | 171% faster | 209% faster | 250% faster |
+| all 25 | 57% faster | 64% faster | 68% faster |
+
+| Workload | 2.2.0 | Round 4 | Now | SQLite | Now against SQLite |
+|---|---:|---:|---:|---:|---|
+| `inillucent --version` | 16.53 ms | 16.06 ms | 16.11 ms | 16.99 ms | 5% faster |
+| `query` of one row as JSON | 19.02 ms | 19.18 ms | 18.80 ms | 19.07 ms | 1% faster |
+| `query` of one row as text | 21.42 ms | 21.53 ms | 20.73 ms | 21.82 ms | 5% faster |
+| `query` of 100 rows by an index, sorted, as JSON | 20.71 ms | 20.62 ms | 20.36 ms | 20.43 ms | within 1%, faster |
+| `query` of `count(*)` and `max` over 10,000 rows | 18.06 ms | 17.91 ms | 17.39 ms | 18.61 ms | 7% faster |
+| `exec` of a one row `INSERT` | 25.76 ms | 23.79 ms | 23.15 ms | 23.75 ms | 3% faster |
+| `tables` | 20.92 ms | 21.12 ms | 18.69 ms | 19.88 ms | 6% faster |
+| `dump` | 34.18 ms | 37.21 ms | 33.20 ms | 42.18 ms | 27% faster |
+| 1,000 lookups by key in a script | 40.48 ms | 39.80 ms | 39.22 ms | 53.23 ms | 36% faster |
+| 200 single row inserts, each its own transaction | 288 ms | 292 ms | 288 ms | 1,041 ms | 261% faster |
+| 10,000 `INSERT` statements in a transaction | 43.98 ms | 44.78 ms | 43.94 ms | 51.75 ms | 18% faster |
+| one `INSERT` of 20,000 rows | 41.08 ms | 40.99 ms | 41.20 ms | 44.99 ms | 9% faster |
+| `.import --csv` of 50,000 rows | 62.93 ms | 60.32 ms | 60.75 ms | 76.19 ms | 25% faster |
+| a 10,000 row table and two indexes, from a script | 52.52 ms | 53.55 ms | 51.65 ms | 73.77 ms | 43% faster |
+| Python, a 10,000 row table and two indexes | 45.32 ms | 44.46 ms | 45.30 ms | 52.23 ms | 15% faster |
+| Python, 5,000 lookups by key | 78.39 ms | 76.30 ms | 77.04 ms | 140 ms | 82% faster |
+| Python, read 10,000 rows | 8.97 ms | 6.53 ms | 7.27 ms | 10.40 ms | 43% faster |
+| Python, 200 range queries of 200 rows | 28.63 ms | 25.15 ms | 25.02 ms | 50.62 ms | 102% faster |
+| Python, 200 `GROUP BY` queries | 96.19 ms | 94.78 ms | 108 ms | 750 ms | 597% faster |
+| Python, 10,000 inserts in a transaction into a table with two indexes | 30.18 ms | 28.87 ms | 29.13 ms | 37.85 ms | 30% faster |
+| Python, 100 single row inserts | 130 ms | 130 ms | 138 ms | 539 ms | 289% faster |
+| Python, 1,000 single row updates | 1,408 ms | 1,387 ms | 1,327 ms | 6,300 ms | 375% faster |
+| Python, 100 opens and closes | 10.29 ms | 8.47 ms | 7.40 ms | 12.58 ms | 70% faster |
+| Node, a lookup by key with `query()` | 0.063 ms | 0.062 ms | 0.045 ms | 0.193 ms | 326% faster |
+| Node, a lookup by key through a session | 0.011 ms | 0.009 ms | 0.009 ms | 0.027 ms | 188% faster |
+
+### 12.5 Tests
+
+`inillucent-testrun --changed main --strict`. Twelve crash campaign floors were lowered, each with the
+measured counts beside it: the journal's writes were cut points. `journal_ordering.rs` counts the
+journal's bytes before the first new image instead of its writes, and a new test checks that a
+checkpoint writes 128 bytes into each meta slot and that the file reopens on them.

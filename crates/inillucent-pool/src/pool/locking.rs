@@ -47,6 +47,7 @@ impl Pool {
     /// @param level - the level to raise to
     /// @param budget_millis - how long to keep trying
     pub fn lock_within(&self, level: FileLock, budget_millis: u64) -> DbResult<()> {
+        self.lease.settle();
         lock_with_wait(self.file.as_ref(), level, budget_millis)
     }
 
@@ -54,6 +55,7 @@ impl Pool {
     ///
     /// @param level - the level to drop to, `None` to release entirely
     pub fn unlock(&self, level: FileLock) -> DbResult<()> {
+        self.lease.settle();
         if self.file.lock_level() <= level {
             return Ok(());
         }
@@ -63,8 +65,35 @@ impl Pool {
     }
 
     /// Returns the level currently held.
+    ///
+    /// **It does not end a lease** (task-2197). A caller that only asks, between
+    /// statements, would otherwise turn a lease into a lock held the ordinary way
+    /// that nothing then lets go of. A lease reads as SHARED here until the
+    /// thread in [`crate::lease`] lets it go, and as no lock after that.
     pub fn lock_level(&self) -> FileLock {
         self.file.lock_level()
+    }
+
+    /// Ends a lease, so the lock is held the ordinary way again or has been let
+    /// go. A statement calls this before it relies on the lock it holds; see
+    /// [`crate::lease`].
+    pub fn claim_lease(&self) {
+        self.lease.settle();
+    }
+
+    /// Keeps SHARED past the end of a statement that only read, and reports
+    /// whether it did; see [`crate::lease`].
+    ///
+    /// @param held_since - when the lock was taken the ordinary way
+    pub fn lease_shared(&self, held_since: std::time::Instant) -> bool {
+        self.lease.arm(held_since)
+    }
+
+    /// Reports, once, that a lease ended by letting the lock go since the
+    /// last time this was asked, which makes what was derived under the lock
+    /// stale.
+    pub fn lease_was_released(&self) -> bool {
+        self.lease.take_released()
     }
 
     /// Raises a shared lock to the exclusive one, before this pool writes the
@@ -103,6 +132,7 @@ impl Pool {
     /// can reach - one being created, or one a test opened without the
     /// protocol - and a pool holding EXCLUSIVE has nothing to raise.
     pub fn hold_for_writing(&self) -> DbResult<()> {
+        self.lease.settle();
         let level = self.file.lock_level();
         if level == FileLock::None || level == FileLock::Exclusive || !self.writable.get() {
             return Ok(());
@@ -151,6 +181,7 @@ impl Pool {
         // outgrows its pool would otherwise ask for RESERVED, be refused and
         // fail its statement. Its dirty pages are ones the replay made and the
         // log holds, so keeping them resident loses nothing.
+        self.lease.settle();
         let level = self.file.lock_level();
         if level == FileLock::Shared && self.file.check_reserved_lock().unwrap_or(false) {
             Counters::add(&self.counters.held_back, 1);

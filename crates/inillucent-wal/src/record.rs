@@ -134,6 +134,27 @@ pub enum Body<'a> {
         /// The keys of the rows that went away, as [`put_key_list`] writes them.
         keys: &'a [u8],
     },
+    /// Rows were inserted into leaves, one entry per row, by one transaction.
+    ///
+    /// **One record for a run of a transaction's inserts, not one per row
+    /// (task-2191, decision D1).** 10,000 inserts into a table with two indexes
+    /// wrote 30,000 `InsertRow` records, each a 32 byte header and a checksum
+    /// around a row of about 30 bytes, and paid the log's lock and its buffer
+    /// once per row. The writer keeps one of these open while a transaction
+    /// inserts and closes it before any other record is appended and before its
+    /// buffer is written to the file (`Wal::append_insert_row`), so every page
+    /// an entry touches is stamped with this record's LSN and none of them can
+    /// reach the data file before the whole record is in the log. Entries may
+    /// name different trees and pages; a replay applies each entry whose page's
+    /// stamp is below the record's, deciding once per page per record, because
+    /// the entries for one page all landed before its stamp could move past.
+    InsertRows {
+        /// How many entries `entries` holds.
+        count: u32,
+        /// The entries, each a `u64` tree, a `u64` page and a `u32` length
+        /// before the row's bytes; see [`insert_row_entries`].
+        entries: &'a [u8],
+    },
     /// One fixed-width slot of one row was overwritten.
     UpdateInPlace {
         /// The tree the leaf belongs to.
@@ -343,6 +364,7 @@ impl Body<'_> {
             Body::InsertRow { .. } => kind::INSERT_ROW,
             Body::DeleteRow { .. } => kind::DELETE_ROW,
             Body::DeleteRows { .. } => kind::DELETE_ROWS,
+            Body::InsertRows { .. } => kind::INSERT_ROWS,
             Body::UpdateInPlace { .. } => kind::UPDATE_IN_PLACE,
             Body::CompactLeaf { .. } => kind::COMPACT_LEAF,
             Body::Structural {
@@ -418,6 +440,15 @@ pub mod kind {
     /// log record has kind 17, which this format does not define" rather than
     /// misreading it.
     pub const DELETE_ROWS: u8 = 17;
+    /// [`super::Body::InsertRows`].
+    ///
+    /// A log written before it holds no record of this kind, so an older log
+    /// reads unchanged, and an older build refuses a log holding one with "a
+    /// log record has kind 18, which this format does not define" rather than
+    /// misreading it. A clean close folds every record below the checkpoint,
+    /// so an older build meets one only in the log of a newer build that
+    /// crashed, until a newer build has opened the file once.
+    pub const INSERT_ROWS: u8 = 18;
 }
 
 /// One decoded log record.
@@ -473,6 +504,9 @@ impl<'a> Record<'a> {
             | Body::CatalogChange { .. }
             | Body::BulkBuilt { .. }
             | Body::Pad { .. } => PageList::none(),
+            // **Many pages, so none here.** Recovery decides each entry's page
+            // itself; see `entries_to_apply` in `recover.rs`.
+            Body::InsertRows { .. } => PageList::none(),
         }
     }
 
@@ -646,6 +680,10 @@ fn encode_body(body: &Body<'_>, out: &mut Vec<u8>) -> DbResult<()> {
         Body::DeleteRows { tree, page, keys } => {
             put_tree_page_bytes(out, *tree, *page, keys);
         }
+        Body::InsertRows { count, entries } => {
+            out.extend_from_slice(&count.to_le_bytes());
+            out.extend_from_slice(entries);
+        }
         Body::UpdateInPlace {
             tree,
             page,
@@ -756,6 +794,23 @@ fn decode_body(kind: u8, payload: &[u8]) -> DbResult<(Body<'_>, usize)> {
         kind::DELETE_ROWS => {
             let (tree, page, keys) = cursor.tree_page_bytes()?;
             Body::DeleteRows { tree, page, keys }
+        }
+        kind::INSERT_ROWS => {
+            let count = cursor.u32()?;
+            let from = cursor.used();
+            // Every entry takes at least its twenty bytes of tree, page and
+            // length, so a count the payload cannot hold is refused before the
+            // walk below.
+            if count as usize > cursor.remaining() / ENTRY_FIXED_BYTES {
+                return Err(corrupt("an insert record names more rows than it holds"));
+            }
+            for _ in 0..count {
+                cursor.tree_page_bytes()?;
+            }
+            let entries = payload
+                .get(from..cursor.used())
+                .ok_or_else(|| corrupt("an insert record's entries end before they do"))?;
+            Body::InsertRows { count, entries }
         }
         kind::UPDATE_IN_PLACE => {
             let tree = cursor.u64()?;
@@ -877,6 +932,94 @@ fn put_tree_page_bytes(out: &mut Vec<u8>, tree: u64, page: u64, bytes: &[u8]) {
     out.extend_from_slice(&tree.to_le_bytes());
     out.extend_from_slice(&page.to_le_bytes());
     put_bytes(out, bytes);
+}
+
+/// The fixed part of one `InsertRows` entry: tree, page and the row's length.
+const ENTRY_FIXED_BYTES: usize = 20;
+
+/// Starts an `InsertRows` record at the end of a buffer and returns where it
+/// starts; [`finish_insert_rows`] completes it.
+///
+/// The header and the count are written as zeros and filled in at the finish,
+/// because the writer adds entries one row at a time and learns the length
+/// and the count last.
+///
+/// @param out - the log's buffer
+pub fn begin_insert_rows(out: &mut Vec<u8>) -> usize {
+    let start = out.len();
+    out.extend_from_slice(&[0u8; HEADER_BYTES + 4]);
+    start
+}
+
+/// Appends one entry to the `InsertRows` record being built.
+///
+/// @param out - the log's buffer
+/// @param tree - the tree the leaf belongs to
+/// @param page - the leaf's page number
+/// @param row - the row, in the leaf's tagged encoding
+pub fn put_insert_row_entry(out: &mut Vec<u8>, tree: u64, page: u64, row: &[u8]) {
+    put_tree_page_bytes(out, tree, page, row);
+}
+
+/// How many bytes [`put_insert_row_entry`] adds for a row.
+///
+/// @param row - the row
+pub fn insert_row_entry_bytes(row: &[u8]) -> usize {
+    ENTRY_FIXED_BYTES.saturating_add(row.len())
+}
+
+/// Completes the `InsertRows` record [`begin_insert_rows`] started: pads it to
+/// the record alignment, writes its header and count, and checksums it.
+/// Returns the record's length.
+///
+/// @param out - the log's buffer, whose record runs from `start` to its end
+/// @param start - where [`begin_insert_rows`] said it starts
+/// @param lsn - the record's position
+/// @param txn - the transaction it belongs to
+/// @param count - how many entries it holds
+pub fn finish_insert_rows(
+    out: &mut Vec<u8>,
+    start: usize,
+    lsn: u64,
+    txn: u64,
+    count: u32,
+) -> DbResult<usize> {
+    while !(out.len().saturating_sub(start)).is_multiple_of(ALIGN) {
+        out.push(0);
+    }
+    let length = out.len().saturating_sub(start);
+    if length > MAX_RECORD_BYTES {
+        return Err(misuse(format!(
+            "an insert record of {length} bytes is past the {MAX_RECORD_BYTES}-byte ceiling"
+        )));
+    }
+    let record = out
+        .get_mut(start..)
+        .ok_or_else(|| misuse("the insert record vanished from the buffer it was built in"))?;
+    put_u32(record, HEADER_BYTES, count)?;
+    put_u32(record, at::LENGTH, length as u32)?;
+    put_u64(record, at::LSN, lsn)?;
+    put_u64(record, at::TXN, txn)?;
+    put_u8(record, at::KIND, kind::INSERT_ROWS)?;
+    let sum = crc32(
+        record
+            .get(at::CHECKSUMMED_FROM..)
+            .ok_or_else(|| misuse("the insert record is shorter than its own header"))?,
+    );
+    put_u32(record, at::CHECKSUM, sum)?;
+    Ok(length)
+}
+
+/// Reads the entries of an `InsertRows` record, each as its tree, page and row.
+///
+/// @param entries - the record's `entries`, which its decode already walked
+pub fn insert_row_entries(entries: &[u8]) -> DbResult<Vec<(u64, u64, &[u8])>> {
+    let mut cursor = Cursor::new(entries);
+    let mut found = Vec::with_capacity(entries.len() / ENTRY_FIXED_BYTES);
+    while cursor.remaining() > 0 {
+        found.push(cursor.tree_page_bytes()?);
+    }
+    Ok(found)
 }
 
 /// Appends a list of keys in the form a `DeleteRows` record carries them.
@@ -1093,6 +1236,10 @@ mod tests {
                 page: 9,
                 row: b"row-bytes",
             },
+            Body::InsertRows {
+                count: 2,
+                entries: TWO_ENTRIES,
+            },
             Body::DeleteRow {
                 tree: 7,
                 page: 9,
@@ -1250,6 +1397,57 @@ mod tests {
                 "a defined kind was refused: {body:?}"
             );
         }
+    }
+
+    /// Two `InsertRows` entries: tree 7, page 9, `abc`, then tree 8, page 10, `de`.
+    const TWO_ENTRIES: &[u8] = b"\x07\x00\x00\x00\x00\x00\x00\x00\x09\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00abc\x08\x00\x00\x00\x00\x00\x00\x00\x0a\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00de";
+
+    /// The record the writer builds a row at a time is the record the encoder
+    /// writes for the same entries, and its entries read back in order.
+    #[test]
+    fn an_insert_record_built_a_row_at_a_time_is_the_encoded_one() {
+        let mut built = Vec::new();
+        let start = begin_insert_rows(&mut built);
+        put_insert_row_entry(&mut built, 7, 9, b"abc");
+        put_insert_row_entry(&mut built, 8, 10, b"de");
+        let length = finish_insert_rows(&mut built, start, 42, 8, 2).expect("it finishes");
+        assert_eq!(length, built.len());
+        let whole = encoded(Body::InsertRows {
+            count: 2,
+            entries: TWO_ENTRIES,
+        });
+        assert_eq!(built, whole);
+        let record = Record::decode(&built).unwrap().unwrap();
+        let Body::InsertRows { count, entries } = record.body else {
+            panic!("decoded as {:?}", record.body);
+        };
+        assert_eq!(count, 2);
+        assert_eq!(
+            insert_row_entries(entries).expect("the entries read"),
+            vec![(7, 9, &b"abc"[..]), (8, 10, &b"de"[..])]
+        );
+        assert_eq!(insert_row_entry_bytes(b"abc"), 23);
+    }
+
+    /// An `InsertRows` record whose count is more than its entries could hold
+    /// is refused before its entries are walked, and one whose count is more
+    /// than the entries it has is refused when the walk runs out.
+    #[test]
+    fn an_insert_record_with_a_wrong_count_is_refused() {
+        for count in [u32::MAX, 3] {
+            let mut bytes = encoded(Body::InsertRows {
+                count: 2,
+                entries: TWO_ENTRIES,
+            });
+            put_u32(&mut bytes, HEADER_BYTES, count).unwrap();
+            let sum = crc32(bytes.get(at::CHECKSUMMED_FROM..).unwrap());
+            put_u32(&mut bytes, at::CHECKSUM, sum).unwrap();
+            assert!(
+                Record::decode(&bytes).is_err(),
+                "a count of {count} was accepted"
+            );
+        }
+        assert!(insert_row_entries(&TWO_ENTRIES[..TWO_ENTRIES.len() - 1]).is_err());
     }
 
     /// Every kind survives a round trip, and every record is 8-byte aligned.

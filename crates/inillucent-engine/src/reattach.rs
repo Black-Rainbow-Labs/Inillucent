@@ -197,6 +197,8 @@ impl ImportedDatabase {
         trees.insert(SCHEMA_VIEW_ROOT, catalog_tree);
         self.schema.trees = trees;
         self.schema.entries = entries;
+        // Carried to the new writer, as `resync_from_file_within` carries it.
+        let deferred = self.storage.wal.commit_syncs_deferred();
         self.storage.wal = std::rc::Rc::new(Wal::open(
             std::sync::Arc::clone(&self.storage.vfs),
             &db_path,
@@ -205,6 +207,7 @@ impl ImportedDatabase {
             1,
             WalOptions::default(),
         )?);
+        self.storage.wal.defer_commit_syncs(deferred);
         self.storage
             .database
             .pool()

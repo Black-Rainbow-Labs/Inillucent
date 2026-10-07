@@ -152,6 +152,18 @@ impl Redo for PageStore {
                 format!("delete {}", String::from_utf8_lossy(keys)),
                 lsn,
             ),
+            Body::InsertRows { entries, .. } => {
+                let listed = inillucent_wal::record::insert_row_entries(entries)?;
+                for ((_, page, row), take) in listed.into_iter().zip(wanted) {
+                    if *take {
+                        self.note(
+                            page,
+                            format!("insert {}", String::from_utf8_lossy(row)),
+                            lsn,
+                        );
+                    }
+                }
+            }
             Body::UpdateInPlace {
                 page, key, column, ..
             } => self.note(page, format!("update {column} of {key:?}"), lsn),
@@ -1719,4 +1731,66 @@ fn a_stamp_below_the_logs_end_is_skipped_rather_than_refused() {
     // And the transactions that did not touch page 1 are all there, so the
     // skip was one page's rather than the whole replay's.
     assert_atomic_and_prefixed(&store, "a stamp below the log's end");
+}
+
+/// A transaction's inserts share one `InsertRows` record, each row replays
+/// once, and a page whose stamp already reached the record takes none of them.
+///
+/// **What makes the batch sound** (task-2191, decision D1). Three inserts by
+/// one transaction, two of them into page 10, come back as one LSN; a second
+/// transaction's insert starts a new record. Replayed onto an empty store, every
+/// row lands once and in order. Replayed onto a store whose page 10 already
+/// carries the record's LSN, as it does when the page reached the data file
+/// after the record, page 10 takes neither of its rows and page 11 still takes
+/// its own: the decision is made once per page before any entry stamps it, so
+/// the second row of page 10 is not mistaken for the first.
+#[test]
+fn a_batch_of_inserts_replays_each_row_once_and_respects_each_pages_stamp() {
+    let vfs: Arc<dyn Vfs> = Arc::new(MemoryVfs::new());
+    let path = DbPath::new("batch.rdb");
+    let wal = log_on(Arc::clone(&vfs), &path, Synchronous::Full);
+    let first = wal.append_insert_row(7, 1, 10, b"a1").expect("an insert");
+    let second = wal.append_insert_row(7, 1, 11, b"b1").expect("an insert");
+    let third = wal.append_insert_row(7, 1, 10, b"a2").expect("an insert");
+    assert_eq!(
+        (first, second),
+        (first, first),
+        "one record holds the three rows"
+    );
+    assert_eq!(third, first, "one record holds the three rows");
+    wal.commit(7, 1).expect("a commit");
+    let other = wal.append_insert_row(8, 1, 12, b"c1").expect("an insert");
+    assert!(
+        other > first,
+        "a commit closed the record and a new one began"
+    );
+    wal.commit(8, 2).expect("a commit");
+    drop(wal);
+
+    let (store, outcome) = recover_into(vfs.as_ref(), &path);
+    assert_eq!(outcome.committed, 2);
+    let rows = |store: &PageStore, page: u64| store.logical.get(&page).cloned().unwrap_or_default();
+    assert_eq!(
+        rows(&store, 10),
+        vec!["insert a1".to_string(), "insert a2".to_string()]
+    );
+    assert_eq!(rows(&store, 11), vec!["insert b1".to_string()]);
+    assert_eq!(rows(&store, 12), vec!["insert c1".to_string()]);
+
+    let mut stamped = PageStore::default();
+    stamped.put(10, b"", first);
+    recover::recover(
+        vfs.as_ref(),
+        &path,
+        RecoveryStart::fresh(UUID),
+        &mut stamped,
+    )
+    .expect("recovery runs");
+    assert_eq!(
+        rows(&stamped, 10),
+        Vec::<String>::new(),
+        "page 10 already had the record"
+    );
+    assert_eq!(rows(&stamped, 11), vec!["insert b1".to_string()]);
+    assert_eq!(rows(&stamped, 12), vec!["insert c1".to_string()]);
 }

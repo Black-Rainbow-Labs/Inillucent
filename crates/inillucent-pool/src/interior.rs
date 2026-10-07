@@ -336,10 +336,21 @@ impl<'p> InteriorRef<'p> {
         if target >= high_value {
             return last;
         }
-        let span = u128::from(high_value.saturating_sub(low_value));
-        let into = u128::from(target.saturating_sub(low_value));
-        let width = u128::try_from(last.saturating_sub(low)).unwrap_or(0);
-        let offset = usize::try_from(into.saturating_mul(width) / span.max(1)).unwrap_or(0);
+        // **In 64 bits, by dropping the low bits both ends share** (task-2197).
+        // The product of the distance and the width does not fit in 64 bits,
+        // and the 128 bit division it took was 2% of a range query that reads
+        // 200 rows through an index. The midpoint is a guess the comparison
+        // then checks, so losing the bits below 2^32 of the span changes
+        // nothing a window of at most a few hundred children can tell apart.
+        let span = high_value.saturating_sub(low_value);
+        let into = target.saturating_sub(low_value);
+        let shift = 32u32.saturating_sub(span.leading_zeros());
+        let width = u64::try_from(last.saturating_sub(low))
+            .unwrap_or(0)
+            .min(u64::from(u32::MAX));
+        let offset =
+            usize::try_from((into >> shift).saturating_mul(width) / (span >> shift).max(1))
+                .unwrap_or(0);
         low.saturating_add(offset.min(last.saturating_sub(low)))
     }
 

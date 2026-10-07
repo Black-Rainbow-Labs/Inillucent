@@ -712,7 +712,7 @@ fn the_encoding_orders_these_terms(keys: &[SortKey]) -> bool {
         })
 }
 
-/// Encodes one row's sort terms into a single comparable buffer.
+/// Appends one row's sort terms to a buffer, as one comparable key.
 ///
 /// The terms are concatenated because the encoding is self-delimiting - a text
 /// or blob payload is escaped and terminated - which is the same property that
@@ -720,16 +720,15 @@ fn the_encoding_orders_these_terms(keys: &[SortKey]) -> bool {
 ///
 /// @param row - the row
 /// @param keys - the sort terms, in order
-fn encode_sort_key(row: &[OwnedDatum], keys: &[SortKey]) -> Vec<u8> {
-    let mut out = Vec::new();
+/// @param out - where the bytes go
+fn encode_sort_key_into(row: &[OwnedDatum], keys: &[SortKey], out: &mut Vec<u8>) {
     for term in keys {
         let value = row
             .get(term.column)
             .map(OwnedDatum::borrow)
             .unwrap_or(Datum::Null);
-        key::encode_into_with(&value, term.collation, &mut out);
+        key::encode_into_with(&value, term.collation, out);
     }
-    out
 }
 
 /// Sorts rows in place, through the encoded keys where that is the same order.
@@ -758,18 +757,42 @@ pub(crate) fn sort_rows(rows: &mut Vec<Vec<OwnedDatum>>, keys: &[SortKey]) {
         return;
     }
 
-    let mut encoded: Vec<(Vec<u8>, usize)> = rows
-        .iter()
-        .enumerate()
-        .map(|(at, row)| (encode_sort_key(row, keys), at))
-        .collect();
-    encoded.sort_unstable();
+    // **Every key in one buffer, and its first sixteen bytes as a number**
+    // (task-2197). Each row's key was its own `Vec<u8>`, an allocation and a
+    // free per row, and every comparison went through two slices. A range
+    // query of 200 rows sorted 200 times spent 12% of its time here. Two
+    // numbers that differ order as the keys do: they differ at a byte both
+    // keys have, or where one key has ended and is padded with zeros, which
+    // is where the shorter key sorts first anyway. Two that are equal leave
+    // the order to the whole keys, compared as bytes.
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut encoded: Vec<(u128, u32, u32, usize)> = Vec::with_capacity(rows.len());
+    for (at, row) in rows.iter().enumerate() {
+        let start = bytes.len();
+        encode_sort_key_into(row, keys, &mut bytes);
+        let key = bytes.get(start..).unwrap_or(&[]);
+        let mut prefix = [0u8; 16];
+        let lead = key.len().min(16);
+        if let (Some(into), Some(from)) = (prefix.get_mut(..lead), key.get(..lead)) {
+            into.copy_from_slice(from);
+        }
+        let end = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        let begin = u32::try_from(start).unwrap_or(u32::MAX);
+        encoded.push((u128::from_be_bytes(prefix), begin, end, at));
+    }
+    let whole = |begin: u32, end: u32| bytes.get(begin as usize..end as usize).unwrap_or(&[]);
+    encoded.sort_unstable_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| whole(left.1, left.2).cmp(whole(right.1, right.2)))
+            .then_with(|| left.3.cmp(&right.3))
+    });
 
     // The rows are moved rather than cloned: a clone here would copy every
     // text and blob in the result set, which is the allocation this whole
     // operator is built to avoid.
     let mut held: Vec<Option<Vec<OwnedDatum>>> = rows.drain(..).map(Some).collect();
-    for (_, at) in encoded {
+    for (_, _, _, at) in encoded {
         if let Some(row) = held.get_mut(at).and_then(Option::take) {
             rows.push(row);
         }

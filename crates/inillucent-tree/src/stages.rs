@@ -61,7 +61,9 @@ pub struct PutStages {
     pub deltas: u128,
     /// Of `locate`: the binary search of the sorted region.
     pub search: u128,
-    /// Asking the leaf whether the row fits, which is a second `modify` of the page.
+    /// Of `locate`: asking the leaf whether the row fits. It is asked of the parse
+    /// `locate` already made (task-2191), so it is part of `locate` and is not
+    /// added to it again.
     pub room: u128,
     /// Of `room`: parsing the leaf and doing the arithmetic, without the `modify` around it.
     ///

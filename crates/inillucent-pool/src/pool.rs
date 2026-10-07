@@ -375,12 +375,15 @@ pub(crate) fn lock_with_wait(
     let mut waited = 0u64;
     let mut pause = 1u64;
     loop {
-        match file.lock(level) {
+        let refused = match file.lock(level) {
             Ok(()) => return Ok(()),
-            Err(error) if waited >= budget_millis => {
-                return Err(error.into_db_error());
-            }
-            Err(_) => {}
+            Err(error) => error,
+        };
+        if waited == 0 && crate::lease::retry_after_yield(file, level) {
+            return Ok(());
+        }
+        if waited >= budget_millis {
+            return Err(refused.into_db_error());
         }
         std::thread::sleep(std::time::Duration::from_millis(pause));
         waited = waited.saturating_add(pause);
@@ -469,8 +472,10 @@ pub struct Pool {
     pins: chunked::Chunked<Cell<u32>>,
     /// The bookkeeping.
     state: RefCell<State>,
-    /// Where pages come from and go.
-    file: Box<dyn VfsFile>,
+    /// Where pages come from and go, shared with [`crate::lease`].
+    file: Arc<dyn VfsFile>,
+    /// SHARED kept between statements that only read; see [`crate::lease`].
+    lease: crate::lease::Lease,
     /// The rollback journal, when `PRAGMA journal_mode` selected one.
     ///
     /// `None` is the write-ahead log, which is the default and costs a branch
@@ -723,6 +728,7 @@ impl Pool {
         let buffers = chunked::Chunked::new(frames, || RefCell::new(Vec::new()));
         let latches = chunked::Chunked::new(frames, VersionLatch::new);
         let pins = chunked::Chunked::new(frames, || Cell::new(0));
+        let (file, lease) = crate::lease::Lease::for_file(file);
         Ok(Pool {
             page_size,
             buffers,
@@ -739,6 +745,7 @@ impl Pool {
                 clock: Rng::new(0x5EED_0B0F_C0FF_EE01),
             }),
             file,
+            lease,
             journal: RefCell::new(None),
             fold_protected_by_log: Cell::new(false),
             scratch: RefCell::new(vec![0u8; page_size]),

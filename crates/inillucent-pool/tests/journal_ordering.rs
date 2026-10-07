@@ -414,15 +414,21 @@ fn every_pre_image_is_durable_before_the_first_new_image() {
         );
     };
 
-    // Every pre-image the batch needs, written to the journal.
-    let journal_writes = events
+    // Every pre-image the batch needs, written to the journal. Counted in
+    // bytes rather than in writes: the journal holds its records until the
+    // seal and writes them in one call, so one write can carry all five.
+    let journal_bytes: u64 = events
         .iter()
-        .filter(|event| event.kind == "write" && event.path == journal_name)
-        .count();
+        .filter(|event| {
+            event.kind == "write" && event.path == journal_name && event.seq < first_new_image
+        })
+        .map(|event| event.length)
+        .sum();
+    let one_record = (PAGE_SIZE + 16) as u64;
     assert!(
-        journal_writes >= TARGETS.len(),
-        "the journal took {journal_writes} writes for {} pages, so not every pre-image was \
-         saved",
+        journal_bytes >= one_record * TARGETS.len() as u64,
+        "the journal took {journal_bytes} bytes before the first new image for {} pages of \
+         {one_record} bytes each, so not every pre-image was saved",
         TARGETS.len()
     );
 
@@ -578,4 +584,53 @@ fn a_fold_that_reached_only_the_shadow_slot_is_seen() {
         reader.generation()
     );
     reader.end_access().expect("the reader lets it go");
+}
+
+/// A checkpoint under a rollback journal writes the meta record into each slot,
+/// not the slot's whole page, and the file reopens on the record it wrote.
+///
+/// The rest of a meta page is the zero padding every earlier write of it left,
+/// so the shorter write leaves the same bytes on the disk. A slot written
+/// shorter than the record, or a checksum the shorter write no longer matched,
+/// fails here on the reopen.
+#[test]
+fn a_checkpoint_writes_the_meta_record_and_not_the_meta_pages() {
+    let vfs = built(53);
+    let mut database = opened(&vfs, true);
+    let before = vfs.trace().len() as u64;
+    assert!(
+        write_and_checkpoint(&mut database),
+        "the sequence did not complete"
+    );
+    drop(database);
+    let database_name = path().as_path().display().to_string();
+    let slot_writes: Vec<(u64, u64)> = vfs
+        .trace()
+        .events()
+        .into_iter()
+        .filter(|event| {
+            event.seq > before
+                && event.kind == "write"
+                && event.path == database_name
+                && (event.offset == 0 || event.offset == PAGE_SIZE as u64)
+        })
+        .map(|event| (event.offset, event.length))
+        .collect();
+    let record = inillucent_pool::meta::META_RECORD_BYTES as u64;
+    assert_eq!(
+        slot_writes,
+        vec![(PAGE_SIZE as u64, record), (0, record)],
+        "the checkpoint wrote the meta slots as {slot_writes:?}, not the shadow and then the \
+         primary as {record} bytes each"
+    );
+    let reopened = Database::open(vfs.as_ref(), &path(), 16).expect("the database reopens");
+    for page in TARGETS {
+        let guard = reopened.pool().fetch(page).expect("the page reads");
+        assert_eq!(
+            page::read_u64(&guard, MARKER).expect("the marker reads"),
+            AFTER,
+            "page {} does not hold what the checkpoint wrote",
+            page.0
+        );
+    }
 }

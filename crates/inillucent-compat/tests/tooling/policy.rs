@@ -93,7 +93,8 @@ const UNSAFE_CRATES: [&str; 1] = ["inillucent-driver-capi"];
 ///
 /// The first two are the operating-system boundary, which cannot be crossed in
 /// safe Rust. Everything else in the engine is safe code, and the crate-level
-/// `forbid(unsafe_code)` in `inillucent-base` says so to the compiler as well.
+/// `deny(unsafe_code)` in `inillucent-base` says so to the compiler as well,
+/// with one module allowed: the hardware CRC below.
 ///
 /// Most of the rest are measurement binaries, not the engine: a global
 /// allocator is the only way to count heap allocations, and `GlobalAlloc` is an
@@ -110,7 +111,17 @@ const UNSAFE_CRATES: [&str; 1] = ["inillucent-driver-capi"];
 // are FFI. Each call installs a handler and reads nothing back; each handler
 // stores `true` into an already-allocated `AtomicBool` and returns, which is
 // the whole of what a handler is allowed to do.
-const UNSAFE_ALLOWED: [&str; 22] = [
+const UNSAFE_ALLOWED: [&str; 23] = [
+    // **CRC-32 by the processor's instructions, added by task-2191.** Checking a
+    // page as it is read was 20% of a cold query of 100 rows from the command
+    // line. Carryless multiply on x86-64 and `CRC32X` on aarch64 compute the
+    // same reflected polynomial as the tables several times faster, and both
+    // are `std::arch` intrinsics. Each runs inside a `#[target_feature]`
+    // function called only after the run time check for its feature, every
+    // load reads a whole 16 byte block borrowed from the input slice, and a
+    // test compares every answer with the table implementation at every
+    // length to 300 bytes and random lengths to 70 KiB.
+    "crates/inillucent-base/src/crc_hardware.rs",
     // **The AVX2 dot product, added by task-2000's design 9.** It is the one place
     // in the engine where safe Rust cannot express the thing that has to happen: a
     // 256-bit fused multiply-add is an intrinsic, every intrinsic in

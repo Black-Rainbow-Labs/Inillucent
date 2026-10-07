@@ -314,7 +314,7 @@ impl Pool {
 
     /// Syncs the journal, which must happen before the first page is written.
     pub fn seal_journal(&self) -> DbResult<()> {
-        match self.journal.borrow().as_ref() {
+        match self.journal.borrow_mut().as_mut() {
             Some(journal) => journal.seal(),
             None => Ok(()),
         }

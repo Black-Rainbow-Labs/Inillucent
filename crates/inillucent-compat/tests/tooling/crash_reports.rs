@@ -76,7 +76,7 @@ enum Shape {
 /// holding the writer's lock (`Database::with_writer_slot`). Those calls are
 /// the cut points that went: five to eight per campaign, all of them before the
 /// commit, with every state and every recovered answer unchanged.
-const FLOORS: [Floor; 19] = [
+const FLOORS: [Floor; 20] = [
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
     // commit before that change and at the change itself: 88 cut points
@@ -133,10 +133,46 @@ const FLOORS: [Floor; 19] = [
     // every sync is a cut point. Measured through `inillucent-testrun` by
     // putting the sync back: 54 cut points with it and 53 without. Every cut
     // point still recovers to a state the campaign accepts.
+    // **Ten fewer since a rollback journal writes its records and its header
+    // in one call at the seal (task-2191).** Each pre-image used to be one
+    // write of the record and one of the header, and every write is a cut
+    // point. A cut before the seal finds no page overwritten, which is what
+    // the dropped cut points tested. Measured through `inillucent-testrun`:
+    // 53 cut points before the change and 43 after. Every cut point
+    // still recovers to a state the campaign accepts.
+    // **Two fewer since a statement that only read keeps SHARED for the next
+    // one (task-2197).** The statement after it takes no lock and reads no
+    // meta record, and a lock and a read are each a cut point. Measured
+    // through the campaign with the lease switched off: 43 cut points, and 41
+    // with it. Every cut point still recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 53,
+        least: 41,
+    },
+    // **The same workload with the commit's log sync left to the fold that
+    // follows it, which is what the command line's `exec` runs under
+    // (task-2191).** 51 cut points when it was added: the log is not synced at
+    // the commit or in the fold, and the fold runs inside the statement. The
+    // unarmed run is the only acknowledged one, because the statement returns
+    // once the fold is done. Breaking the mode so it acknowledges without
+    // folding fails the campaign with an acknowledged commit lost.
+    // **Twelve fewer since a rollback journal writes its records and its header
+    // in one call at the seal (task-2191).** Each pre-image used to be one
+    // write of the record and one of the header, and every write is a cut
+    // point. A cut before the seal finds no page overwritten, which is what
+    // the dropped cut points tested. Measured through `inillucent-testrun`:
+    // 51 cut points before the change and 39 after. Every cut point
+    // still recovers to a state the campaign accepts.
+    // **Two fewer since a statement that only read keeps SHARED for the next
+    // one (task-2197).** The statement after it takes no lock and reads no
+    // meta record, and a lock and a read are each a cut point. Measured
+    // through the campaign with the lease switched off: 39 cut points, and 37
+    // with it. Every cut point still recovers to a state the campaign accepts.
+    Floor {
+        name: "delete-fold-crash.txt",
+        shape: Shape::CutPoints,
+        least: 37,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -196,10 +232,22 @@ const FLOORS: [Floor; 19] = [
     // `delete-full-crash.txt`, which runs the same workload, by putting the
     // sync back: 54 cut points with it and 53 without. Every cut point still
     // recovers to a state the campaign accepts.
+    // **Ten fewer since a rollback journal writes its records and its header
+    // in one call at the seal (task-2191).** Each pre-image used to be one
+    // write of the record and one of the header, and every write is a cut
+    // point. A cut before the seal finds no page overwritten, which is what
+    // the dropped cut points tested. Measured through `inillucent-testrun`:
+    // 53 cut points before the change and 43 after. Every cut point
+    // still recovers to a state the campaign accepts.
+    // **Two fewer since a statement that only read keeps SHARED for the next
+    // one (task-2197).** The statement after it takes no lock and reads no
+    // meta record, and a lock and a read are each a cut point. Measured
+    // through the campaign with the lease switched off: 43 cut points, and 41
+    // with it. Every cut point still recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-disk-full.txt",
         shape: Shape::CutPoints,
-        least: 53,
+        least: 41,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -259,10 +307,22 @@ const FLOORS: [Floor; 19] = [
     // `delete-full-crash.txt`, which runs the same workload, by putting the
     // sync back: 54 cut points with it and 53 without. Every cut point still
     // recovers to a state the campaign accepts.
+    // **Ten fewer since a rollback journal writes its records and its header
+    // in one call at the seal (task-2191).** Each pre-image used to be one
+    // write of the record and one of the header, and every write is a cut
+    // point. A cut before the seal finds no page overwritten, which is what
+    // the dropped cut points tested. Measured through `inillucent-testrun`:
+    // 53 cut points before the change and 43 after. Every cut point
+    // still recovers to a state the campaign accepts.
+    // **Two fewer since a statement that only read keeps SHARED for the next
+    // one (task-2197).** The statement after it takes no lock and reads no
+    // meta record, and a lock and a read are each a cut point. Measured
+    // through the campaign with the lease switched off: 43 cut points, and 41
+    // with it. Every cut point still recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-io-error.txt",
         shape: Shape::CutPoints,
-        least: 53,
+        least: 41,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -322,10 +382,22 @@ const FLOORS: [Floor; 19] = [
     // `delete-full-crash.txt`, which runs the same workload, by putting the
     // sync back: 54 cut points with it and 53 without. Every cut point still
     // recovers to a state the campaign accepts.
+    // **Ten fewer since a rollback journal writes its records and its header
+    // in one call at the seal (task-2191).** Each pre-image used to be one
+    // write of the record and one of the header, and every write is a cut
+    // point. A cut before the seal finds no page overwritten, which is what
+    // the dropped cut points tested. Measured through `inillucent-testrun`:
+    // 53 cut points before the change and 43 after. Every cut point
+    // still recovers to a state the campaign accepts.
+    // **Two fewer since a statement that only read keeps SHARED for the next
+    // one (task-2197).** The statement after it takes no lock and reads no
+    // meta record, and a lock and a read are each a cut point. Measured
+    // through the campaign with the lease switched off: 43 cut points, and 41
+    // with it. Every cut point still recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-short-write.txt",
         shape: Shape::CutPoints,
-        least: 53,
+        least: 41,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** 161 cut points became 153 over the same
@@ -374,10 +446,17 @@ const FLOORS: [Floor; 19] = [
     // every sync is a cut point. Measured through `inillucent-testrun` by
     // putting the sync back: 135 cut points with it and 133 without. Every cut
     // point still recovers to a state the campaign accepts.
+    // **Twenty two fewer since a rollback journal writes its records and its header
+    // in one call at the seal (task-2191).** Each pre-image used to be one
+    // write of the record and one of the header, and every write is a cut
+    // point. A cut before the seal finds no page overwritten, which is what
+    // the dropped cut points tested. Measured through `inillucent-testrun`:
+    // 133 cut points before the change and 111 after. Every cut point
+    // still recovers to a state the campaign accepts.
     Floor {
         name: "truncate-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 133,
+        least: 111,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** 161 cut points became 153 over the same
@@ -426,10 +505,17 @@ const FLOORS: [Floor; 19] = [
     // every sync is a cut point. Measured through `inillucent-testrun` by
     // putting the sync back: 135 cut points with it and 133 without. Every cut
     // point still recovers to a state the campaign accepts.
+    // **Twenty two fewer since a rollback journal writes its records and its header
+    // in one call at the seal (task-2191).** Each pre-image used to be one
+    // write of the record and one of the header, and every write is a cut
+    // point. A cut before the seal finds no page overwritten, which is what
+    // the dropped cut points tested. Measured through `inillucent-testrun`:
+    // 133 cut points before the change and 111 after. Every cut point
+    // still recovers to a state the campaign accepts.
     Floor {
         name: "persist-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 133,
+        least: 111,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -475,10 +561,17 @@ const FLOORS: [Floor; 19] = [
     // every sync is a cut point. Measured through `inillucent-testrun` by
     // putting the sync back: 42 cut points with it and 41 without. Every cut
     // point still recovers to a state the campaign accepts.
+    // **Twelve fewer since a rollback journal writes its records and its header
+    // in one call at the seal (task-2191).** Each pre-image used to be one
+    // write of the record and one of the header, and every write is a cut
+    // point. A cut before the seal finds no page overwritten, which is what
+    // the dropped cut points tested. Measured through `inillucent-testrun`:
+    // 41 cut points before the change and 29 after. Every cut point
+    // still recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-checkpoint-crash.txt",
         shape: Shape::CutPoints,
-        least: 41,
+        least: 29,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -526,10 +619,17 @@ const FLOORS: [Floor; 19] = [
     // `delete-full-checkpoint-crash.txt`, which runs the same workload, by
     // putting the sync back: 42 cut points with it and 41 without. Every cut
     // point still recovers to a state the campaign accepts.
+    // **Twelve fewer since a rollback journal writes its records and its header
+    // in one call at the seal (task-2191).** Each pre-image used to be one
+    // write of the record and one of the header, and every write is a cut
+    // point. A cut before the seal finds no page overwritten, which is what
+    // the dropped cut points tested. Measured through `inillucent-testrun`:
+    // 41 cut points before the change and 29 after. Every cut point
+    // still recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-checkpoint-disk-full.txt",
         shape: Shape::CutPoints,
-        least: 41,
+        least: 29,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -577,10 +677,17 @@ const FLOORS: [Floor; 19] = [
     // `delete-full-checkpoint-crash.txt`, which runs the same workload, by
     // putting the sync back: 42 cut points with it and 41 without. Every cut
     // point still recovers to a state the campaign accepts.
+    // **Twelve fewer since a rollback journal writes its records and its header
+    // in one call at the seal (task-2191).** Each pre-image used to be one
+    // write of the record and one of the header, and every write is a cut
+    // point. A cut before the seal finds no page overwritten, which is what
+    // the dropped cut points tested. Measured through `inillucent-testrun`:
+    // 41 cut points before the change and 29 after. Every cut point
+    // still recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-checkpoint-io-error.txt",
         shape: Shape::CutPoints,
-        least: 41,
+        least: 29,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -614,10 +721,17 @@ const FLOORS: [Floor; 19] = [
     // putting each change back in turn: 43 cut points before both, 43 with the
     // meta slots change alone, 42 with the header change alone, and 42 with
     // both. Every cut point still recovers to a state the campaign accepts.
+    // **Twelve fewer since a rollback journal writes its records and its header
+    // in one call at the seal (task-2191).** Each pre-image used to be one
+    // write of the record and one of the header, and every write is a cut
+    // point. A cut before the seal finds no page overwritten, which is what
+    // the dropped cut points tested. Measured through `inillucent-testrun`:
+    // 42 cut points before the change and 30 after. Every cut point
+    // still recovers to a state the campaign accepts.
     Floor {
         name: "truncate-full-checkpoint-crash.txt",
         shape: Shape::CutPoints,
-        least: 42,
+        least: 30,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -650,10 +764,17 @@ const FLOORS: [Floor; 19] = [
     // by putting each change back in turn: 43 cut points before both, 43 with
     // the meta slots change alone, 42 with the header change alone, and 42 with
     // both. Every cut point still recovers to a state the campaign accepts.
+    // **Twelve fewer since a rollback journal writes its records and its header
+    // in one call at the seal (task-2191).** Each pre-image used to be one
+    // write of the record and one of the header, and every write is a cut
+    // point. A cut before the seal finds no page overwritten, which is what
+    // the dropped cut points tested. Measured through `inillucent-testrun`:
+    // 42 cut points before the change and 30 after. Every cut point
+    // still recovers to a state the campaign accepts.
     Floor {
         name: "persist-full-checkpoint-crash.txt",
         shape: Shape::CutPoints,
-        least: 42,
+        least: 30,
     },
     // **Three fewer since `BEGIN` became deferred (task-2173).** The
     // workload opens with `BEGIN`, which took the write lock itself before

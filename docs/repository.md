@@ -263,8 +263,8 @@ a prerequisite and its suite cannot skip. Those two checks keep this table equal
 
 ## What the tests cover
 
-The workspace has 4,153 tests across 316 test targets, counted tier by tier in the tier table of
-`tests/inillucent-testing-tdd.md`. There are 316 rows in `tests/selection.toml`,
+The workspace has 4,153 tests across 318 test targets, counted tier by tier in the tier table of
+`tests/inillucent-testing-tdd.md`. There are 318 rows in `tests/selection.toml`,
 and each row is one `[[target]]` that the runner runs. `tools/doc-facts/check.mjs` fails when this
 page gives a different count from `tests/selection.toml`.
 
@@ -284,7 +284,7 @@ The tests fall into these classes:
 `inillucent-pool` and `inillucent-tree` are the two crates with the most coverage: 93.4% and 92.0% of
 regions, and 94.3% and 93.8% of lines. Those numbers come from the table below.
 
-29 of the 29 crates deny `unwrap`, `expect`, `panic` and slice indexing, and 21 forbid `unsafe`.
+29 of the 29 crates deny `unwrap`, `expect`, `panic` and slice indexing, and 20 forbid `unsafe`.
 Those lints cover every path that reads SQL text, database pages, log frames, network bytes or file
 system results. The lints go on each crate root: `lib.rs` for a library and `main.rs` for
 `inillucent-bench`, which is a program.

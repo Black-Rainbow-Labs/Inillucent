@@ -16,8 +16,8 @@ search and keyword search built in. Everything lives in one file.
   is on the roadmap.
 - A storage engine written from scratch in Rust.
 - 419% faster than SQLite overall, and 3,061% faster on reads by key.[^1]
-- 137% faster than SQLite through the `Connection` API an application calls, and 69% faster on
-  48 common and edge case workloads.[^1]
+- 64% faster than SQLite when called the way programs call it: 136% faster from Python, 207%
+  faster from Node and 46% faster through scripts piped into the shell.[^4]
 - 174% faster than PostgreSQL with pgvector for semantic search.[^3]
 - 302% better than PostgreSQL full text search at finding identifiers.[^3]
 - A command line and an MCP server with the same commands.
@@ -238,13 +238,11 @@ MIT. See [LICENSE](LICENSE).
     Thirty paired rounds, four runs in a row, at 100,000 rows on Windows x64, on 26 September 2026
     with release 1.0.32, with both programs on the same eight performance cores. Overall: 419%
     faster, the weighted geometric mean across ten families of work, with a 95% lower bound of 405%.
-    The `Connection` figures are from 3 October 2026 with release 2.1.2, ten paired rounds through
-    `Connection::prepare` and `Statement::step`: 137% faster on the same ten families. On the 48
-    workloads of `inillucent-fullgate --plan hillclimb`, measured on 4 October 2026, this release is
-    69% faster, where 2.1.2 was 34% faster and 2.1.1 was 30% slower.
     Reads by key: 3,061% faster. Every result is hashed and compared with SQLite's before its time
-    counts. Five of the thirty workloads are slower than SQLite. [Performance](docs/performance.md)
-    names each one.
+    counts. A newer run on 7 October 2026, with the build released as 2.3.0, measured 484% faster,
+    with one of the thirty workloads slower than SQLite, but it was not graded: SQLite ran 7% slower
+    than its idle reference on this machine, which makes inillucent's figure read high.
+    [Performance](docs/performance.md) has both runs and names each slower workload.
 
 [^2]: Processor time was 344 ms against 1,043 ms for SQLite for one round of the same plan at
     100,000 rows, on 26 September 2026.
@@ -256,3 +254,11 @@ MIT. See [LICENSE](LICENSE).
     against 0.136 for PostgreSQL full text search, 302% better. Of 17 graded comparisons, Inillucent
     was better on 15, equivalent on 1, inconclusive on 1 and worse on none.
     [Retrieval quality](docs/retrieval-quality.md) has the full table.
+
+[^4]: Measured on 6 October 2026 with the build released as 2.3.0, over 25 workloads called the way
+    programs call each engine: one process per command, a SQL script piped into the shell, the
+    Python driver and the npm package, against the `sqlite3` 3.53.4 shell, Python's `sqlite3` module
+    and Node's `node:sqlite`. Fifteen rounds, each engine with its own default settings. The command
+    line is 3% faster than SQLite, because starting a program costs both engines the same and is
+    most of a short command. [Performance](docs/performance.md#how-programs-call-it) has every
+    workload.

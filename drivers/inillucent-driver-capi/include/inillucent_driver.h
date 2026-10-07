@@ -416,6 +416,23 @@ int32_t inillucent_stmt_execute_params(inillucent_stmt *stmt,
                                        inillucent_error **error);
 void    inillucent_params_free(inillucent_params *params);
 
+/* One foreign call per execution, for a binding running inside CPython.
+ * inillucent_py_init_threads takes the addresses of PyEval_SaveThread and
+ * PyEval_RestoreThread, in that order (count 2). inillucent_py_stmt_execute
+ * reads a list or tuple of parameters the way inillucent_py_params reads one
+ * row, binds them in place of what was bound, runs the statement with the
+ * interpreter lock let go, and returns a new reference: the result list
+ * inillucent_rows_py builds, an int holding the address of an
+ * inillucent_error the caller raises from and frees, or None when a value is
+ * not one it reads, so the caller binds that execution another way.
+ * inillucent_py_execute does the same for a statement with no parameters,
+ * given as a str. Call both with the interpreter lock held (ctypes.PyDLL),
+ * after inillucent_py_init and inillucent_py_init_params. Since ABI 1.4.0. */
+int32_t inillucent_py_init_threads(const void *const *api, size_t count);
+void   *inillucent_py_stmt_execute(inillucent_stmt *stmt, void *params,
+                                   uint64_t limit);
+void   *inillucent_py_execute(inillucent_conn *conn, void *sql, uint64_t limit);
+
 /* For Node. The library is also a Node addon: process.dlopen() calls this,
  * and it fills exports with open, connect, query, batch, disconnect and
  * close. Node's napi_* functions are looked up in the host process when it is

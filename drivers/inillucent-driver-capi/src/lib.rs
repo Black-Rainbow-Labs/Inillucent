@@ -94,11 +94,12 @@ pub use capi::value::*;
 /// before has met that one.
 ///
 /// 1.1.0 added `inillucent_open_with_key`, 1.2.0 added
-/// `inillucent_open_with_timeout`, and 1.3.0 added `inillucent_rows_json`,
-/// `inillucent_bind_json` and `inillucent_stmt_execute_many`. A new symbol is a
-/// minor version: a binding written against 1.0.0 still finds every symbol it
-/// calls.
-pub const ABI_VERSION: u32 = 1_003_000;
+/// `inillucent_open_with_timeout`, 1.3.0 added `inillucent_rows_json`,
+/// `inillucent_bind_json` and `inillucent_stmt_execute_many`, and 1.4.0 added
+/// `inillucent_py_stmt_execute`, `inillucent_py_execute` and
+/// `inillucent_py_init_threads`. A new symbol is a minor version: a binding
+/// written against 1.0.0 still finds every symbol it calls.
+pub const ABI_VERSION: u32 = 1_004_000;
 
 // —— status codes, which the header freezes ————————————————————————
 

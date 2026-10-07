@@ -299,3 +299,222 @@ unsafe fn build_result(api: &PyApi, rows: &inillucent_driver::Rows) -> Option<*m
     })?;
     Some(whole.release())
 }
+
+/// The two CPython functions that let the interpreter lock go around a
+/// statement and take it back, in the order `inillucent_py_init_threads`
+/// receives their addresses.
+struct PyThreads {
+    /// `PyEval_SaveThread()`, which releases the lock and answers the thread
+    /// state to give back.
+    save: unsafe extern "C" fn() -> *mut c_void,
+    /// `PyEval_RestoreThread(state)`.
+    restore: unsafe extern "C" fn(*mut c_void),
+}
+
+/// The table, set once by the first `inillucent_py_init_threads`.
+static PY_THREADS: OnceLock<PyThreads> = OnceLock::new();
+
+/// Takes the addresses of `PyEval_SaveThread` and `PyEval_RestoreThread`, in
+/// that order.
+///
+/// **So a statement run through [`inillucent_py_stmt_execute`] lets other
+/// Python threads run (task-2197)**, as one run through `ctypes.CDLL` does and
+/// as Python's own `sqlite3` module does around `sqlite3_step`. One process
+/// holds one CPython, so the first table is kept and a later call with a
+/// different one is refused.
+///
+/// @param api - the two addresses
+/// @param count - how many there are, which must be 2
+///
+/// # Safety
+///
+/// `api` must point to `count` readable pointers, the two CPython functions
+/// named above, in the CPython of this process.
+#[no_mangle]
+pub unsafe extern "C" fn inillucent_py_init_threads(
+    api: *const *const c_void,
+    count: usize,
+) -> i32 {
+    guarded_value(
+        || {
+            if api.is_null() || count != 2 {
+                return INILLUCENT_MISUSE;
+            }
+            let at = std::slice::from_raw_parts(api, count);
+            let (Some(&save), Some(&restore)) = (at.first(), at.get(1)) else {
+                return INILLUCENT_MISUSE;
+            };
+            if save.is_null() || restore.is_null() {
+                return INILLUCENT_MISUSE;
+            }
+            let table = PyThreads {
+                save: as_function(save),
+                restore: as_function(restore),
+            };
+            let kept = PY_THREADS.get_or_init(|| table);
+            match kept.save as usize == save as usize {
+                true => INILLUCENT_OK,
+                false => INILLUCENT_MISUSE,
+            }
+        },
+        INILLUCENT_INTERNAL,
+    )
+}
+
+/// Gives the interpreter lock back when it goes out of scope, so a panic
+/// inside the statement cannot leave the thread without it.
+struct Unlocked {
+    /// The thread state `PyEval_SaveThread` answered, null when the lock was
+    /// never let go.
+    state: *mut c_void,
+}
+
+impl Unlocked {
+    /// Lets the interpreter lock go, when the table to take it back is set.
+    fn release() -> Unlocked {
+        let state = match PY_THREADS.get() {
+            // SAFETY: the caller holds the lock, which is what the binding's
+            // `ctypes.PyDLL` call promises.
+            Some(threads) => unsafe { (threads.save)() },
+            None => std::ptr::null_mut(),
+        };
+        Unlocked { state }
+    }
+}
+
+impl Drop for Unlocked {
+    /// Takes the interpreter lock back.
+    fn drop(&mut self) {
+        if let (false, Some(threads)) = (self.state.is_null(), PY_THREADS.get()) {
+            // SAFETY: `state` is what `PyEval_SaveThread` answered on this
+            // thread, and it is given back once.
+            unsafe { (threads.restore)(self.state) };
+        }
+    }
+}
+
+/// Runs a statement with the interpreter lock let go, and builds what the
+/// Python binding receives from it.
+///
+/// A result is the list `inillucent_rows_py` builds. A failure is an `int`, the
+/// address of an `inillucent_error` the binding raises from and frees.
+///
+/// @param api - the table
+/// @param run - runs the statement
+unsafe fn answer_for(
+    api: &PyApi,
+    run: impl FnOnce() -> Option<inillucent_driver::Result<inillucent_driver::Rows>>,
+) -> *mut PyObject {
+    let ran = {
+        let _unlocked = Unlocked::release();
+        run()
+    };
+    let failure = match ran {
+        Some(Ok(rows)) => return build_result(api, &rows).unwrap_or(std::ptr::null_mut()),
+        Some(Err(why)) => why,
+        None => inillucent_driver::Error::said(
+            inillucent_driver::Status::InvalidState,
+            "the statement or connection handle is not live",
+        ),
+    };
+    let mut error: *mut inillucent_error = std::ptr::null_mut();
+    report(&mut error, &failure, failure.detail.is_some());
+    (api.long_from_long_long)(error as usize as i64)
+}
+
+/// Answers `None`, a new reference, which tells the binding to take its other
+/// path.
+///
+/// @param api - the table
+unsafe fn not_here(api: &PyApi) -> *mut PyObject {
+    (api.incref)(api.none as *mut PyObject);
+    api.none as *mut PyObject
+}
+
+/// Binds a list or tuple of Python values, runs the statement and returns its
+/// result as Python objects, in one call.
+///
+/// **One foreign call per execution where there were four (task-2197).** The
+/// binding wrote the values as JSON, bound them, ran the statement, built the
+/// result and freed it, each its own `ctypes` call with its own handle lookup.
+/// A point query through Python spent about half of its 17 us in that crossing.
+/// The values replace the statement's bindings, as `inillucent_bind_json`
+/// replaces them.
+///
+/// Answers the result list `inillucent_rows_py` builds; an `int`, the address
+/// of an `inillucent_error`, on a failure; and `None` when a value is not one
+/// this reads, so the binding sends that execution the JSON way and its refusal
+/// is the one it always was.
+///
+/// @param stmt - the statement
+/// @param params - a list or tuple of values, a borrowed reference
+/// @param limit - how many rows to hand back
+///
+/// # Safety
+///
+/// Call it only through `ctypes.PyDLL`, with the interpreter lock held, after
+/// `inillucent_py_init` and `inillucent_py_init_params` succeeded. `stmt` must
+/// be null or a pointer this library returned, and `params` a live object.
+#[no_mangle]
+pub unsafe extern "C" fn inillucent_py_stmt_execute(
+    stmt: *mut crate::capi::stmt::inillucent_stmt,
+    params: *mut c_void,
+    limit: u64,
+) -> *mut c_void {
+    guarded_value(
+        || {
+            let Some(api) = PY_API.get() else {
+                return std::ptr::null_mut();
+            };
+            let Some(values) = crate::capi::params::read_values(params) else {
+                return not_here(api);
+            };
+            answer_for(api, || {
+                crate::capi::stmt::run_with_values(stmt, values, limit)
+            })
+        },
+        std::ptr::null_mut(),
+    )
+}
+
+/// Runs one statement with no parameters and returns its result as Python
+/// objects, in one call.
+///
+/// `inillucent_execute` and `inillucent_rows_py` together, for the reason
+/// [`inillucent_py_stmt_execute`] gives. The text is read from the `str`
+/// itself, without the binding encoding a copy.
+///
+/// Answers as [`inillucent_py_stmt_execute`] does, and `None` for text that is
+/// not exactly a `str`.
+///
+/// @param conn - the connection
+/// @param sql - the statement, a `str`, a borrowed reference
+/// @param limit - how many rows to hand back
+///
+/// # Safety
+///
+/// As [`inillucent_py_stmt_execute`]; `conn` must be null or a pointer this
+/// library returned.
+#[no_mangle]
+pub unsafe extern "C" fn inillucent_py_execute(
+    conn: *mut crate::capi::db::inillucent_conn,
+    sql: *mut c_void,
+    limit: u64,
+) -> *mut c_void {
+    guarded_value(
+        || {
+            let Some(api) = PY_API.get() else {
+                return std::ptr::null_mut();
+            };
+            let Some(text) = crate::capi::params::read_str(sql) else {
+                return not_here(api);
+            };
+            answer_for(api, || {
+                let database = database_of(conn)?;
+                let connection = database.database.session_as(session_of(conn));
+                Some(connection.query(text, &[], crate::capi::value::capped(limit)))
+            })
+        },
+        std::ptr::null_mut(),
+    )
+}

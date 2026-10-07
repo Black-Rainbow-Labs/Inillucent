@@ -312,16 +312,20 @@ fn every_stability_is_one_of_the_two_that_mean_something() {
         .map(|(name, _)| name)
         .collect();
     // The three JSON calls arrived in 1.3.0 and stay provisional until a second
-    // binding has used them (task-2191).
+    // binding has used them (task-2191). The three one call Python calls of
+    // 1.4.0 are provisional with the rest of the Python calls (task-2197).
     assert_eq!(
         provisional,
         vec![
             "inillucent_bind_json",
             "inillucent_cancel",
             "inillucent_params_free",
+            "inillucent_py_execute",
             "inillucent_py_init",
             "inillucent_py_init_params",
+            "inillucent_py_init_threads",
             "inillucent_py_params",
+            "inillucent_py_stmt_execute",
             "inillucent_rows_json",
             "inillucent_rows_py",
             "inillucent_stmt_execute_many",

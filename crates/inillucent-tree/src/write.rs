@@ -421,6 +421,19 @@ pub trait TreeLog {
     /// @param body - what is about to happen
     fn log(&mut self, body: Body<'_>) -> DbResult<u64>;
 
+    /// Logs one inserted row and returns the LSN to stamp its leaf with.
+    ///
+    /// The default is an `InsertRow` record of its own. The engine's log joins
+    /// consecutive inserts of a transaction into one `InsertRows` record
+    /// (task-2191); see `inillucent_wal::Wal::append_insert_row`.
+    ///
+    /// @param tree - the tree the leaf belongs to
+    /// @param page - the leaf's page number
+    /// @param row - the row, in the leaf's tagged encoding
+    fn log_insert_row(&mut self, tree: u64, page: u64, row: &[u8]) -> DbResult<u64> {
+        self.log(Body::InsertRow { tree, page, row })
+    }
+
     /// Whether this log is collecting before-images.
     ///
     /// **The log is asked rather than told.** A write path that had to be
@@ -1147,11 +1160,8 @@ impl PagedTree {
         let orphaned = self.orphaned_extents(database, page, located)?;
         timing.orphans = crate::stages::elapsed(asking);
         let logging = crate::stages::clock();
-        let lsn = log.log(Body::InsertRow {
-            tree: self.tree_id(),
-            page: page.0,
-            row: encoded_row,
-        })?;
+        let lsn = log.log_insert_row(self.tree_id(), page.0, encoded_row)?;
+        self.forget_largest_key_on(page);
         timing.logging = crate::stages::elapsed(logging);
         let writing = crate::stages::clock();
         database.pool().modify(page, |bytes| {

@@ -52,7 +52,7 @@ If a word on another page is not here and should be, add it.
 | **fsync** | The operating system call that makes written bytes reach the disk. It is the slow part of a commit. `PRAGMA synchronous` controls how often the engine calls it. |
 | **Group commit** | Writing the log records of several commits with one fsync, so each commit pays less for the disk write. |
 | **Journal** | A file that holds a copy of a page from before a change, so a crash can put the old page back. inillucent accepts SQLite's six `PRAGMA journal_mode` values, and `delete` is the default. In inillucent the journal mode decides how a checkpoint is protected, and the write ahead log records every change in every mode. |
-| **`locking_mode`** | The pragma that decides whether a connection keeps its file lock. The default, `normal`, releases the lock between statements, so other processes can use the file. `exclusive` keeps the lock until the connection closes. |
+| **`locking_mode`** | The pragma that decides whether a connection keeps its file lock. The default, `normal`, releases the lock between statements, so other processes can use the file; a statement that only read keeps its shared lock for up to a millisecond first, so the next statement need not take it again. `exclusive` keeps the lock until the connection closes. |
 | **Log record** | One entry in the write ahead log: a page image, a row change, a commit or a checkpoint. |
 | **LSN** | Log sequence number: the position of a record in the write ahead log. Every page stores the LSN of the last record that changed it, so recovery can skip records the page already has. |
 | **MVCC** | Multiversion concurrency control: keeping several versions of a row so a reader can read an old version while a writer writes a new one. |

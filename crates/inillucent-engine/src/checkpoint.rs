@@ -456,7 +456,11 @@ impl ImportedDatabase {
         if reclaiming {
             self.refresh_statistics()?;
         }
-        self.storage.wal.sync()?;
+        // Handed to the file system and not synced when this fold makes the
+        // commit durable; see `hand_over_the_log`. A reclaiming fold retires
+        // segments and keeps the sync.
+        let held = !reclaiming && self.the_fold_holds_the_commit();
+        self.hand_over_the_log(held)?;
         // **The segment boundary is moved to the checkpoint point first.**
         // A segment is only retirable once every record in it is below the
         // checkpoint LSN, and the segment being appended to never is - the
@@ -517,8 +521,11 @@ impl ImportedDatabase {
         // what `inillucent-txn`'s own copy of this checkpoint measures:
         // `recovering_checkpointing_and_recovering_again_is_the_same_database`.
         inillucent_txn::engine::log_free_map_pages(&mut self.storage.database, &self.storage.wal)?;
-        self.storage.wal.sync()?;
-        let recovery_from = self.record_recovery_point(oldest_dirty)?;
+        self.hand_over_the_log(held)?;
+        let recovery_from = self.record_recovery_point(oldest_dirty, held)?;
+        if !reclaiming {
+            self.note_where_the_log_ends(recovery_from)?;
+        }
         self.storage.database.checkpoint_after_free_map()?;
         if reclaiming {
             reclaim(&self.storage.wal, recovery_from)?;
@@ -565,8 +572,11 @@ impl ImportedDatabase {
     /// pass took past the 150 line bar `policy.rs` holds a new function to.
     ///
     /// @param oldest_dirty - the earliest log position any dirty page still needs
-    fn record_recovery_point(&mut self, oldest_dirty: u64) -> DbResult<u64> {
-        let durable = self.storage.wal.write_ahead_point();
+    fn record_recovery_point(&mut self, oldest_dirty: u64, unsynced: bool) -> DbResult<u64> {
+        let durable = match unsynced {
+            true => self.storage.wal.written_end(),
+            false => self.storage.wal.write_ahead_point(),
+        };
         self.storage.database.pool().set_durable_lsn(durable);
         let recovery_from = self.recovery_point(durable, oldest_dirty);
         let recovery_sequence = self.storage.wal.sequence_containing(recovery_from)?;
@@ -575,6 +585,47 @@ impl ImportedDatabase {
             .set_log_position(recovery_from, 0, recovery_sequence);
         self.storage.database.pool().set_retained_lsn(recovery_from);
         Ok(recovery_from)
+    }
+
+    /// Hands the log's records to the file system before the fold writes a
+    /// page: synced, or only written when the fold is what makes the commit
+    /// durable (task-2191, decision D3's companion D2).
+    ///
+    /// **No sync when the fold holds the commit.** See
+    /// `ImportedDatabase::hold_commits_for_the_fold`: the rollback journal this
+    /// fold seals before its first page write is what makes the writes
+    /// recoverable, so the records are handed over first, keeping their order
+    /// before the pages, and the meta record's recovery point is the end of
+    /// what was written.
+    ///
+    /// @param held - whether this fold makes the commit durable
+    fn hand_over_the_log(&self, held: bool) -> DbResult<()> {
+        match held {
+            true => self.storage.wal.flush(),
+            false => self.storage.wal.sync(),
+        }
+    }
+
+    /// Records the segment's length in the meta record when the checkpoint at
+    /// `recovery_from` leaves nothing after itself.
+    ///
+    /// **So a later first statement that finds the segment that long by name
+    /// reads no log at all** (task-2191, decision D3). See
+    /// `inillucent_pool::meta::at::LOG_END_AT_CHECKPOINT`. A reclaiming
+    /// checkpoint appends its own record after this, so its caller does not
+    /// ask, and the length stays unset.
+    ///
+    /// @param recovery_from - the checkpoint's recovery point
+    fn note_where_the_log_ends(&mut self, recovery_from: u64) -> DbResult<()> {
+        if recovery_from != self.storage.wal.written_end()
+            || self.storage.database.meta().wal_sequence != self.storage.wal.sequence()
+        {
+            return Ok(());
+        }
+        if let Some(length) = self.storage.wal.length_if_it_ends_at(recovery_from)? {
+            self.storage.database.set_log_end_at_checkpoint(length);
+        }
+        Ok(())
     }
 
     /// Folds every attached database's log into its own file.

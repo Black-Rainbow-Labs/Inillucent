@@ -734,6 +734,14 @@ fn replay(
             if !should_replay(&record, analysis) {
                 continue;
             }
+            if let Body::InsertRows { entries, .. } = record.body {
+                let wanted = entries_to_apply(redo, &record, entries, analysis.valid_end)?;
+                if wanted.iter().any(|take| *take) {
+                    redo.redo(&record, &wanted)?;
+                    outcome.applied = outcome.applied.saturating_add(1);
+                }
+                continue;
+            }
             let pages = record.pages();
             let mut wanted = [false; MAX_PAGES];
             let mut any = pages.as_slice().is_empty();
@@ -765,6 +773,57 @@ fn replay(
         }
     }
     Ok(())
+}
+
+/// Decides, for each entry of an `InsertRows` record, whether its row is
+/// applied: one answer per entry, in order.
+///
+/// **Every answer is given before any entry is applied.** The page LSN rule
+/// applies a record to a page whose stamp is below the record's, and applying
+/// an entry stamps the page with the record's LSN, so a page asked after its
+/// first entry was applied would refuse its second. The entries for one page
+/// all landed before the page could be written with this stamp (see
+/// `Wal::append_insert_row`), so one answer covers all of them, and a page is
+/// asked once per record. A stamp from another stream is refused here as it is
+/// for every other record.
+/// `a_batch_of_inserts_replays_each_row_once_and_respects_each_pages_stamp`
+/// replays two rows into one page and checks both land.
+///
+/// @param redo - the applier, asked for each page's stamp
+/// @param record - the record
+/// @param entries - its entries
+/// @param valid_end - the position past the last record the scan accepted
+fn entries_to_apply(
+    redo: &mut dyn Redo,
+    record: &Record<'_>,
+    entries: &[u8],
+    valid_end: u64,
+) -> DbResult<Vec<bool>> {
+    let listed = crate::record::insert_row_entries(entries)?;
+    let mut decided: Vec<(u64, bool)> = Vec::new();
+    let mut wanted = Vec::with_capacity(listed.len());
+    for (_, page, _) in listed {
+        let known = decided
+            .iter()
+            .find(|(seen, _)| *seen == page)
+            .map(|(_, take)| *take);
+        let take = match known {
+            Some(take) => take,
+            None => {
+                let below = match redo.page_lsn(page)? {
+                    Some(lsn) => {
+                        refuse_a_stamp_from_another_stream(page, lsn, valid_end)?;
+                        lsn < record.lsn
+                    }
+                    None => true,
+                };
+                decided.push((page, below));
+                below
+            }
+        };
+        wanted.push(take);
+    }
+    Ok(wanted)
 }
 
 /// Refuses a page whose stamp cannot have come from the log being replayed.

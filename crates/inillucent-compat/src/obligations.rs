@@ -185,9 +185,14 @@ pub fn pragma_page() -> String {
     out.push_str(
         "mode the file lock is released between statements, so a second process can open\n",
     );
+    out.push_str("the database. A statement that only read keeps its shared lock for up to a\n");
     out.push_str(
-        "the database. In `exclusive` mode the connection keeps the lock until it closes.\n",
+        "millisecond, so a statement that follows at once does not take it again; a writer\n",
     );
+    out.push_str(
+        "in another process waits that long at most. In `exclusive` mode the connection\n",
+    );
+    out.push_str("keeps the lock until it closes.\n");
     out.push_str(
         "`exclusive` is faster for a program that only ever opens one connection. While\n",
     );

@@ -416,6 +416,18 @@ impl TreeLog for WalLog<'_> {
         Ok(lsn)
     }
 
+    fn log_insert_row(&mut self, tree: u64, page: u64, row: &[u8]) -> DbResult<u64> {
+        self.wrote = true;
+        let lsn = self.wal.append_insert_row(self.txn, tree, page, row)?;
+        // Armed as `log` arms it: the batch's LSN is where its first entry is,
+        // so the watermark is never past a record this transaction wrote.
+        if self.uncommitted.load(std::sync::atomic::Ordering::SeqCst) == u64::MAX {
+            self.uncommitted
+                .store(lsn, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(lsn)
+    }
+
     fn wants_undo(&self) -> bool {
         self.undo.is_some()
     }

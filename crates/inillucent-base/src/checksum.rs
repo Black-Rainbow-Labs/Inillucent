@@ -196,9 +196,27 @@ pub fn crc32(data: &[u8]) -> u32 {
 /// measurement from 9.7 ms to well under a millisecond, and the comment above
 /// records it.
 ///
+/// **A different instruction computes this polynomial, and it is used**
+/// (task-2191). Carryless multiply on x86-64 and the ARMv8 `CRC32X` both compute
+/// the reflected `0xedb88320`, so the values do not change. A piece of 64 bytes
+/// or more goes to [`crate::crc_hardware`] when the processor has them, and
+/// everything else to [`crc32_continue_table`].
+///
 /// @param previous - the result so far, or zero to start
 /// @param data - the next piece
 pub fn crc32_continue(previous: u32, data: &[u8]) -> u32 {
+    match crate::crc_hardware::crc32_continue(previous, data) {
+        Some(found) => found,
+        None => crc32_continue_table(previous, data),
+    }
+}
+
+/// [`crc32_continue`] by the tables alone, for a short piece, a processor
+/// without the instructions, and the bytes after the last whole block.
+///
+/// @param previous - the result so far, or zero to start
+/// @param data - the next piece
+pub(crate) fn crc32_continue_table(previous: u32, data: &[u8]) -> u32 {
     /// How long a piece has to be before it is split into four streams.
     const SPLIT_FROM: usize = 4_096;
     if data.len() < SPLIT_FROM {
@@ -457,6 +475,39 @@ mod tests {
             slow = crc32_one_byte_at_a_time(slow, chunk);
         }
         assert_eq!(running, slow);
+    }
+
+    /// The processor's CRC is the table's CRC: every length to 300 bytes, which
+    /// covers the 64 byte threshold, every block remainder and the four way
+    /// folding's group boundaries, and 200 random lengths to 70 KiB, each from a
+    /// random starting value.
+    ///
+    /// On a processor with the instructions, which every machine this runs on
+    /// has, it also asserts that the hardware path answered, so a module that
+    /// quietly fell back to the table everywhere would fail here.
+    #[test]
+    fn crc_hardware_matches_the_table_at_every_length() {
+        let mut rng = Rng::new(0x2191_0004);
+        let mut data = vec![0u8; 70 * 1024];
+        rng.fill(&mut data);
+        let mut answered = 0usize;
+        let lengths: Vec<usize> = (0..=300usize)
+            .chain((0..200).map(|_| (rng.next_u64() % (70 * 1024 + 1)) as usize))
+            .collect();
+        for length in lengths {
+            let piece = data.get(..length).unwrap_or(&[]);
+            let start = rng.next_u64() as u32;
+            let table = crc32_continue_table(start, piece);
+            if let Some(hardware) = crate::crc_hardware::crc32_continue(start, piece) {
+                answered += 1;
+                assert_eq!(hardware, table, "length {length} from {start:08x}");
+            }
+            assert_eq!(crc32_continue(start, piece), table, "length {length}");
+        }
+        assert!(
+            answered > 400,
+            "the hardware path answered {answered} of the 437 pieces of 64 bytes or more"
+        );
     }
 
     /// Prints how long a 32 KiB page's CRC takes; run by hand with `--ignored`.

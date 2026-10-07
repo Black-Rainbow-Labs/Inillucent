@@ -2735,7 +2735,6 @@ fn put_stage_line(
     let named = stages.encode
         + stages.find
         + stages.locate
-        + stages.room
         + stages.undo
         + stages.apply
         + stages.making;
@@ -2747,8 +2746,8 @@ fn put_stage_line(
         per(stages.whole),
     );
     line.push_str(&format!(
-        "\n  {:<24} us/write: encode {:.2}, find the leaf {:.2}, locate {:.2}, \
-         room {:.2}, undo {:.2}, apply {:.2}, make room {:.2}, rest {:.2}",
+        "\n  {:<24} us/write: encode {:.2}, find the leaf {:.2}, locate {:.2} \
+         (room {:.2} of it), undo {:.2}, apply {:.2}, make room {:.2}, rest {:.2}",
         "",
         per(stages.encode),
         per(stages.find),

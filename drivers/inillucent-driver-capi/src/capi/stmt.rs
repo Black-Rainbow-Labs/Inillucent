@@ -291,6 +291,38 @@ pub unsafe extern "C" fn inillucent_stmt_execute(
         }
     })
 }
+/// Runs a statement with these values bound in place of what was bound, as
+/// `inillucent_bind_json` followed by `inillucent_stmt_execute` would.
+///
+/// The body of the Python binding's one call per execution (task-2197). The
+/// values replace the statement's bindings, as `inillucent_bind_json` replaces
+/// them, so a later `inillucent_stmt_execute` runs with what this one ran with.
+/// Answers `None` for a handle that is not live, which the caller reports as a
+/// misuse.
+///
+/// @param stmt - the statement
+/// @param values - the values of `?1`, `?2`, ...
+/// @param limit - how many rows to hand back
+///
+/// # Safety
+///
+/// `stmt` must be null or a pointer this library returned.
+pub(crate) unsafe fn run_with_values(
+    stmt: *mut inillucent_stmt,
+    values: Vec<Value>,
+    limit: u64,
+) -> Option<inillucent_driver::Result<inillucent_driver::Rows>> {
+    held(stmt as *const inillucent_stmt)?;
+    let statement = stmt.as_mut()?;
+    let database = database_in(&statement.connection)?;
+    if let Err(why) = within_declared(statement, values.len()) {
+        return Some(Err(why));
+    }
+    statement.params = values;
+    let connection = database.database.session_as(statement.connection.session);
+    Some(connection.query(&statement.sql, &statement.params, capped(limit)))
+}
+
 /// Reads the JSON text a caller passed, refusing a null pointer or bytes that
 /// are not UTF-8.
 ///

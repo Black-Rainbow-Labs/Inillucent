@@ -130,6 +130,9 @@ pub struct Database {
     /// line verb paid all of it inside the open and `refresh_catalog` ran three
     /// times. They wait here, and the open adds them with one refresh.
     modules_waiting: RefCell<Vec<std::sync::Arc<dyn inillucent_ext::vtab::Module>>>,
+    /// Whether the engine's commits wait for the fold, kept so a deferred open
+    /// applies it when it finishes; see [`Database::hold_commits_for_the_fold`].
+    commits_wait_for_fold: std::cell::Cell<bool>,
     /// The same writer the engine holds.
     ///
     /// **A second handle on one group, not a second group (task-1962, A1
@@ -459,6 +462,7 @@ impl Database {
                 changes: std::cell::Cell::new(0),
                 next_session: std::cell::Cell::new(1),
                 modules_waiting: RefCell::new(Vec::new()),
+                commits_wait_for_fold: std::cell::Cell::new(false),
             });
         }
         let keyed = key.is_some();
@@ -577,6 +581,7 @@ impl Database {
             changes: std::cell::Cell::new(0),
             next_session: std::cell::Cell::new(1),
             modules_waiting: RefCell::new(Vec::new()),
+            commits_wait_for_fold: std::cell::Cell::new(false),
         }
     }
 
@@ -604,6 +609,9 @@ impl Database {
                 *slot = match ImportedDatabase::finish_open(*pending, shared) {
                     Ok(mut engine) => {
                         engine.register_modules(waiting);
+                        if self.commits_wait_for_fold.get() {
+                            engine.hold_commits_for_the_fold();
+                        }
                         Slot::Ready(Box::new(engine))
                     }
                     Err(error) => Slot::Failed(error),
@@ -679,6 +687,7 @@ impl Database {
             changes: std::cell::Cell::new(0),
             next_session: std::cell::Cell::new(1),
             modules_waiting: RefCell::new(Vec::new()),
+            commits_wait_for_fold: std::cell::Cell::new(false),
         })
     }
 
@@ -837,6 +846,21 @@ impl Database {
             }
         }
         self.ready()?.register_module(module)
+    }
+
+    /// Makes every commit durable by the fold that follows its statement
+    /// instead of by a sync of the log, for a program that runs one statement
+    /// and exits.
+    ///
+    /// See `ImportedDatabase::hold_commits_for_the_fold`. Kept here when the
+    /// open is still deferred, so asking does not finish it.
+    pub fn hold_commits_for_the_fold(&self) -> DbResult<()> {
+        self.commits_wait_for_fold.set(true);
+        if self.pending() {
+            return Ok(());
+        }
+        self.ready()?.hold_commits_for_the_fold();
+        Ok(())
     }
 
     /// Returns how many compiled statements this database is holding.

@@ -10,10 +10,14 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
-**Faster than SQLite in 19 of 25 workloads called the way most programs call it.** Measured on 25
-workloads (one `inillucent` process per command, a SQL script piped into `inillucent-shell`, the
-Python driver and the npm package) against the same use of SQLite 3.53.4, the build after 2.1.5's
-changes was 51% slower and this one is 46% faster. `docs/performance.md` has every workload. The
+**64% faster than SQLite called the way most programs call it.** Measured on 25 workloads (one
+`inillucent` process per command, a SQL script piped into `inillucent-shell`, the Python driver and
+the npm package) against the same use of SQLite 3.53.4, the build after 2.1.5's changes was 51%
+slower and 2.2.0 is 46% faster. After the changes below the 25 together are 64% faster, where 2.2.0
+measured 50% faster in the same runs on 6 October 2026: the Python driver 136% faster, the npm
+package 207% faster, scripts piped into the shell 46% faster and the command line 3% faster. Six of
+the 25 are 200% faster or more. Four command line calls are within 1% of SQLite either way, because
+starting a program costs both engines the same. `docs/performance.md` has every workload. The
 changes:
 
 - The C library is a Node addon, and the npm package runs `query`, `exec` and `batch` in the Node
@@ -46,6 +50,44 @@ changes:
   only when the copy it read does not check out. The first statement takes the lock and checks the
   record as it did. On Windows the file's identity is read when something asks for it, not at every
   open. A Python open and close went from 40 us to 29 us.
+- Page and log checksums are computed with the processor's instructions where it has them:
+  carryless multiply on x86-64 and `CRC32X` on aarch64. They compute the same CRC-32 polynomial, so
+  no stored value changes. A 32 KiB page takes 0.64 us instead of 3.93 us.
+- `inillucent --db f exec` folds its change into the data file before it reports success, and its
+  commit no longer syncs the log on its own: a one row `exec` makes two syncs instead of three. Only
+  the command line's `exec` does this; the MCP server and the drivers are unchanged.
+- A Python execution is one foreign call: `inillucent_py_stmt_execute` and `inillucent_py_execute`
+  read the parameters out of their Python objects, run the statement with the interpreter lock let
+  go and return the result as Python objects, and `inillucent_py_init_threads` takes the two
+  CPython functions that let the lock go. Three new provisional C calls, ABI 1.4.0. A point query
+  from Python went from 17.25 us to 6.25 us a call.
+- A statement that only read keeps its shared lock for up to 1 ms with nothing running and 250 us
+  in all, so the statement after it takes no lock and reads no meta record. A thread lets an idle
+  lease go, and a connection in the same process that needs the file takes it away at once. A
+  point query from Python went to 3.3 us a call, against 18 to 22 us for Python's `sqlite3`.
+- `inillucent-shell` writes its output in 64 KiB blocks when standard output is not a terminal,
+  and writes what it holds before anything goes to standard error and before it waits for input.
+  60,000 point queries through the shell went from 340 ms to 170 ms.
+- An `ORDER BY` encodes its sort keys into one buffer, and an interior page guesses the child in 64
+  bits instead of with a 128 bit division.
+- `docs/performance.md` gives the current figures only: the engine against SQLite overall and by
+  family, and each way of calling it, in percent. Every earlier run, each hill climb and the
+  investigations behind them moved to `docs/performance-history.md`.
+- The meta record keeps the log segment's length when a fold leaves nothing after its checkpoint,
+  and a first statement that finds the segment that long by name reads no log and opens the segment
+  only when it writes. A command after another process wrote the file no longer waits for the virus
+  scanner on the segment.
+- The command line and the shell carve buffer pool frames and every other block from 4 KiB to
+  64 KiB out of page aligned chunks, and carve every smaller block from one shared chunk instead of
+  one chunk per size. A cold 100 row query takes about 140 fewer page faults.
+- The rollback journal writes its header and all its records in one call when it is sealed, instead
+  of two writes per page. A checkpoint writes the 128 byte meta record into each slot instead of the
+  slot's whole page.
+- Random numbers come from `ProcessPrng` instead of `BCryptGenRandom`, so a write no longer loads
+  `bcrypt.dll`. That load was about 0.7 ms of every command line `exec`.
+- A transaction's inserts share one `InsertRows` log record, one entry per row, instead of one
+  record per row and per index entry. A build older than 2.3.0 cannot replay a log holding one,
+  which it meets only after a newer build crashed without closing.
 
 **A third performance hill climb through the `Connection`.** Of the workloads the hillclimb and
 contract plans run, 12 are still slower than SQLite 3.53.4, where 16 were on 2.1.3. Against 2.1.3,

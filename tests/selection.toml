@@ -2295,6 +2295,13 @@ covers = ["inillucent-pool"]
 [[target]]
 package = "inillucent-pool"
 kind = "test"
+name = "lease"
+tier = "engine"
+covers = ["inillucent-pool"]
+
+[[target]]
+package = "inillucent-pool"
+kind = "test"
 name = "fault_campaign"
 tier = "durability"
 covers = ["inillucent-pool", "inillucent-sim"]
@@ -3098,6 +3105,16 @@ name = "e2e"
 module = "setup_embeddings"
 tier = "e2e"
 # It runs `inillucent setup-embeddings` as a child process.
+covers = ["inillucent-cli"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "e2e"
+module = "shell_output"
+tier = "e2e"
+# The shell writes its output in blocks when it is not a terminal (task-2197):
+# order on one pipe, a program waiting for each answer, and a long output.
 covers = ["inillucent-cli"]
 
 # `--root` against the file system rather than against path text.

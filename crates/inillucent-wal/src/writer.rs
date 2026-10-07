@@ -195,10 +195,17 @@ pub struct WalStats {
 
 /// The open segment.
 struct OpenSegment {
-    file: Box<dyn VfsFile>,
+    /// The handle, or `None` until the first write or the second check of the
+    /// log's tail needs it; see [`Wal::open_deferred`].
+    file: Option<Box<dyn VfsFile>>,
     path: DbPath,
     sequence: u64,
     first_lsn: u64,
+    /// Where the log resumes in this segment, which opening it checks the
+    /// header against.
+    resume: u64,
+    /// How many times the tail was asked while the handle was not open.
+    tails_by_name: u32,
 }
 
 /// The log's mutable bookkeeping.
@@ -225,11 +232,35 @@ struct Inner {
     folded_at: u64,
     /// True while one thread is doing the write and the sync for everybody.
     draining: bool,
+    /// The `InsertRows` record being built at the end of `buffer`, if any; see
+    /// [`Wal::append_insert_row`].
+    batch: Option<OpenBatch>,
     /// The first failure, which every later call repeats.
     poisoned: Option<DbError>,
     /// Stats.
     stats: WalStats,
 }
+
+/// An `InsertRows` record still taking entries.
+#[derive(Clone, Copy)]
+struct OpenBatch {
+    /// Where the record starts in the buffer.
+    start: usize,
+    /// Its position in the log, which every page an entry touches is stamped with.
+    lsn: u64,
+    /// The transaction whose inserts it holds.
+    txn: u64,
+    /// How many entries it holds.
+    count: u32,
+}
+
+/// The most an `InsertRows` record holds before it is closed and another
+/// begins.
+///
+/// Small enough that a record stays far below the log's spill size and
+/// `MAX_RECORD_BYTES`, and large enough that 10,000 inserts of a short row
+/// make tens of records rather than tens of thousands.
+const BATCH_BYTES: usize = 64 << 10;
 
 /// Everything a handle shares with the other handles on the same log.
 struct Shared {
@@ -255,6 +286,9 @@ struct Shared {
     /// The policy, atomic so a pragma can change it without taking the lock a
     /// commit is waiting on.
     synchronous: AtomicU64,
+    /// Whether a commit leaves its sync to the fold that follows it; see
+    /// [`Wal::defer_commit_syncs`].
+    commit_sync_deferred: std::sync::atomic::AtomicBool,
     /// The lowest sequence number [`Wal::retire_segments_below`] still has to
     /// look at.
     ///
@@ -364,6 +398,71 @@ impl Wal {
             first_lsn,
             reused,
         )?;
+        Ok(Wal::over(
+            vfs, name, directory, uuid, first_lsn, options, segment,
+        ))
+    }
+
+    /// A log resuming at `next_lsn` in segment `sequence`, whose file is not
+    /// opened until a record is written to it or its tail is asked twice.
+    ///
+    /// **For an open that learned by name that the log holds nothing past the
+    /// checkpoint** (task-2191, decision D3). Opening the segment for writing
+    /// at the first statement made a command that only reads open it, and on
+    /// Windows the first open of a file another process wrote waits for the
+    /// virus scanner, about 3 ms. The first check of the tail asks its length
+    /// by name; a second opens the handle, so a long session asks a handle
+    /// once a statement as before. The first write opens it too, under the
+    /// writer's lock.
+    ///
+    /// @param vfs - the file system
+    /// @param base - the database file's path
+    /// @param uuid - the database's identity
+    /// @param next_lsn - where the next record goes
+    /// @param sequence - the segment to append to
+    /// @param segment_first - the segment's own first LSN, which its length
+    ///   by name and `next_lsn` give
+    /// @param options - the log's settings
+    pub fn open_deferred(
+        vfs: Arc<dyn Vfs>,
+        base: &DbPath,
+        uuid: u128,
+        next_lsn: u64,
+        sequence: u64,
+        segment_first: u64,
+        options: WalOptions,
+    ) -> Wal {
+        let name = base.as_path().to_string_lossy().to_string();
+        let directory = base.as_path().parent().map(std::path::Path::to_path_buf);
+        let segment = OpenSegment {
+            file: None,
+            path: segment_path(&name, directory.as_deref(), sequence),
+            sequence,
+            first_lsn: segment_first,
+            resume: next_lsn,
+            tails_by_name: 0,
+        };
+        Wal::over(vfs, name, directory, uuid, next_lsn, options, segment)
+    }
+
+    /// Builds the log around its segment, opened or not.
+    ///
+    /// @param vfs - the file system
+    /// @param name - the database file's path as a string
+    /// @param directory - the directory it is in
+    /// @param uuid - the database's identity
+    /// @param first_lsn - where the next record goes
+    /// @param options - the log's settings
+    /// @param segment - the segment to append to
+    fn over(
+        vfs: Arc<dyn Vfs>,
+        name: String,
+        directory: Option<std::path::PathBuf>,
+        uuid: u128,
+        first_lsn: u64,
+        options: WalOptions,
+        segment: OpenSegment,
+    ) -> Wal {
         let shared = Shared {
             inner: Mutex::new(Inner {
                 buffer: Vec::with_capacity(64 << 10),
@@ -375,6 +474,7 @@ impl Wal {
                 since_checkpoint: 0,
                 folded_at: 0,
                 draining: false,
+                batch: None,
                 poisoned: None,
                 stats: WalStats {
                     segments: 1,
@@ -390,6 +490,7 @@ impl Wal {
             uuid,
             segment_bytes: options.segment_bytes.max(segment::HEADER_BYTES as u64 * 2),
             synchronous: AtomicU64::new(policy_code(options.synchronous)),
+            commit_sync_deferred: std::sync::atomic::AtomicBool::new(false),
             // A new handle knows nothing about which of the segments below it
             // are still on disk, so it starts at the bottom and learns.
             retired_below: AtomicU64::new(1),
@@ -405,10 +506,9 @@ impl Wal {
         // log, which cost every fresh database a wasted sector and broke
         // `inillucent-wal/tests/log.rs`'s own exact-LSN assertions for no
         // durability this crate does not already have.
-        let wal = Wal {
+        Wal {
             shared: Arc::new(shared),
-        };
-        Ok(wal)
+        }
     }
 
     /// Returns a second handle on the same log, for another thread.
@@ -430,6 +530,29 @@ impl Wal {
         self.shared
             .synchronous
             .store(policy_code(policy), Ordering::Relaxed);
+    }
+
+    /// Makes a commit append its records and leave the sync to the caller.
+    ///
+    /// **For a caller that folds straight after the commit, holding the lock
+    /// across** (task-2191). The command line's `exec` runs one statement and
+    /// folds it into the data file before it reports success; the fold seals a
+    /// rollback journal before it writes a page, so the commit's own log sync
+    /// bought nothing a crash could use. With it deferred, a one row `exec`
+    /// makes two syncs, the journal and the data file, where it made three.
+    /// See `ImportedDatabase::hold_commits_for_the_fold` for the whole
+    /// argument and `durability.rs`'s campaign for the proof.
+    ///
+    /// @param deferred - whether commits leave their sync to the caller
+    pub fn defer_commit_syncs(&self, deferred: bool) {
+        self.shared
+            .commit_sync_deferred
+            .store(deferred, Ordering::Relaxed);
+    }
+
+    /// Returns whether commits leave their sync to the caller.
+    pub fn commit_syncs_deferred(&self) -> bool {
+        self.shared.commit_sync_deferred.load(Ordering::Relaxed)
     }
 
     /// Returns the position past the last durable byte of the log.
@@ -609,6 +732,9 @@ impl Wal {
     /// @param body - what happened
     pub fn append(&self, txn: u64, body: Body<'_>) -> DbResult<u64> {
         let mut inner = self.lock()?;
+        // Any other record closes the open batch first, so the batch's
+        // entries are all below it in the log; see `append_insert_row`.
+        Wal::close_batch(&mut inner)?;
         // The full segment check under the lock this append takes anyway; see
         // `Shared::segment_first`. A roll lets the lock go, because rolling
         // drives the buffer out under it. The decision is made on the position
@@ -650,6 +776,108 @@ impl Wal {
             self.flush()?;
         }
         Ok(lsn)
+    }
+
+    /// Appends one inserted row to the open `InsertRows` record, or starts one,
+    /// and returns the record's LSN for the caller to stamp the page with.
+    ///
+    /// **One record for a run of a transaction's inserts** (task-2191, decision
+    /// D1); see `Body::InsertRows`. The record stays open at the end of the
+    /// buffer while the same transaction keeps inserting and it holds less than
+    /// [`BATCH_BYTES`]. It is closed by any other record (`append` closes it
+    /// first), by a different transaction's insert, and before the buffer is
+    /// written to the file (`drive`), so a page stamped with its LSN can never
+    /// reach the data file ahead of the whole record: the write ahead gate
+    /// waits for the log to pass the stamp, and the log cannot pass it without
+    /// closing the record.
+    ///
+    /// @param txn - the inserting transaction
+    /// @param tree - the tree the leaf belongs to
+    /// @param page - the leaf's page number
+    /// @param row - the row, in the leaf's tagged encoding
+    pub fn append_insert_row(&self, txn: u64, tree: u64, page: u64, row: &[u8]) -> DbResult<u64> {
+        let mut inner = self.lock()?;
+        let first = self.shared.segment_first.load(Ordering::Acquire);
+        if inner.next_lsn.saturating_sub(first) >= self.shared.segment_bytes {
+            Wal::close_batch(&mut inner)?;
+            let next = inner.next_lsn;
+            drop(inner);
+            self.roll_now(next)?;
+            inner = self.lock()?;
+        }
+        Wal::check_poison(&inner)?;
+        let entry = crate::record::insert_row_entry_bytes(row);
+        let joins = inner.batch.filter(|batch| {
+            batch.txn == txn
+                && inner
+                    .buffer
+                    .len()
+                    .saturating_sub(batch.start)
+                    .saturating_add(entry)
+                    <= BATCH_BYTES
+        });
+        let lsn = match joins {
+            Some(batch) => {
+                crate::record::put_insert_row_entry(&mut inner.buffer, tree, page, row);
+                inner.batch = Some(OpenBatch {
+                    count: batch.count.saturating_add(1),
+                    ..batch
+                });
+                inner.next_lsn = inner.next_lsn.saturating_add(entry as u64);
+                batch.lsn
+            }
+            None => {
+                Wal::close_batch(&mut inner)?;
+                let lsn = inner.next_lsn;
+                let start = crate::record::begin_insert_rows(&mut inner.buffer);
+                crate::record::put_insert_row_entry(&mut inner.buffer, tree, page, row);
+                let opened = inner.buffer.len().saturating_sub(start) as u64;
+                inner.batch = Some(OpenBatch {
+                    start,
+                    lsn,
+                    txn,
+                    count: 1,
+                });
+                inner.next_lsn = lsn.saturating_add(opened);
+                inner.stats.records = inner.stats.records.saturating_add(1);
+                lsn
+            }
+        };
+        let added = match joins {
+            Some(_) => entry as u64,
+            None => (crate::record::HEADER_BYTES + 4 + entry) as u64,
+        };
+        inner.stats.bytes = inner.stats.bytes.saturating_add(added);
+        inner.since_checkpoint = inner.since_checkpoint.saturating_add(added);
+        let over = inner.buffer.len() >= SPILL_BYTES;
+        drop(inner);
+        if over {
+            self.flush()?;
+        }
+        Ok(lsn)
+    }
+
+    /// Completes the open `InsertRows` record, if there is one, so that the
+    /// buffer ends on a whole record.
+    ///
+    /// @param inner - the locked bookkeeping
+    fn close_batch(inner: &mut Inner) -> DbResult<()> {
+        let Some(batch) = inner.batch.take() else {
+            return Ok(());
+        };
+        let built = inner.buffer.len().saturating_sub(batch.start);
+        let length = crate::record::finish_insert_rows(
+            &mut inner.buffer,
+            batch.start,
+            batch.lsn,
+            batch.txn,
+            batch.count,
+        )?;
+        let padding = length.saturating_sub(built) as u64;
+        inner.next_lsn = inner.next_lsn.saturating_add(padding);
+        inner.stats.bytes = inner.stats.bytes.saturating_add(padding);
+        inner.since_checkpoint = inner.since_checkpoint.saturating_add(padding);
+        Ok(())
     }
 
     /// Appends a `Commit` record and makes it durable under the policy.
@@ -723,6 +951,9 @@ impl Wal {
     ///
     /// @param end - the stream position the caller needs to reach
     pub fn await_commit(&self, end: u64) -> DbResult<()> {
+        if self.commit_syncs_deferred() {
+            return self.drive(end, false);
+        }
         match self.synchronous() {
             Synchronous::Full => self.drive(end, true),
             Synchronous::Normal => {
@@ -1010,17 +1241,65 @@ impl Wal {
     /// file lock. A caller therefore sees the generation move first, and
     /// `ImportedDatabase::the_meta_moved` is asked before this is.
     pub fn tail_of_open_segment(&self) -> DbResult<LogTail> {
-        let segment = self.io_lock()?;
-        let size = segment
-            .file
-            .file_size()
-            .map_err(inillucent_vfs::VfsError::into_db_error)?;
+        let mut segment = self.io_lock()?;
+        let size = match (&segment.file, segment.tails_by_name) {
+            (None, 0) => {
+                segment.tails_by_name = 1;
+                let path = segment.path.clone();
+                match self
+                    .shared
+                    .vfs
+                    .size_by_name(&path)
+                    .map_err(inillucent_vfs::VfsError::into_db_error)?
+                {
+                    Some(size) => size,
+                    // Gone since the open measured it: report a tail that is
+                    // not this handle's, so the caller resynchronises.
+                    None => {
+                        return Ok(LogTail {
+                            sequence: segment.sequence,
+                            next_lsn: u64::MAX,
+                        })
+                    }
+                }
+            }
+            _ => self
+                .segment_file(&mut segment)?
+                .file_size()
+                .map_err(inillucent_vfs::VfsError::into_db_error)?,
+        };
         Ok(LogTail {
             sequence: segment.sequence,
             next_lsn: segment
                 .first_lsn
                 .saturating_add(size.saturating_sub(segment::HEADER_BYTES as u64)),
         })
+    }
+
+    /// Returns the open segment's length when the file ends exactly at `lsn`,
+    /// or `None` when it does not or the segment is not open.
+    ///
+    /// **What a checkpoint that left nothing after itself writes into the meta
+    /// record** (task-2191, decision D3), so a later first statement can tell
+    /// by asking the length by name that nothing was appended since. Measured
+    /// off the file rather than computed from this handle's counters, because
+    /// a file with bytes past this handle's end would make the length a later
+    /// open compares with describe something else.
+    ///
+    /// @param lsn - the position the checkpoint recorded as its end
+    pub fn length_if_it_ends_at(&self, lsn: u64) -> DbResult<Option<u64>> {
+        let segment = self.io_lock()?;
+        let Some(file) = segment.file.as_ref() else {
+            return Ok(None);
+        };
+        let size = file
+            .file_size()
+            .map_err(inillucent_vfs::VfsError::into_db_error)?;
+        let Some(body) = lsn.checked_sub(segment.first_lsn) else {
+            return Ok(None);
+        };
+        let expected = (segment::HEADER_BYTES as u64).saturating_add(body);
+        Ok((size == expected).then_some(size))
     }
 
     /// Returns the open segment's first LSN.
@@ -1061,6 +1340,8 @@ impl Wal {
                 drop(guard);
                 continue;
             }
+            // The buffer goes out on a whole record; see `append_insert_row`.
+            Wal::close_batch(&mut inner)?;
             inner.draining = true;
             let payload = std::mem::take(&mut inner.buffer);
             let start = inner.buffer_start;
@@ -1130,28 +1411,59 @@ impl Wal {
     /// @param payload - the bytes to write
     /// @param sync - whether to sync afterwards
     fn write_and_sync(&self, start: u64, payload: &[u8], sync: bool) -> DbResult<(u64, u64)> {
-        let segment = self.io_lock()?;
+        let mut segment = self.io_lock()?;
+        if payload.is_empty() && !sync {
+            return Ok((0, 0));
+        }
+        self.segment_file(&mut segment)?;
         let mut writes = 0u64;
         if !payload.is_empty() {
             let offset = segment::HEADER_BYTES as u64
                 + start
                     .checked_sub(segment.first_lsn)
                     .ok_or_else(|| misuse("a log drain would write before the segment it is in"))?;
-            segment
-                .file
+            self.segment_file(&mut segment)?
                 .write_all_at(offset, payload)
                 .map_err(inillucent_vfs::VfsError::into_db_error)?;
             writes = 1;
         }
         let mut syncs = 0u64;
         if sync {
-            segment
-                .file
+            self.segment_file(&mut segment)?
                 .sync(SyncMode::Normal)
                 .map_err(inillucent_vfs::VfsError::into_db_error)?;
             syncs = 1;
         }
         Ok((writes, syncs))
+    }
+
+    /// Returns the open segment's handle, opening it if it was deferred.
+    ///
+    /// Opening checks the header as [`Wal::open`] does, and the segment's
+    /// first LSN is taken from it, so a deferred segment whose length by name
+    /// implied another first LSN is written where its own header says.
+    ///
+    /// @param segment - the locked segment
+    fn segment_file<'a>(&self, segment: &'a mut OpenSegment) -> DbResult<&'a dyn VfsFile> {
+        if segment.file.is_none() {
+            let opened = open_segment(
+                self.shared.vfs.as_ref(),
+                &self.shared.base,
+                self.shared.directory.as_deref(),
+                self.shared.uuid,
+                segment.sequence,
+                segment.resume,
+                None,
+            )?;
+            self.shared
+                .segment_first
+                .store(opened.first_lsn, Ordering::Release);
+            *segment = opened;
+        }
+        segment
+            .file
+            .as_deref()
+            .ok_or_else(|| misuse("a log segment that was just opened is not open"))
     }
 
     /// Locks the bookkeeping.
@@ -1392,7 +1704,7 @@ fn open_segment(
                 if let Ok(held) = SegmentHeader::decode(&head) {
                     if held.belongs_to(uuid, sequence).is_ok() && held.first_lsn <= first_lsn {
                         return Ok(OpenSegment {
-                            file,
+                            file: Some(file),
                             path,
                             sequence,
                             // The segment's *own* first LSN, which is what every
@@ -1400,6 +1712,8 @@ fn open_segment(
                             // position here would put the next record at the wrong
                             // place in a segment that already holds records.
                             first_lsn: held.first_lsn,
+                            resume: first_lsn,
+                            tails_by_name: 0,
                         });
                     }
                 }
@@ -1432,10 +1746,12 @@ fn open_segment(
     file.write_all_at(0, &image)
         .map_err(inillucent_vfs::VfsError::into_db_error)?;
     Ok(OpenSegment {
-        file,
+        file: Some(file),
         path,
         sequence,
         first_lsn,
+        resume: first_lsn,
+        tails_by_name: 0,
     })
 }
 

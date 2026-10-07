@@ -1129,6 +1129,12 @@ These numbers are from the graded run of 26 September 2026 on `main` at `bc46bc9
 and the same 128 MiB memory budget. Each figure is the median of the two middle runs of four. [Performance](performance.md) has every
 workload, the method and the later runs.
 
+A newer run on 7 October 2026, with the build released as 2.3.0, measured 484% faster, 79% less
+processor time and 14% more peak memory, with every family faster than SQLite. It was not graded:
+SQLite ran 7% slower than its idle reference on that machine, which makes inillucent's figure read
+high. Called the way programs call it, from the command line, the shell, Python and Node, 2.3.0 is
+64% faster than the same use of SQLite.
+
 | | SQLite 3.53.4 | inillucent | Result |
 |---|---|---|---|
 | elapsed time, weighted over ten workload families | the reference | 5.19x | **419% faster** |
@@ -1158,9 +1164,9 @@ the page cache and one `CREATE INDEX`. [Performance](performance.md#memory) brea
 
 | Gap | Where it stands |
 |---|---|
-| Memory is 11.5% more than SQLite's | open. See [Performance](performance.md#memory) |
+| Memory is more than SQLite's: 11.5% in the graded run, 14% in the newest | open. See [Performance](performance.md#memory) |
 | `open.prepare` and `schema` miss their speed bars | open. Both are faster than SQLite |
-| A correlated `IN` subquery over many outer rows is slower than SQLite | open. 807% slower over 400 outer rows. Write it as a join. See [Performance](performance.md#the-workloads-that-are-slower) |
+| A correlated `IN` subquery over many outer rows was slower than SQLite | 807% slower over 400 outer rows in the graded run; 30% faster in the newest run, which was not graded. See [Performance](performance.md#the-workloads-that-are-slower) |
 | The C API has 54 functions where SQLite has about 290 | open. The list of what is missing is in [Architecture and operations](#architecture-and-operations) |
 | One thread per database | open |
 | A SQLite file cannot be opened directly | by design. `inillucent migrate` copies it |

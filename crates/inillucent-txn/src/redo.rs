@@ -1036,6 +1036,37 @@ impl<R: RowRedo> Redo for Applier<'_, R> {
     }
 
     fn redo(&mut self, record: &Record<'_>, wanted: &[bool]) -> DbResult<()> {
+        self.redo_record(record, wanted)
+    }
+}
+
+impl<R: RowRedo> Applier<'_, R> {
+    /// Applies an `InsertRows` record's entries: each an `InsertRow` of its
+    /// own, applied when recovery decided its page wants it (see
+    /// `entries_to_apply` in `inillucent-wal`'s recovery).
+    ///
+    /// @param entries - the record's entries
+    /// @param wanted - one answer per entry, in order
+    /// @param lsn - the record's LSN, which each applied row stamps its page with
+    fn redo_insert_rows(&mut self, entries: &[u8], wanted: &[bool], lsn: u64) -> DbResult<()> {
+        let listed = inillucent_wal::record::insert_row_entries(entries)?;
+        for ((tree, page, row), take) in listed.into_iter().zip(wanted) {
+            if *take {
+                self.rows
+                    .insert_row(self.database, tree, PageId(page), row, lsn)?;
+                self.stats.rows = self.stats.rows.saturating_add(1);
+            } else {
+                self.stats.skipped = self.stats.skipped.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// The body of [`Redo::redo`] for this applier.
+    ///
+    /// @param record - the record
+    /// @param wanted - which of its pages want it
+    fn redo_record(&mut self, record: &Record<'_>, wanted: &[bool]) -> DbResult<()> {
         let lsn = record.lsn;
         if self.images_only {
             return self.redo_image(record, wanted, lsn);
@@ -1129,6 +1160,7 @@ impl<R: RowRedo> Redo for Applier<'_, R> {
                     .delete_rows(self.database, tree, PageId(page), keys, lsn)?;
                 self.stats.rows = self.stats.rows.saturating_add(1);
             }
+            Body::InsertRows { entries, .. } => self.redo_insert_rows(entries, wanted, lsn)?,
             Body::UpdateInPlace {
                 tree,
                 page,

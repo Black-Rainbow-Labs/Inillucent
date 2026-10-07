@@ -181,9 +181,30 @@ mod at {
     /// Zero means none, which is what a file written before this field existed
     /// says, and is the mode such a file was made with.
     ///
-    /// The last field named here; the region continues at 120 for whatever
-    /// comes next.
     pub const AUTO_VACUUM: usize = 116;
+    /// The open log segment's length in bytes when the checkpoint left nothing
+    /// after it to replay, 8 bytes.
+    ///
+    /// **So a first statement can tell there is nothing to replay without
+    /// opening the log** (task-2191, decision D3). Opening the segment was the
+    /// only way to learn where the log ends, and on Windows the first open of a
+    /// file after another process wrote it waits for the virus scanner, about
+    /// 3 ms, once for the data file and once for the segment, where SQLite has
+    /// one file to pay for. A first statement that finds the segment the meta
+    /// record names at exactly this length, asked by name, and no segment after
+    /// it, has nothing to replay. Asking by name was tested against a process
+    /// appending to the segment without closing or syncing it: no query that
+    /// began after a write returned a smaller size, in about 650,000 queries.
+    ///
+    /// Zero means unknown, which is what a file written before this field
+    /// existed says and what any checkpoint that left records after itself
+    /// writes; the open then reads the log as it always did. Every change to
+    /// the log position resets it (`Database::set_log_position`), so it never
+    /// describes a segment the meta record no longer names.
+    ///
+    /// The last field named here; the region continues at 128 for whatever
+    /// comes next.
+    pub const LOG_END_AT_CHECKPOINT: usize = 120;
 }
 
 /// The smallest a meta page can be and still hold every field.
@@ -204,7 +225,7 @@ pub const META_BYTES: usize = at::RESERVED;
 /// `every_field_lives_below_the_record_length` fails when one is added past
 /// it, because a check that read 120 bytes of a record 128 bytes long would
 /// answer "unchanged" about a change it could not see.
-pub const META_RECORD_BYTES: usize = at::AUTO_VACUUM + 4;
+pub const META_RECORD_BYTES: usize = at::LOG_END_AT_CHECKPOINT + 8;
 
 /// What the meta page says about the database.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -251,6 +272,9 @@ pub struct Meta {
     pub high_water_lsn: u64,
     /// What `PRAGMA auto_vacuum` reads back - see `at::AUTO_VACUUM`.
     pub auto_vacuum: u8,
+    /// The segment's length when the checkpoint left nothing to replay, or
+    /// zero - see `at::LOG_END_AT_CHECKPOINT`.
+    pub log_end_at_checkpoint: u64,
 }
 
 impl Meta {
@@ -275,6 +299,7 @@ impl Meta {
             wal: false,
             high_water_lsn: 0,
             auto_vacuum: 0,
+            log_end_at_checkpoint: 0,
         }
     }
 
@@ -318,6 +343,13 @@ impl Meta {
                 page,
                 at::AUTO_VACUUM,
                 &u32::from(self.auto_vacuum).to_le_bytes(),
+            )?;
+        }
+        if page.len() >= at::LOG_END_AT_CHECKPOINT.saturating_add(8) {
+            put(
+                page,
+                at::LOG_END_AT_CHECKPOINT,
+                &self.log_end_at_checkpoint.to_le_bytes(),
             )?;
         }
         let sum = checksum(page)?;
@@ -365,6 +397,7 @@ impl Meta {
             wal: i32v(page, at::WAL) != 0,
             high_water_lsn: u64_or_zero(page, at::HIGH_WATER_LSN),
             auto_vacuum: u8::try_from(i32v(page, at::AUTO_VACUUM)).unwrap_or(0),
+            log_end_at_checkpoint: u64_or_zero(page, at::LOG_END_AT_CHECKPOINT),
         })
     }
 
@@ -532,6 +565,7 @@ mod tests {
             high_water_lsn: 900_000,
             // And the vacuum mode, which a reopen reads back.
             auto_vacuum: 2,
+            log_end_at_checkpoint: 0,
         };
         let mut page = vec![0u8; 32_768];
         meta.encode(&mut page).unwrap();
@@ -565,6 +599,7 @@ mod tests {
             wal: true,
             high_water_lsn: 900_000,
             auto_vacuum: 2,
+            log_end_at_checkpoint: 0,
         };
         let moved: [(&str, Meta); 15] = [
             (
@@ -657,6 +692,7 @@ mod tests {
                 "auto_vacuum",
                 Meta {
                     auto_vacuum: 1,
+                    log_end_at_checkpoint: 0,
                     ..base
                 },
             ),

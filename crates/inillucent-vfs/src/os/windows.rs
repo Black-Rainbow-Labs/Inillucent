@@ -18,9 +18,6 @@ use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Security::Cryptography::{
-    BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-};
 use windows_sys::Win32::Storage::FileSystem::{
     GetFileInformationByHandle, GetFileSizeEx, LockFileEx, ReadFile, UnlockFileEx,
     BY_HANDLE_FILE_INFORMATION, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
@@ -169,6 +166,7 @@ pub fn path_state(path: &std::path::Path) -> io::Result<Option<crate::os::PathSt
             return Ok(Some(crate::os::PathState {
                 read_only: stat.file_attributes & FILE_ATTRIBUTE_READONLY != 0,
                 file: stat.file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0,
+                len: u64::try_from(stat.end_of_file).ok(),
             }));
         }
         // **"Not found" is an answer, and asking again is a second system call
@@ -190,6 +188,7 @@ pub fn path_state(path: &std::path::Path) -> io::Result<Option<crate::os::PathSt
         return Ok(Some(crate::os::PathState {
             read_only: attributes & FILE_ATTRIBUTE_READONLY != 0,
             file: attributes & FILE_ATTRIBUTE_DIRECTORY == 0,
+            len: None,
         }));
     }
     // SAFETY: reads the calling thread's last error, which the call above set.
@@ -410,29 +409,34 @@ pub fn full_sync(file: &File) -> std::io::Result<()> {
     file.sync_all()
 }
 
-/// Fills `output` with randomness from the system preferred generator.
+// `ProcessPrng` is the system generator's user mode entry point, the one the
+// standard library itself calls for its hash seeds. It has no import library
+// in the SDK, so it is linked the way the standard library links it.
+#[link(name = "bcryptprimitives", kind = "raw-dylib")]
+extern "system" {
+    fn ProcessPrng(pbdata: *mut u8, cbdata: usize) -> i32;
+}
+
+/// Fills `output` with randomness from the system generator.
+///
+/// **`ProcessPrng`, not `BCryptGenRandom` (task-2191).** Both read the same
+/// generator. `BCryptGenRandom` lives in `bcrypt.dll`, which a one row `exec`
+/// loaded for nothing but the rollback journal's nonce: 23 more pages of a
+/// library mapped into a process that runs one statement. `bcryptprimitives.dll`,
+/// which holds `ProcessPrng`, is already loaded, because the standard library
+/// seeds its hash maps from it. Windows documents that `ProcessPrng` always
+/// returns TRUE, and the check below is kept for the day it does not.
+///
+/// @param output - where the bytes go
 pub fn system_randomness(output: &mut [u8]) -> VfsResult<()> {
     if output.is_empty() {
         return Ok(());
     }
-    let length = u32::try_from(output.len())
-        .map_err(|_| error::misuse("randomness request is larger than a single call allows"))?;
-    // SAFETY: the buffer is valid for `length` bytes for the duration of the
-    // call, and passing a null algorithm handle with
-    // BCRYPT_USE_SYSTEM_PREFERRED_RNG is the documented way to ask for the
-    // system generator without opening one.
-    let status = unsafe {
-        BCryptGenRandom(
-            std::ptr::null_mut(),
-            output.as_mut_ptr(),
-            length,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    };
-    if status != 0 {
-        return Err(error::misuse(format!(
-            "BCryptGenRandom failed with 0x{status:08x}"
-        )));
+    // SAFETY: the buffer is valid for `output.len()` bytes for the duration of
+    // the call, and `ProcessPrng` writes at most that many and keeps nothing.
+    let ok = unsafe { ProcessPrng(output.as_mut_ptr(), output.len()) };
+    if ok == 0 {
+        return Err(error::misuse("ProcessPrng reported a failure"));
     }
     Ok(())
 }
@@ -847,5 +851,32 @@ fn guard<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(inner) => inner,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[cfg(test)]
+mod randomness_tests {
+    use super::system_randomness;
+
+    /// The generator fills the whole buffer, and two calls do not agree.
+    ///
+    /// A binding that wrote nothing would leave zeros, and one that wrote the
+    /// same bytes every time would give every journal the same nonce, which is
+    /// the one thing the nonce exists to prevent.
+    #[test]
+    fn system_randomness_fills_the_buffer_and_differs_between_calls() {
+        let mut first = [0u8; 64];
+        let mut second = [0u8; 64];
+        system_randomness(&mut first).unwrap();
+        system_randomness(&mut second).unwrap();
+        assert!(
+            first.iter().any(|byte| *byte != 0),
+            "the buffer is all zeros"
+        );
+        assert!(
+            first[32..].iter().any(|byte| *byte != 0),
+            "the second half was not written"
+        );
+        assert_ne!(first, second, "two calls returned the same bytes");
     }
 }

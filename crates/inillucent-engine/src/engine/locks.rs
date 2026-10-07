@@ -625,10 +625,14 @@ impl ImportedDatabase {
         // resynchronised read back 2. The pragma is set once and expected to
         // hold for the connection, so it is carried across.
         let synchronous = self.storage.wal.synchronous();
+        // And so is whether its commits wait for the fold; see
+        // `hold_commits_for_the_fold`.
+        let deferred = self.storage.wal.commit_syncs_deferred();
         let (wal, highest_txn) =
             crate::recovery::resync_file(&mut self.storage.database, &vfs, &db_path, &doubtful)?;
         self.storage.wal = wal;
         self.storage.wal.set_synchronous(synchronous);
+        self.storage.wal.defer_commit_syncs(deferred);
         // Past every number the shared log holds - see `resync_file`.
         self.writing.raise_transactions_past(highest_txn);
         self.renumber_an_untouched_transaction();
@@ -737,15 +741,14 @@ impl ImportedDatabase {
         // asking `main` alone answered "nothing was written" and released every
         // file with the attachment's pages still dirty - which lost 116 of 599
         // acknowledged inserts through `ATTACH` under load.
-        let wrote = self.storage.database.lock_level() > inillucent_vfs::FileLock::Shared
-            || self.storage.database.pool().dirty_pages() > 0
-            || self.storage.database.pool().journal_is_hot()
-            || self.session_state.attached.iter().any(|held| {
-                held.path.is_some()
-                    && (held.database.lock_level() > inillucent_vfs::FileLock::Shared
-                        || held.database.pool().dirty_pages() > 0
-                        || held.database.pool().journal_is_hot())
-            });
+        let wrote = self.wrote_anything();
+        if wrote
+            && self.storage.database.pool().lock_level() != inillucent_vfs::FileLock::None
+            && self.storage.wal.commit_syncs_deferred()
+            && self.fold_holding_the_commit()?
+        {
+            return self.storage.database.end_access();
+        }
         if wrote && self.storage.database.pool().lock_level() != inillucent_vfs::FileLock::None {
             // **The log, once.** `Wal::commit` already syncs under `synchronous =
             // FULL`, so for an autocommit statement this returns without doing
@@ -811,6 +814,9 @@ impl ImportedDatabase {
                 self.checkpoint_of(false)?;
             }
         }
+        if !wrote && self.may_lease() {
+            return self.storage.database.end_access_leased();
+        }
         // Every attached file is let go on the same terms `main` is: the
         // checkpoint above wrote all of them - `checkpoint_attached` is part of
         // it - so each one's file is current before its lock is released.
@@ -820,6 +826,132 @@ impl ImportedDatabase {
             }
         }
         self.storage.database.end_access()
+    }
+
+    /// Reports whether the statement now ending wrote anything to any file this
+    /// connection holds: a lock above SHARED, a dirty page or a hot journal, on
+    /// `main` or on an attached file. See `release_if_idle` for why every file
+    /// is asked and not only `main`.
+    fn wrote_anything(&self) -> bool {
+        self.storage.database.lock_level() > inillucent_vfs::FileLock::Shared
+            || self.storage.database.pool().dirty_pages() > 0
+            || self.storage.database.pool().journal_is_hot()
+            || self.session_state.attached.iter().any(|held| {
+                held.path.is_some()
+                    && (held.database.lock_level() > inillucent_vfs::FileLock::Shared
+                        || held.database.pool().dirty_pages() > 0
+                        || held.database.pool().journal_is_hot())
+            })
+    }
+
+    /// Reports whether a statement that only read may keep SHARED for the next
+    /// one rather than let it go.
+    ///
+    /// **Why it keeps it** (task-2197). Taking SHARED again for the next
+    /// statement, and reading the meta record to learn that nothing folded, was
+    /// four kernel calls around a point query whose own work is a microsecond.
+    /// While SHARED is held nothing can fold, so the next statement asks only
+    /// the log's length; see `inillucent_pool::lease` for how long the lock is
+    /// kept and what lets it go. Only `main`, with a file and nothing attached:
+    /// an attachment is let go on the terms `release_if_idle` gives.
+    fn may_lease(&self) -> bool {
+        !self.storage.path.as_os_str().is_empty()
+            && !self
+                .session_state
+                .attached
+                .iter()
+                .any(|held| held.path.is_some())
+    }
+
+    /// Makes this connection's commits durable by the fold that follows each
+    /// statement instead of by a sync of the log.
+    ///
+    /// **For the command line's `exec`, which runs one statement and exits**
+    /// (task-2191, decision D2). A one row `exec` wrote its change twice: to
+    /// the log at the commit, with a sync, and to the data file by the fold at
+    /// close, which seals a rollback journal (a sync) and syncs the data file.
+    /// SQLite makes the same three syncs. With this set, the commit appends its
+    /// records without a sync, the statement keeps its lock, and the release
+    /// folds before it lets the lock go (`fold_holding_the_commit`), so the
+    /// statement returns, and `exec` prints its result, only once the data file
+    /// holds the change. That is two syncs.
+    ///
+    /// **What a crash leaves.** Before the journal is sealed, nothing in the
+    /// data file has changed and the log's unsynced tail either reached the disk,
+    /// and recovery replays a transaction nobody was told had committed, or did
+    /// not, and it is gone; both are states a crash before the acknowledgement
+    /// may leave. After the seal and before the journal is deleted, the next
+    /// open restores the pre images and the file is as it was before the
+    /// statement. After the delete, the data file and its meta record hold the
+    /// change, and a log tail lost below the meta record's checkpoint is never
+    /// read. `durability.rs`'s `power_loss_at_every_cut_point_of_a_commit_the_fold_holds`
+    /// cuts the power at every file call of the statement and checks that each
+    /// recovers to the state before it or after it, and to the state after it
+    /// once the statement returned.
+    ///
+    /// The library never sets it: a connection that runs many statements would
+    /// pay two syncs a statement instead of one.
+    pub fn hold_commits_for_the_fold(&mut self) {
+        self.storage.wal.defer_commit_syncs(true);
+    }
+
+    /// Folds `main` while this statement still holds the lock, for a
+    /// connection whose commits wait for the fold, and reports whether it did.
+    ///
+    /// `false` leaves the release to the ordinary path, which syncs the log
+    /// first: an attached file, a fold that also has to shrink the log (its
+    /// checkpoint record and the retirement of old segments rest on a durable
+    /// log), or readers in other processes that keep the lock from going to
+    /// EXCLUSIVE.
+    ///
+    /// **The write ahead gate is lifted for this fold only.** It refuses a page
+    /// whose records the log has not made durable, and asks the log to sync
+    /// when one comes, which is the sync this exists to remove. The rollback
+    /// journal the fold seals before its first page write is what makes those
+    /// writes recoverable, as it is in SQLite's rollback mode. The gate is put
+    /// back at the log's own durable point afterwards.
+    fn fold_holding_the_commit(&mut self) -> DbResult<bool> {
+        let attached = self
+            .session_state
+            .attached
+            .iter()
+            .any(|held| held.path.is_some());
+        let housekeeping = self.storage.wal.stats().segments > 1
+            || self.storage.wal.open_segment_bytes() >= crate::checkpoint::CLOSE_RECLAIM_BYTES;
+        if attached
+            || housekeeping
+            || !self.the_fold_holds_the_commit()
+            || !self
+                .storage
+                .database
+                .try_hold_for_writing(crate::checkpoint::FOLD_PATIENCE_MILLIS)
+        {
+            return Ok(false);
+        }
+        self.storage.database.pool().set_durable_lsn(u64::MAX);
+        let folded = self.checkpoint_of(false);
+        self.storage
+            .database
+            .pool()
+            .set_durable_lsn(self.storage.wal.write_ahead_point());
+        folded.map(|()| true)
+    }
+
+    /// Reports whether this connection's commits wait for the fold and a
+    /// rollback journal protects that fold.
+    ///
+    /// `delete`, `truncate` and `persist` keep pre images on disk for the
+    /// length of a fold. `wal` protects its fold with page images in the log,
+    /// which has to be synced first, and `memory` and `off` keep nothing a
+    /// crash could use, so under those a commit that waited is synced at the
+    /// release as it always was.
+    pub(crate) fn the_fold_holds_the_commit(&self) -> bool {
+        use inillucent_pool::journal::JournalMode;
+        self.storage.wal.commit_syncs_deferred()
+            && matches!(
+                self.pragmas.journal_mode(),
+                JournalMode::Delete | JournalMode::Truncate | JournalMode::Persist
+            )
     }
 
     /// Takes the lock, folds every file, and lets the lock go.

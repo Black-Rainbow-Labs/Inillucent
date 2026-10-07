@@ -118,7 +118,10 @@ which it does for a file another process is still creating.
 
 `locking_mode` starts at **normal**, which is also SQLite's default. In normal
 mode the file lock is released between statements, so a second process can open
-the database. In `exclusive` mode the connection keeps the lock until it closes.
+the database. A statement that only read keeps its shared lock for up to a
+millisecond, so a statement that follows at once does not take it again; a writer
+in another process waits that long at most. In `exclusive` mode the connection
+keeps the lock until it closes.
 `exclusive` is faster for a program that only ever opens one connection. While
 it holds the lock, a second process waits for `busy_timeout` and then fails. Any
 value other than `normal` or `exclusive` is an error.

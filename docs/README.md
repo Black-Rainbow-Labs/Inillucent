@@ -47,7 +47,7 @@ this index.
 
 | | Page | What it covers |
 |---|---|---|
-| 16 | [Performance](performance.md) | Speed, processor time, memory and file size against SQLite 3.53.4, and the workloads that are slower |
+| 16 | [Performance](performance.md) | Current speed, processor time, memory and file size against SQLite 3.53.4, overall and by category, and the workloads that are slower. Every earlier run and each hill climb is in [Performance history](performance-history.md) |
 | 17 | [Feature comparison](feature-comparison.md) | The full 416 case differential probe against SQLite, feature by feature, and the retrieval engine against pgvector |
 | 18 | [Retrieval quality](retrieval-quality.md) | The 17 graded comparisons with PostgreSQL and pgvector, and how a measurement becomes a verdict |
 | 19 | [Synthetic corpus](../tests/synthetic-corpus.md) | How to build the public corpus that every retrieval number is measured on |

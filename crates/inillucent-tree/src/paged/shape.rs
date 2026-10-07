@@ -134,6 +134,28 @@ impl PagedTree {
         });
     }
 
+    /// Forgets the remembered largest key when it was read from `page`, which
+    /// an insert is about to change.
+    ///
+    /// **The leaf's stamp no longer says it changed** (task-2191). The hint
+    /// holds while the leaf carries the stamp it was read at, and every write
+    /// used to move the stamp. A transaction's inserts now share one log
+    /// record, so a second insert into the leaf stamps it with the same LSN as
+    /// the first, and a hint read between them would outlive a row with a
+    /// larger key: the next rowid it handed out was one already taken. An
+    /// append sets the hint again right after (`note_appended_key`).
+    ///
+    /// @param page - the leaf an insert is about to change
+    pub(crate) fn forget_largest_key_on(&self, page: PageId) {
+        if self
+            .largest_hint
+            .get()
+            .is_some_and(|hint| hint.page == page)
+        {
+            self.largest_hint.set(None);
+        }
+    }
+
     /// Moves the remembered largest key up to a key this tree just appended.
     ///
     /// Called right after the append, with nothing else written between, by

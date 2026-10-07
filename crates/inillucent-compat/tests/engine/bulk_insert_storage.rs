@@ -102,8 +102,13 @@ fn digest(connection: &Connection<'_>, table: &str) -> (i64, i64, i64, i64) {
     )
 }
 
-/// The bulk build appends no log record per row, and the row by row insert of
-/// the same rows does, so the count of records says which path ran.
+/// The bulk build appends nothing to the log per row, and the row by row insert
+/// of the same rows does, so the log's growth says which path ran.
+///
+/// **Counted in bytes, not records** (task-2191). A transaction's inserts now
+/// share one `InsertRows` record per 64 KiB, so the row by row path writes a
+/// few hundred records for 20,000 rows, while every row still costs its entry:
+/// at least 20 bytes of tree, page and length before the row.
 #[test]
 fn the_bulk_build_writes_no_log_record_per_row() {
     let path = fresh("records");
@@ -118,24 +123,24 @@ fn the_bulk_build_writes_no_log_record_per_row() {
              INSERT INTO held VALUES (0, 'already here', 0)",
         )
         .expect("the targets are made");
-    let before = database.log_stats().records;
+    let before = database.log_stats().bytes;
     connection
         .execute_batch("INSERT INTO empty SELECT id, k, n FROM src")
         .expect("the copy into the empty table runs");
-    let bulk = database.log_stats().records.saturating_sub(before);
-    let before = database.log_stats().records;
+    let bulk = database.log_stats().bytes.saturating_sub(before);
+    let before = database.log_stats().bytes;
     connection
         .execute_batch("INSERT INTO held SELECT id, k, n FROM src")
         .expect("the copy into the table that holds a row runs");
-    let ordinary = database.log_stats().records.saturating_sub(before);
+    let ordinary = database.log_stats().bytes.saturating_sub(before);
     assert!(
-        ordinary >= ROWS as u64,
-        "the row by row insert appended {ordinary} records for {ROWS} rows, so this \
+        ordinary >= ROWS as u64 * 20,
+        "the row by row insert appended {ordinary} bytes for {ROWS} rows, so this \
          measure cannot tell the two paths apart"
     );
     assert!(
-        bulk < ROWS as u64 / 20,
-        "the copy into an empty table appended {bulk} log records for {ROWS} rows, which is \
+        bulk < ordinary / 20,
+        "the copy into an empty table appended {bulk} bytes of log for {ROWS} rows, which is \
          the row by row insert's cost ({ordinary}) and not the bulk build's"
     );
     assert_eq!(digest(&connection, "empty").0, ROWS);

@@ -326,6 +326,52 @@ pub unsafe extern "C" fn inillucent_params_free(params: *mut inillucent_params) 
     )
 }
 
+/// Reads one execution's values out of a list or a tuple, for the Python
+/// binding's one call per execution (task-2197).
+///
+/// Answers `None`, with no Python exception left set, for anything the JSON
+/// path should read instead, which is the rule [`inillucent_py_params`] keeps.
+///
+/// @param row - the list or tuple of values, a borrowed reference
+///
+/// # Safety
+///
+/// `row` must be a live Python object, with the interpreter lock held.
+pub(crate) unsafe fn read_values(row: *mut c_void) -> Option<Vec<Value>> {
+    let api = PY_READ.get()?;
+    let read = read_row(api, row);
+    if read.is_none() {
+        (api.err_clear)();
+    }
+    read
+}
+
+/// Reads a `str` as the UTF-8 text CPython keeps for it.
+///
+/// Answers `None`, with no Python exception left set, for an object that is
+/// not exactly a `str` or one that cannot be written as UTF-8.
+///
+/// @param text - the object, a borrowed reference
+///
+/// # Safety
+///
+/// `text` must be a live Python object, with the interpreter lock held. The
+/// answer borrows the object's own buffer and lives as long as the object.
+pub(crate) unsafe fn read_str<'a>(text: *mut c_void) -> Option<&'a str> {
+    let api = PY_READ.get()?;
+    if type_of(text) != api.str_type {
+        return None;
+    }
+    let mut size: isize = 0;
+    let bytes = (api.unicode_as_utf8_and_size)(text, &mut size);
+    if bytes.is_null() {
+        (api.err_clear)();
+        return None;
+    }
+    let length = usize::try_from(size).ok()?;
+    std::str::from_utf8(std::slice::from_raw_parts(bytes as *const u8, length)).ok()
+}
+
 /// Reads a list or a tuple item by item.
 ///
 /// @param api - the table

@@ -263,6 +263,7 @@ def main():
     check_encryption()
     check_execute_many()
     check_execute_many_failure()
+    check_one_call()
     return 0
 
 
@@ -417,6 +418,66 @@ def check_execute_many_failure():
     assert direct[0] is not None, "the duplicate key did not fail the batch"
     assert direct[1] == [(1, "one"), (2, "two")], f"kept {direct[1]!r}"
     print("  ok    a failing execute_many keeps the rows before the failing one, both ways")
+
+
+def answers_by(statements, one_call):
+    """Run statements through one of the two ways an execution crosses, and
+    return each one's rows, or its failure as (type, status, message).
+
+    @param statements - (sql, params) pairs, params None for no parameters
+    @param one_call - whether each execution is one foreign call, or the
+        calls it took before ABI 1.4.0
+    """
+    kept = (inillucent._STMT_EXECUTE, inillucent._CONN_EXECUTE)
+    if not one_call:
+        inillucent._STMT_EXECUTE = inillucent._CONN_EXECUTE = None
+    path = scratch("one_call")
+    database = inillucent.Database(path)
+    answers = []
+    try:
+        connection = database.connect()
+        connection.execute("CREATE TABLE t (n INTEGER PRIMARY KEY, a TEXT UNIQUE, b)")
+        for sql, params in statements:
+            try:
+                rows = connection.execute(sql) if params is None else connection.execute(sql, params)
+                answers.append((rows.columns, [tuple(row) for row in rows], rows.affected, rows.tag))
+            except (inillucent.DriverError, TypeError) as why:
+                answers.append((type(why).__name__, getattr(why, "status", None), str(why)))
+        return answers
+    finally:
+        inillucent._STMT_EXECUTE, inillucent._CONN_EXECUTE = kept
+        database.close()
+        remove_database(path)
+
+
+def check_one_call():
+    """An execution gives the same rows and the same failures whether it is
+    one foreign call or the four it took before ABI 1.4.0.
+
+    The suite above runs every case through the one call when the library has
+    it; this asks about the cases the two ways in could disagree on: every
+    value type, a constraint failure, a syntax error, too many values, a value
+    neither way can bind, and a statement with no parameters.
+    """
+    if inillucent._STMT_EXECUTE is None:
+        print("  skip  one call per execution: not available with this library or Python")
+        return
+    statements = [
+        ("INSERT INTO t (a, b) VALUES (?1, ?2)", ("x", 1)),
+        ("INSERT INTO t (a, b) VALUES (?1, ?2)", ("x", 2)),
+        ("SELECT ?1, ?2, ?3, ?4, ?5, ?6", (None, 2**63 - 1, -1.5, "\u00e9t\u00e9", b"\x00\xff", True)),
+        ("SELEC 1", ()),
+        ("SELECT ?1", (1, 2)),
+        ("SELECT ?1", (2**64,)),
+        ("SELECT ?1", (bytearray(b"ab"),)),
+        ("SELECT n, a, b FROM t ORDER BY n", None),
+        ("UPDATE t SET b = b + 1", None),
+        ("SELECT count(*) FROM t WHERE a = ?1", ["x"]),
+    ]
+    direct, before = answers_by(statements, True), answers_by(statements, False)
+    for nth, (one, other) in enumerate(zip(direct, before)):
+        assert one == other, f"statement {nth}: {one!r} in one call, {other!r} the old way"
+    print("  ok    one call per execution answers as the calls before it did")
 
 
 if __name__ == "__main__":

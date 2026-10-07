@@ -20,7 +20,7 @@ impl Pool {
         meta.high_water_lsn = meta.high_water_lsn.max(self.high_water_lsn.get());
         let mut image = vec![0u8; self.page_size];
         meta.encode(&mut image)?;
-        self.write_both_slots(&image)?;
+        self.write_both_slots(&image, true)?;
         self.sync_data_file()?;
         Counters::add(&self.counters.folds, 1);
         Counters::add(&self.counters.writes, 2);
@@ -147,7 +147,7 @@ impl Pool {
             // statement. With the primary first, that reader saw nothing and
             // went on without looking for the journal the dead writer left.
             MetaRoute::OneSync => {
-                self.write_both_slots(image)?;
+                self.write_both_slots(image, false)?;
                 self.sync_data_file()
             }
             // **Pages first, with a sync of their own, when nothing on the disk
@@ -164,7 +164,7 @@ impl Pool {
                 self.journal_page(META_PAGE)?;
                 self.journal_page(SHADOW_PAGE)?;
                 self.seal_journal()?;
-                self.write_both_slots(image)?;
+                self.write_both_slots(image, false)?;
                 self.sync_data_file()
             }
         }
@@ -172,11 +172,28 @@ impl Pool {
 
     /// Writes the meta record into the shadow slot and then the primary.
     ///
+    /// **A checkpoint writes the record's first [`META_RECORD_BYTES`] bytes,
+    /// not the page (task-2191).** `Meta::encode` writes zeros over the rest of
+    /// the page, and every slot write before this one did too, so the bytes
+    /// after the record on the disk are already the bytes the image holds there
+    /// and the checksum over the whole page still matches. Writing 32 KiB to
+    /// change 128 bytes cost a one row `exec` about 0.16 ms, two writes and the
+    /// sync that carried them. A file being created gets whole pages: the
+    /// slots are the first thing in it, and a file holding only the record of
+    /// the shadow slot would be too short to read back two whole pages. An
+    /// encrypted file reads, changes and writes the unit, which is correct and
+    /// costs more than the whole page would.
+    ///
     /// @param image - the encoded record, one page long
-    fn write_both_slots(&self, image: &[u8]) -> DbResult<()> {
+    /// @param whole - whether to write the whole page, for a file being created
+    fn write_both_slots(&self, image: &[u8], whole: bool) -> DbResult<()> {
+        let written = match whole {
+            true => image,
+            false => image.get(..crate::meta::META_RECORD_BYTES).unwrap_or(image),
+        };
         for slot in [SHADOW_PAGE, META_PAGE] {
             self.file
-                .write_all_at(slot.0.saturating_mul(self.page_size as u64), image)
+                .write_all_at(slot.0.saturating_mul(self.page_size as u64), written)
                 .map_err(|error| error.into_db_error())?;
         }
         Ok(())

@@ -5,7 +5,7 @@
 # `inillucent-compat::obligations::the_registers_match_the_engine` fails if
 # this file and the engine disagree.
 
-count = 65
+count = 68
 profile = "default"
 
 [[symbol]]
@@ -141,6 +141,10 @@ name = "inillucent_prepare"
 signature = "inillucent_prepare( conn: *mut inillucent_conn, sql: *const c_char, out: *mut *mut inillucent_stmt, error: *mut *mut inillucent_error, ) -> i32"
 
 [[symbol]]
+name = "inillucent_py_execute"
+signature = "inillucent_py_execute( conn: *mut crate::capi::db::inillucent_conn, sql: *mut c_void, limit: u64, ) -> *mut c_void"
+
+[[symbol]]
 name = "inillucent_py_init"
 signature = "inillucent_py_init(api: *const *const c_void, count: usize) -> i32"
 
@@ -149,8 +153,16 @@ name = "inillucent_py_init_params"
 signature = "inillucent_py_init_params(api: *const *const c_void, count: usize) -> i32"
 
 [[symbol]]
+name = "inillucent_py_init_threads"
+signature = "inillucent_py_init_threads( api: *const *const c_void, count: usize, ) -> i32"
+
+[[symbol]]
 name = "inillucent_py_params"
 signature = "inillucent_py_params(rows: *mut c_void) -> *mut inillucent_params"
+
+[[symbol]]
+name = "inillucent_py_stmt_execute"
+signature = "inillucent_py_stmt_execute( stmt: *mut crate::capi::stmt::inillucent_stmt, params: *mut c_void, limit: u64, ) -> *mut c_void"
 
 [[symbol]]
 name = "inillucent_rows_affected"

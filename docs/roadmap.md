@@ -4,7 +4,7 @@ This page lists the open work on inillucent, in the order it is being worked. Ea
 the work is, why a user would want it, and where it stands today. Work that is finished, and work
 that was decided against, is in [Closed items](closed-items.md).
 
-Every speed ratio on this page comes from the run of 23 September 2026 in
+Every speed ratio on this page comes from the runs of 7 October 2026 in
 [Performance](performance.md). A ratio is SQLite's time divided by inillucent's time on the same
 workload. A ratio above 1.00x means inillucent was faster, and one below 1.00x means inillucent was
 slower.
@@ -27,7 +27,7 @@ slower.
 
 | # | Item | Why a user wants it | Status |
 |---|---|---|---|
-| 1 | Workloads that are slower than SQLite | faster joins, full text indexing and statement preparation | both families on the list meet their bars on the per round statistic; four workloads are still slower than SQLite |
+| 1 | Workloads that are slower than SQLite | faster statement preparation and index builds | one weighted workload is still slower than SQLite; `open.prepare` and `schema` miss their bars |
 | 2 | Memory held by a retrieval index | a large search index that fits in a small machine's memory | the postings and the chunk text are smaller in memory; the graph is unchanged; the 512 MiB goal is not yet measured |
 | 3 | Two lines of the command line that bypass the driver | one code path from every program to the engine | 28 lines are down to 2 |
 | 4 | PostgreSQL parity | a server that PostgreSQL clients can connect to | designed, not built |
@@ -42,27 +42,20 @@ most of them. Some workloads are still slower, and they hold down the families t
 **Why a user wants it.** These workloads are common operations: a join over an index range, building
 a full text index, and compiling a short statement.
 
-**Status.** Measured 23 September 2026:
+**Status.** Measured 7 October 2026, the median of three runs:
 
 | Workload | Family | Workload ratio | Family ratio |
 |---|---|---:|---:|
-| `join.range` | `read.join` | 0.84x | 4.21x |
-| `extension.fts.build` | `extension` | 0.95x | 1.73x |
-| `prepare.trivial` | `open.prepare` | 0.57x | 1.69x |
+| `prepare.trivial` | `open.prepare` | 0.58x | 2.02x |
+| `schema.index` | `schema` | 1.48x | 1.47x |
 
-- `read.join` meets its bar of 3.00x when the family is graded one round at a time. `read.join`
-  misses its bar on the older pooled statistic. `join.range` is the workload that pulls the pooled
-  lower bound down. `join.range` probes an index once for each of two hundred rows, and SQLite
-  spreads its statement overhead across those rows.
-- `extension` meets its bar of 1.50x on the per round statistic. `extension.fts.build` is the
-  slowest workload in the family. An FTS5 build is four ordinary row writes for each document. One
-  way to save a row write would move the per column token counts into the content row. That change
-  cannot ship: `fts5::the_content_table_holds_the_rows` checks that the content table matches the
-  layout of SQLite's own FTS5 tables, and an extra column fails that test.
-- `open.prepare` misses its bar of 5.00x, at 1.69x. `prepare.trivial` compiles `SELECT 1` on every
-  call.
-- `schema` misses its bar of 3.00x, at 1.31x. `schema` is one workload, `schema.index`, run once a
+- `prepare.trivial` is the one weighted workload slower than SQLite, 72% slower. It compiles
+  `SELECT 1` on every call. `open.prepare` misses its bar of 5.00x, at 2.02x.
+- `schema` misses its bar of 3.00x, at 1.47x. `schema` is one workload, `schema.index`, run once a
   round.
+- `join.range` (1.02x) and `extension.fts.build` (1.14x), both slower than SQLite on 23 September,
+  are now faster. `read.join` is at 5.26x against its bar of 3.00x and `extension` at 2.47x against
+  1.50x.
 
 [The workloads that are slower](performance.md#the-workloads-that-are-slower) has the time each
 workload takes and the reason. [By family](performance.md#by-family) has every family's ratio, lower

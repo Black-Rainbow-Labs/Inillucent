@@ -257,10 +257,11 @@ reference it is. Every entry has `production_dependency = false`, and
 
 ## Unsafe code
 
-21 of the 29 crates forbid `unsafe` with `#![forbid(unsafe_code)]`. The others use `unsafe` only in
+20 of the 29 crates forbid `unsafe` with `#![forbid(unsafe_code)]`. The others use `unsafe` only in
 the files named in `UNSAFE_ALLOWED` in `crates/inillucent-compat/tests/tooling/policy.rs`. Examples are the
 allocator in `inillucent-alloc`, the operating system calls in `inillucent-vfs`, the TLS files in
-`inillucent-remote`, the Ctrl+C handler in `inillucent-cli`, and the AVX2 dot product in
+`inillucent-remote`, the Ctrl+C handler in `inillucent-cli`, the processor CRC in
+`crates/inillucent-base/src/crc_hardware.rs`, and the AVX2 dot product in
 `crates/inillucent-core/src/distance.rs`.
 
 Every `unsafe` block in those files has a `SAFETY:` comment, and every `unsafe` function has a

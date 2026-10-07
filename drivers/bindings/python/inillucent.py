@@ -529,6 +529,48 @@ def _python_params() -> "Optional[ctypes.PyDLL]":
 
 _PARAMS = _python_params()
 
+
+def _python_calls() -> "Optional[ctypes.PyDLL]":
+    """Let one execution be one foreign call, when the library can take it.
+
+    **Bind, run and build the result in one call** (task-2197). An execution
+    made four ``ctypes`` calls before this, with ``json.dumps`` of its values in
+    front of them: a point query from Python spent about half of its 17 us
+    crossing. ``inillucent_py_stmt_execute`` reads the values out of their
+    Python objects, runs the statement with the interpreter lock let go, as the
+    ``CDLL`` call it replaces did, and answers the result built as Python
+    objects. It needs both tables above, and the two CPython functions that let
+    the lock go and take it back. Under another Python, or an older library,
+    this answers ``None`` and every execution takes the calls it took before.
+    """
+    if _PY is None or _PARAMS is None or not hasattr(_LIB, "inillucent_py_stmt_execute"):
+        return None
+    try:
+        api = ctypes.pythonapi
+        addresses = [
+            ctypes.cast(api.PyEval_SaveThread, c_void_p).value,
+            ctypes.cast(api.PyEval_RestoreThread, c_void_p).value,
+        ]
+    except (AttributeError, ValueError):
+        return None
+    table = (c_void_p * len(addresses))(*addresses)
+    if _LIB.inillucent_py_init_threads(table, len(addresses)) != OK:
+        return None
+    holding = ctypes.PyDLL(_LIB._name)
+    for name in ("inillucent_py_stmt_execute", "inillucent_py_execute"):
+        function = getattr(holding, name)
+        function.argtypes = [c_void_p, ctypes.py_object, c_uint64]
+        function.restype = ctypes.py_object
+    return holding
+
+
+_CALLS = _python_calls()
+_STMT_EXECUTE = None if _CALLS is None else _CALLS.inillucent_py_stmt_execute
+_CONN_EXECUTE = None if _CALLS is None else _CALLS.inillucent_py_execute
+
+# Every row, which is what a `limit` of None asks for.
+_ALL_ROWS = (1 << 64) - 1
+
 # The Python types a parameter may be, which `json.dumps` writes as the JSON the
 # library reads. Anything else is refused by `_bind`'s rule, before it is sent.
 _PLAIN = (type(None), bool, int, float, str)
@@ -726,12 +768,31 @@ class Rows:
         finally:
             _LIB.inillucent_rows_free(handle)
 
-    def _read_python(self, handle: c_void_p) -> None:
-        """Read the whole result in one call, built as Python objects."""
-        try:
-            whole = _PY.inillucent_rows_py(handle)
-        finally:
-            _LIB.inillucent_rows_free(handle)
+    @classmethod
+    def _built(cls, whole: list) -> "Rows":
+        """Make a result from the list the library built as Python objects.
+
+        The form ``inillucent_py_stmt_execute`` answers, which has no handle to
+        read or free.
+        """
+        made = cls.__new__(cls)
+        made._take(whole)
+        return made
+
+    @staticmethod
+    def _answer(got: Any) -> "Rows":
+        """Turn what a one call execution answered into a result, or raise.
+
+        A list is the result. An ``int`` is the address of the error the call
+        failed with.
+        """
+        if got.__class__ is list:
+            return Rows._built(got)
+        _raise(c_void_p(got))
+        raise DriverError(INTERNAL, "the library answered neither a result nor an error")
+
+    def _take(self, whole: list) -> None:
+        """Set every field from the list the library builds."""
         (
             self.columns,
             self.column_types,
@@ -743,6 +804,14 @@ class Rows:
             self.tag,
         ) = whole
         self.more = bool(more)
+
+    def _read_python(self, handle: c_void_p) -> None:
+        """Read the whole result in one call, built as Python objects."""
+        try:
+            whole = _PY.inillucent_rows_py(handle)
+        finally:
+            _LIB.inillucent_rows_free(handle)
+        self._take(whole)
 
     def _read_json(self, handle: c_void_p) -> None:
         """Read the whole result in one call, as JSON.
@@ -923,8 +992,12 @@ class Connection:
         :attr:`Rows.total` is exact either way, because the engine materialises
         and the count was taken rather than estimated.
         """
-        capped = (1 << 64) - 1 if limit is None else limit
+        capped = _ALL_ROWS if limit is None else limit
         if not params:
+            if _CONN_EXECUTE is not None and self._handle:
+                got = _CONN_EXECUTE(self._handle, sql, capped)
+                if got is not None:
+                    return Rows._answer(got)
             rows = c_void_p()
             error = c_void_p()
             status = _LIB.inillucent_execute(
@@ -1015,6 +1088,10 @@ class Statement:
 
     def execute(self, params: Sequence[Any] = (), limit: Optional[int] = None) -> Rows:
         """Bind these values and run it."""
+        if _STMT_EXECUTE is not None and self._handle:
+            got = _STMT_EXECUTE(self._handle, params, _ALL_ROWS if limit is None else limit)
+            if got is not None:
+                return Rows._answer(got)
         if _JSON:
             wire = _to_wire(params)
             error = c_void_p()

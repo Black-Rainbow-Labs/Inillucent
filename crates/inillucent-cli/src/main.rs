@@ -354,6 +354,7 @@ fn main() {
 
 /// Everything `main` does, on the sized thread.
 fn run() {
+    inillucent_cli::shell::output::flush_on_panic();
     let invocation = parse(std::env::args().skip(1));
     if invocation.help {
         usage();
@@ -407,6 +408,7 @@ fn run() {
     inillucent_cli::interrupt::stop_on_ctrl_c(shell.cancel_flag());
     if invocation.version {
         dot::run(&mut shell, ".version");
+        inillucent_cli::shell::output::flush();
         return;
     }
     // The settings run before safe mode is armed, because `-init` names a
@@ -418,7 +420,13 @@ fn run() {
     shell.readonly = invocation.readonly;
     shell.safe = invocation.safe;
     if invocation.statements.is_empty() {
-        let lines = std::io::stdin().lines().map_while(Result::ok);
+        // Through `FlushingStdin`, so the answers printed so far are written
+        // out before the shell waits for more input; see `shell::output`.
+        let input = std::io::BufReader::with_capacity(
+            64 << 10,
+            inillucent_cli::shell::output::FlushingStdin,
+        );
+        let lines = std::io::BufRead::lines(input).map_while(Result::ok);
         drive(&mut shell, lines);
     } else {
         let statements = invocation.statements.clone();
@@ -427,6 +435,7 @@ fn run() {
     // `.testcase`/`.check` report their tally once, at the end, and only when
     // some ran - which is what makes the line invisible to an ordinary script.
     commands::report_tests(&mut shell);
+    inillucent_cli::shell::output::flush();
     if shell.failed {
         std::process::exit(1);
     }

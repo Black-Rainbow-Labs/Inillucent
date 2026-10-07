@@ -242,7 +242,7 @@ last checkpoint before it reads anything. If a rollback journal is beside the fi
 a process died while it held the lock, and the connection puts the journal's old pages back before
 it replays, as an open does.
 
-The check costs two reads. The connection reads the 120 bytes of the meta record in the second of
+The check costs two reads. The connection reads the 128 bytes of the meta record in the second of
 the file's two meta pages, the shadow copy, and the length of the log segment it appends to. A
 checkpoint writes the same record to both meta pages and always writes the shadow copy first, so a
 checkpoint that has changed either page has changed the shadow copy. On Windows a statement outside
@@ -352,6 +352,45 @@ records are on disk. A single connection does one write and one sync for each co
 **A failed write stops the log.** If a log write or sync fails, the log keeps the error and every
 later call returns it. The engine then refuses to start new work, because a log with a gap in its
 durable records cannot be trusted.
+
+**Inserts share a record.** The rows one transaction inserts in a row, into its table and its
+indexes, go into one `InsertRows` record of up to 64 KiB, one entry per row, with one header and one
+checksum. 10,000 inserts into a table with two indexes wrote 30,000 records and now write a few tens.
+The record stays open at the end of the log's buffer while the transaction keeps inserting, and it
+is closed before any other record is appended and before the buffer is written to the file. Every
+page an entry changes is stamped with the record's LSN, so the write ahead rule keeps the page out of
+the file until the whole record is in the log. Recovery decides for each page once whether it already
+has the record, then applies that page's entries. A build older than 2.3.0 cannot replay a log that
+holds one and refuses it with `a log record has kind 18, which this format does not define`. A clean
+close folds the log into the file, so this only matters for a database whose connection stopped
+without closing and is then opened by an older build.
+
+### The command line's `exec`
+
+`inillucent --db f exec` runs one statement and exits, and its close folds the change into the data
+file. A one row `INSERT` made three syncs: the log at the commit, then the rollback journal and the
+data file in the fold. SQLite makes three too. `exec` now folds inside the statement, before it lets
+the lock go, and prints its result once the data file holds the change:
+
+1. The commit appends its records to the log and does not sync it.
+2. The statement keeps its lock, raises it to EXCLUSIVE and folds. The fold hands the log's records
+   to the file system without a sync, saves the old page images in the rollback journal and syncs
+   it, writes the pages and the meta record and syncs the data file, and deletes the journal.
+3. `exec` reports success.
+
+That is two syncs. A crash before the journal is synced leaves the data file as it was, and the
+log's tail either reached the disk, so recovery replays a transaction nobody was told had committed,
+or did not. A crash after the journal is synced and before it is deleted puts the old pages back.
+After it is deleted the data file and its meta record hold the change on their own, and a log tail
+lost below the meta record's checkpoint is never read.
+`durability.rs`'s `power_loss_at_every_cut_point_of_a_commit_the_fold_holds` cuts the power at each
+of the 51 file calls of this path and checks that every one recovers to the state before the
+statement or after it, and to the state after it once `exec` returned.
+
+Only the command line program does this, and only for `exec`. The MCP server and every driver keep
+the log sync at the commit, because a connection that runs many statements would pay two syncs a
+statement instead of one. Under `journal_mode = wal`, with an attached file, or when the fold has to
+shrink the log, `exec` syncs the log first as it always did.
 
 ### A copy into an empty table
 
@@ -496,6 +535,19 @@ did not have yet, the command line prints a line such as this one:
 replayed the log: 1 committed transactions were in the log and not yet in the database file (3 records scanned, 2 applied). A connection that still has the file open, or one that ended before a checkpoint, wrote them.
 ```
 
+**A first statement after a clean close reads no log.** A fold that leaves nothing after its
+checkpoint writes the length of the log segment into the meta record. A first statement asks the file
+system for that segment's length by name, and for whether a segment after it exists, without opening
+either file. When the segment is still that long and nothing follows it, nothing was appended since
+the fold, and the statement skips the scan. A writable connection then opens the segment at its first
+write, or at the second statement that checks the log's end, which a long session does once. On
+Windows the first open of a file another process wrote waits for the virus scanner, about 3 ms, and
+a command after a write paid it for the data file and for the segment, where SQLite has one file.
+Any difference sends the statement down the path in the chart. The length by name was tested against
+a process appending to the segment without closing or syncing it: no query that began after a write
+returned a smaller length, in about 650,000 queries. A file written before this field existed has a
+zero there, which means the log is read.
+
 That is the normal state while another process has the database open and has not checkpointed, so
 the line says nothing about damage. When the log also held a transaction with no commit record, which
 is what a process killed in the middle of a transaction leaves, the line starts with `recovered the
@@ -632,9 +684,14 @@ Format 2 changed two things in a page:
   binary search, and the area can use the leaf's whole free space. The layout is in
   `crates/inillucent-tree/src/leaf/delta.rs`.
 - **A page's checksum covers its LSN.** In format 1 a flipped bit in the LSN went undetected. The
-  rule is in `crates/inillucent-pool/src/page.rs`. The checksum is CRC-32/ISO-HDLC; over a page it
-  is computed as four interleaved streams joined with zlib's combine arithmetic, which gives the same
-  value as one stream.
+  rule is in `crates/inillucent-pool/src/page.rs`. The checksum is CRC-32/ISO-HDLC. A processor
+  that has the instructions computes it with them: carryless multiply on x86-64 and `CRC32X` on
+  aarch64, which compute the same polynomial, so the values do not change. A 32 KiB page takes
+  0.64 us that way against 3.93 us in the tables. Without them it is computed from tables as four
+  interleaved streams joined with zlib's combine arithmetic, which gives the same value as one
+  stream. `crates/inillucent-base/src/crc_hardware.rs` is the one file in that crate allowed
+  `unsafe`, and a test compares its answers with the tables at every length to 300 bytes and at
+  random lengths to 70 KiB.
 
 A read of a leaf that took writes merges the delta area into the packed rows. The second time a
 reader reads such a leaf without the page changing, it packs a copy of the leaf, and the buffer pool

@@ -24,7 +24,7 @@
 # decision somebody made rather than a line somebody edited.
 
 schema_version = 1
-abi_version = "1.3.0"
+abi_version = "1.4.0"
 
 [[symbol]]
 name = "inillucent_abi_version"
@@ -230,6 +230,25 @@ since = "1.3.0"
 name = "inillucent_params_free"
 stability = "provisional"
 since = "1.3.0"
+
+# One foreign call per execution from Python: the parameters read out of their
+# objects, the statement run with the interpreter lock let go, and the result
+# built as Python objects (task-2197). Provisional, as the rest of the Python
+# calls are.
+[[symbol]]
+name = "inillucent_py_init_threads"
+stability = "provisional"
+since = "1.4.0"
+
+[[symbol]]
+name = "inillucent_py_stmt_execute"
+stability = "provisional"
+since = "1.4.0"
+
+[[symbol]]
+name = "inillucent_py_execute"
+stability = "provisional"
+since = "1.4.0"
 
 # The Node addon's entry point, which Node calls when it loads the library
 # (task-2191). Provisional with the rest of 1.3.0.

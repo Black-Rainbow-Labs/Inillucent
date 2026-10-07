@@ -104,7 +104,7 @@ Closed by decision. The memory figure stays where it is.
 inserts 2,000 rows in one transaction into a table with two secondary indexes. It read about 0.60x.
 
 **Result on 2026-09-23.** **1.47x, 7.0 µs a row against SQLite's 10.2.** The `write` family went from
-2.12x on 2026-09-20 to 3.04x. [Performance](performance.md#what-moved-since-2026-09-23) has the run.
+2.12x on 2026-09-20 to 3.04x. [Performance](performance-history.md#what-moved-since-2026-09-23) has the run.
 
 **What was done.** Two changes to the leaf page:
 
@@ -280,7 +280,7 @@ Windows charges more than Linux for the calls SQLite makes to the operating syst
 
 **Status.** Settled. Nothing since the allocator change has been measured on Linux, so the Linux
 figure is older than the Windows figure of 419%. A new measurement needs a Linux machine that is not
-also running the Windows arm. [Linux](performance.md#linux) has the details.
+also running the Windows arm. [Linux](performance-history.md#linux) has the details.
 
 ## Threads
 

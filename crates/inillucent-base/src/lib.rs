@@ -18,7 +18,7 @@
 //! being duplicated or forced into a crate whose own contents land in phase 2.
 //! `docs/invariants/layering.toml` records the refinement and enforces it.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(clippy::indexing_slicing)]
 #![deny(clippy::unwrap_used)]
@@ -42,6 +42,10 @@ pub mod budget;
 pub mod buffer;
 pub mod bytes;
 pub mod checksum;
+/// The one module here allowed `unsafe`: CRC-32 by the processor's own
+/// instructions. Its module comment says why and how the risk is confined.
+#[allow(unsafe_code)]
+mod crc_hardware;
 pub mod crypt;
 pub mod deflate;
 pub mod error;

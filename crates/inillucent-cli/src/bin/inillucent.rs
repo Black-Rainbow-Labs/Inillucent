@@ -444,6 +444,17 @@ fn dispatch(command: &'static Command, invocation: &Invocation) -> ExitCode {
     };
     context.limit = invocation.limit;
     context.null = invocation.null.clone();
+    // **`exec` reports success once the data file holds the change** (task-2191).
+    // The program runs that one statement and exits, and its close would fold
+    // anyway; folding inside the statement, before its lock goes, lets the
+    // commit skip the log's sync, so a one row `exec` makes two syncs where it
+    // made three. See `ImportedDatabase::hold_commits_for_the_fold`. The MCP
+    // server's `exec` keeps its connection and does not do this.
+    if command.name == "exec" {
+        if let Err(error) = context.shell().hold_commits_for_the_fold() {
+            return report(&Failed::from_engine(&error), invocation.json, command.name);
+        }
+    }
     // Ctrl+C stops the command rather than the process, so a long `query` or a
     // `migrate` can be given up on without losing what it has already reported
     // (task-1932, H11).

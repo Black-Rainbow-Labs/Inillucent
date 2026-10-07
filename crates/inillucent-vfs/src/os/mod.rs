@@ -31,6 +31,11 @@ pub struct PathState {
     pub read_only: bool,
     /// Whether it is a file rather than a directory.
     pub file: bool,
+    /// Its length in bytes, when the query that answered says it.
+    ///
+    /// `None` only from Windows's older attribute call, which a Windows
+    /// without `GetFileInformationByName` falls back to.
+    pub len: Option<u64>,
 }
 
 impl PathState {
@@ -41,6 +46,7 @@ impl PathState {
         PathState {
             read_only: metadata.permissions().readonly(),
             file: metadata.is_file(),
+            len: Some(metadata.len()),
         }
     }
 }
@@ -274,6 +280,25 @@ impl Vfs for OsVfs {
     }
 
     /// Reports whether a path exists, and whether it is writable when asked.
+    /// Returns a file's length by its name, without opening it.
+    ///
+    /// See [`Vfs::size_by_name`]. The by name query `path_state` makes answers
+    /// the length too; the older Windows call does not, and then the standard
+    /// library's `metadata` does.
+    ///
+    /// @param path - the file
+    fn size_by_name(&self, path: &DbPath) -> VfsResult<Option<u64>> {
+        crate::confine::authorize(path)?;
+        match platform::path_state(path.as_path()) {
+            Ok(None) => Ok(None),
+            Ok(Some(PathState { len: Some(len), .. })) => Ok(Some(len)),
+            Ok(Some(_)) => std::fs::metadata(path.as_path())
+                .map(|metadata| Some(metadata.len()))
+                .map_err(|error| VfsError::from_io(VfsOperation::Access, &error)),
+            Err(error) => Err(VfsError::from_io(VfsOperation::Access, &error)),
+        }
+    }
+
     fn access(&self, path: &DbPath, mode: AccessMode) -> VfsResult<bool> {
         // A confined process is told the file is not there rather than that it
         // may not look, because "does `C:/Users/…/id_rsa` exist" is itself an

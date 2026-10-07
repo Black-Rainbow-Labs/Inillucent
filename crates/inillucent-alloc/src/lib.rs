@@ -547,17 +547,37 @@ unsafe impl GlobalAlloc for Pooled {
     }
 }
 
-/// How many bytes [`Carved`] takes from the system at a time for one class.
+/// How many bytes [`Carved`] takes from the system at a time for its small
+/// classes.
 const CHUNK_BYTES: usize = 64 << 10;
+
+/// How many bytes [`Carved`] takes from the system at a time for one page
+/// sized class: sixteen 32 KiB frames.
+///
+/// Reserving it costs one call and no page faults: the memory is touched only
+/// when a block of it is used.
+const BIG_CHUNK_BYTES: usize = 512 << 10;
+
+/// The alignment of a page sized chunk, one operating system page.
+///
+/// A 32 KiB block on a page boundary covers eight pages. The Windows heap's
+/// 16 byte aligned block covers nine, and the ninth is one more first touch
+/// fault on every page the buffer pool reads.
+const BIG_CHUNK_ALIGN: usize = 4 << 10;
 
 thread_local! {
     /// [`Carved`]'s free list heads, one per class.
     static CARVED_HEADS: [Cell<*mut u8>; CLASSES] =
         const { [const { Cell::new(std::ptr::null_mut()) }; CLASSES] };
-    /// Where [`Carved`] carves the next block of each class, and where that
-    /// chunk ends.
-    static CARVED_SPANS: [Cell<(usize, usize)>; CLASSES] =
-        const { [const { Cell::new((0, 0)) }; CLASSES] };
+    /// Where [`Carved`] carves the next small block, of any class, and where
+    /// that chunk ends.
+    static CARVED_SPAN: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    /// [`Carved`]'s free list heads for the page sized classes.
+    static CARVED_BIG_HEADS: [Cell<*mut u8>; BIG_CLASSES] =
+        const { [const { Cell::new(std::ptr::null_mut()) }; BIG_CLASSES] };
+    /// Where [`Carved`] carves the next block of each page sized class.
+    static CARVED_BIG_SPANS: [Cell<(usize, usize)>; BIG_CLASSES] =
+        const { [const { Cell::new((0, 0)) }; BIG_CLASSES] };
 }
 
 /// A size-classed free list that carves its blocks out of larger chunks, for a
@@ -568,28 +588,43 @@ thread_local! {
 /// not hold, and a statement that keeps what it builds, such as an `.import` of
 /// 50,000 rows held for one bulk build, empties every list at once and sends
 /// each value to the Windows heap: the heap was 38% of the import. This takes
-/// 64 KiB from the system for a class whose list is empty and hands out blocks
-/// from it, so a block costs a pointer bump.
+/// 64 KiB from the system at a time and hands out blocks from it, so a block
+/// costs a pointer bump.
+///
+/// **Every small class carves from the same chunk.** With a chunk per class, a
+/// one row query, which allocates 3,248 blocks in more than a hundred classes,
+/// touched at least one fresh 4 KiB page per class, and each first touch is a
+/// page fault. From one chunk, blocks of different sizes share pages, and the
+/// pages touched follow the bytes allocated. A class's free list still holds
+/// only its own blocks.
 ///
 /// **Freed blocks are kept, not given back.** A carved block is part of a chunk
 /// and the system cannot take it alone, so a class keeps every block it has
 /// carved, which is at most the most of that class the program held at once.
 /// That is why the command line and the shell install it and the MCP server,
 /// which runs for as long as its client does, keeps [`Pooled`].
+///
+/// **Page sized blocks are carved too, on page boundaries.** Every buffer pool
+/// frame is a 32 KiB block, and a cold query from the command line reads tens
+/// of pages into frames used for the first time. Taken from the Windows heap
+/// one at a time, each block cost a heap call and nine first touch faults.
+/// Carved from a 512 KiB chunk aligned to a page, it costs a pointer bump and
+/// eight. In a new process, reading 64 pages of 32 KiB took 681 us into heap
+/// blocks and 473 us into one page aligned region.
 pub struct Carved;
 
 impl Carved {
     /// Carves one block of a class, taking a new chunk when the last is spent.
     ///
+    /// The rest of a spent chunk, less than the 4 KiB of the largest small
+    /// class, is left unused.
+    ///
     /// @param class - the size class
     #[inline]
     fn carve(class: usize) -> *mut u8 {
         let size = layout_of(class).size();
-        CARVED_SPANS
-            .try_with(|spans| {
-                let Some(span) = spans.get(class) else {
-                    return std::ptr::null_mut();
-                };
+        CARVED_SPAN
+            .try_with(|span| {
                 let (mut next, mut end) = span.get();
                 if next.saturating_add(size) > end || next == 0 {
                     let Ok(chunk) = Layout::from_size_align(CHUNK_BYTES.max(size), GRAIN) else {
@@ -608,19 +643,147 @@ impl Carved {
             })
             .unwrap_or(std::ptr::null_mut())
     }
+
+    /// Allocates a block too large for the small classes: a page sized block,
+    /// or one from the system for anything larger or more aligned.
+    ///
+    /// Kept out of line: `alloc` is inlined into every allocation in the
+    /// program, and with this path inlined too the command line's code grew
+    /// from 7.0 MB to 8.7 MB. A large block is rare next to a small one.
+    ///
+    /// @param layout - the allocation's layout
+    ///
+    /// # Safety
+    ///
+    /// As for [`GlobalAlloc::alloc`].
+    #[inline(never)]
+    unsafe fn alloc_large(layout: Layout) -> *mut u8 {
+        if let Some(big) = big_class_of(layout) {
+            return Carved::alloc_big(big);
+        }
+        // SAFETY: a size above the page sized classes, or an alignment above
+        // the grain, goes to the system unchanged.
+        unsafe { System.alloc(layout) }
+    }
+
+    /// Frees a block [`Carved::alloc_large`] made.
+    ///
+    /// @param pointer - the block
+    /// @param layout - the layout it was allocated with
+    ///
+    /// # Safety
+    ///
+    /// As for [`GlobalAlloc::dealloc`].
+    #[inline(never)]
+    unsafe fn dealloc_large(pointer: *mut u8, layout: Layout) {
+        if let Some(big) = big_class_of(layout) {
+            return Carved::free_big(pointer, big);
+        }
+        // SAFETY: `alloc_large` took this block from the system with this
+        // layout.
+        unsafe { System.dealloc(pointer, layout) }
+    }
+
+    /// Hands out one page sized block: from the class's free list when it
+    /// holds one, or carved from the class's chunk.
+    ///
+    /// When the thread's lists are gone, which happens only while the thread
+    /// is ending, the block comes from the system with the class's own
+    /// layout, so it is still a whole block of its class if it is ever freed
+    /// onto a list.
+    ///
+    /// @param class - the page sized class
+    #[inline]
+    fn alloc_big(class: usize) -> *mut u8 {
+        let taken = CARVED_BIG_HEADS
+            .try_with(|heads| {
+                let Some(head) = heads.get(class) else {
+                    return std::ptr::null_mut();
+                };
+                let block = head.get();
+                if block.is_null() {
+                    return Carved::carve_big(class);
+                }
+                // SAFETY: a block on the list holds the next link in its
+                // first eight bytes, written by `free_big`.
+                head.set(unsafe { block.cast::<*mut u8>().read() });
+                block
+            })
+            .unwrap_or(std::ptr::null_mut());
+        if !taken.is_null() {
+            return taken;
+        }
+        // SAFETY: a fresh allocation with the class's valid, nonzero layout.
+        unsafe { System.alloc(big_layout_of(class)) }
+    }
+
+    /// Carves one page sized block, taking a new page aligned chunk when the
+    /// class's last chunk is spent.
+    ///
+    /// @param class - the page sized class
+    #[inline]
+    fn carve_big(class: usize) -> *mut u8 {
+        let size = big_layout_of(class).size();
+        CARVED_BIG_SPANS
+            .try_with(|spans| {
+                let Some(span) = spans.get(class) else {
+                    return std::ptr::null_mut();
+                };
+                let (mut next, mut end) = span.get();
+                if next.saturating_add(size) > end || next == 0 {
+                    let Ok(chunk) =
+                        Layout::from_size_align(BIG_CHUNK_BYTES.max(size), BIG_CHUNK_ALIGN)
+                    else {
+                        return std::ptr::null_mut();
+                    };
+                    // SAFETY: a fresh allocation with a valid, nonzero layout.
+                    let base = unsafe { System.alloc(chunk) };
+                    if base.is_null() {
+                        return std::ptr::null_mut();
+                    }
+                    next = base as usize;
+                    end = next.saturating_add(chunk.size());
+                }
+                span.set((next.saturating_add(size), end));
+                next as *mut u8
+            })
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// Puts a page sized block on its class's free list. It is never given
+    /// back to the system, because a carved block is part of a chunk.
+    ///
+    /// @param pointer - the block
+    /// @param class - its page sized class
+    #[inline]
+    fn free_big(pointer: *mut u8, class: usize) {
+        let _ = CARVED_BIG_HEADS.try_with(|heads| {
+            if let Some(head) = heads.get(class) {
+                // SAFETY: the block is at least 8 KiB and aligned to the grain,
+                // and nothing else holds it any more.
+                unsafe { pointer.cast::<*mut u8>().write(head.get()) };
+                head.set(pointer);
+            }
+        });
+    }
 }
 
-// SAFETY: a block of a class is either carved from a chunk this allocator
-// took from `System` with room for it, or one it handed out before and was
-// given back with a layout of the same class. Blocks above `LARGEST` or more
+// SAFETY: a block of a class, small or page sized, is either carved from a
+// chunk this allocator took from `System` with room for it, taken from
+// `System` with the class's own layout, or one it handed out before and was
+// given back with a layout of the same class. Blocks above 64 KiB or more
 // aligned than the grain go to `System` unchanged in both directions.
 unsafe impl GlobalAlloc for Carved {
-    #[inline]
+    // SAFETY: as the comment on this impl says. Out of line, as it was before
+    // the page sized classes were carved: with them carved, `alloc` and
+    // `dealloc` became small enough to inline at every allocation and every
+    // drop, the command line's code grew from 7.0 MB to 8.7 MB, and a one row
+    // query took 0.3 ms longer to start.
+    #[inline(never)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let Some(class) = class_of(layout) else {
-            // SAFETY: as for this function; `big_alloc` forwards anything it
-            // does not keep to the system allocator unchanged.
-            return unsafe { big_alloc(layout) };
+            // SAFETY: as for this function.
+            return unsafe { Carved::alloc_large(layout) };
         };
         let taken = CARVED_HEADS
             .try_with(|heads| {
@@ -645,12 +808,11 @@ unsafe impl GlobalAlloc for Carved {
 
     // SAFETY: the pointer and layout are the ones `alloc` handed out, so a
     // block of a class holds at least the link written into its first word.
-    #[inline]
+    #[inline(never)]
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         let Some(class) = class_of(layout) else {
-            // SAFETY: as for this function; `big_dealloc` hands anything it
-            // does not keep back to the system allocator with this layout.
-            return unsafe { big_dealloc(pointer, layout) };
+            // SAFETY: as for this function.
+            return unsafe { Carved::dealloc_large(pointer, layout) };
         };
         let _ = CARVED_HEADS.try_with(|heads| {
             if let Some(head) = heads.get(class) {
@@ -993,6 +1155,53 @@ mod tests {
                 let again = Carved.alloc(layout);
                 assert_eq!(again, last, "the freed block was not recycled");
                 held.push(again);
+                for pointer in held {
+                    Carved.dealloc(pointer, layout);
+                }
+            }
+        })
+        .join()
+        .expect("the thread ran");
+    }
+
+    /// `Carved` carves page sized blocks on page boundaries, keeps them apart,
+    /// hands a freed one out again, and keeps a block's bytes when a
+    /// reallocation moves it to a larger class.
+    #[test]
+    fn carved_page_sized_blocks_are_page_aligned_distinct_and_recycled() {
+        std::thread::spawn(|| {
+            let layout = Layout::from_size_align(32 << 10, 8).expect("a layout");
+            let per_chunk = BIG_CHUNK_BYTES / layout.size();
+            // SAFETY: every pointer comes from `Carved` and is freed with the
+            // layout it was made with.
+            unsafe {
+                let mut held = Vec::new();
+                for nth in 0..per_chunk.saturating_add(3) {
+                    let pointer = Carved.alloc(layout);
+                    assert!(!pointer.is_null());
+                    assert_eq!(pointer as usize % BIG_CHUNK_ALIGN, 0, "block {nth}");
+                    std::ptr::write_bytes(pointer, (nth % 251) as u8, layout.size());
+                    held.push(pointer);
+                }
+                for (nth, pointer) in held.iter().enumerate() {
+                    for at in [0, layout.size() - 1] {
+                        assert_eq!(pointer.add(at).read(), (nth % 251) as u8, "block {nth}");
+                    }
+                }
+                let last = held.pop().expect("a block");
+                Carved.dealloc(last, layout);
+                let again = Carved.alloc(layout);
+                assert_eq!(again, last, "the freed block was not recycled");
+                // Growing to the 64 KiB class moves the block and keeps its bytes.
+                std::ptr::write_bytes(again, 7, layout.size());
+                let grown = Carved.realloc(again, layout, 40 << 10);
+                assert!(!grown.is_null());
+                assert_eq!(grown.read(), 7);
+                assert_eq!(grown.add(layout.size() - 1).read(), 7);
+                Carved.dealloc(
+                    grown,
+                    Layout::from_size_align(40 << 10, 8).expect("a layout"),
+                );
                 for pointer in held {
                     Carved.dealloc(pointer, layout);
                 }
