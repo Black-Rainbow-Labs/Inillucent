@@ -531,6 +531,10 @@ impl VfsFile for CryptFile {
         self.inner.lock_level()
     }
 
+    fn may_lease(&self) -> bool {
+        self.inner.may_lease()
+    }
+
     /// Passes the reserved lock check through.
     fn check_reserved_lock(&self) -> VfsResult<bool> {
         self.inner.check_reserved_lock()

@@ -564,7 +564,7 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "inillucent"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-compat",
@@ -576,15 +576,15 @@ dependencies = [
 
 [[package]]
 name = "inillucent-alloc"
-version = "2.3.1"
+version = "2.3.2"
 
 [[package]]
 name = "inillucent-base"
-version = "2.3.1"
+version = "2.3.2"
 
 [[package]]
 name = "inillucent-bench"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -601,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-catalog"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-pool",
@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-cli"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-alloc",
  "inillucent-base",
@@ -632,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-compat"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent",
  "inillucent-alloc",
@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-core"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-driver"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-engine",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-driver-capi"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-alloc",
  "inillucent-base",
@@ -697,7 +697,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-engine"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-catalog",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-exec"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-pool",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-ext"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-catalog",
@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-migrate"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-catalog",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-model"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-pool",
@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-pool"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-sim",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-remote"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-engine",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-scalar"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-sql",
@@ -801,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-search"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-core",
@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-sim"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-vfs",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-sql"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-value",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-sqlite-reader"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-catalog",
@@ -841,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-storage"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-value",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-transaction"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-storage",
@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-tree"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-pool",
@@ -871,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-txn"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-pool",
@@ -884,14 +884,14 @@ dependencies = [
 
 [[package]]
 name = "inillucent-value"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
 ]
 
 [[package]]
 name = "inillucent-vfs"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "libc",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "inillucent-wal"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "inillucent-base",
  "inillucent-sim",

@@ -8,10 +8,20 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
-## 1.0.31 to 2.3.1, 25 September to 7 October 2026
+## 1.0.31 to 2.3.2, 25 September to 7 October 2026
 
-The entries in this section were written for the releases from 1.0.31 to 2.3.1 and are not split by
+The entries in this section were written for the releases from 1.0.31 to 2.3.2 and are not split by
 release. The changelog in each release's tag is the one that release was cut with.
+
+**2.3.2 makes the crash campaigns give the same report on every run.** 2.3.0's read lease keeps
+SHARED for up to 1 ms after a statement that only read. Whether it does depends on the clock, and a
+thread lets an idle lease go at a moment the clock chooses. The crash campaigns number every call
+the simulated file system receives and cut the power at each one, so with the lease the same seed
+made 41, 42 or 43 calls, and the public tests of 2.3.1 failed because the campaigns rewrote their
+checked in reports. A file now says whether it may be leased (`VfsFile::may_lease`, true unless a
+file system says otherwise), and the simulated file system says no. The campaigns' reports are
+again the ones measured before the lease, and every cut point still recovers to a state the
+campaign accepts. Files on disk lease as in 2.3.0.
 
 **2.3.1 changes no behaviour of 2.3.0.** The public tests of 2.3.0 failed on one line of the
 benchmark program `inillucent-fullgate` that was not in `rustfmt`'s layout. 2.3.1 has that line

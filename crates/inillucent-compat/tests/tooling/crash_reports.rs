@@ -140,15 +140,10 @@ const FLOORS: [Floor; 20] = [
     // the dropped cut points tested. Measured through `inillucent-testrun`:
     // 53 cut points before the change and 43 after. Every cut point
     // still recovers to a state the campaign accepts.
-    // **Two fewer since a statement that only read keeps SHARED for the next
-    // one (task-2197).** The statement after it takes no lock and reads no
-    // meta record, and a lock and a read are each a cut point. Measured
-    // through the campaign with the lease switched off: 43 cut points, and 41
-    // with it. Every cut point still recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 41,
+        least: 43,
     },
     // **The same workload with the commit's log sync left to the fold that
     // follows it, which is what the command line's `exec` runs under
@@ -164,15 +159,10 @@ const FLOORS: [Floor; 20] = [
     // the dropped cut points tested. Measured through `inillucent-testrun`:
     // 51 cut points before the change and 39 after. Every cut point
     // still recovers to a state the campaign accepts.
-    // **Two fewer since a statement that only read keeps SHARED for the next
-    // one (task-2197).** The statement after it takes no lock and reads no
-    // meta record, and a lock and a read are each a cut point. Measured
-    // through the campaign with the lease switched off: 39 cut points, and 37
-    // with it. Every cut point still recovers to a state the campaign accepts.
     Floor {
         name: "delete-fold-crash.txt",
         shape: Shape::CutPoints,
-        least: 37,
+        least: 39,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -239,15 +229,10 @@ const FLOORS: [Floor; 20] = [
     // the dropped cut points tested. Measured through `inillucent-testrun`:
     // 53 cut points before the change and 43 after. Every cut point
     // still recovers to a state the campaign accepts.
-    // **Two fewer since a statement that only read keeps SHARED for the next
-    // one (task-2197).** The statement after it takes no lock and reads no
-    // meta record, and a lock and a read are each a cut point. Measured
-    // through the campaign with the lease switched off: 43 cut points, and 41
-    // with it. Every cut point still recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-disk-full.txt",
         shape: Shape::CutPoints,
-        least: 41,
+        least: 43,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -314,15 +299,10 @@ const FLOORS: [Floor; 20] = [
     // the dropped cut points tested. Measured through `inillucent-testrun`:
     // 53 cut points before the change and 43 after. Every cut point
     // still recovers to a state the campaign accepts.
-    // **Two fewer since a statement that only read keeps SHARED for the next
-    // one (task-2197).** The statement after it takes no lock and reads no
-    // meta record, and a lock and a read are each a cut point. Measured
-    // through the campaign with the lease switched off: 43 cut points, and 41
-    // with it. Every cut point still recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-io-error.txt",
         shape: Shape::CutPoints,
-        least: 41,
+        least: 43,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -389,15 +369,10 @@ const FLOORS: [Floor; 20] = [
     // the dropped cut points tested. Measured through `inillucent-testrun`:
     // 53 cut points before the change and 43 after. Every cut point
     // still recovers to a state the campaign accepts.
-    // **Two fewer since a statement that only read keeps SHARED for the next
-    // one (task-2197).** The statement after it takes no lock and reads no
-    // meta record, and a lock and a read are each a cut point. Measured
-    // through the campaign with the lease switched off: 43 cut points, and 41
-    // with it. Every cut point still recovers to a state the campaign accepts.
     Floor {
         name: "delete-full-short-write.txt",
         shape: Shape::CutPoints,
-        least: 41,
+        least: 43,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** 161 cut points became 153 over the same

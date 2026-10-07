@@ -834,6 +834,12 @@ impl VfsFile for SimFile {
         *guard(&self.level)
     }
 
+    /// A seeded run has to make the same calls every time, and a lease decides
+    /// by the clock; see [`VfsFile::may_lease`].
+    fn may_lease(&self) -> bool {
+        false
+    }
+
     /// Reports whether another handle holds RESERVED or stronger.
     fn check_reserved_lock(&self) -> VfsResult<bool> {
         self.state.require_power(VfsOperation::CheckReservedLock)?;

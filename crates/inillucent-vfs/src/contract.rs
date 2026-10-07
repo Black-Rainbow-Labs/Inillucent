@@ -345,6 +345,18 @@ pub trait VfsFile: Send + Sync + Debug {
     /// Reports whether some other handle holds RESERVED or stronger.
     fn check_reserved_lock(&self) -> VfsResult<bool>;
 
+    /// Reports whether SHARED may be kept on this handle between statements
+    /// (`inillucent_pool::lease`).
+    ///
+    /// **A file system whose calls are seeded and numbered answers false.** A
+    /// lease reads the clock to decide whether the next statement takes a lock,
+    /// and its releasing thread unlocks at a moment the clock chooses, so two
+    /// runs of one seed would make different calls and a crash campaign would
+    /// cut at different points on each run.
+    fn may_lease(&self) -> bool {
+        true
+    }
+
     /// Returns what the device underneath guarantees.
     fn device_characteristics(&self) -> DeviceCharacteristics;
 

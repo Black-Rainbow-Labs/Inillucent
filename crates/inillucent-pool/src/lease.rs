@@ -211,14 +211,18 @@ impl Lease {
     /// or the lease ends.
     ///
     /// Answers false, and arms nothing, when `held_since` is already [`MOST`]
-    /// ago or the handle does not hold exactly SHARED; the caller then lets
-    /// the lock go the ordinary way.
+    /// ago, the handle does not hold exactly SHARED, or the file does not allow
+    /// a lease (`VfsFile::may_lease`); the caller then lets the lock go the
+    /// ordinary way.
     ///
     /// @param held_since - when the lock was taken the ordinary way
     pub fn arm(&self, held_since: Instant) -> bool {
         let now = Instant::now();
         let held_until = held_since + MOST;
-        if now >= held_until || self.cell.file.lock_level() != FileLock::Shared {
+        if now >= held_until
+            || !self.cell.file.may_lease()
+            || self.cell.file.lock_level() != FileLock::Shared
+        {
             return false;
         }
         *self.cell.state() = State::Armed {
