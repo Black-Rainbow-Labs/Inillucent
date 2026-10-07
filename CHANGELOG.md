@@ -8,7 +8,20 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
-## Unreleased
+## 1.0.31 to 2.3.1, 25 September to 7 October 2026
+
+The entries in this section were written for the releases from 1.0.31 to 2.3.1 and are not split by
+release. The changelog in each release's tag is the one that release was cut with.
+
+**2.3.1 changes no behaviour of 2.3.0.** The public tests of 2.3.0 failed on one line of the
+benchmark program `inillucent-fullgate` that was not in `rustfmt`'s layout. 2.3.1 has that line
+fixed, and two tests that failed on timing are fixed:
+
+- `the_recorded_stages_nest_the_way_the_calls_do` failed in 10 of 20 runs. The check for room in a
+  leaf has run inside the key search since 2.2.0, so its time is part of the search's time, and the
+  test and the benchmark's write breakdown added it a second time.
+- `a_lease_holds_the_file_until_it_is_idle` opened its second file handle after the 1 ms read lease
+  started, so on a busy machine the lease had already ended.
 
 **64% faster than SQLite called the way most programs call it.** Measured on 25 workloads (one
 `inillucent` process per command, a SQL script piped into `inillucent-shell`, the Python driver and

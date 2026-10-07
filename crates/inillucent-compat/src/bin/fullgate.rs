@@ -2732,12 +2732,8 @@ fn put_stage_line(
     let rows = stages.rows as f64;
     let per = |nanos: u128| nanos as f64 / rows / 1e3;
     let ms = |nanos: u128| nanos as f64 / 1e6;
-    let named = stages.encode
-        + stages.find
-        + stages.locate
-        + stages.undo
-        + stages.apply
-        + stages.making;
+    let named =
+        stages.encode + stages.find + stages.locate + stages.undo + stages.apply + stages.making;
     let inside_modify = stages.modify.saturating_sub(stages.plan + stages.delta);
     let mut line = format!(
         "{} writes, {:.2} ms, {:.2} us a write",
