@@ -11,8 +11,6 @@
 //! columns keep their duplicates, which is what a caller reading the header of
 //! `SELECT a, a FROM t` sees in SQLite too.
 
-use inillucent_value::Collation;
-
 use super::BoundSelect;
 use crate::catalog_view::ColumnInfo;
 
@@ -76,9 +74,9 @@ pub fn unique_column_names(names: &[Vec<u8>]) -> Vec<Vec<u8>> {
 /// @param name - the name as written or derived
 /// @param position - the column's position, counting from zero
 fn base_name(name: &[u8], position: usize) -> Vec<u8> {
-    let unnamed = name.is_empty()
-        || name.eq_ignore_ascii_case(b"true")
-        || name.eq_ignore_ascii_case(b"false");
+    // An empty name written with `AS ''` is a name, and stays empty: SQLite
+    // only invents `columnN` for a column that has no name at all.
+    let unnamed = name.eq_ignore_ascii_case(b"true") || name.eq_ignore_ascii_case(b"false");
     if unnamed {
         return format!("column{}", position.saturating_add(1)).into_bytes();
     }
@@ -139,7 +137,7 @@ pub fn subquery_columns(select: &BoundSelect, names: &[Vec<u8>]) -> Vec<ColumnIn
         .zip(unique)
         .map(|((index, column), name)| {
             let folded = name.to_ascii_lowercase();
-            let collation = column.expr.collation().unwrap_or(Collation::Binary);
+            let collation = select.column_collation(index);
             ColumnInfo {
                 name,
                 folded,
@@ -238,7 +236,7 @@ mod tests {
     fn unnamed_columns_are_called_column_and_a_position() {
         assert_eq!(
             unique_column_names(&names(&["", "TRUE", "b"])),
-            names(&["column1", "column2", "b"])
+            names(&["", "column2", "b"])
         );
     }
 }

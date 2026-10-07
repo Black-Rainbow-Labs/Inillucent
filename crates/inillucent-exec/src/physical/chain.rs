@@ -837,7 +837,11 @@ fn already_sorted(
     let default_nulls = sort_keys
         .iter()
         .all(|term| term.nulls_first != term.descending);
-    let answered_by_the_walk = if !default_nulls {
+    let answered_by_the_walk = if plan.order_constant && !sort_keys.is_empty() {
+        // Every key is a column `WHERE` equates to an outside value, which
+        // SQLite does not sort by; the rows leave in scan order.
+        true
+    } else if !default_nulls {
         false
     } else if is_reverse_scan(prepared) {
         // A reverse scan produces descending key order, so a descending
@@ -849,7 +853,10 @@ fn already_sorted(
     } else {
         ascending()
     };
-    answered_by_the_walk || (is_skip_scan(prepared) && ascending())
+    // The skip scan yields the distinct prefix with NULLs first, so it answers
+    // only the default placement too. `DISTINCT c ORDER BY c NULLS LAST` over
+    // an index skipped its sorter and returned the NULL first.
+    answered_by_the_walk || (default_nulls && is_skip_scan(prepared) && ascending())
 }
 
 /// What the *source* may stop after, which is not the statement's LIMIT.

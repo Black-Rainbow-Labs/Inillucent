@@ -249,6 +249,31 @@ that does not select `inillucent-bench` does not compile oniguruma and does not 
 scripts in `packaging/` still need `Import-MsvcEnvironment` from `packaging/stage-layout.ps1` loaded
 by hand.
 
+**A run uses 80% of the machine's processors.** The development machine is also the machine a
+person works at, and a run that took every processor made the editor and the browser stop
+answering. The runner confines itself, its cargo builds and every test process to 80% of the
+logical processors, rounded down, fastest first: 19 of 24 here, every performance core and 11
+efficiency cores. The limit is the processor affinity mask, which every child process inherits.
+It sets `CARGO_BUILD_JOBS` to the same count and runs that many test binaries at once. The first
+line of every run names the processors. `--cpu <percent>` or `INILLUCENT_CPU_PERCENT` changes the
+share, and 100 removes it. CI sets `INILLUCENT_CPU_PERCENT=100`.
+
+`ship.ps1`, `release-all.ps1` and `nightly.ps1` do the same through `Enter-ProcessorShare` in
+`packaging/stage-layout.ps1`. A cargo command you type by hand does not, so put
+`pwsh tools/capped.ps1` in front of it:
+
+```sh
+pwsh tools/capped.ps1 cargo test -p inillucent-sql --lib
+pwsh tools/capped.ps1 cargo build --release -p inillucent-cli
+```
+
+`tools/capped.ps1` also imports the MSVC environment, so a raw cargo build of `onig_sys` works.
+
+A Windows job object with a processor rate limit was tried first and does not work here. `pwsh`
+on this machine is the Microsoft Store package, Windows runs it in a job that lets every child
+leave, and the children left the capped job too. The affinity mask is not a job, so they keep it.
+`tasks/task-2205-build-and-test-cpu-tdd.md` has the measurements.
+
 **Two optional machine settings, both off here.** `pwsh packaging/setup-machine.ps1 -Linker` sets
 `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER` to the toolchain's `rust-lld.exe`, and `-Sccache`
 sets `RUSTC_WRAPPER` to sccache with its cache on D:. Both are user environment variables, because

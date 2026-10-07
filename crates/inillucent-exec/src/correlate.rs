@@ -732,6 +732,29 @@ pub fn correlations_of(
     prepare_blocks(found, catalog, resolve, None, plan.levers)
 }
 
+/// Returns the first correlation parameter number no expression in a block uses.
+///
+/// **A nested block arrives with some of its outer references already
+/// parameters.** The enclosing block's own preparation rewrote every reference
+/// to a query further out, at every depth, into parameters numbered from
+/// [`FIRST_CORRELATION_PARAMETER`]. Numbering this block's feeds from the same
+/// place again gave the middle query's column and the outermost query's column
+/// one number, so `(SELECT x FROM w WHERE EXISTS (SELECT 1 WHERE x = v1))` read
+/// `x = x` and answered the first outer row's value for every row.
+///
+/// @param block - the block about to be rewritten, nested blocks included
+fn first_free_parameter(block: &mut BoundSelect) -> u32 {
+    let mut next = FIRST_CORRELATION_PARAMETER;
+    inillucent_sql::rewrite::rewrite_select(block, &mut |expr: &mut BoundExpr| {
+        if let BoundExpr::Parameter(number) = expr {
+            if *number >= FIRST_CORRELATION_PARAMETER {
+                next = next.max(number.saturating_add(1));
+            }
+        }
+    });
+    next
+}
+
 /// Rewrites each gathered block's outer references into parameters, and plans it.
 ///
 /// @param found - the correlated blocks
@@ -764,7 +787,7 @@ fn prepare_blocks(
             && target_root.is_some_and(|root| !reads_table(&block, root));
         let owned = owned_sources(&block);
         let mut feeds = Vec::new();
-        let mut next = FIRST_CORRELATION_PARAMETER;
+        let mut next = first_free_parameter(&mut block);
         let mut unresolved = false;
         inillucent_sql::rewrite::rewrite_select(&mut block, &mut |expr: &mut BoundExpr| {
             let outer = match expr {

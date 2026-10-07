@@ -38,10 +38,18 @@ pub const OR: Power = Power(1);
 pub const AND: Power = Power(2);
 /// Prefix `NOT`.
 pub const NOT: Power = Power(3);
-/// Every comparison, and the quasi-comparisons that share its level.
+/// `=`, `<>`, `IS`, `IN`, `LIKE`, `BETWEEN` and the other quasi-comparisons.
 pub const COMPARISON: Power = Power(4);
+/// `<`, `<=`, `>`, `>=`.
+///
+/// **One level tighter than `=`, as SQLite's grammar declares them.** Lemon's
+/// table lists `IS MATCH LIKE BETWEEN IN ISNULL NOTNULL NE EQ` on one line and
+/// `GT LE LT GE` on the next, so `2 = 1 < 3` is `2 = (1 < 3)`, which is false,
+/// and `1 BETWEEN 0 AND x <= 3` takes `x <= 3` as its upper bound. Sharing one
+/// level read both from the left and answered 1 for each.
+pub const RELATIONAL: Power = Power(5);
 /// `&`, `|`, `<<`, `>>`.
-pub const BITWISE: Power = Power(5);
+pub const BITWISE: Power = Power(6);
 /// `<->`, `<=>`, `<#>`, `<+>`, `<~>`, `<%>`.
 ///
 /// **The same level as the bitwise operators, which is where PostgreSQL puts
@@ -51,27 +59,26 @@ pub const BITWISE: Power = Power(5);
 /// `WHERE v <=> q < 0.5` and `ORDER BY v <=> q` parse the way anybody writing
 /// them means, and it is the only property of the level that matters: nothing
 /// mixes a distance with a shift.
-pub const DISTANCE: Power = Power(5);
+pub const DISTANCE: Power = Power(6);
 /// `+` and `-`.
-pub const ADDITIVE: Power = Power(6);
+pub const ADDITIVE: Power = Power(7);
 /// `*`, `/`, `%`.
-pub const MULTIPLICATIVE: Power = Power(7);
+pub const MULTIPLICATIVE: Power = Power(8);
 /// `||`, `->`, `->>`.
-pub const CONCAT: Power = Power(8);
+pub const CONCAT: Power = Power(9);
 /// Postfix `COLLATE`.
-pub const COLLATE: Power = Power(9);
+pub const COLLATE: Power = Power(10);
 /// Prefix `~`, `+`, `-`.
-pub const UNARY: Power = Power(10);
+pub const UNARY: Power = Power(11);
 
 /// Returns the binding power of an infix punctuator, when it has one.
 pub fn infix_power(punctuator: Punctuator) -> Option<Power> {
     let power = match punctuator {
-        Punctuator::Equal
-        | Punctuator::NotEqual
-        | Punctuator::Less
+        Punctuator::Equal | Punctuator::NotEqual => COMPARISON,
+        Punctuator::Less
         | Punctuator::LessEqual
         | Punctuator::Greater
-        | Punctuator::GreaterEqual => COMPARISON,
+        | Punctuator::GreaterEqual => RELATIONAL,
         Punctuator::BitAnd | Punctuator::BitOr | Punctuator::ShiftLeft | Punctuator::ShiftRight => {
             BITWISE
         }
@@ -103,6 +110,7 @@ mod tests {
             AND,
             NOT,
             COMPARISON,
+            RELATIONAL,
             BITWISE,
             ADDITIVE,
             MULTIPLICATIVE,
@@ -116,19 +124,21 @@ mod tests {
         }
     }
 
-    /// Every comparison shares one level. This is the rule that decides how
-    /// `a = b IS NULL` parses, and separating them is the usual mistake.
+    /// `=` and `<>` share the level of `IS`, which decides how `a = b IS NULL`
+    /// parses, and the ordering comparisons bind one level tighter, which
+    /// decides how `a = b < c` parses. Both are SQLite's grammar.
     #[test]
-    fn every_comparison_shares_one_level() {
+    fn equality_and_ordering_comparisons_have_their_own_levels() {
+        for punctuator in [Punctuator::Equal, Punctuator::NotEqual] {
+            assert_eq!(infix_power(punctuator), Some(COMPARISON), "{punctuator:?}");
+        }
         for punctuator in [
-            Punctuator::Equal,
-            Punctuator::NotEqual,
             Punctuator::Less,
             Punctuator::LessEqual,
             Punctuator::Greater,
             Punctuator::GreaterEqual,
         ] {
-            assert_eq!(infix_power(punctuator), Some(COMPARISON), "{punctuator:?}");
+            assert_eq!(infix_power(punctuator), Some(RELATIONAL), "{punctuator:?}");
         }
     }
 

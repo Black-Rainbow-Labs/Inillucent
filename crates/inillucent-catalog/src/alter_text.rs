@@ -70,8 +70,8 @@ pub fn constraint_names(sql: &[u8]) -> DbResult<Vec<Vec<u8>>> {
     for element in text.elements() {
         match element.table_level {
             true => {
-                if text.word(element.first).as_deref() == Some(b"constraint") {
-                    names.extend(text.folded_name(element.first.saturating_add(1)));
+                for label in text.labels(&element) {
+                    names.extend(text.folded_name(label.saturating_add(1)));
                 }
             }
             false => {
@@ -143,16 +143,10 @@ pub fn drop_constraint(sql: &[u8], folded: &[u8]) -> DbResult<Dropped> {
     let elements = text.elements();
     for (at, element) in elements.iter().enumerate() {
         if element.table_level {
-            let named = text.word(element.first).as_deref() == Some(b"constraint")
-                && text.folded_name(element.first.saturating_add(1)).as_deref() == Some(folded);
-            if !named {
-                continue;
+            if let Some(dropped) = drop_table_label(&text, &elements, at, folded) {
+                return Ok(dropped);
             }
-            let kind_at = element.first.saturating_add(2);
-            if text.word(kind_at).as_deref() != Some(b"check") {
-                return Ok(Dropped::Refused);
-            }
-            return Ok(Dropped::Text(text.cut_table_element(&elements, at)));
+            continue;
         }
         for constraint in text.column_constraints(*element) {
             let named = constraint.name.and_then(|name| text.folded_name(name));
@@ -167,6 +161,49 @@ pub fn drop_constraint(sql: &[u8], folded: &[u8]) -> DbResult<Dropped> {
         }
     }
     Ok(Dropped::Missing)
+}
+
+/// Drops the table constraint a `CONSTRAINT name` label names, when one of an
+/// element's labels is that name.
+///
+/// Table constraints need no comma between them, so one element can hold
+/// `CHECK (a>b) FOREIGN KEY(a) REFERENCES t` or `PRIMARY KEY(a) CONSTRAINT one
+/// CHECK (b<10)`, and one constraint can carry several labels in a row. SQLite
+/// drops only the named constraint, or only the label when another label
+/// follows it, and leaves the rest of the element in place.
+///
+/// @param text - the stored statement
+/// @param elements - every element of the column list
+/// @param at - the index of the table constraint element
+/// @param folded - the folded name being dropped
+fn drop_table_label(
+    text: &Text<'_>,
+    elements: &[Element],
+    at: usize,
+    folded: &[u8],
+) -> Option<Dropped> {
+    let element = elements.get(at)?;
+    let label = text
+        .labels(element)
+        .into_iter()
+        .find(|label| text.folded_name(label.saturating_add(1)).as_deref() == Some(folded))?;
+    let kind_at = label.saturating_add(2);
+    if text.word(kind_at).as_deref() == Some(b"constraint") {
+        return Some(Dropped::Text(text.cut_tokens(
+            label,
+            label.saturating_add(1),
+            element,
+        )));
+    }
+    let open = kind_at.saturating_add(1);
+    if text.word(kind_at).as_deref() != Some(b"check") || !text.is(open, Punctuator::LeftParen) {
+        return Some(Dropped::Refused);
+    }
+    let end = text.after_conflict(text.group_end(open), element.last);
+    if label == element.first && end >= element.last {
+        return Some(Dropped::Text(text.cut_table_element(elements, at)));
+    }
+    Some(Dropped::Text(text.cut_tokens(label, end, element)))
 }
 
 impl<'a> Text<'a> {
@@ -288,10 +325,11 @@ impl<'a> Text<'a> {
         if end <= first {
             return;
         }
-        let lead = match self.word(first).as_deref() {
-            Some(b"constraint") => self.word(first.saturating_add(2)),
-            other => other.map(<[u8]>::to_vec),
-        };
+        let mut lead_at = first;
+        while self.word(lead_at).as_deref() == Some(b"constraint") {
+            lead_at = lead_at.saturating_add(2);
+        }
+        let lead = self.word(lead_at);
         let table_level = matches!(
             lead.as_deref(),
             Some(b"primary") | Some(b"unique") | Some(b"check") | Some(b"foreign")
@@ -530,6 +568,49 @@ impl<'a> Text<'a> {
         out.extend_from_slice(self.sql.get(..from).unwrap_or(&[]));
         out.extend_from_slice(self.sql.get(to..).unwrap_or(&[]));
         out
+    }
+
+    /// Removes the tokens from `first` to `last` of one element, which keeps
+    /// other tokens.
+    ///
+    /// Tokens followed by more of the element go up to the next token, so the
+    /// space after them goes too. Tokens that end the element go from the end
+    /// of the token before them, so no space is left before the comma.
+    ///
+    /// @param first - the position of the first token to remove
+    /// @param last - the position of the last token to remove
+    /// @param element - the element the tokens are in
+    fn cut_tokens(&self, first: usize, last: usize, element: &Element) -> Vec<u8> {
+        let (from, to) = match last < element.last {
+            true => (self.start_of(first), self.start_after(last)),
+            false => (
+                self.end_before(first),
+                self.end_before(last.saturating_add(1)),
+            ),
+        };
+        let mut out = Vec::with_capacity(self.sql.len());
+        out.extend_from_slice(self.sql.get(..from).unwrap_or(&[]));
+        out.extend_from_slice(self.sql.get(to..).unwrap_or(&[]));
+        out
+    }
+
+    /// Returns the positions of the `CONSTRAINT` words at the top level of a
+    /// table constraint element, outside any parentheses.
+    ///
+    /// @param element - the element
+    fn labels(&self, element: &Element) -> Vec<usize> {
+        let mut labels = Vec::new();
+        let mut depth = 0usize;
+        for at in element.first..=element.last {
+            if self.is(at, Punctuator::LeftParen) {
+                depth = depth.saturating_add(1);
+            } else if self.is(at, Punctuator::RightParen) {
+                depth = depth.saturating_sub(1);
+            } else if depth == 0 && self.word(at).as_deref() == Some(b"constraint") {
+                labels.push(at);
+            }
+        }
+        labels
     }
 
     /// Removes a table constraint, taking the comma that separates it.

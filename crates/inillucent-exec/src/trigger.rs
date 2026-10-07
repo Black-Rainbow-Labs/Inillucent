@@ -324,6 +324,26 @@ pub fn fire_before_insert(
     })
 }
 
+/// Runs only the foreign key checks among a statement's `BEFORE` triggers.
+///
+/// For an `INSERT OR REPLACE` that has already removed the rows it replaces:
+/// SQLite checks the new row's own foreign keys after those deletes, and the
+/// deletes may have cascaded away the parent the row names. Written triggers
+/// are left out because they have already run for this row.
+///
+/// @param triggers - the triggers the statement fires
+/// @param target - the file and its trees
+/// @param firing - the row as it will be written
+pub fn fire_key_checks(
+    triggers: &[BoundTrigger],
+    target: &mut dyn WriteTarget,
+    firing: &TriggerFiring<'_>,
+) -> DbResult<Fired> {
+    fire_where(triggers, TriggerTime::Before, target, firing, &|trigger| {
+        trigger.foreign_key
+    })
+}
+
 /// Runs the triggers of one timing that a test selects, in schema order.
 ///
 /// @param triggers - the triggers the statement fires
@@ -348,6 +368,17 @@ fn fire_where(
         params,
         depth,
     } = *firing;
+    // **A recursive firing is bounded here, at run time.** The binder caps
+    // how deep it inlines bodies, but `PRAGMA recursive_triggers` hands a body
+    // its own trigger back while it runs, which the binder never sees. With no
+    // check, a delete trigger that reinserts the row it deleted under
+    // `INSERT OR REPLACE` recursed until the thread's stack overflowed and the
+    // process died. SQLite stops at `SQLITE_MAX_TRIGGER_DEPTH`.
+    if depth.0 >= params.trigger_depth() {
+        return Err(inillucent_base::error::statement_refusal(
+            "too many levels of trigger recursion",
+        ));
+    }
     let deeper = TriggerFiring {
         depth: depth.deeper(),
         ..*firing
@@ -369,10 +400,18 @@ fn fire_where(
                 continue;
             }
         }
+        // A trigger program restores the connection's last rowid when it ends,
+        // so an insert in the body is seen by the statements after it and by
+        // nothing outside the trigger.
+        let outer_rowid = params.last_insert_rowid();
         for statement in &trigger.body {
-            match run_body(statement, trigger, target, &deeper) {
+            let ran = run_body(statement, trigger, target, &deeper);
+            match ran {
                 Ok(()) => {}
-                Err(error) if is_ignore(&error) => return Ok(Fired::SkipRow),
+                Err(error) if is_ignore(&error) => {
+                    params.set_last_insert_rowid(outer_rowid);
+                    return Ok(Fired::SkipRow);
+                }
                 // **An immediate foreign key is checked when the statement
                 // ends**, as SQLite checks it; see
                 // `WriteTarget::defer_key_check`. Only a foreign key trigger's
@@ -386,9 +425,13 @@ fn fire_where(
                 {
                     break;
                 }
-                Err(error) => return Err(named(error, trigger)),
+                Err(error) => {
+                    params.set_last_insert_rowid(outer_rowid);
+                    return Err(named(error, trigger));
+                }
             }
         }
+        params.set_last_insert_rowid(outer_rowid);
     }
     Ok(Fired::Continue)
 }
@@ -586,13 +629,18 @@ fn run_body(
             let params = folded.as_ref().unwrap_or(params);
             // The clause this statement runs with is what the triggers it
             // fires are handed, as SQLite does; see `Depth`.
-            dml::insert_at(
+            let changes = dml::insert_at(
                 &insert,
                 target,
                 params,
                 &supplied,
                 Depth(depth.0, insert.on_conflict),
             )?;
+            // The body's own insert moves `last_insert_rowid()` for the
+            // statements after it; `fire_where` puts the outer value back.
+            if let Some(rowid) = changes.last_rowid {
+                firing.params.set_last_insert_rowid(rowid);
+            }
             Ok(())
         }
         BoundTriggerStatement::Update(update) => {

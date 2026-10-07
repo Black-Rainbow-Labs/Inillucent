@@ -42,6 +42,38 @@
 /// @param out - the string being built, appended to
 /// @param text - the text to escape into it
 pub fn escape_into(out: &mut String, text: &str) {
+    escape_with(out, text, needs_escape);
+}
+
+/// Appends `text` to `out` escaped the way SQLite's JSON functions escape it.
+///
+/// The same as [`escape_into`] except that DELETE is left raw. SQLite writes
+/// it raw, so `json_quote(char(127))` is three characters long there, and a
+/// program that compared or measured the result saw a different string here.
+/// The command line's own JSON output keeps escaping it, for the terminal
+/// reason [`escape_into`] gives.
+///
+/// @param out - the string being built, appended to
+/// @param text - the SQL text to escape
+pub fn escape_sql_into(out: &mut String, text: &str) {
+    escape_with(out, text, |byte| byte != 0x7f && needs_escape(byte));
+}
+
+/// Returns `text` escaped the way SQLite's JSON functions escape it.
+///
+/// @param text - the SQL text to escape
+pub fn escape_sql(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    escape_sql_into(&mut out, text);
+    out
+}
+
+/// Appends `text` with every byte a predicate names escaped.
+///
+/// @param out - the string being built, appended to
+/// @param text - the text to escape
+/// @param escaped - whether a byte is written escaped
+fn escape_with(out: &mut String, text: &str, escaped: impl Fn(u8) -> bool) {
     out.reserve(text.len());
     // **Runs that need no escape are copied whole** (task-2191). Every byte
     // this function escapes is ASCII, and an ASCII byte never occurs inside a
@@ -50,7 +82,7 @@ pub fn escape_into(out: &mut String, text: &str) {
     // appended in one copy. Almost all text is such runs: it was a push per
     // character for every value of every JSON result.
     let mut rest = text;
-    while let Some(at) = rest.bytes().position(needs_escape) {
+    while let Some(at) = rest.bytes().position(&escaped) {
         let (plain, tail) = rest.split_at(at);
         out.push_str(plain);
         let Some(character) = tail.chars().next() else {

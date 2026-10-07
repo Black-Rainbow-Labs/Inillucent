@@ -8,7 +8,7 @@
 
 use inillucent_value::{Affinity, Collation};
 
-use super::BoundExpr;
+use super::{BoundExpr, BoundSource, SourceRows};
 
 /// Returns the affinity and collation a comparison between two operands uses.
 ///
@@ -55,4 +55,39 @@ pub fn comparison_rules_over(
         .or_else(|| right.collation())
         .unwrap_or(Collation::Binary);
     (affinity, collation)
+}
+
+/// Returns the affinity an operand has in a comparison, reading a column of a
+/// derived table, a view or a CTE that carries no affinity as having none.
+///
+/// A declared column with no type is stored as BLOB and the comparison applies
+/// nothing to it. A derived column no arm gave an affinity is also stored as
+/// BLOB, but SQLite treats it as having none, so the other operand's affinity
+/// applies to it.
+///
+/// @param sources - the FROM terms the operand's column number is looked up in
+/// @param expr - the operand
+pub(super) fn seen_affinity_among(sources: &[BoundSource], expr: &BoundExpr) -> Option<Affinity> {
+    if let BoundExpr::Column {
+        source,
+        column,
+        affinity: Affinity::Blob,
+        ..
+    } = expr
+    {
+        let nothing =
+            sources
+                .iter()
+                .find(|held| held.id == *source)
+                .is_some_and(|held| match &held.rows {
+                    SourceRows::Subquery(block) => {
+                        block.column_affinity_if_any(usize::from(*column)).is_none()
+                    }
+                    _ => false,
+                });
+        if nothing {
+            return None;
+        }
+    }
+    expr.affinity()
 }

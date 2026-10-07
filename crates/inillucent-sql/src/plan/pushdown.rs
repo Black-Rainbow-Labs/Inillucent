@@ -94,6 +94,13 @@ fn push_filters(select: &mut BoundSelect) {
         if block.compounds.is_empty() {
             if accepts_a_pushed_filter(block) {
                 push_into_arm(block, id, &conjuncts);
+            } else if accepts_a_grouped_filter(block) {
+                let on_groups: Vec<BoundExpr> = conjuncts
+                    .iter()
+                    .filter(|conjunct| reads_only_grouping_columns(conjunct, id, block))
+                    .cloned()
+                    .collect();
+                push_into_arm(block, id, &on_groups);
             }
         } else if accepts_a_compound_filter(block) {
             push_into_compound(block, id, &conjuncts);
@@ -162,9 +169,23 @@ fn accepts_a_compound_filter(block: &BoundSelect) -> bool {
         .compounds
         .iter()
         .all(|(op, _)| *op == crate::ast::CompoundOp::UnionAll);
+    // SQLite refuses to push into a compound joined by anything but UNION ALL
+    // when any result column of any arm has a collation other than BINARY. The
+    // compound removes duplicates under that collation and the pushed term
+    // compares under its own, so the two can keep different rows:
+    // `SELECT * FROM (SELECT a FROM t1 INTERSECT SELECT b FROM t2) WHERE a||''
+    // = 'ABC'` with NOCASE columns keeps 'ABC' only when nothing is pushed.
+    let binary_columns = |arm: &BoundSelect| {
+        arm.columns
+            .iter()
+            .all(|column| crate::bind::result_collation(&column.expr) == Collation::Binary)
+    };
     block.limit.is_none()
         && block.offset.is_none()
         && (all_union_all || block.order_by.is_empty())
+        && (all_union_all
+            || (binary_columns(block)
+                && block.compounds.iter().all(|(_, arm)| binary_columns(arm))))
         && block.windows.is_empty()
         && block
             .compounds
@@ -209,6 +230,53 @@ fn accepts_a_pushed_filter(block: &BoundSelect) -> bool {
         && block.having.is_none()
         && block.windows.is_empty()
         && block.values.is_empty()
+}
+
+/// Reports whether a grouped derived table can take a filter on its grouping
+/// columns.
+///
+/// **SQLite's push down into an aggregate.** A condition that reads only the
+/// columns a derived table groups by keeps or removes whole groups, so it can
+/// be tested on the rows before they are grouped. That is what lets `SELECT s
+/// FROM (SELECT g, sum(v) s FROM t GROUP BY g) WHERE g = 5` search an index on
+/// `g` rather than group the whole table: a view that sums per customer,
+/// read for one customer, cost the whole table per read, and a correlated
+/// lookup into such a view 3,000 times took nine times SQLite's time. Not with
+/// a window, a `DISTINCT` or a `LIMIT`, which work on the grouped rows.
+///
+/// @param block - the derived table's query
+fn accepts_a_grouped_filter(block: &BoundSelect) -> bool {
+    block.compounds.is_empty()
+        && !block.group_by.is_empty()
+        && block.limit.is_none()
+        && block.offset.is_none()
+        && !block.distinct
+        && block.windows.is_empty()
+        && block.values.is_empty()
+}
+
+/// Reports whether every derived table column a condition reads is computed
+/// by an expression the derived table groups by.
+///
+/// @param conjunct - the condition, over the derived table's columns
+/// @param id - the derived table's statement-wide number
+/// @param block - the derived table's query
+fn reads_only_grouping_columns(conjunct: &BoundExpr, id: usize, block: &BoundSelect) -> bool {
+    let mut grouped = true;
+    let mut probe = conjunct.clone();
+    crate::rewrite::rewrite_expr(&mut probe, &mut |expr: &mut BoundExpr| {
+        if let BoundExpr::Column { source, column, .. } = expr {
+            if *source == id {
+                let computed = block
+                    .columns
+                    .get(usize::from(*column))
+                    .map(|held| &held.expr);
+                grouped &=
+                    computed.is_some_and(|inner| block.group_by.iter().any(|key| key == inner));
+            }
+        }
+    });
+    grouped
 }
 
 /// Reports whether a condition is one that may be evaluated anywhere, any
@@ -302,17 +370,35 @@ fn substituted(conjunct: &BoundExpr, id: usize, block: &BoundSelect) -> Option<B
 /// @param id - the derived table's statement-wide number
 /// @param block - the derived table's query
 fn replace_columns(expr: &mut BoundExpr, id: usize, block: &BoundSelect) -> bool {
-    if let BoundExpr::Column { source, column, .. } = expr {
+    if let BoundExpr::Column {
+        source,
+        column,
+        collation: outer_collation,
+        ..
+    } = expr
+    {
         if *source != id {
             return true;
         }
+        let outer_collation = *outer_collation;
         let Some(inner) = block.columns.get(usize::from(*column)) else {
             return false;
         };
         if !pushable(&inner.expr, usize::MAX) {
             return false;
         }
-        *expr = inner.expr.clone();
+        // A JSON call stands behind a unary plus, so the pushed copy reads the
+        // column as the plain text the derived table hands out; see `inline`
+        // in `flatten.rs`. Pushed bare, `WHERE NOT json_quote(c0)` over
+        // `SELECT json(TRUE) AS c0` read the JSON mark and kept no row.
+        *expr = match &inner.expr {
+            BoundExpr::Json { .. } => BoundExpr::Unary {
+                op: crate::ast::UnaryOp::Identity,
+                operand: Box::new(inner.expr.clone()),
+            },
+            other => other.clone(),
+        };
+        *expr = with_derived_collation(std::mem::replace(expr, BoundExpr::Null), outer_collation);
         return true;
     }
     let replaced = expr
@@ -323,6 +409,29 @@ fn replace_columns(expr: &mut BoundExpr, id: usize, block: &BoundSelect) -> bool
         refresh_comparison_rules(expr);
     }
     replaced
+}
+
+/// Makes a substituted expression compare with the collation the derived
+/// table's column had.
+///
+/// SQLite's `substExpr` wraps the replacement in a `COLLATE` when its own
+/// collation differs from the one the replaced column had. For a compound
+/// derived table the column has the leftmost arm's collation, so a filter
+/// `b = 'BbB'` over `SELECT a, b FROM t1 UNION ALL SELECT c, d FROM t2` with a
+/// NOCASE `t1.b` must compare `t2.d` with NOCASE as well. Without the wrapper
+/// each arm compared with its own column's collation and the BINARY arm
+/// missed the row the unpushed filter would have kept.
+///
+/// @param replacement - the expression that replaced the derived column
+/// @param outer - the collation the derived table's column had
+fn with_derived_collation(replacement: BoundExpr, outer: Collation) -> BoundExpr {
+    if crate::bind::result_collation(&replacement) == outer {
+        return replacement;
+    }
+    BoundExpr::Collate {
+        operand: Box::new(replacement),
+        collation: outer,
+    }
 }
 
 /// Recomputes the affinity and collation a comparison applies, from its

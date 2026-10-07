@@ -111,7 +111,7 @@ const UNSAFE_CRATES: [&str; 1] = ["inillucent-driver-capi"];
 // are FFI. Each call installs a handler and reads nothing back; each handler
 // stores `true` into an already-allocated `AtomicBool` and returns, which is
 // the whole of what a handler is allowed to do.
-const UNSAFE_ALLOWED: [&str; 23] = [
+const UNSAFE_ALLOWED: [&str; 24] = [
     // **CRC-32 by the processor's instructions, added by task-2191.** Checking a
     // page as it is read was 20% of a cold query of 100 rows from the command
     // line. Carryless multiply on x86-64 and `CRC32X` on aarch64 compute the
@@ -227,6 +227,13 @@ const UNSAFE_ALLOWED: [&str; 23] = [
     // handles and structures the calling frame owns, and each carries its own
     // SAFETY note.
     "crates/inillucent-compat/src/supervise.rs",
+    // **How much of the machine a test run may take (task-2205).** A hard
+    // limit on a process tree's processor time is an operating system object
+    // with no standard library form: a Windows job object with
+    // `JobObjectCpuRateControlInformation`, `SetPriorityClass` for the
+    // priority, and `setpriority` on Linux. Each is an FFI call on this
+    // process's own handle, and each carries its own SAFETY note.
+    "crates/inillucent-compat/src/processor_share.rs",
     // The allocator arm. A `GlobalAlloc` is the only way to
     // ask what the system allocator costs, and the question had to be asked:
     // the TDD expected the Linux gap to be the heap. Every path either forwards

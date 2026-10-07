@@ -2105,6 +2105,9 @@ impl<'a> Binder<'a> {
 
     /// Binds every `CHECK` the table declares.
     fn bind_checks(&mut self, table: &TableInfo) -> Result<Vec<BoundCheck>, ParseError> {
+        if self.ignore_checks {
+            return Ok(Vec::new());
+        }
         let mut checks = Vec::with_capacity(table.checks.len());
         for check in &table.checks {
             checks.push(BoundCheck {

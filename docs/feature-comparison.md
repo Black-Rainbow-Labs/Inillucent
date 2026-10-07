@@ -971,7 +971,7 @@ The 26 that answer differently with no arguments:
 
 ## Constructs the probe does not reach
 
-`inillucent capabilities` lists 53 capabilities reported by the engine. 12 of them are `no`: the
+`inillucent capabilities` lists 55 capabilities reported by the engine. 13 of them are `no`: the
 engine refuses the construct, and all but one of them with exit code 3. None of these is one of the
 416 cases. Most of them run in SQLite. One, writing to a view, is refused by SQLite too, with the
 same message and exit code 1.

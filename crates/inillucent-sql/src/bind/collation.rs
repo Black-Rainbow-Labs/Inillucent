@@ -45,6 +45,14 @@ impl BoundExpr {
                 collation,
                 ..
             } if *collation != Collation::Binary => Some(*collation),
+            // The `coalesce` SQLite builds for a merged `USING` column of a
+            // `FULL` join reads the collation of its first argument, so a
+            // NOCASE column keeps comparing as NOCASE after the merge.
+            BoundExpr::Function {
+                func: crate::function::ScalarFunc::UsingCoalesce,
+                arguments,
+                ..
+            } => arguments.first().and_then(BoundExpr::collation),
             other => other.explicit_collation(),
         }
     }

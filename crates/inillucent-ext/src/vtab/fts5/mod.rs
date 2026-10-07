@@ -526,9 +526,17 @@ impl VirtualTable for Fts5Table {
     /// engine tests the rowid against the matched rows.
     fn best_index(&self, query: &mut IndexQuery) -> DbResult<()> {
         let mut plan = PLAN_SCAN;
+        // **An equality on the table's own column is a match.** That is how
+        // FTS5 reads `SELECT * FROM t('query')`, whose argument binds that
+        // column, and `WHERE t = 'query'`; both returned no rows here, because
+        // the equality was tested against a column that holds nothing.
+        let table_match = |constraint: &inillucent_sql::vtab::ConstraintSpec| {
+            constraint.op == ConstraintOp::Match
+                || (constraint.op == ConstraintOp::Eq && constraint.column == self.match_column())
+        };
         let matches = query.constraints.iter().any(|constraint| {
             constraint.usable
-                && constraint.op == ConstraintOp::Match
+                && table_match(constraint)
                 && (0..=self.match_column()).contains(&constraint.column)
         });
         for index in 0..query.constraints.len() {
@@ -538,7 +546,7 @@ impl VirtualTable for Fts5Table {
             if !constraint.usable {
                 continue;
             }
-            if constraint.op == ConstraintOp::Match && constraint.column == self.match_column() {
+            if table_match(&constraint) && constraint.column == self.match_column() {
                 query.use_constraint(index, true);
                 plan = PLAN_MATCH;
                 break;
@@ -614,6 +622,7 @@ impl VirtualTable for Fts5Table {
                 .collect(),
             match_column: self.match_column(),
             rank_column: self.rank_column(),
+            rank_weights: Vec::new(),
             tokenizer: self.tokenizer.clone(),
             shadows: self.shadows.clone(),
             rows: Vec::new(),
@@ -683,6 +692,13 @@ impl VirtualTable for Fts5Table {
                     .filter(|value| !matches!(value, Value::Null))
                     .and_then(text_of)
                 {
+                    if command.as_slice() == b"delete" {
+                        let Some(key) = rowid.as_integer() else {
+                            return Ok(None);
+                        };
+                        self.remove_given(context, key, values)?;
+                        return Ok(None);
+                    }
                     let argument = values.get(self.rank_column() as usize).cloned();
                     self.command(context, &command, argument)?;
                     return Ok(None);

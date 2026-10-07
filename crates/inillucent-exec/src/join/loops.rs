@@ -7,7 +7,7 @@
 use inillucent_base::DbResult;
 use inillucent_pool::Pool;
 use inillucent_tree::datum::{Datum, OwnedDatum};
-use inillucent_tree::leaf::Hit;
+use inillucent_tree::leaf::{Hit, LeafRef};
 use inillucent_tree::PagedTree;
 
 use crate::batch::{Batch, Vector};
@@ -279,6 +279,7 @@ impl Probing<'_, '_> {
             inner,
             pool,
             inner_projection,
+            needed,
             width,
             inner_width,
             downstream,
@@ -287,11 +288,16 @@ impl Probing<'_, '_> {
         let (kind, width, inner_width) = (*kind, *width, *inner_width);
         let mut seen = 0usize;
         let mut reported = Flow::Continue;
-        inner.visit_leaves(pool, &mut |leaf| {
-            let rows: Vec<Vec<Datum<'_>>> = if leaf.needs_materialising() {
-                leaf.live()?
-            } else {
-                Vec::new()
+        // **A leaf's out-of-line values are read only when a column the statement reads holds
+        // one.** `visit_leaves` reads every one of them before it hands a leaf over, and this
+        // walk runs once per outer row, so an inner row holding a 110 KB document that nothing
+        // reads cost 110 KB per outer row: `FROM json_each(...) e, j` took 0.17 s for 20,000
+        // elements and quadruple that for twice as many. The same rule as `FullScan::run`.
+        let mut leaf_rows = |leaf: &LeafRef<'_>, unread_extents: bool| -> DbResult<bool> {
+            let rows: Vec<Vec<Datum<'_>>> = match (leaf.needs_materialising(), unread_extents) {
+                (false, _) => Vec::new(),
+                (true, false) => leaf.live()?,
+                (true, true) => live_rows_of_needed(leaf, inner_projection, needed)?,
             };
             let live = if leaf.needs_materialising() {
                 rows.len()
@@ -317,7 +323,10 @@ impl Probing<'_, '_> {
                 }
             }
             for (position, column) in inner_projection.0.iter().enumerate() {
-                columns.push(if leaf.needs_materialising() {
+                // A column nothing reads is a NULL constant, as it is in a probe.
+                columns.push(if !crate::paged::is_needed(needed, position) {
+                    Vector::Const(Datum::Null)
+                } else if leaf.needs_materialising() {
                     Vector::Values(held.get(position).map(Vec::as_slice).unwrap_or(&[]))
                 } else {
                     Vector::from_column(leaf.column(*column)?)
@@ -329,7 +338,21 @@ impl Probing<'_, '_> {
             }
             reported = downstream.push(&Batch::new(live, columns))?;
             Ok(reported == Flow::Continue)
-        })?;
+        };
+        let mut visit = |leaf: &LeafRef<'_>| -> DbResult<bool> {
+            if !leaf.has_extents() {
+                return leaf_rows(leaf, false);
+            }
+            if reads_nothing_out_of_line(leaf, inner_projection, needed)? {
+                return leaf_rows(leaf, true);
+            }
+            let held = inner.read_extents(pool, leaf)?;
+            leaf_rows(&leaf.with_extents(&held), false)
+        };
+        match needed.is_some() {
+            true => inner.visit_leaves_unresolved(pool, &mut visit)?,
+            false => inner.visit_leaves(pool, &mut visit)?,
+        }
         if let Some(answered) = self.emit_unmatched(batch, nth, seen)? {
             reported = answered;
         }
@@ -912,6 +935,74 @@ impl Sink for NestedLoopJoin<'_> {
         }
         self.downstream.reset()
     }
+}
+/// Reports whether none of the columns a statement reads holds a value out of line in a leaf.
+///
+/// The sorted region is asked by column and the delta area by row, because a value written
+/// since the leaf was last compacted is tagged in its own row and is not in any column's class
+/// array. A statement that reads every column, which is `needed` being `None`, always answers
+/// no.
+///
+/// @param leaf - the leaf, its out-of-line values not read
+/// @param projection - which tree column each output position is
+/// @param needed - which output positions the statement reads, or `None` for all
+fn reads_nothing_out_of_line(
+    leaf: &LeafRef<'_>,
+    projection: &Projection,
+    needed: &crate::paged::Needed,
+) -> DbResult<bool> {
+    if needed.is_none() {
+        return Ok(false);
+    }
+    for (position, column) in projection.0.iter().enumerate() {
+        if !crate::paged::is_needed(needed, position) {
+            continue;
+        }
+        if leaf.column(*column)?.any_extent()? {
+            return Ok(false);
+        }
+        for index in 0..leaf.delta_count() {
+            if leaf.delta_extent_at(index, *column)?.is_some() {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Returns a leaf's live rows in key order, holding only the columns the statement reads.
+///
+/// Every other column of a row is NULL. This is for a leaf whose out-of-line values have not
+/// been read, where `LeafRef::live` would fail on a column that holds one.
+///
+/// @param leaf - the leaf, its out-of-line values not read
+/// @param projection - which tree column each output position is
+/// @param needed - which output positions the statement reads
+fn live_rows_of_needed<'p>(
+    leaf: &LeafRef<'p>,
+    projection: &Projection,
+    needed: &crate::paged::Needed,
+) -> DbResult<Vec<Vec<Datum<'p>>>> {
+    let columns: Vec<usize> = projection
+        .0
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| crate::paged::is_needed(needed, *position))
+        .map(|(_, column)| *column)
+        .collect();
+    let width = leaf.column_count();
+    let mut rows: Vec<Vec<Datum<'p>>> = Vec::new();
+    leaf.visit_live(&columns, &mut |values| {
+        let mut row = vec![Datum::Null; width];
+        for (column, value) in columns.iter().zip(values) {
+            if let Some(slot) = row.get_mut(*column) {
+                *slot = *value;
+            }
+        }
+        rows.push(row);
+        Ok(())
+    })?;
+    Ok(rows)
 }
 /// Reports whether a concatenated row satisfies a join condition.
 ///

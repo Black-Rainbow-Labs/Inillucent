@@ -19,3 +19,9 @@ capability fts5_columnsize_option
 statement ok
 CREATE VIRTUAL TABLE d USING fts5(body, columnsize=0)
 
+case capability-fts5-contentless-delete-option
+capability fts5_contentless_delete_option
+
+statement ok
+CREATE VIRTUAL TABLE d USING fts5(body, content='', contentless_delete=1)
+

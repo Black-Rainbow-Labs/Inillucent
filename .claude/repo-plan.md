@@ -960,3 +960,14 @@ they are touching do not collide; two that have not, do.
   So the DELETE crash campaigns have 13 fewer cut points after the commit than before, and their
   floors in `crash_reports.rs` say so. A change that makes the close roll or delete segments again
   will raise those counts, which is not a defect in the campaign. (task-2191)
+- **A run is confined to 19 of the 24 processors, and a timing taken under it is not comparable to
+  one taken before.** `inillucent-testrun`, `ship.ps1`, `release-all.ps1` and `nightly.ps1` set the
+  processor affinity mask to 80% of the logical processors, fastest first (`0xC1FFFF` here), and
+  every child inherits it. A suite time recorded before 2026-10-07 had 24. `--cpu 100` or
+  `INILLUCENT_CPU_PERCENT=100` gives all of them back for a measurement that needs it. Do not try
+  to cap a build with a job object from `pwsh`: `pwsh` here is the Store package, and its children
+  leave every job, a capped one included. (task-2205)
+- **`Get-Process` and `taskkill` may not see a test process that `Get-CimInstance Win32_Process`
+  lists.** A stuck `inillucent_bench` test binary under a runner was invisible to both and was
+  stopped with `Get-CimInstance Win32_Process -Filter "ProcessId=<pid>" | Invoke-CimMethod -MethodName
+  Terminate`. (task-2205)

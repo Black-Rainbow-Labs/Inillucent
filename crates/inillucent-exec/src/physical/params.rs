@@ -205,6 +205,11 @@ pub struct Params {
     /// because it is read where a body statement is *run* - see
     /// `crate::trigger::run_body` - and not where one is translated.
     recursive_triggers: std::cell::Cell<bool>,
+    /// How deep a recursive trigger may nest, from `.limit trigger_depth`.
+    ///
+    /// Read where a recursive firing goes one level further in; see
+    /// `crate::trigger::fire_where`.
+    trigger_depth: std::cell::Cell<usize>,
     /// Whether an `INSERT` stores each value as its source produced it, without
     /// applying the column's affinity.
     ///
@@ -264,6 +269,7 @@ impl Clone for Params {
             reads: std::cell::Cell::new(self.reads.get()),
             context: self.context.clone(),
             recursive_triggers: self.recursive_triggers.clone(),
+            trigger_depth: self.trigger_depth.clone(),
             keeps_types: self.keeps_types.clone(),
             subqueries: self.subqueries.clone(),
             shared_rows: self.copy_of_shared_rows(),
@@ -271,6 +277,9 @@ impl Clone for Params {
         }
     }
 }
+/// `SQLITE_MAX_TRIGGER_DEPTH`, the depth a connection allows until it says otherwise.
+pub const DEFAULT_TRIGGER_DEPTH: usize = 1000;
+
 impl Params {
     /// Returns an empty parameter set.
     pub fn new() -> Params {
@@ -280,6 +289,7 @@ impl Params {
             reads: std::cell::Cell::new(0),
             context: std::cell::Cell::new(crate::scalar::Context::default()),
             recursive_triggers: std::cell::Cell::new(false),
+            trigger_depth: std::cell::Cell::new(DEFAULT_TRIGGER_DEPTH),
             keeps_types: std::cell::Cell::new(false),
             subqueries: Vec::new(),
             shared_rows: std::cell::OnceCell::new(),
@@ -297,6 +307,7 @@ impl Params {
             reads: std::cell::Cell::new(0),
             context: std::cell::Cell::new(crate::scalar::Context::default()),
             recursive_triggers: std::cell::Cell::new(false),
+            trigger_depth: std::cell::Cell::new(DEFAULT_TRIGGER_DEPTH),
             keeps_types: std::cell::Cell::new(false),
             subqueries: Vec::new(),
             shared_rows: std::cell::OnceCell::new(),
@@ -317,6 +328,7 @@ impl Params {
             reads: std::cell::Cell::new(self.reads.get()),
             context: self.context.clone(),
             recursive_triggers: self.recursive_triggers.clone(),
+            trigger_depth: self.trigger_depth.clone(),
             keeps_types: self.keeps_types.clone(),
             subqueries,
             shared_rows: self.copy_of_shared_rows(),
@@ -343,6 +355,7 @@ impl Params {
             reads: std::cell::Cell::new(self.reads.get()),
             context: self.context.clone(),
             recursive_triggers: self.recursive_triggers.clone(),
+            trigger_depth: self.trigger_depth.clone(),
             keeps_types: self.keeps_types.clone(),
             subqueries: Vec::new(),
             shared_rows: self.copy_of_shared_rows(),
@@ -480,6 +493,27 @@ impl Params {
         self.context.set(context);
     }
 
+    /// Returns what `last_insert_rowid()` currently answers for this statement.
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.context.get().last_insert_rowid
+    }
+
+    /// Changes what `last_insert_rowid()` answers for the rest of this statement.
+    ///
+    /// SQLite moves the connection's last rowid at every insert, including the
+    /// inserts a trigger body makes, and puts the outer value back when the
+    /// trigger ends. The value rides in a `Cell`, so a trigger firing can move
+    /// it on the `Params` it was handed without copying them for every row.
+    ///
+    /// @param rowid - the rowid the next expression should read
+    pub fn set_last_insert_rowid(&self, rowid: i64) {
+        let held = self.context.get();
+        self.context.set(crate::scalar::Context {
+            last_insert_rowid: rowid,
+            ..held
+        });
+    }
+
     /// Returns a copy of this set that says `last_insert_rowid()` is `rowid`.
     ///
     /// For the expressions of a `RETURNING` clause, which SQLite evaluates after
@@ -494,6 +528,17 @@ impl Params {
             ..held
         });
         copy
+    }
+    /// Sets how deep a recursive trigger may nest.
+    ///
+    /// @param depth - the connection's `trigger_depth` limit
+    pub fn set_trigger_depth(&self, depth: usize) {
+        self.trigger_depth.set(depth);
+    }
+
+    /// Returns how deep a recursive trigger may nest.
+    pub fn trigger_depth(&self) -> usize {
+        self.trigger_depth.get()
     }
 
     /// Tells this set whether a trigger's own writes fire triggers.

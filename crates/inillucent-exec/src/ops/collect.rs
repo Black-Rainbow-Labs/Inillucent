@@ -344,3 +344,53 @@ pub fn emit_rows(rows: &[Vec<OwnedDatum>], downstream: &mut dyn Sink) -> DbResul
     }
     Ok(Flow::Continue)
 }
+/// Emits rows that all begin with the same leading values, without copying those values into
+/// every row.
+///
+/// A lateral join pairs one outer row with every row a module answered. Building each joined row
+/// by cloning the outer row copied the outer row's text once per answer, so `FROM j,
+/// json_each(j.doc)` over a 110 KB document copied 110 KB for each of its 20,000 elements. The
+/// leading values are constant columns of the batch instead, which borrow the one copy.
+///
+/// @param prefix - the values every emitted row starts with
+/// @param rows - the rest of each emitted row, all of the same width
+/// @param downstream - what to push them into
+pub fn emit_rows_after_prefix(
+    prefix: &[OwnedDatum],
+    rows: &[Vec<OwnedDatum>],
+    downstream: &mut dyn Sink,
+) -> DbResult<Flow> {
+    let rest = rows.first().map(|row| row.len()).unwrap_or(0);
+    if prefix.len().saturating_add(rest) == 0 {
+        return Ok(Flow::Continue);
+    }
+    for chunk in rows.chunks(crate::batch::BATCH_ROWS) {
+        let mut columns_owned: Vec<Vec<Datum<'_>>> = Vec::with_capacity(rest);
+        for column in 0..rest {
+            columns_owned.push(
+                chunk
+                    .iter()
+                    .map(|row| {
+                        row.get(column)
+                            .map(OwnedDatum::borrow)
+                            .unwrap_or(Datum::Null)
+                    })
+                    .collect(),
+            );
+        }
+        let mut columns: Vec<Vector<'_>> = prefix
+            .iter()
+            .map(|value| Vector::Const(value.borrow()))
+            .collect();
+        columns.extend(
+            columns_owned
+                .iter()
+                .map(|values| Vector::Values(values.as_slice())),
+        );
+        let batch = Batch::new(chunk.len(), columns);
+        if downstream.push(&batch)? == Flow::Stop {
+            return Ok(Flow::Stop);
+        }
+    }
+    Ok(Flow::Continue)
+}

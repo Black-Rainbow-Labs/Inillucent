@@ -106,6 +106,7 @@ pub fn call(func: JsonFunc, arguments: &[Argument<'_>]) -> DbResult<Answer> {
         JsonFunc::Type => type_of(arguments),
         JsonFunc::Valid => valid(arguments),
         JsonFunc::Quote => quote(arguments),
+        JsonFunc::WalkValue => Ok(walk_value(arguments)),
         JsonFunc::ArrayInsert => array_insert(arguments, false),
         JsonFunc::ArrayInsertB => array_insert(arguments, true),
     }
@@ -461,6 +462,11 @@ fn extract(arguments: &[Argument<'_>], binary: bool) -> DbResult<Answer> {
     }
     let mut items = Vec::with_capacity(paths.len());
     for argument in paths {
+        // A NULL path makes the whole answer NULL, as it does with one path.
+        // It was read as the path text 'NULL' and refused as malformed.
+        if argument.value.is_null() {
+            return Ok(Answer::null());
+        }
         let steps = path_of(argument)?;
         items.push(path::lookup(&node, &steps)?.cloned().unwrap_or(Node::Null));
     }
@@ -497,7 +503,7 @@ fn arrow(arguments: &[Argument<'_>], sql: bool) -> DbResult<Answer> {
                 // An empty right operand is neither a path nor a label.
                 return Err(path::bad_path(source));
             } else {
-                vec![path::Step::Key(source.to_string())]
+                path::parse(&abbreviated_path(source))?
             }
         }
         _ => return Err(path::bad_path("?")),
@@ -509,6 +515,27 @@ fn arrow(arguments: &[Argument<'_>], sql: bool) -> DbResult<Answer> {
         return as_sql(found);
     }
     answer(found, false)
+}
+
+/// Returns the full path a bare right operand of `->` or `->>` stands for.
+///
+/// SQLite's three spellings: a name of letters, digits and underscores is
+/// `$.name`, text such as `[3]` is `$[3]`, and anything else is the quoted key
+/// `$."text"`. The quoted form is why a label with a backslash escape finds
+/// the member the escape spells: `'a\x62c'` is looked up as `abc`.
+///
+/// @param source - the right operand, which does not begin with `$`
+fn abbreviated_path(source: &str) -> String {
+    let plain = source
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '_');
+    if plain {
+        format!("$.{source}")
+    } else if source.len() >= 3 && source.starts_with('[') && source.ends_with(']') {
+        format!("${source}")
+    } else {
+        format!("$.\"{source}\"")
+    }
 }
 
 /// `json_insert`, `json_replace`, `json_set` and their binary forms.
@@ -757,6 +784,27 @@ fn valid_blob(bytes: &[u8], flags: i64) -> bool {
     let strict = flags & 8 != 0 && binary::is_valid(bytes);
     let shallow = flags & 4 != 0 && binary::read_header(bytes, 0).is_ok();
     strict || shallow || valid_text(bytes, flags)
+}
+
+/// The `value` of a `json_each` or `json_tree` row, with the JSON mark when
+/// the row's `type` is an array or an object.
+///
+/// The value of a container row is already its JSON text, and the value of a
+/// scalar row is the SQL value, so only the mark is decided here.
+///
+/// @param arguments - the row's `value`, then its `type`
+fn walk_value(arguments: &[Argument<'_>]) -> Answer {
+    let value = arguments
+        .first()
+        .map_or(Value::Null, |argument| argument.value.clone());
+    let container = arguments.get(1).is_some_and(|kind| match &kind.value {
+        Value::Text(text) => matches!(text.utf8_bytes().as_ref(), b"array" | b"object"),
+        _ => false,
+    });
+    Answer {
+        value,
+        json: container,
+    }
 }
 
 /// `json_quote(X)`.

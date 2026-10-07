@@ -713,6 +713,24 @@ pub static CAPABILITIES: &[Capability] = &[
         },
     },
     Capability {
+        name: "fts5_contentless_delete_option",
+        support: Support::No,
+        note: "The FTS5 index finds a row's postings from its text, which a contentless table does not keep: `contentless_delete=1` is refused rather than accepted and ignored. The `delete` command, which supplies the text, works on a contentless table.",
+        probe: Probe::Runs {
+            setup: &[],
+            sql: "CREATE VIRTUAL TABLE d USING fts5(body, content='', contentless_delete=1)",
+        },
+    },
+    Capability {
+        name: "window_json_and_percentile_aggregates",
+        support: Support::Yes,
+        note: "json_group_array, json_group_object, median, percentile and group_concat with a separator that is a column run over a window frame, as they do over a group.",
+        probe: Probe::Runs {
+            setup: &["CREATE TABLE t (a INTEGER, s TEXT)", "INSERT INTO t VALUES (1, '-'), (2, '+')"],
+            sql: "SELECT json_group_array(a) OVER (ORDER BY a), group_concat(a, s) OVER (ORDER BY a) FROM t",
+        },
+    },
+    Capability {
         name: "changing_a_schema_row",
         support: Support::No,
         note: "An INSERT into sqlite_schema under PRAGMA writable_schema records a virtual table, which is what a dump replays; an UPDATE or a DELETE of a schema row is refused.",

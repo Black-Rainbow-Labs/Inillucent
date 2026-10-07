@@ -35,7 +35,7 @@ use inillucent_sql::ast::{FrameExclude, FrameUnit};
 /// two executors hold it in different places - a record column in the VM, an
 /// evaluated batch column in the vectorised executor - and neither shape is
 /// worth teaching this module about.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Bound {
     /// `UNBOUNDED PRECEDING`.
     UnboundedPreceding,
@@ -50,10 +50,21 @@ pub enum Bound {
         /// Whether it counts backwards.
         preceding: bool,
     },
+    /// A `RANGE` offset, which may be a fraction.
+    ///
+    /// **Its own variant because `RANGE` measures in ordering values, not
+    /// rows.** `RANGE BETWEEN 0.5 PRECEDING AND 0.5 FOLLOWING` was read as an
+    /// integer offset of 0 and gave every row a frame of its peers alone.
+    RangeOffset {
+        /// How far, in ordering values.
+        distance: f64,
+        /// Whether it counts backwards.
+        preceding: bool,
+    },
 }
 
 /// A frame specification with both ends resolved.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrameSpec {
     /// `ROWS`, `RANGE` or `GROUPS`.
     pub unit: FrameUnit,
@@ -78,6 +89,14 @@ pub struct Partition {
     pub end: usize,
     /// The peer group of each row, as `(first, last_exclusive)`.
     pub peers: Vec<(usize, usize)>,
+    /// The first row of each peer group, in order.
+    ///
+    /// **Kept so a group is found by a binary search.** `dense_rank()` and a
+    /// `GROUPS` offset bound used to walk the groups from the partition's
+    /// start for every row, which made both quadratic in the number of groups:
+    /// `dense_rank() OVER (ORDER BY a)` over 50,000 distinct values walked
+    /// more than a billion groups.
+    pub group_starts: Vec<usize>,
 }
 
 impl Partition {
@@ -100,6 +119,43 @@ impl Partition {
             .copied()
             .unwrap_or((row, row.saturating_add(1)))
     }
+
+    /// Returns the zero based position of a row's peer group in the partition.
+    ///
+    /// @param row - an absolute row number
+    pub fn group_of(&self, row: usize) -> usize {
+        let (peer_start, _) = self.peers_of(row);
+        match self.group_starts.binary_search(&peer_start) {
+            Ok(found) => found,
+            Err(after) => after.saturating_sub(1),
+        }
+    }
+
+    /// Returns the half open row range of one peer group, by its position.
+    ///
+    /// @param group - the zero based position of the group
+    pub fn group_rows(&self, group: usize) -> Option<(usize, usize)> {
+        let first = *self.group_starts.get(group)?;
+        let next = self
+            .group_starts
+            .get(group.saturating_add(1))
+            .copied()
+            .unwrap_or(self.end);
+        Some((first, next))
+    }
+}
+
+/// Returns the first row of each peer group, in order.
+///
+/// @param peers - the peer group of each row of the partition
+fn group_starts(peers: &[(usize, usize)]) -> Vec<usize> {
+    let mut starts: Vec<usize> = Vec::new();
+    for (first, _) in peers {
+        if starts.last() != Some(first) {
+            starts.push(*first);
+        }
+    }
+    starts
 }
 
 /// Splits a sorted row range into partitions and peer groups.
@@ -124,10 +180,12 @@ pub fn partitions(
         while end < total && same_partition(start, end) {
             end = end.saturating_add(1);
         }
+        let peers = peer_groups(start, end, &same_order, ordered);
         found.push(Partition {
             start,
             end,
-            peers: peer_groups(start, end, &same_order, ordered),
+            group_starts: group_starts(&peers),
+            peers,
         });
         start = end;
     }
@@ -186,23 +244,13 @@ pub fn rank(partition: &Partition, row: usize) -> i64 {
 
 /// Returns `dense_rank()`: how many peer groups have started up to this row.
 ///
-/// Walks group to group rather than row to row, so a partition of one peer
-/// group answers in one step however many rows it holds.
+/// A binary search of the partition's group starts, so it costs the same for
+/// every row however many groups come before it.
 ///
 /// @param partition - the row's partition
 /// @param row - an absolute row number
 pub fn dense_rank(partition: &Partition, row: usize) -> i64 {
-    let mut rank = 1i64;
-    let mut member = partition.start;
-    while member < row && member < partition.end {
-        let (_, group_end) = partition.peers_of(member);
-        if group_end > row || group_end <= member {
-            break;
-        }
-        rank = rank.saturating_add(1);
-        member = group_end;
-    }
-    rank
+    (partition.group_of(row) as i64).saturating_add(1)
 }
 
 /// Returns `percent_rank()`.
@@ -278,6 +326,49 @@ pub fn offset_row(
         return None;
     }
     Some(target as usize)
+}
+
+/// Returns the first and last row of one row's frame before `EXCLUDE`, or
+/// `None` when the frame is empty.
+///
+/// **The bounds alone, for a caller that walks the frame itself.** Listing
+/// every member made each row's frame cost its length, so a running total,
+/// `sum(v) OVER (ORDER BY id)`, cost the square of the partition: 100,000 rows
+/// ran past a minute where SQLite takes a tenth of a second. Both bounds only
+/// move forward from one row to the next, so a caller can add the rows that
+/// enter and take out the rows that leave.
+///
+/// @param partition - the row's partition
+/// @param row - the row whose frame this is
+/// @param spec - the frame, with its offsets already resolved
+/// @param order_value - as for [`frame`]
+/// @param descending - whether that ordering term is descending
+pub fn frame_bounds(
+    partition: &Partition,
+    row: usize,
+    spec: &FrameSpec,
+    order_value: impl Fn(usize) -> Option<f64>,
+    descending: bool,
+) -> Option<(usize, usize)> {
+    let low = bound_of(
+        partition,
+        row,
+        spec,
+        spec.start,
+        true,
+        &order_value,
+        descending,
+    )?;
+    let high = bound_of(
+        partition,
+        row,
+        spec,
+        spec.end,
+        false,
+        &order_value,
+        descending,
+    )?;
+    (low <= high && !partition.is_empty()).then_some((low, high))
 }
 
 /// Returns the rows of one row's frame, in partition order.
@@ -428,13 +519,25 @@ fn bound_of(
             FrameUnit::Range => range_bound(
                 partition,
                 row,
-                distance,
+                distance as f64,
                 preceding,
                 is_start,
                 order_value,
                 descending,
             )?,
         },
+        Bound::RangeOffset {
+            distance,
+            preceding,
+        } => range_bound(
+            partition,
+            row,
+            distance,
+            preceding,
+            is_start,
+            order_value,
+            descending,
+        )?,
     })
 }
 
@@ -452,22 +555,22 @@ fn group_bound(
     preceding: bool,
     is_start: bool,
 ) -> Option<usize> {
-    let here = dense_rank(partition, row);
+    let here = partition.group_of(row) as i64;
     let wanted = if preceding {
         here.saturating_sub(offset)
     } else {
         here.saturating_add(offset)
     };
-    let mut answer = None;
-    for member in partition.start..partition.end {
-        if dense_rank(partition, member) != wanted {
-            continue;
-        }
-        answer = Some(member);
-        if is_start {
-            break;
-        }
-    }
+    let answer = usize::try_from(wanted)
+        .ok()
+        .and_then(|group| partition.group_rows(group))
+        .map(|(first, next)| {
+            if is_start {
+                first
+            } else {
+                next.saturating_sub(1)
+            }
+        });
     match answer {
         Some(member) => Some(member),
         // The wanted group is off one end of the partition. Which end decides
@@ -502,7 +605,7 @@ fn group_bound(
 fn range_bound(
     partition: &Partition,
     row: usize,
-    offset: i64,
+    offset: f64,
     preceding: bool,
     is_start: bool,
     order_value: &impl Fn(usize) -> Option<f64>,
@@ -535,46 +638,58 @@ fn range_bound(
             })
         }
     };
-    let offset = offset as f64;
     let limit = if preceding != descending {
         here - offset
     } else {
         here + offset
     };
-    let mut answer = None;
-    for member in partition.start..partition.end {
-        // A row whose ordering value is NULL is not within any distance of a
-        // row that has one, so it can never be the row an offset bound lands
-        // on. An `UNBOUNDED` bound still reaches it, which is why this is here
-        // rather than in `frame`.
-        let Some(value) = order_value(member) else {
-            continue;
-        };
-        // Text sorts above every number, which is what an infinity does in
-        // each of the four comparisons below.
-        let value = if value.is_nan() { f64::INFINITY } else { value };
-        let inside = if is_start {
-            if descending {
-                value <= limit
-            } else {
-                value >= limit
-            }
-        } else if descending {
-            value >= limit
-        } else {
-            value <= limit
-        };
-        if !inside {
-            continue;
+    // **NULL rows sit beyond every value at the end they sort to.** SQLite
+    // compares a bound with a NULL row's value as though the NULL were smaller
+    // than any number in the order the window sorts by, so the NULLs at the
+    // front of an ascending partition fall inside a frame that ends
+    // `1 PRECEDING` of its first number. Skipping them left
+    // `count(*) OVER (ORDER BY a RANGE BETWEEN UNBOUNDED PRECEDING AND
+    // 1 PRECEDING)` at 0 on the first number, where SQLite counts the NULLs.
+    // Text sorts above every number, which is what an infinity does here.
+    let nulls_first = order_value(partition.start).is_none();
+    let null_value = if nulls_first != descending {
+        f64::NEG_INFINITY
+    } else {
+        f64::INFINITY
+    };
+    let effective = |member: usize| match order_value(member) {
+        None => null_value,
+        Some(value) if value.is_nan() => f64::INFINITY,
+        Some(value) => value,
+    };
+    let inside = |member: usize| {
+        let value = effective(member);
+        match (is_start, descending) {
+            (true, false) | (false, true) => value >= limit,
+            (true, true) | (false, false) => value <= limit,
         }
-        answer = Some(member);
-        if is_start {
-            break;
+    };
+    // **A binary search, because the partition is sorted.** The values run in
+    // the window's order, so `inside` is false then true for a start and true
+    // then false for an end. A scan of the whole partition for every row was
+    // quadratic: a RANGE offset frame over 20,000 rows compared 400 million
+    // pairs.
+    let (mut low, mut high) = (partition.start, partition.end);
+    while low < high {
+        let middle = low.saturating_add(high.saturating_sub(low) / 2);
+        if inside(middle) != is_start {
+            low = middle.saturating_add(1);
+        } else {
+            high = middle;
         }
     }
     // No row is on the right side of the limit, so the frame begins after the
     // partition ends or ends before it begins. Both are empty (task-1913).
-    answer
+    if is_start {
+        (low < partition.end).then_some(low)
+    } else {
+        low.checked_sub(1).filter(|last| *last >= partition.start)
+    }
 }
 
 #[cfg(test)]

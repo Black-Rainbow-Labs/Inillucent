@@ -8,6 +8,95 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
+## Unreleased
+
+**The test runner and the release scripts use 80% of the machine's processors, and the test build
+is optimised.** `inillucent-testrun` confines itself, its cargo builds and every test process to
+80% of the logical processors, rounded down, fastest first: 19 of 24 on the development machine. It
+runs that many test binaries at once and sets `CARGO_BUILD_JOBS` to the same count. `--cpu
+<percent>` or `INILLUCENT_CPU_PERCENT` changes the share and 100 removes it; CI sets 100.
+`ship.ps1`, `release-all.ps1` and `nightly.ps1` do the same, and `pwsh tools/capped.ps1 <command>`
+runs any command under the same limit. The limit is the processor affinity mask, which every child
+inherits. A Windows job object was tried first and does not hold here, because the Store `pwsh`
+lets its children leave every job. The dev and test profile now builds at `opt-level = 1`, which
+pays for the processors the share gives back: the change cadence's tests took 503 s on 19
+processors against 493 s on all 24 before. A cold build takes about a minute longer, and a rebuild
+after an edit is no slower. `tasks/task-2205-build-and-test-cpu-tdd.md` has the
+measurements.
+
+**A bug hunt through other engines' bug reports and SQLite's own tests, and what it found.** About
+1,200 cases were written from Turso issues, SQLite release notes and SQLite forum threads, and
+10,657 more were converted from SQLite's TCL test suite. Each case runs through `inillucent-shell`
+and the pinned `sqlite3` and the output is compared byte for byte. The cases that found a defect are
+in `compat/corpus/usage/bug-hunt-*.sql`; the rest are a new nightly suite,
+`nightly::research_corpus`, over `compat/corpus/research/`. `tasks/task-2201-bug-hunt-tdd.md` has
+every defect, its cause and its fix.
+
+Two fixes change what an index holds. **Run `REINDEX` on a file written before this release** if
+it has a partial index, or an index on an expression with a `COLLATE` other than `BINARY`:
+
+- A partial index held the rows whose predicate is NULL, so `WHERE b = 'x' AND a > 5` could return
+  rows where `a` is NULL.
+- An index on an expression with `COLLATE NOCASE` compared its keys in `BINARY` order, so a unique
+  index accepted 'arth' beside 'ARTH' and a search through it found only the exact case.
+- `RTRIM` compared the shared bytes before it dropped trailing spaces, so a string ending in spaces
+  sorted after one ending in a control character. Only an `RTRIM` index holding such values needs
+  `REINDEX`.
+
+Wrong answers fixed:
+
+- `DROP TABLE t` also deleted a trigger named `t` that belonged to another table.
+- A column declared `b GENERATED ALWAYS AS (...)` took `GENERATED` as its type and NUMERIC affinity,
+  so a stored `556.0` came back as `556`.
+- `x IN ((SELECT ...))` with the subquery in extra parentheses tested only its first row.
+- A nested `WITH` inside a common table expression's body could capture the outer names.
+- A filter was pushed into the arms of a `UNION`, `INTERSECT` or `EXCEPT` whose columns compare
+  under `NOCASE`, which changed which rows the compound kept.
+- `substr(x, -2000000000)`, a `->>` label with a JSON5 escape, `printf` with an unknown
+  conversion, `printf('%p')` in upper case, and the column names of `AS ''` now answer as SQLite
+  does.
+- On a `WITHOUT ROWID` table whose primary key has `COLLATE NOCASE` or `RTRIM`, `UPDATE` and
+  `DELETE` changed the wrong row or no row, and `INSERT OR IGNORE` and upserts overwrote the row
+  already there.
+- `<`, `<=`, `>` and `>=` bound as loosely as `=`, so `2 = 1 < 3` was 1.
+- A subquery two levels deep that read both its parent and the outermost query answered the first
+  outer row's value for every row.
+- `FROM j, json_each(j.doc) e JOIN t ON t.id = e.value` returned no rows.
+- A table function on the right of a `RIGHT` or `FULL JOIN` returned nothing.
+- On an FTS5 table, `SELECT * FROM t('query')` and `WHERE t = 'query'` returned no rows, the `delete`
+  command failed, and `rank` ignored the weights set with `INSERT INTO t(t, rank)`.
+- Window frames: `RANGE` with NULLs first, a `RANGE` offset of 0.5, `GROUPS` frames and
+  `dense_rank()` gave wrong values in some partitions.
+- A window function in the first arm of a compound derived table dropped every other arm.
+- JSON: `json_group_array` over a derived table or over `json_each` quoted objects it should have
+  nested, and `json_extract` with a NULL among its paths did not return NULL.
+- `INSERT OR REPLACE` on a table whose foreign key cascades to itself deleted the new row too, and a
+  `REPLACE` constraint replaced a row that a constraint with the default `ABORT` refused.
+- A table whose `VIRTUAL` generated column comes before other columns decoded the wrong column in
+  some `WHERE` clauses, `UPDATE`s and `DELETE`s.
+- `last_insert_rowid()` inside a trigger, `sqlite_sequence` after triggers that insert into the same
+  table, `LIKE ... ESCAPE '%'`, a skip scan with `NULLS LAST`, an `ON` term after a `RIGHT JOIN`,
+  the affinity of a `USING` column of a `FULL JOIN`, and the collation and affinity of a compound
+  derived table's columns now answer as SQLite does.
+
+Crashes and hangs fixed: a recursive trigger under `recursive_triggers` overflowed the stack and
+stopped the process; it now stops at the trigger depth limit with an error. A recursive common table
+expression whose step aggregates, or has a different number of columns, ran forever; both are
+refused as SQLite refuses them.
+
+SQL that was refused and now runs: a table function followed by a derived table; `json_group_array`,
+`json_group_object`, `median` and `percentile` over a window; a column constraint that is only
+`DEFERRABLE INITIALLY DEFERRED`; table constraints with no comma between them; a string as a key
+column name, as in `PRIMARY KEY('a')`; join words in any order, as in `OUTER LEFT NATURAL JOIN`; and a `USING` column of a parenthesised
+join named by an outer `USING` or by its bare name, which was refused as ambiguous.
+`contentless_delete=1` on an FTS5 table, which was accepted and ignored, is now refused with exit
+code 3.
+
+Faster: a running `sum() OVER (ORDER BY ...)` over 100,000 rows took more than 60 seconds and is
+now linear; `json_each` over a 20,000 element array went from 2.0 s to 0.011 s; and joining
+`json_each(j.doc)` to rows with large documents went from 2.1 s to 0.02 s at 20,000 elements. A
+filter on the grouping column of an aggregate view now reaches the view's index.
+
 ## 1.0.31 to 2.3.3, 25 September to 7 October 2026
 
 The entries in this section were written for the releases from 1.0.31 to 2.3.3 and are not split by

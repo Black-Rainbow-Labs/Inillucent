@@ -112,7 +112,23 @@ pub fn write(
     if sequence_root == 0 {
         return Ok(());
     }
-    let rowid = match mark.rowid {
+    // **A row another statement wrote since `mark` was read is reused.** A
+    // trigger body that inserts into the same table runs as its own statement
+    // and creates the table's row when its own `mark` had none, so the
+    // statement that fired it would then create a second row for the same
+    // table. SQLite keeps one counter for the whole statement and writes one
+    // row, so a row found now is updated and the larger of the two values is
+    // kept.
+    let mut existing = mark.rowid;
+    let mut seq = seq;
+    if existing.is_none() {
+        let current = read(target, sequence_root, name, 0)?;
+        if current.rowid.is_some() {
+            existing = current.rowid;
+            seq = seq.max(current.seq);
+        }
+    }
+    let rowid = match existing {
         Some(held) => held,
         None => next_rowid(target, sequence_root)?,
     };
@@ -126,7 +142,7 @@ pub fn write(
         return Ok(());
     };
     let borrowed: Vec<Datum<'_>> = row.iter().map(OwnedDatum::borrow).collect();
-    if mark.rowid.is_some() {
+    if existing.is_some() {
         if let Some(key) = borrowed.get(..1) {
             tree.delete(database, log, key)?;
         }

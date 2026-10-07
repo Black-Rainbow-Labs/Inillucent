@@ -46,6 +46,50 @@ const K1: f64 = 1.2;
 /// The length-normalisation constant.
 const B: f64 = 0.75;
 
+/// Returns the column weights the `rank` column scores with.
+///
+/// **The `rank` setting is read, not only kept.** `INSERT INTO t(t, rank)
+/// VALUES('rank', 'bm25(10.0, 1.0)')` is how an application weights its
+/// columns for every query, and it was stored in `%_config` and then ignored:
+/// `rank` kept scoring every column at one, so the order a search returned
+/// was not the order the application asked for. A setting that names another
+/// function, or that does not parse, leaves every weight at one.
+///
+/// @param context - the running statement
+/// @param shadows - the table's shadow tables
+/// @param columns - how many columns the table declares
+pub fn configured_weights(
+    context: &mut Context<'_>,
+    shadows: &ShadowTables,
+    columns: usize,
+) -> DbResult<Vec<f64>> {
+    let mut weights = vec![1.0f64; columns];
+    let key = [inillucent_value::Value::owned_text(b"rank")?];
+    let Some(row) = shadows.read_keyed(context, b"config", &key, 2)? else {
+        return Ok(weights);
+    };
+    let text = match row.get(1) {
+        Some(inillucent_value::Value::Text(text)) => text.utf8_bytes().into_owned(),
+        _ => return Ok(weights),
+    };
+    let text = String::from_utf8_lossy(&text);
+    let trimmed = text.trim();
+    let Some(arguments) = trimmed
+        .strip_prefix("bm25")
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix('('))
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return Ok(weights);
+    };
+    for (slot, argument) in weights.iter_mut().zip(arguments.split(',')) {
+        if let Ok(weight) = argument.trim().parse::<f64>() {
+            *slot = weight;
+        }
+    }
+    Ok(weights)
+}
+
 /// Scores every matched row, returning `(rowid, score)` pairs.
 pub fn score(
     rows: &[i64],
@@ -55,14 +99,14 @@ pub fn score(
     shadows: &ShadowTables,
     totals: &Totals,
     columns: usize,
+    weights: &[f64],
 ) -> DbResult<Vec<(i64, f64)>> {
-    let weights = vec![1.0f64; columns];
     let mut out = Vec::with_capacity(rows.len());
     for rowid in rows {
         let sizes = row_sizes(context, shadows, *rowid, columns)?;
         out.push((
             *rowid,
-            score_row(*rowid, hits, &query.phrases, totals, &sizes, &weights),
+            score_row(*rowid, hits, &query.phrases, totals, &sizes, weights),
         ));
     }
     Ok(out)

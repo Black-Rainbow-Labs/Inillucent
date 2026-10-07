@@ -82,7 +82,7 @@ The Python conformance runner prints the size of the table when it finishes:
 
 ```
 $ python drivers/bindings/python/run_conformance.py
-53 capabilities reported
+55 capabilities reported
 ```
 
 The 52 rows are 34 `yes`, 2 `partial` and 16 `no`. The two `partial` rows are:

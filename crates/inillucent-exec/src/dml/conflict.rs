@@ -259,6 +259,40 @@ pub(crate) fn conflicting_row(
     Ok(None)
 }
 
+/// Returns every constraint a new row collides with, in the order they are asked.
+///
+/// [`conflicting_row`] stops at the first. A `REPLACE` has to know whether any
+/// constraint that does not replace also collides, because SQLite checks those
+/// first and refuses the row before it deletes anything.
+///
+/// @param table - the table being written
+/// @param layout - the table tree's layout
+/// @param target - the file and its trees
+/// @param row - the row about to be written
+/// @param indexes - the table's expression indexes
+pub(crate) fn all_conflicts(
+    table: &TableInfo,
+    layout: &SourceLayout,
+    target: &mut dyn WriteTarget,
+    row: &[OwnedDatum],
+    indexes: IndexExprs<'_>,
+) -> DbResult<Vec<Conflict>> {
+    let probe = Probe {
+        table,
+        layout,
+        row,
+        replacing: None,
+        indexes,
+    };
+    let mut found = Vec::new();
+    for check in checks(table) {
+        if let Some(conflict) = probe.ask(check, target)? {
+            found.push(conflict);
+        }
+    }
+    Ok(found)
+}
+
 /// One constraint the conflict search asks.
 #[derive(Clone, Copy)]
 enum Check<'t> {
@@ -331,6 +365,18 @@ impl Probe<'_> {
         let key = key_of(layout, row);
         if key.is_empty() || !row_exists(table, target, &key)? {
             return Ok(None);
+        }
+        // **A key equal under its collation can be the row itself.** On a
+        // `WITHOUT ROWID` table keyed `COLLATE NOCASE`, `UPDATE t SET k = 'A'
+        // WHERE k = 'a'` changes the key's bytes, so the row counts as moved,
+        // and the probe for 'A' finds the row being updated. That is not a
+        // collision with another row.
+        if let Some(before) = self.replacing {
+            if let Some(found) = read_row(table, target, &key)? {
+                if key_of(layout, &found) == key_of(layout, before) {
+                    return Ok(None);
+                }
+            }
         }
         let (code, message) = rowid_message(table);
         Ok(Some(Conflict {
@@ -490,7 +536,7 @@ pub(crate) fn upsert_row(
     } else {
         let mut blank = vec![OwnedDatum::Null; space.width];
         for (at, value) in clash.key.iter().enumerate() {
-            if let Some(column) = layout.key_columns.get(at).copied() {
+            if let Some(column) = layout.identity.get(at).copied() {
                 if let Some(cell) = blank.get_mut(column) {
                     *cell = value.clone();
                 }

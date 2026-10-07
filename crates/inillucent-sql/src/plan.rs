@@ -25,6 +25,7 @@ mod covering;
 mod describe;
 mod flatten;
 mod hint;
+mod order_constant;
 mod outer_paths;
 mod partial;
 mod pattern;
@@ -605,6 +606,10 @@ pub struct PhysicalPlan {
     pub aggregation: AggregationMode,
     /// Whether the results have to pass through a sorter.
     pub needs_sort: bool,
+    /// Whether every `ORDER BY` term is a column that `WHERE` equates to a value
+    /// from outside the query, so the rows leave in scan order as SQLite
+    /// returns them; see `order_constant`.
+    pub order_constant: bool,
     /// Whether the outermost term is walked backwards.
     ///
     /// A B-tree read from its last entry to its first produces exactly the
@@ -976,6 +981,7 @@ fn plan_block(select: BoundSelect, levers: Levers, in_compound: bool) -> Physica
         None
     };
     let needs_sort = !select.order_by.is_empty() && provided.is_none();
+    let order_constant = single && order_constant::plan_skips_sort(&select, &sources, aggregation);
     let reverse_stream = reverse::reverses_the_row_stream(&select, &sources, levers);
     let reverse = provided.unwrap_or(false)
         || (!reverse_stream && reverse::reverses_unordered_scan(&select, &sources, levers));
@@ -996,6 +1002,7 @@ fn plan_block(select: BoundSelect, levers: Levers, in_compound: bool) -> Physica
         select,
         aggregation,
         needs_sort,
+        order_constant,
         reverse,
         reverse_stream,
         grouped_walk,
@@ -1160,6 +1167,9 @@ fn ordering_provided(
         let mut expr = &term.expr;
         while let BoundExpr::Collate { operand, .. } = expr {
             expr = operand;
+        }
+        if order_constant::equated_to_outside_value(select, id, expr, term.collation) {
+            continue;
         }
         let named = match expr {
             BoundExpr::Column { source, column, .. } if *source == id => {
@@ -1351,9 +1361,13 @@ fn best_order(
     if run.len() < 2 || run.len() > 8 {
         return run.to_vec();
     }
+    let prerequisites = argument_prerequisites(select, terms, run);
     let mut best: Option<(f64, Vec<usize>)> = None;
     let mut candidate = run.to_vec();
     permute(&mut candidate, 0, &mut |order| {
+        if !respects_prerequisites(order, &prerequisites) {
+            return;
+        }
         let cost = order_cost(select, terms, order, levers);
         let better = best
             .as_ref()
@@ -1363,6 +1377,67 @@ fn best_order(
         }
     });
     best.map(|(_, order)| order).unwrap_or_else(|| run.to_vec())
+}
+
+/// Returns, for each table function in a run, the terms its arguments read.
+///
+/// **A function cannot run before its argument exists.** The cost model
+/// priced a function whose argument was not yet available as an ordinary
+/// scan, so in `FROM j, json_each(j.doc) e JOIN t ON t.id = e.value` the cheap
+/// order put `e` first. The function then ran with a NULL document, returned
+/// nothing, and the query answered no rows where SQLite answers every match.
+/// This is SQLite's prerequisite rule for a virtual table's constraints.
+///
+/// Each pair is (the position that needs, the position it needs), both in
+/// `select.sources`. A term outside the run, such as one an earlier pinned run
+/// holds, is already placed and adds no pair.
+///
+/// @param select - the bound statement
+/// @param terms - the statement's `WHERE` and `ON` conjuncts
+/// @param run - the positions of one run of reorderable terms
+fn argument_prerequisites(
+    select: &BoundSelect,
+    terms: &[BoundExpr],
+    run: &[usize],
+) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    for term in terms {
+        if !flatten::is_table_argument(select, term) {
+            continue;
+        }
+        let BoundExpr::Compare { left, right, .. } = term else {
+            continue;
+        };
+        let BoundExpr::Column { source: needs, .. } = left.as_ref() else {
+            continue;
+        };
+        let position_of = |id: usize| {
+            run.iter()
+                .copied()
+                .find(|at| select.sources.get(*at).is_some_and(|held| held.id == id))
+        };
+        let Some(dependent) = position_of(*needs) else {
+            continue;
+        };
+        let mut used = Vec::new();
+        right.sources_used(&mut used);
+        for id in used.into_iter().filter(|id| id != needs) {
+            if let Some(needed) = position_of(id) {
+                pairs.push((dependent, needed));
+            }
+        }
+    }
+    pairs
+}
+
+/// Reports whether every term in an order comes after the terms it needs.
+///
+/// @param order - one permutation of a run
+/// @param prerequisites - pairs from [`argument_prerequisites`]
+fn respects_prerequisites(order: &[usize], prerequisites: &[(usize, usize)]) -> bool {
+    prerequisites.iter().all(|(needs, needed)| {
+        order.iter().position(|at| at == needs) > order.iter().position(|at| at == needed)
+    })
 }
 
 /// Calls a closure with every permutation of a slice.

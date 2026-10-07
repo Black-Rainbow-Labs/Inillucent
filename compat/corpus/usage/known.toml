@@ -75,3 +75,8 @@ reason = "N2: page size. PRAGMA page_size reads 32768 in inillucent and 4096 in 
 case = "orm/4/4.44-update-with-limit-needs-sqlite-enable-update-delete-limit-de"
 kind = "deviation"
 reason = "N1: UPDATE/DELETE ... LIMIT: the pinned sqlite3 shell is built without SQLITE_ENABLE_UPDATE_DELETE_LIMIT"
+
+[[known]]
+case = "bug-hunt/queries/recursive_trigger_replace_duplicate_unique"
+kind = "defect"
+reason = "Bug hunt (tasks/task-2201-bug-hunt-tdd.md section 6): with recursive_triggers on, INSERT OR REPLACE whose delete trigger reinserts the replaced key recurses until the trigger depth limit and reports too many levels of trigger recursion, where SQLite reports UNIQUE constraint failed. It overflowed the stack and killed the process before the depth check was added."

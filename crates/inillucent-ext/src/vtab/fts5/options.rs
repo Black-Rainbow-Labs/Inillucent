@@ -107,6 +107,17 @@ pub(super) fn parse_options(arguments: &[Vec<u8>]) -> DbResult<Options> {
                 "columnsize" if unquote_option(&value).trim() != "1" => {
                     unsupported = Some(format!("fts5 columnsize={}", unquote_option(&value)))
                 }
+                // A contentless table that may be deleted from. Accepted and
+                // ignored, a `DELETE` was refused and `count(*)` still counted
+                // the row, so the table answered as though the delete had not
+                // been written. Refused until the index can find a row's
+                // postings without its text.
+                "contentless_delete" if unquote_option(&value).trim() != "0" => {
+                    unsupported = Some(format!(
+                        "fts5 contentless_delete={}",
+                        unquote_option(&value)
+                    ))
+                }
 
                 // The options this build understands and the ones it does not
                 // are both accepted, because refusing one would make a schema
@@ -178,7 +189,8 @@ fn split_option(text: &str) -> Option<(String, String)> {
 /// @param what - the option and the value it was given
 pub(super) fn unsupported_option(what: &str) -> inillucent_base::DbError {
     failure(format!(
-        "{what} is not built; this index stores full positions and one size per column"
+        "{what} is not built; this fts5 index stores full positions and one size per column, \
+         and finds a row's postings from its text"
     ))
     .with_message(format!("{what} is not built"))
     .with_unsupported(what.to_string())

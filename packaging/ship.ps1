@@ -132,6 +132,10 @@ $root = Split-Path -Parent $PSScriptRoot
 if ($Only) { $Only = @($Only -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
 if ($Skip) { $Skip = @($Skip -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
 . (Join-Path $PSScriptRoot 'stage-layout.ps1')
+# The release's builds and its test run use 80% of the machine's processors (task-2205). Every
+# process this script starts inherits the affinity mask, and release-all.ps1 and inillucent-testrun
+# see INILLUCENT_CPU_SHARE_ENTERED and keep it.
+Enter-ProcessorShare
 . (Join-Path $PSScriptRoot 'nightly-evidence.ps1')
 . (Join-Path $PSScriptRoot 'site/install-page.ps1')
 . (Join-Path $PSScriptRoot 'github-token.ps1')

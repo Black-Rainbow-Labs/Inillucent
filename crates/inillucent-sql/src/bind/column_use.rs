@@ -83,3 +83,72 @@ impl ColumnUse {
         }
     }
 }
+
+impl super::BoundSelect {
+    /// Adds what a `WHERE` reads of one FROM term, leaving out the term's own
+    /// table function arguments.
+    ///
+    /// **An argument is the function's input, not a column it hands back.**
+    /// `json_each(j.doc)` is bound as `json = j.doc` on the hidden `json`
+    /// column, and the module applies it. Counting it as a read made the scan
+    /// ask the cursor for `json` on every row, which is the whole document:
+    /// a 20,000 element array was copied 20,000 times, and `SELECT count(*)
+    /// FROM j, json_each(j.doc)` took seven seconds where SQLite takes a tenth.
+    /// An argument the module does not apply is offered back as a recheck, and
+    /// the scan reads the column for that.
+    ///
+    /// @param filter - the block's `WHERE`
+    /// @param source - the statement-wide number of the FROM term
+    /// @param into - the reads found so far
+    pub(super) fn filter_columns_read(
+        &self,
+        filter: &BoundExpr,
+        source: usize,
+        into: &mut ColumnUse,
+    ) {
+        let table = self
+            .sources
+            .iter()
+            .find(|term| term.id == source)
+            .map(|term| term.table.as_ref())
+            .filter(|table| table.kind == crate::catalog_view::TableKind::Virtual);
+        let Some(table) = table else {
+            filter.columns_read(source, into);
+            return;
+        };
+        let mut conjuncts = Vec::new();
+        crate::plan::split_conjunction(filter, &mut conjuncts);
+        for conjunct in &conjuncts {
+            let argument = match conjunct {
+                BoundExpr::Compare {
+                    op: crate::ast::BinaryOp::Equal,
+                    left,
+                    ..
+                } => match left.as_ref() {
+                    BoundExpr::Column {
+                        source: owner,
+                        column,
+                        ..
+                    } => {
+                        *owner == source
+                            && table
+                                .columns
+                                .get(usize::from(*column))
+                                .is_some_and(|declared| declared.hidden)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if argument {
+                // The value side may still read another term, which is that
+                // term's read, not this one's.
+                if let BoundExpr::Compare { right, .. } = conjunct {
+                    right.columns_read(source, into);
+                }
+                continue;
+            }
+            conjunct.columns_read(source, into);
+        }
+    }
+}

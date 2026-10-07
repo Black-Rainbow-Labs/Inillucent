@@ -65,7 +65,25 @@ impl<'a> Binder<'a> {
         }
         // A view body cannot see a CTE of the statement that reads it.
         let saved_ctes = core::mem::take(&mut self.ctes);
-        let bound = self.bind_select(body.select);
+        // **A view that reads itself is refused by name.** It used to expand
+        // until the nesting limit and report "unsupported: too many levels of
+        // nested SELECT", exit code 3, which says the engine has not built
+        // something rather than that the schema is wrong.
+        let key = (database_index, table.folded.clone());
+        let bound = if self.expanding_views.contains(&key) {
+            Err(super::refused(
+                format!(
+                    "view {} is circularly defined",
+                    String::from_utf8_lossy(&view_name)
+                ),
+                span,
+            ))
+        } else {
+            self.expanding_views.push(key);
+            let bound = self.bind_select(body.select);
+            self.expanding_views.pop();
+            bound
+        };
         self.ctes = saved_ctes;
         self.view_database = saved_view_database;
         self.call_site = saved_site;

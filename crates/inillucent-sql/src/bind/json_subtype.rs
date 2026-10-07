@@ -28,6 +28,7 @@ impl Binder<'_> {
     /// @param argument - the call's one argument
     pub(super) fn bind_subtype(&mut self, argument: ExprId) -> Result<BoundExpr, ParseError> {
         let bound = self.bind_expr(argument)?;
+        let bound = self.walk_value(&bound).unwrap_or(bound);
         // A JSON group aggregate carries the subtype too, and its function
         // is in the binder's list rather than in the expression - so the
         // slot is resolved here, where the list is.
@@ -72,6 +73,9 @@ impl Binder<'_> {
     ///
     /// @param argument - the argument, bound
     pub(super) fn marked_as_json(&self, argument: BoundExpr) -> BoundExpr {
+        if let Some(walked) = self.walk_value(&argument) {
+            return walked;
+        }
         let wrapper = match &argument {
             BoundExpr::Aggregate { slot, .. } => {
                 json_aggregate_wrapper(self.aggregates.get(*slot).map(|held| held.func))
@@ -101,6 +105,47 @@ impl Binder<'_> {
             },
             None => argument,
         }
+    }
+}
+
+impl Binder<'_> {
+    /// Returns a `json_each` or `json_tree` row's `value` wrapped so that it
+    /// carries the JSON mark when the row is an array or an object, or `None`
+    /// for any other expression.
+    ///
+    /// See `JsonFunc::WalkValue`. The row's `type` column is the second
+    /// argument; it reads the same term, so it costs one more column of a row
+    /// the scan already produced.
+    ///
+    /// @param argument - an argument of a JSON function, bound
+    pub(super) fn walk_value(&self, argument: &BoundExpr) -> Option<BoundExpr> {
+        const VALUE: u16 = 1;
+        const TYPE: u16 = 2;
+        let BoundExpr::Column {
+            source,
+            column: VALUE,
+            ..
+        } = argument
+        else {
+            return None;
+        };
+        let term = self.sources.iter().find(|term| term.id == *source)?;
+        let walks = term.table.kind == crate::catalog_view::TableKind::Virtual
+            && matches!(term.table.folded.as_slice(), b"json_each" | b"json_tree");
+        if !walks {
+            return None;
+        }
+        let kind = BoundExpr::Column {
+            source: *source,
+            column: TYPE,
+            slot: TYPE,
+            affinity: inillucent_value::affinity::Affinity::Blob,
+            collation: Collation::Binary,
+        };
+        Some(BoundExpr::Json {
+            func: function::JsonFunc::WalkValue,
+            arguments: vec![argument.clone(), kind],
+        })
     }
 }
 
@@ -146,7 +191,7 @@ fn json_subtype(bound: &BoundExpr) -> Subtyped {
     };
     use function::JsonFunc;
     match func {
-        JsonFunc::Extract | JsonFunc::Arrow => Subtyped::WhenShaped,
+        JsonFunc::Extract | JsonFunc::Arrow | JsonFunc::WalkValue => Subtyped::WhenShaped,
         JsonFunc::Jsonb
         | JsonFunc::ArrayB
         | JsonFunc::ExtractB
@@ -165,4 +210,15 @@ fn json_subtype(bound: &BoundExpr) -> Subtyped {
         | JsonFunc::Pretty => Subtyped::Never,
         _ => Subtyped::Always,
     }
+}
+
+/// Reports whether an expression's value always carries the JSON subtype.
+///
+/// For a caller that reads the value after it has left the expression, such
+/// as a window pass that computes each argument into a column first and so
+/// cannot ask the producing call at run time.
+///
+/// @param bound - the expression
+pub fn always_json(bound: &BoundExpr) -> bool {
+    json_subtype(bound) == Subtyped::Always
 }

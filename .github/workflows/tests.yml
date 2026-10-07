@@ -76,6 +76,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # A hosted runner is a machine nobody is sitting at, so the test runner and
+  # the release scripts take all of it rather than the 80% they leave free on
+  # the development machine (task-2205).
+  INILLUCENT_CPU_PERCENT: 100
   # A backtrace on the one test that failed, rather than a name and nothing.
   RUST_BACKTRACE: 1
   # A runner has a network, so the HTTP client's test fetches the real files

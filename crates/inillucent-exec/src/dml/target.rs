@@ -586,11 +586,11 @@ pub(crate) fn key_columns(
     source: usize,
     layout: &SourceLayout,
 ) -> DbResult<Vec<BoundExpr>> {
-    if layout.key_columns.len() == 1 && layout.key_columns.first().copied() == layout.rowid {
+    if layout.identity.len() == 1 && layout.identity.first().copied() == layout.rowid {
         return Ok(vec![BoundExpr::Rowid { source }]);
     }
-    let mut exprs = Vec::with_capacity(layout.key_columns.len());
-    for tree_column in &layout.key_columns {
+    let mut exprs = Vec::with_capacity(layout.identity.len());
+    for tree_column in &layout.identity {
         let slot = layout
             .slots
             .iter()
@@ -605,7 +605,13 @@ pub(crate) fn key_columns(
         exprs.push(BoundExpr::Column {
             source,
             column: u16::try_from(slot).unwrap_or_default(),
-            slot: u16::try_from(slot).unwrap_or_default(),
+            // The record slot, which differs from the declared position once a
+            // `VIRTUAL` generated column is declared ahead of the key column.
+            slot: u16::try_from(slot)
+                .ok()
+                .and_then(|declared| table.record_slot(declared))
+                .and_then(|record| u16::try_from(record).ok())
+                .unwrap_or_else(|| u16::try_from(slot).unwrap_or_default()),
             affinity,
             collation,
         });

@@ -37,7 +37,11 @@ pub(crate) fn checked_integer_literal(
             .filter(|byte| **byte != b'_')
             .skip_while(|byte| **byte == b'0')
             .count();
-        if significant > 16 {
+        // `-0x8000000000000000` is refused too: the literal is the smallest
+        // integer, and SQLite will not negate it.
+        let negated_floor = text.starts_with(b"-")
+            && matches!(integer_literal(digits), BoundExpr::Integer(i64::MIN));
+        if significant > 16 || negated_floor {
             return Err(crate::bind::refused(
                 format!("hex literal too big: {}", String::from_utf8_lossy(text)),
                 span,

@@ -77,7 +77,7 @@ pub(super) fn update_unwatched(
         return Ok(None);
     }
     let table = &statement.table;
-    let width = setup.layout.key_columns.len();
+    let width = setup.layout.identity.len();
     let prefixes: Vec<&[OwnedDatum]> = keys
         .iter()
         .map(|row| row.get(..width).unwrap_or(row))
@@ -265,7 +265,7 @@ fn decide(
     }
     match difference(before, &after) {
         Difference::Nothing => Ok(Rewrite::Unchanged),
-        Difference::One(column) if column >= layout.key_columns.len() => {
+        Difference::One(column) if column >= layout.identity.len() => {
             let Some(value) = after.get(column).cloned() else {
                 return Err(misuse("a changed column is not in the row"));
             };

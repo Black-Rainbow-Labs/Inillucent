@@ -231,11 +231,31 @@ impl Binder<'_> {
     fn query_columns(&mut self, block: crate::bind::BoundSelect) -> Vec<BoundExpr> {
         let mut bound_rights = Vec::with_capacity(block.columns.len());
         for at in 0..block.columns.len() {
-            let mut one = block.clone();
-            one.columns = block
-                .columns
-                .get(at..at.saturating_add(1))
-                .map_or_else(Vec::new, <[crate::bind::BoundResultColumn]>::to_vec);
+            // **A compound is read through a derived table.** Its `ORDER BY`
+            // terms and its other arms name result columns by position, so
+            // cutting the first arm's list down to one column left `ORDER BY 1`
+            // sorting by whichever column survived and left the other arms
+            // two columns wide. `(SELECT 5,6 UNION SELECT 3,4 ORDER BY 1)`
+            // then took its first row from the wrong order. The derived table
+            // keeps the whole compound and each part reads one of its columns.
+            let mut one = if block.compounds.is_empty() {
+                block.clone()
+            } else {
+                let (wrapper, columns) = self.read_through_derived_table(block.clone());
+                let mut wrapper = wrapper;
+                if let (Some(column), Some(read)) = (block.columns.get(at), columns.get(at)) {
+                    let mut kept = column.clone();
+                    kept.expr = read.clone();
+                    wrapper.columns = vec![kept];
+                }
+                wrapper
+            };
+            if block.compounds.is_empty() {
+                one.columns = block
+                    .columns
+                    .get(at..at.saturating_add(1))
+                    .map_or_else(Vec::new, <[crate::bind::BoundResultColumn]>::to_vec);
+            }
             let collation = one
                 .columns
                 .first()
@@ -345,6 +365,7 @@ impl Binder<'_> {
         if lefts.len() != rights.len() {
             return Err(misused(span));
         }
+        let lefts = lefts_keep_column_collation(lefts, &rights);
         compare_bound_rows(op, &lefts, &rights, span)
     }
 
@@ -616,6 +637,52 @@ pub(super) fn row_in_rules(
         rules.push((affinity, collation));
     }
     rules
+}
+
+/// Marks each part of a row query on the left that reads a column, so that the
+/// column's collation counts when it is BINARY.
+///
+/// SQLite compares the parts of `(SELECT bb, 1) >= (aa, 1)` through the
+/// expressions inside the subquery, so a left part that reads a column has a
+/// collation of its own even when it is BINARY, and that collation wins over
+/// the right part's implicit one. A scalar subquery written alone has no
+/// collation, which is why this is done only for the parts of a row query.
+/// With a NOCASE `aa` holding 'a' and `bb` holding 'A', that comparison
+/// answers 0. A right part with an explicit `COLLATE` still wins, so it is
+/// left alone.
+///
+/// @param lefts - the left row's parts, one scalar subquery per result column
+/// @param rights - the right row's parts
+fn lefts_keep_column_collation(lefts: Vec<BoundExpr>, rights: &[BoundExpr]) -> Vec<BoundExpr> {
+    lefts
+        .into_iter()
+        .enumerate()
+        .map(|(at, left)| {
+            let reads_column = match &left {
+                BoundExpr::Subquery {
+                    kind: SubqueryKind::Scalar,
+                    block,
+                    collation: Collation::Binary,
+                    ..
+                } => block
+                    .columns
+                    .first()
+                    .is_some_and(|column| column.expr.collation().is_some()),
+                _ => false,
+            };
+            let right_explicit = rights
+                .get(at)
+                .is_some_and(|right| right.explicit_collation().is_some());
+            if reads_column && !right_explicit {
+                BoundExpr::Collate {
+                    operand: Box::new(left),
+                    collation: Collation::Binary,
+                }
+            } else {
+                left
+            }
+        })
+        .collect()
 }
 
 /// Returns the `AND` chain of part equalities, each compared under given rules.

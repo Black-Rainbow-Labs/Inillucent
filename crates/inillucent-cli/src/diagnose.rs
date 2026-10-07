@@ -268,15 +268,16 @@ pub fn limit(shell: &mut Shell, arguments: &[&str]) {
         )),
         [(name, limit)] => {
             let (name, limit) = (*name, *limit);
-            // **A second argument sets, which it always said it did.** The
-            // reference's `.limit NAME VALUE` sets and then prints what is now
-            // in force; this printed the compiled-in default and dropped the
-            // value on the floor, so the whole register was read-only and every
-            // reading was a constant (task-1946, H3).
+            // **A second argument sets, which it always said it did.** This
+            // printed the compiled-in default and dropped the value, so the
+            // whole register was read-only and every reading was a constant
+            // (task-1946, H3). The pinned 3.53.4 shell sets and prints nothing;
+            // only `.limit NAME` alone prints the value in force.
             if let Some(value) = arguments.get(1) {
                 match value.parse::<i64>() {
                     Ok(requested) => {
                         shell.set_limit(limit, requested);
+                        return;
                     }
                     Err(_) => {
                         shell.complain(&format!("not a number: \"{value}\""));

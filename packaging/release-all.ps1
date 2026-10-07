@@ -97,6 +97,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'stage-layout.ps1')
+# Five fat LTO builds at once took the whole machine (task-2205). Every build below is a child of
+# this process and inherits its affinity mask, so the five share 80% of the processors between them.
+Enter-ProcessorShare
 
 # Where cargo puts its output. Reading CARGO_TARGET_DIR rather than assuming
 # <root>/target is what lets a release keep tens of gigabytes of intermediate

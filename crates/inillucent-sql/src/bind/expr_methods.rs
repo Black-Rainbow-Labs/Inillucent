@@ -20,6 +20,15 @@ impl BoundExpr {
             BoundExpr::Generated { affinity, .. } => Some(*affinity),
             BoundExpr::Rowid { .. } => Some(Affinity::Integer),
             BoundExpr::Collate { operand, .. } => operand.affinity(),
+            // SQLite marks the `coalesce` it builds for a merged `USING` column
+            // so that it reads the first argument's affinity. Without it
+            // `x = '2.5'` over a REAL `x` merged by a `FULL JOIN` compared the
+            // text with no conversion and matched nothing.
+            BoundExpr::Function {
+                func: ScalarFunc::UsingCoalesce,
+                arguments,
+                ..
+            } => arguments.first().and_then(BoundExpr::affinity),
             // SQLite gives a scalar subquery the affinity of its first result
             // column, so `(SELECT a FROM t) = 3` over a TEXT column `a` applies
             // TEXT affinity to the 3.

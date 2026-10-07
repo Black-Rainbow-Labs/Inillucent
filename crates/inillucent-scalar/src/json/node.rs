@@ -99,18 +99,19 @@ impl Node {
 
 /// Returns whether a character can sit in a JSON string with no escape.
 fn needs_no_escape(character: char) -> bool {
-    character != '"' && character != '\\' && character >= ' ' && character != '\u{7f}'
+    character != '"' && character != '\\' && character >= ' '
 }
 
 /// Escapes SQL text into the body of a JSON string.
 ///
 /// One of three identical copies until task-1946's M4, and this was the one that
 /// decided what `json_quote` and every other SQL JSON function produce. It is
-/// `inillucent_base::json::escape` now, which escapes exactly what this did.
+/// `inillucent_base::json::escape_sql` now, which leaves DELETE raw as SQLite
+/// does.
 ///
 /// @param content - the text to escape
 pub fn escape(content: &str) -> String {
-    inillucent_base::json::escape(content)
+    inillucent_base::json::escape_sql(content)
 }
 
 #[cfg(test)]

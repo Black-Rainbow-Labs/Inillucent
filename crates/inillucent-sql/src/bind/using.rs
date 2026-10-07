@@ -345,9 +345,10 @@ impl Binder<'_> {
         copies: &[(usize, u16)],
         span: Span,
     ) -> Result<BoundExpr, ParseError> {
-        let Some(func) = function::lookup_scalar(b"coalesce") else {
+        if function::lookup_scalar(b"coalesce").is_none() {
             return Err(no_such_function(b"coalesce", span));
-        };
+        }
+        let func = function::ScalarFunc::UsingCoalesce;
         let mut arguments = Vec::with_capacity(copies.len());
         for &(source, column) in copies {
             arguments.push(self.authorized_column(source, column, span)?);
@@ -362,6 +363,38 @@ impl Binder<'_> {
             collation,
         })
     }
+}
+
+/// Applies the `USING` rule to a name that matched a parenthesised join.
+///
+/// A parenthesised join is a derived table, and an outer `USING` that names
+/// one of its columns marks that column suppressed, as it does for a table.
+/// The inner table lookup in `lookupName` finds that column first, so it has to
+/// take the same path as a table's suppressed column, or the one merged column
+/// counts twice and the name is ambiguous.
+///
+/// Returns true when the match was a suppressed `USING` column and has been
+/// stepped; the caller then moves to the next term.
+///
+/// @param source - the derived table that holds the matching columns
+/// @param hits - the derived table's columns that carry the name
+/// @param unqualified - whether the reference had no table qualifier
+/// @param state - the source id, the copy found so far and the `FULL` join copies
+pub(super) fn nested_using_step(
+    source: &BoundSource,
+    hits: &[u16],
+    unqualified: bool,
+    state: (usize, &mut Option<(usize, u16)>, &mut Vec<(usize, u16)>),
+) -> bool {
+    let (id, found, coalesced) = state;
+    let [only] = hits else {
+        return false;
+    };
+    if !unqualified || !source.suppressed.contains(only) {
+        return false;
+    }
+    step_using_match(source.join, (id, *only), found, coalesced);
+    true
 }
 
 /// Applies SQLite's rule for an unqualified name that a `USING` join repeats.

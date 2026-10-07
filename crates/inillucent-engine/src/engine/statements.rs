@@ -214,6 +214,7 @@ impl crate::ImportedDatabase {
                 self.pragmas.defer_foreign_keys(),
             )
             .with_scratch(self.compiled.take_binder_scratch());
+        binder.ignore_checks_if(self.pragmas.ignore_check_constraints());
         let outcome = binder.bind_statement(&parsed.statement);
         self.compiled.recycle_binder(binder.into_scratch());
         let bound = outcome.map_err(refused)?;
@@ -324,6 +325,7 @@ impl ImportedDatabase {
                 self.pragmas.defer_foreign_keys(),
             )
             .with_scratch(self.compiled.take_binder_scratch());
+        binder.ignore_checks_if(self.pragmas.ignore_check_constraints());
         let outcome = binder.bind_statement(&parsed.statement);
         // Before the `?`, so a statement that fails to bind still hands its
         // vectors back: a connection whose application sends a syntax error
@@ -467,6 +469,7 @@ impl ImportedDatabase {
             )
             .in_schema()
             .with_scratch(self.compiled.take_binder_scratch());
+        binder.ignore_checks_if(self.pragmas.ignore_check_constraints());
         let bound = binder.bind_statement(&parsed.statement).map_err(refused);
         self.compiled.recycle_binder(binder.into_scratch());
         self.compiled.recycle(parsed);

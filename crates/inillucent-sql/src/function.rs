@@ -59,6 +59,10 @@ pub enum ScalarFunc {
     Char,
     /// `coalesce(...)`
     Coalesce,
+    /// The `coalesce` SQLite builds for a column that a `FULL` or `RIGHT JOIN`
+    /// with `USING` merges. It computes what `coalesce` does and has the
+    /// affinity of its first argument, which a written `coalesce` does not.
+    UsingCoalesce,
     /// `concat(...)`
     Concat,
     /// `concat_ws(sep, ...)`
@@ -774,6 +778,15 @@ pub enum JsonFunc {
     ArrayInsert,
     /// `jsonb_array_insert(X, P, V, ...)`
     ArrayInsertB,
+    /// The `value` of a `json_each` or `json_tree` row, marked as JSON when
+    /// the row's `type` is an array or an object.
+    ///
+    /// Not a name anybody can call: the binder puts it around such a column
+    /// where a JSON function reads it. SQLite gives that value the JSON
+    /// subtype for a container, so `json_group_array(value)` over the
+    /// members of `[{"a":1}]` rebuilds `[{"a":1}]`. Read as plain text here,
+    /// every nested object came back as a quoted string.
+    WalkValue,
 }
 
 impl JsonFunc {
@@ -785,6 +798,7 @@ impl JsonFunc {
     pub fn arity(self) -> (usize, usize) {
         match self {
             JsonFunc::Json | JsonFunc::Jsonb | JsonFunc::ErrorPosition | JsonFunc::Quote => (1, 1),
+            JsonFunc::WalkValue => (2, 2),
             JsonFunc::Array | JsonFunc::ArrayB | JsonFunc::Object | JsonFunc::ObjectB => {
                 (0, usize::MAX)
             }
@@ -862,6 +876,7 @@ impl JsonFunc {
                 | JsonFunc::Object
                 | JsonFunc::ObjectB
                 | JsonFunc::Quote
+                | JsonFunc::WalkValue
         )
     }
 }
@@ -1095,7 +1110,9 @@ pub fn scalar_arity_ok(func: ScalarFunc, count: usize) -> bool {
         }
         ScalarFunc::Round => count == 1 || count == 2,
         ScalarFunc::Substr => count == 2 || count == 3,
-        ScalarFunc::Coalesce | ScalarFunc::Max | ScalarFunc::Min => count >= 2,
+        ScalarFunc::Coalesce | ScalarFunc::UsingCoalesce | ScalarFunc::Max | ScalarFunc::Min => {
+            count >= 2
+        }
         // `char()` with no arguments is the empty string in SQLite, not a
         // parse error (task-1979, F16). `concat()` keeps its floor of one,
         // which is the reference's own rule for that name.

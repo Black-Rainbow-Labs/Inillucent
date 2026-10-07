@@ -19,5 +19,6 @@
 mod matrix;
 mod matrix_random;
 mod release_format_history;
+mod research_corpus;
 mod storm_nightly;
 mod story_large_table_nightly;

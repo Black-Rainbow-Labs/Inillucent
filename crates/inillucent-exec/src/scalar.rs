@@ -264,7 +264,7 @@ impl ScalarCall {
     /// @param nth - the row's position among the live rows
     fn lazy_value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<Option<Computed<'p>>> {
         match self.func {
-            ScalarFunc::Coalesce | ScalarFunc::IfNull => {
+            ScalarFunc::Coalesce | ScalarFunc::UsingCoalesce | ScalarFunc::IfNull => {
                 for argument in &self.arguments {
                     let value = argument.value(batch, nth)?;
                     if !value.get().is_null() {

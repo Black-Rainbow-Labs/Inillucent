@@ -215,6 +215,15 @@ impl<'a> IndexExprs<'a> {
     /// makes an `UPDATE` that moves a row across the predicate a removal from
     /// the index on the old image and an insertion on the new one.
     ///
+    /// **NULL is not true.** A partial index's `WHERE` is read the way a
+    /// query's `WHERE` is, so a row whose predicate is NULL has no entry. This
+    /// used to share the `CHECK` rule, where NULL passes, and `WHERE a > 5`
+    /// then gave every row with a NULL `a` an entry. A query that repeats the
+    /// predicate reads the index without testing it again, so
+    /// `SELECT a FROM t WHERE b = 'x' AND a > 5 ORDER BY a` returned those rows
+    /// with `a` NULL. The index build already used the query rule, so a
+    /// `REINDEX` repairs a file written before the change.
+    ///
     /// @param position - the index's position in the table's `indexes`
     /// @param row - the row image, in tree-column order
     pub fn holds(&self, position: usize, row: &[OwnedDatum]) -> DbResult<bool> {
@@ -225,7 +234,7 @@ impl<'a> IndexExprs<'a> {
             return Ok(true);
         };
         let answer = self.space.evaluate(predicate.as_ref(), &[row])?;
-        Ok(!is_false(&answer))
+        Ok(!matches!(answer, OwnedDatum::Null) && !is_false(&answer))
     }
 
     /// Returns one key column's value, when the index computes it.
@@ -279,6 +288,9 @@ pub struct WriteDeclarations {
     /// the type check of its ordinary and virtual columns ahead of `NOT NULL`.
     /// See [`WriteDeclarations::generated_types_are_met`].
     types_before_not_null: bool,
+    /// The largest row the connection stores, in bytes: its length limit, or
+    /// no limit when the limit is zero.
+    length_limit: u64,
 }
 
 /// One `NOT NULL` column's `DEFAULT`, compiled.
@@ -411,6 +423,10 @@ impl WriteDeclarations {
             defaults: standins,
             virtuals,
             types_before_not_null: table.strict && table.columns.iter().any(|c| c.generated),
+            length_limit: u64::try_from(params.settings().length_limit)
+                .ok()
+                .filter(|limit| *limit > 0)
+                .unwrap_or(u64::MAX),
         })
     }
 
@@ -463,6 +479,16 @@ impl WriteDeclarations {
             // satisfy the constraint, so it is the same as having none.
             return Ok(false);
         }
+        // **The default gets the column's affinity, like any stored value.**
+        // Affinity was applied before `NOT NULL` was checked, so the stand in
+        // missed it: `a INT NOT NULL DEFAULT '5'` stored the text '5', and
+        // `WHERE a = 5` then found nothing.
+        let value = match self.affinities.iter().find(|(held, _)| *held == slot) {
+            Some((_, affinity)) if !already_stored_as(&value, *affinity) => {
+                convert(value, *affinity)
+            }
+            _ => value,
+        };
         let Some(cell) = row.get_mut(slot) else {
             return Ok(false);
         };
@@ -558,6 +584,7 @@ impl WriteDeclarations {
         space: &RowSpace,
         row: &[OwnedDatum],
     ) -> DbResult<()> {
+        self.row_fits(row)?;
         if self.types_before_not_null {
             return self.typed_columns_are_met(table, row, true);
         }
@@ -570,6 +597,38 @@ impl WriteDeclarations {
         }
         self.virtual_types_are_met(table, space, row)?;
         self.typed_columns_are_met(table, row, true)
+    }
+
+    /// Refuses a row whose record would be larger than the length limit.
+    ///
+    /// Each value is held to the limit where it is computed, but a row of three
+    /// values just under it is three times over, and SQLite refuses the record
+    /// with "string or blob too big". Writing one here took 20 seconds for a
+    /// row of three `zeroblob(1e9)` values. The size counted is the text and
+    /// blob bytes and one header byte per value, which is never more than the
+    /// record SQLite measures, so no row SQLite stores is refused.
+    ///
+    /// @param row - the image about to be written
+    fn row_fits(&self, row: &[OwnedDatum]) -> DbResult<()> {
+        if self.length_limit == u64::MAX {
+            return Ok(());
+        }
+        let mut size = 1u64;
+        for value in row {
+            let bytes = match value {
+                OwnedDatum::Text(bytes) | OwnedDatum::Blob(bytes) => bytes.len() as u64,
+                _ => 0,
+            };
+            size = size.saturating_add(bytes).saturating_add(1);
+        }
+        if size <= self.length_limit {
+            return Ok(());
+        }
+        Err(
+            inillucent_base::error::DbError::primary(inillucent_base::error::PrimaryCode::TooBig)
+                .with_message("string or blob too big")
+                .with_detail("string or blob too big"),
+        )
     }
 
     /// Refuses a virtual generated column of a `STRICT` table whose computed

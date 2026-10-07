@@ -259,6 +259,16 @@ fn can_flatten(select: &BoundSelect, position: usize, in_compound: bool) -> bool
     if source.join == JoinKind::Left && !outer_join_allows(select, block) {
         return false;
     }
+    // A derived table that joins with RIGHT or FULL fills its unmatched right
+    // rows after the scan, so moving its terms into an enclosing join loses the
+    // rows an enclosing equality would have kept.
+    if block
+        .sources
+        .iter()
+        .any(|inner| matches!(inner.join, JoinKind::Right | JoinKind::Full))
+    {
+        return false;
+    }
     if block.sources.iter().any(|inner| {
         matches!(
             inner.rows,
@@ -308,7 +318,13 @@ fn limits_allow(
         return false;
     }
     let sub_order = !block.order_by.is_empty() && !drops_its_order_by(select, block, in_compound);
-    if sub_order && (outer_order || aggregate) {
+    // **An arm of a compound keeps a derived table's order.** SQLite moves the
+    // derived table's `ORDER BY` onto the arm it flattens into, and runs each
+    // arm of a `UNION ALL` in that order. This engine's arms carry no
+    // `ORDER BY` of their own, so flattening one in dropped it:
+    // `SELECT * FROM (SELECT a FROM t ORDER BY a DESC) UNION ALL SELECT 100`
+    // came back in table order. Not flattening keeps the order.
+    if sub_order && (outer_order || aggregate || in_compound) {
         return false;
     }
     let computes = select
@@ -411,10 +427,22 @@ fn inline(select: &mut BoundSelect, position: usize, in_compound: bool) {
     };
     let mut block = *block;
     let id = source.id;
+    // **A JSON value read through a derived table is plain text in SQLite.**
+    // The JSON mark travels here by a JSON call being the argument of another,
+    // so putting `json_object(...)` in place of the column a query read from
+    // `(SELECT json_object(...) AS obj FROM foo)` handed `json_group_array(obj)`
+    // the mark, and the array held objects where SQLite holds quoted strings.
+    // A unary plus is the identity on the value and is not a JSON call.
     let replacements: Vec<BoundExpr> = block
         .columns
         .iter()
-        .map(|column| column.expr.clone())
+        .map(|column| match &column.expr {
+            BoundExpr::Json { .. } => BoundExpr::Unary {
+                op: crate::ast::UnaryOp::Identity,
+                operand: Box::new(column.expr.clone()),
+            },
+            other => other.clone(),
+        })
         .collect();
     let mut substitute = |expr: &mut BoundExpr| {
         if let BoundExpr::Column { source, column, .. } = expr {

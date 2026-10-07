@@ -273,7 +273,7 @@ pub(super) fn distinct_prefix(index: &IndexInfo, entry: &[OwnedDatum]) -> Option
 /// @param row - the row, in tree-column order
 pub(super) fn key_of(layout: &SourceLayout, row: &[OwnedDatum]) -> Vec<OwnedDatum> {
     layout
-        .key_columns
+        .identity
         .iter()
         .filter_map(|column| row.get(*column).cloned())
         .collect()
@@ -389,7 +389,7 @@ mod tests {
             tree_key: 1,
             slots: vec![Some(0), Some(1), Some(2)],
             rowid: Some(0),
-            identity: vec![0],
+            identity: vec![2, 0],
             types: vec![crate::expr::StaticType::Unknown; 3],
             width: 3,
             key_columns: vec![2, 0],

@@ -36,8 +36,8 @@
 //! aggregate where it computes none (its `WHERE`, its `ORDER BY` when nothing
 //! else aggregates), and `misuse of aggregate function f()` when the subquery
 //! that wrote the call would not allow an aggregate there. Both are raised here
-//! with the same words. A window function in the owning query is refused by
-//! name. An owner that is not a `SELECT` (the target of an `UPDATE` or `DELETE`,
+//! with the same words. A window function in the owning query moves to the
+//! outer query, which reads the aggregates through the derived table. An owner that is not a `SELECT` (the target of an `UPDATE` or `DELETE`,
 //! a trigger body) keeps the earlier behavior of registering the call in the
 //! subquery. A compound is supported: the first arm is rewritten with the
 //! compound's `ORDER BY`, `LIMIT` and later arms moved onto the outer query, and
@@ -184,6 +184,24 @@ impl Lowering {
         }
     }
 
+    /// Rewrites the expressions a window function reads.
+    ///
+    /// @param window - a window function of the original query
+    fn lower_window(&mut self, window: &mut super::BoundWindow) {
+        for expr in &mut window.arguments {
+            self.lower(expr);
+        }
+        if let Some(filter) = &mut window.filter {
+            self.lower(filter);
+        }
+        for expr in &mut window.partition_by {
+            self.lower(expr);
+        }
+        for term in &mut window.order_by {
+            self.lower(&mut term.expr);
+        }
+    }
+
     /// Rewrites a subquery's reads of the original query's FROM terms.
     ///
     /// @param block - a subquery of the original query's output
@@ -262,14 +280,20 @@ fn stand_in(source: usize, index: usize, aggregate: &BoundAggregate) -> BoundExp
     }
 }
 
-/// Adds to a list the FROM terms an expression reads, not looking into a
-/// subquery's block.
+/// Adds to a list the FROM terms an expression reads, including the ones a
+/// subquery in it is correlated to.
 ///
 /// @param expr - the expression
 /// @param into - the numbers read, with repeats
 fn terms_read(expr: &BoundExpr, into: &mut Vec<usize>) {
     if let BoundExpr::Column { source, .. } | BoundExpr::Rowid { source } = expr {
         into.push(*source);
+    }
+    // A subquery in the arguments reads the terms it is correlated to, which
+    // is how SQLite decides that `sum((SELECT x))` belongs to the query that
+    // has `x`.
+    if let BoundExpr::Subquery { block, .. } = expr {
+        into.extend(block.correlations.iter().copied());
     }
     for child in expr.children() {
         terms_read(child, into);
@@ -541,9 +565,9 @@ impl Binder<'_> {
         used: OuterUse,
     ) -> Result<BoundSelect, ParseError> {
         self.correlations.retain(|id| *id != used.source);
-        if !bound.windows.is_empty() || !bound.values.is_empty() {
+        if !bound.values.is_empty() {
             return Err(unsupported(
-                "an aggregate of an enclosing query inside a subquery, with a window function",
+                "an aggregate of an enclosing query inside a subquery, with a VALUES list",
                 Span::default(),
             ));
         }
@@ -579,11 +603,18 @@ impl Binder<'_> {
             aggregates,
             compounds,
             mut correlations,
+            mut windows,
             ..
         } = bound;
         correlations.retain(|id| *id != used.source);
         for column in &mut columns {
             lowering.lower(&mut column.expr);
+        }
+        // Window functions run after the aggregation, so they move to the
+        // outer query with every expression they read taken from the derived
+        // table, as the result columns are.
+        for window in &mut windows {
+            lowering.lower_window(window);
         }
         let having = having.map(|mut held| {
             lowering.lower(&mut held);
@@ -606,6 +637,7 @@ impl Binder<'_> {
         );
         let source = self.derived_term(used.source, inner);
         let mut outer = block_over(source, having, columns);
+        outer.windows = windows;
         outer.distinct = distinct;
         outer.order_by = order_by;
         outer.limit = limit;

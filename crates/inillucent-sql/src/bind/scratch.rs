@@ -116,6 +116,15 @@ pub(super) struct BlockFrame {
     correlations: Vec<usize>,
     tail_may_name_an_alias: bool,
     deferred: Option<(Vec<u8>, crate::lexer::Span)>,
+    /// The table function argument constraints the enclosing block has bound
+    /// and not yet put in its `WHERE`.
+    ///
+    /// **Per block, like the correlations.** They name the enclosing block's
+    /// FROM terms, and a derived table bound after a table function took them
+    /// into its own `WHERE`: `SELECT count(*) FROM json_each('[1,2]'),
+    /// (SELECT 1 AS x)` failed with "the tree read for FROM term 0 does not
+    /// carry column 8", because the subquery's pipeline has no term 0.
+    pending_constraints: Vec<BoundExpr>,
 }
 
 impl<'a> Binder<'a> {
@@ -186,6 +195,7 @@ impl<'a> Binder<'a> {
             correlations: core::mem::take(&mut self.correlations),
             tail_may_name_an_alias: self.tail_may_name_an_alias,
             deferred: self.outer.deferred.take(),
+            pending_constraints: core::mem::take(&mut self.pending_constraints),
         }
     }
 
@@ -212,11 +222,54 @@ impl<'a> Binder<'a> {
         self.result_aliases = frame.result_aliases;
         self.allow_aggregates = frame.allow_aggregates;
         self.allow_windows = frame.allow_windows;
+        self.pending_constraints = frame.pending_constraints;
         self.in_group_by = frame.in_group_by;
         self.in_plain_order_by = frame.in_plain_order_by;
         self.inside_aggregate = frame.inside_aggregate;
         self.tail_may_name_an_alias = frame.tail_may_name_an_alias;
         self.outer.deferred = frame.deferred;
         ids
+    }
+}
+
+impl Binder<'_> {
+    /// Takes the table function argument constraints that belong in the `WHERE`.
+    ///
+    /// An argument such as `json_each(t.tags)` constrains the function's own
+    /// term, so on the right side of a `LEFT JOIN` it is part of that join's
+    /// `ON`. In the `WHERE` it would reject the null extended row of an outer
+    /// row the function returned nothing for. Those are added to the term's
+    /// `ON`; the rest are returned.
+    pub(super) fn pending_for_the_where(&mut self) -> Vec<BoundExpr> {
+        let pending = core::mem::take(&mut self.pending_constraints);
+        let mut for_where = Vec::with_capacity(pending.len());
+        for constraint in pending {
+            let owner = match &constraint {
+                BoundExpr::Compare { left, .. } => match **left {
+                    BoundExpr::Column { source, .. } => Some(source),
+                    _ => None,
+                },
+                _ => None,
+            };
+            // **Every outer join, not only `LEFT`.** The planner seeks an outer
+            // join's term on its own `ON` alone, so an argument left in the
+            // `WHERE` never reached the function: `a RIGHT JOIN json_each('[..]')`
+            // returned no rows and `RIGHT JOIN generate_series(1, 2)` failed
+            // with "first argument missing". Every row a table function returns
+            // satisfies its arguments, so in the `ON` they null extend nothing.
+            let left_joined = owner
+                .and_then(|id| self.sources.get_mut(id))
+                .filter(|source| crate::plan::is_outer(source.join));
+            match left_joined {
+                Some(source) => {
+                    source.constraint = Some(match source.constraint.take() {
+                        Some(existing) => BoundExpr::And(Box::new(existing), Box::new(constraint)),
+                        None => constraint,
+                    });
+                }
+                None => for_where.push(constraint),
+            }
+        }
+        for_where
     }
 }

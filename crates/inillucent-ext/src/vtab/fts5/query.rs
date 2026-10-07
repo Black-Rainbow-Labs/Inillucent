@@ -59,6 +59,9 @@ pub(crate) struct Fts5Cursor {
     pub(crate) names: Vec<Vec<u8>>,
     pub(crate) match_column: i32,
     pub(crate) rank_column: i32,
+    /// The column weights `rank` scores with, from the `rank` setting; see
+    /// `bm25::configured_weights`.
+    pub(crate) rank_weights: Vec<f64>,
     pub(crate) tokenizer: Tokenizer,
     pub(crate) shadows: ShadowTables,
     pub(crate) rows: Vec<MatchedRow>,
@@ -544,6 +547,11 @@ impl VirtualCursor for Fts5Cursor {
         // started from. That is what a buffer has to be transparent about.
         let totals = buffered_totals(context, &self.shadows, &self.pending, self.columns);
         let ranked = plan.index_number & PLAN_RANKED != 0;
+        // Read only when a score is: most matches never ask for one.
+        self.rank_weights.clear();
+        if ranked {
+            self.rank_weights = bm25::configured_weights(context, &self.shadows, self.columns)?;
+        }
         // **A ranked plan needs the positions, and most plans do not.** The
         // cheap walk answers `None` for the queries whose answer depends on
         // them, and those fall through to the full evaluation.
@@ -568,6 +576,7 @@ impl VirtualCursor for Fts5Cursor {
                 &self.shadows,
                 &totals,
                 self.columns,
+                &self.rank_weights,
             )?;
             self.rows = scores
                 .into_iter()
@@ -635,10 +644,13 @@ impl VirtualCursor for Fts5Cursor {
                 return Ok(Value::Real(0.0));
             }
             // The same arithmetic `bm25::score` would have done in `filter`,
-            // for this row alone: `rank` *is* `bm25` with every weight one, so
-            // the two cannot disagree.
+            // for this row alone, with the weights the `rank` setting names,
+            // so the two cannot disagree.
             self.ensure_hits(context)?;
-            let weights = vec![1.0f64; self.columns];
+            if self.rank_weights.is_empty() {
+                self.rank_weights = bm25::configured_weights(context, &self.shadows, self.columns)?;
+            }
+            let weights = self.rank_weights.clone();
             let sizes = bm25::row_sizes(context, &self.shadows, row.rowid, self.columns)?;
             return Ok(Value::Real(bm25::score_row(
                 row.rowid,

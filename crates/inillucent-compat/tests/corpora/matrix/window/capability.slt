@@ -19,3 +19,15 @@ CREATE TABLE t (a INTEGER)
 query T rowsort
 SELECT a FROM t UNION ALL SELECT row_number() OVER () FROM t
 
+case capability-window-json-and-percentile-aggregates
+capability window_json_and_percentile_aggregates
+
+statement ok
+CREATE TABLE t (a INTEGER, s TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, '-'), (2, '+')
+
+query TT rowsort
+SELECT json_group_array(a) OVER (ORDER BY a), group_concat(a, s) OVER (ORDER BY a) FROM t
+

@@ -39,9 +39,11 @@ use column_names::finish_view_columns;
 mod view_term;
 pub use column_names::{subquery_columns, unique_column_names};
 pub use column_use::ColumnUse;
+pub use json_subtype::always_json;
 mod derived_note;
 mod having;
 mod json_subtype;
+mod limit_columns;
 pub(crate) mod literal;
 mod matching;
 mod nested_names;
@@ -899,10 +901,21 @@ impl BoundSelect {
                     .iter()
                     .any(|index| index.partial_sql.is_some())
             });
-        if partial && self.filter.is_some() {
-            let mut apart = ColumnUse::default();
-            self.gather_columns(source, &mut apart, false);
-            used.outside_filter = apart.columns;
+        // **A block with no `WHERE` still reads columns outside it.** The
+        // predicate can be repeated by a join's `ON` clause, and leaving this
+        // empty when there was no `WHERE` told the planner the block read
+        // nothing else of the term: `SELECT a, b, c FROM t1 JOIN t2 ON a = b
+        // AND c IS NOT NULL` over an index on `t2(b)` declared `WHERE c IS NOT
+        // NULL` was planned as covering and failed with "the tree read for
+        // FROM term 1 does not carry column 1".
+        if partial {
+            if self.filter.is_some() {
+                let mut apart = ColumnUse::default();
+                self.gather_columns(source, &mut apart, false);
+                used.outside_filter = apart.columns;
+            } else {
+                used.outside_filter = used.columns.clone();
+            }
         }
         used
     }
@@ -915,7 +928,7 @@ impl BoundSelect {
     fn gather_columns(&self, source: usize, into: &mut ColumnUse, include_filter: bool) {
         for term in &self.sources {
             if let Some(constraint) = &term.constraint {
-                constraint.columns_read(source, into);
+                self.filter_columns_read(constraint, source, into);
             }
             match &term.rows {
                 SourceRows::Table | SourceRows::RecursiveSelf { .. } => {}
@@ -933,12 +946,10 @@ impl BoundSelect {
                 }
             }
         }
-        for expr in self
-            .filter
-            .iter()
-            .filter(|_| include_filter)
-            .chain(self.having.iter())
-        {
+        if let Some(filter) = self.filter.as_ref().filter(|_| include_filter) {
+            self.filter_columns_read(filter, source, into);
+        }
+        for expr in self.having.iter() {
             expr.columns_read(source, into);
         }
         for expr in self
@@ -1184,6 +1195,10 @@ pub struct Binder<'a> {
     pub(crate) view_target: Option<usize>,
     /// Whether foreign keys are enforced, which `PRAGMA foreign_keys` decides.
     pub(crate) foreign_keys: bool,
+    /// Whether `PRAGMA ignore_check_constraints` turned `CHECK` off.
+    pub(crate) ignore_checks: bool,
+    /// The views being expanded, innermost last, as database and folded name.
+    pub(crate) expanding_views: Vec<(usize, Vec<u8>)>,
     /// Whether every key's checks wait for the commit, which
     /// `PRAGMA defer_foreign_keys` decides for the transaction.
     pub(crate) defer_foreign_keys: bool,
@@ -1424,6 +1439,8 @@ impl<'a> Binder<'a> {
             shared_ctes: Vec::new(),
             shared_anonymous: 0,
             foreign_keys: false,
+            ignore_checks: false,
+            expanding_views: Vec::new(),
             defer_foreign_keys: false,
             firing_foreign_keys: Vec::new(),
             foreign_key_depth: 0,
@@ -1454,6 +1471,18 @@ impl<'a> Binder<'a> {
         self.foreign_keys = enforced;
         self.defer_foreign_keys = deferred;
         self
+    }
+
+    /// Turns `CHECK` enforcement off, for `PRAGMA ignore_check_constraints`.
+    ///
+    /// The pragma was stored and never read, so a `CHECK` still refused rows
+    /// after a script turned it off, which is the step a bulk import takes. A
+    /// setter and not a `with_` step, because each `with_` step moves the
+    /// whole binder and one more move was measurable on `prepare.point`.
+    ///
+    /// @param ignored - whether the pragma is on
+    pub fn ignore_checks_if(&mut self, ignored: bool) {
+        self.ignore_checks = ignored;
     }
 
     /// Returns what the bound statement depends on.
@@ -1641,6 +1670,7 @@ impl<'a> Binder<'a> {
             Some(expr) => Some(self.bind_expr(expr)?),
             None => None,
         };
+        self.refuse_limit_columns(bound)?;
         bound.aggregates = self.aggregates.clone();
         bound.windows = self.windows.clone();
         bound.correlations = self.correlations.clone();
@@ -1729,40 +1759,6 @@ impl<'a> Binder<'a> {
             shared: None,
             serial: 0,
         })
-    }
-
-    /// Takes the table function argument constraints that belong in the `WHERE`.
-    ///
-    /// An argument such as `json_each(t.tags)` constrains the function's own
-    /// term, so on the right side of a `LEFT JOIN` it is part of that join's
-    /// `ON`. In the `WHERE` it would reject the null extended row of an outer
-    /// row the function returned nothing for. Those are added to the term's
-    /// `ON`; the rest are returned.
-    fn pending_for_the_where(&mut self) -> Vec<BoundExpr> {
-        let pending = core::mem::take(&mut self.pending_constraints);
-        let mut for_where = Vec::with_capacity(pending.len());
-        for constraint in pending {
-            let owner = match &constraint {
-                BoundExpr::Compare { left, .. } => match **left {
-                    BoundExpr::Column { source, .. } => Some(source),
-                    _ => None,
-                },
-                _ => None,
-            };
-            let left_joined = owner
-                .and_then(|id| self.sources.get_mut(id))
-                .filter(|source| source.join == JoinKind::Left);
-            match left_joined {
-                Some(source) => {
-                    source.constraint = Some(match source.constraint.take() {
-                        Some(existing) => BoundExpr::And(Box::new(existing), Box::new(constraint)),
-                        None => constraint,
-                    });
-                }
-                None => for_where.push(constraint),
-            }
-        }
-        for_where
     }
 
     /// Binds a `SELECT` arm: FROM, WHERE, GROUP BY, HAVING, and the results.
@@ -2284,7 +2280,17 @@ impl<'a> Binder<'a> {
         let Some(column) = last.first() else {
             return Err(unsupported("a subquery with no result column", span));
         };
-        let (affinity, collation) = comparison_rules(&operand, &column.expr);
+        // **The column is read as the arm's own FROM terms see it.** A derived
+        // table or CTE column with no affinity has none, so a TEXT operand
+        // applies TEXT to it: `b IN s` over `WITH s AS (VALUES (123), (456))`
+        // matched nothing when the column was read as an untyped declared one.
+        let arm = block.compounds.last().map_or(&block, |(_, arm)| arm);
+        let (affinity, collation) = comparison_rules_over(
+            &operand,
+            &column.expr,
+            self.seen_affinity(&operand),
+            comparison_rules::seen_affinity_among(&arm.sources, &column.expr),
+        );
         Ok(BoundExpr::Subquery {
             id: self.next_subquery_id(),
             kind: SubqueryKind::In,
@@ -2306,9 +2312,14 @@ impl<'a> Binder<'a> {
         span: Span,
     ) -> Result<(), ParseError> {
         let nested = self.ast.select(select).is_some_and(|held| held.nested_from);
-        let bound = self.bind_select(select)?;
+        let mut bound = self.bind_select(select)?;
+        let origins = if nested {
+            self.expose_using_columns(&mut bound)?
+        } else {
+            Vec::new()
+        };
         let names = if nested {
-            self.nested_names_of(&bound)
+            self.nested_names_of(&bound, &origins)
         } else {
             Vec::new()
         };
@@ -2322,40 +2333,9 @@ impl<'a> Binder<'a> {
         if !names.is_empty() {
             self.nested_names.push((id, names));
         }
+        let hidden: Vec<bool> = origins.iter().map(|origin| origin.hidden).collect();
+        self.hide_derived_columns(id, &hidden);
         Ok(())
-    }
-
-    /// Returns which inner table and column each column of a parenthesised join
-    /// came from.
-    ///
-    /// @param bound - the block built for the parenthesised join
-    fn nested_names_of(&self, bound: &BoundSelect) -> Vec<NestedName> {
-        let mut names = Vec::new();
-        for (index, column) in bound.columns.iter().enumerate() {
-            let origin = match &column.expr {
-                BoundExpr::Column { source, column, .. } => Some((*source, *column)),
-                BoundExpr::Function { arguments, .. } => match arguments.first() {
-                    Some(BoundExpr::Column { source, column, .. }) => Some((*source, *column)),
-                    _ => None,
-                },
-                _ => None,
-            };
-            let Some((source, inner)) = origin else {
-                continue;
-            };
-            let Some(held) = self.sources.get(source) else {
-                continue;
-            };
-            let Some(info) = held.table.column(inner) else {
-                continue;
-            };
-            names.push(NestedName {
-                table: held.alias.to_ascii_lowercase(),
-                column: info.folded.clone(),
-                index: index as u16,
-            });
-        }
-        names
     }
 
     /// Registers a bound block as one FROM term of the current block.
@@ -3067,6 +3047,14 @@ impl<'a> Binder<'a> {
                     Span::default(),
                 ));
             };
+            // **An ordinal that names an aggregate is refused here.** The
+            // aggregate check runs while a term is bound, and an ordinal is
+            // resolved to an expression the result list already bound, so
+            // `SELECT count(*) FROM t GROUP BY 1` reached the executor and
+            // failed there with an internal message.
+            if aggregate::holds_aggregate(&column.expr) {
+                return Err(self.aggregate_misuse(b"", Span::default()));
+            }
             return Ok(match named {
                 Some(collation) => collation::apply_collation(column.expr.clone(), collation),
                 None => column.expr.clone(),
@@ -3722,27 +3710,7 @@ impl<'a> Binder<'a> {
     ///
     /// @param expr - the operand
     fn seen_affinity(&self, expr: &BoundExpr) -> Option<Affinity> {
-        if let BoundExpr::Column {
-            source,
-            column,
-            affinity: Affinity::Blob,
-            ..
-        } = expr
-        {
-            let nothing = self
-                .sources
-                .get(*source)
-                .is_some_and(|held| match &held.rows {
-                    SourceRows::Subquery(block) => {
-                        block.column_affinity_if_any(usize::from(*column)).is_none()
-                    }
-                    _ => false,
-                });
-            if nothing {
-                return None;
-            }
-        }
-        expr.affinity()
+        comparison_rules::seen_affinity_among(&self.sources, expr)
     }
 
     /// Returns the inner names of the derived table standing for a parenthesised
@@ -3812,6 +3780,16 @@ impl<'a> Binder<'a> {
                 if let Some(names) = self.nested_names_for(id) {
                     match nested_hits(names, &folded, table_folded.as_deref()) {
                         NestedHits::Some(hits) => {
+                            let unqualified = table_folded.is_none();
+                            let hits = nested_names::prefer_shown(source, hits, unqualified);
+                            if using::nested_using_step(
+                                source,
+                                &hits,
+                                unqualified,
+                                (id, &mut found, &mut coalesced),
+                            ) {
+                                continue;
+                            }
                             if hits.len() > 1 || found.is_some() {
                                 let written = self.written_reference(database, table, column);
                                 return Err(ambiguous_column(&written, span));
@@ -3860,6 +3838,11 @@ impl<'a> Binder<'a> {
                             &mut found,
                             &mut coalesced,
                         );
+                        continue;
+                    }
+                    // Two terms with one name joined by `USING` share the column,
+                    // so `t.a` keeps the first copy instead of being ambiguous.
+                    if found.is_some() && source.suppressed.contains(&index) {
                         continue;
                     }
                     if found.is_some() {
@@ -3930,6 +3913,17 @@ impl<'a> Binder<'a> {
                 .iter()
                 .find(|(name, _)| name.as_slice() == folded)
             {
+                // `GROUP BY c` over `count(*) AS c` is the ordinal case
+                // written as a name; see `bind_group_term`.
+                if self.in_group_by && aggregate::holds_aggregate(expr) {
+                    return Err(self.aggregate_misuse(b"", Span::default()));
+                }
+                // `HAVING max(m + 5)` over `min(f1) AS m` nests one aggregate
+                // in another, which reached the executor as an internal error.
+                if self.inside_aggregate && aggregate::holds_aggregate(expr) {
+                    let name = String::from_utf8_lossy(self.ast.text(column));
+                    return Err(refused(format!("misuse of aliased aggregate {name}"), span));
+                }
                 return Ok(expr.clone());
             }
             if let Some(bound) = self.bind_where_alias(folded)? {

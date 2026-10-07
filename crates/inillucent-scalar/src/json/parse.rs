@@ -146,7 +146,14 @@ impl Parser<'_> {
     fn skip_space(&mut self) {
         loop {
             match self.peek() {
-                Some(b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) => self.at += 1,
+                Some(b' ' | b'\t' | b'\n' | b'\r') => self.at += 1,
+                // Vertical tab and form feed are JSON5 whitespace and not
+                // RFC 8259 whitespace, so `json_valid(X)` with its default
+                // flags refuses a document that uses them, as SQLite does.
+                Some(0x0b | 0x0c) => {
+                    self.used_json5 = true;
+                    self.at += 1;
+                }
                 Some(b'/') if self.peek_at(1) == Some(b'/') => {
                     self.used_json5 = true;
                     self.at += 2;
@@ -350,7 +357,10 @@ impl Parser<'_> {
 
     /// Parses one value.
     fn value(&mut self) -> Result<Node, ParseFailure> {
-        if self.depth >= MAX_DEPTH {
+        // Only an array or an object goes a level deeper. Refusing every value
+        // at the limit refused `[[...[0]...]]` nested exactly 1000 deep, which
+        // SQLite accepts, while the same nesting around nothing passed.
+        if self.depth >= MAX_DEPTH && matches!(self.peek(), Some(b'{' | b'[')) {
             return Err(self.fail());
         }
         match self.peek() {

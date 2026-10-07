@@ -87,6 +87,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'stage-layout.ps1')
+# The night's suite, builds and gates run on 80% of the machine's processors, so a person working
+# late still has a usable machine (task-2205). The share keeps every performance core, so the gates,
+# which pin themselves to the performance cores, measure on the same processors as before.
+Enter-ProcessorShare
 . (Join-Path $PSScriptRoot 'nightly-evidence.ps1')
 . (Join-Path $PSScriptRoot 'nightly-gates.ps1')
 . (Join-Path $PSScriptRoot 'github-token.ps1')

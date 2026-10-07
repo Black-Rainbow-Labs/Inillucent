@@ -65,6 +65,8 @@ pub mod obligations;
 pub mod oracle;
 pub mod perf;
 pub mod procstat;
+// How much of the machine a test run and its builds may take (task-2205).
+pub mod processor_share;
 pub mod quiet;
 pub mod rendering;
 pub mod report;

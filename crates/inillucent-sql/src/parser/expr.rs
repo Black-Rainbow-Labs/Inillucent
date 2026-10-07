@@ -595,7 +595,7 @@ impl Parser<'_> {
     }
 
     /// Returns whether the next word begins a column constraint.
-    fn at_constraint_keyword(&mut self) -> Result<bool, ParseError> {
+    pub(super) fn at_constraint_keyword(&mut self) -> Result<bool, ParseError> {
         let Some(keyword) = self.peek()?.keyword() else {
             return Ok(false);
         };
@@ -871,7 +871,21 @@ impl Parser<'_> {
                     }
                 }
                 end = self.expect(Punctuator::RightParen)?.span;
-                InRhs::List(values)
+                // SQLite reads `x IN ((SELECT ...))` as `x IN (SELECT ...)`
+                // at any depth of grouping, because parentheses are not
+                // nodes. A list of one scalar subquery is therefore the
+                // subquery form.
+                let lone_subquery = match (values.as_slice(), values.first()) {
+                    ([_], Some(id)) => match self.ast.expr(*id) {
+                        Some(Expr::Subquery(select)) => Some(*select),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match lone_subquery {
+                    Some(select) => InRhs::Select(select),
+                    None => InRhs::List(values),
+                }
             }
         } else {
             // The token's span, not the interned name's - see

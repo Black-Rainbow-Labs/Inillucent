@@ -258,11 +258,18 @@ mod tests {
     ///
     /// @param key_columns - which tree columns form the key
     fn a_layout(key_columns: Vec<usize>) -> SourceLayout {
+        // A WITHOUT ROWID table's row is identified by its key columns, and a
+        // rowid table's by its rowid, which is what the write paths read.
+        let identity = if key_columns.is_empty() {
+            vec![0]
+        } else {
+            key_columns.clone()
+        };
         SourceLayout {
             tree_key: 1,
             slots: vec![Some(0), Some(1), Some(2)],
             rowid: Some(0),
-            identity: vec![0],
+            identity,
             types: vec![crate::expr::StaticType::Unknown; 3],
             width: 3,
             key_columns,

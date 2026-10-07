@@ -196,7 +196,7 @@ pub fn text5_to_json(content: &str) -> String {
         if character != '\\' {
             match character {
                 '"' => out.push_str("\\\""),
-                character if character < ' ' || character == '\u{7f}' => {
+                character if character < ' ' => {
                     out.push_str(&escape(&character.to_string()));
                 }
                 character => out.push(character),

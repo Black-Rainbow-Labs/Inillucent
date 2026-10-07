@@ -98,6 +98,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use inillucent_compat::layering;
+use inillucent_compat::processor_share;
 use inillucent_compat::selection::{self, Cadence, Kind, Map, Row, Target};
 use inillucent_compat::supervise::{self, Limits, Stopped};
 use inillucent_compat::testplan::{self, json_field, json_text, Artifact};
@@ -127,6 +128,9 @@ struct Options {
     cadence: Option<Cadence>,
     /// How many test binaries to run at once.
     jobs: usize,
+    /// The share of the machine's processor time the run and its builds may
+    /// take, in percent. See `processor_share`.
+    cpu_percent: u32,
     /// How many threads each test binary uses internally.
     test_threads: usize,
     /// Print the selection and stop.
@@ -184,6 +188,7 @@ impl Options {
             changed: other.changed.clone(),
             cadence: other.cadence,
             jobs: other.jobs,
+            cpu_percent: other.cpu_percent,
             test_threads: other.test_threads,
             list: other.list,
             list_tiers: other.list_tiers,
@@ -207,9 +212,13 @@ impl Default for Options {
             targets: Vec::new(),
             changed: None,
             cadence: None,
-            jobs: std::thread::available_parallelism()
-                .map(std::num::NonZeroUsize::get)
-                .unwrap_or(4),
+            // A share of the processors, not all of them (task-2205): the
+            // count `parse_options` works out once it knows the share.
+            jobs: processor_share::jobs_for(
+                processor_share::processors(),
+                processor_share::DEFAULT_PERCENT,
+            ),
+            cpu_percent: processor_share::DEFAULT_PERCENT,
             // Two, not one, and not the default. Each binary already runs its
             // own tests on several threads; multiplying that by the number of
             // binaries in flight oversubscribes the machine badly enough to be
@@ -238,6 +247,8 @@ impl Default for Options {
 fn parse_options(arguments: &[String]) -> Result<Options, String> {
     let mut options = Options::default();
     let mut index = 0usize;
+    let mut cpu_flag: Option<String> = None;
+    let mut jobs_given = false;
     while let Some(argument) = arguments.get(index) {
         index += 1;
         let mut take = |name: &str| -> Result<String, String> {
@@ -253,7 +264,9 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
                 options.jobs = value
                     .parse()
                     .map_err(|_| format!("`--jobs` wants a number, not `{value}`"))?;
+                jobs_given = true;
             }
+            "--cpu" => cpu_flag = Some(take("--cpu")?),
             "--test-threads" => {
                 let value = take("--test-threads")?;
                 options.test_threads = value
@@ -307,6 +320,11 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
         if options.jobs == 0 {
             return Err("`--jobs` must be at least 1".to_string());
         }
+    }
+    options.cpu_percent = processor_share::requested_percent(cpu_flag.as_deref())?;
+    if !jobs_given {
+        options.jobs =
+            processor_share::jobs_for(processor_share::processors(), options.cpu_percent);
     }
     Ok(options)
 }
@@ -405,7 +423,11 @@ fn usage() -> String {
        by tests/timings.toml; n jobs with k = 1..n run it all once\n\
      \n\
      Execution:\n  \
-       --jobs <n>          test binaries at once (default: the machine's cores)\n  \
+       --jobs <n>          test binaries at once (default: the --cpu share of the\n                      \
+       machine's processors, rounded down)\n  \
+       --cpu <percent>     the share of the machine's processor time the builds and\n                      \
+       the tests may take together (default: 80, or INILLUCENT_CPU_PERCENT).\n                      \
+       Held by a job object on Windows; 100 removes the cap\n  \
        --test-threads <n>  threads inside each binary (default: 2)\n  \
        --no-build          do not build first\n  \
        --artifacts <file>  run the executables this artifact list names and start no\n                      \
@@ -553,6 +575,7 @@ fn main() -> ExitCode {
             return did_not_run();
         }
     };
+    limit_processor_share(&options);
     match run(&options) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
@@ -561,6 +584,27 @@ fn main() -> ExitCode {
             did_not_run()
         }
     }
+}
+
+/// Holds this run, its cargo builds and its tests to the `--cpu` share of the
+/// machine, before anything is started (task-2205).
+///
+/// The processor affinity mask `processor_share::enter` sets is copied into
+/// every process started afterwards. Cargo's own job count is set through
+/// `CARGO_BUILD_JOBS`, which every cargo this run starts reads, unless the
+/// caller already set it, so cargo does not start more compilers than there
+/// are processors in the mask. A share of 100 changes nothing, which is what CI
+/// asks for.
+///
+/// @param options - what the command line asked for
+fn limit_processor_share(options: &Options) {
+    let processors = processor_share::processors();
+    let entered = processor_share::enter(options.cpu_percent);
+    if options.cpu_percent < 100 && std::env::var_os("CARGO_BUILD_JOBS").is_none() {
+        let jobs = entered.processors_for_jobs(options.cpu_percent, processors);
+        std::env::set_var("CARGO_BUILD_JOBS", jobs.to_string());
+    }
+    println!("{}", entered.describe(options.cpu_percent, processors));
 }
 
 /// Selects, builds, runs and reports. Returns whether everything passed.

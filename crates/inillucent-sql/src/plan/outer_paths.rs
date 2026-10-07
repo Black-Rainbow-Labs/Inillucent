@@ -48,8 +48,23 @@ pub(super) fn choose_term_path(
         // know which those are: `list l RIGHT JOIN todo t ON t.list_id = l.id` with an
         // index on `list_id` probed `todo` per list and never produced the todo whose
         // list does not exist.
-        let on_terms = if source.join == JoinKind::Left {
-            outer_terms(source)
+        //
+        // **A table function on a `RIGHT` or `FULL` term is still given its
+        // arguments.** The function learns them only from what it is offered,
+        // and a function's arguments are not a filter on the rows the join
+        // keeps, since every row it returns satisfies them. With nothing
+        // offered, `a RIGHT JOIN generate_series(1, 2)` failed with "first
+        // argument missing" and `a RIGHT JOIN json_each('[..]')` returned no
+        // rows. Only constant arguments, because the term is read once.
+        let all_on = outer_terms(source);
+        let on_terms: Vec<BoundExpr> = if source.join == JoinKind::Left {
+            all_on.clone()
+        } else if source.table.module.is_some() {
+            all_on
+                .iter()
+                .filter(|term| is_constant_table_argument(select, term))
+                .cloned()
+                .collect()
         } else {
             Vec::new()
         };
@@ -66,17 +81,28 @@ pub(super) fn choose_term_path(
         // Every conjunct of the condition turned into part of the key, so the probe
         // answers the condition and an index nested loop can null-extend on an empty
         // probe.
-        on_enforced = !on_terms.is_empty() && on_consumed.iter().all(|held| *held);
+        on_enforced = source.join == JoinKind::Left
+            && !on_terms.is_empty()
+            && on_consumed.iter().all(|held| *held);
         // A term the module was offered is applied by the module itself, and its
         // hidden columns hold no value in the rows it returns, so the join must not
         // test it again.
+        //
+        // `on_terms` is only part of the `ON` for a `RIGHT` or `FULL` term, so
+        // what remains is every conjunct of the whole `ON` the module did not
+        // consume.
         if source.table.module.is_some() {
+            let taken: Vec<&BoundExpr> = on_terms
+                .iter()
+                .zip(&on_consumed)
+                .filter(|(_, held)| **held)
+                .map(|(term, _)| term)
+                .collect();
             remaining_on = Some(
-                on_terms
+                all_on
                     .iter()
-                    .zip(&on_consumed)
-                    .filter(|(_, held)| !**held)
-                    .map(|(term, _)| term.clone())
+                    .filter(|term| !taken.contains(term))
+                    .cloned()
                     .reduce(|left, right| BoundExpr::And(Box::new(left), Box::new(right))),
             );
         }
@@ -91,6 +117,20 @@ pub(super) fn choose_term_path(
         on_enforced,
         remaining_on,
     }
+}
+
+/// Reports whether a conjunct is a table function argument whose value reads
+/// no FROM term.
+///
+/// @param select - the bound statement
+/// @param term - one conjunct of an outer join's `ON`
+fn is_constant_table_argument(select: &BoundSelect, term: &BoundExpr) -> bool {
+    let BoundExpr::Compare { right, .. } = term else {
+        return false;
+    };
+    let mut used = Vec::new();
+    right.sources_used(&mut used);
+    used.is_empty() && super::flatten::is_table_argument(select, term)
 }
 
 /// Reports whether a `RIGHT` or `FULL` join comes after a term in the FROM
@@ -151,13 +191,48 @@ fn choose_path_without_where(
             *slot = true;
         }
     }
+    // An `ON` term of an inner join written after the `RIGHT` or `FULL` join is
+    // tested on the null extended rows too, so it is withheld like the `WHERE`.
+    // A `LEFT JOIN t1 ON c = 3 ... WHERE t1.a <> 0` becomes an inner join, and
+    // `c = 3` was turned into a seek on the first term, which dropped the rows
+    // the `RIGHT JOIN` null extends and then left `t1` matching on a NULL `c`.
+    let late = ons_written_after_the_right_join(select, source.id);
+    for (slot, held_back) in offered.iter_mut().zip(&late) {
+        if *held_back {
+            *slot = true;
+        }
+    }
     let path = choose_path(level, ids, source, select, terms, &mut offered, levers);
     for (index, (slot, held)) in consumed.iter_mut().zip(&offered).enumerate() {
-        if !withheld.get(index).copied().unwrap_or(false) {
+        if !withheld.get(index).copied().unwrap_or(false)
+            && !late.get(index).copied().unwrap_or(false)
+        {
             *slot = *held;
         }
     }
     path
+}
+
+/// Returns, for each statement term, whether it is the `ON` of an inner join
+/// written after the first `RIGHT` or `FULL` join that follows a term.
+///
+/// @param select - the bound statement
+/// @param id - the term that the `RIGHT` or `FULL` join null extends
+fn ons_written_after_the_right_join(select: &BoundSelect, id: usize) -> Vec<bool> {
+    let owners = hint::statement_terms_with_owners(select).1;
+    let at = select.sources.iter().position(|source| source.id == id);
+    let right = at.and_then(|at| {
+        (at.saturating_add(1)..select.sources.len()).find(|later| {
+            select
+                .sources
+                .get(*later)
+                .is_some_and(|source| matches!(source.join, JoinKind::Right | JoinKind::Full))
+        })
+    });
+    owners
+        .iter()
+        .map(|owner| matches!((owner, right), (Some(owner), Some(right)) if *owner > right))
+        .collect()
 }
 
 /// Moves the unenforced `ON` terms of inner joins into the `RIGHT` or `FULL`

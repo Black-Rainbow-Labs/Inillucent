@@ -72,7 +72,20 @@ fn matches(
     // found it on seed 20261002.
     let pattern = before_nul(pattern);
     let subject = before_nul(subject);
-    let (any, one) = if is_like { (b'%', b'_') } else { (b'*', b'?') };
+    let (mut any, mut one) = if is_like { (b'%', b'_') } else { (b'*', b'?') };
+    // **A wildcard named as the escape character stops being a wildcard.**
+    // SQLite clears `matchAll` or `matchOne` when `ESCAPE` names it, so with
+    // `ESCAPE '%'` the pattern `'abc%%'` is the text `abc%` and not `abc`
+    // followed by anything. The cleared byte is NUL, which `before_nul` has
+    // already removed from the pattern, so it can never match again.
+    if let Some([mark]) = escape {
+        if *mark == any {
+            any = 0;
+        }
+        if *mark == one {
+            one = 0;
+        }
+    }
     let mut p = 0usize;
     let mut s = 0usize;
     let mut star_pattern: Option<usize> = None;

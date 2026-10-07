@@ -114,6 +114,9 @@ pub struct WindowCall {
     pub collation: Collation,
     /// The columns holding its arguments.
     pub arguments: Vec<usize>,
+    /// Bit `n` set when argument `n` was produced by a JSON function, for the
+    /// JSON group aggregates.
+    pub json_marks: u32,
     /// The column holding its `FILTER (WHERE ...)` value.
     pub filter: Option<usize>,
     /// The window's own `ORDER BY`.
@@ -228,10 +231,13 @@ pub fn compute_values(rows: &[Vec<OwnedDatum>], plan: &WindowPlan) -> DbResult<V
             !call.order.is_empty(),
         );
         for partition in &partitions {
-            if let Some(kind) = slides_a_sum(call) {
-                for (row, value) in
-                    (partition.start..partition.end).zip(sliding_sums(rows, call, partition, kind)?)
-                {
+            let streamed = match (slides_a_sum(call), grows_from_the_start(call)) {
+                (Some(kind), _) => Some(sliding_sums(rows, call, partition, kind)?),
+                (None, Some(kind)) => Some(growing_aggregate(rows, call, partition, kind)?),
+                (None, None) => None,
+            };
+            if let Some(values) = streamed {
+                for (row, value) in (partition.start..partition.end).zip(values) {
                     if let Some(slot) = extra.get_mut(slot_of(row)) {
                         *slot = value;
                     }
@@ -304,30 +310,194 @@ fn sliding_sums(
         return Ok(Vec::new());
     };
     let mut accumulator = Accumulator::new(kind);
-    let mut held: Vec<usize> = Vec::new();
+    // The rows the accumulator holds, as a half open range of the partition.
+    // **Both ends only move forward**, because the partition is sorted by the
+    // window's order and every bound is a fixed distance from the row. So the
+    // rows that leave are a run at the front and the rows that enter a run at
+    // the back, and the whole partition costs one pass. Listing each row's
+    // frame and comparing it with the last one cost the frame's length per
+    // row: `sum(v) OVER (ORDER BY id ROWS 1000 PRECEDING)` over 100,000 rows
+    // was ten times SQLite's time.
+    let (mut held_start, mut held_end) = (partition.start, partition.start);
     let mut values = Vec::with_capacity(partition.end.saturating_sub(partition.start));
     for row in partition.start..partition.end {
-        let mut frame: Vec<usize> = frame_of(rows, call, partition, row)
-            .into_iter()
-            .filter(|member| passes_filter(rows, call, *member))
-            .collect();
-        frame.sort_unstable();
-        for leaving in held
-            .iter()
-            .filter(|member| frame.binary_search(member).is_err())
-        {
-            accumulator.pull(&value_at(rows, *leaving, column));
+        let (start, end) = match frame_bounds(rows, call, partition, row)? {
+            Some((low, high)) => (low, high.saturating_add(1)),
+            None => (held_end, held_end),
+        };
+        if start < held_start || end < held_end {
+            return sliding_sums_by_row(rows, call, partition, column, values);
         }
-        for entering in frame
-            .iter()
-            .filter(|member| held.binary_search(member).is_err())
-        {
-            accumulator.push(&value_at(rows, *entering, column));
+        for leaving in held_start..start.min(held_end) {
+            if passes_filter(rows, call, leaving) {
+                accumulator.pull(&value_at(rows, leaving, column));
+            }
         }
-        held = frame;
+        for entering in start.max(held_end)..end {
+            if passes_filter(rows, call, entering) {
+                accumulator.push(&value_at(rows, entering, column));
+            }
+        }
+        held_start = start;
+        held_end = end.max(start);
         values.push(accumulator.finish()?);
     }
     Ok(values)
+}
+
+/// Finishes a sliding sum by recomputing each remaining row's frame.
+///
+/// The bounds of a sorted partition only move forward, so this is not
+/// expected to run. It is here so that a frame which ever moved backwards
+/// would be answered correctly and slowly rather than wrongly.
+///
+/// @param rows - the buffered input
+/// @param call - the window call
+/// @param partition - the partition
+/// @param column - the summed argument's column
+/// @param values - the answers already computed, extended in place
+fn sliding_sums_by_row(
+    rows: &[Vec<OwnedDatum>],
+    call: &WindowCall,
+    partition: &frames::Partition,
+    column: usize,
+    mut values: Vec<OwnedDatum>,
+) -> DbResult<Vec<OwnedDatum>> {
+    let first = partition.start.saturating_add(values.len());
+    for row in first..partition.end {
+        let WindowSlot::Aggregate(kind) = &call.func else {
+            return Ok(values);
+        };
+        let mut accumulator = Accumulator::new(kind.clone());
+        for member in frame_of(rows, call, partition, row)? {
+            if passes_filter(rows, call, member) {
+                accumulator.push(&value_at(rows, member, column));
+            }
+        }
+        values.push(accumulator.finish()?);
+    }
+    Ok(values)
+}
+
+/// Returns the accumulator kind when a call is an aggregate over a frame that
+/// starts at `UNBOUNDED PRECEDING`, with no `EXCLUDE` and no `DISTINCT`.
+///
+/// Such a frame only grows from one row to the next, so one accumulator for
+/// the partition answers every row by adding the rows that entered. That is
+/// the default frame of every ordered window, `RANGE BETWEEN UNBOUNDED
+/// PRECEDING AND CURRENT ROW`, so it is the running total, the running count
+/// and the running `max` of every report that has one.
+///
+/// @param call - the window call
+fn grows_from_the_start(call: &WindowCall) -> Option<AggregateKind> {
+    let WindowSlot::Aggregate(kind) = &call.func else {
+        return None;
+    };
+    let grows = matches!(call.frame.start, FrameEnd::UnboundedPreceding)
+        && call.frame.exclude == FrameExclude::NoOthers
+        && !call.distinct;
+    grows.then(|| kind.clone())
+}
+
+/// Computes an aggregate over a growing frame for every row of one partition.
+///
+/// **One accumulator, fed the rows as the frame reaches them.** This ran the
+/// whole frame through a fresh accumulator for every row, so a running total
+/// cost the square of the partition: `sum(v) OVER (ORDER BY id)` over 100,000
+/// rows did not finish in a minute.
+///
+/// @param rows - the buffered input
+/// @param call - the window call
+/// @param partition - the partition
+/// @param kind - the aggregate
+fn growing_aggregate(
+    rows: &[Vec<OwnedDatum>],
+    call: &WindowCall,
+    partition: &frames::Partition,
+    kind: AggregateKind,
+) -> DbResult<Vec<OwnedDatum>> {
+    let whole_rows = keeps_whole_rows(&kind);
+    let mut accumulator = Accumulator::new(kind);
+    accumulator.compare_under(call.collation);
+    let mut added = partition.start;
+    let mut values = Vec::with_capacity(partition.end.saturating_sub(partition.start));
+    for row in partition.start..partition.end {
+        let end = match frame_bounds(rows, call, partition, row)? {
+            Some((_, high)) => high.saturating_add(1),
+            None => partition.start,
+        };
+        if end < added {
+            // A frame that shrank, which a sorted partition does not give.
+            values.push(aggregate(rows, call, partition, row, call_kind(call))?);
+            continue;
+        }
+        for member in added..end {
+            if passes_filter(rows, call, member) {
+                feed(&mut accumulator, rows, call, member, whole_rows)?;
+            }
+        }
+        added = end;
+        values.push(accumulator.finish()?);
+    }
+    Ok(values)
+}
+
+/// Returns a window call's aggregate kind, or `count(*)`'s when it has none.
+///
+/// @param call - the window call
+fn call_kind(call: &WindowCall) -> AggregateKind {
+    match &call.func {
+        WindowSlot::Aggregate(kind) => kind.clone(),
+        WindowSlot::Plain(_) => AggregateKind::CountStar,
+    }
+}
+
+/// Reports whether an aggregate keeps each row's arguments whole rather than
+/// folding the first one: a JSON group aggregate, whose NULL is a member
+/// rather than a row to skip, a computed separator, and the percentile
+/// family's fraction.
+///
+/// @param kind - the aggregate
+fn keeps_whole_rows(kind: &AggregateKind) -> bool {
+    matches!(
+        kind,
+        AggregateKind::JsonGroupArray(_)
+            | AggregateKind::JsonGroupObject(_)
+            | AggregateKind::GroupConcatComputed
+            | AggregateKind::Percentile(_)
+    )
+}
+
+/// Adds one frame member to an accumulator.
+///
+/// @param accumulator - the accumulator
+/// @param rows - the buffered input
+/// @param call - the window call
+/// @param member - the row being added
+/// @param whole_rows - whether the aggregate keeps every argument
+fn feed(
+    accumulator: &mut Accumulator,
+    rows: &[Vec<OwnedDatum>],
+    call: &WindowCall,
+    member: usize,
+    whole_rows: bool,
+) -> DbResult<()> {
+    if whole_rows {
+        let values = call
+            .arguments
+            .iter()
+            .map(|column| Value::from(&value_at(rows, member, *column)).into_owned())
+            .collect::<DbResult<Vec<_>>>()?;
+        accumulator.push_values_marked(values, call.json_marks);
+        return Ok(());
+    }
+    let value = match call.arguments.first() {
+        Some(column) => value_at(rows, member, *column),
+        // `count(*)` has no argument and counts the row itself.
+        None => Datum::Int(1),
+    };
+    accumulator.push(&value);
+    Ok(())
 }
 
 /// Returns one value of one row, or NULL when the column is not there.
@@ -467,9 +637,29 @@ fn evaluate(
         WindowSlot::Plain(WindowFunc::Lead) => offset_row(rows, call, partition, row, false),
         WindowSlot::Plain(WindowFunc::FirstValue)
         | WindowSlot::Plain(WindowFunc::LastValue)
+        | WindowSlot::Plain(WindowFunc::NthValue)
+            if call.frame.exclude == FrameExclude::NoOthers =>
+        {
+            // The frame is one run of rows, so the member wanted is found from
+            // its two ends. Listing the frame cost its length per row, which
+            // made `last_value(x) OVER (ORDER BY y)`, whose default frame
+            // grows with the partition, quadratic.
+            let bounds = frame_bounds(rows, call, partition, row)?;
+            let run: Vec<usize> = match bounds {
+                Some((low, high)) => match &call.func {
+                    WindowSlot::Plain(WindowFunc::FirstValue) => vec![low],
+                    WindowSlot::Plain(WindowFunc::LastValue) => vec![high],
+                    _ => (low..=high).take(nth_wanted(rows, call, row)?).collect(),
+                },
+                None => Vec::new(),
+            };
+            positional(rows, call, &run, row)?
+        }
+        WindowSlot::Plain(WindowFunc::FirstValue)
+        | WindowSlot::Plain(WindowFunc::LastValue)
         | WindowSlot::Plain(WindowFunc::NthValue) => {
-            let frame = frame_of(rows, call, partition, row);
-            positional(rows, call, &frame, row)
+            let frame = frame_of(rows, call, partition, row)?;
+            positional(rows, call, &frame, row)?
         }
         WindowSlot::Aggregate(kind) => aggregate(rows, call, partition, row, kind.clone())?,
     })
@@ -532,35 +722,44 @@ fn offset_row(
     }
 }
 
+/// Returns how many leading frame members `nth_value` needs: its position.
+///
+/// @param rows - the buffered input
+/// @param call - the `nth_value` call
+/// @param row - the row
+fn nth_wanted(rows: &[Vec<OwnedDatum>], call: &WindowCall, row: usize) -> DbResult<usize> {
+    let Some(column) = call.arguments.get(1) else {
+        return Ok(0);
+    };
+    Ok(checked_argument(&value_at(rows, row, *column), Argument::NthValue)? as usize)
+}
+
 /// Computes `first_value`, `last_value` or `nth_value` over a frame.
 fn positional(
     rows: &[Vec<OwnedDatum>],
     call: &WindowCall,
     frame: &[usize],
     row: usize,
-) -> OwnedDatum {
+) -> DbResult<OwnedDatum> {
     let Some(value_column) = call.arguments.first() else {
-        return OwnedDatum::Null;
+        return Ok(OwnedDatum::Null);
     };
     let picked = match &call.func {
         WindowSlot::Plain(WindowFunc::FirstValue) => frame.first().copied(),
         WindowSlot::Plain(WindowFunc::LastValue) => frame.last().copied(),
         WindowSlot::Plain(WindowFunc::NthValue) => {
             let Some(column) = call.arguments.get(1) else {
-                return OwnedDatum::Null;
+                return Ok(OwnedDatum::Null);
             };
-            let nth = integer_of(&value_at(rows, row, *column));
-            if nth < 1 {
-                return OwnedDatum::Null;
-            }
-            frame.get((nth as usize).saturating_sub(1)).copied()
+            let nth = checked_argument(&value_at(rows, row, *column), Argument::NthValue)? as usize;
+            frame.get(nth.saturating_sub(1)).copied()
         }
         _ => None,
     };
-    match picked {
+    Ok(match picked {
         Some(member) => OwnedDatum::from_datum(&value_at(rows, member, *value_column)),
         None => OwnedDatum::Null,
-    }
+    })
 }
 
 /// Runs an aggregate over one row's frame.
@@ -575,7 +774,8 @@ fn aggregate(
     row: usize,
     kind: AggregateKind,
 ) -> DbResult<OwnedDatum> {
-    let frame = frame_of(rows, call, partition, row);
+    let frame = frame_of(rows, call, partition, row)?;
+    let whole_rows = keeps_whole_rows(&kind);
     let mut accumulator = Accumulator::new(kind);
     // `min` and `max` over a frame compare the way they do over a group.
     accumulator.compare_under(call.collation);
@@ -596,7 +796,7 @@ fn aggregate(
                 continue;
             }
         }
-        accumulator.push(&value);
+        feed(&mut accumulator, rows, call, member, whole_rows)?;
     }
     accumulator.finish()
 }
@@ -610,41 +810,169 @@ fn frame_of(
     call: &WindowCall,
     partition: &frames::Partition,
     row: usize,
-) -> Vec<usize> {
-    let spec = frames::FrameSpec {
-        unit: call.frame.unit,
-        start: resolve(rows, call.frame.start, row),
-        end: resolve(rows, call.frame.end, row),
-        exclude: call.frame.exclude,
-    };
-    let first = call.order.first();
-    let order_column = first.map(|term| term.column);
-    let descending = first.is_some_and(|term| term.descending);
-    frames::frame(
+) -> DbResult<Vec<usize>> {
+    let spec = frame_spec(rows, call, row)?;
+    let descending = call.order.first().is_some_and(|term| term.descending);
+    Ok(frames::frame(
         partition,
         row,
         &spec,
-        |member| match order_column {
-            Some(column) => real_or_null(&value_at(rows, member, column)),
-            // No ordering term at all, so no `RANGE` offset can be resolved
-            // against one. Every row reads alike, which is what the frame
-            // arithmetic did before there was a NULL to tell apart.
-            None => Some(0.0),
-        },
+        |member| order_value(rows, call, member),
         descending,
-    )
+    ))
+}
+
+/// Returns the first and last row of one row's frame before `EXCLUDE`, or
+/// `None` when the frame is empty. See `frames::frame_bounds`.
+///
+/// @param rows - the buffered input
+/// @param call - the window call
+/// @param partition - the row's partition
+/// @param row - the row whose frame it is
+fn frame_bounds(
+    rows: &[Vec<OwnedDatum>],
+    call: &WindowCall,
+    partition: &frames::Partition,
+    row: usize,
+) -> DbResult<Option<(usize, usize)>> {
+    let spec = frame_spec(rows, call, row)?;
+    let descending = call.order.first().is_some_and(|term| term.descending);
+    Ok(frames::frame_bounds(
+        partition,
+        row,
+        &spec,
+        |member| order_value(rows, call, member),
+        descending,
+    ))
+}
+
+/// Resolves one row's frame specification, evaluating its offsets.
+///
+/// @param rows - the buffered input
+/// @param call - the window call
+/// @param row - the row whose frame it is
+fn frame_spec(
+    rows: &[Vec<OwnedDatum>],
+    call: &WindowCall,
+    row: usize,
+) -> DbResult<frames::FrameSpec> {
+    let unit = call.frame.unit;
+    Ok(frames::FrameSpec {
+        unit,
+        start: resolve(rows, call.frame.start, row, unit, true)?,
+        end: resolve(rows, call.frame.end, row, unit, false)?,
+        exclude: call.frame.exclude,
+    })
+}
+
+/// Returns a row's single `ORDER BY` value, for a `RANGE` offset.
+///
+/// @param rows - the buffered input
+/// @param call - the window call
+/// @param member - the row
+fn order_value(rows: &[Vec<OwnedDatum>], call: &WindowCall, member: usize) -> Option<f64> {
+    match call.order.first().map(|term| term.column) {
+        Some(column) => real_or_null(&value_at(rows, member, column)),
+        // No ordering term at all, so no `RANGE` offset can be resolved
+        // against one. Every row reads alike, which is what the frame
+        // arithmetic did before there was a NULL to tell apart.
+        None => Some(0.0),
+    }
 }
 
 /// Reads one end of a frame into the shared form, evaluating its offset.
-fn resolve(rows: &[Vec<OwnedDatum>], bound: FrameEnd, row: usize) -> frames::Bound {
-    match bound {
-        FrameEnd::UnboundedPreceding => frames::Bound::UnboundedPreceding,
-        FrameEnd::CurrentRow => frames::Bound::CurrentRow,
-        FrameEnd::UnboundedFollowing => frames::Bound::UnboundedFollowing,
-        FrameEnd::Offset { column, preceding } => frames::Bound::Offset {
-            distance: integer_of(&value_at(rows, row, column)),
+///
+/// @param rows - the buffered input
+/// @param bound - the end as the binder left it
+/// @param row - the row whose frame it is
+/// @param unit - `ROWS`, `RANGE` or `GROUPS`
+/// @param is_start - whether this is the frame's start
+fn resolve(
+    rows: &[Vec<OwnedDatum>],
+    bound: FrameEnd,
+    row: usize,
+    unit: FrameUnit,
+    is_start: bool,
+) -> DbResult<frames::Bound> {
+    let FrameEnd::Offset { column, preceding } = bound else {
+        return Ok(match bound {
+            FrameEnd::UnboundedPreceding => frames::Bound::UnboundedPreceding,
+            FrameEnd::UnboundedFollowing => frames::Bound::UnboundedFollowing,
+            _ => frames::Bound::CurrentRow,
+        });
+    };
+    let value = value_at(rows, row, column);
+    let range = unit == FrameUnit::Range;
+    let argument = match (range, is_start) {
+        (true, true) => Argument::RangeStart,
+        (true, false) => Argument::RangeEnd,
+        (false, true) => Argument::RowsStart,
+        (false, false) => Argument::RowsEnd,
+    };
+    let distance = checked_argument(&value, argument)?;
+    Ok(if range {
+        frames::Bound::RangeOffset {
+            distance,
             preceding,
-        },
+        }
+    } else {
+        frames::Bound::Offset {
+            distance: distance as i64,
+            preceding,
+        }
+    })
+}
+
+/// A window argument SQLite checks before it uses it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Argument {
+    /// A `ROWS` or `GROUPS` frame's starting offset.
+    RowsStart,
+    /// A `ROWS` or `GROUPS` frame's ending offset.
+    RowsEnd,
+    /// A `RANGE` frame's starting offset.
+    RangeStart,
+    /// A `RANGE` frame's ending offset.
+    RangeEnd,
+    /// The second argument of `nth_value`.
+    NthValue,
+}
+
+/// Checks a frame offset or an `nth_value` position the way SQLite does.
+///
+/// **A bad value is an error, never a guess.** A negative, fractional, NULL or
+/// non numeric offset was read as an integer here, so `ROWS BETWEEN 1.5
+/// PRECEDING` was one row, `-1 FOLLOWING` an empty frame, and `nth_value(a, 0)`
+/// a column of NULLs. SQLite refuses each with a message naming the argument.
+/// A `ROWS` or `GROUPS` offset and the `nth_value` position must be integers
+/// after numeric affinity, so `'2'` and `2.0` pass; a `RANGE` offset may be any
+/// number.
+///
+/// @param value - the evaluated argument
+/// @param argument - which argument it is
+fn checked_argument(value: &Datum<'_>, argument: Argument) -> DbResult<f64> {
+    let message = match argument {
+        Argument::RowsStart => "frame starting offset must be a non-negative integer",
+        Argument::RowsEnd => "frame ending offset must be a non-negative integer",
+        Argument::RangeStart => "frame starting offset must be a non-negative number",
+        Argument::RangeEnd => "frame ending offset must be a non-negative number",
+        Argument::NthValue => "second argument to nth_value must be a positive integer",
+    };
+    let range = matches!(argument, Argument::RangeStart | Argument::RangeEnd);
+    let number = match inillucent_value::affinity::apply_numeric_affinity(Value::from(value), true)
+    {
+        Value::Integer(held) => Some(held as f64),
+        Value::Real(held) if range || (held.fract() == 0.0 && held.abs() < 9.2e18) => Some(held),
+        _ => None,
+    };
+    let floor = if argument == Argument::NthValue {
+        1.0
+    } else {
+        0.0
+    };
+    match number {
+        Some(held) if held >= floor => Ok(held),
+        _ => Err(inillucent_base::error::statement_refusal(message)),
     }
 }
 
@@ -683,6 +1011,7 @@ mod tests {
             distinct: false,
             collation: Collation::Binary,
             arguments,
+            json_marks: 0,
             filter: None,
             order: vec![OrderTerm {
                 column: 0,

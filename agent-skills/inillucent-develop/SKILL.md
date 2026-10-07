@@ -54,6 +54,16 @@ target/debug/inillucent-testrun --strict                # fail when a prerequisi
 A git worktree's `.cargo/config.toml` may point cargo at a different target directory. The runner
 binary is then in that directory's `debug/` folder.
 
+The runner uses 80% of the machine's logical processors, fastest first, so the person at the
+machine keeps the rest. Its first line names them. Every cargo build and test process it starts
+inherits that processor affinity mask. `--cpu <percent>` or `INILLUCENT_CPU_PERCENT` changes the
+share, and 100 removes it. A cargo command typed by hand has no limit, so run it through
+`pwsh tools/capped.ps1`, which also imports the MSVC environment:
+
+```sh
+pwsh tools/capped.ps1 cargo test -p inillucent-sql --lib
+```
+
 ### How `--changed` picks targets
 
 ```mermaid

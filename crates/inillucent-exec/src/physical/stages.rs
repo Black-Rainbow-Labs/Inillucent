@@ -612,7 +612,7 @@ fn mark_needed(plan: &PhysicalPlan, catalog: &dyn TreeCatalog, stages: &mut [Pre
             gathered = Some((term.id, plan.select.columns_read(term.id)));
         }
         if let Some((_, used)) = &gathered {
-            mark_stage_needed(catalog, stage, used, stages_after);
+            mark_stage_needed(catalog, stage, used, stages_after, &term.table);
         }
     }
 }
@@ -623,13 +623,15 @@ fn mark_needed(plan: &PhysicalPlan, catalog: &dyn TreeCatalog, stages: &mut [Pre
 /// @param stage - the stage to mark
 /// @param used - what the statement reads of the stage's FROM term
 /// @param stages_after - how many stages read this one's row after it
+/// @param table - the stage's table, which says which declared column a record slot is
 fn mark_stage_needed(
     catalog: &dyn TreeCatalog,
     stage: &mut PreparedStage,
     used: &inillucent_sql::bind::ColumnUse,
     stages_after: usize,
+    table: &inillucent_sql::catalog_view::TableInfo,
 ) {
-    if stage.layout.is_some() || stage.kind == AccessKind::Materialised {
+    if stage.layout.is_some() {
         return;
     }
     let Some(layout) = catalog.layout(stage.root) else {
@@ -641,8 +643,22 @@ fn mark_stage_needed(
     let width = layout.width;
     let mut needed = ColumnMask::empty();
     let mut mark = |column: usize| column < width && needed.mark(column);
+    // A slot is its declared position unless a column takes no record slot or
+    // the record puts the key first. Asked once, so a statement over an
+    // ordinary table pays nothing per column at compile time.
+    let shifted = table.without_rowid || table.columns.iter().any(|c| c.generated && !c.stored);
     for slot in &used.columns {
-        match layout.slots.get(usize::from(*slot)).copied().flatten() {
+        // `used.columns` holds record slots and `layout.slots` is indexed by
+        // declared position. A `VIRTUAL` generated column takes no record slot,
+        // so every column declared after one has a record slot one lower than
+        // its declared position, and indexing `layout.slots` by the record slot
+        // read the neighbouring column: `SELECT rowid FROM t WHERE x = 4` over
+        // `t(g AS (x+0), id, x)` decoded `id` and compared that with 4.
+        let declared = match shifted {
+            true => declared_of_slot(table, *slot),
+            false => usize::from(*slot),
+        };
+        match layout.slots.get(declared).copied().flatten() {
             Some(column) if mark(column) => {}
             _ => return,
         }
@@ -670,6 +686,19 @@ fn mark_stage_needed(
         return;
     }
     stage.needed = Some(needed);
+}
+/// Returns the declared position of the column that holds a record slot.
+///
+/// A table with no `VIRTUAL` generated column has the same number for both, so
+/// that is the answer when no declared column matches.
+///
+/// @param table - the table the slot belongs to
+/// @param slot - a record slot, as `ColumnUse::columns` lists them
+fn declared_of_slot(table: &inillucent_sql::catalog_view::TableInfo, slot: u16) -> usize {
+    (0..table.columns.len())
+        .filter_map(|declared| u16::try_from(declared).ok())
+        .find(|declared| table.record_slot(*declared) == Some(usize::from(slot)))
+        .map_or(usize::from(slot), usize::from)
 }
 /// Returns the collation an expression is compared and ordered under.
 ///

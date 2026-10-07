@@ -109,7 +109,10 @@ impl Binder<'_> {
     /// together with one column reference per result column.
     ///
     /// @param block - the bound query
-    fn read_through_derived_table(&mut self, block: BoundSelect) -> (BoundSelect, Vec<BoundExpr>) {
+    pub(super) fn read_through_derived_table(
+        &mut self,
+        block: BoundSelect,
+    ) -> (BoundSelect, Vec<BoundExpr>) {
         let id = self.sources.len();
         let table = subquery_table(b"subquery", &[], &block);
         let columns: Vec<BoundExpr> = block

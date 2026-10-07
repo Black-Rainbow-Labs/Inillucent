@@ -301,30 +301,23 @@ pub fn nocase_key_bytes(bytes: &[u8], out: &mut Vec<u8>) -> bool {
     true
 }
 
-/// RTRIM: BINARY, except that a longer string whose tail is all spaces is
-/// equal rather than greater.
+/// RTRIM: BINARY after the trailing spaces of both strings are dropped.
+///
+/// SQLite trims first and compares second, so a space that ends one string is
+/// less than a control character that ends the other: `' ' > char(20)` is 0
+/// under RTRIM, because the left side becomes empty. Comparing the shared
+/// prefix and only then looking at the tails answered 1.
 fn compare_rtrim(left: &[u8], right: &[u8]) -> Ordering {
-    let shared = left.len().min(right.len());
-    for index in 0..shared {
-        let left_byte = left.get(index).copied().unwrap_or(0);
-        let right_byte = right.get(index).copied().unwrap_or(0);
-        match left_byte.cmp(&right_byte) {
-            Ordering::Equal => continue,
-            other => return other,
-        }
-    }
-    let left_tail = left.get(shared..).unwrap_or(&[]);
-    let right_tail = right.get(shared..).unwrap_or(&[]);
-    if all_spaces(left_tail) && all_spaces(right_tail) {
-        Ordering::Equal
-    } else {
-        left.len().cmp(&right.len())
-    }
+    trim_trailing_spaces(left).cmp(trim_trailing_spaces(right))
 }
 
-/// Reports whether every byte is a space.
-fn all_spaces(bytes: &[u8]) -> bool {
-    bytes.iter().all(|byte| *byte == b' ')
+/// Returns the bytes without the spaces that end them.
+fn trim_trailing_spaces(bytes: &[u8]) -> &[u8] {
+    let kept = bytes
+        .iter()
+        .rposition(|byte| *byte != b' ')
+        .map_or(0, |last| last + 1);
+    bytes.get(..kept).unwrap_or(bytes)
 }
 
 /// A collation as the catalog knows it: a name, a behaviour, and a generation.

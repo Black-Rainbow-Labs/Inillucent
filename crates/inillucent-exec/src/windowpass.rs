@@ -24,7 +24,7 @@ use inillucent_sql::ast::{NullOrder, SortOrder};
 use inillucent_sql::bind::WindowCall as BoundWindowCall;
 use inillucent_sql::function::AggregateFunc;
 
-use crate::aggregate::AggregateKind;
+use crate::aggregate::{AggregateKind, Percentile};
 use crate::expr::{compile, Expr, StaticType};
 use crate::join::ValuesScan;
 use crate::ops::{CollectInto, Distinct, Limit, Project, Sink, Sort, SortKey};
@@ -473,14 +473,26 @@ fn window_plan(
                 AggregateFunc::Avg => AggregateKind::Average,
                 AggregateFunc::Min => AggregateKind::Minimum,
                 AggregateFunc::Max => AggregateKind::Maximum,
-                AggregateFunc::GroupConcat => {
-                    let separator = match call.arguments.get(1) {
-                        None => ",".to_string(),
-                        Some(BoundExpr::Text(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
-                        Some(_) => return unsupported("group_concat with a computed separator"),
-                    };
-                    AggregateKind::GroupConcat(separator)
-                }
+                // **The same kinds a grouped call gets.** A window aggregate
+                // folds each frame through the grouped accumulator, so a kind
+                // that keeps whole rows works here once the whole row is handed
+                // to it; see `window::aggregate`. These were refused with exit
+                // code 3, and SQLite answers every one of them over a window.
+                AggregateFunc::GroupConcat => match call.arguments.get(1) {
+                    None => AggregateKind::GroupConcat(",".to_string()),
+                    Some(BoundExpr::Text(bytes)) => {
+                        AggregateKind::GroupConcat(String::from_utf8_lossy(bytes).into_owned())
+                    }
+                    Some(_) => AggregateKind::GroupConcatComputed,
+                },
+                AggregateFunc::JsonGroupArray => AggregateKind::JsonGroupArray(false),
+                AggregateFunc::JsonbGroupArray => AggregateKind::JsonGroupArray(true),
+                AggregateFunc::JsonGroupObject => AggregateKind::JsonGroupObject(false),
+                AggregateFunc::JsonbGroupObject => AggregateKind::JsonGroupObject(true),
+                AggregateFunc::Median => AggregateKind::Percentile(Percentile::Median),
+                AggregateFunc::Percentile => AggregateKind::Percentile(Percentile::Hundredths),
+                AggregateFunc::PercentileCont => AggregateKind::Percentile(Percentile::Continuous),
+                AggregateFunc::PercentileDisc => AggregateKind::Percentile(Percentile::Discrete),
                 other => return unsupported(&format!("the aggregate {other:?} over a window")),
             }),
         };
@@ -493,8 +505,20 @@ fn window_plan(
             Some(expr) => Some(column_of(pre, expr)?),
             None => None,
         };
+        // Which arguments a JSON function produced, for the JSON group
+        // aggregates: the value is read out of a buffered column, which cannot
+        // say where it came from.
+        let json_marks = call
+            .arguments
+            .iter()
+            .enumerate()
+            .filter(|(_, expr)| inillucent_sql::bind::always_json(expr))
+            .fold(0u32, |marks, (at, _)| {
+                marks | 1u32.checked_shl(at as u32).unwrap_or(0)
+            });
         calls.push(WindowCall {
             func,
+            json_marks,
             distinct: call.distinct,
             collation: call.collation,
             arguments,

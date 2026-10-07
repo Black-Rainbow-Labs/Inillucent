@@ -1747,6 +1747,19 @@ shards = 4
 covers = ["inillucent-engine", "inillucent-sql", "inillucent-exec", "inillucent-scalar"]
 requires = ["oracle"]
 
+# The research corpus: about 1,200 cases gathered from Turso's issues, SQLite's
+# release notes and forum and the SQLancer bug lists, compared byte for byte
+# with the pinned shell (tasks/task-2201-bug-hunt-tdd.md). The cases that found
+# a defect are also in the usage corpus, which runs on every change.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "nightly"
+module = "research_corpus"
+tier = "nightly"
+covers = ["inillucent-cli"]
+requires = ["shell"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"
@@ -2892,6 +2905,18 @@ package = "inillucent"
 kind = "test"
 name = "budget"
 tier = "perf"
+
+# The processor share every run and release script holds itself to (task-2205).
+# It measures how much processor time a child was given, so it needs the machine
+# otherwise idle, which the exclusive tier gives it. Its uncapped control fails
+# the case on a machine too busy to tell a cap from the load.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "perf"
+module = "processor_share"
+tier = "perf"
+covers = ["inillucent-compat"]
 
 # --- retrieval: the embedding and retrieval engine, and its graded harness
 

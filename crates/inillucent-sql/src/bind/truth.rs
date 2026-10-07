@@ -71,6 +71,10 @@ impl Binder<'_> {
     pub(super) fn truth_literal(&self, right: ExprId) -> Option<bool> {
         match self.ast.expr(right)? {
             Expr::Literal(Literal::Boolean(truth)) => Some(*truth),
+            // `x IS TRUE COLLATE NOCASE` is still a truth test in SQLite: a
+            // collation changes how text compares and a truth test compares
+            // nothing. Read as `x IS 1`, `0.5 IS TRUE COLLATE NOCASE` was 0.
+            Expr::Collate { operand, .. } => self.truth_literal(*operand),
             _ => None,
         }
     }

@@ -86,7 +86,13 @@ fn may_drop_columns(block: &BoundSelect) -> bool {
             && arm.windows.is_empty()
             && arm.values.is_empty()
     };
+    // **A compound's `ORDER BY` sorts by its result columns.** `SELECT a FROM
+    // (SELECT a, b FROM t1 UNION ALL SELECT x, y FROM t2 ORDER BY 2)` reads
+    // only `a`, and setting `b` to NULL left the merge nothing to order by,
+    // so the arms came back one after the other. SQLite keeps every column an
+    // `ORDER BY` names; this keeps them all.
     arms.into_iter().all(plain)
+        && (block.compounds.is_empty() || block.order_by.is_empty())
         && block
             .compounds
             .iter()

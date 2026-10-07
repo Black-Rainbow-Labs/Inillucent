@@ -211,7 +211,11 @@ impl crate::ImportedDatabase {
             .entries_of(at)
             .iter()
             .filter(|held| {
-                held.entry.name.to_ascii_lowercase() == folded
+                // A trigger has a namespace of its own, so a trigger that
+                // shares the table's name is another table's trigger and
+                // stays.
+                (held.entry.kind != ObjectKind::Trigger
+                    && held.entry.name.to_ascii_lowercase() == folded)
                     || held.entry.table.to_ascii_lowercase() == folded
             })
             .map(|held| held.rowid)

@@ -23,7 +23,7 @@
 //! for the text row `'1'`. Taking the first arm's affinity, which this file
 //! replaces, made it true for both.
 
-use inillucent_value::Affinity;
+use inillucent_value::{Affinity, Collation};
 
 use super::{BoundExpr, BoundSelect, SubqueryKind};
 use crate::ast::{BinaryOp, UnaryOp};
@@ -74,6 +74,22 @@ impl BoundSelect {
         let mut arms: Vec<&BoundExpr> = Vec::new();
         self.collect_arm_columns(index, &mut arms);
         compound_affinity(&arms)
+    }
+
+    /// Returns the collation result column `index` of this block, with every
+    /// compound arm, compares with.
+    ///
+    /// SQLite reads it from the leftmost arm whose expression has a collation
+    /// of its own, so a derived table over `SELECT a, b FROM t1 UNION ALL
+    /// SELECT c, d FROM t2` with a NOCASE `t1.b` has a NOCASE `b`. Reading the
+    /// first arm alone gave a `VALUES` first arm or a literal no collation at
+    /// all, where the arm to its right should have supplied one.
+    ///
+    /// @param index - which result column
+    pub fn column_collation(&self, index: usize) -> Collation {
+        let mut arms: Vec<&BoundExpr> = Vec::new();
+        self.collect_arm_columns(index, &mut arms);
+        super::set_rules::compound_collation(arms)
     }
 
     /// Returns the affinity a scalar subquery has as an operand.

@@ -97,7 +97,7 @@ fn read_key(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option
         loop {
             match characters.next()? {
                 '"' => return Some(name),
-                '\\' => name.push(characters.next()?),
+                '\\' => name.push(read_escape(characters)?),
                 character => name.push(character),
             }
         }
@@ -110,6 +110,53 @@ fn read_key(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option
         characters.next();
     }
     (!name.is_empty()).then_some(name)
+}
+
+/// Reads the character a backslash escape stands for inside a quoted key.
+///
+/// SQLite compares a quoted path key with the document's member names after
+/// reading the JSON5 escapes in both, so a path key written with a hex escape
+/// for the letter b finds the member `abc`. Reading the escape letter
+/// literally made that key `ax62c`. An escape that is not valid, such as a
+/// short hex run, keeps the letter that followed the backslash, as before.
+///
+/// @param characters - the path, positioned just after the backslash
+fn read_escape(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<char> {
+    let letter = characters.next()?;
+    let decoded = match letter {
+        'b' => Some('\u{8}'),
+        'f' => Some('\u{c}'),
+        'n' => Some('\n'),
+        'r' => Some('\r'),
+        't' => Some('\t'),
+        'v' => Some('\u{b}'),
+        '0' if !characters.peek().is_some_and(char::is_ascii_digit) => Some('\0'),
+        'x' => read_hex(characters, 2),
+        'u' => read_hex(characters, 4),
+        _ => None,
+    };
+    Some(decoded.unwrap_or(letter))
+}
+
+/// Reads exactly `count` hex digits as one character, consuming nothing when
+/// the next characters are not that many hex digits or not a valid character.
+///
+/// @param characters - the path, positioned at the first digit
+/// @param count - how many digits to read
+fn read_hex(
+    characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    count: usize,
+) -> Option<char> {
+    let mut ahead = characters.clone();
+    let mut value: u32 = 0;
+    for _ in 0..count {
+        value = value
+            .checked_mul(16)?
+            .checked_add(ahead.next()?.to_digit(16)?)?;
+    }
+    let decoded = char::from_u32(value)?;
+    *characters = ahead;
+    Some(decoded)
 }
 
 /// Reads the index after a `[`: a number, `#`, or `#-` and a number, then the `]`.

@@ -192,6 +192,18 @@ impl Binder<'_> {
             .and_then(BoundExpr::collation)
             .unwrap_or(Collation::Binary);
         let func = self.vector_aggregate(func, &bound);
+        // A JSON group aggregate reads the JSON mark of what it folds, and a
+        // `json_each` row's `value` has one when it is an array or an object.
+        let bound = match func {
+            AggregateFunc::JsonGroupArray
+            | AggregateFunc::JsonbGroupArray
+            | AggregateFunc::JsonGroupObject
+            | AggregateFunc::JsonbGroupObject => bound
+                .into_iter()
+                .map(|argument| self.walk_value(&argument).unwrap_or(argument))
+                .collect(),
+            _ => bound,
+        };
         // **`DISTINCT` takes exactly one argument (task-1913).** SQLite
         // answers `DISTINCT aggregates must have exactly one argument`,
         // and this accepted `group_concat(DISTINCT s, ',')` and answered
@@ -337,4 +349,11 @@ impl Binder<'_> {
         };
         BoundExpr::Aggregate { slot, collation }
     }
+}
+
+/// Reports whether a bound expression computes an aggregate of its own block.
+///
+/// @param expr - the bound expression
+pub(super) fn holds_aggregate(expr: &BoundExpr) -> bool {
+    matches!(expr, BoundExpr::Aggregate { .. }) || expr.children().into_iter().any(holds_aggregate)
 }

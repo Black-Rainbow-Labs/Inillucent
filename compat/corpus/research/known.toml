@@ -1,0 +1,116 @@
+# Research corpus cases that do not yet print what SQLite 3.53.4 prints.
+#
+# nightly::research_corpus fails when a case differs and is not listed here,
+# and when a listed case matches, so a row comes out when its case is fixed.
+# kind is "defect" for something to fix and "deviation" for a deliberate
+# difference. The reasons refer to tasks/task-2201-bug-hunt-tdd.md section 6.
+
+[[known]]
+case = "research/mine/pragma-function-and-module-list"
+kind = "deviation"
+reason = "The module list names the modules this build has. json_each is registered as a module here and is not listed by the pinned shell."
+
+[[known]]
+case = "research/mine/collate-unknown"
+kind = "defect"
+reason = "SELECT 'a' COLLATE nosuch is refused when it is bound; SQLite refuses an unknown collation only where one is used to compare."
+
+[[known]]
+case = "research/sqlite-forum/left_join_fts5_case_match"
+kind = "deviation"
+reason = "Both engines refuse the statement. SQLite says no query solution and this engine says unable to use function MATCH in the requested context."
+
+[[known]]
+case = "research/sqlite-forum/left_join_fts5_case_expr"
+kind = "deviation"
+reason = "Both engines refuse the statement, with different messages, as in left_join_fts5_case_match."
+
+[[known]]
+case = "research/sqlite-forum/fts5_leftjoin_match_case_on_clause"
+kind = "deviation"
+reason = "Both engines refuse the statement, with different messages, as in left_join_fts5_case_match."
+
+[[known]]
+case = "research/sqlite-forum/window_count_in_order_by_subquery_inconsistent"
+kind = "defect"
+reason = "An aggregate inside the ORDER BY of a subquery in a result column is refused here as a misuse; SQLite accepts it there and refuses the same subquery in a WHERE."
+
+[[known]]
+case = "research/sqlite-forum/defer_fk_drop_then_rename_commit_fails"
+kind = "deviation"
+reason = "With deferred foreign keys, DROP TABLE of a parent and a rename of its replacement leave SQLite's violation counter raised, so its COMMIT fails. This engine checks the keys at the commit, finds every child row has a parent, and commits."
+
+[[known]]
+case = "research/sqlite-forum/update_from_join_on_references_target"
+kind = "defect"
+reason = "UPDATE t1 ... FROM t2 JOIN t3 ON ... aa: the target table is visible inside the FROM clause's ON here, and SQLite reports no such column."
+
+[[known]]
+case = "research/sqlite-forum/update_from_same_table_ambiguous_column"
+kind = "deviation"
+reason = "Both engines refuse the statement as ambiguous and name a different one of the two ambiguous columns."
+
+[[known]]
+case = "research/sqlite-forum/insert_default_values_into_ill_formed_view_returning"
+kind = "deviation"
+reason = "Both engines refuse the statement. SQLite names the unknown collation in the view first; this engine names the view as not writable first."
+
+[[known]]
+case = "research/sqlite-forum/fts5_trigram_option_without_value"
+kind = "defect"
+reason = "The trigram tokenizer is not built, so the statement is refused with exit code 3."
+
+[[known]]
+case = "research/sqlite-forum/fts5_external_content_delete_then_reinsert"
+kind = "deviation"
+reason = "The delete command for rows the index never held: SQLite reports the index as malformed on the next query; this engine removes nothing and answers the query."
+
+[[known]]
+case = "research/sqlite-forum/fts5_external_content_view_no_trigger_match"
+kind = "defect"
+reason = "An external content table whose content is a view: a scan of the full text table reads the content through the shadow table mechanism, which has no tree for a view, so it returns no rows."
+
+[[known]]
+case = "research/sqlite-forum/fts5_match_phrase_near_prefix_bm25"
+kind = "deviation"
+reason = "One bm25 score differs in the seventeenth significant digit, because the per phrase terms are added in a different order."
+
+[[known]]
+case = "research/sqlite-forum/fts5_contentless_delete_rebuild"
+kind = "defect"
+reason = "contentless_delete=1 is refused with exit code 3; the index cannot yet find a row's postings without its text."
+
+[[known]]
+case = "research/sqlite-forum/insert_or_fail_fk_unique"
+kind = "defect"
+reason = "INSERT OR FAIL of two rows where the second breaks a UNIQUE constraint and the first an immediate foreign key: SQLite reports the foreign key and keeps nothing; this engine reports the UNIQUE constraint and keeps the first row."
+
+[[known]]
+case = "research/sqlite-forum/recursive_trigger_replace_duplicate_unique"
+kind = "defect"
+reason = "With recursive_triggers on, INSERT OR REPLACE whose delete trigger reinserts the replaced key recurses until the trigger depth limit; SQLite reports the UNIQUE constraint."
+
+[[known]]
+case = "research/sqlite-forum/trigger_replace_between_case"
+kind = "defect"
+reason = "The same recursion as recursive_trigger_replace_duplicate_unique, through REPLACE INTO with a delete trigger."
+
+[[known]]
+case = "research/sqlite-forum/insert_error_midway_statement_journal"
+kind = "deviation"
+reason = "A window function in a VALUES row is refused when the statement is bound here; SQLite runs it and fails on its argument."
+
+[[known]]
+case = "research/sqlite-forum/utf16be_glob_index"
+kind = "deviation"
+reason = "This engine stores UTF-8 only and refuses PRAGMA encoding = 'UTF-16be', as docs/sql.md says."
+
+[[known]]
+case = "research/sqlite-release-notes/without_rowid_pk_not_null_and_order"
+kind = "deviation"
+reason = "N2 of the usage corpus: a WITHOUT ROWID table whose primary key is DESC is scanned in ascending key order when the query has no ORDER BY."
+
+[[known]]
+case = "research/turso/delete_limit_offset"
+kind = "deviation"
+reason = "DELETE ... LIMIT: the pinned sqlite3 shell is built without SQLITE_ENABLE_UPDATE_DELETE_LIMIT."

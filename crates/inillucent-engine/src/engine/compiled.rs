@@ -80,6 +80,15 @@ impl crate::ImportedDatabase {
         params.set_context(self.scalar_context());
         params.forget_shared_rows();
         params.set_recursive_triggers(self.pragmas.recursive_triggers());
+        params.set_trigger_depth(
+            usize::try_from(
+                self.pragmas
+                    .limits()
+                    .borrow()
+                    .get(inillucent_base::limits::Limit::TriggerDepth),
+            )
+            .unwrap_or(0),
+        );
         // **The file lock, taken here and released here.** Both entry points -
         // `execute_any` and `execute_statement` - come through this function, so
         // no statement can run without it. Under `exclusive`, which is the
@@ -714,6 +723,7 @@ impl crate::ImportedDatabase {
                 self.pragmas.defer_foreign_keys(),
             )
             .with_scratch(self.compiled.take_binder_scratch());
+        binder.ignore_checks_if(self.pragmas.ignore_check_constraints());
         let outcome = binder.bind_statement(inner);
         self.compiled.recycle_binder(binder.into_scratch());
         let bound = outcome.map_err(refused)?;

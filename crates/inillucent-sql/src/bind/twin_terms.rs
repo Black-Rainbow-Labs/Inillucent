@@ -61,14 +61,26 @@ impl Binder<'_> {
         // A subquery written with no alias is given a name nothing else can
         // use, so two of them never share one. The binder's stand in name for
         // it is only for messages.
-        if term.table.kind == crate::catalog_view::TableKind::Subquery && term.alias == b"subquery"
-        {
+        //
+        // **Asked of the flag, on both sides.** This compared the alias text
+        // with "subquery" on this term only, so a subquery the query named
+        // `subQuery` was the twin of an unnamed one beside it, and every
+        // reference to it failed with "ambiguous column name".
+        // The binder's own derived tables, made for an outer aggregate or a row
+        // value, carry the stand in name without the flag.
+        let unnamed = |source: &super::BoundSource| {
+            source.derived.anonymous
+                || (source.table.kind == crate::catalog_view::TableKind::Subquery
+                    && source.alias == b"subquery")
+        };
+        if unnamed(term) {
             return false;
         }
         scope.iter().any(|other| {
             *other != id
                 && self.sources.get(*other).is_some_and(|held| {
-                    held.alias.eq_ignore_ascii_case(&term.alias)
+                    !unnamed(held)
+                        && held.alias.eq_ignore_ascii_case(&term.alias)
                         && held.table.database == term.table.database
                 })
         })

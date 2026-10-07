@@ -300,6 +300,13 @@ pub fn pin(class: CoreClass) -> Result<Placement, String> {
     })
 }
 
+/// Returns every logical processor the machine reports, with its rank.
+///
+/// Empty where the platform cannot say, which on macOS is always.
+pub fn machine_processors() -> Vec<Processor> {
+    platform::processors()
+}
+
 /// Confines this process to exactly the processors named.
 ///
 /// @param processors - logical processor numbers

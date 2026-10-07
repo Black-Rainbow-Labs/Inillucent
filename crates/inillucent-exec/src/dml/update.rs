@@ -189,7 +189,7 @@ pub fn update_at_cached(
     for row in keys {
         // An `UPDATE ... FROM` carries its assigned values after the key, so
         // the probe is the key columns and no more.
-        let key = row.get(..layout.key_columns.len()).unwrap_or(row);
+        let key = row.get(..layout.identity.len()).unwrap_or(row);
         // A row an earlier statement in the same transaction removed is skipped
         // rather than resurrected, which is what SQLite does.
         let Some(before) = read_row(table, target, key)? else {
@@ -201,7 +201,7 @@ pub fn update_at_cached(
         if *joined {
             // The values sit after the key columns of the row the keys query
             // produced, in assignment order.
-            let width = layout.key_columns.len();
+            let width = layout.identity.len();
             for (position, slot) in projected_slots.iter().enumerate() {
                 let (Some(slot), Some(value)) = (*slot, row.get(width.saturating_add(position)))
                 else {
@@ -859,7 +859,7 @@ fn update_view(
 /// @param after - the row as it will be
 pub(crate) fn same_key(layout: &SourceLayout, before: &[OwnedDatum], after: &[OwnedDatum]) -> bool {
     layout
-        .key_columns
+        .identity
         .iter()
         .all(|column| before.get(*column) == after.get(*column))
 }

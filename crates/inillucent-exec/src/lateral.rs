@@ -34,7 +34,7 @@ use inillucent_tree::datum::OwnedDatum;
 
 use crate::batch::Batch;
 use crate::expr::Eval;
-use crate::ops::{emit_rows, Flow, Sink};
+use crate::ops::{emit_rows, emit_rows_after_prefix, Flow, Sink};
 use crate::physical::{Params, TreeCatalog};
 
 /// What a lateral join evaluates against each outer row.
@@ -143,13 +143,18 @@ impl LateralModule<'_> {
     /// A join with no condition keeps every row. A NULL condition rejects the
     /// row, as it does in a `WHERE`.
     ///
-    /// @param joined - the outer row followed by the module's row
-    fn on_holds(&self, joined: &[OwnedDatum]) -> DbResult<bool> {
+    /// The pair is read as the outer row followed by the module's row, without joining them into
+    /// one row first: a joined row copies the outer row, and an outer row holding a large
+    /// document would be copied once per row the module answered.
+    ///
+    /// @param outer - the outer row
+    /// @param row - the module's row, padded to the module's width
+    fn on_holds(&self, outer: &[OwnedDatum], row: &[OwnedDatum]) -> DbResult<bool> {
         let Some(condition) = &self.on else {
             return Ok(true);
         };
         let borrowed: Vec<inillucent_tree::datum::Datum<'_>> =
-            joined.iter().map(OwnedDatum::borrow).collect();
+            outer.iter().chain(row).map(OwnedDatum::borrow).collect();
         let columns: Vec<crate::batch::Vector<'_>> = borrowed
             .iter()
             .map(|value| crate::batch::Vector::Const(*value))
@@ -191,23 +196,26 @@ impl Sink for LateralModule<'_> {
                 outer.push(OwnedDatum::from_datum(&batch.value(nth, column)?));
             }
             let mut produced: Vec<Vec<OwnedDatum>> = Vec::with_capacity(rows.len());
-            for row in rows {
-                let mut joined = outer.clone();
-                joined.extend(row);
-                joined.resize(outer_width.saturating_add(self.width), OwnedDatum::Null);
-                if self.on_holds(&joined)? {
-                    produced.push(joined);
+            for mut row in rows {
+                row.resize(self.width, OwnedDatum::Null);
+                if self.on_holds(&outer, &row)? {
+                    produced.push(row);
                 }
             }
             if produced.is_empty() && self.left {
                 let mut padded = outer;
                 padded.resize(outer_width.saturating_add(self.width), OwnedDatum::Null);
-                produced.push(padded);
+                if emit_rows(&[padded], self.downstream.as_mut())? == Flow::Stop {
+                    return Ok(Flow::Stop);
+                }
+                continue;
             }
             if produced.is_empty() {
                 continue;
             }
-            if emit_rows(&produced, self.downstream.as_mut())? == Flow::Stop {
+            // The outer values are shared by every row of the expansion rather than copied
+            // into each one, so the cost of an outer row does not grow with the rows it expands to.
+            if emit_rows_after_prefix(&outer, &produced, self.downstream.as_mut())? == Flow::Stop {
                 return Ok(Flow::Stop);
             }
         }

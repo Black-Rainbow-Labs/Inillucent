@@ -18,9 +18,10 @@ use inillucent_value::{cast, fpdecode, numeric, TextEncoding, Value};
 ///
 /// The first argument is the format; the rest are consumed left to right.
 ///
-/// **An unknown conversion makes the whole answer NULL, as it does in SQLite**:
-/// `printf('%y', 1)`, `printf('%5')`, `printf('%1$d', 1)` and `printf('%hd', 1)`
-/// are all NULL. A lone `%` at the very end of the format is a literal one.
+/// **An unknown conversion ends the answer at that point, as it does in
+/// SQLite**: `printf('a%y', 1)` is `a`, and when nothing was written before it,
+/// as in `printf('%y', 1)`, `printf('%5')`, `printf('%1$d', 1)` and
+/// `printf('%hd', 1)`, the answer is NULL. `%j` and `%J` are unknown too. A lone `%` at the very end of the format is a literal one.
 pub fn format(arguments: &[Value<'static>], encoding: TextEncoding) -> Value<'static> {
     let Some(first) = arguments
         .first()
@@ -30,6 +31,11 @@ pub fn format(arguments: &[Value<'static>], encoding: TextEncoding) -> Value<'st
         return Value::Null;
     };
     let template = text_of(Some(first), encoding);
+    // An empty format is NULL in SQLite, although a format that produces
+    // nothing, such as `'%s'` with an empty argument, is the empty string.
+    if template.is_empty() {
+        return Value::Null;
+    }
     let mut out: Vec<u8> = Vec::new();
     let mut next = 1usize;
     let mut index = 0usize;
@@ -44,7 +50,13 @@ pub fn format(arguments: &[Value<'static>], encoding: TextEncoding) -> Value<'st
             break;
         }
         let Some((mut spec, after)) = parse_spec(&template, index) else {
-            return Value::Null;
+            // SQLite stops at an unknown conversion and answers what it had
+            // written. Nothing written is NULL, because its text buffer was
+            // never allocated.
+            return match out.is_empty() {
+                true => Value::Null,
+                false => Value::owned_text(&out).unwrap_or(Value::Null),
+            };
         };
         index = after;
         take_widths(&mut spec, arguments, &mut next);
@@ -251,8 +263,9 @@ fn integer_of(value: Option<&Value<'static>>) -> i64 {
 fn render(spec: &Spec, argument: Option<&Value<'static>>, encoding: TextEncoding) -> Vec<u8> {
     match spec.conversion {
         b'd' | b'i' | b'u' => integer(spec, integer_of(argument)),
-        b'x' | b'p' => based(spec, integer_of(argument), 16, false),
-        b'X' => based(spec, integer_of(argument), 16, true),
+        b'x' => based(spec, integer_of(argument), 16, false),
+        // SQLite prints `%p` as uppercase hexadecimal, like `%X`.
+        b'X' | b'p' => based(spec, integer_of(argument), 16, true),
         b'o' => based(spec, integer_of(argument), 8, false),
         b'r' => ordinal(spec, integer_of(argument)),
         b'f' | b'e' | b'E' | b'g' | b'G' => real(spec, argument),
@@ -363,8 +376,16 @@ fn ordinal(spec: &Spec, value: i64) -> Vec<u8> {
 
 /// Renders an integer conversion.
 fn integer(spec: &Spec, value: i64) -> Vec<u8> {
-    let negative = value < 0;
-    let magnitude = value.unsigned_abs().to_string();
+    // **`%u` is unsigned.** SQLite reads the argument's 64 bits as an unsigned
+    // number and never prints a sign for it, so `printf('%u', -1)` is
+    // `18446744073709551615`; this printed `-1`.
+    let unsigned = spec.conversion == b'u';
+    let negative = value < 0 && !unsigned;
+    let magnitude = if unsigned {
+        (value as u64).to_string()
+    } else {
+        value.unsigned_abs().to_string()
+    };
     let mut digits = magnitude.into_bytes();
     if let Some(precision) = spec.precision {
         while digits.len() < precision {
@@ -373,6 +394,8 @@ fn integer(spec: &Spec, value: i64) -> Vec<u8> {
     }
     let sign = if negative {
         Some(b'-')
+    } else if unsigned {
+        None
     } else if spec.plus {
         Some(b'+')
     } else if spec.space {

@@ -586,6 +586,36 @@ fn key_collation(table: &TableInfo, declared: usize, column: &IndexColumnInfo) -
         .unwrap_or(Collation::Binary)
 }
 
+/// Adds an expression key column to an index tree's directory, and reports
+/// whether the tree is still ordered as a plain BINARY walk would read it.
+///
+/// An expression key is ordered by the collation its `COLLATE` names. It was
+/// built in BINARY order before, so a unique index on `substr(b, 2, 4) COLLATE
+/// NOCASE` accepted 'arth' beside 'ARTH', and a seek through it found only the
+/// exact case.
+///
+/// @param column - the key column, which indexes an expression
+/// @param columns - the tree's column directory
+/// @param types - the static type of each directory column
+fn push_expression_key(
+    column: &IndexColumnInfo,
+    columns: &mut Vec<ColumnSpec>,
+    types: &mut Vec<StaticType>,
+) -> bool {
+    let collation = if column.collation.is_empty() {
+        Collation::Binary
+    } else {
+        collation_of(&column.collation)
+    };
+    columns.push(
+        ColumnSpec::key(PhysicalType::Any)
+            .with_collation(collation)
+            .with_descending(column.descending),
+    );
+    types.push(StaticType::Unknown);
+    collation == Collation::Binary
+}
+
 /// Returns the column directory and the layout an index tree is built with.
 ///
 /// Shared by the fixture import, which fills the tree from SQLite's own index
@@ -626,8 +656,7 @@ pub(crate) fn index_shape(
         // over a `DESC` index answered its ties in the opposite order to
         // SQLite's, on every one of the seven statements `ordering.rs` names.
         let Some(declared) = column.column.map(usize::from) else {
-            columns.push(ColumnSpec::key(PhysicalType::Any).with_descending(column.descending));
-            types.push(StaticType::Unknown);
+            ordered &= push_expression_key(column, &mut columns, &mut types);
             continue;
         };
         // A key on a `VIRTUAL` generated column holds its expression's value,

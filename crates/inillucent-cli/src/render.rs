@@ -181,8 +181,10 @@ fn plain(layout: &Layout, value: &Value<'static>) -> String {
 /// Two rules, both the reference's. A value is printed as a C string, so it
 /// stops at the first NUL; and a control character is printed in caret
 /// notation, because a shell that emitted raw control bytes could be made to
-/// drive a terminal by the contents of a database. A newline is left alone,
-/// since a multi-line value is meant to look like one.
+/// drive a terminal by the contents of a database. A newline and a tab are
+/// left alone, since a multi-line or tabbed value is meant to look like one,
+/// and so is DELETE, which the reference prints raw. Printing the last two as
+/// `^I` and `^?` made every tab separated value differ from `sqlite3`.
 fn printable(bytes: &[u8]) -> String {
     let end = bytes
         .iter()
@@ -192,13 +194,11 @@ fn printable(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(visible.len());
     for chunk in String::from_utf8_lossy(visible).chars() {
         let code = chunk as u32;
-        if chunk == '\n' {
+        if chunk == '\n' || chunk == '\t' {
             out.push(chunk);
         } else if code < 0x20 {
             out.push('^');
             out.push(char::from_u32(code + 0x40).unwrap_or('?'));
-        } else if code == 0x7f {
-            out.push_str("^?");
         } else {
             out.push(chunk);
         }
@@ -503,7 +503,7 @@ fn json(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Ve
                 let name = columns.get(position).cloned().unwrap_or_default();
                 format!(
                     "\"{}\":{}",
-                    inillucent_base::json::escape(&name),
+                    inillucent_base::json::escape_sql(&name),
                     json_value(value)
                 )
             })
@@ -523,7 +523,7 @@ fn json_value(value: &Value<'static>) -> String {
         Value::Real(_) => number_text(value),
         Value::Text(text) => format!(
             "\"{}\"",
-            inillucent_base::json::escape(&String::from_utf8_lossy(text.raw()))
+            inillucent_base::json::escape_sql(&String::from_utf8_lossy(text.raw()))
         ),
         // A blob's bytes, each as its own escape: the reference writes
         // `"\u00ab"` rather than the hex a reader might expect, and a consumer
@@ -934,8 +934,9 @@ mod tests {
     fn control_characters_are_escaped() {
         assert_eq!(printable(b"ab"), "ab");
         assert_eq!(printable(&[0x01, 0x02]), "^A^B");
-        assert_eq!(printable(&[0x09, b't']), "^It");
-        assert_eq!(printable(&[0x7f]), "^?");
+        assert_eq!(printable(&[0x09, b't']), "\tt");
+        assert_eq!(printable(&[0x0d, b'r']), "^Mr");
+        assert_eq!(printable(&[0x7f]), "\u{7f}");
         assert_eq!(printable(b"a\nb"), "a\nb");
         assert_eq!(printable(&[b'a', 0, b'b']), "a");
     }
@@ -1005,5 +1006,6 @@ mod tests {
         assert_eq!(inillucent_base::json::escape("a\u{8}b"), "a\\bb");
         assert_eq!(inillucent_base::json::escape("a\u{c}b"), "a\\fb");
         assert_eq!(inillucent_base::json::escape("a\u{7f}b"), "a\\u007fb");
+        assert_eq!(inillucent_base::json::escape_sql("a\u{7f}b"), "a\u{7f}b");
     }
 }

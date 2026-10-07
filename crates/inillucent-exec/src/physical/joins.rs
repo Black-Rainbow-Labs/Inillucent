@@ -988,13 +988,19 @@ pub(crate) fn materialise_stage(
             if let Some(rows) = inner.select.shared.and_then(|key| params.shared_rows(key)) {
                 return Ok(rows);
             }
-            let rows = if !inner.select.windows.is_empty() {
+            // **The compound is checked before the window.** `inner.select` is
+            // the first arm, so `SELECT sum(a) OVER () FROM t UNION ALL SELECT
+            // x FROM u` has windows on `inner.select` and arms in
+            // `inner.compounds`. Checking the windows first ran only the first
+            // arm and dropped every row of the others. `run_compound` runs a
+            // windowed first arm itself, as the top level does.
+            let rows = if !inner.compounds.is_empty() {
+                run_compound(inner, catalog, params)?.0
+            } else if !inner.select.windows.is_empty() {
                 crate::windowpass::run_windowed(inner, catalog, params)?.0
-            } else if inner.compounds.is_empty() {
+            } else {
                 let prepared = prepare(inner, catalog, ForcePlan::default())?;
                 run_prepared(inner, catalog, &prepared, params)?.0
-            } else {
-                run_compound(inner, catalog, params)?.0
             };
             let rows = store_with_affinity(rows, affinities);
             if let Some(key) = inner.select.shared {
@@ -1044,8 +1050,15 @@ pub(crate) fn materialise_stage(
             let pool = catalog.pool_for(stage.root).ok_or_else(|| {
                 misuse("a materialised stage names a database this connection does not hold")
             })?;
-            FullScan::new(tree, Projection::all(stage.width)).run(pool, &mut sink)?;
-            let rows = collected.borrow().clone();
+            // **Only the columns the statement reads are copied, the rest are NULL.** Every
+            // column was copied for every row, and the joins above copy each row of this
+            // buffer once per outer row, so an unread document column cost its length for
+            // each pair: `FROM json_each(...) e, j` over a 110 KB `j.doc` copied 110 KB for
+            // each of 20,000 pairs.
+            FullScan::new(tree, Projection::all(stage.width))
+                .with_needed(stage.needed)
+                .run(pool, &mut sink)?;
+            let rows = collected.take();
             Ok(rows)
         }
     }

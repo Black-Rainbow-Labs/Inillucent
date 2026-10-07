@@ -155,6 +155,9 @@ impl ImportedDatabase {
             )),
             b"user_version" => self.pragma_user_version(argument, at),
             b"application_id" => self.pragma_application_id(argument, at),
+            // A set answers no row, as in SQLite; it printed the old cookie. The
+            // value is ignored, because this engine refuses schema row edits.
+            b"schema_version" if argument.is_some() => Ok(Outcome::empty()),
             b"schema_version" => Ok(named_integer(
                 "schema_version",
                 i64::from(self.file_of(at)?.schema_cookie()),

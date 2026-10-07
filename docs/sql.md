@@ -140,7 +140,7 @@ otherwise.
 | Compound queries | `UNION`, `UNION ALL`, `EXCEPT`, `INTERSECT` |
 | Subqueries | in `WHERE`, `IN`, `EXISTS`, as a value, and as a table in `FROM`, correlated or not. Row values in comparisons and in `IN`, with a value list or a subquery, such as `(a, b) IN (SELECT x, y FROM s)`. Recursive CTEs with `ORDER BY`, `LIMIT` and `OFFSET` |
 | Common table expressions | `WITH`, `WITH RECURSIVE`, `MATERIALIZED` and `NOT MATERIALIZED`, and `WITH` on `INSERT`, `UPDATE` and `DELETE` |
-| Window functions | all eleven window functions, `PARTITION BY`, `ROWS`, `RANGE` and `GROUPS` frames, every `EXCLUDE` clause, `FILTER`, and named `WINDOW` clauses |
+| Window functions | all eleven window functions and every aggregate function, `json_group_array`, `json_group_object`, `median` and `percentile` included, `PARTITION BY`, `ROWS`, `RANGE` and `GROUPS` frames, every `EXCLUDE` clause, `FILTER`, and named `WINDOW` clauses |
 | Writes | `INSERT`, `UPDATE`, `DELETE` and `REPLACE`, every `OR` conflict clause, `RETURNING`, `UPDATE ... FROM`, and `ON CONFLICT ... DO UPDATE` and `DO NOTHING`, with a target that is a column list, a partial index (the `WHERE` must match the index) or an expression such as `ON CONFLICT(lower(name))`. `DO UPDATE` runs the `CHECK`, `NOT NULL` and `STRICT` checks and fires the table's `UPDATE` triggers |
 | Tables | `CREATE TABLE`, `CREATE TABLE ... AS SELECT`, `WITHOUT ROWID`, `STRICT`, `VIRTUAL` and `STORED` generated columns, `AUTOINCREMENT`. A generated column has its declared affinity and collation, takes `STRICT`, `NOT NULL`, `UNIQUE` and `ON CONFLICT`, and can be a foreign key parent or child |
 | Indexes | unique, descending, partial, on an expression, with `COLLATE`, on a `WITHOUT ROWID` table. `REINDEX`, `INDEXED BY`, and `ANALYZE`, which writes `sqlite_stat1` in each database it measures, `ANALYZE aux` included |
@@ -223,7 +223,7 @@ grouping and before a limit, so the answer would be wrong.
 | Extension | What is there |
 |---|---|
 | JSON | a binary storage form, and all 30 function names, `json_*` and `jsonb_*` |
-| FTS5 | full text search with `MATCH`, `bm25()`, `highlight()`, `snippet()`, external content and contentless tables, and `fts5vocab`. The tokenizers are `ascii`, `unicode61` and `porter` |
+| FTS5 | full text search with `MATCH`, `t('query')` and `t = 'query'`, `bm25()`, `highlight()`, `snippet()`, the `rank` setting, external content and contentless tables with the `delete` command, and `fts5vocab`. The tokenizers are `ascii`, `unicode61` and `porter` |
 | FTS3 and FTS4 | the `fts3` and `fts4` modules with `matchinfo()` and `offsets()`. `fts4aux` and `fts3tokenize` are missing |
 | R-Tree | `rtree`, `rtree_i32` and `geopoly` |
 | Others | `dbstat`, `sqlite_dbpage`, `bytecode`, `tables_used`, `completion`, `zipfile`, `fsdir` |
@@ -318,6 +318,7 @@ exit code 3.
 | an FTS5 tokenizer inillucent does not have | `tokenize='trigram'` | `ascii`, `unicode61` or `porter` |
 | FTS5 `detail='none'` or `detail='column'` | `fts5(body, detail='none')` | leave `detail` out. The index stores full positions |
 | FTS5 `columnsize=0` | `fts5(body, columnsize=0)` | leave `columnsize` out |
+| FTS5 `contentless_delete=1` | `fts5(body, content='', contentless_delete=1)` | a contentless table, removing rows with the `delete` command and the text they were indexed with |
 
 ### Refused by both engines
 

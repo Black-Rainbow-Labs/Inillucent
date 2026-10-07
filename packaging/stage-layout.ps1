@@ -336,6 +336,111 @@ function Import-MsvcEnvironment {
     Write-Host "  MSVC environment from $install"
 }
 
+function Enter-ProcessorShare {
+    <#
+    .SYNOPSIS
+        Confines this script, and every process it starts from now on, to a share of the machine's
+        logical processors.
+
+    .DESCRIPTION
+        **The development machine is also the machine a person works at (task-2205).** A release
+        builds five targets at once, each with cargo's default of one compiler per processor, and
+        the nightly runs the whole suite. Either one took the 24 processor machine to 100% and kept
+        it there. This does what `inillucent-testrun` does for itself, in
+        `crates/inillucent-compat/src/processor_share.rs`:
+
+          - the processor affinity mask of this process is set to the share's number of logical
+            processors, fastest first (all 8 performance cores and 11 efficiency cores at 80% on
+            the development machine). Windows copies the mask into every child at creation, so
+            every cargo, rustc, linker and test process is confined to it;
+          - CARGO_BUILD_JOBS is set to the same count, unless it is already set, so cargo does not
+            start more compilers than there are processors for them;
+          - the priority is left alone: below normal starved the build behind other tickets'
+            builds.
+
+        **Why a mask and not a job object.** On this machine pwsh is the Microsoft Store package.
+        Windows runs a packaged program in a job with JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, and
+        every program the package starts leaves every job in the chain, so a job object with a
+        processor rate limit capped nothing: measured on 2026-10-07, the five target build kept the
+        machine at a median of 96% under it. The affinity mask is not a job, and cmd, a second
+        pwsh, cargo and rustc all carried it.
+
+        The share is -Percent, else INILLUCENT_CPU_PERCENT, else 80. 100 changes nothing. A script
+        started from one that already entered a share sees INILLUCENT_CPU_SHARE_ENTERED, keeps the
+        mask it inherited, and does nothing more.
+
+        The mask lasts as long as the process. Call it from a script run with `pwsh -File`, not
+        from an interactive shell you mean to keep using with every processor.
+
+    .PARAMETER Percent
+        The share, from 1 to 100. 0 means INILLUCENT_CPU_PERCENT or 80.
+    #>
+    param([int] $Percent = 0)
+    if ($env:INILLUCENT_CPU_SHARE_ENTERED) { return }
+    if ($Percent -eq 0) {
+        $Percent = if ($env:INILLUCENT_CPU_PERCENT) { [int]($env:INILLUCENT_CPU_PERCENT.Trim().TrimEnd('%')) } else { 80 }
+    }
+    if ($Percent -lt 1 -or $Percent -gt 100) { throw "the processor share must be from 1 to 100, not $Percent" }
+    $env:INILLUCENT_CPU_SHARE_ENTERED = '1'
+    if ($Percent -ge 100) {
+        Write-Host "  processor share: all processors, uncapped"
+        return
+    }
+    if (-not $IsWindows) {
+        $count = [math]::Max(1, [math]::Floor([Environment]::ProcessorCount * $Percent / 100))
+        if (-not $env:CARGO_BUILD_JOBS) { $env:CARGO_BUILD_JOBS = [string]$count }
+        Write-Host "  processor share: not held on this platform from PowerShell; CARGO_BUILD_JOBS=$($env:CARGO_BUILD_JOBS) is the limit"
+        return
+    }
+    if (-not ('InillucentProcessorShare' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class InillucentProcessorShare {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetSystemCpuSetInformation(IntPtr information, uint length, out uint returned, IntPtr process, uint flags);
+    // Every logical processor in group 0 with its efficiency class, as pairs of index and class.
+    // Parsed from bytes, as crates/inillucent-compat/src/affinity.rs does: each entry starts with
+    // its own Size; Type is at 4, Group at 12, LogicalProcessorIndex at 14, EfficiencyClass at 18.
+    public static List<int[]> Processors() {
+        List<int[]> found = new List<int[]>();
+        uint length;
+        GetSystemCpuSetInformation(IntPtr.Zero, 0, out length, IntPtr.Zero, 0);
+        if (length == 0) { return found; }
+        IntPtr buffer = Marshal.AllocHGlobal((int)length);
+        try {
+            if (!GetSystemCpuSetInformation(buffer, length, out length, IntPtr.Zero, 0)) { return found; }
+            int at = 0;
+            while (at + 19 <= (int)length) {
+                int size = Marshal.ReadInt32(buffer, at);
+                if (size <= 0) { break; }
+                if (Marshal.ReadInt32(buffer, at + 4) == 0 && Marshal.ReadInt16(buffer, at + 12) == 0) {
+                    found.Add(new int[] { Marshal.ReadByte(buffer, at + 14), Marshal.ReadByte(buffer, at + 18) });
+                }
+                at += size;
+            }
+        } finally { Marshal.FreeHGlobal(buffer); }
+        return found;
+    }
+}
+'@
+    }
+    $me = Get-Process -Id $PID
+    $allowed = [int64]$me.ProcessorAffinity
+    $machine = @([InillucentProcessorShare]::Processors())
+    $count = [math]::Max(1, [math]::Floor($machine.Count * $Percent / 100))
+    # Fastest class first, then lowest index, among the processors this process may already use.
+    $kept = @($machine | Where-Object { $allowed -band ([int64]1 -shl $_[0]) } |
+            Sort-Object -Property @{ Expression = { $_[1] }; Descending = $true }, @{ Expression = { $_[0] } } |
+            Select-Object -First $count)
+    $mask = [int64]0
+    foreach ($processor in $kept) { $mask = $mask -bor ([int64]1 -shl $processor[0]) }
+    if ($mask -ne 0 -and $mask -ne $allowed) { $me.ProcessorAffinity = [IntPtr]$mask }
+    if (-not $env:CARGO_BUILD_JOBS) { $env:CARGO_BUILD_JOBS = [string]$kept.Count }
+    Write-Host ("  processor share: {0}% of {1} processors ({2} processors 0x{3:X}), CARGO_BUILD_JOBS={4}; INILLUCENT_CPU_PERCENT=100 removes it" -f $Percent, $machine.Count, $kept.Count, [int64]$me.ProcessorAffinity, $env:CARGO_BUILD_JOBS)
+}
+
 function Get-CrossBin {
     <#
     .SYNOPSIS

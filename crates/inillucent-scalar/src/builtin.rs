@@ -199,7 +199,7 @@ pub fn call_with(
         }
         ScalarFunc::Abs => unary(arguments, absolute),
         ScalarFunc::Char => char_of(arguments),
-        ScalarFunc::Coalesce => coalesce(arguments),
+        ScalarFunc::Coalesce | ScalarFunc::UsingCoalesce => coalesce(arguments),
         ScalarFunc::Concat => concat(arguments, None, encoding),
         ScalarFunc::ConcatWs => concat_with_separator(arguments, encoding),
         ScalarFunc::Glob => pattern_call(arguments, false, encoding, false),
@@ -1039,7 +1039,11 @@ fn substring(arguments: &[Value<'static>], encoding: TextEncoding) -> Value<'sta
     let count = match arguments.get(2) {
         Some(value) if value.is_null() => return Value::Null,
         Some(value) => cast::integer_value(value),
-        None => i64::MAX,
+        // SQLite starts from the default value length limit when there is no
+        // length argument, not from the largest integer. The two differ when
+        // the start is a large negative: `substr('abc', -1000000000000000)`
+        // is empty because the limit plus the start is below zero.
+        None => DEFAULT_VALUE_LENGTH_LIMIT,
     };
     let (first, count) = substring_span(start, count, total);
     let first = usize::try_from(first)
@@ -1058,6 +1062,9 @@ fn substring(arguments: &[Value<'static>], encoding: TextEncoding) -> Value<'sta
     Value::owned_text(&out).unwrap_or(Value::Null)
 }
 
+/// The value length limit SQLite starts from for `substr` with no length.
+const DEFAULT_VALUE_LENGTH_LIMIT: i64 = 1_000_000_000;
+
 /// Returns the zero based first unit and the unit count `substr` takes.
 ///
 /// This follows the steps of SQLite's `substrFunc` one for one. A negative
@@ -1068,7 +1075,7 @@ fn substring(arguments: &[Value<'static>], encoding: TextEncoding) -> Value<'sta
 /// answered 18 characters where SQLite answers 19.
 ///
 /// @param start - the start argument as an integer, counting from one
-/// @param count - the length argument, or `i64::MAX` when there is none
+/// @param count - the length argument, or the default length limit when there is none
 /// @param total - how many units the subject holds
 fn substring_span(start: i64, count: i64, total: i64) -> (i64, i64) {
     let (mut first, mut count) = (start, count);

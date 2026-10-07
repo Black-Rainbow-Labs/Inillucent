@@ -16,7 +16,7 @@ use crate::ast::{
 };
 use crate::diagnostic::{ParseError, ParseErrorKind};
 use crate::keyword::Keyword;
-use crate::lexer::{self, Punctuator, Span, TokenKind};
+use crate::lexer::{self, Punctuator, QuoteForm, Span, TokenKind};
 
 /// Returns the declared type of a column as `PRAGMA table_info` reports it.
 ///
@@ -129,8 +129,7 @@ impl Parser<'_> {
         let mut constraints = Vec::new();
         loop {
             if self.at_table_constraint()? {
-                let named = self.parse_constraint_name()?;
-                constraints.push((named, self.parse_table_constraint()?));
+                self.parse_table_constraint_run(&mut constraints)?;
             } else {
                 columns.push(self.parse_column_def()?);
                 // **Charged here, the way a result set is charged in
@@ -217,6 +216,30 @@ impl Parser<'_> {
         ))
     }
 
+    /// Parses the table constraints between two commas.
+    ///
+    /// SQLite's grammar lets table constraints follow each other without a
+    /// comma (`PRIMARY KEY(a) UNIQUE(b)`), and lets `CONSTRAINT name` stand
+    /// alone, so `CONSTRAINT one CONSTRAINT two CHECK (x)` is accepted. The last
+    /// name written before a constraint is the one it takes, and a name with no
+    /// constraint after it names nothing.
+    /// @param constraints - where each parsed constraint and its name is appended
+    fn parse_table_constraint_run(
+        &mut self,
+        constraints: &mut Vec<(Option<NameId>, TableConstraint)>,
+    ) -> Result<(), ParseError> {
+        let mut pending = None;
+        loop {
+            if self.at_keyword(Keyword::CONSTRAINT)? {
+                pending = self.parse_constraint_name()?;
+            } else if self.at_table_constraint()? {
+                constraints.push((pending.take(), self.parse_table_constraint()?));
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
     /// Parses an optional `CONSTRAINT name` prefix.
     fn parse_constraint_name(&mut self) -> Result<Option<NameId>, ParseError> {
         if !self.eat_keyword(Keyword::CONSTRAINT)? {
@@ -234,14 +257,34 @@ impl Parser<'_> {
         // error - which is what the pinned release does. Asking the wide
         // question here would read the `left` of `a left` as a type and accept
         // a statement SQLite refuses.
-        let declared_type = if Parser::token_is_type_word(self.peek()?) {
-            let id = self.parse_type_name()?;
-            Some(declared_type_text(self.ast.text(id)))
-        } else {
-            None
-        };
+        // `GENERATED` is a word a type name may contain, but right after the
+        // column name it begins `GENERATED ALWAYS AS (...)`. Read as a type it
+        // gave the column the NUMERIC affinity of an unknown type name, which
+        // turned a generated 556.0 into 556.
+        let declared_type =
+            if Parser::token_is_type_word(self.peek()?) && !self.at_constraint_keyword()? {
+                let id = self.parse_type_name()?;
+                Some(declared_type_text(self.ast.text(id)))
+            } else {
+                None
+            };
         let mut constraints = Vec::new();
         loop {
+            if self.at_deferral()? {
+                // SQLite's `ccons ::= defer_subclause` is a constraint of its own. It
+                // changes the foreign key written before it in this column and is
+                // ignored when there is none.
+                let (deferrable, initially_deferred) = self.parse_deferral()?;
+                let key = constraints.iter_mut().rev().find_map(|(_, c)| match c {
+                    ColumnConstraint::References(clause) => Some(clause),
+                    _ => None,
+                });
+                if let Some(clause) = key {
+                    clause.deferrable = deferrable;
+                    clause.initially_deferred = initially_deferred;
+                }
+                continue;
+            }
             let named = self.parse_constraint_name()?;
             // **A name with no constraint after it is legal.** SQLite's
             // grammar has `ccons ::= CONSTRAINT nm` as a constraint of its own,
@@ -533,10 +576,51 @@ impl Parser<'_> {
         Ok(columns)
     }
 
+    /// Reads a string literal written as an index key as the column it names.
+    ///
+    /// SQLite turns a string there into an identifier, so `PRIMARY KEY('a')` and
+    /// `CREATE INDEX i ON t('c')` index the columns `a` and `c`. A backtick
+    /// name is used because it never falls back to a string literal.
+    /// @param expr - the parsed key expression
+    fn string_as_column_name(&mut self, expr: crate::ast::ExprId) -> crate::ast::ExprId {
+        // The expression parser reads `'b' COLLATE nocase` as one collated
+        // expression, so the string is looked for under the collation too.
+        if let Some(Expr::Collate { operand, collation }) = self.ast.expr(expr) {
+            let (operand, collation) = (*operand, *collation);
+            let converted = self.string_as_column_name(operand);
+            if converted == operand {
+                return expr;
+            }
+            let span = self.ast.expr_span(expr);
+            return self.ast.add_expr(
+                Expr::Collate {
+                    operand: converted,
+                    collation,
+                },
+                span,
+            );
+        }
+        let span = self.ast.expr_span(expr);
+        let text = match self.ast.expr(expr) {
+            Some(Expr::Literal(Literal::String(text))) => text.clone(),
+            _ => return expr,
+        };
+        let column = self.ast.intern(text, QuoteForm::Backtick, span);
+        self.ast.add_expr(
+            Expr::Column {
+                database: None,
+                table: None,
+                column,
+            },
+            span,
+        )
+    }
+
     /// Parses one indexed column: an expression with an optional collation and
     /// direction.
     pub(super) fn parse_indexed_column(&mut self) -> Result<IndexedColumn, ParseError> {
         let expr = self.parse_expr()?;
+        let expr = self.string_as_column_name(expr);
         let collation = if self.eat_keyword(Keyword::COLLATE)? {
             Some(self.parse_name()?)
         } else {
@@ -602,6 +686,29 @@ impl Parser<'_> {
             }
             break;
         }
+        let (deferrable, initially_deferred) = self.parse_deferral()?;
+        Ok(ForeignKeyClause {
+            table,
+            columns,
+            actions,
+            deferrable,
+            initially_deferred,
+        })
+    }
+
+    /// Returns whether the next tokens are `DEFERRABLE` or `NOT DEFERRABLE`.
+    fn at_deferral(&mut self) -> Result<bool, ParseError> {
+        if self.at_keyword(Keyword::DEFERRABLE)? {
+            return Ok(true);
+        }
+        Ok(self.at_keyword(Keyword::NOT)? && self.at_keyword_ahead(1, Keyword::DEFERRABLE)?)
+    }
+
+    /// Parses an optional `[NOT] DEFERRABLE [INITIALLY DEFERRED | IMMEDIATE]` clause.
+    ///
+    /// Returns whether the key is deferrable, when the clause was written, and
+    /// whether it starts deferred.
+    fn parse_deferral(&mut self) -> Result<(Option<bool>, bool), ParseError> {
         let mut deferrable = None;
         let mut initially_deferred = false;
         if self.at_keyword(Keyword::NOT)? && self.at_keyword_ahead(1, Keyword::DEFERRABLE)? {
@@ -618,13 +725,7 @@ impl Parser<'_> {
                 self.expect_keyword(Keyword::IMMEDIATE)?;
             }
         }
-        Ok(ForeignKeyClause {
-            table,
-            columns,
-            actions,
-            deferrable,
-            initially_deferred,
-        })
+        Ok((deferrable, initially_deferred))
     }
 
     /// Parses `SET NULL`, `SET DEFAULT`, `CASCADE`, `RESTRICT` or `NO ACTION`.

@@ -166,12 +166,12 @@ check a run against.
 | `differential` | 36 | 363 | `change` | graded against the pinned SQLite 3.53.4 |
 | `durability` | 44 | 274 | `merge` | crashes, injected faults, corruption and concurrency |
 | `e2e` | 39 | 447 | `change` | the public surfaces an application binds to, end to end |
-| `perf` | 1 | 8 | `merge` | the cost guards — **runs alone**, see §5 |
+| `perf` | 2 | 12 | `merge` | the cost guards, and the check that a run stays on its share of the processors — **runs alone**, see §5 |
 | `retrieval` | 12 | 570 | `change` | the embedding and retrieval engine, and its graded harness |
 | `tooling` | 18 | 153 | `change` | the checks that keep the repository's own rules true |
 | `matrix` | 24 | 187 | `change` | the SQL statement matrix: every statement form with every pair of contexts, graded against the pinned SQLite |
 | `matrix_deep` | 24 | 54 | `merge` | the statement matrix at every configuration arm, every triple of contexts, and the driver's other surfaces |
-| `nightly` | 6 | 105 | `nightly` | the long forms, run on a schedule rather than on a change |
+| `nightly` | 7 | 107 | `nightly` | the long forms, run on a schedule rather than on a change |
 
 The map that assigns them is `tests/selection.toml`, and it is data rather than
 code so that a person can read the whole arrangement in one file.
@@ -533,9 +533,16 @@ Measured over `engine + differential + durability`:
 | 24 | 1 | 57.6 s |
 | 8 | 3 | 59.7 s |
 
-24×2 is the default. One thread per binary is worse because a suite with many
+Two threads per binary is the default. One thread per binary is worse because a suite with many
 tests loses its own parallelism; three threads across eight binaries is worse
 because the long tail is back.
+
+**The number of binaries is the run's share of the processors, not all of them.** The runner
+confines itself and everything it starts to 80% of the logical processors, fastest first, with the
+processor affinity mask, and runs that many binaries at once: 19 on the 24 processor development
+machine. `--cpu <percent>` or `INILLUCENT_CPU_PERCENT` changes the share, and 100 gives the table
+above. The table was measured before the share existed. The share and why it is a mask rather than
+a job object are in `tasks/task-2205-build-and-test-cpu-tdd.md`.
 
 ---
 

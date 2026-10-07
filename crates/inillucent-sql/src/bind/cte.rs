@@ -46,6 +46,9 @@ pub struct CteBinding {
     pub recursive: bool,
     /// `Some(true)` for `MATERIALIZED`, `Some(false)` for `NOT MATERIALIZED`.
     pub materialized: Option<bool>,
+    /// The position of the `WITH` that defined it in the stack of `WITH`
+    /// levels, which is how far down the body of the definition may look.
+    pub level: usize,
 }
 
 /// One recursive CTE whose definition is being bound.
@@ -96,6 +99,7 @@ impl Binder<'_> {
                 select: cte.select,
                 recursive: with.recursive,
                 materialized: cte.materialized,
+                level: self.ctes.len(),
             });
         }
         self.ctes.push(bindings);
@@ -383,14 +387,7 @@ impl Binder<'_> {
 
         let seed = self.bind_isolated_arm(first)?;
         let table = subquery_table(&alias, &cte.columns, &seed);
-        if !cte.columns.is_empty() && cte.columns.len() != seed.columns.len() {
-            return Err(super::refusal::named_column_count(
-                &alias,
-                seed.columns.len(),
-                cte.columns.len(),
-                span,
-            ));
-        }
+        named_columns_fit(&alias, &cte.columns, seed.columns.len(), span)?;
         self.recursing.push(RecursiveTarget {
             folded: cte.folded.clone(),
             id,
@@ -422,6 +419,12 @@ impl Binder<'_> {
                 .recursing
                 .last()
                 .is_some_and(|target| target.referenced);
+            if let Err(refusal) =
+                arm_refusal(&bound, table.columns.len(), referenced, *op, &alias, span)
+            {
+                outcome = Err(refusal);
+                break;
+            }
             if referenced {
                 steps.push((*op, bound));
             } else {
@@ -521,6 +524,13 @@ impl<'a> Binder<'a> {
             ));
         }
         self.binding_ctes.push(cte.select);
+        // **A definition sees the names of its own `WITH` and the ones
+        // outside it, not the ones of a `WITH` nested in the query that
+        // happens to use it.** The levels above the definition's own are set
+        // aside while its body is bound and put back afterwards.
+        let hidden = self
+            .ctes
+            .split_off(cte.level.saturating_add(1).min(self.ctes.len()));
         // **`RECURSIVE` is a keyword SQLite does not require.** A CTE
         // whose FROM names itself *is* the recursion, written or not,
         // and reading the keyword as the only evidence sent this
@@ -535,6 +545,7 @@ impl<'a> Binder<'a> {
             }
             bound
         };
+        self.ctes.extend(hidden);
         self.binding_ctes.pop();
         // A recursive CTE's references to itself, inside its own arms, are the
         // recursion and not uses of it.
@@ -588,4 +599,93 @@ impl<'a> Binder<'a> {
         }
         (found, database_name)
     }
+}
+
+/// Refuses a recursive common table expression that names a different number
+/// of columns than its first arm makes.
+///
+/// @param alias - the expression's name, for the message
+/// @param named - the column names written after the name, if any
+/// @param width - the number of columns of the first arm
+/// @param span - where the statement is, for the error
+fn named_columns_fit<T>(
+    alias: &[u8],
+    named: &[T],
+    width: usize,
+    span: Span,
+) -> Result<(), ParseError> {
+    if named.is_empty() || named.len() == width {
+        return Ok(());
+    }
+    Err(super::refusal::named_column_count(
+        alias,
+        width,
+        named.len(),
+        span,
+    ))
+}
+
+/// Refuses an arm of a recursive common table expression that SQLite refuses.
+///
+/// An arm of another width than the first is refused, as in any compound. A
+/// recursive step of the wrong width was run, and `WITH i(x) AS (SELECT 1
+/// UNION ALL SELECT x+1, x*2 FROM i)` never finished. A recursive step is also
+/// held to [`recursive_step_refusal`].
+///
+/// @param arm - the bound arm
+/// @param width - the number of columns of the first arm
+/// @param recursive - whether the arm reads the recursive table
+/// @param op - the compound operator in front of the arm
+/// @param alias - the recursive table's name, for the message
+/// @param span - where the statement is, for the error
+fn arm_refusal(
+    arm: &crate::bind::BoundSelect,
+    width: usize,
+    recursive: bool,
+    op: CompoundOp,
+    alias: &[u8],
+    span: Span,
+) -> Result<(), ParseError> {
+    if arm.columns.len() != width {
+        return Err(super::refusal::compound_width_mismatch(op, span));
+    }
+    match recursive
+        .then(|| recursive_step_refusal(arm, alias))
+        .flatten()
+    {
+        Some(reason) => Err(super::refused(reason, span)),
+        None => Ok(()),
+    }
+}
+
+/// Returns why SQLite refuses a recursive step, or `None` when it does not.
+///
+/// **An aggregate in the step never finishes.** Each pass of the recursion
+/// feeds the rows the last pass produced back in, and `SELECT count(*) FROM r`
+/// produces a row from no rows, so the queue never empties: `WITH RECURSIVE
+/// r(n) AS (SELECT 1 UNION ALL SELECT count(*) FROM r) SELECT * FROM r` ran
+/// until it was stopped. SQLite refuses an aggregate, a `GROUP BY` and a
+/// window function in a recursive step, and a step that names the recursive
+/// table twice, before it runs anything.
+///
+/// @param step - the bound recursive arm
+/// @param alias - the recursive table's name, for the message
+fn recursive_step_refusal(step: &crate::bind::BoundSelect, alias: &[u8]) -> Option<String> {
+    if !step.aggregates.is_empty() || !step.group_by.is_empty() {
+        return Some("recursive aggregate queries not supported".to_string());
+    }
+    if !step.windows.is_empty() {
+        return Some("cannot use window functions in recursive queries".to_string());
+    }
+    let references = step
+        .sources
+        .iter()
+        .filter(|source| matches!(source.rows, SourceRows::RecursiveSelf { .. }))
+        .count();
+    (references > 1).then(|| {
+        format!(
+            "multiple references to recursive table: {}",
+            String::from_utf8_lossy(alias)
+        )
+    })
 }

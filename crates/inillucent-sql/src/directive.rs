@@ -1083,8 +1083,21 @@ impl<'a> Binder<'a> {
         for (position, (column, name)) in bound.columns.iter().zip(&names).enumerate() {
             create_sql.extend_from_slice(if position > 0 { between } else { open });
             create_sql.extend_from_slice(&quoted_name(name));
-            create_sql
-                .extend_from_slice(affinity_type(&column.declared_type, column.expr.affinity()));
+            // **A compound's column has the affinity every arm agrees on.**
+            // SQLite stores no type for `SELECT id FROM a UNION SELECT id FROM
+            // b` over an INT and a TEXT `id`, and this wrote the first arm's
+            // type, so a join on the copy converted values it should not.
+            // The same holds for a column read out of a view or a derived
+            // table, whose declared type is the first arm's and whose
+            // affinity is the one the arms agreed on.
+            let by_affinity =
+                !bound.compounds.is_empty() || reads_derived_column(&bound, &column.expr);
+            let (declared, held): (&[u8], _) = if by_affinity {
+                (b"", bound.column_affinity_if_any(position))
+            } else {
+                (&column.declared_type, column.expr.affinity())
+            };
+            create_sql.extend_from_slice(affinity_type(declared, held));
         }
         create_sql.extend_from_slice(close);
         self.record_write_dependency(index);
@@ -3002,6 +3015,25 @@ fn quoted_name(name: &[u8]) -> Vec<u8> {
     }
     out.push(b'"');
     out
+}
+
+/// Reports whether a result column is a bare column of a derived table, a view
+/// or a CTE.
+///
+/// Such a column's declared type comes from the first arm of the query that
+/// built it, while its affinity is the one every arm agreed on, and the
+/// affinity is what `CREATE TABLE ... AS SELECT` writes.
+///
+/// @param bound - the bound query
+/// @param expr - the result column's expression
+fn reads_derived_column(bound: &crate::bind::BoundSelect, expr: &crate::bind::BoundExpr) -> bool {
+    let crate::bind::BoundExpr::Column { source, .. } = expr else {
+        return false;
+    };
+    bound
+        .sources
+        .iter()
+        .any(|held| held.id == *source && matches!(held.rows, crate::bind::SourceRows::Subquery(_)))
 }
 
 /// Returns the type name a `CREATE TABLE ... AS SELECT` writes for a column.

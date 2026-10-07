@@ -410,6 +410,9 @@ fn fire_after_insert(
     params: &Params,
     depth: Depth,
 ) -> DbResult<bool> {
+    if triggers.is_empty() {
+        return Ok(false);
+    }
     let after = trigger::TriggerFiring {
         rows: trigger::TriggerRows {
             old: None,
@@ -420,7 +423,18 @@ fn fire_after_insert(
         params,
         depth,
     };
-    Ok(trigger::fire(triggers, TriggerTime::After, target, &after)? == trigger::Fired::SkipRow)
+    // **The row just written is `last_insert_rowid()` inside its own `AFTER
+    // INSERT` trigger.** SQLite sets the connection's last rowid as the row
+    // goes in, before the trigger program runs, but the statement's `Params`
+    // hold the value from before the statement began. The outer value is put
+    // back afterwards, as SQLite does when a trigger program ends.
+    let outer = params.last_insert_rowid();
+    if let Some(OwnedDatum::Int(written)) = layout.rowid.and_then(|at| row.get(at)) {
+        params.set_last_insert_rowid(*written);
+    }
+    let fired = trigger::fire(triggers, TriggerTime::After, target, &after);
+    params.set_last_insert_rowid(outer);
+    Ok(fired? == trigger::Fired::SkipRow)
 }
 
 /// Reads the high-water mark of an `AUTOINCREMENT` table, once for the statement.
@@ -464,9 +478,25 @@ fn close_sequence(
     let Some(mark) = mark else {
         return Ok(());
     };
+    let root = statement.sequence_root;
+    let name = &statement.table.name;
+    // **A trigger body that inserts into the table may have moved the mark
+    // already.** Each such insert is a statement of its own that read the mark
+    // when it began and wrote it when it ended, while SQLite keeps one counter
+    // for the whole statement. Taking the larger of the two stops this
+    // statement from writing back a value below what its triggers handed out.
+    // A table with no triggers cannot be reached that way and reads nothing.
+    let mut high_water = high_water;
+    if !statement.triggers.is_empty() && root != 0 {
+        // Only the row this statement writes counts: a body that inserted a
+        // different `sqlite_sequence` row of its own leaves this one alone.
+        let current = crate::sequence::read(target, root, name, 0)?;
+        if current.rowid == mark.rowid {
+            high_water = high_water.max(current.seq);
+        }
+    }
     if high_water > mark.seq || mark.rowid.is_none() {
-        let root = statement.sequence_root;
-        crate::sequence::write(target, root, &statement.table.name, mark, high_water)?;
+        crate::sequence::write(target, root, name, mark, high_water)?;
     }
     Ok(())
 }
@@ -659,6 +689,73 @@ fn uses_last_rowid(statement: &BoundInsert) -> bool {
     statement.returning.iter().any(|column| calls(&column.expr))
 }
 
+/// Enforces every colliding constraint that does not replace, before a
+/// `REPLACE` deletes anything, and reports whether the row is skipped.
+///
+/// SQLite generates the checks for every `ABORT`, `FAIL`, `ROLLBACK` and
+/// `IGNORE` constraint before those of the `REPLACE` ones, so a row that
+/// collides with both is refused or skipped before anything is deleted. The
+/// probe order here would otherwise reach a `REPLACE` constraint first.
+///
+/// @param statement - the bound insert
+/// @param layout - the table tree's layout
+/// @param target - the file and its trees
+/// @param row - the row image about to be written
+/// @param indexes - the compiled expressions of the table's indexes
+fn skipped_before_replace(
+    statement: &BoundInsert,
+    layout: &SourceLayout,
+    target: &mut dyn WriteTarget,
+    row: &[OwnedDatum],
+    indexes: IndexExprs<'_>,
+) -> DbResult<bool> {
+    let others = super::conflict::all_conflicts(&statement.table, layout, target, row, indexes)?;
+    for other in others {
+        match resolution_for_arm(statement, other.conflict, None) {
+            Resolution::Skip => return Ok(true),
+            Resolution::Raise => {
+                let unwind = unwind_of(statement.on_conflict.or(other.conflict));
+                return Err(other.error.or_unwind(unwind));
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+/// Checks the new row's own foreign keys again after a `REPLACE` removed rows.
+///
+/// SQLite checks them once the conflicting rows are gone, and the delete's
+/// cascade can remove the parent the new row names, which the check run
+/// before the write could not see.
+///
+/// @param statement - the bound insert
+/// @param target - the file and its trees
+/// @param row - the row image about to be written
+/// @param request - the write's layout, parameters and depth
+fn check_keys_after_replace(
+    statement: &BoundInsert,
+    target: &mut dyn WriteTarget,
+    row: &[OwnedDatum],
+    request: WriteRequest<'_>,
+) -> DbResult<()> {
+    if !statement.triggers.iter().any(|trigger| trigger.foreign_key) {
+        return Ok(());
+    }
+    let firing = trigger::TriggerFiring {
+        rows: trigger::TriggerRows {
+            old: None,
+            new: Some(row),
+        },
+        slots: &request.layout.slots,
+        rowid: request.layout.rowid,
+        params: request.params,
+        depth: request.depth,
+    };
+    trigger::fire_key_checks(&statement.triggers, target, &firing)?;
+    Ok(())
+}
+
 /// Chooses the key of a row again, after its `BEFORE` triggers ran.
 ///
 /// **A `BEFORE` body can insert into the table being written**, and then the key
@@ -839,11 +936,24 @@ fn write_one(
         .map(|arm| arm.constraint)
         .filter(|constraint| *constraint != UpsertConstraint::Any)
         .collect();
+    // **Each constraint is replaced once.** A row a trigger or a cascade puts
+    // back makes SQLite refuse the insert; it was deleted a second time here.
+    let mut replaced: Vec<UpsertConstraint> = Vec::new();
     while let Some(clash) = conflicting_row(table, layout, target, &row, None, indexes, &targets)? {
         let arm = matching_arm(statement, clash.which);
         match resolution_for_arm(statement, clash.conflict, arm) {
             Resolution::Skip => return Ok(None),
+            Resolution::Replace if replaced.contains(&clash.which) => {
+                return Err(clash
+                    .error
+                    .or_unwind(inillucent_base::error::Unwind::Statement));
+            }
             Resolution::Replace => {
+                let first = targets.is_empty() && replaced.is_empty();
+                if first && skipped_before_replace(statement, layout, target, &row, indexes)? {
+                    return Ok(None);
+                }
+                replaced.push(clash.which);
                 let Some(held) = read_row(table, target, &clash.key)? else {
                     return Ok(None);
                 };
@@ -904,6 +1014,9 @@ fn write_one(
                 return Err(clash.error.or_unwind(unwind));
             }
         }
+    }
+    if !replaced.is_empty() {
+        check_keys_after_replace(statement, target, &row, request)?;
     }
     place_row(table, layout, target, None, &row, indexes)?;
     Ok(Some(Stored::Inserted(row)))
@@ -1066,9 +1179,9 @@ fn place_row(
             return Ok(());
         }
         if let Difference::One(column) = difference(previous, row) {
-            if column >= layout.key_columns.len() {
+            if column >= layout.identity.len() {
                 let key: Vec<Datum<'_>> = layout
-                    .key_columns
+                    .identity
                     .iter()
                     .filter_map(|held| borrowed.get(*held).copied())
                     .collect();

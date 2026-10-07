@@ -413,34 +413,73 @@ impl Parser<'_> {
     }
 
     /// Parses a join operator, returning the kind and whether it was natural.
+    ///
+    /// SQLite's grammar is `JOIN`, or one to three join words and then `JOIN`,
+    /// in any order and with repeats, so `OUTER LEFT NATURAL JOIN` and
+    /// `LEFT RIGHT JOIN` are accepted. The words are read as a set of flags
+    /// the way `sqlite3JoinType` does, so the kind is the same one it picks.
     fn parse_join_operator(&mut self) -> Result<Option<(JoinKind, bool)>, ParseError> {
         if self.eat(Punctuator::Comma)? {
             return Ok(Some((JoinKind::Comma, false)));
         }
-        let natural = self.at_keyword(Keyword::NATURAL)?;
-        let offset = usize::from(natural);
-        let kind = match self.peek_at(offset)?.keyword() {
-            Some(Keyword::JOIN) => JoinKind::Inner,
-            Some(Keyword::INNER) => JoinKind::Inner,
-            Some(Keyword::CROSS) => JoinKind::Cross,
-            Some(Keyword::LEFT) => JoinKind::Left,
-            Some(Keyword::RIGHT) => JoinKind::Right,
-            Some(Keyword::FULL) => JoinKind::Full,
-            _ => return Ok(None),
-        };
-        if natural {
-            self.bump()?;
+        let mut words = 0;
+        while words < 3 && Self::is_join_word(self.peek_at(words)?.keyword()) {
+            words += 1;
         }
-        if kind != JoinKind::Inner || self.at_keyword(Keyword::INNER)? {
-            self.bump()?;
-            if matches!(kind, JoinKind::Left | JoinKind::Right | JoinKind::Full) {
-                self.eat_keyword(Keyword::OUTER)?;
+        if words == 0 || self.peek_at(words)?.keyword() != Some(Keyword::JOIN) {
+            if words == 0 && self.at_keyword(Keyword::JOIN)? {
+                self.bump()?;
+                return Ok(Some((JoinKind::Inner, false)));
             }
-            self.expect_keyword(Keyword::JOIN)?;
-        } else {
-            self.expect_keyword(Keyword::JOIN)?;
+            return Ok(None);
         }
+        let first = self.cursor();
+        let (mut natural, mut left, mut right, mut outer) = (false, false, false, false);
+        let (mut inner, mut cross) = (false, false);
+        let mut written = Vec::new();
+        for _ in 0..words {
+            written.push(String::from_utf8_lossy(self.peek()?.text(self.source())).into_owned());
+            match self.peek()?.keyword() {
+                Some(Keyword::NATURAL) => natural = true,
+                Some(Keyword::LEFT) => (left, outer) = (true, true),
+                Some(Keyword::RIGHT) => (right, outer) = (true, true),
+                Some(Keyword::FULL) => (left, right, outer) = (true, true, true),
+                Some(Keyword::OUTER) => outer = true,
+                Some(Keyword::INNER) => inner = true,
+                _ => (inner, cross) = (true, true),
+            }
+            self.bump()?;
+        }
+        self.expect_keyword(Keyword::JOIN)?;
+        // SQLite refuses a mix of inner and outer words, and `OUTER` on its own.
+        if (inner && outer) || (outer && !left && !right) {
+            return Err(ParseError::new(
+                ParseErrorKind::Refused(format!("unknown join type: {}", written.join(" "))),
+                Span::at(first),
+            ));
+        }
+        let kind = match (left, right) {
+            (true, true) => JoinKind::Full,
+            (true, false) => JoinKind::Left,
+            (false, true) => JoinKind::Right,
+            _ if cross => JoinKind::Cross,
+            _ => JoinKind::Inner,
+        };
         Ok(Some((kind, natural)))
+    }
+
+    /// Returns whether a keyword is one of the words SQLite allows before `JOIN`.
+    fn is_join_word(keyword: Option<Keyword>) -> bool {
+        matches!(
+            keyword,
+            Some(Keyword::NATURAL)
+                | Some(Keyword::LEFT)
+                | Some(Keyword::RIGHT)
+                | Some(Keyword::FULL)
+                | Some(Keyword::OUTER)
+                | Some(Keyword::INNER)
+                | Some(Keyword::CROSS)
+        )
     }
 
     /// Parses `ON expr` or `USING (a, b)`.
@@ -552,6 +591,10 @@ impl Parser<'_> {
         let FromSource::Join(inner) = &held.source else {
             return;
         };
+        if inner.len() == 1 && !(first && held.alias.is_none()) {
+            self.merge_single_group(term);
+            return;
+        }
         if inner.len() < 2 || (first && held.alias.is_none()) {
             return;
         }
@@ -559,6 +602,36 @@ impl Parser<'_> {
         let select = self.select_over_terms(inner, span);
         if let Some(stored) = self.ast_from_term_mut(term) {
             stored.source = FromSource::Subquery(select);
+        }
+    }
+
+    /// Replaces a parenthesised group of one term with that term.
+    ///
+    /// **SQLite does this when the group has an alias or follows a join**
+    /// (`seltablist ::= stl_prefix LP seltablist RP as on_using`). The outer
+    /// term keeps its join kind, alias and constraint and takes the inner
+    /// term's source, so `JOIN (t2) AS x USING (b)` merges `b` like
+    /// `JOIN t2 AS x USING (b)`. Wrapping it in a subquery gave the result
+    /// `b` twice. The inner term's own alias and index hint are dropped, as
+    /// SQLite drops them.
+    ///
+    /// @param term - the FROM term whose source is a join of exactly one term
+    fn merge_single_group(&mut self, term: FromTermId) {
+        let Some(held) = self.ast.from_term(term) else {
+            return;
+        };
+        let FromSource::Join(inner) = &held.source else {
+            return;
+        };
+        let Some(only) = inner.first().and_then(|id| self.ast.from_term(*id)) else {
+            return;
+        };
+        let mut source = only.source.clone();
+        if let FromSource::Table { indexed_by, .. } = &mut source {
+            *indexed_by = IndexHint::None;
+        }
+        if let Some(stored) = self.ast_from_term_mut(term) {
+            stored.source = source;
         }
     }
 

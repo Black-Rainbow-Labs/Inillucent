@@ -440,17 +440,67 @@ impl Fts5Table {
         let Some(content) = self.shadows.read_row(context, &suffix, rowid)? else {
             return Ok(());
         };
+        let texts: Vec<Option<Vec<u8>>> = (0..self.options.columns.len())
+            .map(|index| {
+                offsets
+                    .get(index)
+                    .and_then(|at| content.get(*at))
+                    .and_then(text_of)
+            })
+            .collect();
+        self.remove_postings(context, rowid, &texts)
+    }
+
+    /// FTS5's `delete` command: removes one row whose text the caller supplies.
+    ///
+    /// **The way a contentless or an external content table is kept in step.**
+    /// SQLite's documented triggers for an external content table run
+    /// `INSERT INTO f(f, rowid, a, b) VALUES('delete', old.rowid, old.a, old.b)`,
+    /// because by the time an `AFTER DELETE` or `AFTER UPDATE` trigger runs, the
+    /// content row holds the new text or nothing, and the postings can only be
+    /// found from the old one. The command was not recognised here, so every
+    /// `UPDATE` and `DELETE` of such a content table failed with "SQL logic
+    /// error" and the index kept postings for text that was gone.
+    ///
+    /// @param context - the running statement
+    /// @param rowid - the row the text was indexed under
+    /// @param values - the row's declared columns, in declared order
+    pub(crate) fn remove_given(
+        &mut self,
+        context: &mut Context<'_>,
+        rowid: i64,
+        values: &[Value<'static>],
+    ) -> DbResult<()> {
+        if !self.stores_no_rows() {
+            return Err(failure(
+                "'delete' may only be used with a contentless or external content fts5 table",
+            ));
+        }
+        let texts: Vec<Option<Vec<u8>>> = (0..self.options.columns.len())
+            .map(|index| values.get(index).and_then(text_of))
+            .collect();
+        self.remove_postings(context, rowid, &texts)
+    }
+
+    /// Takes one row out of every doclist its text is in, and out of the sizes
+    /// and the totals.
+    ///
+    /// @param context - the running statement
+    /// @param rowid - the row
+    /// @param texts - the text of each declared column, `None` for NULL
+    fn remove_postings(
+        &mut self,
+        context: &mut Context<'_>,
+        rowid: i64,
+        texts: &[Option<Vec<u8>>],
+    ) -> DbResult<()> {
         let width = self.options.columns.len();
         let mut terms: Vec<Vec<u8>> = Vec::new();
         for (index, column) in self.options.columns.iter().enumerate() {
             if column.unindexed {
                 continue;
             }
-            let Some(text) = offsets
-                .get(index)
-                .and_then(|at| content.get(*at))
-                .and_then(text_of)
-            else {
+            let Some(text) = texts.get(index).cloned().flatten() else {
                 continue;
             };
             terms.extend(self.tokenizer.tokens(&text));
