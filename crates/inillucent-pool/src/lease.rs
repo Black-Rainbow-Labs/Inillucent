@@ -318,8 +318,23 @@ struct Reaper {
 static REAPER: OnceLock<Reaper> = OnceLock::new();
 
 /// Returns the releasing thread's state, starting the thread the first time.
+///
+/// **The thread is started after `REAPER` holds its value.** It used to be
+/// started inside `get_or_init`, and a thread that ran before `get_or_init`
+/// stored the value found `REAPER.get()` empty and exited. That process then
+/// had no releasing thread at all, so an idle lease was kept until the
+/// connection's next statement and a writer in another process was refused
+/// meanwhile. It happened on a loaded Linux runner in 2.3.2's public tests.
 fn reaper() -> &'static Reaper {
-    REAPER.get_or_init(|| {
+    let mut first = false;
+    let reaper = REAPER.get_or_init(|| {
+        first = true;
+        Reaper {
+            cells: Mutex::new(Vec::new()),
+            wake: Condvar::new(),
+        }
+    });
+    if first {
         let spawned = std::thread::Builder::new()
             .name("inillucent-lease".into())
             .spawn(|| {
@@ -331,11 +346,8 @@ fn reaper() -> &'static Reaper {
         // at `MOST` on the next statement; the only cost is a writer that waits
         // longer for an idle reader.
         drop(spawned);
-        Reaper {
-            cells: Mutex::new(Vec::new()),
-            wake: Condvar::new(),
-        }
-    })
+    }
+    reaper
 }
 
 impl Reaper {

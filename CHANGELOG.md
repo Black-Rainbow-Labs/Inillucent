@@ -8,10 +8,19 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
-## 1.0.31 to 2.3.2, 25 September to 7 October 2026
+## 1.0.31 to 2.3.3, 25 September to 7 October 2026
 
-The entries in this section were written for the releases from 1.0.31 to 2.3.2 and are not split by
+The entries in this section were written for the releases from 1.0.31 to 2.3.3 and are not split by
 release. The changelog in each release's tag is the one that release was cut with.
+
+**2.3.3 fixes a race that could leave a process with no thread to end its read leases.** The thread
+that lets an idle lease go was started from inside the call that records it, and a thread that ran
+before that call finished found nothing recorded and exited. A process where that happened kept
+SHARED after a read until the connection's next statement or its close, so a writer in another
+process waited for its busy timeout and was then refused. It affects 2.3.0, 2.3.1 and 2.3.2, and
+depends on thread timing, so most processes were not affected. The thread is now started after the
+call returns. It was found by the public tests of 2.3.2, where two lease tests and a busy timeout
+test failed on Linux.
 
 **2.3.2 makes the crash campaigns give the same report on every run.** 2.3.0's read lease keeps
 SHARED for up to 1 ms after a statement that only read. Whether it does depends on the clock, and a
