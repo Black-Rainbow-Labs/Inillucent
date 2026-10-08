@@ -60,6 +60,16 @@ impl Eval for ColumnRef {
     fn column(&self) -> Option<usize> {
         Some(self.index)
     }
+
+    /// Reads the column's integers for the whole batch, when it holds nothing else.
+    fn ints_over(&self, batch: &Batch<'_>, out: &mut Vec<i64>) -> bool {
+        batch.ints_of(self.index, out)
+    }
+
+    /// Reads the column's reals for the whole batch, when it holds nothing else.
+    fn reals_over(&self, batch: &Batch<'_>, out: &mut Vec<f64>) -> bool {
+        batch.reals_of(self.index, out)
+    }
 }
 
 /// `sqlite_offset(X)`: where in the file the row holding X lives.
@@ -113,6 +123,16 @@ impl Eval for Literal {
             OwnedDatum::Real(number) => Computed::Borrowed(Datum::Real(*number)),
             owned => Computed::Owned(owned.clone()),
         })
+    }
+
+    /// Repeats an integer constant once per live row.
+    fn ints_over(&self, batch: &Batch<'_>, out: &mut Vec<i64>) -> bool {
+        out.clear();
+        let OwnedDatum::Int(number) = self.value else {
+            return false;
+        };
+        out.resize(batch.live(), number);
+        true
     }
 }
 
@@ -256,6 +276,27 @@ impl Eval for IntArith {
             return generic_arith(self.op, &left.get(), &right.get());
         };
         Ok(Computed::Borrowed(integer_arith(self.op, a, b)))
+    }
+
+    /// Computes the batch's results when both operands are integers throughout and nothing
+    /// overflows; an overflow makes a real, which this cannot hold, so the answer is then no.
+    fn ints_over(&self, batch: &Batch<'_>, out: &mut Vec<i64>) -> bool {
+        let mut right = Vec::new();
+        if !self.left.ints_over(batch, out) || !self.right.ints_over(batch, &mut right) {
+            return false;
+        }
+        for (left, right) in out.iter_mut().zip(&right) {
+            let checked = match self.op {
+                ArithOp::Add => left.checked_add(*right),
+                ArithOp::Subtract => left.checked_sub(*right),
+                ArithOp::Multiply => left.checked_mul(*right),
+            };
+            match checked {
+                Some(number) => *left = number,
+                None => return false,
+            }
+        }
+        out.len() == right.len()
     }
 }
 
@@ -615,6 +656,14 @@ impl Eval for Length {
             Datum::Int(number) => Datum::Int(number.to_string().len() as i64),
             Datum::Real(number) => Datum::Int(format_real(number).len() as i64),
         }))
+    }
+
+    /// Counts the whole batch's lengths in one loop over a typed text or blob column.
+    fn ints_over(&self, batch: &Batch<'_>, out: &mut Vec<i64>) -> bool {
+        match self.inner.column() {
+            Some(column) => batch.lengths_of(column, out),
+            None => false,
+        }
     }
 }
 

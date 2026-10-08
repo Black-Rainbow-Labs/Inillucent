@@ -769,9 +769,13 @@ An `inillucent_hnsw` index takes the same commands through its own name:
 ### The first search in a process
 
 The first search of an `inillucent_search` table in a process reads the table's index into memory.
-Later searches in the same process use that copy until a write changes the table. The index is
-stored as segments, plus the rows written since the last compaction. On the first search the engine
-joins the segments into one and adds those rows to it, and that is most of the cost.
+Later searches on the same connection use that copy. A write adds its rows to the copy at the next
+search instead of throwing the copy away, and so does a commit that moves rows into a new segment,
+so a program that inserts and searches in turn pays for its own rows and not for the whole index.
+Measured on 5,000 rows of 384 numbers, one insert and one search took 51 ms in release 2.3.4 and
+0.44 ms after this change. The index is stored as segments, plus the rows written since the last compaction.
+On the first search the engine joins the segments into one and adds those rows to it, and that is
+most of the cost.
 
 Measured on the `examples/rag-agent` database after a first sync: 3,696 chunks with 768 number
 vectors, stored as 3 segments and 472 rows not yet compacted.

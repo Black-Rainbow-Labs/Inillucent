@@ -22,7 +22,27 @@ mod platform;
 #[path = "windows.rs"]
 mod platform;
 
+#[cfg(windows)]
+#[path = "windows_log.rs"]
+mod windows_log;
+
 pub use platform::system_randomness;
+
+/// Returns how many times this process asked the kernel the length of a log segment that every
+/// connection shares, or 0 where segments are not shared.
+///
+/// See `windows_log`: while the process holds the segment's oplock the length is kept in memory,
+/// so a test can tell from this count whether the oplock held.
+pub fn log_size_queries() -> u64 {
+    #[cfg(windows)]
+    {
+        windows_log::log_size_queries()
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
 
 /// What a path names, as [`path_state`] answers it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,9 +239,28 @@ impl Vfs for OsVfs {
             && (options.create || options.exclusive)
             && options.kind.survives_a_restart()
             && !matches!(platform::path_state(path.as_path()), Ok(Some(_)));
-        let file = fs_options
-            .open(path.as_path())
-            .map_err(|error| VfsError::from_io(VfsOperation::Open, &error).about(path.as_path()))?;
+        #[cfg(windows)]
+        let log = match options.kind {
+            crate::contract::FileKind::Wal => windows_log::open_log_share(
+                path.as_path(),
+                !options.read_only,
+                options.create,
+                options.exclusive,
+            )
+            .map_err(|error| VfsError::from_io(VfsOperation::Open, &error).about(path.as_path()))?,
+            _ => None,
+        };
+        #[cfg(windows)]
+        let file = match &log {
+            Some(share) => Arc::clone(share.file()),
+            None => Arc::new(fs_options.open(path.as_path()).map_err(|error| {
+                VfsError::from_io(VfsOperation::Open, &error).about(path.as_path())
+            })?),
+        };
+        #[cfg(not(windows))]
+        let file = Arc::new(fs_options.open(path.as_path()).map_err(|error| {
+            VfsError::from_io(VfsOperation::Open, &error).about(path.as_path())
+        })?);
         // **And the directory entry that names it is forced.** `delete` and
         // `rename` have done this since phase 1 and `open` never did, so on
         // ext4 or XFS a power loss could leave a log segment whose header had
@@ -233,7 +272,6 @@ impl Vfs for OsVfs {
         if creating {
             self.force_the_directory_entry(path)?;
         }
-        let file = Arc::new(file);
         let (locks, known) = platform::lock_state(&file, next_handle())?;
         let identity = std::sync::OnceLock::new();
         if let Some(known) = known {
@@ -246,6 +284,8 @@ impl Vfs for OsVfs {
             options,
             identity,
             shm: Mutex::new(None),
+            #[cfg(windows)]
+            log,
         }))
     }
 
@@ -408,9 +448,54 @@ pub struct OsFile {
     identity: std::sync::OnceLock<FileIdentity>,
     locks: platform::LockState,
     shm: Mutex<Option<Arc<dyn SharedMemory>>>,
+    /// The process's shared object for a log segment, through which every read, write, length
+    /// and truncation of this handle goes; see `windows_log`.
+    #[cfg(windows)]
+    log: Option<Arc<windows_log::LogShare>>,
 }
 
 impl OsFile {
+    /// Reads at an absolute offset, through the shared log segment when this handle has one.
+    ///
+    /// @param offset - where to read from
+    /// @param output - where the bytes go
+    fn read_at(&self, offset: u64, output: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(windows)]
+        if let Some(share) = &self.log {
+            return share.read_at(offset, output);
+        }
+        platform::read_at(&self.file, offset, output)
+    }
+
+    /// Reads at an absolute offset into memory not yet initialised, through the shared log
+    /// segment when this handle has one.
+    ///
+    /// @param offset - where to read from
+    /// @param output - where the bytes go
+    fn read_at_spare(
+        &self,
+        offset: u64,
+        output: &mut [std::mem::MaybeUninit<u8>],
+    ) -> std::io::Result<usize> {
+        #[cfg(windows)]
+        if let Some(share) = &self.log {
+            return share.read_at_spare(offset, output);
+        }
+        platform::read_at_spare(&self.file, offset, output)
+    }
+
+    /// Writes at an absolute offset, through the shared log segment when this handle has one.
+    ///
+    /// @param offset - where to write
+    /// @param input - the bytes
+    fn write_at(&self, offset: u64, input: &[u8]) -> std::io::Result<usize> {
+        #[cfg(windows)]
+        if let Some(share) = &self.log {
+            return share.write_at(offset, input);
+        }
+        platform::write_at(&self.file, offset, input)
+    }
+
     /// Refuses a mutating operation on a handle opened read-only.
     fn require_writable(&self, operation: VfsOperation) -> VfsResult<()> {
         if self.options.read_only {
@@ -434,7 +519,7 @@ impl VfsFile for OsFile {
             let at = offset.checked_add(filled as u64).ok_or_else(|| {
                 VfsError::new(VfsOperation::Read.extended_code(), "read offset overflowed")
             })?;
-            match platform::read_at(&self.file, at, target) {
+            match self.read_at(at, target) {
                 Ok(0) => break,
                 Ok(count) => filled = filled.saturating_add(count),
                 Err(io) if io.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -481,7 +566,7 @@ impl VfsFile for OsFile {
             let at = offset.checked_add(filled as u64).ok_or_else(|| {
                 VfsError::new(VfsOperation::Read.extended_code(), "read offset overflowed")
             })?;
-            match platform::read_at_spare(&self.file, at, target) {
+            match self.read_at_spare(at, target) {
                 Ok(0) => break,
                 Ok(count) => filled = filled.saturating_add(count).min(len),
                 Err(io) if io.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -519,7 +604,7 @@ impl VfsFile for OsFile {
                     "write offset overflowed",
                 )
             })?;
-            match platform::write_at(&self.file, at, source) {
+            match self.write_at(at, source) {
                 Ok(0) => {
                     return Err(error::disk_full(format!("write stalled at {at}")));
                 }
@@ -531,8 +616,14 @@ impl VfsFile for OsFile {
         Ok(())
     }
 
-    /// Returns the file's length.
+    /// Returns the file's length; a shared log segment answers from memory while its oplock holds.
     fn file_size(&self) -> VfsResult<u64> {
+        #[cfg(windows)]
+        if let Some(share) = &self.log {
+            return share
+                .len()
+                .map_err(|error| VfsError::from_io(VfsOperation::FileSize, &error));
+        }
         platform::file_len(&self.file)
             .map_err(|error| VfsError::from_io(VfsOperation::FileSize, &error))
     }
@@ -542,7 +633,12 @@ impl VfsFile for OsFile {
         self.require_writable(VfsOperation::Truncate)?;
         self.file
             .set_len(size)
-            .map_err(|error| VfsError::from_io(VfsOperation::Truncate, &error))
+            .map_err(|error| VfsError::from_io(VfsOperation::Truncate, &error))?;
+        #[cfg(windows)]
+        if let Some(share) = &self.log {
+            share.set_to(size);
+        }
+        Ok(())
     }
 
     /// Flushes written data toward durable media.

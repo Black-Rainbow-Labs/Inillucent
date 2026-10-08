@@ -126,6 +126,11 @@ path = "src/bin/hcprobe.rs"
 name = "inillucent-searchgate"
 path = "src/bin/searchgate.rs"
 
+# The common uses of an inillucent_search table, one case at a time.
+[[bin]]
+name = "inillucent-searchprobe"
+path = "src/bin/searchprobe.rs"
+
 # What an ordinary write pays to keep a vector index current (M8).
 [[bin]]
 name = "inillucent-foldgate"

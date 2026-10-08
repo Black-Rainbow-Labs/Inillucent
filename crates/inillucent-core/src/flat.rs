@@ -25,6 +25,14 @@ use crate::vectors::{Scorer, VectorSet};
 /// thousand dot products across cores costs more in coordination than it saves.
 const PARALLEL_ABOVE: usize = 4_096;
 
+/// The fewest candidates one task of the parallel scan takes.
+///
+/// **Why** (task-2209). Left to split as it likes, the pool cut a scan of 5,000 vectors of 384
+/// numbers into tasks of a few vectors each, and stealing, waking and sleeping were 60% of the
+/// samples of a vector search against 6% for the dot products. A task of 2,048 vectors is still
+/// spread across the cores for a large table.
+const PARALLEL_TASK: usize = 2_048;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 /// One result of a search: which chunk, and how far from the query it is.
 pub struct Neighbour {
@@ -168,7 +176,7 @@ pub fn search_with<S: Scorer + Sync>(
             // takes 1.67 ms.
             return groups
                 .par_iter()
-                .flat_map(|g| g.par_iter().copied())
+                .flat_map(|g| g.par_iter().with_min_len(PARALLEL_TASK).copied())
                 .filter(|chunk| filter.passes(*chunk, store))
                 .map(score)
                 .fold(|| TopK::new(k), TopK::pushed)
@@ -191,6 +199,7 @@ pub fn search_with<S: Scorer + Sync>(
     if n > PARALLEL_ABOVE {
         return (0..n as u32)
             .into_par_iter()
+            .with_min_len(PARALLEL_TASK)
             .filter(|chunk| trivial || filter.passes(*chunk, store))
             .map(score)
             .fold(|| TopK::new(k), TopK::pushed)

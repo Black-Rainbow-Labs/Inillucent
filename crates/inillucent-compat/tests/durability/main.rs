@@ -32,6 +32,7 @@ mod file_damage;
 mod fold_protocol;
 mod free_map_checkpoint_crash;
 mod large_transactions;
+mod log_oplock;
 mod logical_split_crash;
 mod multi_database_crash;
 mod new_engine_free_map_recovery;

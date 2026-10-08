@@ -253,11 +253,7 @@ impl Sink for SimpleAggregate {
                         Some(slots) => {
                             accumulator.push_dense_ints(slots.range(0, live));
                         }
-                        None => {
-                            for nth in 0..live {
-                                accumulator.push(&argument.value(batch, nth)?.get());
-                            }
-                        }
+                        None => push_argument(accumulator, argument.as_ref(), batch)?,
                     }
                 }
             }
@@ -287,6 +283,76 @@ impl Sink for SimpleAggregate {
         self.downstream.reset()
     }
 }
+/// Folds one argument of a whole batch into an accumulator: in one loop when the argument
+/// produces the batch's integers or reals at once, a row at a time otherwise.
+///
+/// See [`Eval::ints_over`]. A `DISTINCT` accumulator or one that keeps whole rows still gets
+/// every value, through `push_int` and `push_real`, which hand those kinds to `push`.
+///
+/// @param accumulator - the aggregate's accumulator
+/// @param argument - the aggregate's argument
+/// @param batch - the rows
+fn push_argument(
+    accumulator: &mut Accumulator,
+    argument: &dyn Eval,
+    batch: &Batch<'_>,
+) -> DbResult<()> {
+    let mut ints = Vec::new();
+    if argument.ints_over(batch, &mut ints) {
+        for value in ints {
+            accumulator.push_int(value);
+        }
+        return Ok(());
+    }
+    let mut reals = Vec::new();
+    if argument.reals_over(batch, &mut reals) {
+        for value in reals {
+            accumulator.push_real(value);
+        }
+        return Ok(());
+    }
+    for nth in 0..batch.live() {
+        accumulator.push(&argument.value(batch, nth)?.get());
+    }
+    Ok(())
+}
+
+/// One aggregate's argument for a whole batch, as the grouped batch loop reads it.
+enum BatchArgument {
+    /// `count(*)`: nothing to read.
+    Rows,
+    /// One integer per live row.
+    Ints(Vec<i64>),
+    /// One real per live row.
+    Reals(Vec<f64>),
+    /// Fed a row at a time through `AggregateSpec::feed`.
+    PerRow,
+}
+
+impl BatchArgument {
+    /// Evaluates one aggregate's argument over a batch, in one loop where the argument allows.
+    ///
+    /// @param spec - the aggregate
+    /// @param batch - the rows
+    fn of(spec: &AggregateSpec, batch: &Batch<'_>) -> BatchArgument {
+        if spec.filter.is_some() || spec.takes_whole_row() {
+            return BatchArgument::PerRow;
+        }
+        let Some(argument) = &spec.argument else {
+            return BatchArgument::Rows;
+        };
+        let mut ints = Vec::new();
+        if argument.ints_over(batch, &mut ints) {
+            return BatchArgument::Ints(ints);
+        }
+        let mut reals = Vec::new();
+        if argument.reals_over(batch, &mut reals) {
+            return BatchArgument::Reals(reals);
+        }
+        BatchArgument::PerRow
+    }
+}
+
 /// Aggregates by a grouping key.
 ///
 /// The group key is interned into a memcmp-comparable byte string, so the hash
@@ -326,8 +392,27 @@ pub struct HashAggregate {
     /// For each key, whether the groups are emitted in descending order of it.
     /// Empty when every key is ascending, which is nearly every statement.
     descending: Vec<bool>,
+    /// For a `GROUP BY` on one key, the position of the group each small non negative integer
+    /// key value belongs to, plus one, or zero when that value has not been seen.
+    ///
+    /// **Why** (task-2209). A row of a known group encoded its key, hashed the bytes, probed the
+    /// table and compared the key: most of `push` on `GROUP BY grp` over 20,000 rows, where the
+    /// key is a column holding 97 values. An integer under [`DENSE_KEYS`] now goes straight to its
+    /// position. A value seen for the first time takes the ordinary path, which finds or makes the
+    /// group by its encoded key, and is then remembered here, so a real that encodes equal to an
+    /// integer still lands in that integer's group.
+    dense: Vec<u32>,
+    /// Set at the first key that is not an integer under [`DENSE_KEYS`], so a `GROUP BY` on text
+    /// does not evaluate its key twice a row for the rest of the statement.
+    dense_off: bool,
     downstream: Box<dyn Sink>,
 }
+
+/// The integer key values below which a one key `GROUP BY` finds its group by value.
+///
+/// 65,536 positions are 256 KiB at most, made only as far as the largest value seen.
+const DENSE_KEYS: i64 = 1 << 16;
+
 impl HashAggregate {
     /// Returns a grouped aggregate.
     ///
@@ -358,6 +443,8 @@ impl HashAggregate {
             held: Vec::new(),
             accumulators: Vec::new(),
             descending: Vec::new(),
+            dense: Vec::new(),
+            dense_off: false,
             downstream,
         }
     }
@@ -488,12 +575,181 @@ impl HashAggregate {
         Ok(at)
     }
 }
-impl Sink for HashAggregate {
-    fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
+impl HashAggregate {
+    /// Returns the group of a row whose one key is a small non negative integer, when that value
+    /// has been seen before.
+    ///
+    /// @param batch - the rows
+    /// @param nth - the row
+    fn dense_group(&mut self, batch: &Batch<'_>, nth: usize) -> DbResult<Option<(usize, i64)>> {
+        if self.dense_off {
+            return Ok(None);
+        }
+        let [key] = self.keys.as_slice() else {
+            self.dense_off = true;
+            return Ok(None);
+        };
+        let value = match key.value(batch, nth)?.get() {
+            Datum::Int(value) if (0..DENSE_KEYS).contains(&value) => value,
+            _ => {
+                self.dense_off = true;
+                return Ok(None);
+            }
+        };
+        let seen = self.dense.get(value as usize).copied().unwrap_or(0);
+        Ok(Some((seen as usize, value)))
+    }
+
+    /// Remembers which group a small integer key value belongs to.
+    ///
+    /// @param value - the key value, already known to be under `DENSE_KEYS`
+    /// @param at - the group's position
+    fn remember_dense(&mut self, value: i64, at: usize) {
+        let index = value as usize;
+        if self.dense.len() <= index {
+            self.dense.resize(index.saturating_add(1), 0);
+        }
+        if let (Some(slot), Ok(position)) = (self.dense.get_mut(index), u32::try_from(at)) {
+            *slot = position.saturating_add(1);
+        }
+    }
+
+    /// Feeds one row into its group's counts or accumulators.
+    ///
+    /// @param batch - the rows
+    /// @param nth - the row
+    /// @param at - the group's position
+    fn feed_group(&mut self, batch: &Batch<'_>, nth: usize, at: usize) -> DbResult<()> {
+        let width = self.specs.len();
+        let from = at.saturating_mul(width);
+        if let Some(counts) = &mut self.counts {
+            for count in counts.iter_mut().skip(from).take(width) {
+                *count = count.saturating_add(1);
+            }
+            return Ok(());
+        }
+        for (index, spec) in self.specs.iter().enumerate() {
+            let Some(accumulator) = self.accumulators.get_mut(from.saturating_add(index)) else {
+                continue;
+            };
+            spec.feed(accumulator, batch, nth)?;
+        }
+        Ok(())
+    }
+}
+
+impl HashAggregate {
+    /// Folds a whole batch in one loop when the one key is a small integer on every row, and
+    /// answers whether it did.
+    ///
+    /// **Why** (task-2209). With the key found by value, what was left of a row was evaluating
+    /// the key and each argument through two dynamic calls and folding a `Datum` through
+    /// `Accumulator::push`. The key and every argument that can are read for the whole batch
+    /// first, and the loop is then an array index and an addition per aggregate. A batch whose
+    /// key column is not all small integers answers no, and the per row loop takes it.
+    ///
+    /// @param batch - the rows
+    fn push_dense_batch(&mut self, batch: &Batch<'_>) -> DbResult<bool> {
+        if self.dense_off {
+            return Ok(false);
+        }
+        let [key] = self.keys.as_slice() else {
+            return Ok(false);
+        };
+        let mut keys = Vec::new();
+        if !key.ints_over(batch, &mut keys)
+            || keys.iter().any(|value| !(0..DENSE_KEYS).contains(value))
+        {
+            return Ok(false);
+        }
+        let arguments: Vec<BatchArgument> = self
+            .specs
+            .iter()
+            .map(|spec| BatchArgument::of(spec, batch))
+            .collect();
+        let width = self.specs.len();
+        for (nth, value) in keys.iter().enumerate() {
+            let seen = self.dense.get(*value as usize).copied().unwrap_or(0) as usize;
+            let at = match seen {
+                0 => {
+                    let at = self.group_of_row(batch, nth)?;
+                    self.remember_dense(*value, at);
+                    at
+                }
+                known => known - 1,
+            };
+            let from = at.saturating_mul(width);
+            if let Some(counts) = &mut self.counts {
+                for count in counts.iter_mut().skip(from).take(width) {
+                    *count = count.saturating_add(1);
+                }
+                continue;
+            }
+            for (index, (spec, argument)) in self.specs.iter().zip(&arguments).enumerate() {
+                let Some(accumulator) = self.accumulators.get_mut(from.saturating_add(index))
+                else {
+                    continue;
+                };
+                match argument {
+                    BatchArgument::Rows => accumulator.push_count(1),
+                    BatchArgument::Ints(values) => {
+                        if let Some(value) = values.get(nth) {
+                            accumulator.push_int(*value);
+                        }
+                    }
+                    BatchArgument::Reals(values) => {
+                        if let Some(value) = values.get(nth) {
+                            accumulator.push_real(*value);
+                        }
+                    }
+                    BatchArgument::PerRow => spec.feed(accumulator, batch, nth)?,
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Finds or makes the group one row belongs to, by its encoded key.
+    ///
+    /// @param batch - the rows
+    /// @param nth - the row
+    fn group_of_row(&mut self, batch: &Batch<'_>, nth: usize) -> DbResult<usize> {
         let mut encoded = Vec::with_capacity(32);
         let mut values = Vec::with_capacity(self.keys.len());
-        let width = self.specs.len();
+        for expression in &self.keys {
+            let value = expression.value(batch, nth)?;
+            key::encode_into_with(
+                &value.get(),
+                self.collations
+                    .get(values.len())
+                    .copied()
+                    .unwrap_or(Collation::Binary),
+                &mut encoded,
+            );
+            values.push(value);
+        }
+        match self.groups.find(&encoded) {
+            Some(at) => Ok(at),
+            None => self.add_group(&encoded, &values),
+        }
+    }
+}
+
+impl Sink for HashAggregate {
+    fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
+        if self.push_dense_batch(batch)? {
+            return Ok(Flow::Continue);
+        }
+        let mut encoded = Vec::with_capacity(32);
+        let mut values = Vec::with_capacity(self.keys.len());
         for nth in 0..batch.live() {
+            let dense = self.dense_group(batch, nth)?;
+            if let Some((seen, _)) = dense {
+                if seen > 0 {
+                    self.feed_group(batch, nth, seen - 1)?;
+                    continue;
+                }
+            }
             encoded.clear();
             values.clear();
             for expression in &self.keys {
@@ -512,20 +768,10 @@ impl Sink for HashAggregate {
                 Some(at) => at,
                 None => self.add_group(&encoded, &values)?,
             };
-            let from = at.saturating_mul(width);
-            if let Some(counts) = &mut self.counts {
-                for count in counts.iter_mut().skip(from).take(width) {
-                    *count = count.saturating_add(1);
-                }
-                continue;
+            if let Some((_, value)) = dense {
+                self.remember_dense(value, at);
             }
-            for (index, spec) in self.specs.iter().enumerate() {
-                let Some(accumulator) = self.accumulators.get_mut(from.saturating_add(index))
-                else {
-                    continue;
-                };
-                spec.feed(accumulator, batch, nth)?;
-            }
+            self.feed_group(batch, nth, at)?;
         }
         Ok(Flow::Continue)
     }
@@ -590,6 +836,8 @@ impl Sink for HashAggregate {
     fn reset(&mut self) -> DbResult<()> {
         self.groups.clear();
         self.held.clear();
+        self.dense.clear();
+        self.dense_off = false;
         self.accumulators.clear();
         if let Some(counts) = &mut self.counts {
             counts.clear();

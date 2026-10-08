@@ -616,6 +616,65 @@ impl Accumulator {
         }
     }
 
+    /// Folds one integer in, exactly as `push(&Datum::Int(value))` does.
+    ///
+    /// **The counts and sums without the general dispatch** (task-2209). A batch evaluated in one
+    /// loop hands its values over one at a time, and `push` compared the kind, tested for NULL,
+    /// looked for a `DISTINCT` set and matched the kind again for each; for a count or a sum of
+    /// integers none of that decides anything. Every other kind, and a `DISTINCT` one, goes
+    /// through `push`.
+    ///
+    /// @param value - the argument's value for this row
+    pub fn push_int(&mut self, value: i64) {
+        if self.rare.as_ref().is_some_and(|rare| rare.seen.is_some()) {
+            return self.push(&Datum::Int(value));
+        }
+        match self.kind {
+            AggregateKind::CountStar | AggregateKind::Count => {
+                self.count = self.count.saturating_add(1);
+            }
+            AggregateKind::Sum | AggregateKind::Total | AggregateKind::Average => {
+                self.count = self.count.saturating_add(1);
+                if self.is_real {
+                    self.add_int(value);
+                    return;
+                }
+                match self.integer_sum.checked_add(value) {
+                    Some(total) => self.integer_sum = total,
+                    None => {
+                        self.seed_real();
+                        self.add_int(value);
+                    }
+                }
+            }
+            _ => self.push(&Datum::Int(value)),
+        }
+    }
+
+    /// Folds one real in, exactly as `push(&Datum::Real(value))` does. See
+    /// [`Accumulator::push_int`].
+    ///
+    /// @param value - the argument's value for this row
+    pub fn push_real(&mut self, value: f64) {
+        if self.rare.as_ref().is_some_and(|rare| rare.seen.is_some()) {
+            return self.push(&Datum::Real(value));
+        }
+        match self.kind {
+            AggregateKind::CountStar | AggregateKind::Count => {
+                self.count = self.count.saturating_add(1);
+            }
+            AggregateKind::Sum | AggregateKind::Total | AggregateKind::Average => {
+                self.count = self.count.saturating_add(1);
+                if !self.is_real {
+                    self.seed_real();
+                }
+                self.saw_real = true;
+                self.add_real(value);
+            }
+            _ => self.push(&Datum::Real(value)),
+        }
+    }
+
     /// Folds one value in.
     ///
     /// @param value - the argument's value for this row, or NULL for `count(*)`

@@ -10,6 +10,31 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**Common operations are 51.5% faster than in 2.3.4, and search much more than that.** Measured by
+the gate's 82 workloads through the `Connection` API against 2.3.4, with SQLite timed in the same
+rounds, and by a new search benchmark, `inillucent-searchprobe`. All 88 cases together are 61%
+faster. `tasks/task-2209-performance-hillclimb-7.md` has every change, its measurement and its test.
+
+- A search after an insert into an `inillucent_search` table is 158 times faster: the connection
+  keeps its loaded index across its own writes and commits and adds only the new rows to it. A
+  keyword search is 3.1 times faster, a first search after an open 1.7 times, a vector search and a
+  hybrid one about 1.5 times, and inserts 1.5 times, because a table in the default exact mode no
+  longer builds a full graph it never reads.
+- A read after a write keeps the read lock for the next statement, as a read after a read already
+  did: a point read by rowid after inserts is 3 to 5 times faster.
+- On Windows a process holds an opportunistic lock on its open log segment while no other process
+  has the segment open, and then knows the log's length without asking the operating system before
+  every statement. An autocommit point read went from 1.8 us to 0.5 us. Another process's open of the
+  segment waits until this process has stopped trusting its own count, so its commits are always
+  seen. `INILLUCENT_LOG_OPLOCK=0` turns this off; see `docs/sql.md`.
+- Aggregates read their arguments and their `GROUP BY` key a batch of rows at a time, and a
+  `GROUP BY` on one small integer key finds its group by value: `SELECT grp, count(*), sum(amount)
+  ... GROUP BY grp` is 7.8 times faster, `sum(length(label))` over a table 1.5 times.
+- `ORDER BY a, b LIMIT n` rejects rows by the first term without reading the rest, 1.75 times faster.
+- An insert no longer searches the tree for the largest rowid on every row.
+- Known cost: `write.insert.batch` is about 4% slower, from the overlapped I/O the shared log
+  segment uses on Windows.
+
 **The test runner and the release scripts use 80% of the machine's processors, and the test build
 is optimised.** `inillucent-testrun` confines itself, its cargo builds and every test process to
 80% of the logical processors, rounded down, fastest first: 19 of 24 on the development machine. It

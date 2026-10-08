@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io;
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::AsRawHandle;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -351,6 +352,7 @@ pub fn lock_state(
     Ok((
         LockState {
             level: Mutex::new(FileLock::None),
+            seen: AtomicU8::new(0),
         },
         None,
     ))
@@ -442,7 +444,7 @@ pub fn system_randomness(output: &mut [u8]) -> VfsResult<()> {
 }
 
 /// Builds the overlapped structure that carries a lock's start offset.
-fn overlapped_at(offset: u64) -> OVERLAPPED {
+pub(crate) fn overlapped_at(offset: u64) -> OVERLAPPED {
     // SAFETY: OVERLAPPED is a plain data structure with no invalid bit patterns
     // for the fields the call reads; every field it reads is set here, and the
     // union is written rather than read, which is what makes zeroing sound.
@@ -695,17 +697,91 @@ fn allocation_granularity() -> u64 {
 #[derive(Debug)]
 pub struct LockState {
     level: Mutex<FileLock>,
+    /// A copy of `level` for reading without the mutex, written whenever a transition ends.
+    ///
+    /// **Why** (task-2209). The engine asks a handle its level three or four times a statement
+    /// (`set_reserved_writes`, `begin_read`, `wrote_anything`, `end_access_leased`), and each ask
+    /// took the mutex: `lock_level` was 3.8% of an autocommit point read. A transition still runs
+    /// under the mutex, so two transitions cannot interleave; a reader sees the level as it stood
+    /// when the last one ended, which is all the mutex gave a reader too, since the level could
+    /// change the moment the guard was dropped.
+    seen: AtomicU8,
+}
+
+/// The mutex guard of a transition, which copies the level it leaves into `LockState::seen`
+/// however the transition ends, an early error included.
+struct Transition<'a> {
+    level: std::sync::MutexGuard<'a, FileLock>,
+    seen: &'a AtomicU8,
+}
+
+impl std::ops::Deref for Transition<'_> {
+    type Target = FileLock;
+
+    /// Reads the level under the mutex.
+    fn deref(&self) -> &FileLock {
+        &self.level
+    }
+}
+
+impl std::ops::DerefMut for Transition<'_> {
+    /// Writes the level under the mutex.
+    fn deref_mut(&mut self) -> &mut FileLock {
+        &mut self.level
+    }
+}
+
+impl Drop for Transition<'_> {
+    /// Publishes the level the transition left.
+    fn drop(&mut self) {
+        self.seen
+            .store(level_number(*self.level), Ordering::Release);
+    }
+}
+
+/// Returns a lock level as the number `LockState::seen` holds.
+///
+/// @param level - the level
+fn level_number(level: FileLock) -> u8 {
+    match level {
+        FileLock::None => 0,
+        FileLock::Shared => 1,
+        FileLock::Reserved => 2,
+        FileLock::Pending => 3,
+        FileLock::Exclusive => 4,
+    }
+}
+
+/// Returns the lock level `LockState::seen` holds as a number.
+///
+/// @param number - the number
+fn level_of(number: u8) -> FileLock {
+    match number {
+        1 => FileLock::Shared,
+        2 => FileLock::Reserved,
+        3 => FileLock::Pending,
+        4 => FileLock::Exclusive,
+        _ => FileLock::None,
+    }
 }
 
 impl LockState {
     /// Returns the level this handle holds.
     pub fn level(&self) -> FileLock {
-        *guard(&self.level)
+        level_of(self.seen.load(Ordering::Acquire))
+    }
+
+    /// Takes the mutex for a transition whose end is copied into `seen`.
+    fn transition(&self) -> Transition<'_> {
+        Transition {
+            level: guard(&self.level),
+            seen: &self.seen,
+        }
     }
 
     /// Raises the lock to `target`, one protocol step at a time.
     pub fn acquire(&self, file: &File, target: FileLock) -> VfsResult<()> {
-        let mut level = guard(&self.level);
+        let mut level = self.transition();
         if target <= *level {
             return Ok(());
         }
@@ -751,7 +827,7 @@ impl LockState {
     /// harmless call this is removing from the path where it is provably
     /// pointless, rather than a thing to reason about per level.
     pub fn release(&self, file: &File, target: FileLock) -> VfsResult<()> {
-        let mut level = guard(&self.level);
+        let mut level = self.transition();
         if target >= *level {
             return Ok(());
         }
@@ -847,7 +923,7 @@ fn promote_to_exclusive(file: &File) -> VfsResult<()> {
 }
 
 /// Locks a mutex, recovering from poisoning rather than propagating a panic.
-fn guard<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn guard<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(inner) => inner,
         Err(poisoned) => poisoned.into_inner(),

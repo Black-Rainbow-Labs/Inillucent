@@ -111,7 +111,7 @@ const UNSAFE_CRATES: [&str; 1] = ["inillucent-driver-capi"];
 // are FFI. Each call installs a handler and reads nothing back; each handler
 // stores `true` into an already-allocated `AtomicBool` and returns, which is
 // the whole of what a handler is allowed to do.
-const UNSAFE_ALLOWED: [&str; 24] = [
+const UNSAFE_ALLOWED: [&str; 25] = [
     // **CRC-32 by the processor's instructions, added by task-2191.** Checking a
     // page as it is read was 20% of a cold query of 100 rows from the command
     // line. Carryless multiply on x86-64 and `CRC32X` on aarch64 compute the
@@ -178,6 +178,15 @@ const UNSAFE_ALLOWED: [&str; 24] = [
     "crates/inillucent-remote/src/tls/unix.rs",
     "crates/inillucent-remote/src/tls/windows.rs",
     "crates/inillucent-vfs/src/os/windows.rs",
+    // **The batch oplock on the log segment, added by task-2209.** Asking
+    // Windows for the log file's length before every statement was the largest
+    // fixed cost of a small write. The file is opened for overlapped I/O so a
+    // watcher thread can hold a batch oplock and learn when another process
+    // opens the log; while the oplock is held the length kept in memory is the
+    // length on disk. `ReadFile`, `WriteFile`, `DeviceIoControl` and the event
+    // calls are FFI, the same ground as `windows.rs`, and each block carries a
+    // `SAFETY:` note about the buffer and the `OVERLAPPED` it hands the kernel.
+    "crates/inillucent-vfs/src/os/windows_log.rs",
     "crates/inillucent-vfs/src/os/unix.rs",
     // **The read into a buffer's reserved space, added by task-2191.**
     // `VfsFile::read_exact_into` reads a page into a frame's spare capacity, so

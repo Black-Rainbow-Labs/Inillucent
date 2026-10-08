@@ -319,6 +319,158 @@ mod tests {
         assert_eq!(total, 1_000);
     }
 
+    /// The grouped batch loop answers what a plain per row fold answers, over a typed batch, the
+    /// same batch under a selection vector, materialised values, and keys the direct table cannot
+    /// hold.
+    ///
+    /// **What this guards** (task-2209). A one key `GROUP BY` reads its key and its integer and
+    /// real arguments for a whole batch at once when it can, and a row at a time when it cannot.
+    /// The expected answer here is computed in plain Rust from the same values, so a batch read
+    /// that drops a row, reads the wrong slot under a selection vector or sends a row to the wrong
+    /// group shows as a different count or sum.
+    #[test]
+    fn the_grouped_batch_loop_agrees_with_a_plain_fold() {
+        let rows = 3_000usize;
+        let keys: Vec<i64> = (0..rows).map(|n| ((n * 7919) % 97) as i64).collect();
+        let amounts: Vec<i64> = (0..rows).map(|n| n as i64 * 3 - 1_000).collect();
+        let reals: Vec<f64> = (0..rows).map(|n| n as f64 * 0.25).collect();
+        let key_bytes = ints(&keys);
+        let amount_bytes = ints(&amounts);
+        let real_bytes: Vec<u8> = reals
+            .iter()
+            .flat_map(|v| v.to_bits().to_le_bytes())
+            .collect();
+        let every_other: Vec<u32> = (0..rows as u32).filter(|n| n % 2 == 1).collect();
+        let key_values: Vec<Datum<'_>> = keys.iter().map(|k| Datum::Int(*k)).collect();
+        let amount_values: Vec<Datum<'_>> = amounts.iter().map(|v| Datum::Int(*v)).collect();
+        let real_values: Vec<Datum<'_>> = reals.iter().map(|v| Datum::Real(*v)).collect();
+        // A key past the direct table on one row, so a run of these has to leave it mid statement.
+        let mut wide_keys = key_values.clone();
+        if let Some(slot) = wide_keys.get_mut(1_500) {
+            *slot = Datum::Int(1 << 20);
+        }
+        let spec = |kind: AggregateKind, column: Option<usize>| AggregateSpec {
+            kind,
+            argument: column.map(|at| compile(&Expr::Column(at), &[StaticType::Int; 3]).unwrap()),
+            extra: Vec::new(),
+            distinct: None,
+            filter: None,
+            order_by: Vec::new(),
+            collation: Collation::Binary,
+        };
+        let expected = |live: &dyn Fn(usize) -> bool, key_of: &dyn Fn(usize) -> i64| {
+            let mut groups: std::collections::BTreeMap<i64, (i64, i64, f64)> = Default::default();
+            for n in (0..rows).filter(|n| live(*n)) {
+                let entry = groups.entry(key_of(n)).or_insert((0, 0, 0.0));
+                entry.0 += 1;
+                entry.1 += amounts[n];
+                entry.2 += reals[n];
+            }
+            groups
+        };
+        let run = |batch: &Batch<'_>| {
+            let mut grouped = HashAggregate::new(
+                vec![compile(&Expr::Column(0), &[StaticType::Int; 3]).unwrap()],
+                Vec::new(),
+                vec![
+                    spec(AggregateKind::CountStar, None),
+                    spec(AggregateKind::Sum, Some(1)),
+                    spec(AggregateKind::Total, Some(2)),
+                ],
+                Box::new(Collect::new()),
+            );
+            grouped.push(batch).unwrap();
+            let mut found: std::collections::BTreeMap<i64, (i64, i64, f64)> = Default::default();
+            for (key, finished) in grouped.group_rows() {
+                found.insert(
+                    key[0].borrow().as_int().unwrap(),
+                    (
+                        finished[0].borrow().as_int().unwrap(),
+                        finished[1].borrow().as_int().unwrap(),
+                        match finished[2].borrow() {
+                            Datum::Real(value) => value,
+                            other => panic!("total gave {other:?}"),
+                        },
+                    ),
+                );
+            }
+            found
+        };
+        let typed = || {
+            vec![
+                Vector::Int64 {
+                    width: 8,
+                    base: 0,
+                    bytes: &key_bytes,
+                    class: None,
+                },
+                Vector::Int64 {
+                    width: 8,
+                    base: 0,
+                    bytes: &amount_bytes,
+                    class: None,
+                },
+                Vector::Float64 {
+                    bytes: &real_bytes,
+                    class: None,
+                },
+            ]
+        };
+        let all = |_: usize| true;
+        let odd = |n: usize| n % 2 == 1;
+        let plain_key = |n: usize| keys[n];
+        let wide_key = |n: usize| if n == 1_500 { 1 << 20 } else { keys[n] };
+        // A case's name, its batch, which rows are live, and each row's key.
+        type Case<'a> = (
+            &'a str,
+            Batch<'a>,
+            &'a dyn Fn(usize) -> bool,
+            &'a dyn Fn(usize) -> i64,
+        );
+        let cases: Vec<Case<'_>> = vec![
+            ("typed", Batch::new(rows, typed()), &all, &plain_key),
+            (
+                "selected",
+                Batch {
+                    rows,
+                    selection: Some(&every_other),
+                    columns: typed().into(),
+                },
+                &odd,
+                &plain_key,
+            ),
+            (
+                "values",
+                Batch::new(
+                    rows,
+                    vec![
+                        Vector::Values(&key_values),
+                        Vector::Values(&amount_values),
+                        Vector::Values(&real_values),
+                    ],
+                ),
+                &all,
+                &plain_key,
+            ),
+            (
+                "wide key",
+                Batch::new(
+                    rows,
+                    vec![
+                        Vector::Values(&wide_keys),
+                        Vector::Values(&amount_values),
+                        Vector::Values(&real_values),
+                    ],
+                ),
+                &all,
+                &wide_key,
+            ),
+        ];
+        for (name, batch, live, key_of) in cases {
+            assert_eq!(run(&batch), expected(live, key_of), "{name}");
+        }
+    }
+
     /// The run-detecting grouped path and the per-row one produce the same
     /// groups, the same counts and the same sums, over runs that start and end
     /// on batch boundaries and runs that do not.

@@ -207,7 +207,34 @@ impl ImportedDatabase {
             // happened.
             self.committed_elsewhere_modules();
         }
+        if !inside {
+            self.writing.set_entry_mark(self.statement_entry());
+        }
         Ok(())
+    }
+
+    /// Returns where the log and the pool stand now, for comparing a statement's end with its start.
+    fn statement_entry(&self) -> crate::engine::state::StatementEntry {
+        crate::engine::state::StatementEntry {
+            written_end: self.storage.wal.written_end(),
+            dirty_pages: self.storage.database.pool().dirty_pages(),
+        }
+    }
+
+    /// Reports whether the statement now ending changed anything, as opposed to only reading
+    /// after earlier statements left committed pages dirty in the pool.
+    ///
+    /// A write raises the lock past SHARED, appends to the log or dirties a page, so a statement
+    /// that did none of these, and left no hot journal, only read. `wrote_anything` answers a
+    /// different question: whether the pool holds anything not yet folded, which is true after
+    /// every commit until the next fold.
+    fn this_statement_wrote(&self) -> bool {
+        let now = self.statement_entry();
+        let entry = self.writing.entry_mark();
+        self.storage.database.lock_level() > inillucent_vfs::FileLock::Shared
+            || self.storage.database.pool().journal_is_hot()
+            || now.written_end != entry.written_end
+            || now.dirty_pages > entry.dirty_pages
     }
 
     /// Refuses the first write of a transaction that read before another
@@ -814,7 +841,7 @@ impl ImportedDatabase {
                 self.checkpoint_of(false)?;
             }
         }
-        if !wrote && self.may_lease() {
+        if !self.this_statement_wrote() && self.may_lease() {
             return self.storage.database.end_access_leased();
         }
         // Every attached file is let go on the same terms `main` is: the

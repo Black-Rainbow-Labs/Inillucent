@@ -120,6 +120,32 @@ pub trait Eval: Send + Sync {
     fn json_value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<(Computed<'p>, bool)> {
         Ok((self.value(batch, nth)?, false))
     }
+
+    /// Writes this expression's value for every live row of a batch into `out`, and answers
+    /// whether every one was a non NULL integer.
+    ///
+    /// **A whole batch in one call** (task-2209). The aggregate operators evaluated their
+    /// arguments and group keys a row at a time, two dynamic calls and a `Datum` a row, which was
+    /// most of a `sum(length(label))` or a `GROUP BY grp` over a scan. A node that can produce the
+    /// batch's values in one loop overrides this; every other answers no, and the caller takes
+    /// the per row path, which gives the same answers. `out` means nothing after a no.
+    ///
+    /// @param batch - the batch being evaluated
+    /// @param out - where the values go, one per live row
+    fn ints_over(&self, batch: &Batch<'_>, out: &mut Vec<i64>) -> bool {
+        let _ = (batch, out);
+        false
+    }
+
+    /// Writes this expression's value for every live row of a batch into `out`, and answers
+    /// whether every one was a non NULL real. See [`Eval::ints_over`].
+    ///
+    /// @param batch - the batch being evaluated
+    /// @param out - where the values go, one per live row
+    fn reals_over(&self, batch: &Batch<'_>, out: &mut Vec<f64>) -> bool {
+        let _ = (batch, out);
+        false
+    }
 }
 /// What an application-defined scalar does with one row's arguments.
 ///

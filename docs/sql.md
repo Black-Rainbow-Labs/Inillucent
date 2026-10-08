@@ -403,6 +403,17 @@ engine reads the file header and the end of the log again before each statement.
 reads no table, such as `SELECT 1` or `SELECT json_extract(?1, '$.a')`, takes no lock and reads
 neither, which is what SQLite does.
 
+**The end of the log on Windows.** Under `normal`, a connection learns whether another process
+committed by asking the open log segment its length before each statement. On Windows that question
+cost more than the rest of an autocommit point read. A process now holds an opportunistic lock on
+its open log segment while no other process has the segment open, and answers the question from the
+length its own writes left, with no call into the operating system. When another process opens the
+segment, its open waits until this process has stopped using that length, so every commit the
+other process makes is seen by the next statement here. One process stopped in a
+debugger holds up other processes' opens of its log segment until it is resumed or ends. Setting the
+environment variable `INILLUCENT_LOG_OPLOCK=0` turns the lock off, and every statement asks the
+length as before. Linux and macOS ask the length on every statement.
+
 **A large transaction.** A transaction on a database file can change more pages than the page cache
 holds, in every journal mode and both locking modes. A changed page the cache cannot keep goes to a
 temporary spill file of the connection's own and is read back from there, and the fold after the

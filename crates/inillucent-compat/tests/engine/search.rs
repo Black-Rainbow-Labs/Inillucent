@@ -1166,3 +1166,206 @@ fn a_rowid_list_finds_and_deletes_exactly_the_listed_rows() {
         "the deleted rows are gone from the index as well"
     );
 }
+
+// --- task-2209: the cached index across writes, and the graph of an exact table ---
+
+/// Returns the vector row `id` of the cache tests stores: on a circle, so every row is a
+/// different distance from any query and an ordering is not decided by a tie.
+///
+/// @param id - the row
+fn circle(id: i64) -> [f32; 4] {
+    let angle = id as f32 * 0.37;
+    [angle.cos(), angle.sin(), 0.25, (id % 7) as f32 * 0.01]
+}
+
+/// Answers the two questions the cache tests compare: every row the keyword finds, sorted, and
+/// the five rows nearest a fixed vector, in order.
+///
+/// @param connection - the connection to ask
+fn answers(connection: &Connection<'_>) -> (Vec<String>, Vec<String>) {
+    let mut keyword = column(
+        connection,
+        "SELECT rowid FROM docs WHERE docs MATCH 'eligible' AND k = 1000",
+    );
+    keyword.sort_by_key(|id| id.parse::<i64>().unwrap_or(-1));
+    let nearest = column(
+        connection,
+        &format!(
+            "SELECT rowid FROM docs WHERE vector = x'{}' AND k = 5",
+            hex(&[0.6, 0.8, 0.25, 0.0])
+        ),
+    );
+    (keyword, nearest)
+}
+
+/// Writes one row of the cache tests.
+///
+/// @param connection - the connection to write through
+/// @param id - the row
+fn write_circle_row(connection: &Connection<'_>, id: i64) {
+    exec(
+        connection,
+        &format!(
+            "INSERT INTO docs(rowid, title, body, vector) VALUES \
+             ({id}, 'row {id}', 'an eligible account number {id}', x'{}')",
+            hex(&circle(id))
+        ),
+    );
+}
+
+/// A connection that searched keeps answering correctly after each of its own writes, and agrees
+/// with a connection that loads the index from the file.
+///
+/// **What this guards** (task-2209). Every write and every commit used to drop the connection's
+/// cached index, so the search after an insert loaded every segment again: 51 ms a cycle on 5,000
+/// rows of 384 numbers. The cache is now kept and brought up to date from the delta log, and a
+/// flush or a merge of this connection's own re-keys it to the new segments instead of dropping
+/// it. `compact = 8` makes a flush every eight commits and merges after that, so the forty writes
+/// below cross both several times. A second session has a cache of its own and loads from the
+/// segments, so any difference between the kept index and the stored one shows as a different
+/// answer.
+#[test]
+fn a_kept_index_answers_like_a_fresh_one_after_every_write() {
+    let path = scratch(AREA, "kept-index", "inillucent");
+    let database = Database::open(&path).expect("the database opens");
+    let warm = database.session();
+    exec(
+        &warm,
+        "CREATE VIRTUAL TABLE docs USING inillucent_search(title, body, dims = 4, compact = 8)",
+    );
+    for id in 1..=40 {
+        write_circle_row(&warm, id);
+        let (keyword, nearest) = answers(&warm);
+        assert_eq!(
+            keyword.len(),
+            id as usize,
+            "row {id} was not found after its own write"
+        );
+        assert_eq!(nearest.len(), id.min(5) as usize);
+        if id % 4 == 0 {
+            let fresh = database.session();
+            assert_eq!(
+                answers(&fresh),
+                (keyword, nearest),
+                "after {id} writes the kept index and a fresh load disagree"
+            );
+        }
+    }
+    assert!(
+        state(&warm, "docs", "folds") >= 4,
+        "the writes were meant to cross several flushes"
+    );
+}
+
+/// A write rolled back after a search that saw it is gone from the next search, and the kept
+/// index agrees with a fresh load.
+///
+/// The cache is no longer dropped when a row is written, so this is the case where it holds an
+/// entry the log then loses. A rollback still drops it, and its key would not match anyway.
+#[test]
+fn a_kept_index_forgets_a_rolled_back_write() {
+    let path = scratch(AREA, "kept-rollback", "inillucent");
+    let database = Database::open(&path).expect("the database opens");
+    let warm = database.session();
+    exec(
+        &warm,
+        "CREATE VIRTUAL TABLE docs USING inillucent_search(title, body, dims = 4, compact = 8)",
+    );
+    for id in 1..=10 {
+        write_circle_row(&warm, id);
+    }
+    let before = answers(&warm);
+    exec(&warm, "BEGIN");
+    write_circle_row(&warm, 11);
+    write_circle_row(&warm, 12);
+    assert_eq!(
+        answers(&warm).0.len(),
+        12,
+        "the transaction's own rows are found inside it"
+    );
+    exec(&warm, "ROLLBACK");
+    assert_eq!(answers(&warm), before, "a rolled back row is still found");
+    exec(&warm, "BEGIN");
+    write_circle_row(&warm, 13);
+    exec(&warm, "SAVEPOINT s");
+    write_circle_row(&warm, 14);
+    assert_eq!(answers(&warm).0.len(), 12);
+    exec(&warm, "ROLLBACK TO s");
+    exec(&warm, "COMMIT");
+    let after = answers(&warm);
+    assert_eq!(after.0.len(), 11);
+    assert!(
+        !after.0.contains(&"14".to_string()),
+        "the row the savepoint took back is found"
+    );
+    assert_eq!(answers(&database.session()), after);
+}
+
+/// An exact table answers the true nearest rows with the two link graph it now builds.
+///
+/// **Why the graph changed** (task-2209). `mode = 'exact'` compares the query with every stored
+/// vector and never walks the graph, so building a full graph at every flush was most of the cost
+/// of an insert: 58% of the processor time of 5,000 inserts of 384 numbers. The table now builds
+/// the two link graph a lexical table builds. This checks the answers against a brute force
+/// ordering over 300 rows of 8 numbers, past several flushes.
+#[test]
+fn an_exact_table_answers_the_true_nearest_rows() {
+    let connection = start_inillucent(AREA, "exact-nearest");
+    exec(
+        &connection,
+        "CREATE VIRTUAL TABLE pts USING inillucent_search(label, dims = 8, compact = 64)",
+    );
+    let mut seed: u64 = 11;
+    let mut next = move || {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        ((seed >> 33) % 2001) as f32 / 1000.0 - 1.0
+    };
+    let unit = |raw: Vec<f32>| {
+        let length = raw.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+        raw.into_iter().map(|x| x / length).collect::<Vec<f32>>()
+    };
+    let mut stored = Vec::new();
+    exec(&connection, "BEGIN");
+    for id in 1..=300i64 {
+        let vector = unit((0..8).map(|_| next()).collect());
+        exec(
+            &connection,
+            &format!(
+                "INSERT INTO pts(rowid, label, vector) VALUES ({id}, 'p{id}', x'{}')",
+                hex(&vector)
+            ),
+        );
+        stored.push((id, vector));
+        if id % 100 == 0 {
+            exec(&connection, "COMMIT");
+            exec(&connection, "BEGIN");
+        }
+    }
+    exec(&connection, "COMMIT");
+    for _ in 0..10 {
+        let query = unit((0..8).map(|_| next()).collect());
+        let mut expected: Vec<(f32, i64)> = stored
+            .iter()
+            .map(|(id, vector)| {
+                let dot: f32 = vector.iter().zip(&query).map(|(a, b)| a * b).sum();
+                (1.0 - dot, *id)
+            })
+            .collect();
+        expected.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let expected: Vec<String> = expected
+            .iter()
+            .take(10)
+            .map(|(_, id)| id.to_string())
+            .collect();
+        let found = column(
+            &connection,
+            &format!(
+                "SELECT rowid FROM pts WHERE vector = x'{}' AND k = 10",
+                hex(&query)
+            ),
+        );
+        assert_eq!(found, expected, "an exact table missed a true nearest row");
+    }
+}

@@ -1061,6 +1061,26 @@ pub(crate) struct Writing {
     /// rather than a depth because there is exactly one sweep at a time by
     /// construction: it runs after a statement, at the outermost level.
     settling: std::cell::Cell<bool>,
+    /// Where the log end and the pool stood when the outermost statement entered, so its release can
+    /// tell a statement that wrote from one that only read after earlier writes.
+    ///
+    /// **Why the dirty page count alone does not answer it** (task-2209). A commit leaves its pages
+    /// dirty in the pool until the next fold, because they are already in the log. A read after any
+    /// write therefore saw dirty pages, counted as a write, and let the lock go instead of keeping
+    /// the read lease, so every read until the next fold took SHARED again and read the meta
+    /// record. In the gate a point read by rowid after 20,000 inserts cost 4.6 us against 1.4 us for
+    /// the same read on a folded file.
+    entry_mark: std::cell::Cell<StatementEntry>,
+}
+
+/// The log end and the dirty page count at the start of a statement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StatementEntry {
+    /// The end of what this connection had written or replayed into the log, a log sequence
+    /// number. It only grows, across segments too, so a new segment needs no field of its own.
+    pub(crate) written_end: u64,
+    /// The pool's dirty pages.
+    pub(crate) dirty_pages: usize,
 }
 
 /// The compiled statements this connection is holding on to.
@@ -1437,6 +1457,7 @@ impl Writing {
             implicit_transaction: std::cell::Cell::new(false),
             running: std::cell::Cell::new(0),
             settling: std::cell::Cell::new(false),
+            entry_mark: std::cell::Cell::new(StatementEntry::default()),
         }
     }
 
@@ -1532,6 +1553,18 @@ impl Writing {
     /// @param value - what to set it to
     pub(crate) fn set_settling(&self, value: bool) {
         self.settling.set(value);
+    }
+
+    /// Returns where the log and the pool stood when the outermost statement entered.
+    pub(crate) fn entry_mark(&self) -> StatementEntry {
+        self.entry_mark.get()
+    }
+
+    /// Records where the log and the pool stand as the outermost statement enters.
+    ///
+    /// @param mark - the log end, the segment and the dirty page count
+    pub(crate) fn set_entry_mark(&self, mark: StatementEntry) {
+        self.entry_mark.set(mark);
     }
 
     /// Returns statement txn.

@@ -1043,20 +1043,26 @@ impl Index {
         // The `?` is outside the join, because a closure that returns early out of
         // `join` would leave the other leg's result unclaimed. Both legs hand back a
         // `Result` and the vector leg's is unwrapped here.
-        let (vector_found, lexical_hits) = rayon::join(
-            || match branches.runs_vector() {
-                // **Only when the vector branch runs.** A lexical-only search is the
-                // fallback a caller uses when its embedder is down, and it passes an
-                // empty vector deliberately; refusing that would turn the fallback
-                // into a failure, which is the opposite of what it is for.
-                true => self.vector_search(query_vector, filter, candidates, ef_search),
-                false => Ok(Vec::new()),
-            },
-            || match branches.runs_lexical() {
-                true => self.lexical_search(query, filter, candidates),
-                false => Vec::new(),
-            },
-        );
+        //
+        // **Only when both legs run** (task-2209). Called from a thread outside the pool, which is
+        // every SQL search, `rayon::join` sends both closures into the pool and blocks until they
+        // finish, so a keyword search with no vector paid a handoff to another thread and back:
+        // 42% of `search_branches` on a 5,000 row table. One leg runs where it is called.
+        let (vector_found, lexical_hits) = match (branches.runs_vector(), branches.runs_lexical()) {
+            (true, true) => rayon::join(
+                || self.vector_search(query_vector, filter, candidates, ef_search),
+                || self.lexical_search(query, filter, candidates),
+            ),
+            (true, false) => (
+                self.vector_search(query_vector, filter, candidates, ef_search),
+                Vec::new(),
+            ),
+            (false, true) => (
+                Ok(Vec::new()),
+                self.lexical_search(query, filter, candidates),
+            ),
+            (false, false) => (Ok(Vec::new()), Vec::new()),
+        };
         let vector_hits = self.without_the_unembedded(vector_found?);
 
         let bounds = ScoreBounds {

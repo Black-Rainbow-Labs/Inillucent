@@ -574,4 +574,7 @@ Both are off by default.
 
 Every earlier measurement is in [Performance history](performance-history.md): the last graded
 engine run of 26 September 2026, the hill climbs through the Connection, all six rounds of the
-comparison of how programs call it, and the investigations behind each change.
+comparison of how programs call it, and the investigations behind each change. The latest hill climb
+made the gate's 82 workloads 51.5% faster through the Connection than release 2.3.4, and searches of
+an `inillucent_search` table 276% faster; [its section](performance-history.md#a-hill-climb-on-common-operations-against-release-234)
+has the figures.

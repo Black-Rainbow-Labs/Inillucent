@@ -1589,6 +1589,28 @@ tier = "differential"
 covers = ["inillucent-engine", "inillucent-exec"]
 requires = ["oracle"]
 
+# A one key hash GROUP BY that finds small integers by value, against SQLite
+# with integers, reals, NULLs and text in one statement (task-2209).
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "differential"
+module = "group_by"
+tier = "differential"
+covers = ["inillucent-engine", "inillucent-exec"]
+requires = ["oracle"]
+
+# Rowids allocated while the largest key is remembered, after writes of every
+# kind, against SQLite (task-2209).
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "differential"
+module = "rowid_hint"
+tier = "differential"
+covers = ["inillucent-engine", "inillucent-exec", "inillucent-tree"]
+requires = ["oracle"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"
@@ -2646,6 +2668,16 @@ package = "inillucent-compat"
 kind = "test"
 name = "durability"
 module = "process_readers"
+tier = "durability"
+covers = ["inillucent-cli", "inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-vfs"]
+
+# A reader holding the log segment's oplock sees another process's commit at
+# once, and the oplock is taken and given back (task-2209).
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "log_oplock"
 tier = "durability"
 covers = ["inillucent-cli", "inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-vfs"]
 

@@ -797,6 +797,75 @@ pub fn read_index(r: &mut impl Read) -> Result<Index> {
     Index::from_parts(config, store, vectors, graph, Some(lexical))
 }
 
+/// Reads back an index that `write_index` wrote, from bytes already in memory.
+///
+/// The same stream and the same checks as [`read_index`], without its copies. `read_index`
+/// copies each section out of its reader before parsing it, and grows each buffer a megabyte at
+/// a time, zeroing it first, because a reader cannot say how many bytes it really holds. Bytes in
+/// memory can: a section is a slice of them, and the vectors are copied once into a buffer of
+/// their final size. Measured on a segment of 5,000 rows of 384 numbers, the first search after an
+/// open spent half its time in `read_index`, most of it zeroing, copying and freeing.
+/// @param bytes - the bytes `write_index` produced
+pub fn read_index_bytes(bytes: &[u8]) -> Result<Index> {
+    let mut cursor = bytes;
+    check_header(&mut cursor, KIND_STREAM)?;
+    let saved: SavedConfig =
+        serde_json::from_slice(take_section(&mut cursor)?).context("reading the config")?;
+    let config = saved.to_config()?;
+    let store = Store::read_from(&mut take_section(&mut cursor)?).context("reading the store")?;
+    let vectors = {
+        let mut section = take_section(&mut cursor)?;
+        let mut buf4 = [0u8; 4];
+        section.read_exact(&mut buf4)?;
+        let dims = u32::from_le_bytes(buf4) as usize;
+        section.read_exact(&mut buf4)?;
+        let count = u32::from_le_bytes(buf4) as usize;
+        // The same refusal `read_index` makes of a product an attacker chose.
+        let wanted = dims
+            .checked_mul(count)
+            .ok_or_else(|| anyhow::anyhow!("a vector section claims {count} vectors of {dims}"))?;
+        let width = wanted
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| anyhow::anyhow!("a vector section claims {count} vectors of {dims}"))?;
+        let Some(raw) = section.get(..width) else {
+            anyhow::bail!("a vector section claims {count} vectors of {dims} and holds fewer");
+        };
+        // Native order, as `read_pod_vec` reads it.
+        let mut data = Vec::with_capacity(wanted);
+        data.extend(
+            raw.chunks_exact(4)
+                .filter_map(|four| <[u8; 4]>::try_from(four).ok())
+                .map(f32::from_ne_bytes),
+        );
+        VectorSet::from_raw(dims, config.metric, data)
+    };
+    let params = saved.hnsw_params();
+    let graph = Hnsw::read_graph(&mut take_section(&mut cursor)?, params)?;
+    let lexical = Bm25Index::read_from(&mut take_section(&mut cursor)?)
+        .context("reading the lexical index")?;
+    Index::from_parts(config, store, vectors, graph, Some(lexical))
+}
+
+/// Splits one length-prefixed section off the front of bytes in memory.
+///
+/// A length longer than what is left is an error, never an allocation, so a corrupt length
+/// costs nothing.
+/// @param cursor - the bytes still to read, advanced past the section
+fn take_section<'a>(cursor: &mut &'a [u8]) -> Result<&'a [u8]> {
+    let Some((length, rest)) = cursor.split_first_chunk::<8>() else {
+        anyhow::bail!("reading a section length: the stream ends");
+    };
+    let length = u64::from_le_bytes(*length);
+    let Some((section, after)) = usize::try_from(length)
+        .ok()
+        .and_then(|length| rest.split_at_checked(length))
+    else {
+        anyhow::bail!("index section claims {length} bytes, more than the stream holds");
+    };
+    *cursor = after;
+    Ok(section)
+}
+
 /// Writes one length-prefixed section.
 fn section(w: &mut impl Write, bytes: &[u8]) -> Result<()> {
     w.write_all(&(bytes.len() as u64).to_le_bytes())?;
@@ -2378,6 +2447,60 @@ mod tests {
         let loaded = read_index(&mut bytes.as_slice()).unwrap();
         assert_eq!(loaded.config().metric, crate::distance::Metric::L2);
         assert_eq!(loaded.vectors().copy_of(5), original.vectors().copy_of(5));
+    }
+
+    /// `read_index_bytes` reads what `read_index` reads, and refuses every truncation of it.
+    ///
+    /// The search module reads segments with `read_index_bytes` since task-2209, which slices each
+    /// section out of the bytes instead of copying it. Every vector, a keyword search and a vector
+    /// search must come back as `read_index` gives them, and a stream cut anywhere must be an
+    /// error rather than a shorter index or a panic.
+    #[test]
+    fn reading_from_memory_agrees_with_reading_a_stream() {
+        let original = small_index();
+        let mut bytes = Vec::new();
+        write_index(&original, &mut bytes).unwrap();
+        let streamed = read_index(&mut bytes.as_slice()).unwrap();
+        let sliced = read_index_bytes(&bytes).unwrap();
+        assert_eq!(sliced.vectors().len(), streamed.vectors().len());
+        for ordinal in 0..streamed.vectors().len() as u32 {
+            assert_eq!(
+                sliced.vectors().copy_of(ordinal),
+                streamed.vectors().copy_of(ordinal)
+            );
+        }
+        let filter = Filter::default();
+        let query = original.vectors().copy_of(11);
+        let near = |index: &Index| {
+            index
+                .vector_search(&query, &index.compile(&filter), 5, Some(64))
+                .expect("the query is this index's width and finite")
+        };
+        assert_eq!(near(&sliced), near(&streamed));
+        let words = |index: &Index| {
+            index
+                .search_branches(
+                    "offer eligibility",
+                    &[],
+                    &index.compile(&filter),
+                    10,
+                    None,
+                    crate::index::Branches::Lexical,
+                )
+                .expect("a keyword search")
+                .0
+                .iter()
+                .map(|hit| (hit.chunk, hit.score.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(words(&sliced), words(&streamed));
+        for cut in (0..bytes.len()).step_by(97) {
+            assert!(
+                read_index_bytes(&bytes[..cut]).is_err(),
+                "a stream cut at {cut} of {} bytes was read",
+                bytes.len()
+            );
+        }
     }
 
     // -- segment deltas ------------------------------------------------------

@@ -170,9 +170,9 @@ sha256 = "0c6c4ace63ffcb8104de467d93ae011623a00d0418c5bb2dcdd2a3cd97a49944"
 
 [[amendment]]
 path = "crates/inillucent-core/src/bm25.rs"
-ticket = "task-2117"
-reason = "clippy cleanup for the CI lint step: three explicit derefs that auto-deref already does are removed. No behaviour change."
-sha256 = "cb468c6f04b6f019644e4817162f075d49f9b6731fab15de049efa22bcf49a7d"
+ticket = "task-2209"
+reason = "keyword search sizes its per term, score and tier maps before filling them. Same results; checked by the search suites."
+sha256 = "da43b73b85eebc56a8a454769c7ebd332918076bbd1b4bbd63b49c8922dcc87f"
 
 [[amendment]]
 path = "crates/inillucent-core/src/distance.rs"
@@ -206,9 +206,9 @@ sha256 = "4182ddd2da345204712e76afd00077e777825676aa04d99225ce55fbc798345c"
 
 [[amendment]]
 path = "crates/inillucent-core/src/flat.rs"
-ticket = "task-1932"
-reason = "M4: the 33rd flag name is an error rather than an abort, so add_chunks and the four Index methods over it answer a Result"
-sha256 = "ef2b935a4f7ec6a35b8755f758e11eb863dc37fb28f7abeda781f3b9154c2e0d"
+ticket = "task-2209"
+reason = "the exact vector scan splits its work into tasks of at least 2,048 vectors. Same results; checked by the search suites."
+sha256 = "b034924d8df5e6adea39f46a8a66be40d53753f4651c6462bb6812ab8aab9b99"
 
 [[amendment]]
 path = "crates/inillucent-core/src/hnsw.rs"
@@ -218,9 +218,9 @@ sha256 = "4f7f5de8ef8a032a4b1c63ae71a3dee623c315263f3ac51ffde5ef4b59abfc26"
 
 [[amendment]]
 path = "crates/inillucent-core/src/index.rs"
-ticket = "task-2167"
-reason = "Index::set_document_attributes, so inillucent-search can put back the facet values a merge in 2.0.3 wrote without. Attributes are only read by a filter; nothing derived from them changes."
-sha256 = "b68c3bc018acc91545e0d49475dc66a4755c647cdf0cb007d8adef8b84086c08"
+ticket = "task-2209"
+reason = "a hybrid search runs one branch in place and joins only when both branches run. Same results; checked by the search suites."
+sha256 = "be2a3d087b9aad227c2962fd51c077cd149a12701c2ce48cab5dbfb99db79af2"
 
 [[amendment]]
 path = "crates/inillucent-core/src/install.rs"
@@ -242,9 +242,9 @@ sha256 = "99e6623fdd7f1026b6829b901ebc2b8107b7ddd3c6abc37cd4518de3fdfaa9ba"
 
 [[amendment]]
 path = "crates/inillucent-core/src/persist.rs"
-ticket = "task-2068"
-reason = "a load counts where the text section begins and files the arena there rather than reading it; write_to still writes the text inline, so an index written by any build opens under either."
-sha256 = "96aa68a5a91c85fdad287b5d2bc23e5b20a116580945961f6dd31370bc81c167"
+ticket = "task-2209"
+reason = "a search segment is read from bytes already in memory without copying each section; reading_from_memory_agrees_with_reading_a_stream checks it against the stream reader."
+sha256 = "fc2996adde4e4646c332fb091d9a313c206c5f65485714539fb62c0deaa99907"
 
 [[amendment]]
 path = "crates/inillucent-core/src/quantize.rs"

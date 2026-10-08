@@ -969,6 +969,9 @@ impl Bm25Index {
                     1.0 / variants.len() as f32
                 };
                 let idf = self.idf(postings.len());
+                // Sized before the loop (task-2209): growing these maps one rehash at a time
+                // was a quarter of a keyword search over 5,000 rows whose terms match thousands.
+                per_term.reserve(postings.len());
                 for p in postings.iter() {
                     if !trivial && !filter.passes(p.chunk, store) {
                         continue;
@@ -988,6 +991,7 @@ impl Bm25Index {
                     *per_term.entry(p.chunk).or_insert(0.0) += weight * contribution;
                 }
             }
+            scores.reserve(per_term.len());
             for (chunk, contribution) in per_term.drain() {
                 let entry = scores.entry(chunk).or_insert((0.0, 0.0, 0));
                 entry.0 += contribution;
@@ -999,7 +1003,7 @@ impl Bm25Index {
         // The tier is carried alongside the hit rather than folded into the score,
         // because folding it in would need a constant bigger than any possible score
         // difference, and there is no such constant that is also safe.
-        let mut tiers: HashMap<u32, u32> = HashMap::new();
+        let mut tiers: HashMap<u32, u32> = HashMap::with_capacity(scores.len());
         let hits: Vec<LexicalHit> = scores
             .into_iter()
             .map(|(chunk, (score, mass, matched))| {

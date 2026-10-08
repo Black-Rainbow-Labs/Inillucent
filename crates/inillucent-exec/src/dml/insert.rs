@@ -1140,8 +1140,17 @@ fn place_row(
         if let Some(previous) = previous {
             write_index_entry(index, target, &previous, false)?;
         }
-        if let Some(after) = after {
-            write_index_entry(index, target, &after, true)?;
+        // **A new row's entry in a non unique index is a new key** (task-2209). Every caller
+        // reaches here with no previous row only after the conflict checks proved the row's key
+        // free, and such an entry ends in that key, so the tree searches only its delta directory
+        // for it, as `place_row_absent` already does. A unique index keys its entries on the
+        // indexed values alone and keeps `put`.
+        match after {
+            Some(after) if before.is_none() && !index.unique => {
+                add_new_row_entry(index, target, &after)?;
+            }
+            Some(after) => write_index_entry(index, target, &after, true)?,
+            None => {}
         }
     }
     let (database, trees, log) = target.parts_for(table.root)?;

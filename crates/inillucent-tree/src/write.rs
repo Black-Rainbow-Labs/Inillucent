@@ -781,9 +781,35 @@ impl PagedTree {
         log: &mut dyn TreeLog,
         row: &[Datum<'_>],
     ) -> DbResult<bool> {
-        Ok(self
+        // **An append keeps the largest key hint, as `put_absent` does** (task-2209). The write
+        // forgets the hint for the leaf it touches, so every insert through `put` made the next
+        // rowid allocation descend the tree again: 4.7% of a row into a table with two indexes.
+        let appending = self.appending_key(database, row);
+        let replaced = self
             .write_row(database, log, row, false, true, false)?
-            .is_some())
+            .is_some();
+        if let (false, Some((key, page))) = (replaced, appending) {
+            self.note_appended_key(database.pool(), page, key);
+        }
+        Ok(replaced)
+    }
+
+    /// Returns a one column integer key that lies above the remembered largest key, with the leaf
+    /// the memory was read from: the case in which writing the row keeps the memory true by
+    /// moving it to this key.
+    ///
+    /// @param database - the file
+    /// @param row - the row about to be written, key first
+    fn appending_key(&self, database: &Database, row: &[Datum<'_>]) -> Option<(i64, PageId)> {
+        match (self.key_columns(), row.first()) {
+            (1, Some(Datum::Int(key))) => {
+                let page = self.largest_hint_page()?;
+                self.hinted_largest_key(database.pool())
+                    .filter(|largest| key > largest)
+                    .map(|_| (*key, page))
+            }
+            _ => None,
+        }
     }
 
     /// Inserts one row whose key the caller knows is not live in the tree.
@@ -841,18 +867,12 @@ impl PagedTree {
     ) -> DbResult<bool> {
         // An append above the remembered largest key keeps the memory true
         // (task-2191). See `PagedTree::largest_hint`.
-        let appending = match (self.key_columns(), row.first()) {
-            (1, Some(Datum::Int(key))) => self
-                .hinted_largest_key(database.pool())
-                .filter(|largest| key > largest)
-                .map(|_| *key),
-            _ => None,
-        };
+        let appending = self.appending_key(database, row);
         let placed = self
             .write_row(database, log, row, false, false, false)?
             .is_none();
-        if let (true, Some(key)) = (placed, appending) {
-            self.note_appended_key(database.pool(), key);
+        if let (true, Some((key, page))) = (placed, appending) {
+            self.note_appended_key(database.pool(), page, key);
         }
         Ok(placed)
     }

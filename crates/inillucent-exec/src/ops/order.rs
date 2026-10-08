@@ -450,12 +450,14 @@ impl Sink for TopN {
             downstream: _,
         } = self;
         let width = batch.columns.len();
-        // One sort term is the shape every `ORDER BY ... LIMIT n` in the
-        // scorecard has, and the shape the fast rejection test needs. A
-        // multi-term sort falls through to the general comparison, which is
-        // what every term used to cost.
-        let single = if keys.len() == 1 { keys.first() } else { None };
-        let reader = single.map(|term| KeyColumn::of(batch, term.column));
+        // **The first term decides most rejections, however many terms there
+        // are** (task-2209). Only a one term sort used the fast reader, so
+        // `ORDER BY label, id LIMIT 10` compared every row through the general
+        // path. The first term is read the fast way for any sort, and only a
+        // row whose first key equals the worst kept row's goes on to the
+        // remaining terms.
+        let first = keys.first();
+        let reader = first.map(|term| KeyColumn::of(batch, term.column));
         for nth in 0..batch.live() {
             // Compare before materialising. `ORDER BY label LIMIT 100` over
             // 100,000 rows keeps 100 of them, so copying every row into owned
@@ -464,14 +466,21 @@ impl Sink for TopN {
             // columns straight out of the batch, which is still borrowing the
             // page, and only a row that earns its place is copied.
             if best.len() >= *limit {
-                let worse = match (best.last(), single, reader.as_ref()) {
+                let worse = match (best.last(), first, reader.as_ref()) {
                     (Some(worst), Some(term), Some(reader)) => {
                         let candidate = reader.at(batch.row_at(nth))?;
                         let held = worst
                             .get(term.column)
                             .map(OwnedDatum::borrow)
                             .unwrap_or(Datum::Null);
-                        order_under(&candidate, &held, term) != Ordering::Less
+                        match order_under(&candidate, &held, term) {
+                            Ordering::Less => false,
+                            Ordering::Greater => true,
+                            Ordering::Equal => {
+                                keys.len() == 1
+                                    || compare_batch_row(batch, nth, worst, keys)? != Ordering::Less
+                            }
+                        }
                     }
                     (Some(worst), _, _) => {
                         compare_batch_row(batch, nth, worst, keys)? != Ordering::Less

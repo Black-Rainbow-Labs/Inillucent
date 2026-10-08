@@ -82,6 +82,15 @@ const ROLE_ROWID: char = 'i';
 /// collide; `options::MAX_FACET_COLUMN` is what keeps a position inside it.
 const ROLE_FACET_FIRST: u8 = b'A';
 
+/// Returns the ids of a segment manifest in ascending order, the order the cache keys by.
+///
+/// @param segments - the manifest
+fn sorted_ids(segments: &[SegmentMeta]) -> Vec<i64> {
+    let mut ids: Vec<i64> = segments.iter().map(|segment| segment.id).collect();
+    ids.sort_unstable();
+    ids
+}
+
 /// The module.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SearchModule;
@@ -275,8 +284,11 @@ impl SearchTable {
                 digest,
             },
         )?;
+        // The cache is not dropped here. It is keyed by the live segments and the delta entries it
+        // applied, and the next search applies only the entries added since. Dropping it on every
+        // write made a search after each insert load every segment again: 51 ms a cycle on 5,000
+        // rows of 384 numbers.
         self.touched = true;
-        self.cache.forget();
         Ok(())
     }
 
@@ -462,6 +474,7 @@ impl SearchTable {
         })?;
         self.store.write_generation(context, id, &bytes)?;
         let mut segments = merge::live_segments(context, &self.store)?;
+        let before = sorted_ids(&segments);
         segments.push(SegmentMeta {
             id,
             level: 0,
@@ -486,7 +499,8 @@ impl SearchTable {
             .set_state(context, state::CHUNKS, total_chunks(&segments))?;
         self.store.forget_deltas(context, highest)?;
         self.store.set_state(context, state::BUILD, highest)?;
-        self.cache.forget();
+        self.cache
+            .after_flush(&before, &pending, sorted_ids(&segments));
         self.merge_cascade(context)
     }
 
@@ -876,6 +890,7 @@ impl SearchTable {
             .unwrap_or(0);
         let merged_ids: Vec<i64> = state.inputs.iter().map(|segment| segment.id).collect();
         let mut segments = merge::live_segments(context, &self.store)?;
+        let before = sorted_ids(&segments);
         segments.retain(|segment| !merged_ids.contains(&segment.id));
         segments.push(SegmentMeta {
             id: state.accumulator,
@@ -891,7 +906,7 @@ impl SearchTable {
         // `state::MERGE` itself is not touched here: `merge_cascade` is what
         // owns the list of every in-flight merge, and this one's absence
         // from it is simply this merge never being added back to `kept`.
-        self.cache.forget();
+        self.cache.after_merge(&before, sorted_ids(&segments));
         Ok(())
     }
 
@@ -1241,11 +1256,14 @@ impl VirtualTable for SearchTable {
     }
 
     /// Ends the transaction.
+    ///
+    /// The cached index is kept. What the transaction wrote is now committed, so an index that
+    /// covers it is still an index of the table, and its key is checked against the live
+    /// segments and the delta log before every search in any case.
     fn commit(&mut self, _context: &mut Context<'_>) -> DbResult<()> {
         self.pending = None;
         self.marks.clear();
         self.touched = false;
-        self.cache.forget();
         Ok(())
     }
 

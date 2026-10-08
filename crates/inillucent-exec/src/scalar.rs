@@ -903,6 +903,25 @@ impl Eval for IntByConstant {
         let right = self.general.right.value(batch, nth)?;
         self.general.apply(left, right)
     }
+
+    /// Divides a whole batch of integers by the constant, when the left side is integers
+    /// throughout; the rule per value is the one `value` applies.
+    fn ints_over(&self, batch: &Batch<'_>, out: &mut Vec<i64>) -> bool {
+        if !self.general.left.ints_over(batch, out) {
+            return false;
+        }
+        for number in out.iter_mut() {
+            let answer = match self.general.op {
+                BinaryOp::Modulo => number.checked_rem(self.divisor),
+                _ => number.checked_div(self.divisor),
+            };
+            match answer {
+                Some(answer) => *number = answer,
+                None => return false,
+            }
+        }
+        true
+    }
 }
 
 /// Returns how many bytes a value's text form takes.
@@ -1278,11 +1297,8 @@ pub(crate) fn like_shape(pattern: &[u8], subject: &[u8], fold: bool) -> Option<b
     // SQLite reads a pattern and a subject as C strings, so each ends at its
     // first NUL: `'a' LIKE ('a' || x'00' || 'zz')` is 1. The general matcher
     // keeps that rule, and text holding a NUL goes to it.
-    if pattern.contains(&0) || subject.contains(&0) {
+    if pattern.contains(&0) {
         return None;
-    }
-    if pattern.iter().all(|byte| *byte == b'%') && !pattern.is_empty() {
-        return Some(true);
     }
     let leading = pattern.first() == Some(&b'%');
     let trailing = pattern.len() > 1 && pattern.last() == Some(&b'%');
@@ -1291,6 +1307,23 @@ pub(crate) fn like_shape(pattern: &[u8], subject: &[u8], fold: bool) -> Option<b
     let literal = pattern.get(from..to)?;
     if literal.iter().any(|byte| *byte == b'%' || *byte == b'_') {
         return None;
+    }
+    // **`%literal%` looks for a NUL only before the end of a match** (task-2209). A subject cut
+    // at a NUL is a prefix of the whole, so a whole subject without the literal cannot hold it
+    // cut either, and one with the literal holds it cut exactly when no NUL comes before the
+    // match ends. Scanning every subject for a NUL first read each row twice.
+    if leading && trailing && !literal.is_empty() {
+        return match find_literal(subject, literal, fold) {
+            None => Some(false),
+            Some(end) if subject.get(..end).is_some_and(|head| !head.contains(&0)) => Some(true),
+            Some(_) => None,
+        };
+    }
+    if subject.contains(&0) {
+        return None;
+    }
+    if pattern.iter().all(|byte| *byte == b'%') && !pattern.is_empty() {
+        return Some(true);
     }
     let same = |left: &[u8], right: &[u8]| {
         left.len() == right.len()
@@ -1325,12 +1358,18 @@ pub(crate) fn like_shape(pattern: &[u8], subject: &[u8], fold: bool) -> Option<b
 /// @param literal - the literal, not empty
 /// @param fold - whether ASCII letters match regardless of case
 fn holds_literal(subject: &[u8], literal: &[u8], fold: bool) -> bool {
-    let Some((&first, rest)) = literal.split_first() else {
-        return true;
-    };
-    let Some(last_start) = subject.len().checked_sub(literal.len()) else {
-        return false;
-    };
+    literal.is_empty() || find_literal(subject, literal, fold).is_some()
+}
+
+/// Returns the end of the first place a text holds a literal, letters compared as `like_shape`
+/// compares them, or `None` when it does not hold it.
+///
+/// @param subject - the text being matched
+/// @param literal - the literal, not empty
+/// @param fold - whether ASCII letters match regardless of case
+fn find_literal(subject: &[u8], literal: &[u8], fold: bool) -> Option<usize> {
+    let (&first, rest) = literal.split_first()?;
+    let last_start = subject.len().checked_sub(literal.len())?;
     let (lower, upper) = match fold {
         true => (first.to_ascii_lowercase(), first.to_ascii_uppercase()),
         false => (first, first),
@@ -1344,26 +1383,52 @@ fn holds_literal(subject: &[u8], literal: &[u8], fold: bool) -> bool {
     };
     let mut at = 0usize;
     while at <= last_start {
-        let Some(window) = subject.get(at..=last_start) else {
-            return false;
-        };
-        let found = match lower == upper {
-            true => window.iter().position(|byte| *byte == lower),
-            false => window
-                .iter()
-                .position(|byte| *byte == lower || *byte == upper),
-        };
-        let Some(offset) = found else {
-            return false;
-        };
+        let window = subject.get(at..=last_start)?;
+        let offset = first_of_two(window, lower, upper)?;
         let start = at.saturating_add(offset);
-        let tail = subject.get(start.saturating_add(1)..start.saturating_add(literal.len()));
+        let end = start.saturating_add(literal.len());
+        let tail = subject.get(start.saturating_add(1)..end);
         if tail.is_some_and(|tail| same(rest, tail)) {
-            return true;
+            return Some(end);
         }
         at = start.saturating_add(1);
     }
-    false
+    None
+}
+
+/// Returns the position of the first byte equal to either of two, eight bytes at a time.
+///
+/// The word test is the one `memchr` uses: a byte of `word ^ repeated(b)` is zero exactly where
+/// the word holds `b`, and `(x - 0x01..) & !x & 0x80..` is nonzero exactly when some byte of `x`
+/// is zero. A word that may hold one is then searched byte by byte, so the answer is the first.
+///
+/// @param haystack - the bytes to search
+/// @param lower - one byte to look for
+/// @param upper - the other, or the same byte again
+fn first_of_two(haystack: &[u8], lower: u8, upper: u8) -> Option<usize> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    let has_zero = |word: u64| word.wrapping_sub(ONES) & !word & HIGHS != 0;
+    let (lows, ups) = (
+        ONES.wrapping_mul(u64::from(lower)),
+        ONES.wrapping_mul(u64::from(upper)),
+    );
+    let mut chunks = haystack.chunks_exact(8);
+    let mut base = 0usize;
+    for chunk in chunks.by_ref() {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(chunk);
+        let word = u64::from_le_bytes(bytes);
+        if has_zero(word ^ lows) || has_zero(word ^ ups) {
+            break;
+        }
+        base = base.saturating_add(8);
+    }
+    haystack
+        .get(base..)?
+        .iter()
+        .position(|byte| *byte == lower || *byte == upper)
+        .map(|offset| base.saturating_add(offset))
 }
 
 #[cfg(test)]

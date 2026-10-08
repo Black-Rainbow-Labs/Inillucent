@@ -156,24 +156,35 @@ impl PagedTree {
         }
     }
 
+    /// Returns the leaf the remembered largest key was read from, when there is one.
+    pub(crate) fn largest_hint_page(&self) -> Option<PageId> {
+        self.largest_hint.get().map(|hint| hint.page)
+    }
+
     /// Moves the remembered largest key up to a key this tree just appended.
     ///
     /// Called right after the append, with nothing else written between, by
     /// a caller that saw the hint hold before it: the leaf then holds what it
     /// held plus this key, so the key is the largest.
     ///
+    /// **The leaf is the caller's, read before the append** (task-2209). The
+    /// append's own write forgets the hint for the leaf it changes, so this read
+    /// the hint back, found none, and kept nothing: every append left the next
+    /// rowid to be found by descending the tree. The leaf is checked again here
+    /// to still be this tree's rightmost one, so an append that split it keeps
+    /// nothing.
+    ///
     /// @param pool - the buffer pool
+    /// @param leaf - the leaf the hint was read from before the append
     /// @param key - the key appended
-    pub(crate) fn note_appended_key(&self, pool: &Pool, key: i64) {
-        let Some(hint) = self.largest_hint.get() else {
-            return;
-        };
-        let refreshed = pool.fetch(hint.page).ok().and_then(|guard| {
+    pub(crate) fn note_appended_key(&self, pool: &Pool, leaf: PageId, key: i64) {
+        let refreshed = pool.fetch(leaf).ok().and_then(|guard| {
             let still = page::kind_of(&guard).ok() == Some(PageKind::Leaf)
+                && page::tree_of(&guard).ok() == Some(self.tree_id)
                 && page::right_of(&guard).ok() == Some(PageId::NONE);
             let lsn = page::lsn_of(&guard).ok().filter(|lsn| *lsn != 0)?;
             still.then_some(LargestHint {
-                page: hint.page,
+                page: leaf,
                 lsn,
                 largest: key,
             })

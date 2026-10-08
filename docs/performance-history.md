@@ -464,6 +464,43 @@ of leaves that a bulk build packed full, so each leaf is packed again and split.
 `tasks/task-2185-performance-hillclimb-3.md` lists every change, every measurement and the changes
 that were tried and not kept.
 
+### A hill climb on common operations against release 2.3.4
+
+This one measured inillucent against its own release 2.3.4, on both plans
+through the Connection and on a new search benchmark, `inillucent-searchprobe`: 5,000 rows of 384
+numbers in an `inillucent_search` table, with inserts, keyword, vector and hybrid searches, an insert
+then a search, and the first search after an open. A case's score is its speedup against 2.3.4. For
+a gate workload that is one round's ratio to SQLite divided by 2.3.4's median ratio, so SQLite still
+cancels a machine that slows down. A set's score is the geometric mean of its cases' medians.
+Measured on 7 October 2026 in two quiet windows, three interleaved passes of every build, 60 rounds
+of each gate workload and three runs of each search case:
+
+| Set | Cases | After the climb, against 2.3.4 |
+|---|---:|---|
+| gate workloads, both plans | 82 | **51.5% faster** |
+| gate workloads, train | 53 | 50.2% faster |
+| gate workloads, test | 29 | 53.8% faster |
+| search cases | 6 | **276% faster** |
+| every case | 88 | 61% faster |
+
+Two builds that change no code the gate runs read 0.3% faster and 0.1% slower, which is the noise of
+these numbers.
+
+| Workload | Change in inillucent | What changed |
+|---|---|---|
+| an insert then a search, `inillucent_search` | 158 times faster | a connection keeps its loaded index across its own writes and commits and adds only the new rows |
+| `ai.group.total` | 678% faster | a one key `GROUP BY` finds a small integer key's group by value, and aggregates read their arguments a batch of rows at a time |
+| `ai.point.rowid`, `ai.point.newest` | 455% and 460% faster | a read after a write keeps the read lock for the next statement, and on Windows a held oplock on the log segment answers its length without a system call |
+| `point.rowid` | 116% faster | the oplock |
+| keyword search | 208% faster | a search with one branch runs where it is called instead of through the thread pool, and the BM25 maps are sized before scoring |
+| `churn.scan` | 87% faster | the batch evaluation of aggregate arguments |
+| `app.order.text.limit` | 75% faster | a top N with several sort terms rejects rows by the first term's typed reader |
+| 5,000 inserts into `inillucent_search` | 51% faster | an exact table builds a two link graph, since it never walks one |
+| `write.insert.batch` | about 4% slower | the log segment's writes go through overlapped I/O on Windows |
+
+`tasks/task-2209-performance-hillclimb-7.md` lists all fourteen changes, the two rounds of advice
+they came from, what was tried and not kept, and the tests.
+
 ## Through the command line, the shell, Python and Node
 
 Every number above times statements inside one process. Most people call inillucent another way: one

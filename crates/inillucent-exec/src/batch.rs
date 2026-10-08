@@ -481,6 +481,167 @@ impl<'p> Batch<'p> {
     pub fn is_dense(&self) -> bool {
         self.selection.is_none()
     }
+
+    /// Calls `each` with the row index of every live row, in order.
+    ///
+    /// @param each - what to do with one row's index
+    pub fn for_each_live(&self, mut each: impl FnMut(usize)) {
+        match self.selection {
+            Some(selection) => {
+                for row in selection {
+                    each(*row as usize);
+                }
+            }
+            None => {
+                for row in 0..self.rows {
+                    each(row);
+                }
+            }
+        }
+    }
+
+    /// Writes one column's value for every live row into `out` as integers, and answers whether
+    /// every one was a non NULL integer.
+    ///
+    /// **The batch half of `Eval::ints_over`** (task-2209). An aggregate over an expression read
+    /// each row through two dynamic calls and a `Datum`; reading a typed column's slots in one
+    /// loop is what lets `sum(length(label))` and `GROUP BY grp` work a batch at a time. `out` is
+    /// cleared first, and its contents mean nothing when the answer is false.
+    ///
+    /// @param column - which column
+    /// @param out - where the values go, one per live row
+    pub fn ints_of(&self, column: usize, out: &mut Vec<i64>) -> bool {
+        out.clear();
+        let Some(vector) = self.columns.get(column) else {
+            return false;
+        };
+        out.reserve(self.live());
+        match (vector, self.selection) {
+            (
+                Vector::Int64 {
+                    bytes,
+                    width,
+                    base,
+                    class: None,
+                },
+                None,
+            ) => {
+                DenseInts {
+                    bytes,
+                    width: *width,
+                    base: *base,
+                }
+                .range(0, self.rows)
+                .for_each(|value| out.push(value));
+                out.len() == self.rows
+            }
+            (
+                Vector::Int64 {
+                    bytes,
+                    width,
+                    base,
+                    class: None,
+                },
+                Some(selection),
+            ) => {
+                for row in selection {
+                    out.push(read_slot(bytes, *width, *base, *row as usize));
+                }
+                true
+            }
+            (Vector::Const(Datum::Int(value)), _) => {
+                out.resize(self.live(), *value);
+                true
+            }
+            (Vector::Int64 { .. } | Vector::Column(_) | Vector::Values(_), _) => {
+                let mut every = true;
+                self.for_each_live(|row| match vector.at(row) {
+                    Ok(Datum::Int(value)) if every => out.push(value),
+                    _ => every = false,
+                });
+                every
+            }
+            _ => false,
+        }
+    }
+
+    /// Writes one column's value for every live row into `out` as doubles, and answers whether
+    /// every one was a non NULL real.
+    ///
+    /// The real counterpart of [`Batch::ints_of`]; an integer in the column is a no, so a sum
+    /// that has to switch between the two classes keeps the per row path.
+    ///
+    /// @param column - which column
+    /// @param out - where the values go, one per live row
+    pub fn reals_of(&self, column: usize, out: &mut Vec<f64>) -> bool {
+        out.clear();
+        let Some(vector) = self.columns.get(column) else {
+            return false;
+        };
+        out.reserve(self.live());
+        match (vector, self.selection) {
+            (Vector::Float64 { bytes, class: None }, None) => {
+                for slot in bytes.chunks_exact(8).take(self.rows) {
+                    let mut word = [0u8; 8];
+                    word.copy_from_slice(slot);
+                    out.push(f64::from_bits(u64::from_le_bytes(word)));
+                }
+                out.len() == self.rows
+            }
+            (Vector::Const(Datum::Real(value)), _) => {
+                out.resize(self.live(), *value);
+                true
+            }
+            (Vector::Float64 { .. } | Vector::Column(_) | Vector::Values(_), _) => {
+                let mut every = true;
+                self.for_each_live(|row| match vector.at(row) {
+                    Ok(Datum::Real(value)) if every => out.push(value),
+                    _ => every = false,
+                });
+                every
+            }
+            _ => false,
+        }
+    }
+
+    /// Writes `length(x)` of one text or blob column for every live row into `out`, and answers
+    /// whether the column is a typed variable width one with no NULL, the only kind this reads.
+    ///
+    /// Characters up to the first NUL for text and bytes for a blob, which is `Length`'s rule.
+    ///
+    /// @param column - which column
+    /// @param out - where the lengths go, one per live row
+    pub fn lengths_of(&self, column: usize, out: &mut Vec<i64>) -> bool {
+        out.clear();
+        let Some(Vector::Variable {
+            slots,
+            width,
+            page,
+            text,
+        }) = self.columns.get(column)
+        else {
+            return false;
+        };
+        out.reserve(self.live());
+        let mut every = true;
+        self.for_each_live(|row| {
+            let at = row.saturating_mul(*width);
+            let Some(slot) = slots.get(at..at.saturating_add(*width)) else {
+                every = false;
+                return;
+            };
+            let (offset, length) = inillucent_tree::types::read_heap_slot(slot);
+            let bytes = page
+                .get(offset..offset.saturating_add(length))
+                .unwrap_or(&[]);
+            out.push(if *text {
+                inillucent_value::encoding::utf8_character_count_to_nul(bytes) as i64
+            } else {
+                bytes.len() as i64
+            });
+        });
+        every
+    }
 }
 
 #[cfg(test)]

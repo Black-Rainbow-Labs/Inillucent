@@ -1218,3 +1218,43 @@ fn a_statement_outside_a_transaction_rereads_nothing() {
         "one step of `SELECT 1` made {trivial_allocations} allocation(s) against a bound of {STEP_ALLOCATIONS}"
     );
 }
+
+/// Reads after a write keep the read lease, so they read the meta record about as rarely as reads
+/// after nothing.
+///
+/// **What this guards** (task-2209). A commit leaves its pages dirty in the pool until the next
+/// fold, because they are already in the log. `release_if_idle` counted those dirty pages as a
+/// write by the statement ending, so every read after any write let the lock go, and the next read
+/// took it again and read the meta record: one probe a statement, where a read on a folded file
+/// makes almost none. In the gate a point read by rowid after 20,000 inserts cost 4.6 us against
+/// 1.4 us. The lease is let go after `lease::MOST` and `lease::IDLE`, so a few probes over
+/// `RUNS` statements are expected; the bound is a tenth of a probe a statement, against the one a
+/// statement this reached before.
+#[test]
+fn reads_after_a_write_keep_the_read_lease() {
+    let directory = scratch("reads-after-a-write");
+    let database = build(&directory.join("b.rdb"));
+    let connection = database.session();
+    connection
+        .execute("INSERT INTO t VALUES (100000, 'later@example.com', 3)")
+        .expect("one autocommit write");
+    let mut statement = connection
+        .prepare("SELECT bucket FROM t WHERE id = ?1")
+        .expect("the statement prepares");
+    let before = database.cache_stats();
+    for id in 0..RUNS {
+        statement.reset();
+        statement
+            .bind_integer(1, (id as i64).wrapping_mul(97) % ROWS)
+            .expect("the id binds");
+        assert!(statement.step().expect("the statement steps"));
+    }
+    let after = database.cache_stats();
+    let meta_probes = after.meta_probes.saturating_sub(before.meta_probes);
+    println!("{RUNS} point reads after one autocommit write: {meta_probes} record read(s)");
+    assert!(
+        meta_probes <= RUNS / 10,
+        "{RUNS} point reads after one write read the meta record {meta_probes} time(s); a read \
+         that keeps the lease reads it only when the lease has run out"
+    );
+}

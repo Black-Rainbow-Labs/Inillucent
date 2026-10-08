@@ -182,6 +182,48 @@ impl Cache {
         }
     }
 
+    /// Keeps the cached index after this connection's own flush moved delta entries into a segment.
+    ///
+    /// A flush writes a new segment from exactly the delta entries above the covered mark and
+    /// removes those entries from the log. A cached index built over the segments before the
+    /// flush plus those same entries holds the same live rows as one built over the segments
+    /// after it, so only its key changes. Without this, the first search after every commit that
+    /// crossed the flush threshold loaded every segment again: 36 ms on 5,000 rows of 384
+    /// numbers, against well under a millisecond for the search itself.
+    ///
+    /// @param before - the live segment ids before the flush, sorted
+    /// @param flushed - the delta entries the flush wrote into the new segment, in log order
+    /// @param after - the live segment ids after the flush, sorted
+    pub fn after_flush(&self, before: &[i64], flushed: &[Delta], after: Vec<i64>) {
+        let Ok(mut held) = self.inner.lock() else {
+            return;
+        };
+        match held.as_mut() {
+            Some(cached) if cached.segments == before && cached.applied == flushed => {
+                cached.segments = after;
+                cached.applied = Vec::new();
+            }
+            _ => *held = None,
+        }
+    }
+
+    /// Keeps the cached index after a finished merge replaced some segments with one.
+    ///
+    /// A merge folds its inputs into one segment that holds the same live rows, and it does not
+    /// touch the delta log, so a cached index over the inputs is an index over the result.
+    ///
+    /// @param before - the live segment ids before the merge, sorted
+    /// @param after - the live segment ids after the merge, sorted
+    pub fn after_merge(&self, before: &[i64], after: Vec<i64>) {
+        let Ok(mut held) = self.inner.lock() else {
+            return;
+        };
+        match held.as_mut() {
+            Some(cached) if cached.segments == before => cached.segments = after,
+            _ => *held = None,
+        }
+    }
+
     /// Answers one search, refreshing the merged index first.
     pub fn search(
         &self,
@@ -243,7 +285,19 @@ pub fn configuration(options: &Options) -> IndexConfig {
         // "never traverse": every vector search compares every candidate, which
         // is the only setting that is correct by construction and is what an
         // exact table promises.
-        Mode::Exact => config.hnsw.exhaustive_below = usize::MAX,
+        //
+        // An exact table never walks its graph, so it gets the same two link graph a lexical
+        // only table gets below: the structures stay indexed by chunk ordinal and `append` still
+        // finds a graph to extend, but a flush no longer spends most of its time linking nodes
+        // nobody visits. Measured on 5,000 rows of 384 numbers inserted in one transaction, the
+        // graph build was 58% of the processor time of the insert. A table cannot change its
+        // mode after it is created, and a `m` or `ef_construction` the declaration names still
+        // applies, because those are set after this.
+        Mode::Exact => {
+            config.hnsw.exhaustive_below = usize::MAX;
+            config.hnsw.m = 2;
+            config.hnsw.ef_construction = 2;
+        }
         Mode::Approximate => {}
     }
     if !options.has_vectors() {
@@ -1083,8 +1137,7 @@ fn load_segment_bytes(
     require_sealed: bool,
 ) -> DbResult<Index> {
     if !inillucent_core::persist::is_segment_delta(bytes) {
-        let mut cursor: &[u8] = bytes;
-        return inillucent_core::persist::read_index(&mut cursor).map_err(|error| {
+        return inillucent_core::persist::read_index_bytes(bytes).map_err(|error| {
             failure(format!(
                 "inillucent_search: unreadable segment {id}: {error}"
             ))

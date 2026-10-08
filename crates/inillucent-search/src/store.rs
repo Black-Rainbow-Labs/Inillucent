@@ -682,6 +682,12 @@ impl Store {
             if !same_generation || !same_ordinal {
                 return Ok(None);
             }
+            // Sized once from the first part, because `write_generation` cuts every part but the
+            // last to the same length. Growing by doubling copied a 7.7 MB segment several times
+            // on its way in.
+            if ordinal == 0 {
+                bytes.reserve(blob.raw().len().saturating_mul(parts.max(1) as usize));
+            }
             bytes.extend_from_slice(blob.raw());
         }
         Ok(Some(bytes))

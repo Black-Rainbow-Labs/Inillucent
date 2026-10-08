@@ -312,6 +312,11 @@ struct Reaper {
     cells: Mutex<Vec<Weak<LeaseCell>>>,
     /// Woken when a cell is added.
     wake: Condvar,
+    /// Whether the thread found no lease and is waiting on `wake`, or about to.
+    waiting: AtomicBool,
+    /// Set by every `watch` and cleared by the thread's look, so the thread can tell leases that
+    /// keep being armed from a connection that has gone quiet.
+    recent: AtomicBool,
 }
 
 /// The one releasing thread of this process, started by the first lease.
@@ -332,6 +337,8 @@ fn reaper() -> &'static Reaper {
         Reaper {
             cells: Mutex::new(Vec::new()),
             wake: Condvar::new(),
+            waiting: AtomicBool::new(false),
+            recent: AtomicBool::new(false),
         }
     });
     if first {
@@ -368,8 +375,21 @@ impl Reaper {
     /// sent between the thread's look and its wait was lost, and an idle
     /// lease was kept until the next statement.
     ///
+    /// **Nothing at all when the cell is listed and the thread is not waiting** (task-2209). This
+    /// runs after every statement that only read, and taking the list's lock and notifying the
+    /// condition variable each time was a kernel call per statement to wake a thread that was
+    /// almost always asleep in `thread::sleep`, where a notify does nothing. The thread sets
+    /// `waiting` before it looks for a lease, and this reads it after the lease was armed, with a
+    /// sequentially consistent fence on both sides. So either the thread's look comes after the
+    /// arm and finds the lease, or this sees `waiting` and wakes it under the lock as before.
+    ///
     /// @param cell - the cell that was just armed
     fn watch(&self, cell: &Arc<LeaseCell>) {
+        self.recent.store(true, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if cell.queued.load(Ordering::Acquire) && !self.waiting.load(Ordering::SeqCst) {
+            return;
+        }
         let mut cells = self.cells();
         if !cell.queued.swap(true, Ordering::AcqRel) {
             cells.push(Arc::downgrade(cell));
@@ -380,18 +400,34 @@ impl Reaper {
 
     /// The thread's loop: sleep until the earliest lease ends, let the ended
     /// ones go, and wait for a lease when there is none.
+    ///
+    /// **It looks again after `IDLE` instead of waiting while leases keep being armed**
+    /// (task-2209). A connection running statements back to back holds its lease only between
+    /// statements, so a look usually lands inside a statement and finds none. The thread then
+    /// waited on `wake`, and the next statement's `watch` woke it: one wake a statement, 12% of the
+    /// samples of an autocommit point read loop. Now the thread waits only when no lease was armed
+    /// since its previous look, which is when a wake is worth a kernel call.
     fn run(&self) {
         loop {
             let earliest = {
                 let mut cells = self.cells();
                 loop {
+                    // Before the look, so a `watch` that misses this flag armed its lease
+                    // before the look and the look finds it.
+                    self.waiting.store(true, Ordering::SeqCst);
+                    std::sync::atomic::fence(Ordering::SeqCst);
                     let earliest = cells
                         .iter()
                         .filter_map(Weak::upgrade)
                         .filter_map(|cell| cell.deadline())
                         .min();
                     if let Some(earliest) = earliest {
+                        self.waiting.store(false, Ordering::SeqCst);
                         break earliest;
+                    }
+                    if self.recent.swap(false, Ordering::Relaxed) {
+                        self.waiting.store(false, Ordering::SeqCst);
+                        break Instant::now() + IDLE;
                     }
                     cells = match self.wake.wait(cells) {
                         Ok(held) => held,
