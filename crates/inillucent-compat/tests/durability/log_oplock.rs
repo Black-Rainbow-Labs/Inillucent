@@ -20,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use inillucent_compat::cliproc::program;
 use inillucent_compat::workspace_root;
@@ -128,6 +128,7 @@ fn newest_segment(database: &Path) -> PathBuf {
 /// Runs a hundred point reads and answers how many log length queries they made.
 ///
 /// @param statement - the prepared point read
+#[cfg(windows)]
 fn queries_over_a_hundred_reads(statement: &mut inillucent_engine::connect::Statement<'_>) -> u64 {
     let before = inillucent_vfs::os::log_size_queries();
     for id in 0..100i64 {
@@ -144,8 +145,9 @@ fn queries_over_a_hundred_reads(statement: &mut inillucent_engine::connect::Stat
 /// they did.
 ///
 /// @param statement - the prepared point read
+#[cfg(windows)]
 fn becomes_solo(statement: &mut inillucent_engine::connect::Statement<'_>) -> bool {
-    let started = Instant::now();
+    let started = std::time::Instant::now();
     while started.elapsed() < Duration::from_secs(2) {
         if queries_over_a_hundred_reads(statement) == 0 {
             return true;

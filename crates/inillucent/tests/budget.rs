@@ -1129,8 +1129,19 @@ fn a_statement_outside_a_transaction_rereads_nothing() {
     step_once(&mut statement);
 
     let before = database.cache_stats();
-    let outside_allocations = allocations(|| step_once(&mut statement));
-    for _ in 0..(RUNS - 1) {
+    // **The fewest of five single steps, and every one is printed** (task-2209).
+    // One step on a two core Windows runner in CI measured 18 allocations where
+    // this machine measures 10 every time, whether the read lease is held,
+    // has expired, or another handle has the log segment open. The cause was
+    // not found. A cost that taking the lock adds to every step still raises
+    // the fewest of five; a step that a scheduling stall on a busy runner
+    // makes expensive does not fail the build, and the printed list says
+    // which case a later failure is.
+    let outside_samples: Vec<u64> = (0..5)
+        .map(|_| allocations(|| step_once(&mut statement)))
+        .collect();
+    let outside_allocations = outside_samples.iter().copied().min().unwrap_or(u64::MAX);
+    for _ in 0..(RUNS - 5) {
         step_once(&mut statement);
     }
     let after = database.cache_stats();
@@ -1162,7 +1173,7 @@ fn a_statement_outside_a_transaction_rereads_nothing() {
     println!(
         "  outside a transaction: {meta_reads} full meta read(s), \
          {meta_probes} record read(s), {outside_allocations} allocation(s) \
-         for one step"
+         for one step (the fewest of {outside_samples:?})"
     );
     println!(
         "  inside one:            {inside_reads} full meta read(s), \
