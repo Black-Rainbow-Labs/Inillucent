@@ -82,14 +82,20 @@ formatting() {
     # and the report would end up labelled with the last package.
     local name
     # The workspace members, read from the manifest's own list so a new
-    # crate is covered the day it is added.
-    for member in $(sed -n 's@^ *"\(crates/[a-z-]*\|drivers/[a-z-]*\)",@\1@p' "$root/Cargo.toml"); do
+    # crate is covered the day it is added. `-E` and a group rather than a
+    # basic expression with `\|`, which is GNU only: BSD sed on macOS matched
+    # no member at all, and the empty list then stopped bash 3.2 on `set -u`.
+    for member in $(sed -E -n 's@^ *"((crates|drivers)/[a-z-]*)",@\1@p' "$root/Cargo.toml"); do
         name="${member##*/}"
         case "$name" in
             inillucent-bench) continue ;;
         esac
         packages+=(-p "$name")
     done
+    if [ "${#packages[@]}" -eq 0 ]; then
+        echo "read no workspace members out of Cargo.toml"
+        return 1
+    fi
     cargo fmt --manifest-path "$root/Cargo.toml" "${packages[@]}" --check
 }
 stage format 'a governed crate that is unformatted fails policy.rs anyway' formatting
@@ -200,10 +206,12 @@ stage urls 'a URL a shipped package names has to resolve for somebody with no cr
 # criterion 10; task-1969, 4.13). It is the only test any gate program has, and a
 # quick run that skipped it was a quick run with nothing holding the programs
 # that decide pass or fail.
+# The five suites are modules of the one `tooling` binary, as `tools/validate.ps1`
+# already names them; `--test policy` and the rest name targets that no longer
+# exist, so the stage failed before it ran anything.
 stage contracts 'dependencies, layering, the command table and the test map' \
     cargo test --manifest-path "$root/Cargo.toml" -p inillucent-compat \
-    --test policy --test selection --test command_parity --test harness \
-    --test gates_fail_closed
+    --test tooling -- policy:: selection:: command_parity:: harness:: gates_fail_closed::
 
 # **A published compatibility report may not carry its own unresolved Problems
 # table (task-1946, M5).** compat/compat-report.md shipped fourteen rows saying
