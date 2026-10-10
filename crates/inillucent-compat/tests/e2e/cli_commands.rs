@@ -2724,3 +2724,205 @@ fn a_newer_format_version_is_refused_as_unsupported() {
         "the refusal names the version it found: {message}"
     );
 }
+
+// --- tokenizer packs ---------------------------------------------------------
+
+/// Runs the program with its install root, and so its tokenizer folder, in a
+/// directory of the test's own.
+///
+/// `cliproc::run` passes the environment through unchanged, and an install run
+/// that way would write into the real per-user folder of whoever runs the
+/// suite. `INILLUCENT_TOKENIZER_DIR` is removed so the install root is the only
+/// place the program looks.
+///
+/// @param binary - the built `inillucent`
+/// @param home - the install root for this run
+/// @param arguments - the command line
+fn run_at_home(binary: &Path, home: &Path, arguments: &[&str]) -> Ran {
+    let output = std::process::Command::new(binary)
+        .args(arguments)
+        .env("INILLUCENT_HOME", home)
+        .env_remove("INILLUCENT_TOKENIZER_DIR")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap_or_else(|error| panic!("{} did not start: {error}", binary.display()));
+    Ran {
+        code: output.status.code().unwrap_or(130),
+        stdout: String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+        stderr: String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n"),
+    }
+}
+
+/// Returns the names `tokenizer list` reports, in its order.
+///
+/// @param binary - the built `inillucent`
+/// @param home - the install root
+fn listed_tokenizers(binary: &Path, home: &Path) -> Vec<String> {
+    let ran = run_at_home(binary, home, &["tokenizer", "list", "--output", "json"]);
+    succeeded("tokenizer list", &ran);
+    rows(&ran.stdout)
+        .into_iter()
+        .filter_map(|row| row.into_iter().next())
+        .collect()
+}
+
+/// The example pack the repository ships, as a path for `--file`.
+fn example_pack() -> String {
+    workspace_root()
+        .join("examples/tokenizers/pt-br.json")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// `tokenizer` installs a pack, lists it beside `porter`, installs it again as
+/// a no-op, and removes it.
+#[test]
+fn tokenizer_installs_lists_and_removes_a_pack() {
+    let binary = program("inillucent");
+    let home = area("tokenizer-install");
+    assert_eq!(listed_tokenizers(&binary, &home), vec!["porter"]);
+
+    let pack = example_pack();
+    let installed = run_at_home(
+        &binary,
+        &home,
+        &["tokenizer", "install", "--file", &pack, "--output", "json"],
+    );
+    succeeded("tokenizer install", &installed);
+    assert_eq!(text_field(&installed.stdout, "name"), "pt-br");
+    let written = std::fs::read_to_string(home.join("tokenizers/pt-br.json"))
+        .expect("the pack is in the install root's tokenizer folder");
+    let example = std::fs::read_to_string(&pack).expect("the example reads");
+    assert_eq!(
+        written.trim_end(),
+        inillucent_core::tokenize::pack::Pack::parse(&example)
+            .expect("the example is a pack")
+            .to_json(),
+        "the canonical form is what is installed"
+    );
+    assert_eq!(listed_tokenizers(&binary, &home), vec!["porter", "pt-br"]);
+
+    let again = run_at_home(
+        &binary,
+        &home,
+        &["tokenizer", "install", "--file", &pack, "--output", "json"],
+    );
+    succeeded("tokenizer install, a second time", &again);
+    assert!(
+        again
+            .stdout
+            .replace(' ', "")
+            .contains("\"installed\":false"),
+        "the second install reported writing: {}",
+        again.stdout
+    );
+
+    let removed = run_at_home(&binary, &home, &["tokenizer", "remove", "--name", "pt-br"]);
+    succeeded("tokenizer remove", &removed);
+    assert_eq!(listed_tokenizers(&binary, &home), vec!["porter"]);
+    let gone = run_at_home(&binary, &home, &["tokenizer", "remove", "--name", "pt-br"]);
+    assert_eq!(gone.code, 1, "{}", gone.said());
+}
+
+/// A file that is not a valid pack is refused with what is wrong, and nothing
+/// is written.
+#[test]
+fn tokenizer_refuses_a_pack_that_does_not_read() {
+    let binary = program("inillucent");
+    let home = area("tokenizer-bad");
+    let file = home.join("klingon.json");
+    std::fs::write(
+        &file,
+        r#"{"format":1,"name":"klingon","stemmer":"klingon"}"#,
+    )
+    .expect("the file is written");
+    let ran = run_at_home(
+        &binary,
+        &home,
+        &["tokenizer", "install", "--file", &file.to_string_lossy()],
+    );
+    assert_eq!(ran.code, 1, "{}", ran.said());
+    assert!(ran.said().contains("klingon"), "{}", ran.said());
+    assert!(ran.said().contains("portuguese"), "{}", ran.said());
+    assert!(!home.join("tokenizers").exists());
+    assert_eq!(listed_tokenizers(&binary, &home), vec!["porter"]);
+}
+
+/// Under `--root` and under `--readonly`, `install` is refused and writes
+/// nothing, and `list` still answers.
+#[test]
+fn tokenizer_install_is_refused_under_root_and_readonly() {
+    let binary = program("inillucent");
+    let home = area("tokenizer-root");
+    let pack = home.join("pt-br.json");
+    std::fs::copy(example_pack(), &pack).expect("the pack is copied into the root");
+    let file = pack.to_string_lossy().into_owned();
+    let root = home.to_string_lossy().into_owned();
+    for surface in [vec!["--root", root.as_str()], vec!["--readonly"]] {
+        let mut arguments = surface.clone();
+        arguments.extend(["tokenizer", "install", "--file", file.as_str()]);
+        let ran = run_at_home(&binary, &home, &arguments);
+        assert_eq!(ran.code, 1, "{surface:?}: {}", ran.said());
+        assert!(
+            ran.said().contains("tokenizer install"),
+            "{surface:?}: {}",
+            ran.said()
+        );
+        assert!(
+            !home.join("tokenizers").exists(),
+            "{surface:?} wrote a pack"
+        );
+        let mut listing = surface.clone();
+        listing.extend(["tokenizer", "--output", "json"]);
+        let listed = run_at_home(&binary, &home, &listing);
+        succeeded("tokenizer list", &listed);
+    }
+}
+
+/// A pack installed by the command line is what `CREATE` finds by name, and the
+/// table it makes finds a word written without its accents.
+#[test]
+fn tokenizer_pack_reaches_a_table_through_the_command_line() {
+    let binary = program("inillucent");
+    let home = area("tokenizer-table");
+    let installed = run_at_home(
+        &binary,
+        &home,
+        &["tokenizer", "install", "--file", &example_pack()],
+    );
+    succeeded("tokenizer install", &installed);
+    let database = home.join("app.rdb").to_string_lossy().into_owned();
+    for arguments in [
+        vec!["create", database.as_str()],
+        vec![
+            "--db",
+            database.as_str(),
+            "exec",
+            "CREATE VIRTUAL TABLE t USING inillucent_search(body, tokenize = 'pt-br')",
+        ],
+        vec![
+            "--db",
+            database.as_str(),
+            "exec",
+            "INSERT INTO t(rowid, body) VALUES (1, 'Política de reembolso'), \
+             (2, 'Notificação enviada')",
+        ],
+    ] {
+        let ran = run_at_home(&binary, &home, &arguments);
+        succeeded(arguments.get(2).copied().unwrap_or("create"), &ran);
+    }
+    let found = run_at_home(
+        &binary,
+        &home,
+        &[
+            "--db",
+            database.as_str(),
+            "query",
+            "SELECT rowid FROM t WHERE t MATCH 'notificacao'",
+            "--output",
+            "json",
+        ],
+    );
+    succeeded("query", &found);
+    assert_eq!(rows(&found.stdout), vec![vec!["2".to_string()]]);
+}

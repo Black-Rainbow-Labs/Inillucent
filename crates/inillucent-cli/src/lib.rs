@@ -134,6 +134,7 @@ pub mod mcp;
 pub mod render;
 pub mod setup;
 pub mod shell;
+pub mod tokenizer;
 // The second file allowed `unsafe`; see its module comment and `policy.rs`.
 #[allow(unsafe_code)]
 mod stack;

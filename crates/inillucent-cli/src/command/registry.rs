@@ -686,6 +686,36 @@ const SETUP_PARAMS: &[Param] = &[
     FORMAT,
 ];
 
+/// The parameters `tokenizer` takes.
+const TOKENIZER_PARAMS: &[Param] = &[
+    Param {
+        name: "action",
+        kind: Kind::Text,
+        required: false,
+        positional: true,
+        description: "'list' to show porter and every installed pack, which is what happens when \
+                      it is omitted; 'install' to add the pack 'file' holds; 'remove' to delete \
+                      the pack 'name' names.",
+    },
+    Param {
+        name: "file",
+        kind: Kind::Text,
+        required: false,
+        positional: false,
+        description: "For install: the pack's JSON file. It is checked before anything is \
+                      written, and installed under the name the pack gives itself.",
+    },
+    Param {
+        name: "name",
+        kind: Kind::Text,
+        required: false,
+        positional: false,
+        description: "For remove: the pack to delete. Tables already created with it keep \
+                      working, because each holds its own copy.",
+    },
+    FORMAT,
+];
+
 /// The parameters `version` takes.
 const VERSION_PARAMS: &[Param] = &[FORMAT];
 
@@ -1043,6 +1073,23 @@ pub static COMMANDS: &[Command] = &[
         cli_only: None,
         writes: Writes::Yes,
         run: crate::setup::setup_embeddings,
+    },
+    Command {
+        name: "tokenizer",
+        summary: "List, install or remove the tokenizer packs a search table can name.",
+        detail: "A search table turns text into terms with a tokenizer. 'porter', built in, is \
+                 English. A tokenizer pack is a small JSON file naming a Snowball stemmer, a \
+                 stopword list and accent folding, for another language: \
+                 examples/tokenizers/pt-br.json is Brazilian Portuguese. 'install' checks the \
+                 file and copies it into the tokenizer folder, and CREATE VIRTUAL TABLE ... \
+                 USING inillucent_search(body, tokenize = 'pt-br') then finds it by name. The \
+                 table copies the pack into its own configuration, so it opens on any machine \
+                 and 'remove' never breaks it. Refused under --root and --readonly, except \
+                 'list'.",
+        params: TOKENIZER_PARAMS,
+        cli_only: None,
+        writes: Writes::No,
+        run: crate::tokenizer::tokenizer,
     },
     Command {
         name: "version",

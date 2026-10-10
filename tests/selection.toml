@@ -2583,7 +2583,7 @@ module = "mcp_wire"
 tier = "e2e"
 covers = ["inillucent-cli"]
 # One `initialize` handshake over real pipes and one `tools/call` of each of
-# the 29 MCP tools. `command_parity` keeps the tool set equal to the registry;
+# the 30 MCP tools. `command_parity` keeps the tool set equal to the registry;
 # nothing called a tool by name over the wire.
 # `inillucent_embed` is called with a table that is not there, which a build with embedding
 # support refuses by name and a build without it refuses as unsupported, so the row builds the
