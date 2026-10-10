@@ -499,7 +499,7 @@ Three functions describe each hit:
 | `rerank_depth` | how many rows of the combined list the reranker scores, from 1 to 1,000. See [Reranking a search](#reranking-a-search) | 60 |
 | `metric` (or `distance`) | `'cosine'` or `'l2'`. Any other value is refused | `'cosine'` |
 | `m`, `ef_construction`, `ef_search` | the HNSW graph settings, as in [Index settings](#index-settings) | 16, 64, 64 |
-| `tokenize` | the tokenizer. `porter` is the only one | `porter` |
+| `tokenize` | the tokenizer: `porter`, which is English, or the name of an installed tokenizer pack. See [Tokenizer packs](#tokenizer-packs) | `porter` |
 | `compact` | how many pending changes a commit collects before it writes them into the index | 1,024 |
 | `segment_merge` | how many segments of one size are merged into one larger segment | 4 |
 | `merge_budget` | how many rows one commit may merge before it leaves the rest for a later commit | 8,192 |
@@ -507,6 +507,28 @@ Three functions describe each hit:
 
 The table records its options in the `<table>_config` table, so you can read back what a table was
 declared with: `SELECT k, v FROM docs_config`.
+
+### Tokenizer packs
+
+```sh
+inillucent tokenizer install --file examples/tokenizers/pt-br.json
+```
+
+```sql
+CREATE VIRTUAL TABLE docs_pt USING inillucent_search(body, tokenize = 'pt-br');
+INSERT INTO docs_pt(rowid, body) VALUES (1, 'Notificação enviada');
+SELECT rowid FROM docs_pt WHERE docs_pt MATCH 'notificacoes';  -- 1
+```
+
+`porter`, the default tokenizer, is English. A tokenizer pack is a JSON file that names a stemmer,
+a stopword list and accent folding for another language. `examples/tokenizers/pt-br.json` is
+Brazilian Portuguese: it stems Portuguese words and folds accents, so the query `notificacoes`
+finds the row `Notificação enviada`.
+
+The table copies the pack into `docs_pt_config` when it is created. It keeps working after the pack
+is removed, and it opens on a machine that never installed the pack. A name that is not installed
+is refused with the status `invalid_state`, and the message lists the packs there are.
+[Tokenizer packs](tokenizer-packs.md) has the file format, the steps and every error.
 
 ### Exact and approximate mode
 

@@ -5,7 +5,7 @@ description: Serve an inillucent database to an AI agent over MCP with inillucen
 
 # Giving an agent a database over MCP
 
-`inillucent-mcp` serves 29 of the CLI's commands as MCP tools over standard input and output. The
+`inillucent-mcp` serves 30 of the CLI's commands as MCP tools over standard input and output. The
 tools are generated from the same command table as the `inillucent` command line. A test,
 `command_parity.rs`, fails the build if the two ever disagree. Each tool's description is the text
 `inillucent help <command>` prints.
@@ -25,7 +25,7 @@ sequenceDiagram
     M-->>A: server name, version and instructions
     A->>M: notifications/initialized
     A->>M: tools/list
-    M-->>A: 28 tools, each with a JSON Schema
+    M-->>A: 30 tools, each with a JSON Schema
     A->>M: tools/call inillucent_query
     M->>D: run the statement
     D-->>M: rows
@@ -56,13 +56,13 @@ The messages are JSON-RPC 2.0, one JSON object per line, on the server's standar
 | `--root DIR` | refuse every path that resolves outside `DIR`, following links |
 | `--limit N` | how many rows a call gets when it does not set `limit`. The default is 200 |
 
-## The 28 tools
+## The 30 tools
 
 | Group | Tools |
 |---|---|
 | Read and write | `inillucent_query`, `inillucent_exec`, `inillucent_batch`, `inillucent_run` |
 | Look at the schema | `inillucent_tables`, `inillucent_describe`, `inillucent_schema`, `inillucent_indexes`, `inillucent_databases`, `inillucent_explain` |
-| Search | `inillucent_search`, `inillucent_vector_search`, `inillucent_setup_embeddings` |
+| Search | `inillucent_search`, `inillucent_vector_search`, `inillucent_setup_embeddings`, `inillucent_tokenizer`, `inillucent_embed` |
 | Files | `inillucent_create`, `inillucent_import`, `inillucent_export`, `inillucent_dump`, `inillucent_backup`, `inillucent_restore`, `inillucent_migrate` |
 | Maintenance | `inillucent_checkpoint`, `inillucent_integrity_check`, `inillucent_analyze`, `inillucent_stats` |
 | About the engine | `inillucent_capabilities`, `inillucent_functions`, `inillucent_version`, `inillucent_help` |

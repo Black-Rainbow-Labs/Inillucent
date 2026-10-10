@@ -83,7 +83,9 @@ kernels do its arithmetic and tokenizing and decide nothing about SQL or storage
 PostgreSQL comparison, and no shipped program links `inillucent-bench`.
 
 `rust-stemmers` is also allowed in `inillucent-ext` for the FTS5 `porter` tokenizer. The same Porter
-stemmer is already in `inillucent-core`, and a second copy in `inillucent-ext` would repeat it.
+stemmer is already in `inillucent-core`, and a second copy in `inillucent-ext` would repeat it. In
+`inillucent-core` it is also the stemmer a tokenizer pack names: a pack chooses one of the 18
+Snowball algorithms the crate already links, and adds no dependency.
 
 The lowest crates take almost nothing. `inillucent-base` has no third party dependency.
 `inillucent-vfs` has only the operating system boundary. Every other crate builds on these two, so
