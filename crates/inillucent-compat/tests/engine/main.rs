@@ -69,6 +69,7 @@ mod search_facet_compare;
 mod search_fusion;
 mod search_recall;
 mod search_rerank;
+mod search_tokenizer;
 mod segment_delta_chain;
 mod segment_merge_bound;
 mod segmented_generations;

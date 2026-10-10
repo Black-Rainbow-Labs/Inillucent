@@ -169,6 +169,24 @@ pub trait Module: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Returns the shadow tables a `CREATE VIRTUAL TABLE` is about to build,
+    /// and is the module's last chance to refuse that statement before
+    /// anything is written.
+    ///
+    /// **Separate from [`Module::shadow_tables`] because that one also runs on
+    /// every open.** A check that only a create may make, such as whether a
+    /// file the declaration names is installed, cannot go there: a table that
+    /// exists would then stop opening when the file went away. Made in
+    /// [`Module::connect`] instead, the same refusal comes after the engine has
+    /// written the shadow tables, and the rolled back transaction stays in the
+    /// log, where every later open reports discarding it. The default is
+    /// [`Module::shadow_tables`].
+    ///
+    /// @param arguments - the declaration being created
+    fn shadow_tables_to_create(&self, arguments: &ModuleArguments) -> DbResult<Vec<ShadowTable>> {
+        self.shadow_tables(arguments)
+    }
+
     /// Connects to a table, whether it is being created or reopened.
     ///
     /// `creating` is true only for the `CREATE VIRTUAL TABLE` that first makes

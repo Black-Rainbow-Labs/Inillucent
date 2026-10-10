@@ -48,7 +48,7 @@ use inillucent_ext::vtab::{
 };
 
 use crate::merge::{self, Cache, Hit, Request};
-use crate::options::{self, Options, DEFAULT_K};
+use crate::options::{self, Options, TokenizerChoice, DEFAULT_K};
 use crate::store::{state, Delta, MergeState, Op, Row, SegmentMeta, Store};
 
 /// The plan number for a scan of every row.
@@ -107,13 +107,31 @@ impl Module for SearchModule {
         Ok(crate::store::shadow_tables(declared.columns.len()))
     }
 
+    /// Returns the shadow tables of a table being created, after checking that
+    /// the tokenizer pack it names is installed.
+    ///
+    /// The check is here, before the engine writes anything, so a pack that is
+    /// not installed is refused by a statement that leaves no trace. `connect`
+    /// reads the pack again to keep it.
+    fn shadow_tables_to_create(&self, arguments: &ModuleArguments) -> DbResult<Vec<ShadowTable>> {
+        let mut declared = options::parse(&arguments.arguments)?;
+        options::resolve_installed(&mut declared)?;
+        Ok(crate::store::shadow_tables(declared.columns.len()))
+    }
+
     /// Connects to a table, whether it is being created or reopened.
     fn connect(
         &self,
         arguments: &ModuleArguments,
         creating: bool,
     ) -> DbResult<Box<dyn VirtualTable>> {
-        let declared = options::parse(&arguments.arguments)?;
+        let mut declared = options::parse(&arguments.arguments)?;
+        // Only a table being created reads the tokenizer folder. A table being
+        // reopened keeps the name until its `%_config` is read, so it opens
+        // whether or not the pack is still installed.
+        if creating {
+            options::resolve_installed(&mut declared)?;
+        }
         let store = Store::of(arguments, declared.columns.len())?;
         Ok(Box::new(SearchTable {
             declaration: declaration_of(&declared, &arguments.table),
@@ -121,6 +139,7 @@ impl Module for SearchModule {
             store,
             cache: Arc::new(Cache::new()),
             stored_config: Arc::new(OnceLock::new()),
+            stored_tokenizer: Arc::new(OnceLock::new()),
             creating,
             pending: None,
             marks: Vec::new(),
@@ -140,12 +159,54 @@ fn readable_here(
     store: &Store,
     stored: &OnceLock<Vec<(String, String)>>,
 ) -> DbResult<()> {
+    options::readable(config_here(context, store, stored)?)
+}
+
+/// Returns the rows `%_config` holds, reading them the first time and
+/// remembering them after.
+///
+/// @param context - the running statement
+/// @param store - the table's shadow tables
+/// @param stored - where this connection keeps what `%_config` said
+fn config_here<'a>(
+    context: &mut Context<'_>,
+    store: &Store,
+    stored: &'a OnceLock<Vec<(String, String)>>,
+) -> DbResult<&'a Vec<(String, String)>> {
     if let Some(rows) = stored.get() {
-        return options::readable(rows);
+        return Ok(rows);
     }
     let rows = store.read_config(context)?;
-    let held = stored.get_or_init(|| rows);
-    options::readable(held)
+    Ok(stored.get_or_init(|| rows))
+}
+
+/// Returns the tokenizer the table's terms were made with, resolving it from
+/// `%_config` the first time and remembering it after.
+///
+/// **The read path's half of [`options::stored_tokenizer`].** A write resolves
+/// the tokenizer in `begin`, which a `SELECT` never reaches, so a cursor that
+/// did not ask would search a reopened pack table with no tokenizer at all. The
+/// answer is shared with the table and every cursor it opens, so the pack is
+/// parsed once per connection, never once per query.
+///
+/// @param context - the running statement
+/// @param store - the table's shadow tables
+/// @param stored - where this connection keeps what `%_config` said
+/// @param resolved - where this connection keeps the resolved tokenizer
+/// @param declared - the tokenizer the `CREATE` text gives
+fn tokenizer_here(
+    context: &mut Context<'_>,
+    store: &Store,
+    stored: &OnceLock<Vec<(String, String)>>,
+    resolved: &OnceLock<TokenizerChoice>,
+    declared: &TokenizerChoice,
+) -> DbResult<TokenizerChoice> {
+    if let Some(choice) = resolved.get() {
+        return Ok(choice.clone());
+    }
+    let rows = config_here(context, store, stored)?;
+    let choice = options::stored_tokenizer(rows, declared)?;
+    Ok(resolved.get_or_init(|| choice).clone())
 }
 
 /// Returns the columns a declaration produces, visible ones first.
@@ -204,6 +265,10 @@ struct SearchTable {
     /// with the cursors the table opens, which is why it is an `Arc`: the read
     /// path is the one that was not asking.
     stored_config: Arc<OnceLock<Vec<(String, String)>>>,
+    /// The tokenizer the table's terms were made with, once `%_config` has
+    /// been read for it. Shared with the cursors for the same reason as
+    /// `stored_config`.
+    stored_tokenizer: Arc<OnceLock<TokenizerChoice>>,
     creating: bool,
     /// The commit sequence this transaction is publishing under, once it has
     /// written anything.
@@ -299,6 +364,8 @@ impl SearchTable {
             return Ok(());
         }
         self.options = options::from_config(&rows, &self.options)?;
+        // `from_config` resolved the tokenizer, so the cursors need not.
+        let _ = self.stored_tokenizer.set(self.options.tokenizer.clone());
         Ok(())
     }
 
@@ -1202,6 +1269,7 @@ impl VirtualTable for SearchTable {
             store: self.store.clone(),
             cache: Arc::clone(&self.cache),
             stored_config: Arc::clone(&self.stored_config),
+            stored_tokenizer: Arc::clone(&self.stored_tokenizer),
             query_column: self.query_column(),
             limit_column: self.limit_column(),
             vector_column: self.vector_column(),
@@ -1223,6 +1291,10 @@ impl VirtualTable for SearchTable {
         self.touched = false;
         if self.creating {
             self.creating = false;
+            // A table whose pack was not read would store its name and no
+            // pack, and no later open could tokenize it. `connect` resolves it;
+            // this refuses to write the configuration if anything did not.
+            merge::tokenizer_of(&self.options)?;
             let rows = self.options.config_rows();
             self.store.write_config(context, &rows)?;
             self.store.set_state(context, state::SEQUENCE, 0)?;
@@ -1310,6 +1382,24 @@ impl VirtualTable for SearchTable {
 
     /// Checks that the rows, the log and every live segment agree.
     fn integrity(&mut self, context: &mut Context<'_>) -> DbResult<Option<String>> {
+        // An integrity check needs no write, so `begin` may not have read the
+        // table's tokenizer yet, and a segment cannot be loaded without it.
+        if matches!(self.options.tokenizer, TokenizerChoice::Named(_)) {
+            match tokenizer_here(
+                context,
+                &self.store,
+                &self.stored_config,
+                &self.stored_tokenizer,
+                &self.options.tokenizer,
+            ) {
+                Ok(choice) => self.options.tokenizer = choice,
+                Err(error) => {
+                    return Ok(Some(format!(
+                        "the table's tokenizer cannot be read: {error}"
+                    )))
+                }
+            }
+        }
         let mut problems: Vec<String> = Vec::new();
         for segment in merge::live_segments(context, &self.store)? {
             // Goes through the strict reader rather than `persist::read_index`
@@ -1452,6 +1542,8 @@ struct SearchCursor {
     cache: Arc<Cache>,
     /// The rows `%_config` holds, shared with the table that opened this.
     stored_config: Arc<OnceLock<Vec<(String, String)>>>,
+    /// The tokenizer `%_config` names, shared with the table that opened this.
+    stored_tokenizer: Arc<OnceLock<TokenizerChoice>>,
     query_column: i32,
     limit_column: i32,
     vector_column: i32,
@@ -1575,6 +1667,16 @@ impl VirtualCursor for SearchCursor {
                     "inillucent_search: this table was declared without a vector width",
                 ));
             }
+            // Resolved only for a search. A scan or a rowid lookup reads stored
+            // rows and tokenizes nothing, so a table whose stored pack cannot be
+            // read can still be dumped and repaired.
+            self.options.tokenizer = tokenizer_here(
+                context,
+                &self.store,
+                &self.stored_config,
+                &self.stored_tokenizer,
+                &self.options.tokenizer,
+            )?;
             let hits = self.search_hits(context)?;
             self.rows = hits.into_iter().map(|hit| (hit.id, Some(hit))).collect();
             return Ok(());

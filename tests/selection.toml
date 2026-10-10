@@ -2247,6 +2247,14 @@ covers = ["inillucent-search", "inillucent-sql", "inillucent-engine"]
 [[target]]
 package = "inillucent-compat"
 kind = "test"
+name = "engine"
+module = "search_tokenizer"
+tier = "engine"
+covers = ["inillucent-search", "inillucent-core", "inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
 name = "durability"
 module = "search_crash"
 tier = "durability"

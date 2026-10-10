@@ -151,7 +151,7 @@ impl ImportedDatabase {
             arguments: arguments.to_vec(),
             shadows: Vec::new(),
         };
-        for shadow in found.shadow_tables(&connect)? {
+        for shadow in found.shadow_tables_to_create(&connect)? {
             // **A shadow with an owner already exists.** It belongs to another
             // table and is being *read*, not made - see `ShadowTable::owner`.
             // Creating it would put a second, empty copy of somebody else's

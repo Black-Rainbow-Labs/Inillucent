@@ -65,16 +65,18 @@
 //! several batches wide in one go.
 
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use inillucent_base::error::statement_refusal;
 use inillucent_base::DbResult;
 use inillucent_core::filter::{AttributeFilter, Filter};
 use inillucent_core::index::{Index, IndexConfig};
 use inillucent_core::rank::{AdaptiveWeights, Fusion, HitOrigin, RRF_K};
 use inillucent_core::store::ChunkInput;
+use inillucent_core::tokenize::Tokenizer;
 use inillucent_ext::vtab::{failure, Context};
 
-use crate::options::{FusionChoice, Metric, Mode, Options};
+use crate::options::{FusionChoice, Metric, Mode, Options, TokenizerChoice};
 use crate::store::{state, Delta, Op, Row, SegmentMeta, Store};
 
 /// The source name every row of a search table is filed under.
@@ -257,6 +259,35 @@ impl Cache {
         refresh(&mut held, context, store, options)?;
         Ok(held.as_ref().map(|cached| cached.rows).unwrap_or(0))
     }
+}
+
+/// Returns the tokenizer a table's terms are made with.
+///
+/// **An unresolved pack name is refused, not read as `porter`.** A reopened
+/// table holds only the name its `CREATE` text gives until its `%_config` has
+/// been read. Searching with the built in English tokenizer then would answer
+/// a Portuguese table in English, find nothing, and look like an empty result.
+///
+/// @param options - the table's declaration
+pub fn tokenizer_of(options: &Options) -> DbResult<Arc<Tokenizer>> {
+    match &options.tokenizer {
+        TokenizerChoice::Porter => Ok(Arc::new(Tokenizer::default())),
+        TokenizerChoice::Pack(pack) => Ok(Arc::new(Tokenizer::from_pack(pack))),
+        TokenizerChoice::Named(name) => Err(statement_refusal(format!(
+            "inillucent_search: the tokenizer pack {name} has not been read from the table's \
+             configuration"
+        ))),
+    }
+}
+
+/// Returns an empty index for this table: its configuration, and its tokenizer.
+///
+/// @param options - the table's declaration
+pub fn new_index(options: &Options) -> DbResult<Index> {
+    Ok(Index::with_tokenizer(
+        configuration(options),
+        tokenizer_of(options)?,
+    ))
 }
 
 /// Returns the index configuration a declaration implies.
@@ -648,7 +679,7 @@ pub fn build_from_rows(
         Ok(true)
     })?;
     let rows = chunks.len();
-    let mut index = Index::new(configuration(options));
+    let mut index = new_index(options)?;
     if !chunks.is_empty() {
         index
             .add(chunks, &vectors)
@@ -714,7 +745,7 @@ pub fn build_segment_from_batch(
         }
     }
     let inserted = chunks.len();
-    let mut index = Index::new(configuration(options));
+    let mut index = new_index(options)?;
     if !chunks.is_empty() {
         index
             .add(chunks, &vectors)
@@ -1136,12 +1167,18 @@ fn load_segment_bytes(
     bytes: &[u8],
     require_sealed: bool,
 ) -> DbResult<Index> {
+    // **The bytes hold terms and no tokenizer, so the table's own is set on
+    // every index read back here, the base of a delta chain included.** A
+    // query, an append, a fold into another segment and the BM25 ceiling all
+    // tokenize with it, and the bytes do not say which tokenizer made them.
     if !inillucent_core::persist::is_segment_delta(bytes) {
-        return inillucent_core::persist::read_index_bytes(bytes).map_err(|error| {
+        let mut index = inillucent_core::persist::read_index_bytes(bytes).map_err(|error| {
             failure(format!(
                 "inillucent_search: unreadable segment {id}: {error}"
             ))
-        });
+        })?;
+        index.set_tokenizer(tokenizer_of(options)?);
+        return Ok(index);
     }
     let parsed = inillucent_core::persist::parse_segment_delta(bytes).map_err(|error| {
         failure(format!(
@@ -1156,7 +1193,7 @@ fn load_segment_bytes(
     let base = match parsed.base {
         Some(base_id) => load_segment_by_id(context, store, options, base_id, false)?,
         None => {
-            let mut index = Index::new(configuration(options));
+            let mut index = new_index(options)?;
             index.commit();
             index
         }
@@ -1261,7 +1298,7 @@ fn refresh(
     }
     let mut fold_order = live;
     fold_order.sort_by_key(|segment| segment.covers_from);
-    let mut index = Index::new(configuration(options));
+    let mut index = new_index(options)?;
     index.commit();
     let mut first = true;
     for segment in &fold_order {
@@ -1519,6 +1556,27 @@ mod tests {
     fn declaration(source: &[&str]) -> Options {
         let arguments: Vec<Vec<u8>> = source.iter().map(|text| text.as_bytes().to_vec()).collect();
         options::parse(&arguments).expect("parsed")
+    }
+
+    /// A pack name that was never read from the table's configuration is
+    /// refused, rather than searched with the built in English tokenizer.
+    #[test]
+    fn an_unresolved_tokenizer_is_refused_rather_than_read_as_english() {
+        let reopened = declaration(&["body", "tokenize = 'pt-br'"]);
+        assert_eq!(
+            reopened.tokenizer,
+            TokenizerChoice::Named("pt-br".to_string())
+        );
+        let refused = tokenizer_of(&reopened).err().map(|error| error.to_string());
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|text| text.contains("pt-br")),
+            "{refused:?}"
+        );
+        assert!(new_index(&reopened).is_err());
+        let porter = tokenizer_of(&declaration(&["body"])).expect("porter needs nothing");
+        assert_eq!(porter.name(), "porter");
     }
 
     /// An exact table is configured never to traverse the graph.

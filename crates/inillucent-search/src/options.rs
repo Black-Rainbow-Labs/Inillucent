@@ -15,17 +15,48 @@
 //! this repository already had, given a transactional home and a SQL front
 //! door.
 
+use std::sync::Arc;
+
+use inillucent_base::error::{statement_refusal, unmet_requirement};
 use inillucent_base::DbResult;
+use inillucent_core::install;
+use inillucent_core::tokenize::pack::{valid_name, Pack, PackError, PACK_FORMAT, PORTER};
 use inillucent_ext::vtab::failure;
 
-/// The tokenizer this build has, named so a stored table records which one
-/// produced its terms.
+/// Which tokenizer a table's terms are made with.
 ///
-/// One name, not a family: `inillucent-core` has exactly one tokenizer - Porter
-/// stemming with an English stop list, compound identifier splitting and
-/// address preservation - and a `tokenize=` option that accepted a name it then
-/// ignored would be a promise the index does not keep.
-pub const TOKENIZER: &str = "porter";
+/// **A `tokenize=` option that accepted a name and then ignored it would be a
+/// promise the index does not keep**, which is why the option used to accept
+/// `porter` alone. It keeps the promise for every name now. `porter` is the built
+/// in English tokenizer: Porter stemming with an English stop list, compound
+/// identifier splitting and address preservation. Any other name is an
+/// installed tokenizer pack, which the table copies into its `%_config` when it
+/// is created. Every later reader and writer rebuilds the tokenizer from that
+/// copy, so a table opens on any machine running this build, with or without
+/// the pack installed, and two machines never tokenize one table two ways.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenizerChoice {
+    /// The built in English tokenizer.
+    Porter,
+    /// A tokenizer pack, read and checked.
+    Pack(Arc<Pack>),
+    /// A pack name read from the `CREATE` text of a table being reopened,
+    /// before its `%_config` has been read. Nothing tokenizes with it:
+    /// `crate::merge::tokenizer_of` refuses it, so a path that forgot to resolve
+    /// the table's pack fails instead of searching in English.
+    Named(String),
+}
+
+impl TokenizerChoice {
+    /// Returns the name a table records: `porter`, or the pack's name.
+    pub fn name(&self) -> &str {
+        match self {
+            TokenizerChoice::Porter => PORTER,
+            TokenizerChoice::Pack(pack) => &pack.name,
+            TokenizerChoice::Named(name) => name,
+        }
+    }
+}
 
 /// The format version stamped into `%_config` by a table that declares no
 /// facet column.
@@ -346,6 +377,8 @@ pub struct Options {
     /// How many rows of the fused list a search that names `question` hands to the reranker, when
     /// the declaration said. `None` means [`DEFAULT_RERANK_DEPTH`].
     pub rerank_depth: Option<usize>,
+    /// Which tokenizer the table's terms are made with.
+    pub tokenizer: TokenizerChoice,
     /// How many delta rows may accumulate before a commit folds them in, or
     /// zero to compact only when asked.
     pub compact: Option<u64>,
@@ -497,6 +530,10 @@ impl Options {
     /// `CREATE` text also carries it, because the two can disagree only if
     /// somebody edited `sqlite_schema` by hand - and then the config is the one
     /// the stored rows were actually built against.
+    ///
+    /// A table that names a tokenizer pack also stores the whole pack, as the
+    /// row `tokenizer_pack` after `tokenize`. A `porter` table writes exactly the
+    /// rows it wrote before packs existed.
     pub fn config_rows(&self) -> Vec<(String, String)> {
         let names: Vec<String> = self
             .columns
@@ -508,7 +545,7 @@ impl Options {
             .iter()
             .filter_map(|position| self.facet_name(*position))
             .collect();
-        vec![
+        let mut rows = vec![
             ("format".to_string(), self.format().to_string()),
             // **The release that wrote the table, beside the format number it
             // wrote** (task-2053). The number alone tells a reader that it
@@ -553,7 +590,7 @@ impl Options {
                     .map(|depth| depth.to_string())
                     .unwrap_or_default(),
             ),
-            ("tokenize".to_string(), TOKENIZER.to_string()),
+            ("tokenize".to_string(), self.tokenizer.name().to_string()),
             (
                 "compact".to_string(),
                 self.compact.map(|n| n.to_string()).unwrap_or_default(),
@@ -586,7 +623,15 @@ impl Options {
                 "threads".to_string(),
                 self.threads.map(|n| n.to_string()).unwrap_or_default(),
             ),
-        ]
+        ];
+        if let TokenizerChoice::Pack(pack) = &self.tokenizer {
+            let after = rows
+                .iter()
+                .position(|(key, _)| key == "tokenize")
+                .map_or(rows.len(), |at| at.saturating_add(1));
+            rows.insert(after, ("tokenizer_pack".to_string(), pack.to_json()));
+        }
+        rows
     }
 }
 
@@ -615,6 +660,7 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
     let mut compact: Option<u64> = None;
     let mut segment_merge: Option<usize> = None;
     let mut merge_budget: Option<u64> = None;
+    let mut tokenizer = TokenizerChoice::Porter;
     for argument in arguments {
         let text = String::from_utf8_lossy(argument).trim().to_string();
         if text.is_empty() {
@@ -671,13 +717,7 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
             // stays that way: see `FusionChoice` for the two corpora that disagree.
             "fusion" => fusion_named = Some(FusionChoice::parse(&value)?),
             "rerank_depth" => rerank_depth = Some(depth(&value)?),
-            "tokenize" | "tokenizer" => {
-                if !value.eq_ignore_ascii_case(TOKENIZER) {
-                    return Err(failure(format!(
-                        "inillucent_search: the only tokenizer this build has is {TOKENIZER}, not {value}"
-                    )));
-                }
-            }
+            "tokenize" | "tokenizer" => tokenizer = tokenizer_named(&value)?,
             "compact" => {
                 compact = Some(value.parse::<u64>().map_err(|_| {
                     failure(format!(
@@ -724,6 +764,7 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
         vector_weight,
         fusion,
         rerank_depth,
+        tokenizer,
         compact,
         segment_merge,
         merge_budget,
@@ -731,6 +772,151 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
         source_column,
         threads,
     })
+}
+
+/// Reads the value of a `tokenize` option.
+///
+/// `porter` in any case is the built in tokenizer. Any other value must be a
+/// pack name, which is checked here, before it is ever joined to a folder: a
+/// name like `../x` is refused as text and never becomes a path.
+///
+/// @param value - the option's value, unquoted
+fn tokenizer_named(value: &str) -> DbResult<TokenizerChoice> {
+    if value.eq_ignore_ascii_case(PORTER) {
+        return Ok(TokenizerChoice::Porter);
+    }
+    if valid_name(value) {
+        return Ok(TokenizerChoice::Named(value.to_string()));
+    }
+    Err(statement_refusal(format!(
+        "inillucent_search: a tokenizer name is lowercase letters, digits, - and _, not {value}"
+    )))
+}
+
+/// Replaces a pack name with the installed pack, for a table being created.
+///
+/// **Only `CREATE` reads the tokenizer folder.** A table copies the pack into
+/// its `%_config` here, and every later open reads that copy, so removing or
+/// changing the installed file never changes an existing table. A name nobody
+/// installed is an unmet requirement, not a syntax error: the statement is
+/// right, and the same statement works once the pack is installed.
+///
+/// @param options - the declaration being created
+pub fn resolve_installed(options: &mut Options) -> DbResult<()> {
+    let TokenizerChoice::Named(name) = &options.tokenizer else {
+        return Ok(());
+    };
+    let name = name.clone();
+    let folder = install::tokenizer_folder();
+    match install::tokenizer_pack(&name) {
+        Ok(Some(pack)) => {
+            options.tokenizer = TokenizerChoice::Pack(Arc::new(pack));
+            Ok(())
+        }
+        Ok(None) => {
+            let installed = install::installed_tokenizers();
+            let listed = if installed.is_empty() {
+                "none".to_string()
+            } else {
+                installed.join(", ")
+            };
+            let said = format!(
+                "inillucent_search: no tokenizer named {name} is installed. This build has \
+                 {PORTER}. Installed packs: {listed}. Run inillucent tokenizer install --file \
+                 <pack>.json to add one"
+            );
+            Err(unmet_requirement("a tokenizer pack", said.clone())
+                .with_detail(format!("{said} (looked in {})", folder.display())))
+        }
+        Err(error) => {
+            let said =
+                format!("inillucent_search: the tokenizer pack {name} does not read: {error}");
+            Err(statement_refusal(said.clone())
+                .with_detail(format!("{said} (in {})", folder.display())))
+        }
+    }
+}
+
+/// Returns the refusal for a table whose stored tokenizer and declared
+/// tokenizer disagree.
+///
+/// @param stored - the name `%_config` records
+/// @param declared - the name the `CREATE` text gives
+fn produced_by(stored: &str, declared: &str) -> inillucent_base::DbError {
+    statement_refusal(format!(
+        "inillucent_search: the terms were produced by {stored}, but the table declares {declared}"
+    ))
+}
+
+/// Returns the tokenizer a stored table's terms were made with, read from its
+/// `%_config`.
+///
+/// **The one resolution, for every path that tokenizes.** A write reaches it
+/// through [`from_config`], a cursor through `readable_here`, and an integrity
+/// check directly. Three copies of this rule would be three chances for a
+/// reader to tokenize differently from the writer that made the terms.
+///
+/// The stored name must agree with the declared one. A pack table must hold
+/// its pack: a missing row is refused rather than read as `porter`, which
+/// would search a Portuguese table in English and find nothing. A stored pack
+/// in a later format is `unsupported`, so the command line exits 3 and says to
+/// upgrade.
+///
+/// @param rows - the key/value pairs read from `%_config`
+/// @param declared - the tokenizer the `CREATE` text gives
+pub fn stored_tokenizer(
+    rows: &[(String, String)],
+    declared: &TokenizerChoice,
+) -> DbResult<TokenizerChoice> {
+    if rows.is_empty() {
+        return Ok(declared.clone());
+    }
+    let find = |key: &str| {
+        rows.iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.trim())
+    };
+    // A table written before the row existed was written by the only
+    // tokenizer there was.
+    let stored = find("tokenize").unwrap_or(PORTER);
+    if stored.eq_ignore_ascii_case(PORTER) {
+        return match declared {
+            TokenizerChoice::Porter => Ok(TokenizerChoice::Porter),
+            other => Err(produced_by(PORTER, other.name())),
+        };
+    }
+    if !valid_name(stored) {
+        return Err(statement_refusal(format!(
+            "inillucent_search: the terms were produced by {stored}, which this build does not have"
+        )));
+    }
+    if declared.name() != stored {
+        return Err(produced_by(stored, declared.name()));
+    }
+    let Some(json) = find("tokenizer_pack").filter(|json| !json.is_empty()) else {
+        return Err(statement_refusal(format!(
+            "inillucent_search: the terms were produced by the tokenizer pack {stored}, and the \
+             table's configuration does not hold the pack"
+        )));
+    };
+    match Pack::parse(json) {
+        Ok(pack) if pack.name == stored => Ok(TokenizerChoice::Pack(Arc::new(pack))),
+        Ok(pack) => Err(produced_by(&pack.name, stored)),
+        Err(PackError::Format(format)) => {
+            let said = format!(
+                "inillucent_search: this table's tokenizer pack is in format {format}, and this \
+                 build reads format {PACK_FORMAT}"
+            );
+            Err(
+                statement_refusal(format!("{said}; upgrade inillucent to open it"))
+                    .with_message(said)
+                    .with_unsupported(format!("a tokenizer pack in format {format}")),
+            )
+        }
+        Err(error) => Err(statement_refusal(format!(
+            "inillucent_search: the table's stored tokenizer pack {stored} does not read: {error}"
+        ))),
+    }
 }
 
 /// Reads a rerank depth, refusing one that is not a whole number from 1 to 1,000.
@@ -966,13 +1152,7 @@ pub fn from_config(rows: &[(String, String)], fallback: &Options) -> DbResult<Op
         Some(name) => Mode::parse(&name)?,
         None => fallback.mode,
     };
-    if let Some(tokenizer) = find("tokenize") {
-        if !tokenizer.eq_ignore_ascii_case(TOKENIZER) {
-            return Err(failure(format!(
-                "inillucent_search: the terms were produced by {tokenizer}, which this build does not have"
-            )));
-        }
-    }
+    let tokenizer = stored_tokenizer(rows, &fallback.tokenizer)?;
     let compact = find("compact").and_then(|value| value.parse::<u64>().ok());
     let segment_merge = find("segment_merge").and_then(|value| value.parse::<usize>().ok());
     let merge_budget = find("merge_budget").and_then(|value| value.parse::<u64>().ok());
@@ -1007,6 +1187,7 @@ pub fn from_config(rows: &[(String, String)], fallback: &Options) -> DbResult<Op
         rerank_depth: find("rerank_depth")
             .and_then(|value| depth(&value).ok())
             .or(fallback.rerank_depth),
+        tokenizer,
         compact: compact.or(fallback.compact),
         segment_merge: segment_merge.or(fallback.segment_merge),
         merge_budget: merge_budget.or(fallback.merge_budget),
@@ -1450,5 +1631,169 @@ mod tests {
         );
         let raised = parse(&[b"body".to_vec(), b"segment_merge = 6".to_vec()]).expect("parsed");
         assert_eq!(raised.crisis_at(), 36);
+    }
+
+    /// The example pack the repository ships.
+    fn example_pack() -> Arc<Pack> {
+        Arc::new(
+            Pack::parse(include_str!("../../../examples/tokenizers/pt-br.json"))
+                .expect("the example pack reads"),
+        )
+    }
+
+    /// The `%_config` rows of a table created with the example pack.
+    fn pack_rows() -> Vec<(String, String)> {
+        let mut options = parse(&[b"body".to_vec()]).expect("parsed");
+        options.tokenizer = TokenizerChoice::Pack(example_pack());
+        options.config_rows()
+    }
+
+    /// Replaces one stored row's value, or removes the row when `value` is
+    /// `None`.
+    fn with_row(
+        mut rows: Vec<(String, String)>,
+        key: &str,
+        value: Option<&str>,
+    ) -> Vec<(String, String)> {
+        match value {
+            Some(value) => {
+                for row in rows.iter_mut().filter(|(name, _)| name == key) {
+                    row.1 = value.to_string();
+                }
+            }
+            None => rows.retain(|(name, _)| name != key),
+        }
+        rows
+    }
+
+    /// A table that names no tokenizer writes the twenty rows it wrote before
+    /// packs existed, in the same order, and no pack row.
+    #[test]
+    fn a_porter_table_writes_the_rows_it_always_wrote() {
+        let rows = parse(&[b"body".to_vec()]).expect("parsed").config_rows();
+        let keys: Vec<&str> = rows.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "format",
+                "writer",
+                "columns",
+                "facets",
+                "dims",
+                "metric",
+                "m",
+                "ef_construction",
+                "ef_search",
+                "mode",
+                "vector_weight",
+                "fusion",
+                "rerank_depth",
+                "tokenize",
+                "compact",
+                "segment_merge",
+                "merge_budget",
+                "source",
+                "source_column",
+                "threads",
+            ]
+        );
+        assert!(rows.contains(&("tokenize".to_string(), "porter".to_string())));
+        let pack = pack_rows();
+        let at = pack.iter().position(|(key, _)| key == "tokenizer_pack");
+        assert_eq!(at, Some(14), "the pack follows the tokenize row");
+        assert_eq!(pack.len(), 21);
+    }
+
+    /// A tokenizer name that could not be a pack's is refused as text, and
+    /// `porter` in any case and a pack name are read.
+    #[test]
+    fn a_tokenizer_name_that_is_not_a_plain_word_is_refused() {
+        for value in ["'../x'", "'pt/br'", "'PT-BR'", "'porter unicode61'"] {
+            let option = format!("tokenize = {value}");
+            let refused =
+                parse(&[b"body".to_vec(), option.into_bytes()]).expect_err("the name is refused");
+            let message = refused.message();
+            let named = value.trim_matches('\'');
+            assert!(message.contains("tokenizer name"), "{message}");
+            assert!(message.contains(named), "{message}");
+        }
+        let porter = parse(&[b"body".to_vec(), b"tokenize = 'PORTER'".to_vec()]).expect("read");
+        assert_eq!(porter.tokenizer, TokenizerChoice::Porter);
+        let named = parse(&[b"body".to_vec(), b"tokenizer = pt-br".to_vec()]).expect("read");
+        assert_eq!(named.tokenizer, TokenizerChoice::Named("pt-br".to_string()));
+    }
+
+    /// A reopened table rebuilds its pack from the configuration, and a write
+    /// reads it through `from_config` too.
+    #[test]
+    fn a_stored_pack_is_rebuilt_from_the_configuration() {
+        let declared = TokenizerChoice::Named("pt-br".to_string());
+        assert_eq!(
+            stored_tokenizer(&pack_rows(), &declared),
+            Ok(TokenizerChoice::Pack(example_pack()))
+        );
+        let fallback = parse(&[b"body".to_vec(), b"tokenize = 'pt-br'".to_vec()]).expect("read");
+        let read = from_config(&pack_rows(), &fallback).expect("read");
+        assert_eq!(read.tokenizer, TokenizerChoice::Pack(example_pack()));
+        let porter = parse(&[b"body".to_vec()]).expect("parsed");
+        assert_eq!(
+            stored_tokenizer(&porter.config_rows(), &TokenizerChoice::Porter),
+            Ok(TokenizerChoice::Porter)
+        );
+    }
+
+    /// A stored pack in a later format refuses as `unsupported`, so the command
+    /// line exits 3 and says to upgrade.
+    #[test]
+    fn a_stored_pack_in_a_later_format_refuses_as_unsupported() {
+        let later = example_pack()
+            .to_json()
+            .replacen("\"format\":1", "\"format\":2", 1);
+        let rows = with_row(pack_rows(), "tokenizer_pack", Some(&later));
+        let refused = stored_tokenizer(&rows, &TokenizerChoice::Named("pt-br".to_string()))
+            .expect_err("a later format is refused");
+        assert_eq!(refused.unsupported(), Some("a tokenizer pack in format 2"));
+        assert!(
+            refused.message().contains("format 2"),
+            "{}",
+            refused.message()
+        );
+    }
+
+    /// A pack table whose configuration lost its pack is refused, not read as
+    /// `porter`.
+    #[test]
+    fn a_configuration_that_lost_its_pack_is_refused() {
+        let declared = TokenizerChoice::Named("pt-br".to_string());
+        for rows in [
+            with_row(pack_rows(), "tokenizer_pack", None),
+            with_row(pack_rows(), "tokenizer_pack", Some("")),
+        ] {
+            let refused = stored_tokenizer(&rows, &declared).expect_err("refused");
+            assert!(refused.message().contains("pt-br"), "{}", refused.message());
+            assert_eq!(refused.unsupported(), None);
+        }
+    }
+
+    /// A stored name and a declared name that differ are refused in both
+    /// directions, naming both.
+    #[test]
+    fn a_stored_name_that_differs_from_the_declared_one_is_refused() {
+        let porter_rows = parse(&[b"body".to_vec()]).expect("parsed").config_rows();
+        for (rows, declared) in [
+            (porter_rows, TokenizerChoice::Named("pt-br".to_string())),
+            (pack_rows(), TokenizerChoice::Porter),
+            (pack_rows(), TokenizerChoice::Named("es".to_string())),
+        ] {
+            let refused = stored_tokenizer(&rows, &declared).expect_err("refused");
+            let message = refused.message();
+            assert!(message.contains(declared.name()), "{message}");
+            let stored = rows
+                .iter()
+                .find(|(key, _)| key == "tokenize")
+                .map(|(_, value)| value.as_str())
+                .unwrap_or_default();
+            assert!(message.contains(stored), "{message}");
+        }
     }
 }

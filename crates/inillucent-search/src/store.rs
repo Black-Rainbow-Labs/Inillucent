@@ -13,7 +13,8 @@
 //!
 //! - `%_config(k, v)` - the definition. Written once when the table is created
 //!   and read every time it is connected: columns, vector width, distance,
-//!   tokenizer identity, exact or approximate, the format number, and the
+//!   tokenizer identity (and a tokenizer pack's whole definition, for a table
+//!   that names one), exact or approximate, the format number, and the
 //!   release that wrote it. The last two are what let a later build refuse this
 //!   table by name instead of answering out of a store it does not understand -
 //!   see `crate::options::readable`.
