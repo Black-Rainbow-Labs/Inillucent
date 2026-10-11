@@ -189,13 +189,16 @@ impl ImportedDatabase {
         // **Created only if it is still empty once the lock is held.** Two
         // processes attaching the same new file both found nothing; the second
         // used to truncate the database the first had just written, as the
-        // open of `main` did.
-        let created = Database::create_if_empty(
+        // open of `main` did. The lock is held until `finish_new_file`, so
+        // another process never reads the file before its catalog exists; see
+        // `Database::create_held`.
+        let created = Database::create_held(
             vfs,
             path,
             Options::default()
                 .with_page_size(self.storage.page_size)
                 .with_frames(self.storage.frames.max(64)),
+            true,
         )?;
         let Some(mut fresh) = created else {
             return Ok(());

@@ -31,6 +31,10 @@ Wrong answers and lost data:
 - Two processes that opened a missing database at the same moment could delete the file the other
   had just created, and a process could fail with "cannot find the file" because another created
   the file a moment after it looked. An empty file now opens as an empty database, as in SQLite.
+  In 2.5.0 a process that opened the file while another was still creating it could still fail
+  every statement with "the database has no catalog tree", because the creating process let the
+  file go before it wrote the catalog. It now holds the file until the catalog is written, for
+  `ATTACH` of a new file as well.
 - `n IN (1, '1')` over an index returned the row twice and an `UPDATE` applied twice; the same for a
   `NOCASE` column and `IN ('a@x.com', 'A@X.COM')`.
 - `INSERT INTO t(rowid, ...)` ignored the value when the table has an `INTEGER PRIMARY KEY`, so

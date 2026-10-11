@@ -306,7 +306,7 @@ impl Database {
     /// @param path - where to create it
     /// @param options - the page size and pool size
     pub fn create(vfs: &dyn Vfs, path: &DbPath, options: Options) -> DbResult<Database> {
-        Self::create_within(vfs, path, options, false)?
+        Self::create_within(vfs, path, options, false, false)?
             .ok_or_else(|| misuse("a create that may replace a file declined to"))
     }
 
@@ -328,21 +328,47 @@ impl Database {
         path: &DbPath,
         options: Options,
     ) -> DbResult<Option<Database>> {
-        Self::create_within(vfs, path, options, true)
+        Self::create_within(vfs, path, options, true, false)
     }
 
-    /// Creates a fresh, empty database: the body of [`Database::create`] and
-    /// [`Database::create_if_empty`].
+    /// [`Database::create`] or [`Database::create_if_empty`], still holding the
+    /// file exclusively when it returns.
+    ///
+    /// **For a caller that writes the catalog before anybody may read the file.**
+    /// The two meta pages written here name no catalog tree, and the caller
+    /// writes one and then calls [`Database::finish_new_file`], which lets the
+    /// lock go. Let go here instead, another process that opened the path in
+    /// between read a database with no catalog and failed every statement with
+    /// "the database has no catalog tree": one shell in about 15 under load in
+    /// `durability::process_create`, and on the Linux CI runner unloaded.
     ///
     /// @param vfs - the file system to create in
     /// @param path - where to create it
     /// @param options - the page size and pool size
     /// @param only_if_empty - whether a file that already holds bytes is left as it is
+    pub fn create_held(
+        vfs: &dyn Vfs,
+        path: &DbPath,
+        options: Options,
+        only_if_empty: bool,
+    ) -> DbResult<Option<Database>> {
+        Self::create_within(vfs, path, options, only_if_empty, true)
+    }
+
+    /// Creates a fresh, empty database: the body of [`Database::create`],
+    /// [`Database::create_if_empty`] and [`Database::create_held`].
+    ///
+    /// @param vfs - the file system to create in
+    /// @param path - where to create it
+    /// @param options - the page size and pool size
+    /// @param only_if_empty - whether a file that already holds bytes is left as it is
+    /// @param hold - whether the exclusive lock is kept for the caller to let go
     fn create_within(
         vfs: &dyn Vfs,
         path: &DbPath,
         options: Options,
         only_if_empty: bool,
+        hold: bool,
     ) -> DbResult<Option<Database>> {
         let file = vfs
             .open(path, OpenOptions::main_db())
@@ -413,8 +439,11 @@ impl Database {
         // process to read; keeping it would make creating a database and then
         // opening it a deadlock with itself, which is what the pool's own tests
         // do. The connection takes whatever lock it needs at its first
-        // statement, exactly as an opened one does.
-        database.pool.unlock(FileLock::None)?;
+        // statement, exactly as an opened one does. A caller that asked to hold
+        // it lets it go in `finish_new_file`.
+        if !hold {
+            database.pool.unlock(FileLock::None)?;
+        }
         Ok(Some(database))
     }
 
@@ -1791,6 +1820,11 @@ impl Database {
         self.pool.finish_new_file(&mut meta)?;
         self.meta = meta;
         self.disk_meta = meta;
+        // The file is whole now, so a create that held it lets it go; see
+        // `Database::create_held`.
+        if self.pool.lock_level() > FileLock::None {
+            self.pool.unlock(FileLock::None)?;
+        }
         Ok(())
     }
 

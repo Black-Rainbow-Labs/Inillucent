@@ -433,10 +433,10 @@ impl crate::ImportedDatabase {
         let options = Options::default()
             .with_page_size(page_size)
             .with_frames(frames.max(64));
-        let created = match only_if_empty {
-            true => Database::create_if_empty(vfs.as_ref(), &db_path, options)?,
-            false => Some(Database::create(vfs.as_ref(), &db_path, options)?),
-        };
+        // **Held until the catalog is written**, so no other process reads the
+        // file between its first meta record, which names no catalog, and
+        // `finish_new_file`, which lets the lock go. See `Database::create_held`.
+        let created = Database::create_held(vfs.as_ref(), &db_path, options, only_if_empty)?;
         let Some(mut database) = created else {
             return Ok(None);
         };
