@@ -104,7 +104,8 @@ fn upserts_onto_a_thousand_keys_finish_in_time() {
     let (_, database) = fresh("upsert");
     let few = onto_ten_keys(
         &database,
-        "INSERT INTO few SELECT value % 10, 1 FROM generate_series(1, 40000) WHERE true          ON CONFLICT(id) DO UPDATE SET n = n + 1;",
+        "INSERT INTO few SELECT value % 10, 1 FROM generate_series(1, 40000) WHERE true \
+         ON CONFLICT(id) DO UPDATE SET n = n + 1;",
     );
     let session = database.session();
     session
@@ -125,7 +126,8 @@ fn upserts_onto_a_thousand_keys_finish_in_time() {
     println!("40,000 upserts onto 1,000 keys: {took:?}, against {few:?} onto 10 keys");
     assert!(
         took < few * TIMES_TEN_KEYS,
-        "40,000 upserts onto 1,000 keys took {took:?}, more than {TIMES_TEN_KEYS} times the {few:?}          onto 10 keys; each one rebuilt the delta area of its leaf"
+        "40,000 upserts onto 1,000 keys took {took:?}, more than {TIMES_TEN_KEYS} times the {few:?} \
+         onto 10 keys; each one rebuilt the delta area of its leaf"
     );
 }
 
@@ -156,7 +158,8 @@ fn replaces_onto_a_thousand_keys_finish_in_time() {
     println!("40,000 replaces onto 1,000 keys: {took:?}, against {few:?} onto 10 keys");
     assert!(
         took < few * TIMES_TEN_KEYS,
-        "40,000 replaces onto 1,000 keys took {took:?}, more than {TIMES_TEN_KEYS} times the {few:?}          onto 10 keys; each one rebuilt the delta area of its leaf"
+        "40,000 replaces onto 1,000 keys took {took:?}, more than {TIMES_TEN_KEYS} times the {few:?} \
+         onto 10 keys; each one rebuilt the delta area of its leaf"
     );
 }
 
