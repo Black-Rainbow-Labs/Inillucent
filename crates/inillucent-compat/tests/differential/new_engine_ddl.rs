@@ -312,7 +312,7 @@ fn a_view_and_a_trigger_are_stored_as_written() {
     pair.campaign(&[
         "CREATE VIEW reds AS SELECT id, email FROM members WHERE team = 'red'",
         "DROP VIEW reds",
-        "CREATE TRIGGER bump AFTER INSERT ON members BEGIN          UPDATE members SET score = score + 1 WHERE id = NEW.id; END",
+        "CREATE TRIGGER bump AFTER INSERT ON members BEGIN UPDATE members SET score = score + 1 WHERE id = NEW.id; END",
     ]);
 }
 

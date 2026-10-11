@@ -175,12 +175,28 @@ fn incremental_vacuum_stays_on_the_file_system_too() {
     build(&mut engine);
     let before = count(&mut engine, "SELECT count(*) FROM t");
     let pages_before = count(&mut engine, "PRAGMA page_count");
+    let free_before = count(&mut engine, "PRAGMA freelist_count");
+    let root_before = count(
+        &mut engine,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
+    );
 
     run(&mut engine, "PRAGMA incremental_vacuum(1)");
 
-    assert!(
-        count(&mut engine, "PRAGMA page_count") < pages_before,
-        "the pragma reclaimed nothing, so it never reached the rebuild this test is about:          still {pages_before} pages"
+    // One step gives back one page. The pragma no longer rebuilds the file.
+    assert_eq!(
+        count(&mut engine, "PRAGMA page_count"),
+        pages_before - 1,
+        "the pragma did not give back exactly one page"
+    );
+    assert_eq!(count(&mut engine, "PRAGMA freelist_count"), free_before - 1);
+    assert_eq!(
+        count(
+            &mut engine,
+            "SELECT rootpage FROM sqlite_schema WHERE name = 't'"
+        ),
+        root_before,
+        "the pragma moved the root of t"
     );
 
     assert_eq!(

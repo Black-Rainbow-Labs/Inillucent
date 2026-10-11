@@ -358,6 +358,57 @@ pub fn lock_state(
     ))
 }
 
+/// Returns the file index of the file at a path, or `None` when nothing is there.
+///
+/// One `GetFileInformationByName` call where this Windows has it, the same call
+/// `path_state` makes, so the check that a database was not replaced costs about
+/// 3 us. An older Windows, or a path too long for the call, opens the file and
+/// asks the handle. The engine compares this function's answer only with its
+/// own earlier answer for the same path, never with a handle's.
+///
+/// @param path - the path to ask about
+pub fn file_number_by_name(path: &std::path::Path) -> io::Result<Option<u128>> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{
+        GetLastError, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+    };
+    /// The longest path the call takes without the long path prefix.
+    const SHORT_PATH: usize = 259;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.len() <= SHORT_PATH && !wide.contains(&0) {
+        wide.push(0);
+        if let Some(by_name) = file_information_by_name() {
+            let mut stat = FileStatInformation::default();
+            // SAFETY: `wide` is a NUL terminated UTF-16 string and `stat` is a
+            // writable buffer of the size passed, both alive across the call,
+            // which keeps neither. Class 0 is `FileStatByNameInfo`.
+            let ok = unsafe {
+                by_name(
+                    wide.as_ptr(),
+                    0,
+                    (&mut stat as *mut FileStatInformation).cast(),
+                    std::mem::size_of::<FileStatInformation>() as u32,
+                )
+            };
+            if ok != 0 {
+                return Ok(Some(u128::from(stat.file_id as u64)));
+            }
+            // SAFETY: reads the calling thread's last error, which the call above set.
+            let code = unsafe { GetLastError() };
+            if matches!(code, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
+                return Ok(None);
+            }
+        }
+    }
+    match std::fs::File::open(path) {
+        Ok(file) => file_identity(&file)
+            .map(|identity| Some(identity.file))
+            .map_err(|_| io::Error::other("the file's index could not be read")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Returns the volume serial number and file index that identify a file.
 pub fn file_identity(file: &File) -> VfsResult<FileIdentity> {
     // SAFETY: BY_HANDLE_FILE_INFORMATION is plain data with no invalid bit

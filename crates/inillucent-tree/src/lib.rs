@@ -51,12 +51,17 @@
 )]
 
 pub mod datum;
+mod extents;
+mod format;
 pub mod key;
 pub mod keyenc;
+mod keylimit;
 pub mod leaf;
 pub mod mutate;
 pub mod page;
 pub mod paged;
+pub mod relocate;
+mod separator;
 pub mod split_log;
 pub mod stages;
 pub mod tree;
@@ -64,6 +69,7 @@ pub mod types;
 pub mod write;
 
 pub use datum::Datum;
+pub use keylimit::MAX_KEY_BYTES;
 pub use leaf::{LeafBuilder, LeafRef};
 pub use mutate::{Applied, DeltaPlan, LeafMut};
 pub use page::{PageId, PageSize};

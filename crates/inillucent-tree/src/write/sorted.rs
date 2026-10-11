@@ -291,7 +291,8 @@ impl PagedTree {
         let guard = pool.fetch(page)?;
         let leaf = LeafRef::parse(&guard)?
             .with_collations(self.collations())
-            .with_directions(self.directions());
+            .with_directions(self.directions())
+            .with_pool(pool);
         // A row is copied out only when the leaf holds an out-of-line value,
         // which a copy of the page would not. Otherwise the undo images and the
         // caller both read a copy of the page (task-2185): copying each row
@@ -323,12 +324,18 @@ impl PagedTree {
                 },
                 false => Vec::new(),
             };
-            if let (Located::Delta(index), true) = (located, leaf.has_extents()) {
-                for column in 0..leaf.column_count() {
-                    if let Some(reference) = leaf.delta_extent_at(index, column)? {
-                        orphaned.push(reference);
+            match (located, leaf.has_extents()) {
+                (Located::Delta(index), true) => {
+                    for column in 0..leaf.column_count() {
+                        if let Some(reference) = leaf.delta_extent_at(index, column)? {
+                            orphaned.push(reference);
+                        }
                     }
                 }
+                (Located::Sorted(row), true) => {
+                    orphaned.extend(leaf.sorted_value_extents(row)?);
+                }
+                _ => {}
             }
             doomed.push(Doomed { located, row });
         }
@@ -612,7 +619,8 @@ impl PagedTree {
         let guard = pool.fetch(page)?;
         let leaf = LeafRef::parse(&guard)?
             .with_collations(self.collations())
-            .with_directions(self.directions());
+            .with_directions(self.directions())
+            .with_pool(pool);
         for (index, key) in keys.iter().enumerate() {
             let located = self.locate_in(&leaf, key)?;
             let Some(before) = self.row_in_leaf(pool, &leaf, located)? else {

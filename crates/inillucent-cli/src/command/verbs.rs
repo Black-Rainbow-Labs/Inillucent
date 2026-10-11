@@ -131,7 +131,9 @@ fn blob_literal(fields: &[(String, Json)]) -> Result<String, Failed> {
              for a vector, or {\"blob\": \"<hex>\"} for bytes.",
         ));
     };
-    if hex.is_empty() || hex.len() % 2 != 0 || !hex.chars().all(|digit| digit.is_ascii_hexdigit()) {
+    // An empty string is no digits, which is an even number of them: it names
+    // the empty blob, the same value `x''` is and `zeroblob(0)` returns.
+    if hex.len() % 2 != 0 || !hex.chars().all(|digit| digit.is_ascii_hexdigit()) {
         return Err(Failed::misuse(
             "the value of \"blob\" has to be an even number of hexadecimal digits.",
         ));
@@ -382,6 +384,9 @@ fn bound_values(context: &Context, arguments: &Arguments) -> Result<Vec<Json>, F
             ),
         ));
     }
+    // A byte order mark is not JSON, and Notepad and PowerShell's `Out-File`
+    // write one, so a parameters file saved there was refused as "not JSON".
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
     let parsed = json::parse(text.trim())
         .map_err(|why| Failed::misuse(format!("'params-file' is not JSON: {why}")))?;
     match parsed {
@@ -455,11 +460,18 @@ pub fn exec(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fai
 pub fn batch(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
     let sql = arguments.required_text("sql")?.to_string();
     context.refuse_if_it_writes(&sql)?;
-    let joined = !context
+    let already_open = !context
         .shell()
         .connection()
         .autocommit()
         .map_err(|error| Failed::from_engine(&error))?;
+    // **A script with its own BEGIN and COMMIT runs as written.** Wrapping it
+    // made its BEGIN fail with "cannot start a transaction within a
+    // transaction", so the output of `.dump` could not be loaded with
+    // `batch`. Its own transaction makes it atomic, and a failure inside it
+    // rolls that transaction back below.
+    let own = !already_open && crate::shell::controls_its_own_transaction(context.shell(), &sql);
+    let joined = already_open || own;
     let before = context
         .shell()
         .connection()
@@ -499,6 +511,12 @@ pub fn batch(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fa
                 });
             }
         }
+        // A script that opened its own transaction and failed inside it does
+        // not leave the session holding that transaction.
+        let left_open = !context.shell().connection().autocommit().unwrap_or(true);
+        if own && left_open {
+            let _ = context.shell().execute("ROLLBACK");
+        }
         return Err(failed);
     }
     if !joined {
@@ -525,7 +543,9 @@ pub fn batch(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fa
     produced.extra.push((
         "transaction".to_string(),
         Json::Text(
-            if joined {
+            if own {
+                "the script's own"
+            } else if joined {
                 "joined the open transaction; not committed"
             } else {
                 "committed"
@@ -801,7 +821,7 @@ pub fn schema(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
 pub fn describe(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
     let name = arguments.required_text("table")?.to_string();
     let info = format!(
-        "SELECT cid, name, type, \"notnull\", dflt_value, pk,          CASE hidden WHEN 1 THEN 'hidden' WHEN 2 THEN 'generated virtual'          WHEN 3 THEN 'generated stored' ELSE '' END AS kind          FROM pragma_table_xinfo({})",
+        "SELECT cid, name, type, \"notnull\", dflt_value, pk, CASE hidden WHEN 1 THEN 'hidden' WHEN 2 THEN 'generated virtual' WHEN 3 THEN 'generated stored' ELSE '' END AS kind FROM pragma_table_xinfo({})",
         quoted_text(&name)
     );
     let mut produced = produce(context, "describe", &info, &[], 0)?;
@@ -917,6 +937,7 @@ pub fn import(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
     let file = arguments.required_text("file")?.to_string();
     let table_name = arguments.required_text("table")?.to_string();
     let confined = context.confine(&file)?;
+    ensure_readable_file(&file, &confined)?;
     let mut line = String::from(".import");
     match arguments.text("format").unwrap_or("csv") {
         "csv" => line.push_str(" --csv"),
@@ -959,10 +980,42 @@ pub fn import(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
     if produced.changes == 0 {
         produced.changes = row_count(context, &table_name).saturating_sub(before_rows);
     }
-    if produced.text.is_empty() {
-        produced.text = format!("imported {} rows into {table_name}", produced.changes);
-    }
+    // The warnings about rows with too few or too many fields come back as the
+    // text, so the count goes after them instead of replacing them.
+    let counted = format!("imported {} rows into {table_name}", produced.changes);
+    produced.text = match produced.text.is_empty() {
+        true => counted,
+        false => format!("{}\n{counted}", produced.text),
+    };
     Ok(produced)
+}
+
+/// Refuses a path that is not a file the command can read, naming the cause.
+///
+/// **The shell's complaint about a file it could not open has no status of its
+/// own, so a missing file was reported as `syntax`.** That is the status for a
+/// statement that is wrong, and it sends a script looking at its SQL. A file
+/// that is not there is `not_found`, and one that is there and cannot be read is
+/// `io`.
+///
+/// @param named - the path as the caller wrote it, for the message
+/// @param path - the path after confinement
+fn ensure_readable_file(named: &str, path: &std::path::Path) -> Result<(), Failed> {
+    match std::fs::metadata(path) {
+        Ok(found) if found.is_file() => Ok(()),
+        Ok(_) => Err(Failed::said(
+            Status::Io,
+            format!("\"{named}\" is not a file, so there is nothing to read rows from."),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(Failed::said(
+            Status::NotFound,
+            format!("there is no file at \"{named}\"."),
+        )),
+        Err(error) => Err(Failed::said(
+            Status::Io,
+            format!("cannot read \"{named}\": {error}"),
+        )),
+    }
 }
 
 /// Returns how many rows a table holds, or zero when it holds none or is absent.
@@ -1030,6 +1083,14 @@ pub fn export(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
                 Failed::said(Status::Io, format!("cannot open \"{named}\": {message}"))
             })?;
     }
+    // **`insert` names the table the rows came from.** `.mode insert` alone
+    // writes `INSERT INTO tab(...)`, SQLite's placeholder, so an export of the
+    // table `people` could not be loaded back without editing every line. A
+    // query has no one table, and keeps the placeholder, as in `sqlite3`.
+    let mode = match (mode.as_str(), arguments.text("table")) {
+        ("insert", Some(table)) => format!("insert \"{}\"", table.replace('"', "\"\"")),
+        _ => mode,
+    };
     let script = format!(".mode {mode}\n.headers on\n{sql};");
     // An export of nothing still writes its header, so a reader of the file
     // learns the columns. The shell prints no header for an empty result,
@@ -1093,7 +1154,7 @@ pub fn backup(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
     context
         .shell()
         .backup_to(&named)
-        .map_err(|message| Failed::said(Status::Io, message))?;
+        .map_err(|error| Failed::from_engine(&error))?;
     Ok(Outcome::said("backup", format!("wrote {named}")).with("wrote", json::text(&named)))
 }
 
@@ -1706,6 +1767,7 @@ pub fn migrate(context: &mut Context, arguments: &Arguments) -> Result<Outcome, 
             format!("\"{destination}\" already exists. This tool never overwrites."),
         ));
     }
+    ensure_folder_exists(&destination, &to)?;
     match kind.as_str() {
         "sqlite" => migrate_sqlite_file(&from, &to),
         "index" => Err(Failed::unsupported(
@@ -1717,6 +1779,32 @@ pub fn migrate(context: &mut Context, arguments: &Arguments) -> Result<Outcome, 
             "'{other}' is not a migration kind. Use sqlite, postgres, mysql or index."
         ))),
     }
+}
+
+/// Refuses a destination whose folder is not there, as `not_found`.
+///
+/// **The migration stages its file beside the destination, and the failure to
+/// create that file was reported as `corrupt`** with the message "database disk
+/// image is malformed", which says the source is damaged when the destination
+/// folder was never made. Asking first names the folder and the right status.
+///
+/// @param named - the destination as the caller wrote it
+/// @param path - the destination after confinement
+fn ensure_folder_exists(named: &str, path: &std::path::Path) -> Result<(), Failed> {
+    let folder = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => return Ok(()),
+    };
+    if folder.is_dir() {
+        return Ok(());
+    }
+    Err(Failed::said(
+        Status::NotFound,
+        format!(
+            "there is no folder \"{}\" to write \"{named}\" in. Make the folder first.",
+            folder.display()
+        ),
+    ))
 }
 
 /// The environment variable a source may be given in instead of an argument.
@@ -1829,6 +1917,7 @@ fn migrate_remote(
             format!("\"{destination}\" already exists. This tool never overwrites."),
         ));
     }
+    ensure_folder_exists(destination, &to)?;
     let mut plan = inillucent_remote::Plan::new(url, &to);
     // The surface's own ceiling. `command::run` has already armed it on this
     // thread, so this is belt and braces rather than the only bound - but a

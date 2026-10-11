@@ -97,8 +97,8 @@ mod translate;
 mod catalog;
 
 pub use catalog::{ForcePlan, SourceLayout, TreeCatalog};
-pub(crate) use chain::Listing;
 pub use chain::{build, build_prepared, build_prepared_described, build_statement, Statement};
+pub(crate) use chain::{entering_predicate, HeldBefore, Listing};
 pub use params::{Params, Slots, ENGINE_PARAMETER_BASE};
 pub use run::{
     keep_partial_rows, prepare_any, rowid_seek_key, run, run_any, run_any_prepared,

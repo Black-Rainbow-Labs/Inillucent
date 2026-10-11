@@ -14,9 +14,9 @@ sha256 = "bb4b0a0bd2523ba2f97d85ffea879878ad69ffbe500c63be074df3c724ba6307"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/arm.rs"
-ticket = "task-2110"
-reason = "Bug 5: a manifest can say runnable false, for a model whose vectors come from outside (the Qwen3 teachers), and an installed arm that fails to open fails the arm tests rather than skipping"
-sha256 = "b5af34b3436dc579039fa0d92f87d6ffef0e3c6ccfe0722ee07e64fff674a2a1"
+ticket = "task-2217"
+reason = "a string literal that held the indentation of a joined line is one line again"
+sha256 = "99c47dc3dfa4ad44fcc52207778baafad736673f3f941526ffe5da963e663dd6"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/corpus.rs"
@@ -62,9 +62,9 @@ sha256 = "c608e2fc48e23f1e8080e9ea3ee239c7b8ace703c28015c3237ee41acc0390f7"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/llamacpp.rs"
-ticket = "task-1973"
-reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. The batch and slot indexing in the concurrent embed path, and every serde_json::Value index, which panics on a missing key. Doc comments on truncation and manifest."
-sha256 = "ab368ee7cdb99c2bb13b3c15299ac1ef2f29784b20f38137f2368703054b2777"
+ticket = "task-2217"
+reason = "two string literals that held the indentation of a joined line are one line again"
+sha256 = "b7039d2a42cfcb59e5a5ddf7a57af84f11c308fe7dfce8a76a1c945f4f996457"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/main.rs"
@@ -80,9 +80,9 @@ sha256 = "641c0bafaaaa7821837056b1f26a50d8211e10693074d87df99ab9868754bf9e"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/models.rs"
-ticket = "task-2158"
-reason = "task-2158: the test manifest names its kind, a bi encoder, because ModelManifest gained the kind field. No change to what the test checks."
-sha256 = "3d2dbe24ef0c37622e70284d8157e49473da890cce172a33c29d9756f0b39fdb"
+ticket = "task-2217"
+reason = "a string literal that held the indentation of a joined line is one line again"
+sha256 = "43b80e0a6d91dd9f826a65426e41ef600f6cd51224e31840add9f9d5b9eaff6e"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/queryset.rs"
@@ -272,9 +272,9 @@ sha256 = "6efe79dd4b4eba7c665aa583ef9c9efcd2aef465c9a7429befb4136e6c661efb"
 
 [[amendment]]
 path = "crates/inillucent-core/src/store.rs"
-ticket = "task-2167"
-reason = "Store::set_attributes replaces one document's attributes by appending them and pointing its range at them. Used only to repair facet values a 2.0.3 merge dropped."
-sha256 = "29b36c2453b8c32cf89021eec7711d7c03c9c8a5ded6f0085a40908f45efbb6a"
+ticket = "task-2217"
+reason = "a test assertion message that held the indentation of a joined line is one line again"
+sha256 = "0788bef043d67c3ae8d5f563e5c9c2252635bfc03766463dd5c4468bfc3db42a"
 
 [[amendment]]
 path = "crates/inillucent-core/src/tokenize.rs"

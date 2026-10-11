@@ -184,19 +184,26 @@ pub fn right_image<'d, R: AsRef<[Datum<'d>]>>(
     Ok(image)
 }
 
+/// What an interior page holds in each separator slot, as the page stores it:
+/// the separator's bytes, or the reference and prefix of one stored out of line.
+pub type StoredSlot = (bool, Vec<u8>);
+
 /// Returns an interior page's separators, children and level.
 ///
 /// Children come back as page ids whether the resident frame holds them
-/// swizzled or not, so the write path and a replay read the same list.
+/// swizzled or not, so the write path and a replay read the same list. A
+/// separator comes back as the page stores it, with its flag, so a rebuilt page
+/// moves a separator stored out of line without reading or writing its pages.
 ///
 /// @param pool - the buffer pool
 /// @param page - the interior page
-pub fn read_interior(pool: &Pool, page: PageId) -> DbResult<(Vec<Vec<u8>>, Vec<PageId>, u16)> {
+pub fn read_interior(pool: &Pool, page: PageId) -> DbResult<(Vec<StoredSlot>, Vec<PageId>, u16)> {
     let guard = pool.fetch(page)?;
     let interior = InteriorRef::parse(&guard)?;
     let mut separators = Vec::with_capacity(interior.count());
     for slot in 0..interior.count() {
-        separators.push(interior.key(slot)?.to_vec());
+        let (out_of_line, bytes) = interior.separator_slot(slot)?;
+        separators.push((out_of_line, bytes.to_vec()));
     }
     let mut children = Vec::with_capacity(interior.children());
     for child in 0..interior.children() {
@@ -227,22 +234,54 @@ pub fn parent_image(
     separator: &[u8],
     right: PageId,
 ) -> DbResult<Option<Vec<u8>>> {
+    parent_image_with_slot(
+        pool,
+        page_size,
+        tree,
+        parent,
+        left,
+        (false, separator),
+        right,
+    )
+}
+
+/// [`parent_image`] for a separator the page may store out of line.
+///
+/// @param pool - the buffer pool holding the parent
+/// @param page_size - the database's page size
+/// @param tree - the tree the page belongs to
+/// @param parent - the interior page
+/// @param left - the child that was split
+/// @param separator - what the page stores for the right half's first key
+/// @param right - the new child
+pub(crate) fn parent_image_with_slot(
+    pool: &Pool,
+    page_size: usize,
+    tree: u64,
+    parent: PageId,
+    left: PageId,
+    separator: inillucent_pool::interior::SlotBytes<'_>,
+    right: PageId,
+) -> DbResult<Option<Vec<u8>>> {
     let (mut separators, mut children, level) = read_interior(pool, parent)?;
     let Some(position) = children.iter().position(|page| *page == left) else {
         return Ok(None);
     };
-    separators.insert(position, separator.to_vec());
+    separators.insert(position, (separator.0, separator.1.to_vec()));
     children.insert(position.saturating_add(1), right);
     let builder = InteriorBuilder::new(page_size, tree, level)?;
-    let keys: Vec<&[u8]> = separators.iter().map(Vec::as_slice).collect();
-    if !builder.fits(&keys) {
+    let slots: Vec<inillucent_pool::interior::SlotBytes<'_>> = separators
+        .iter()
+        .map(|(out_of_line, bytes)| (*out_of_line, bytes.as_slice()))
+        .collect();
+    if !builder.fits_slots(&slots) {
         return Ok(None);
     }
     let swips: Vec<Swip> = children
         .iter()
         .map(|page| Swip::unswizzled(*page))
         .collect();
-    Ok(Some(builder.build(&keys, &swips)?))
+    Ok(Some(builder.build_slots(&slots, &swips)?))
 }
 
 #[cfg(test)]

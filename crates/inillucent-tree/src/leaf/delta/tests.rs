@@ -381,15 +381,6 @@ fn live_between_agrees_with_the_rules_for_every_bound() {
 /// @param page - a page from `LeafBuilder::encode`
 /// @param rows - the delta rows, each a list of values in column order
 fn with_delta(page: &[u8], rows: &[Vec<Datum<'_>>]) -> Vec<u8> {
-    let mut out = page.to_vec();
-    let leaf = LeafRef::parse(&out).unwrap();
-    let count = leaf.row_count();
-    let columns = leaf.column_count();
-    let mut end = leaf_header::DIRECTORY + columns * leaf.directory_entry_size();
-    for index in 0..columns {
-        end = align8(end);
-        end += class_bytes(count) + count * leaf.column_width(index).unwrap();
-    }
     let encoded: Vec<Vec<u8>> = rows
         .iter()
         .map(|row| {
@@ -400,13 +391,30 @@ fn with_delta(page: &[u8], rows: &[Vec<Datum<'_>>]) -> Vec<u8> {
             bytes
         })
         .collect();
+    with_encoded_delta(page, &encoded)
+}
+
+/// Writes a delta area of rows already in their tagged bytes into a page.
+///
+/// @param page - a page from `LeafBuilder::encode`
+/// @param encoded - the delta rows, each the tagged bytes of its values in column order
+fn with_encoded_delta(page: &[u8], encoded: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = page.to_vec();
+    let leaf = LeafRef::parse(&out).unwrap();
+    let count = leaf.row_count();
+    let columns = leaf.column_count();
+    let mut end = leaf_header::DIRECTORY + columns * leaf.directory_entry_size();
+    for index in 0..columns {
+        end = align8(end);
+        end += class_bytes(count) + count * leaf.column_width(index).unwrap();
+    }
     // The area sits against the heap: the directory, then the rows in the
     // order the directory names them. The caller hands them in directory
     // order, which is key order for any page a writer produced - and a test
     // of what the integrity check refuses can hand them in any other.
     let heap_start = leaf.heap_start;
     let body: usize = encoded.iter().map(|row| row.len() + 2).sum();
-    let delta_start = heap_start - body - DELTA_ENTRY * rows.len();
+    let delta_start = heap_start - body - DELTA_ENTRY * encoded.len();
     // Room for a tombstone bitmap between the mini-columns and the delta
     // area, because that is where the layout puts one and a later
     // `with_tombstones` has to have somewhere to write it.
@@ -414,7 +422,7 @@ fn with_delta(page: &[u8], rows: &[Vec<Datum<'_>>]) -> Vec<u8> {
         align8(end + tombstone_bytes(count)) <= delta_start,
         "the delta does not fit: the columns end at {end} and the area starts at {delta_start}"
     );
-    let mut at = delta_start + DELTA_ENTRY * rows.len();
+    let mut at = delta_start + DELTA_ENTRY * encoded.len();
     for (index, row) in encoded.iter().enumerate() {
         let entry = delta_start + DELTA_ENTRY * index;
         page::write_u16(&mut out, entry, (heap_start - at) as u16).unwrap();
@@ -423,7 +431,7 @@ fn with_delta(page: &[u8], rows: &[Vec<Datum<'_>>]) -> Vec<u8> {
         at += 2 + row.len();
     }
     page::write_u32(&mut out, leaf_header::DELTA_START, delta_start as u32).unwrap();
-    page::write_u16(&mut out, leaf_header::DELTA_COUNT, rows.len() as u16).unwrap();
+    page::write_u16(&mut out, leaf_header::DELTA_COUNT, encoded.len() as u16).unwrap();
     out[header::FLAGS] |= LEAF_HAS_DELTA;
     out
 }
@@ -905,4 +913,78 @@ fn a_format_one_compaction_replays_as_a_format_one_page() {
         .unwrap();
     expected[header::FLAGS] &= !LEAF_DELTA_DIRECTORY;
     assert_eq!(image, expected);
+}
+
+/// A delta row whose key is stored out of line round trips through every
+/// reader that walks a delta row, and the plain extent tag is refused in a key
+/// position.
+///
+/// The key is the tagged key extent: the reference, a prefix length and the
+/// prefix. `tagged_span` steps over it by that length, `delta_extent_at` names
+/// its reference, and `compare_delta_key` decides from the prefix when it can
+/// and refuses by naming the pool when it cannot.
+#[test]
+fn a_delta_row_with_a_key_stored_out_of_line_reads_back() {
+    use crate::datum::{tag, KEY_EXTENT_TAG_HEAD_BYTES};
+    use inillucent_pool::extent::ExtentRef;
+
+    let columns = vec![
+        ColumnSpec::key(PhysicalType::Text),
+        ColumnSpec::new(PhysicalType::Text),
+    ];
+    let builder = LeafBuilder::new(8192, 1, columns, 1).unwrap();
+    let sorted = vec![vec![Datum::Text(b"a"), Datum::Text(b"packed")]];
+    let key: Vec<u8> = std::iter::once(b'm')
+        .chain(std::iter::repeat_n(b'x', 3_000))
+        .collect();
+    let prefix = &key[..key_prefix_bytes(8192)];
+    let reference = ExtentRef::run(inillucent_pool::PageId(77), key.len() as u64);
+    let mut row = Vec::new();
+    encode_key_extent_tagged(&mut row, reference, prefix);
+    Datum::Text(b"value").encode_tagged(&mut row);
+    assert_eq!(row[0], tag::KEY_EXTENT);
+    assert_eq!(
+        Datum::tagged_span(&row).unwrap(),
+        KEY_EXTENT_TAG_HEAD_BYTES + prefix.len()
+    );
+    let mut page = with_encoded_delta(&builder.encode(&sorted).unwrap(), &[row]);
+    page[header::FLAGS] |= LEAF_HAS_EXTENTS;
+
+    let bare = LeafRef::parse(&page).unwrap();
+    assert_eq!(bare.delta_extent_at(0, 0).unwrap(), Some(reference));
+    assert_eq!(bare.delta_extent_at(0, 1).unwrap(), None);
+    assert!(bare.delta_extents_in(0).unwrap());
+    // Decided by the prefix, with nothing attached.
+    let above = [Datum::Text(b"z")];
+    assert!(bare.compare_delta_key(0, &above).unwrap().is_lt());
+    // A probe that ties over the prefix needs the whole value.
+    let mut tie = key.clone();
+    tie.push(b'y');
+    let refusal = bare
+        .compare_delta_key(0, &[Datum::Text(&tie)])
+        .expect_err("a tie needs the whole value");
+    assert!(refusal
+        .detail()
+        .is_some_and(|said| said.contains("attach the tree's pool")));
+
+    let mut held = Extents::default();
+    held.push_delta(0, 0, key.clone());
+    let leaf = LeafRef::parse(&page).unwrap().with_extents(&held);
+    assert!(leaf
+        .compare_delta_key(0, &[Datum::Text(&tie)])
+        .unwrap()
+        .is_lt());
+    assert!(leaf
+        .compare_delta_key(0, &[Datum::Text(&key)])
+        .unwrap()
+        .is_eq());
+    leaf.integrity().unwrap();
+
+    // The plain extent tag belongs to the columns that are not keys.
+    let mut wrong = Vec::new();
+    encode_extent_tagged(&mut wrong, reference);
+    Datum::Text(b"value").encode_tagged(&mut wrong);
+    let mut page = with_encoded_delta(&builder.encode(&sorted).unwrap(), &[wrong]);
+    page[header::FLAGS] |= LEAF_HAS_EXTENTS;
+    assert!(LeafRef::parse(&page).unwrap().integrity().is_err());
 }

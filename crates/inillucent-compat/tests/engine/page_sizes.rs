@@ -255,16 +255,18 @@ fn rtree_writes_two_hundred_boxes_at_every_page_size() {
     }
 }
 
-/// A row that genuinely cannot fit a page is refused, and says why.
+/// A key longer than a page is stored, and a row that genuinely cannot fit a
+/// page is refused, and says why.
 ///
-/// **The other half of not answering `SQLITE_CORRUPT`.** A key column is never
-/// stored out of line, because a descent compares keys and a comparison that
-/// read another page would turn every search into a chain of them - so a key
-/// longer than a page cannot be stored at all. That is a statement this engine
-/// will not run, not a damaged file, and it has to read as one: a corruption
-/// code sends the reader to the integrity check instead of to their schema.
+/// **The other half of not answering `SQLITE_CORRUPT`.** A key column over the
+/// spill threshold is stored on pages of its own with its first bytes kept in
+/// the leaf, so a key eight times the page is stored and found. A row of many
+/// values that are each under the threshold still cannot fit, and that is a
+/// statement this engine will not run, not a damaged file. It has to read as
+/// one: a corruption code sends the reader to the integrity check instead of to
+/// their schema.
 #[test]
-fn a_key_longer_than_a_page_is_refused_rather_than_called_corrupt() {
+fn a_key_longer_than_a_page_is_stored_and_a_row_that_cannot_fit_is_refused() {
     let (mut database, _path) = database("oversized-key", 512);
     run(
         &mut database,
@@ -272,23 +274,44 @@ fn a_key_longer_than_a_page_is_refused_rather_than_called_corrupt() {
         "CREATE TABLE t (k TEXT PRIMARY KEY, v TEXT)",
     );
     let key = "k".repeat(4_096);
+    run(
+        &mut database,
+        512,
+        &format!("INSERT INTO t (k, v) VALUES ('{key}', 'v')"),
+    );
+    assert_eq!(
+        count(
+            &mut database,
+            &format!("SELECT count(*) FROM t WHERE k = '{key}'")
+        ),
+        1,
+        "a key eight times the page is found"
+    );
+
+    let columns: Vec<String> = (0..12).map(|at| format!("c{at} TEXT")).collect();
+    run(
+        &mut database,
+        512,
+        &format!(
+            "CREATE TABLE r (id INTEGER PRIMARY KEY, {})",
+            columns.join(", ")
+        ),
+    );
+    // Each value is under the threshold of a 512 byte page, which is 64 bytes,
+    // and together they fill more than the page holds.
+    let values: Vec<String> = (0..12).map(|_| format!("'{}'", "v".repeat(60))).collect();
     let error = database
         .execute_any(
-            &format!("INSERT INTO t (k, v) VALUES ('{key}', 'v')"),
+            &format!("INSERT INTO r VALUES (1, {})", values.join(", ")),
             &Params::new(),
         )
-        .expect_err("a key eight times the page cannot be stored");
+        .expect_err("twelve values of 60 bytes cannot be stored in a 512 byte page");
     assert_ne!(
         error.code(),
         inillucent_base::error::PrimaryCode::Corrupt,
         "a row the engine cannot store answered `{}` ({:?})",
         error.message(),
         error.detail()
-    );
-    let detail = error.detail().unwrap_or_default().to_string();
-    assert!(
-        detail.contains("key"),
-        "the refusal said `{detail}`, which does not name the key column as the reason"
     );
 }
 
@@ -339,7 +362,7 @@ fn a_row_in_a_table_created_in_the_same_transaction_survives_a_reopen() {
             assert_eq!(
                 count(&mut database, &query),
                 1,
-                "the row written into t{last}, the last of {tables} tables created in one                  transaction, is gone after a reopen at a {page_size}-byte page"
+                "the row written into t{last}, the last of {tables} tables created in one transaction, is gone after a reopen at a {page_size}-byte page"
             );
             assert_eq!(
                 count(
@@ -351,4 +374,60 @@ fn a_row_in_a_table_created_in_the_same_transaction_survives_a_reopen() {
             );
         }
     }
+}
+
+/// A file made at 4,096 byte pages and opened with the default open keeps its
+/// page size through `VACUUM`.
+///
+/// The connection held the page size the caller asked for at open, 32,768 by
+/// default, not the size the file was made at, and `VACUUM` rebuilds at the
+/// connection's size. `PRAGMA page_size` already reported the file's own size,
+/// so nothing showed until the file was rebuilt at another one.
+#[test]
+fn a_file_opened_with_the_default_keeps_its_own_page_size_through_vacuum() {
+    use inillucent_compat::newengine::connect::Database;
+    let directory =
+        inillucent_compat::workspace_root().join("_agent_output/page-sizes/default-open");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("the directory is made");
+    let path = directory.join("small.rdb");
+    let page_size = |database: &Database| -> i64 {
+        let rows = database
+            .session()
+            .query("PRAGMA page_size")
+            .expect("the pragma runs");
+        match rows.first().and_then(|row| row.first()) {
+            Some(OwnedDatum::Int(n)) => *n,
+            other => panic!("PRAGMA page_size answered {other:?}"),
+        }
+    };
+    {
+        let made = Database::open_at(&path, 4_096, 256).expect("the file is made at 4,096");
+        made.session()
+            .execute_batch(
+                "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT); \
+                 INSERT INTO t SELECT value, 'row ' || value FROM generate_series(1, 500); \
+                 DELETE FROM t WHERE a % 2 = 0;",
+            )
+            .expect("the rows are written");
+    }
+    {
+        let opened = Database::open(&path).expect("the file opens with the default");
+        assert_eq!(page_size(&opened), 4_096, "the file's own size is reported");
+        opened
+            .session()
+            .execute_batch("VACUUM")
+            .expect("VACUUM runs");
+    }
+    let reopened = Database::open(&path).expect("the rebuilt file opens");
+    assert_eq!(
+        page_size(&reopened),
+        4_096,
+        "VACUUM kept the file's page size"
+    );
+    let rows = reopened
+        .session()
+        .query("SELECT count(*) FROM t")
+        .expect("the count runs");
+    assert_eq!(rows, vec![vec![OwnedDatum::Int(250)]]);
 }

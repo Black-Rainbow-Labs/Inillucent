@@ -205,16 +205,31 @@ fn there_is_a_database_at(path: &Path) -> DbResult<bool> {
     match inillucent_vfs::os::path_state(path) {
         Ok(Some(found)) if found.file => Ok(true),
         Ok(None) => Ok(false),
-        Ok(Some(_)) => Err(inillucent_base::error::refusal(format!(
+        Ok(Some(_)) => Err(cannot_open(format!(
             "{} is not a file, so it is neither a database to open nor a path to create one at",
             path.display()
         ))),
-        Err(error) => Err(inillucent_base::error::refusal(format!(
+        Err(error) => Err(cannot_open(format!(
             "cannot tell whether there is a database at {}: {error}. Refusing rather than \
              creating one, because creating one deletes whatever is there",
             path.display()
         ))),
     }
+}
+
+/// Builds the error for a path that cannot be opened as a database file.
+///
+/// **The code is `CantOpen`, which callers report as `io`.** These refusals were
+/// built with `refusal`, whose code is the one for a misused statement, so a
+/// directory given as the database was reported as `syntax`: the status that
+/// tells a caller their SQL is wrong. The file system is what refused here, and
+/// `io` is the status that says so.
+///
+/// @param said - the sentence, safe for a caller to read
+fn cannot_open(said: String) -> DbError {
+    DbError::primary(PrimaryCode::CantOpen)
+        .with_message(said.clone())
+        .with_detail(said)
 }
 
 /// Reports whether a path names a file, asking the file system the light way.
@@ -226,6 +241,131 @@ fn there_is_a_database_at(path: &Path) -> DbResult<bool> {
 /// @param path - the path to ask about
 pub fn is_a_file(path: &Path) -> bool {
     matches!(inillucent_vfs::os::path_state(path), Ok(Some(state)) if state.file)
+}
+
+/// Reports whether a path names a file that holds no bytes at all.
+///
+/// @param path - the database file
+fn is_an_empty_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|found| found.is_file() && found.len() == 0)
+}
+
+/// Creates a database at a path that holds nothing or an empty file, or opens
+/// the one another process created there first.
+///
+/// See [`ImportedDatabase::create_unless_present`]: the creation deletes nothing
+/// and gives way to a database another process has already written.
+///
+/// @param vfs - the file system the database lives on
+/// @param path - the database file
+/// @param page_size - the page size to build at
+/// @param frames - how many frames the buffer pool holds
+fn create_or_open(
+    vfs: std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    path: &Path,
+    page_size: usize,
+    frames: usize,
+) -> DbResult<Slot> {
+    let created = ImportedDatabase::create_unless_present(
+        std::sync::Arc::clone(&vfs),
+        path.to_path_buf(),
+        page_size,
+        frames,
+    )?;
+    match created {
+        Some(engine) => Ok(Slot::Ready(Box::new(engine))),
+        None => ImportedDatabase::begin_open(vfs, path.to_path_buf(), page_size, frames, false)
+            .and_then(Slot::pending),
+    }
+}
+
+/// Builds an I/O failure whose sentence is the message a caller reads.
+///
+/// @param said - what failed and why
+fn io_failure(said: String) -> inillucent_base::DbError {
+    inillucent_base::DbError::primary(inillucent_base::error::PrimaryCode::IoErr)
+        .with_message(said.clone())
+        .with_detail(said)
+}
+
+/// Copies one file, reporting a failure as an I/O error that names both paths.
+///
+/// @param from - the file to copy
+/// @param to - where the copy goes
+fn copy_file(from: &Path, to: &Path) -> DbResult<()> {
+    std::fs::copy(from, to).map(|_| ()).map_err(|error| {
+        io_failure(format!(
+            "cannot copy {} to {}: {error}",
+            from.display(),
+            to.display()
+        ))
+    })
+}
+
+/// Copies every log segment beside a database to the same segment of another
+/// database name.
+///
+/// @param from - the database whose log is copied
+/// @param to - the database the copies are named for
+fn copy_log(from: &Path, to: &Path) -> DbResult<()> {
+    let (Some(directory), Some(base), Some(target)) = (
+        from.parent(),
+        from.file_name().and_then(|name| name.to_str()),
+        to.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return Ok(());
+    };
+    // A bare file name's parent is the empty path, which names no directory to list: the C
+    // driver's conformance program backs up `capi-lifecycle.rdb` and got an I/O error.
+    let directory = match directory.as_os_str().is_empty() {
+        true => Path::new("."),
+        false => directory,
+    };
+    let listing = std::fs::read_dir(directory)
+        .map_err(|error| io_failure(format!("cannot list {}: {error}", directory.display())))?;
+    for entry in listing.flatten() {
+        let name = entry.file_name();
+        let Some(sequence) = name
+            .to_str()
+            .and_then(|name| inillucent_wal::segment::sequence_of_segment_name(base, name))
+        else {
+            continue;
+        };
+        let copy = to.with_file_name(inillucent_wal::segment::segment_name(target, sequence));
+        copy_file(&entry.path(), &copy)?;
+    }
+    Ok(())
+}
+
+/// Reports whether two paths name the same existing file.
+///
+/// Compared after the file system resolves both, so `./app.rdb`, a different
+/// letter case on Windows, and a link all count as the same file. A path that
+/// does not exist yet names no file, so it is never the same as another.
+///
+/// @param one - a path
+/// @param other - another path
+fn same_file(one: &Path, other: &Path) -> bool {
+    match (std::fs::canonicalize(one), std::fs::canonicalize(other)) {
+        (Ok(one), Ok(other)) => one == other,
+        _ => false,
+    }
+}
+
+/// Returns a scratch name beside a backup's destination, unique to this
+/// process and moment, for the copy to be written and checked under before it
+/// is renamed into place. Beside it, so the rename stays on one volume and is
+/// a single directory update.
+///
+/// @param destination - where the backup goes
+fn backup_scratch(destination: &Path) -> std::path::PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let mut name = destination.as_os_str().to_os_string();
+    name.push(format!(".backup-{}-{stamp}", std::process::id()));
+    std::path::PathBuf::from(name)
 }
 
 /// Opens a database read only after an open for writing was refused permission,
@@ -498,13 +638,35 @@ impl Database {
         let vfs = crate::encryption::file_system(key, page_size)?;
         let explain = |error| crate::encryption::explain_a_wrong_key(error, keyed);
         let opened = match (exists, read_only, first_try) {
-            // The open above failed on a file that is there, so it is not tried
-            // again; a refusal of permission still falls back to reading.
-            (true, false, Some(error)) => {
-                opened_read_only_instead(error, vfs, &path, page_size, frames)
-                    .map(|engine| Slot::Ready(Box::new(engine)))
-                    .map_err(explain)
+            // **An empty file is an empty database, as in SQLite.** It failed the
+            // open above as malformed, having no meta record. It is created in
+            // place, under the lock, unless another process is creating it right
+            // now, in which case the database that process wrote is opened.
+            (true, false, Some(_)) if is_an_empty_file(&path) => {
+                create_or_open(vfs, &path, page_size, frames)
             }
+            // The open above failed, and a refusal of permission still falls
+            // back to reading.
+            //
+            // **It is tried once more first, because the file may not have been
+            // there when it failed.** Eight shells opening a path with nothing at
+            // it all failed the first open with "cannot find the file", and the
+            // ones that found the file here because another shell had just
+            // created it reported that error rather than opening what was now
+            // there: one shell in about a hundred, in
+            // `durability::process_create`.
+            (true, false, Some(error)) => match ImportedDatabase::begin_open(
+                std::sync::Arc::clone(&vfs),
+                path.clone(),
+                page_size,
+                frames,
+                false,
+            ) {
+                Ok(pending) => Ok(Slot::pending(pending)?),
+                Err(_) => opened_read_only_instead(error, vfs, &path, page_size, frames)
+                    .map(|engine| Slot::Ready(Box::new(engine)))
+                    .map_err(explain),
+            },
             // **The open stops after the file's own checks** (task-2191). The
             // rest runs at the first statement; see `Slot::Pending`.
             (true, false, None) => {
@@ -536,8 +698,7 @@ impl Database {
                      create one",
                 ))
             }
-            (false, false, _) => ImportedDatabase::create_on(vfs, path.clone(), page_size, frames)
-                .map(|engine| Slot::Ready(Box::new(engine))),
+            (false, false, _) => create_or_open(vfs, &path, page_size, frames),
         };
         let slot = match opened {
             Ok(slot) => slot,
@@ -994,23 +1155,144 @@ impl Database {
     /// checked is a file that is assumed to be a database, and the cost of
     /// finding out otherwise is paid at the worst possible moment.
     ///
+    /// **A file already at `path` is replaced, and only once the copy has been
+    /// checked.** The copy is written to a scratch file beside `path`, opened
+    /// and walked there, and renamed over `path`, so a backup that fails part
+    /// way leaves the old file as it was. The replaced database's log segments
+    /// are removed first, because recovery reads segments by their name: one
+    /// left beside the new file is replayed into it as if it were its own.
+    ///
+    /// **The database itself is refused as the destination.** The copy used to
+    /// be written straight onto `path`, and `std::fs::copy` of a file onto
+    /// itself truncates it, so `inillucent backup app.rdb --db app.rdb` failed
+    /// with `io` and left nothing of the database. Found by the bug hunt's CLI
+    /// round trips.
+    ///
     /// @param path - where the copy goes
     pub fn backup_to(&self, path: impl AsRef<Path>) -> DbResult<()> {
         let path = path.as_ref();
-        self.checkpoint()?;
-        std::fs::copy(&self.path, path).map_err(|error| {
-            inillucent_base::error::misuse(format!(
-                "cannot copy {} to {}: {error}",
-                self.path.display(),
+        if same_file(&self.path, path) {
+            return Err(inillucent_base::error::statement_refusal(format!(
+                "cannot back up {} onto itself; give the backup a different path",
+                self.path.display()
+            )));
+        }
+        let scratch = backup_scratch(path);
+        let written = self.write_checked_copy(&scratch);
+        let vfs = std::sync::Arc::clone(&self.ready()?.storage.vfs);
+        // The check opened the scratch copy, which started a log beside it.
+        crate::rebuild::remove_log_segments(&vfs, &scratch);
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&scratch);
+            return Err(error);
+        }
+        // **A destination another process has open is held against its writers
+        // until the copy is in its place**, for the reason `VACUUM` is: a commit
+        // to the old file after the rename would go to a file no path names.
+        // Each of that process's connections then finds the file replaced and
+        // reopens. See `crate::rebuild::WritersHeldOut`.
+        let held_out = match path.exists() {
+            true => match crate::rebuild::WritersHeldOut::take(
+                &vfs,
+                path,
+                inillucent_pool::file::default_busy_millis(),
+            ) {
+                Ok(held) => Some(held),
+                Err(error) => {
+                    let _ = std::fs::remove_file(&scratch);
+                    return Err(error);
+                }
+            },
+            false => None,
+        };
+        crate::rebuild::remove_log_segments(&vfs, path);
+        let renamed = std::fs::rename(&scratch, path);
+        drop(held_out);
+        renamed.map_err(|error| {
+            let _ = std::fs::remove_file(&scratch);
+            io_failure(format!(
+                "cannot put the checked copy at {}: {error}",
                 path.display()
             ))
-        })?;
+        })
+    }
+
+    /// Copies this database's file to `scratch` and checks that the copy opens
+    /// and that every tree in it is sound.
+    ///
+    /// @param scratch - where the copy goes, a name nothing else uses
+    fn write_checked_copy(&self, scratch: &Path) -> DbResult<()> {
+        // **A checkpoint is tried, briefly.** When nobody else holds the file it
+        // folds the log, so the copy is the file and nothing else, byte for
+        // byte. It needs the file to itself, and it used to wait the whole busy
+        // timeout beside another process's read transaction before giving way
+        // to the copy below, which was correct all along: the copy takes the
+        // log with the file.
+        let folded = self.checkpoint_unless_busy()?;
+        self.copy_beside_another_process(scratch, !folded)?;
         // **The copy is opened with the key this database was.** It is the
         // same bytes, so it is encrypted the same way, and the check below
-        // has to be able to read it.
+        // has to be able to read it. Its own checkpoint folds the log copied
+        // with it into its file, before the caller removes that log, and only
+        // then: with no log it would rewrite the meta page, and the backup would
+        // no longer be the source byte for byte.
         let key = self.ready()?.encryption_key()?;
-        let copy = Database::open_keyed(path, PAGE_SIZE, DEFAULT_FRAMES, false, key)?;
-        copy.check()
+        let copy = Database::open_keyed(scratch, PAGE_SIZE, DEFAULT_FRAMES, false, key)?;
+        copy.check()?;
+        match folded {
+            true => Ok(()),
+            false => copy.checkpoint(),
+        }
+    }
+
+    /// Checkpoints when the file can be had within a moment, gives way when it cannot, and
+    /// reports which.
+    ///
+    /// For a backup, which copies the log with the file when the checkpoint gave way and so is
+    /// correct either way; see [`Database::write_checked_copy`].
+    fn checkpoint_unless_busy(&self) -> DbResult<bool> {
+        let mut engine = self.ready()?;
+        let budget = engine.storage.database.busy_millis();
+        engine
+            .storage
+            .database
+            .set_busy_millis(crate::engine::locks::BRIEF_FOLD_MILLIS.min(budget));
+        let folded = engine.checkpoint();
+        engine.storage.database.set_busy_millis(budget);
+        match folded {
+            Ok(()) => Ok(true),
+            Err(error) if error.code() == inillucent_base::error::PrimaryCode::Busy => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Copies this database's file and its log under the shared lock, for a backup.
+    ///
+    /// **A backup is a read, and another process's open transaction does not
+    /// stop a read.** The checkpoint a backup begins with needs the file to
+    /// itself, so while another process held even a read transaction,
+    /// `inillucent backup`, `.backup` and `.clone` waited out the busy
+    /// timeout and failed, where SQLite copies at once. Under the shared lock no
+    /// process can fold the log into the file, so the file and the log segments
+    /// beside it are one state; a writer may still append to the log, and a
+    /// record the copy cut short has no commit after it, which recovery
+    /// discards. The copy is opened and checked afterwards like any other.
+    ///
+    /// @param scratch - where the copy goes, a name nothing else uses
+    /// @param with_log - whether to copy the log segments too
+    fn copy_beside_another_process(&self, scratch: &Path, with_log: bool) -> DbResult<()> {
+        let mut engine = self.ready()?;
+        engine.enter(false)?;
+        // **The log only when the checkpoint gave way.** After a checkpoint the file holds
+        // everything, and a copy of the old segments made the copy's own checkpoint move its
+        // log position, so the backup was no longer the source byte for byte.
+        let copied = copy_file(&self.path, scratch).and_then(|()| match with_log {
+            true => copy_log(&self.path, scratch),
+            false => Ok(()),
+        });
+        let left = engine.leave();
+        copied?;
+        left
     }
 
     /// Reports whether this database is encrypted.
@@ -1429,7 +1711,7 @@ impl<'d> Connection<'d> {
         // `prepare_statement` answers the count beside the plan, and on a plan
         // cache hit it answers it without parsing at all - which is the path
         // that used to parse every time for a number it already had.
-        let compiled = self.engine()?.prepare_statement(sql)?;
+        let compiled = self.engine()?.prepare_current_statement(sql)?;
         let declared = compiled.parameters;
         let generation = self.engine()?.schema_generation();
         let mut params = Params::new();
@@ -1531,7 +1813,7 @@ impl<'d> Connection<'d> {
             // a transaction"), rather than the `SQLITE_MISUSE` `refusal`
             // hands out.
             return Err(inillucent_base::error::statement_refusal(
-                "a transaction is already open on this database; this engine does not nest                  them, because committing the inner one would commit the outer one's work too.",
+                "a transaction is already open on this database; this engine does not nest them, because committing the inner one would commit the outer one's work too.",
             ));
         }
         self.execute_batch("BEGIN")?;
@@ -1763,7 +2045,7 @@ impl Statement<'_> {
             // bound against it.
             held.use_session(self.session);
             if held.schema_generation() != self.generation {
-                self.compiled = held.prepare_statement(&self.sql)?;
+                self.compiled = held.prepare_current_statement(&self.sql)?;
                 self.generation = held.schema_generation();
             }
             inillucent_exec::physical::take_partial_rows();
@@ -1869,7 +2151,7 @@ impl Statement<'_> {
         let mut held = self.database.ready()?;
         held.use_session(self.session);
         if held.schema_generation() != self.generation {
-            self.compiled = held.prepare_statement(&self.sql)?;
+            self.compiled = held.prepare_current_statement(&self.sql)?;
             self.generation = held.schema_generation();
         }
         held.runs_rows_at_once(&self.compiled)

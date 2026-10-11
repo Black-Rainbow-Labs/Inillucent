@@ -9,6 +9,7 @@ feature, the study says which feature and why, and the feature's own page says h
 
 | Date | Study | What it answers |
 |---|---|---|
+| 8 October 2026 | [How inillucent was made faster than SQLite](performance-hill-climbing.md) | The hill climbs that took the engine from 432% slower than SQLite to 505% faster: the loop, the benchmarks and why they can be trusted, the changes that moved the numbers most, the advice taken and not taken, and what is still slower. Published at [inillucent.com/research/hill-climbing](https://inillucent.com/research/hill-climbing) |
 | 29 September 2026 | [Retrieval for RAG](rag-retrieval-study.md) | Which search techniques put the right text in front of a language model, measured on 67,369 emails with 119 graded questions, and what inillucent built because of each result |
 
 [Retrieval for RAG, explained from the start](../rag-explained.md) teaches the same techniques to a

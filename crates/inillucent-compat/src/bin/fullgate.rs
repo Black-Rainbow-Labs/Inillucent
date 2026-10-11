@@ -1710,7 +1710,7 @@ fn run_the_connection_arm(
         for entry in pairs.iter_mut() {
             entry.agreed = false;
             entry.disagreement = format!(
-                "round {round}: the connection arm left {api_state:?} where the pipeline arm                  left {pipeline_state:?}"
+                "round {round}: the connection arm left {api_state:?} where the pipeline arm left {pipeline_state:?}"
             );
         }
         return Ok(());

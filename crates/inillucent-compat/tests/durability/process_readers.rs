@@ -515,3 +515,57 @@ fn readers_see_only_prefixes_at_the_default_page_size() {
 fn readers_see_only_prefixes_at_sqlites_page_size() {
     readers_beside_a_writer_see_only_prefixes(&sqlite_page_arm());
 }
+
+/// A reader that stays open follows pages another process moved and cut.
+///
+/// The reader holds a connection and its pool across a `FULL` delete made by the
+/// command line. The delete moves pages to lower numbers and cuts the file, so
+/// the reader's next statement must not read a page from its own pool that now
+/// has another meaning, and must not read past the end of the shorter file.
+#[test]
+fn a_reader_follows_a_page_moved_by_another_process() {
+    use inillucent_driver::{Database, Value};
+    let directory = workspace_root().join("_agent_output/process-readers/moved-page");
+    let _ = std::fs::remove_dir_all(&directory);
+    let _ = std::fs::create_dir_all(&directory);
+    let path = directory.join("app.rdb");
+    let opened = Database::open(&path).expect("the database opens");
+    let session = opened.session();
+    session
+        .execute_batch(
+            "PRAGMA auto_vacuum = full; \
+             CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); \
+             INSERT INTO t SELECT value, hex(randomblob(400)) FROM generate_series(1, 2000);",
+        )
+        .expect("the table fills");
+    let first = session
+        .query_all("SELECT count(*), sum(length(v)) FROM t", &[])
+        .expect("the first read runs");
+    assert_eq!(first.rows[0][0], Value::Integer(2000));
+
+    let text = path.to_string_lossy().to_string();
+    let ran = inillucent_compat::cliproc::run(
+        &program("inillucent"),
+        &[
+            "--db",
+            text.as_str(),
+            "exec",
+            "DELETE FROM t WHERE id > 100",
+        ],
+    );
+    assert_eq!(ran.code, 0, "the delete runs: {}", ran.stderr);
+
+    let after = session
+        .query_all("SELECT count(*), sum(length(v)) FROM t", &[])
+        .expect("the read after the move runs");
+    assert_eq!(after.rows[0][0], Value::Integer(100));
+    assert_eq!(after.rows[0][1], Value::Integer(100 * 800));
+    let every = session
+        .query_all("SELECT id FROM t ORDER BY id", &[])
+        .expect("a scan runs");
+    assert_eq!(every.rows.len(), 100);
+    let check = session
+        .query_all("PRAGMA integrity_check", &[])
+        .expect("the check runs");
+    assert_eq!(check.rows, vec![vec![Value::Text("ok".to_string())]]);
+}

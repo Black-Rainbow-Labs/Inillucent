@@ -521,22 +521,32 @@ fn remove_then(
         return Ok(false);
     }
     remove_row(table, layout, target, key, row, indexes)?;
-    between(target)?;
-    fire(
-        triggers,
-        TriggerTime::After,
-        target,
-        &trigger::TriggerFiring {
-            rows: trigger::TriggerRows {
-                old: Some(row),
-                new: None,
-            },
-            slots: &layout.slots,
-            rowid: layout.rowid,
-            params,
-            depth,
+    let after = trigger::TriggerFiring {
+        rows: trigger::TriggerRows {
+            old: Some(row),
+            new: None,
         },
-    )?;
+        slots: &layout.slots,
+        rowid: layout.rowid,
+        params,
+        depth,
+    };
+    // **The keys' actions, then `RETURNING`, then the `AFTER` triggers.** That
+    // is SQLite's order for each row: a cascade has already removed the
+    // children when `RETURNING` is computed, and a user's `AFTER` trigger has
+    // not yet run. `RETURNING` used to be computed before the cascade, so a
+    // subquery in it counted children the statement was deleting.
+    let action = |held: &inillucent_sql::dml::BoundTrigger| {
+        held.foreign_key && inillucent_sql::dml::changes_rows(held)
+    };
+    trigger::fire_where(triggers, TriggerTime::After, target, &after, &|held| {
+        action(held) && (!replacing || held.foreign_key)
+    })?;
+    between(target)?;
+    let recursive = !replacing || params.recursive_triggers();
+    trigger::fire_where(triggers, TriggerTime::After, target, &after, &|held| {
+        !action(held) && (held.foreign_key || recursive)
+    })?;
     Ok(true)
 }
 /// Removes one row and every index entry that named it.

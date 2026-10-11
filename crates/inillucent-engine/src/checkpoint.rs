@@ -527,6 +527,12 @@ impl ImportedDatabase {
             self.note_where_the_log_ends(recovery_from)?;
         }
         self.storage.database.checkpoint_after_free_map()?;
+        // **The file is cut only by a checkpoint that moved the recovery point**, and
+        // this one just did: no record in the window the next recovery replays names a
+        // page past the end. A fold that did not move it, such as the one an open
+        // makes after a replay, would leave a file too short for records it still
+        // has to replay.
+        self.storage.database.cut_to_page_count()?;
         if reclaiming {
             reclaim(&self.storage.wal, recovery_from)?;
         }
@@ -740,6 +746,7 @@ impl ImportedDatabase {
             // below it are retired.
             held.database.pool().set_retained_lsn(recovery_from);
             held.database.checkpoint_after_free_map()?;
+            held.database.cut_to_page_count()?;
             if reclaiming {
                 reclaim(&held.wal, recovery_from)?;
             }

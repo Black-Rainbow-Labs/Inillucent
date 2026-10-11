@@ -168,9 +168,6 @@ pub(crate) struct Pragmas {
     /// set by `PRAGMA legacy_alter_table`.
     legacy_alter_table: std::cell::Cell<bool>,
 
-    /// The ceiling `PRAGMA max_page_count` set, in pages.
-    max_page_count: std::cell::Cell<i64>,
-
     /// What `PRAGMA temp_store` reports.
     ///
     /// The *setting* rather than the state, which is what SQLite reports: this
@@ -365,18 +362,6 @@ impl Pragmas {
         self.locking_exclusive.set(value);
     }
 
-    /// Returns max page count.
-    pub(crate) fn max_page_count(&self) -> i64 {
-        self.max_page_count.get()
-    }
-
-    /// Sets max page count.
-    ///
-    /// @param value - what to set it to
-    pub(crate) fn set_max_page_count(&self, value: i64) {
-        self.max_page_count.set(value);
-    }
-
     /// Returns query only.
     pub(crate) fn query_only(&self) -> bool {
         self.query_only.get()
@@ -540,7 +525,6 @@ impl Pragmas {
             query_only: std::cell::Cell::new(false),
             recursive_triggers: std::cell::Cell::new(false),
             legacy_alter_table: std::cell::Cell::new(false),
-            max_page_count: std::cell::Cell::new(crate::pragma::DEFAULT_MAX_PAGE_COUNT),
             temp_store: std::cell::Cell::new(0),
             remembered: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         }
@@ -689,6 +673,12 @@ pub(crate) struct Schema {
     /// the TDD's "every plan cache is invalidated" made into two lines that
     /// cannot get out of step.
     pub(crate) catalog_generation: u64,
+    /// The one table `define_table` appended since the last catalog refresh, when that is all
+    /// that changed: its position in `tables`, how long `tables` was after the append, and the
+    /// generation the catalog had. `refresh_catalog` adds that table to the catalog it holds
+    /// instead of building the catalog again from every table, which made each `CREATE TABLE`
+    /// cost time in proportion to the tables that already existed.
+    pub(crate) appended: Option<(usize, usize, u64)>,
     pub(crate) trees: HashMap<u32, PagedTree>,
     pub(crate) layouts: HashMap<u32, std::rc::Rc<SourceLayout>>,
     /// For each table root, its index roots ordered smallest tree first.
@@ -812,6 +802,11 @@ pub(crate) struct Storage {
     /// it is what lets `:memory:` be a database rather than a path the
     /// operating system refuses.
     pub(crate) vfs: std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    /// The number the file system gave the database file when this connection opened it.
+    ///
+    /// `None` for a database with no file, and on a file system that has no such number. See
+    /// `ImportedDatabase::file_was_replaced`.
+    pub(crate) opened_as: Option<u128>,
 }
 
 /// What a transaction in progress has done so far.
@@ -840,6 +835,32 @@ pub(crate) struct StatementMark {
     pub(crate) dropped: usize,
     /// How long the list of trees this transaction has built was.
     pub(crate) built: usize,
+    /// How long the list of meta field changes was.
+    pub(crate) meta: usize,
+}
+
+/// A value a meta field held before the open transaction changed it.
+///
+/// `PRAGMA user_version` and `PRAGMA application_id` live in the meta page,
+/// which is not in the log, so the undo buffer, which holds row images, cannot
+/// put them back. This record can.
+#[derive(Clone, Copy)]
+pub(crate) struct MetaChange {
+    /// Which attached database the field belongs to, as the pragma named it.
+    pub(crate) at: Option<usize>,
+    /// Which field changed.
+    pub(crate) field: MetaField,
+    /// What it held before.
+    pub(crate) before: i32,
+}
+
+/// The meta fields a statement inside a transaction can change.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetaField {
+    /// `PRAGMA user_version`.
+    UserVersion,
+    /// `PRAGMA application_id`.
+    ApplicationId,
 }
 
 /// One thing a transaction has dropped and has not yet committed.
@@ -977,6 +998,29 @@ pub(crate) struct Writing {
     /// page P marked free while p still pointed at it, so the *next* statement
     /// to allocate anything overwrote p's rows.
     pending_frees: std::cell::RefCell<Vec<PendingFree>>,
+    /// Pages `PRAGMA incremental_vacuum` has asked to give back in this transaction,
+    /// by schema.
+    ///
+    /// **Queued, and run at the commit.** The pragma answers at once, but the moves
+    /// that give the pages back are records of the transaction, so a `ROLLBACK`
+    /// drops the request with the transaction and every move happens in one place.
+    /// See `ImportedDatabase::shrink_participants`.
+    incremental_steps: std::cell::RefCell<std::collections::BTreeMap<usize, u64>>,
+    /// The files in which this transaction dropped a tree, as a participant mask.
+    ///
+    /// Read at the commit, where the roots the drops left holes in are filled. See
+    /// `ImportedDatabase::compact_roots`.
+    roots_released: std::cell::Cell<u16>,
+    /// Meta fields the open transaction changed, each with its value before.
+    ///
+    /// **A `ROLLBACK` used to leave `PRAGMA user_version` as the transaction
+    /// set it**, and the pragma checkpointed at once, so the value was in the
+    /// file before the transaction decided anything. A migration that failed
+    /// part way left the file at the new version, and the migration was
+    /// skipped on the next start. The change is now kept in memory with its
+    /// old value until the commit checkpoints it, and a rollback puts the old
+    /// value back.
+    meta_changes: std::cell::RefCell<Vec<MetaChange>>,
     /// Trees the open transaction has built, waiting for its commit.
     ///
     /// **The other half of task-2043's rule, and the leak it left (task-2065).**
@@ -1419,6 +1463,37 @@ impl Writing {
         &self.pending_frees
     }
 
+    /// Returns the cell holding the pages `PRAGMA incremental_vacuum` asked for.
+    ///
+    /// The cell rather than a borrow of it, for the reason [`Writing::marks`]
+    /// hands back the cell.
+    pub(crate) fn incremental_steps(
+        &self,
+    ) -> &std::cell::RefCell<std::collections::BTreeMap<usize, u64>> {
+        &self.incremental_steps
+    }
+
+    /// Notes that a tree of one file was dropped.
+    ///
+    /// @param at - the schema, as the binder numbers them
+    pub(crate) fn note_root_released(&self, at: usize) {
+        self.roots_released
+            .set(self.roots_released.get() | crate::schema_bit(at));
+    }
+
+    /// Returns the files in which trees were dropped, and forgets them.
+    pub(crate) fn take_roots_released(&self) -> u16 {
+        self.roots_released.replace(0)
+    }
+
+    /// Returns the cell holding the meta fields the open transaction changed.
+    ///
+    /// The cell rather than a borrow of it, for the reason [`Writing::marks`]
+    /// hands back the cell.
+    pub(crate) fn meta_changes(&self) -> &std::cell::RefCell<Vec<MetaChange>> {
+        &self.meta_changes
+    }
+
     /// Returns the cell holding the trees this transaction has built.
     ///
     /// The cell rather than a borrow of it, for the reason [`Writing::marks`]
@@ -1453,6 +1528,9 @@ impl Writing {
             decided_over: std::cell::Cell::new(0),
             marks: std::cell::RefCell::new(Vec::new()),
             pending_frees: std::cell::RefCell::new(Vec::new()),
+            incremental_steps: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            roots_released: std::cell::Cell::new(0),
+            meta_changes: std::cell::RefCell::new(Vec::new()),
             built: std::cell::RefCell::new(Vec::new()),
             implicit_transaction: std::cell::Cell::new(false),
             running: std::cell::Cell::new(0),
@@ -1582,6 +1660,47 @@ impl Writing {
     /// Returns touched.
     pub(crate) fn touched(&self) -> u16 {
         self.touched.get()
+    }
+
+    /// Moves every record of the open transaction that names a schema after `at` down one
+    /// place, for a `DETACH` of a schema the transaction has not written.
+    ///
+    /// **The transaction records what it wrote by schema position**, in the touched mask, the
+    /// undo records, the pending frees, the trees it built and the meta changes. Detaching an
+    /// earlier schema moves every later one down, so those records would name the wrong file:
+    /// the detach was refused instead, where SQLite allows it. `at` itself is never named,
+    /// because the caller refuses a detach of a schema the transaction wrote.
+    ///
+    /// @param at - the position of the schema being detached
+    pub(crate) fn schema_detached(&self, at: usize) {
+        let moved = |schema: usize| match schema > at {
+            true => schema.saturating_sub(1),
+            false => schema,
+        };
+        let shift = u32::try_from(at).unwrap_or(u32::MAX);
+        let mask = self.touched.get();
+        let below = mask
+            & 1u16
+                .checked_shl(shift)
+                .map_or(u16::MAX, |bit| bit.wrapping_sub(1));
+        let above = mask
+            .checked_shr(shift.saturating_add(1))
+            .unwrap_or(0)
+            .checked_shl(shift)
+            .unwrap_or(0);
+        self.touched.set(below | above);
+        for record in self.undo.borrow_mut().iter_mut() {
+            record.schema = moved(record.schema);
+        }
+        for free in self.pending_frees.borrow_mut().iter_mut() {
+            free.schema = moved(free.schema);
+        }
+        for built in self.built.borrow_mut().iter_mut() {
+            built.schema = moved(built.schema);
+        }
+        for change in self.meta_changes.borrow_mut().iter_mut() {
+            change.at = change.at.map(moved);
+        }
     }
 
     /// Sets touched.

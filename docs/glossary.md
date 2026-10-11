@@ -17,6 +17,7 @@ If a word on another page is not here and should be, add it.
 
 | Term | What it means |
 |---|---|
+| **Auto vacuum** | A setting of `PRAGMA auto_vacuum` that makes the file shorter when a delete frees pages. In `FULL` mode each commit moves the pages at the end of the file into free pages nearer the start and lowers the page count. In `INCREMENTAL` mode that happens only when `PRAGMA incremental_vacuum` runs. In `NONE` mode, the default, freed pages stay in the file and later writes reuse them. |
 | **B-tree** | The structure a table or an index is stored in. It is a shallow tree of pages with the rows in key order, so finding one key takes a few page reads however large the table is. |
 | **B+tree** | A B-tree that keeps rows only in its leaves. The pages above the leaves hold only keys and page numbers. inillucent's tables and indexes are B+trees, and so are SQLite's tables. |
 | **Blob extent** | Where the end of a value too long for one page is stored, as a chain of pages. SQLite calls the same idea an **overflow page**. |
@@ -28,6 +29,7 @@ If a word on another page is not here and should be, add it.
 | **Eviction** | Removing a page from the buffer pool to make room for another page. A page that was changed is written out before it is evicted. |
 | **Frame** | One slot in the buffer pool. A frame holds one page. |
 | **Free map** | The record of which pages in the file are unused. A new page is taken from the free map before the file is made longer. SQLite calls its version the **freelist**. |
+| **Incremental vacuum** | `PRAGMA incremental_vacuum(N)`. In a file in `INCREMENTAL` auto vacuum mode it gives back up to N free pages when the statement commits, or every free page when N is left out. It does nothing in the other two modes. |
 | **Interior page** | A B-tree page above the leaves. It holds keys and the page numbers of the pages below it. |
 | **Leaf** | A B-tree page at the bottom of the tree. Leaves hold the rows. |
 | **Meta page** | The first page of an inillucent file. It holds the page size, the page number of the catalog and the start of the free map, and it is written in two copies. The engine refuses to open a file whose meta page cannot be read. |

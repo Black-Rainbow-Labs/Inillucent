@@ -10,6 +10,190 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**A bug hunt driven by real applications found about 100 defects, and this fixes most of them.**
+Eight hunts ran: application schemas the way ORMs write them, messy real data, speed against
+SQLite, the command line's round trips, two processes on one file, processes killed while they
+write, search with writes and reopens, and SQLite's own fixed bugs from 3.46 to 3.53. Each fix has
+a test that failed before it. `tasks/task-2217-bug-hunt-8.md` has every defect, its test and the
+ones left open. The usage corpus can now close the database and open it again in the middle of a
+case: a line `-- reopen` runs the rest of the case in a new shell process.
+
+Wrong answers and lost data:
+
+- A `UNIQUE` index accepted a duplicate of the first key of every leaf after the first: 6529, 13057
+  and 19585 in a 20,000 row integer column. Plain `INSERT`, `OR IGNORE`, `OR REPLACE`, both upsert
+  forms and `UPDATE` all let it through. `PRAGMA integrity_check` reports such a duplicate as
+  "non-unique entry in index"; delete the extra row and run `REINDEX`.
+- A process that kept a database open ran each statement with the plan it compiled before another
+  process changed the schema: `SELECT *` returned the old columns, a dropped column failed with an
+  internal error, and an `INSERT` after another process dropped and recreated the table reported
+  success and was lost. A table, view or column another process created was never found.
+- Two processes that opened a missing database at the same moment could delete the file the other
+  had just created, and a process could fail with "cannot find the file" because another created
+  the file a moment after it looked. An empty file now opens as an empty database, as in SQLite.
+- `n IN (1, '1')` over an index returned the row twice and an `UPDATE` applied twice; the same for a
+  `NOCASE` column and `IN ('a@x.com', 'A@X.COM')`.
+- `INSERT INTO t(rowid, ...)` ignored the value when the table has an `INTEGER PRIMARY KEY`, so
+  `INSERT INTO new(rowid, a) SELECT rowid, a FROM old` renumbered every row.
+- `PRAGMA user_version` and `PRAGMA application_id` set inside a transaction survived `ROLLBACK`.
+- `VACUUM` reset the `AUTOINCREMENT` high water mark, so an id could be handed out twice, and dropped
+  WAL mode from the file. It is also about 150 times faster: it copied each row in a transaction of
+  its own.
+- A table deleted from the front, such as a queue or a log trimmed to its newest rows, never gave a
+  page back, and the file grew by every round of inserts it took. At pages smaller than the default
+  it then still kept an interior page and a leaf for each parent a trim emptied, about 6 pages a
+  round at 4,096 byte pages; such an interior page now hands its last child to the one beside it
+  and is freed, and the file stays the same size over 40 rounds.
+- A foreign key's `CASCADE`, `SET NULL` and `SET DEFAULT` ran after the parent's `AFTER` triggers,
+  and a `DELETE`'s `RETURNING` was computed before them.
+- `inillucent backup` onto the database it copies destroyed it. A backup over an existing database
+  now replaces it only after the copy is checked, and removes the replaced database's log.
+- FTS5: integer `bm25()` weights were ignored, a prefix query after a write in the same transaction
+  failed, `UPDATE ... SET rowid` wrote the rowid into the first column, a failed multi row insert
+  kept its earlier rows, `'rebuild'` added to the statistics, `snippet()` did not choose or centre
+  its window as SQLite does, `rank MATCH 'bm25(...)'` was refused, and a multi row update or delete
+  took time that grew as the square of the rows. FTS3 and FTS4: `docid` writes, reads through
+  `content=`, the default `snippet()` column, `notindexed` and the `merge` commands. The `ascii`
+  tokenizer and the `porter` stemmer now give SQLite's tokens.
+- `VACUUM` in one process lost rows another process inserted beside it: 265 of 502 acknowledged
+  inserts in one measurement, with no error and a clean `integrity_check`. `VACUUM` let go of the
+  write lock before it renamed the rebuilt file into place, and a process that still had the old
+  file open went on writing to it, and could truncate the rebuilt file's log by name. `VACUUM` now
+  waits for readers to finish, as SQLite's does, removes the old log and renames the rebuilt file
+  while it holds the file exclusively. Every connection that takes a lock, and every open, checks
+  that its path still names the file it opened, and reopens when it does not. A backup written
+  over a database another process has open holds that database's write lock across the rename
+  too. In the bug hunt's `VACUUM` scenario with writers killed at random, 4 of 30 runs lost commits
+  before and 0 of 80 after.
+- After a process was killed in the middle of a write, the processes that opened the file at the
+  same moment could lose acknowledged commits. One of them put back the rollback journal the
+  killed process left, and every other one opening at that moment skipped the journal and read
+  pages it had not been put back over. They failed with "replaying InsertRow ... found no room
+  in leaf", and the next open that succeeded stopped at that record and dropped every commit
+  after it. An open now waits while such a journal is being put back.
+- With several processes writing and one checkpointing, a process could checkpoint without the
+  commits another process had made after a roll of the log to a new segment, and those commits
+  were lost. A connection now notices the roll before it relies on what it last read.
+- `SELECT DISTINCT` over an index that later writes had filled, from several processes, returned
+  too few values or failed with "database disk image is malformed".
+- A connection that ran a statement and then a deferred `BEGIN`, such as a process per request
+  that sets `PRAGMA busy_timeout` first, could wait out the whole busy timeout beside another
+  process doing the same. Four such workers finished 16 to 31 of 60 transactions; they now finish
+  all 60.
+- `inillucent backup`, `VACUUM INTO` and `PRAGMA wal_checkpoint` beside another process's open
+  transaction waited the whole busy timeout and then failed. The backup and `VACUUM INTO` now copy
+  the file and its log under a shared lock, and `wal_checkpoint` answers with `busy` set to 1, as
+  SQLite does. A process that opened the file beside another's transaction waited 5 to 10 seconds
+  before its first read, and `PRAGMA user_version` and the other pragmas that only read asked for
+  the write lock. Both now answer at once.
+- A nearest neighbour query on an empty vector index failed, and an `inillucent_search` `MATCH`
+  silently read FTS5 operators as words; they are now refused as unsupported.
+- `DETACH` of a database attached before another one that the open transaction had written was
+  refused, where SQLite detaches it and commits the write. After any `DETACH` of an earlier
+  database, `<later>.sqlite_schema` was "no such table".
+- A process waiting for a lock slept longer between tries the longer it had waited, up to 50 ms, so
+  a process that had just committed and wanted the lock again took it ahead of one that had waited
+  seconds. With 16 processes each running `BEGIN IMMEDIATE` for 15 s, the slowest transaction
+  waited 4.9 s of the 5 s busy timeout. A wait now tries every 2 or 3 ms once it has waited 15 ms:
+  the slowest transaction waited under 0.9 s, the 99th percentile fell from about 2 s to about
+  0.4 s, and 70% more transactions committed.
+- `PRAGMA max_page_count` was reported and not enforced, so a write past it succeeded. A statement
+  that needs a page past the ceiling now fails with `database or disk is full` (status `full`),
+  takes no page and is undone. As in SQLite for a statement that writes many rows, the open
+  transaction stays open; SQLite rolls the whole transaction back when a statement of one row
+  fails this way, and this engine does not. A ceiling of 0, a negative number or text is ignored,
+  as in SQLite, where it used to lower the ceiling to the page count.
+- `PRAGMA auto_vacuum = FULL` and `INCREMENTAL` changed nothing, and `PRAGMA incremental_vacuum`
+  rebuilt the whole file. A file in FULL mode now gives pages back at every commit and a file in
+  INCREMENTAL mode gives back N pages for `PRAGMA incremental_vacuum(N)`. Each step moves the last
+  page of the file into the lowest free page, rewrites the one reference that named it, lowers the
+  page count and lets the next checkpoint cut the file. A leaf, an interior page, an out of line
+  value chain, a shared extent page and a root move. A page that cannot be placed stays where it
+  is and the step stops. Table and index roots are kept at the start of the file in both modes.
+  A delete now frees the out of line values of the rows it deletes in the same statement, where
+  they used to stay allocated until the row's page was rewritten. Deleting 1,900 of 2,000 rows
+  of 480 bytes at 8,192 byte pages leaves a file of 27 pages, down from 311, and no free page.
+  New files are format 3 and write owned extent pages, which record the tree and the key of
+  their owner so that a page can be moved. A format 2 file keeps the older extent layout until
+  a long key or `VACUUM` raises it to format 3. `.dbinfo` reports the largest root page.
+- A database made at a page size other than the default and opened without naming the size kept
+  the default size in memory, so `VACUUM` rebuilt the file at 32,768 byte pages.
+- FTS3 and FTS4 `snippet()` chose its window the way FTS5 does, so for long text it showed
+  different words from SQLite. It now uses SQLite's FTS3 fragment selection, which picks up to
+  four fragments that cover the most phrases and joins them with the ellipsis text.
+- About 40 smaller differences from SQLite in `GLOB`, affinity, `IS`, `strftime`, `unistr`, JSON5,
+  `printf`, window frames and the parser.
+- An indexed or primary key value over about 32 KB was refused with "this row is larger than a page
+  even with its large values stored outside it; a key column is never stored outside the page", and
+  an index over keys of about 17 KB could fail to split with "bad parameter or other API misuse".
+  SQLite stores a 50,000 character value in an indexed `TEXT` column. A key over `page_size / 8`
+  bytes, 4,096 at the default page size, is now stored on pages of its own like any other large
+  value, and the leaf keeps a reference and the first 512 bytes of it, so a search compares the
+  prefix and reads the rest only when the prefix ties. A separator in an interior page is shortened
+  to the shortest prefix that still separates its two leaves, and stored out of line when two
+  neighbouring keys share a prefix that long, which is what duplicates of a long value in an indexed
+  column produce. Nothing changes for a key under the threshold, and the longest key is now
+  1,048,576 bytes, refused with a message that says so. The same change prices both halves of a
+  split, so a row too large for a page is refused with a sentence instead of "bad parameter or other
+  API misuse".
+
+**Every new file is format 3, and no earlier release opens a format 3 file.** A format 3 file may
+store a key or a separator out of line, and its extent pages record the tree and key of the row
+that owns them. A file an earlier release created stays at format 2 until it first stores a key or
+a separator out of line or is rebuilt by `VACUUM`, which write a new log record (kind 19) before the
+first page. A format 2 file that does neither stays byte for byte a format 2 file, which every
+release from 0.1.8 on reads. Releases from 0.1.5 to 2.4.2 refuse a format 3 file by name as
+`unsupported`, 0.1.1 to 0.1.3 report it as malformed, and a log holding the new record is refused by
+kind, as with every record added since 0.1.8. So a database created by this release cannot be
+opened by an earlier one. Files written by released versions open with no migration, and nothing
+lowers a file's number once it has moved.
+`docs/relational-architecture.md` section 6 has the table of what each release sees.
+
+Speed, measured on 10,000 rows in each of two tables with no index on the compared column, against
+SQLite 3.53.4 (median of three runs through each shell):
+
+- A correlated subquery whose table has no index for its comparison with the enclosing query read
+  that table once for every outer row. It now reads the table once into a hash table and looks up
+  each outer row in it. `WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)` went from 1.219 s to 5 ms
+  (SQLite 5 ms), `NOT EXISTS` from 1.226 s to 5 ms (SQLite 0.94 s), and `SELECT sum((SELECT
+  count(*) FROM b WHERE b.k = a.k)) FROM a` from 2.185 s to 7 ms (SQLite 1.73 s). The whole
+  condition of the subquery still runs over the rows found, so only the rows it reads change.
+  `PRAGMA automatic_index = OFF` turns it off, and a request byte budget too small for the table
+  makes the subquery scan as before and the statement succeed. A subquery inside `UPDATE`,
+  `DELETE` and `INSERT` keeps scanning. A statement with a single outer row pays for reading the
+  table into the hash table: about 3 ms for 10,000 rows.
+- A join whose condition had anything beside equalities, such as `ON a.k = b.k AND a.id < b.id`,
+  or whose equality had an expression on one side, such as `ON a.k = b.k + 1`, ran as a nested
+  loop although its plan printed an automatic index. It now runs through the hash join: 2.0 to
+  2.8 s became 5 to 7 ms (SQLite 3 to 5 ms). The hash join tests the rest of the condition for
+  each pair its key finds, so a row of `a` whose partners all fail it is still null extended in a
+  `LEFT` join, and `RIGHT` and `FULL` joins keep the rows nothing matched.
+- `EXPLAIN QUERY PLAN` shows these. A subquery used as an aggregate argument, as in `sum((SELECT
+  ...))`, printed no node and now does. A correlated `IN` printed a `CREATE BLOOM FILTER` line that
+  SQLite does not print and no longer does. A positive `EXISTS` over a table read this way prints
+  the loop and automatic index lines SQLite prints for it, other correlated subqueries print the
+  same two lines under their node, an index that is `PARTIAL` or keyed on a constant says so, and a
+  key that is an expression prints as `(<expr>=?)`. `docs/sql.md` lists where the text still
+  differs from SQLite.
+
+The command line: `import` drops a byte order mark, pads short rows and keeps going past a rejected
+row as `sqlite3` does, and renames duplicate header names; `batch` runs a script that has its own
+`BEGIN` and `COMMIT`; `export <table> --format insert` names the table; status codes name the cause;
+and 110 messages and help texts no longer hold a run of spaces where a line was joined.
+
+## 2.3.4 to 2.4.2, 7 and 8 October 2026
+
+The entries in this section were written for the releases from 2.3.4 to 2.4.2 and are not split by
+release. 2.3.4 carries the processor share of the test runner and the bug hunt. 2.4.0 carries the
+hill climb on common operations. 2.4.1 and 2.4.2 change tests only.
+
+**Measured on 8 October 2026, release 2.4.2 against SQLite 3.53.4:** the engine plan is 505% faster
+(484% for 2.3.0), the 48 common and edge case workloads through the `Connection` API are 276% faster
+on the training set and 261% on the held out set with 67% less processor time, and the 25 workloads
+called the way programs call them are 74% faster (69% for 2.3.0 in the same rounds). None of the
+engine runs was graded, because SQLite ran 4% slower than its idle reference. `docs/performance.md`
+has every figure.
+
 **Common operations are 51.5% faster than in 2.3.4, and search much more than that.** Measured by
 the gate's 82 workloads through the `Connection` API against 2.3.4, with SQLite timed in the same
 rounds, and by a new search benchmark, `inillucent-searchprobe`. All 88 cases together are 61%

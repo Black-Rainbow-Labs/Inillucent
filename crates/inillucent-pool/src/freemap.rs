@@ -257,6 +257,98 @@ impl FreeMap {
         Ok(None)
     }
 
+    /// Returns the lowest page below `limit` that is not allocated.
+    ///
+    /// The step that lowers the file's end asks for the page a moved page goes
+    /// to, and the lowest one is the answer that fills the file from its front.
+    /// A page held back because the lock bytes are in it is allocated, so it is
+    /// never the answer. Whole bytes of set bits are skipped eight pages at a time.
+    ///
+    /// @param limit - only pages below this number are considered
+    pub fn lowest_free_below(&self, limit: u64) -> Option<PageId> {
+        let per = pages_per_map(self.page_size) as u64;
+        for (index, (_, bytes)) in self.pages.iter().enumerate() {
+            let base = (index as u64).saturating_mul(per);
+            if base >= limit {
+                break;
+            }
+            let body = bytes.get(COMMON_HEADER..).unwrap_or(&[]);
+            let mut from = 0usize;
+            while let Some(offset) = body
+                .get(from..)
+                .and_then(|rest| rest.iter().position(|byte| *byte != 0xFF))
+            {
+                let at = from.saturating_add(offset);
+                let byte = body.get(at).copied().unwrap_or(0xFF);
+                for bit in 0..8u64 {
+                    let page = base
+                        .saturating_add((at as u64).saturating_mul(8))
+                        .saturating_add(bit);
+                    if page >= limit {
+                        return None;
+                    }
+                    let free = byte & (1u8 << bit) == 0;
+                    if free
+                        && page >= crate::meta::FIRST_DATA_PAGE.0
+                        && !self.is_reserved(PageId(page))
+                    {
+                        return Some(PageId(page));
+                    }
+                }
+                from = at.saturating_add(1);
+            }
+        }
+        None
+    }
+
+    /// Reports whether any page below `limit` is not allocated.
+    ///
+    /// @param limit - only pages below this number are considered
+    pub fn has_free_below(&self, limit: u64) -> bool {
+        self.lowest_free_below(limit).is_some()
+    }
+
+    /// Returns where a map page sits in the chain, when `page` is one.
+    ///
+    /// @param page - the page to look for
+    pub fn chain_index_of(&self, page: PageId) -> Option<usize> {
+        self.pages.iter().position(|(id, _)| *id == page)
+    }
+
+    /// Returns the map page that precedes the one at a chain index.
+    ///
+    /// @param index - a position in the chain
+    pub fn chain_previous(&self, index: usize) -> Option<PageId> {
+        index
+            .checked_sub(1)
+            .and_then(|before| self.pages.get(before))
+            .map(|(id, _)| *id)
+    }
+
+    /// Gives a map page a new page number, keeping every bit it holds.
+    ///
+    /// The previous map page's `RIGHT` field is rewritten to name the new number.
+    /// The caller changes the bits for the two pages in the map itself, sets the
+    /// meta record's head when the first page moved, and installs the page at its
+    /// new number. Returns the index of the page in the chain.
+    ///
+    /// @param from - the map page's current number
+    /// @param to - the number it moves to
+    pub fn relink_map_page(&mut self, from: PageId, to: PageId) -> DbResult<usize> {
+        let index = self
+            .chain_index_of(from)
+            .ok_or_else(|| corrupt(format!("page {} is not a free-map page", from.0)))?;
+        if let Some(entry) = self.pages.get_mut(index) {
+            entry.0 = to;
+        }
+        if let Some(before) = index.checked_sub(1) {
+            if let Some((_, previous)) = self.pages.get_mut(before) {
+                page::set_right(previous, to)?;
+            }
+        }
+        Ok(index)
+    }
+
     /// Returns how many pages the chain can describe at all.
     ///
     /// A file may never grow past this without the chain growing first, which
@@ -481,5 +573,42 @@ mod tests {
         assert_eq!(map.free_count(), before - 3);
         map.free(PageId(3)).unwrap();
         assert_eq!(map.free_count(), before - 2);
+    }
+
+    /// The lowest free page below a limit is found, and a dense file has none.
+    #[test]
+    fn the_lowest_free_page_is_found_below_a_limit() {
+        let (mut map, _) = map_over(512, 100);
+        for _ in 0..30 {
+            map.allocate_run(1).unwrap();
+        }
+        // Pages 3 to 32 are taken. The lowest free page is 33.
+        assert_eq!(map.lowest_free_below(100), Some(PageId(33)));
+        assert!(map.has_free_below(34));
+        assert!(!map.has_free_below(33));
+        map.free(PageId(7)).unwrap();
+        assert_eq!(map.lowest_free_below(100), Some(PageId(7)));
+        assert_eq!(map.lowest_free_below(7), None);
+    }
+
+    /// A relinked map page keeps every bit, and the chain is rewritten around it.
+    #[test]
+    fn a_relinked_map_page_keeps_every_bit() {
+        let per = pages_per_map(512) as u64;
+        let (mut map, _) = map_over(512, per * 2 + 5);
+        assert!(map.chain_len() >= 3);
+        let before: Vec<bool> = (0..per * 2).map(|n| map.is_allocated(PageId(n))).collect();
+        let ids: Vec<PageId> = map.pages().map(|(id, _)| id).collect();
+        let middle = ids[1];
+        let to = PageId(per * 2 + 50);
+        let index = map.relink_map_page(middle, to).unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(map.chain_previous(1), Some(ids[0]));
+        let after: Vec<(PageId, &[u8])> = map.pages().collect();
+        assert_eq!(after[1].0, to);
+        assert_eq!(page::right_of(after[0].1).unwrap(), to);
+        let after_bits: Vec<bool> = (0..per * 2).map(|n| map.is_allocated(PageId(n))).collect();
+        assert_eq!(before, after_bits);
+        assert!(map.relink_map_page(PageId(1), to).is_err());
     }
 }

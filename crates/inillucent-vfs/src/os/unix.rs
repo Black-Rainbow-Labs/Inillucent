@@ -233,6 +233,17 @@ pub fn path_state(path: &std::path::Path) -> io::Result<Option<crate::os::PathSt
     }
 }
 
+/// Returns the inode number of the file at a path, or `None` when nothing is there.
+///
+/// @param path - the path to ask about
+pub fn file_number_by_name(path: &std::path::Path) -> io::Result<Option<u128>> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some(u128::from(metadata.ino()))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Returns the names in a directory that start with a prefix.
 ///
 /// The Windows module says why it does not list every name there; a POSIX

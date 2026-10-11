@@ -234,9 +234,9 @@ impl crate::ImportedDatabase {
         &mut self,
         argument: Option<&PragmaArgument>,
     ) -> DbResult<Outcome> {
-        let truncates = argument
-            .map(|argument| argument_text(argument).eq_ignore_ascii_case("truncate"))
-            .unwrap_or(false);
+        let mode = argument.map(argument_text).unwrap_or_default();
+        let truncates = mode.eq_ignore_ascii_case("truncate");
+        let passive = mode.is_empty() || mode.eq_ignore_ascii_case("passive");
         // **Refused, not answered `1 | -1 | -1`, once the open transaction has
         // written anything.** The pinned reference checkpoints fine after a
         // bare `BEGIN` - no write lock is held yet - and answers `database
@@ -260,10 +260,14 @@ impl crate::ImportedDatabase {
         // "no frames moved". A caller polling the second column to decide
         // whether a checkpoint is due needs to be able to tell those apart.
         if self.pragmas.journal_mode() != inillucent_pool::journal::JournalMode::Wal {
-            self.checkpoint()?;
+            let busy = match self.checkpoint() {
+                Ok(()) => 0,
+                Err(error) if error.code() == PrimaryCode::Busy => i64::from(!passive),
+                Err(error) => return Err(error),
+            };
             return Ok(Outcome {
                 rows: vec![vec![
-                    OwnedDatum::Int(0),
+                    OwnedDatum::Int(busy),
                     OwnedDatum::Int(-1),
                     OwnedDatum::Int(-1),
                 ]],
@@ -275,12 +279,24 @@ impl crate::ImportedDatabase {
         // Counting what the checkpoint wrote also counted the meta page it
         // always rewrites, so a checkpoint with nothing to do reported 3.
         let waiting = self.storage.database.pool().dirty_pages() as i64;
-        self.checkpoint()?;
-        let moved = if truncates { 0 } else { waiting };
+        // **Another process holding the file is an answer, not a failure.**
+        // SQLite returns the row with nothing checkpointed: `busy` 0 for
+        // PASSIVE, which never waits for readers, and 1 for FULL, RESTART and
+        // TRUNCATE. This failed the statement with "readers are still present",
+        // so a program that checkpoints on a timer stopped at the first moment
+        // another process was reading.
+        let (busy, log, moved) = match self.checkpoint() {
+            Ok(()) => {
+                let moved = if truncates { 0 } else { waiting };
+                (0, moved, moved)
+            }
+            Err(error) if error.code() == PrimaryCode::Busy => (i64::from(!passive), waiting, 0),
+            Err(error) => return Err(error),
+        };
         Ok(Outcome {
             rows: vec![vec![
-                OwnedDatum::Int(0),
-                OwnedDatum::Int(moved),
+                OwnedDatum::Int(busy),
+                OwnedDatum::Int(log),
                 OwnedDatum::Int(moved),
             ]],
             names: std::rc::Rc::new(vec!["busy".into(), "log".into(), "checkpointed".into()]),

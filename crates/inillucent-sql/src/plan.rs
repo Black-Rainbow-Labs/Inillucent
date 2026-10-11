@@ -774,8 +774,17 @@ impl Levers {
     /// disables this one, and the outermost scan of a query with no `ORDER BY`
     /// then runs backwards, as SQLite's does.
     pub const FORWARD_UNORDERED: u32 = 128;
+    /// Read the table of a correlated subquery once into a hash table, when the
+    /// subquery compares one of its columns with a column of the enclosing query.
+    ///
+    /// Works only while `AUTOMATIC_INDEX` is on as well. It is a lever of its
+    /// own because the statements that change data do not carry the connection's
+    /// levers to the subqueries they run, and those subqueries keep scanning:
+    /// their plans are made with this one off, so the plan text says what runs.
+    pub const BLOCK_TABLE: u32 = 256;
     /// Every lever this build has.
-    pub const EVERY: u32 = Levers::FORWARD_UNORDERED
+    pub const EVERY: u32 = Levers::BLOCK_TABLE
+        | Levers::FORWARD_UNORDERED
         | Levers::PLAN_CACHE
         | Levers::COVERING_INDEX
         | Levers::INDEXED_WRITE

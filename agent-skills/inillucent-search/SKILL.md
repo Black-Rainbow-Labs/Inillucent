@@ -174,7 +174,7 @@ bind the bytes.
 | `dims = N` | makes the table hold vectors of N numbers. Without `dims`, an insert with a vector is refused with the status `constraint` |
 | `mode = 'exact'` or `mode = 'approximate'` | how the vector half searches. The default is `exact` |
 | `vector_weight = 0.5` | fixes the vector list's weight, from 0 to 1, in place of the weight chosen for each query. Added in 1.0.30 |
-| `store MATCH '...'` | the keyword query, in FTS5 syntax |
+| `store MATCH '...'` | the keyword query, as plain words. A row scores for any word it holds. FTS5 operators fail with the status `unsupported` (exit code 3): a double quote, a word ending in `*`, capital `AND`, `NOT` or `NEAR` between words, and `column:word` |
 | `vector = ?` | the query vector |
 | `k = 10` | how many results to retrieve |
 | `ORDER BY rank` | best result first |

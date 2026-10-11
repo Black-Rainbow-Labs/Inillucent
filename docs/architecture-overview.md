@@ -247,7 +247,7 @@ flowchart TB
 | **[Blob extents](glossary.md#storage)** | the rest of a value too long to fit in a leaf, stored as a chain of pages |
 | **The [free map](glossary.md#storage)** | the pages that are not in use. A new page is taken from the free map before the file grows |
 
-A new file uses format version 2, written in the meta page. This build also reads format 1.
+A new file uses format version 2, written in the meta page. This build also reads format 1, and a file moves to format 3 the first time it stores a key too long for its leaf out of line.
 
 The page size is 32 KiB unless the file was created with another page size. `inillucent stats`
 reports it. For `notes.rdb` above, `inillucent stats` printed `page size: 32768` and

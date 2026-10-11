@@ -936,7 +936,7 @@ mod spill_tests {
         assert_eq!(never, 0, "a sort with nowhere to spill wrote a run");
         assert!(
             runs > 1,
-            "the threshold was never reached, so this compared an in-memory sort against an              in-memory sort and proved nothing: {runs} run(s)"
+            "the threshold was never reached, so this compared an in-memory sort against an in-memory sort and proved nothing: {runs} run(s)"
         );
         assert_eq!(in_memory.len(), rows.len(), "the in-memory sort lost rows");
         assert_eq!(

@@ -834,8 +834,8 @@ pub(crate) fn holds_no_row(target: &mut dyn WriteTarget, table: &TableInfo) -> D
 /// out of line it is also a page read per value.
 ///
 /// `visit_live` performs the same merge of the sorted region and the delta area
-/// while reading only the columns asked for, and a key column is never out of
-/// line, so asking for column 0 alone is both correct and cheap. The rows it
+/// while reading only the columns asked for, and column 0 of this tree is an
+/// integer rowid, so asking for it alone is both correct and cheap. The rows it
 /// visits are not in key order, so this takes the maximum rather than the last.
 ///
 /// @param tree - the tree

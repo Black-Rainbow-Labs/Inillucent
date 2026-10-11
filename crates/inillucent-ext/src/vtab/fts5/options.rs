@@ -78,6 +78,7 @@ pub(super) fn parse_options(arguments: &[Vec<u8>]) -> DbResult<Options> {
     let mut content: Option<Vec<u8>> = None;
     let mut contentless = false;
     let mut unsupported: Option<String> = None;
+    let mut not_indexed: Vec<String> = Vec::new();
     for argument in arguments {
         let text = String::from_utf8_lossy(argument).trim().to_string();
         if let Some((name, value)) = split_option(&text) {
@@ -95,6 +96,12 @@ pub(super) fn parse_options(arguments: &[Vec<u8>]) -> DbResult<Options> {
                     content = Some(unquote_option(&value).as_bytes().to_vec())
                 }
                 "content" => contentless = true,
+                // FTS4 names a column it must not index as `notindexed=b`,
+                // where FTS5 writes `b UNINDEXED`. The column is still stored
+                // and returned; a query never finds a row through it.
+                "notindexed" => {
+                    not_indexed.push(unquote_option(&value).trim().to_ascii_lowercase())
+                }
                 // **Three options that change what the index holds.** Each is
                 // accepted at the value this build does store - which is
                 // SQLite's own default - and refused at every other, because
@@ -145,6 +152,12 @@ pub(super) fn parse_options(arguments: &[Vec<u8>]) -> DbResult<Options> {
     }
     if columns.is_empty() {
         return Err(failure("an fts5 table needs at least one column"));
+    }
+    for column in columns.iter_mut() {
+        let folded = String::from_utf8_lossy(&column.name).to_ascii_lowercase();
+        if not_indexed.contains(&folded) {
+            column.unindexed = true;
+        }
     }
     Ok(Options {
         columns,

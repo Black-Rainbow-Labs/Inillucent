@@ -809,10 +809,10 @@ pub fn dbinfo(shell: &mut Shell, arguments: &[&str]) {
         // The *stored* default, which is zero until an application writes one -
         // not the cache size in force, which is a connection's own setting.
         ("default cache size:", "0".to_string()),
-        ("autovacuum top root:", "0".to_string()),
+        ("autovacuum top root:", top_root_of(shell).to_string()),
         (
             "incremental vacuum:",
-            integer_of(shell, "PRAGMA auto_vacuum;").to_string(),
+            i64::from(integer_of(shell, "PRAGMA auto_vacuum;") == 2).to_string(),
         ),
         ("text encoding:", "1 (utf8)".to_string()),
         (
@@ -1047,6 +1047,16 @@ pub fn filectrl(shell: &mut Shell, arguments: &[&str]) {
     }
 }
 
+/// Returns the largest root page number when the file is in a mode that keeps
+/// the roots at the start of the file, and 0 in mode NONE.
+///
+/// @param shell - the shell to ask
+fn top_root_of(shell: &Shell) -> i64 {
+    if integer_of(shell, "PRAGMA auto_vacuum;") == 0 {
+        return 0;
+    }
+    integer_of(shell, "SELECT max(rootpage) FROM sqlite_schema;")
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,7 +1075,7 @@ mod tests {
             let sql = content_query(table);
             assert!(
                 sql.ends_with(';'),
-                "`{table}`'s query is hashed as text and the reference's ends                  in a semicolon; this one is {sql:?}"
+                "`{table}`'s query is hashed as text and the reference's ends in a semicolon; this one is {sql:?}"
             );
         }
     }
@@ -1159,7 +1169,7 @@ mod tests {
         assert_eq!(
             rendered.find("4096"),
             Some(37),
-            "the value starts one space past a 36-wide label, which is where              the reference puts it"
+            "the value starts one space past a 36-wide label, which is where the reference puts it"
         );
     }
 }

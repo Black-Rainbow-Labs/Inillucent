@@ -351,7 +351,7 @@ pub fn fire_key_checks(
 /// @param target - the file and its trees
 /// @param firing - the row, the slots and the depth this firing runs at
 /// @param keep - whether a trigger is run
-fn fire_where(
+pub(crate) fn fire_where(
     triggers: &[BoundTrigger],
     time: TriggerTime,
     target: &mut dyn WriteTarget,

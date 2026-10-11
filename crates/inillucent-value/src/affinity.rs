@@ -165,14 +165,13 @@ pub fn apply_numeric_affinity<'a>(value: Value<'a>, try_for_integer: bool) -> Va
             return Value::Integer(integer);
         }
     }
-    let real = parsed.value;
+    // **The narrowing is `sqlite3VdbeIntegerAffinity`, the permissive test.** This used the
+    // conservative `real_same_as_int`, so text such as '1e16' or '4503599627370496.0' stayed a
+    // real in an INTEGER or NUMERIC column, while SQLite stores the integer.
     if try_for_integer {
-        let candidate = numeric::real_to_i64(real);
-        if numeric::real_same_as_int(real, candidate) {
-            return Value::Integer(candidate);
-        }
+        return integer_affinity(Value::Real(parsed.value));
     }
-    Value::Real(real)
+    Value::Real(parsed.value)
 }
 
 /// Reports the integer a value with integer syntax should become.

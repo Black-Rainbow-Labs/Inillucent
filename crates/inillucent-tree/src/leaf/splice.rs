@@ -118,7 +118,14 @@ fn delta_heap_if_it_fits(order: &LiveOrder<'_>, page_size: usize) -> DbResult<Op
             if !fits_slot(column, value, class, page_size) {
                 return Ok(None);
             }
-            heap = heap.saturating_add(heap_cost_of(column.physical, value, class));
+            // The threshold above is unbounded, so no value classifies as out of line
+            // and the cost of one is never read.
+            heap = heap.saturating_add(heap_cost_of(
+                column.physical,
+                value,
+                class,
+                EXTENT_REF_BYTES,
+            ));
         }
     }
     Ok(Some(heap))

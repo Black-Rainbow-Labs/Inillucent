@@ -273,8 +273,8 @@ impl ImportedDatabase {
         // tree when the index is its primary key, so on a table carrying message bodies it failed
         // outright with "page is not a blob extent" - which meant a real database had no statistics
         // at all, and a planner with no selectivity falls back to scanning. `visit_live` performs the
-        // same merge of the sorted region and the delta area while decoding only what is asked for,
-        // and a key column is never out of line.
+        // same merge of the sorted region and the delta area while decoding only what is asked for.
+        // A key stored out of line is read with the extents `visit_leaves` attaches to the leaf.
         let measured: Vec<usize> = (0..width).collect();
         tree.visit_leaves(pool, &mut |leaf| {
             leaf.visit_live(&measured, &mut |row| {

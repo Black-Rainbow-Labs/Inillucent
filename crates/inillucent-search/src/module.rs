@@ -1430,6 +1430,15 @@ impl VirtualTable for SearchTable {
                 let new = new_rowid.as_integer().unwrap_or(old);
                 let row = self.row_of(values)?;
                 if new != old {
+                    // **Checked before the old row goes.** `UPDATE t SET rowid =
+                    // 5` onto a rowid the table already holds is a constraint
+                    // failure, as an insert of that rowid is; writing over the
+                    // row would lose it without a word.
+                    if self.store.read_row(context, new)?.is_some() {
+                        return Err(constraint(
+                            "UNIQUE constraint failed: the rowid is already in the index",
+                        ));
+                    }
                     self.remove(context, old)?;
                 }
                 let existed = self.store.read_row(context, new)?.is_some();
@@ -1529,7 +1538,14 @@ impl VirtualCursor for SearchCursor {
         let mut wanted_rowid: Option<i64> = None;
         for (role, value) in plan.index_string.chars().zip(plan.arguments.iter()) {
             match role {
-                ROLE_QUERY => self.request.text = text_of(Some(value)),
+                ROLE_QUERY => {
+                    self.request.text = text_of(Some(value));
+                    if let Some(refused) = self.request.text.as_deref().and_then(|text| {
+                        crate::query_syntax::refuse_operator_syntax(text, &self.options.columns)
+                    }) {
+                        return Err(refused);
+                    }
+                }
                 ROLE_LIMIT => {
                     let limit = value.as_integer().unwrap_or(DEFAULT_K);
                     self.request.limit = limit.clamp(1, 1_000_000) as usize;

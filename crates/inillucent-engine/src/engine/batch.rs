@@ -50,6 +50,8 @@ impl crate::ImportedDatabase {
         self.writing.undo().borrow_mut().clear();
         self.writing.marks().borrow_mut().clear();
         self.writing.pending_frees().borrow_mut().clear();
+        self.writing.incremental_steps().borrow_mut().clear();
+        self.writing.meta_changes().borrow_mut().clear();
         self.writing.built().borrow_mut().clear();
         self.writing.set_touched(0);
     }
@@ -94,6 +96,7 @@ impl crate::ImportedDatabase {
                 undo: 0,
                 dropped: 0,
                 built: 0,
+                meta: 0,
             },
         };
         self.undo_to_floor(to, true, self.current_txn())
@@ -212,6 +215,7 @@ impl crate::ImportedDatabase {
         // `reload_entries` runs is what stops the walk it does reaching a tree
         // that is on its way out.
         self.release_built_trees(built_floor, txn)?;
+        self.restore_meta_changes(to.meta)?;
         let held = self.writing.undo().borrow().len();
         self.writing
             .marks()
@@ -235,7 +239,7 @@ impl crate::ImportedDatabase {
             // table the binder names and nothing can read is a wrong answer
             // waiting to happen. Refused by name until the re-attach is written.
             return Err(refusal(format!(
-                "rolling back left {} in the schema with no tree attached;                  undoing a DROP inside a transaction is not supported yet",
+                "rolling back left {} in the schema with no tree attached; undoing a DROP inside a transaction is not supported yet",
                 missing.join(", ")
             )));
         }
@@ -540,6 +544,9 @@ impl crate::ImportedDatabase {
         self.session_state.modules_begun.set(false);
         let told = self.rollback_modules(None);
         let txn = self.current_txn();
+        // Before the undo is committed, which settles space: a page count the
+        // abandoned transaction asked to lower is not lowered.
+        self.writing.incremental_steps().borrow_mut().clear();
         let undone = self.undo_to(None);
         // **A finished rollback is committed, as a change that changes no row.**
         // See `commit_the_undo`. Skipped when the undo failed part way, because
@@ -553,6 +560,7 @@ impl crate::ImportedDatabase {
         // makes that true even when the undo above failed part-way. An
         // abandoned transaction frees nothing.
         self.writing.pending_frees().borrow_mut().clear();
+        self.writing.incremental_steps().borrow_mut().clear();
         // Cleared rather than released, because `undo_to(None)` has already
         // given these pages back. An entry still here is one the undo failed
         // part-way through, and releasing it a second time would hand a page to
@@ -667,7 +675,15 @@ impl crate::ImportedDatabase {
         // schema and the participant set has to say so.
         self.flush_pending_frees(txn)?;
         let participants = self.writing.replace_touched(0);
-        self.commit_across(txn, participants)
+        self.commit_across(txn, participants)?;
+        // A meta field the transaction set reaches the file only at a
+        // checkpoint; see `set_meta_field`.
+        let changed_meta = !self.writing.meta_changes().borrow().is_empty();
+        self.writing.meta_changes().borrow_mut().clear();
+        if changed_meta {
+            self.checkpoint()?;
+        }
+        Ok(())
     }
 
     /// Returns where a statement's writes begin, in each record.
@@ -693,6 +709,7 @@ impl crate::ImportedDatabase {
             undo: self.writing.undo().borrow().len(),
             dropped: self.writing.pending_frees().borrow().len(),
             built: self.writing.built().borrow().len(),
+            meta: self.writing.meta_changes().borrow().len(),
         }
     }
 
@@ -960,6 +977,21 @@ impl crate::ImportedDatabase {
     /// @param txn - the transaction to commit
     /// @param participants - the schemas it wrote
     pub(crate) fn commit_across(&mut self, txn: u64, participants: u16) -> DbResult<()> {
+        // **Pages the transaction gave up are freed, and the end of the file is
+        // given back, before the commit record.** The moves are records of this
+        // transaction, so a crash before the record loses them with the rest of it.
+        // The checkpoint that cuts the file waits until the commit is durable.
+        let (participants, shrunk) = self.settle_space(txn, participants)?;
+        self.commit_voting(txn, participants)?;
+        self.checkpoint_after_shrink(shrunk)
+    }
+
+    /// Commits one transaction across every file it wrote, once the space it frees
+    /// has been settled. See [`ImportedDatabase::commit_across`].
+    ///
+    /// @param txn - the transaction to commit
+    /// @param participants - the schemas it wrote
+    fn commit_voting(&mut self, txn: u64, participants: u16) -> DbResult<()> {
         // **Every commit passes through here, which is why the record of what
         // this transaction built is cleared here and nowhere else
         // (task-2065).** That list exists so an abandoned transaction can give
@@ -973,6 +1005,7 @@ impl crate::ImportedDatabase {
         // After the undo rather than before it: `abandon`'s `OR FAIL` path
         // undoes the failed statement and then commits what came before, and
         // the undo is what needs the list.
+        self.sync_built_trees()?;
         self.writing.built().borrow_mut().clear();
         let durable: Vec<usize> = schemas_in(participants)
             .filter(|at| self.path_of(*at).is_some())
@@ -1010,6 +1043,31 @@ impl crate::ImportedDatabase {
             return Err(error);
         }
         journal.commit()
+    }
+
+    /// Syncs the data file of every database in which this transaction built a tree.
+    ///
+    /// **Once per commit, not once per tree.** A tree is built by writing its pages straight into
+    /// the file with no log record behind them, so they have to reach the media before the commit
+    /// record does. `build_tree_rows` leaves the sync to this function, which runs before the
+    /// commit. A transaction that creates 1,600 tables used to sync the file 1,600 times, 3 to 4
+    /// ms each, and now syncs it once per database.
+    fn sync_built_trees(&self) -> DbResult<()> {
+        let mut schemas: Vec<usize> = self
+            .writing
+            .built()
+            .borrow()
+            .iter()
+            .map(|held| held.schema)
+            .collect();
+        schemas.sort_unstable();
+        schemas.dedup();
+        for at in schemas {
+            if let Some(file) = self.schema_file(at) {
+                file.pool().sync_data_file()?;
+            }
+        }
+        Ok(())
     }
 
     /// Appends and awaits one `Commit` record per schema a transaction wrote.

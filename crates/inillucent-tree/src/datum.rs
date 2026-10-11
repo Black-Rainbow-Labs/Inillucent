@@ -84,13 +84,25 @@ pub mod tag {
     ///
     /// **Only a delta row carries one.** The sorted region says a value is out
     /// of line in its class array, where the two bits cost nothing; a delta row
-    /// has no class array, so the tag has to say it. A key column is never
-    /// spilled, so a tag byte in a key position is always one of the four above.
+    /// has no class array, so the tag has to say it. A key column never carries
+    /// this one: its out of line values use [`KEY_EXTENT`], and a decoder that
+    /// meets this tag in a key position refuses the row as corrupt.
     pub const EXTENT: u8 = 5;
+    /// A key column value stored out of line: the sixteen byte reference, a
+    /// `u16` prefix length and then that many bytes of the value's start.
+    ///
+    /// **A tag of its own, so a decoder never needs the column's position to
+    /// know how long the value is.** The prefix is what lets a comparison decide
+    /// most orderings without reading the pages the value is on.
+    pub const KEY_EXTENT: u8 = 6;
 }
 
 /// How many bytes a tagged extent reference occupies.
 pub const EXTENT_TAG_BYTES: usize = 17;
+
+/// How many bytes a tagged key extent occupies before its prefix: the tag, the
+/// sixteen byte reference and the `u16` prefix length.
+pub const KEY_EXTENT_TAG_HEAD_BYTES: usize = 19;
 
 impl<'p> Datum<'p> {
     /// Returns the rank the class sorts at.
@@ -240,7 +252,7 @@ impl<'p> Datum<'p> {
                 };
                 Ok((value, 5usize.saturating_add(length)))
             }
-            tag::EXTENT => Err(corrupt(concat!(
+            tag::EXTENT | tag::KEY_EXTENT => Err(corrupt(concat!(
                 "this delta value is stored out of line; read the leaf's ",
                 "extents through the tree first"
             ))),
@@ -271,6 +283,7 @@ impl<'p> Datum<'p> {
                 }
                 Ok(EXTENT_TAG_BYTES)
             }
+            tag::KEY_EXTENT => Self::key_extent_span(bytes),
             tag::TEXT | tag::BLOB => {
                 let length_bytes = rest
                     .get(..4)
@@ -285,6 +298,39 @@ impl<'p> Datum<'p> {
             }
             other => Err(corrupt(format!("tag byte {other} is not a value"))),
         }
+    }
+
+    /// Returns how many bytes the tagged key extent at the front of a buffer occupies.
+    ///
+    /// @param bytes - the buffer, starting at the tag byte
+    fn key_extent_span(bytes: &[u8]) -> DbResult<usize> {
+        let length = Self::key_extent_prefix_len(bytes)?;
+        let span = KEY_EXTENT_TAG_HEAD_BYTES.saturating_add(length);
+        if bytes.len() < span {
+            return Err(corrupt("a tagged key extent runs past the buffer"));
+        }
+        Ok(span)
+    }
+
+    /// Returns the prefix length a tagged key extent declares.
+    ///
+    /// @param bytes - the buffer, starting at the tag byte
+    pub fn key_extent_prefix_len(bytes: &[u8]) -> DbResult<usize> {
+        bytes
+            .get(EXTENT_TAG_BYTES..KEY_EXTENT_TAG_HEAD_BYTES)
+            .and_then(|raw| <[u8; 2]>::try_from(raw).ok())
+            .map(|raw| u16::from_le_bytes(raw) as usize)
+            .ok_or_else(|| corrupt("a tagged key extent has no prefix length"))
+    }
+
+    /// Returns the prefix a tagged key extent carries.
+    ///
+    /// @param bytes - the buffer, starting at the tag byte
+    pub fn key_extent_prefix(bytes: &[u8]) -> DbResult<&[u8]> {
+        let length = Self::key_extent_prefix_len(bytes)?;
+        bytes
+            .get(KEY_EXTENT_TAG_HEAD_BYTES..KEY_EXTENT_TAG_HEAD_BYTES.saturating_add(length))
+            .ok_or_else(|| corrupt("a tagged key extent prefix runs past the buffer"))
     }
 
     /// Returns the tag byte at the front of a buffer.

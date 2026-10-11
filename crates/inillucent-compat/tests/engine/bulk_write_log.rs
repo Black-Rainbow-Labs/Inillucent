@@ -98,8 +98,8 @@ const UPDATES: [&str; 5] = [
 const PART_WAY: [&str; 4] = [
     "UPDATE OR FAIL t SET body = CASE WHEN id = 2500 THEN NULL ELSE body || '?' END",
     "UPDATE OR IGNORE t SET body = CASE WHEN id % 13 = 0 THEN NULL ELSE body || 'i' END",
-    "UPDATE OR FAIL t SET body = CASE WHEN id = 2500 THEN NULL ELSE body || 'f' END      WHERE id BETWEEN 1 AND 5000",
-    "UPDATE OR IGNORE t SET body = CASE WHEN id % 13 = 0 THEN NULL ELSE body || 'g' END      WHERE id BETWEEN 1 AND 5000",
+    "UPDATE OR FAIL t SET body = CASE WHEN id = 2500 THEN NULL ELSE body || 'f' END WHERE id BETWEEN 1 AND 5000",
+    "UPDATE OR IGNORE t SET body = CASE WHEN id % 13 = 0 THEN NULL ELSE body || 'g' END WHERE id BETWEEN 1 AND 5000",
 ];
 
 /// Returns the path every run in this file uses.

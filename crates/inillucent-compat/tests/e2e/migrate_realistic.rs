@@ -569,7 +569,7 @@ fn a_generated_column_crosses_as_an_expression_and_not_as_a_value() {
 fn a_digest_that_does_not_match_names_the_rows_and_the_columns() {
     let Some(source) = fixture("chat-archive") else {
         inillucent_compat::differential::skipping(
-            "compat/fixtures/realistic/chat-archive.db is not built; run              tools/build-realistic-fixtures.sh",
+            "compat/fixtures/realistic/chat-archive.db is not built; run tools/build-realistic-fixtures.sh",
         );
         return;
     };

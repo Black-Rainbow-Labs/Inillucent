@@ -671,7 +671,7 @@ fn a_long_recursion_answers_and_a_runaway_meets_the_budget() {
     let connection = connect();
     let counted = connection
         .query(
-            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000001)              SELECT count(*) FROM n",
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000001) SELECT count(*) FROM n",
         )
         .expect("a long recursion answers")
         .first()

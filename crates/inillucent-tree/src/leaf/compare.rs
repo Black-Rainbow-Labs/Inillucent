@@ -57,12 +57,25 @@ impl<'p> LeafRef<'p> {
         probe: &[Datum<'_>],
     ) -> DbResult<std::cmp::Ordering> {
         for (index, wanted) in probe.iter().enumerate().take(view.width) {
-            let held = match view.columns.get(index).and_then(|held| held.as_ref()) {
-                Some(column) => column.value(row)?,
-                // Past the inline capacity: fall back to the general path,
-                // which is correct and only slower.
-                None => self.value(row, index)?,
+            // Past the inline capacity the column is read from the directory:
+            // correct for every key width and only slower.
+            let derived;
+            let column = match view.columns.get(index).and_then(|held| held.as_ref()) {
+                Some(column) => column,
+                None => {
+                    derived = self.column(index)?;
+                    &derived
+                }
             };
+            if let Some(spilled) = column.spilled_key(row)? {
+                let whole = self.extents.and_then(|held| held.get(row, index));
+                let order = self.compare_spilled(&spilled, wanted, index, whole)?;
+                if order != std::cmp::Ordering::Equal {
+                    return Ok(order);
+                }
+                continue;
+            }
+            let held = column.value(row)?;
             let order = self.directed(
                 crate::types::compare_under(&held, wanted, self.collation_of(index)),
                 index,
@@ -72,6 +85,55 @@ impl<'p> LeafRef<'p> {
             }
         }
         Ok(std::cmp::Ordering::Equal)
+    }
+    /// Compares a key value stored out of line against a probe value.
+    ///
+    /// **Three steps, and the last is the only one that can need the pool.**
+    /// The class decides when the probe is NULL, a number, or the other of text
+    /// and blob. The prefix the leaf kept decides when a byte differs inside it,
+    /// under a rule the collation allows. Otherwise the whole value is read:
+    /// from the extents a caller attached, else through the pool, else the
+    /// comparison refuses. It never guesses an order.
+    ///
+    /// The direction of the column is applied to the answer, as it is for a
+    /// value held in the leaf.
+    ///
+    /// @param spilled - the reference and prefix the leaf holds
+    /// @param wanted - the probe's value for this key column
+    /// @param index - which key column this is
+    /// @param whole - the whole value, when the caller already read it
+    pub(super) fn compare_spilled(
+        &self,
+        spilled: &SpilledKey<'_>,
+        wanted: &Datum<'_>,
+        index: usize,
+        whole: Option<&[u8]>,
+    ) -> DbResult<std::cmp::Ordering> {
+        let held_rank = extent_datum(spilled.reference.class, spilled.physical, &[]).sort_rank();
+        if held_rank != wanted.sort_rank() {
+            return Ok(self.directed(held_rank.cmp(&wanted.sort_rank()), index));
+        }
+        let collation = self.collation_of(index);
+        let probe = wanted.as_bytes().unwrap_or(&[]);
+        if let Some(order) = decide_by_prefix(spilled.prefix, probe, held_rank == 2, collation) {
+            return Ok(self.directed(order, index));
+        }
+        let fetched;
+        let bytes = match (whole, self.pool) {
+            (Some(bytes), _) => bytes,
+            (None, Some(pool)) => {
+                fetched = crate::paged::read_extent(pool.0, spilled.reference)?;
+                fetched.as_slice()
+            }
+            (None, None) => {
+                return Err(misuse(concat!(
+                    "this key is stored out of line; attach the tree's pool to the ",
+                    "leaf before searching it"
+                )))
+            }
+        };
+        let held = extent_datum(spilled.reference.class, spilled.physical, bytes);
+        Ok(self.directed(crate::types::compare_under(&held, wanted, collation), index))
     }
     /// Returns the run of sorted rows whose key begins with a prefix.
     ///
@@ -525,6 +587,59 @@ impl<'p> LeafRef<'p> {
     }
 }
 
+/// Decides the order of a long text or blob from its leading bytes alone, when
+/// those bytes are enough.
+///
+/// The held value is longer than `prefix`. BINARY and every blob compare bytes
+/// from the front and stop at the first difference, so a difference inside the
+/// bytes both sides have decides the order. NOCASE folds each byte and stops
+/// the same way, except that two NUL bytes at one position end the walk and
+/// leave the lengths to decide, which the prefix cannot do. RTRIM, DECIMAL,
+/// UINT and a custom collation are never decided here. A probe that matches the
+/// prefix for its whole length is left to the full comparison too, so the rule
+/// stays the same for every case.
+///
+/// @param prefix - the leading bytes of the held value
+/// @param probe - the probe's bytes
+/// @param is_text - whether both sides are text rather than blobs
+/// @param collation - the key column's collation
+fn decide_by_prefix(
+    prefix: &[u8],
+    probe: &[u8],
+    is_text: bool,
+    collation: inillucent_value::collation::Collation,
+) -> Option<std::cmp::Ordering> {
+    use inillucent_value::collation::Collation;
+    let shared = prefix.len().min(probe.len());
+    let (held, wanted) = (prefix.get(..shared)?, probe.get(..shared)?);
+    let collation = if is_text {
+        collation
+    } else {
+        Collation::Binary
+    };
+    match collation {
+        Collation::Binary => Some(held.cmp(wanted)).filter(|order| order.is_ne()),
+        Collation::NoCase => decide_nocase(held, wanted),
+        _ => None,
+    }
+}
+/// The NOCASE rule of [`decide_by_prefix`] over two slices of equal length.
+///
+/// @param held - the held value's leading bytes
+/// @param wanted - the probe's leading bytes, as many
+fn decide_nocase(held: &[u8], wanted: &[u8]) -> Option<std::cmp::Ordering> {
+    for (left, right) in held.iter().zip(wanted.iter()) {
+        if *left == 0 && *right == 0 {
+            return None;
+        }
+        let order = left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase());
+        if order.is_ne() {
+            return Some(order);
+        }
+    }
+    None
+}
+
 /// A leaf's key columns, derived once and reused across a binary search.
 #[derive(Clone, Copy, Debug)]
 pub struct KeyView<'p> {
@@ -663,4 +778,151 @@ pub fn compare_rows_under(
         }
     }
     std::cmp::Ordering::Equal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ColumnSpec;
+    use inillucent_pool::extent::ExtentRef;
+    use inillucent_value::collation::Collation;
+
+    /// A spiller that hands out one reference and writes nothing.
+    struct Nowhere;
+
+    impl Spill for Nowhere {
+        fn spill(&mut self, _row: usize, _column: usize, value: &[u8]) -> DbResult<ExtentRef> {
+            Ok(ExtentRef::run(
+                inillucent_pool::PageId(9),
+                value.len() as u64,
+            ))
+        }
+    }
+
+    /// Builds a one row leaf at a 4,096 byte page, whose one key is stored out of
+    /// line because it is over 512 bytes.
+    ///
+    /// @param key - the key's bytes
+    fn leaf_page(key: &[u8]) -> Vec<u8> {
+        let builder = LeafBuilder::new(4_096, 1, vec![ColumnSpec::key(PhysicalType::Text)], 1)
+            .expect("a builder");
+        let rows = vec![vec![Datum::Text(key)]];
+        match builder
+            .pack_with(&rows, 1.0, Some(&mut Nowhere))
+            .expect("a pack")
+        {
+            Packed::Filled { page, .. } => page,
+            Packed::RowTooLarge => panic!("the key was refused"),
+        }
+    }
+
+    /// Returns a long key that starts with `head`, `length` bytes long in all.
+    ///
+    /// @param head - the leading bytes
+    /// @param length - the key's whole length
+    fn long_key(head: &[u8], length: usize) -> Vec<u8> {
+        let mut key = head.to_vec();
+        key.resize(length, b'x');
+        key
+    }
+
+    /// Compares a stored long key against a probe, with or without the whole
+    /// value attached, and returns both answers.
+    ///
+    /// @param key - the key stored out of line
+    /// @param probe - the probe's bytes
+    /// @param collation - the key column's collation
+    fn answers(
+        key: &[u8],
+        probe: &[u8],
+        collation: Collation,
+    ) -> (DbResult<std::cmp::Ordering>, DbResult<std::cmp::Ordering>) {
+        let page = leaf_page(key);
+        let collations = [collation];
+        let bare = LeafRef::parse(&page)
+            .expect("a leaf")
+            .with_collations(&collations);
+        let mut held = Extents::default();
+        held.push(0, 0, key.to_vec());
+        let with_value = LeafRef::parse(&page)
+            .expect("a leaf")
+            .with_collations(&collations)
+            .with_extents(&held);
+        let wanted = [Datum::Text(probe)];
+        (
+            bare.compare_key(0, &wanted),
+            with_value.compare_key(0, &wanted),
+        )
+    }
+
+    /// A key stored out of line compares right under every collation, and reads
+    /// the rest of the value only when the prefix does not decide.
+    ///
+    /// **An error rather than a guess when the value is needed and not
+    /// attached.** The first case in each group differs inside the prefix, so a
+    /// leaf with nothing attached still answers; the others tie over the prefix,
+    /// or the collation never lets a prefix decide, and then the leaf with
+    /// nothing attached names the pool in its refusal.
+    #[test]
+    fn a_long_key_is_decided_by_its_prefix_when_the_collation_allows_it() {
+        let held = long_key(b"hello", 5_000);
+        let upper = long_key(b"HELLO", 5_000);
+        let nul_held = long_key(b"ab\0cd", 5_000);
+        let nul_probe = long_key(b"AB\0zz", 4_000);
+        let nul_apart = long_key(b"ac", 4_000);
+        for collation in [Collation::Binary, Collation::NoCase, Collation::RTrim] {
+            let decided_early = collation != Collation::RTrim;
+            let help = long_key(b"help", 4_000);
+            let same = long_key(b"hello", 4_000);
+            let cases: [(&[u8], &[u8], bool); 5] = [
+                (&held, &help, decided_early),
+                (&held, &same, false),
+                (&held, &upper, collation == Collation::Binary),
+                // BINARY sees `a` against `A`; NOCASE reaches the NUL both hold.
+                (&nul_held, &nul_probe, collation == Collation::Binary),
+                (&nul_held, &nul_apart, decided_early),
+            ];
+            for (key, probe, bare_answers) in cases {
+                let (bare, with_value) = answers(key, probe, collation);
+                let wanted =
+                    crate::types::compare_under(&Datum::Text(key), &Datum::Text(probe), collation);
+                assert_eq!(with_value.unwrap(), wanted, "{collation:?}");
+                match (bare_answers, bare) {
+                    (true, answer) => assert_eq!(answer.unwrap(), wanted, "{collation:?}"),
+                    (false, answer) => {
+                        let refusal = answer.expect_err("a tie needs the whole value");
+                        assert!(
+                            refusal
+                                .detail()
+                                .is_some_and(|said| said.contains("attach the tree's pool")),
+                            "{collation:?}: {refusal:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A probe of another class and a descending column are decided without
+    /// reading the value.
+    #[test]
+    fn a_long_key_orders_by_class_and_direction_before_its_bytes() {
+        let key = long_key(b"abc", 3_000);
+        let page = leaf_page(&key);
+        let leaf = LeafRef::parse(&page).expect("a leaf");
+        // A text key sorts above NULL and numbers and below a blob, with the
+        // pool absent: the class decides without reading the value.
+        assert!(leaf.compare_key(0, &[Datum::Null]).unwrap().is_gt());
+        assert!(leaf.compare_key(0, &[Datum::Int(5)]).unwrap().is_gt());
+        assert!(leaf.compare_key(0, &[Datum::Blob(b"abc")]).unwrap().is_lt());
+        let down = [true];
+        let reversed = LeafRef::parse(&page)
+            .expect("a leaf")
+            .with_directions(&down);
+        assert!(reversed.compare_key(0, &[Datum::Null]).unwrap().is_lt());
+        assert!(reversed
+            .compare_key(0, &[Datum::Text(b"abd")])
+            .unwrap()
+            .is_gt());
+    }
 }

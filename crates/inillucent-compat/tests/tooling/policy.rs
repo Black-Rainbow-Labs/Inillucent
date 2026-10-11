@@ -482,7 +482,7 @@ fn every_governed_crate_denies_undocumented_items() {
         ] {
             assert!(
                 text.contains(&format!("#![deny({lint})]")),
-                "{crate_name} does not carry `#![deny({lint})]`. Naming the lint in a                  `cfg_attr(test, allow(...))` block is not denying it."
+                "{crate_name} does not carry `#![deny({lint})]`. Naming the lint in a `cfg_attr(test, allow(...))` block is not denying it."
             );
         }
     }
@@ -1375,7 +1375,11 @@ const CEILINGS: [(&str, usize); 17] = [
     // `skip` (the distinct prefix walk). What is left here is the tree itself:
     // its fields, its statistics, its key encoding, the extent store and the
     // integrity check.
-    ("crates/inillucent-tree/src/paged.rs", 2_300),
+    // **Lowered to 2,050 when the extent store moved to `extents.rs`.** Reading,
+    // writing and freeing an out of line value are one question with its own
+    // module, and the owned layout of an extent page grew them. `paged.rs`
+    // re-exports the four functions, so no caller's path moved.
+    ("crates/inillucent-tree/src/paged.rs", 2_050),
     // **Lowered to 200 in task-1962 (A7).** 3,003 lines holding the write
     // target, the key search and the four statements became six modules under
     // `dml/`, beside the `index.rs` that was already there: `target` (where a

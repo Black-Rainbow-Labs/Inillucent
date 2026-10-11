@@ -1137,7 +1137,19 @@ fn text_probes(store: &Store) -> Vec<String> {
         // begin with the same words still produces distinct queries. A probe
         // pack that collapsed to two questions would report a pass it had not
         // earned.
-        let all: Vec<&str> = content.split_whitespace().collect();
+        // Only letters and digits are kept. A word such as `task-2047).**` is
+        // query syntax to an FTS5 table and a refusal to an inillucent_search
+        // table, and a probe that one engine refuses compares nothing.
+        let cleaned: Vec<String> = content
+            .split_whitespace()
+            .map(|word| {
+                word.chars()
+                    .filter(|c| c.is_alphanumeric())
+                    .collect::<String>()
+            })
+            .filter(|word| !word.is_empty())
+            .collect();
+        let all: Vec<&str> = cleaned.iter().map(String::as_str).collect();
         if all.is_empty() {
             continue;
         }

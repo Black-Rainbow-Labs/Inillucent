@@ -199,7 +199,7 @@ impl Campaign<'_> {
         let opened = ImportedDatabase::create_on(
             Arc::clone(&vfs) as Arc<dyn Vfs>,
             self.path(),
-            PAGE_SIZE,
+            page_size_in_force(),
             FRAMES,
         );
         assert!(
@@ -228,7 +228,7 @@ impl Campaign<'_> {
     ///
     /// @param vfs - the simulator holding the file
     fn reopen(&self, vfs: Arc<dyn Vfs>) -> Result<ImportedDatabase, inillucent_base::DbError> {
-        let mut engine = ImportedDatabase::open_on(vfs, self.path(), PAGE_SIZE, FRAMES)?;
+        let mut engine = ImportedDatabase::open_on(vfs, self.path(), page_size_in_force(), FRAMES)?;
         run_script(&mut engine, &format!("PRAGMA journal_mode={}", self.mode))?;
         Ok(engine)
     }
@@ -370,4 +370,37 @@ pub fn record(name: &str, report: &str) {
     let directory = crate::workspace_root().join("_agent_output/crash-campaigns");
     let _ = std::fs::create_dir_all(&directory);
     let _ = std::fs::write(directory.join(format!("{name}.tsv")), report);
+}
+
+thread_local! {
+    /// The page size the campaign running on this thread builds at.
+    static PAGE_SIZE_IN_FORCE: std::cell::Cell<usize> = const { std::cell::Cell::new(PAGE_SIZE) };
+}
+
+/// Returns the page size the campaign running on this thread builds at.
+fn page_size_in_force() -> usize {
+    PAGE_SIZE_IN_FORCE.with(|held| held.get())
+}
+
+impl Campaign<'_> {
+    /// Runs the campaign on a database built at another page size.
+    ///
+    /// **A campaign that needs a tree three levels deep builds one in seconds at a
+    /// small page and in minutes at the default**, and every cut builds the
+    /// schema again. The size is put back when the run ends, whether it passes or
+    /// panics.
+    ///
+    /// @param page_size - the page size the runs build at
+    pub fn run_at(&self, page_size: usize) -> String {
+        /// Puts the previous page size back when it is dropped.
+        struct Restore(usize);
+        impl Drop for Restore {
+            /// Restores the page size that was in force before.
+            fn drop(&mut self) {
+                PAGE_SIZE_IN_FORCE.with(|held| held.set(self.0));
+            }
+        }
+        let _restore = Restore(PAGE_SIZE_IN_FORCE.with(|held| held.replace(page_size)));
+        self.run()
+    }
 }

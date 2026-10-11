@@ -70,6 +70,7 @@ pub mod embed_refusal;
 pub mod merge;
 pub mod module;
 pub mod options;
+pub mod query_syntax;
 #[cfg(feature = "embed")]
 pub mod rerank;
 pub mod rerank_search;

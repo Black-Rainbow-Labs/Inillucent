@@ -641,7 +641,7 @@ fn cancel(path: &Path) -> Result<Option<String>, String> {
     let database = fresh(path)?;
     let connection = database.session();
     connection.cancel().map_err(|error| error.message)?;
-    let counted = "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 50000)                    SELECT count(*) FROM c";
+    let counted = "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 50000) SELECT count(*) FROM c";
     if let Some(problem) = expect_value(&connection, counted, "50000") {
         return Ok(Some(format!(
             "after a cancel with nothing running, {problem}"

@@ -787,8 +787,8 @@ fn build_materialised_join<'t>(
         params,
         &joined_types,
     )?;
-    // **The automatic index.** When the condition is a conjunction of plain
-    // equalities with one side of the join per term, the inner rows go into a
+    // **The automatic index.** When the condition has an equality with one side
+    // of the join on each side of the `=`, the inner rows go into a
     // hash table keyed on the inner halves and every outer row probes it -
     // which turns a join that was rows-times-rows into rows-plus-rows. SQLite
     // builds a transient b-tree for the same reason and puts it under the same
@@ -796,9 +796,8 @@ fn build_materialised_join<'t>(
     // does not.
     //
     // The nested loop below is what `PRAGMA automatic_index = off` selects, and
-    // it is also what a condition this cannot key on gets - which is most of
-    // them, deliberately: a residual predicate the hash key did not capture
-    // would have to be re-tested per pair, and there is nowhere here to do it.
+    // it is also what a condition with no key equality gets. Conjuncts beside a
+    // key equality go to the hash join as a condition it tests for each pair.
     if plan
         .levers
         .has(inillucent_sql::plan::Levers::AUTOMATIC_INDEX)
@@ -857,6 +856,12 @@ fn build_materialised_join<'t>(
                     downstream,
                 )
                 .with_widths(stage.offset, stage.width);
+                // The conjuncts the key did not take are tested for each pair
+                // the key finds, so an outer join null extends a row whose
+                // candidates all fail them.
+                if let Some(rest) = &keys.rest {
+                    join = join.with_condition(compile(rest, &joined_types)?);
+                }
                 join.build_materialised(&rows)?;
                 return Ok(Box::new(join));
             }

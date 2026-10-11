@@ -240,7 +240,20 @@ When a connection takes the lock, it checks whether another process changed the 
 since it last looked. If either moved, it drops its cached pages and replays the log from the file's
 last checkpoint before it reads anything. If a rollback journal is beside the file at that moment,
 a process died while it held the lock, and the connection puts the journal's old pages back before
-it replays, as an open does.
+it replays, as an open does. When several processes find such a journal at once, one puts it back
+and the others wait, holding no lock, until it is gone. An open that went ahead read pages the
+journal had not been put back over yet.
+
+A schema another process changed is the schema a statement runs against. A statement is compiled
+before it takes the lock, so when taking the lock rereads the catalog, the statement is compiled
+again and run, as `sqlite3_step` does after `SQLITE_SCHEMA`. A statement that fails to compile, for
+example because it names a table another process created after this one opened the file, takes the
+shared lock once to see whether the schema moved, and is compiled again when it did.
+
+An open that finds no database creates one without deleting anything, and only while the file is
+still empty under the exclusive lock. A second process that opened the same missing path at the same
+moment waits for that lock and then opens the database the first one wrote. An empty file opens as
+an empty database, as in SQLite.
 
 The check costs two reads. The connection reads the 128 bytes of the meta record in the second of
 the file's two meta pages, the shadow copy, and the length of the log segment it appends to. A
@@ -293,16 +306,19 @@ records of the next committed transaction named pages the replay did not know: t
 a crash failed with `read 0 of 32768 bytes at` the file's own size, or applied rows to an older copy
 of a page, and a fold then wrote the result into the file.
 
-Two statements are refused inside an open transaction:
+Two statements are refused inside an open transaction in some cases:
 
 | Statement | Error |
 |---|---|
-| `DETACH` | `cannot DETACH database within transaction` |
+| `DETACH` | `cannot DETACH database within transaction`, or `database NAME is locked` when the transaction has written to that file |
 | `VACUUM` | `cannot VACUUM from within a transaction` |
 
-`DETACH` is refused because a transaction records the files it touches by their attachment number,
-and removing one would renumber the others. `VACUUM` is refused because it reads committed rows,
-and an open transaction has not committed.
+`DETACH` is allowed for a file the transaction has not written to, as in SQLite, when no file
+attached after it has been written to either. A transaction records the files it writes to by their
+attachment number, and removing a file renumbers the ones attached after it. A `DETACH` that would
+renumber a file the transaction has written to is refused until the transaction ends. SQLite allows
+that case. `VACUUM` is refused because it reads committed rows, and an open transaction has not
+committed.
 
 A transaction that writes to more than one attached file is decided by a super journal outside those
 files. Each file's log holds a vote. Recovery reads the super journal to learn whether the vote
@@ -432,8 +448,10 @@ no `RETURNING`, and, for an `UPDATE`, no `FROM` and no subquery that reads the r
    row is copied out only when the leaf holds a value stored outside the page. An `UPDATE` writes
    one log record and one undo entry per row, the records the row by row path writes.
 4. It changes the leaf once and stamps it with the last record's LSN.
-5. A `DELETE` checks once whether the leaf has emptied enough to merge with its neighbour. Then it
-   removes each index's entries the same way, in that index's order.
+5. A `DELETE` checks once whether the leaf has emptied enough to merge with its neighbour. An
+   interior page that a merge leaves with one child hands that child to the interior page beside it
+   and is freed; the root is never freed, so a tree's height never shrinks. Then it removes each
+   index's entries the same way, in that index's order.
 
 An `UPDATE` writes a row this way when exactly one column outside the key changes. When a new value
 fits where the old one lies, the row is changed in place. When one does not, the leaf is packed again
@@ -580,6 +598,51 @@ putting the old pages back is a write.
 The `durability` tier stops a simulated machine at a chosen write or sync, then reads back what the
 file holds.
 
+### Giving pages back: the step, and its two log records
+
+In `FULL` mode every commit runs a step on each file that has a free page below its end, and in
+`INCREMENTAL` mode a commit runs it for the number of pages `PRAGMA incremental_vacuum(N)` asked for.
+The step is in `crates/inillucent-engine/src/engine/shrink.rs` and runs inside `commit_across`, after
+the trees are built and before the commit is voted on. It looks at the last page of the file. A page
+that is free is dropped from the end by lowering the page count. A page in use is moved to the lowest
+free page, the one reference to it is rewritten, and the page count is lowered by one.
+
+The step finds the one reference to a page by the page's kind. A leaf or an interior page is found by
+descending its tree with the page's first key. An extent page in the owned layout is found by its
+owner tree and owner key, and a chain page by its `prev` link. A free map page is found by walking the
+chain of free map pages. The step moves only these. It stops, and the file keeps the pages above that
+page, at a root, at an extent page in the older layout, at an extent page with no owner key, and at a
+page that no tree owns. `PRAGMA integrity_check` reports a page that no tree owns.
+
+Two log record kinds belong to the step, so that recovery repeats a move exactly:
+
+| Record | Kind | What it says |
+|---|---|---|
+| `Relink` | 20 | one field that named a moved page now names its new page number |
+| `PageCount` | 21 | the file now has this many pages |
+
+A move writes the page image to its new number under a `WritePage` record, then a `Relink` for each
+field that named the page, then frees the old number. A build older than this one cannot replay a log
+that holds either record and refuses it with `a log record has kind 20, which this format does not
+define`. A clean close folds the log into the file, so this matters only for a database whose
+connection stopped without closing and is then opened by an older build.
+
+The file is cut by the checkpoint. After the meta record that holds the lower page count is durable,
+the checkpoint shortens the file to that many pages. A crash before the cut leaves a file longer than
+its meta record says, and the next open cuts it. A file is never shorter than its meta record says.
+The code is in `crates/inillucent-pool/src/pool/truncate.rs` and `fold.rs`.
+
+**The root rule.** The step must never meet a root at the end of the file, because a root is named by
+a row of the catalog and moving one is a schema change for every connection. So in `FULL` and
+`INCREMENTAL` mode the roots are kept at the start of the file, as SQLite keeps them. The meta record
+holds `largest_root`, the highest page number that is a root, at offset 128, and the meta record is
+136 bytes. A new table or index takes the page above `largest_root`, and whatever page was there moves
+out of the way. A `DROP` moves the highest root into the slot the dropped root frees at the commit and
+rewrites that table's catalog row. In `NONE` mode `largest_root` is 0 and none of this applies.
+
+`DELETE` frees the out of line values of the rows it deletes at once. A deleted row's references to
+extent pages are overwritten with a dead reference, so the pages are free when the step looks.
+
 ### Checkpoints
 
 A checkpoint writes the changed pages from the buffer pool into the database file, records the new
@@ -662,14 +725,15 @@ recover and compare the result. Each campaign runs from a fixed seed and writes 
 ## 6. What a file's format version promises
 
 The first eight bytes of a database are `RDB2` and four zero bytes. The next four bytes are the
-**format version**. This build writes format `2` and reads formats `1` and `2`. The number is covered
-by the meta page's checksum, so a hand edited version fails the checksum.
+**format version**. This build reads formats `1`, `2` and `3`. It writes format `3` to every file it
+creates, and moves a format `2` file to format `3` at the first of three events (see "Format 3" below).
+The number is covered by the meta page's checksum, so a hand edited version fails the checksum.
 
 | Rule | What it means |
 |---|---|
 | A point release reads every file an earlier point release of the same minor version wrote | a bug fix never changes the format version |
 | A change to the layout of a page, a record or the header raises the format version | that is a minor version, and it comes with a migration |
-| A build that meets a higher version refuses the file by name | the error is `this database is format version N and this build reads version 2; upgrade inillucent to open it`, with the status `unsupported`. The command line exits 3 |
+| A build that meets a higher version refuses the file by name | the error is `this database is format version N and this build reads version 3; upgrade inillucent to open it`, with the status `unsupported`. The command line exits 3 |
 | A version below 1 is reported as damage | there is no format 0, so a zero means the header was overwritten |
 
 A migration is `inillucent-migrate`, which reads the older file and writes a new one. It does not
@@ -710,10 +774,55 @@ Releases 0.1.5, 0.1.6 and 0.1.7 refuse a format 2 file with
 Releases 0.1.1, 0.1.2 and 0.1.3 answer `database disk image is malformed: neither meta page is
 readable`. None of them reads the file.
 
+### Format 3, and when a file moves to it
+
+Format 3 means that the file may hold a key or a separator stored out of line, extent pages in the
+owned layout, or both. A file this build creates says format 3 from the start and always writes extent
+pages in the owned layout. A file at format 2 keeps writing extent pages in the older layout. It moves
+to format 3 at the first of three events: the first key stored out of line, a `VACUUM`, which rebuilds
+it as a new file, and `PRAGMA auto_vacuum` set to `FULL` or `INCREMENTAL`. Every reader handles both
+layouts on every page. There is no format 4. Nothing lowers the number again: the number says what a
+reader has to be able to read, and lowering it would need a walk of every page.
+
+A value over `page_size / 8` bytes, 4,096 at the default page size, goes out of line in any column,
+an indexed column and a primary key included. The first time a transaction writes one, it moves the
+file to format 3 in memory and writes one log record, `Format` (kind 19), before the first page of the
+value. That record belongs to no transaction, so recovery replays it whether or not the transaction
+that wrote it committed. The next checkpoint writes the meta page with the new number. The rule that
+holds all of this together: the data file never holds a page of a key stored out of line while its meta
+page says 2 and its log holds no `Format` record.
+
+| File | This build | Releases 0.1.8 to 2.4.2 | Releases 0.1.5 to 0.1.7 | Releases before 0.1.5 |
+|---|---|---|---|---|
+| format 1, written by 0.1.1 to 0.1.7 | opens, and writes format 2 at the first checkpoint | the same | opens | opens |
+| format 2, written by an earlier build, none of the three events yet | opens, stays 2 | opens | refuses by name, status `unsupported` | `database disk image is malformed` |
+| format 3, created by this build or raised by one of the three events | opens | refuses by name: `format version 3`, status `unsupported`, exit code 3 | the same | `database disk image is malformed` |
+| format 2 in the file, and a log holding a `Format` record after a crash | recovers | refuses: `a log record has kind 19, which this format does not define` | the same | the same |
+
+The longest key is 1,048,576 bytes of encoded key. A longer one is refused before any page is touched,
+with `an index or primary key entry is longer than 1,048,576 bytes`. The limit exists because a delete
+and an in place update carry the whole key in their log record, and a record is at most 4 MiB.
+
+### The owned extent layout
+
+An extent page in the owned layout records who refers to it, so the step that gives pages back can
+rewrite the reference when it moves the page. Bit `EXTENT_OWNED` of the FLAGS byte in the common
+header says a page is in this layout; a page without the bit is in the older layout, and every reader
+handles both.
+
+| Page | Owned layout |
+|---|---|
+| a chain page of a value larger than a page | the `next` link at offset 32, a `prev` link at offset 40, the payload length at 48, the owner key length at 52 (0 except on the first page), a flag word at 54 whose bit 0 `HEAD` marks the first page, then on the first page the owner key, then the payload. The owner tree is the `TREE` field of the common header |
+| a shared page of values smaller than a page | each directory entry is 16 bytes, `(offset, length, owner tree)`, and the bytes of a slot begin with a two byte key length and the owner key, then the value |
+
+An owner key longer than a quarter of the page is not stored, so that page has a key length of 0. A
+separator stored out of line in an interior page is written the same way. The step does not move such
+a page. `crates/inillucent-pool/src/extent/owned.rs` and `shared.rs` hold the layouts.
+
 ### Values stored outside a page
 
-A value too large for its leaf is stored on other pages. The leaf keeps a sixteen byte **extent
-reference**: a page number and a length. Two bits above the page number, `CLASS_STATED` and
+A value too large for its leaf, including a key, is stored on other pages. The leaf keeps a sixteen
+byte **extent reference**: a page number and a length. Two bits above the page number, `CLASS_STATED` and
 `CLASS_TEXT`, say whether the value is text or a blob when the column's declared type would give the
 wrong answer. A column declared with no type, as in `CREATE TABLE t (a)`, is such a case.
 
@@ -722,6 +831,22 @@ reference as a page number above 2^62, fails to fetch it, and reports an error. 
 bytes with the wrong type. `ExtentClass` in `crates/inillucent-pool/src/extent.rs` holds the
 encoding. `extent_class_for` and `extent_datum` in `crates/inillucent-tree/src/leaf/layout.rs` write
 and read it.
+
+**A key column keeps a prefix beside the reference.** The leaf's record for a key stored out of line
+is the sixteen byte reference, a two byte prefix length and then the first 512 bytes of the value, or
+the first `page_size / 8` bytes at a page under 4,096. A comparison reads the prefix first and reads
+the rest from the pages only when the prefix does not decide. A delta row holds the same record under
+its own tag, `KEY_EXTENT`, so a decoder knows how long it is without knowing the column. A leaf that
+the tree has not given a pool or the values refuses a comparison the prefix does not settle, with an
+error, and never guesses an order.
+
+**A separator is shortened, and stored out of line when that is not enough.** A split writes the
+shortest prefix of the right leaf's first key that sorts above the left leaf's last key, when the
+whole key is over `page_size / 8` bytes. When even that is over the limit, which two neighbouring keys
+sharing a long prefix produce, the interior page keeps the reference, the prefix length and the
+prefix in the separator's slot. The slot's length word has its top bit set, and bit 0 of the page's
+flag byte says the page holds at least one such slot. No page has ever set either, so every page
+written before this one reads as it always did.
 
 ### Layouts inside the file
 
@@ -762,20 +887,31 @@ record from a future build and checks each refusal, including the command line's
 
 | Command | What it does |
 |---|---|
-| `inillucent backup <file>` | runs a checkpoint, copies the database file to `<file>`, then opens the copy and checks every tree in it. A file already at `<file>` is replaced |
+| `inillucent backup <file>` | copies the database file and its log files, under the shared lock, to a scratch file beside `<file>`, opens the copy and checks every tree in it, then renames it to `<file>`. A file already at `<file>` is replaced only then, while the backup holds that database's RESERVED lock, and the log files of the database it held are removed. The database being copied is refused as the destination |
 | `inillucent restore <file>` | points this session at `<file>`. It changes no file. To replace a database, copy the backup over it |
 | `VACUUM` | rebuilds the database: it runs the stored `CREATE` statements again, copies every row back through the normal write path, writes the result beside the database, and renames it over the database |
 | `VACUUM INTO '<file>'` | writes a compacted copy the same way. It refuses a file that already exists, with `output file already exists` |
 | `inillucent checkpoint` | runs `PRAGMA wal_checkpoint`. Run it before you copy a database file by hand |
 
 A rename replaces a directory entry in one step, so a crash leaves either the old file or the new
-one. `VACUUM` and `VACUUM INTO` both fail inside an open transaction. `--root` confines both
+one. `VACUUM` holds the write lock from the start, so no other process can commit to the old file
+after the rebuild read it, and takes the file exclusively before it removes the old log and renames
+the rebuilt file, so every reader has finished with the old one. A process that still has the old
+file open finds out the next time it takes a lock, or as it opens: it compares the number the file
+system gives the path now with the one it read when it opened the file, and reopens when they
+differ. On Windows that is one `GetFileInformationByName` call, and on Linux and macOS one `stat`. `VACUUM` and `VACUUM INTO` both fail inside an open transaction. `--root` confines both
 (section 8).
 
 `VACUUM` does all its file work through the connection's own `Vfs`: it creates the new file, renames
 it with `Vfs::rename`, and deletes the old log segments through the same `Vfs`. An application that
 supplies an encrypting or in memory `Vfs` therefore gets a `VACUUM` that stays inside it. The code is
 in `crates/inillucent-engine/src/rebuild.rs`.
+
+`VACUUM` also applies the `auto_vacuum` mode a connection set on a file that already had tables.
+`PRAGMA auto_vacuum = FULL` on such a file changes nothing until the next `VACUUM`, which writes the
+new file in that mode, raises it to format 3, and creates every root before any row page, so the roots
+come out consecutive at the start of the file and `largest_root` names the highest of them. `VACUUM
+INTO` writes the mode the source file has.
 
 **Checked by:** `crates/inillucent-compat/tests/engine/vacuum_on_vfs.rs`, and `vacuum_crash.rs`, which
 crashes a simulated machine inside the rename.
@@ -805,11 +941,16 @@ outside the file they read. To check a database before you rely on it, open it a
 ### What one request may spend
 
 `inillucent_base::budget` limits the rows, the bytes and the time one request may use, and holds the
-flag `cancel` sets. The engine checks the budget at two points:
+flag `cancel` sets. The engine checks the budget at three points:
 
 - every batch a result collects, which limits what the caller receives;
 - every leaf a scan reads, which limits the work done on the way. A `SELECT` whose `WHERE` rejects
-  every row still stops.
+  every row still stops;
+- every table a statement reads into memory to answer faster. The build side of a hash join counts
+  its bytes, and a statement whose build side does not fit fails with `bytes`. A correlated
+  subquery reads its table once into a hash table when no index serves its key. When that table
+  does not fit, the subquery scans the table for each outer row as it did before, and the
+  statement succeeds.
 
 | Program | Rows scanned | Row bytes | Time | Rows one call returns | Request and reply size |
 |---|---|---|---|---|---|

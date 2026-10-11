@@ -209,7 +209,7 @@ impl ImportedDatabase {
         let text = argument_text(argument);
         if text.is_empty() {
             return Err(refusal(
-                "PRAGMA rekey = '' would remove the encryption, which rewrites every page.                  `inillucent decrypt` writes a plaintext copy",
+                "PRAGMA rekey = '' would remove the encryption, which rewrites every page. `inillucent decrypt` writes a plaintext copy",
             ));
         }
         self.rekey(EncryptionKey::parse(&text))?;
@@ -237,7 +237,7 @@ impl ImportedDatabase {
         }
         if !self.is_encrypted() {
             return Err(refusal(
-                "this database is not encrypted. Changing the key needs an encrypted                  database, and `inillucent encrypt` writes an encrypted copy of this one",
+                "this database is not encrypted. Changing the key needs an encrypted database, and `inillucent encrypt` writes an encrypted copy of this one",
             ));
         }
         self.checkpoint()?;

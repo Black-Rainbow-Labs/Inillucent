@@ -542,7 +542,7 @@ impl ImportedDatabase {
                 // writing a *compacted* database, and a byte copy reproduces
                 // the free pages and the half-empty leaves it was asked to
                 // remove - which is what it used to do here.
-                self.rebuild_into(std::path::Path::new(&path))?;
+                self.rebuild_copy_into(std::path::Path::new(&path))?;
                 Ok(Outcome::empty())
             }
         }

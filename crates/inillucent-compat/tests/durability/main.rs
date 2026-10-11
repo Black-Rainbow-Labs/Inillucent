@@ -16,6 +16,7 @@
 //! `tests/selection.toml`. `selection::discover` finds a module file with no
 //! row, so `no_test_hides_outside_the_map` names one that was forgotten.
 
+mod auto_vacuum_crash;
 mod btree_model;
 mod bulk_build_crash;
 mod bulk_insert_crash;
@@ -34,6 +35,7 @@ mod free_map_checkpoint_crash;
 mod large_transactions;
 mod log_oplock;
 mod logical_split_crash;
+mod long_key_crash;
 mod multi_database_crash;
 mod new_engine_free_map_recovery;
 mod new_engine_recovery_shapes;
@@ -42,9 +44,13 @@ mod phase2_campaigns;
 mod process_campaign;
 mod process_concurrency;
 mod process_crash;
+mod process_create;
+mod process_deferred;
 mod process_interleavings;
 mod process_journal_handoff;
+mod process_maintenance;
 mod process_readers;
+mod process_schema_change;
 mod process_storm;
 mod reindex_crash;
 mod search_crash;

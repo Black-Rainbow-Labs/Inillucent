@@ -86,15 +86,36 @@ function withoutCarets(text) {
 }
 
 /**
- * Runs one shell over a fresh database and resolves with its output, exit status and duration.
+ * Runs a case over a fresh database, one shell process for each part of the script between
+ * `-- reopen` lines, so a case can check what a closed and reopened file holds. The outputs are
+ * joined, the times added, and the first crash or timeout is the case's result.
  * @param program - the shell to run
  * @param directory - an empty directory for the case's files
  * @param script - the case's SQL, without the preamble
  */
-function runShell(program, directory, script) {
+async function runShell(program, directory, script) {
+  rmSync(directory, { recursive: true, force: true });
+  mkdirSync(directory, { recursive: true });
+  const joined = { text: '', code: 0, signal: null, ms: 0, timedOut: false };
+  for (const part of script.split(/^-- reopen[^\n]*\n/m)) {
+    const result = await runSession(program, directory, part);
+    joined.text += result.text;
+    joined.ms += result.ms;
+    if (crashed(result)) return { ...result, text: joined.text, ms: joined.ms };
+    joined.code = result.code;
+  }
+  return joined;
+}
+
+/**
+ * Runs one shell process over the case's database and resolves with its output, exit status and
+ * duration.
+ * @param program - the shell to run
+ * @param directory - the case's directory, which already exists
+ * @param script - the SQL for this process, without the preamble
+ */
+function runSession(program, directory, script) {
   return new Promise((resolvePromise) => {
-    rmSync(directory, { recursive: true, force: true });
-    mkdirSync(directory, { recursive: true });
     const started = process.hrtime.bigint();
     const child = spawn(program, [join(directory, 'case.db')], { cwd: directory });
     const chunks = { out: [], err: [] };

@@ -431,7 +431,7 @@ mod arms {
         OnnxEmbedder::open_manifest(&model.dir, &model.manifest, 8, Device::Cpu).unwrap_or_else(
             |err| {
                 panic!(
-                    "{} is installed and did not open, so the install or the loader is broken:                      {err:#}",
+                    "{} is installed and did not open, so the install or the loader is broken: {err:#}",
                     model.manifest.id
                 )
             },

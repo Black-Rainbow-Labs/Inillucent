@@ -432,7 +432,7 @@ fn run(
     let ours_base = summarise(&mut ours_startup);
     let theirs_base = summarise(&mut theirs_startup);
     println!(
-        "startup         ours {:>8.1} ms {:>8.1} ms cpu {:>7.1} MiB | sqlite {:>8.1} ms {:>8.1} ms cpu {:>7.1} MiB",
+        "startup ours {:>8.1} ms {:>8.1} ms cpu {:>7.1} MiB | sqlite {:>8.1} ms {:>8.1} ms cpu {:>7.1} MiB",
         ours_base.wall, ours_base.cpu, ours_base.peak,
         theirs_base.wall, theirs_base.cpu, theirs_base.peak,
     );

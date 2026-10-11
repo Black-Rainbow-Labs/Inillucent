@@ -339,6 +339,12 @@ impl Vfs for OsVfs {
         }
     }
 
+    fn file_number_by_name(&self, path: &DbPath) -> VfsResult<Option<u128>> {
+        crate::confine::authorize(path)?;
+        platform::file_number_by_name(path.as_path())
+            .map_err(|error| VfsError::from_io(VfsOperation::Access, &error))
+    }
+
     fn access(&self, path: &DbPath, mode: AccessMode) -> VfsResult<bool> {
         // A confined process is told the file is not there rather than that it
         // may not look, because "does `C:/Users/…/id_rsa` exist" is itself an

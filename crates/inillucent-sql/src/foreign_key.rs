@@ -115,11 +115,18 @@ fn conjunction(parts: &[String]) -> String {
     parts.join(" AND ")
 }
 
-/// Returns `"c1" = OLD."p1" AND ...`, which finds the children of one parent.
-fn children_of(child: &[Vec<u8>], parent: &[Vec<u8>], row: &str) -> String {
-    let mut parts = Vec::with_capacity(child.len());
-    for (near, far) in child.iter().zip(parent.iter()) {
-        parts.push(format!("{} = {row}.{}", quote(near), quote(far)));
+/// Returns `"p1" = +NEW."c1" AND ...`, which finds the parent of one child row.
+///
+/// The unary plus removes the affinity of the child's value, so the parent column's affinity is
+/// the one applied when the two are compared.
+///
+/// @param parent - the parent's key column names
+/// @param child - the child's key column names
+/// @param row - `NEW`
+fn parent_lookup(parent: &[Vec<u8>], child: &[Vec<u8>], row: &str) -> String {
+    let mut parts = Vec::with_capacity(parent.len());
+    for (far, near) in parent.iter().zip(child.iter()) {
+        parts.push(format!("{} = +{row}.{}", quote(far), quote(near)));
     }
     conjunction(&parts)
 }
@@ -278,7 +285,11 @@ fn child_check(
         .iter()
         .map(|column| format!("NEW.{} IS NOT NULL", quote(column)))
         .collect();
-    let lookup = children_of(far, near, "NEW");
+    // **The parent column's affinity is applied to the child's value.** SQLite does this before
+    // it looks the key up, so the integer 1 finds the parent row `'1'` of a TEXT key. A column
+    // compared with a column applies no conversion, so the child's value goes through a unary
+    // plus, which gives it no affinity and lets the parent column's affinity apply to it.
+    let lookup = parent_lookup(far, near, "NEW");
     guards.push(format!(
         "NOT EXISTS (SELECT 1 FROM {} WHERE {lookup})",
         qualified(database, &parent.name)
@@ -836,7 +847,8 @@ pub fn violation_query(
         .iter()
         .zip(near.iter())
         .map(|(parent_column, child_column)| {
-            format!("p.{} = c.{}", quote(parent_column), quote(child_column))
+            // The child's value takes the parent column's affinity; see `parent_lookup`.
+            format!("p.{} = +c.{}", quote(parent_column), quote(child_column))
         })
         .collect();
     guards.push(format!(
@@ -1105,11 +1117,11 @@ mod tests {
     /// A composite key compares every column, in the order the clause wrote.
     #[test]
     fn a_composite_key_compares_every_column() {
-        let matching = children_of(
+        let matching = parent_lookup(
             &[b"a".to_vec(), b"b".to_vec()],
             &[b"x".to_vec(), b"y".to_vec()],
-            "OLD",
+            "NEW",
         );
-        assert_eq!(matching, "\"a\" = OLD.\"x\" AND \"b\" = OLD.\"y\"");
+        assert_eq!(matching, "\"a\" = +NEW.\"x\" AND \"b\" = +NEW.\"y\"");
     }
 }

@@ -465,7 +465,7 @@ fn run(fixture: &Path, settings: &Settings) -> Result<Option<bool>, String> {
         // what the acceptance number is actually varying by.
         if let Some(bare) = measure_point_probe_key_only(&database, plan.rows)? {
             println!(
-                "  {bare:.1} ns per probe carrying the rowid alone                    (the other {:.1} ns is the projection's OwnedDatum copies)",
+                "  {bare:.1} ns per probe carrying the rowid alone (the other {:.1} ns is the projection's OwnedDatum copies)",
                 nanos - bare
             );
         }

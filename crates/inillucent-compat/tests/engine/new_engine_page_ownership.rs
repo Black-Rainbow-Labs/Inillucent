@@ -759,7 +759,7 @@ fn the_page_walk_is_not_what_quick_check_is_not_paying_for() {
     let with_the_walk = fetches(&mut engine, "PRAGMA integrity_check");
     assert!(
         with_the_walk <= without_the_walk.saturating_mul(3) / 2,
-        "the page walk fetched {with_the_walk} pages against {without_the_walk} for the          tree walk alone, so it is no longer the cheap half and the split between the          two pragmas needs rereading"
+        "the page walk fetched {with_the_walk} pages against {without_the_walk} for the tree walk alone, so it is no longer the cheap half and the split between the two pragmas needs rereading"
     );
 
     // And with indexes, where the pass `quick_check` leaves out is the one that
@@ -788,7 +788,7 @@ fn the_page_walk_is_not_what_quick_check_is_not_paying_for() {
     let full = fetches(&mut engine, "PRAGMA integrity_check");
     assert!(
         full > quick,
-        "integrity_check fetched {full} pages and quick_check {quick}, so the index pass          is no longer the expensive half and the split needs rereading"
+        "integrity_check fetched {full} pages and quick_check {quick}, so the index pass is no longer the expensive half and the split needs rereading"
     );
 }
 

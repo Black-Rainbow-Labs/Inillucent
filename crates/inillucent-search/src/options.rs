@@ -212,7 +212,7 @@ impl Metric {
     /// Reads a metric back from its name, refusing one this build cannot honour.
     pub fn parse(text: &str) -> DbResult<Metric> {
         match text.trim().to_ascii_lowercase().as_str() {
-            "cosine" => Ok(Metric::Cosine),
+            "cosine" | "cos" => Ok(Metric::Cosine),
             "l2" => Ok(Metric::L2),
             // **The sentence is the message, not only the detail (task-1979,
             // section 8.1, gap 10).** `failure` sets the detail alone, and a
@@ -223,7 +223,7 @@ impl Metric {
             // pgvector has and this build does not, which is the whole of how
             // this is reached.
             other => Err(inillucent_base::error::statement_refusal(format!(
-                "inillucent_search: the only distances this build implements are cosine and l2, not {other}"
+                "the metric must be one of cosine (also written cos) or l2, not {other}"
             ))),
         }
     }

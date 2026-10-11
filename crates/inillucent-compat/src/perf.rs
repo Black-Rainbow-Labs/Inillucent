@@ -1141,7 +1141,7 @@ fn correlated_read_workloads(point: u32) -> Vec<Workload> {
         Workload {
             name: "correlated.exists".to_string(),
             family: "read.correlated".to_string(),
-            sql: "SELECT count(*) FROM wide a WHERE EXISTS (SELECT 1 FROM side_table b WHERE                   b.owner = a.id)"
+            sql: "SELECT count(*) FROM wide a WHERE EXISTS (SELECT 1 FROM side_table b WHERE b.owner = a.id)"
                 .to_string(),
             pre: None,
             post: None,
@@ -1154,7 +1154,7 @@ fn correlated_read_workloads(point: u32) -> Vec<Workload> {
         Workload {
             name: "correlated.in".to_string(),
             family: "read.correlated".to_string(),
-            sql: "SELECT count(*) FROM wide a WHERE a.id IN (SELECT b.owner FROM side_table b                   WHERE b.owner = a.id)"
+            sql: "SELECT count(*) FROM wide a WHERE a.id IN (SELECT b.owner FROM side_table b WHERE b.owner = a.id)"
                 .to_string(),
             pre: None,
             post: None,

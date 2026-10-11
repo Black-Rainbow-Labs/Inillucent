@@ -126,4 +126,58 @@ keeps the lock until it closes.
 it holds the lock, a second process waits for `busy_timeout` and then fails. Any
 value other than `normal` or `exclusive` is an error.
 
+## What `automatic_index` switches
+
+`PRAGMA automatic_index = OFF` turns off two things. A join whose inner table has no
+index for the join equality stops reading that table once into a hash table, and walks
+the table for each outer row. A correlated subquery whose table has no index for its
+equality against the enclosing query stops reading that table once into a hash table
+as well, and scans it for each outer row. `EXPLAIN QUERY PLAN` follows the setting.
+A subquery inside an `UPDATE`, `DELETE` or `INSERT` always scans.
+
+## What `auto_vacuum`, `incremental_vacuum` and `max_page_count` do
+
+`PRAGMA auto_vacuum` reads the mode of the file: 0 for NONE, 1 for FULL and 2 for
+INCREMENTAL. NONE is the default. In NONE mode a page that a delete frees stays in the
+file and later writes reuse it, so the file does not become shorter.
+
+In FULL mode every commit moves the pages at the end of the file into free pages nearer
+the start, lowers the page count, and the file is cut at the next checkpoint. After a
+delete in FULL mode `PRAGMA freelist_count` reads 0. In INCREMENTAL mode the free pages
+stay in the file until `PRAGMA incremental_vacuum(N)` is run. It gives back up to N free
+pages when the statement commits, and every free page when N is left out, is 0 or is
+negative. It prints one empty row for each page it was asked to give back, up to
+`freelist_count`, as SQLite does. In NONE and FULL mode `PRAGMA incremental_vacuum`
+prints nothing and changes nothing. A `ROLLBACK` discards the request.
+
+`PRAGMA auto_vacuum = NONE`, `FULL`, `INCREMENTAL`, `0`, `1` or `2` sets the mode at
+once on a file that has no table, and on a file that is already in FULL or INCREMENTAL
+mode. On a file in NONE mode that has tables, the connection remembers the value and
+`PRAGMA auto_vacuum` keeps reading 0 until `VACUUM` rebuilds the file in the new mode.
+Any other value is ignored. Setting a mode other than NONE raises a file at format 2 to
+format 3.
+
+In FULL and INCREMENTAL mode the root page of every table and index is kept at the start
+of the file, so the step that gives pages back never has to move one. A new table or
+index takes the page after the largest root, and `DROP` moves the highest root into the
+slot it frees. The meta record holds the largest root as `largest_root`.
+
+The step moves only pages whose owner it can find. It stops at a root, at a page that no
+tree owns, and at an extent page in the layout that format 2 files use. The file then
+keeps the pages above that page, `PRAGMA freelist_count` can read more than 0, and
+`VACUUM` rebuilds the file without that limit.
+
+`PRAGMA max_page_count` reads the limit on the number of pages in the file.
+`PRAGMA max_page_count = N` sets it when N is a positive integer. A value below the
+current page count is raised to the page count, and a value above 4294967294 is lowered
+to it. Any other value leaves the limit as it was. The limit is held on the open file in
+memory and is not written to the file, so it applies to one file on one connection and
+a reopened file has the default again.
+
+A statement that would make the file longer than the limit fails with the message
+`database or disk is full` and the status `full`. The statement is rolled back and the
+transaction it was in stays open. SQLite rolled back the whole transaction in the cases
+that were measured, so this differs from SQLite. The sort spill and the temporary files
+do not count against the limit.
+
 `compat/api/pragmas.toml` holds the same register in a form a program can read.

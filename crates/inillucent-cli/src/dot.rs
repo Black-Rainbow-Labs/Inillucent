@@ -204,7 +204,7 @@ pub fn run(shell: &mut Shell, line: &str) {
 /// @param arguments - the words after the command
 fn clone(shell: &mut Shell, arguments: &[&str]) {
     let named = shell.column(
-        "SELECT name FROM sqlite_master WHERE type IN ('table','index')          AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
+        "SELECT name FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
     );
     backup(shell, arguments);
     for name in named {
@@ -339,6 +339,26 @@ fn parameter_value(shell: &Shell, word: &str) -> Result<Value<'static>, String> 
         .unwrap_or(Value::Null))
 }
 
+/// Returns a bound value as `.parameter list` prints it, which is SQL's `quote()`.
+///
+/// `quote()` writes a blob as `X'..'` with an upper case `X` and upper case
+/// digits, where the literal the rest of the shell writes is lower case.
+///
+/// @param value - the bound value
+fn quoted_parameter(value: &Value<'static>) -> String {
+    match value {
+        Value::Blob(blob) => {
+            let digits: String = blob
+                .raw()
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect();
+            format!("X'{digits}'")
+        }
+        other => literal(other),
+    }
+}
+
 /// `.parameter init | list | set NAME VALUE | unset NAME | clear`.
 ///
 /// **The one dot command with no substitute.** A bound parameter could not be
@@ -354,6 +374,22 @@ fn parameter_value(shell: &Shell, word: &str) -> Result<Value<'static>, String> 
 /// @param shell - the shell
 /// @param arguments - the words after the command
 fn parameter(shell: &mut Shell, arguments: &[&str]) {
+    // **The shape of the command is checked before it is read.** The reference
+    // runs `clear`, `list` and `init` with nothing after them, `set` with a name
+    // and one value, and `unset` with a name, and prints the help for the
+    // command for anything else. A second value was dropped here, so
+    // `.parameter set :f 'it''s'` bound `it` and said nothing about the `s`.
+    let words = arguments.len();
+    let shaped = match arguments.first().copied() {
+        Some("clear" | "list" | "init") => words == 1,
+        Some("set") => words == 3,
+        Some("unset") => words == 2,
+        _ => false,
+    };
+    if !shaped {
+        help(shell, &["parameter"]);
+        return;
+    }
     match arguments.first().copied().unwrap_or("list") {
         "init" => {}
         "clear" => shell.parameters.clear(),
@@ -361,7 +397,7 @@ fn parameter(shell: &mut Shell, arguments: &[&str]) {
             let listed: Vec<(String, String)> = shell
                 .parameters
                 .iter()
-                .map(|(name, value)| (name.clone(), literal(value)))
+                .map(|(name, value)| (name.clone(), quoted_parameter(value)))
                 .collect();
             // The reference pads the name column to the widest name, which is
             // what makes a list of several read as a table.
@@ -414,40 +450,47 @@ fn without_terminator(line: &str) -> &str {
     trimmed.strip_suffix(';').unwrap_or(trimmed)
 }
 
+/// Splits a dot command into its words the way the reference does.
+///
+/// **A quote opens a word only at the start of that word.** A word that begins
+/// with `'` or `"` runs to the next quote of the same kind, and a word that
+/// begins with anything else runs to the next white space, quotes and all. The
+/// first reading is what lets `.print "a b"` print `a b`; the second is what lets
+/// `.parameter set :b x'0102'` hand `x'0102'` to the expression reader as one
+/// word, where a quote in the middle of a word used to end it and start another,
+/// and the parameter was bound to the text `x`.
+///
+/// There is no doubled quote: `'it''s'` is the word `it` followed by the word
+/// `s`, as it is in the reference, which then refuses the `.parameter set` for
+/// having too many words.
+///
+/// @param line - the dot command, leading dot included
 fn split(line: &str) -> Vec<String> {
     let mut words = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut started = false;
-    for character in line.chars() {
-        match quote {
-            Some(open) if character == open => {
-                quote = None;
-                words.push(core::mem::take(&mut current));
-                started = false;
-            }
-            Some(_) => current.push(character),
-            None if character == '\'' || character == '"' => {
-                if started {
-                    words.push(core::mem::take(&mut current));
+    let mut characters = line.chars().peekable();
+    loop {
+        while characters
+            .next_if(|character| character.is_whitespace())
+            .is_some()
+        {}
+        let Some(&first) = characters.peek() else {
+            break;
+        };
+        let mut word = String::new();
+        if first == '\'' || first == '"' {
+            characters.next();
+            for character in characters.by_ref() {
+                if character == first {
+                    break;
                 }
-                quote = Some(character);
-                started = true;
+                word.push(character);
             }
-            None if character.is_whitespace() => {
-                if started {
-                    words.push(core::mem::take(&mut current));
-                    started = false;
-                }
-            }
-            None => {
-                current.push(character);
-                started = true;
+        } else {
+            while let Some(character) = characters.next_if(|character| !character.is_whitespace()) {
+                word.push(character);
             }
         }
-    }
-    if started {
-        words.push(current);
+        words.push(word);
     }
     words
 }
@@ -662,14 +705,63 @@ fn indexes(shell: &mut Shell, arguments: &[&str]) {
     }
 }
 
+/// What `.schema` was asked for.
+#[derive(Default)]
+struct SchemaOptions<'a> {
+    /// `--indent`: put each column of a table on a line of its own.
+    indent: bool,
+    /// `--nosys`: leave out the objects whose names begin with `sqlite_`.
+    nosys: bool,
+    /// The `LIKE` pattern naming the objects to show, if one was given.
+    pattern: Option<&'a str>,
+}
+
+/// Reads the options and the pattern after `.schema`.
+///
+/// **An option is read as an option.** The first word was taken as the pattern
+/// whatever it was, so `.schema --indent` matched no object and printed nothing.
+/// The reference accepts one or two dashes, refuses an option it does not know
+/// by name, and refuses a second pattern with the usage line.
+///
+/// @param shell - where a complaint goes
+/// @param arguments - the words after `.schema`
+fn schema_options<'a>(shell: &mut Shell, arguments: &[&'a str]) -> Option<SchemaOptions<'a>> {
+    let mut options = SchemaOptions::default();
+    for argument in arguments {
+        let flag = argument
+            .strip_prefix('-')
+            .map(|rest| rest.strip_prefix('-').unwrap_or(rest));
+        match flag {
+            Some("indent") => options.indent = true,
+            Some("nosys") => options.nosys = true,
+            Some(_) => {
+                shell.complain(&format!("Unknown option: \"{argument}\""));
+                return None;
+            }
+            None if options.pattern.is_none() => options.pattern = Some(argument),
+            None => {
+                shell.complain("Usage: .schema ?--indent? ?--nosys? ?LIKE-PATTERN?");
+                return None;
+            }
+        }
+    }
+    Some(options)
+}
+
 /// `.schema`: the statements that would rebuild what is there.
 fn schema(shell: &mut Shell, arguments: &[&str]) {
+    let Some(options) = schema_options(shell, arguments) else {
+        return;
+    };
     let mut sql = String::from("SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL");
-    if let Some(pattern) = arguments.first() {
+    if let Some(pattern) = options.pattern {
         let quoted = literal_text(pattern);
         sql.push_str(&format!(
             " AND (name LIKE {quoted} OR tbl_name LIKE {quoted})"
         ));
+    }
+    if options.nosys {
+        sql.push_str(" AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'");
     }
     sql.push_str(" ORDER BY rowid");
     let Ok((_, rows)) = shell.collect(&sql) else {
@@ -685,6 +777,10 @@ fn schema(shell: &mut Shell, arguments: &[&str]) {
             // `.schema` on a view worth reading.
             let listed = view_columns(shell, &name);
             shell.say(&format!("{statement}\n/* {name}({listed}) */;"));
+            continue;
+        }
+        if options.indent && kind != "trigger" {
+            shell.say(&crate::schema_indent::indented(&statement));
             continue;
         }
         shell.say(&format!("{statement};"));
@@ -889,16 +985,62 @@ fn read(shell: &mut Shell, arguments: &[&str]) {
     drive(shell, lines.into_iter());
 }
 
+/// Reports an option a dot command does not know, in the reference's form.
+///
+/// Two lines: the command as typed, and a caret under the first character of
+/// the option. The caret's column is where that word starts in the command.
+///
+/// @param shell - where the complaint goes
+/// @param command - the command with its dot, such as `.dump`
+/// @param arguments - every word after the command
+/// @param option - the word that was not understood
+fn unknown_option(shell: &mut Shell, command: &str, arguments: &[&str], option: &str) {
+    let line = shell.line;
+    let typed = format!("{command} {}", arguments.join(" "));
+    let before = arguments
+        .iter()
+        .take_while(|word| **word != option)
+        .map(|word| word.chars().count() + 1)
+        .sum::<usize>();
+    let column = command.chars().count() + 1 + before;
+    shell.complain(&format!("line {line}: {typed}"));
+    shell.complain(&format!(
+        "line {line}: {}^--- unknown option",
+        " ".repeat(column)
+    ));
+}
+
 /// `.dump`: the SQL that would rebuild the database.
 fn dump(shell: &mut Shell, arguments: &[&str]) {
-    let confined = match arguments.first().copied() {
-        None => None,
-        Some(named) => match confine_path(shell, named) {
-            Some(path) => Some(path),
-            None => return,
-        },
-    };
-    crate::dump::dump(shell, confined.as_deref());
+    let mut options = crate::dump::DumpOptions::default();
+    for argument in arguments {
+        if let Some(flag) = argument.strip_prefix('-') {
+            // **An option is read as an option.** The first word after `.dump`
+            // was taken as the pattern whatever it was, so `.dump --nosys`
+            // matched no table whose name looked like `--nosys` and dumped
+            // nothing, and `inillucent dump --data-only` was an empty dump.
+            // One or two dashes both work, as they do in the reference.
+            match flag.strip_prefix('-').unwrap_or(flag) {
+                "data-only" => options.data_only = true,
+                "nosys" => options.nosys = true,
+                "newlines" => {}
+                "preserve-rowids" => {
+                    shell.complain("Error: .dump --preserve-rowids is not built");
+                    return;
+                }
+                _ => {
+                    unknown_option(shell, ".dump", arguments, argument);
+                    return;
+                }
+            }
+            continue;
+        }
+        let Some(pattern) = confine_path(shell, argument) else {
+            return;
+        };
+        options.patterns.push(pattern);
+    }
+    crate::dump::dump(shell, &options);
 }
 
 /// `.backup`: copies a database into a file.
@@ -914,8 +1056,8 @@ fn backup(shell: &mut Shell, arguments: &[&str]) {
     let path = path.as_str();
     // A checkpoint and a file copy, which is what a backup of this format is:
     // one file is one database, and there is no second writer to race.
-    if let Err(message) = shell.backup_to(path) {
-        shell.complain(&format!("Error: {message}"));
+    if let Err(error) = shell.backup_to(path) {
+        shell.complain(&format!("Error: {}", error.message()));
     }
 }
 

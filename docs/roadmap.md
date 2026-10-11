@@ -4,7 +4,7 @@ This page lists the open work on inillucent, in the order it is being worked. Ea
 the work is, why a user would want it, and where it stands today. Work that is finished, and work
 that was decided against, is in [Closed items](closed-items.md).
 
-Every speed ratio on this page comes from the runs of 7 October 2026 in
+Every speed ratio on this page comes from the runs of 8 October 2026 in
 [Performance](performance.md). A ratio is SQLite's time divided by inillucent's time on the same
 workload. A ratio above 1.00x means inillucent was faster, and one below 1.00x means inillucent was
 slower.
@@ -42,20 +42,20 @@ most of them. Some workloads are still slower, and they hold down the families t
 **Why a user wants it.** These workloads are common operations: a join over an index range, building
 a full text index, and compiling a short statement.
 
-**Status.** Measured 7 October 2026, the median of three runs:
+**Status.** Measured 8 October 2026 with release 2.4.2, the median of three runs:
 
 | Workload | Family | Workload ratio | Family ratio |
 |---|---|---:|---:|
-| `prepare.trivial` | `open.prepare` | 0.58x | 2.02x |
-| `schema.index` | `schema` | 1.48x | 1.47x |
+| `prepare.trivial` | `open.prepare` | 0.57x | 1.98x |
+| `schema.index` | `schema` | 1.43x | 1.05x |
 
-- `prepare.trivial` is the one weighted workload slower than SQLite, 72% slower. It compiles
-  `SELECT 1` on every call. `open.prepare` misses its bar of 5.00x, at 2.02x.
-- `schema` misses its bar of 3.00x, at 1.47x. `schema` is one workload, `schema.index`, run once a
-  round.
-- `join.range` (1.02x) and `extension.fts.build` (1.14x), both slower than SQLite on 23 September,
-  are now faster. `read.join` is at 5.26x against its bar of 3.00x and `extension` at 2.47x against
-  1.50x.
+- `prepare.trivial` is the one weighted workload slower than SQLite, 75% slower. It compiles
+  `SELECT 1` on every call. `open.prepare` misses its bar of 5.00x, at 1.98x.
+- `schema` misses its bar of 3.00x, at 1.05x. `schema` is one workload, `schema.index`, run once a
+  round, and the family value moves with how fast the disk finishes a sync: 1.32x, 1.86x and 1.05x
+  in the three runs.
+- `join.range` is level with SQLite at 1.00x. `read.join` is at 5.22x against its bar of 3.00x and
+  `extension` at 2.27x against 1.50x.
 
 [The workloads that are slower](performance.md#the-workloads-that-are-slower) has the time each
 workload takes and the reason. [By family](performance.md#by-family) has every family's ratio, lower

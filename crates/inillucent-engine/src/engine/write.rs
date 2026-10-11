@@ -416,6 +416,13 @@ impl TreeLog for WalLog<'_> {
         Ok(lsn)
     }
 
+    fn log_format(&mut self, version: u32) -> DbResult<u64> {
+        // Owned by no transaction, so recovery replays it even when this
+        // transaction is abandoned; see `TreeLog::log_format`.
+        self.wrote = true;
+        self.wal.append(0, Body::Format { version })
+    }
+
     fn log_insert_row(&mut self, tree: u64, page: u64, row: &[u8]) -> DbResult<u64> {
         self.wrote = true;
         let lsn = self.wal.append_insert_row(self.txn, tree, page, row)?;

@@ -1011,7 +1011,7 @@ fn live_rows_of_needed<'p>(
 ///
 /// @param condition - the join condition, or `None` for a cross product
 /// @param joined - the outer row followed by the inner row
-fn keeps(condition: Option<&dyn Eval>, joined: &[OwnedDatum]) -> DbResult<bool> {
+pub(crate) fn keeps(condition: Option<&dyn Eval>, joined: &[OwnedDatum]) -> DbResult<bool> {
     {
         let Some(condition) = condition else {
             return Ok(true);

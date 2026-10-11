@@ -158,20 +158,15 @@ impl ImportedDatabase {
         };
         let bytes = converted.as_deref().unwrap_or(bytes);
         let candidates = self.probe_module(connected, bytes, depth)?;
-        if candidates.is_empty() {
-            // **An index that holds nothing is not an answer of nothing.** A
-            // nearest-neighbour probe returns the `k` nearest rows however far
-            // away they are, so an empty candidate list means the store is
-            // empty rather than that nothing matched - and `None` here is the
-            // planner's word for "no index", which sends the query to the
-            // exhaustive scan. Returning the empty list instead is how a
-            // `CREATE INDEX` used to make a working search answer zero rows
-            // with nothing failing and nothing logged. The cause of the empty
-            // store is fixed; this is what stops the *symptom* being a wrong
-            // answer if anything ever empties one again. A table that really
-            // holds no rows gets the same answer from the scan.
-            return Ok(None);
-        }
+        // **An index that holds nothing answers an empty list, and an empty list is an answer.**
+        // `None` means there is no index of that name, and the executor refuses the statement for
+        // it with "no vector index named". This used to return `None` for an empty candidate list
+        // so that the query fell back to a scan, but the executor has no scan to fall back to at
+        // this point, so an empty table, a table emptied by `DELETE`, a table whose vectors are all
+        // NULL and a `WHERE` that removes every row all failed with that refusal. A nearest
+        // neighbour probe returns the `k` nearest rows however far away they are, so an empty list
+        // means the index holds no vector: there is no neighbour, and no row is the right answer.
+        // Rows whose vector is NULL are not in the index, which `docs/vector-search.md` says.
         Ok(Some(candidates))
     }
 
@@ -496,7 +491,7 @@ impl ImportedDatabase {
                 String::from_utf8_lossy(&column.name)
             ))
         })?;
-        let declared = store_options(module, settings)?;
+        let declared = store_options(module, name, settings)?;
         // **The structure the index named is the module the store uses.** An
         // `ivfflat` is an inverted file and needs no lexical half, so it is its
         // own module with its own three shadow tables; `inillucent_hnsw` is the
@@ -619,9 +614,17 @@ const DEFAULT_HNSW_MODE: &str = "approximate";
 /// mode to switch to, so `WITH (mode = 'exact')` there would be accepted and
 /// then not honoured.
 ///
+/// A metric the graph does not know is refused here, by the index's name. The store would refuse it
+/// as well when it is created, but its message cannot say which `CREATE INDEX` the setting came
+/// from, and it is a message about a table the person never wrote.
+///
 /// @param module - `inillucent_hnsw` or `ivfflat`
+/// @param name - the index's name, for the message
 /// @param settings - the folded `(name, value)` pairs `WITH ( ... )` carried
-fn store_options(module: &[u8], settings: &[(Vec<u8>, Vec<u8>)]) -> DbResult<String> {
+fn store_options(module: &[u8], name: &[u8], settings: &[(Vec<u8>, Vec<u8>)]) -> DbResult<String> {
+    if module != b"ivfflat" {
+        check_metric_setting(name, settings)?;
+    }
     let names_mode = settings.iter().any(|(option, _)| option == b"mode");
     if names_mode && module == b"ivfflat" {
         return Err(refusal(
@@ -640,6 +643,28 @@ fn store_options(module: &[u8], settings: &[(Vec<u8>, Vec<u8>)]) -> DbResult<Str
         declared.push_str(&format!(", mode={DEFAULT_HNSW_MODE}"));
     }
     Ok(declared)
+}
+
+/// Refuses a `metric` setting that names no distance the graph implements.
+///
+/// @param name - the index's name, for the message
+/// @param settings - the folded `(name, value)` pairs `WITH ( ... )` carried
+fn check_metric_setting(name: &[u8], settings: &[(Vec<u8>, Vec<u8>)]) -> DbResult<()> {
+    for (option, value) in settings {
+        if option != b"metric" && option != b"distance" {
+            continue;
+        }
+        let text = String::from_utf8_lossy(value);
+        let bare = text.trim().trim_matches('\'').trim_matches('"');
+        if let Err(error) = inillucent_search::options::Metric::parse(bare) {
+            return Err(refusal(format!(
+                "index {}: {}",
+                String::from_utf8_lossy(name),
+                error.message()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Returns the distance a connected vector index's own store was declared to

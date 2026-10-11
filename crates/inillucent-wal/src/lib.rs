@@ -66,7 +66,7 @@ pub mod recover;
 pub mod segment;
 pub mod writer;
 
-pub use record::{Body, PageList, Record, Structural, MAX_RECORD_BYTES};
+pub use record::{Body, PageList, Record, RelinkSite, Structural, MAX_RECORD_BYTES};
 pub use recover::{
     recover, recover_keeping, truncate_after, DryRun, KeptSegment, Recovered, RecoveryStart, Redo,
 };

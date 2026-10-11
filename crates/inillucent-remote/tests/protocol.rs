@@ -696,7 +696,7 @@ fn a_real_servers_scram_challenge_decodes() {
         .expect("the challenge names an iteration count");
     assert!(
         iterations >= 4096,
-        "an iteration count below RFC 7677's floor would be the server's own problem,          but this recording should not carry one: {iterations}"
+        "an iteration count below RFC 7677's floor would be the server's own problem, but this recording should not carry one: {iterations}"
     );
 
     let nonce = attributes

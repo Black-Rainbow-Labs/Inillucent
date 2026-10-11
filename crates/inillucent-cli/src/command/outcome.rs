@@ -89,6 +89,13 @@ impl Failed {
     /// @param failure - what the shell reported
     pub fn from_shell(failure: &crate::shell::Failure) -> Failed {
         match failure.error.as_ref() {
+            // A value with no marker to bind to is reported by the shell with the
+            // number of markers the statement has, which the engine's own
+            // sentence, "column index out of range", does not say.
+            Some(error) if error.code() == inillucent_base::PrimaryCode::Range => Failed {
+                message: failure.message.clone(),
+                ..Failed::from_engine(error)
+            },
             Some(error) => Failed::from_engine(error),
             // A failure with no error behind it came from the shell rather than
             // the engine - a dot command's own complaint - and `syntax` is the

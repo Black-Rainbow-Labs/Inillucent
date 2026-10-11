@@ -131,6 +131,12 @@ impl Parser<'_> {
             if self.at_table_constraint()? {
                 self.parse_table_constraint_run(&mut constraints)?;
             } else {
+                // **A column cannot follow a table constraint.** SQLite's grammar puts every
+                // column first and every table constraint after, so `CREATE TABLE t(a,
+                // UNIQUE(a), b)` is a syntax error at `b`.
+                if !constraints.is_empty() {
+                    return Err(self.unexpected(&["a table constraint"])?);
+                }
                 columns.push(self.parse_column_def()?);
                 // **Charged here, the way a result set is charged in
                 // `parse_result_columns`** (task-2066 section 4.2, item 21).
@@ -457,7 +463,12 @@ impl Parser<'_> {
         // makes `DEFAULT hello` the text `hello`, and a double quoted word the
         // same, because there is no column in scope for it to name. `TRUE` and
         // `FALSE` are the two words that keep their meaning.
-        if Parser::token_is_plain_name(first) {
+        // The three `CURRENT_` words are names to the grammar elsewhere, and keep their meaning here.
+        let current_word = matches!(
+            first.keyword(),
+            Some(Keyword::CURRENT_DATE | Keyword::CURRENT_TIME | Keyword::CURRENT_TIMESTAMP)
+        );
+        if Parser::token_is_plain_name(first) && !current_word {
             let word = lexer::identifier_text(self.source, first).into_owned();
             if !word.eq_ignore_ascii_case(b"true") && !word.eq_ignore_ascii_case(b"false") {
                 self.bump()?;

@@ -13,6 +13,7 @@ use inillucent_pool::page::{self, PageKind};
 use inillucent_pool::{PageGuard, PageId, Pool, Swip};
 
 use super::*;
+use crate::separator::{child_in, separator_full};
 
 impl PagedTree {
     /// Encodes a key tuple without allocating when it fits inline.
@@ -123,7 +124,7 @@ impl PagedTree {
                 if page::kind_of(&guard)? == PageKind::Leaf {
                     return Ok(Descent { steps, leaf: page });
                 }
-                InteriorRef::parse(&guard)?.child_for(key)?.0
+                child_in(pool, &InteriorRef::parse(&guard)?, key)?.0
             };
             steps.push((page, child));
             page = self.take_child(pool, page, child)?;
@@ -161,12 +162,12 @@ impl PagedTree {
                     return Ok((Descent { steps, leaf: page }, low, high));
                 }
                 let interior = InteriorRef::parse(&guard)?;
-                let child = interior.child_for(key)?.0;
+                let child = child_in(pool, &interior, key)?.0;
                 if let Some(below) = child.checked_sub(1) {
-                    low = Some(interior.key(below)?.to_vec());
+                    low = Some(separator_full(pool, &interior, below)?);
                 }
                 if child < interior.count() {
-                    high = Some(interior.key(child)?.to_vec());
+                    high = Some(separator_full(pool, &interior, child)?);
                 }
                 child
             };
@@ -222,7 +223,7 @@ impl PagedTree {
             }
             let (swip, at) = {
                 let interior = InteriorRef::parse(&guard)?;
-                let (_, swip, at) = interior.child_for(key)?;
+                let (_, swip, at) = child_in(pool, &interior, key)?;
                 (swip, at)
             };
             if let Some(seen) = observed {

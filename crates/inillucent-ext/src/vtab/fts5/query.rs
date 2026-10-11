@@ -62,6 +62,9 @@ pub(crate) struct Fts5Cursor {
     /// The column weights `rank` scores with, from the `rank` setting; see
     /// `bm25::configured_weights`.
     pub(crate) rank_weights: Vec<f64>,
+    /// The rank function a `rank MATCH '...'` constraint gave this query, such
+    /// as `bm25(10.0, 1.0)`, which replaces the `rank` setting for it.
+    pub(crate) rank_setting: Option<String>,
     pub(crate) tokenizer: Tokenizer,
     pub(crate) shadows: ShadowTables,
     pub(crate) rows: Vec<MatchedRow>,
@@ -97,7 +100,85 @@ pub(crate) struct Fts5Cursor {
     /// ten-column table ten times. The row is the same row each time.
     pub(crate) held: Option<(i64, Vec<Value<'static>>)>,
 }
+/// Reads one `bm25()` weight argument the way `sqlite3_value_double` does.
+///
+/// An integer weight such as `bm25(t, 10, 1)` used to be read as 1 because only
+/// a real was accepted. Any numeric value is a weight: an integer, a real, text
+/// that starts with a number, and zero or a negative number as well. NULL and a
+/// text or blob that does not start with a number read as 0, which is what
+/// SQLite does.
+///
+/// @param argument - one argument of the `bm25` call
+fn weight_of(argument: &Value<'static>) -> f64 {
+    match argument {
+        Value::Integer(number) => *number as f64,
+        Value::Real(number) => *number,
+        Value::Text(text) => leading_number(&String::from_utf8_lossy(&text.utf8_bytes())),
+        Value::Blob(blob) => leading_number(&String::from_utf8_lossy(blob.raw())),
+        Value::Null => 0.0,
+    }
+}
+
+/// Reads the number a piece of text starts with, as `atof` does.
+///
+/// Leading spaces are skipped, `3abc` is 3, and text that does not start with a
+/// number is 0. Words such as `inf` and `nan` are not numbers here.
+///
+/// @param text - the text to read
+fn leading_number(text: &str) -> f64 {
+    let trimmed = text.trim_start();
+    let allowed = |character: char| matches!(character, '0'..='9' | '.' | '+' | '-' | 'e' | 'E');
+    let candidate_end = trimmed
+        .char_indices()
+        .find(|(_, character)| !allowed(*character))
+        .map(|(at, _)| at)
+        .unwrap_or(trimmed.len());
+    let mut end = candidate_end;
+    while end > 0 {
+        if let Some(prefix) = trimmed.get(..end) {
+            if let Ok(number) = prefix.parse::<f64>() {
+                return number;
+            }
+        }
+        end -= 1;
+    }
+    0.0
+}
+
 impl Fts5Cursor {
+    /// Returns the column weights `rank` scores this query with.
+    ///
+    /// The function a `rank MATCH '...'` constraint named wins over the
+    /// table's `rank` setting, which is what SQLite does for that query.
+    ///
+    /// @param context - the running statement
+    fn load_rank_weights(&self, context: &mut Context<'_>) -> DbResult<Vec<f64>> {
+        match &self.rank_setting {
+            Some(setting) => Ok(bm25::weights_from_setting(setting, self.columns)),
+            None => bm25::configured_weights(context, &self.shadows, self.columns),
+        }
+    }
+
+    /// Returns where the query's phrases occur in one column's tokens.
+    ///
+    /// The occurrences of a `NEAR` group count only where the group matches,
+    /// which is how SQLite reports them to `highlight` and `snippet`.
+    ///
+    /// @param spans - the column's tokens with their byte ranges
+    /// @param column - which column the tokens are from
+    fn instances_of(&self, spans: &[snippet::Span], column: usize) -> Vec<snippet::Instance> {
+        let found = snippet::instances_in(&self.phrases, spans, column);
+        let groups = self
+            .query
+            .as_ref()
+            .map(Query::near_groups)
+            .unwrap_or_default();
+        if groups.is_empty() {
+            return found;
+        }
+        snippet::keep_near_matches(found, &groups, &self.phrases)
+    }
+
     /// Builds the phrase hits if the cheap walk did not.
     ///
     /// The one caller that needs them is a score, and a score is asked for per
@@ -129,6 +210,12 @@ impl Fts5Cursor {
     /// way to get from a position back to a range of the original text, and it
     /// is what SQLite does too.
     ///
+    /// **A phrase, not a token.** `MATCH '"quick brown"'` marks the two words
+    /// as one range and `MATCH 'quick AND brown'` marks them as two, because
+    /// the first is one phrase of two terms and the second is two phrases of
+    /// one. Phrases that overlap are one range. A column that does not exist
+    /// answers an empty string, as SQLite does.
+    ///
     /// @param context - the statement's context
     /// @param arguments - the column index, the opening mark, the closing mark
     fn highlight(
@@ -136,37 +223,32 @@ impl Fts5Cursor {
         context: &mut Context<'_>,
         arguments: &[Value<'static>],
     ) -> DbResult<Value<'static>> {
-        let column = arguments
-            .first()
-            .and_then(Value::as_integer)
-            .unwrap_or(0)
-            .max(0) as usize;
+        let requested = arguments.first().and_then(Value::as_integer).unwrap_or(0);
         let open = text_argument(arguments.get(1));
         let close = text_argument(arguments.get(2));
+        let column = match usize::try_from(requested) {
+            Ok(column) if column < self.columns => column,
+            _ => return Value::owned_text(b""),
+        };
         let Some(text) = self.column_text(context, column)? else {
             return Ok(Value::Null);
         };
-        let marked = self.marked_spans(&text);
-        let mut out = Vec::with_capacity(text.len());
-        let mut at = 0usize;
-        for (start, end) in marked {
-            out.extend_from_slice(text.get(at..start).unwrap_or_default());
-            out.extend_from_slice(&open);
-            out.extend_from_slice(text.get(start..end).unwrap_or_default());
-            out.extend_from_slice(&close);
-            at = end;
-        }
-        out.extend_from_slice(text.get(at..).unwrap_or_default());
+        let spans = self.tokenizer.spans(&text);
+        let instances = self.instances_of(&spans, column);
+        let ranges = snippet::coalesced(&instances);
+        let out = snippet::highlight_text(&text, &spans, &ranges, (&open, &close));
         Ok(Value::owned_text(&out).unwrap_or(Value::Null))
     }
 
     /// Answers `snippet(t, column, open, close, ellipsis, tokens)`.
     ///
-    /// The window is the run of `tokens` tokens holding the most matched ones,
-    /// earliest when several tie - which is SQLite's rule and the reason a
-    /// snippet of a long document lands on the interesting part rather than on
-    /// its first sentence. The ellipsis is written only where text was actually
-    /// cut, so a snippet of a short column reads as the whole column.
+    /// The window is chosen the way SQLite chooses it, by the `snippet` module:
+    /// every occurrence of a phrase starts a window centred on it, so does the
+    /// start of the sentence the occurrence is in, and the first window with the
+    /// best score wins. A column of `-1` considers every column and shows the
+    /// one holding the best window; the first column is shown when nothing
+    /// matches in any of them. The ellipsis is written only where text was
+    /// actually cut, so a snippet of a short column reads as the whole column.
     ///
     /// @param context - the statement's context
     /// @param arguments - column, open, close, ellipsis, token count
@@ -175,11 +257,7 @@ impl Fts5Cursor {
         context: &mut Context<'_>,
         arguments: &[Value<'static>],
     ) -> DbResult<Value<'static>> {
-        let column = arguments
-            .first()
-            .and_then(Value::as_integer)
-            .unwrap_or(0)
-            .max(0) as usize;
+        let requested = arguments.first().and_then(Value::as_integer).unwrap_or(0);
         let open = text_argument(arguments.get(1));
         let close = text_argument(arguments.get(2));
         let ellipsis = text_argument(arguments.get(3));
@@ -187,70 +265,168 @@ impl Fts5Cursor {
             .get(4)
             .and_then(Value::as_integer)
             .unwrap_or(15)
-            .clamp(1, 64) as usize;
-        let Some(text) = self.column_text(context, column)? else {
+            .clamp(0, 64);
+        let best = self.best_snippet_window(context, requested, wanted)?;
+        let Some(text) = self.column_text(context, best.column)? else {
             return Ok(Value::Null);
         };
         let spans = self.tokenizer.spans(&text);
-        if spans.is_empty() {
-            return Ok(Value::owned_text(&text).unwrap_or(Value::Null));
-        }
-        let wanted_terms = self.wanted_terms();
-        let hit: Vec<bool> = spans
-            .iter()
-            .map(|(token, _, _)| matches_a_term(token, &wanted_terms))
-            .collect();
-        // The best window, by how many matched tokens it holds.
-        let mut best = 0usize;
-        let mut best_score = usize::MAX;
-        for start in 0..spans.len() {
-            let end = start.saturating_add(wanted).min(spans.len());
-            let score = hit
-                .get(start..end)
-                .map(|run| run.iter().filter(|held| **held).count())
-                .unwrap_or(0);
-            if best_score == usize::MAX || score > best_score {
-                best_score = score;
-                best = start;
-            }
-            if end == spans.len() {
-                break;
-            }
-        }
-        let end = best.saturating_add(wanted).min(spans.len());
-        let from = spans.get(best).map(|(_, start, _)| *start).unwrap_or(0);
-        let to = spans
-            .get(end.saturating_sub(1))
-            .map(|(_, _, stop)| *stop)
-            .unwrap_or(text.len());
-        let mut out = Vec::with_capacity(to.saturating_sub(from).saturating_add(16));
-        if best > 0 {
-            out.extend_from_slice(&ellipsis);
-        }
-        let mut at = from;
-        for (index, (_, start, stop)) in spans.iter().enumerate() {
-            if index < best || index >= end {
-                continue;
-            }
-            if !hit.get(index).copied().unwrap_or(false) {
-                continue;
-            }
-            out.extend_from_slice(text.get(at..*start).unwrap_or_default());
-            out.extend_from_slice(&open);
-            out.extend_from_slice(text.get(*start..*stop).unwrap_or_default());
-            out.extend_from_slice(&close);
-            at = *stop;
-        }
-        out.extend_from_slice(text.get(at..to).unwrap_or_default());
-        if end < spans.len() {
-            out.extend_from_slice(&ellipsis);
-        }
+        // `nColSize` is what the best window was found in, and the column's own
+        // token count when no window scored.
+        let tokens = match best.size {
+            0 => spans.len() as i64,
+            size => size,
+        };
+        let instances = self.instances_of(&spans, best.column);
+        let ranges = snippet::coalesced(&instances);
+        let words = (open.as_slice(), close.as_slice(), ellipsis.as_slice());
+        let out =
+            snippet::snippet_text(&text, &spans, &ranges, (best.start, wanted, tokens), words);
         Ok(Value::owned_text(&out).unwrap_or(Value::Null))
     }
 
-    /// Returns one column's stored text for the current row.
+    /// Answers FTS3 and FTS4 `snippet(t, open, close, ellipsis, column, tokens)`.
+    ///
+    /// The fragments are chosen and written the way SQLite's `fts3_snippet.c`
+    /// does it, by the `fts3_snippet` module: up to four fragments, each holding
+    /// the tokens argument divided by the fragment count, joined by the
+    /// ellipsis. A negative column considers every column for every fragment.
     ///
     /// @param context - the statement's context
+    /// @param arguments - open, close, ellipsis, column, token count, all optional
+    fn snippet_three(
+        &mut self,
+        context: &mut Context<'_>,
+        arguments: &[Value<'static>],
+    ) -> DbResult<Value<'static>> {
+        let open = arguments
+            .first()
+            .map_or(b"<b>".to_vec(), |v| text_argument(Some(v)));
+        let close = arguments
+            .get(1)
+            .map_or(b"</b>".to_vec(), |v| text_argument(Some(v)));
+        let ellipsis = arguments
+            .get(2)
+            .map_or(b"<b>...</b>".to_vec(), |v| text_argument(Some(v)));
+        let named = arguments.get(3).and_then(Value::as_integer).unwrap_or(-1);
+        let tokens = arguments.get(4).and_then(Value::as_integer).unwrap_or(15);
+        if tokens == 0 || self.phrases.is_empty() {
+            return Value::owned_text(b"");
+        }
+        let tokens = tokens.clamp(-64, 64);
+        let texts = self.column_sources(context)?;
+        let columns = self.column_hits(&texts, named);
+        let (fragments, size) = fts3_snippet::choose_fragments(&columns, tokens);
+        let marks = fts3_snippet::Marks {
+            open: &open,
+            close: &close,
+            ellipsis: &ellipsis,
+        };
+        let mut out = fts3_snippet::Buffer::default();
+        for (index, fragment) in fragments.iter().enumerate() {
+            let Some(Some((text, spans))) = texts.get(fragment.column) else {
+                continue;
+            };
+            let source = fts3_snippet::Source { text, spans };
+            let place = fts3_snippet::Placement {
+                index,
+                last: index + 1 == fragments.len(),
+                size,
+            };
+            fts3_snippet::append_fragment(&mut out, &source, fragment, &place, &marks);
+        }
+        match out.finish() {
+            Some(bytes) => Ok(Value::owned_text(&bytes).unwrap_or(Value::Null)),
+            None => Ok(Value::Null),
+        }
+    }
+
+    /// Reads every column's text and tokens for the current row.
+    ///
+    /// @param context - the statement's context
+    fn column_sources(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> DbResult<Vec<Option<(Vec<u8>, Vec<snippet::Span>)>>> {
+        let mut texts = Vec::with_capacity(self.columns);
+        for column in 0..self.columns {
+            let text = self.column_text(context, column)?;
+            texts.push(text.map(|bytes| {
+                let spans = self.tokenizer.spans(&bytes);
+                (bytes, spans)
+            }));
+        }
+        Ok(texts)
+    }
+
+    /// Finds the phrase occurrences of the columns a snippet considers.
+    ///
+    /// @param texts - each column's text and tokens
+    /// @param named - the column argument, negative for every column
+    fn column_hits(
+        &self,
+        texts: &[Option<(Vec<u8>, Vec<snippet::Span>)>],
+        named: i64,
+    ) -> Vec<fts3_snippet::ColumnHits> {
+        let mut columns = Vec::new();
+        for column in 0..self.columns {
+            if named >= 0 && column as i64 != named {
+                continue;
+            }
+            let spans = texts
+                .get(column)
+                .and_then(Option::as_ref)
+                .map(|(_, spans)| spans.as_slice());
+            let found = self.instances_of(spans.unwrap_or_default(), column);
+            columns.push(fts3_snippet::ColumnHits {
+                column,
+                hits: fts3_snippet::hits_of(&found, self.phrases.len()),
+            });
+        }
+        columns
+    }
+
+    /// Returns the column and the first token of the window `snippet` shows.
+    ///
+    /// @param context - the statement's context
+    /// @param requested - the column argument, negative for every column
+    /// @param wanted - how many tokens the snippet shows
+    fn best_snippet_window(
+        &mut self,
+        context: &mut Context<'_>,
+        requested: i64,
+        wanted: i64,
+    ) -> DbResult<snippet::Best> {
+        let first = usize::try_from(requested).unwrap_or(0);
+        let candidates: Vec<usize> = if requested < 0 {
+            (0..self.columns).collect()
+        } else {
+            vec![first]
+        };
+        let mut best = snippet::Best {
+            column: first,
+            start: 0,
+            score: 0,
+            size: 0,
+        };
+        for column in candidates {
+            let Some(text) = self.column_text(context, column)? else {
+                continue;
+            };
+            let spans = self.tokenizer.spans(&text);
+            let instances = self.instances_of(&spans, column);
+            let sentences = snippet::sentence_starts(&text, &spans);
+            let windows = snippet::ColumnWindows {
+                column,
+                instances: &instances,
+                sentences: &sentences,
+                tokens: spans.len() as i64,
+            };
+            snippet::consider_column(&mut best, &windows, self.phrases.len(), wanted);
+        }
+        Ok(best)
+    }
+
     /// Fills in where each declared column sits, the first time a row is read.
     ///
     /// `open` is handed no catalog - a cursor is made before a statement runs -
@@ -265,6 +441,9 @@ impl Fts5Cursor {
         }
     }
 
+    /// Returns one column's stored text for the current row.
+    ///
+    /// @param context - the statement's context
     /// @param column - which declared column
     fn column_text(
         &mut self,
@@ -294,63 +473,6 @@ impl Fts5Cursor {
                 _ => None,
             },
         )
-    }
-
-    /// Returns the byte ranges the query's phrases occupy in one column.
-    ///
-    /// **A phrase, not a token.** `MATCH '"quick brown"'` marks the two words
-    /// as one range and `MATCH 'quick AND brown'` marks them as two, because
-    /// the first is one phrase of two terms and the second is two phrases of
-    /// one - and the reference draws exactly that distinction. Marking every
-    /// matched token and merging adjacent ones gets the first case right and
-    /// the second wrong.
-    ///
-    /// The ranges come back in order and non-overlapping: two phrases that
-    /// claim the same word - `'quick OR "quick brown"'` - would otherwise
-    /// produce nested marks and text repeated between them.
-    ///
-    /// @param text - the column's bytes
-    fn marked_spans(&self, text: &[u8]) -> Vec<(usize, usize)> {
-        let spans = self.tokenizer.spans(text);
-        let mut marked: Vec<(usize, usize)> = Vec::new();
-        for phrase in &self.phrases {
-            if phrase.terms.is_empty() {
-                continue;
-            }
-            let mut at = 0usize;
-            while at.saturating_add(phrase.terms.len()) <= spans.len() {
-                let fits = phrase.terms.iter().enumerate().all(|(offset, term)| {
-                    spans
-                        .get(at.saturating_add(offset))
-                        .is_some_and(|(token, _, _)| {
-                            matches_a_term(token, std::slice::from_ref(term))
-                        })
-                });
-                if !fits {
-                    at = at.saturating_add(1);
-                    continue;
-                }
-                let from = spans.get(at).map(|(_, start, _)| *start).unwrap_or(0);
-                let to = spans
-                    .get(at.saturating_add(phrase.terms.len()).saturating_sub(1))
-                    .map(|(_, _, end)| *end)
-                    .unwrap_or(from);
-                marked.push((from, to));
-                at = at.saturating_add(phrase.terms.len());
-            }
-        }
-        marked.sort_unstable();
-        marked.dedup();
-        // Overlaps go, keeping the first - which is the longest match starting
-        // earliest once the list is sorted by start.
-        let mut kept: Vec<(usize, usize)> = Vec::with_capacity(marked.len());
-        for (from, to) in marked {
-            match kept.last() {
-                Some((_, last)) if from < *last => {}
-                _ => kept.push((from, to)),
-            }
-        }
-        kept
     }
 
     /// Returns every term the query asked for, across its phrases.
@@ -468,6 +590,27 @@ impl Fts5Cursor {
             .flat_map(|phrase| phrase.terms.iter().cloned())
             .collect()
     }
+
+    /// Finds the one row a `rowid = ?` plan names, when the table has it.
+    ///
+    /// `%_docsize` holds one row per indexed document and a contentless table has no
+    /// `%_content` to ask, so it is the record of which rowids exist for both.
+    ///
+    /// @param context - the connection's shadow table access
+    /// @param plan - the plan, whose first argument is the rowid
+    fn filter_by_rowid(&mut self, context: &mut Context<'_>, plan: &FilterPlan) -> DbResult<()> {
+        let Some(rowid) = plan.arguments.first().and_then(Value::as_integer) else {
+            return Ok(());
+        };
+        let suffix: &[u8] = match self.contentless {
+            true => b"docsize",
+            false => &self.content.clone(),
+        };
+        if self.shadows.read_row(context, suffix, rowid)?.is_some() {
+            self.rows.push(MatchedRow { rowid, score: None });
+        }
+        Ok(())
+    }
 }
 impl VirtualCursor for Fts5Cursor {
     /// Runs the query and collects every row it matched.
@@ -481,27 +624,21 @@ impl VirtualCursor for Fts5Cursor {
         self.at = 0;
         self.held = None;
         if plan.index_number == PLAN_ROWID {
-            let Some(rowid) = plan.arguments.first().and_then(Value::as_integer) else {
-                return Ok(());
-            };
-            // `%_docsize` holds one row per indexed document and a contentless
-            // table has no `%_content` to ask, so it is the record of which
-            // rowids exist for both.
-            let suffix: &[u8] = match self.contentless {
-                true => b"docsize",
-                false => &self.content.clone(),
-            };
-            if self.shadows.read_row(context, suffix, rowid)?.is_some() {
-                self.rows.push(MatchedRow { rowid, score: None });
-            }
-            return Ok(());
+            return self.filter_by_rowid(context, plan);
         }
         if plan.index_number & PLAN_MATCH == 0 {
             // **The index's own rows, not the owner's.** An external content
             // table's owner may hold rows this index has never seen, and a
             // scan that returned them would answer with documents no query
             // could match. `%_docsize` has one row per indexed document.
-            let suffix: &[u8] = if self.external.is_some() || self.contentless {
+            //
+            // **FTS3 and FTS4 read through to the owner instead.** SQLite
+            // answers `SELECT * FROM t` on `content=n` with every row of `n`,
+            // before any `rebuild`, because the scan never looks at the index.
+            let reads_owner = self.external.is_some() && self.dialect == Dialect::Three;
+            let suffix: &[u8] = if reads_owner {
+                b""
+            } else if self.external.is_some() || self.contentless {
                 b"docsize"
             } else {
                 b"content"
@@ -549,8 +686,12 @@ impl VirtualCursor for Fts5Cursor {
         let ranked = plan.index_number & PLAN_RANKED != 0;
         // Read only when a score is: most matches never ask for one.
         self.rank_weights.clear();
+        self.rank_setting = (plan.index_number & PLAN_RANK_FUNCTION != 0)
+            .then(|| plan.arguments.get(1).and_then(text_of))
+            .flatten()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
         if ranked {
-            self.rank_weights = bm25::configured_weights(context, &self.shadows, self.columns)?;
+            self.rank_weights = self.load_rank_weights(context)?;
         }
         // **A ranked plan needs the positions, and most plans do not.** The
         // cheap walk answers `None` for the queries whose answer depends on
@@ -648,7 +789,7 @@ impl VirtualCursor for Fts5Cursor {
             // so the two cannot disagree.
             self.ensure_hits(context)?;
             if self.rank_weights.is_empty() {
-                self.rank_weights = bm25::configured_weights(context, &self.shadows, self.columns)?;
+                self.rank_weights = self.load_rank_weights(context)?;
             }
             let weights = self.rank_weights.clone();
             let sizes = bm25::row_sizes(context, &self.shadows, row.rowid, self.columns)?;
@@ -709,33 +850,9 @@ impl VirtualCursor for Fts5Cursor {
             return self.highlight(context, arguments);
         }
         if name == b"snippet" {
-            // **The same snippet, and a different argument order.** FTS3 takes
-            // the markers first and the column fourth; FTS5 takes the column
-            // first. Rewriting the call here rather than writing the routine
-            // twice is what keeps the two dialects from drifting apart.
+            // FTS3 and FTS4 choose and write fragments by their own routine.
             if self.dialect == Dialect::Three {
-                let start = arguments.first().cloned().unwrap_or(text_value(b"<b>"));
-                let end = arguments.get(1).cloned().unwrap_or(text_value(b"</b>"));
-                let ellipsis = arguments
-                    .get(2)
-                    .cloned()
-                    .unwrap_or(text_value(b"<b>...</b>"));
-                let column = arguments
-                    .get(3)
-                    .and_then(Value::as_integer)
-                    .unwrap_or(-1)
-                    .max(0);
-                let tokens = arguments.get(4).and_then(Value::as_integer).unwrap_or(15);
-                return self.snippet(
-                    context,
-                    &[
-                        Value::Integer(column),
-                        start,
-                        end,
-                        ellipsis,
-                        Value::Integer(tokens),
-                    ],
-                );
+                return self.snippet_three(context, arguments);
             }
             return self.snippet(context, arguments);
         }
@@ -770,7 +887,7 @@ impl VirtualCursor for Fts5Cursor {
         }
         let mut weights = vec![1.0f64; self.columns];
         for (slot, argument) in weights.iter_mut().zip(arguments.iter()) {
-            *slot = argument.as_real().unwrap_or(1.0);
+            *slot = weight_of(argument);
         }
         // The hits are the query's, so the same maps score every row of it.
         self.ensure_hits(context)?;

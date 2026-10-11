@@ -748,6 +748,69 @@ pub fn a_hot_journal_is_beside(vfs: &dyn Vfs, database: &DbPath) -> bool {
     journal.read_exact_at(0, &mut magic).is_ok() && magic == MAGIC
 }
 
+/// Opens the database and takes the whole lock chain on it, waiting while a
+/// journal with pages to put back is beside it and another process holds the
+/// lock.
+///
+/// Returns the handle with the lock held, or `None` when there is nothing to
+/// put back: the journal has gone, or it is one that holds no page.
+///
+/// **A refused lock used to mean "somebody else will deal with it", and the
+/// open went on reading.** The somebody was often another process opening the
+/// same file after the same crash, which had taken SHARED and RESERVED and was
+/// waiting for EXCLUSIVE to put the journal back. Every other process opening
+/// at that moment skipped the journal and read pages that still held rows of
+/// the transaction the crash interrupted, which an eviction had written early.
+/// The first of them to replay a record committed after the restore found the
+/// leaf fuller than the record expected: "replaying InsertRow at 78030792 found
+/// no room in leaf 58". A later open that succeeded did so by stopping at that
+/// record, and every acknowledged commit after it was gone. Six writers
+/// starting together on one crashed file failed 15 rounds of 20.
+///
+/// So a journal that still holds pages is waited for, with no lock held while
+/// waiting, until this process gets the lock or the journal is gone. A
+/// finished journal, which `truncate` and `persist` leave behind, holds
+/// nothing and is not waited for: a writer may hold RESERVED for a whole
+/// transaction beside it, and readers have to be able to open meanwhile.
+///
+/// @param vfs - where the files live
+/// @param database - the database file's path
+fn wait_for_the_journal(vfs: &dyn Vfs, database: &DbPath) -> DbResult<Option<Box<dyn VfsFile>>> {
+    let budget = std::time::Duration::from_millis(crate::file::default_busy_millis());
+    let started = std::time::Instant::now();
+    let mut pause = 1u64;
+    loop {
+        if !vfs
+            .access(&database.journal(), AccessMode::Exists)
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        let Ok(target) = vfs.open(database, OpenOptions::main_db()) else {
+            return Ok(None);
+        };
+        if hold_the_database(target.as_ref()) {
+            return Ok(Some(target));
+        }
+        drop(target);
+        if !a_hot_journal_is_beside(vfs, database) {
+            return Ok(None);
+        }
+        if started.elapsed() >= budget {
+            return Err(inillucent_base::error::DbError::primary(
+                inillucent_base::error::PrimaryCode::Busy,
+            )
+            .with_message(
+                "a process stopped in the middle of writing this database and left a rollback \
+                 journal, and another process holds the database while it is recovered; try \
+                 again",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(pause));
+        pause = pause.saturating_mul(2).min(50);
+    }
+}
+
 /// Takes the whole lock chain on a database, reporting whether it got it.
 ///
 /// **The one thing that makes a journal beside a file interpretable.** A journal
@@ -758,9 +821,10 @@ pub fn a_hot_journal_is_beside(vfs: &dyn Vfs, database: &DbPath) -> bool {
 /// putting its pre-images back then undoes a checkpoint that is still running or
 /// has already finished (task-1987).
 ///
-/// SHARED and RESERVED are asked for with no wait, because a concurrent holder
-/// refuses them at once and there is nothing here worth waiting for - whoever
-/// holds the file will dispose of its own journal. EXCLUSIVE is the one step
+/// SHARED and RESERVED are asked for with no wait, and the caller,
+/// [`wait_for_the_journal`], tries again with nothing held. Waiting here while
+/// holding SHARED would stand in the way of the process that has RESERVED and
+/// is about to put the journal back. EXCLUSIVE is the one step
 /// allowed to wait: RESERVED already stops new readers arriving, so all it waits
 /// for is the readers already inside to leave, and it waits the same bounded,
 /// backing-off way [`crate::pool::Pool::lock_within`] does rather than a second,
@@ -862,12 +926,9 @@ pub fn replay_hot_journal(vfs: &dyn Vfs, database: &DbPath) -> DbResult<bool> {
     if !vfs.access(&path, AccessMode::Exists).unwrap_or(false) {
         return Ok(false);
     }
-    let Ok(target) = vfs.open(database, OpenOptions::main_db()) else {
+    let Some(target) = wait_for_the_journal(vfs, database)? else {
         return Ok(false);
     };
-    if !hold_the_database(target.as_ref()) {
-        return Ok(false);
-    }
     // **Asked again, now that the lock is held.** Between the first look and
     // this one, the process that owned that journal can have finished its
     // checkpoint and disposed of it, so the file having been there a moment ago
@@ -1317,12 +1378,17 @@ mod tests {
         }
         drop(journal);
 
+        // **It waits, and reports busy when the wait runs out.** It used to
+        // answer "nothing to replay" at once, and the open that called it went
+        // on to read pages the journal had not been put back over; see
+        // `wait_for_the_journal`.
         let before = sim.trace().len();
-        let restored = replay_hot_journal(vfs.as_ref(), &path)
-            .expect("a locked file is a refusal, not an error");
-        assert!(
-            !restored,
-            "a hot journal was replayed while another connection held the file"
+        let refused =
+            crate::file::with_open_busy_millis(200, || replay_hot_journal(vfs.as_ref(), &path));
+        assert_eq!(
+            refused.map_err(|error| error.code()),
+            Err(inillucent_base::error::PrimaryCode::Busy),
+            "a hot journal beside a file another connection holds is waited for, then busy"
         );
         let wrote_the_database = sim.trace().events()[before..].iter().any(|event| {
             event.kind == "write" && event.path == path.as_path().display().to_string()
@@ -1347,6 +1413,76 @@ mod tests {
         assert!(
             replay_hot_journal(vfs.as_ref(), &path).expect("the replay runs"),
             "the journal should now be free to replay"
+        );
+    }
+
+    /// A replay that finds another handle holding the lock beside a hot journal
+    /// waits for it, and then puts the journal back itself.
+    ///
+    /// **The other handle is another process opening after the same crash.**
+    /// It holds SHARED and RESERVED while it waits for EXCLUSIVE to put the
+    /// journal back. The replay used to answer "nothing to replay" when its own
+    /// RESERVED was refused, and the open that called it read pages the
+    /// journal had not been put back over. Six processes opening one crashed
+    /// file together failed 15 rounds of 20 with "replaying InsertRow ... found
+    /// no room in leaf", and a later open that got past it lost every
+    /// acknowledged commit after that record.
+    #[test]
+    fn a_replay_waits_for_another_handle_beside_a_hot_journal() {
+        use inillucent_sim::media::MediaModel;
+        use inillucent_sim::sim_vfs::{SimConfig, SimVfs};
+
+        let sim = std::sync::Arc::new(SimVfs::new(SimConfig {
+            seed: 4_243,
+            model: MediaModel::default(),
+            ..SimConfig::default()
+        }));
+        let vfs: std::sync::Arc<dyn Vfs> = sim.clone();
+        let path = DbPath::new("/race.db");
+        let page_size = 64usize;
+        let file = vfs
+            .open(&path, OpenOptions::main_db())
+            .expect("the file opens");
+        for page in 0..3u64 {
+            file.write_all_at(page * page_size as u64, &[page as u8 + 1; 64])
+                .expect("the page is written");
+        }
+        let mut journal = Journal::new(
+            std::sync::Arc::clone(&vfs),
+            &path,
+            JournalMode::Delete,
+            page_size,
+        );
+        journal
+            .save(PageId(2), &[3u8; 64])
+            .expect("the pre-image is saved");
+        journal.seal().expect("the journal syncs");
+        file.write_all_at(2 * page_size as u64, &[0xffu8; 64])
+            .expect("the page is overwritten");
+        drop(journal);
+        // The other opener: SHARED and RESERVED, held for a moment.
+        file.lock(FileLock::Shared).expect("SHARED");
+        file.lock(FileLock::Reserved).expect("RESERVED");
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            file.unlock(FileLock::None)
+                .expect("the other opener lets go");
+            file
+        });
+        let restored = replay_hot_journal(vfs.as_ref(), &path).expect("the replay runs");
+        let file = holder.join().expect("the other opener finishes");
+        assert!(
+            restored,
+            "the replay gave up instead of waiting for the lock"
+        );
+        let mut image = [0u8; 64];
+        file.read_exact_at(2 * page_size as u64, &mut image)
+            .expect("the page reads");
+        assert!(image.iter().all(|byte| *byte == 3), "the pre-image is back");
+        assert!(
+            !vfs.access(&path.journal(), AccessMode::Exists)
+                .unwrap_or(false),
+            "the journal is gone once it has been put back"
         );
     }
 

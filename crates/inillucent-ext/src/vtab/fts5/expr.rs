@@ -132,6 +132,40 @@ impl Query {
     }
 }
 
+impl Query {
+    /// Returns where each `NEAR` group sits in the list of phrases.
+    ///
+    /// Each answer is the index of the group's first phrase, how many phrases
+    /// the group has, and the distance it allows. The phrases of a group are
+    /// next to each other in [`Query::phrases`], because they are listed in
+    /// written order.
+    pub fn near_groups(&self) -> Vec<(usize, usize, u32)> {
+        let mut groups = Vec::new();
+        let mut counter = 0usize;
+        collect_near(&self.root, &mut counter, &mut groups);
+        groups
+    }
+}
+
+/// Finds the `NEAR` groups of an expression, numbering phrases as it goes.
+///
+/// @param node - the expression
+/// @param counter - the index of the next phrase, advanced past this node
+/// @param into - where each group's first phrase, size and distance go
+fn collect_near(node: &Match, counter: &mut usize, into: &mut Vec<(usize, usize, u32)>) {
+    match node {
+        Match::Phrase(_) => *counter = counter.saturating_add(1),
+        Match::Near { phrases, distance } => {
+            into.push((*counter, phrases.len(), *distance));
+            *counter = counter.saturating_add(phrases.len());
+        }
+        Match::And(left, right) | Match::Or(left, right) | Match::Not(left, right) => {
+            collect_near(left, counter, into);
+            collect_near(right, counter, into);
+        }
+    }
+}
+
 /// Adds every phrase of an expression to a list, in written order.
 fn collect_phrases(node: &Match, into: &mut Vec<Phrase>) {
     match node {
@@ -958,12 +992,16 @@ fn term_doclists(
 ) -> DbResult<Vec<Vec<u8>>> {
     let mut doclists = Vec::new();
     if term.prefix {
-        // **The staged rows go out first.** A term this transaction created is
-        // held in the buffer and written in term order at the flush, so a scan
-        // that ran before it would not see it - and a prefix search inside the
-        // transaction that wrote the term would miss it. The point lookup
-        // below needs no flush, because the buffer answers it.
-        super::flush_doclists(context, shadows, buffer)?;
+        // **The staged doclists are read from the buffer, not flushed.** A
+        // term this transaction created is held in the buffer and written in
+        // term order at the flush, so the scan of `%_idx` below cannot see it.
+        // Flushing here fixed that and made every prefix query that follows a
+        // write in the same transaction fail with "a module wrote to a shadow
+        // table while answering a query", because a query may not write. The
+        // buffer's doclists that start with the prefix are added instead, and
+        // they replace the stored row of the same term, since the staged
+        // doclist is the newer one.
+        let staged = super::staged_with_prefix(buffer, &term.token);
         // A prefix reads every term the dictionary holds that starts with it.
         // The dictionary is in term order, so the run is contiguous - which is
         // what makes a prefix search cheaper than a scan of every term.
@@ -979,6 +1017,9 @@ fn term_doclists(
             if !candidate.starts_with(&term.token) {
                 return Ok(false);
             }
+            if staged.contains_key(candidate) {
+                return Ok(true);
+            }
             rows.push(values.to_vec());
             Ok(true)
         })?;
@@ -990,6 +1031,7 @@ fn term_doclists(
                 .unwrap_or_default();
             doclists.push(super::require_doclist(context, shadows, &candidate, &row)?);
         }
+        doclists.extend(staged.into_values());
     } else if let Some(bytes) = super::read_doclist(context, shadows, buffer, &term.token)? {
         doclists.push(bytes);
     }

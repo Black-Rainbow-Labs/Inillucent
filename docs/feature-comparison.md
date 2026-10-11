@@ -251,8 +251,9 @@ one.
 | `upsert.returning` | Upsert with RETURNING | same |
 
 With two `ON CONFLICT` clauses, the write takes the first clause whose target names the constraint
-that failed. The last clause may leave out its target and then catches every other conflict. This
-is SQLite's rule.
+that failed. When one row breaks two constraints that two clauses name, the clause written first
+runs. The last clause may leave out its target and then catches every other conflict. This is
+SQLite's rule.
 
 ### CREATE TABLE
 
@@ -532,7 +533,7 @@ given a column.
 | `prag.journal.mode` | PRAGMA journal_mode | same |
 | `prag.locking` | PRAGMA locking_mode and temp_store | same |
 | `prag.encoding` | PRAGMA encoding | same |
-| `prag.autovacuum` | PRAGMA auto_vacuum and incremental_vacuum | same |
+| `prag.autovacuum` | PRAGMA auto_vacuum and incremental_vacuum | same. `FULL` and `INCREMENTAL` give pages back to the file system, and `PRAGMA incremental_vacuum(N)` gives back up to N pages |
 | `prag.secure` | PRAGMA secure_delete and cell_size_check | same |
 | `prag.fk.switches` | PRAGMA foreign_keys, defer_foreign_keys, ignore_check_constraints | same |
 | `prag.trigger.switches` | PRAGMA recursive_triggers and legacy_alter_table | same |
@@ -541,7 +542,7 @@ given a column.
 | `prag.maintenance` | PRAGMA optimize, shrink_memory, wal_checkpoint | same |
 | `prag.runtime` | PRAGMA busy_timeout, threads, query_only | same |
 | `prag.memory` | PRAGMA mmap_size, soft_heap_limit, hard_heap_limit | same |
-| `prag.max.page` | PRAGMA max_page_count | same |
+| `prag.max.page` | PRAGMA max_page_count | same. The limit is enforced, and a statement that would grow the file past it fails with `database or disk is full`. Only that statement is rolled back, where SQLite rolled back the whole transaction in the cases that were measured |
 | `prag.schema.switches` | PRAGMA trusted_schema and writable_schema | same |
 | `prag.planner` | PRAGMA analysis_limit and automatic_index | same |
 | `prag.introspect` | PRAGMA module_list, function_list, pragma_list exist | same |
@@ -570,7 +571,9 @@ answers in SQLite, refused here:
 Both lists are empty. The eight silent pragmas print nothing in both engines: `case_sensitive_like`,
 `data_store_directory`, `foreign_key_check`, `foreign_key_list`, `incremental_vacuum`,
 `optimize`, `shrink_memory` and `temp_store_directory`. Each of them changes something and has
-no result to print. SQLite has `data_store_directory` on Windows only, and so does inillucent.
+no result to print. `incremental_vacuum` prints nothing in both engines because the probe asks it of
+a database in the default `auto_vacuum` mode, `NONE`. In `INCREMENTAL` mode both engines print one
+empty row for each page given back. SQLite has `data_store_directory` on Windows only, and so does inillucent.
 `registers.rs::the_pragma_register_agrees_exactly` compares the two lists on Windows and on Linux.
 
 Three defaults match SQLite and one does not:
@@ -655,6 +658,12 @@ Some FTS5 options are refused with exit code 3 instead of being accepted and ign
 two ranges, because it is two phrases. `MATCH '"quick brown"'` marks one, because it is one phrase
 of two words. FTS3 and FTS4 tables use the same index as FTS5, with `docid`, `snippet()`,
 `offsets()` and `matchinfo()`.
+
+A token longer than 1000 bytes is cut to its first 1000 bytes, in the index and in a query alike, so
+two tokens that share their first 1000 bytes are one token to `MATCH`. SQLite cuts at 32768 bytes.
+The text of the column is stored whole, and a row with a token of 100000 characters is accepted.
+`snippet()` and `highlight()` follow SQLite's own choice of window and its rules for joining
+matches that overlap, and a `NEAR` group marks only the words that are near each other.
 
 ### R-Tree
 
@@ -1129,11 +1138,12 @@ These numbers are from the graded run of 26 September 2026 on `main` at `bc46bc9
 and the same 128 MiB memory budget. Each figure is the median of the two middle runs of four. [Performance](performance.md) has every
 workload, the method and the later runs.
 
-A newer run on 7 October 2026, with the build released as 2.3.0, measured 484% faster, 79% less
-processor time and 14% more peak memory, with every family faster than SQLite. It was not graded:
-SQLite ran 7% slower than its idle reference on that machine, which makes inillucent's figure read
-high. Called the way programs call it, from the command line, the shell, Python and Node, 2.3.0 is
-64% faster than the same use of SQLite.
+The newest run, on 8 October 2026 with release 2.4.2, measured 505% faster, 73% less processor time
+and 14% more peak memory, with every family faster than SQLite. It was not graded: SQLite ran 4%
+slower than its idle reference on that machine, which makes inillucent's figure read high. Through
+the `Connection` API that every driver calls, 2.4.2 is 276% faster than SQLite on 48 common and
+edge case workloads and uses 67% less processor time. Called the way programs call it, from the
+command line, the shell, Python and Node, 2.4.2 is 74% faster than the same use of SQLite.
 
 | | SQLite 3.53.4 | inillucent | Result |
 |---|---|---|---|
@@ -1166,7 +1176,7 @@ the page cache and one `CREATE INDEX`. [Performance](performance.md#memory) brea
 |---|---|
 | Memory is more than SQLite's: 11.5% in the graded run, 14% in the newest | open. See [Performance](performance.md#memory) |
 | `open.prepare` and `schema` miss their speed bars | open. Both are faster than SQLite |
-| A correlated `IN` subquery over many outer rows was slower than SQLite | 807% slower over 400 outer rows in the graded run; 30% faster in the newest run, which was not graded. See [Performance](performance.md#the-workloads-that-are-slower) |
+| A correlated `IN` subquery over many outer rows was slower than SQLite | 807% slower over 400 outer rows in the graded run; 27% faster in the newest run, which was not graded. See [Performance](performance.md#the-workloads-that-are-slower) |
 | The C API has 54 functions where SQLite has about 290 | open. The list of what is missing is in [Architecture and operations](#architecture-and-operations) |
 | One thread per database | open |
 | A SQLite file cannot be opened directly | by design. `inillucent migrate` copies it |

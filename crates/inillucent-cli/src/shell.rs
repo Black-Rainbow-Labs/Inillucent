@@ -164,7 +164,7 @@ pub struct Shell {
     ///
     /// The reference draws the excerpt under an error from the rest of the line, not from
     /// the statement alone, so the statements that follow a failing one appear in it.
-    pub excerpt: Option<String>,
+    pub excerpt: Option<Excerpt>,
     /// The engine's error for the first statement that failed since `failed`
     /// was last cleared, when the failure came from the engine.
     ///
@@ -558,11 +558,8 @@ impl Shell {
     /// Copies the open database into a file and checks the copy.
     ///
     /// @param path - where the copy goes
-    pub fn backup_to(&self, path: &str) -> Result<(), String> {
-        self.open_slot()
-            .database
-            .backup_to(path)
-            .map_err(|error| error.message().to_string())
+    pub fn backup_to(&self, path: &str) -> Result<(), inillucent_base::DbError> {
+        self.open_slot().database.backup_to(path)
     }
 
     /// Writes a copy of the database, encrypted with `key` or in plaintext.
@@ -992,7 +989,7 @@ impl Shell {
         };
         let mut lines = vec![heading];
         if let Some(offset) = failure.offset {
-            let shown = self.excerpt.as_deref().unwrap_or(sql);
+            let shown = self.excerpt.as_ref().map_or(sql, Excerpt::text);
             lines.extend(error_context(shown.as_bytes(), offset as usize));
         }
         self.print_or_hold(lines, failure.compiling);
@@ -1029,6 +1026,40 @@ impl Shell {
     /// Runs a statement and collects its column names and rows.
     pub fn collect(&self, sql: &str) -> Result<(Vec<String>, Vec<Vec<Value<'static>>>), Failure> {
         self.collect_bound(sql, &[])
+    }
+
+    /// Returns the message for a value that could not be bound, which says how
+    /// many values the statement takes when the reason is that it takes fewer.
+    ///
+    /// **The engine's own message for this is "column index out of range",
+    /// which names neither number.** A caller who passed three values to a
+    /// statement with two markers was told nothing about which of the two was
+    /// wrong. The count of markers is asked of the statement itself. The first
+    /// words are unchanged, so a program that matches on them still does.
+    ///
+    /// @param connection - the connection the statement was prepared on
+    /// @param sql - the statement
+    /// @param given - how many values the caller passed
+    /// @param error - the engine's refusal
+    fn too_many_parameters(
+        &self,
+        connection: &Connection<'_>,
+        sql: &str,
+        given: usize,
+        error: &inillucent_base::DbError,
+    ) -> String {
+        let said = reason(error);
+        if error.code() != inillucent_base::PrimaryCode::Range {
+            return said;
+        }
+        match connection.parameter_count(sql) {
+            Ok(takes) => format!(
+                "{said}: the statement takes {takes} parameter{}, and {given} {} given",
+                if takes == 1 { "" } else { "s" },
+                if given == 1 { "was" } else { "were" }
+            ),
+            Err(_) => said,
+        }
     }
 
     /// Runs a statement with values bound by position, and collects its rows.
@@ -1070,7 +1101,7 @@ impl Shell {
             statement
                 .bind(nth as u32 + 1, value.clone())
                 .map_err(|error| Failure {
-                    message: reason(&error),
+                    message: self.too_many_parameters(&connection, sql, bound.len(), &error),
                     offset: None,
                     compiling: true,
                     error: Some(error),
@@ -1222,6 +1253,26 @@ impl Shell {
     }
 }
 
+/// The text an error report draws its excerpt from: a chunk of input from the start of one
+/// statement to the end of the chunk.
+///
+/// It shares the chunk instead of copying the rest of it. A line of 20,000 statements gave each
+/// statement its own copy of everything after it, which made the line quadratic in its length
+/// (3.4 s against SQLite's 0.05 s). Only a failing statement ever reads the text.
+#[derive(Clone)]
+pub struct Excerpt {
+    chunk: std::rc::Rc<str>,
+    start: usize,
+}
+
+impl Excerpt {
+    /// Returns the excerpt: the chunk from the statement's first character, without trailing
+    /// whitespace.
+    pub fn text(&self) -> &str {
+        self.chunk.get(self.start..).unwrap_or_default().trim_end()
+    }
+}
+
 /// Reads input line by line, running statements as they become complete.
 ///
 /// A line beginning with a dot is a command, but only when nothing is
@@ -1319,6 +1370,37 @@ fn ends_in_complete_statement(shell: &Shell, text: &str) -> Option<usize> {
     None
 }
 
+/// Reports whether a script begins, commits or rolls back a transaction of its
+/// own in any of its statements.
+///
+/// For `batch`, which wraps a script in a transaction: a script that has its
+/// own `BEGIN` and `COMMIT`, such as `.dump` output, failed at its `BEGIN` with
+/// "cannot start a transaction within a transaction". Statements are cut where
+/// [`complete_statement`] cuts them, so a word inside a string, a comment or a
+/// trigger body is not read as one.
+///
+/// @param shell - the shell
+/// @param text - the script
+pub(crate) fn controls_its_own_transaction(shell: &Shell, text: &str) -> bool {
+    let mut rest = text;
+    loop {
+        let start = inillucent_driver::leading_trivia(rest);
+        let statement = rest.get(start..).unwrap_or_default();
+        let word: String = statement
+            .chars()
+            .take_while(char::is_ascii_alphabetic)
+            .collect::<String>()
+            .to_ascii_uppercase();
+        if matches!(word.as_str(), "BEGIN" | "COMMIT" | "END" | "ROLLBACK") {
+            return true;
+        }
+        match complete_statement(shell, rest) {
+            Some(consumed) if consumed > 0 => rest = rest.get(consumed..).unwrap_or_default(),
+            _ => return false,
+        }
+    }
+}
+
 /// Reports whether text holds nothing but whitespace and comments.
 ///
 /// @param text - the text after a statement's semicolon
@@ -1369,6 +1451,7 @@ fn run_chunk_from(shell: &mut Shell, chunk: &str, first_end: Option<usize>) {
     // build the excerpt, which was 2% of a script of single row inserts.
     let mut at = 0usize;
     let mut known = first_end;
+    let mut whole: Option<std::rc::Rc<str>> = None;
     loop {
         let rest = chunk.get(at..).unwrap_or("");
         let consumed = match known.take() {
@@ -1384,11 +1467,12 @@ fn run_chunk_from(shell: &mut Shell, chunk: &str, first_end: Option<usize>) {
             shell.excerpt = if remainder.trim().is_empty() {
                 None
             } else {
-                Some(
-                    format!("{}{remainder}", statement.trim_start())
-                        .trim_end()
-                        .to_string(),
-                )
+                let lead = statement.len().saturating_sub(statement.trim_start().len());
+                let shared = whole.get_or_insert_with(|| std::rc::Rc::<str>::from(chunk));
+                Some(Excerpt {
+                    chunk: shared.clone(),
+                    start: at.saturating_add(lead),
+                })
             };
             shell.run(statement.trim());
         }

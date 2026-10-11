@@ -81,9 +81,10 @@ with both engines reading the same vectors.
 | Result | Detail | Source |
 |---|---|---|
 | **419% faster than SQLite 3.53.4** | 5.19x, weighted over ten workload families | [Performance](performance.md) |
-| **484% faster than SQLite in the newest run** | 5.84x weighted, on 2026-10-07 with the build released as 2.3.0. Not graded: SQLite ran 7% slower than its idle reference, which makes this figure read high | [Performance](performance.md) |
-| **64% faster than SQLite called the way programs call it** | 25 workloads on 2026-10-06: 136% faster from Python, 207% from Node, 46% through scripts into the shell and 3% from the command line | [Performance](performance.md#how-programs-call-it) |
-| **67% less processor time** | 344 ms against 1,043 ms for one round of the same plan | [Performance](performance.md) |
+| **505% faster than SQLite in the newest run** | 6.05x weighted, on 2026-10-08 with release 2.4.2. Not graded: SQLite ran 4% slower than its idle reference, which makes this figure read high | [Performance](performance.md) |
+| **276% faster than SQLite through the `Connection` API** | 48 common and edge case workloads on 2026-10-08 with release 2.4.2: 276% faster on the 28 training workloads and 261% on the 20 held out | [Performance](performance.md#through-the-connection-api) |
+| **74% faster than SQLite called the way programs call it** | 25 workloads on 2026-10-08 with release 2.4.2: 418% faster from Node, 135% from Python, 49% through scripts into the shell and 6% from the command line | [Performance](performance.md#how-programs-call-it) |
+| **67% less processor time** | 344 ms against 1,043 ms for one round of the same plan in the graded run, and 73% less in the newest. Through the `Connection` API, 641 ms against 1,945 ms on the 48 workloads, also 67% less | [Performance](performance.md#memory) |
 | **11.5% more memory** | 41.48 MiB against 37.21 MiB peak, with the same 128 MiB cache. SQLite uses less | [Performance](performance.md#memory) |
 | **A file 3.6% larger** | 17,432,576 bytes against 16,830,464 bytes for the same imported data | [Performance](performance.md#disk) |
 | **402 of 416 SQL cases give SQLite's exact answer** | each case runs through both shells on a new database, and the output bytes are compared | [Feature comparison](feature-comparison.md) |

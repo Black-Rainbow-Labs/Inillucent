@@ -138,8 +138,17 @@ pub struct Param {
 pub enum Writes {
     /// It only reads. `--readonly` admits it and it never creates a file.
     No,
-    /// It changes the database. `--readonly` refuses it by name.
+    /// It changes the database, and a database it is pointed at that is not
+    /// there is made. `--readonly` refuses it by name.
     Yes,
+    /// It changes a database that is already there. `--readonly` refuses it by
+    /// name, and a path with no file is `not_found`, as it is for a read.
+    ///
+    /// **`analyze`, `checkpoint`, `embed` and `restore`.** Each works on rows or
+    /// pages that already exist, so a typo in `--db` made an empty file and then
+    /// had nothing to work on. `exec`, `batch`, `run` and `import` stay on `Yes`
+    /// because a script that sets a database up in one line expects the file.
+    Existing,
     /// It may change the database, and refuses each statement that does.
     ///
     /// `--readonly` admits the verb and the shell underneath refuses the
@@ -151,7 +160,7 @@ pub enum Writes {
 impl Writes {
     /// Whether `--readonly` refuses this command before it runs.
     pub fn refused_when_read_only(self) -> bool {
-        self == Writes::Yes
+        matches!(self, Writes::Yes | Writes::Existing)
     }
 
     /// Whether this command may create the database file it was pointed at.
@@ -159,9 +168,11 @@ impl Writes {
     /// A read verb does not make the file it was pointed at, so
     /// `inillucent --db typo.rdb tables` reports a missing database rather
     /// than leaving an empty one behind. `run` may, because
-    /// `sqlite3 new.db ".read schema.sql"` does.
+    /// `sqlite3 new.db ".read schema.sql"` does. So do `exec`, `batch` and
+    /// `import`, which set a database up. A verb that changes a database that
+    /// must already exist does not.
     pub fn may_create(self) -> bool {
-        self != Writes::No
+        matches!(self, Writes::Yes | Writes::PerStatement)
     }
 }
 

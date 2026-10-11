@@ -342,7 +342,7 @@ mod tests {
         assert_eq!(
             query.columns.len(),
             2,
-            "a WITHOUT ROWID table's key is every column of it, and a query              that read one of them would address the wrong row"
+            "a WITHOUT ROWID table's key is every column of it, and a query that read one of them would address the wrong row"
         );
     }
 }

@@ -75,6 +75,8 @@ struct JoinRecipe {
     needed: crate::paged::Needed,
     /// Whether the key is a full inner key (a probe) or a prefix (a range).
     full_key: bool,
+    /// The `WHERE` terms the rows entering this join already satisfy, tested in front of it.
+    entering: Option<std::rc::Rc<dyn Eval>>,
 }
 
 /// Attempts to describe one inner stage as an [`IndexNestedLoopJoin`], the
@@ -173,6 +175,7 @@ fn try_join_recipe(
         inner_projection: Projection::all(stage.width),
         needed: stage.needed,
         full_key,
+        entering: crate::physical::entering_predicate(plan, space, params, space.stages, index)?,
     }))
 }
 
@@ -313,17 +316,83 @@ impl Compiled {
     ) -> DbResult<()> {
         let folded = crate::subquery::fold(plan, catalog, params)?;
         let params = folded.as_ref().unwrap_or(params);
+        self.share_bindings(params);
+        let source = {
+            let mut space = self.held.view(&self.prepared.stages);
+            space.catalog = Some(catalog);
+            source_for_run(plan, catalog, &space, params, &self.prepared, self.limit)?
+        };
+        self.run_source(catalog, params, source)
+    }
+
+    /// Runs the chain over rows the caller supplies in place of its first
+    /// stage's source.
+    ///
+    /// The rows must have that stage's width and the shape its scan produces:
+    /// a correlated subquery's built table hands over the rows of one key, and
+    /// everything above the source, the filter included, runs as it does for a
+    /// scan. A plan whose source would read nothing, because of a `LIMIT 0` or a
+    /// constant filter that rejects, still reads nothing.
+    ///
+    /// @param plan - the planner's output this chain was compiled from
+    /// @param catalog - where the trees and layouts come from, for this call only
+    /// @param params - the values bound to `?1`, `?2`, ...
+    /// @param rows - the rows the first stage supplies
+    pub fn run_over_rows(
+        &mut self,
+        plan: &PhysicalPlan,
+        catalog: &dyn TreeCatalog,
+        params: &Params,
+        rows: Vec<Vec<OwnedDatum>>,
+    ) -> DbResult<()> {
+        let folded = crate::subquery::fold(plan, catalog, params)?;
+        let params = folded.as_ref().unwrap_or(params);
+        self.share_bindings(params);
+        let source = {
+            let mut space = self.held.view(&self.prepared.stages);
+            space.catalog = Some(catalog);
+            source_for_run(plan, catalog, &space, params, &self.prepared, self.limit)?
+        };
+        let source = match source {
+            crate::physical::Source::Rows(empty) => crate::physical::Source::Rows(empty),
+            _ => crate::physical::Source::Rows(rows),
+        };
+        self.run_source(catalog, params, source)
+    }
+
+    /// Drops the built tables of the correlated blocks this chain answers.
+    pub fn drop_block_tables(&self) {
+        if let Some(recipe) = &self.correlated {
+            for correlation in recipe.correlations.iter() {
+                correlation.drop_table();
+            }
+        }
+    }
+
+    /// Copies the values of an execution into the cell the chain reads.
+    ///
+    /// @param params - this execution's parameters
+    fn share_bindings(&self, params: &Params) {
         let bound = params.bindings();
         if !std::sync::Arc::ptr_eq(&self.bindings, &bound) {
             if let (Ok(from), Ok(mut held)) = (bound.lock(), self.bindings.lock()) {
                 held.copy_from(&from);
             }
         }
-        let source = {
-            let mut space = self.held.view(&self.prepared.stages);
-            space.catalog = Some(catalog);
-            source_for_run(plan, catalog, &space, params, &self.prepared, self.limit)?
-        };
+    }
+
+    /// Drives the chain from a source, wrapping it in the joins and the
+    /// correlation operator the chain was built with.
+    ///
+    /// @param catalog - where the trees and layouts come from, for this call only
+    /// @param params - this execution's parameters
+    /// @param source - what feeds the chain
+    fn run_source(
+        &mut self,
+        catalog: &dyn TreeCatalog,
+        params: &Params,
+        source: crate::physical::Source<'_>,
+    ) -> DbResult<()> {
         // Also clears `self.collected`: `CollectInto::reset` empties the
         // buffer it was given, which is this chain's own sink at the bottom
         // of `upper`.
@@ -375,6 +444,12 @@ impl Compiled {
                 )
                 .with_needed(recipe.needed),
             );
+            if let Some(predicate) = &recipe.entering {
+                chain = Box::new(crate::physical::HeldBefore::new(
+                    std::rc::Rc::clone(predicate),
+                    chain,
+                ));
+            }
         }
         source.run(pool, chain.as_mut())
     }

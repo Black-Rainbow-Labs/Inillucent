@@ -325,7 +325,7 @@ fn a_match_reads_a_bounded_number_of_shadow_rows() {
         .fetches_for("SELECT title FROM documents WHERE documents MATCH 'lorem' ORDER BY title");
     assert!(
         counted * 4 < projected,
-        "count(*) read {counted} rows and a projection read {projected}:          count(*) is reading the documents it is only counting"
+        "count(*) read {counted} rows and a projection read {projected}: count(*) is reading the documents it is only counting"
     );
 }
 

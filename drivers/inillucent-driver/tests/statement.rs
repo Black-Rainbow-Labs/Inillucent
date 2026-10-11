@@ -340,7 +340,7 @@ fn the_default_ceiling_is_the_engines() {
     assert_eq!(
         inillucent_engine::DEFAULT_STATEMENT_CACHE,
         1_000,
-        "the default ceiling moved; the note on `OpenOptions::statement_cache` has to move          with it"
+        "the default ceiling moved; the note on `OpenOptions::statement_cache` has to move with it"
     );
 }
 

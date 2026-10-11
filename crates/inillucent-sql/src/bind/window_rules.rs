@@ -138,3 +138,24 @@ impl Binder<'_> {
         Ok(spec)
     }
 }
+
+/// Reports whether a frame starts after the point it ends, which is refused whatever its offsets
+/// are, as SQLite's `sqlite3WindowAlloc` does: a start of `CURRENT ROW` cannot end `PRECEDING`,
+/// and a start of `FOLLOWING` cannot end `PRECEDING` or at `CURRENT ROW`.
+///
+/// @param start - where the frame starts
+/// @param end - where the frame ends
+pub(super) fn starts_after_end(
+    start: &super::BoundFrameBound,
+    end: &super::BoundFrameBound,
+) -> bool {
+    use super::BoundFrameBound;
+    matches!(
+        (start, end),
+        (BoundFrameBound::CurrentRow, BoundFrameBound::Preceding(_))
+            | (
+                BoundFrameBound::Following(_),
+                BoundFrameBound::Preceding(_) | BoundFrameBound::CurrentRow
+            )
+    )
+}

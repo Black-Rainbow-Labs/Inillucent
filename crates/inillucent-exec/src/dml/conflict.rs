@@ -246,14 +246,24 @@ pub(crate) fn conflicting_row(
         }
         return Ok(None);
     }
-    for named in [true, false] {
-        for check in checks(table) {
-            if targets.contains(&check.constraint()) != named {
-                continue;
-            }
-            if let Some(found) = probe.ask(check, target)? {
-                return Ok(Some(found));
-            }
+    // **The constraints the clauses name are asked in the order the clauses were written.** A
+    // row that collides with two of them runs the first clause. The rowid of a rowid table is
+    // still asked before every index, as SQLite does.
+    let mut named: Vec<Check<'_>> = checks(table)
+        .filter(|check| targets.contains(&check.constraint()))
+        .collect();
+    let rowid_table = !table.without_rowid;
+    named.sort_by_key(|check| match check {
+        Check::OwnKey if rowid_table => 0,
+        _ => targets
+            .iter()
+            .position(|named| *named == check.constraint())
+            .map_or(usize::MAX, |at| at.saturating_add(1)),
+    });
+    let rest = checks(table).filter(|check| !targets.contains(&check.constraint()));
+    for check in named.into_iter().chain(rest) {
+        if let Some(found) = probe.ask(check, target)? {
+            return Ok(Some(found));
         }
     }
     Ok(None)

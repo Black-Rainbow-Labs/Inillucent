@@ -226,6 +226,7 @@ impl crate::ImportedDatabase {
                 database,
                 page_size,
                 frames,
+                opened_as: file_number(vfs.as_ref(), &target),
                 path: target,
                 wal,
                 // A file this call just created has no log to recover.
@@ -256,6 +257,7 @@ impl crate::ImportedDatabase {
                 next_root: FIRST_CREATED_ROOT,
                 imposters: Vec::new(),
                 catalog_generation: 0,
+                appended: None,
                 next_handle: FIRST_ATTACHED_HANDLE,
                 ddl_schema: 0,
             },
@@ -377,18 +379,67 @@ impl crate::ImportedDatabase {
     ) -> DbResult<ImportedDatabase> {
         let db_path = DbPath::new(path.to_string_lossy().as_ref());
         let _ = vfs.delete(&db_path, false);
+        Self::create_in_place(vfs, path, page_size, frames, false)?.ok_or_else(|| {
+            inillucent_base::error::misuse("a create that may replace a file declined to")
+        })
+    }
+
+    /// Creates a database at a path that holds nothing or an empty file, and
+    /// creates nothing when another process got there first.
+    ///
+    /// **What an open that found no database calls.** It deletes nothing, and
+    /// the file is written under the exclusive lock, so a second process that
+    /// also found nothing waits for the first, finds its database and answers
+    /// `None`; the caller then opens that database. [`ImportedDatabase::create_on`]
+    /// deleted the path first, so the second of two processes started together
+    /// could delete the database the first had just created, and the first
+    /// failed with "The system cannot find the file specified".
+    ///
+    /// @param vfs - the file system to create in
+    /// @param path - where to create it
+    /// @param page_size - the page size
+    /// @param frames - how many frames the pool holds
+    pub fn create_unless_present(
+        vfs: std::sync::Arc<dyn inillucent_vfs::Vfs>,
+        path: PathBuf,
+        page_size: usize,
+        frames: usize,
+    ) -> DbResult<Option<ImportedDatabase>> {
+        Self::create_in_place(vfs, path, page_size, frames, true)
+    }
+
+    /// Writes a new database's meta pages and catalog and opens it: the body
+    /// of [`ImportedDatabase::create_on`] and
+    /// [`ImportedDatabase::create_unless_present`].
+    ///
+    /// @param vfs - the file system to create in
+    /// @param path - where to create it
+    /// @param page_size - the page size
+    /// @param frames - how many frames the pool holds
+    /// @param only_if_empty - whether a file that already holds bytes is opened rather than replaced
+    fn create_in_place(
+        vfs: std::sync::Arc<dyn inillucent_vfs::Vfs>,
+        path: PathBuf,
+        page_size: usize,
+        frames: usize,
+        only_if_empty: bool,
+    ) -> DbResult<Option<ImportedDatabase>> {
+        let db_path = DbPath::new(path.to_string_lossy().as_ref());
         // A rollback journal beside a file that is not there belongs to the
         // file this one replaces. It is settled before the create, whose
         // truncation then discards whatever it put back, rather than replayed
         // onto the new file as the second open below used to do.
         settle_a_hot_journal(vfs.as_ref(), &db_path, false)?;
-        let mut database = Database::create(
-            vfs.as_ref(),
-            &db_path,
-            Options::default()
-                .with_page_size(page_size)
-                .with_frames(frames.max(64)),
-        )?;
+        let options = Options::default()
+            .with_page_size(page_size)
+            .with_frames(frames.max(64));
+        let created = match only_if_empty {
+            true => Database::create_if_empty(vfs.as_ref(), &db_path, options)?,
+            false => Some(Database::create(vfs.as_ref(), &db_path, options)?),
+        };
+        let Some(mut database) = created else {
+            return Ok(None);
+        };
         // An empty catalog is a catalog tree with no entries, not the absence of
         // one: every later DDL statement inserts into it, and a database whose
         // catalog root pointed nowhere would be one no `CREATE TABLE` could
@@ -403,6 +454,8 @@ impl crate::ImportedDatabase {
         // call. The handle holds what a fresh open would read back: the meta
         // record it just wrote, the catalog's pages and the free map.
         let database = crate::recovery::ready_a_created_file(&vfs, database)?;
+        // After the create, because there was no file to number before it.
+        let opened_as = file_number(vfs.as_ref(), &path);
         let pending = PendingOpen {
             vfs,
             path,
@@ -411,8 +464,9 @@ impl crate::ImportedDatabase {
             frames,
             read_only: false,
             database,
+            opened_as,
         };
-        ImportedDatabase::finish_open(pending, SharedState::fresh())
+        ImportedDatabase::finish_open(pending, SharedState::fresh()).map(Some)
     }
 
     /// Opens a database this engine wrote, reading its schema from the file.
@@ -506,6 +560,44 @@ impl crate::ImportedDatabase {
         ImportedDatabase::finish_open(pending, SharedState::fresh())
     }
 
+    /// Takes SHARED on the file a pending open holds, and opens again while the path has
+    /// stopped naming that file.
+    ///
+    /// **Recovery writes the log by name, so it has to be the log of the file at the path.**
+    /// `VACUUM` and a backup rename a new file over the database. An open whose handle was on
+    /// the old file went on to recover the old file's log under the new file's segment names,
+    /// and truncated the segment the new file's writers had just committed into: 949,248 bytes
+    /// in one run of the crash hunter's `VACUUM` scenario, traced to
+    /// `recover_the_open_file` inside a reopen. A `VACUUM` takes EXCLUSIVE before it renames,
+    /// so once SHARED is held here the answer cannot change until it is let go.
+    ///
+    /// @param pending - what [`ImportedDatabase::begin_open`] did
+    fn lock_the_file_it_opened(mut pending: PendingOpen) -> DbResult<PendingOpen> {
+        /// How many times the open follows a file that keeps being replaced.
+        const REOPENS: usize = 50;
+        for _ in 0..REOPENS {
+            pending.database.begin_read()?;
+            let now = file_number(pending.vfs.as_ref(), &pending.path);
+            if pending.opened_as.is_none() || now == pending.opened_as {
+                return Ok(pending);
+            }
+            pending.database.end_access()?;
+            pending = ImportedDatabase::begin_open(
+                std::sync::Arc::clone(&pending.vfs),
+                pending.path.clone(),
+                pending.page_size,
+                pending.frames,
+                pending.read_only,
+            )?;
+        }
+        Err(
+            inillucent_base::error::DbError::primary(inillucent_base::error::PrimaryCode::Busy)
+                .with_message(
+                "another process kept replacing the database file while it was opened; try again",
+            ),
+        )
+    }
+
     /// The part of an open whose failures are the open's own: a hot journal
     /// put back, the file opened, its format checked and its meta record read.
     ///
@@ -543,6 +635,15 @@ impl crate::ImportedDatabase {
         // A read only connection cannot do it and refuses instead - see
         // `settle_a_hot_journal`.
         settle_a_hot_journal(vfs.as_ref(), &db_path, read_only)?;
+        // **Read before the file is opened, never after.** A `VACUUM` in
+        // another process can rename a new file over the path between the two.
+        // Read after, the number named the new file while the handle held the
+        // old one, so this connection never found out its file had been
+        // replaced: it wrote log segments by name beside a file that was not
+        // its own, and the next open read "column 5 does not exist" and
+        // "tagged value has no tag byte". Read before, the same rename costs one
+        // reopen that was not needed. See `ImportedDatabase::file_was_replaced`.
+        let opened_as = file_number(vfs.as_ref(), &path);
         let database = crate::recovery::open_file_before_recovery(
             &vfs,
             &db_path,
@@ -560,6 +661,7 @@ impl crate::ImportedDatabase {
             frames,
             read_only,
             database,
+            opened_as,
         })
     }
 
@@ -576,6 +678,7 @@ impl crate::ImportedDatabase {
         pending: PendingOpen,
         shared: SharedState,
     ) -> DbResult<ImportedDatabase> {
+        let pending = ImportedDatabase::lock_the_file_it_opened(pending)?;
         let PendingOpen {
             vfs,
             path,
@@ -583,9 +686,9 @@ impl crate::ImportedDatabase {
             page_size,
             frames,
             read_only,
-            mut database,
+            database,
+            opened_as,
         } = pending;
-        database.begin_read()?;
         // **A file opened as `main` asks the same question an attached one
         // does.** A database this connection is opened on may have been the
         // participant of a cross-file commit that a crash caught undecided, and
@@ -638,6 +741,14 @@ impl crate::ImportedDatabase {
         // Above every number the log still holds, so that this run cannot
         // call something by a name a crashed one already used.
         shared.writing.start_at(highest_txn.saturating_add(1));
+        // **The file's own page size, not the one the caller asked for.** The
+        // default open asks for 32,768, and a file made at 4,096 opened that way
+        // kept 32,768 here, so `VACUUM` rebuilt it at 32,768 and the cache size
+        // pragmas counted in pages of the wrong size.
+        let page_size = match database.page_size() {
+            0 => page_size,
+            own => own,
+        };
         let mut opened = ImportedDatabase {
             counters: shared.counters,
             compiled: shared.compiled,
@@ -646,6 +757,7 @@ impl crate::ImportedDatabase {
                 database,
                 page_size,
                 frames,
+                opened_as,
                 path,
                 wal,
                 recovery,
@@ -667,6 +779,7 @@ impl crate::ImportedDatabase {
                 ddl_schema: 0,
                 imposters: Vec::new(),
                 catalog_generation: 0,
+                appended: None,
             },
             pragmas: shared.pragmas,
             session_state: SessionState {
@@ -719,7 +832,7 @@ impl crate::ImportedDatabase {
             && self.storage.database.has_an_unclaimed_tail()?
             && self.may_write_what_the_open_read()?
         {
-            self.storage.database.give_back_the_unclaimed_tail()?;
+            self.storage.database.trim_to_page_count()?;
         }
         self.let_go_after_the_open()
     }
@@ -735,7 +848,7 @@ impl crate::ImportedDatabase {
     /// A refusal or a move leaves the change to a later statement, which
     /// catches up first, and puts the lock back to SHARED.
     fn may_write_what_the_open_read(&mut self) -> DbResult<bool> {
-        let held = self.storage.database.pool().hold_for_writing();
+        let held = self.storage.database.pool().try_hold_for_writing();
         if let Err(error) = held {
             if error.code() != inillucent_base::error::PrimaryCode::Busy {
                 return Err(error);
@@ -783,7 +896,7 @@ impl crate::ImportedDatabase {
 /// meta record carries.
 ///
 /// **What makes giving the file's tail back safe** (task-2070).
-/// `Database::give_back_the_unclaimed_tail` cuts the file to
+/// `Database::trim_to_page_count` cuts the file to
 /// `page_count * page_size`, and `page_count` comes from the meta record - so a
 /// meta record that is behind the file turns the trim from reclaiming a tail
 /// nothing owns into deleting pages the catalog is pointing at. Measured: a
@@ -824,7 +937,7 @@ pub(crate) fn stats_of(shape: &TreeShape) -> inillucent_catalog::paged::TreeStat
 /// `layouts` maps are keyed by. They are different numbers - see the module
 /// documentation on `newengine::ddl` - and carrying them together is what lets a
 /// rename change the row without the tree it names moving.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Recorded {
     /// The rowid the catalog tree stores it under.
     pub(crate) rowid: i64,
@@ -885,6 +998,22 @@ pub(crate) const FIRST_ATTACHED_HANDLE: u32 = 0xC000_0000;
 /// SQLite's `SQLITE_MAX_ATTACHED` default, and the number `attach.rs` grades
 /// against.
 pub(crate) const MAX_ATTACHED: usize = 10;
+
+/// Returns the number the file system knows a database file by, or `None` when it has no file
+/// or the file system cannot say. Read at open, for `ImportedDatabase::file_was_replaced`.
+///
+/// @param vfs - the file system the database is on
+/// @param path - the database file
+pub(crate) fn file_number(vfs: &dyn inillucent_vfs::Vfs, path: &std::path::Path) -> Option<u128> {
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    vfs.file_number_by_name(&inillucent_vfs::DbPath::new(
+        path.to_string_lossy().as_ref(),
+    ))
+    .ok()
+    .flatten()
+}
 
 /// Returns the path the imported database is written to.
 ///
@@ -976,6 +1105,8 @@ pub(crate) struct PendingOpen {
     read_only: bool,
     /// The file, with its format checked and its meta record read.
     database: Database,
+    /// The number the file system gave the path just before the file was opened.
+    opened_as: Option<u128>,
 }
 
 impl PendingOpen {

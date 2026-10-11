@@ -1219,3 +1219,209 @@ fn rewriting_sorted_keys_a_leaf_at_a_time_matches_rewriting_one_at_a_time() {
             .unwrap_or_else(|error| panic!("seed {seed}: integrity failed: {error:?}"));
     }
 }
+
+/// The children of an interior page.
+///
+/// @param database - the file
+/// @param page - the interior page
+fn children_of(database: &Database, page: PageId) -> Vec<PageId> {
+    inillucent_tree::split_log::read_interior(database.pool(), page)
+        .unwrap_or_else(|error| panic!("page {} is not an interior page: {error:?}", page.0))
+        .1
+}
+
+/// How many pages the tree reaches from its root, interior pages and leaves.
+///
+/// @param database - the file
+/// @param page - the page to count from
+/// @param level - its level, 0 for a leaf
+fn pages_under(database: &Database, page: PageId, level: u16) -> usize {
+    if level == 0 {
+        return 1;
+    }
+    let below: usize = children_of(database, page)
+        .into_iter()
+        .map(|child| pages_under(database, child, level - 1))
+        .sum();
+    below + 1
+}
+
+/// Deletes these keys in this order, from the tree and the model.
+///
+/// @param database - the file
+/// @param tree - the tree
+/// @param model - what it should hold
+/// @param keys - the keys, in the order to delete them
+fn delete_keys(
+    database: &mut Database,
+    tree: &mut PagedTree,
+    model: &mut BTreeMap<i64, Row>,
+    keys: impl Iterator<Item = i64>,
+) {
+    let mut log = NoLog::default();
+    let mut near = None;
+    for key in keys {
+        tree.delete_near(database, &mut log, &[Datum::Int(key)], &mut near)
+            .unwrap_or_else(|error| panic!("deleting {key} failed: {error:?}"));
+        model.remove(&key);
+    }
+}
+
+/// Deleting a tree from the front frees the interior pages it empties, and not only the
+/// leaves.
+///
+/// A trim empties the root's first child down to its last leaf while the child after it
+/// is full, as every interior page of a bulk built tree is. The first leaf merge in the
+/// child after it makes room, and the emptied child is handed over then. Before that
+/// change the root kept every child it ever had.
+#[test]
+fn deleting_a_tree_from_the_front_frees_the_parents_it_empties() {
+    let (mut database, mut tree, mut model) = fixture(512, 64, 4_000);
+    let height = tree.height(database.pool()).expect("a height");
+    assert!(
+        height >= 2,
+        "the fixture has no interior level below the root: {height}"
+    );
+    let before = children_of(&database, tree.root()).len();
+    delete_keys(&mut database, &mut tree, &mut model, 0..3_000);
+    assert_agrees(
+        &database,
+        &tree,
+        &model,
+        "after deleting the first three quarters",
+    );
+    tree.check(database.pool())
+        .expect("integrity after the trim");
+    let after = children_of(&database, tree.root()).len();
+    assert!(
+        after < before,
+        "the root kept {after} of its {before} children"
+    );
+    assert!(
+        tree.write_stats().parents_dissolved > 0,
+        "no parent was dissolved: {:?}",
+        tree.write_stats()
+    );
+    assert_eq!(
+        tree.height(database.pool()).expect("a height"),
+        height,
+        "the height changed"
+    );
+    // The pages the tree still reaches are about a quarter of what it had, plus one
+    // interior page per level that a dissolve could not hand over.
+    let reached = pages_under(&database, tree.root(), height);
+    assert!(
+        reached < 4_000 / 4,
+        "the tree still reaches {reached} pages"
+    );
+}
+
+/// The last child of the root, emptied from the back, hands its one leaf to the child
+/// before it, since there is no child after it.
+#[test]
+fn a_last_parent_emptied_hands_its_child_to_the_one_before_it() {
+    let (mut database, mut tree, mut model) = fixture(512, 64, 4_000);
+    let before = children_of(&database, tree.root()).len();
+    // Trim the front first so the children before the last one have room.
+    delete_keys(&mut database, &mut tree, &mut model, 0..2_000);
+    let middle = children_of(&database, tree.root()).len();
+    delete_keys(&mut database, &mut tree, &mut model, (2_400..4_000).rev());
+    assert_agrees(&database, &tree, &model, "after emptying the back");
+    tree.check(database.pool())
+        .expect("integrity after emptying the back");
+    let after = children_of(&database, tree.root()).len();
+    assert!(
+        after < middle && middle <= before,
+        "the root went from {before} to {middle} to {after} children"
+    );
+}
+
+/// Emptying everything under the root leaves the root with one child at the same height,
+/// and inserts split it back out.
+#[test]
+fn dissolving_up_to_the_root_leaves_the_root_with_one_child() {
+    let (mut database, mut tree, mut model) = fixture(512, 64, 4_000);
+    let height = tree.height(database.pool()).expect("a height");
+    delete_keys(&mut database, &mut tree, &mut model, 0..3_999);
+    assert_agrees(&database, &tree, &model, "after deleting all but one row");
+    tree.check(database.pool()).expect("integrity with one row");
+    assert_eq!(
+        tree.height(database.pool()).expect("a height"),
+        height,
+        "the root shrank"
+    );
+    let reached = pages_under(&database, tree.root(), height);
+    assert!(
+        reached <= usize::from(height) + 3,
+        "one row still reaches {reached} pages"
+    );
+    let mut log = NoLog::default();
+    let label = b"refilled".to_vec();
+    for key in 10_000..12_000i64 {
+        tree.insert(
+            &mut database,
+            &mut log,
+            &[Datum::Int(key), Datum::Text(&label), Datum::Int(key)],
+        )
+        .unwrap_or_else(|error| panic!("inserting {key} failed: {error:?}"));
+        model.insert(
+            key,
+            Row {
+                label: label.clone(),
+                counter: key,
+            },
+        );
+    }
+    assert_agrees(&database, &tree, &model, "after refilling");
+    tree.check(database.pool())
+        .expect("integrity after refilling");
+}
+
+/// A queue at a small page and an evicting pool: insert at the top, delete the bottom
+/// half, forty times. The tree agrees with the model after every round and the pages it
+/// reaches stay flat.
+#[test]
+fn a_queue_trimmed_under_an_evicting_pool_stays_flat() {
+    let (mut database, mut tree, mut model) = fixture(512, 32, 0);
+    let mut log = NoLog::default();
+    let label = b"queued".to_vec();
+    let mut next = 0i64;
+    let mut sizes = Vec::new();
+    for round in 0..40 {
+        for _ in 0..600 {
+            tree.insert(
+                &mut database,
+                &mut log,
+                &[Datum::Int(next), Datum::Text(&label), Datum::Int(round)],
+            )
+            .unwrap_or_else(|error| panic!("round {round}: inserting {next} failed: {error:?}"));
+            model.insert(
+                next,
+                Row {
+                    label: label.clone(),
+                    counter: round,
+                },
+            );
+            next += 1;
+        }
+        let oldest: Vec<i64> = model.keys().copied().take(model.len() / 2).collect();
+        delete_keys(&mut database, &mut tree, &mut model, oldest.into_iter());
+        assert_agrees(&database, &tree, &model, &format!("round {round}"));
+        let height = tree.height(database.pool()).expect("a height");
+        sizes.push(pages_under(&database, tree.root(), height));
+    }
+    tree.check(database.pool())
+        .expect("integrity after the queue");
+    // The live rows climb from 300 towards 600 over the first rounds, since each round
+    // keeps half of what it holds, so the size is compared from round ten on.
+    let (steady, last) = (sizes[10], sizes[sizes.len() - 1]);
+    assert!(
+        last <= steady + 2,
+        "the tree grew from {steady} pages to {last}: {sizes:?}"
+    );
+    assert!(
+        tree.write_stats().parents_dissolved > 0,
+        "no parent was dissolved: {:?}",
+        tree.write_stats()
+    );
+}

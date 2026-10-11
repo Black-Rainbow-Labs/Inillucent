@@ -37,6 +37,40 @@ const CONNECTION_PRAGMAS: [&str; 15] = [
     "trusted_schema",
 ];
 
+/// Pragmas that read the file and change nothing, whatever argument they are given: a
+/// table's name, an index's name or a row limit.
+const READING_PRAGMAS: [&str; 16] = [
+    "integrity_check",
+    "quick_check",
+    "table_info",
+    "table_xinfo",
+    "table_list",
+    "index_list",
+    "index_info",
+    "index_xinfo",
+    "foreign_key_list",
+    "foreign_key_check",
+    "database_list",
+    "collation_list",
+    "function_list",
+    "module_list",
+    "pragma_list",
+    "compile_options",
+];
+
+/// Pragmas that read a value when they are given no argument, and set it when they are.
+const READ_OR_SET_PRAGMAS: [&str; 9] = [
+    "journal_mode",
+    "user_version",
+    "application_id",
+    "schema_version",
+    "page_count",
+    "page_size",
+    "freelist_count",
+    "encoding",
+    "data_version",
+];
+
 /// Gives the target of a write plan the schema name the statement wrote before it.
 ///
 /// The row finding query is built from the table alone, so the name the statement wrote does not
@@ -59,7 +93,54 @@ fn is_raise_outside_trigger(error: &inillucent_base::DbError) -> bool {
         .contains("RAISE() may only be used within a trigger-program")
 }
 
+/// How many times a statement is compiled again because another process changed the schema
+/// between its compile and its lock, before the change is reported. SQLite's
+/// `SQLITE_MAX_SCHEMA_RETRY` is 50; a schema that moves under every one of fifty compiles is
+/// another program in a loop of `ALTER`s, and reporting it is the useful answer.
+pub(crate) const SCHEMA_RETRIES: usize = 50;
+
+/// The error a statement returns when its plan was compiled against a schema that another
+/// process changed before the statement took the file lock. SQLite's message for
+/// `SQLITE_SCHEMA`.
+pub(crate) fn schema_moved() -> inillucent_base::DbError {
+    inillucent_base::error::DbError::primary(inillucent_base::error::PrimaryCode::Schema)
+        .with_message("database schema has changed")
+}
+
+/// Reports whether a statement failed only because its plan was compiled against a schema that
+/// moved before it took the lock, so compiling it again and rerunning it is right.
+///
+/// @param error - what the statement returned
+pub(crate) fn is_schema_moved(error: &inillucent_base::DbError) -> bool {
+    error.code() == inillucent_base::error::PrimaryCode::Schema
+}
+
 impl crate::ImportedDatabase {
+    /// Reports whether another process changed the schema since this connection last read it,
+    /// rereading it when it did.
+    ///
+    /// **For a compile that failed.** A statement is compiled before it takes the file lock, and
+    /// the lock is what rereads the catalog, so a statement naming a table another process
+    /// created after this one opened failed with "no such table" at its compile, never reached
+    /// the lock, and failed the same way for as long as the process lived. SQLite's
+    /// `sqlite3Prepare` answers a failed prepare by reading the schema cookie under a shared lock
+    /// (`schemaIsValid`) and preparing again when it moved; this is that check.
+    ///
+    /// A statement already running, such as a trigger body being compiled, has the lock and the
+    /// catalog it saw, so there is nothing to ask. A lock that cannot be had now answers no, and
+    /// the caller reports the compile's own error.
+    pub(crate) fn schema_moved_elsewhere(&mut self) -> DbResult<bool> {
+        if self.writing.running() > 0 {
+            return Ok(false);
+        }
+        let before = self.schema_generation();
+        if self.enter(false).is_err() {
+            return Ok(false);
+        }
+        self.leave()?;
+        Ok(self.schema_generation() != before)
+    }
+
     /// Runs one already-compiled statement.
     ///
     /// @param cached - the compiled statement
@@ -95,7 +176,8 @@ impl crate::ImportedDatabase {
         // default, both calls compare two integers. Under `normal` this is what
         // lets a second process have the file between statements, and what makes
         // this connection notice when one has written to it.
-        let writing = Self::writes_of(cached) && !takes_no_write_lock(cached);
+        let writing =
+            Self::writes_of(cached) && !takes_no_write_lock(cached) && !only_reads_the_file(cached);
         // **A deferred `BEGIN` takes no lock at all (task-2173)**, which is what
         // SQLite's does. It reads and writes nothing, and the first statement
         // inside the transaction takes the lock that statement needs, through
@@ -113,8 +195,37 @@ impl crate::ImportedDatabase {
         let lockless = self.writing.batch().is_none()
             && self.writing.running() == 0
             && (begins_without_a_lock(cached) || super::lockless::reads_no_file(cached));
+        // **And it ends a lease the statement before it left.** A statement that
+        // only read keeps SHARED for a moment after it ends, and a transaction
+        // that began inside that moment looked like one that had read: its first
+        // INSERT was refused when another process had committed in between, and
+        // otherwise waited for RESERVED while holding SHARED beside a writer
+        // waiting for SHARED to go. Four processes each running `SELECT 1; BEGIN;
+        // INSERT; COMMIT` in a loop finished 16 to 31 of 60 transactions, the
+        // median one in 5.4 s; SQLite finished all 60 at 30 ms.
+        if lockless
+            && begins_without_a_lock(cached)
+            && !self.pragmas.locking_exclusive()
+            && self.storage.database.lock_level() == inillucent_vfs::FileLock::Shared
+        {
+            self.storage.database.end_access()?;
+        }
         if !lockless {
+            let compiled_against = self.schema_generation();
             self.enter(writing)?;
+            // **The plan was compiled before the lock was taken, and taking it
+            // is what rereads the catalog after another process committed.**
+            // So a generation that moved here means the plan describes a schema
+            // the file no longer holds: `SELECT *` returned a column list
+            // another process had since changed, and after its `DROP COLUMN`
+            // failed with "the tree read for FROM term 0 does not carry column
+            // 3". SQLite answers the same moment with `SQLITE_SCHEMA` inside
+            // `sqlite3_step` and compiles the statement again; the callers of
+            // this function do the same on `PrimaryCode::Schema`.
+            if self.schema_generation() != compiled_against {
+                self.leave()?;
+                return Err(schema_moved());
+            }
         }
         let reads = self.session_state.nesting.get() == 0 && opens_a_transaction(cached);
         self.session_state
@@ -551,7 +662,7 @@ impl crate::ImportedDatabase {
                     .collect();
                 let folded = inillucent_exec::subquery::fold_expressions(&assigned, self, params)?;
                 let params = folded.as_ref().unwrap_or(params);
-                let changed = self.update_module(statement, &keys, params)?;
+                let changed = self.update_module_statement(statement, &keys, params)?;
                 if self.writing.batch().is_none() {
                     self.sync_modules()?;
                     self.seal()?;
@@ -724,6 +835,7 @@ impl crate::ImportedDatabase {
             )
             .with_scratch(self.compiled.take_binder_scratch());
         binder.ignore_checks_if(self.pragmas.ignore_check_constraints());
+        binder.writable_schema_if(self.pragmas.writable_schema());
         let outcome = binder.bind_statement(inner);
         self.compiled.recycle_binder(binder.into_scratch());
         let bound = outcome.map_err(refused)?;
@@ -1103,12 +1215,11 @@ impl crate::ImportedDatabase {
         let keys = self.keys_of(query, params)?;
         // A view fires its trigger once for every row of the join, so its rows
         // are not reduced to one per target row.
-        Ok(
-            match statement.from.is_empty() || statement.view_rows.is_some() {
-                true => keys,
-                false => dml::one_row_per_target(keys, statement.assignments.len()),
-            },
-        )
+        let keys = match statement.from.is_empty() || statement.view_rows.is_some() {
+            true => keys,
+            false => dml::one_row_per_target(keys, statement.assignments.len()),
+        };
+        Ok(rowid_order_when_sqlite_does(statement, keys))
     }
 
     /// Returns the query that finds an `UPDATE`'s rows, and its shape.
@@ -1509,6 +1620,7 @@ impl crate::ImportedDatabase {
                     undo: 0,
                     dropped: 0,
                     built: 0,
+                    meta: 0,
                 },
                 false,
                 txn,
@@ -1735,4 +1847,78 @@ fn takes_no_write_lock(cached: &Cached) -> bool {
         }
         _ => false,
     }
+}
+
+/// Reports whether a pragma only reads the file, so it takes the shared lock a query takes.
+///
+/// **A pragma was a write to the lock.** Every directive asked for the write lock, so a new
+/// process running `PRAGMA quick_check` or reading `PRAGMA journal_mode` while another process
+/// wrote waited for that writer, and failed after the busy timeout with "wanted it for writing";
+/// `.tables` and `.schema` took five seconds. SQLite reads these under the shared lock.
+///
+/// @param cached - the compiled statement
+fn only_reads_the_file(cached: &Cached) -> bool {
+    let Cached::Ddl(sql) = cached else {
+        return false;
+    };
+    let text = sql.trim_start().to_ascii_lowercase();
+    let Some(rest) = text.strip_prefix("pragma") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+        .collect();
+    let after = rest.get(name.len()..).unwrap_or_default().trim();
+    let bare = name.rsplit('.').next().unwrap_or_default();
+    let no_argument = after.is_empty() || after == ";";
+    READING_PRAGMAS.contains(&bare) || (no_argument && READ_OR_SET_PRAGMAS.contains(&bare))
+}
+
+/// Puts an `UPDATE`'s rows in rowid order when SQLite visits them in that order.
+///
+/// **SQLite collects the rowids first and then updates them in ascending order** whenever the
+/// scan cannot be trusted to stay put: the statement says `OR REPLACE`, or it assigns a column
+/// an index holds, which changes the index the scan may be walking. The rows were visited in
+/// the order of whatever index found them, so `UPDATE OR IGNORE t SET c = '01' WHERE c > 'A'`
+/// over a unique `c` skipped a different row than SQLite does. A statement with its own
+/// `ORDER BY`, a `FROM` clause or a table keyed other than by a rowid keeps the order it has.
+///
+/// @param statement - the bound update
+/// @param keys - the rows the plan found, in the plan's order
+fn rowid_order_when_sqlite_does(
+    statement: &inillucent_sql::dml::BoundUpdate,
+    mut keys: Vec<Vec<inillucent_tree::datum::OwnedDatum>>,
+) -> Vec<Vec<inillucent_tree::datum::OwnedDatum>> {
+    use inillucent_tree::datum::OwnedDatum;
+    let table = &statement.table;
+    let plain = statement.from.is_empty()
+        && statement.view_rows.is_none()
+        && statement.order_by.is_empty()
+        && statement.limit.is_none()
+        && !table.without_rowid;
+    let assigns_indexed = statement.assignments.iter().any(|assignment| {
+        assignment.rowid
+            || table.indexes.iter().any(|index| {
+                index
+                    .columns
+                    .iter()
+                    .any(|held| held.column.is_none_or(|column| column == assignment.column))
+            })
+    });
+    let replacing = statement.on_conflict == Some(inillucent_sql::ast::ConflictAction::Replace);
+    if !plain || !(replacing || assigns_indexed) {
+        return keys;
+    }
+    let all_integers = keys
+        .iter()
+        .all(|row| matches!(row.first(), Some(OwnedDatum::Int(_))));
+    if all_integers {
+        keys.sort_by_key(|row| match row.first() {
+            Some(OwnedDatum::Int(rowid)) => *rowid,
+            _ => i64::MIN,
+        });
+    }
+    keys
 }

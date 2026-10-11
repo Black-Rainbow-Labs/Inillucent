@@ -263,7 +263,9 @@ not. An email address is kept whole and is not stemmed.
 
 ### Scoring
 
-A row scores for any query word it contains. It does not need every word. BM25 gives each row a
+A row scores for any query word it contains. It does not need every word. The query is plain words:
+a query that uses the FTS5 operators (a quoted phrase, a prefix star, capital `AND`, `NOT` or `NEAR`,
+or `column:word`) fails with the status `unsupported`. BM25 gives each row a
 score from three ideas:
 
 1. **A rare word counts for more than a common word.** The weight of a word is

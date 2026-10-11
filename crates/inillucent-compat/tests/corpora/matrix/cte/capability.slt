@@ -7,3 +7,18 @@ capability recursive_cte
 query I rowsort
 WITH RECURSIVE counter(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM counter WHERE n < 3) SELECT n FROM counter
 
+case capability-max-page-count
+capability max_page_count
+
+statement ok
+CREATE TABLE cap_mp (a INTEGER PRIMARY KEY, b)
+
+statement ok
+WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 400) INSERT INTO cap_mp SELECT n, printf('%.400c', 'x') || n FROM c
+
+query I rowsort
+PRAGMA max_page_count = 1
+
+statement error
+CREATE INDEX cap_mp_b ON cap_mp (b)
+

@@ -207,6 +207,59 @@ mod tests {
         }
     }
 
+    /// Runs a hash join on column 0 whose pairs must also pass a condition, and returns its rows.
+    ///
+    /// The build side is `(1, 10)` and `(1, 11)` and the probe side is `(1, 100)` and `(2, 200)`.
+    /// The condition is that the build row's second column, column 3 of the joined row, is above
+    /// `floor`.
+    fn conditional_join(kind: JoinKind, floor: i64) -> Vec<Vec<OwnedDatum>> {
+        let types = [StaticType::Int; 4];
+        let (rows, sink) = collector();
+        let condition = Expr::Compare(
+            crate::expr::CompareOp::Greater,
+            Box::new(Expr::Column(3)),
+            Box::new(Expr::Literal(OwnedDatum::Int(floor))),
+        );
+        let mut join = HashJoin::new(
+            kind,
+            vec![compile(&Expr::Column(0), &types).unwrap()],
+            vec![compile(&Expr::Column(0), &types).unwrap()],
+            sink,
+        )
+        .with_widths(2, 2)
+        .with_condition(compile(&condition, &types).unwrap());
+        join.build_materialised(&pairs(&[(1, 10), (1, 11)]))
+            .unwrap();
+        push_rows(&mut join, &pairs(&[(1, 100), (2, 200)])).unwrap();
+        join.finish().unwrap();
+        let produced = rows.borrow().clone();
+        produced
+    }
+
+    /// A pair the key finds is a match only when it passes the rest of the condition.
+    ///
+    /// An inner join drops the pair that fails; an outer join null extends a probe row none of
+    /// whose pairs pass, and a right join keeps the build rows that no pair passed for.
+    #[test]
+    fn a_hash_join_tests_the_rest_of_the_condition_for_each_pair() {
+        let inner = conditional_join(JoinKind::Inner, 10);
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner[0][3], OwnedDatum::Int(11));
+        let left = conditional_join(JoinKind::Left, 50);
+        assert_eq!(left.len(), 2);
+        assert_eq!(left[0][2], OwnedDatum::Null);
+        assert_eq!(left[1][2], OwnedDatum::Null);
+        let right = conditional_join(JoinKind::Right, 10);
+        assert_eq!(right.len(), 2);
+        assert_eq!(right[0][3], OwnedDatum::Int(11));
+        assert_eq!(right[1][0], OwnedDatum::Null);
+        assert_eq!(right[1][3], OwnedDatum::Int(10));
+        let semi = conditional_join(JoinKind::Semi, 50);
+        assert!(semi.is_empty());
+        let anti = conditional_join(JoinKind::Anti, 50);
+        assert_eq!(anti.len(), 2);
+    }
+
     /// A NULL join key matches nothing, on either side.
     #[test]
     fn a_null_key_matches_nothing() {

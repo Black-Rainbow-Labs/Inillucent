@@ -68,6 +68,12 @@ impl crate::ImportedDatabase {
         self.storage.database.pool().page_count()
     }
 
+    /// Returns the highest page that is the root of a tree, or zero when the file
+    /// does not keep its roots at the start. See `inillucent_pool::Meta::largest_root`.
+    pub fn largest_root(&self) -> u64 {
+        self.storage.database.largest_root()
+    }
+
     /// Returns how many pool frames hold a page right now.
     ///
     /// The measurable half of "what does the engine have in memory": the pool

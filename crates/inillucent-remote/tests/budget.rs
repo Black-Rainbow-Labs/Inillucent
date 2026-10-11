@@ -196,7 +196,7 @@ fn a_migration_past_its_deadline_stops_and_publishes_nothing() {
     // `DEADLINE / PER_ROW`, 35, and fewer when sleeps round up.
     assert!(
         source.sent < ROWS as u64 / 2,
-        "the source handed over {} of {ROWS} rows: the migration stopped at the end rather          than at its deadline",
+        "the source handed over {} of {ROWS} rows: the migration stopped at the end rather than at its deadline",
         source.sent
     );
     assert!(

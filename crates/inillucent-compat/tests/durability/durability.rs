@@ -864,7 +864,7 @@ fn campaign(journal: Journal, failure: Failure, limit: u64, corruption_allowed: 
                         let lost_it = *other == Recovery::Rows(before.clone());
                         assert!(
                             held || lost_it,
-                            "call {nth}: an acknowledged commit came back as neither state\n                               got {other:?}\n  before {before:?}\n  after {after:?}"
+                            "call {nth}: an acknowledged commit came back as neither state\n got {other:?}\n  before {before:?}\n  after {after:?}"
                         );
                         if lost_it {
                             acknowledged_and_lost = acknowledged_and_lost.saturating_add(1);

@@ -158,3 +158,60 @@ impl KeyEncoding {
         }
     }
 }
+
+/// Returns the shortest prefix of `right` that sorts above `left`.
+///
+/// A separator between two leaves has to sort above every key of the left leaf
+/// and at or below every key of the right one. The right leaf's first key is
+/// always such a key, and it can be long. Its prefix up to and including the
+/// first byte that differs from the left leaf's last key is shorter and does
+/// the same job: it has a larger byte at that position, or `left` is a proper
+/// prefix of it, and it is a prefix of `right`, so it sorts at or below
+/// `right`.
+///
+/// `left` must sort below `right`. When it does not, `right` itself is returned.
+///
+/// @param left - the encoded last key of the left leaf
+/// @param right - the encoded first key of the right leaf
+pub fn shorten_separator<'r>(left: &[u8], right: &'r [u8]) -> &'r [u8] {
+    let shared = left
+        .iter()
+        .zip(right.iter())
+        .take_while(|(held, other)| held == other)
+        .count();
+    if shared >= right.len() {
+        return right;
+    }
+    right.get(..shared.saturating_add(1)).unwrap_or(right)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The separator is the shortest prefix of the right key that sorts above
+    /// the left key, and it bounds both sides the way a separator must.
+    #[test]
+    fn a_separator_is_the_shortest_prefix_that_sorts_above_the_left_key() {
+        let mut shared = vec![b'p'; 5_000];
+        let mut left_long = shared.clone();
+        left_long.push(b'a');
+        shared.push(b'b');
+        shared.extend_from_slice(b"tail that is not needed");
+        let cases: [(&[u8], &[u8], &[u8]); 4] = [
+            (b"abc", b"abd", b"abd"),
+            (b"abc", b"abcd", b"abcd"),
+            (b"a", b"b", b"b"),
+            (&left_long, &shared, &shared[..5_001]),
+        ];
+        for (left, right, wanted) in cases {
+            let separator = shorten_separator(left, right);
+            assert_eq!(separator, wanted);
+            assert!(left < separator, "above the left key");
+            assert!(separator <= right, "at or below the right key");
+        }
+        // Not a case a split produces, but the answer is still the right key.
+        assert_eq!(shorten_separator(b"b", b"a"), b"a");
+        assert_eq!(shorten_separator(b"a", b"a"), b"a");
+    }
+}

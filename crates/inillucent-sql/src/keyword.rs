@@ -133,9 +133,9 @@ keywords! {
     26 => CREATE, b"CREATE", false;
     27 => CROSS, b"CROSS", false;
     28 => CURRENT, b"CURRENT", true;
-    29 => CURRENT_DATE, b"CURRENT_DATE", false;
-    30 => CURRENT_TIME, b"CURRENT_TIME", false;
-    31 => CURRENT_TIMESTAMP, b"CURRENT_TIMESTAMP", false;
+    29 => CURRENT_DATE, b"CURRENT_DATE", true;
+    30 => CURRENT_TIME, b"CURRENT_TIME", true;
+    31 => CURRENT_TIMESTAMP, b"CURRENT_TIMESTAMP", true;
     32 => DATABASE, b"DATABASE", true;
     33 => DEFAULT, b"DEFAULT", false;
     34 => DEFERRABLE, b"DEFERRABLE", false;
@@ -164,7 +164,7 @@ keywords! {
     57 => FROM, b"FROM", false;
     58 => FULL, b"FULL", false;
     59 => GENERATED, b"GENERATED", true;
-    60 => GLOB, b"GLOB", false;
+    60 => GLOB, b"GLOB", true;
     61 => GROUP, b"GROUP", false;
     62 => GROUPS, b"GROUPS", true;
     63 => HAVING, b"HAVING", false;
@@ -186,7 +186,7 @@ keywords! {
     79 => KEY, b"KEY", true;
     80 => LAST, b"LAST", true;
     81 => LEFT, b"LEFT", false;
-    82 => LIKE, b"LIKE", false;
+    82 => LIKE, b"LIKE", true;
     83 => LIMIT, b"LIMIT", false;
     84 => MATCH, b"MATCH", true;
     85 => MATERIALIZED, b"MATERIALIZED", true;
@@ -215,7 +215,7 @@ keywords! {
     108 => RANGE, b"RANGE", true;
     109 => RECURSIVE, b"RECURSIVE", true;
     110 => REFERENCES, b"REFERENCES", false;
-    111 => REGEXP, b"REGEXP", false;
+    111 => REGEXP, b"REGEXP", true;
     112 => REINDEX, b"REINDEX", true;
     113 => RELEASE, b"RELEASE", true;
     114 => RENAME, b"RENAME", true;

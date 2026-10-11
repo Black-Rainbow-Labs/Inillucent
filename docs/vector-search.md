@@ -95,6 +95,15 @@ fail, so the engine stops it at the write.
 
 A row whose vector is NULL is allowed. It is left out of any vector index on the column.
 
+A nearest neighbor query answers differently with and without an index when some rows have no
+distance. A row whose vector is NULL, or whose cosine distance is NULL because it is the zero
+vector, has a NULL distance. A query with no index sorts NULL first in `ORDER BY ... ASC`, so those
+rows come back before the nearest rows. A query that uses an index returns only the rows the index
+holds, so those rows are not in the answer. The index answers what a nearest neighbor search means:
+a row with no vector is not near anything. Write `WHERE v IS NOT NULL` in the query if the answer
+must be the same with and without the index. A table with no rows, a table whose vectors are all
+NULL and a `WHERE` that removes every row answer no rows.
+
 ## Find the nearest rows
 
 ```sql
@@ -248,7 +257,7 @@ CREATE INDEX passage_l2 ON passage USING inillucent_hnsw (v) WITH (metric = 'l2'
 | Setting | What it does | Default |
 |---|---|---|
 | `mode` | `'approximate'` walks the HNSW graph. `'exact'` compares the query with every stored vector | `'approximate'` |
-| `metric` (or `distance`) | the distance the index is built for: `'cosine'` or `'l2'` | `'cosine'` |
+| `metric` (or `distance`) | the distance the index is built for: `'cosine'` (also written `'cos'`) or `'l2'`. Any other name is refused and the message lists these | `'cosine'` |
 | `m` | how many neighbors each node of the HNSW graph links to | 16 |
 | `ef_construction` | how many candidates the graph build considers for each new node | 64 |
 | `ef_search` | how many candidates a graph walk keeps. A larger number raises recall and costs time. An index in exact mode does not walk the graph, so it ignores this | 64 |
@@ -467,7 +476,7 @@ models already return vectors of length 1. `l2_normalize(v)` scales any other ve
 
 | Hidden column | As a constraint | Meaning |
 |---|---|---|
-| the table's own name | `docs MATCH 'text'` | the keyword query, in FTS5 syntax |
+| the table's own name | `docs MATCH 'text'` | the keyword query, as plain words. See [The keyword query](#the-keyword-query) |
 | `vector` | `vector = ?1`, or `vector = embed('search_query: ' \|\| ?1)` | the query vector |
 | `k` | `k = 20` | how many hits the search collects. Defaults to 10 |
 | `recall` | `recall = 0.9` | in approximate mode, widens the graph walk to reach this recall. Exact mode ignores it |
@@ -479,6 +488,29 @@ question: `SELECT rowid, title FROM docs('release', 2)`.
 
 `k` and `LIMIT` are different. `k` decides how many hits the search collects. `LIMIT` trims the
 rows the query returns.
+
+### The keyword query
+
+The text after `MATCH` on an `inillucent_search` table is a list of plain words. A row scores for
+any word it holds, and a row does not need every word. `docs MATCH 'alpha beta'` returns the rows
+that hold `alpha`, the rows that hold `beta` and the rows that hold both, with the rows that hold
+both ranked first. The word `OR` between words changes nothing, because that is already how the
+words combine.
+
+An `inillucent_search` table does not implement the FTS5 query language. A query that uses one of
+these forms fails with the status `unsupported`, and the command line exits with code 3:
+
+| Form | Example | Why it is refused |
+|---|---|---|
+| a double quote | `"release process"` | FTS5 reads it as a phrase. The table has no phrase match |
+| a word ending in `*` | `rel*` | FTS5 reads it as a prefix match |
+| `AND`, `NOT` or `NEAR` in capitals between words | `alpha NOT beta` | FTS5 reads it as an operator. Read as a word, `NOT` would return the rows that hold `beta` |
+| a column name and a colon before a word | `body:alpha` | FTS5 reads it as a filter on one column |
+
+A colon after any other word, a question mark, and `not` or `and` in lower case are ordinary text
+and are searched as words, so a question typed by a person and the prefix `search_query: ` that an
+embedding model expects both work. To filter rows by a column, declare the column `FACET`. To use
+the FTS5 query language, use an `fts5` table.
 
 Three functions describe each hit:
 
@@ -821,7 +853,7 @@ id  body         v                                             distance
 
 | Parameter | `search` | `vector-search` |
 |---|---|---|
-| first argument | the query, in FTS5 syntax | the table |
+| first argument | the query. FTS5 syntax on an FTS5 table, plain words on an `inillucent_search` table | the table |
 | `--table` | the table to search | |
 | `--column` | | the `VECTOR(N)` column |
 | `--vector` | | the query vector, a JSON array with exactly N numbers |

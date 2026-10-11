@@ -119,7 +119,7 @@ fn parse_levers(names: &str) -> Result<u32, String> {
             "fused-bytecode" => Levers::FUSED_BYTECODE,
             other => {
                 return Err(format!(
-                    "unknown lever `{other}`; the levers are covering-index, indexed-write, \n                     ordered-walk, streaming-group, fused-bytecode, all"
+                    "unknown lever `{other}`; the levers are covering-index, indexed-write, \n ordered-walk, streaming-group, fused-bytecode, all"
                 ))
             }
         };

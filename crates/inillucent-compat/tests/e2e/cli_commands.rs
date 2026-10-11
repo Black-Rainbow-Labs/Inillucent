@@ -515,7 +515,7 @@ fn describe_lists_generated_columns() {
             "--db",
             path.as_str(),
             "exec",
-            "CREATE TABLE orders (id INTEGER PRIMARY KEY, at TEXT,              business_day TEXT GENERATED ALWAYS AS (date(at)) STORED,              doubled INTEGER GENERATED ALWAYS AS (id * 2) VIRTUAL)",
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, at TEXT, business_day TEXT GENERATED ALWAYS AS (date(at)) STORED, doubled INTEGER GENERATED ALWAYS AS (id * 2) VIRTUAL)",
         ],
     ] {
         succeeded("setup", &run(&binary, &arguments));

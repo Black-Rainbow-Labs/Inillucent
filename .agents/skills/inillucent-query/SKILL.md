@@ -110,6 +110,13 @@ not put `BEGIN` or `COMMIT` in its input. Use `batch` whenever two changes must 
   comes back. With `--output json`, each column in `columns` reports the storage class its values
   really had, or `mixed` when the values had different classes. Trust `columns`. The declared type
   that `describe` shows is only the affinity.
+- **A file does not get shorter when rows are deleted, unless `auto_vacuum` is on.** `PRAGMA
+  auto_vacuum` reads 0 (NONE, the default), 1 (FULL) or 2 (INCREMENTAL). In NONE mode the pages a
+  delete frees stay in the file and later writes reuse them. In FULL mode each commit gives the free
+  pages back, so `PRAGMA freelist_count` reads 0 and the file is shorter. In INCREMENTAL mode
+  `PRAGMA incremental_vacuum(100)` gives back up to 100 free pages. `PRAGMA auto_vacuum = FULL` on a
+  file that already has tables takes effect after `VACUUM`. It is a write, so a `--readonly`
+  connection refuses it.
 
 ## Anything the commands do not cover
 

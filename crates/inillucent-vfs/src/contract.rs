@@ -464,6 +464,22 @@ pub trait Vfs: Send + Sync + Debug {
         self.open(path, options)?.file_size().map(Some)
     }
 
+    /// Returns the number the file system knows the file at a path by, or `None` when nothing
+    /// is there or this file system cannot say.
+    ///
+    /// **For telling whether a file was replaced under an open handle.** `VACUUM` and a backup
+    /// write a new file and rename it over the database, and a process that had the old one open
+    /// went on reading, locking and writing the old one. Its commits went to a file no path
+    /// named, and were lost. The engine compares this number with the one it read when it opened
+    /// the file. It is asked by name, without opening the file, where the platform can. The
+    /// default answers `None`, which turns the check off for a file system with no such number.
+    ///
+    /// @param path - the file
+    fn file_number_by_name(&self, path: &DbPath) -> VfsResult<Option<u128>> {
+        let _ = path;
+        Ok(None)
+    }
+
     /// Resolves a path to the canonical absolute form the VFS will use.
     fn full_pathname(&self, path: &DbPath) -> VfsResult<DbPath>;
 

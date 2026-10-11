@@ -80,10 +80,13 @@
 // Every item is re-exported, so nothing outside this directory changed.
 use self::index::*;
 use self::query::*;
+mod fts3_snippet;
 mod index;
 mod merge;
 mod query;
+mod snippet;
 
+pub use doclist::{doclist_entries_decoded, reset_doclist_entries_decoded};
 pub use index::{build_stages, decode_sizes, reset_build_stages, Buffer, BuildStages, Pending};
 
 pub mod bm25;
@@ -339,6 +342,11 @@ const PLAN_ROWID: i32 = 1;
 const PLAN_MATCH: i32 = 2;
 /// The plan bit that says the rows come back ranked.
 const PLAN_RANKED: i32 = 4;
+/// The plan bit that says a `rank MATCH '...'` constraint came after the match.
+///
+/// The second argument of the plan is then the rank function for this query,
+/// such as `bm25(10.0, 1.0)`.
+const PLAN_RANK_FUNCTION: i32 = 8;
 /// Where a plan keeps the column a `MATCH` was written on, plus one.
 ///
 /// **`body MATCH 'ships'` searches one column**, as SQLite's FTS5 does: it
@@ -575,10 +583,25 @@ impl VirtualTable for Fts5Table {
                 return Ok(());
             }
         }
+        // **`rank MATCH 'bm25(10.0, 1.0)'` chooses the rank function for this
+        // query**, as it does in SQLite. It is only meaningful beside a match,
+        // and it is taken after the match so that the match stays the first
+        // argument of the plan.
+        if plan & PLAN_MATCH != 0 && self.dialect == Dialect::Five {
+            let rank_match = query.constraints.iter().position(|constraint| {
+                constraint.usable
+                    && constraint.op == ConstraintOp::Match
+                    && constraint.column == self.rank_column()
+            });
+            if let Some(index) = rank_match {
+                query.use_constraint(index, true);
+                plan |= PLAN_RANK_FUNCTION;
+            }
+        }
         // `ORDER BY rank` is the reason the column exists: a match already
         // knows every row's score, so ordering by it costs a sort of the
         // matches rather than a sort of the table.
-        if plan == PLAN_MATCH {
+        if plan & !PLAN_RANK_FUNCTION == PLAN_MATCH {
             if let Some(order) = query.order_by.first() {
                 if query.order_by.len() == 1
                     && self.dialect == Dialect::Five
@@ -623,6 +646,7 @@ impl VirtualTable for Fts5Table {
             match_column: self.match_column(),
             rank_column: self.rank_column(),
             rank_weights: Vec::new(),
+            rank_setting: None,
             tokenizer: self.tokenizer.clone(),
             shadows: self.shadows.clone(),
             rows: Vec::new(),
@@ -703,15 +727,13 @@ impl VirtualTable for Fts5Table {
                     self.command(context, &command, argument)?;
                     return Ok(None);
                 }
-                let key = match rowid.as_integer() {
+                let key = match rowid.as_integer().or_else(|| self.named_docid(values)) {
                     Some(key) => {
                         // A rowid the caller named may collide, so it is asked
                         // about; and it moves the mark, so the next allocated
                         // one is above it.
                         if self.holds_row(context, key)? {
-                            return Err(constraint(
-                                "UNIQUE constraint failed: the rowid is already in the index",
-                            ));
+                            return Err(self.rowid_taken());
                         }
                         note_content_rowid(&self.pending, key);
                         key
@@ -741,8 +763,17 @@ impl VirtualTable for Fts5Table {
                     return Ok(None);
                 };
                 let new = new_rowid.as_integer().unwrap_or(old);
+                let new = self.named_docid(values).unwrap_or(new);
+                // **Checked before the old row goes.** `UPDATE t SET rowid = 5`
+                // onto a rowid the table already holds is a constraint
+                // failure, and removing the old row first would leave the
+                // statement having deleted a row it then refused to move.
+                if new != old && self.holds_row(context, new)? {
+                    return Err(self.rowid_taken());
+                }
                 self.remove(context, old)?;
                 self.add(context, new, values)?;
+                note_content_rowid(&self.pending, new);
                 Ok(Some(new))
             }
         }
@@ -913,13 +944,6 @@ fn phrase_counts(hits: &expr::Hits, rowid: i64, column: usize) -> (i64, i64, i64
         }
     }
     (here, every, rows)
-}
-
-/// Returns a text value, for a default an argument did not supply.
-///
-/// @param bytes - the text
-fn text_value(bytes: &[u8]) -> Value<'static> {
-    Value::owned_text(bytes).unwrap_or(Value::Null)
 }
 
 /// Returns a function argument as bytes, or nothing for a NULL.

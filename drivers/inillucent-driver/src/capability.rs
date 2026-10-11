@@ -377,7 +377,7 @@ pub static CAPABILITIES: &[Capability] = &[
     Capability {
         name: "large_values",
         support: Support::Yes,
-        note: "A value larger than a page is stored outside it, in a contiguous run,                whatever its column is declared - a text in a column declared BLOB, or in                one declared nothing at all, as much as a text in a column declared TEXT.                The reference says what the bytes read back as when the column would say                something else, which is what makes that possible; until it did, an                undeclared column refused about 32 KB. Probed by `typeof` rather than by                whether the insert runs, because the way this fails is a text coming back                as a blob.",
+        note: "A value larger than a page is stored outside it, in a contiguous run, whatever its column is declared - a text in a column declared BLOB, or in one declared nothing at all, as much as a text in a column declared TEXT. The reference says what the bytes read back as when the column would say something else, which is what makes that possible; until it did, an undeclared column refused about 32 KB. Probed by `typeof` rather than by whether the insert runs, because the way this fails is a text coming back as a blob.",
         probe: Probe::Answers {
             setup: &[
                 "CREATE TABLE cap_large (a)",
@@ -544,6 +544,36 @@ pub static CAPABILITIES: &[Capability] = &[
         },
     },
     Capability {
+        name: "auto_vacuum",
+        support: Support::Yes,
+        // Probed by its value. The pragma is also accepted and ignored by an engine that does not
+        // give pages back, so a probe that only asked whether the statement runs would pass it.
+        note: "PRAGMA auto_vacuum = FULL or INCREMENTAL gives the pages a delete frees back to the file system, so the file shrinks and PRAGMA freelist_count reads 0 after the delete. PRAGMA incremental_vacuum(N) gives back up to N pages in INCREMENTAL mode. The mode is chosen on an empty database or followed by VACUUM.",
+        probe: Probe::Answers {
+            setup: &[
+                "PRAGMA auto_vacuum = FULL",
+                "CREATE TABLE cap_av (a INTEGER PRIMARY KEY, b)",
+                "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 400) INSERT INTO cap_av SELECT n, zeroblob(5000) FROM c",
+                "DELETE FROM cap_av WHERE a > 10",
+            ],
+            sql: "PRAGMA freelist_count",
+            expect: "0",
+        },
+    },
+    Capability {
+        name: "max_page_count",
+        support: Support::Yes,
+        note: "PRAGMA max_page_count = N is enforced: a statement that would grow the file past N pages is refused with the status full, and only that statement is rolled back. The limit is kept on the open file and is not written to it. A value below the current page count is raised to the page count.",
+        probe: Probe::Refuses {
+            setup: &[
+                "CREATE TABLE cap_mp (a INTEGER PRIMARY KEY, b)",
+                "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 400) INSERT INTO cap_mp SELECT n, printf('%.400c', 'x') || n FROM c",
+                "PRAGMA max_page_count = 1",
+            ],
+            sql: "CREATE INDEX cap_mp_b ON cap_mp (b)",
+        },
+    },
+    Capability {
         name: "load_extension",
         support: Support::No,
         note: "There is no C extension interface to load a shared library into, so load_extension() refuses. Full text search (FTS5) and vector search (HNSW) are built in rather than loaded, which covers the usual reason to load one.",
@@ -564,7 +594,7 @@ pub static CAPABILITIES: &[Capability] = &[
     Capability {
         name: "window_in_compound_arm",
         support: Support::Yes,
-        note: "A window function inside an arm of a UNION, EXCEPT or INTERSECT runs. It                used to be refused, because the binder threw away the arm's window calls                when it left the arm's block and the physical pass was then handed a                WindowRef in a statement that claimed to have no windows (task-2042).",
+        note: "A window function inside an arm of a UNION, EXCEPT or INTERSECT runs. It used to be refused, because the binder threw away the arm's window calls when it left the arm's block and the physical pass was then handed a WindowRef in a statement that claimed to have no windows (task-2042).",
         probe: Probe::Runs {
             setup: &["CREATE TABLE t (a INTEGER)"],
             sql: "SELECT a FROM t UNION ALL SELECT row_number() OVER () FROM t",
@@ -580,7 +610,7 @@ pub static CAPABILITIES: &[Capability] = &[
         // `SELECT 1 UNION ALL SELECT count(*) FROM t GROUP BY a` came back
         // with a blank where the count belongs. A `Probe::Runs` row would
         // have called that supported.
-        note: "An aggregate inside an arm of a UNION, EXCEPT or INTERSECT that is not the                first runs and returns its value. It used to be refused - and, with a GROUP                BY on that arm, to answer one blank row per group instead (task-2042).",
+        note: "An aggregate inside an arm of a UNION, EXCEPT or INTERSECT that is not the first runs and returns its value. It used to be refused - and, with a GROUP BY on that arm, to answer one blank row per group instead (task-2042).",
         probe: Probe::Answers {
             setup: &[
                 "CREATE TABLE cap_compound_agg (a INTEGER)",
@@ -591,7 +621,7 @@ pub static CAPABILITIES: &[Capability] = &[
             // never the broken one. 9 + 1 + 1 + 1; the grouped arm answering
             // blanks gives 9, and `sum` ignores a NULL rather than reporting
             // it, which is what makes the two numbers different.
-            sql: "SELECT sum(v) FROM                   (SELECT 9 AS v UNION ALL SELECT count(*) FROM cap_compound_agg GROUP BY a)",
+            sql: "SELECT sum(v) FROM (SELECT 9 AS v UNION ALL SELECT count(*) FROM cap_compound_agg GROUP BY a)",
             expect: "12",
         },
     },

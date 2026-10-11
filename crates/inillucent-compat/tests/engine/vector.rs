@@ -285,14 +285,14 @@ fn a_vector_column_and_the_search_store_agree_with_an_exhaustive_cosine() {
     let connection = held.session();
     connection
         .execute_batch(
-            "CREATE TABLE embedding (id INTEGER PRIMARY KEY, v VECTOR(32));              CREATE VIRTUAL TABLE store USING inillucent_search(body, dims=32)",
+            "CREATE TABLE embedding (id INTEGER PRIMARY KEY, v VECTOR(32)); CREATE VIRTUAL TABLE store USING inillucent_search(body, dims=32)",
         )
         .expect("both stores are created");
     let corpus: Vec<Vec<f32>> = (0..VECTORS).map(|index| vector_of(index as u64)).collect();
     let mut batch = String::new();
     for (index, vector) in corpus.iter().enumerate() {
         batch.push_str(&format!(
-            "INSERT INTO embedding(id, v) VALUES ({index}, {0});              INSERT INTO store(body, vector) VALUES ('{index}', {0}); ",
+            "INSERT INTO embedding(id, v) VALUES ({index}, {0}); INSERT INTO store(body, vector) VALUES ('{index}', {0}); ",
             literal(vector)
         ));
     }
@@ -334,7 +334,7 @@ fn a_vector_column_and_the_search_store_agree_with_an_exhaustive_cosine() {
         let by_store: Vec<i64> = texts(
             &connection,
             &format!(
-                "SELECT body FROM store WHERE store MATCH '' AND vector = {} AND k = 10                  ORDER BY rank",
+                "SELECT body FROM store WHERE store MATCH '' AND vector = {} AND k = 10 ORDER BY rank",
                 literal(&probe)
             ),
         )
@@ -350,7 +350,7 @@ fn a_vector_column_and_the_search_store_agree_with_an_exhaustive_cosine() {
     assert_eq!(
         (column_hits, store_hits),
         (wanted_total, wanted_total),
-        "recall against an exhaustive cosine: column {column_hits}, store {store_hits},          of {wanted_total}"
+        "recall against an exhaustive cosine: column {column_hits}, store {store_hits}, of {wanted_total}"
     );
 }
 
@@ -403,7 +403,7 @@ fn an_index_using_the_module_is_built_and_maintained() {
     let connection = held.session();
     connection
         .execute_batch(
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(32));              INSERT INTO t(id, v) VALUES (1, {east});              INSERT INTO t(id, v) VALUES (2, {north})"
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(32)); INSERT INTO t(id, v) VALUES (1, {east}); INSERT INTO t(id, v) VALUES (2, {north})"
                 .replace("{east}", &literal(&tilt(0.0)))
                 .replace("{north}", &literal(&tilt(1.0)))
                 .as_str(),
@@ -497,7 +497,7 @@ fn the_plan_uses_the_index_and_the_index_agrees_with_exhaustive_cosine() {
     // the whole row is rendered rather than its first column.
     let plan: Vec<String> = connection
         .query(&format!(
-            "EXPLAIN QUERY PLAN SELECT id FROM embedding              ORDER BY vector_distance_cos(v, {}) LIMIT 10",
+            "EXPLAIN QUERY PLAN SELECT id FROM embedding ORDER BY vector_distance_cos(v, {}) LIMIT 10",
             literal(&probe)
         ))
         .expect("the plan is explained")

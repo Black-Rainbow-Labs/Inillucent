@@ -136,8 +136,10 @@ mod rebuild;
 pub mod recovery;
 mod schema_write;
 use recovery::OpenedFile;
+mod roots;
 /// Session-scoped `total_changes()` accounting.
 mod session_changes;
+mod shrink;
 mod spillfile;
 /// The engine's half of a vector index a module owns.
 mod vectors;
@@ -1178,72 +1180,11 @@ impl ImportedDatabase {
         self.refresh_catalog();
     }
 
-    /// Rebuilds this database into a file that holds nothing spare.
-    ///
-    /// **What `VACUUM` and `VACUUM INTO` both do**, differing only in where the
-    /// result goes. See `crate::rebuild` for why it is a logical copy rather
-    /// than a page one - in short, because a page copy reproduces the free
-    /// space it was asked to remove.
-    ///
-    /// @param destination - the file to write, which must not already exist
-    pub(crate) fn rebuild_into(&mut self, destination: &std::path::Path) -> DbResult<()> {
-        self.checkpoint()?;
-        crate::rebuild::rebuild_into(
-            std::sync::Arc::clone(&self.storage.vfs),
-            self,
-            destination,
-            self.storage.page_size,
-            self.storage.frames,
-        )
-    }
-
-    /// Rebuilds this database into a database held in memory, and discards it.
-    ///
-    /// **What `VACUUM INTO ':memory:'` and `VACUUM INTO ''` do.** SQLite opens
-    /// the target as a private in memory or temporary database, copies into it,
-    /// and closes it, so the statement succeeds and leaves nothing behind. It is
-    /// still a full rebuild, which is what makes it a check that the schema and
-    /// every row can be replayed.
-    pub(crate) fn rebuild_into_memory(&mut self) -> DbResult<()> {
-        self.checkpoint()?;
-        let vfs: std::sync::Arc<dyn inillucent_vfs::Vfs> =
-            std::sync::Arc::new(inillucent_vfs::memory::MemoryVfs::new());
-        crate::rebuild::rebuild_into(
-            vfs,
-            self,
-            std::path::Path::new("vacuum-into-memory.rdb"),
-            self.storage.page_size,
-            self.storage.frames,
-        )
-    }
-
-    /// Gives free pages back to the filesystem, up to a budget.
-    ///
-    /// **What `PRAGMA incremental_vacuum` asks for, done the way this engine
-    /// can do it.** SQLite relocates the trailing free pages one at a time and
-    /// truncates, which its pointer map makes cheap; here free space is given
-    /// back by rebuilding, so the budget is a *threshold* rather than a
-    /// quantity: asked to reclaim `n` pages, it reclaims every free page or
-    /// none, and reclaiming more than was asked is never a wrong answer - only
-    /// a longer one. That is the same reasoning `analysis_limit` already uses.
-    ///
-    /// Doing nothing when there is nothing free is what keeps the pragma cheap
-    /// to call in a loop, which is how applications use it.
-    ///
-    /// @param pages - how many free pages the caller asked to see returned
-    pub(crate) fn reclaim_free_pages(&mut self, pages: usize) -> DbResult<()> {
-        let free = self.storage.database.free_pages();
-        if free == 0 || free < pages as u64 {
-            return Ok(());
-        }
-        self.vacuum_in_place()
-    }
-
     /// Rebuilds this database over itself, reclaiming everything nothing uses.
     ///
     /// The work is `crate::rebuild::vacuum_in_place`, which is where every other
     /// piece of the statement already lives; this is the method the directive
-    /// and `reclaim_free_pages` call.
+    /// calls.
     pub(crate) fn vacuum_in_place(&mut self) -> DbResult<()> {
         crate::rebuild::vacuum_in_place(self)
     }

@@ -98,7 +98,8 @@ impl PagedTree {
             let guard = pool.fetch(page)?;
             let leaf = LeafRef::parse(&guard)?
                 .with_collations(&self.collations)
-                .with_directions(&self.directions);
+                .with_directions(&self.directions)
+                .with_pool(pool);
             // **The out-of-line values are read here, once per leaf, for every
             // walk in the crate.** A consumer that had to know about extents
             // would be five consumers that each had to; attaching them where the
@@ -107,7 +108,12 @@ impl PagedTree {
             // allocates nothing.
             let next = leaf.right_sibling();
             let more = match !resolve && leaf.has_extents() {
-                true => visit(&leaf)?,
+                true => {
+                    // Only the key values stored out of line are read, because
+                    // the keys of a written leaf are decoded to merge its rows.
+                    let keys = leaf.read_key_extents(pool)?;
+                    visit(&leaf.with_extents(&keys))?
+                }
                 false => self.with_leaf_extents(pool, copies.of(page), leaf, |leaf| visit(leaf))?,
             };
             if !more {
@@ -176,7 +182,8 @@ impl PagedTree {
                 let guard = pool.fetch(descent.leaf)?;
                 let leaf = LeafRef::parse(&guard)?
                     .with_collations(&self.collations)
-                    .with_directions(&self.directions);
+                    .with_directions(&self.directions)
+                    .with_pool(pool);
                 if !self.with_leaf_extents(pool, Some(descent.leaf), leaf, |leaf| visit(leaf))? {
                     return Ok(());
                 }
@@ -407,7 +414,8 @@ impl PagedTree {
         let mut next = {
             let leaf = LeafRef::parse(&guard)?
                 .with_collations(&self.collations)
-                .with_directions(&self.directions);
+                .with_directions(&self.directions)
+                .with_pool(pool);
             match self.with_leaf_extents(pool, Some(page), leaf, |leaf| {
                 Self::equal_span(leaf, key, RUN_SCAN, visit)
             })? {
@@ -421,7 +429,8 @@ impl PagedTree {
             let guard = pool.fetch(next)?;
             let leaf = LeafRef::parse(&guard)?
                 .with_collations(&self.collations)
-                .with_directions(&self.directions);
+                .with_directions(&self.directions)
+                .with_pool(pool);
             match self.with_leaf_extents(pool, Some(next), leaf, |leaf| {
                 Self::equal_span(leaf, key, RUN_SCAN, visit)
             })? {
@@ -624,30 +633,111 @@ impl PagedTree {
         self.last_leaf.set(Some(page));
         let leaf = LeafRef::parse(&guard)?
             .with_collations(&self.collations)
-            .with_directions(&self.directions);
+            .with_directions(&self.directions)
+            .with_pool(pool);
         // **One row's out-of-line values, not the leaf's.** A leaf whose values
         // are out of line holds a great many rows - it is sixteen bytes per
         // value rather than four kilobytes - so resolving the whole leaf to
         // answer one probe read three hundred extents to return one. It measured
         // 31 us per point read against SQLite's 13.
         //
-        // The row is found first, which is safe because finding it reads only
-        // key columns and a key is never out of line.
-        if !leaf.has_extents() {
+        // The row is found first, which reads only key columns: the prefix a key
+        // stored out of line keeps in the leaf, and the rest of the key only when
+        // the prefix ties, through the pool the leaf was given.
+        let prefix = probe.len() < self.key_columns;
+        if !leaf.has_extents() && !prefix {
             return self.probe_leaf(&leaf, probe, read);
         }
-        let Some(hit) = self.hit_in(&leaf, probe)? else {
+        if let Some(hit) = self.hit_in(&leaf, probe)? {
+            return self.read_hit(pool, &leaf, hit, read);
+        }
+        if !prefix || !Self::run_may_continue(&leaf, probe)? {
             return Ok(None);
-        };
+        }
+        let next = leaf.right_sibling();
+        drop(guard);
+        self.probe_right_of(pool, next, probe, read)
+    }
+    /// Reads a row a probe found, with that row's out-of-line values attached when the leaf has
+    /// any.
+    ///
+    /// @param pool - the buffer pool
+    /// @param leaf - the leaf holding the row
+    /// @param hit - where in the leaf the row is
+    /// @param read - what to do with the leaf and the row index
+    fn read_hit<R>(
+        &self,
+        pool: &Pool,
+        leaf: &LeafRef<'_>,
+        hit: Hit,
+        read: impl FnOnce(&LeafRef<'_>, Hit) -> DbResult<R>,
+    ) -> DbResult<Option<R>> {
+        if !leaf.has_extents() {
+            return Ok(Some(read(leaf, hit)?));
+        }
         let held = match hit {
-            Hit::Sorted(row) => self.read_extents_row(pool, &leaf, row)?,
+            Hit::Sorted(row) => self.read_extents_row(pool, leaf, row)?,
             // A delta row can hold one too, as a tagged reference: the write
             // path spills the value and puts the reference in the delta rather
             // than repacking the leaf around it.
-            Hit::Delta(index) => self.read_extents_delta(pool, &leaf, index)?,
+            Hit::Delta(index) => self.read_extents_delta(pool, leaf, index)?,
         };
-        let leaf = leaf.with_extents(&held);
+        let leaf = (*leaf).with_extents(&held);
         Ok(Some(read(&leaf, hit)?))
+    }
+    /// Reports whether the keys that begin with a prefix can continue in the next leaf, because
+    /// nothing in this leaf, sorted or written since, sorts past the prefix. The rule
+    /// [`PagedTree::visit_equal`]'s walk uses.
+    ///
+    /// @param leaf - the leaf a probe missed in
+    /// @param probe - the prefix
+    fn run_may_continue(leaf: &LeafRef<'_>, probe: &[Datum<'_>]) -> DbResult<bool> {
+        let (begin, _) = leaf.equal_run(probe, 1)?;
+        Ok(begin >= leaf.row_count() && !leaf.holds_a_key_past(probe)?)
+    }
+    /// Probes for a prefix in the leaves to the right of the one the descent landed on.
+    ///
+    /// **A prefix sorts before every key that begins with it**, so the descent for `(6529)` in an
+    /// index of `(k, rowid)` goes left of a separator `(6529, 6529)` and lands on the leaf before
+    /// it. When the first key with that prefix begins the next leaf, a probe that stopped at the
+    /// landed leaf found nothing. The uniqueness check of a `UNIQUE` index probes this way, so a
+    /// duplicate of the first key of every leaf after the first was accepted: 6529, 13057 and
+    /// 19585 in a 20,000 row integer column, and `PRAGMA integrity_check` then reported
+    /// "non-unique entry". Found by the bug hunt's ORM schemas.
+    ///
+    /// @param pool - the buffer pool
+    /// @param next - the leaf to the right of the one already searched
+    /// @param probe - the prefix
+    /// @param read - what to do with the leaf and the row index
+    fn probe_right_of<R>(
+        &self,
+        pool: &Pool,
+        mut next: PageId,
+        probe: &[Datum<'_>],
+        read: impl FnOnce(&LeafRef<'_>, Hit) -> DbResult<R>,
+    ) -> DbResult<Option<R>> {
+        let mut seen = 0u64;
+        while !next.is_none() {
+            let guard = pool.fetch(next)?;
+            let leaf = LeafRef::parse(&guard)?
+                .with_collations(&self.collations)
+                .with_directions(&self.directions)
+                .with_pool(pool);
+            if let Some(hit) = self.hit_in(&leaf, probe)? {
+                return self.read_hit(pool, &leaf, hit, read);
+            }
+            if !Self::run_may_continue(&leaf, probe)? {
+                return Ok(None);
+            }
+            next = leaf.right_sibling();
+            seen = seen.saturating_add(1);
+            if seen > self.leaf_count.saturating_add(1) {
+                return Err(corrupt(
+                    "a prefix probe visited more leaves than the tree holds",
+                ));
+            }
+        }
+        Ok(None)
     }
     /// Finds a key inside a leaf the caller has already descended to.
     ///

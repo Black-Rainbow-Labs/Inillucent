@@ -400,10 +400,18 @@ pub fn extent_datum<'p>(class: ExtentClass, physical: PhysicalType, bytes: &'p [
 /// @param physical - the column's layout
 /// @param value - the value to measure
 /// @param class - the class the value classified as
-pub(crate) fn heap_cost_of(physical: PhysicalType, value: &Datum<'_>, class: ValueClass) -> usize {
+/// @param extent_bytes - what a value stored out of line costs in this column: the
+///   reference for an ordinary column, and the reference, prefix length and prefix
+///   for a key column
+pub(crate) fn heap_cost_of(
+    physical: PhysicalType,
+    value: &Datum<'_>,
+    class: ValueClass,
+    extent_bytes: usize,
+) -> usize {
     match class {
         ValueClass::Null => 0,
-        ValueClass::Extent => EXTENT_REF_BYTES,
+        ValueClass::Extent => extent_bytes,
         ValueClass::Exception => value.tagged_len(),
         ValueClass::Typed => match physical {
             PhysicalType::Int64 | PhysicalType::Float64 => 0,
@@ -543,11 +551,58 @@ mod tests {
                 assert_ne!(classify_at(physical, &short, 512), ValueClass::Extent);
             }
         }
-        // A key column's threshold is `usize::MAX`, which is how the builder
-        // says a key is never stored outside its page.
+        // With no threshold to spill at, nothing goes out of line.
         assert_eq!(
             classify_at(PhysicalType::Text, &text, usize::MAX),
             ValueClass::Typed
         );
+    }
+
+    /// A key column spills at the same length as every other column, and a
+    /// value it spills costs the reference, the prefix length and the prefix.
+    ///
+    /// The builder used to answer `usize::MAX` for a key column, which kept a
+    /// key of any length in the leaf and made one over about 17 KB impossible
+    /// to split.
+    #[test]
+    fn a_key_column_spills_at_the_same_threshold_as_any_other_column() {
+        use crate::leaf::{key_prefix_bytes, LeafBuilder, EXTENT_DIVISOR, KEY_PREFIX_BYTES};
+        use crate::types::ColumnSpec;
+
+        for page_size in [512usize, 4_096, 32_768, 65_536] {
+            let builder = LeafBuilder::new(
+                page_size,
+                1,
+                vec![
+                    ColumnSpec::key(PhysicalType::Text),
+                    ColumnSpec::new(PhysicalType::Text),
+                ],
+                1,
+            )
+            .unwrap();
+            let threshold = page_size / EXTENT_DIVISOR;
+            assert_eq!(builder.threshold(true), threshold);
+            assert_eq!(builder.threshold(false), usize::MAX);
+            let long = vec![b'k'; threshold + 1];
+            let value = Datum::Text(long.as_slice());
+            let class = classify_at(PhysicalType::Text, &value, builder.threshold(true));
+            assert_eq!(class, ValueClass::Extent);
+            let prefix = key_prefix_bytes(page_size);
+            assert_eq!(prefix, KEY_PREFIX_BYTES.min(threshold));
+            assert!(
+                prefix < long.len(),
+                "a spilled key is longer than its prefix"
+            );
+            assert_eq!(
+                heap_cost_of(PhysicalType::Text, &value, class, builder.extent_cost(0)),
+                EXTENT_REF_BYTES + 2 + prefix
+            );
+            assert_eq!(
+                heap_cost_of(PhysicalType::Text, &value, class, builder.extent_cost(1)),
+                EXTENT_REF_BYTES
+            );
+        }
+        assert_eq!(key_prefix_bytes(32_768), 512);
+        assert_eq!(key_prefix_bytes(512), 64);
     }
 }

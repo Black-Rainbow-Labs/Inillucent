@@ -436,12 +436,7 @@ impl Engine {
         // **In log order.** Two passes, claims then releases, made
         // a page that was freed and allocated again inside the replayed range
         // come back free while it was live. See `Applier::free_map_changes`.
-        for change in &free_map {
-            match change.allocated {
-                true => database.claim(change.page)?,
-                false => database.release(change.page, 1)?,
-            }
-        }
+        crate::redo::apply_free_map_changes(&mut database, &free_map)?;
         recover::truncate_after(vfs.as_ref(), path, &outcome)?;
         // **The log resumes above every stamp the file carries.**
         // The one rule, in both open paths: a page's LSN has to be a position

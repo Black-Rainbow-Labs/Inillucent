@@ -35,6 +35,7 @@ mod migrate_sqlite;
 mod new_engine_ddl;
 mod new_engine_differential;
 mod new_engine_extents;
+mod new_engine_long_keys;
 mod new_engine_pragma;
 mod new_engine_vtab;
 mod new_engine_writes;

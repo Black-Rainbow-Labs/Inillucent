@@ -197,6 +197,7 @@ impl Pool {
             self.journal_page(SHADOW_PAGE)?;
         }
         self.flush()?;
+        self.sync_pages_if_asked()?;
         // Every page this checkpoint wrote has now raised the high water, so
         // the number recorded here bounds the stamps the file actually holds
         // rather than the ones it held a checkpoint ago. It never goes

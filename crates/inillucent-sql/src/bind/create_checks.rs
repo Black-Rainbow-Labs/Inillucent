@@ -311,7 +311,7 @@ impl Binder<'_> {
                 Span::default(),
             ));
         }
-        if written.to_ascii_lowercase().starts_with(b"sqlite_") {
+        if !self.writable_schema && written.to_ascii_lowercase().starts_with(b"sqlite_") {
             return Err(refused(
                 format!("object name reserved for internal use: {name}"),
                 Span::default(),

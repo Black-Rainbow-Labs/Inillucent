@@ -55,6 +55,8 @@
 use inillucent_base::error::{corrupt, misuse};
 use inillucent_base::DbResult;
 
+use inillucent_pool::extent::ExtentRef;
+
 use crate::datum::Datum;
 use crate::leaf::{
     class_bytes, leaf_header, tombstone_bytes, LeafRef, DELTA_ENTRY, FORMAT_ONE_DELTA_LIMIT,
@@ -571,10 +573,6 @@ impl<'p> LeafMut<'p> {
         if index >= leaf.delta_count() {
             return Err(misuse(format!("delta row {index} does not exist")));
         }
-        let kept: Vec<Vec<u8>> = (0..leaf.delta_count())
-            .filter(|position| *position != index)
-            .map(|position| leaf.delta_row(position).map(<[u8]>::to_vec))
-            .collect::<DbResult<Vec<Vec<u8>>>>()?;
         // **The extent flag is the union of both regions, so removing the row
         // that held the only reference has to clear it.** A flag left set over
         // a leaf holding nothing out of line is what the integrity check calls
@@ -582,7 +580,12 @@ impl<'p> LeafMut<'p> {
         // extents that are not there. Only asked when the removed row actually
         // held one, which is rare: the scan costs nothing on an ordinary write.
         let dropped = leaf.delta_extents_in(index)?;
-        self.rewrite_delta(&kept)?;
+        if leaf.has_delta_directory() {
+            self.close_delta_gap(index)?;
+        } else {
+            let (kept, count) = kept_delta_rows(&leaf, |position| position == index)?;
+            self.rewrite_delta(&kept, count)?;
+        }
         if dropped {
             let union = {
                 let leaf = LeafRef::parse(self.page)?;
@@ -595,6 +598,132 @@ impl<'p> LeafMut<'p> {
             self.set_flag(crate::leaf::LEAF_HAS_EXTENTS, union)?;
         }
         Ok(())
+    }
+
+    /// Removes one row from a delta area that has a directory, by closing the gap it leaves.
+    ///
+    /// The rows that sit below the removed one in the page, which are the rows written after it,
+    /// move up by its size; the rows above it stay where they are; the directory loses the
+    /// removed row's entry and the entries of the moved rows get their new distance. The cost is
+    /// one move of at most the delta area and one pass over the directory, with no allocation.
+    /// Rebuilding the whole area took a copy of every row in it: 100 microseconds for an area of
+    /// 1,000 rows, which made `INSERT OR REPLACE` onto 1,000 keys 40 times slower than SQLite.
+    ///
+    /// **The page that results depends only on the page before and the row removed**, and
+    /// removing several rows leaves the same bytes in any order, so a replay of the log that
+    /// calls this builds the page the session built. Bytes the area gave up are zeroed.
+    ///
+    /// @param index - the row's position in the directory
+    fn close_delta_gap(&mut self, index: usize) -> DbResult<()> {
+        let (heap_start, count, old_start, rows_start, has_tombstones, row_count) = {
+            let leaf = LeafRef::parse(self.page)?;
+            (
+                leaf.heap_start(),
+                leaf.delta_count(),
+                leaf.delta_start(),
+                leaf.delta_rows_start(),
+                leaf.has_tombstones(),
+                leaf.row_count(),
+            )
+        };
+        let entry_at =
+            |position: usize| old_start.saturating_add(position.saturating_mul(DELTA_ENTRY));
+        let removed_distance = page::read_u16(self.page, entry_at(index))? as usize;
+        let at = heap_start
+            .checked_sub(removed_distance)
+            .ok_or_else(|| corrupt("a delta row is before the start of the page"))?;
+        let size = (page::read_u16(self.page, at)? as usize).saturating_add(2);
+        if at < rows_start || at.saturating_add(size) > heap_start {
+            return Err(corrupt("a delta row lies outside the delta rows"));
+        }
+        let bitmap = if has_tombstones {
+            tombstone_bytes(row_count)
+        } else {
+            0
+        };
+        let shift = size.saturating_add(DELTA_ENTRY);
+        let new_start = old_start.saturating_add(shift);
+        // The rows below the removed one move up over the gap.
+        self.page
+            .copy_within(rows_start..at, rows_start.saturating_add(size));
+        // The directory, last entry first, so a write never lands on an entry not yet read.
+        for position in (0..count).rev() {
+            if position == index {
+                continue;
+            }
+            let mut distance = page::read_u16(self.page, entry_at(position))? as usize;
+            if distance > removed_distance {
+                distance = distance.saturating_sub(size);
+            }
+            let kept_before = if position > index {
+                position - 1
+            } else {
+                position
+            };
+            let target = new_start.saturating_add(kept_before.saturating_mul(DELTA_ENTRY));
+            page::write_u16(
+                self.page,
+                target,
+                u16::try_from(distance).unwrap_or(u16::MAX),
+            )?;
+        }
+        // The bitmap sits just below the area and moves up with it. After the directory, because
+        // its new place overlaps where the old directory was.
+        let freed_from = old_start.saturating_sub(bitmap);
+        if bitmap > 0 {
+            self.page
+                .copy_within(freed_from..old_start, freed_from.saturating_add(shift));
+        }
+        self.page
+            .get_mut(freed_from..freed_from.saturating_add(shift))
+            .ok_or_else(|| corrupt("the freed delta area ran past the page"))?
+            .fill(0);
+        page::write_u32(self.page, leaf_header::DELTA_START, new_start as u32)?;
+        page::write_u16(
+            self.page,
+            leaf_header::DELTA_COUNT,
+            count.saturating_sub(1) as u16,
+        )?;
+        self.set_flag(LEAF_HAS_DELTA, count > 1)?;
+        Ok(())
+    }
+
+    /// Writes a row over the delta row it replaces, when the two take the same number of bytes.
+    ///
+    /// Returns `false` and changes nothing when the row cannot be written over: the leaf is in
+    /// format 1, the old row has an out of line value, or the lengths differ. The caller then
+    /// removes the old row and inserts the new one, which gives the same rows.
+    ///
+    /// **Why this exists.** Removing a delta row rebuilds the whole delta area, which costs a
+    /// copy of every row in it. An upsert or an `INSERT OR REPLACE` onto 1,000 keys leaves all
+    /// 1,000 rows in the delta area of one leaf, because nothing runs out of room, so each
+    /// update copied 1,000 rows: 952 ms for 40,000 updates against SQLite's 23 ms. A replacement
+    /// the same length as the row it replaces needs no other row to move. The key is the same, so
+    /// the row keeps its place in the directory.
+    ///
+    /// **Recovery runs this same function** (`redo::insert_row`), so the page it rebuilds has the
+    /// bytes the session's page had.
+    ///
+    /// @param index - the old row's position in the delta area
+    /// @param encoded - the new row's bytes
+    pub fn overwrite_delta(&mut self, index: usize, encoded: &[u8]) -> DbResult<bool> {
+        let at = {
+            let leaf = LeafRef::parse(self.page)?;
+            if !leaf.has_delta_directory() || index >= leaf.delta_count() {
+                return Ok(false);
+            }
+            if leaf.delta_row(index)?.len() != encoded.len() || leaf.delta_extents_in(index)? {
+                return Ok(false);
+            }
+            leaf.delta_offset(index)?
+        };
+        let start = at.saturating_add(2);
+        let body = self
+            .page
+            .get_mut(start..start.saturating_add(encoded.len()))
+            .ok_or_else(|| corrupt("a delta row ran past the page"))?;
+        body.copy_from_slice(encoded);
+        Ok(true)
     }
 
     /// Removes several rows from the delta area with one rewrite of it.
@@ -625,11 +754,19 @@ impl<'p> LeafMut<'p> {
             }
             dropped_extent = dropped_extent || leaf.delta_extents_in(*index)?;
         }
-        let kept: Vec<Vec<u8>> = (0..count)
-            .filter(|position| !dropping.get(*position).copied().unwrap_or(false))
-            .map(|position| leaf.delta_row(position).map(<[u8]>::to_vec))
-            .collect::<DbResult<Vec<Vec<u8>>>>()?;
-        self.rewrite_delta(&kept)?;
+        if leaf.has_delta_directory() {
+            // Highest position first, so each removal leaves the positions of the rest alone.
+            let mut positions = indexes.to_vec();
+            positions.sort_unstable_by(|left, right| right.cmp(left));
+            for position in positions {
+                self.close_delta_gap(position)?;
+            }
+        } else {
+            let (kept, kept_count) = kept_delta_rows(&leaf, |position| {
+                dropping.get(position).copied().unwrap_or(false)
+            })?;
+            self.rewrite_delta(&kept, kept_count)?;
+        }
         // The extent flag, as `remove_delta` settles it and for its reason.
         if dropped_extent {
             let union = {
@@ -652,8 +789,10 @@ impl<'p> LeafMut<'p> {
     /// Deterministic in the rows alone, which is what lets recovery replay a
     /// removal onto the same bytes.
     ///
-    /// @param rows - the encoded rows, in the order the directory should name them
-    fn rewrite_delta(&mut self, rows: &[Vec<u8>]) -> DbResult<()> {
+    /// @param rows - the rows as [`kept_delta_rows`] gathers them: each one's two byte length and
+    ///   its bytes, one after the other, in the order the directory should name them
+    /// @param count - how many rows `rows` holds
+    fn rewrite_delta(&mut self, rows: &[u8], count: usize) -> DbResult<()> {
         let (heap_start, row_count, has_tombstones, old_delta_start, format_one) = {
             let leaf = LeafRef::parse(self.page)?;
             (
@@ -672,10 +811,7 @@ impl<'p> LeafMut<'p> {
         } else {
             0
         };
-        let total: usize = rows
-            .iter()
-            .map(|row| row.len().saturating_add(2).saturating_add(entry_size))
-            .fold(0usize, usize::saturating_add);
+        let total = rows.len().saturating_add(count.saturating_mul(entry_size));
         let new_delta_start = heap_start
             .checked_sub(total)
             .ok_or_else(|| corrupt("the delta area ran below the page"))?;
@@ -695,22 +831,22 @@ impl<'p> LeafMut<'p> {
         } else {
             Vec::new()
         };
-        let mut at = new_delta_start.saturating_add(rows.len().saturating_mul(entry_size));
-        for (index, row) in rows.iter().enumerate() {
-            if !format_one {
+        let rows_start = new_delta_start.saturating_add(count.saturating_mul(entry_size));
+        if !format_one {
+            let mut at = rows_start;
+            for index in 0..count {
                 let distance = u16::try_from(heap_start.saturating_sub(at))
                     .map_err(|_| corrupt("a delta row is too far from the heap"))?;
                 let entry = new_delta_start.saturating_add(index.saturating_mul(DELTA_ENTRY));
                 page::write_u16(self.page, entry, distance)?;
+                let length = page::read_u16(rows, at.saturating_sub(rows_start))? as usize;
+                at = at.saturating_add(2).saturating_add(length);
             }
-            page::write_u16(self.page, at, row.len() as u16)?;
-            let body = self
-                .page
-                .get_mut(at.saturating_add(2)..at.saturating_add(2).saturating_add(row.len()))
-                .ok_or_else(|| corrupt("a delta row ran past the page"))?;
-            body.copy_from_slice(row);
-            at = at.saturating_add(2).saturating_add(row.len());
         }
+        self.page
+            .get_mut(rows_start..rows_start.saturating_add(rows.len()))
+            .ok_or_else(|| corrupt("a delta row ran past the page"))?
+            .copy_from_slice(rows);
         // **The bytes the area gave up are zeroed (task-2180).** A removal moves
         // the area up and used to leave the old rows' bytes below it, so the
         // gap held whatever the order of removals left there: two removals one
@@ -736,8 +872,8 @@ impl<'p> LeafMut<'p> {
             target.copy_from_slice(&saved);
         }
         page::write_u32(self.page, leaf_header::DELTA_START, new_delta_start as u32)?;
-        page::write_u16(self.page, leaf_header::DELTA_COUNT, rows.len() as u16)?;
-        self.set_flag(LEAF_HAS_DELTA, !rows.is_empty())?;
+        page::write_u16(self.page, leaf_header::DELTA_COUNT, count as u16)?;
+        self.set_flag(LEAF_HAS_DELTA, count > 0)?;
         Ok(())
     }
 
@@ -747,11 +883,23 @@ impl<'p> LeafMut<'p> {
     /// is nowhere to put it, which is the same answer an insert gives and takes
     /// the same route out: compact, then try again.
     ///
+    /// **The row's out of line values are overwritten with a dead reference.** The
+    /// statement that deletes a row frees its values' pages at once, and a reference
+    /// left naming them would be freed again by the repack that drops the tombstone,
+    /// after the pages had been given to another value. A key column's value is
+    /// left, because the sorted rows around the tombstone are still compared with it
+    /// until the leaf is repacked; the repack frees it then.
+    ///
     /// @param row - the row's position in the sorted region
     pub fn set_tombstone(&mut self, row: usize) -> DbResult<Applied> {
-        let (row_count, delta_start, has_tombstones) = {
+        let (row_count, delta_start, has_tombstones, has_extents) = {
             let leaf = LeafRef::parse(self.page)?;
-            (leaf.row_count(), leaf.delta_start(), leaf.has_tombstones())
+            (
+                leaf.row_count(),
+                leaf.delta_start(),
+                leaf.has_tombstones(),
+                leaf.has_extents(),
+            )
         };
         if row >= row_count {
             return Err(misuse(format!("row {row} is not in the sorted region")));
@@ -776,7 +924,36 @@ impl<'p> LeafMut<'p> {
             .get_mut(start.saturating_add(row / 8))
             .ok_or_else(|| corrupt("the tombstone bitmap ran past the page"))?;
         *byte |= 1u8 << (row % 8);
+        if has_extents {
+            self.kill_value_extents(row)?;
+        }
         Ok(Applied::Yes)
+    }
+
+    /// Overwrites the references of one sorted row's non key out of line values
+    /// with [`ExtentRef::dead`].
+    ///
+    /// @param row - the row's position in the sorted region
+    fn kill_value_extents(&mut self, row: usize) -> DbResult<()> {
+        let sites: Vec<usize> = {
+            let leaf = LeafRef::parse(self.page)?;
+            let mut sites = Vec::new();
+            for column in leaf.key_columns()..leaf.column_count() {
+                let mini = leaf.column(column)?;
+                if mini.class_at(row)? == crate::types::ValueClass::Extent {
+                    sites.push(mini.extent_offset(row)?);
+                }
+            }
+            sites
+        };
+        let dead = ExtentRef::dead().encode();
+        for at in sites {
+            self.page
+                .get_mut(at..at.saturating_add(dead.len()))
+                .ok_or_else(|| corrupt("an extent reference runs past the page"))?
+                .copy_from_slice(&dead);
+        }
+        Ok(())
     }
 
     /// Clears one sorted-region row's tombstone.
@@ -1097,6 +1274,34 @@ impl<'p> LeafMut<'p> {
     pub fn set_right(&mut self, right: crate::page::PageId) -> DbResult<()> {
         page::set_right(self.page, right)
     }
+}
+
+/// Gathers the delta rows a leaf keeps, as one buffer of each row's two byte length and bytes in
+/// directory order, with how many rows that is.
+///
+/// **One buffer, not one allocation per row.** Removing a delta row used to copy each of the other
+/// rows into a vector of its own, which was most of the cost of an update or a delete of a row
+/// that sits in a delta area holding a thousand rows.
+///
+/// @param leaf - the leaf
+/// @param dropping - whether the row at a position in the directory is removed
+fn kept_delta_rows(
+    leaf: &LeafRef<'_>,
+    dropping: impl Fn(usize) -> bool,
+) -> DbResult<(Vec<u8>, usize)> {
+    let total = leaf.delta_count();
+    let mut kept = Vec::with_capacity(leaf.heap_start().saturating_sub(leaf.delta_rows_start()));
+    let mut count = 0usize;
+    for position in 0..total {
+        if dropping(position) {
+            continue;
+        }
+        let row = leaf.delta_row(position)?;
+        kept.extend_from_slice(&(row.len() as u16).to_le_bytes());
+        kept.extend_from_slice(row);
+        count = count.saturating_add(1);
+    }
+    Ok((kept, count))
 }
 
 /// Rounds an offset up to the next multiple of eight.
@@ -2048,7 +2253,7 @@ mod tests {
                 .expect("a plan")
                 .unwrap_or_else(|| {
                     panic!(
-                        "a {length}-byte value: `room_for` passed a {}-byte row and                          `plan_encoded` then had nowhere to put it",
+                        "a {length}-byte value: `room_for` passed a {}-byte row and `plan_encoded` then had nowhere to put it",
                         encoded.len()
                     )
                 });
@@ -2064,7 +2269,7 @@ mod tests {
         // check is strict.
         assert!(
             agreed > 100,
-            "the room check accepted only {agreed} of 999 row lengths, so this case is no              longer exercising the boundary it was written for"
+            "the room check accepted only {agreed} of 999 row lengths, so this case is no longer exercising the boundary it was written for"
         );
     }
 }

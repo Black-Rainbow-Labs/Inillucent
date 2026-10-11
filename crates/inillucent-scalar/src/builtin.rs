@@ -525,16 +525,16 @@ fn iif(arguments: &[Value<'static>]) -> Value<'static> {
     arguments.get(at).cloned().unwrap_or(Value::Null)
 }
 
-/// `unistr(x)`, which expands the two Unicode escapes.
+/// `unistr(x)`, which expands backslash escapes.
 ///
-/// `\uXXXX` and `\UXXXXXXXX` name a code point; the punctuation escapes stand
-/// for themselves; and anything else is `invalid Unicode escape`, which is a
-/// statement failure rather than a NULL. A non-text argument is returned
-/// unchanged, which is the reference's answer for `unistr(1)`.
+/// Two backslashes are one backslash; a backslash and four hex digits, `\uXXXX`, `\+XXXXXX` and
+/// `\UXXXXXXXX` name a code point; and anything else is `invalid Unicode escape`, which is a
+/// statement failure rather than a NULL. A non text argument is returned unchanged, which is the
+/// reference's answer for `unistr(1)`.
 ///
-/// Returns `None` when the escape is not one of the two, which the caller turns
-/// into the refusal - the sentence is in `refusal_for` so that the failure
-/// carries a message rather than becoming a quiet NULL.
+/// Returns `None` when an escape is malformed, which the caller turns into the refusal. The
+/// sentence is in `refusal_for` so that the failure carries a message rather than becoming a
+/// quiet NULL.
 ///
 /// @param value - the argument, or nothing
 fn unistr(value: Option<&Value<'static>>) -> Option<Value<'static>> {
@@ -546,44 +546,73 @@ fn unistr(value: Option<&Value<'static>>) -> Option<Value<'static>> {
     Some(Value::owned_text(&expanded).unwrap_or(Value::Null))
 }
 
-/// Expands `unistr`'s escapes, or returns nothing when one is malformed.
+/// Expands the escapes of `unistr`, or returns nothing when one is malformed.
+///
+/// The forms and their digit counts are SQLite's: a backslash followed by a hex digit starts four
+/// digits, `+` starts six, `u` four and `U` eight. A surrogate or a value past U+10FFFF is
+/// written as the bytes its number spells, which is what SQLite's own encoder does, so
+/// `unistr('\d83d')` is the three bytes ED A0 BD.
 ///
 /// @param bytes - the text as written
 fn expand_unicode_escapes(bytes: &[u8]) -> Option<Vec<u8>> {
-    const PUNCTUATION: &[u8] = b"\\'\"";
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0usize;
     while at < bytes.len() {
         let byte = bytes.get(at).copied()?;
+        at += 1;
         if byte != b'\\' {
             out.push(byte);
+            continue;
+        }
+        let letter = bytes.get(at).copied()?;
+        if letter == b'\\' {
+            out.push(b'\\');
             at += 1;
             continue;
         }
-        let letter = bytes.get(at + 1).copied()?;
-        let width = match letter {
-            b'u' => 4usize,
-            b'U' => 8,
-            other if PUNCTUATION.contains(&other) => {
-                out.push(other);
-                at += 2;
-                continue;
-            }
+        let (skip, width) = match letter {
+            b'+' => (1usize, 6usize),
+            b'u' => (1, 4),
+            b'U' => (1, 8),
+            other if other.is_ascii_hexdigit() => (0, 4),
             _ => return None,
         };
-        let digits = bytes.get(at + 2..at + 2 + width)?;
+        let start = at + skip;
+        let digits = bytes.get(start..start + width)?;
         let mut point = 0u32;
         for digit in digits {
-            point = point
-                .checked_mul(16)?
-                .checked_add(char::from(*digit).to_digit(16)?)?;
+            point = (point << 4) | char::from(*digit).to_digit(16)?;
         }
-        let character = char::from_u32(point)?;
-        let mut buffer = [0u8; 4];
-        out.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
-        at += 2 + width;
+        push_code_point(&mut out, point);
+        at = start + width;
     }
     Some(out)
+}
+
+/// Appends a code point as UTF-8 bytes without checking it is a character.
+///
+/// This is `sqlite3AppendOneUtf8Character`: a surrogate and a value past U+10FFFF are encoded by
+/// the same bit layout as any other, which `char::encode_utf8` refuses to do.
+///
+/// @param out - the text being built
+/// @param point - the number the escape spelled
+fn push_code_point(out: &mut Vec<u8>, point: u32) {
+    let low = |shift: u32| 0x80 | ((point >> shift) & 0x3f) as u8;
+    if point < 0x80 {
+        out.push(point as u8);
+    } else if point < 0x800 {
+        out.push(0xc0 | ((point >> 6) & 0x1f) as u8);
+        out.push(low(0));
+    } else if point < 0x1_0000 {
+        out.push(0xe0 | ((point >> 12) & 0x0f) as u8);
+        out.push(low(6));
+        out.push(low(0));
+    } else {
+        out.push(0xf0 | ((point >> 18) & 0x07) as u8);
+        out.push(low(12));
+        out.push(low(6));
+        out.push(low(0));
+    }
 }
 
 /// `unistr_quote(x)`, which is `quote()` with the control characters escaped.
@@ -771,21 +800,21 @@ fn unhex(arguments: &[Value<'static>], encoding: TextEncoding) -> Value<'static>
         .map(|value| eval::text_bytes(value, encoding))
         .unwrap_or_default();
     let bytes = eval::text_bytes(value, encoding);
-    let filtered: Vec<u8> = bytes
-        .into_iter()
-        .filter(|byte| !ignored.contains(byte))
-        .collect();
-    if !filtered.len().is_multiple_of(2) {
-        return Value::Null;
-    }
-    let mut out = Vec::with_capacity(filtered.len() / 2);
+    // **An ignored character may stand between two bytes and not inside one.** The two digits of
+    // a byte must be next to each other, so `unhex('4 142', ' ')` is NULL, where removing the
+    // ignored characters first made it the bytes 41 42.
+    let mut out = Vec::with_capacity(bytes.len() / 2);
     let mut index = 0usize;
-    while index < filtered.len() {
+    while let Some(byte) = bytes.get(index) {
+        if ignored.contains(byte) {
+            index = index.saturating_add(1);
+            continue;
+        }
         let (Some(high), Some(low)) = (
-            filtered.get(index).and_then(|byte| nibble(*byte)),
-            filtered
+            nibble(*byte),
+            bytes
                 .get(index.saturating_add(1))
-                .and_then(|byte| nibble(*byte)),
+                .and_then(|next| nibble(*next)),
         ) else {
             return Value::Null;
         };

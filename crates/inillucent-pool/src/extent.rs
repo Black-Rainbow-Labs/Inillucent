@@ -98,6 +98,8 @@ use inillucent_base::DbResult;
 use crate::page::{self, PageKind};
 use crate::PageId;
 
+pub mod owned;
+
 /// Byte offsets inside an extent page's own header.
 mod at {
     /// The first page of the next run, 8 bytes.
@@ -298,216 +300,27 @@ impl ExtentRef {
     pub fn is_packed(&self) -> bool {
         self.slot.is_some()
     }
-}
 
-/// The shared page: several small out-of-line values in one page.
-///
-/// A slotted page. The directory grows forward from [`shared::at::DIRECTORY`]
-/// and the payload grows backward from the end, which is the arrangement that
-/// lets one number - the payload's low water mark - say how much room is left
-/// without walking anything.
-pub mod shared {
-    use super::{corrupt, misuse, DbResult, PageId, MAX_SLOTS};
-    use crate::page::{self, PageKind};
-
-    /// Byte offsets inside a shared extent page's own header.
-    pub mod at {
-        /// How many slots the directory holds, 4 bytes.
-        pub const SLOTS: usize = 32;
-        /// How many of those slots are live, 4 bytes.
-        pub const LIVE: usize = 36;
-        /// Where the payload begins; everything from here to the end is in use.
-        pub const FLOOR: usize = 40;
-        /// The directory; bytes 44..48 are reserved and zero.
-        pub const DIRECTORY: usize = 48;
+    /// Returns the reference that stands in for a value whose pages were freed.
+    ///
+    /// **A deleted row's value is freed by the statement that deletes it**, and the
+    /// row stays in its leaf as a tombstone until the leaf is repacked. The
+    /// tombstone keeps its place so the sorted rows around it still compare, but its
+    /// value is gone, so the reference is overwritten with this one. No page has
+    /// this number, and every reader of references skips it, which is what stops a
+    /// repack or a `DROP` from freeing a page that has since been given to another
+    /// value.
+    pub fn dead() -> ExtentRef {
+        ExtentRef::run(PageId(PAGE_MASK), 0)
     }
 
-    /// How many bytes one directory entry takes.
-    const ENTRY: usize = 8;
-
-    /// Writes an empty shared page into a buffer.
-    ///
-    /// @param image - the page buffer, exactly one page long
-    /// @param tree - the tree the values belong to
-    pub fn initialise(image: &mut [u8], tree: u64) -> DbResult<()> {
-        let size = image.len();
-        if size <= at::DIRECTORY {
-            return Err(misuse("the page size leaves no room for a shared extent"));
-        }
-        for byte in image.iter_mut() {
-            *byte = 0;
-        }
-        page::write_common(image, PageKind::BlobShared, 0, tree)?;
-        page::write_u32(image, at::SLOTS, 0)?;
-        page::write_u32(image, at::LIVE, 0)?;
-        page::write_u32(image, at::FLOOR, u32::try_from(size).unwrap_or(u32::MAX))?;
-        Ok(())
-    }
-
-    /// Returns how many slots a page's directory holds.
-    ///
-    /// @param image - the page bytes
-    pub fn slots(image: &[u8]) -> DbResult<u32> {
-        page::read_u32(image, at::SLOTS)
-    }
-
-    /// Returns how many of a page's slots still hold a value.
-    ///
-    /// @param image - the page bytes
-    pub fn live(image: &[u8]) -> DbResult<u32> {
-        page::read_u32(image, at::LIVE)
-    }
-
-    /// Returns how many bytes a value of this length would need on a page.
-    ///
-    /// The value itself plus the directory entry that finds it.
-    ///
-    /// @param length - the value's length
-    pub fn cost(length: usize) -> usize {
-        length.saturating_add(ENTRY)
-    }
-
-    /// Returns whether a value of this length fits in what is left of a page.
-    ///
-    /// @param image - the page bytes
-    /// @param length - the value's length
-    pub fn has_room(image: &[u8], length: usize) -> DbResult<bool> {
-        let count = slots(image)? as usize;
-        if count >= MAX_SLOTS as usize {
-            return Ok(false);
-        }
-        let floor = page::read_u32(image, at::FLOOR)? as usize;
-        if floor > image.len() {
-            return Err(corrupt(
-                "a shared extent page's payload starts past its end",
-            ));
-        }
-        let directory = at::DIRECTORY.saturating_add(count.saturating_add(1).saturating_mul(ENTRY));
-        Ok(floor.saturating_sub(directory) >= length)
-    }
-
-    /// Returns the longest value a *fresh* shared page can hold.
-    ///
-    /// **A shared page holds less than a dedicated one, and the difference is
-    /// where a bound TEXT of 32,700 bytes was lost (task-1979, section 10,
-    /// D2).** [`super::payload_capacity`] is what an extent page of its own
-    /// holds - the page minus its header - and a shared page spends another
-    /// forty eight bytes on its own header and eight on each directory entry.
-    /// `write_extent` routed by the first number and then placed by the second,
-    /// so a value between the two reached [`place`] on a page freshly made for
-    /// it, was refused with `a shared extent page has no room for this value`,
-    /// and the caller read `bad parameter or other API misuse`. Measured on the
-    /// default 32,768 byte page: 32,000 bytes stored and 32,700 did not.
-    ///
-    /// @param page_size - the database's page size in bytes
-    pub fn capacity(page_size: usize) -> usize {
-        page_size.saturating_sub(at::DIRECTORY.saturating_add(ENTRY))
-    }
-
-    /// Places a value on a page and returns the slot it went into.
-    ///
-    /// @param image - the page bytes
-    /// @param value - the bytes to store
-    pub fn place(image: &mut [u8], value: &[u8]) -> DbResult<u16> {
-        if !has_room(image, value.len())? {
-            return Err(misuse("a shared extent page has no room for this value"));
-        }
-        let count = slots(image)?;
-        let floor = page::read_u32(image, at::FLOOR)? as usize;
-        let start = floor.saturating_sub(value.len());
-        image
-            .get_mut(start..floor)
-            .ok_or_else(|| corrupt("a shared extent payload runs past its page"))?
-            .copy_from_slice(value);
-        let entry = at::DIRECTORY.saturating_add((count as usize).saturating_mul(ENTRY));
-        page::write_u32(image, entry, u32::try_from(start).unwrap_or(0))?;
-        page::write_u32(
-            image,
-            entry.saturating_add(4),
-            u32::try_from(value.len()).unwrap_or(0),
-        )?;
-        page::write_u32(image, at::SLOTS, count.saturating_add(1))?;
-        page::write_u32(image, at::LIVE, live(image)?.saturating_add(1))?;
-        page::write_u32(image, at::FLOOR, u32::try_from(start).unwrap_or(0))?;
-        u16::try_from(count).map_err(|_| corrupt("a shared extent page has too many slots"))
-    }
-
-    /// Returns one slot's bytes.
-    ///
-    /// @param image - the page bytes
-    /// @param slot - which slot
-    pub fn read(image: &[u8], slot: u16) -> DbResult<&[u8]> {
-        if page::kind_of(image)? != PageKind::BlobShared {
-            return Err(corrupt("page is not a shared blob extent"));
-        }
-        let count = slots(image)?;
-        if u32::from(slot) >= count {
-            return Err(corrupt(format!(
-                "a reference names slot {slot} of a shared page that holds {count}"
-            )));
-        }
-        let entry = at::DIRECTORY.saturating_add((slot as usize).saturating_mul(ENTRY));
-        let start = page::read_u32(image, entry)? as usize;
-        let length = page::read_u32(image, entry.saturating_add(4))? as usize;
-        if start == 0 && length == 0 {
-            return Err(corrupt(format!(
-                "a reference names slot {slot} of a shared page, which has been freed"
-            )));
-        }
-        image
-            .get(start..start.saturating_add(length))
-            .ok_or_else(|| corrupt("a shared extent slot runs past its page"))
-    }
-
-    /// Clears one slot and returns how many are still live.
-    ///
-    /// The bytes are left where they are: compacting a page would move a value
-    /// whose reference lives in a leaf this function cannot see. The page goes
-    /// back to the free map when nothing on it is live, which is the caller's
-    /// decision to make from the number this returns.
-    ///
-    /// @param image - the page bytes
-    /// @param slot - which slot
-    pub fn clear(image: &mut [u8], slot: u16) -> DbResult<u32> {
-        if page::kind_of(image)? != PageKind::BlobShared {
-            return Err(corrupt("page is not a shared blob extent"));
-        }
-        let count = slots(image)?;
-        if u32::from(slot) >= count {
-            return Err(corrupt(format!(
-                "a free names slot {slot} of a shared page that holds {count}"
-            )));
-        }
-        let entry = at::DIRECTORY.saturating_add((slot as usize).saturating_mul(ENTRY));
-        let length = page::read_u32(image, entry.saturating_add(4))?;
-        let start = page::read_u32(image, entry)?;
-        if start == 0 && length == 0 {
-            // Already cleared. Freeing twice is not damage - a repack that
-            // carried a reference and a caller that freed it can arrive here in
-            // either order - so the live count is left alone.
-            return live(image);
-        }
-        page::write_u32(image, entry, 0)?;
-        page::write_u32(image, entry.saturating_add(4), 0)?;
-        let remaining = live(image)?.saturating_sub(1);
-        page::write_u32(image, at::LIVE, remaining)?;
-        Ok(remaining)
-    }
-
-    /// Returns whether a page is a shared extent page.
-    ///
-    /// @param image - the page bytes
-    pub fn is_shared(image: &[u8]) -> bool {
-        matches!(page::kind_of(image), Ok(PageKind::BlobShared))
-    }
-
-    /// The page a shared reference names, for a caller reading one.
-    ///
-    /// @param reference - the reference
-    pub fn page_of(reference: &super::ExtentRef) -> PageId {
-        reference.first
+    /// Reports whether this is [`ExtentRef::dead`].
+    pub fn is_dead(&self) -> bool {
+        self.first.0 == PAGE_MASK
     }
 }
+
+pub mod shared;
 
 /// Returns how many pages a value of this length needs.
 ///
@@ -580,6 +393,9 @@ pub fn encode_run(
 pub fn read_page(image: &[u8]) -> DbResult<(&[u8], PageId)> {
     if page::kind_of(image)? != PageKind::BlobExtent {
         return Err(corrupt("page is not a blob extent"));
+    }
+    if owned::is_owned(image) {
+        return owned::read_payload(image);
     }
     let length = page::read_u32(image, at::PAYLOAD)? as usize;
     if length > payload_capacity(image.len()) {

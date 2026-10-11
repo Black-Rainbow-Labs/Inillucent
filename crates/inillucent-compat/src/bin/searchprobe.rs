@@ -302,7 +302,7 @@ fn run(directory: &Path, sizes: Sizes, only: Option<&str>) -> Result<(), String>
         }
         times.push(("search.cold", each));
     }
-    println!("case                       median ms");
+    println!("case median ms");
     for (name, each) in times {
         println!("{name:<24} {:>12.3}", median(each));
     }

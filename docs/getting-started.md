@@ -102,6 +102,10 @@ inillucent --db app.rdb describe note
 rows changed. `query` runs a `SELECT` and prints the rows. `describe` prints a table's columns,
 indexes, row count and `CREATE` statement.
 
+The commands that set a database up, `exec`, `batch`, `run` and `import`, create the file when
+`--db` names one that is missing. Every other command answers `not_found` and creates nothing,
+`analyze`, `checkpoint`, `embed` and `restore` included. An empty file opens as an empty database.
+
 To see every command, or every option of one command:
 
 ```sh

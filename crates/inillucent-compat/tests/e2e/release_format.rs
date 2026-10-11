@@ -60,6 +60,18 @@ fn scratch(name: &str) -> PathBuf {
     path
 }
 
+/// Returns the format version a release's fixture carries, from byte 8 of its file.
+///
+/// @param version - the release that wrote the fixture
+fn fixture_format(version: &str) -> u32 {
+    let path = interop::directory().join(version).join("app.rdb");
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|why| panic!("{} could not be read: {why}", path.display()));
+    let mut four = [0u8; 4];
+    four.copy_from_slice(bytes.get(8..12).expect("a fixture has a header"));
+    u32::from_le_bytes(four)
+}
+
 /// Reads one staged fixture and compares every answer to what it recorded.
 ///
 /// Rule 1.1: each question answers with a value, and the value is compared to
@@ -137,6 +149,121 @@ fn the_current_build_reads_what_an_earlier_release_wrote() {
             area.display()
         );
         read_everything(&version, &database);
+    }
+}
+
+/// Opening a format 2 fixture, reading it and checkpointing it leaves it at format 2.
+///
+/// **The number moves only when a file first stores a key out of line.** A file
+/// that does not is byte for byte a format 2 file, and a build that stamped 3 on
+/// it at a checkpoint would make every release from 0.1.8 refuse a file it reads
+/// correctly. The newest fixture is the release that wrote format 2, and both
+/// copies of its meta record are read before and after. Releases from the one that
+/// creates every new file at format 3 on have format 3 fixtures, so the newest
+/// fixture at format 2 is the one read.
+#[test]
+fn opening_a_format_two_fixture_and_checkpointing_it_leaves_it_at_two() {
+    let Some(newest) = interop::versions()
+        .into_iter()
+        .rev()
+        .find(|version| fixture_format(version) == 2)
+    else {
+        panic!("tests/interop holds no format 2 fixture");
+    };
+    let area = scratch("stays-at-two");
+    let database = interop::stage(&newest, &area);
+    let formats = |path: &Path| -> (u32, u32) {
+        let bytes = std::fs::read(path).expect("the staged fixture reads");
+        let read = |at: usize| -> u32 {
+            let mut four = [0u8; 4];
+            four.copy_from_slice(bytes.get(at..at + 4).expect("a header"));
+            u32::from_le_bytes(four)
+        };
+        let page_size = read(12) as usize;
+        (read(8), read(page_size + 8))
+    };
+    assert_eq!(
+        formats(&database).0,
+        2,
+        "{newest} writes format 2, so its fixture says 2 before this build opens it"
+    );
+    {
+        let arm = default_arm();
+        let handle = open(&arm, &database);
+        let connection = handle.session();
+        assert_eq!(
+            ask(&connection, "SELECT count(*) FROM note"),
+            "121",
+            "{newest}: the fixture holds the 120 rows it was built with and the one the log holds"
+        );
+        run(
+            &connection,
+            "INSERT INTO note (id, title, body, weight, tag) VALUES (9200, 't', 'b', 1.0, 'x')",
+        );
+        run(&connection, "PRAGMA wal_checkpoint");
+    }
+    assert_eq!(
+        formats(&database),
+        (2, 2),
+        "{newest}: a checkpoint of a file with no key stored out of line moved its format"
+    );
+}
+
+/// Every fixture a format 3 release wrote reads its long keys back through their index.
+///
+/// `tools/build-interop-fixture.ps1` runs `tests/interop/build-long-keys.sql` for a
+/// release whose new file says format 3. That puts 83 keys of about 5,000 bytes,
+/// which are stored on pages of their own, and the separators between them,
+/// which are stored out of line too, into the index `long_key_k`. Every later build
+/// has to find each key through that index and read every byte of it back, so a
+/// change to how a key extent or an out of line separator is read fails here. No
+/// fixture before the first format 3 release has the table, so for those this
+/// checks nothing.
+#[test]
+fn every_format_three_fixture_reads_its_long_keys() {
+    let prefix = "replace(hex(zeroblob(2496)), '0', 'k')";
+    for version in interop::versions() {
+        if fixture_format(&version) < 3 {
+            continue;
+        }
+        let area = scratch(&format!("long-keys-{version}"));
+        let database = interop::stage(&version, &area);
+        let arm = default_arm();
+        let handle = open(&arm, &database);
+        let connection = handle.session();
+        assert_eq!(
+            ask(&connection, "PRAGMA integrity_check"),
+            "ok",
+            "{version}: the fixture with long keys does not verify under this build"
+        );
+        assert_eq!(
+            ask(
+                &connection,
+                "SELECT count(*) || ' ' || sum(length(k)) FROM long_key"
+            ),
+            "84 414583",
+            "{version}: the long keys did not read back at their full length"
+        );
+        assert_eq!(
+            ask(
+                &connection,
+                &format!("SELECT id FROM long_key INDEXED BY long_key_k WHERE k = {prefix} || 'b'")
+            ),
+            "3",
+            "{version}: the index did not find a long key that shares its first 4,992 bytes \
+             with 82 others"
+        );
+        assert_eq!(
+            ask(
+                &connection,
+                &format!(
+                    "SELECT group_concat(id, ',') FROM (SELECT id FROM long_key INDEXED BY \
+                     long_key_k WHERE k > {prefix} || '085' ORDER BY k)"
+                )
+            ),
+            "86,87,88,89,2,3,4",
+            "{version}: a range over the long keys returned them in the wrong order"
+        );
     }
 }
 

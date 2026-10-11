@@ -307,7 +307,9 @@ async function checkResearch(site, checkIn) {
   if (!fs.existsSync(file)) return;
   const module = await import(`file://${file.replace(/\\/g, '/')}`);
   const check = checkIn(file);
-  for (const study of module.studies) {
+  // `allStudies` holds every study on the site, the lab reports on their own pages included. A site
+  // built before the lab pages exports only `studies`.
+  for (const study of module.allStudies ?? module.studies) {
     for (const value of [study.title, study.summary]) check(`study ${study.id}`, value);
     for (const section of study.sections) {
       const values = [section.title, ...section.paragraphs, ...(section.points ?? []), section.decision ?? '', ...tableProse(section.table), ...figureProse(section.figure)];
@@ -327,14 +329,30 @@ function tableProse(table) {
 }
 
 /**
- * Returns the prose of a figure from the site's data: its caption, and its step and row labels.
+ * Returns the prose of a figure from the site's data: its caption, its step and row labels, and
+ * for a chart the notes on its points and markers and the text printed beside each bar.
  *
  * @param figure - a figure from the site's data, or undefined
  */
 function figureProse(figure) {
   if (!figure) return [];
-  const labels = figure.kind === 'flow' ? figure.lanes.flatMap((lane) => [lane.note ?? '', ...lane.steps]) : figure.kind === 'intervals' ? figure.rows.map((row) => row.label) : [];
-  return [figure.caption, ...labels];
+  return [figure.caption, figure.axisLabel ?? '', ...figureLabels(figure)];
+}
+
+/**
+ * Returns the words a figure prints besides its caption, by the kind of figure.
+ *
+ * @param figure - a figure from the site's data
+ */
+function figureLabels(figure) {
+  if (figure.kind === 'flow') return figure.lanes.flatMap((lane) => [lane.label ?? '', lane.note ?? '', ...lane.steps]);
+  if (figure.kind === 'intervals') return figure.rows.map((row) => row.label);
+  if (figure.kind === 'line') {
+    const notes = figure.series.flatMap((series) => [series.name, ...series.points.map((point) => point.note ?? '')]);
+    return [...notes, ...(figure.markers ?? []).map((marker) => marker.text)];
+  }
+  if (figure.kind === 'bars') return [figure.beforeLabel ?? '', figure.afterLabel ?? '', ...figure.rows.flatMap((row) => [row.label, row.display])];
+  return [];
 }
 
 /**

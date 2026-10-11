@@ -334,13 +334,7 @@ fn apply_free_map_changes(
     database: &mut Database,
     changes: &[inillucent_txn::redo::FreeMapChange],
 ) -> DbResult<()> {
-    for change in changes {
-        match change.allocated {
-            true => database.claim(change.page)?,
-            false => database.release(change.page, 1)?,
-        }
-    }
-    Ok(())
+    inillucent_txn::redo::apply_free_map_changes(database, changes)
 }
 
 /// Returns where this file's recovery starts.
@@ -700,7 +694,7 @@ fn fold_what_the_replay_grew(
     if database.pool().page_count() == database.meta().page_count {
         return Ok(());
     }
-    match database.pool().hold_for_writing() {
+    match database.pool().try_hold_for_writing() {
         Ok(()) if the_log_ends_where_the_replay_did(vfs, db_path, database.uuid(), outcome)? => {
             database.checkpoint()
         }
@@ -838,12 +832,7 @@ pub(crate) fn resync_file(
         repaired,
         &mut Keep::default(),
     )?;
-    for change in &free_map {
-        match change.allocated {
-            true => database.claim(change.page)?,
-            false => database.release(change.page, 1)?,
-        }
-    }
+    apply_free_map_changes(database, &free_map)?;
     // **Only with the writer's slot held.** A writer holds RESERVED while its
     // transaction runs, so this replay can end in the middle of its records,
     // and cutting the log there would remove them. See

@@ -218,12 +218,12 @@ fn the_capability_table_matches_the_engine() {
                     (false, Outcome::Answered(got)) if got != expect => {}
                     (false, Outcome::Refused(_)) => {}
                     (true, other) => wrong.push(format!(
-                        "`{}` is declared supported and answered `{}` where `{expect}` was                          required - a registration nothing can reach is the failure this                          row exists to catch",
+                        "`{}` is declared supported and answered `{}` where `{expect}` was required - a registration nothing can reach is the failure this row exists to catch",
                         entry.name,
                         described(&other)
                     )),
                     (false, other) => wrong.push(format!(
-                        "`{}` is declared unsupported and answered `{expect}` anyway ({}).                          The engine has grown it; update capability.rs.",
+                        "`{}` is declared unsupported and answered `{expect}` anyway ({}). The engine has grown it; update capability.rs.",
                         entry.name,
                         described(&other)
                     )),
@@ -234,12 +234,12 @@ fn the_capability_table_matches_the_engine() {
                 (false, Outcome::Answered(got)) if got != expect => {}
                 (false, Outcome::Refused(_)) => {}
                 (true, other) => wrong.push(format!(
-                    "`{}` is declared supported and a keyed database answered `{}` where                      `{expect}` was required",
+                    "`{}` is declared supported and a keyed database answered `{}` where `{expect}` was required",
                     entry.name,
                     described(&other)
                 )),
                 (false, other) => wrong.push(format!(
-                    "`{}` is declared unsupported and a keyed database answered `{expect}`                      anyway ({}). The engine has grown it; update capability.rs.",
+                    "`{}` is declared unsupported and a keyed database answered `{expect}` anyway ({}). The engine has grown it; update capability.rs.",
                     entry.name,
                     described(&other)
                 )),

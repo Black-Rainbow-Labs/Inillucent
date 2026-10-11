@@ -16,6 +16,11 @@
 //! is the bulk build's own.
 
 use super::*;
+use crate::separator::{slot_bytes_for, store_separators};
+
+mod leafplan;
+use inillucent_pool::interior::SlotBytes;
+use leafplan::{plan_leaves, LeafPlan};
 
 /// Records one bulk-built page's allocation and writes the page itself straight
 /// into the data file.
@@ -90,81 +95,33 @@ fn write_built_page(
     database.pool().write_built_page(id, image, stamp)
 }
 
-/// How many rows each leaf takes, and the separator that opens each one.
+/// How a bulk built row's key becomes the bytes a descent compares.
 ///
-/// Pass one of the build. Nothing is encoded, allocated or written: this only asks
-/// the leaf builder how many of the rows at a given offset fit, and encodes the
-/// first key of each group as the separator the level above will carry.
-///
-/// An empty run still produces one boundary and one separator, because an empty
-/// tree is still a tree: one empty leaf, so every reader has a page to land on and
-/// nothing has to special-case a root that does not exist. `empty` is what tells
-/// pass two to write that leaf rather than encode no rows into it.
-///
-/// @param builder - the leaf builder, which owns the page size and the layout
-/// @param rows - the rows, already in key order
-/// @param key_columns - how many leading columns are the key
-/// @param encoding - how a key tuple becomes comparable bytes
-/// @param collations - one per key column
-/// @param directions - one per key column, true for descending
-fn plan_leaves<'d>(
-    builder: &LeafBuilder,
-    rows: &dyn crate::leaf::Rows<'d>,
-    key_columns: usize,
+/// A value spilled from a row records that key on its first page, so the step that
+/// moves pages can find the leaf that holds the reference.
+struct KeyOrder<'a> {
+    /// How the key tuple is encoded.
     encoding: KeyEncoding,
-    collations: &[Collation],
-    directions: &[bool],
-) -> DbResult<LeafPlan> {
-    let mut boundaries: Vec<usize> = Vec::new();
-    let mut separators: Vec<Vec<u8>> = Vec::new();
-    let mut head: Vec<Datum<'d>> = Vec::with_capacity(key_columns);
-    let mut at = 0usize;
-    let mut row_count = 0u64;
-    let total = rows.len();
-    while at < total {
-        let placed = builder.fit(rows, at, BULK_FILL, true);
-        if placed == 0 {
-            // Every oversized text and blob would have gone out of line, so what is
-            // left is keys, fixed-width slots and sixteen bytes per reference. A row
-            // that still does not fit is one whose *key* is most of a page.
-            return Err(misuse(
-                "a row's keys and fixed-width columns alone are larger than a page",
-            ));
-        }
-        head.clear();
-        for column in 0..key_columns {
-            head.push(rows.value(at, column));
-        }
-        let mut separator = Vec::new();
-        encoding.encode_into(&head, collations, directions, &mut separator);
-        separators.push(separator);
-        boundaries.push(placed);
-        at = at.saturating_add(placed);
-        row_count = row_count.saturating_add(placed as u64);
-    }
-    let empty = boundaries.is_empty();
-    if empty {
-        boundaries.push(0);
-        separators.push(Vec::new());
-    }
-    Ok(LeafPlan {
-        boundaries,
-        separators,
-        row_count,
-        empty,
-    })
+    /// The collation of each key column.
+    collations: &'a [Collation],
+    /// The direction of each key column.
+    directions: &'a [bool],
+    /// How many leading columns are the key.
+    key_columns: usize,
 }
 
-/// What pass one worked out about the leaves.
-struct LeafPlan {
-    /// How many rows each leaf holds, in order.
-    boundaries: Vec<usize>,
-    /// Each leaf's first key, encoded, one per boundary.
-    separators: Vec<Vec<u8>>,
-    /// How many rows the tree will hold.
-    row_count: u64,
-    /// Whether the run was empty and the single leaf is the empty one.
-    empty: bool,
+impl KeyOrder<'_> {
+    /// Returns the encoded key of one row of a source.
+    ///
+    /// @param rows - the rows being built
+    /// @param row - which row, in the source's own order
+    fn owner_of<'d>(&self, rows: &dyn crate::leaf::Rows<'d>, row: usize) -> Vec<u8> {
+        let values: Vec<Datum<'d>> = (0..self.key_columns)
+            .map(|column| rows.value(row, column))
+            .collect();
+        self.encoding
+            .encode_ordered(&values, self.collations, self.directions)
+    }
 }
 
 /// The leaves pass one planned, written as one run of consecutive pages.
@@ -182,6 +139,7 @@ struct LeafPlan {
 /// @param database - the file being built into
 /// @param log - where the records go, when there are any
 /// @param tree_id - the tree these pages belong to
+/// @param keys - how a row's key becomes the bytes a descent compares, which a value spilled from the row records
 /// @param builder - the leaf builder
 /// @param rows - the rows, already in key order
 /// @param plan - what pass one worked out
@@ -189,6 +147,7 @@ fn write_leaf_run<'d>(
     database: &mut Database,
     log: &mut Option<&mut dyn crate::write::TreeLog>,
     tree_id: u64,
+    keys: &KeyOrder<'_>,
     builder: &LeafBuilder,
     rows: &dyn crate::leaf::Rows<'d>,
     plan: &LeafPlan,
@@ -203,6 +162,7 @@ fn write_leaf_run<'d>(
         let mut image = if plan.empty {
             builder.encode_empty()?
         } else {
+            let owner_of = |row: usize| keys.owner_of(rows, placed_at.saturating_add(row));
             let mut spiller = Extender {
                 database,
                 log: match log.as_deref_mut() {
@@ -210,7 +170,9 @@ fn write_leaf_run<'d>(
                     None => &mut nowhere,
                 },
                 tree_id,
+                key_columns: keys.key_columns,
                 written: Vec::new(),
+                owner_of: &owner_of,
             };
             builder.encode_rows(rows, placed_at, placed, Some(&mut spiller))?
         };
@@ -280,14 +242,16 @@ fn build_interior_levels(
         let mut parent_keys: Vec<Vec<u8>> = Vec::new();
         let mut cursor = 0usize;
         while cursor < children.len() {
-            let remaining_keys: Vec<&[u8]> = child_keys
+            // What each separator would cost the page: itself, or the reference
+            // and prefix of it when it is too long to keep whole.
+            let remaining_sizes: Vec<usize> = child_keys
                 .get(cursor.saturating_add(1)..)
                 .unwrap_or(&[])
                 .iter()
-                .map(|key| key.as_slice())
+                .map(|key| slot_bytes_for(key.len(), page_size))
                 .collect();
             let fit = interior
-                .capacity(&remaining_keys)
+                .capacity_of_sizes(&remaining_sizes)
                 .min(children.len().saturating_sub(cursor))
                 .max(1);
             let group: Vec<Swip> = children
@@ -296,13 +260,19 @@ fn build_interior_levels(
                 .iter()
                 .map(|page| Swip::unswizzled(*page))
                 .collect();
-            let group_separators: Vec<&[u8]> = child_keys
-                .get(cursor.saturating_add(1)..cursor.saturating_add(fit))
-                .unwrap_or(&[])
+            let stored = store_separators(
+                database,
+                log,
+                tree_id,
+                child_keys
+                    .get(cursor.saturating_add(1)..cursor.saturating_add(fit))
+                    .unwrap_or(&[]),
+            )?;
+            let group_separators: Vec<SlotBytes<'_>> = stored
                 .iter()
-                .map(|key| key.as_slice())
+                .map(|(out_of_line, bytes)| (*out_of_line, bytes.as_slice()))
                 .collect();
-            let mut image = interior.build(&group_separators, &group)?;
+            let mut image = interior.build_slots(&group_separators, &group)?;
             let id = database.allocate(1)?;
             write_built_page(log, database, id, &mut image)?;
             pages_written = pages_written.saturating_add(1);
@@ -487,8 +457,10 @@ impl PagedTree {
     /// @param columns - the column directory
     /// @param key_columns - how many leading columns form the key
     /// @param rows - the rows, already sorted by the key columns
-    /// @param sync - whether to sync the data file once the pages are written
-    fn bulk_build_rows_syncing<'d>(
+    /// @param sync - whether to sync the data file once the pages are written; the engine passes
+    ///   false and syncs once before the commit that names the tree, so a transaction that
+    ///   builds 1,600 tables syncs the file once and not 1,600 times
+    pub fn bulk_build_rows_syncing<'d>(
         database: &mut Database,
         mut log: Option<&mut dyn crate::write::TreeLog>,
         tree_id: u64,
@@ -502,6 +474,13 @@ impl PagedTree {
         let collations = collations_of(&columns, key_columns);
         let directions = directions_of(&columns, key_columns);
         let builder = LeafBuilder::new(page_size, tree_id, columns.clone(), key_columns)?;
+        crate::keylimit::refuse_rows_with_a_key_over_the_limit(
+            rows,
+            key_columns,
+            encoding,
+            &collations,
+            &directions,
+        )?;
 
         let plan = plan_leaves(
             &builder,
@@ -510,9 +489,16 @@ impl PagedTree {
             encoding,
             &collations,
             &directions,
+            page_size,
         )?;
         let row_count = plan.row_count;
-        let run = write_leaf_run(database, &mut log, tree_id, &builder, rows, &plan)?;
+        let keys = KeyOrder {
+            encoding,
+            collations: &collations,
+            directions: &directions,
+            key_columns,
+        };
+        let run = write_leaf_run(database, &mut log, tree_id, &keys, &builder, rows, &plan)?;
         let leaves = run.leaves;
         let first_leaf = run.first_leaf;
         let levels = build_interior_levels(
@@ -569,6 +555,7 @@ impl PagedTree {
             hint_victim: std::cell::Cell::new(0),
             largest_hint: std::cell::Cell::new(None),
             stats: std::cell::Cell::new(crate::write::WriteStats::default()),
+            merge_backoff: RefCell::new(std::collections::HashMap::new()),
             last_leaf: std::cell::Cell::new(None),
         })
     }

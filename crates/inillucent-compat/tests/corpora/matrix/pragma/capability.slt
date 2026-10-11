@@ -7,3 +7,21 @@ capability integrity_check
 query T rowsort
 PRAGMA integrity_check
 
+case capability-auto-vacuum
+capability auto_vacuum
+
+statement ok
+PRAGMA auto_vacuum = FULL
+
+statement ok
+CREATE TABLE cap_av (a INTEGER PRIMARY KEY, b)
+
+statement ok
+WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 400) INSERT INTO cap_av SELECT n, zeroblob(5000) FROM c
+
+statement ok
+DELETE FROM cap_av WHERE a > 10
+
+query I rowsort
+PRAGMA freelist_count
+

@@ -67,16 +67,17 @@ of each result. The same studies are at [inillucent.com/research](https://inillu
 |---|---|---|
 | 20 | [Research](research/README.md) | The list of studies, newest first |
 | 21 | [Which retrieval techniques find the right text for RAG](research/rag-retrieval-study.md) | Chunking, headings, embedding models, fusion, rerankers and language model helpers, measured on 67,369 emails, and the features each result led to |
+| 22 | [How inillucent was made faster than SQLite](research/performance-hill-climbing.md) | The hill climbs that took the engine from 432% slower than SQLite to 505% faster, how each benchmark was made trustworthy, the changes that moved the numbers most, and the advice taken and not taken |
 
 ## Working on it
 
 | | Page | What it covers |
 |---|---|---|
-| 22 | [Repository and building](repository.md) | The crates and what each one does, building, running the tests, and the test coverage table |
-| 23 | [Dependency policy](dependency-policy.md) | Which crates a production crate may use, and why the allowed list is short |
-| 24 | [Writing style](writing-style.md) | How to write and check a page in this folder or a chapter on inillucent.com |
-| 25 | [Roadmap](roadmap.md) | What is not built yet, in the order it is being worked on |
-| 26 | [Closed items](closed-items.md) | What came off the roadmap, and the measurement that closed each item |
+| 23 | [Repository and building](repository.md) | The crates and what each one does, building, running the tests, and the test coverage table |
+| 24 | [Dependency policy](dependency-policy.md) | Which crates a production crate may use, and why the allowed list is short |
+| 25 | [Writing style](writing-style.md) | How to write and check a page in this folder or a chapter on inillucent.com |
+| 26 | [Roadmap](roadmap.md) | What is not built yet, in the order it is being worked on |
+| 27 | [Closed items](closed-items.md) | What came off the roadmap, and the measurement that closed each item |
 | | [`AGENTS.md`](../AGENTS.md) | The starting page for an AI agent that uses or changes this repository |
 | | [`agent-skills/`](../agent-skills/README.md) | One page for each common job, readable by any AI agent |
 

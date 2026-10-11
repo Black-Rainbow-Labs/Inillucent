@@ -160,7 +160,7 @@ fn build_plain(path: &std::path::Path, rows: u32, page_size: usize) -> Result<Da
         .map_err(|error| error.message().to_string())?;
     connection
         .execute_batch(&format!(
-            "INSERT INTO t(id,label) SELECT seq, 'label ' || seq              FROM (SELECT ((a.n*10+b.n)*10+c.n)*10+d.n+1 AS seq              FROM digits a, digits b, digits c, digits d) WHERE seq <= {rows};"
+            "INSERT INTO t(id,label) SELECT seq, 'label ' || seq FROM (SELECT ((a.n*10+b.n)*10+c.n)*10+d.n+1 AS seq FROM digits a, digits b, digits c, digits d) WHERE seq <= {rows};"
         ))
         .map_err(|error| error.message().to_string())?;
     Ok(database)
@@ -356,7 +356,7 @@ fn spread_delete(
     let per_row = elapsed.as_secs_f64() * 1e6 / (changed.max(1) as f64);
     println!(
         "spread page {page_size:>6} rows {rows:>7} pool {:>4} MiB index {}  delete {:>8.1} ms  {per_row:>7.2} us/row  \
-         reads {:>7}  hits {:>9}  writes {:>7}  cooled {:>7}  evicted {:>7}  rewarms {:>7}  merges {:>4}  [{plan}]",
+         reads {:>7}  hits {:>9}  writes {:>7}  cooled {:>7}  evicted {:>7}  rewarms {:>7}  merges {:>4}  dissolved {:>3}  [{plan}]",
         pool_bytes >> 20,
         u8::from(indexed),
         elapsed.as_secs_f64() * 1e3,
@@ -367,6 +367,7 @@ fn spread_delete(
         after.evicted.saturating_sub(before.evicted),
         after.rewarms.saturating_sub(before.rewarms),
         stats.merges,
+        stats.parents_dissolved,
     );
     Ok(())
 }
@@ -613,6 +614,10 @@ fn subtract_stats(
         compactions: after.compactions.saturating_sub(before.compactions),
         splits: after.splits.saturating_sub(before.splits),
         merges: after.merges.saturating_sub(before.merges),
+        merge_attempts: after.merge_attempts.saturating_sub(before.merge_attempts),
+        parents_dissolved: after
+            .parents_dissolved
+            .saturating_sub(before.parents_dissolved),
         compaction_nanos: after
             .compaction_nanos
             .saturating_sub(before.compaction_nanos),

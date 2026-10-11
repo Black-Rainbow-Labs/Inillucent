@@ -72,6 +72,25 @@ impl<'p> LeafRef<'p> {
     pub fn extent_at(&self, row: usize, column: usize) -> DbResult<ExtentRef> {
         self.column(column)?.extent(row)
     }
+    /// Returns the references of one sorted row's non key out of line values.
+    ///
+    /// The values the statement that deletes the row frees. A key column's value
+    /// is left out: the sorted rows around a tombstone are still compared with it.
+    ///
+    /// @param row - the row's position in the sorted region
+    pub fn sorted_value_extents(&self, row: usize) -> DbResult<Vec<ExtentRef>> {
+        let mut refs = Vec::new();
+        if !self.has_extents() {
+            return Ok(refs);
+        }
+        for column in self.key_columns()..self.column_count() {
+            let mini = self.column(column)?;
+            if mini.class_at(row)? == ValueClass::Extent {
+                refs.push(mini.extent(row)?);
+            }
+        }
+        Ok(refs)
+    }
     /// Reports whether the leaf is in format 2's layout, with a delta directory.
     ///
     /// See [`LEAF_DELTA_DIRECTORY`]. `false` is a leaf format 1 wrote.
@@ -1418,6 +1437,19 @@ impl<'p> Rows<'p> for LiveSource<'p> {
             .unwrap_or(Datum::Null)
     }
 }
+/// A key column value that is stored out of line, as the leaf describes it.
+///
+/// What a comparison can read without the pool: where the whole value is, the
+/// first bytes of it, and the column layout that says how to read the class.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpilledKey<'p> {
+    /// Where the whole value is stored.
+    pub(crate) reference: ExtentRef,
+    /// The leading bytes the leaf keeps.
+    pub(crate) prefix: &'p [u8],
+    /// The layout of the column the value is in.
+    pub(crate) physical: PhysicalType,
+}
 /// A view over one column's class array and value slots.
 #[derive(Clone, Copy, Debug)]
 pub struct MiniColumn<'p> {
@@ -1657,19 +1689,86 @@ impl<'p> MiniColumn<'p> {
         Ok(false)
     }
 
+    /// Returns where in the page the sixteen bytes of one out-of-line value's
+    /// reference begin.
+    ///
+    /// For the step that moves an extent page, which rewrites a reference in place.
+    ///
+    /// @param row - the row's position in the sorted region
+    pub fn extent_offset(&self, row: usize) -> DbResult<usize> {
+        if self.class_at(row)? != ValueClass::Extent {
+            return Err(misuse("that value is not stored out of line"));
+        }
+        self.slot_u32(row)
+    }
+
     /// Returns the extent reference one out-of-line value names.
     ///
     /// @param row - the row's position in the sorted region
     pub fn extent(&self, row: usize) -> DbResult<ExtentRef> {
-        if self.class_at(row)? != ValueClass::Extent {
-            return Err(misuse("that value is not stored out of line"));
-        }
-        let offset = self.slot_u32(row)?;
+        let offset = self.extent_offset(row)?;
         let raw = self
             .page
             .get(offset..offset.saturating_add(EXTENT_REF_BYTES))
             .ok_or_else(|| corrupt("an extent reference runs past the page"))?;
         ExtentRef::decode(raw)
+    }
+
+    /// Reports whether the column directory marks this column as part of the key.
+    pub fn is_key(&self) -> bool {
+        self.flags & COLUMN_KEY != 0
+    }
+
+    /// Returns the leading bytes the leaf keeps for a key value stored out of line.
+    ///
+    /// The heap record of such a value is the sixteen byte reference, a `u16`
+    /// prefix length and then the prefix. Only a key column has the prefix; an
+    /// ordinary column's record is the reference alone.
+    ///
+    /// @param row - the row's position in the sorted region
+    pub fn key_prefix(&self, row: usize) -> DbResult<&'p [u8]> {
+        if !self.is_key() {
+            return Err(corrupt(
+                "only a key column keeps a prefix beside a reference",
+            ));
+        }
+        if self.class_at(row)? != ValueClass::Extent {
+            return Err(misuse("that value is not stored out of line"));
+        }
+        let record = self.slot_u32(row)?.saturating_add(EXTENT_REF_BYTES);
+        let length = self
+            .page
+            .get(record..record.saturating_add(KEY_PREFIX_LENGTH_BYTES))
+            .and_then(|raw| <[u8; 2]>::try_from(raw).ok())
+            .map(|raw| u16::from_le_bytes(raw) as usize)
+            .ok_or_else(|| corrupt("a key prefix length runs past the page"))?;
+        let start = record.saturating_add(KEY_PREFIX_LENGTH_BYTES);
+        self.page
+            .get(start..start.saturating_add(length))
+            .ok_or_else(|| corrupt("a key prefix runs past the page"))
+    }
+
+    /// Returns the reference and prefix of a key value stored out of line, or
+    /// `None` when this row's value is held in the leaf.
+    ///
+    /// **A column the directory says is all typed answers `None` from the flag
+    /// alone**, so a key of integers or of short text never reads its class
+    /// array here. Only a key column that holds something other than typed
+    /// values pays for the class lookup.
+    ///
+    /// @param row - the row's position in the sorted region
+    pub(crate) fn spilled_key(&self, row: usize) -> DbResult<Option<SpilledKey<'p>>> {
+        if self.flags & (COLUMN_ALL_TYPED | COLUMN_KEY) != COLUMN_KEY {
+            return Ok(None);
+        }
+        if self.class_at(row)? != ValueClass::Extent {
+            return Ok(None);
+        }
+        Ok(Some(SpilledKey {
+            reference: self.extent(row)?,
+            prefix: self.key_prefix(row)?,
+            physical: self.physical,
+        }))
     }
 
     /// Reports whether this column's heap references are `(u16, u16)` pairs.

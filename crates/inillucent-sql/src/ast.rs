@@ -64,7 +64,11 @@ pub enum Literal {
     /// `NULL`.
     Null,
     /// `TRUE` or `FALSE`, which SQLite treats as 1 and 0.
-    Boolean(bool),
+    ///
+    /// The name is the word as written. SQLite reads `true` as an identifier first, so a column
+    /// called `true` is what `SELECT true` returns, and the binder looks the name up before it
+    /// takes the word for the number.
+    Boolean(bool, NameId),
     /// An integer literal, as written.
     Integer(Vec<u8>),
     /// A floating-point literal, as written.

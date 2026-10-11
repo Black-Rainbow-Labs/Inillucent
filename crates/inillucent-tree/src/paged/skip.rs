@@ -71,6 +71,17 @@ impl PagedTree {
         // leaf starts with. A tree nobody has written to never sets it, so the
         // resynchronising `upper_bound` below is not on the clean path at all.
         let mut resync: Option<Vec<OwnedDatum>> = None;
+        // **The bound that stops a scan of a damaged tree, from the file's size.**
+        // It was the tree's row count, which is the estimate the catalog
+        // stores and which lags behind rows that sit in leaves' delta areas. A
+        // table indexed and then filled by forty processes, a hundred rows
+        // each, failed `SELECT DISTINCT r` with "database disk image is
+        // malformed" and a clean `integrity_check`. No tree holds more rows
+        // than the file holds bytes.
+        let most_rows = pool
+            .page_count()
+            .saturating_mul(pool.page_size() as u64)
+            .max(self.row_count);
 
         loop {
             if page.is_none() {
@@ -83,7 +94,8 @@ impl PagedTree {
             let step = 'step: {
                 let leaf = LeafRef::parse(&guard)?
                     .with_collations(&self.collations)
-                    .with_directions(&self.directions);
+                    .with_directions(&self.directions)
+                    .with_pool(pool);
                 let resolved = self.read_extents(pool, &leaf)?;
                 let leaf = leaf.with_extents(&resolved);
                 if leaf.has_writes() {
@@ -148,7 +160,7 @@ impl PagedTree {
                         }
                     }
                     visited = visited.saturating_add(1);
-                    if visited > self.row_count.saturating_add(1) {
+                    if visited > most_rows {
                         return Err(corrupt("a skip scan visited more rows than the tree holds"));
                     }
                     // The borrows of the prefix live on the stack when the
@@ -214,81 +226,154 @@ impl PagedTree {
                         spilled = held.iter().map(OwnedDatum::borrow).collect();
                         spilled.as_slice()
                     };
-                    let mut found = None;
-                    if walking {
-                        let mut here = right;
-                        let mut examined = 0usize;
-                        while !here.is_none() {
-                            let stepped = pool.fetch(here)?;
-                            let (low, rows, next) = {
-                                let leaf = LeafRef::parse(&stepped)?
-                                    .with_collations(&self.collations)
-                                    .with_directions(&self.directions);
-                                (
-                                    leaf.upper_bound(borrowed)?,
-                                    leaf.row_count(),
-                                    leaf.right_sibling(),
-                                )
-                            };
-                            if low < rows {
-                                found = Some((here, low, stepped));
-                                break;
-                            }
-                            if next.is_none() {
-                                return Ok(());
-                            }
-                            examined = examined.saturating_add(1);
-                            if examined >= WALK_BUDGET {
-                                break;
-                            }
-                            here = next;
-                        }
-                        if found.is_none() {
+                    let walked = match walking {
+                        true => self.walk_past(pool, borrowed, right)?,
+                        false => Walked::GaveUp,
+                    };
+                    let landing = match walked {
+                        Walked::Landed(landing) => landing,
+                        Walked::End => return Ok(()),
+                        Walked::GaveUp => {
                             // The run is longer than the walk will follow, so
                             // this tree's runs span more leaves than a step is
                             // worth and every later seek descends. One failed
                             // walk per scan is what the measurement costs.
                             walking = false;
-                        }
-                    }
-                    match found {
-                        Some((landed, low, stepped)) => {
-                            page = landed;
-                            row = low;
-                            carried = Some(stepped);
-                        }
-                        None => {
-                            let seek = self.after_prefix(borrowed);
-                            let (landed_guard, landed) =
-                                self.descend_guard(pool, seek.as_slice())?;
-                            let next = {
-                                let leaf = LeafRef::parse(&landed_guard)?
-                                    .with_collations(&self.collations)
-                                    .with_directions(&self.directions);
-                                let low = leaf.upper_bound(borrowed)?;
-                                if low < leaf.row_count() {
-                                    Some((landed, low, true))
-                                } else {
-                                    let right = leaf.right_sibling();
-                                    if right.is_none() {
-                                        None
-                                    } else {
-                                        Some((right, 0, false))
-                                    }
-                                }
-                            };
-                            match next {
-                                Some((next_page, next_row, open)) => {
-                                    page = next_page;
-                                    row = next_row;
-                                    carried = if open { Some(landed_guard) } else { None };
-                                }
+                            match self.descend_past(pool, borrowed)? {
+                                Some(landing) => landing,
                                 None => return Ok(()),
                             }
                         }
+                    };
+                    page = landing.page;
+                    row = landing.row;
+                    carried = landing.open;
+                    // **A leaf with writes is walked from its first row, so
+                    // the value just answered is carried with it.** The
+                    // position came from the leaf's packed rows, and the walk
+                    // indexes the packed rows and the delta area merged, so a
+                    // position from one used in the other skipped values: the
+                    // same query returned 30 of 40. Landing at row 0 and
+                    // skipping the run of the last value is the walk's own
+                    // resynchronising.
+                    if row == 0 {
+                        resync = Some(held.clone());
                     }
                 }
             }
         }
     }
+
+    /// Steps right from a leaf, up to `WALK_BUDGET` leaves, looking for the
+    /// first row above a prefix.
+    ///
+    /// A leaf with writes is landed on at its first row, because its packed
+    /// rows alone do not say where its values are; see the caller.
+    ///
+    /// @param pool - the buffer pool
+    /// @param borrowed - the prefix just answered
+    /// @param right - the first leaf to look at
+    fn walk_past<'p>(
+        &self,
+        pool: &'p Pool,
+        borrowed: &[Datum<'_>],
+        right: PageId,
+    ) -> DbResult<Walked<'p>> {
+        let mut here = right;
+        let mut examined = 0usize;
+        while !here.is_none() {
+            let stepped = pool.fetch(here)?;
+            let (low, rows, next) = {
+                let leaf = LeafRef::parse(&stepped)?
+                    .with_collations(&self.collations)
+                    .with_directions(&self.directions)
+                    .with_pool(pool);
+                match leaf.has_writes() {
+                    true => (0, 1, leaf.right_sibling()),
+                    false => (
+                        leaf.upper_bound(borrowed)?,
+                        leaf.row_count(),
+                        leaf.right_sibling(),
+                    ),
+                }
+            };
+            if low < rows {
+                return Ok(Walked::Landed(Landing {
+                    page: here,
+                    row: low,
+                    open: Some(stepped),
+                }));
+            }
+            if next.is_none() {
+                return Ok(Walked::End);
+            }
+            examined = examined.saturating_add(1);
+            if examined >= WALK_BUDGET {
+                return Ok(Walked::GaveUp);
+            }
+            here = next;
+        }
+        Ok(Walked::GaveUp)
+    }
+
+    /// Descends to the first row above a prefix, or returns `None` when the
+    /// tree has none.
+    ///
+    /// @param pool - the buffer pool
+    /// @param borrowed - the prefix just answered
+    fn descend_past<'p>(
+        &self,
+        pool: &'p Pool,
+        borrowed: &[Datum<'_>],
+    ) -> DbResult<Option<Landing<'p>>> {
+        let seek = self.after_prefix(borrowed);
+        let (landed_guard, landed) = self.descend_guard(pool, seek.as_slice())?;
+        let (low, writes, rows, right) = {
+            let leaf = LeafRef::parse(&landed_guard)?
+                .with_collations(&self.collations)
+                .with_directions(&self.directions)
+                .with_pool(pool);
+            let writes = leaf.has_writes();
+            let low = match writes {
+                true => 0,
+                false => leaf.upper_bound(borrowed)?,
+            };
+            (low, writes, leaf.row_count(), leaf.right_sibling())
+        };
+        if writes || low < rows {
+            return Ok(Some(Landing {
+                page: landed,
+                row: low,
+                open: Some(landed_guard),
+            }));
+        }
+        if right.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Landing {
+            page: right,
+            row: 0,
+            open: None,
+        }))
+    }
+}
+
+/// Where a skip scan goes next after the prefix it just answered.
+struct Landing<'p> {
+    /// The leaf.
+    page: PageId,
+    /// The row in it to start from.
+    row: usize,
+    /// The leaf, still pinned, when the step already has it open.
+    open: Option<PageGuard<'p>>,
+}
+
+/// What a walk to the right found.
+enum Walked<'p> {
+    /// A leaf with a row above the prefix.
+    Landed(Landing<'p>),
+    /// The end of the tree: no row is above the prefix.
+    End,
+    /// The walk ran out of budget, or was not tried; descend instead.
+    GaveUp,
 }

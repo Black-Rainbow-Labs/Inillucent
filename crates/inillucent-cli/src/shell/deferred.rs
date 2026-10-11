@@ -49,7 +49,7 @@ struct Source {
     /// The line of input it started on.
     line: usize,
     /// The excerpt an error in it shows.
-    excerpt: Option<String>,
+    excerpt: Option<super::Excerpt>,
     /// Which line of input it arrived in; see `Shell::chunk_number`.
     chunk: u64,
 }

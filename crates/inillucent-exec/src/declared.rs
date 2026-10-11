@@ -884,6 +884,38 @@ fn source_text_of(table: &TableInfo, position: usize) -> Vec<u8> {
     table
         .checks
         .get(position)
-        .map(|declared| declared.expr_sql.clone())
+        .map(|declared| dequote_label(&declared.expr_sql))
         .unwrap_or_default()
+}
+
+/// Strips quoting from the start of a predicate's source text, as SQLite does to a check's name.
+///
+/// SQLite stores the predicate's text as the constraint's name through `sqlite3ExprListSetName`
+/// with dequoting on, so a predicate that begins with a quote character is cut at the matching
+/// close: `CHECK("a" IN ('x','y'))` fails with `CHECK constraint failed: a`. The rest of the
+/// text is dropped. A doubled quote character stands for one.
+///
+/// @param text - the predicate's source text
+fn dequote_label(text: &[u8]) -> Vec<u8> {
+    let Some(first) = text.first().copied() else {
+        return Vec::new();
+    };
+    let close = match first {
+        b'\'' | b'"' | b'`' => first,
+        b'[' => b']',
+        _ => return text.to_vec(),
+    };
+    let mut label = Vec::with_capacity(text.len());
+    let mut index = 1usize;
+    while let Some(byte) = text.get(index).copied() {
+        if byte == close {
+            if text.get(index.saturating_add(1)).copied() != Some(close) {
+                break;
+            }
+            index = index.saturating_add(1);
+        }
+        label.push(byte);
+        index = index.saturating_add(1);
+    }
+    label
 }

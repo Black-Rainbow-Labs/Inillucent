@@ -181,6 +181,41 @@ fn directory_for(name: &str) -> String {
 fn run_shell(program: &Path, directory: &Path, script: &str) -> String {
     let _ = std::fs::remove_dir_all(directory);
     std::fs::create_dir_all(directory).expect("a case directory can be made");
+    sessions_of(script)
+        .iter()
+        .map(|part| run_session(program, directory, part))
+        .collect()
+}
+
+/// Splits a case's script at each line that begins `-- reopen`.
+///
+/// **A case can close the database and open it again.** Every case used to
+/// run in one shell process, so nothing in the corpus checked what a closed
+/// file holds: a value that only lived in memory, such as a `PRAGMA
+/// user_version` a `ROLLBACK` should have undone, read back correctly in the
+/// same session and was never compared after a reopen. Each part runs in a
+/// shell process of its own on the same file.
+///
+/// @param script - the case's script
+fn sessions_of(script: &str) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    for line in script.split_inclusive('\n') {
+        if line.starts_with("-- reopen") {
+            parts.push(String::new());
+        } else if let Some(last) = parts.last_mut() {
+            last.push_str(line);
+        }
+    }
+    parts
+}
+
+/// Runs one shell process over a case's database and returns its standard
+/// output followed by its standard error, as [`run_shell`] describes.
+///
+/// @param program - the shell
+/// @param directory - the case's directory, which already exists
+/// @param script - the part of the case this process runs
+fn run_session(program: &Path, directory: &Path, script: &str) -> String {
     let mut child = Command::new(program)
         .arg(directory.join("case.db"))
         .current_dir(directory)

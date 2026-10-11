@@ -15,9 +15,12 @@ search and keyword search built in. Everything lives in one file.
 - SQLite's SQL dialect. 402 of 416 probed SQL cases give SQLite's exact answer. A PostgreSQL dialect
   is on the roadmap.
 - A storage engine written from scratch in Rust.
-- 419% faster than SQLite overall, and 3,061% faster on reads by key.[^1]
-- 64% faster than SQLite when called the way programs call it: 136% faster from Python, 207%
-  faster from Node and 46% faster through scripts piped into the shell.[^4]
+- 419% faster than SQLite overall in the last graded run, and 505% faster in the newest run of
+  release 2.4.2. Reads by key are 3,061% faster.[^1]
+- 276% faster than SQLite through the `Connection` API on 48 common and edge case workloads, using
+  67% less processor time.[^2]
+- 74% faster than SQLite when called the way programs call it: 418% faster from Node, 135% from
+  Python and 49% through scripts piped into the shell.[^4]
 - 174% faster than PostgreSQL with pgvector for semantic search.[^3]
 - 302% better than PostgreSQL full text search at finding identifiers.[^3]
 - A command line and an MCP server with the same commands.
@@ -107,8 +110,9 @@ Every install gives you four programs:
 
 Your SQLite queries, schemas and `sqlite3` scripts run unchanged: joins, recursive CTEs, window
 functions, triggers, foreign keys, upserts, `RETURNING`, JSON, FTS5 and more. The storage engine
-under that SQL is written from scratch in Rust. It runs 419% faster than SQLite overall and 3,061%
-faster on reads by key,[^1] and it uses 67% less processor time.[^2]
+under that SQL is written from scratch in Rust. It runs 419% faster than SQLite overall in the last
+graded run and 505% faster in the newest,[^1] and through the API a program calls it uses 67% less
+processor time than SQLite.[^2]
 [SQL support](docs/sql.md)
 
 ### Search by meaning and by keyword
@@ -239,13 +243,19 @@ MIT. See [LICENSE](LICENSE).
     with release 1.0.32, with both programs on the same eight performance cores. Overall: 419%
     faster, the weighted geometric mean across ten families of work, with a 95% lower bound of 405%.
     Reads by key: 3,061% faster. Every result is hashed and compared with SQLite's before its time
-    counts. A newer run on 7 October 2026, with the build released as 2.3.0, measured 484% faster,
-    with one of the thirty workloads slower than SQLite, but it was not graded: SQLite ran 7% slower
-    than its idle reference on this machine, which makes inillucent's figure read high.
-    [Performance](docs/performance.md) has both runs and names each slower workload.
+    counts. The newest run, on 8 October 2026 with release 2.4.2, measured 505% faster, with one of
+    the thirty workloads slower than SQLite, but it was not graded: SQLite ran 4% slower than its
+    idle reference on this machine, which makes inillucent's figure read high.
+    [Performance](docs/performance.md) has the newest run and names each slower workload, and
+    [Performance history](docs/performance-history.md) has the graded one.
 
-[^2]: Processor time was 344 ms against 1,043 ms for SQLite for one round of the same plan at
-    100,000 rows, on 26 September 2026.
+[^2]: Measured on 8 October 2026 with release 2.4.2, through `Connection::prepare` and
+    `Statement::step`, the API every driver calls, on 48 workloads at 100,000 rows: rows written by
+    `INSERT`, tables that churn, queries applications write and edge cases. The 28 training workloads
+    are 276% faster than SQLite and the 20 held out workloads 261% faster. One round took 641 ms of
+    processor time against 1,945 ms for SQLite, 67% less. On 3 October 2026 release 2.1.1 was 18%
+    slower than SQLite on the same workloads and used 115% more processor time.
+    [Performance](docs/performance.md#through-the-connection-api) has the figures.
 
 [^3]: Graded on 20 September 2026 against PostgreSQL with pgvector over a corpus of 185,078
     passages at 768 dimensions. Both engines were loaded with the same vectors and given the same
@@ -255,10 +265,10 @@ MIT. See [LICENSE](LICENSE).
     was better on 15, equivalent on 1, inconclusive on 1 and worse on none.
     [Retrieval quality](docs/retrieval-quality.md) has the full table.
 
-[^4]: Measured on 6 October 2026 with the build released as 2.3.0, over 25 workloads called the way
+[^4]: Measured on 8 October 2026 with release 2.4.2, over 25 workloads called the way
     programs call each engine: one process per command, a SQL script piped into the shell, the
     Python driver and the npm package, against the `sqlite3` 3.53.4 shell, Python's `sqlite3` module
     and Node's `node:sqlite`. Fifteen rounds, each engine with its own default settings. The command
-    line is 3% faster than SQLite, because starting a program costs both engines the same and is
+    line is 6% faster than SQLite, because starting a program costs both engines the same and is
     most of a short command. [Performance](docs/performance.md#how-programs-call-it) has every
     workload.

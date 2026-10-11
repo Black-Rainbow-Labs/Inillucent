@@ -91,6 +91,54 @@ pub enum Structural {
     Merge,
 }
 
+/// Where a page that moved was named, and so which field a relink rewrites.
+///
+/// A page that moves from one number to another is named by exactly one field of
+/// one other page, or by the meta record. `Body::Relink` says which, so a replay
+/// rewrites that one field instead of carrying a whole image of the page that
+/// holds it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelinkSite {
+    /// The child swip in interior page `parent` of tree `tree` that named the page.
+    Child {
+        /// The tree the interior page belongs to.
+        tree: u64,
+        /// The interior page that holds the swip.
+        parent: u64,
+    },
+    /// The `RIGHT` field of leaf `left` of tree `tree`.
+    Sibling {
+        /// The tree the leaf belongs to.
+        tree: u64,
+        /// The leaf whose right sibling the page was.
+        left: u64,
+    },
+    /// Every extent reference in leaf `leaf` of tree `tree` whose first page is `from`.
+    Extent {
+        /// The tree the leaf belongs to.
+        tree: u64,
+        /// The leaf that holds the references.
+        leaf: u64,
+    },
+    /// The `next` field of extent chain page `page`.
+    ChainNext {
+        /// The chain page whose successor moved.
+        page: u64,
+    },
+    /// The `prev` field of extent chain page `page`.
+    ChainPrev {
+        /// The chain page whose predecessor moved.
+        page: u64,
+    },
+    /// The `RIGHT` field of free map page `previous`.
+    MapChain {
+        /// The map page that precedes the one that moved.
+        previous: u64,
+    },
+    /// The meta record's name for the first free map page.
+    MapHead,
+}
+
 /// What a record says happened.
 ///
 /// The borrowed slices point into the buffer the record was decoded from, so
@@ -306,6 +354,48 @@ pub enum Body<'a> {
         /// How many pages the run holds.
         count: u64,
     },
+    /// The file format moved to a higher version.
+    ///
+    /// **Written once per file, before the first page of a key stored out of
+    /// line or of a separator stored out of line.** A file with no such value
+    /// stays at the version it had, so every release that reads that version
+    /// still opens it. This record is what makes a log that holds one refused by
+    /// an older build by kind, as every record added since 0.1.8 has been: it
+    /// meets kind 19 and says "a log record has kind 19, which this format does
+    /// not define". Replay raises the in memory format to `version` and does
+    /// nothing else. It names no page and belongs to no transaction.
+    Format {
+        /// The version the file now has.
+        version: u32,
+    },
+    /// A page moved from one number to another, and one field that named it now
+    /// names the new number.
+    ///
+    /// **Written by the step that lowers the end of the file** (`PRAGMA
+    /// auto_vacuum`). The moved page's contents travel in a `WritePage` record for
+    /// the new number, and the free map changes in `AllocPage` and `FreePage`
+    /// records. This record is the third part: it says which field of which page
+    /// named `from`. A replay applies it to the page `site` names under the page LSN
+    /// rule, and it is idempotent, because it writes nothing when the field no
+    /// longer says `from`.
+    Relink {
+        /// The page number the field named before.
+        from: u64,
+        /// The page number the field names now.
+        to: u64,
+        /// Which field.
+        site: RelinkSite,
+    },
+    /// The file now has this many pages, and pages at or above it are free.
+    ///
+    /// Written by the step that lowers the end of the file, after the moves that
+    /// emptied the pages it gives up. A replay lowers the page count, in log order
+    /// with the free map changes, and the file is cut when a checkpoint writes the
+    /// lower count.
+    PageCount {
+        /// The page count after the step.
+        pages: u64,
+    },
     /// A page was taken out of the free map.
     AllocPage {
         /// The page's number.
@@ -385,6 +475,9 @@ impl Body<'_> {
             Body::CatalogChange { .. } => kind::CATALOG_CHANGE,
             Body::Pad { .. } => kind::PAD,
             Body::BulkBuilt { .. } => kind::BULK_BUILT,
+            Body::Format { .. } => kind::FORMAT,
+            Body::Relink { .. } => kind::RELINK,
+            Body::PageCount { .. } => kind::PAGE_COUNT,
         }
     }
 }
@@ -449,6 +542,26 @@ pub mod kind {
     /// so an older build meets one only in the log of a newer build that
     /// crashed, until a newer build has opened the file once.
     pub const INSERT_ROWS: u8 = 18;
+    /// [`super::Body::Format`].
+    ///
+    /// A log written before it holds no record of this kind, so an older log
+    /// reads unchanged, and an older build refuses a log holding one with "a
+    /// log record has kind 19, which this format does not define" rather than
+    /// misreading it. A log holds one only when the file moved to format 3, and a
+    /// clean close folds it, so an older build meets one only in the log of a
+    /// newer build that crashed.
+    pub const FORMAT: u8 = 19;
+    /// [`super::Body::Relink`].
+    ///
+    /// A log written before it holds no record of this kind, so an older log reads
+    /// unchanged, and an older build refuses a log holding one with "a log record has
+    /// kind 20, which this format does not define". Only a file in `auto_vacuum` mode
+    /// 1 or 2 writes one.
+    pub const RELINK: u8 = 20;
+    /// [`super::Body::PageCount`].
+    ///
+    /// Kind 21, with the same compatibility as [`RELINK`].
+    pub const PAGE_COUNT: u8 = 21;
 }
 
 /// One decoded log record.
@@ -497,16 +610,21 @@ impl<'a> Record<'a> {
             // appended, so recovery has nothing to apply and the page-LSN rule has
             // nothing to decide. See `Body::BulkBuilt`.
             Body::AllocPage { .. }
+            | Body::PageCount { .. }
             | Body::FreePage { .. }
             | Body::Commit { .. }
             | Body::Abort
             | Body::Checkpoint { .. }
             | Body::CatalogChange { .. }
             | Body::BulkBuilt { .. }
+            | Body::Format { .. }
             | Body::Pad { .. } => PageList::none(),
             // **Many pages, so none here.** Recovery decides each entry's page
             // itself; see `entries_to_apply` in `recover.rs`.
             Body::InsertRows { .. } => PageList::none(),
+            // **One page, the one whose field names the moved page.** The page
+            // LSN rule decides whether a replay still has to rewrite it.
+            Body::Relink { site, .. } => relink_pages(&site),
         }
     }
 
@@ -665,6 +783,73 @@ impl PageList {
     }
 }
 
+/// Returns the page whose field a relink rewrites, as a list.
+///
+/// @param site - which field the record rewrites
+fn relink_pages(site: &RelinkSite) -> PageList {
+    match site {
+        RelinkSite::Child { parent: page, .. }
+        | RelinkSite::Sibling { left: page, .. }
+        | RelinkSite::Extent { leaf: page, .. }
+        | RelinkSite::ChainNext { page }
+        | RelinkSite::ChainPrev { page }
+        | RelinkSite::MapChain { previous: page } => PageList::one(*page),
+        RelinkSite::MapHead => PageList::none(),
+    }
+}
+
+/// Writes a relink site: a tag byte, then the words that site carries.
+///
+/// @param site - which field the record rewrites
+/// @param out - the buffer to append to
+fn put_relink_site(site: &RelinkSite, out: &mut Vec<u8>) {
+    let (tag, words): (u8, [u64; 2]) = match *site {
+        RelinkSite::Child { tree, parent } => (1, [tree, parent]),
+        RelinkSite::Sibling { tree, left } => (2, [tree, left]),
+        RelinkSite::Extent { tree, leaf } => (3, [tree, leaf]),
+        RelinkSite::ChainNext { page } => (4, [page, 0]),
+        RelinkSite::ChainPrev { page } => (5, [page, 0]),
+        RelinkSite::MapChain { previous } => (6, [previous, 0]),
+        RelinkSite::MapHead => (7, [0, 0]),
+    };
+    out.push(tag);
+    for word in words {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+}
+
+/// Reads a relink site written by [`put_relink_site`].
+///
+/// @param cursor - the payload cursor, positioned at the tag byte
+fn take_relink_site(cursor: &mut Cursor<'_>) -> DbResult<RelinkSite> {
+    let tag = cursor.u8()?;
+    let first = cursor.u64()?;
+    let second = cursor.u64()?;
+    Ok(match tag {
+        1 => RelinkSite::Child {
+            tree: first,
+            parent: second,
+        },
+        2 => RelinkSite::Sibling {
+            tree: first,
+            left: second,
+        },
+        3 => RelinkSite::Extent {
+            tree: first,
+            leaf: second,
+        },
+        4 => RelinkSite::ChainNext { page: first },
+        5 => RelinkSite::ChainPrev { page: first },
+        6 => RelinkSite::MapChain { previous: first },
+        7 => RelinkSite::MapHead,
+        other => {
+            return Err(corrupt(format!(
+                "a relink record names site {other}, which is not one"
+            )))
+        }
+    })
+}
+
 /// Writes one body's payload.
 ///
 /// @param body - what to write
@@ -771,6 +956,17 @@ fn encode_body(body: &Body<'_>, out: &mut Vec<u8>) -> DbResult<()> {
             out.extend_from_slice(&root.to_le_bytes());
             out.extend_from_slice(&first.to_le_bytes());
             out.extend_from_slice(&count.to_le_bytes());
+        }
+        Body::Format { version } => {
+            out.extend_from_slice(&version.to_le_bytes());
+        }
+        Body::Relink { from, to, site } => {
+            out.extend_from_slice(&from.to_le_bytes());
+            out.extend_from_slice(&to.to_le_bytes());
+            put_relink_site(site, out);
+        }
+        Body::PageCount { pages } => {
+            out.extend_from_slice(&pages.to_le_bytes());
         }
     }
     Ok(())
@@ -907,6 +1103,17 @@ fn decode_body(kind: u8, payload: &[u8]) -> DbResult<(Body<'_>, usize)> {
             root: cursor.u64()?,
             first: cursor.u64()?,
             count: cursor.u64()?,
+        },
+        kind::FORMAT => Body::Format {
+            version: cursor.u32()?,
+        },
+        kind::RELINK => Body::Relink {
+            from: cursor.u64()?,
+            to: cursor.u64()?,
+            site: take_relink_site(&mut cursor)?,
+        },
+        kind::PAGE_COUNT => Body::PageCount {
+            pages: cursor.u64()?,
         },
         other => {
             return Err(corrupt(format!(
@@ -1100,6 +1307,14 @@ impl<'a> Cursor<'a> {
             .ok_or_else(|| corrupt("a log record's payload ends before its fields do"))?;
         self.at = end;
         Ok(slice)
+    }
+
+    /// Takes one byte.
+    fn u8(&mut self) -> DbResult<u8> {
+        self.take(1)?
+            .first()
+            .copied()
+            .ok_or_else(|| corrupt("a log record's payload ends before its fields do"))
     }
 
     /// Takes a little-endian `u32`.
@@ -1314,6 +1529,18 @@ mod tests {
                 first: 2_049,
                 count: 191,
             },
+            Body::Format { version: 3 },
+            Body::Relink {
+                from: 90,
+                to: 12,
+                site: RelinkSite::Child { tree: 7, parent: 4 },
+            },
+            Body::Relink {
+                from: 90,
+                to: 12,
+                site: RelinkSite::MapHead,
+            },
+            Body::PageCount { pages: 89 },
         ]
     }
 
@@ -1371,6 +1598,89 @@ mod tests {
         // Added with the logical split record. Sixteen was not a defined kind
         // before it.
         assert_eq!(kind::SPLIT_LOGICAL, 16);
+        // Nineteen was not a defined kind before the record that moves a file
+        // to format 3.
+        assert_eq!(kind::FORMAT, 19);
+        // Twenty and twenty one were not defined kinds before the records that
+        // move a page and lower the file's end.
+        assert_eq!(kind::RELINK, 20);
+        assert_eq!(kind::PAGE_COUNT, 21);
+    }
+
+    /// The format record has kind 19, round trips, names no page, and is
+    /// refused when a byte is missing.
+    #[test]
+    fn the_format_record_round_trips() {
+        let body = Body::Format { version: 3 };
+        assert_eq!(body.kind(), 19);
+        let bytes = encoded(body);
+        let record = Record::decode(&bytes)
+            .expect("the record decodes")
+            .expect("a whole record");
+        assert_eq!(record.body, body);
+        assert_eq!(record.lsn, 42);
+        assert!(record.pages().as_slice().is_empty());
+        for cut in 0..bytes.len() {
+            assert!(
+                !matches!(Record::decode(bytes.get(..cut).unwrap()), Ok(Some(_))),
+                "a record cut at {cut} decoded"
+            );
+        }
+    }
+
+    /// Every relink site round trips, names the page whose field it rewrites,
+    /// and is refused when a byte is missing.
+    #[test]
+    fn a_relink_record_round_trips_at_every_site() {
+        let sites = [
+            (RelinkSite::Child { tree: 7, parent: 4 }, Some(4)),
+            (RelinkSite::Sibling { tree: 7, left: 5 }, Some(5)),
+            (RelinkSite::Extent { tree: 7, leaf: 6 }, Some(6)),
+            (RelinkSite::ChainNext { page: 8 }, Some(8)),
+            (RelinkSite::ChainPrev { page: 9 }, Some(9)),
+            (RelinkSite::MapChain { previous: 10 }, Some(10)),
+            (RelinkSite::MapHead, None),
+        ];
+        for (site, page) in sites {
+            let body = Body::Relink {
+                from: 90,
+                to: 12,
+                site,
+            };
+            assert_eq!(body.kind(), 20);
+            let bytes = encoded(body);
+            let record = Record::decode(&bytes).unwrap().unwrap();
+            assert_eq!(record.body, body);
+            assert_eq!(record.pages().as_slice(), page.as_slice());
+            for cut in 0..bytes.len() {
+                assert!(
+                    !matches!(Record::decode(bytes.get(..cut).unwrap()), Ok(Some(_))),
+                    "a relink record cut at {cut} decoded"
+                );
+            }
+        }
+    }
+
+    /// The page count record has kind 21, round trips and names no page.
+    #[test]
+    fn the_page_count_record_round_trips() {
+        let body = Body::PageCount { pages: 89 };
+        assert_eq!(body.kind(), 21);
+        let bytes = encoded(body);
+        let record = Record::decode(&bytes).unwrap().unwrap();
+        assert_eq!(record.body, body);
+        assert!(record.pages().as_slice().is_empty());
+    }
+
+    /// A relink record that names a site this format does not define is refused.
+    #[test]
+    fn a_relink_site_that_is_not_defined_is_refused() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&90u64.to_le_bytes());
+        payload.extend_from_slice(&12u64.to_le_bytes());
+        payload.push(99);
+        payload.extend_from_slice(&[0u8; 16]);
+        assert!(decode_body(kind::RELINK, &payload).is_err());
     }
 
     /// A kind this format does not define is refused rather than guessed at.
@@ -1498,6 +1808,13 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(pages.as_slice(), &[left, right, parent]);
+                    with_pages += 1;
+                }
+                Body::Relink {
+                    site: RelinkSite::Child { parent: page, .. },
+                    ..
+                } => {
+                    assert_eq!(pages.as_slice(), &[page]);
                     with_pages += 1;
                 }
                 _ => assert!(pages.as_slice().is_empty(), "{body:?} named a page"),

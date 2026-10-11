@@ -46,28 +46,28 @@ const SIDE: &str =
      CREATE INDEX side_owner ON side_table(owner);";
 
 /// The contract fixture's `side_table` with its 25,000 rows, for the cases that insert into a table already holding rows.
-const SIDE_FILLED: &str = "CREATE TABLE side_table(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, note TEXT);      CREATE INDEX side_owner ON side_table(owner);      WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 25000)      INSERT INTO side_table SELECT i, ((i * 7) % 100000) + 1, 'note ' || i FROM c;";
+const SIDE_FILLED: &str = "CREATE TABLE side_table(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, note TEXT); CREATE INDEX side_owner ON side_table(owner); WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 25000) INSERT INTO side_table SELECT i, ((i * 7) % 100000) + 1, 'note ' || i FROM c;";
 
 /// `SIDE_FILLED` after 2,000 more rows went in, the state the gate's `app.insert.returning` starts from.
-const SIDE_AFTER: &str = "CREATE TABLE side_table(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, note TEXT);      CREATE INDEX side_owner ON side_table(owner);      WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 25000)      INSERT INTO side_table SELECT i, ((i * 7) % 100000) + 1, 'note ' || i FROM c;      WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 2000)      INSERT INTO side_table(owner, note) SELECT (i * 1103515245 + 12345) % 2147483648, 'row ' || i || ' lorem ipsum dolor sit amet consectetur' FROM c;";
+const SIDE_AFTER: &str = "CREATE TABLE side_table(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, note TEXT); CREATE INDEX side_owner ON side_table(owner); WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 25000) INSERT INTO side_table SELECT i, ((i * 7) % 100000) + 1, 'note ' || i FROM c; WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 2000) INSERT INTO side_table(owner, note) SELECT (i * 1103515245 + 12345) % 2147483648, 'row ' || i || ' lorem ipsum dolor sit amet consectetur' FROM c;";
 
 /// A 100,000 row table built by `INSERT ... SELECT`, for the bulk cases.
-const COPIED: &str = "CREATE TABLE copied(id INTEGER PRIMARY KEY, key INTEGER, label TEXT);      WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 100000)      INSERT INTO copied SELECT i, (i * 2654435761) % 100000, 'row ' || i || ' lorem ipsum dolor sit amet' FROM c;";
+const COPIED: &str = "CREATE TABLE copied(id INTEGER PRIMARY KEY, key INTEGER, label TEXT); WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 100000) INSERT INTO copied SELECT i, (i * 2654435761) % 100000, 'row ' || i || ' lorem ipsum dolor sit amet' FROM c;";
 
 /// The hillclimb plan's `fresh` after 20,000 rows went in one at a time, with its two indexes.
 ///
 /// The first row makes the table non-empty, so the copy below is not built in bulk and every row
 /// lands the way an application's single row inserts land: in the delta area of a leaf.
-const FRESH_FILLED: &str = "CREATE TABLE fresh(id INTEGER PRIMARY KEY, grp INTEGER NOT NULL,      name TEXT NOT NULL, amount REAL, created INTEGER NOT NULL);      CREATE INDEX fresh_grp ON fresh(grp, created);      CREATE UNIQUE INDEX fresh_name ON fresh(name);      INSERT INTO fresh(grp, name, amount, created) VALUES (0, 'user 100001', 0.0, 100001);      WITH RECURSIVE c(i) AS (SELECT 2 UNION ALL SELECT i + 1 FROM c WHERE i < 20000)      INSERT INTO fresh(grp, name, amount, created) SELECT ((i * 1103515245 + 12345) % 2147483648) % 97,      'user ' || (100000 + i), (((i * 1103515245 + 12345) % 2147483648) % 10000) * 0.25, 100000 + i FROM c;";
+const FRESH_FILLED: &str = "CREATE TABLE fresh(id INTEGER PRIMARY KEY, grp INTEGER NOT NULL, name TEXT NOT NULL, amount REAL, created INTEGER NOT NULL); CREATE INDEX fresh_grp ON fresh(grp, created); CREATE UNIQUE INDEX fresh_name ON fresh(name); INSERT INTO fresh(grp, name, amount, created) VALUES (0, 'user 100001', 0.0, 100001); WITH RECURSIVE c(i) AS (SELECT 2 UNION ALL SELECT i + 1 FROM c WHERE i < 20000) INSERT INTO fresh(grp, name, amount, created) SELECT ((i * 1103515245 + 12345) % 2147483648) % 97, 'user ' || (100000 + i), (((i * 1103515245 + 12345) % 2147483648) % 10000) * 0.25, 100000 + i FROM c;";
 
 /// `FRESH_FILLED` after every other row was deleted, the state the gate's `churn.refill` writes into.
-const FRESH_HALVED: &str = "CREATE TABLE fresh(id INTEGER PRIMARY KEY, grp INTEGER NOT NULL,      name TEXT NOT NULL, amount REAL, created INTEGER NOT NULL);      CREATE INDEX fresh_grp ON fresh(grp, created);      CREATE UNIQUE INDEX fresh_name ON fresh(name);      INSERT INTO fresh(grp, name, amount, created) VALUES (0, 'user 100001', 0.0, 100001);      WITH RECURSIVE c(i) AS (SELECT 2 UNION ALL SELECT i + 1 FROM c WHERE i < 20000)      INSERT INTO fresh(grp, name, amount, created) SELECT ((i * 1103515245 + 12345) % 2147483648) % 97,      'user ' || (100000 + i), (((i * 1103515245 + 12345) % 2147483648) % 10000) * 0.25, 100000 + i FROM c;      DELETE FROM fresh WHERE id % 2 = 0;";
+const FRESH_HALVED: &str = "CREATE TABLE fresh(id INTEGER PRIMARY KEY, grp INTEGER NOT NULL, name TEXT NOT NULL, amount REAL, created INTEGER NOT NULL); CREATE INDEX fresh_grp ON fresh(grp, created); CREATE UNIQUE INDEX fresh_name ON fresh(name); INSERT INTO fresh(grp, name, amount, created) VALUES (0, 'user 100001', 0.0, 100001); WITH RECURSIVE c(i) AS (SELECT 2 UNION ALL SELECT i + 1 FROM c WHERE i < 20000) INSERT INTO fresh(grp, name, amount, created) SELECT ((i * 1103515245 + 12345) % 2147483648) % 97, 'user ' || (100000 + i), (((i * 1103515245 + 12345) % 2147483648) % 10000) * 0.25, 100000 + i FROM c; DELETE FROM fresh WHERE id % 2 = 0;";
 
 /// The contract fixture's `wide` (400 rows whose `body` is stored out of line) and `side_table`.
-const WIDE_SIDE: &str = "CREATE TABLE side_table(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, note TEXT);      CREATE INDEX side_owner ON side_table(owner);      CREATE TABLE wide(id INTEGER PRIMARY KEY, body TEXT);      WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 25000)      INSERT INTO side_table SELECT i, ((i * 7) % 100000) + 1, 'note ' || i FROM c;      WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 400)      INSERT INTO wide SELECT i, replace(hex(zeroblob(2048)), '0', 'x') FROM c;";
+const WIDE_SIDE: &str = "CREATE TABLE side_table(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, note TEXT); CREATE INDEX side_owner ON side_table(owner); CREATE TABLE wide(id INTEGER PRIMARY KEY, body TEXT); WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 25000) INSERT INTO side_table SELECT i, ((i * 7) % 100000) + 1, 'note ' || i FROM c; WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 400) INSERT INTO wide SELECT i, replace(hex(zeroblob(2048)), '0', 'x') FROM c;";
 
 /// The contract fixture's `main_table` and `side_table`, with their indexes, built in bulk.
-const MAIN_SIDE: &str = "CREATE TABLE main_table(id INTEGER PRIMARY KEY, key INTEGER NOT NULL, category INTEGER NOT NULL, label TEXT NOT NULL, payload BLOB);      CREATE INDEX main_key ON main_table(key);      CREATE INDEX main_category ON main_table(category, key);      CREATE TABLE side_table(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, note TEXT);      CREATE INDEX side_owner ON side_table(owner);      WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 100000)      INSERT INTO main_table SELECT i, (i * 2654435761) % 100000, i % 64, 'row ' || i || ' lorem ipsum dolor sit amet consectetur', zeroblob(48) FROM c;      WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 25000)      INSERT INTO side_table SELECT i, ((i * 7) % 100000) + 1, 'note ' || i FROM c;";
+const MAIN_SIDE: &str = "CREATE TABLE main_table(id INTEGER PRIMARY KEY, key INTEGER NOT NULL, category INTEGER NOT NULL, label TEXT NOT NULL, payload BLOB); CREATE INDEX main_key ON main_table(key); CREATE INDEX main_category ON main_table(category, key); CREATE TABLE side_table(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, note TEXT); CREATE INDEX side_owner ON side_table(owner); WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 100000) INSERT INTO main_table SELECT i, (i * 2654435761) % 100000, i % 64, 'row ' || i || ' lorem ipsum dolor sit amet consectetur', zeroblob(48) FROM c; WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 25000) INSERT INTO side_table SELECT i, ((i * 7) % 100000) + 1, 'note ' || i FROM c;";
 
 /// Returns the scattered integer the gate's `int` bind produces.
 ///
@@ -248,7 +248,7 @@ fn bulk_cases() -> Vec<Case> {
         },
         Case {
             name: "bulk.insert.select",
-            setup: "CREATE TABLE source(id INTEGER PRIMARY KEY, key INTEGER, label TEXT);                     WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 100000)                     INSERT INTO source SELECT i, (i * 2654435761) % 100000, 'row ' || i || ' lorem ipsum dolor sit amet' FROM c;                     CREATE TABLE copied(id INTEGER PRIMARY KEY, key INTEGER, label TEXT);",
+            setup: "CREATE TABLE source(id INTEGER PRIMARY KEY, key INTEGER, label TEXT); WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 100000) INSERT INTO source SELECT i, (i * 2654435761) % 100000, 'row ' || i || ' lorem ipsum dolor sit amet' FROM c; CREATE TABLE copied(id INTEGER PRIMARY KEY, key INTEGER, label TEXT);",
             sql: "INSERT INTO copied SELECT id, key, label FROM source WHERE id BETWEEN ?1 * 1000 + 1 AND ?1 * 1000 + 1000",
             binds: |i| vec![i % 100],
             prepare_each: false,
@@ -331,7 +331,7 @@ fn read_cases() -> Vec<Case> {
         },
         Case {
             name: "read.json.where",
-            setup: "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT);                     WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 5000)                     INSERT INTO docs SELECT i, json_object('k', i % 100, 'name', 'row ' || i, 'tags', json_array(i % 64, i % 7)) FROM c;",
+            setup: "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT); WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 5000) INSERT INTO docs SELECT i, json_object('k', i % 100, 'name', 'row ' || i, 'tags', json_array(i % 64, i % 7)) FROM c;",
             sql: "SELECT count(*) FROM docs WHERE json_extract(body, '$.k') = ?1 % 100",
             binds: |i| vec![i],
             prepare_each: false,

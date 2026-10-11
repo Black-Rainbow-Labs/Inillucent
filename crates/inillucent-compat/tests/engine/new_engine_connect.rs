@@ -269,7 +269,7 @@ fn autocommit_is_still_right_after_a_vacuum() {
         .expect("the transaction opens");
     assert!(
         !connection.autocommit().expect("the state is readable"),
-        "a transaction is open, so the connection is not in autocommit;          answering true here means the handle is on a group nothing writes to"
+        "a transaction is open, so the connection is not in autocommit; answering true here means the handle is on a group nothing writes to"
     );
     connection
         .execute_batch("INSERT INTO t VALUES (4)")

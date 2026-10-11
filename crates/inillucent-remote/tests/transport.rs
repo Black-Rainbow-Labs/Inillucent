@@ -574,7 +574,7 @@ fn a_refusal_names_the_host_and_not_the_password() {
     let detail = said(error);
     assert!(
         detail.contains("127.0.0.1"),
-        "the refusal should name the host whose certificate failed, or the          operator cannot tell which endpoint it was about: {detail}"
+        "the refusal should name the host whose certificate failed, or the operator cannot tell which endpoint it was about: {detail}"
     );
     assert!(
         detail.contains("did not verify"),

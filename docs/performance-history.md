@@ -6,6 +6,78 @@ call it, and the investigations behind them. [Performance](performance.md) has t
 A ratio on this page is SQLite's time divided by inillucent's; a ratio of 2.00x is 100% faster and
 one of 0.50x is 100% slower.
 
+## The engine run of 7 October 2026, release 2.3.0
+
+These were the published engine figures from 7 October 2026 until release 2.4.2 was measured on 8
+October 2026. `inillucent-fullgate` on `main` at `573609d4`, released as 2.3.0 and built with
+`cargo build --release`, three runs of 30 paired rounds on the medium fixture, the median run, both
+engines pinned to the eight performance cores. Every workload's answer agreed with SQLite's on every
+round of all three runs.
+
+| Measurement | Against SQLite 3.53.4 |
+|---|---|
+| the engine, weighted over ten families of work, 100,000 rows | **484% faster** |
+| processor time, one round of the engine plan | **79% less** (234 ms against 1,125 ms) |
+| peak resident memory, one round of the engine plan | **14% more** (43.37 MiB against 38.04 MiB) |
+
+**The runs were not graded.** In all three runs SQLite was 6.8% to 7.3% slower than its idle
+reference, with only a web browser and Task Manager running beside it. A busy machine slows SQLite
+more than inillucent, so the 484% reads somewhat high.
+
+### By family on 7 October 2026
+
+`weight` is the family's share of the engine headline. `bar` is what the performance contract
+(`compat/perf/contract.toml`) asks of the family. The ratio column is SQLite's time divided by
+inillucent's, which is how the contract states its bars; 2.00x is 100% faster.
+
+| family | weight | what it measures | result | ratio | bar |
+|---|---|---|---|---:|---|
+| `read.point` | 16% | one row by rowid, by integer key, and through a secondary index | **3,234% faster** | 33.34x | 100% faster (2.00x), met |
+| `large.values` | 4% | text and blobs across the size where a value stops fitting in a leaf | **1,129% faster** | 12.29x | 50% faster (1.50x), met |
+| `read.analytical` | 10% | scans, aggregates, `GROUP BY`, `DISTINCT`, sorts | **1,043% faster** | 11.43x | 400% faster (5.00x), met |
+| `read.range` | 12% | selective ranges, forward and reverse, covering and not | **493% faster** | 5.93x | 200% faster (3.00x), met |
+| `read.join` | 8% | two table and four table joins | **426% faster** | 5.26x | 200% faster (3.00x), met |
+| `write` | 20% | insert, update, delete, upsert, with and without indexes | **318% faster** | 4.18x | 50% faster (1.50x), met |
+| `transaction` | 10% | autocommit, small batches, large batches, savepoints | **153% faster** | 2.53x | as fast (1.00x), met |
+| `extension` | 8% | JSON, FTS5, R-Tree | **147% faster** | 2.47x | 50% faster (1.50x), met |
+| `open.prepare` | 8% | parse, bind, step one row, reset | **102% faster** | 2.02x | 400% faster (5.00x), missed |
+| `schema` | 4% | `CREATE INDEX` and its backfill | **47% faster** | 1.47x | 200% faster (3.00x), missed |
+
+No family was slower than SQLite. Every family that missed its bar missed it the same way it did on
+26 September, by less: `open.prepare` went from 65% faster to 102% faster and `schema` from 27% to
+47% faster.
+
+### The workloads that were slower on 7 October 2026
+
+Thirty workloads count toward the engine headline. Twenty eight were faster than SQLite. One was level
+with it and one was slower:
+
+| workload | family | result | ratio | why |
+|---|---|---|---:|---|
+| `prepare.trivial` | `open.prepare` | **72% slower** | 0.58x | `SELECT 1` is compiled on every call. The bound result columns, the column name, the boxed statement, the expression tree and the output names are built each time, where SQLite's compile of the same statement allocates less |
+| `txn.autocommit` | `transaction` | **level**, 2% slower to 0% across the three runs | 1.00x | one `fsync` a commit on each engine. On this disk an `fsync` is most of the millisecond a statement takes |
+
+`join.range` (2% faster, 1.02x), `extension.fts.build` (14% faster, 1.14x) and `extension.json`
+(131% faster, 2.31x), all slower than SQLite on 26 September, were faster. `schema.index`, the one
+workload of the `schema` family, was 48% faster (1.48x). The four correlated subquery workloads, which
+the contract does not weight, were all faster: `correlated.exists` 194%, `correlated.in` 30%,
+`correlated.exists.selective` 98% and `correlated.scalar.selective` 63%.
+
+The fastest workloads: `scan.aggregate` 5,369% faster, `point.miss` 5,233%, `large.read` 4,379%,
+`point.rowid` 3,144%, `scan.group` 2,727%, `join.selective` 2,588%, `point.index` 1,946% and
+`range.reverse` 1,749%.
+
+### Memory on 7 October 2026
+
+**Peak resident memory was 43.37 MiB against SQLite's 38.04 MiB, 14% more.** The contract asks for 5%
+less, so this bar was missed. Processor time for one round of the whole plan was 234 ms against
+SQLite's 1,125 ms, 79% less, where the contract asks for 60% less.
+
+Each figure comes from one child process per engine that opens a finished file and runs one round
+of the plan. Most of the memory difference is the cost of a Rust process on this machine before the
+engine starts, and the index build's sort in `schema.index` sets the peak.
+[Memory on 26 September 2026](#memory) has the breakdown by workload.
+
 ## The graded gate run of 26 September 2026
 
 The last engine gate run that passed the quiet check. `main` at `bc46bc9`, release 1.0.32.

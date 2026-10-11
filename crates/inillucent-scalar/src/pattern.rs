@@ -186,52 +186,99 @@ fn character_width(subject: &[u8], offset: usize, _is_like: bool) -> Option<usiz
     Some(width.min(subject.len().saturating_sub(offset)).max(1))
 }
 
+/// Reads one UTF-8 character the way SQLite's `sqlite3Utf8Read` does.
+///
+/// Returns the code point and the bytes it used. A surrogate and the two noncharacters U+FFFE and
+/// U+FFFF read as U+FFFD, and a truncated sequence uses only the bytes present, so a malformed
+/// subject still advances and a class compares the same code points SQLite compares.
+///
+/// @param bytes - the text being read
+/// @param offset - where the character starts
+fn read_character(bytes: &[u8], offset: usize) -> Option<(u32, usize)> {
+    let first = u32::from(bytes.get(offset).copied()?);
+    if first < 0xc0 {
+        return Some((first, 1));
+    }
+    let mut code = if first < 0xe0 {
+        first & 0x1f
+    } else if first < 0xf0 {
+        first & 0x0f
+    } else if first < 0xf8 {
+        first & 0x07
+    } else {
+        first & 0x03
+    };
+    let mut used = 1usize;
+    while let Some(next) = bytes.get(offset.saturating_add(used)).copied() {
+        if next & 0xc0 != 0x80 {
+            break;
+        }
+        code = (code << 6) | u32::from(next & 0x3f);
+        used = used.saturating_add(1);
+    }
+    if code < 0x80 || (code & 0xffff_f800) == 0xd800 || (code & 0xffff_fffe) == 0xfffe {
+        code = 0xfffd;
+    }
+    Some((code, used))
+}
+
 /// Matches a `[...]` character class, returning the bytes consumed on each
 /// side when it matches.
+///
+/// **The class compares characters, not bytes.** It compared single bytes, so a class holding
+/// `é`, a range such as `à-ü`, or a negated class tested against a multi byte character never
+/// matched: `'é' GLOB '[^a]'` was 0. The walk follows SQLite's `patternCompare`: a `^` directly
+/// after the bracket negates, a `]` directly after the bracket or the `^` is a member, a `-` is a
+/// range only when a previous member exists and the next character is not `]`, and a range cannot
+/// start where another range ended.
+///
+/// @param pattern - the whole pattern
+/// @param start - the index of the opening bracket
+/// @param subject - the whole subject
+/// @param offset - where the subject character starts
 fn class_match(
     pattern: &[u8],
     start: usize,
     subject: &[u8],
     offset: usize,
 ) -> Option<(usize, usize)> {
-    let actual = subject.get(offset).copied()?;
+    let (actual, width) = read_character(subject, offset)?;
     let mut index = start.saturating_add(1);
-    let negated = pattern.get(index) == Some(&b'^');
+    let (mut member, used) = read_character(pattern, index)?;
+    index = index.saturating_add(used);
+    let negated = member == u32::from(b'^');
     if negated {
-        index = index.saturating_add(1);
+        let (next, used) = read_character(pattern, index)?;
+        member = next;
+        index = index.saturating_add(used);
     }
     let mut matched = false;
-    let mut first = true;
-    loop {
-        let byte = pattern.get(index).copied()?;
-        if byte == b']' && !first {
-            index = index.saturating_add(1);
-            break;
+    if member == u32::from(b']') {
+        matched = actual == u32::from(b']');
+        let (next, used) = read_character(pattern, index)?;
+        member = next;
+        index = index.saturating_add(used);
+    }
+    let mut prior = 0u32;
+    while member != u32::from(b']') {
+        let upcoming = pattern.get(index).copied();
+        if member == u32::from(b'-') && prior > 0 && upcoming.is_some_and(|byte| byte != b']') {
+            let (high, used) = read_character(pattern, index)?;
+            index = index.saturating_add(used);
+            matched |= actual >= prior && actual <= high;
+            prior = 0;
+        } else {
+            matched |= actual == member;
+            prior = member;
         }
-        first = false;
-        // A `-` between two characters is a range, unless it is the last thing
-        // before the closing bracket.
-        if pattern.get(index.saturating_add(1)) == Some(&b'-')
-            && pattern
-                .get(index.saturating_add(2))
-                .is_some_and(|end| *end != b']')
-        {
-            let high = pattern.get(index.saturating_add(2)).copied()?;
-            if actual >= byte && actual <= high {
-                matched = true;
-            }
-            index = index.saturating_add(3);
-            continue;
-        }
-        if byte == actual {
-            matched = true;
-        }
-        index = index.saturating_add(1);
+        let (next, used) = read_character(pattern, index)?;
+        member = next;
+        index = index.saturating_add(used);
     }
     if matched == negated {
         return None;
     }
-    Some((1, index.saturating_sub(start)))
+    Some((width, index.saturating_sub(start)))
 }
 
 #[cfg(test)]
@@ -270,6 +317,17 @@ mod tests {
         assert!(glob(b"[a-c]bc", b"abc"));
         assert!(!glob(b"[^a-c]bc", b"abc"));
         assert!(glob(b"[^d]bc", b"abc"));
+    }
+
+    /// A class compares characters, so a multi byte member, range or negation matches.
+    #[test]
+    fn a_glob_class_compares_characters_not_bytes() {
+        assert!(glob("[é]".as_bytes(), "é".as_bytes()));
+        assert!(glob("[^a]".as_bytes(), "é".as_bytes()));
+        assert!(glob("[à-ü]".as_bytes(), "é".as_bytes()));
+        assert!(glob("a[^b]b".as_bytes(), "a日b".as_bytes()));
+        assert!(!glob("[^é]".as_bytes(), "é".as_bytes()));
+        assert!(!glob("[a".as_bytes(), b"a"));
     }
 
     /// A pattern of many wildcards against a long subject must not recurse,

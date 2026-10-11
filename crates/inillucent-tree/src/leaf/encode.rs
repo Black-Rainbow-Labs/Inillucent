@@ -103,6 +103,17 @@ pub fn encode_extent_tagged(out: &mut Vec<u8>, reference: ExtentRef) {
     out.push(crate::datum::tag::EXTENT);
     out.extend_from_slice(&reference.encode());
 }
+/// Writes the tagged form a delta row holds for a key value stored out of line.
+///
+/// @param out - the buffer the row is being encoded into
+/// @param reference - where the value was written
+/// @param prefix - the leading bytes of the value, kept beside the reference
+pub fn encode_key_extent_tagged(out: &mut Vec<u8>, reference: ExtentRef, prefix: &[u8]) {
+    out.push(crate::datum::tag::KEY_EXTENT);
+    out.extend_from_slice(&reference.encode());
+    out.extend_from_slice(&(prefix.len() as u16).to_le_bytes());
+    out.extend_from_slice(prefix);
+}
 /// Writes one value of its column's own type, and returns where the heap now
 /// starts.
 ///
@@ -175,6 +186,52 @@ pub(super) fn write_typed_value(
             Ok(start)
         }
     }
+}
+/// Returns the leading bytes of a key value that stay in the leaf when the
+/// value is stored out of line.
+///
+/// @param value - the key value, text or blob
+/// @param page_size - the database's page size in bytes
+pub fn key_prefix_of<'v>(value: &Datum<'v>, page_size: usize) -> &'v [u8] {
+    let bytes = value.as_bytes().unwrap_or(&[]);
+    bytes.get(..key_prefix_bytes(page_size)).unwrap_or(bytes)
+}
+/// Appends the heap record of a value stored out of line, and returns where the
+/// heap now starts.
+///
+/// An ordinary column's record is the sixteen byte reference. A key column's
+/// record is the reference, a `u16` prefix length and then the prefix, which is
+/// what lets a comparison decide most orderings without reading the extent.
+///
+/// @param page - the page being built
+/// @param heap_end - where the heap currently starts
+/// @param reference - where the value was written
+/// @param prefix - the leading bytes to keep beside the reference, for a key column
+pub(super) fn write_extent_record(
+    page: &mut [u8],
+    heap_end: usize,
+    reference: &ExtentRef,
+    prefix: Option<&[u8]>,
+) -> DbResult<usize> {
+    let kept = prefix.unwrap_or(&[]);
+    let extra = match prefix {
+        Some(_) => KEY_PREFIX_LENGTH_BYTES.saturating_add(kept.len()),
+        None => 0,
+    };
+    let start = heap_end
+        .checked_sub(EXTENT_REF_BYTES.saturating_add(extra))
+        .ok_or_else(|| misuse("the heap overflowed the page"))?;
+    let target = page
+        .get_mut(start..heap_end)
+        .ok_or_else(|| misuse("the heap overflowed the page"))?;
+    let (head, tail) = target.split_at_mut(EXTENT_REF_BYTES);
+    head.copy_from_slice(&reference.encode());
+    if prefix.is_some() {
+        let (length, bytes) = tail.split_at_mut(KEY_PREFIX_LENGTH_BYTES);
+        length.copy_from_slice(&(kept.len() as u16).to_le_bytes());
+        bytes.copy_from_slice(kept);
+    }
+    Ok(start)
 }
 /// The rows a leaf builder packs, read one value at a time.
 ///
@@ -418,8 +475,13 @@ impl LeafBuilder {
                 let value = rows.value(row, index);
                 // One classification per value, as in `fit_widths`: the heap cost
                 // and the column's shape are both functions of the class.
-                let class = classify_at(column.physical, &value, self.threshold(index, spilling));
-                heap = heap.saturating_add(heap_cost_of(column.physical, &value, class));
+                let class = classify_at(column.physical, &value, self.threshold(spilling));
+                heap = heap.saturating_add(heap_cost_of(
+                    column.physical,
+                    &value,
+                    class,
+                    self.extent_cost(index),
+                ));
                 if let Some(shape) = shapes.get_mut(index) {
                     shape.observe(column.physical, &value, class, self.page_size);
                 }
@@ -508,8 +570,13 @@ impl LeafBuilder {
                 // asking for them separately classified every value of every
                 // column twice - on the path a compaction and a bulk build
                 // both take.
-                let class = classify_at(column.physical, &value, self.threshold(index, spilling));
-                row_heap = row_heap.saturating_add(heap_cost_of(column.physical, &value, class));
+                let class = classify_at(column.physical, &value, self.threshold(spilling));
+                row_heap = row_heap.saturating_add(heap_cost_of(
+                    column.physical,
+                    &value,
+                    class,
+                    self.extent_cost(index),
+                ));
                 if let Some(shape) = wanted.get_mut(index) {
                     shape.observe(column.physical, &value, class, self.page_size);
                 }
@@ -602,20 +669,32 @@ impl LeafBuilder {
 
     /// Returns the longest value one column keeps in the leaf.
     ///
-    /// **A key column never spills, whatever its length.** Every comparison the
-    /// tree makes - the binary search inside a leaf, the separator an interior
-    /// page holds, the order a bulk build relies on - reads key columns out of
-    /// the page, and a key whose bytes were on another page would turn each of
-    /// those into a page fetch. A long key is a slow tree; a long key out of
-    /// line would be a tree that cannot be searched without the pool.
+    /// **Every column spills at the same length, a key column included.** A
+    /// key value over the threshold is stored on pages of its own and the leaf
+    /// keeps the reference and the first [`KEY_PREFIX_BYTES`] bytes of the
+    /// value, so a comparison reads the prefix and goes to the extent only when
+    /// the prefix does not decide. See [`LeafRef::compare_key_with`].
     ///
-    /// @param column - which column
     /// @param spilling - whether the caller gave a spiller
-    fn threshold(&self, column: usize, spilling: bool) -> usize {
-        if !spilling || column < self.key_columns {
+    pub(crate) fn threshold(&self, spilling: bool) -> usize {
+        if !spilling {
             return usize::MAX;
         }
         self.page_size / EXTENT_DIVISOR
+    }
+
+    /// Returns the heap bytes one value stored out of line costs in a column.
+    ///
+    /// The sixteen byte reference for an ordinary column. A key column adds the
+    /// two byte prefix length and the prefix.
+    ///
+    /// @param column - which column
+    pub(crate) fn extent_cost(&self, column: usize) -> usize {
+        if column < self.key_columns {
+            key_extent_record_bytes(self.page_size)
+        } else {
+            EXTENT_REF_BYTES
+        }
     }
 
     /// Returns the bytes a leaf of `count` rows spends before its heap, at the
@@ -679,7 +758,7 @@ impl LeafBuilder {
                     continue;
                 };
                 let value = rows.value(at.saturating_add(row), index);
-                let class = classify_at(column.physical, &value, self.threshold(index, spilling));
+                let class = classify_at(column.physical, &value, self.threshold(spilling));
                 shape.observe(column.physical, &value, class, self.page_size);
             }
         }
@@ -850,7 +929,7 @@ impl LeafBuilder {
         for (index, column) in self.columns.iter().enumerate() {
             let base = offsets.get(index).copied().unwrap_or(0);
             let values_at = base.saturating_add(class_bytes(count));
-            let threshold = self.threshold(index, spill.is_some());
+            let threshold = self.threshold(spill.is_some());
             let width = layout.width(index, column);
             let frame = layout.base(index);
             for row in 0..count {
@@ -908,13 +987,11 @@ impl LeafBuilder {
                         let reference = spiller
                             .spill(row, index, value.as_bytes().unwrap_or(&[]))?
                             .stating(super::extent_class_for(column.physical, &value));
-                        heap_end = heap_end
-                            .checked_sub(EXTENT_REF_BYTES)
-                            .ok_or_else(|| misuse("the heap overflowed the page"))?;
-                        let target = page
-                            .get_mut(heap_end..heap_end.saturating_add(EXTENT_REF_BYTES))
-                            .ok_or_else(|| misuse("the heap overflowed the page"))?;
-                        target.copy_from_slice(&reference.encode());
+                        let prefix = match index < self.key_columns {
+                            true => Some(key_prefix_of(&value, self.page_size)),
+                            false => None,
+                        };
+                        heap_end = write_extent_record(&mut page, heap_end, &reference, prefix)?;
                         let narrow = narrow_pair_at(column.physical, width);
                         let held = page
                             .get_mut(slot..slot.saturating_add(width))
@@ -1037,6 +1114,65 @@ fn too_wide(columns: usize, page_size: usize) -> inillucent_base::DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A spiller that hands out one reference per value and writes nothing.
+    struct Numbered(u64);
+
+    impl Spill for Numbered {
+        fn spill(&mut self, _row: usize, _column: usize, value: &[u8]) -> DbResult<ExtentRef> {
+            self.0 = self.0.saturating_add(1);
+            Ok(ExtentRef::run(
+                inillucent_pool::PageId(self.0),
+                value.len() as u64,
+            ))
+        }
+    }
+
+    /// Three keys of 40 KB share one 32 KB page, each as a reference and a
+    /// prefix, and the page's integrity check reads the prefix length.
+    ///
+    /// Before keys could go out of line the third key could not be placed at
+    /// all: two of 17 KB already filled a page.
+    #[test]
+    fn three_keys_of_forty_kilobytes_share_a_page_as_references_and_prefixes() {
+        let columns = vec![ColumnSpec::key(PhysicalType::Text)];
+        let builder = LeafBuilder::new(32_768, 1, columns, 1).expect("a builder");
+        let keys: Vec<Vec<u8>> = (0..3u8).map(|n| vec![b'a' + n; 40_000]).collect();
+        let rows: Vec<Vec<Datum<'_>>> = keys.iter().map(|k| vec![Datum::Text(k)]).collect();
+        let mut spill = Numbered(100);
+        let Packed::Filled {
+            mut page,
+            rows: placed,
+        } = builder
+            .pack_with(&rows, 1.0, Some(&mut spill))
+            .expect("a pack")
+        else {
+            panic!("the three keys were refused");
+        };
+        assert_eq!(placed, 3);
+        let mut held = Extents::default();
+        for (row, key) in keys.iter().enumerate() {
+            held.push(row, 0, key.clone());
+        }
+        let leaf = LeafRef::parse(&page).expect("a leaf").with_extents(&held);
+        assert!(leaf.has_extents());
+        let prefix_at = |row: usize| {
+            let prefix = leaf.column(0).unwrap().key_prefix(row).unwrap();
+            assert_eq!(prefix.len(), key_prefix_bytes(32_768));
+            assert_eq!(prefix, &keys[row][..key_prefix_bytes(32_768)]);
+            prefix.as_ptr() as usize - leaf.bytes().as_ptr() as usize
+        };
+        for row in 0..3usize {
+            let reference = leaf.extent_at(row, 0).expect("a reference");
+            assert_eq!(reference.first, inillucent_pool::PageId(101 + row as u64));
+            assert_eq!(reference.length, 40_000);
+        }
+        leaf.integrity().expect("the page is sound");
+        let length_at = prefix_at(1) - KEY_PREFIX_LENGTH_BYTES;
+        page[length_at] = page[length_at].wrapping_sub(1);
+        let altered = LeafRef::parse(&page).expect("a leaf").with_extents(&held);
+        assert!(altered.integrity().is_err(), "a prefix of the wrong length");
+    }
 
     /// One leaf's worth of rows, built to move the things a layout depends on.
     ///

@@ -569,7 +569,7 @@ fn corrupt_pages_never_panic() {
     // `fault_shapes::a_truncated_database_is_refused` asserts truncation near
     // one directly.
     println!(
-        "{} damaged page(s) answered something the undamaged page did not; the checksum above          this layer is what refuses them",
+        "{} damaged page(s) answered something the undamaged page did not; the checksum above this layer is what refuses them",
         wrong.len()
     );
     assert!(

@@ -1524,6 +1524,7 @@ fn build_chain<'t>(
             .ok_or_else(|| misuse("a stage vanished while building"))?;
         chain = build_nested(plan, catalog, space, params, stage, index, chain)?;
         chain = hold_rows_before_join(plan, space, params, stage, chain)?;
+        chain = filter_rows_entering_join(plan, space, params, &prepared.stages, index, chain)?;
         operators.add(|| {
             format!(
                 "{} tree {}{}",
@@ -1577,24 +1578,146 @@ fn hold_rows_before_join<'t>(
         .get(..stage.offset)
         .map(<[StaticType]>::to_vec)
         .unwrap_or_default();
-    Ok(Box::new(HeldBefore {
-        predicate: compile(&translated, &outer_types)?,
-        selection: Vec::new(),
-        downstream: chain,
-    }))
+    Ok(Box::new(HeldBefore::new(
+        std::rc::Rc::from(compile(&translated, &outer_types)?),
+        chain,
+    )))
+}
+
+/// Puts the `WHERE` terms that read only the tables before a join in front of it, so they reject
+/// a row once instead of once for every row the join pairs it with.
+///
+/// **Why.** The planner attaches each `WHERE` term to the innermost table it reads, which is the
+/// level where it can first be tested, but the filters were all put above the last join.
+/// `FROM t x, t y WHERE x.a = 1 AND y.a = 0` over 20,000 rows paired every row with every row,
+/// 400 million pairs and 7.8 s, to keep the 400 that pass. With `x.a = 1` tested before the join
+/// the inner scan runs for the 20 rows of `x` that pass: 0.03 s.
+///
+/// A term is put in front of the join only if the rows entering it hold everything the term reads,
+/// it holds no subquery, and testing it twice gives the same answer; it stays in the filters above
+/// as well. No term moves when the statement has a `RIGHT` or `FULL` join, because that join
+/// null extends the rows of the tables before it and a term tested before it would remove rows the
+/// join then restores.
+///
+/// @param plan - the planner's output
+/// @param space - the joined column space
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param stages - every stage of the join, outermost first
+/// @param index - the position of the stage whose join was just built
+/// @param chain - the join, which the filter is put in front of
+fn filter_rows_entering_join<'t>(
+    plan: &PhysicalPlan,
+    space: &Space<'_>,
+    params: &Params,
+    stages: &[PreparedStage],
+    index: usize,
+    chain: Box<dyn Sink + 't>,
+) -> DbResult<Box<dyn Sink + 't>> {
+    match entering_predicate(plan, space, params, stages, index)? {
+        Some(predicate) => Ok(Box::new(HeldBefore::new(predicate, chain))),
+        None => Ok(chain),
+    }
+}
+
+/// Compiles the terms [`filter_rows_entering_join`] tests in front of one stage's join, or
+/// returns `None` when there are none.
+///
+/// @param plan - the planner's output
+/// @param space - the joined column space
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param stages - every stage of the join, outermost first
+/// @param index - the position of the stage whose join this is
+pub(crate) fn entering_predicate(
+    plan: &PhysicalPlan,
+    space: &Space<'_>,
+    params: &Params,
+    stages: &[PreparedStage],
+    index: usize,
+) -> DbResult<Option<std::rc::Rc<dyn crate::expr::Eval>>> {
+    let Some(stage) = stages.get(index) else {
+        return Ok(None);
+    };
+    let Some(term) = rows_entering_term(plan, stages, index) else {
+        return Ok(None);
+    };
+    let translated = translate_scan(&term, space, params)?;
+    let entering_types: Vec<StaticType> = space
+        .types
+        .get(..stage.offset)
+        .map(<[StaticType]>::to_vec)
+        .unwrap_or_default();
+    Ok(Some(std::rc::Rc::from(compile(
+        &translated,
+        &entering_types,
+    )?)))
+}
+
+/// Returns the terms [`filter_rows_entering_join`] tests in front of one stage's join, joined by
+/// `AND`, or `None` when there are none.
+///
+/// Those are the terms attached to the table just before this stage's table: the rows entering
+/// the join hold that table's columns, and a term attached to an earlier table was put in front of
+/// an earlier join.
+///
+/// @param plan - the planner's output
+/// @param stages - every stage of the join, outermost first
+/// @param index - the position of the stage whose join this is
+fn rows_entering_term(
+    plan: &PhysicalPlan,
+    stages: &[PreparedStage],
+    index: usize,
+) -> Option<BoundExpr> {
+    let stage = stages.get(index)?;
+    let before = stages.get(index.checked_sub(1)?)?;
+    let moves = !stage.is_lookup
+        && before.term.checked_add(1) == Some(stage.term)
+        && plan.sources.iter().all(|source| {
+            !matches!(
+                source.join,
+                inillucent_sql::ast::JoinKind::Right | inillucent_sql::ast::JoinKind::Full
+            )
+        });
+    if !moves {
+        return None;
+    }
+    let attached = plan.residuals.get(before.term)?.as_ref()?;
+    inillucent_sql::plan::conjunction(attached)
+        .into_iter()
+        .filter(|term| {
+            !inillucent_sql::plan::expression_holds_subquery(term)
+                && inillucent_sql::plan::is_repeatable_condition(term)
+        })
+        .reduce(|left, right| BoundExpr::And(Box::new(left), Box::new(right)))
 }
 
 /// A filter in front of a join, which borrows the catalog the join does.
 ///
 /// [`Filter`] owns a `'static` sink, and a join reads trees it borrows, so the
 /// filter that goes in front of a `RIGHT` or `FULL` join cannot be one.
-struct HeldBefore<'t> {
+pub(crate) struct HeldBefore<'t> {
     /// The compiled terms, over the rows entering the join.
-    predicate: Box<dyn crate::expr::Eval>,
+    predicate: std::rc::Rc<dyn crate::expr::Eval>,
     /// Reused across batches.
     selection: Vec<u32>,
     /// The join.
     downstream: Box<dyn Sink + 't>,
+}
+
+impl<'t> HeldBefore<'t> {
+    /// Puts a filter in front of a join.
+    ///
+    /// @param predicate - the compiled terms, over the rows entering the join
+    /// @param downstream - the join
+    pub(crate) fn new(
+        predicate: std::rc::Rc<dyn crate::expr::Eval>,
+        downstream: Box<dyn Sink + 't>,
+    ) -> HeldBefore<'t> {
+        HeldBefore {
+            predicate,
+            selection: Vec::new(),
+            downstream,
+        }
+    }
 }
 
 impl Sink for HeldBefore<'_> {
@@ -1719,7 +1842,7 @@ impl<'t> Statement<'t> {
     pub fn run(&mut self, params: &Params) -> DbResult<()> {
         if !self.rebindable {
             return Err(misuse(
-                "this statement folded a parameter into its operator chain and cannot be re-run                  against different values",
+                "this statement folded a parameter into its operator chain and cannot be re-run against different values",
             ));
         }
         // **Refused rather than run with the old settings.** A `%` or a scalar

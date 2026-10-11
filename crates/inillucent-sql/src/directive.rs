@@ -827,7 +827,7 @@ impl<'a> Binder<'a> {
     ) -> Result<Directive, ParseError> {
         let index = self.resolve_database(database)?;
         let written = self.ast.text(name).to_vec();
-        if written.to_ascii_lowercase().starts_with(b"sqlite_") {
+        if !self.writable_schema && written.to_ascii_lowercase().starts_with(b"sqlite_") {
             return Err(refused(
                 format!(
                     "object name reserved for internal use: {}",
@@ -936,7 +936,7 @@ impl<'a> Binder<'a> {
             None => self.resolve_database(database)?,
         };
         let written = self.ast.text(name).to_vec();
-        if written.to_ascii_lowercase().starts_with(b"sqlite_") {
+        if !self.writable_schema && written.to_ascii_lowercase().starts_with(b"sqlite_") {
             return Err(refused(
                 format!(
                     "object name reserved for internal use: {}",
@@ -1002,7 +1002,7 @@ impl<'a> Binder<'a> {
             None => self.resolve_database(database)?,
         };
         let written = self.ast.text(name).to_vec();
-        if written.to_ascii_lowercase().starts_with(b"sqlite_") {
+        if !self.writable_schema && written.to_ascii_lowercase().starts_with(b"sqlite_") {
             return Err(refused(
                 format!(
                     "object name reserved for internal use: {}",
@@ -1348,32 +1348,38 @@ impl<'a> Binder<'a> {
     ) -> Result<(), ParseError> {
         let table = String::from_utf8_lossy(self.ast.text(table)).into_owned();
         for column in columns {
-            let Some(declared) = column.declared_type.as_ref() else {
-                return Err(refused(
-                    format!(
-                        "missing datatype for {table}.{}",
-                        String::from_utf8_lossy(self.ast.text(column.name))
-                    ),
-                    Span::default(),
-                ));
-            };
-            let folded = declared.to_ascii_uppercase();
-            let allowed = matches!(
-                folded.as_slice(),
-                b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY"
-            );
-            if !allowed {
-                return Err(refused(
-                    format!(
-                        "unknown datatype for {table}.{}: \"{}\"",
-                        String::from_utf8_lossy(self.ast.text(column.name)),
-                        String::from_utf8_lossy(declared)
-                    ),
-                    Span::default(),
-                ));
+            if let Some(fault) = self.strict_column_fault(column, &table) {
+                return Err(refused(fault, Span::default()));
             }
         }
         Ok(())
+    }
+
+    /// Returns the reason a column's declared type is refused in a `STRICT` table, if it is.
+    ///
+    /// `ALTER TABLE ... ADD COLUMN` on a `STRICT` table needs the same test: SQLite rewrites
+    /// the table's text and then fails to read it back, so the column is refused with the same
+    /// words after `error in table t after add column:`.
+    ///
+    /// @param column - the column definition
+    /// @param table - the table's name as written
+    fn strict_column_fault(&self, column: &ast::ColumnDef, table: &str) -> Option<String> {
+        let name = String::from_utf8_lossy(self.ast.text(column.name)).into_owned();
+        let Some(declared) = column.declared_type.as_ref() else {
+            return Some(format!("missing datatype for {table}.{name}"));
+        };
+        let folded = declared.to_ascii_uppercase();
+        let allowed = matches!(
+            folded.as_slice(),
+            b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY"
+        );
+        if allowed {
+            return None;
+        }
+        Some(format!(
+            "unknown datatype for {table}.{name}: \"{}\"",
+            String::from_utf8_lossy(declared)
+        ))
     }
 
     /// Binds an `ANALYZE`.
@@ -1537,12 +1543,18 @@ impl<'a> Binder<'a> {
             }
             ast::AlterAction::AddColumn(definition) => {
                 let risk = self.check_added_column(&target, definition)?;
-                match definition.deferred_failure {
+                let table_name = String::from_utf8_lossy(&target.name).into_owned();
+                let strict_fault = target
+                    .strict
+                    .then(|| self.strict_column_fault(definition, &table_name))
+                    .flatten();
+                let deferred = definition
+                    .deferred_failure
+                    .map(str::to_string)
+                    .or(strict_fault);
+                match deferred {
                     Some(reason) => AlterKind::AddColumnFailsAfter {
-                        message: format!(
-                            "error in table {} after add column: {reason}",
-                            String::from_utf8_lossy(&target.name)
-                        ),
+                        message: format!("error in table {table_name} after add column: {reason}"),
                     },
                     None => AlterKind::AddColumn {
                         start: definition.span.start,
@@ -2108,7 +2120,7 @@ impl<'a> Binder<'a> {
             None => self.resolve_database(database)?,
         };
         let written = self.ast.text(name).to_vec();
-        if written.to_ascii_lowercase().starts_with(b"sqlite_") {
+        if !self.writable_schema && written.to_ascii_lowercase().starts_with(b"sqlite_") {
             return Err(refused(
                 format!(
                     "object name reserved for internal use: {}",
@@ -2354,7 +2366,7 @@ impl<'a> Binder<'a> {
         };
         // After the table is found, as SQLite does: `CREATE TRIGGER sqlite_x ... ON missing` is
         // a missing table and not a reserved name.
-        if written.to_ascii_lowercase().starts_with(b"sqlite_") {
+        if !self.writable_schema && written.to_ascii_lowercase().starts_with(b"sqlite_") {
             return Err(refused(
                 format!(
                     "object name reserved for internal use: {}",
@@ -2515,7 +2527,7 @@ impl<'a> Binder<'a> {
         let (index, database_name, target) = self.index_target(database, table)?;
         self.refuse_unindexable(&target)?;
         let written = self.ast.text(name).to_vec();
-        if written.to_ascii_lowercase().starts_with(b"sqlite_") {
+        if !self.writable_schema && written.to_ascii_lowercase().starts_with(b"sqlite_") {
             return Err(refused(
                 format!(
                     "object name reserved for internal use: {}",

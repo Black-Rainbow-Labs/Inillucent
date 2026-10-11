@@ -55,8 +55,14 @@ The statuses you will see most often, each produced by the release build:
 | `invalid_state` | a misuse the command itself refused: a file that already exists, a path outside `--root`, two statements given to `query` or `exec` | `exec runs one statement and this is several; ... Use batch` |
 
 The driver has four more statuses: `interrupted`, `full`, `too_big` and `internal`. `internal` is a
-defect in inillucent. Report it. `full` means the disk refused a write. The statement that met it
-failed, and the next statement on the same connection writes again once space is free. `too_big`
+defect in inillucent. Report it. `full` means the disk refused a write, or the file is at its
+`PRAGMA max_page_count` (the message is `database or disk is full` in both cases). The statement that
+met it failed, and the next statement on the same connection writes again once space is free. If the
+disk has room, run `PRAGMA max_page_count` and compare it with `PRAGMA page_count`. A limit that was
+set on the connection stays until the file is reopened, and `PRAGMA max_page_count = 4294967294`
+removes it. The transaction the statement was in stays open. A file in the default `auto_vacuum` mode
+keeps the pages that deletes free, so it can be full of free pages: `PRAGMA freelist_count` says how
+many, and `PRAGMA auto_vacuum = FULL` followed by `VACUUM` makes the file give them back. `too_big`
 also covers a page cache with no page it can give up, which a larger `PRAGMA cache_size` lifts.
 Before version 2.0.8 `inillucent batch` and `inillucent analyze` reported `busy` as `syntax`, and the
 driver reported out of memory as `syntax`.
@@ -101,6 +107,17 @@ engine in both directions: a row that says yes and fails, or a row that says no 
 build. The two unchecked rows are `cancel` and `readonly_open`, and both say `partial`. A name that
 is not in the table is the status `not_found` and means no.
 
+An older release that opens a file a newer release created also exits 3:
+
+```text
+Error [unsupported]: could not open "app.rdb": this database is format version 3 and this build reads version 2; upgrade inillucent to open it
+```
+
+Every file that 2.5.0 or a later release creates is format 3, and releases from 0.1.5 to 2.4.2
+refuse it with this message. Upgrade the program that opens the file. Nothing converts a format 3
+file back to format 2. A file that an earlier release created stays at format 2 until it stores a
+key longer than `page_size / 8` or is rebuilt by `VACUUM`, so the earlier release can still open it.
+
 [`docs/feature-comparison.md`](../../docs/feature-comparison.md) compares inillucent with the pinned
 SQLite 3.53.4, case by case. On the 1.0.32 build, 402 of 416 probed cases produce the same answer.
 Of the other fourteen:
@@ -122,9 +139,10 @@ Of the other fourteen:
 | `this surface is confined to a directory with --root, and a migration from a server reaches a host and a port ...` | `--root` also refuses network access | run the server migration without `--root` |
 | `'exec' changes the database, and this is read only.` | the connection was opened with `--readonly` | drop `--readonly`, or run a `SELECT` |
 
-`inillucent backup <file>` does replace an existing file at `<file>`. Never give `backup` the path of
-the database it is copying: on the 1.0.32 build that fails with `io` and leaves the database
-damaged.
+`inillucent backup <file>` replaces an existing file at `<file>`, but only after the copy is
+written beside it and checked, and it removes the log files the replaced database left. A backup
+onto the database it is copying is refused with `cannot back up ... onto itself`. Builds before this
+change copied the file onto itself and destroyed it.
 
 `--readonly` decides by what a statement does. The SQL parser classifies the statement, so
 `SELECT 'delete' FROM t` runs, and `DELETE FROM t` is refused with `readonly`.

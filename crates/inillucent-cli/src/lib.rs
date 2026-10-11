@@ -132,6 +132,7 @@ pub mod json;
 pub mod keys;
 pub mod mcp;
 pub mod render;
+pub mod schema_indent;
 pub mod setup;
 pub mod shell;
 // The second file allowed `unsafe`; see its module comment and `policy.rs`.
