@@ -486,11 +486,41 @@ impl TreeLog for WalLog<'_> {
                 tree,
                 key: KeyCopy::Empty,
                 row: None,
-                page: Some((std::rc::Rc::clone(page), located)),
+                page: Some(FromPage::One(std::rc::Rc::clone(page), located)),
             });
         }
         Ok(())
     }
+
+    fn undo_run_from_page(
+        &mut self,
+        tree: u64,
+        _keys: &[&[Datum<'_>]],
+        page: &std::rc::Rc<[u8]>,
+        located: &[inillucent_tree::Located],
+    ) -> DbResult<()> {
+        if let Some(buffer) = self.undo {
+            // One record for the run; see `TreeLog::undo_run_from_page`.
+            buffer.borrow_mut().push(Before {
+                schema: self.schema,
+                tree,
+                key: KeyCopy::Empty,
+                row: None,
+                page: Some(FromPage::Run(std::rc::Rc::clone(page), located.into())),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Where the rows of an undo record lie in a copy of their leaf, read only if a rollback needs
+/// them.
+#[derive(Clone, Debug)]
+pub(crate) enum FromPage {
+    /// One row.
+    One(std::rc::Rc<[u8]>, inillucent_tree::Located),
+    /// The rows a run removed from one leaf, in the order it removed them (task-2226).
+    Run(std::rc::Rc<[u8]>, Box<[inillucent_tree::Located]>),
 }
 
 /// One row as it was before a statement inside a transaction changed it.
@@ -530,7 +560,7 @@ pub(crate) struct Before {
     ///
     /// Set instead of `row` by a run that removes many rows of one leaf
     /// (task-2183); see `TreeLog::undo_from_page`.
-    pub(crate) page: Option<(std::rc::Rc<[u8]>, inillucent_tree::Located)>,
+    pub(crate) page: Option<FromPage>,
 }
 
 /// The key an undo record keeps, held without a vector when it is one value or two.

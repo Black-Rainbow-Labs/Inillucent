@@ -250,6 +250,9 @@ pub struct Compiled {
     /// Where `upper`'s `CollectInto` writes the rows, and where
     /// [`Compiled::take_rows`] takes them back out.
     collected: std::rc::Rc<std::cell::RefCell<Vec<Vec<OwnedDatum>>>>,
+    /// Where `upper`'s `CollectInto` writes the rows instead while [`Compiled::run_packed`]
+    /// runs: empty otherwise.
+    packed: crate::ops::Packing,
     /// The statement's correlated blocks and their gate, wrapped around
     /// `upper` on every run the way a join is; see [`CorrelatedRecipe`].
     correlated: Option<CorrelatedRecipe>,
@@ -442,7 +445,8 @@ impl Compiled {
                     recipe.full_key,
                     chain,
                 )
-                .with_needed(recipe.needed),
+                .with_needed(recipe.needed)
+                .with_merge(),
             );
             if let Some(predicate) = &recipe.entering {
                 chain = Box::new(crate::physical::HeldBefore::new(
@@ -514,6 +518,34 @@ impl Compiled {
     /// nothing reads the buffer again before the next run clears it.
     pub fn take_rows(&self) -> Vec<Vec<OwnedDatum>> {
         std::mem::take(&mut *self.collected.borrow_mut())
+    }
+
+    /// Runs the chain into a packed set of rows instead of a vector a row.
+    ///
+    /// For an `INSERT ... SELECT` the bulk build will take; see
+    /// [`crate::ops::CollectInto::with_packed`]. On a failure the rows delivered before it are
+    /// kept for [`crate::physical::take_partial_rows`], as `take_rows` keeps them for a
+    /// caller of [`Compiled::run`].
+    ///
+    /// @param plan - the planner's output this chain was compiled from
+    /// @param catalog - where the trees and layouts come from, for this call only
+    /// @param params - the values bound to `?1`, `?2`, ...
+    pub fn run_packed(
+        &mut self,
+        plan: &PhysicalPlan,
+        catalog: &dyn TreeCatalog,
+        params: &Params,
+    ) -> DbResult<crate::packed::PackedRows> {
+        *self.packed.borrow_mut() = Some(crate::packed::PackedRows::new());
+        let ran = self.run(plan, catalog, params);
+        let packed = self.packed.borrow_mut().take().unwrap_or_default();
+        match ran {
+            Ok(()) => Ok(packed),
+            Err(error) => {
+                crate::physical::keep_partial_rows(packed.into_rows());
+                Err(error)
+            }
+        }
     }
 }
 
@@ -693,10 +725,14 @@ pub fn try_compile_limited(
     // exactly once no matter what the rest of this function decides.
     let before = params.reads();
     let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let sink = Box::new(match limit {
-        Some(limit) => CollectInto::with_limit(std::rc::Rc::clone(&collected), limit),
-        None => CollectInto::new(std::rc::Rc::clone(&collected)),
-    });
+    let packed: crate::ops::Packing = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let sink = Box::new(
+        match limit {
+            Some(limit) => CollectInto::with_limit(std::rc::Rc::clone(&collected), limit),
+            None => CollectInto::new(std::rc::Rc::clone(&collected)),
+        }
+        .with_packed(std::rc::Rc::clone(&packed)),
+    );
     // The listing is kept here: a `Compiled` builds its chain once and every
     // later execution reuses it, so rendering the operators costs one render
     // per compiled statement rather than one per execution, and
@@ -743,6 +779,7 @@ pub fn try_compile_limited(
         settings: params.settings(),
         bindings,
         collected,
+        packed,
         correlated,
     }))
 }

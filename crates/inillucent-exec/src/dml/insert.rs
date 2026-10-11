@@ -1393,9 +1393,16 @@ pub(crate) fn declarations_are_met(
         // **A virtual generated column has no slot, and its value is computed.**
         // `NOT NULL` on one was never tested, because the loop only looked at
         // columns the row holds. The value tested is the one a read returns.
-        let value = match slot {
-            Some(slot) => row.get(slot).cloned(),
-            None => declarations.virtual_value(space, row, position as u16)?,
+        // **Borrowed, not cloned (task-2226).** Cloning every value of the row
+        // to ask whether it is NULL was a string copy per text value, 6% of
+        // `INSERT INTO copied SELECT ...` over 100,000 rows.
+        let computed;
+        let value: Option<&OwnedDatum> = match slot {
+            Some(slot) => row.get(slot),
+            None => {
+                computed = declarations.virtual_value(space, row, position as u16)?;
+                computed.as_ref()
+            }
         };
         if slot.is_none() && value.is_none() {
             continue;
@@ -1405,14 +1412,14 @@ pub(crate) fn declarations_are_met(
         // spelling of one and converted here, which is where a column's
         // affinity is applied to a value on its way in.
         if let (Some(slot), Some(width)) = (slot, column.vector_dimensions()) {
-            if let Some(converted) = vector_from_json(value.as_ref(), width) {
+            if let Some(converted) = vector_from_json(value, width) {
                 if let Some(cell) = row.get_mut(slot) {
                     *cell = converted.clone();
                 }
                 vector_column_is_met(&table.name, &column.name, width, Some(&converted))?;
                 continue;
             }
-            vector_column_is_met(&table.name, &column.name, width, value.as_ref())?;
+            vector_column_is_met(&table.name, &column.name, width, value)?;
         }
         if !column.not_null || Some(position as u16) == table.rowid_alias {
             continue;

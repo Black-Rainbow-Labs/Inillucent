@@ -227,6 +227,7 @@ impl crate::ImportedDatabase {
                 page_size,
                 frames,
                 opened_as: file_number(vfs.as_ref(), &target),
+                quiet_checked: std::cell::Cell::new(None),
                 path: target,
                 wal,
                 // A file this call just created has no log to recover.
@@ -758,6 +759,7 @@ impl crate::ImportedDatabase {
                 page_size,
                 frames,
                 opened_as,
+                quiet_checked: std::cell::Cell::new(None),
                 path,
                 wal,
                 recovery,

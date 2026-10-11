@@ -40,12 +40,16 @@ pub(super) fn plan_leaves<'d>(
 ) -> DbResult<LeafPlan> {
     let mut boundaries: Vec<usize> = Vec::new();
     let mut separators: Vec<Vec<u8>> = Vec::new();
+    let mut layouts: Vec<crate::leaf::Layout> = Vec::new();
     let mut head: Vec<Datum<'d>> = Vec::with_capacity(key_columns);
     let mut at = 0usize;
     let mut row_count = 0u64;
     let total = rows.len();
     while at < total {
-        let placed = builder.fit(rows, at, BULK_FILL, true);
+        // The widths are kept for pass two, which encodes the same rows at the same widths;
+        // working them out again was a pass over every value of every leaf, about 4% of an
+        // `INSERT ... SELECT` of 100,000 rows (task-2226).
+        let (placed, layout) = builder.fit_widths(rows, at, BULK_FILL, true);
         if placed == 0 {
             // Every oversized text and blob would have gone out of line, so what is
             // left is keys, fixed-width slots and sixteen bytes per reference. A row
@@ -66,6 +70,7 @@ pub(super) fn plan_leaves<'d>(
         );
         separators.push(separator);
         boundaries.push(placed);
+        layouts.push(layout);
         at = at.saturating_add(placed);
         row_count = row_count.saturating_add(placed as u64);
     }
@@ -77,6 +82,7 @@ pub(super) fn plan_leaves<'d>(
     Ok(LeafPlan {
         boundaries,
         separators,
+        layouts,
         row_count,
         empty,
     })
@@ -88,6 +94,9 @@ pub(super) struct LeafPlan {
     pub(super) boundaries: Vec<usize>,
     /// Each leaf's first key, encoded, one per boundary.
     pub(super) separators: Vec<Vec<u8>>,
+    /// The slot widths pass one priced each leaf at, one per boundary, and none for the
+    /// empty leaf of an empty run.
+    pub(super) layouts: Vec<crate::leaf::Layout>,
     /// How many rows the tree will hold.
     pub(super) row_count: u64,
     /// Whether the run was empty and the single leaf is the empty one.

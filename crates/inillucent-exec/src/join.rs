@@ -48,6 +48,7 @@
 // path it had, so no call site in the workspace moved.
 mod hash;
 mod loops;
+mod merged;
 mod probed;
 mod store;
 pub use hash::*;
@@ -384,6 +385,73 @@ mod tests {
         assert_eq!(produced.len(), 3, "owner 5 has three rows");
         assert_eq!(produced[0][1], OwnedDatum::Int(15));
         assert_eq!(produced[2][1], OwnedDatum::Int(17));
+    }
+
+    /// Runs a prefix join of 401 outer keys into an index of 600 entries, with or without the
+    /// merge, and returns the joined rows in the order they came out and how many outer rows
+    /// were merged.
+    ///
+    /// @param merge - whether the join may merge
+    fn joined_owners(merge: bool) -> (Vec<Vec<OwnedDatum>>, usize) {
+        let vfs = MemoryVfs::new();
+        let path = DbPath::new("inljmerge.rdb");
+        let mut database = Database::create(
+            &vfs,
+            &path,
+            Options::default().with_page_size(512).with_frames(256),
+        )
+        .unwrap();
+        let columns = vec![
+            ColumnSpec::key(PhysicalType::Int64),
+            ColumnSpec::key(PhysicalType::Int64),
+        ];
+        // Owners 0 to 199, three entries each, so the walk meets runs of equal keys.
+        let owned: Vec<Vec<OwnedDatum>> = (0..600i64)
+            .map(|n| vec![OwnedDatum::Int(n / 3), OwnedDatum::Int(n)])
+            .collect();
+        let borrowed: Vec<Vec<Datum<'_>>> = owned
+            .iter()
+            .map(|row| row.iter().map(OwnedDatum::borrow).collect())
+            .collect();
+        let inner = PagedTree::bulk_build(&mut database, 6, columns, 2, &borrowed).unwrap();
+        let (rows, sink) = collector();
+        let types = [StaticType::Int];
+        let join = IndexNestedLoopJoin::new(
+            JoinKind::Inner,
+            &inner,
+            database.pool(),
+            vec![compile(&Expr::Column(0), &types).unwrap()],
+            Projection(vec![1]),
+            false,
+            sink,
+        );
+        let mut join = if merge { join.with_merge() } else { join };
+        // Scattered, with repeats and keys the index does not hold, and a real equal to an
+        // owner in the middle, which is probed after the rows buffered before it are emitted.
+        let mut outer: Vec<Vec<OwnedDatum>> = (0..400i64)
+            .map(|n| vec![OwnedDatum::Int((n * 37) % 250 - 10)])
+            .collect();
+        outer.insert(300, vec![OwnedDatum::Real(17.0)]);
+        push_rows(&mut join, &outer).unwrap();
+        join.finish().unwrap();
+        let mut produced = Vec::new();
+        produced.extend(rows.borrow().iter().cloned());
+        (produced, join.rows_merged())
+    }
+
+    /// The merge emits the rows the probes emit, in the order the probes emit them.
+    ///
+    /// With 600 inner entries the join probes its first 60 outer rows and merges the rest
+    /// (task-2226), so a merge that lost a row, found one twice or put one out of order fails
+    /// the comparison, and `rows_merged` shows the merge ran.
+    #[test]
+    fn an_index_nested_loop_merge_emits_the_rows_the_probes_emit() {
+        let (probed, none) = joined_owners(false);
+        let (merged, buffered) = joined_owners(true);
+        assert_eq!(none, 0);
+        assert!(buffered > 300, "only {buffered} outer rows were merged");
+        assert!(probed.len() > 300, "the join matched {} rows", probed.len());
+        assert_eq!(merged, probed);
     }
 
     /// A nested loop with no condition is a cross product; with one it filters.

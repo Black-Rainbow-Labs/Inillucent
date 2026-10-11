@@ -180,8 +180,17 @@ impl crate::ImportedDatabase {
                 at,
             )?;
             let from_page = match &entry.page {
-                Some((page, located)) => {
+                Some(crate::engine::write::FromPage::One(page, located)) => {
                     Some(inillucent_tree::write::row_from_page(page, *located)?)
+                }
+                Some(crate::engine::write::FromPage::Run(page, located)) => {
+                    // Put back last first, as the rows' own records would have been popped.
+                    for place in located.iter().rev() {
+                        let row = inillucent_tree::write::row_from_page(page, *place)?;
+                        let values: Vec<Datum<'_>> = row.iter().map(OwnedDatum::borrow).collect();
+                        tree.put(database, &mut log, &values)?;
+                    }
+                    continue;
                 }
                 None => None,
             };

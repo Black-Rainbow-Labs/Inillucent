@@ -55,9 +55,11 @@ pub struct UpdateRun {
     /// The row of the key straight after the used ones, as it is, when the
     /// caller was asked about it and has to write it itself.
     pub pending: Option<Vec<OwnedDatum>>,
-    /// The column and new value the caller decided for `pending`, when the
-    /// run asked about later rows before it handed `pending` back; the caller's
-    /// own record of its last decision is then for a different row.
+    /// The column and new value the caller decided for `pending`, whenever the
+    /// caller answered [`Rewrite::Column`] for it: the run asked about later
+    /// rows before it handed `pending` back, or the value did not fit where it
+    /// lies. The value is the one the caller gave, moved back to it, so the
+    /// caller keeps no copy of its answers (task-2226).
     pub pending_column: Option<(usize, OwnedDatum)>,
 }
 
@@ -69,7 +71,10 @@ struct Slotted {
     column: usize,
     /// The new value.
     value: OwnedDatum,
-    /// The row as it was, for the undo image.
+    /// The row as it was, for the undo image, when the leaf holds an out of line value.
+    ///
+    /// Empty otherwise: the run's undo image is then [`Asked::before_page`], one copy of the
+    /// leaf for every row of the run (task-2226).
     before: Vec<OwnedDatum>,
     /// Where the row lies in the leaf.
     located: Located,
@@ -224,7 +229,12 @@ impl PagedTree {
         };
         if underflowed {
             let path = self.leaf_for(database.pool(), &self.encode_key(first))?.1;
-            self.merge_if_small(database, log, page, &path)?;
+            // An emptied leaf waits to be unlinked with the others under its parent; see
+            // `write::unlink`. The next key is in a later leaf, which this delete reaches through
+            // the remembered leaf's right link or a descent.
+            if !self.defer_unlink(database, log, page, path.clone())? {
+                self.merge_if_small(database, log, page, &path)?;
+            }
         }
         Ok(taken)
     }
@@ -384,12 +394,20 @@ impl PagedTree {
         // a bulk delete.
         let mut bytes: Vec<u8> = Vec::with_capacity(run.saturating_mul(16));
         let mut ends: Vec<usize> = Vec::with_capacity(run);
+        // The undo images of a run read from one copy of the leaf are recorded together; see
+        // `TreeLog::undo_run_from_page`.
+        if let (true, Some(copy)) = (wants_undo, snapshot) {
+            let located: Vec<Located> = doomed.iter().map(|held| held.located).collect();
+            log.undo_run_from_page(
+                self.tree_id(),
+                keys.get(..run).unwrap_or(keys),
+                copy,
+                &located,
+            )?;
+        }
         for (key, held) in keys.iter().zip(doomed) {
-            if wants_undo {
-                match snapshot {
-                    Some(copy) => log.undo_from_page(self.tree_id(), key, copy, held.located)?,
-                    None => log.undo(self.tree_id(), key, Some(held.row))?,
-                }
+            if wants_undo && snapshot.is_none() {
+                log.undo(self.tree_id(), key, Some(held.row))?;
             }
             for value in key.iter().take(self.key_columns()) {
                 value.encode_tagged(&mut bytes);
@@ -463,17 +481,17 @@ impl PagedTree {
 fn apply_run(bytes: &mut [u8], doomed: &[Located], lsn: u64) -> DbResult<()> {
     let mut leaf = LeafMut::new(bytes)?;
     let mut deltas = Vec::new();
+    let mut sorted = Vec::with_capacity(doomed.len());
     for located in doomed {
         match *located {
-            Located::Sorted(row) => {
-                if matches!(leaf.set_tombstone(row)?, Applied::NoRoom) {
-                    // Unreachable: the room check answered for this page.
-                    return Err(corrupt("a leaf lost the room for its tombstones"));
-                }
-            }
+            Located::Sorted(row) => sorted.push(row),
             Located::Delta(index) => deltas.push(index),
             Located::Absent => return Err(corrupt("a row that was read could not be deleted")),
         }
+    }
+    if !sorted.is_empty() && matches!(leaf.set_tombstones(&sorted)?, Applied::NoRoom) {
+        // Unreachable: the room check answered for this page.
+        return Err(corrupt("a leaf lost the room for its tombstones"));
     }
     leaf.remove_deltas(&deltas)?;
     leaf.set_lsn(lsn)
@@ -567,7 +585,16 @@ impl PagedTree {
             let mut changes = std::mem::take(&mut asked.slotted);
             let started = changes.len();
             changes.append(&mut asked.repacked);
-            if self.repack_run(database, log, page, keys, &original, &mut changes)? {
+            let before_page = asked.before_page.clone();
+            if self.repack_run(
+                database,
+                log,
+                page,
+                keys,
+                &original,
+                &mut changes,
+                before_page.as_ref(),
+            )? {
                 return outcome.map(|_| true);
             }
             // The rows do not fit one page with their new values. The rows
@@ -578,12 +605,15 @@ impl PagedTree {
             if let (Some(first), Some(fallback)) = (later.into_iter().next(), asked.fallback) {
                 run.taken = fallback.taken;
                 run.counted = fallback.counted;
+                run.pending = Some(match &before_page {
+                    Some(image) => super::row_from_page(image, first.located)?,
+                    None => first.before,
+                });
                 run.pending_column = Some((first.column, first.value));
-                run.pending = Some(first.before);
             }
         }
         if let (Some(image), false) = (asked.copy, asked.slotted.is_empty()) {
-            let lsn = self.log_slots(log, page, keys, asked.slotted)?;
+            let lsn = self.log_slots(log, page, keys, asked.slotted, asked.before_page.as_ref())?;
             database.pool().modify(page, |bytes| {
                 if bytes.len() != image.len() {
                     return Err(corrupt("a leaf changed size during an update"));
@@ -621,16 +651,49 @@ impl PagedTree {
             .with_collations(self.collations())
             .with_directions(self.directions())
             .with_pool(pool);
+        // A row with an out of line value cannot be read back from a copy of the leaf alone.
+        let keep_rows = leaf.has_extents();
+        // **Each column's place in the leaf is read once for the run** (task-2226), when no
+        // value is out of line. `row_in_leaf` read every column's directory entry again for
+        // each row, a fifth of `UPDATE side_table SET note = note || '!'`.
+        let columns: Vec<crate::leaf::MiniColumn<'_>> = match keep_rows {
+            true => Vec::new(),
+            false => (0..leaf.column_count())
+                .map(|column| leaf.column(column))
+                .collect::<DbResult<_>>()?,
+        };
         for (index, key) in keys.iter().enumerate() {
             let located = self.locate_in(&leaf, key)?;
-            let Some(before) = self.row_in_leaf(pool, &leaf, located)? else {
+            let read = match located {
+                Located::Sorted(row) if !keep_rows => Some(
+                    columns
+                        .iter()
+                        .map(|column| {
+                            column
+                                .value(row)
+                                .map(|value| OwnedDatum::from_datum(&value))
+                        })
+                        .collect::<DbResult<Vec<_>>>()?,
+                ),
+                _ => self.row_in_leaf(pool, &leaf, located)?,
+            };
+            let Some(before) = read else {
                 return Ok(index > 0);
             };
             let written = match rewrite(&before)? {
                 Rewrite::Skip => false,
                 Rewrite::Unchanged => true,
                 Rewrite::Column(column, value) => {
-                    let change = Slotted {
+                    let (before, spare) = match keep_rows {
+                        true => (before, None),
+                        false => {
+                            if asked.before_page.is_none() {
+                                asked.before_page = Some(std::rc::Rc::from(guard.bytes()));
+                            }
+                            (Vec::new(), Some(before))
+                        }
+                    };
+                    let mut change = Slotted {
                         key: index,
                         column,
                         value,
@@ -665,7 +728,11 @@ impl PagedTree {
                         });
                         asked.repacked.push(change);
                     } else {
-                        run.pending = Some(change.before);
+                        // The caller is handed the value it decided, so it need
+                        // not keep a copy of every answer for this case.
+                        let row = spare.unwrap_or_else(|| std::mem::take(&mut change.before));
+                        run.pending = Some(row);
+                        run.pending_column = Some((change.column, change.value));
                         return Ok(true);
                     }
                     true
@@ -713,13 +780,26 @@ impl PagedTree {
             return Ok(false);
         };
         let borrowed = value.borrow();
-        let asked = copy.as_deref().unwrap_or(page);
-        if column < self.key_columns() || !would_update_slot(asked, column, row, &borrowed)? {
+        if column < self.key_columns() {
             return Ok(false);
         }
-        let image = copy.get_or_insert_with(|| page.to_vec());
+        // **Once there is a copy, the write is tried on it directly** (task-2226).
+        // `update_slot` refuses before it changes a byte, every refusal being one
+        // `would_update_slot` makes, so asking first only parsed the leaf four more
+        // times a row: `UPDATE side_table SET note = note || '!'` spent a tenth of
+        // its time in the question.
+        let (image, costed) = match copy {
+            Some(image) => (image, false),
+            None => {
+                if !would_update_slot(page, column, row, &borrowed)? {
+                    return Ok(false);
+                }
+                (copy.insert(page.to_vec()), true)
+            }
+        };
         match LeafMut::new(image)?.update_slot(column, row, &borrowed)? {
             Applied::Yes => Ok(true),
+            Applied::NoRoom if !costed => Ok(false),
             Applied::NoRoom => Err(corrupt("a slot write that was costed did not apply")),
         }
     }
@@ -753,6 +833,7 @@ impl PagedTree {
         keys: &[&[Datum<'_>]],
         original: &[u8],
         changes: &mut [Slotted],
+        before_page: Option<&std::rc::Rc<[u8]>>,
     ) -> DbResult<bool> {
         let collations = self.collations().to_vec();
         let directions = self.directions().to_vec();
@@ -814,12 +895,7 @@ impl PagedTree {
         };
         let written = befores.len();
         if log.wants_undo() {
-            for (at, before) in befores {
-                let Some(key) = keys.get(at) else {
-                    return Err(corrupt("a change names a key the run was not given"));
-                };
-                log.undo(self.tree_id(), key, Some(before))?;
-            }
+            self.undo_changes(log, keys, befores, changes, before_page)?;
         }
         match packed {
             Some(mut image) => {
@@ -865,33 +941,39 @@ impl PagedTree {
         Ok(true)
     }
 
-    /// Writes each slot's undo image and `UpdateInPlace` record, in key order.
+    /// Writes the run's undo image and each slot's `UpdateInPlace` record, in key order.
     ///
-    /// Returns the last record's LSN. The undo image is the row the run read,
-    /// moved rather than copied: nothing else needs it.
+    /// Returns the last record's LSN. [`PagedTree::undo_changes`] says what the undo
+    /// image is.
     ///
     /// @param log - where the records go
     /// @param page - the leaf
     /// @param keys - the keys the slots index into
     /// @param slotted - the slots written, in key order
+    /// @param before_page - the leaf as it was, when the rows kept no images of their own
     fn log_slots(
         &self,
         log: &mut dyn TreeLog,
         page: PageId,
         keys: &[&[Datum<'_>]],
-        slotted: Vec<Slotted>,
+        mut slotted: Vec<Slotted>,
+        before_page: Option<&std::rc::Rc<[u8]>>,
     ) -> DbResult<u64> {
         let mut lsn = 0;
         let mut tagged_key = Vec::new();
         let mut slot = Vec::new();
         let written = slotted.len();
+        if log.wants_undo() {
+            let befores: Vec<(usize, Vec<OwnedDatum>)> = slotted
+                .iter_mut()
+                .map(|held| (held.key, std::mem::take(&mut held.before)))
+                .collect();
+            self.undo_changes(log, keys, befores, &slotted, before_page)?;
+        }
         for held in slotted {
             let Some(key) = keys.get(held.key) else {
                 return Err(corrupt("a slot names a key the run was not given"));
             };
-            if log.wants_undo() {
-                log.undo(self.tree_id(), key, Some(held.before))?;
-            }
             tagged_key.clear();
             for value in key.iter().take(self.key_columns()) {
                 value.encode_tagged(&mut tagged_key);
@@ -913,6 +995,48 @@ impl PagedTree {
     }
 }
 
+impl PagedTree {
+    /// Records what the rows an update run changed looked like before it.
+    ///
+    /// The rows' own images when they kept them, which they do when their leaf holds an out of
+    /// line value. Otherwise one record for the run: the copy of the leaf and where each row
+    /// lies in it (task-2226). See `Asked::before_page`.
+    ///
+    /// @param log - where the undo image goes
+    /// @param keys - the keys the changes index into
+    /// @param befores - each change's key index and its own image, empty when it kept none
+    /// @param changes - the changes, in key order
+    /// @param before_page - the leaf as it was, when the rows kept no images
+    fn undo_changes(
+        &self,
+        log: &mut dyn TreeLog,
+        keys: &[&[Datum<'_>]],
+        befores: Vec<(usize, Vec<OwnedDatum>)>,
+        changes: &[Slotted],
+        before_page: Option<&std::rc::Rc<[u8]>>,
+    ) -> DbResult<()> {
+        if let Some(image) = before_page {
+            let mut run_keys: Vec<&[Datum<'_>]> = Vec::with_capacity(changes.len());
+            let mut located: Vec<Located> = Vec::with_capacity(changes.len());
+            for change in changes {
+                let Some(key) = keys.get(change.key) else {
+                    return Err(corrupt("a change names a key the run was not given"));
+                };
+                run_keys.push(key);
+                located.push(change.located);
+            }
+            return log.undo_run_from_page(self.tree_id(), &run_keys, image, &located);
+        }
+        for (at, before) in befores {
+            let Some(key) = keys.get(at) else {
+                return Err(corrupt("a change names a key the run was not given"));
+            };
+            log.undo(self.tree_id(), key, Some(before))?;
+        }
+        Ok(())
+    }
+}
+
 /// The leaf copy an update run writes into, and what it wrote.
 #[derive(Default)]
 struct Asked {
@@ -927,6 +1051,16 @@ struct Asked {
     repacked: Vec<Slotted>,
     /// How far the run had got when the repack began.
     fallback: Option<Fallback>,
+    /// The leaf as it was, the undo image of every row the run changed, when the leaf holds no
+    /// out of line value.
+    ///
+    /// **One copy of the page for the run, not a row for each key** (task-2226). Each row's
+    /// undo image was its own vector, with a heap value for each of its text columns, kept
+    /// until the transaction ended: `UPDATE side_table SET note = note || '!'` made 25,000 of
+    /// them, and making and dropping them was a fifth of the statement. A rollback reads the
+    /// rows back from this copy with [`super::row_from_page`], the reader the delete run's undo
+    /// uses, and only a rollback does.
+    before_page: Option<std::rc::Rc<[u8]>>,
 }
 
 /// How far an update run had got when it began to repack its leaf.

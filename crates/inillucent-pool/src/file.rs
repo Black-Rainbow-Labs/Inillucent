@@ -1170,6 +1170,23 @@ impl Database {
     ///
     /// Returns whether the cache was thrown away, which the caller reports.
     pub fn begin_read(&mut self) -> DbResult<bool> {
+        self.begin_read_unless(|| false)
+    }
+
+    /// Takes SHARED like [`Database::begin_read`], and skips the read of the meta record when
+    /// `unmoved`, asked once the lock is held, answers that nothing outside this process can have
+    /// moved it.
+    ///
+    /// **For the engine's quiet token (task-2226).** The meta record moves only at a fold, which
+    /// needs EXCLUSIVE, so nothing moves it while this connection holds SHARED; and a fold by
+    /// another process before the lock was taken opened the log segment this process holds the
+    /// oplock on. The question is asked after the lock is held for that reason: a fold that
+    /// lands between an earlier look and the lock is still seen. Reading the record was two
+    /// 116 byte reads, about 5 us on the development machine, for every statement that took the
+    /// lock fresh.
+    ///
+    /// @param unmoved - answers whether the record is known not to have moved
+    pub fn begin_read_unless(&mut self, unmoved: impl FnOnce() -> bool) -> DbResult<bool> {
         self.take_back_lease();
         // **Already holding the file means nothing has changed under it.**
         // Another process can only have written while this one held no lock, so
@@ -1199,6 +1216,9 @@ impl Database {
         // changes the answer.
         wait_for_lock_within(self.pool.file(), FileLock::Shared, self.busy_millis)?;
         self.held_since = Some(std::time::Instant::now());
+        if unmoved() {
+            return Ok(false);
+        }
         self.reload_if_moved()
     }
 

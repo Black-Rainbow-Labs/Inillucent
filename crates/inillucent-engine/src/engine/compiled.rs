@@ -14,6 +14,7 @@ use inillucent_sql::bind::{AllowAll, Binder, BoundStatement};
 use inillucent_sql::catalog_view::TableInfo;
 use inillucent_sql::plan::{plan_select_with, Levers, PhysicalPlan};
 
+use crate::engine::bulk::Collected;
 use crate::*;
 
 /// The pragmas whose value belongs to the connection rather than to the file,
@@ -613,8 +614,10 @@ impl crate::ImportedDatabase {
             }
             Cached::Insert(statement, source, values_hold_subquery, setup) => {
                 let rows = match source {
-                    Some(query) => {
-                        let rows = self.run_cached_query(
+                    // Packed when the bulk build could take the rows (task-2226); see
+                    // `crate::engine::bulk::Collected`.
+                    Some(query) if self.bulk_could_take(statement)? => {
+                        let rows = self.run_cached_query_packed(
                             &query.plan,
                             &query.prepared,
                             &query.slot,
@@ -622,9 +625,18 @@ impl crate::ImportedDatabase {
                         );
                         self.before_write(rows)?
                     }
+                    Some(query) => {
+                        let rows = self.run_cached_query(
+                            &query.plan,
+                            &query.prepared,
+                            &query.slot,
+                            params,
+                        );
+                        Collected::Rows(self.before_write(rows)?)
+                    }
                     // Rows a lifted statement hands in (task-2191); none for
                     // an ordinary `VALUES` list.
-                    None => params.take_supplied_rows().unwrap_or_default(),
+                    None => Collected::Rows(params.take_supplied_rows().unwrap_or_default()),
                 };
                 // A `VALUES` list has expressions and no plan, so the
                 // plan-shaped fold never sees it. Folded here instead, or a

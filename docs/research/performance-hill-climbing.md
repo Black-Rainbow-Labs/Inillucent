@@ -3,6 +3,10 @@
 Lab report, written on 8 October 2026. Published at
 [inillucent.com/research/hill-climbing](https://inillucent.com/research/hill-climbing).
 
+**Since this report.** An eighth hill climb ended on 11 October 2026 with release 2.5.4 faster than
+SQLite on 110 of the 116 workloads the benchmark times, and 499% faster on the engine plan in a
+graded run. [After 8 October](#after-8-october) has what it changed.
+
 On 5 September 2026 inillucent's engine was 432% slower than SQLite 3.53.4 on its own benchmark. On 8
 October 2026 release 2.4.2 was 505% faster on the same benchmark, 276% faster through the API a
 program calls, and 74% faster when called from the command line, the shell, Python and Node. This
@@ -321,6 +325,32 @@ It is filed as a known bug.
 
 [Performance](../performance.md) has every current figure and
 [Performance history](../performance-history.md) every earlier one.
+
+## After 8 October
+
+The eighth climb set itself a harder goal than a weighted mean: every one of the 116 workloads, in
+all three measurements, at least as fast as SQLite. It started from 74 of 116, because release 2.5.2
+had added three questions to the file system per statement that cost about 20 us each on Windows. It
+ended at 110 of 116:
+
+| Measurement | Release 2.5.2 | Release 2.5.4 |
+|---|---:|---:|
+| the engine plan through the engine API | 31 of 34 | 31 of 34 |
+| the engine plan through the `Connection` API | 17 of 34 | 32 of 34 |
+| 48 common and edge case workloads through the `Connection` API | 26 of 48 | 47 of 48 |
+
+The changes: the file system questions are skipped while the log's oplock shows no other process
+has opened it; a range delete unlinks the leaves it empties; a join with a large outer side walks the
+inner index once; an update keeps one copy of each leaf as its undo record; an `INSERT ... SELECT`
+into an empty table collects its rows in a few large buffers; and a `WHERE` of integer comparisons
+is tested a batch of rows at a time. One change was to the benchmark: its `Connection` arm compiled
+a statement inside the clock where SQLite's arm compiles before it, and now compiles first.
+
+Two workloads are clearly slower. A range `DELETE` pays for folding the log into the database file,
+which lands on it in the plan's fixed order. `SELECT 1` compiled from text on every call through the
+engine's own API costs more than SQLite's compile; through the `Connection` API it is faster. The
+other four are within 6% of SQLite. [Performance](../performance.md#the-workloads-that-are-slower)
+says why for each, and `tasks/task-2226-performance-hillclimb-8.md` has every figure.
 
 ## What we learned
 

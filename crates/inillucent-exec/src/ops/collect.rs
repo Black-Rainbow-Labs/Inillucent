@@ -198,13 +198,66 @@ impl Sink for Reversed {
 pub struct CollectInto {
     rows: std::rc::Rc<std::cell::RefCell<Vec<Vec<OwnedDatum>>>>,
     limit: Option<usize>,
+    /// Where the rows go instead, while the caller has put a packed set here (task-2226).
+    packed: Option<Packing>,
 }
+
+/// The packed set a [`CollectInto`] fills while the caller has put one in the cell.
+pub type Packing = std::rc::Rc<std::cell::RefCell<Option<crate::packed::PackedRows>>>;
 impl CollectInto {
     /// Returns a sink appending into a shared buffer.
     ///
     /// @param rows - the buffer the caller keeps a handle on
     pub fn new(rows: std::rc::Rc<std::cell::RefCell<Vec<Vec<OwnedDatum>>>>) -> CollectInto {
-        CollectInto { rows, limit: None }
+        CollectInto {
+            rows,
+            limit: None,
+            packed: None,
+        }
+    }
+
+    /// Returns the sink appending into a packed set instead whenever the cell holds one.
+    ///
+    /// **For an `INSERT ... SELECT` the bulk build will take** (task-2226). Its rows are read
+    /// once each and then copied into the images, so a vector a row and a copy of each text
+    /// were 200,000 allocations for a 100,000 row copy. See [`crate::packed::PackedRows`].
+    ///
+    /// @param packing - the cell; empty, the sink collects into `rows` as before
+    pub fn with_packed(mut self, packing: Packing) -> CollectInto {
+        self.packed = Some(packing);
+        self
+    }
+
+    /// Appends a batch's live rows to a packed set, stopping at the limit.
+    ///
+    /// @param packed - the set
+    /// @param batch - the rows
+    /// @param limit - how many rows to keep
+    fn push_packed(
+        packed: &mut crate::packed::PackedRows,
+        batch: &Batch<'_>,
+        limit: Option<usize>,
+    ) -> DbResult<Flow> {
+        let width = batch.columns.len();
+        let mut row: Vec<inillucent_tree::datum::Datum<'_>> = Vec::with_capacity(width);
+        for nth in 0..batch.live() {
+            if limit.is_some_and(|limit| packed.len() >= limit) {
+                return Ok(Flow::Stop);
+            }
+            row.clear();
+            for column in 0..width {
+                row.push(batch.value(nth, column)?);
+            }
+            if !packed.push(row.iter().copied()) {
+                return Err(inillucent_base::error::misuse(
+                    "a row collected for an insert is not as wide as the rows before it",
+                ));
+            }
+        }
+        match limit {
+            Some(limit) if packed.len() >= limit => Ok(Flow::Stop),
+            _ => Ok(Flow::Continue),
+        }
     }
 
     /// Returns a sink that stops the pipeline after `limit` rows.
@@ -218,11 +271,17 @@ impl CollectInto {
         CollectInto {
             rows,
             limit: Some(limit),
+            packed: None,
         }
     }
 }
 impl Sink for CollectInto {
     fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
+        if let Some(packing) = &self.packed {
+            if let Some(packed) = packing.borrow_mut().as_mut() {
+                return CollectInto::push_packed(packed, batch, self.limit);
+            }
+        }
         let mut held = self.rows.borrow_mut();
         for nth in 0..batch.live() {
             if let Some(limit) = self.limit {

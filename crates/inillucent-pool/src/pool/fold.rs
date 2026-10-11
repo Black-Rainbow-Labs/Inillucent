@@ -140,11 +140,16 @@ impl Pool {
         // **No pre images when the redo log carries the after images**
         // (task-2000, design 1a). See `Pool::fold_protected_by_log`.
         if self.journal.borrow().is_some() && !self.fold_protected_by_log.get() {
+            // The file's length once for the pass; see `journal_page_within`.
+            let length = self
+                .file
+                .file_size()
+                .map_err(|error| error.into_db_error())?;
             for (page, _) in &dirty {
-                self.journal_page(*page)?;
+                self.journal_page_within(*page, Some(length))?;
             }
             for (page, _) in &spilled {
-                self.journal_page(*page)?;
+                self.journal_page_within(*page, Some(length))?;
             }
             self.seal_journal()?;
         }
@@ -401,34 +406,61 @@ impl Pool {
     ///   `AllocPage` record's LSN; zero for an unlogged build, where there is no
     ///   log to replay and the bytes stay what the unlogged builder always wrote
     pub fn write_built_page(&self, page: PageId, image: &mut [u8], lsn: u64) -> DbResult<()> {
-        if image.len() != self.page_size {
+        self.write_built_pages(page, image, &[lsn])
+    }
+
+    /// Writes a run of consecutive built pages with one write, each as
+    /// [`Pool::write_built_page`] writes one.
+    ///
+    /// **One call for the run (task-2226).** A bulk build allocates its leaves as one run and
+    /// wrote them a page at a time, and the write calls were a fifth of the build of
+    /// `INSERT INTO copied SELECT ...` over 100,000 rows. The pages are stamped and checksummed
+    /// in the buffer first, so the bytes that reach the file are the bytes one write per page
+    /// would have written.
+    ///
+    /// @param first - the first page of the run, every page already allocated
+    /// @param images - the pages' bytes, one after another, stamped and checksummed in place
+    /// @param lsns - each page's `AllocPage` LSN, or zero for an unlogged build
+    pub fn write_built_pages(
+        &self,
+        first: PageId,
+        images: &mut [u8],
+        lsns: &[u64],
+    ) -> DbResult<()> {
+        if images.len() != self.page_size.saturating_mul(lsns.len()) || lsns.is_empty() {
             return Err(misuse(format!(
-                "a built page image is {} bytes, not {}",
-                image.len(),
+                "{} bytes of built pages is not {} pages of {}",
+                images.len(),
+                lsns.len(),
                 self.page_size
             )));
         }
-        if lsn > 0 {
-            page::set_lsn(image, lsn)?;
-            self.note_high_water_lsn(lsn);
+        for (image, lsn) in images.chunks_mut(self.page_size).zip(lsns) {
+            if *lsn > 0 {
+                page::set_lsn(image, *lsn)?;
+                self.note_high_water_lsn(*lsn);
+            }
+            page::checksum_page(image)?;
         }
-        page::checksum_page(image)?;
         self.hold_for_writing()?;
         self.file
-            .write_all_at(page.0.saturating_mul(self.page_size as u64), image)
+            .write_all_at(first.0.saturating_mul(self.page_size as u64), images)
             .map_err(|error| error.into_db_error())?;
-        Counters::add(&self.counters.writes, 1);
-        // A spilled copy of this page number is the page's previous life, and a
-        // fetch would read it back in place of what was just written.
-        self.forget_spilled(page);
-        if page.0 >= self.page_count.get() {
-            self.page_count.set(page.0.saturating_add(1));
-        }
-        // Only when a frame already holds this page number. `install` would claim
-        // one otherwise, which is the residency this design exists to avoid.
-        if self.lookup(page).is_some() {
-            self.install(page, image)?;
-            self.mark_clean(page);
+        Counters::add(&self.counters.writes, lsns.len() as u64);
+        for (offset, image) in images.chunks(self.page_size).enumerate() {
+            let page = PageId(first.0.saturating_add(offset as u64));
+            // A spilled copy of this page number is the page's previous life, and a
+            // fetch would read it back in place of what was just written.
+            self.forget_spilled(page);
+            if page.0 >= self.page_count.get() {
+                self.page_count.set(page.0.saturating_add(1));
+            }
+            // Only when a frame already holds this page number. `install` would claim
+            // one otherwise, which is the residency this design exists to avoid.
+            if self.lookup(page).is_some() {
+                self.install(page, image)?;
+                self.mark_clean(page);
+            }
         }
         Ok(())
     }

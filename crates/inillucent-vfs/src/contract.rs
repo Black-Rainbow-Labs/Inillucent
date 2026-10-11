@@ -357,6 +357,18 @@ pub trait VfsFile: Send + Sync + Debug {
         true
     }
 
+    /// Returns a value that stays the same while no other process has had this file open, or
+    /// `None` when this file system cannot tell.
+    ///
+    /// **Two equal answers mean nobody outside this process opened, wrote, renamed or deleted the
+    /// file between them.** The Windows file system answers for a log segment while it holds a
+    /// batch oplock on it (`os::windows_log`), and the engine uses the answer to skip asking the
+    /// file system by name whether another process rolled the log or replaced the database
+    /// (task-2226). The default answers `None`, which keeps every check.
+    fn quiet_token(&self) -> Option<u64> {
+        None
+    }
+
     /// Returns what the device underneath guarantees.
     fn device_characteristics(&self) -> DeviceCharacteristics;
 

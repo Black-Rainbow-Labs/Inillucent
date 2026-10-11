@@ -327,6 +327,9 @@ pub struct PagedTree {
     pub(crate) stats: std::cell::Cell<crate::write::WriteStats>,
     /// Live rows of each leaf at its last failed merge attempt; see `merge_backed_off`.
     pub(crate) merge_backoff: RefCell<std::collections::HashMap<PageId, usize>>,
+    /// Leaves a sorted delete emptied and has not taken out of the tree yet, each with the
+    /// interior pages above it, root first; see `write::unlink`.
+    pub(crate) pending_unlinks: RefCell<Vec<(PageId, Vec<PageId>)>>,
     /// The leaf the last point probe of this tree landed on (task-2175).
     ///
     /// `PagedTree::update_in_place` looks here before descending from the root:
@@ -566,6 +569,7 @@ impl PagedTree {
             largest_hint: std::cell::Cell::new(None),
             stats: std::cell::Cell::new(crate::write::WriteStats::default()),
             merge_backoff: RefCell::new(std::collections::HashMap::new()),
+            pending_unlinks: RefCell::new(Vec::new()),
             last_leaf: std::cell::Cell::new(None),
         })
     }

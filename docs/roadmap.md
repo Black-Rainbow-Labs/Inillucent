@@ -27,7 +27,7 @@ slower.
 
 | # | Item | Why a user wants it | Status |
 |---|---|---|---|
-| 1 | Workloads that are slower than SQLite | faster statement preparation and index builds | one weighted workload is still slower than SQLite; `open.prepare` and `schema` miss their bars |
+| 1 | Workloads that are slower than SQLite | faster statement preparation, index builds and range deletes | 110 of 116 benchmark workloads are faster than SQLite; `open.prepare` and `schema` miss their bars |
 | 2 | Memory held by a retrieval index | a large search index that fits in a small machine's memory | the postings and the chunk text are smaller in memory; the graph is unchanged; the 512 MiB goal is not yet measured |
 | 3 | Two lines of the command line that bypass the driver | one code path from every program to the engine | 28 lines are down to 2 |
 | 4 | PostgreSQL parity | a server that PostgreSQL clients can connect to | designed, not built |
@@ -36,26 +36,33 @@ slower.
 
 ## 1. Workloads that are slower than SQLite
 
-**What it is.** The benchmark against SQLite times 30 weighted workloads. inillucent is faster on
-most of them. Some workloads are still slower, and they hold down the families they belong to.
+**What it is.** The benchmark against SQLite times 116 workloads: the engine plan of 34 through the
+engine's API and through the `Connection` API, and 48 common and edge case workloads through the
+`Connection` API. inillucent is faster on 110 of them. The others hold down the families they belong
+to.
 
-**Why a user wants it.** These workloads are common operations: a join over an index range, building
-a full text index, and compiling a short statement.
+**Why a user wants it.** These workloads are common operations: a range delete, a join over an index
+range, a commit, building an index, and compiling a short statement.
 
-**Status.** Measured 8 October 2026 with release 2.4.2, the median of three runs:
+**Status.** Measured 11 October 2026 with release 2.5.4, graded, the median of three runs:
 
-| Workload | Family | Workload ratio | Family ratio |
-|---|---|---:|---:|
-| `prepare.trivial` | `open.prepare` | 0.57x | 1.98x |
-| `schema.index` | `schema` | 1.43x | 1.05x |
+| Workload | Measurement | Ratio |
+|---|---|---:|
+| `edge.delete.range` | 48 workloads, `Connection` | 0.32x |
+| `prepare.trivial` | engine | 0.56x |
+| `join.range` | `Connection`, engine | 0.94x, 0.97x |
+| `txn.autocommit` | engine, `Connection` | 0.97x, 0.98x |
 
-- `prepare.trivial` is the one weighted workload slower than SQLite, 75% slower. It compiles
-  `SELECT 1` on every call. `open.prepare` misses its bar of 5.00x, at 1.98x.
-- `schema` misses its bar of 3.00x, at 1.05x. `schema` is one workload, `schema.index`, run once a
-  round, and the family value moves with how fast the disk finishes a sync: 1.32x, 1.86x and 1.05x
-  in the three runs.
-- `join.range` is level with SQLite at 1.00x. `read.join` is at 5.22x against its bar of 3.00x and
-  `extension` at 2.27x against 1.50x.
+- `edge.delete.range` is level with SQLite on its own. In the plan, the log is folded into the
+  database file during it every round, about 23 ms of its 34 ms. Taking the fold off a user's
+  statement needs a background fold or journaling each page when it is first changed, as SQLite
+  does; the design is in progress.
+- `prepare.trivial` compiles `SELECT 1` on every call through the engine's API. Through the
+  `Connection` API it is 66% faster than SQLite. `open.prepare` misses its bar of 5.00x, at 1.96x.
+- `join.range` and `txn.autocommit` are within 6% and have read between 0.94x and 1.07x across runs.
+  A commit is one sync of the disk on each engine.
+- `schema` misses its bar of 3.00x, at 1.33x. It is one workload, `schema.index`, run once a round,
+  and moves with how fast the disk finishes a sync: 1.16x, 1.26x and 1.33x in the three runs.
 
 [The workloads that are slower](performance.md#the-workloads-that-are-slower) has the time each
 workload takes and the reason. [By family](performance.md#by-family) has every family's ratio, lower

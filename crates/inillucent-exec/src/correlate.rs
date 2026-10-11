@@ -293,8 +293,15 @@ impl Sink for Correlated<'_> {
         // batch's own vectors under a one row selection, with the answers
         // appended as constants.
         let mut answers: Vec<OwnedDatum> = Vec::with_capacity(self.correlations.len());
+        // The gate judges the whole batch in one loop when every conjunct can (task-2226): it
+        // was two thirds of `correlated.exists.selective` asked a row at a time.
+        let judged = crate::expr::truths_of_all(&self.gate, batch);
         for nth in 0..batch.live() {
-            if !passes(&self.gate, batch, nth)? {
+            let kept = match &judged {
+                Some(truths) => truths.get(nth).copied().unwrap_or(false),
+                None => passes(&self.gate, batch, nth)?,
+            };
+            if !kept {
                 continue;
             }
             answers.clear();

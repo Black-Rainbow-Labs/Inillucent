@@ -1502,6 +1502,20 @@ fn time_one_through_a_connection(
     rows: u32,
 ) -> Result<Sample, String> {
     let mut folded = Folded::default();
+    // **The compile of a `prepare: once` workload is before the clock** (task-2226), where this
+    // function's own doc and `sqlite_bench.c` put it: SQLite calls `sqlite3_prepare_v2` and
+    // then reads its clock. This arm read the clock first and compiled inside it, so a workload
+    // that runs once, such as `correlated.scalar.selective`, was timed as a compile plus one
+    // execution against SQLite's one execution.
+    let mut prepared = if workload.prepare_each {
+        None
+    } else {
+        Some(
+            connection
+                .prepare(&workload.sql)
+                .map_err(|error| why(&error))?,
+        )
+    };
     let started = Instant::now();
     // **The commits go where the pipeline arm's go.** `time_write` calls
     // `begin_batch` and `commit_batch` at the points `sqlite_bench.c` commits,
@@ -1514,15 +1528,6 @@ fn time_one_through_a_connection(
     if grouped {
         connection.execute("BEGIN").map_err(|error| why(&error))?;
     }
-    let mut prepared = if workload.prepare_each {
-        None
-    } else {
-        Some(
-            connection
-                .prepare(&workload.sql)
-                .map_err(|error| why(&error))?,
-        )
-    };
     for iteration in 0..workload.repeat {
         match prepared.as_mut() {
             Some(statement) => {

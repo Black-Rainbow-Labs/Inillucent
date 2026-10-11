@@ -55,6 +55,7 @@ use crate::paged::PagedTree;
 mod dissolve;
 mod merge;
 mod sorted;
+mod unlink;
 pub use sorted::{Rewrite, UpdateRun};
 
 /// Reports whether a key sorts after a row's key.
@@ -529,6 +530,32 @@ pub trait TreeLog {
     ) -> DbResult<()> {
         let row = row_from_page(page, located)?;
         self.undo(tree, key, Some(row))
+    }
+
+    /// Records what each row of a run looked like before a delete removed them, as their places
+    /// in one copy of their leaf.
+    ///
+    /// **One record for the run where a log can keep one (task-2226).** A range delete of 40,000
+    /// rows made 40,000 undo records of about 150 bytes each, a new 6 MB buffer for a statement on
+    /// a new connection, and filling it was a fifth of the delete. A log that keeps a run reads
+    /// each row back with [`row_from_page`] only on a rollback. This default records the rows one
+    /// at a time through [`TreeLog::undo_from_page`].
+    ///
+    /// @param tree - the tree the rows are in
+    /// @param keys - each row's key columns, in the order of `located`
+    /// @param page - the leaf's bytes before the write
+    /// @param located - where each row lies in them
+    fn undo_run_from_page(
+        &mut self,
+        tree: u64,
+        keys: &[&[Datum<'_>]],
+        page: &std::rc::Rc<[u8]>,
+        located: &[Located],
+    ) -> DbResult<()> {
+        for (key, place) in keys.iter().zip(located) {
+            self.undo_from_page(tree, key, page, *place)?;
+        }
+        Ok(())
     }
 }
 
@@ -3263,6 +3290,11 @@ impl PagedTree {
         let Some((right, live)) = self.merge_candidate(database, page)? else {
             return Ok(());
         };
+        // An emptied leaf is taken out rather than filled with its sibling's rows; see
+        // `write::unlink`.
+        if live == 0 && self.unlink_emptied_leaf(database, log, page, path)? {
+            return Ok(());
+        }
         let Some((mut separators, mut children, level, parent, position)) =
             self.adjacent_under_one_parent(database, path, page, right)?
         else {

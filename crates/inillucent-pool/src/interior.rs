@@ -478,7 +478,19 @@ impl<'p> InteriorRef<'p> {
             };
             let key = self.key(middle)?;
             let seen = leading_u64(key);
-            if key <= probe {
+            // **The leading eight bytes decide unless they tie** (task-2226). Both
+            // numbers are the first eight bytes padded with zeros, read big endian,
+            // so when they differ the first differing byte is inside those eight
+            // and orders the two keys the way the byte compare would; a padding
+            // zero against a real byte means the padded key ended there and is the
+            // shorter, which the byte compare also puts first. Only a tie needs
+            // the rest of the bytes. Composite index keys of one integer column
+            // and the rowid differ in their first eight bytes at almost every step.
+            let at_or_below = match seen.cmp(&target) {
+                std::cmp::Ordering::Equal => key <= probe,
+                order => order == std::cmp::Ordering::Less,
+            };
+            if at_or_below {
                 low = middle.saturating_add(1);
                 // **The bracket is allowed to be loose, and this end is.** The
                 // new low end is the slot *after* the one just read, so its
@@ -918,8 +930,15 @@ mod tests {
             .collect();
         // Shorter than the guess reads: two-byte keys, zero-padded by the map.
         let short: Vec<Vec<u8>> = (1..=200u16).map(|nth| nth.to_be_bytes().to_vec()).collect();
+        // Prefixes of each other ending in zero bytes, which pad to the same
+        // leading eight bytes as the shorter key: the search may decide by
+        // those eight bytes only when they differ (task-2226), so these must
+        // reach the byte compare.
+        let prefixed: Vec<Vec<u8>> = (1..=150u8)
+            .flat_map(|nth| [vec![nth], vec![nth, 0], vec![nth, 0, 0, 1]])
+            .collect();
 
-        for separators in [&uniform, &clustered, &short] {
+        for separators in [&uniform, &clustered, &short, &prefixed] {
             let refs: Vec<&[u8]> = separators.iter().map(Vec::as_slice).collect();
             let children: Vec<Swip> = (0..=separators.len())
                 .map(|nth| Swip::unswizzled(crate::PageId(nth as u64 + 1)))

@@ -126,14 +126,13 @@ impl ImportedDatabase {
         // that held RESERVED and waited for every SHARED to leave so it could
         // fold: both waited out the busy timeout and one was refused.
         let may_release = !inside || held_before == inillucent_vfs::FileLock::None;
+        // Read before any check by name, so a break that lands during the checks gives a token
+        // that differs from this one. See `quiet_since_checked`.
+        let quiet = self.storage.wal.quiet_token();
         if self.replaced_since_open(taking, writing, held_before) {
             return self.reopen_the_replaced_file(writing, inside);
         }
-        let reloaded = if writing {
-            self.storage.database.begin_write_within(may_release)?
-        } else {
-            self.storage.database.begin_read()?
-        };
+        let reloaded = self.take_the_lock(writing, may_release)?;
         if self.replaced_since_open(taking, writing, held_before) {
             return self.reopen_the_replaced_file(writing, inside);
         }
@@ -182,15 +181,26 @@ impl ImportedDatabase {
         // transaction has no commit record, so recovery treats its records as
         // unfinished, and the next write starts where the valid log ends.
         let poisoned = !inside && self.storage.wal.is_poisoned();
+        // Asked now that the lock is held: an unchanged token means no other process
+        // folded, so the meta record is as last read (task-2226).
+        let meta_quiet = self.quiet_since_checked();
         let moved = reloaded
             || poisoned
-            || (taking && settles && (self.the_meta_moved()? || self.the_log_moved()?));
+            || (taking
+                && settles
+                && ((!meta_quiet && self.the_meta_moved()?) || self.the_log_moved()?));
         if moved && settles {
             self.settle_a_journal_left_by_the_dead(writing)?;
             self.resync_from_file()?;
         }
         if taking && settles {
             self.storage.database.mark_trusted();
+        }
+        // Both questions by name were answered for this statement - asked, skipped on an equal
+        // token, or made moot by the resynchronisation - so the token read before them stands
+        // for "nothing replaced, nothing rolled" until the oplock next breaks.
+        if taking && settles && held_before < inillucent_vfs::FileLock::Reserved {
+            self.storage.quiet_checked.set(quiet);
         }
         // **Every attached file takes its own lock, for the same reason `main`
         // does (task-1979, C2).** An attachment was the one file this engine
@@ -213,6 +223,26 @@ impl ImportedDatabase {
             self.writing.set_entry_mark(self.statement_entry());
         }
         Ok(())
+    }
+
+    /// Takes the lock a statement needs and reports whether the file's cache was thrown away.
+    ///
+    /// A read does not read the meta record when the quiet token, asked once SHARED is held,
+    /// says no other process has had the log segment open since the last full check; see
+    /// `Database::begin_read_unless` and `quiet_since_checked` (task-2226).
+    ///
+    /// @param writing - whether the statement changes the database
+    /// @param may_release - whether the lock may be let go while the write waits for it
+    fn take_the_lock(&mut self, writing: bool, may_release: bool) -> DbResult<bool> {
+        if writing {
+            return self.storage.database.begin_write_within(may_release);
+        }
+        let wal = std::rc::Rc::clone(&self.storage.wal);
+        let checked = self.storage.quiet_checked.get();
+        self.storage.database.begin_read_unless(|| {
+            let now = wal.quiet_token();
+            now.is_some() && now == checked
+        })
     }
 
     /// Rereads the schema after another process committed, and tells the modules.
@@ -274,7 +304,33 @@ impl ImportedDatabase {
     ) -> bool {
         (taking || writing)
             && held_before < inillucent_vfs::FileLock::Reserved
+            && !self.quiet_since_checked()
             && self.file_was_replaced()
+    }
+
+    /// Reports whether no other process has had the open log segment open since a statement last
+    /// asked by name whether the file was replaced or the log rolled, and found neither.
+    ///
+    /// **Why that answers both questions without asking** (task-2226). Each question is one
+    /// lookup by name, about 20 us apiece on the development machine with its file system
+    /// filters, and the two came to 71% of an autocommit point read. Neither can happen without
+    /// another process opening the segment this connection has open:
+    ///
+    /// - `VACUUM` and a backup remove the replaced database's log segments before the rename
+    ///   (`crate::rebuild::remove_log_segments`), and a delete opens the file.
+    /// - A roll that `Wal::next_segment_exists` is there to find comes after records the other
+    ///   process appended to this segment, which opens it. A roll with nothing to append is a
+    ///   checkpoint's, and a checkpoint moves the meta record, which `the_meta_moved` asks of the
+    ///   file on every statement regardless, and then deletes this segment.
+    ///
+    /// While this process holds the batch oplock on the segment, no other handle to it exists,
+    /// and any open breaks it; the watcher moves the token before it lets that open proceed
+    /// (`inillucent_vfs::os::windows_log`). So an equal token means none of the above happened.
+    /// Where there is no oplock - Linux, macOS, `INILLUCENT_LOG_OPLOCK=0`, a segment not opened
+    /// yet - the token is `None` and every check runs as before.
+    fn quiet_since_checked(&self) -> bool {
+        let now = self.storage.wal.quiet_token();
+        now.is_some() && now == self.storage.quiet_checked.get()
     }
 
     /// Reports whether the file at this connection's path is no longer the file it opened.
@@ -667,7 +723,7 @@ impl ImportedDatabase {
         // next segment; see `Wal::next_segment_exists`.
         Ok(tail.sequence != self.storage.wal.sequence()
             || tail.next_lsn != self.storage.wal.written_end()
-            || self.storage.wal.next_segment_exists()?)
+            || (!self.quiet_since_checked() && self.storage.wal.next_segment_exists()?))
     }
 
     /// Puts back the pages a process that died holding the file left in it,

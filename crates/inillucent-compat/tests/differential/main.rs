@@ -31,6 +31,7 @@ mod fts5_parity;
 mod group_by;
 mod json;
 mod lifecycle;
+mod merge_join;
 mod migrate_sqlite;
 mod new_engine_ddl;
 mod new_engine_differential;

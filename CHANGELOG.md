@@ -8,7 +8,7 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
-## Unreleased
+## 2.5.0 to 2.5.4, 10 and 11 October 2026
 
 **A bug hunt driven by real applications found about 100 defects, and this fixes most of them.**
 Eight hunts ran: application schemas the way ORMs write them, messy real data, speed against
@@ -184,6 +184,38 @@ The command line: `import` drops a byte order mark, pads short rows and keeps go
 row as `sqlite3` does, and renames duplicate header names; `batch` runs a script that has its own
 `BEGIN` and `COMMIT`; `export <table> --format insert` names the table; status codes name the cause;
 and 110 messages and help texts no longer hold a run of spaces where a line was joined.
+
+**2.5.4 is faster than SQLite on 110 of the 116 workloads its benchmark times**, and 499% faster on
+the engine plan in a graded run of 11 October 2026 (`docs/performance.md`). 2.5.2 was faster on 74.
+The changes, measured by `inillucent-fullgate` against SQLite 3.53.4 on the medium fixture through
+the `Connection` API (`tasks/task-2226-performance-hillclimb-8.md` has every figure):
+
+- A statement through the `Connection` asked Windows by file name, three times, whether another
+  process had replaced the database or rolled the log. Each question took about 20 us, and a point
+  read by rowid was 400% slower than SQLite. On Windows the questions are now skipped while the
+  batch oplock on the log segment is unbroken, because neither event can happen without another
+  process opening the segment, which breaks it. The same read is now 1,943% faster than SQLite.
+- `DELETE` of a range of rowids unlinks the leaves it empties instead of merging each into its
+  neighbour: 43 ms to 11 ms for 40,000 rows, level with SQLite.
+- `UPDATE` of every row: 18.4 ms to 13.5 ms for 25,000 rows, against SQLite's 14.0 ms. The undo
+  image of each leaf's updated rows is one copy of the leaf.
+- `INSERT ... SELECT` into an empty table: 47.7 ms to 37.6 ms for 100,000 rows, against SQLite's
+  42.6 ms. The rows are collected into a few large buffers instead of an allocation per row and
+  per text value.
+- A join of many outer rows through an index on one integer key walks the index once for the
+  outer rows past the first tenth of the index's size, and gives the rows in the order the probes
+  would: a dashboard query over 12,500 outer rows, 102.8 ms to 70.5 ms against SQLite's 78.3 ms.
+- A `WHERE` made of integer comparisons is tested a batch of rows at a time.
+
+`inillucent-fullgate --api connection` now compiles a statement the plan marks `prepare: once`
+before it starts the clock, as its documentation, the engine arm and SQLite's arm always did. It
+used to compile inside the clock, which made a statement run once look slower than it is. Published
+`Connection` figures for such workloads taken before this change include a compile SQLite's do not.
+
+Two workloads stay slower than SQLite. `edge.delete.range` in the 48 workload plan reads 0.33x
+because the log's fold to the database file (about 23 ms) lands on it every round; the delete alone
+is level with SQLite. `prepare.trivial` through the engine API reads 0.56x; through the
+`Connection` it is 66% faster.
 
 ## 2.3.4 to 2.4.2, 7 and 8 October 2026
 

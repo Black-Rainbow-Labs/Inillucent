@@ -146,6 +146,47 @@ pub trait Eval: Send + Sync {
         let _ = (batch, out);
         false
     }
+
+    /// Writes, for every live row of a batch, whether this predicate is definitely true, and
+    /// answers whether it could do that for the whole batch.
+    ///
+    /// **A filter's predicate over a whole batch** (task-2226). A `WHERE` and a correlated
+    /// block's gate asked `value` once a row: three dynamic calls and a `Datum` for
+    /// `a.id % 100 = 0`, which was two thirds of `correlated.exists.selective` once its block
+    /// ran only for the rows that passed. A comparison of integers answers here in one loop;
+    /// every other node answers no and the caller asks `value` a row at a time, which gives
+    /// the same answers. A NULL is not true, so it is written as false. `out` means nothing
+    /// after a no.
+    ///
+    /// @param batch - the batch being evaluated
+    /// @param out - one verdict per live row
+    fn truths_over(&self, batch: &Batch<'_>, out: &mut Vec<bool>) -> bool {
+        let _ = (batch, out);
+        false
+    }
+}
+
+/// Answers, for every live row of a batch, whether all of a list of predicates is definitely
+/// true, or `None` when one of them cannot answer for a whole batch.
+///
+/// @param predicates - the conjuncts, every one of which must hold
+/// @param batch - the batch being evaluated
+pub fn truths_of_all(predicates: &[Box<dyn Eval>], batch: &Batch<'_>) -> Option<Vec<bool>> {
+    // No conjunct keeps every row.
+    let mut kept: Vec<bool> = vec![true; batch.live()];
+    let mut each: Vec<bool> = Vec::new();
+    for (at, predicate) in predicates.iter().enumerate() {
+        let out = if at == 0 { &mut kept } else { &mut each };
+        if !predicate.truths_over(batch, out) || out.len() != batch.live() {
+            return None;
+        }
+        if at > 0 {
+            for (keep, this) in kept.iter_mut().zip(each.iter()) {
+                *keep &= *this;
+            }
+        }
+    }
+    Some(kept)
 }
 /// What an application-defined scalar does with one row's arguments.
 ///

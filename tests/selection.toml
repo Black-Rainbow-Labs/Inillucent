@@ -1691,6 +1691,18 @@ tier = "differential"
 covers = ["inillucent-engine", "inillucent-exec"]
 requires = ["oracle"]
 
+# An index nested loop that joins the rest of a large outer side with one walk
+# of the inner index, against SQLite, with awkward keys and the shapes that must
+# keep the probes (task-2226).
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "differential"
+module = "merge_join"
+tier = "differential"
+covers = ["inillucent-engine", "inillucent-exec", "inillucent-tree"]
+requires = ["oracle"]
+
 # Rowids allocated while the largest key is remembered, after writes of every
 # kind, against SQLite (task-2209).
 [[target]]

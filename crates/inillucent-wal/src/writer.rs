@@ -1275,6 +1275,17 @@ impl Wal {
         })
     }
 
+    /// Returns a value that stays the same while no other process has had the open segment open,
+    /// or `None` when the segment is not open here or its file system cannot tell.
+    ///
+    /// See `VfsFile::quiet_token`. The sequence is folded in, so a token from one segment never
+    /// equals a token from the next.
+    pub fn quiet_token(&self) -> Option<u64> {
+        let segment = self.io_lock().ok()?;
+        let token = segment.file.as_ref()?.quiet_token()?;
+        Some(token ^ segment.sequence.rotate_left(16))
+    }
+
     /// Reports whether the segment after the open one exists, which means another process rolled
     /// the log on and may have committed there.
     ///

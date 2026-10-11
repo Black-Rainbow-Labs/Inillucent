@@ -303,7 +303,7 @@ impl PagedTree {
     /// @param level - its level
     /// @param separators - its separators
     /// @param children - its children, one more than the separators
-    fn install_interior(
+    pub(super) fn install_interior(
         &self,
         database: &mut Database,
         log: &mut dyn TreeLog,

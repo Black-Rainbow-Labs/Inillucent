@@ -892,6 +892,17 @@ impl<'p> LeafMut<'p> {
     ///
     /// @param row - the row's position in the sorted region
     pub fn set_tombstone(&mut self, row: usize) -> DbResult<Applied> {
+        self.set_tombstones(&[row])
+    }
+
+    /// Marks several rows of the sorted region deleted, as [`LeafMut::set_tombstone`] marks one.
+    ///
+    /// **The header is read once for the run (task-2226).** Reading it for each row was 13% of a
+    /// range delete's work on its leaves. Either every row is marked or, when the bitmap has to be
+    /// made and there is no room for it, none is and the answer is `NoRoom`.
+    ///
+    /// @param rows - the rows' positions in the sorted region
+    pub fn set_tombstones(&mut self, rows: &[usize]) -> DbResult<Applied> {
         let (row_count, delta_start, has_tombstones, has_extents) = {
             let leaf = LeafRef::parse(self.page)?;
             (
@@ -901,7 +912,7 @@ impl<'p> LeafMut<'p> {
                 leaf.has_extents(),
             )
         };
-        if row >= row_count {
+        if let Some(row) = rows.iter().find(|row| **row >= row_count) {
             return Err(misuse(format!("row {row} is not in the sorted region")));
         }
         let bitmap = tombstone_bytes(row_count);
@@ -919,13 +930,17 @@ impl<'p> LeafMut<'p> {
             self.set_flag(LEAF_HAS_TOMBSTONES, true)?;
         }
         let start = delta_start.saturating_sub(bitmap);
-        let byte = self
-            .page
-            .get_mut(start.saturating_add(row / 8))
-            .ok_or_else(|| corrupt("the tombstone bitmap ran past the page"))?;
-        *byte |= 1u8 << (row % 8);
+        for row in rows {
+            let byte = self
+                .page
+                .get_mut(start.saturating_add(row / 8))
+                .ok_or_else(|| corrupt("the tombstone bitmap ran past the page"))?;
+            *byte |= 1u8 << (row % 8);
+        }
         if has_extents {
-            self.kill_value_extents(row)?;
+            for row in rows {
+                self.kill_value_extents(*row)?;
+            }
         }
         Ok(Applied::Yes)
     }
@@ -1199,20 +1214,16 @@ impl<'p> LeafMut<'p> {
     /// saw. The offset this returns is a function of that page and `wanted`
     /// alone, so the replay lands on the same bytes.
     ///
-    /// @param wanted - how many bytes of heap the caller needs
-    fn carve_room(&self, wanted: usize) -> DbResult<Option<usize>> {
-        carve_room(self.page, wanted)
-    }
-
-    /// Performs the move [`carve_room`] costed.
+    /// It performs the move [`carve_room_in`] costs, with one parse of the leaf for
+    /// both the question and the move.
     ///
     /// @param wanted - how many bytes of heap the caller needs
     fn carve_heap(&mut self, wanted: usize) -> DbResult<Option<usize>> {
-        if self.carve_room(wanted)?.is_none() {
-            return Ok(None);
-        }
         let (delta_start, heap_start, row_count, has_tombstones) = {
             let leaf = LeafRef::parse(self.page)?;
+            if carve_room_in(&leaf, wanted)?.is_none() {
+                return Ok(None);
+            }
             (
                 leaf.delta_start(),
                 leaf.heap_start(),
@@ -1434,35 +1445,37 @@ fn columns_end_of(leaf: &LeafRef<'_>) -> DbResult<usize> {
     Ok(end)
 }
 
-/// Returns where `wanted` bytes of heap would be carved, or `None`.
+/// Returns where `wanted` bytes of heap would be carved in a leaf, or `None`.
 ///
 /// Reads only, so the write path can cost a relocation before its record is in
 /// the log. [`LeafMut::carve_heap`] performs what this costs, and the two must
 /// agree: the offset is `heap_start - wanted` in both.
 ///
-/// @param page - the page bytes, exactly one page long
+/// **It takes a leaf already parsed** (task-2226). It used to take the page and
+/// parse it for its header and again for the end of its columns, and
+/// `LeafMut::carve_heap` asked it and then parsed a third time, for each value an
+/// `UPDATE` lengthened.
+///
+/// @param leaf - the leaf
 /// @param wanted - how many bytes of heap the caller needs
-fn carve_room(page: &[u8], wanted: usize) -> DbResult<Option<usize>> {
+fn carve_room_in(leaf: &LeafRef<'_>, wanted: usize) -> DbResult<Option<usize>> {
     // The format's own rule about where a large value lives. See
     // `LeafMut::overwrite_heap_slot`.
-    if wanted > page.len() / crate::leaf::EXTENT_DIVISOR {
+    if wanted > leaf.bytes().len() / crate::leaf::EXTENT_DIVISOR {
         return Ok(None);
     }
-    let (delta_start, heap_start, row_count, has_tombstones) = {
-        let leaf = LeafRef::parse(page)?;
-        (
-            leaf.delta_start(),
-            leaf.heap_start(),
-            leaf.row_count(),
-            leaf.has_tombstones(),
-        )
-    };
+    let (delta_start, heap_start, row_count, has_tombstones) = (
+        leaf.delta_start(),
+        leaf.heap_start(),
+        leaf.row_count(),
+        leaf.has_tombstones(),
+    );
     let bitmap = if has_tombstones {
         tombstone_bytes(row_count)
     } else {
         0
     };
-    let floor = columns_end(page)?;
+    let floor = columns_end_of(leaf)?;
     let Some(new_delta_start) = delta_start.checked_sub(wanted) else {
         return Ok(None);
     };
@@ -1470,27 +1483,6 @@ fn carve_room(page: &[u8], wanted: usize) -> DbResult<Option<usize>> {
         return Ok(None);
     }
     Ok(Some(heap_start.saturating_sub(wanted)))
-}
-
-/// Returns where one row's slot for one column sits in the page.
-///
-/// @param page - the page bytes, exactly one page long
-/// @param column - which column
-/// @param row - the row's position in the sorted region
-fn slot_at(page: &[u8], column: usize, row: usize) -> DbResult<usize> {
-    let (row_count, width, stride) = {
-        let leaf = LeafRef::parse(page)?;
-        (
-            leaf.row_count(),
-            leaf.column_width(column)?,
-            leaf.directory_entry_size(),
-        )
-    };
-    let entry = leaf_header::DIRECTORY.saturating_add(column.saturating_mul(stride));
-    let base = page::read_u32(page, entry.saturating_add(4))? as usize;
-    Ok(base
-        .saturating_add(class_bytes(row_count))
-        .saturating_add(row.saturating_mul(width)))
 }
 
 /// Reports whether [`LeafMut::update_slot`] would write, without writing.
@@ -1520,18 +1512,18 @@ pub fn would_update_slot(
     row: usize,
     value: &Datum<'_>,
 ) -> DbResult<bool> {
-    let (spec, width, frame, class) = {
-        let leaf = LeafRef::parse(page)?;
-        if row >= leaf.row_count() {
-            return Err(misuse(format!("row {row} is not in the sorted region")));
-        }
-        (
-            leaf.spec(column)?,
-            leaf.column_width(column)?,
-            leaf.column_base(column)?,
-            leaf.column(column)?.class_at(row)?,
-        )
-    };
+    // One parse for every question below (task-2226); the slot's place and the
+    // room check each parsed the page again.
+    let leaf = LeafRef::parse(page)?;
+    if row >= leaf.row_count() {
+        return Err(misuse(format!("row {row} is not in the sorted region")));
+    }
+    let (spec, width, frame, class) = (
+        leaf.spec(column)?,
+        leaf.column_width(column)?,
+        leaf.column_base(column)?,
+        leaf.column(column)?.class_at(row)?,
+    );
     if class != crate::types::ValueClass::Typed {
         return Ok(false);
     }
@@ -1541,7 +1533,11 @@ pub fn would_update_slot(
         }
         (PhysicalType::Float64, Datum::Real(_) | Datum::Int(_)) => Ok(true),
         (PhysicalType::Text, Datum::Text(bytes)) | (PhysicalType::Blob, Datum::Blob(bytes)) => {
-            let at = slot_at(page, column, row)?;
+            let entry = leaf_header::DIRECTORY
+                .saturating_add(column.saturating_mul(leaf.directory_entry_size()));
+            let at = (page::read_u32(page, entry.saturating_add(4))? as usize)
+                .saturating_add(class_bytes(leaf.row_count()))
+                .saturating_add(row.saturating_mul(width));
             let slot = page
                 .get(at..at.saturating_add(width))
                 .ok_or_else(|| corrupt("a heap slot runs past the page"))?;
@@ -1549,7 +1545,7 @@ pub fn would_update_slot(
             if bytes.len() <= length {
                 return Ok(true);
             }
-            Ok(carve_room(page, bytes.len())?.is_some())
+            Ok(carve_room_in(&leaf, bytes.len())?.is_some())
         }
         _ => Ok(false),
     }

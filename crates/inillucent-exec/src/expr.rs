@@ -451,6 +451,21 @@ impl Eval for IntColumnAgainstConstant {
             )),
         }))
     }
+
+    /// Compares a whole batch's integers with the constant, when the column holds nothing else.
+    fn truths_over(&self, batch: &Batch<'_>, out: &mut Vec<bool>) -> bool {
+        let mut numbers = Vec::new();
+        if !batch.ints_of(self.column, &mut numbers) {
+            return false;
+        }
+        out.clear();
+        out.extend(
+            numbers
+                .iter()
+                .map(|number| self.op.holds(number.cmp(&self.constant))),
+        );
+        true
+    }
 }
 
 /// A comparison of two proved-integral expressions.
@@ -470,6 +485,23 @@ impl Eval for IntCompare {
         Ok(Computed::Borrowed(Datum::Int(i64::from(
             self.op.holds(left.get().compare(&right.get())),
         ))))
+    }
+
+    /// Compares a whole batch, when both sides produce non NULL integers for every row; a
+    /// NULL on either side makes `value` answer NULL, so those batches take the row path.
+    fn truths_over(&self, batch: &Batch<'_>, out: &mut Vec<bool>) -> bool {
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        if !self.left.ints_over(batch, &mut left) || !self.right.ints_over(batch, &mut right) {
+            return false;
+        }
+        out.clear();
+        out.extend(
+            left.iter()
+                .zip(right.iter())
+                .map(|(left, right)| self.op.holds(left.cmp(right))),
+        );
+        left.len() == right.len()
     }
 }
 
@@ -491,6 +523,42 @@ impl Eval for GenericCompare {
             self.op.holds(left.get().compare(&right.get())),
         ))))
     }
+
+    /// Compares a whole batch, when both sides are non NULL integers throughout.
+    fn truths_over(&self, batch: &Batch<'_>, out: &mut Vec<bool>) -> bool {
+        int_truths_over(self.op, self.left.as_ref(), self.right.as_ref(), batch, out)
+    }
+}
+
+/// Compares two sides that each produce a non NULL integer for every live row of a batch, and
+/// answers whether they did. The integer comparison is the one every comparison node applies to
+/// two integers.
+///
+/// @param op - the comparison
+/// @param left - the left operand
+/// @param right - the right operand
+/// @param batch - the batch being evaluated
+/// @param out - one verdict per live row
+fn int_truths_over(
+    op: CompareOp,
+    left: &dyn Eval,
+    right: &dyn Eval,
+    batch: &Batch<'_>,
+    out: &mut Vec<bool>,
+) -> bool {
+    let mut lefts = Vec::new();
+    let mut rights = Vec::new();
+    if !left.ints_over(batch, &mut lefts) || !right.ints_over(batch, &mut rights) {
+        return false;
+    }
+    out.clear();
+    out.extend(
+        lefts
+            .iter()
+            .zip(rights.iter())
+            .map(|(left, right)| op.holds(left.cmp(right))),
+    );
+    lefts.len() == rights.len()
 }
 
 /// A comparison that applies an affinity and a collation.
@@ -548,6 +616,15 @@ impl Eval for AffinityCompare {
             None => Ok(Computed::Borrowed(Datum::Null)),
         }
     }
+
+    /// Compares a whole batch, when both sides are non NULL integers throughout and the
+    /// affinity leaves an integer alone, the case `value` compares as integers too.
+    fn truths_over(&self, batch: &Batch<'_>, out: &mut Vec<bool>) -> bool {
+        matches!(
+            self.affinity,
+            None | Some(Affinity::Blob | Affinity::Integer | Affinity::Numeric)
+        ) && int_truths_over(self.op, self.left.as_ref(), self.right.as_ref(), batch, out)
+    }
 }
 
 /// `AND` with three-valued logic.
@@ -572,6 +649,19 @@ impl Eval for Conjunction {
                 _ => Datum::Null,
             },
         ))
+    }
+
+    /// Answers for a whole batch when both sides can: a row is definitely true only when both
+    /// sides are.
+    fn truths_over(&self, batch: &Batch<'_>, out: &mut Vec<bool>) -> bool {
+        let mut right = Vec::new();
+        if !self.left.truths_over(batch, out) || !self.right.truths_over(batch, &mut right) {
+            return false;
+        }
+        for (keep, this) in out.iter_mut().zip(right.iter()) {
+            *keep &= *this;
+        }
+        out.len() == right.len()
     }
 }
 

@@ -388,18 +388,17 @@ impl Journal {
                 .reserve_exact(PENDING_BYTES.saturating_add(record_size));
         }
         let start = self.pending.len();
+        // **Appended, not zeroed and then copied over (task-2226).** Zero filling each
+        // record before copying the page into it was 40% of saving a pre image, and a fold
+        // saves one for every dirty page. Only a short image's tail is filled.
+        let width = self.page_size.min(before.len());
+        self.pending.extend_from_slice(&page.0.to_le_bytes());
+        self.pending.extend_from_slice(&[0u8; RECORD_PREFIX - 8]);
+        self.pending
+            .extend_from_slice(before.get(..width).unwrap_or(&[]));
         self.pending.resize(start.saturating_add(record_size), 0);
         let nonce = self.nonce;
         if let Some(record) = self.pending.get_mut(start..) {
-            if let Some(slot) = record.get_mut(..8) {
-                slot.copy_from_slice(&page.0.to_le_bytes());
-            }
-            if let Some(slot) = record.get_mut(RECORD_PREFIX..) {
-                let width = slot.len().min(before.len());
-                if let (Some(target), Some(source)) = (slot.get_mut(..width), before.get(..width)) {
-                    target.copy_from_slice(source);
-                }
-            }
             let checksum =
                 record_checksum(nonce, page.0, record.get(RECORD_PREFIX..).unwrap_or(&[]));
             if let Some(slot) = record.get_mut(8..12) {
@@ -428,22 +427,49 @@ impl Journal {
         let adding = self.pending.len() / record_size.max(1);
         let count = self.written.saturating_add(adding);
         let (page_size, nonce, written) = (self.page_size, self.nonce, self.written);
-        let pending = std::mem::take(&mut self.pending);
+        let mut pending = std::mem::take(&mut self.pending);
+        let outcome = self.write_records(&pending, page_size, count, nonce, written);
+        // **The buffer is kept, emptied, for the next records (task-2226).** Taking it
+        // left the next `save` an empty vector to reserve a megabyte in again, and every
+        // page of that megabyte faulted again as it filled.
+        pending.clear();
+        self.pending = pending;
+        outcome?;
+        self.written = count;
+        self.unsynced.set(true);
+        Ok(())
+    }
+
+    /// Writes records to the journal file, with the header in the same call when the file has
+    /// none yet, or after them otherwise; see [`Journal::write_pending`].
+    ///
+    /// @param records - the records, one after another
+    /// @param page_size - the page size the header states
+    /// @param count - how many records the file holds once these are written
+    /// @param nonce - the transaction's nonce, which the header states
+    /// @param written - how many records the file held before
+    fn write_records(
+        &mut self,
+        records: &[u8],
+        page_size: usize,
+        count: usize,
+        nonce: u64,
+        written: usize,
+    ) -> DbResult<()> {
+        let record_size = page_size.saturating_add(RECORD_PREFIX);
         let file = self.opened()?;
         if written == 0 {
-            let mut whole = Vec::with_capacity(HEADER.saturating_add(pending.len()));
+            let mut whole = Vec::with_capacity(HEADER.saturating_add(records.len()));
             whole.extend_from_slice(&header_bytes(page_size, count, nonce));
-            whole.extend_from_slice(&pending);
+            whole.extend_from_slice(records);
             file.write_all_at(0, &whole)
                 .map_err(|error| error.into_db_error())?;
         } else {
             let offset = HEADER.saturating_add(written.saturating_mul(record_size)) as u64;
-            file.write_all_at(offset, &pending)
+            file.write_all_at(offset, records)
                 .map_err(|error| error.into_db_error())?;
             write_header(file, page_size, count, nonce)?;
         }
-        self.written = count;
-        self.unsynced.set(true);
         Ok(())
     }
 

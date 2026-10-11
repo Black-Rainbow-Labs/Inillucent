@@ -807,6 +807,12 @@ pub(crate) struct Storage {
     /// `None` for a database with no file, and on a file system that has no such number. See
     /// `ImportedDatabase::file_was_replaced`.
     pub(crate) opened_as: Option<u128>,
+    /// The log segment's quiet token as it stood when a statement last asked the file system by
+    /// name whether the file was replaced or the log rolled, and both answers were no.
+    ///
+    /// See `ImportedDatabase::quiet_since_checked`. `None` until the first such check, and after
+    /// any statement that could not get a token.
+    pub(crate) quiet_checked: std::cell::Cell<Option<u64>>,
 }
 
 /// What a transaction in progress has done so far.

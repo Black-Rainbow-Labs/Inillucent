@@ -377,6 +377,7 @@ fn delete_unwatched(
             count_row(&mut changes, target, depth);
         }
     }
+    finish_deletes(target, table.root)?;
     for ((_, index), held) in maintained(table).zip(entries.iter()) {
         let ordered = sorted_by_tree(target, index.root, held.iter().map(Vec::as_slice).collect())?;
         let values: Vec<Datum<'_>> = ordered
@@ -400,8 +401,21 @@ fn delete_unwatched(
                 false,
             )?);
         }
+        finish_deletes(target, index.root)?;
     }
     Ok(changes)
+}
+/// Takes the leaves a tree's sorted deletes emptied out of the tree, now that the statement has
+/// no more keys for it (task-2226); see `PagedTree::finish_deletes`.
+///
+/// @param target - the file and its trees
+/// @param root - the tree
+fn finish_deletes(target: &mut dyn WriteTarget, root: u32) -> DbResult<()> {
+    let (database, trees, log) = target.parts_for(root)?;
+    match trees.get_mut(root) {
+        Some(tree) => tree.finish_deletes(database, log),
+        None => Ok(()),
+    }
 }
 /// Cuts a buffer of key values into one slice per key.
 ///

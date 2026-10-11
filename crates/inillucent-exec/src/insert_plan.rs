@@ -65,6 +65,8 @@ pub enum RowSource<'a> {
     Lent(&'a [OwnedDatum]),
     /// A row the caller gives up.
     Given(Vec<OwnedDatum>),
+    /// One row of a packed set the caller keeps (task-2226): its position.
+    Packed(&'a crate::packed::PackedRows, usize),
 }
 
 impl<'a> From<&'a Vec<OwnedDatum>> for RowSource<'a> {
@@ -95,6 +97,7 @@ impl RowSource<'_> {
                 (false, Some(value)) => value.clone(),
                 (_, None) => OwnedDatum::Null,
             },
+            RowSource::Packed(rows, row) => OwnedDatum::from_datum(&rows.value(*row, at)),
         }
     }
 }
@@ -467,22 +470,25 @@ impl InsertPlan {
         keys: &mut dyn RowidKeys,
         autoincrement: Option<&TableInfo>,
     ) -> DbResult<Row> {
-        let mut row: Row = vec![OwnedDatum::Null; space.width];
-        for planned in &self.columns {
-            let Some(slot) = planned.slot else { continue };
-            let value = match &planned.from {
-                PlannedValue::Supplied(index) => {
-                    let once = self.read_once.get(*index).copied().unwrap_or(false);
-                    supplied.value(*index, once)
-                }
-                PlannedValue::Constant(eval) => space.evaluate(eval.as_ref(), &[])?,
-                PlannedValue::Generated(_) => continue,
-            };
-            if let Some(cell) = row.get_mut(slot) {
-                *cell = value;
+        // **The source row is the image when the plan puts each value back where it was
+        // (task-2226).** `INSERT INTO copied(id, key, label) SELECT id, key, label FROM
+        // main_table` made a second row of three values for each of 100,000 rows and freed
+        // the first, a vector made and a vector freed per row.
+        let reused = match &mut supplied {
+            RowSource::Given(given) if self.given_row_is_the_image(given, space) => {
+                Some(std::mem::take(given))
             }
-        }
+            _ => None,
+        };
+        let reusing = reused.is_some();
+        let mut row: Row = match reused {
+            Some(given) => given,
+            None => self.image_from(&mut supplied, space)?,
+        };
         let supplied_key = match &self.rowid {
+            Some(PlannedRowid::Supplied(index)) if reusing => {
+                row.get(*index).cloned().unwrap_or(OwnedDatum::Null)
+            }
             Some(PlannedRowid::Supplied(index)) => {
                 let once = self.read_once.get(*index).copied().unwrap_or(false);
                 supplied.value(*index, once)
@@ -526,6 +532,67 @@ impl InsertPlan {
         // The generated columns, now that the rest of the row exists.
         self.apply_generated(space, &mut row, &[])?;
         Ok(row)
+    }
+
+    /// Builds a row image from the supplied values, each moved or copied into its tree column.
+    ///
+    /// @param supplied - the values the statement's source produced
+    /// @param space - the row space the expressions read
+    fn image_from(&self, supplied: &mut RowSource<'_>, space: &RowSpace) -> DbResult<Row> {
+        let mut row: Row = vec![OwnedDatum::Null; space.width];
+        for planned in &self.columns {
+            let Some(slot) = planned.slot else { continue };
+            let value = match &planned.from {
+                PlannedValue::Supplied(index) => {
+                    let once = self.read_once.get(*index).copied().unwrap_or(false);
+                    supplied.value(*index, once)
+                }
+                PlannedValue::Constant(eval) => space.evaluate(eval.as_ref(), &[])?,
+                PlannedValue::Generated(_) => continue,
+            };
+            if let Some(cell) = row.get_mut(slot) {
+                *cell = value;
+            }
+        }
+        Ok(row)
+    }
+
+    /// Reports whether a given row already is the image [`InsertPlan::image_from`] would build.
+    ///
+    /// True when the row is as wide as the tree's rows, every planned column takes the supplied
+    /// value at its own tree column's position, and those columns with the rowid's tree column
+    /// are every position. Then building the image moves each value to the place it already
+    /// holds, and the row itself can be kept. The rowid is still worked out from its supplied
+    /// value afterwards, as for any other row.
+    ///
+    /// @param given - the row the source handed over
+    /// @param space - the row space, which says how wide a row is and where the rowid goes
+    fn given_row_is_the_image(&self, given: &[OwnedDatum], space: &RowSpace) -> bool {
+        // One bit a position; a row wider than the mask builds its image the ordinary way.
+        if given.len() != space.width || space.width > 64 {
+            return false;
+        }
+        let bit = |slot: usize| 1u64.checked_shl(slot as u32).unwrap_or(0);
+        let mut written = 0u64;
+        for planned in &self.columns {
+            match (planned.slot, &planned.from) {
+                (None, _) => {}
+                (Some(slot), PlannedValue::Supplied(index)) if *index == slot => {
+                    written |= bit(slot);
+                }
+                _ => return false,
+            }
+        }
+        if let (Some(slot), Some(PlannedRowid::Supplied(index))) = (space.rowid, &self.rowid) {
+            if *index == slot {
+                written |= bit(slot);
+            }
+        }
+        let every = match space.width {
+            64 => u64::MAX,
+            width => bit(width).wrapping_sub(1),
+        };
+        written == every
     }
 
     /// Reports whether a supplied row leaves the table's rowid to be allocated.

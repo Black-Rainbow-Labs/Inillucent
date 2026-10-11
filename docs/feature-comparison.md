@@ -1133,24 +1133,25 @@ scan in all 12 combinations.
 
 ## Speed and memory against SQLite
 
-These numbers are from the graded run of 26 September 2026 on `main` at `bc46bc9`, which is release
-1.0.32: four runs of 30 paired rounds at 100,000 rows, with both engines on the same processor cores
-and the same 128 MiB memory budget. Each figure is the median of the two middle runs of four. [Performance](performance.md) has every
-workload, the method and the later runs.
+These numbers are from the graded run of 11 October 2026 on `main` at `ad4c2b98`, which is release
+2.5.4: three runs of 30 paired rounds at 100,000 rows, with both engines on the same processor cores
+and the same 128 MiB memory budget, and SQLite within 2% of its idle reference in every run. Each
+figure is from the median run. [Performance](performance.md) has every workload, the method and the
+earlier runs.
 
-The newest run, on 8 October 2026 with release 2.4.2, measured 505% faster, 73% less processor time
-and 14% more peak memory, with every family faster than SQLite. It was not graded: SQLite ran 4%
-slower than its idle reference on that machine, which makes inillucent's figure read high. Through
-the `Connection` API that every driver calls, 2.4.2 is 276% faster than SQLite on 48 common and
-edge case workloads and uses 67% less processor time. Called the way programs call it, from the
-command line, the shell, Python and Node, 2.4.2 is 74% faster than the same use of SQLite.
+Of the 116 workloads the benchmark times, 110 are faster than SQLite: 31 of 34 through the engine's
+own API, 32 of 34 through the `Connection` API that every driver calls, and 47 of 48 common and edge
+case workloads through the `Connection` API. Through the `Connection` API, 2.5.4 is 297% faster
+than SQLite on those 48 workloads and uses 66% less processor time. Called the way programs call it,
+from the command line, the shell, Python and Node, release 2.4.2 is 74% faster than the same use of
+SQLite.
 
 | | SQLite 3.53.4 | inillucent | Result |
 |---|---|---|---|
-| elapsed time, weighted over ten workload families | the reference | 5.19x | **419% faster** |
-| elapsed time, the 95% lower bound the gate grades | | 5.05x | 405% faster. The bar asks for 200% faster: met on all four runs |
-| processor time for one round of the whole plan | 1,043 ms | 344 ms | **67% less processor**. The bar asks for 60% less: met on all four runs |
-| peak memory for one round of the whole plan | 37.21 MiB | 41.48 MiB | **11.5% more memory**. The bar asks for 5% less: missed |
+| elapsed time, weighted over ten workload families | the reference | 5.99x | **499% faster** |
+| elapsed time, the 95% lower bound the gate grades | | 5.59x | 459% faster. The bar asks for 200% faster: met on all three runs |
+| processor time for one round of the whole plan | 1,039 ms | 234 ms | **77% less processor**. The bar asks for 60% less: met on all three runs |
+| peak memory for one round of the whole plan | 37.74 MiB | 43.80 MiB | **16% more memory**. The bar asks for 5% less: missed |
 | the database file, the same data imported | 16,830,464 bytes | 17,432,576 bytes | 3.6% larger |
 
 Memory is the one result where inillucent is worse than SQLite. About 3.6 MiB of the process is what
@@ -1159,24 +1160,24 @@ the page cache and one `CREATE INDEX`. [Performance](performance.md#memory) brea
 
 | Family | Weight | Result | Bar |
 |---|---:|---|---|
-| `read.point` | 16% | 31.61x, 3,061% faster | met |
-| `large.values` | 4% | 12.32x, 1,132% faster | met |
-| `read.analytical` | 10% | 11.13x, 1,013% faster | met |
-| `read.range` | 12% | 5.35x, 435% faster | met |
-| `read.join` | 8% | 4.69x, 369% faster | met |
-| `write` | 20% | 3.57x, 257% faster | met |
-| `transaction` | 10% | 2.38x, 138% faster | met |
-| `extension` | 8% | 1.79x, 79% faster | met |
-| `open.prepare` | 8% | 1.65x, 65% faster | missed: the bar asks for 5.00x |
-| `schema` | 4% | 1.27x, 27% faster | missed: the bar asks for 3.00x |
+| `read.point` | 16% | 34.04x, 3,304% faster | met |
+| `large.values` | 4% | 11.59x, 1,059% faster | met |
+| `read.analytical` | 10% | 11.20x, 1,020% faster | met |
+| `read.range` | 12% | 7.43x, 643% faster | met |
+| `read.join` | 8% | 4.94x, 394% faster | met |
+| `write` | 20% | 4.12x, 312% faster | met |
+| `transaction` | 10% | 2.32x, 132% faster | met |
+| `extension` | 8% | 2.27x, 127% faster | met |
+| `open.prepare` | 8% | 1.96x, 96% faster | missed: the bar asks for 5.00x |
+| `schema` | 4% | 1.33x, 33% faster | missed: the bar asks for 3.00x |
 
 ## Known gaps
 
 | Gap | Where it stands |
 |---|---|
-| Memory is more than SQLite's: 11.5% in the graded run, 14% in the newest | open. See [Performance](performance.md#memory) |
+| Memory is more than SQLite's: 16% in the graded run of 2.5.4 | open. See [Performance](performance.md#memory) |
 | `open.prepare` and `schema` miss their speed bars | open. Both are faster than SQLite |
-| A correlated `IN` subquery over many outer rows was slower than SQLite | 807% slower over 400 outer rows in the graded run; 27% faster in the newest run, which was not graded. See [Performance](performance.md#the-workloads-that-are-slower) |
+| A correlated `IN` subquery over many outer rows was slower than SQLite | 807% slower over 400 outer rows in the graded run of 26 September 2026; 28% faster in the graded run of 2.5.4. See [Performance](performance.md#the-workloads-that-are-slower) |
 | The C API has 54 functions where SQLite has about 290 | open. The list of what is missing is in [Architecture and operations](#architecture-and-operations) |
 | One thread per database | open |
 | A SQLite file cannot be opened directly | by design. `inillucent migrate` copies it |

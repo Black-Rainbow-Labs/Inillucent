@@ -19,8 +19,10 @@ use super::*;
 use crate::separator::{slot_bytes_for, store_separators};
 
 mod leafplan;
+mod queue;
 use inillucent_pool::interior::SlotBytes;
 use leafplan::{plan_leaves, LeafPlan};
+use queue::{flush_built_pages, queue_built_page, PendingRun};
 
 /// Records one bulk-built page's allocation and writes the page itself straight
 /// into the data file.
@@ -158,6 +160,7 @@ fn write_leaf_run<'d>(
     let mut pages_written = 0u64;
     let mut leaves: Vec<PageId> = Vec::with_capacity(leaf_pages);
     let mut placed_at = 0usize;
+    let mut pending = PendingRun::default();
     for (index, placed) in plan.boundaries.iter().copied().enumerate() {
         let mut image = if plan.empty {
             builder.encode_empty()?
@@ -174,7 +177,13 @@ fn write_leaf_run<'d>(
                 written: Vec::new(),
                 owner_of: &owner_of,
             };
-            builder.encode_rows(rows, placed_at, placed, Some(&mut spiller))?
+            builder.encode_rows_with(
+                rows,
+                placed_at,
+                placed,
+                Some(&mut spiller),
+                plan.layouts.get(index),
+            )?
         };
         placed_at = placed_at.saturating_add(placed);
         let id = PageId(first_leaf.0.saturating_add(index as u64));
@@ -184,10 +193,11 @@ fn write_leaf_run<'d>(
             PageId::NONE
         };
         page::set_right(&mut image, right)?;
-        write_built_page(log, database, id, &mut image)?;
+        queue_built_page(log, database, &mut pending, id, &mut image)?;
         pages_written = pages_written.saturating_add(1);
         leaves.push(id);
     }
+    flush_built_pages(database, &mut pending)?;
     Ok(LeafRun {
         leaves,
         first_leaf,
@@ -556,6 +566,7 @@ impl PagedTree {
             largest_hint: std::cell::Cell::new(None),
             stats: std::cell::Cell::new(crate::write::WriteStats::default()),
             merge_backoff: RefCell::new(std::collections::HashMap::new()),
+            pending_unlinks: RefCell::new(Vec::new()),
             last_leaf: std::cell::Cell::new(None),
         })
     }

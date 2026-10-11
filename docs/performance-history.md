@@ -6,6 +6,93 @@ call it, and the investigations behind them. [Performance](performance.md) has t
 A ratio on this page is SQLite's time divided by inillucent's; a ratio of 2.00x is 100% faster and
 one of 0.50x is 100% slower.
 
+## The engine run of 8 October 2026, release 2.4.2
+
+These were the published engine figures from 8 October 2026 until release 2.5.4 was measured on 11
+October 2026. `inillucent-fullgate` on `main` at `32fb3c0b`, released as 2.4.2 and built with
+`cargo build --release`, three runs of 30 paired rounds on the medium fixture, the median run, both
+engines pinned to the eight performance cores. Every workload's answer agreed with SQLite's on every
+round of all three runs.
+
+| Measurement | Against SQLite 3.53.4 |
+|---|---|
+| the engine, weighted over ten families of work, 100,000 rows | **505% faster** |
+| the same plan through the `Connection` API | **416% faster** |
+| 48 common and edge case workloads through the `Connection` API | **276% faster** (train), **261% faster** (held out) |
+| processor time, one round of the engine plan | **73% less** (281 ms against 1,039 ms) |
+| peak resident memory, one round of the engine plan | **14% more** (43.17 MiB against 38.03 MiB) |
+
+**The runs were not graded.** In the three runs SQLite was 4.3%, 4.0% and 4.4% slower than its idle
+reference, and 4.5% in the `Connection` run of the same plan. A busy machine slows SQLite more than
+inillucent, so the 505% reads somewhat high.
+
+### By family on 8 October 2026
+
+`weight` is the family's share of the engine headline. `bar` is what the performance contract
+(`compat/perf/contract.toml`) asks of the family. The ratio column is SQLite's time divided by
+inillucent's, which is how the contract states its bars; 2.00x is 100% faster.
+
+| family | weight | what it measures | result | ratio | bar |
+|---|---|---|---|---:|---|
+| `read.point` | 16% | one row by rowid, by integer key, and through a secondary index | **3,319% faster** | 34.19x | 100% faster (2.00x), met |
+| `large.values` | 4% | text and blobs across the size where a value stops fitting in a leaf | **1,134% faster** | 12.34x | 50% faster (1.50x), met |
+| `read.analytical` | 10% | scans, aggregates, `GROUP BY`, `DISTINCT`, sorts | **1,025% faster** | 11.25x | 400% faster (5.00x), met |
+| `read.range` | 12% | selective ranges, forward and reverse, covering and not | **668% faster** | 7.68x | 200% faster (3.00x), met |
+| `read.join` | 8% | two table and four table joins | **422% faster** | 5.22x | 200% faster (3.00x), met |
+| `write` | 20% | insert, update, delete, upsert, with and without indexes | **344% faster** | 4.44x | 50% faster (1.50x), met |
+| `transaction` | 10% | autocommit, small batches, large batches, savepoints | **141% faster** | 2.41x | as fast (1.00x), met |
+| `extension` | 8% | JSON, FTS5, R-Tree | **127% faster** | 2.27x | 50% faster (1.50x), met |
+| `open.prepare` | 8% | parse, bind, step one row, reset | **98% faster** | 1.98x | 400% faster (5.00x), missed |
+| `schema` | 4% | `CREATE INDEX` and its backfill | **5% faster** | 1.05x | 200% faster (3.00x), missed |
+
+No family is slower than SQLite. `open.prepare` and `schema` miss their bars, as they did in every
+earlier run. Three families depend on how fast the disk finishes a sync, and they moved from run to
+run: `schema` read 1.32x, 1.86x and 1.05x in the three runs, `transaction` 2.88x, 2.46x and 2.41x,
+and `extension` 2.47x, 2.56x and 2.27x. Its one workload, `schema.index`, read 1.46x, 1.48x and 1.43x.
+The family value is a mean over rounds, and a few rounds with a slow sync pull it down.
+
+Through the `Connection` API, the same plan reads 5.16x, 416% faster. Every family meets its bar
+there except `open.prepare` (3.41x) and `schema` (1.42x). `open.prepare` is faster through the
+`Connection` than through the engine, because the `Connection` keeps a prepared plan per statement
+text and the engine arm compiles every time.
+
+### The workloads that were slower on 8 October 2026
+
+Thirty workloads count toward the engine headline. Twenty seven are faster than SQLite. Two are level
+with it and one is slower:
+
+| workload | family | result | ratio | why |
+|---|---|---|---:|---|
+| `prepare.trivial` | `open.prepare` | **75% slower** | 0.57x | `SELECT 1` is compiled on every call. The bound result columns, the column name, the boxed statement, the expression tree and the output names are built each time, where SQLite's compile of the same statement allocates less. Through the `Connection` API, which keeps the compiled plan, it is 76% faster |
+| `txn.autocommit` | `transaction` | **level**, 2% slower to 1% slower across the three runs | 0.99x | one `fsync` a commit on each engine. On this disk an `fsync` is most of the millisecond a statement takes |
+| `join.range` | `read.join` | **level**, 1% slower to level across the three runs | 1.00x | a join over a range of 2,500 outer rows, each finding its rows through an index. Both engines do the same index probes |
+
+The four correlated subquery workloads, which the contract does not weight, are all faster:
+`correlated.exists` 198%, `correlated.in` 27%, `correlated.exists.selective` 100% and
+`correlated.scalar.selective` 59%.
+
+The fastest workloads: `scan.aggregate` 5,389% faster, `point.miss` 5,178%, `large.read` 4,388%,
+`point.rowid` 3,638%, `scan.group` 2,718%, `join.selective` 2,599%, `point.index` 1,928% and
+`range.reverse` 1,796%.
+
+### Memory on 8 October 2026
+
+**Processor time for one round of the whole plan is 281 ms against SQLite's 1,039 ms, 73% less**,
+where the contract asks for 60% less. The three runs read 77%, 75% and 73% less. Windows counts
+processor time in ticks of 15.6 ms, so a round's total moves by a tick or two from run to run.
+
+**Peak resident memory is 43.17 MiB against SQLite's 38.03 MiB, 14% more.** The contract asks for 5%
+less, so this bar is missed. Each figure comes from one child process per engine that opens a
+finished file and runs one round of the plan. Most of the memory difference is the cost of a Rust
+process on this machine before the engine starts, and the index build's sort in `schema.index` sets
+the peak. [Memory on 26 September 2026](performance-history.md#memory) has the breakdown by
+workload.
+
+Through the `Connection` API, one round of the 48 common and edge case workloads takes 641 ms of
+processor time against SQLite's 1,945 ms, 67% less, and a peak of 59.78 MiB against 38.58 MiB, 55%
+more. On 3 October 2026 release 2.1.1 took 3,906 ms against 1,820 ms, 115% more than SQLite, with a
+peak of 100.96 MiB.
+
 ## The engine run of 7 October 2026, release 2.3.0
 
 These were the published engine figures from 7 October 2026 until release 2.4.2 was measured on 8
@@ -572,6 +659,45 @@ these numbers.
 
 `tasks/task-2209-performance-hillclimb-7.md` lists all fourteen changes, the two rounds of advice
 they came from, what was tried and not kept, and the tests.
+
+### A hill climb toward every workload faster than SQLite
+
+The goal of this climb was every workload at or above SQLite in three measurements: the engine plan
+through the engine API (34 workloads), the same plan through the `Connection` (34) and the 48
+workloads through the `Connection`. Release 2.5.2 met it on 74 of the 116. Measured on 11 October
+2026, one run of 10 paired rounds of each plan per round of the climb, medians:
+
+| | release 2.5.2 | after the climb |
+|---|---:|---:|
+| workloads at or above SQLite, engine API | 31 of 34 | 31 of 34 |
+| the same plan through the `Connection` | 17 of 34 | 32 of 34 |
+| the 48 workloads through the `Connection` | 26 of 48 | 47 of 48 |
+| geometric mean against SQLite, all 116 | 1.53x | 4.13x |
+
+Most of the `Connection` workloads below SQLite in 2.5.2 were one regression: each statement asked
+Windows by file name, three times, whether another process had replaced the database or rolled the
+log, at about 20 us a question. The checks are now skipped while the batch oplock on the log segment
+is unbroken.
+
+| Workload | 2.5.2 | after | What changed |
+|---|---:|---:|---|
+| `point.rowid`, through the `Connection` | 0.20x | 20.43x | the lookups by name |
+| `app.dashboard` | 0.78x | 1.11x | an index nested loop walks the inner index once for the outer rows past a tenth of its size, and keeps the pairs in probe order |
+| `ai.copy` | 0.87x | 1.13x | an `INSERT ... SELECT` into an empty table collects its rows in a few large buffers; the bulk build keeps its leaf layouts and writes leaves 64 pages to a call |
+| `edge.update.all` | 0.70x | 1.01x | an update run tries each slot write once, keeps one copy of the leaf as the undo image, and reads the leaf's layout once |
+| `correlated.exists.selective`, through the `Connection` | 0.21x | 1.31x | a `WHERE` of integer comparisons is tested a batch at a time, and the gate's clock (below) |
+| `edge.delete.range` | 0.23x | 0.33x | a range delete unlinks the leaves it empties: alone it went from 0.28x to 1.00x, but in the plan the log's fold lands on it |
+
+**The `Connection` arm of `inillucent-fullgate` changed.** It started its clock before compiling a
+statement the plan marks `prepare: once`, although its own documentation, the engine arm and SQLite's
+arm compile before the clock. It now compiles first. For a statement run once, such as the two
+selective correlated workloads, the earlier figures included a compile that SQLite's did not.
+
+Still slower: `edge.delete.range` (the fold of the log into the database file, about 23 ms of its
+34 ms), `prepare.trivial` through the engine API (0.56x; 1.66x through the `Connection`), and
+`join.range` and `txn.autocommit`, which read between 0.95x and 1.07x across runs.
+`tasks/task-2226-performance-hillclimb-8.md` has every change, the advice it used, the tests and the
+reasons for what is left.
 
 ## Through the command line, the shell, Python and Node
 
