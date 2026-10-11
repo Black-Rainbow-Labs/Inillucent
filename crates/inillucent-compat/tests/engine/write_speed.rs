@@ -47,6 +47,36 @@ fn fresh(name: &str) -> (std::path::PathBuf, Database) {
     (directory, database)
 }
 
+/// How many times longer than the same statement onto 10 keys the upsert and replace cases onto
+/// 1,000 keys may take.
+///
+/// The old code copied a leaf's delta area for every write, and that area holds every key the
+/// statement has written since the leaf was packed: 10 rows for the 10 key run, up to 1,000 for the
+/// 1,000 key run. So the old code took many times longer onto 1,000 keys. Measured on a desktop,
+/// the fixed code takes 2.5 times as long onto 1,000 keys for replaces and about as long for
+/// upserts, and the old upserts took about 12 times as long as the fixed ones (952 ms against
+/// 75 ms). A bound in seconds failed on the Windows CI runner, which ran the fixed replaces in
+/// 2.9 s against 2.5 s because it is about five times slower than a desktop; the 10 key run is
+/// slower there by the same amount.
+const TIMES_TEN_KEYS: u32 = 6;
+
+/// Times one statement onto 10 keys of a table of its own, for the 1,000 key case to be compared
+/// with on the same machine at the same moment.
+///
+/// @param database - the database the case runs in
+/// @param statement - the statement, writing into the table `few`
+fn onto_ten_keys(database: &Database, statement: &str) -> Duration {
+    let session = database.session();
+    session
+        .execute_batch("CREATE TABLE few(id INTEGER PRIMARY KEY, n INT);")
+        .expect("the 10 key table is made");
+    let started = Instant::now();
+    session
+        .execute_batch(statement)
+        .expect("the statement onto 10 keys runs");
+    started.elapsed()
+}
+
 /// Returns the integers in the first row a query answers.
 ///
 /// @param database - the database
@@ -72,6 +102,10 @@ fn integers(database: &Database, sql: &str) -> Vec<i64> {
 #[test]
 fn upserts_onto_a_thousand_keys_finish_in_time() {
     let (_, database) = fresh("upsert");
+    let few = onto_ten_keys(
+        &database,
+        "INSERT INTO few SELECT value % 10, 1 FROM generate_series(1, 40000) WHERE true          ON CONFLICT(id) DO UPDATE SET n = n + 1;",
+    );
     let session = database.session();
     session
         .execute_batch("CREATE TABLE k(id INTEGER PRIMARY KEY, n INT);")
@@ -88,9 +122,10 @@ fn upserts_onto_a_thousand_keys_finish_in_time() {
         integers(&database, "SELECT count(*), sum(n), min(n), max(n) FROM k"),
         vec![1000, 40_000, 40, 40]
     );
+    println!("40,000 upserts onto 1,000 keys: {took:?}, against {few:?} onto 10 keys");
     assert!(
-        took < Duration::from_millis(2_000),
-        "40,000 upserts onto 1,000 keys took {took:?}; each one rebuilt the delta area of its leaf"
+        took < few * TIMES_TEN_KEYS,
+        "40,000 upserts onto 1,000 keys took {took:?}, more than {TIMES_TEN_KEYS} times the {few:?}          onto 10 keys; each one rebuilt the delta area of its leaf"
     );
 }
 
@@ -99,6 +134,10 @@ fn upserts_onto_a_thousand_keys_finish_in_time() {
 #[test]
 fn replaces_onto_a_thousand_keys_finish_in_time() {
     let (_, database) = fresh("replace");
+    let few = onto_ten_keys(
+        &database,
+        "INSERT OR REPLACE INTO few SELECT value % 10, value FROM generate_series(1, 40000);",
+    );
     let session = database.session();
     session
         .execute_batch("CREATE TABLE k(id INTEGER PRIMARY KEY, n INT);")
@@ -114,9 +153,10 @@ fn replaces_onto_a_thousand_keys_finish_in_time() {
         integers(&database, "SELECT count(*), sum(n), min(n), max(n) FROM k"),
         vec![1000, 39_500_500, 39_001, 40_000]
     );
+    println!("40,000 replaces onto 1,000 keys: {took:?}, against {few:?} onto 10 keys");
     assert!(
-        took < Duration::from_millis(2_500),
-        "40,000 replaces onto 1,000 keys took {took:?}; each one rebuilt the delta area of its leaf"
+        took < few * TIMES_TEN_KEYS,
+        "40,000 replaces onto 1,000 keys took {took:?}, more than {TIMES_TEN_KEYS} times the {few:?}          onto 10 keys; each one rebuilt the delta area of its leaf"
     );
 }
 
