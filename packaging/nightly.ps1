@@ -528,6 +528,11 @@ $env:CARGO_TARGET_DIR = Join-Path $Worktree 'target'
 # This machine has a network, so the HTTP client's tests fetch the real files the installer fetches
 # instead of skipping, as they do in CI.
 $env:INILLUCENT_NETWORK_TESTS = '1'
+# `tooling::workload_freshness` looks for Nikaya beside the checkout it runs in, which from the
+# nightly worktree is J:/build/nikaya/server and does not exist, so on 2026-10-04 it failed with
+# "the Nikaya checkout is not at ...". Nikaya sits beside the main checkout.
+$nikaya = Join-Path (Split-Path -Parent $main) 'nikaya/server'
+if (Test-Path -LiteralPath (Join-Path $nikaya 'src')) { $env:NIKAYA_ROOT = $nikaya }
 # `onig_sys` compiles oniguruma with cl.exe, and a scheduled task has no INCLUDE.
 Import-MsvcEnvironment | Out-Null
 

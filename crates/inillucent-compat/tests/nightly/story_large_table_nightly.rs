@@ -298,6 +298,29 @@ fn pool_bytes(connection: &Connection) -> u64 {
     u64::try_from(bytes).unwrap_or(2 * 1024 * 1024).max(1)
 }
 
+/// Returns how many bytes the database holds, asked of the engine:
+/// `PRAGMA page_count` times `PRAGMA page_size`.
+///
+/// **Not the file's length.** Committed pages wait in the write ahead log
+/// until a fold copies them into the file, so the file trails the database. On
+/// 2026-10-12, after the 20,000 row probe, the 32,768 byte arm's file was 6
+/// pages long while `page_count` said 41. Sized from the file, each row seemed
+/// to cost 9 bytes at 32,768 and 1 byte at 4,096, so the build asked for
+/// 9,320,675 and 83,886,080 rows where it had asked for 1,613,193 and
+/// 2,046,001 on 2026-09-23. The 4,096 byte arm then ran for hours and the
+/// runner stopped it every night from 2026-10-04.
+///
+/// @param connection - the open database
+fn database_bytes(connection: &Connection) -> u64 {
+    let pages = scalar(connection, "PRAGMA page_count")
+        .parse::<u64>()
+        .unwrap_or(0);
+    let page = scalar(connection, "PRAGMA page_size")
+        .parse::<u64>()
+        .unwrap_or(4096);
+    pages.saturating_mul(page)
+}
+
 /// How large a pool this test runs against, in kibibytes.
 ///
 /// **Set rather than inherited, and this is the whole reason the test is
@@ -365,19 +388,19 @@ fn narrow_the_pool(connection: &Connection, arm: &Arm) -> u64 {
 /// the text and the index entry added up - and the real figure on disk is
 /// several hundred once pages, the index tree and the free map are counted, so
 /// a table meant to be ten times the pool came out sixty times it and took
-/// proportionally longer. The first batch is written, the file is measured, and
-/// the rest is sized from what that batch actually cost. A measured width
+/// proportionally longer. The first batch is written, the database is measured
+/// through [`database_bytes`], and the rest is sized from what that batch
+/// actually cost. A measured width
 /// cannot drift from the engine the way a constant can, which is the argument
 /// [`pool_bytes`] already makes for asking the pragmas. It is also what keeps
 /// the table the same size in bytes at both page sizes, whose rows cost a
 /// different number of bytes each.
 ///
-/// @param connection - the open database
+/// @param connection - the open database, to measure
 /// @param written - how many rows the probe batch put in
-/// @param path - the database file, to measure
-fn rows_needed(connection: &Connection, written: i64, path: &Path) -> i64 {
-    let file = std::fs::metadata(path).map(|held| held.len()).unwrap_or(0);
-    let per_row = (file / u64::try_from(written).unwrap_or(1).max(1)).max(1);
+fn rows_needed(connection: &Connection, written: i64) -> i64 {
+    let held = database_bytes(connection);
+    let per_row = (held / u64::try_from(written).unwrap_or(1).max(1)).max(1);
     let wanted = pool_bytes(connection).saturating_mul(PAST_THE_POOL);
     i64::try_from((wanted / per_row).max(200_000)).unwrap_or(200_000)
 }
@@ -388,9 +411,8 @@ fn rows_needed(connection: &Connection, written: i64, path: &Path) -> i64 {
 /// costs on disk; then the remainder.
 ///
 /// @param connection - the database
-/// @param path - the database file, to measure the probe batch against
 /// @param arm - the page size the file must have
-fn build(connection: &Connection, path: &Path, arm: &Arm) -> i64 {
+fn build(connection: &Connection, arm: &Arm) -> i64 {
     narrow_the_pool(connection, arm);
     for statement in [
         "CREATE TABLE big(a INTEGER PRIMARY KEY, b TEXT, d INTEGER)",
@@ -402,7 +424,7 @@ fn build(connection: &Connection, path: &Path, arm: &Arm) -> i64 {
     }
     let probe = 20_000i64;
     let mut at = load(connection, 1, probe);
-    let rows = rows_needed(connection, probe, path).max(probe);
+    let rows = rows_needed(connection, probe).max(probe);
     while at <= rows {
         at = load(connection, at, (at + 20_000 - 1).min(rows));
     }
@@ -446,17 +468,16 @@ fn load(connection: &Connection, first: i64, last: i64) -> i64 {
 /// **Without this the whole file could pass on a table that fits** (rule 1.4).
 /// A change that made the rows narrower, or raised the default cache, would
 /// leave both arms green while grading exactly what the small generator
-/// already grades. Returns the file's size, for the cost line.
+/// already grades. The size is the database's, from [`database_bytes`], since
+/// the file's length leaves out what is still in the log. Returns it, for the
+/// cost line.
 ///
 /// @param connection - the database
-/// @param path - the database file
 /// @param rows - how many rows the build wrote
 /// @param arm - the arm, for the message
-fn the_table_is_past_the_pool(connection: &Connection, path: &Path, rows: i64, arm: &Arm) -> u64 {
+fn the_table_is_past_the_pool(connection: &Connection, rows: i64, arm: &Arm) -> u64 {
     let held = pool_bytes(connection);
-    let file_bytes = std::fs::metadata(path)
-        .map(|bytes| bytes.len())
-        .unwrap_or(0);
+    let file_bytes = database_bytes(connection);
     let ratio = file_bytes / held.max(1);
     assert_eq!(
         scalar(connection, "SELECT count(*) FROM big"),
@@ -738,7 +759,7 @@ struct Costs {
 ///
 /// @param arm - the arm
 /// @param rows - how many rows the build wrote
-/// @param file_bytes - the file's size after the build
+/// @param file_bytes - the database's size after the build
 /// @param costs - how long each part took
 fn print_costs(arm: &Arm, rows: i64, file_bytes: u64, costs: &Costs) {
     let seconds = |spent: Duration| format!("{:.1} s", spent.as_secs_f64());
@@ -768,9 +789,9 @@ fn the_story_at(arm: Arm) {
     let connection = database.session().expect("the connection opens");
 
     let started = Instant::now();
-    let rows = build(&connection, &path, &arm);
+    let rows = build(&connection, &arm);
     let build_cost = started.elapsed();
-    let file_bytes = the_table_is_past_the_pool(&connection, &path, rows, &arm);
+    let file_bytes = the_table_is_past_the_pool(&connection, rows, &arm);
     let everything: Vec<i64> = (1..=rows).collect();
 
     let started = Instant::now();
