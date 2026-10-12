@@ -496,13 +496,14 @@ fn a_search_table_refuses_what_has_no_meaning() {
         "CREATE VIRTUAL TABLE s USING inillucent_search(body, dims=3, dims=4)"
     )
     .contains("more than once"));
-    assert_eq!(
-        refusal(
-            &connection,
-            "CREATE VIRTUAL TABLE s USING inillucent_search(body, tokenize='nosuch')"
-        ),
-        "no such tokenizer: nosuch"
-    );
+    // A name that is not `porter` is a tokenizer pack, and one nobody
+    // installed is refused naming the tokenizers there are. The list of
+    // installed packs depends on the machine, so only the start is checked.
+    assert!(refusal(
+        &connection,
+        "CREATE VIRTUAL TABLE s USING inillucent_search(body, tokenize='nosuch')"
+    )
+    .contains("no tokenizer named nosuch is installed. This build has porter"));
     exec(
         &connection,
         "CREATE TABLE vt (id INTEGER PRIMARY KEY, v VECTOR(3))",
