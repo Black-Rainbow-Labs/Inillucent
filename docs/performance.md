@@ -1,32 +1,50 @@
 # Performance against SQLite
 
-This page gives inillucent's current speed next to SQLite 3.53.4, in two measurements: the engine
-on its own, and inillucent called the way programs call it (one process per command, a script
-piped into the shell, the Python driver and the npm package). It then gives processor time, memory
-and file size, and the method. Every earlier measurement, including each hill climb, is in
-[Performance history](performance-history.md). [Feature comparison](feature-comparison.md)
-compares what each engine can do.
+This page gives inillucent's current speed next to SQLite 3.53.4, in three measurements: the engine
+on its own, the engine through the `Connection` API every driver calls, and inillucent called the way
+programs call it (one process per command, a script piped into the shell, the Python driver and the
+npm package). It then gives processor time, memory and file size, and the method. Every earlier
+measurement, including each hill climb, is in [Performance history](performance-history.md).
+[Feature comparison](feature-comparison.md) compares what each engine can do. How the engine
+was made this fast is in [the hill climbing lab report](research/performance-hill-climbing.md),
+also published at [inillucent.com/research/hill-climbing](https://inillucent.com/research/hill-climbing).
 
 ## Summary
 
-| Measurement | Against SQLite 3.53.4 |
-|---|---|
-| **The engine**, weighted over ten families of work, 100,000 rows | **484% faster** |
-| **Processor time**, one round of the engine plan | **79% less** |
-| **Peak resident memory**, one round of the engine plan | **14% more** |
-| **Database file**, the same imported data | **3.6% larger** |
-| **Called the way programs call it**, all 25 workloads | **64% faster** |
-| the Python driver, against Python's `sqlite3` module, 9 workloads | **136% faster** |
-| the npm package, against Node's `node:sqlite`, 2 workloads | **207% faster** |
-| SQL scripts piped into the shell, against the `sqlite3` shell, 6 workloads | **46% faster** |
-| the command line, one process per command, against the `sqlite3` shell, 8 workloads | **3% faster** |
+**110 of the 116 workloads the benchmark times are faster than SQLite.** The benchmark runs the
+engine plan of 34 workloads through the engine's own API, the same 34 through the `Connection` API,
+and 48 common and edge case workloads through the `Connection` API. Every answer agreed with
+SQLite's.
 
-The two measurements answer different questions. The engine figure times statements inside one
-process, so it is what an application that keeps a database open sees. The second figure includes
-everything a caller pays around the engine: starting a program, crossing from Python or Node into
-the C library, and building each language's own values. Starting a program costs about the same
-for both engines and is most of a short command, which is why the command line is close to SQLite
-while the engine is several times faster.
+| Measurement | Workloads faster than SQLite | Against SQLite 3.53.4 |
+|---|---:|---|
+| **The engine**, weighted over ten families of work, 100,000 rows | 31 of 34 | **499% faster** |
+| the same plan through the `Connection` API | 32 of 34 | **411% faster** |
+| 48 common and edge case workloads through the `Connection` API | 47 of 48 | **297% faster** (train), **266% faster** (held out) |
+| **Processor time**, one round of the engine plan | | **77% less** |
+| processor time, one round of the 48 workloads through the `Connection` API | | **66% less** |
+| **Peak resident memory**, one round of the engine plan | | **16% more** |
+| **Database file**, the same imported data | | **3.6% larger** |
+| **Called the way programs call it**, release 2.4.2 | 25 of 25 | **74% faster** |
+| the npm package, against Node's `node:sqlite`, 2 workloads | | **418% faster** |
+| the Python driver, against Python's `sqlite3` module, 9 workloads | | **135% faster** |
+| SQL scripts piped into the shell, against the `sqlite3` shell, 6 workloads | | **49% faster** |
+| the command line, one process per command, against the `sqlite3` shell, 8 workloads | | **6% faster** |
+
+The six workloads that are not faster, and why, are in
+[The workloads that are slower](#the-workloads-that-are-slower). In short: one statement pays for
+the log being folded into the database file, one compiles `SELECT 1` from text on every call through
+an API no program uses, and the other four are within 6% of SQLite, where the disk's sync or the
+same index probes decide the time.
+
+The measurements answer different questions. The engine figure times statements inside one process,
+so it is what an application that keeps a database open sees. The `Connection` figures time the same
+kind of work through the API a driver calls, which adds the plan cache lookup, the parameter binding
+and the file lock a statement takes outside a transaction. The figure of how programs call it
+includes everything a caller pays around the engine: starting a program, crossing from Python or
+Node into the C library, and building each language's own values. Starting a program costs about
+the same for both engines and is most of a short command, which is why the command line is close to
+SQLite while the engine is several times faster.
 
 Each figure is a geometric mean over its workloads, so one very fast workload cannot carry the
 result.
@@ -34,20 +52,21 @@ result.
 | | Engine measurement | Measurement of how programs call it |
 |---|---|---|
 | **Program** | `inillucent-fullgate` | the usage benchmark (Node, Python and the programs themselves) |
-| **Build** | `main` at `573609d4`, released as 2.3.0, built with `cargo build --release` | the 2.3.0 release build, profile guided as `packaging/release-all.ps1` makes it |
+| **Build** | `main` at `ad4c2b98`, released as 2.5.4, built with `cargo build --release` | the 2.4.2 release build, profile guided as `packaging/release-all.ps1` makes it, beside the 2.3.0 release build |
 | **Data** | the medium fixture, 100,000 rows | a table of 10,000 rows with two indexes |
-| **Rounds** | three runs of 30 paired rounds; the median run | 15 rounds, each workload once per engine per round, in rotating order |
+| **Rounds** | three runs of 30 paired rounds, the median run; one run of 10 rounds for each `Connection` plan | 15 rounds, each workload once per engine per round, in rotating order |
 | **Settings** | `synchronous = FULL`, a 128 MiB page cache on both engines, no plan cache | each engine's own defaults |
-| **Date** | 7 October 2026 | 6 October 2026 |
-| **Answers checked** | every workload's answer hashed and compared with SQLite's: all 34 agreed on every round of all three runs | not compared |
+| **Date** | 11 October 2026 | 8 October 2026 |
+| **Answers checked** | every workload's answer hashed and compared with SQLite's: every workload agreed on every round of every run | not compared |
 | **Machine** | Windows 11 on x64, Intel Core Ultra 9 285. Both engines pinned to the same eight performance cores | the same machine, not pinned |
 
-**The engine runs were not graded.** The gate compares SQLite's own speed with a reference recorded
-on this machine when it was idle, and grades a run only when SQLite is within 3% of it. In all three
-runs SQLite was 6.8% to 7.3% slower than the reference, with only a web browser and Task Manager
-running beside it. A busy machine slows SQLite more than inillucent, so the 484% reads somewhat high.
-The last graded run, on 26 September 2026 with release 1.0.32, measured 419% faster; it is in
-[Performance history](performance-history.md#the-graded-gate-run-of-26-september-2026).
+**Every engine run was graded.** The gate compares SQLite's own speed with a reference recorded on
+this machine when it was idle, and grades a run only when SQLite is within 3% of it. In the three
+runs SQLite was 1.82%, 1.41% and 1.18% slower than the reference, and 1.92% in the `Connection` run of
+the same plan. The three runs read 501%, 493% and 499% faster; the median is the headline, with a 95%
+lower bound of 459%. The last graded run before this one, on 26 September 2026 with release 1.0.32,
+measured 419% faster; the ungraded run of 8 October 2026 with release 2.4.2 read 505%. Both are in
+[Performance history](performance-history.md).
 
 ## By family
 
@@ -57,51 +76,100 @@ inillucent's, which is how the contract states its bars; 2.00x is 100% faster.
 
 | family | weight | what it measures | result | ratio | bar |
 |---|---|---|---|---:|---|
-| `read.point` | 16% | one row by rowid, by integer key, and through a secondary index | **3,234% faster** | 33.34x | 100% faster (2.00x), met |
-| `large.values` | 4% | text and blobs across the size where a value stops fitting in a leaf | **1,129% faster** | 12.29x | 50% faster (1.50x), met |
-| `read.analytical` | 10% | scans, aggregates, `GROUP BY`, `DISTINCT`, sorts | **1,043% faster** | 11.43x | 400% faster (5.00x), met |
-| `read.range` | 12% | selective ranges, forward and reverse, covering and not | **493% faster** | 5.93x | 200% faster (3.00x), met |
-| `read.join` | 8% | two table and four table joins | **426% faster** | 5.26x | 200% faster (3.00x), met |
-| `write` | 20% | insert, update, delete, upsert, with and without indexes | **318% faster** | 4.18x | 50% faster (1.50x), met |
-| `transaction` | 10% | autocommit, small batches, large batches, savepoints | **153% faster** | 2.53x | as fast (1.00x), met |
-| `extension` | 8% | JSON, FTS5, R-Tree | **147% faster** | 2.47x | 50% faster (1.50x), met |
-| `open.prepare` | 8% | parse, bind, step one row, reset | **102% faster** | 2.02x | 400% faster (5.00x), missed |
-| `schema` | 4% | `CREATE INDEX` and its backfill | **47% faster** | 1.47x | 200% faster (3.00x), missed |
+| `read.point` | 16% | one row by rowid, by integer key, and through a secondary index | **3,304% faster** | 34.04x | 100% faster (2.00x), met |
+| `large.values` | 4% | text and blobs across the size where a value stops fitting in a leaf | **1,059% faster** | 11.59x | 50% faster (1.50x), met |
+| `read.analytical` | 10% | scans, aggregates, `GROUP BY`, `DISTINCT`, sorts | **1,020% faster** | 11.20x | 400% faster (5.00x), met |
+| `read.range` | 12% | selective ranges, forward and reverse, covering and not | **643% faster** | 7.43x | 200% faster (3.00x), met |
+| `read.join` | 8% | two table and four table joins | **394% faster** | 4.94x | 200% faster (3.00x), met |
+| `write` | 20% | insert, update, delete, upsert, with and without indexes | **312% faster** | 4.12x | 50% faster (1.50x), met |
+| `transaction` | 10% | autocommit, small batches, large batches, savepoints | **132% faster** | 2.32x | as fast (1.00x), met |
+| `extension` | 8% | JSON, FTS5, R-Tree | **127% faster** | 2.27x | 50% faster (1.50x), met |
+| `open.prepare` | 8% | parse, bind, step one row, reset | **96% faster** | 1.96x | 400% faster (5.00x), missed |
+| `schema` | 4% | `CREATE INDEX` and its backfill | **33% faster** | 1.33x | 200% faster (3.00x), missed |
 
-No family is slower than SQLite. Every family that misses its bar misses it the same way it did on
-26 September, by less: `open.prepare` went from 65% faster to 102% faster and `schema` from 27% to
-47% faster.
+No family is slower than SQLite. `open.prepare` and `schema` miss their bars, as they did in every
+earlier run. `schema` depends on how fast the disk finishes a sync and read 1.16x, 1.26x and 1.33x in
+the three runs.
+
+Through the `Connection` API, the same plan reads 5.11x, 411% faster. Every family meets its bar
+there except `open.prepare` (3.36x) and `schema` (1.42x). `open.prepare` is faster through the
+`Connection` than through the engine, because the `Connection` keeps a prepared plan per statement
+text and the engine arm compiles every time.
 
 ## The workloads that are slower
 
-Thirty workloads count toward the engine headline. Twenty eight are faster than SQLite. One is level
-with it and one is slower:
+Six of the 116 workloads are not faster than SQLite. Two are slower by a clear margin, and four are
+within 6%:
 
-| workload | family | result | ratio | why |
+| workload | measurement | result | ratio | why |
 |---|---|---|---:|---|
-| `prepare.trivial` | `open.prepare` | **72% slower** | 0.58x | `SELECT 1` is compiled on every call. The bound result columns, the column name, the boxed statement, the expression tree and the output names are built each time, where SQLite's compile of the same statement allocates less |
-| `txn.autocommit` | `transaction` | **level**, 2% slower to 0% across the three runs | 1.00x | one `fsync` a commit on each engine. On this disk an `fsync` is most of the millisecond a statement takes |
+| `edge.delete.range` | 48 workloads, `Connection` | **212% slower** | 0.32x | `DELETE` of 40,000 rows by a range of rowids. On its own the delete is level with SQLite. In this plan the log passes the size at which it is folded into the database file during this statement every round, and the fold (about 23 ms of the statement's 34 ms) is charged to it. SQLite's rollback journal does the same kind of work inside every write statement instead |
+| `prepare.trivial` | engine | **79% slower** | 0.56x | `SELECT 1` compiled from text on every call through the engine's own API, which no program calls. Through the `Connection` API, which keeps the compiled plan, it is 66% faster |
+| `join.range` | `Connection` | **6% slower** | 0.94x | a join over a range of 200 outer rows, each finding its rows through an index. Both engines do the same index probes. Earlier runs read it between 0.95x and 1.05x |
+| `join.range` | engine | **3% slower** | 0.97x | as above |
+| `txn.autocommit` | engine | **3% slower** | 0.97x | one sync of the disk per commit on each engine. On this disk a sync takes about as long as the whole 1.1 ms statement. Earlier runs read it between 0.97x and 1.07x |
+| `txn.autocommit` | `Connection` | **2% slower** | 0.98x | as above |
 
-`join.range` (2% faster, 1.02x), `extension.fts.build` (14% faster, 1.14x) and `extension.json`
-(131% faster, 2.31x), all slower than SQLite on 26 September, are now faster. `schema.index`, the one
-workload of the `schema` family, is 48% faster (1.48x). The four correlated subquery workloads, which
-the contract does not weight, are all faster: `correlated.exists` 194%, `correlated.in` 30%,
-`correlated.exists.selective` 98% and `correlated.scalar.selective` 63%.
+The four correlated subquery workloads, which the contract does not weight, are all faster:
+`correlated.exists` 198%, `correlated.in` 28%, `correlated.exists.selective` 134% and
+`correlated.scalar.selective` 90%.
 
-The fastest workloads: `scan.aggregate` 5,369% faster, `point.miss` 5,233%, `large.read` 4,379%,
-`point.rowid` 3,144%, `scan.group` 2,727%, `join.selective` 2,588%, `point.index` 1,946% and
-`range.reverse` 1,749%.
+The fastest workloads: `scan.aggregate` 5,436% faster, `point.miss` 5,112%, `large.read` 4,335%,
+`point.rowid` 3,597%, `scan.group` 2,694%, `join.selective` 2,447%, `point.index` 1,919% and
+`range.covering` 1,737%.
 
 ## Memory
 
-**Peak resident memory is 43.37 MiB against SQLite's 38.04 MiB, 14% more.** The contract asks for 5%
-less, so this bar is missed. Processor time for one round of the whole plan is 234 ms against
-SQLite's 1,125 ms, 79% less, where the contract asks for 60% less.
+**Processor time for one round of the whole plan is 234 ms against SQLite's 1,039 ms, 77% less**,
+where the contract asks for 60% less. The three runs read 81%, 72% and 77% less. Windows counts
+processor time in ticks of 15.6 ms, so a round's total moves by a tick or two from run to run.
 
-Each figure comes from one child process per engine that opens a finished file and runs one round
-of the plan. Most of the memory difference is the cost of a Rust process on this machine before the
-engine starts, and the index build's sort in `schema.index` sets the peak.
-[Memory on 26 September 2026](performance-history.md#memory) has the breakdown by workload.
+**Peak resident memory is 43.80 MiB against SQLite's 37.74 MiB, 16% more.** The contract asks for 5%
+less, so this bar is missed. Each figure comes from one child process per engine that opens a
+finished file and runs one round of the plan. Most of the memory difference is the cost of a Rust
+process on this machine before the engine starts, and the index build's sort in `schema.index` sets
+the peak. [Memory on 26 September 2026](performance-history.md#memory) has the breakdown by
+workload.
+
+Through the `Connection` API, one round of the 48 common and edge case workloads takes 641 ms of
+processor time against SQLite's 1,906 ms, 66% less, and a peak of 60.68 MiB against 38.27 MiB, 59%
+more. On 3 October 2026 release 2.1.1 took 3,906 ms against 1,820 ms, 115% more than SQLite, with a
+peak of 100.96 MiB.
+
+## Through the `Connection` API
+
+The engine headline calls the engine's `plan`, `prepare` and `pipeline` functions directly. A program
+calls `Connection::prepare` and `Statement::step`, which every language driver uses. `inillucent-fullgate
+--api connection` times that path, on the engine plan and on a second plan of 48 workloads that
+applications meet and the engine plan does not: rows written by `INSERT` instead of a bulk import, a
+table that churns, queries applications write, edge cases and checks that every written row is still
+there. A workload is in the held out set when FNV-1a of its name is 0 mod 3. No change was designed by
+looking at a held out workload.
+
+| Plan, through the `Connection` | Release 2.1.1, 3 October 2026 | Release 2.4.2, 8 October 2026 | Release 2.5.4, 11 October 2026 |
+|---|---|---|---|
+| the 48 workloads, train set of 28 | 18% slower (0.851x) | 276% faster (3.758x) | **297% faster** (3.966x) |
+| the 48 workloads, held out set of 20 | 49% slower (0.669x) | 261% faster (3.613x) | **266% faster** (3.659x) |
+| the engine plan, weighted | 94% faster (1.94x) | 416% faster (5.16x) | **411% faster** (5.11x) |
+| workloads faster than SQLite, both plans | | 74 of 82 | **79 of 82** |
+
+Each figure is one run of 10 rounds. The 2.5.4 run of the engine plan was graded; the 48 workload
+plan has no idle reference to grade against. Three workloads through the `Connection` are slower than
+SQLite in the 2.5.4 run: `edge.delete.range` (0.32x), `join.range` (0.94x) and `txn.autocommit`
+(0.98x). [The workloads that are slower](#the-workloads-that-are-slower) says why for each. Release
+2.5.2 had been 80% slower than SQLite on point reads through the `Connection`, because each statement
+asked Windows three times by file name whether another process had replaced the database or rolled
+the log; 2.5.4 skips those questions while the log's oplock shows no other process has opened it.
+
+**How the `Connection` arm times a statement changed in 2.5.4.** It compiled a statement the plan
+marks `prepare: once` inside the clock, where the engine arm and SQLite's arm compile before it. It
+now compiles first, so a workload that runs its statement once, such as the two selective correlated
+workloads, no longer counts a compile that SQLite's figure does not. The release 2.1.1 and 2.4.2
+columns were taken the old way. [A hill climb toward every workload faster than
+SQLite](performance-history.md#a-hill-climb-toward-every-workload-faster-than-sqlite) has every
+workload's figure before and after. [The hill climbs through the
+Connection](performance-history.md#through-the-connection-on-common-and-edge-case-workloads) have
+every earlier figure and the changes behind each one.
 
 ## How programs call it
 
@@ -110,49 +178,54 @@ around them: start the `inillucent` program once per command, pipe a SQL script 
 `inillucent-shell`, call the Python driver, or call the npm package. Each is compared with the
 same use of SQLite: the `sqlite3` 3.53.4 shell, Python's `sqlite3` module and Node's `node:sqlite`.
 Each engine runs with its own default settings, because the defaults are what this kind of use gets.
+Release 2.3.0 ran in the same rounds, so the two releases are compared on the same machine state.
 
-| How it was called | Workloads | Against SQLite |
-|---|---:|---|
-| the Python driver | 9 | **136% faster** |
-| the npm package | 2 | **207% faster** |
-| SQL scripts piped into the shell | 6 | **46% faster** |
-| the command line, one process per command | 8 | **3% faster** |
-| all 25 | 25 | **64% faster** |
+| How it was called | Workloads | 2.3.0 against SQLite | 2.4.2 against SQLite |
+|---|---:|---|---|
+| the npm package | 2 | 357% faster | **418% faster** |
+| the Python driver | 9 | 128% faster | **135% faster** |
+| SQL scripts piped into the shell | 6 | 48% faster | **49% faster** |
+| the command line, one process per command | 8 | 5% faster | **6% faster** |
+| all 25 | 25 | 69% faster | **74% faster** |
+
+Seven of the 25 are three times as fast as SQLite or more. The 2.3.0 figures here are higher than
+the 64% published for it on 6 October 2026, because SQLite's side of this run was slower on several
+workloads, which is the spread from one day's run to the next.
 
 ### Python and Node
 
-| Workload | inillucent | SQLite | Result |
-|---|---:|---:|---|
-| Python, 5,000 lookups by key | 21.50 ms | 96.16 ms | **347% faster** |
-| Python, 200 `GROUP BY` queries | 94.29 ms | 522 ms | **453% faster** |
-| Python, 1,000 single row updates | 1,243 ms | 6,284 ms | **405% faster** |
-| Python, 100 single row inserts | 124 ms | 456 ms | **268% faster** |
-| Python, 200 range queries of 200 rows | 18.86 ms | 41.72 ms | **121% faster** |
-| Python, read 10,000 rows | 5.88 ms | 7.88 ms | **34% faster** |
-| Python, a 10,000 row table and two indexes | 37.35 ms | 46.66 ms | **25% faster** |
-| Python, 10,000 inserts in a transaction into a table with two indexes | 24.30 ms | 30.34 ms | **25% faster** |
-| Python, 100 opens and closes | 6.82 ms | 7.17 ms | **5% faster** |
-| Node, a lookup by key through a session | 0.004 ms | 0.014 ms | **237% faster** |
-| Node, a lookup by key with `query()` | 0.034 ms | 0.096 ms | **181% faster** |
+| Workload | 2.3.0 | 2.4.2 | SQLite | 2.4.2 against SQLite |
+|---|---:|---:|---:|---|
+| Python, 200 `GROUP BY` queries | 93.18 ms | 93.67 ms | 537 ms | **473% faster** |
+| Python, 5,000 lookups by key | 21.20 ms | 17.20 ms | 90.62 ms | **427% faster** |
+| Python, 1,000 single row updates | 1,240 ms | 1,219 ms | 5,805 ms | **376% faster** |
+| Python, 100 single row inserts | 122 ms | 132 ms | 436 ms | **230% faster** |
+| Python, 200 range queries of 200 rows | 18.74 ms | 18.41 ms | 35.94 ms | **95% faster** |
+| Python, 100 opens and closes | 8.35 ms | 6.73 ms | 9.44 ms | **40% faster** |
+| Python, read 10,000 rows | 5.99 ms | 5.99 ms | 7.68 ms | **28% faster** |
+| Python, a 10,000 row table and two indexes | 37.74 ms | 37.67 ms | 46.75 ms | **24% faster** |
+| Python, 10,000 inserts in a transaction into a table with two indexes | 24.00 ms | 27.11 ms | 28.36 ms | **5% faster** |
+| Node, a lookup by key with `query()` | 0.034 ms | 0.033 ms | 0.18 ms | **447% faster** |
+| Node, a lookup by key through a session | 0.004 ms | 0.003 ms | 0.016 ms | **391% faster** |
 
 ### The shell and the command line
 
-| Workload | inillucent | SQLite | Result |
-|---|---:|---:|---|
-| shell, 200 single row inserts, each its own transaction | 270 ms | 868 ms | **222% faster** |
-| shell, 1,000 lookups by key in a script | 26.99 ms | 42.89 ms | **59% faster** |
-| shell, a 10,000 row table and two indexes | 52.25 ms | 70.90 ms | **36% faster** |
-| shell, `.import --csv` of 50,000 rows | 57.66 ms | 69.19 ms | **20% faster** |
-| shell, one `INSERT` of 20,000 rows | 40.68 ms | 44.26 ms | **9% faster** |
-| shell, 10,000 `INSERT` statements in a transaction | 39.67 ms | 42.52 ms | **7% faster** |
-| command line, `dump` | 30.74 ms | 36.22 ms | **18% faster** |
-| command line, `exec` of a one row `INSERT` | 22.79 ms | 24.26 ms | **6% faster** |
-| command line, `tables` | 18.67 ms | 19.09 ms | **2% faster** |
-| command line, `query` of one row as JSON | 19.23 ms | 19.19 ms | level |
-| command line, `query` of one row as text | 18.58 ms | 18.40 ms | 1% slower |
-| command line, `query` of 100 rows by an index, sorted, as JSON | 19.50 ms | 19.33 ms | 1% slower |
-| command line, `query` of `count(*)` and `max` over 10,000 rows | 18.93 ms | 18.82 ms | 1% slower |
-| command line, `--version` | 17.20 ms | 17.00 ms | 1% slower |
+| Workload | 2.3.0 | 2.4.2 | SQLite | 2.4.2 against SQLite |
+|---|---:|---:|---:|---|
+| shell, 200 single row inserts, each its own transaction | 271 ms | 274 ms | 883 ms | **222% faster** |
+| shell, 1,000 lookups by key in a script | 27.64 ms | 25.21 ms | 40.99 ms | **63% faster** |
+| shell, a 10,000 row table and two indexes | 52.33 ms | 52.67 ms | 72.87 ms | **38% faster** |
+| shell, 10,000 `INSERT` statements in a transaction | 38.37 ms | 38.53 ms | 46.21 ms | **20% faster** |
+| shell, `.import --csv` of 50,000 rows | 57.29 ms | 58.69 ms | 68.73 ms | **17% faster** |
+| shell, one `INSERT` of 20,000 rows | 40.49 ms | 41.22 ms | 44.61 ms | **8% faster** |
+| command line, `dump` | 30.69 ms | 30.79 ms | 36.68 ms | **19% faster** |
+| command line, `query` of 100 rows by an index, sorted, as JSON | 19.88 ms | 19.37 ms | 20.82 ms | **7% faster** |
+| command line, `tables` | 18.82 ms | 18.39 ms | 19.74 ms | **7% faster** |
+| command line, `--version` | 16.76 ms | 16.11 ms | 16.69 ms | **4% faster** |
+| command line, `query` of one row as JSON | 18.34 ms | 18.18 ms | 18.71 ms | **3% faster** |
+| command line, `exec` of a one row `INSERT` | 23.16 ms | 23.97 ms | 24.54 ms | **2% faster** |
+| command line, `query` of one row as text | 18.57 ms | 18.70 ms | 19.08 ms | **2% faster** |
+| command line, `query` of `count(*)` and `max` over 10,000 rows | 19.69 ms | 18.98 ms | 19.36 ms | **2% faster** |
 
 ### Where the time goes, and why SQLite does not pay the same
 
@@ -162,7 +235,14 @@ benchmark and 5.7 ms from a terminal, and a one row query takes 7.5 ms (inilluce
 starting the process, for both engines, so no engine can be several times faster than another at
 it. The benchmark starts each program with Node's `windowsHide` option, which gives every program a
 hidden console of its own and adds about 11 ms to every start. Measured from a terminal instead,
-the command line group is 4% faster than SQLite and the shell group 56% faster.
+for release 2.3.0 on 6 October 2026, the command line group was 4% faster than SQLite and the shell
+group 56% faster.
+
+**Inserts from Python are slower in 2.4.2 than in 2.3.0.** 10,000 inserts in a transaction took
+27.11 ms against 24.00 ms, and 100 single row inserts 132 ms against 122 ms, in the same rounds. On
+Windows, 2.4.2 writes the log through one shared file object opened for overlapped I/O, which lets a
+reader skip the system call that asked the log its length on every statement. The hill climb of 7 October
+2026 measured the same cost on the gate's batched insert, about 4%. Both are still faster than SQLite.
 
 **Writing a row.** 10,000 inserts from Python into a table with no index take 14.2 ms in inillucent
 and 12.2 ms in SQLite, so the remaining cost is in writing a row into the table, before any index.
@@ -222,8 +302,8 @@ flowchart TB
     H -->|quiet| J["Weighted headline and each family against its bar"]
 ```
 
-A run that grades every family and misses one bar exits with code 1. Each of the four runs exited 1,
-because `open.prepare`, `schema` and the memory figure miss their bars. Those misses are listed in
+A run that is not graded exits with code 4, as the runs of 8 October 2026 did. A run that grades every family and misses one bar exits with code 1. Each of the four graded runs of
+26 September 2026 exited 1, because `open.prepare`, `schema` and the memory figure miss their bars. Those misses are listed in
 `compat/perf/known-misses.txt`, which the nightly run reads so that a known miss does not make the
 night red.
 
@@ -335,7 +415,7 @@ was taken before that change, with the same mask set on the gate process from ou
 ### How a ratio is taken
 
 The gate pairs the two engines round by round and reports the median of the thirty paired ratios.
-A published gate figure is the median of the runs taken: of three runs on 7 October 2026, and of the
+A published gate figure is the median of the runs taken: of three runs on 8 October 2026, and of the
 two middle runs of four on 26 September 2026. An absolute time beside it is
 the median of the four runs' own medians. These are two summaries of one set of rounds, so dividing
 the printed times gives a number close to the printed ratio. For `scan.sort`, 22.88 ms and 125.22 ms
@@ -573,8 +653,9 @@ Both are off by default.
 ## History
 
 Every earlier measurement is in [Performance history](performance-history.md): the last graded
-engine run of 26 September 2026, the hill climbs through the Connection, all six rounds of the
-comparison of how programs call it, and the investigations behind each change. The latest hill climb
+engine run of 26 September 2026, the engine run of 7 October 2026 with release 2.3.0, the hill climbs
+through the Connection, all six rounds of the comparison of how programs call it, and the
+investigations behind each change. The latest hill climb
 made the gate's 82 workloads 51.5% faster through the Connection than release 2.3.4, and searches of
 an `inillucent_search` table 276% faster; [its section](performance-history.md#a-hill-climb-on-common-operations-against-release-234)
 has the figures.

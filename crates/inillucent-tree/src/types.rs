@@ -346,6 +346,19 @@ pub struct ColumnSpec {
     /// catalog says what the order is, and a page that carried its own could
     /// disagree with it.
     pub descending: bool,
+    /// Whether this single key column can hold a value that is not an integer.
+    ///
+    /// **A `WITHOUT ROWID` table with `a INTEGER PRIMARY KEY`.** INTEGER
+    /// affinity leaves a text, a blob or a real that does not convert as it is,
+    /// so the key is an integer almost always and not always. A rowid tree
+    /// never holds anything else and answers a probe for a non integer with
+    /// "not found" without looking; a tree with this flag looks.
+    ///
+    /// Not written to the page, for the reason the collation is not: the
+    /// catalog decides it, and a file written before the flag existed is read
+    /// the same way because the eight byte separators of an integer key did not
+    /// change.
+    pub mixed_key: bool,
 }
 
 impl ColumnSpec {
@@ -358,6 +371,7 @@ impl ColumnSpec {
             flags: COLUMN_NULLABLE,
             collation: Collation::Binary,
             descending: false,
+            mixed_key: false,
         }
     }
 
@@ -373,7 +387,16 @@ impl ColumnSpec {
             flags: COLUMN_KEY,
             collation: Collation::Binary,
             descending: false,
+            mixed_key: false,
         }
+    }
+
+    /// Returns the same key column marked as one that may hold a non integer.
+    ///
+    /// @param mixed_key - whether a probe for a non integer must be searched for
+    pub fn with_mixed_key(mut self, mixed_key: bool) -> ColumnSpec {
+        self.mixed_key = mixed_key;
+        self
     }
 
     /// Returns the same column under a collation.

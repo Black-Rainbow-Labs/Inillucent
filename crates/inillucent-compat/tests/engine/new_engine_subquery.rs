@@ -306,7 +306,7 @@ fn a_correlated_subquery_is_answered_per_row() {
             // SQL's own rule and not this engine's - so the comparison excludes
             // it rather than comparing two different questions. The rule itself
             // is asserted below.
-            "SELECT id FROM item WHERE id NOT IN              (SELECT item_id FROM part WHERE item_id IS NOT NULL) ORDER BY id",
+            "SELECT id FROM item WHERE id NOT IN (SELECT item_id FROM part WHERE item_id IS NOT NULL) ORDER BY id",
         ),
         "NOT EXISTS and NOT IN disagreed about the same question"
     );
@@ -336,7 +336,7 @@ fn a_subquery_in_a_compound_arm_is_folded_too() {
     assert_eq!(
         integers(
             &connection,
-            "SELECT id FROM item WHERE id IN (SELECT item_id FROM part)              UNION              SELECT id FROM item WHERE price = (SELECT min(price) FROM item)              ORDER BY id"
+            "SELECT id FROM item WHERE id IN (SELECT item_id FROM part) UNION SELECT id FROM item WHERE price = (SELECT min(price) FROM item) ORDER BY id"
         ),
         vec![2, 3, 4],
         "one arm's subquery was not folded"
@@ -390,7 +390,7 @@ fn a_subquery_in_a_values_list_and_in_a_set_is_folded() {
         .expect("the fixture table is emptied");
     connection
         .execute_batch(
-            "INSERT INTO item(id, name, price) VALUES (1, 'one', 1);              INSERT INTO item(id, name, price) VALUES (2, 'two', 2)",
+            "INSERT INTO item(id, name, price) VALUES (1, 'one', 1); INSERT INTO item(id, name, price) VALUES (2, 'two', 2)",
         )
         .expect("two rows load");
 

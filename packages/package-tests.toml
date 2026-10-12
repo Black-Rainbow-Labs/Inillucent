@@ -45,6 +45,13 @@ requires = ["python", "programs"]
 about = "what is inside the wheel, and a round trip against the binary that is in it. It was referenced by nothing at all until task-2036 - not by a selection row, not by a script, not by the release - so a wheel could ship with its native half missing and this file would sit there passing on nobody's machine."
 
 [[test]]
+language = "python"
+path = "packages/python/tests/test_driver_defects.py"
+command = "python packages/python/tests/test_driver_defects.py"
+requires = ["python", "programs", "capi"]
+about = "the Python driver and helpers against defects found by hand: a second statement, the helpers' encoding, a refused close, a limit past 2**64, a path of the wrong type, NaN binding"
+
+[[test]]
 language = "npm"
 path = "packages/npm/inillucent/conformance.test.mjs"
 command = "node --test packages/npm/inillucent/conformance.test.mjs"

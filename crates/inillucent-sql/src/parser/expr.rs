@@ -276,10 +276,10 @@ impl Parser<'_> {
             && !self.peek_at(1)?.is(Punctuator::Dot)
             && !self.peek_at(1)?.is(Punctuator::LeftParen)
         {
-            self.bump()?;
+            let (name, _) = self.parse_name_spanned()?;
             return Ok(self
                 .ast
-                .add_expr(Expr::Literal(Literal::Boolean(is_true)), token.span));
+                .add_expr(Expr::Literal(Literal::Boolean(is_true, name)), token.span));
         }
         // `like(X, Y)` is a function call even though LIKE is a hard keyword,
         // and so are `glob`, `regexp` and `match`. SQLite's grammar has a rule
@@ -746,17 +746,6 @@ impl Parser<'_> {
     fn parse_is(&mut self, left: ExprId) -> Result<Option<ExprId>, ParseError> {
         self.expect_keyword(Keyword::IS)?;
         let negated = self.eat_keyword(Keyword::NOT)?;
-        if self.at_keyword(Keyword::NULL)? {
-            let end = self.bump()?.span;
-            let span = self.ast.expr_span(left).to(end);
-            return Ok(Some(self.ast.add_expr(
-                Expr::IsNull {
-                    negated,
-                    operand: left,
-                },
-                span,
-            )));
-        }
         let distinct_from = if self.at_keyword(Keyword::DISTINCT)? {
             self.bump()?;
             self.expect_keyword(Keyword::FROM)?;
@@ -766,6 +755,19 @@ impl Parser<'_> {
         };
         let right = self.parse_expr_bp(Power(precedence::COMPARISON.0.saturating_add(1)))?;
         let span = self.ast.expr_span(left).to(self.ast.expr_span(right));
+        // **`x IS NULL` is `IS` with a right operand, as in SQLite's grammar.** The word `NULL`
+        // used to be consumed on its own, so `1 IS NULL + 2` was `(1 IS NULL) + 2` and gave 2,
+        // where SQLite reads `1 IS (NULL + 2)` and gives 0. Only a right operand that is the
+        // bare literal becomes the null test the planner recognises.
+        if !distinct_from && matches!(self.ast.expr(right), Some(Expr::Literal(Literal::Null))) {
+            return Ok(Some(self.ast.add_expr(
+                Expr::IsNull {
+                    negated,
+                    operand: left,
+                },
+                span,
+            )));
+        }
         Ok(Some(self.ast.add_expr(
             Expr::Is {
                 negated,
@@ -976,6 +978,18 @@ impl Parser<'_> {
         } else {
             None
         };
+        // **Only `LIKE` takes an `ESCAPE`.** SQLite reads `a GLOB b ESCAPE c` as a
+        // call `glob(b, a, c)` and the function takes two arguments, so it
+        // refuses the statement and names the operator the way it was written.
+        if escape.is_some() && op != PatternOp::Like {
+            return Err(ParseError::new(
+                ParseErrorKind::Refused(format!(
+                    "wrong number of arguments to function {}()",
+                    String::from_utf8_lossy(token.text(self.source()))
+                )),
+                token.span,
+            ));
+        }
         let span = self.ast.expr_span(left).to(end);
         Ok(Some(self.ast.add_expr(
             Expr::Pattern {

@@ -222,7 +222,7 @@ fn a_callback_can_ask_whether_a_transaction_is_open() {
         assert_eq!(
             answer.as_ref(),
             Ok(&false),
-            "a transaction is open, so `autocommit` from inside the authorizer              should answer false; it answered {answer:?}"
+            "a transaction is open, so `autocommit` from inside the authorizer should answer false; it answered {answer:?}"
         );
     }
 
@@ -299,7 +299,7 @@ fn a_callback_can_read_and_set_a_run_time_limit() {
         .expect("the authorizer was called at least once");
     assert_eq!(
         first_read, 300,
-        "the first read from inside the authorizer should see the limit set          before the statement started"
+        "the first read from inside the authorizer should see the limit set before the statement started"
     );
     assert_eq!(
         first_before, 300,
@@ -308,7 +308,7 @@ fn a_callback_can_read_and_set_a_run_time_limit() {
     assert_eq!(
         database.limit(inillucent_base::limits::Limit::VariableNumber),
         250,
-        "the write the authorizer made should be the one in force afterwards;          a different answer means it wrote to a group nothing else reads"
+        "the write the authorizer made should be the one in force afterwards; a different answer means it wrote to a group nothing else reads"
     );
 }
 

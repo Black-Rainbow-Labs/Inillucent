@@ -75,6 +75,14 @@ impl ImportedDatabase {
                     continue;
                 };
                 let value = inillucent_value::Value::from(&vector.borrow()).into_owned()?;
+                // The row this one replaces is removed first, whether or not the statement
+                // reported it: `INSERT OR REPLACE`, `REPLACE` and `ON CONFLICT DO UPDATE` write a
+                // rowid the index already holds, and the store refuses a second insert of one.
+                // Removing a rowid the store does not hold does nothing.
+                self.change_module(
+                    &index.name,
+                    &inillucent_sql::vtab::Change::Delete(inillucent_value::Value::Integer(*rowid)),
+                )?;
                 if matches!(value, inillucent_value::Value::Null) {
                     continue;
                 }
@@ -157,21 +165,17 @@ impl ImportedDatabase {
             _ => None,
         };
         let bytes = converted.as_deref().unwrap_or(bytes);
+        refuse_a_probe_the_scan_would_refuse(connected, bytes)?;
         let candidates = self.probe_module(connected, bytes, depth)?;
-        if candidates.is_empty() {
-            // **An index that holds nothing is not an answer of nothing.** A
-            // nearest-neighbour probe returns the `k` nearest rows however far
-            // away they are, so an empty candidate list means the store is
-            // empty rather than that nothing matched - and `None` here is the
-            // planner's word for "no index", which sends the query to the
-            // exhaustive scan. Returning the empty list instead is how a
-            // `CREATE INDEX` used to make a working search answer zero rows
-            // with nothing failing and nothing logged. The cause of the empty
-            // store is fixed; this is what stops the *symptom* being a wrong
-            // answer if anything ever empties one again. A table that really
-            // holds no rows gets the same answer from the scan.
-            return Ok(None);
-        }
+        // **An index that holds nothing answers an empty list, and an empty list is an answer.**
+        // `None` means there is no index of that name, and the executor refuses the statement for
+        // it with "no vector index named". This used to return `None` for an empty candidate list
+        // so that the query fell back to a scan, but the executor has no scan to fall back to at
+        // this point, so an empty table, a table emptied by `DELETE`, a table whose vectors are all
+        // NULL and a `WHERE` that removes every row all failed with that refusal. A nearest
+        // neighbour probe returns the `k` nearest rows however far away they are, so an empty list
+        // means the index holds no vector: there is no neighbour, and no row is the right answer.
+        // Rows whose vector is NULL are not in the index, which `docs/vector-search.md` says.
         Ok(Some(candidates))
     }
 
@@ -266,7 +270,9 @@ impl ImportedDatabase {
             catalog: None,
         };
         cursor.filter(&mut context, &plan)?;
-        let mut found = Vec::with_capacity(depth);
+        // The capacity is capped because `depth` is the statement's LIMIT: a LIMIT of
+        // 9223372036854775807 asked for an allocation no machine has, and aborted the process.
+        let mut found = Vec::with_capacity(depth.min(4096));
         while !cursor.eof() {
             found.push(cursor.rowid()?);
             cursor.next(&mut context)?;
@@ -496,7 +502,7 @@ impl ImportedDatabase {
                 String::from_utf8_lossy(&column.name)
             ))
         })?;
-        let declared = store_options(module, settings)?;
+        let declared = store_options(module, name, settings)?;
         // **The structure the index named is the module the store uses.** An
         // `ivfflat` is an inverted file and needs no lexical half, so it is its
         // own module with its own three shadow tables; `inillucent_hnsw` is the
@@ -586,6 +592,36 @@ impl ImportedDatabase {
     }
 }
 
+/// Refuses a query vector with the words the same query gets when no index answers it.
+///
+/// The store's own check says "this index has 3 dimensions, and the vector has 2", which names
+/// a table the person never wrote. Without the index the statement says
+/// `different vector dimensions 3 and 2`, so adding an index changed the message of an error.
+///
+/// @param connected - the index's store
+/// @param probe - the query vector's bytes, already converted from a JSON array
+fn refuse_a_probe_the_scan_would_refuse(connected: &vtab::Connected, probe: &[u8]) -> DbResult<()> {
+    let function = match declared_metric(connected) {
+        inillucent_sql::catalog_view::IndexMetric::L2 => "vector_distance_l2",
+        _ => "vector_distance_cos",
+    };
+    if !probe.len().is_multiple_of(4) {
+        return Err(refusal(format!("{function}: argument 2 is not a vector")));
+    }
+    let Some(dims) = argument_of(&connected.arguments.arguments, b"dims")
+        .and_then(|raw| String::from_utf8_lossy(&raw).trim().parse::<usize>().ok())
+    else {
+        return Ok(());
+    };
+    let width = probe.len() / 4;
+    if width != dims {
+        return Err(refusal(format!(
+            "different vector dimensions {dims} and {width}"
+        )));
+    }
+    Ok(())
+}
+
 /// The mode an `inillucent_hnsw` index gets when its `WITH ( ... )` names none.
 ///
 /// **Approximate, because an HNSW index that is never traversed is not an HNSW
@@ -619,9 +655,17 @@ const DEFAULT_HNSW_MODE: &str = "approximate";
 /// mode to switch to, so `WITH (mode = 'exact')` there would be accepted and
 /// then not honoured.
 ///
+/// A metric the graph does not know is refused here, by the index's name. The store would refuse it
+/// as well when it is created, but its message cannot say which `CREATE INDEX` the setting came
+/// from, and it is a message about a table the person never wrote.
+///
 /// @param module - `inillucent_hnsw` or `ivfflat`
+/// @param name - the index's name, for the message
 /// @param settings - the folded `(name, value)` pairs `WITH ( ... )` carried
-fn store_options(module: &[u8], settings: &[(Vec<u8>, Vec<u8>)]) -> DbResult<String> {
+fn store_options(module: &[u8], name: &[u8], settings: &[(Vec<u8>, Vec<u8>)]) -> DbResult<String> {
+    if module != b"ivfflat" {
+        check_metric_setting(name, settings)?;
+    }
     let names_mode = settings.iter().any(|(option, _)| option == b"mode");
     if names_mode && module == b"ivfflat" {
         return Err(refusal(
@@ -640,6 +684,28 @@ fn store_options(module: &[u8], settings: &[(Vec<u8>, Vec<u8>)]) -> DbResult<Str
         declared.push_str(&format!(", mode={DEFAULT_HNSW_MODE}"));
     }
     Ok(declared)
+}
+
+/// Refuses a `metric` setting that names no distance the graph implements.
+///
+/// @param name - the index's name, for the message
+/// @param settings - the folded `(name, value)` pairs `WITH ( ... )` carried
+fn check_metric_setting(name: &[u8], settings: &[(Vec<u8>, Vec<u8>)]) -> DbResult<()> {
+    for (option, value) in settings {
+        if option != b"metric" && option != b"distance" {
+            continue;
+        }
+        let text = String::from_utf8_lossy(value);
+        let bare = text.trim().trim_matches('\'').trim_matches('"');
+        if let Err(error) = inillucent_search::options::Metric::parse(bare) {
+            return Err(refusal(format!(
+                "index {}: {}",
+                String::from_utf8_lossy(name),
+                error.message()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Returns the distance a connected vector index's own store was declared to

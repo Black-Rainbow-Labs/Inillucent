@@ -230,6 +230,15 @@ impl Error {
             // moment `NotFound` has to be exact the mechanism that carries
             // `unsupported` carries this too, in one line.
             (None, None, _) if error.message().starts_with("no such ") => Status::NotFound,
+            // **A transaction statement in the wrong state is `invalid_state`.**
+            // `BEGIN` inside a transaction and `COMMIT` or `ROLLBACK` with none
+            // open are valid SQL that the connection's state refuses, so
+            // `syntax` told a caller that its SQL was wrong. The wording is
+            // SQLite's and the engine reproduces it exactly, which is why it can
+            // be compared here, as `no such ` is above.
+            (None, None, _) if is_transaction_state_refusal(error.message()) => {
+                Status::InvalidState
+            }
             (None, None, _) => Status::Syntax,
         };
         Error {
@@ -244,6 +253,16 @@ impl Error {
             engine_code: error.extended().value(),
         }
     }
+}
+
+/// Says whether an engine message is a transaction statement refused because of
+/// the connection's state.
+///
+/// @param message - the engine's message
+fn is_transaction_state_refusal(message: &str) -> bool {
+    message == "cannot start a transaction within a transaction"
+        || message == "cannot commit - no transaction is active"
+        || message == "cannot rollback - no transaction is active"
 }
 
 impl std::fmt::Display for Error {
@@ -287,6 +306,23 @@ mod tests {
         let error = Error::from_engine(&engine, false);
         assert_eq!(error.status, Status::Syntax);
         assert_eq!(error.feature, None);
+    }
+
+    /// `BEGIN` inside a transaction and `COMMIT` or `ROLLBACK` with no
+    /// transaction are `invalid_state`, and they used to be `syntax`.
+    #[test]
+    fn a_transaction_statement_in_the_wrong_state_is_invalid_state() {
+        for said in [
+            "cannot start a transaction within a transaction",
+            "cannot commit - no transaction is active",
+            "cannot rollback - no transaction is active",
+        ] {
+            let engine = DbError::primary(PrimaryCode::Error).with_message(said);
+            let error = Error::from_engine(&engine, false);
+            assert_eq!(error.status, Status::InvalidState, "{said}");
+        }
+        let other = DbError::primary(PrimaryCode::Error).with_message("near \"x\": syntax error");
+        assert_eq!(Error::from_engine(&other, false).status, Status::Syntax);
     }
 
     /// **A path a confined process may not reach is `invalid_state`, and it

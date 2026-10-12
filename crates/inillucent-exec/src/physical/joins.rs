@@ -277,6 +277,7 @@ pub(crate) fn build_nested<'t>(
         stage,
         index,
         kind: join_kind_of(source_term.join),
+        merge: true,
     };
     build_index_probe(plan, catalog, space, params, &probe, downstream)
 }
@@ -292,6 +293,10 @@ struct ProbeStage<'a> {
     index: usize,
     /// The join kind the operator is built with.
     kind: JoinKind,
+    /// Whether the join may hold rows back to merge them, which only a join whose caller calls
+    /// `finish` before it reads what came out may do. See
+    /// [`crate::join::IndexNestedLoopJoin::with_merge`].
+    merge: bool,
 }
 /// Builds one inner stage as an index nested loop of a given kind.
 ///
@@ -314,7 +319,12 @@ fn build_index_probe<'t>(
     probe: &ProbeStage<'_>,
     downstream: Box<dyn Sink + 't>,
 ) -> DbResult<Box<dyn Sink + 't>> {
-    let ProbeStage { stage, index, kind } = *probe;
+    let ProbeStage {
+        stage,
+        index,
+        kind,
+        merge,
+    } = *probe;
     let source_term = plan
         .sources
         .get(stage.term)
@@ -377,27 +387,29 @@ fn build_index_probe<'t>(
         .iter()
         .map(|expr| compile(expr, &outer_types))
         .collect::<DbResult<Vec<_>>>()?;
-    Ok(Box::new(
-        IndexNestedLoopJoin::new(
-            // **The lookup stage carries the same kind as the seek that fed it.**
-            // A null-extended index row probes the table with a NULL identity and
-            // finds nothing; an `Inner` lookup would drop it, which would lose the
-            // very row the outer join produced it for.
-            kind,
-            tree,
-            // **This stage's pool, not the pipeline's.** The inner side of an index
-            // nested loop is where a join across two databases reaches the second
-            // file, so the pool travels with the stage that reads it.
-            catalog.pool_for(stage.root).ok_or_else(|| {
-                misuse("the inner side of a join names a database this connection does not hold")
-            })?,
-            compiled,
-            Projection::all(stage.width),
-            full_key,
-            downstream,
-        )
-        .with_needed(stage.needed),
-    ))
+    let join = IndexNestedLoopJoin::new(
+        // **The lookup stage carries the same kind as the seek that fed it.**
+        // A null-extended index row probes the table with a NULL identity and
+        // finds nothing; an `Inner` lookup would drop it, which would lose the
+        // very row the outer join produced it for.
+        kind,
+        tree,
+        // **This stage's pool, not the pipeline's.** The inner side of an index
+        // nested loop is where a join across two databases reaches the second
+        // file, so the pool travels with the stage that reads it.
+        catalog.pool_for(stage.root).ok_or_else(|| {
+            misuse("the inner side of a join names a database this connection does not hold")
+        })?,
+        compiled,
+        Projection::all(stage.width),
+        full_key,
+        downstream,
+    )
+    .with_needed(stage.needed);
+    Ok(Box::new(match merge {
+        true => join.with_merge(),
+        false => join,
+    }))
 }
 /// Returns the first stage of a left join term that has to be probed and then
 /// tested, when `index` is that term's last stage.
@@ -505,10 +517,14 @@ pub(crate) fn build_probed_outer<'t>(
         let stage = stages
             .get(index)
             .ok_or_else(|| misuse("a stage vanished while building"))?;
+        // **Never merged** (task-2226): `ProbedOuterJoin` pushes one outer row and reads what
+        // came out before the next, and never calls `finish` between them, so a row the merge
+        // held back was a match the outer row never saw, and the row came back null extended.
         let inner = ProbeStage {
             stage,
             index,
             kind: JoinKind::Inner,
+            merge: false,
         };
         probe = build_index_probe(plan, catalog, space, params, &inner, probe)?;
     }
@@ -787,8 +803,8 @@ fn build_materialised_join<'t>(
         params,
         &joined_types,
     )?;
-    // **The automatic index.** When the condition is a conjunction of plain
-    // equalities with one side of the join per term, the inner rows go into a
+    // **The automatic index.** When the condition has an equality with one side
+    // of the join on each side of the `=`, the inner rows go into a
     // hash table keyed on the inner halves and every outer row probes it -
     // which turns a join that was rows-times-rows into rows-plus-rows. SQLite
     // builds a transient b-tree for the same reason and puts it under the same
@@ -796,9 +812,8 @@ fn build_materialised_join<'t>(
     // does not.
     //
     // The nested loop below is what `PRAGMA automatic_index = off` selects, and
-    // it is also what a condition this cannot key on gets - which is most of
-    // them, deliberately: a residual predicate the hash key did not capture
-    // would have to be re-tested per pair, and there is nowhere here to do it.
+    // it is also what a condition with no key equality gets. Conjuncts beside a
+    // key equality go to the hash join as a condition it tests for each pair.
     if plan
         .levers
         .has(inillucent_sql::plan::Levers::AUTOMATIC_INDEX)
@@ -857,6 +872,12 @@ fn build_materialised_join<'t>(
                     downstream,
                 )
                 .with_widths(stage.offset, stage.width);
+                // The conjuncts the key did not take are tested for each pair
+                // the key finds, so an outer join null extends a row whose
+                // candidates all fail them.
+                if let Some(rest) = &keys.rest {
+                    join = join.with_condition(compile(rest, &joined_types)?);
+                }
                 join.build_materialised(&rows)?;
                 return Ok(Box::new(join));
             }

@@ -399,8 +399,23 @@ fn as_sql(node: &Node) -> DbResult<Answer> {
             Ok(value) => Answer::plain(Value::Integer(value)),
             Err(_) => Answer::plain(Value::Real(text.parse::<f64>().unwrap_or(0.0))),
         },
-        Node::Int5(text) => match render::integer5_value(text) {
-            Some(value) => Answer::plain(Value::Integer(value)),
+        // A hex literal past the integer range is a real, as SQLite reads the decimal text it
+        // writes for it, and one past 16 significant digits is refused as malformed.
+        Node::Int5(text) => match render::integer5_parts(text) {
+            Some((_, None)) => return Err(malformed()),
+            Some((negative, Some(magnitude))) => {
+                // SQLite reads the unsigned digits first and negates afterwards, so the magnitude
+                // 2^63 is a real under either sign.
+                match i64::try_from(magnitude) {
+                    Ok(value) => {
+                        Answer::plain(Value::Integer(if negative { -value } else { value }))
+                    }
+                    Err(_) => {
+                        let real = magnitude as f64;
+                        Answer::plain(Value::Real(if negative { -real } else { real }))
+                    }
+                }
+            }
             None => Answer::plain(Value::Real(0.0)),
         },
         Node::Float(text) => Answer::plain(Value::Real(parse_real(text))),
@@ -506,7 +521,26 @@ fn arrow(arguments: &[Argument<'_>], sql: bool) -> DbResult<Answer> {
                 path::parse(&abbreviated_path(source))?
             }
         }
-        _ => return Err(path::bad_path("?")),
+        // **A real or a blob is read as the text it has, and then as a label**, because SQLite
+        // takes the text of the right operand before it asks whether it is an integer. `x -> 1.5`
+        // looks for the member named `1.5`, and `x ->> x'61'` for the member named `a`. These
+        // were refused as `bad JSON path`.
+        other => {
+            let bytes = match other {
+                Value::Real(real) => inillucent_value::numeric::real_to_text(*real),
+                Value::Blob(blob) => blob.raw().to_vec(),
+                _ => return Err(path::bad_path("?")),
+            };
+            let source = std::str::from_utf8(&bytes).map_err(|_| malformed())?;
+            if source.is_empty() {
+                return Err(path::bad_path(source));
+            }
+            if source.starts_with('$') {
+                path::parse(source)?
+            } else {
+                path::parse(&abbreviated_path(source))?
+            }
+        }
     };
     let Some(found) = path::lookup(&node, &steps)? else {
         return Ok(Answer::null());

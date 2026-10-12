@@ -87,6 +87,20 @@ pub(crate) fn rebuild_into(
                 error
             ))
         })?;
+    // **One transaction for the whole copy.** Each row used to be its own
+    // autocommit statement, so each was a commit with its log syncs: 20,000
+    // rows took 72 seconds against SQLite's 48 milliseconds. Nothing reads the
+    // new file until it is renamed into place, and a failure part way is
+    // thrown away with the file, so the transaction gives nothing up.
+    // **The mode goes in before the first table**, so every root the rebuild makes is
+    // placed at the start of the file by the rule a file in that mode follows. The
+    // mode is the one the connection will have after the rebuild: the file's own, or
+    // the one a `PRAGMA auto_vacuum` asked for on a file that already held tables.
+    let mode = source.pragmas.auto_vacuum();
+    if mode != 0 {
+        fresh.apply_auto_vacuum_mode(crate::MAIN, mode, true)?;
+    }
+    fresh.begin_batch();
     replay_schema(&mut fresh, &captured, |entry| {
         entry.kind == ObjectKind::Table && !entry.shadow
     })?;
@@ -96,12 +110,14 @@ pub(crate) fn rebuild_into(
         }
         copy_rows(source, &mut fresh, &entry.name, entry.shadow)?;
     }
+    carry_sequences(source, &mut fresh)?;
     replay_schema(&mut fresh, &captured, |entry| {
         entry.kind == ObjectKind::Index
     })?;
     replay_schema(&mut fresh, &captured, |entry| {
         matches!(entry.kind, ObjectKind::View | ObjectKind::Trigger)
     })?;
+    fresh.commit_batch()?;
     carry_header(source, &mut fresh).map_err(|error| {
         inillucent_base::error::misuse(format!("VACUUM could not carry the header: {error}"))
     })?;
@@ -230,14 +246,81 @@ fn copy_rows(
         false => "INSERT INTO",
     };
     let insert = format!("{verb} {name} ({names}) VALUES ({placeholders})");
+    let statement = fresh.prepare_statement(&insert)?;
+    let at_once = fresh.runs_rows_at_once(&statement)?;
+    let mut rows = rows.into_iter().peekable();
+    while rows.peek().is_some() {
+        let chunk: Vec<Vec<inillucent_tree::datum::OwnedDatum>> = rows
+            .by_ref()
+            .take(ROWS_PER_STATEMENT)
+            .map(|row| {
+                kept.iter()
+                    .map(|at| {
+                        row.get(*at)
+                            .cloned()
+                            .unwrap_or(inillucent_tree::datum::OwnedDatum::Null)
+                    })
+                    .collect()
+            })
+            .collect();
+        if at_once
+            && fresh
+                .execute_rows_at_once(&statement, chunk.clone())?
+                .is_some()
+        {
+            continue;
+        }
+        for row in chunk {
+            let mut params = inillucent_exec::physical::Params::new();
+            for (slot, value) in row.into_iter().enumerate() {
+                params.set(slot.saturating_add(1) as u32, value);
+            }
+            fresh.execute_any(&insert, &params)?;
+        }
+    }
+    Ok(())
+}
+
+/// How many rows one `INSERT` of a rebuild carries when the engine can run rows at once.
+///
+/// **One statement per chunk where the copy ran one per row.** A rebuild of two tables of
+/// 500,000 rows made a million statements, each paying for the lock check, the counters and the
+/// undo mark that `execute_rows_at_once` pays once. The chunk bounds the copy of the rows a
+/// failed chunk would be run again from.
+const ROWS_PER_STATEMENT: usize = 20_000;
+
+/// Carries every `AUTOINCREMENT` table's high water mark across a rebuild.
+///
+/// **`sqlite_sequence` is skipped with the other `sqlite_` tables**, and the
+/// copy inserts rows with their own ids, so the sequence the rebuilt file held
+/// was the largest id that survived rather than the largest ever handed out:
+/// after `DELETE` of the newest row, `VACUUM` gave its id to the next insert,
+/// and a table emptied before `VACUUM` lost its row in `sqlite_sequence`. A
+/// reused id points an old reference at a new row. SQLite copies
+/// `sqlite_sequence` as it is. Found by the bug hunt's ORM schemas.
+///
+/// @param source - the database being rebuilt
+/// @param fresh - the database being built
+fn carry_sequences(source: &ImportedDatabase, fresh: &mut ImportedDatabase) -> DbResult<()> {
+    let has_sequences = source
+        .main_entries()
+        .iter()
+        .any(|entry| entry.name.eq_ignore_ascii_case(b"sqlite_sequence"));
+    if !has_sequences {
+        return Ok(());
+    }
+    let (rows, _) = source.run("SELECT name, seq FROM main.sqlite_sequence")?;
+    let empty = inillucent_exec::physical::Params::new();
+    fresh.execute_any("DELETE FROM main.sqlite_sequence", &empty)?;
     for row in rows {
         let mut params = inillucent_exec::physical::Params::new();
-        for (slot, at) in kept.iter().enumerate() {
-            if let Some(value) = row.get(*at) {
-                params.set(slot.saturating_add(1) as u32, value.clone());
-            }
+        for (slot, value) in row.into_iter().enumerate() {
+            params.set(slot.saturating_add(1) as u32, value);
         }
-        fresh.execute_any(&insert, &params)?;
+        fresh.execute_any(
+            "INSERT INTO main.sqlite_sequence(name, seq) VALUES (?1, ?2)",
+            &params,
+        )?;
     }
     Ok(())
 }
@@ -252,13 +335,15 @@ fn copy_rows(
 /// @param source - the database being rebuilt
 /// @param fresh - the database being built
 fn carry_header(source: &ImportedDatabase, fresh: &mut ImportedDatabase) -> DbResult<()> {
-    // The vacuum mode is in the header too, and SQLite keeps it across a
-    // `VACUUM`. Set directly rather than by `PRAGMA auto_vacuum`, which the
-    // rebuilt file refuses once it holds a table; the checkpoint the
-    // `user_version` below takes writes it.
-    let mode = source.storage.database.auto_vacuum();
-    fresh.storage.database.set_auto_vacuum(mode);
-    fresh.pragmas.set_auto_vacuum(mode);
+    // The vacuum mode was applied before the first table, so the roots are where
+    // the mode keeps them, and SQLite keeps the mode across a `VACUUM`.
+    // **WAL mode is in the header as well, and it outlives the connection.**
+    // It was not carried, so a database in WAL mode came out of `VACUUM` in
+    // `delete` mode and stayed there on every later open; SQLite keeps it.
+    fresh
+        .storage
+        .database
+        .set_wal_mode(source.storage.database.wal_mode());
     let empty = inillucent_exec::physical::Params::new();
     fresh.execute_any(
         &format!("PRAGMA user_version={}", source.user_version()),
@@ -468,7 +553,7 @@ pub(crate) struct ConnectionSettings {
     query_only: bool,
     recursive_triggers: bool,
     legacy_alter_table: bool,
-    max_page_count: i64,
+    max_page_count: u64,
     temp_store: i64,
     /// The settings `pragma::remembered` stores, which a `VACUUM` must not
     /// reset: `PRAGMA mmap_size` would read its default again afterwards.
@@ -506,7 +591,7 @@ impl ConnectionSettings {
             query_only: database.pragmas.query_only(),
             recursive_triggers: database.pragmas.recursive_triggers(),
             legacy_alter_table: database.pragmas.legacy_alter_table(),
-            max_page_count: database.pragmas.max_page_count(),
+            max_page_count: database.storage.database.max_page_count(),
             temp_store: database.pragmas.temp_store(),
             remembered: database.pragmas.remembered_all(),
             busy_timeout_ms: database.pragmas.busy_timeout_ms(),
@@ -562,7 +647,10 @@ impl ConnectionSettings {
         database
             .pragmas
             .set_legacy_alter_table(self.legacy_alter_table);
-        database.pragmas.set_max_page_count(self.max_page_count);
+        database
+            .storage
+            .database
+            .set_max_page_count(self.max_page_count);
         database.pragmas.set_temp_store(self.temp_store);
         database.pragmas.restore_remembered(self.remembered);
         database.pragmas.set_busy_timeout_ms(self.busy_timeout_ms);
@@ -754,6 +842,11 @@ pub(crate) fn vacuum_in_place(connection: &mut ImportedDatabase) -> DbResult<()>
         &inillucent_vfs::DbPath::new(scratch.to_string_lossy().as_ref()),
         false,
     );
+    // **The statement holds the write lock for all of this**, and keeps it
+    // until the rename below has landed: `VACUUM` takes it on its way in, and
+    // every statement the rebuild runs is nested inside it. No other process
+    // can commit to the old file while it is held. See the old connection's
+    // close below for the moment that used to let go of it too early.
     connection.rebuild_into(&scratch)?;
     let path = connection.storage.path.clone();
     let page_size = connection.storage.page_size;
@@ -799,28 +892,61 @@ pub(crate) fn vacuum_in_place(connection: &mut ImportedDatabase) -> DbResult<()>
     let compiled = std::rc::Rc::clone(&connection.compiled);
     let settings = ConnectionSettings::capture(connection);
     let schemas = AttachedSchemas::take(connection);
-    // **The old file is closed before it is replaced, not after** -
-    // assigning through `connection` drops the old value first, which is the
-    // only moment in this function when neither file is open by us. A
-    // pool still holding frames of a file whose bytes changed underneath
-    // it would answer from the database that used to be there.
+    // **The rename comes before the old file is closed, so the lock is held
+    // across it.** The old connection used to be closed first, which let go of
+    // the write lock while the rebuilt file was still only a scratch name.
+    // Another process waiting to insert took the lock in that moment and
+    // committed to the old file, and the rename then put its rows out of reach:
+    // 265 of 502 acknowledged inserts went missing, with no error. A process
+    // that takes the lock after the rename finds the file replaced and reopens;
+    // see `ImportedDatabase::file_was_replaced`.
+    //
     // **On the caller's own VFS.** `ImportedDatabase::open` constructs a
     // fresh `OsVfs`, so this used to move the whole connection onto the
     // operating system's file system for the rest of the session whatever
     // it was opened on (task-1946, H2).
-    *connection = reopened(&vfs, &scratch, page_size, frames, "the rebuilt file")?;
-    // **The one crash-sensitive moment.** Up to here neither `path` nor
-    // its log segments have been touched, so a crash recovers the
-    // original the ordinary way. `commit_rebuild` is a single rename, and
-    // once it returns `path` holds the rebuilt bytes durably.
-    commit_rebuild(&vfs, &scratch, &path)?;
-    // Only now, with the rename durable, do `path`'s pre-rebuild segments
-    // stop describing anything true - left beside the new file they would
-    // be replayed over it on the next open, undoing the rebuild. Removing
-    // them earlier, before the rename could be proven to land, was this
-    // function's defect: a crash between the removal and the copy left
-    // the original unrecoverable, its log already gone.
+    let rebuilt = reopened(&vfs, &scratch, page_size, frames, "the rebuilt file")?;
+    // **The old file's log goes before the rename, while no process but this
+    // one can reach the rebuilt file.** `rebuild_into` checkpointed the old
+    // file under the write lock this statement still holds, so its log holds
+    // nothing the file does not, and no other process can append to it. A
+    // crash from here to the rename leaves the old file whole with no log
+    // beside it, and a crash after the rename leaves the rebuilt file with no
+    // stale log beside it.
+    //
+    // **After the rename was the wrong place.** The rebuilt file's log is
+    // numbered from the start, as every new database's is, and the lock this
+    // statement holds is on the old file. So a process that found its file
+    // replaced could reopen onto the rebuilt one and write its commits into a
+    // segment with the same name as one of the old file's, between this
+    // function reading that segment's header and deleting it. The commits
+    // were acknowledged and went with the deleted file: in the crash hunter's
+    // `VACUUM` scenario, acknowledged deletes came back and inserts went
+    // missing in 4 of 30 runs. A trace of one run showed the writer opening
+    // the rebuilt file one millisecond after `VACUUM` read the header.
+    //
+    // The order this replaced, removal before a byte copy, lost the original
+    // because the copy could be cut off halfway; see
+    // `an_early_segment_removal_loses_the_original_to_an_interrupted_copy`. A
+    // rename cannot be.
+    // **EXCLUSIVE first, so no process holds the old file at all when it is
+    // replaced.** RESERVED keeps writers out and lets readers read, and a
+    // process that held SHARED on the old file while the rename landed went on
+    // to recover the old file's log under the names the new file's log then
+    // used, truncating commits other processes had made. With EXCLUSIVE, a
+    // process that holds any lock on the file knows it has not been replaced
+    // yet; see `ImportedDatabase::lock_the_file_it_opened`. SQLite's `VACUUM`
+    // takes EXCLUSIVE to write its result too.
+    connection.storage.database.pool().hold_for_writing()?;
     remove_log_segments(&vfs, &path);
+    // **The one crash-sensitive moment.** `commit_rebuild` is a single rename,
+    // and once it returns `path` holds the rebuilt bytes durably.
+    commit_rebuild(&vfs, &scratch, &path)?;
+    // The old connection closes without folding: its file is one no path
+    // names now, and its log is gone. It holds nothing to fold, because
+    // `rebuild_into` checkpointed it and the rebuild only read.
+    connection.storage.read_only = true;
+    *connection = rebuilt;
     *connection = reopened(&vfs, &path, page_size, frames, "the database it replaced")?;
     writer.adopt(&connection.writing);
     connection.writing = writer;
@@ -841,6 +967,172 @@ pub(crate) fn vacuum_in_place(connection: &mut ImportedDatabase) -> DbResult<()>
     // so this is only the log segments it picked up along the way.
     remove_log_segments(&vfs, &scratch);
     Ok(())
+}
+
+impl ImportedDatabase {
+    /// Rebuilds this database into a file that holds nothing spare.
+    ///
+    /// **What `VACUUM` and `VACUUM INTO` both do**, differing only in where the
+    /// result goes. See `crate::rebuild` for why it is a logical copy rather
+    /// than a page one - in short, because a page copy reproduces the free
+    /// space it was asked to remove.
+    ///
+    /// @param destination - the file to write, which must not already exist
+    pub(crate) fn rebuild_into(&mut self, destination: &std::path::Path) -> DbResult<()> {
+        self.checkpoint()?;
+        self.rebuild_without_checkpoint(destination)
+    }
+
+    /// Writes a rebuilt copy of this database to another file, for `VACUUM INTO`.
+    ///
+    /// **The checkpoint is a courtesy here, not a need.** The rebuild reads the
+    /// source through ordinary statements, which read the file and the log
+    /// together, so another process's open transaction, which makes the
+    /// checkpoint answer `busy`, does not stop the copy. It failed with
+    /// "readers are still present" where SQLite writes the copy. `VACUUM` in
+    /// place keeps the checkpoint, because it then renames the result over the
+    /// file another process is reading.
+    ///
+    /// @param destination - the file to write, which must not already exist
+    pub(crate) fn rebuild_copy_into(&mut self, destination: &std::path::Path) -> DbResult<()> {
+        match self.checkpoint() {
+            Err(error) if error.code() == inillucent_base::error::PrimaryCode::Busy => {}
+            other => other?,
+        }
+        self.rebuild_without_checkpoint(destination)
+    }
+
+    /// The rebuild both [`ImportedDatabase::rebuild_into`] and
+    /// [`ImportedDatabase::rebuild_copy_into`] run once the checkpoint is decided.
+    ///
+    /// @param destination - the file to write, which must not already exist
+    fn rebuild_without_checkpoint(&mut self, destination: &std::path::Path) -> DbResult<()> {
+        crate::rebuild::rebuild_into(
+            std::sync::Arc::clone(&self.storage.vfs),
+            self,
+            destination,
+            self.storage.page_size,
+            self.storage.frames,
+        )
+    }
+
+    /// Rebuilds this database into a database held in memory, and discards it.
+    ///
+    /// **What `VACUUM INTO ':memory:'` and `VACUUM INTO ''` do.** SQLite opens
+    /// the target as a private in memory or temporary database, copies into it,
+    /// and closes it, so the statement succeeds and leaves nothing behind. It is
+    /// still a full rebuild, which is what makes it a check that the schema and
+    /// every row can be replayed.
+    pub(crate) fn rebuild_into_memory(&mut self) -> DbResult<()> {
+        self.checkpoint()?;
+        let vfs: std::sync::Arc<dyn inillucent_vfs::Vfs> =
+            std::sync::Arc::new(inillucent_vfs::memory::MemoryVfs::new());
+        crate::rebuild::rebuild_into(
+            vfs,
+            self,
+            std::path::Path::new("vacuum-into-memory.rdb"),
+            self.storage.page_size,
+            self.storage.frames,
+        )
+    }
+}
+
+/// Reopens a connection on the file now at its path, keeping everything that belongs to the
+/// connection rather than to the file.
+///
+/// **For a file another process replaced.** `VACUUM` and a backup rename a new file over the
+/// database, and every connection that had the old one open has to move to the new one before it
+/// reads or writes again; see `ImportedDatabase::file_was_replaced`. What is carried is what
+/// `vacuum_in_place` carries across its own reopen: the writer, the settings, the plan cache's
+/// handle, the counters, the temporary and attached databases.
+///
+/// The old connection is marked read only before it is dropped, so its close folds nothing. Its
+/// file is one no path names any more, and a fold would roll its log into segment names that now
+/// belong to the new file's log.
+///
+/// @param connection - the connection to move
+pub(crate) fn reopen_in_place(connection: &mut ImportedDatabase) -> DbResult<()> {
+    let path = connection.storage.path.clone();
+    let vfs = std::sync::Arc::clone(&connection.storage.vfs);
+    let fresh = reopened(
+        &vfs,
+        &path,
+        connection.storage.page_size,
+        connection.storage.frames,
+        "the file another process put in its place",
+    )?;
+    let writer = std::rc::Rc::clone(&connection.writing);
+    let pragmas = std::rc::Rc::clone(&connection.pragmas);
+    let counters = std::rc::Rc::clone(&connection.counters);
+    let compiled = std::rc::Rc::clone(&connection.compiled);
+    let settings = ConnectionSettings::capture(connection);
+    let schemas = AttachedSchemas::take(connection);
+    connection.storage.read_only = true;
+    *connection = fresh;
+    writer.adopt(&connection.writing);
+    connection.writing = writer;
+    connection.pragmas = pragmas;
+    compiled.adopt(&connection.compiled);
+    connection.compiled = compiled;
+    connection.counters = counters;
+    schemas.restore(connection)?;
+    settings.restore(connection)
+}
+
+/// A second handle on a database, holding RESERVED so that no other process can write it.
+///
+/// **What makes a backup over a database another process has open lose nothing.** The backup
+/// writes its copy under a scratch name and renames it over the destination, and a process that
+/// had the destination open kept writing the old file after the rename, to a file no path names.
+/// Held while the old log segments are removed and the rename lands, so no commit can fall between
+/// them. RESERVED keeps every writer out and lets readers read. `VACUUM` does not need one: the
+/// statement already holds the write lock on its own connection, and keeps it across the rename.
+///
+/// Dropping it lets the lock go. A writer that was waiting then holds the old file and finds, by
+/// `ImportedDatabase::file_was_replaced`, that it has to reopen.
+pub(crate) struct WritersHeldOut {
+    /// The handle the lock is held on.
+    file: Box<dyn inillucent_vfs::VfsFile>,
+}
+
+impl WritersHeldOut {
+    /// Opens a second handle on a database and takes RESERVED on it, waiting as long as a write
+    /// would.
+    ///
+    /// @param vfs - the file system the database is on
+    /// @param path - the database file
+    /// @param busy_millis - how long to wait for another writer to finish
+    pub(crate) fn take(
+        vfs: &std::sync::Arc<dyn inillucent_vfs::Vfs>,
+        path: &Path,
+        busy_millis: u64,
+    ) -> DbResult<WritersHeldOut> {
+        let options = inillucent_vfs::OpenOptions {
+            create: false,
+            ..inillucent_vfs::OpenOptions::of_kind(inillucent_vfs::FileKind::MainDb)
+        };
+        let file = vfs
+            .open(
+                &inillucent_vfs::DbPath::new(path.to_string_lossy().as_ref()),
+                options,
+            )
+            .map_err(|error| error.into_db_error())?;
+        for level in [
+            inillucent_vfs::FileLock::Shared,
+            inillucent_vfs::FileLock::Reserved,
+        ] {
+            inillucent_pool::pool::lock_with_wait(file.as_ref(), level, busy_millis)?;
+        }
+        Ok(WritersHeldOut { file })
+    }
+}
+
+impl Drop for WritersHeldOut {
+    /// Lets the lock go before the handle closes, so a waiting writer is not left to the
+    /// operating system's own time for releasing a closed handle's locks.
+    fn drop(&mut self) {
+        let _ = self.file.unlock(inillucent_vfs::FileLock::None);
+    }
 }
 
 #[cfg(test)]
@@ -971,6 +1263,47 @@ mod vacuum_crash {
             rows(&reopened),
             before,
             "a crash before the rename must leave the original database exactly as it was"
+        );
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&scratch);
+        remove_log_segments(&os_vfs(), &path);
+        remove_log_segments(&os_vfs(), &scratch);
+    }
+
+    /// A crash between removing the original's log segments and the rename,
+    /// which is the order `vacuum_in_place` runs in, leaves the original whole.
+    ///
+    /// `rebuild_into` checkpoints the original before it copies a row, so the
+    /// file holds everything its log does and the log can go first. It goes
+    /// first because a process that reopened onto the rebuilt file could write
+    /// a segment with the name of one of the original's while it was being
+    /// removed after the rename.
+    #[test]
+    fn a_crash_after_the_early_segment_removal_recovers_the_original() {
+        let path = temp_db_path("segments-gone");
+        let mut engine = seeded(&path);
+        let before = rows(&engine);
+
+        let scratch = scratch_beside(&path, 4);
+        let _ = std::fs::remove_file(&scratch);
+        engine
+            .rebuild_into(&scratch)
+            .expect("the rebuild checkpoints the original and writes the scratch file");
+        assert!(
+            has_log_segments(&path),
+            "the original has log segments for this case to remove"
+        );
+        remove_log_segments(&os_vfs(), &path);
+        // The crash: the rename never runs.
+        drop(engine);
+
+        let reopened = ImportedDatabase::open(path.clone(), PAGE_SIZE, FRAMES)
+            .expect("the original opens without its log");
+        assert_eq!(
+            rows(&reopened),
+            before,
+            "the original holds every row its log did"
         );
         drop(reopened);
         let _ = std::fs::remove_file(&path);

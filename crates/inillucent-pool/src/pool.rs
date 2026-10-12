@@ -364,11 +364,7 @@ impl State {
 /// @param file - the file to lock
 /// @param level - the level to raise to
 /// @param budget_millis - how long to keep trying
-pub(crate) fn lock_with_wait(
-    file: &dyn VfsFile,
-    level: FileLock,
-    budget_millis: u64,
-) -> DbResult<()> {
+pub fn lock_with_wait(file: &dyn VfsFile, level: FileLock, budget_millis: u64) -> DbResult<()> {
     if file.lock_level() >= level {
         return Ok(());
     }
@@ -387,7 +383,7 @@ pub(crate) fn lock_with_wait(
         }
         std::thread::sleep(std::time::Duration::from_millis(pause));
         waited = waited.saturating_add(pause);
-        pause = pause.saturating_mul(2).min(50);
+        pause = crate::busy::next_busy_pause(pause, waited);
     }
 }
 
@@ -636,6 +632,11 @@ pub struct Pool {
     write_lock_millis: Cell<u64>,
     /// Whether the file handle may write; a read only open says no.
     writable: Cell<bool>,
+    /// Whether the page count was lowered, so the file is longer than the pages it counts.
+    cut_pending: Cell<bool>,
+    /// Whether the next checkpoint syncs the data file between its pages and its
+    /// meta record. See [`Pool::sync_pages_before_the_next_meta`].
+    sync_pages_first: Cell<bool>,
 }
 
 /// The pool's counters, one cell each.
@@ -692,6 +693,7 @@ mod merged;
 mod meta_write;
 mod spill;
 mod swizzle;
+mod truncate;
 
 pub use spill::SpillOpener;
 
@@ -773,6 +775,8 @@ impl Pool {
             spill_opener: RefCell::new(None),
             write_lock_millis: Cell::new(crate::file::default_busy_millis()),
             writable: Cell::new(true),
+            cut_pending: Cell::new(false),
+            sync_pages_first: Cell::new(false),
         })
     }
 

@@ -357,6 +357,18 @@ pub trait VfsFile: Send + Sync + Debug {
         true
     }
 
+    /// Returns a value that stays the same while no other process has had this file open, or
+    /// `None` when this file system cannot tell.
+    ///
+    /// **Two equal answers mean nobody outside this process opened, wrote, renamed or deleted the
+    /// file between them.** The Windows file system answers for a log segment while it holds a
+    /// batch oplock on it (`os::windows_log`), and the engine uses the answer to skip asking the
+    /// file system by name whether another process rolled the log or replaced the database
+    /// (task-2226). The default answers `None`, which keeps every check.
+    fn quiet_token(&self) -> Option<u64> {
+        None
+    }
+
     /// Returns what the device underneath guarantees.
     fn device_characteristics(&self) -> DeviceCharacteristics;
 
@@ -462,6 +474,22 @@ pub trait Vfs: Send + Sync + Debug {
             ..OpenOptions::of_kind(FileKind::Wal)
         };
         self.open(path, options)?.file_size().map(Some)
+    }
+
+    /// Returns the number the file system knows the file at a path by, or `None` when nothing
+    /// is there or this file system cannot say.
+    ///
+    /// **For telling whether a file was replaced under an open handle.** `VACUUM` and a backup
+    /// write a new file and rename it over the database, and a process that had the old one open
+    /// went on reading, locking and writing the old one. Its commits went to a file no path
+    /// named, and were lost. The engine compares this number with the one it read when it opened
+    /// the file. It is asked by name, without opening the file, where the platform can. The
+    /// default answers `None`, which turns the check off for a file system with no such number.
+    ///
+    /// @param path - the file
+    fn file_number_by_name(&self, path: &DbPath) -> VfsResult<Option<u128>> {
+        let _ = path;
+        Ok(None)
     }
 
     /// Resolves a path to the canonical absolute form the VFS will use.

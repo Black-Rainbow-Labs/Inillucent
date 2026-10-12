@@ -29,6 +29,80 @@
 
 use inillucent_sql::ast::{FrameExclude, FrameUnit};
 
+/// A number a `RANGE` frame measures in: an integer stays exact, as SQLite's arithmetic keeps it.
+///
+/// **A `RANGE` offset was a double, so the integers past 2^53 lost their low bits.** Over the
+/// values 1 and the smallest integer, `RANGE BETWEEN 9223372036854775807 PRECEDING AND CURRENT
+/// ROW` is one row for the 1 in SQLite, because 1 - 9223372036854775807 is an exact integer that
+/// the smallest integer is below. As doubles the difference rounded to the smallest integer and
+/// the frame held both rows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Number {
+    /// An integer value.
+    Int(i64),
+    /// A real value.
+    Real(f64),
+}
+
+impl From<f64> for Number {
+    fn from(value: f64) -> Number {
+        Number::Real(value)
+    }
+}
+
+impl From<i64> for Number {
+    fn from(value: i64) -> Number {
+        Number::Int(value)
+    }
+}
+
+impl Number {
+    /// Returns the number as a double.
+    fn real(self) -> f64 {
+        match self {
+            Number::Int(value) => value as f64,
+            Number::Real(value) => value,
+        }
+    }
+
+    /// Adds or subtracts, the way SQL does: integers stay integers until the result does not fit,
+    /// and then the answer is a real.
+    ///
+    /// @param other - the amount
+    /// @param subtract - whether to subtract it
+    fn shifted(self, other: Number, subtract: bool) -> Number {
+        if let (Number::Int(left), Number::Int(right)) = (self, other) {
+            let exact = if subtract {
+                left.checked_sub(right)
+            } else {
+                left.checked_add(right)
+            };
+            if let Some(value) = exact {
+                return Number::Int(value);
+            }
+        }
+        let (left, right) = (self.real(), other.real());
+        Number::Real(if subtract { left - right } else { left + right })
+    }
+
+    /// Orders two numbers exactly, or says they have no order when one is not a number.
+    ///
+    /// @param other - the number to compare with
+    fn order(self, other: Number) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Number::Int(left), Number::Int(right)) => Some(left.cmp(&right)),
+            (Number::Real(left), Number::Real(right)) => left.partial_cmp(&right),
+            (Number::Int(left), Number::Real(right)) if !right.is_nan() => {
+                Some(inillucent_value::compare::compare_int_and_real(left, right))
+            }
+            (Number::Real(left), Number::Int(right)) if !left.is_nan() => {
+                Some(inillucent_value::compare::compare_int_and_real(right, left).reverse())
+            }
+            _ => None,
+        }
+    }
+}
+
 /// One end of a frame, with the offset already resolved to a number.
 ///
 /// The offset expression is evaluated once per row by the caller, because the
@@ -57,7 +131,7 @@ pub enum Bound {
     /// integer offset of 0 and gave every row a frame of its peers alone.
     RangeOffset {
         /// How far, in ordering values.
-        distance: f64,
+        distance: Number,
         /// Whether it counts backwards.
         preceding: bool,
     },
@@ -343,13 +417,14 @@ pub fn offset_row(
 /// @param spec - the frame, with its offsets already resolved
 /// @param order_value - as for [`frame`]
 /// @param descending - whether that ordering term is descending
-pub fn frame_bounds(
+pub fn frame_bounds<N: Into<Number>>(
     partition: &Partition,
     row: usize,
     spec: &FrameSpec,
-    order_value: impl Fn(usize) -> Option<f64>,
+    order_value: impl Fn(usize) -> Option<N>,
     descending: bool,
 ) -> Option<(usize, usize)> {
+    let order_value = |member: usize| order_value(member).map(Into::into);
     let low = bound_of(
         partition,
         row,
@@ -380,13 +455,14 @@ pub fn frame_bounds(
 ///   `None` when that value is NULL, and NaN when it is text or a blob, which
 ///   SQLite does not offset
 /// @param descending - whether that ordering term is descending
-pub fn frame(
+pub fn frame<N: Into<Number>>(
     partition: &Partition,
     row: usize,
     spec: &FrameSpec,
-    order_value: impl Fn(usize) -> Option<f64>,
+    order_value: impl Fn(usize) -> Option<N>,
     descending: bool,
 ) -> Vec<usize> {
+    let order_value = |member: usize| order_value(member).map(Into::into);
     let (peer_start, peer_end) = partition.peers_of(row);
     let low = bound_of(
         partition,
@@ -472,7 +548,7 @@ fn bound_of(
     spec: &FrameSpec,
     bound: Bound,
     is_start: bool,
-    order_value: &impl Fn(usize) -> Option<f64>,
+    order_value: &impl Fn(usize) -> Option<Number>,
     descending: bool,
 ) -> Option<usize> {
     let (peer_start, peer_end) = partition.peers_of(row);
@@ -519,7 +595,7 @@ fn bound_of(
             FrameUnit::Range => range_bound(
                 partition,
                 row,
-                distance as f64,
+                Number::Int(distance),
                 preceding,
                 is_start,
                 order_value,
@@ -605,10 +681,10 @@ fn group_bound(
 fn range_bound(
     partition: &Partition,
     row: usize,
-    offset: f64,
+    offset: Number,
     preceding: bool,
     is_start: bool,
-    order_value: &impl Fn(usize) -> Option<f64>,
+    order_value: &impl Fn(usize) -> Option<Number>,
     descending: bool,
 ) -> Option<usize> {
     // **A NULL ordering value has no distance to anything, so an offset bound
@@ -629,7 +705,7 @@ fn range_bound(
     // leaves out.
     let (peer_start, peer_end) = partition.peers_of(row);
     let here = match order_value(row) {
-        Some(here) if !here.is_nan() => here,
+        Some(here) if !here.real().is_nan() => here,
         _ => {
             return Some(if is_start {
                 peer_start
@@ -638,11 +714,7 @@ fn range_bound(
             })
         }
     };
-    let limit = if preceding != descending {
-        here - offset
-    } else {
-        here + offset
-    };
+    let limit = here.shifted(offset, preceding != descending);
     // **NULL rows sit beyond every value at the end they sort to.** SQLite
     // compares a bound with a NULL row's value as though the NULL were smaller
     // than any number in the order the window sorts by, so the NULLs at the
@@ -653,20 +725,21 @@ fn range_bound(
     // Text sorts above every number, which is what an infinity does here.
     let nulls_first = order_value(partition.start).is_none();
     let null_value = if nulls_first != descending {
-        f64::NEG_INFINITY
+        Number::Real(f64::NEG_INFINITY)
     } else {
-        f64::INFINITY
+        Number::Real(f64::INFINITY)
     };
     let effective = |member: usize| match order_value(member) {
         None => null_value,
-        Some(value) if value.is_nan() => f64::INFINITY,
+        Some(value) if value.real().is_nan() => Number::Real(f64::INFINITY),
         Some(value) => value,
     };
     let inside = |member: usize| {
         let value = effective(member);
+        let order = value.order(limit);
         match (is_start, descending) {
-            (true, false) | (false, true) => value >= limit,
-            (true, true) | (false, false) => value <= limit,
+            (true, false) | (false, true) => order.is_some_and(|found| found.is_ge()),
+            (true, true) | (false, false) => order.is_some_and(|found| found.is_le()),
         }
     };
     // **A binary search, because the partition is sorted.** The values run in

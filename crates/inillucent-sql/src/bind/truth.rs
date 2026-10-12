@@ -8,7 +8,7 @@
 //! with the integer 1 that was used before is gone. The test never yields NULL:
 //! a NULL operand is neither true nor false.
 
-use super::{comparison_rules, Binder, BoundExpr};
+use super::{Binder, BoundExpr};
 use crate::ast::{Expr, ExprId, Literal};
 use crate::diagnostic::ParseError;
 use crate::lexer::Span;
@@ -54,7 +54,9 @@ impl Binder<'_> {
         }
         let left = self.bind_expr(left)?;
         let right = self.bind_expr(right)?;
-        let (affinity, collation) = comparison_rules(&left, &right);
+        // `=` already reads a derived column that has no affinity as having none, so the other
+        // operand's affinity applies to it. `IS` shares that rule.
+        let (affinity, collation) = self.comparison_rules_seen(&left, &right);
         Ok(BoundExpr::Is {
             negated: inverted,
             left: Box::new(left),
@@ -70,7 +72,7 @@ impl Binder<'_> {
     /// @param right - the expression after `IS`
     pub(super) fn truth_literal(&self, right: ExprId) -> Option<bool> {
         match self.ast.expr(right)? {
-            Expr::Literal(Literal::Boolean(truth)) => Some(*truth),
+            Expr::Literal(Literal::Boolean(truth, _)) => Some(*truth),
             // `x IS TRUE COLLATE NOCASE` is still a truth test in SQLite: a
             // collation changes how text compares and a truth test compares
             // nothing. Read as `x IS 1`, `0.5 IS TRUE COLLATE NOCASE` was 0.

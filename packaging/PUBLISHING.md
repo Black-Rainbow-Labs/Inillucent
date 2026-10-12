@@ -6,7 +6,7 @@ it reads and the files that carry the version. This page describes each destinat
 what it publishes, what it needs, how `ship.ps1` checks it, and how to run or repair that one step
 by hand.
 
-Words used here and not explained, such as route, mirror, tap, notarise and DPAPI, are in the terms
+Words used here and not explained, such as route, tap, notarise and DPAPI, are in the terms
 table at the top of [`README.md`](README.md#terms-used-on-this-page).
 
 ## Where each destination stands
@@ -24,10 +24,11 @@ Checked on 2026-09-24 with requests that carried no credential. Every destinatio
 | Packagist | `black-rainbow-labs/inillucent` | yes |
 | Homebrew | `brew install black-rainbow-labs/inillucent/inillucent` | yes |
 
-The development repository (the `origin` remote) is private. The mirror
-`Black-Rainbow-Labs/Inillucent` (the `brl` remote) is public, and every published package links to
-it. GitHub gives a private repository's workflow runs two cores and a public one's four, which is
-why both workflows split their targets across several jobs.
+Development and releases both happen in one public repository, `Black-Rainbow-Labs/Inillucent`,
+which is the `origin` remote. Every published package links to it. The earlier development
+repository, `jasonmcaffee/inillucent`, is kept as the `archive` remote, and nothing is pushed to it.
+GitHub gives a public repository's workflow runs four cores, which is why both workflows split
+their targets across several jobs.
 
 ## Repairing a release
 
@@ -52,8 +53,8 @@ keep the commit they first saw for a version. So a broken release is fixed by a 
 |---|---|---|
 | 0.1.0 | inillucent.com, GitHub | Withdrawn. Its archives told readers to run a Go command that did not exist. The downloads answer 404. The GitHub release keeps its assets and is titled as withdrawn. |
 | 0.1.3, 0.1.4 | npm | Marked deprecated. They shipped broken and npm cannot replace a version. |
-| v0.1.5 | Go module | Serves 0.1.3's source. The Go tag was pushed before the mirror held the release. |
-| 0.1.6 | Packagist | Serves 0.1.3's source. Packagist read the tag before the mirror held the release. |
+| v0.1.5 | Go module | Serves 0.1.3's source. The Go tag was pushed before the public repository held the release. |
+| 0.1.6 | Packagist | Serves 0.1.3's source. Packagist read the tag before the public repository held the release. |
 
 ## Build: every target, signed
 
@@ -98,31 +99,29 @@ creates the annotated tag `v<version>`, and pushes the commit to the default bra
 then the tag. A release cut from a worktree has no upstream branch, so the route pushes `HEAD` to
 the default branch by name.
 
-## Mirror
+## The mirror route was removed
 
-`ship.ps1` route: `mirror`.
+`ship.ps1` no longer has a `mirror` route. It was removed on 2026-10-11, when development moved
+into the one public repository. The `tag` route above pushes the release commit and the tag
+`v<version>` straight to `origin`, so no second repository needs a release commit built for it.
+
+`packaging/mirror-github.ps1` is no longer called by `ship.ps1`. It is kept only to check old
+release tags:
 
 ```powershell
-pwsh packaging/mirror-github.ps1 -Verify                  # check every release tag on the mirror
-pwsh packaging/mirror-github.ps1 -Version 1.0.30          # build the commit, push nothing
-pwsh packaging/mirror-github.ps1 -Version 1.0.30 -Push    # push the commit and the tag
+pwsh packaging/mirror-github.ps1 -Verify    # check every old release tag
 ```
 
-The mirror holds one commit per release and no development history. `mirror-github.ps1` builds that
-commit with `git commit-tree` from the tree of the tag `v<version>`, and refuses when the commit's
-tree differs from the tag's tree. The same inputs always give the same commit hash. The tag it
-pushes is annotated.
-
-`-Verify` reads the mirror and prints `same tree` for each release tag whose tree matches the tag of
-the same name in the development repository. Do not combine `-Verify` with `-Push`: `-Verify` checks
-and exits, so nothing is pushed.
+The older releases each have one commit on the public repository, built by that script. `-Verify`
+prints `same tree` for each release tag whose tree matches the tag of the same name in the archive
+remote. Do not use `-Push`.
 
 ## GitHub release
 
 `ship.ps1` route: `github`.
 
-The release is created on the mirror, named by the `brl` remote. `gh` with no `--repo` would use
-`origin`. Every file in `dist/` whose name contains the version is attached, with `SHA256SUMS` and
+The release is created on the repository named by the `origin` remote, after the `tag` route has
+pushed `v<version>` there. Every file in `dist/` whose name contains the version is attached, with `SHA256SUMS` and
 its signature. The macOS zip that `rcodesign` sends to Apple's notary is left out.
 
 `gh` needs a token. `ship.ps1` uses `GH_TOKEN` when it is set, then a `gh auth login`, then the
@@ -259,8 +258,9 @@ The route needs a PyPI API token. `ship.ps1` passes it to `twine` as `TWINE_USER
 `ship.ps1` route: `go`.
 
 Go has no registry and no account. A tag is the release. The module is in a subfolder, so the tag is
-`packages/go/v<version>`. The `go` route pushes that tag to the mirror, on the mirror's own
-`v<version>` commit, and refuses when the mirror has no `v<version>` tag yet.
+`packages/go/v<version>`. The `go` route tags the local `v<version>` commit as
+`packages/go/v<version>` and pushes that tag to `origin`. It refuses when there is no local
+`v<version>` tag yet.
 
 `go install` takes the version without the folder prefix:
 
@@ -285,7 +285,7 @@ so `ship.ps1` asks
 It loads `Inillucent\` from `packages/php/src/` and declares the two `bin` scripts.
 
 The `packagist` route calls Packagist's `update-package` API with the sealed token, so Packagist
-reads the mirror's tags straight after the `mirror` and `go` routes. Packagist accounts sign in with
+reads the repository's tags straight after the `tag` and `go` routes. Packagist accounts sign in with
 GitHub, so `PACKAGIST_USER` names a person's GitHub account. `ship.ps1` has a default for it.
 
 `ship.ps1` checks that `https://repo.packagist.org/p2/black-rainbow-labs/inillucent.json` names the
@@ -305,7 +305,7 @@ leaves the placeholder, prints a warning and exits 1. The `homebrew` route then 
 and pushes the tap. On Windows it runs `update.sh` with the `bash` that ships with Git for Windows,
 because the `bash` on the `PATH` can be the WSL one, which cannot open a Windows path.
 
-The formula downloads from inillucent.com. Its `head` spec clones the mirror, for
+The formula downloads from inillucent.com. Its `head` spec clones the repository, for
 `brew install --HEAD`. Its `test do` block creates a database, reads a row back and asks
 `inillucent-mcp` for its tool list. Homebrew does not run on Windows, so that block runs only on a
 machine that installs the formula.
@@ -314,22 +314,20 @@ machine that installs the formula.
 `https://raw.githubusercontent.com/Black-Rainbow-Labs/homebrew-inillucent/main/Formula/inillucent.rb`,
 because that copy is the one `brew` reads.
 
-## The tests workflow on the mirror
+## The tests workflow in Black-Rainbow-Labs/Inillucent
 
 `ship.ps1` route: `ci`.
 
 ```powershell
-pwsh packaging/ci-status.ps1                     # the mirror's main; starts a run when it has none
+pwsh packaging/ci-status.ps1                     # main on origin; starts a run when it has none
 pwsh packaging/ci-status.ps1 -TimeoutMinutes 0   # read once, start nothing, do not wait
 ```
 
-CI runs only on the public mirror. `.github/workflows/tests.yml` and `nightly.yml` run there at 03:00
-UTC and when started by hand, never on a push. Both are disabled in the development repository,
-where the private Actions spending stopped every job on 2026-10-02, and each job's `if:` names the
-mirror so a workflow turned back on there still runs nothing. The `ci` route starts the tests
-workflow on the mirror's `main`, which the `mirror` route has just set to the release, and waits
-for it. `ci-status.ps1` runs the same check alone, and a deploy made any other way is finished when
-it exits 0.
+CI runs in `Black-Rainbow-Labs/Inillucent`. `.github/workflows/tests.yml` and `nightly.yml` run
+there at 03:00 UTC and when started by hand, never on a push. The `ci` route starts the tests
+workflow on `main`, which the `tag` route has just pushed the release to, and waits for it.
+`ci-status.ps1` runs the same check alone, and a deploy made any other way is finished when it
+exits 0.
 
 A run that GitHub could not start, because the workflow file is not YAML, is reported as a failure
 with no jobs. From 2026-09-24 every run on both repositories was one of those, and every release

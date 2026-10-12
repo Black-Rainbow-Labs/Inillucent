@@ -850,7 +850,9 @@ fn check_search(transaction: &Connection<'_>) -> Result<(), Fault> {
             "SELECT count(DISTINCT seq) FROM ledger WHERE worker = ?1",
             &[Value::Text(name.clone())],
         )?);
-        let token = format!("\"{name}\"");
+        // The bare name, a single word such as `r5`: `inillucent_search` takes plain words and
+        // refuses FTS5's quoted phrase as unsupported.
+        let token = name.clone();
         let found = integer(&read(
             transaction,
             "SELECT count(*) FROM (SELECT rowid FROM note WHERE note MATCH ?1 AND k = 1000)",

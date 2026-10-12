@@ -276,6 +276,7 @@ impl crate::ImportedDatabase {
                 &format!("SELECT {projection} FROM \"{quoted}\" WHERE rowid = {rowid}"),
                 &inillucent_exec::physical::Params::new(),
             )?;
+            let mut new_rowid = rowid;
             let mut values = vec![Value::Null; width];
             if let Some(row) = held.rows.first() {
                 for (position, at) in visible.iter().enumerate() {
@@ -307,6 +308,14 @@ impl crate::ImportedDatabase {
                         )
                     })?,
                 };
+                // **`SET rowid = 10` moves the row.** The assignment carries
+                // `column: 0` and says nothing else about which column it is, so
+                // it used to be written into the first declared column while
+                // the row kept its rowid. It is the new rowid of the change.
+                if assignment.rowid {
+                    new_rowid = module_rowid(value)?;
+                    continue;
+                }
                 if let Some(slot) = values.get_mut(usize::from(assignment.column)) {
                     *slot = Value::from(&value.borrow()).into_owned()?;
                 }
@@ -315,7 +324,7 @@ impl crate::ImportedDatabase {
                 &table.name,
                 &Change::Update {
                     old_rowid: Value::Integer(rowid),
-                    new_rowid: Value::Integer(rowid),
+                    new_rowid: Value::Integer(new_rowid),
                     values,
                 },
             )?;
@@ -344,10 +353,27 @@ impl crate::ImportedDatabase {
     ) -> DbResult<Outcome> {
         let mut changed = 0usize;
         let mut images: Vec<Vec<inillucent_tree::datum::OwnedDatum>> = Vec::new();
-        if let Err(error) =
-            self.insert_rows_into_module(statement, params, selected, &mut changed, &mut images)
-        {
-            self.record_changes(changed as i64, changed as i64);
+        // **A statement that fails leaves none of its rows.** `OR FAIL` keeps
+        // what it wrote and `OR ROLLBACK` ends the transaction, so only the
+        // other algorithms put the statement back.
+        let atomic = !matches!(
+            statement.on_conflict,
+            Some(
+                inillucent_sql::ast::ConflictAction::Fail
+                    | inillucent_sql::ast::ConflictAction::Rollback
+            )
+        );
+        let started = match atomic {
+            true => self.begin_module_statement(module_insert_rows(statement, selected))?,
+            false => None,
+        };
+        let applied =
+            self.insert_rows_into_module(statement, params, selected, &mut changed, &mut images);
+        let abandoned = started.is_some() && applied.is_err();
+        let applied = self.end_module_statement(started, applied);
+        if let Err(error) = applied {
+            let kept = if abandoned { 0 } else { changed };
+            self.record_changes(kept as i64, kept as i64);
             // **`OR ROLLBACK` ends the transaction when the module refuses a
             // row as a constraint**, as it does for an ordinary table: SQLite
             // sets the statement's error action from the conflict clause, so
@@ -633,6 +659,109 @@ impl crate::ImportedDatabase {
         Ok(supplied)
     }
 
+    /// Applies an `UPDATE` of a module's table as one statement.
+    ///
+    /// A statement that changes several rows and fails on a later one leaves
+    /// none of them changed, which is what it does for an ordinary table. See
+    /// [`ImportedDatabase::begin_module_statement`].
+    ///
+    /// @param statement - the bound update
+    /// @param keys - the rowid of each row the `WHERE` selected
+    /// @param params - the bound parameters
+    pub(crate) fn update_module_statement(
+        &mut self,
+        statement: &inillucent_sql::dml::BoundUpdate,
+        keys: &[Vec<inillucent_tree::datum::OwnedDatum>],
+        params: &inillucent_exec::physical::Params,
+    ) -> DbResult<usize> {
+        let started = self.begin_module_statement(keys.len())?;
+        let applied = self.update_module(statement, keys, params);
+        self.end_module_statement(started, applied)
+    }
+
+    /// Marks the point a statement that writes several rows is put back to.
+    ///
+    /// **A module has no statement journal of its own, so the engine takes one
+    /// for it.** A multi row `INSERT` or `UPDATE` hands the module its rows one
+    /// at a time, and one that failed on the second row kept the first: the
+    /// shadow tables had changed and the module's buffer had staged the row, and
+    /// nothing put either back. The statement is bracketed the way a savepoint
+    /// is. Every module flushes first, so what it holds in memory before the
+    /// statement is under the undo log and what is left in its buffer belongs to
+    /// the statement, and each is told a savepoint opened, so that
+    /// [`ImportedDatabase::end_module_statement`] can tell them to roll back to
+    /// it.
+    ///
+    /// A statement of one row is not bracketed: it either writes its row or
+    /// fails before writing anything, and a flush for every statement of a bulk
+    /// load made of single row inserts would undo the buffering the modules
+    /// exist for.
+    ///
+    /// @param rows - how many rows the statement hands to the module
+    pub(crate) fn begin_module_statement(
+        &mut self,
+        rows: usize,
+    ) -> DbResult<Option<ModuleStatement>> {
+        if rows < 2 || self.session_state.virtual_tables.is_empty() {
+            return Ok(None);
+        }
+        if !self.session_state.modules_begun.get() {
+            self.session_state.modules_begun.set(true);
+            self.begin_modules()?;
+        }
+        self.sync_modules_before_savepoint()?;
+        let level = i32::try_from(self.writing.marks().borrow().len()).unwrap_or(i32::MAX);
+        self.savepoint_modules(level)?;
+        Ok(Some(ModuleStatement {
+            mark: self.statement_mark(),
+            level,
+            txn: self.current_txn(),
+            autocommit: self.writing.batch().is_none(),
+        }))
+    }
+
+    /// Ends a statement [`ImportedDatabase::begin_module_statement`] bracketed.
+    ///
+    /// A statement that worked releases the point. One that failed is put back:
+    /// the modules discard what they staged since the point, the shadow trees
+    /// are restored from the undo log, and outside a transaction the restore is
+    /// committed together with the writes it undid, so a replay of the log
+    /// arrives at the same pages. The error returned is the statement's own
+    /// unless putting it back failed.
+    ///
+    /// @param started - what `begin_module_statement` answered
+    /// @param outcome - what the statement's writes answered
+    pub(crate) fn end_module_statement<T>(
+        &mut self,
+        started: Option<ModuleStatement>,
+        outcome: DbResult<T>,
+    ) -> DbResult<T> {
+        let Some(started) = started else {
+            return outcome;
+        };
+        let error = match outcome {
+            Ok(value) => {
+                self.release_modules(started.level)?;
+                return Ok(value);
+            }
+            Err(error) => error,
+        };
+        let told = self.rollback_modules(Some(started.level));
+        let undone = self.undo_to_floor(started.mark, false, started.txn);
+        let sealed = match (started.autocommit, &undone) {
+            (true, Ok(())) => {
+                self.writing.undo().borrow_mut().clear();
+                self.seal()
+            }
+            _ => Ok(()),
+        };
+        Err(undone
+            .err()
+            .or(told.err())
+            .or(sealed.err())
+            .unwrap_or(error))
+    }
+
     /// Flushes every connected module before the engine commits.
     ///
     /// **Once per transaction, not once per row.** FTS5 holds a segment in
@@ -642,11 +771,31 @@ impl crate::ImportedDatabase {
     /// per row against SQLite's 5.5. SQLite syncs its modules at the end of the
     /// statement's transaction and so does this.
     pub(crate) fn sync_modules(&mut self) -> DbResult<()> {
+        self.sync_modules_matching(false)
+    }
+
+    /// Flushes the modules that cannot put their own buffer back, before a savepoint opens.
+    ///
+    /// A module that can (see `VirtualTable::undoes_its_own_buffer`) is left holding its buffer.
+    /// The flush used to be unconditional, and a bulk load made of multi row statements paid for
+    /// the whole of a full text index once per statement.
+    pub(crate) fn sync_modules_before_savepoint(&mut self) -> DbResult<()> {
+        self.sync_modules_matching(true)
+    }
+
+    /// Flushes the connected modules, all of them or only those that cannot undo their buffer.
+    ///
+    /// @param skip_self_undoing - whether a module that undoes its own buffer is left alone
+    fn sync_modules_matching(&mut self, skip_self_undoing: bool) -> DbResult<()> {
         let names: Vec<Vec<u8>> = self.session_state.virtual_tables.keys().cloned().collect();
         for name in names {
             let Some(mut connected) = self.session_state.virtual_tables.remove(&name) else {
                 continue;
             };
+            if skip_self_undoing && connected.table.undoes_its_own_buffer() {
+                self.session_state.virtual_tables.insert(name, connected);
+                continue;
+            }
             let outcome = {
                 let txn = self.current_txn();
                 let at = self.schema.ddl_schema;
@@ -859,6 +1008,50 @@ impl crate::ImportedDatabase {
             Moment::Savepoint(level) => connected.table.savepoint(&mut context, level),
             Moment::Release(level) => connected.table.release(&mut context, level),
         }
+    }
+}
+
+/// The point a statement that writes several rows to a module is put back to.
+pub(crate) struct ModuleStatement {
+    /// Where the statement's writes begin in the transaction's records.
+    mark: crate::engine::state::StatementMark,
+    /// The savepoint level the modules were told.
+    level: i32,
+    /// The transaction the statement writes under.
+    txn: u64,
+    /// Whether the statement is its own transaction.
+    autocommit: bool,
+}
+
+/// Returns how many rows an insert into a module hands over.
+///
+/// @param statement - the bound insert
+/// @param selected - the rows a `SELECT` source produced, `None` for `VALUES`
+fn module_insert_rows(
+    statement: &inillucent_sql::dml::BoundInsert,
+    selected: Option<&[Vec<inillucent_tree::datum::OwnedDatum>]>,
+) -> usize {
+    match (&statement.source, selected) {
+        (inillucent_sql::dml::BoundInsertSource::Values(values), _) => values.len(),
+        (inillucent_sql::dml::BoundInsertSource::Select(_), Some(rows)) => rows.len(),
+        (inillucent_sql::dml::BoundInsertSource::Select(_), None) => 0,
+    }
+}
+
+/// Returns the rowid an `UPDATE ... SET rowid = value` moves a row to.
+///
+/// The value takes integer affinity first, so `'5'` and `5.0` both move the row
+/// to 5, and what is still not an integer is refused with `datatype mismatch`,
+/// which is what SQLite answers and what an update of an ordinary table does.
+///
+/// @param value - the value the statement assigned to the rowid
+fn module_rowid(value: inillucent_tree::datum::OwnedDatum) -> DbResult<i64> {
+    match inillucent_exec::declared::to_key_affinity(value) {
+        inillucent_tree::datum::OwnedDatum::Int(rowid) => Ok(rowid),
+        _ => Err(inillucent_base::DbError::new(inillucent_base::ExtendedCode(
+            inillucent_sql::dml::codes::MISMATCH,
+        ))
+        .with_message("datatype mismatch")),
     }
 }
 

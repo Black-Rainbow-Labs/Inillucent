@@ -75,6 +75,8 @@ struct JoinRecipe {
     needed: crate::paged::Needed,
     /// Whether the key is a full inner key (a probe) or a prefix (a range).
     full_key: bool,
+    /// The `WHERE` terms the rows entering this join already satisfy, tested in front of it.
+    entering: Option<std::rc::Rc<dyn Eval>>,
 }
 
 /// Attempts to describe one inner stage as an [`IndexNestedLoopJoin`], the
@@ -173,6 +175,7 @@ fn try_join_recipe(
         inner_projection: Projection::all(stage.width),
         needed: stage.needed,
         full_key,
+        entering: crate::physical::entering_predicate(plan, space, params, space.stages, index)?,
     }))
 }
 
@@ -247,6 +250,9 @@ pub struct Compiled {
     /// Where `upper`'s `CollectInto` writes the rows, and where
     /// [`Compiled::take_rows`] takes them back out.
     collected: std::rc::Rc<std::cell::RefCell<Vec<Vec<OwnedDatum>>>>,
+    /// Where `upper`'s `CollectInto` writes the rows instead while [`Compiled::run_packed`]
+    /// runs: empty otherwise.
+    packed: crate::ops::Packing,
     /// The statement's correlated blocks and their gate, wrapped around
     /// `upper` on every run the way a join is; see [`CorrelatedRecipe`].
     correlated: Option<CorrelatedRecipe>,
@@ -313,17 +319,83 @@ impl Compiled {
     ) -> DbResult<()> {
         let folded = crate::subquery::fold(plan, catalog, params)?;
         let params = folded.as_ref().unwrap_or(params);
+        self.share_bindings(params);
+        let source = {
+            let mut space = self.held.view(&self.prepared.stages);
+            space.catalog = Some(catalog);
+            source_for_run(plan, catalog, &space, params, &self.prepared, self.limit)?
+        };
+        self.run_source(catalog, params, source)
+    }
+
+    /// Runs the chain over rows the caller supplies in place of its first
+    /// stage's source.
+    ///
+    /// The rows must have that stage's width and the shape its scan produces:
+    /// a correlated subquery's built table hands over the rows of one key, and
+    /// everything above the source, the filter included, runs as it does for a
+    /// scan. A plan whose source would read nothing, because of a `LIMIT 0` or a
+    /// constant filter that rejects, still reads nothing.
+    ///
+    /// @param plan - the planner's output this chain was compiled from
+    /// @param catalog - where the trees and layouts come from, for this call only
+    /// @param params - the values bound to `?1`, `?2`, ...
+    /// @param rows - the rows the first stage supplies
+    pub fn run_over_rows(
+        &mut self,
+        plan: &PhysicalPlan,
+        catalog: &dyn TreeCatalog,
+        params: &Params,
+        rows: Vec<Vec<OwnedDatum>>,
+    ) -> DbResult<()> {
+        let folded = crate::subquery::fold(plan, catalog, params)?;
+        let params = folded.as_ref().unwrap_or(params);
+        self.share_bindings(params);
+        let source = {
+            let mut space = self.held.view(&self.prepared.stages);
+            space.catalog = Some(catalog);
+            source_for_run(plan, catalog, &space, params, &self.prepared, self.limit)?
+        };
+        let source = match source {
+            crate::physical::Source::Rows(empty) => crate::physical::Source::Rows(empty),
+            _ => crate::physical::Source::Rows(rows),
+        };
+        self.run_source(catalog, params, source)
+    }
+
+    /// Drops the built tables of the correlated blocks this chain answers.
+    pub fn drop_block_tables(&self) {
+        if let Some(recipe) = &self.correlated {
+            for correlation in recipe.correlations.iter() {
+                correlation.drop_table();
+            }
+        }
+    }
+
+    /// Copies the values of an execution into the cell the chain reads.
+    ///
+    /// @param params - this execution's parameters
+    fn share_bindings(&self, params: &Params) {
         let bound = params.bindings();
         if !std::sync::Arc::ptr_eq(&self.bindings, &bound) {
             if let (Ok(from), Ok(mut held)) = (bound.lock(), self.bindings.lock()) {
                 held.copy_from(&from);
             }
         }
-        let source = {
-            let mut space = self.held.view(&self.prepared.stages);
-            space.catalog = Some(catalog);
-            source_for_run(plan, catalog, &space, params, &self.prepared, self.limit)?
-        };
+    }
+
+    /// Drives the chain from a source, wrapping it in the joins and the
+    /// correlation operator the chain was built with.
+    ///
+    /// @param catalog - where the trees and layouts come from, for this call only
+    /// @param params - this execution's parameters
+    /// @param source - what feeds the chain
+    fn run_source(
+        &mut self,
+        catalog: &dyn TreeCatalog,
+        params: &Params,
+        source: crate::physical::Source<'_>,
+    ) -> DbResult<()> {
         // Also clears `self.collected`: `CollectInto::reset` empties the
         // buffer it was given, which is this chain's own sink at the bottom
         // of `upper`.
@@ -373,8 +445,15 @@ impl Compiled {
                     recipe.full_key,
                     chain,
                 )
-                .with_needed(recipe.needed),
+                .with_needed(recipe.needed)
+                .with_merge(),
             );
+            if let Some(predicate) = &recipe.entering {
+                chain = Box::new(crate::physical::HeldBefore::new(
+                    std::rc::Rc::clone(predicate),
+                    chain,
+                ));
+            }
         }
         source.run(pool, chain.as_mut())
     }
@@ -439,6 +518,34 @@ impl Compiled {
     /// nothing reads the buffer again before the next run clears it.
     pub fn take_rows(&self) -> Vec<Vec<OwnedDatum>> {
         std::mem::take(&mut *self.collected.borrow_mut())
+    }
+
+    /// Runs the chain into a packed set of rows instead of a vector a row.
+    ///
+    /// For an `INSERT ... SELECT` the bulk build will take; see
+    /// [`crate::ops::CollectInto::with_packed`]. On a failure the rows delivered before it are
+    /// kept for [`crate::physical::take_partial_rows`], as `take_rows` keeps them for a
+    /// caller of [`Compiled::run`].
+    ///
+    /// @param plan - the planner's output this chain was compiled from
+    /// @param catalog - where the trees and layouts come from, for this call only
+    /// @param params - the values bound to `?1`, `?2`, ...
+    pub fn run_packed(
+        &mut self,
+        plan: &PhysicalPlan,
+        catalog: &dyn TreeCatalog,
+        params: &Params,
+    ) -> DbResult<crate::packed::PackedRows> {
+        *self.packed.borrow_mut() = Some(crate::packed::PackedRows::new());
+        let ran = self.run(plan, catalog, params);
+        let packed = self.packed.borrow_mut().take().unwrap_or_default();
+        match ran {
+            Ok(()) => Ok(packed),
+            Err(error) => {
+                crate::physical::keep_partial_rows(packed.into_rows());
+                Err(error)
+            }
+        }
     }
 }
 
@@ -618,10 +725,14 @@ pub fn try_compile_limited(
     // exactly once no matter what the rest of this function decides.
     let before = params.reads();
     let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let sink = Box::new(match limit {
-        Some(limit) => CollectInto::with_limit(std::rc::Rc::clone(&collected), limit),
-        None => CollectInto::new(std::rc::Rc::clone(&collected)),
-    });
+    let packed: crate::ops::Packing = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let sink = Box::new(
+        match limit {
+            Some(limit) => CollectInto::with_limit(std::rc::Rc::clone(&collected), limit),
+            None => CollectInto::new(std::rc::Rc::clone(&collected)),
+        }
+        .with_packed(std::rc::Rc::clone(&packed)),
+    );
     // The listing is kept here: a `Compiled` builds its chain once and every
     // later execution reuses it, so rendering the operators costs one render
     // per compiled statement rather than one per execution, and
@@ -668,6 +779,7 @@ pub fn try_compile_limited(
         settings: params.settings(),
         bindings,
         collected,
+        packed,
         correlated,
     }))
 }

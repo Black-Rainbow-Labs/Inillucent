@@ -1,20 +1,20 @@
 <#
 .SYNOPSIS
-    Waits for GitHub's tests workflow on the public mirror, starting it when the commit has no run,
-    and exits 0 only when it passed.
+    Waits for GitHub's tests workflow on Black-Rainbow-Labs/Inillucent, starting it when the commit
+    has no run, and exits 0 only when it passed.
 
 .DESCRIPTION
     A deploy is finished when this exits 0. `ship.ps1` runs it as its last route, and an agent that
-    ran any deploy by another route (a mirror push of examples, a site publish, a hand pushed fix)
+    ran any deploy by another route (a push to main, a site publish, a hand pushed fix)
     runs it before it calls the work done:
 
         pwsh packaging/ci-status.ps1
 
-    With no arguments it reads the head of `main` on the public mirror (the `brl` remote), starts the
-    tests workflow there when that commit has no run, waits for it, prints the verdict with the run's
-    URL, and exits 0 when it passed and 1 otherwise. CI runs only on the mirror, at night and by
-    hand: the private development repository's workflows are disabled, because its Actions spending
-    stopped every job there on 2026-10-02.
+    With no arguments it reads the head of `main` on the `origin` remote, which is
+    Black-Rainbow-Labs/Inillucent, starts the tests workflow there when that commit has no run, waits
+    for it, prints the verdict with the run's URL, and exits 0 when it passed and 1 otherwise. CI
+    runs at night and by hand, never on a push. The private repository development used until
+    task-2245 has its workflows disabled.
 
     WHY IT EXISTS
 
@@ -24,11 +24,10 @@
     `packaging/ci-evidence.ps1` has the rules for reading a run.
 
 .PARAMETER Remote
-    Which repositories to read, by git remote. Default brl, the public mirror.
+    Which repositories to read, by git remote. Default origin, Black-Rainbow-Labs/Inillucent.
 
 .PARAMETER Sha
-    Read this commit on every named repository instead of each one's branch head. The public mirror
-    has its own commits, so this is for one repository at a time.
+    Read this commit on every named repository instead of each one's branch head.
 
 .PARAMETER Branch
     The branch whose head is read. Default main.
@@ -39,12 +38,12 @@
 
 .EXAMPLE
     pwsh packaging/ci-status.ps1
-    pwsh packaging/ci-status.ps1 -Remote origin -Sha 1722bc79f1b8a7f5c0d5d3b0b3c8e4a7a2b1c0d9
+    pwsh packaging/ci-status.ps1 -Sha 1722bc79f1b8a7f5c0d5d3b0b3c8e4a7a2b1c0d9
     pwsh packaging/ci-status.ps1 -TimeoutMinutes 0
 #>
 [CmdletBinding()]
 param(
-    [string] $Remote = 'brl',
+    [string] $Remote = 'origin',
     [string] $Sha,
     [string] $Branch = 'main',
     [int] $TimeoutMinutes = 180

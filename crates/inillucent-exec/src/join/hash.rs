@@ -5,76 +5,17 @@
 //! that are equal under the dialect's rules hash alike and two that are
 //! not cannot collide into one group.
 
-use std::collections::HashMap;
-
 use inillucent_base::DbResult;
-use inillucent_tree::datum::{Datum, OwnedDatum};
+use inillucent_tree::datum::OwnedDatum;
 use inillucent_tree::key;
 
-use crate::batch::{Batch, Vector};
+use crate::autoindex::HashTable;
+use crate::batch::Batch;
 use crate::expr::Eval;
 use crate::ops::{emit_rows, Flow, Sink};
 
 use super::*;
 
-/// A hash table over encoded join keys.
-///
-/// The key is the memcmp encoding rather than the values, for the same reason
-/// an interior page's separator is: one `Vec<u8>` hashes and compares in one
-/// call where a tuple of tagged values dispatches per column. The encoding is
-/// exact - `inillucent-tree`'s key module documents how - so two rows hash together
-/// exactly when SQL says their keys are equal.
-struct HashTable {
-    /// Encoded key to the positions in `rows` that carry it.
-    index: HashMap<Vec<u8>, Vec<u32>>,
-    /// The build side's rows.
-    rows: Vec<Vec<OwnedDatum>>,
-    /// Which build rows have been matched, for a right/full outer join.
-    matched: Vec<bool>,
-}
-impl HashTable {
-    /// Returns an empty table.
-    fn new() -> HashTable {
-        HashTable {
-            index: HashMap::new(),
-            rows: Vec::new(),
-            matched: Vec::new(),
-        }
-    }
-
-    /// Forgets every build row, so the join can be run again.
-    fn clear(&mut self) {
-        self.index.clear();
-        self.rows.clear();
-        self.matched.clear();
-    }
-
-    /// Adds one build row under an encoded key.
-    ///
-    /// A NULL in the key is dropped rather than indexed: SQL equality is never
-    /// true for NULL, so a NULL-keyed build row can never match a probe, and
-    /// keeping it in the table would only make it findable.
-    ///
-    /// @param key - the encoded join key
-    /// @param row - the build row
-    /// @param has_null - whether any key column was NULL
-    fn insert(&mut self, key: Vec<u8>, row: Vec<OwnedDatum>, has_null: bool) {
-        let position = self.rows.len() as u32;
-        self.rows.push(row);
-        self.matched.push(false);
-        if has_null {
-            return;
-        }
-        self.index.entry(key).or_default().push(position);
-    }
-
-    /// Returns the build rows carrying an encoded key.
-    ///
-    /// @param key - the encoded probe key
-    fn probe(&self, key: &[u8]) -> &[u32] {
-        self.index.get(key).map(Vec::as_slice).unwrap_or(&[])
-    }
-}
 /// How a join treats rows that find no partner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JoinKind {
@@ -132,6 +73,9 @@ pub struct HashJoin<'s> {
     /// The probe side's key expressions, over the probe batch's columns.
     probe_keys: Vec<Box<dyn Eval>>,
     table: HashTable,
+    /// The conjuncts of the join condition the key did not take, over the
+    /// joined row, tested for each candidate pair the key finds.
+    condition: Option<Box<dyn Eval>>,
     downstream: Box<dyn Sink + 's>,
     /// Reused between probes so a join of a million rows makes no allocation
     /// per row.
@@ -157,6 +101,7 @@ impl<'s> HashJoin<'s> {
             build_keys,
             probe_keys,
             table: HashTable::new(),
+            condition: None,
             downstream,
             scratch: Vec::new(),
         }
@@ -175,26 +120,28 @@ impl<'s> HashJoin<'s> {
         self
     }
 
+    /// Returns the join with a condition tested for each pair the key finds.
+    ///
+    /// The key decides which pairs are candidates and the condition decides
+    /// which candidates are partners. A probe row none of whose candidates pass
+    /// is unmatched, and an outer join null extends it exactly as it does a row
+    /// with an empty bucket.
+    ///
+    /// @param condition - the conjuncts the key did not take, over the probe row followed by the build row
+    pub fn with_condition(mut self, condition: Box<dyn Eval>) -> HashJoin<'s> {
+        self.condition = Some(condition);
+        self
+    }
+
     /// Adds one batch of build rows to the table.
     ///
     /// @param batch - a batch from the build side
     pub fn build(&mut self, batch: &Batch<'_>) -> DbResult<()> {
-        // **The build side is charged here (task-1932, H6).** It is the whole
-        // of one input held in memory before a single output row exists, and
-        // before this the request budget saw none of it: a join whose build
-        // side is the large table and whose answer is one row spent one row's
-        // worth of a 256 MiB cap.
-        inillucent_base::budget::materialise(crate::ops::batch_bytes(batch))?;
-        let width = batch.columns.len();
-        for nth in 0..batch.live() {
-            let mut row = Vec::with_capacity(width);
-            for column in 0..width {
-                row.push(OwnedDatum::from_datum(&batch.value(nth, column)?));
-            }
-            let (encoded, has_null) = encode_row_key(&self.build_keys, batch, nth)?;
-            self.table.insert(encoded, row, has_null);
-        }
-        Ok(())
+        // The build side is charged to the request budget inside `absorb`: it
+        // is the whole of one input held in memory before a single output row
+        // exists, and a join whose build side is the large table and whose
+        // answer is one row must still count that table.
+        self.table.absorb(&self.build_keys, batch)
     }
 
     /// Returns how many rows the build side put in the table.
@@ -213,38 +160,34 @@ impl<'s> HashJoin<'s> {
     ///
     /// @param rows - the inner side's rows, in the order they were read
     pub fn build_materialised(&mut self, rows: &[Vec<OwnedDatum>]) -> DbResult<()> {
-        let width = rows.first().map(Vec::len).unwrap_or(0);
-        if width == 0 {
-            return Ok(());
-        }
-        let mut start = 0usize;
-        while start < rows.len() {
-            let end = start
-                .saturating_add(crate::batch::BATCH_ROWS)
-                .min(rows.len());
-            let chunk = rows.get(start..end).unwrap_or(&[]);
-            let mut held: Vec<Vec<Datum<'_>>> = Vec::with_capacity(width);
-            for column in 0..width {
-                held.push(
-                    chunk
-                        .iter()
-                        .map(|row| {
-                            row.get(column)
-                                .map(OwnedDatum::borrow)
-                                .unwrap_or(Datum::Null)
-                        })
-                        .collect(),
-                );
-            }
-            let columns: Vec<Vector<'_>> = held
-                .iter()
-                .map(|values| Vector::Values(values.as_slice()))
-                .collect();
-            self.build(&Batch::new(chunk.len(), columns))?;
-            start = end;
-        }
-        Ok(())
+        self.table.absorb_rows(&self.build_keys, rows)
     }
+}
+/// Returns the candidate build rows that pass a join condition with a probe row.
+///
+/// @param condition - the conjuncts the key did not take, over the probe row followed by the build row
+/// @param probe - the probe row
+/// @param rows - the build rows
+/// @param candidates - the positions in `rows` the key found
+fn passing_pairs(
+    condition: &dyn Eval,
+    probe: &[OwnedDatum],
+    rows: &[Vec<OwnedDatum>],
+    candidates: Vec<u32>,
+) -> DbResult<Vec<u32>> {
+    let mut joined: Vec<OwnedDatum> = Vec::new();
+    let mut passing = Vec::with_capacity(candidates.len());
+    for position in candidates {
+        joined.clear();
+        joined.extend(probe.iter().cloned());
+        if let Some(build) = rows.get(position as usize) {
+            joined.extend(build.iter().cloned());
+        }
+        if super::loops::keeps(Some(condition), &joined)? {
+            passing.push(position);
+        }
+    }
+    Ok(passing)
 }
 impl Sink for HashJoin<'_> {
     fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
@@ -262,6 +205,7 @@ impl Sink for HashJoin<'_> {
             build_width,
             probe_keys,
             table,
+            condition,
             downstream,
             scratch,
             ..
@@ -292,6 +236,13 @@ impl Sink for HashJoin<'_> {
             let matches: Vec<u32> = match found.is_empty() {
                 true => Vec::new(),
                 false => found.to_vec(),
+            };
+            let matches = match condition.as_deref() {
+                Some(test) if !matches.is_empty() => {
+                    let probe = materialise(batch, nth, width)?;
+                    passing_pairs(test, &probe, &table.rows, matches)?
+                }
+                _ => matches,
             };
             match kind {
                 JoinKind::Semi => {

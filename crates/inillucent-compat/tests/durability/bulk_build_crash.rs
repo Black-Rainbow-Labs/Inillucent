@@ -286,7 +286,7 @@ fn every_cut_of_a_bulk_index_build_is_recoverable() {
 "));
                 }
                 Recovery::WithoutIndex => panic!(
-                    "cut {nth}: the CREATE INDEX was acknowledged and the index is not there                      after recovery - an acknowledged commit that the log cannot rebuild"
+                    "cut {nth}: the CREATE INDEX was acknowledged and the index is not there after recovery - an acknowledged commit that the log cannot rebuild"
                 ),
                 Recovery::Broken(said) => {
                     panic!("cut {nth}: an acknowledged commit came back unreadable: {said}")

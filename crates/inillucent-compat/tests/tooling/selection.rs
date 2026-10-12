@@ -764,7 +764,7 @@ fn every_feature_is_either_built_or_written_off() {
     }
     assert!(
         read >= 20,
-        "read {read} manifests, which means this is looking in the wrong place rather than          that the workspace has no features"
+        "read {read} manifests, which means this is looking in the wrong place rather than that the workspace has no features"
     );
     assert!(
         unanswered.is_empty(),

@@ -52,6 +52,9 @@ pub struct IndexNestedLoopJoin<'t> {
     /// Reused across probes, so a join over a million outer rows makes one
     /// selection vector rather than a million.
     selection: Vec<u32>,
+    /// The outer rows kept for one walk of the inner tree, once enough have arrived that the
+    /// walk costs less than probing them; see `super::merged`.
+    merge: Option<super::merged::MergeBuffer>,
 }
 impl<'t> IndexNestedLoopJoin<'t> {
     /// Returns an index nested loop join.
@@ -84,7 +87,36 @@ impl<'t> IndexNestedLoopJoin<'t> {
             full_key,
             downstream,
             selection: Vec::new(),
+            merge: None,
         }
+    }
+
+    /// Returns the join allowed to join the rest of a large outer side with one walk of the
+    /// inner tree (task-2226).
+    ///
+    /// Only an inner join on one key, into a tree whose first key column ascends: the walk
+    /// meets the sorted outer keys in that column's order. The rows still come out in the order
+    /// the probes would give them. See `super::merged`.
+    ///
+    /// **Only for a caller that calls `finish` before it reads the output.** The rows held for
+    /// the walk come out at `finish`. `ProbedOuterJoin` pushes one outer row and reads its
+    /// matches at once, so the joins inside it are built without this.
+    pub fn with_merge(mut self) -> IndexNestedLoopJoin<'t> {
+        let ascending = !self.inner.directions().first().copied().unwrap_or(true);
+        if self.kind == JoinKind::Inner && self.outer_keys.len() == 1 && ascending {
+            self.merge = Some(super::merged::MergeBuffer::for_inner(
+                self.inner.row_count(),
+            ));
+        }
+        self
+    }
+
+    /// Returns how many outer rows this join has joined by walking the inner tree rather than
+    /// by probing it, across every execution; see `super::merged`.
+    pub fn rows_merged(&self) -> usize {
+        self.merge
+            .as_ref()
+            .map_or(0, super::merged::MergeBuffer::merged)
     }
 
     /// Returns the join emitting only the inner columns the statement reads.
@@ -128,7 +160,14 @@ impl Sink for IndexNestedLoopJoin<'_> {
             full_key,
             downstream,
             selection,
+            merge,
         } = self;
+        // Rows from here on are kept for one walk of the inner tree, when the join may do that;
+        // see `super::merged`.
+        let buffer_from = match merge.as_mut() {
+            Some(held) => held.buffer_from(batch.live(), batch.columns.len()),
+            None => usize::MAX,
+        };
         let width = batch.columns.len();
         let inner_width = inner_projection.0.len();
         let mut probing = Probing {
@@ -153,7 +192,27 @@ impl Sink for IndexNestedLoopJoin<'_> {
                 probing.cross_product(batch, nth)?
             } else {
                 with_seek_key(outer_keys, batch, nth, |key| {
-                    probing.inner_matches(batch, nth, key)
+                    match (nth >= buffer_from, key, merge.as_mut()) {
+                        (true, [Datum::Int(value)], Some(held)) => {
+                            held.keep(*value, batch, nth).map(|()| Flow::Continue)
+                        }
+                        // A key that is not one integer is probed: the walk pairs integers
+                        // only. The rows buffered before it go first, to keep the order.
+                        (_, _, Some(held)) if held.holds_rows() => {
+                            let flow = held.emit(
+                                probing.inner,
+                                probing.pool,
+                                probing.inner_projection,
+                                probing.needed,
+                                &mut *probing.downstream,
+                            )?;
+                            match flow {
+                                Flow::Stop => Ok(Flow::Stop),
+                                Flow::Continue => probing.inner_matches(batch, nth, key),
+                            }
+                        }
+                        _ => probing.inner_matches(batch, nth, key),
+                    }
                 })?
             };
             if flow == Flow::Stop {
@@ -164,12 +223,25 @@ impl Sink for IndexNestedLoopJoin<'_> {
     }
 
     fn finish(&mut self) -> DbResult<()> {
+        if let Some(held) = self.merge.as_mut() {
+            // A pipeline that asked to stop is still finished, as the probes' path finishes it.
+            held.emit(
+                self.inner,
+                self.pool,
+                &self.inner_projection,
+                &self.needed,
+                self.downstream.as_mut(),
+            )?;
+        }
         self.downstream.finish()
     }
 
     /// Returns this operator and everything below it to its pre-input state.
     fn reset(&mut self) -> DbResult<()> {
         self.selection.clear();
+        if let Some(held) = self.merge.as_mut() {
+            held.clear();
+        }
         self.downstream.reset()
     }
 }
@@ -574,12 +646,10 @@ impl Probing<'_, '_> {
             // throw most of it away. On an index built before its rows were
             // loaded - the ordinary application order - every leaf is delta,
             // and that ran per probe.
-            // The same cap `PagedTree::visit_equal` gives `equal_run`, so the
-            // span this merges and the span the visitor matched are found the
-            // same way.
-            const RUN_SCAN: usize = 8;
+            // The sorted run is the one the visitor already found, passed on
+            // so it is not searched for a second time.
             let merged: Vec<Vec<Datum<'_>>> = if leaf.needs_materialising() {
-                leaf.live_matching(probe, RUN_SCAN)?
+                leaf.live_matching_run(probe, start, end)?
             } else {
                 Vec::new()
             };
@@ -1011,7 +1081,7 @@ fn live_rows_of_needed<'p>(
 ///
 /// @param condition - the join condition, or `None` for a cross product
 /// @param joined - the outer row followed by the inner row
-fn keeps(condition: Option<&dyn Eval>, joined: &[OwnedDatum]) -> DbResult<bool> {
+pub(crate) fn keeps(condition: Option<&dyn Eval>, joined: &[OwnedDatum]) -> DbResult<bool> {
     {
         let Some(condition) = condition else {
             return Ok(true);
@@ -1020,8 +1090,11 @@ fn keeps(condition: Option<&dyn Eval>, joined: &[OwnedDatum]) -> DbResult<bool> 
         let columns: Vec<Vector<'_>> = borrowed.iter().map(|value| Vector::Const(*value)).collect();
         let batch = Batch::new(1, columns);
         // SQL's three-valued logic: only a true keeps the row, so a NULL
-        // condition drops it exactly as a false does.
+        // condition drops it exactly as a false does. **True by SQLite's rule,
+        // not only a non zero integer (bug hunt 9).** A bare column holding 2.5
+        // or the text '5' is true, and this kept only integers, so
+        // `FROM y JOIN x ON x.c1 = y.c1 WHERE x.c2` lost every such row.
         let verdict = condition.value(&batch, 0)?;
-        Ok(matches!(verdict.get(), Datum::Int(number) if number != 0))
+        Ok(crate::expr::truth(&verdict.get()) == Some(true))
     }
 }

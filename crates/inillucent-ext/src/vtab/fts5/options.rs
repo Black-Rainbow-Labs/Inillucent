@@ -65,6 +65,14 @@ pub(super) struct Options {
     /// chooses the option for: the source text is not supposed to be in the
     /// database at all, and it was, silently.
     pub(super) contentless: bool,
+    /// What SQLite refuses in these arguments, when anything.
+    ///
+    /// **Read only when a table is being created.** SQLite refuses a reserved column name, a
+    /// column option other than `UNINDEXED`, an option it does not have and a malformed value for
+    /// `prefix`, `columnsize`, `detail` and the others. A table in a file that an older build
+    /// wrote has to go on opening, so the arguments are still read leniently and the first
+    /// problem is kept here for `CREATE VIRTUAL TABLE` to refuse.
+    pub(super) invalid: Option<String>,
 }
 
 /// Reads the arguments of a `CREATE VIRTUAL TABLE ... USING fts5(...)`.
@@ -78,9 +86,14 @@ pub(super) fn parse_options(arguments: &[Vec<u8>]) -> DbResult<Options> {
     let mut content: Option<Vec<u8>> = None;
     let mut contentless = false;
     let mut unsupported: Option<String> = None;
+    let mut not_indexed: Vec<String> = Vec::new();
+    let mut invalid: Option<String> = None;
     for argument in arguments {
         let text = String::from_utf8_lossy(argument).trim().to_string();
         if let Some((name, value)) = split_option(&text) {
+            if invalid.is_none() {
+                invalid = refusal_for_option(&name, &value);
+            }
             match name.to_ascii_lowercase().as_str() {
                 "tokenize" => tokenizer = tokenize::parse_specification(&value),
                 // **An external content table names its rows' owner**, and
@@ -95,6 +108,12 @@ pub(super) fn parse_options(arguments: &[Vec<u8>]) -> DbResult<Options> {
                     content = Some(unquote_option(&value).as_bytes().to_vec())
                 }
                 "content" => contentless = true,
+                // FTS4 names a column it must not index as `notindexed=b`,
+                // where FTS5 writes `b UNINDEXED`. The column is still stored
+                // and returned; a query never finds a row through it.
+                "notindexed" => {
+                    not_indexed.push(unquote_option(&value).trim().to_ascii_lowercase())
+                }
                 // **Three options that change what the index holds.** Each is
                 // accepted at the value this build does store - which is
                 // SQLite's own default - and refused at every other, because
@@ -138,6 +157,9 @@ pub(super) fn parse_options(arguments: &[Vec<u8>]) -> DbResult<Options> {
             .iter()
             .skip(1)
             .any(|word| word.eq_ignore_ascii_case(b"UNINDEXED"));
+        if invalid.is_none() {
+            invalid = refusal_for_column(&text, &words);
+        }
         columns.push(ColumnSpec {
             name: name.clone(),
             unindexed,
@@ -146,13 +168,174 @@ pub(super) fn parse_options(arguments: &[Vec<u8>]) -> DbResult<Options> {
     if columns.is_empty() {
         return Err(failure("an fts5 table needs at least one column"));
     }
+    for column in columns.iter_mut() {
+        let folded = String::from_utf8_lossy(&column.name).to_ascii_lowercase();
+        if not_indexed.contains(&folded) {
+            column.unindexed = true;
+        }
+    }
     Ok(Options {
         columns,
         tokenizer,
         content,
         contentless,
         unsupported,
+        invalid,
     })
+}
+
+/// Refuses, when an FTS5 table is created, what SQLite refuses in its declaration.
+///
+/// The table may not be called `rank`, no column may be called `rank` or `rowid`, no two columns
+/// may share a name when case is ignored, and no column may share the table's name, because that
+/// column is the hidden one the table's `MATCH` is written on. The last two are reported by SQLite
+/// as `vtable constructor failed`, which is the words used here.
+///
+/// @param options - the parsed arguments
+/// @param table - the table's name
+pub(super) fn refuse_at_create(options: &Options, table: &[u8]) -> DbResult<()> {
+    let table = String::from_utf8_lossy(table).into_owned();
+    let refuse = |said: String| Err(failure(said.clone()).with_message(said));
+    if table.eq_ignore_ascii_case("rank") {
+        return refuse(format!("reserved fts5 table name: {table}"));
+    }
+    if let Some(said) = &options.invalid {
+        return refuse(said.clone());
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for column in &options.columns {
+        let name = String::from_utf8_lossy(&column.name).to_ascii_lowercase();
+        if name == table.to_ascii_lowercase() || seen.contains(&name) {
+            return refuse(format!("vtable constructor failed: {table}"));
+        }
+        seen.push(name);
+    }
+    Ok(())
+}
+
+/// Reports whether an option name is a directive SQLite knows, the way SQLite compares them.
+///
+/// SQLite tests `strnicmp(directive, name, length of name)`, so any leading part of a directive's
+/// name stands for it: `pre` is `prefix`. The directives are tried in the order SQLite tries
+/// them, and the first that matches is the one that is meant.
+///
+/// @param name - the option as written
+fn directive_of(name: &str) -> Option<&'static str> {
+    const DIRECTIVES: [&str; 10] = [
+        "prefix",
+        "tokenize",
+        "content",
+        "contentless_delete",
+        "contentless_unindexed",
+        "content_rowid",
+        "columnsize",
+        "locale",
+        "detail",
+        "tokendata",
+    ];
+    DIRECTIVES.into_iter().find(|full| {
+        full.len() >= name.len()
+            && full
+                .get(..name.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(name))
+    })
+}
+
+/// Returns what SQLite refuses about one `name = value` argument, in SQLite's words.
+///
+/// @param name - the option as written
+/// @param value - its value as written, quotes included
+fn refusal_for_option(name: &str, value: &str) -> Option<String> {
+    let value = unquote_option(value);
+    let zero_or_one = |label: &str| {
+        (value != "0" && value != "1").then(|| format!("malformed {label}=... directive"))
+    };
+    match directive_of(name) {
+        None => Some(format!("unrecognized option: \"{name}\"")),
+        Some("prefix") => malformed_prefix(value),
+        Some("contentless_delete") => zero_or_one("contentless_delete"),
+        Some("contentless_unindexed") => zero_or_one("contentless_delete"),
+        Some("columnsize") => zero_or_one("columnsize"),
+        Some("locale") => zero_or_one("locale"),
+        Some("tokendata") => zero_or_one("tokendata"),
+        Some("detail") => (!["none", "full", "column", "columns"]
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(value)))
+        .then(|| "malformed detail=... directive".to_string()),
+        Some(_) => None,
+    }
+}
+
+/// Returns what SQLite refuses about a `prefix=` value, which is a list of lengths.
+///
+/// @param value - the value, quotes removed
+fn malformed_prefix(value: &str) -> Option<String> {
+    // SQLite's loop in `sqlite3Fts5ConfigParse`: skip spaces, read a number, skip spaces, take one
+    // comma if there is one. So `2 3` and `2, 3` are both two lengths, and `2,,3` is malformed.
+    let bytes = value.as_bytes();
+    let mut at = 0usize;
+    let mut seen = 0usize;
+    loop {
+        while bytes.get(at) == Some(&b' ') {
+            at = at.saturating_add(1);
+        }
+        if at >= bytes.len() {
+            return None;
+        }
+        let digits = bytes
+            .get(at..)
+            .unwrap_or(&[])
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            return Some("malformed prefix=... directive".to_string());
+        }
+        let length: usize = value
+            .get(at..at.saturating_add(digits))
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(1000);
+        if length == 0 || length >= 1000 {
+            return Some("prefix length out of range (max 999)".to_string());
+        }
+        seen += 1;
+        if seen > 31 {
+            return Some("too many prefix indexes (max 31)".to_string());
+        }
+        at = at.saturating_add(digits);
+        while bytes.get(at) == Some(&b' ') {
+            at = at.saturating_add(1);
+        }
+        if bytes.get(at) == Some(&b',') {
+            at = at.saturating_add(1);
+        }
+    }
+}
+
+/// Returns what SQLite refuses about a column argument, in SQLite's words.
+///
+/// A column is its name and at most one option, which can only be `UNINDEXED`. The name may not
+/// be `rank` or `rowid`.
+///
+/// @param text - the argument as written
+/// @param words - the argument split into its words, quotes honoured
+fn refusal_for_column(text: &str, words: &[Vec<u8>]) -> Option<String> {
+    let name = words.first().map(|word| String::from_utf8_lossy(word));
+    if let Some(name) = name {
+        if name.eq_ignore_ascii_case("rank") || name.eq_ignore_ascii_case("rowid") {
+            return Some(format!("reserved fts5 column name: {name}"));
+        }
+    }
+    if words.len() > 2 {
+        return Some(format!("parse error in \"{text}\""));
+    }
+    match words.get(1) {
+        Some(word) if !word.eq_ignore_ascii_case(b"UNINDEXED") => Some(format!(
+            "unrecognized column option: {}",
+            String::from_utf8_lossy(word)
+        )),
+        _ => None,
+    }
 }
 
 /// Strips the quotes an option's value is written inside.

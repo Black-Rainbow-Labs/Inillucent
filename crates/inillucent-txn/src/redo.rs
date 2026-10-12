@@ -28,14 +28,16 @@ use std::collections::HashMap;
 
 use inillucent_base::error::{corrupt, misuse};
 use inillucent_base::DbResult;
+use inillucent_pool::extent::ExtentRef;
 use inillucent_pool::page::{self, header};
-use inillucent_pool::{Database, PageId};
-use inillucent_tree::datum::Datum;
+use inillucent_pool::{Database, PageId, Pool};
+use inillucent_tree::datum::{Datum, OwnedDatum};
 use inillucent_tree::leaf::{LeafBuilder, LeafRef};
 use inillucent_tree::mutate::{Applied, LeafMut};
+use inillucent_tree::relocate::apply_relink;
 use inillucent_tree::types::ColumnSpec;
 use inillucent_tree::write::Located;
-use inillucent_wal::record::{Body, Record};
+use inillucent_wal::record::{Body, Record, RelinkSite};
 use inillucent_wal::Redo;
 
 /// One logical split record, as a replay needs it.
@@ -356,7 +358,10 @@ fn holds_extent(bytes: &[u8], columns: usize) -> DbResult<bool> {
         if rest.is_empty() {
             break;
         }
-        if Datum::tag_of(rest)? == inillucent_tree::datum::tag::EXTENT {
+        let kind = Datum::tag_of(rest)?;
+        if kind == inillucent_tree::datum::tag::EXTENT
+            || kind == inillucent_tree::datum::tag::KEY_EXTENT
+        {
             return Ok(true);
         }
         at = at.saturating_add(Datum::tagged_span(rest)?);
@@ -411,6 +416,92 @@ fn key_order(shape: &RedoTree) -> (Vec<inillucent_value::collation::Collation>, 
         .map(|spec| spec.descending)
         .collect();
     (collations, directions)
+}
+
+/// Decodes the key at the front of a logged row, reading any key column stored
+/// out of line through the pool.
+///
+/// @param pool - the pool the extent pages are read through
+/// @param shape - the tree's column directory and key width
+/// @param row - the record's bytes
+fn resolved_key(pool: &Pool, shape: &RedoTree, row: &[u8]) -> DbResult<Vec<OwnedDatum>> {
+    let mut key = Vec::with_capacity(shape.key_columns);
+    let mut at = 0usize;
+    for column in 0..shape.key_columns {
+        let rest = row.get(at..).unwrap_or(&[]);
+        if rest.is_empty() {
+            break;
+        }
+        at = at.saturating_add(Datum::tagged_span(rest)?);
+        if Datum::tag_of(rest)? != inillucent_tree::datum::tag::KEY_EXTENT {
+            key.push(OwnedDatum::from_datum(&Datum::decode_tagged(rest)?.0));
+            continue;
+        }
+        let reference = ExtentRef::decode(rest.get(1..).unwrap_or(&[]))?;
+        let bytes = inillucent_tree::paged::read_extent(pool, reference)?;
+        let physical = shape
+            .columns
+            .get(column)
+            .map(|spec| spec.physical)
+            .unwrap_or(inillucent_tree::types::PhysicalType::Any);
+        key.push(OwnedDatum::from_datum(
+            &inillucent_tree::leaf::extent_datum(reference.class, physical, &bytes),
+        ));
+    }
+    Ok(key)
+}
+
+/// Reports whether a row's key extent starts on a page a write after this record stamped.
+///
+/// @param pool - the pool the pages are read through
+/// @param shape - the tree's column directory and key width
+/// @param row - the record's row bytes
+/// @param lsn - the record's LSN
+fn key_extent_reused_after(pool: &Pool, shape: &RedoTree, row: &[u8], lsn: u64) -> DbResult<bool> {
+    let mut at = 0usize;
+    for _ in 0..shape.key_columns {
+        let rest = row.get(at..).unwrap_or(&[]);
+        if rest.is_empty() {
+            break;
+        }
+        at = at.saturating_add(Datum::tagged_span(rest)?);
+        if Datum::tag_of(rest)? != inillucent_tree::datum::tag::KEY_EXTENT {
+            continue;
+        }
+        let reference = ExtentRef::decode(rest.get(1..).unwrap_or(&[]))?;
+        let guard = pool.fetch(reference.first)?;
+        if page::lsn_of(&guard)? > lsn {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Finds where a key sits in a leaf, before the leaf is modified.
+///
+/// The search compares a key stored out of line through the pool, so it reads
+/// the page through a guard rather than inside the pool's change call.
+///
+/// @param pool - the pool the page and any extents are read through
+/// @param page - the leaf
+/// @param key - the key, one value per key column
+/// @param shape - the tree's column directory and key width
+/// @param collations - the collation of each key column
+/// @param directions - the direction of each key column
+fn locate_before_modify(
+    pool: &Pool,
+    page: PageId,
+    key: &[Datum<'_>],
+    shape: &RedoTree,
+    collations: &[inillucent_value::collation::Collation],
+    directions: &[bool],
+) -> DbResult<(Located, usize)> {
+    let guard = pool.fetch(page)?;
+    LeafRef::parse(&guard)?
+        .with_collations(collations)
+        .with_directions(directions)
+        .with_pool(pool)
+        .locate_slot(key, shape.key_columns)
 }
 
 impl RowRedo for TreeRows {
@@ -539,11 +630,38 @@ impl RowRedo for TreeRows {
         // **Only the key is decoded.** A row's later columns can hold an
         // out-of-line reference, which is not a value a `Datum` carries - and
         // the replay does not need one, because it writes the record's bytes
-        // back verbatim. Key columns are never written out of line, so the
-        // front of the record always decodes.
-        let key = decode_all(row, shape.key_columns)?;
+        // back verbatim. A key column stored out of line is read through the
+        // pool: the pages of a key extent were applied before the record that
+        // names them, so the read answers.
+        //
+        // **Unless a later write reused the extent's pages (bug hunt 9).** A key
+        // extent is freed only when its row is deleted or replaced, and a page freed
+        // that way can be allocated again before the next checkpoint. The page then
+        // holds a newer stamp than this record, its extent records are skipped by the
+        // page LSN rule, and the key cannot be read. The row it named was removed
+        // later in this same log, so the insert is skipped: replaying it was what left
+        // a database that had freed and reused such a page unopenable, with "page is
+        // not a blob extent".
+        let key = match resolved_key(database.pool(), &shape, row) {
+            Ok(key) => key,
+            Err(error) => {
+                if key_extent_reused_after(database.pool(), &shape, row, lsn)? {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
+        let key: Vec<Datum<'_>> = key.iter().map(OwnedDatum::borrow).collect();
         let spilled = holds_extent(row, shape.columns.len())?;
         let (collations, directions) = key_order(&shape);
+        let (located, slot) = locate_before_modify(
+            database.pool(),
+            page,
+            &key,
+            &shape,
+            &collations,
+            &directions,
+        )?;
         database.pool().modify(page, |bytes| {
             let mut leaf = LeafMut::new(bytes)?;
             // An insert replaces, exactly as the write path's does: whatever the
@@ -559,12 +677,16 @@ impl RowRedo for TreeRows {
             // order after whatever the key named has gone. A replay that put it
             // anywhere else would produce a page whose bytes differ from the
             // one the write left - valid, readable, and not the page the rest
-            // of the log was written against.
-            let (located, slot) = leaf
-                .view()?
-                .with_collations(&collations)
-                .with_directions(&directions)
-                .locate_slot(&key, shape.key_columns)?;
+            // of the log was written against. The search ran just before this,
+            // on the same page, because a key stored out of line is compared
+            // through the pool and a page being modified is not read through it.
+            // The write path writes a row the same length as the delta row it replaces over it;
+            // see `LeafMut::overwrite_delta`. Doing the same here keeps the page's bytes equal.
+            if let (Located::Delta(index), false) = (located, spilled) {
+                if leaf.overwrite_delta(index, row)? {
+                    return leaf.set_lsn(lsn);
+                }
+            }
             match located {
                 Located::Sorted(at) => {
                     leaf.set_tombstone(at)?;
@@ -600,13 +722,16 @@ impl RowRedo for TreeRows {
         let shape = self.shape(tree)?.clone();
         let values = decode_all(key, shape.key_columns)?;
         let (collations, directions) = key_order(&shape);
+        let (located, _) = locate_before_modify(
+            database.pool(),
+            page,
+            &values,
+            &shape,
+            &collations,
+            &directions,
+        )?;
         database.pool().modify(page, |bytes| {
             let mut leaf = LeafMut::new(bytes)?;
-            let located = leaf
-                .view()?
-                .with_collations(&collations)
-                .with_directions(&directions)
-                .locate(&values, shape.key_columns)?;
             match located {
                 Located::Sorted(at) => {
                     leaf.set_tombstone(at)?;
@@ -637,13 +762,16 @@ impl RowRedo for TreeRows {
         let values = decode_all(key, shape.key_columns)?;
         let (new_value, _) = Datum::decode_tagged(value)?;
         let (collations, directions) = key_order(&shape);
+        let (located, _) = locate_before_modify(
+            database.pool(),
+            page,
+            &values,
+            &shape,
+            &collations,
+            &directions,
+        )?;
         database.pool().modify(page, |bytes| {
             let mut leaf = LeafMut::new(bytes)?;
-            let located = leaf
-                .view()?
-                .with_collations(&collations)
-                .with_directions(&directions)
-                .locate(&values, shape.key_columns)?;
             let Located::Sorted(row) = located else {
                 // An in-place update is only ever logged against a row in the
                 // sorted region - that is the condition the write path checks
@@ -799,6 +927,12 @@ pub struct FreeMapChange {
     pub page: PageId,
     /// True for an `AllocPage`, false for a `FreePage`.
     pub allocated: bool,
+    /// For a `PageCount` record, the page count it carries; `None` for the others.
+    ///
+    /// Kept in this list because the page count has to move in log order with the
+    /// pages that are claimed and released: a page claimed after the count fell is
+    /// above the new end, and the count rises to take it in.
+    pub count: Option<u64>,
 }
 
 /// Applies records to a database file.
@@ -1036,7 +1170,15 @@ impl<R: RowRedo> Redo for Applier<'_, R> {
     }
 
     fn redo(&mut self, record: &Record<'_>, wanted: &[bool]) -> DbResult<()> {
-        self.redo_record(record, wanted)
+        self.redo_record(record, wanted).map_err(|error| {
+            let said = error.detail().unwrap_or_default().to_string();
+            error.with_detail(format!(
+                "record kind {} at lsn {} naming pages {:?}: {said}",
+                record.body.kind(),
+                record.lsn,
+                record.pages().as_slice()
+            ))
+        })
     }
 }
 
@@ -1060,6 +1202,65 @@ impl<R: RowRedo> Applier<'_, R> {
             }
         }
         Ok(())
+    }
+
+    /// Applies a `Relink` record: rewrites the one field that named a page that
+    /// moved.
+    ///
+    /// A site that names a page is applied only when the page-LSN rule says the
+    /// page still needs it. The meta record has no LSN, so a move of the first free
+    /// map page is applied when the record names the page the meta record still
+    /// holds, which is also true only once.
+    ///
+    /// @param from - the page number the field named
+    /// @param to - the page number it names now
+    /// @param site - which field
+    /// @param wanted - whether the page the site names still needs the record
+    /// @param lsn - the record's LSN
+    fn redo_relink(
+        &mut self,
+        from: u64,
+        to: u64,
+        site: RelinkSite,
+        wanted: &[bool],
+        lsn: u64,
+    ) -> DbResult<()> {
+        if site == RelinkSite::MapHead {
+            if self.database.meta().free_map == PageId(from) {
+                self.database.set_free_map_head(PageId(to));
+            }
+            return Ok(());
+        }
+        if !wanted.first().copied().unwrap_or(true) {
+            self.stats.skipped = self.stats.skipped.saturating_add(1);
+            return Ok(());
+        }
+        apply_relink(self.database.pool(), site, PageId(from), PageId(to), lsn).map_err(
+            |error| {
+                let said = error.detail().unwrap_or_default().to_string();
+                error.with_detail(format!("relinking page {from} to {to} at {site:?}: {said}"))
+            },
+        )?;
+        self.stats.rows = self.stats.rows.saturating_add(1);
+        Ok(())
+    }
+
+    /// Notes one change to the free map or to the page count, in log order.
+    ///
+    /// The caller applies the list after the scan, so a page freed and allocated
+    /// again inside the window ends allocated, and a page count that fell and rose
+    /// again ends where the last record left it.
+    ///
+    /// @param page - the page the record named, or none for a page count
+    /// @param allocated - true for an `AllocPage`
+    /// @param count - the page count a `PageCount` record carries
+    fn note_map_change(&mut self, page: PageId, allocated: bool, count: Option<u64>) {
+        self.free_map.push(FreeMapChange {
+            page,
+            allocated,
+            count,
+        });
+        self.stats.allocations = self.stats.allocations.saturating_add(1);
     }
 
     /// The body of [`Redo::redo`] for this applier.
@@ -1179,20 +1380,8 @@ impl<R: RowRedo> Applier<'_, R> {
                 )?;
                 self.stats.rows = self.stats.rows.saturating_add(1);
             }
-            Body::AllocPage { page } => {
-                self.free_map.push(FreeMapChange {
-                    page: PageId(page),
-                    allocated: true,
-                });
-                self.stats.allocations = self.stats.allocations.saturating_add(1);
-            }
-            Body::FreePage { page } => {
-                self.free_map.push(FreeMapChange {
-                    page: PageId(page),
-                    allocated: false,
-                });
-                self.stats.allocations = self.stats.allocations.saturating_add(1);
-            }
+            Body::AllocPage { page } => self.note_map_change(PageId(page), true, None),
+            Body::FreePage { page } => self.note_map_change(PageId(page), false, None),
             Body::Commit { cts } => self.stats.latest_cts = self.stats.latest_cts.max(cts),
             Body::Checkpoint { cts_watermark, .. } => {
                 self.stats.latest_cts = self.stats.latest_cts.max(cts_watermark)
@@ -1202,8 +1391,7 @@ impl<R: RowRedo> Applier<'_, R> {
             // is a compile error instead of a silent no-op.
             Body::Abort => {}
             Body::CatalogChange { .. } => self.stats.catalog_changed = true,
-            // Pure filler - see `inillucent_wal::record::Body::Pad` - so
-            // replaying one changes nothing.
+            // Pure filler, see `inillucent_wal::record::Body::Pad`: replaying one changes nothing.
             Body::Pad { .. } => {}
             // **A bulk build's pages were durable before this record was
             // appended**, so there is nothing to apply - see
@@ -1213,7 +1401,41 @@ impl<R: RowRedo> Applier<'_, R> {
             Body::BulkBuilt { count, .. } => {
                 self.stats.bulk_built = self.stats.bulk_built.saturating_add(count)
             }
+            Body::Format { version } => drop(self.database.raise_format(version)),
+            Body::Relink { from, to, site } => self.redo_relink(from, to, site, wanted, lsn)?,
+            Body::PageCount { pages } => self.note_map_change(PageId::NONE, false, Some(pages)),
         }
         Ok(())
     }
+}
+
+/// Puts the free map's and the page count's changes back, in log order.
+///
+/// **In log order.** Claiming every allocation and then releasing every free gave
+/// the frees the last word, so a page freed and allocated again inside the
+/// replayed range came back free while it was live. A `PageCount` record lowers
+/// the page count at its place in that order; a page claimed after it raises the
+/// count again. When the whole list is applied, every page the pool holds at or
+/// above the final count is dropped without being written, because it is free.
+///
+/// @param database - the file being recovered
+/// @param changes - what the replay did to the free map and the page count
+pub fn apply_free_map_changes(database: &mut Database, changes: &[FreeMapChange]) -> DbResult<()> {
+    let mut lowered = false;
+    for change in changes {
+        match (change.count, change.allocated) {
+            (Some(pages), _) => {
+                if pages < database.pool().page_count() {
+                    database.lower_page_count(pages);
+                    lowered = true;
+                }
+            }
+            (None, true) => database.claim(change.page)?,
+            (None, false) => database.release(change.page, 1)?,
+        }
+    }
+    if lowered {
+        database.discard_beyond_page_count()?;
+    }
+    Ok(())
 }

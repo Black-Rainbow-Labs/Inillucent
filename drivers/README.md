@@ -82,7 +82,7 @@ The Python conformance runner prints the size of the table when it finishes:
 
 ```
 $ python drivers/bindings/python/run_conformance.py
-55 capabilities reported
+57 capabilities reported
 ```
 
 The 52 rows are 34 `yes`, 2 `partial` and 16 `no`. The two `partial` rows are:
@@ -302,8 +302,8 @@ Every binding follows the same six steps.
 | `INILLUCENT_CORRUPT` | 8 | The file is damaged |
 | `INILLUCENT_IO` | 9 | The operating system reported an error |
 | `INILLUCENT_FULL` | 10 | The disk is full |
-| `INILLUCENT_TOO_BIG` | 11 | A value or result exceeds a limit, or the page cache ran out of pages it could give up |
-| `INILLUCENT_INVALID_STATE` | 12 | The caller broke the ABI's contract. `INILLUCENT_MISUSE` is the same value |
+| `INILLUCENT_TOO_BIG` | 11 | A value or result exceeds a limit, or the page cache ran out of pages it could give up. `inillucent_bind_text` and `inillucent_bind_blob` answer it for a length above 2147483647 bytes, without reading the buffer |
+| `INILLUCENT_INVALID_STATE` | 12 | The caller broke the ABI's contract. `INILLUCENT_MISUSE` is the same value. It is also the status of text that holds a second statement, passed to `inillucent_execute`, `inillucent_prepare` or `inillucent_txn_execute`, which run one statement (`inillucent_execute_batch` runs several), and of `BEGIN` inside a transaction or `COMMIT` or `ROLLBACK` with none open |
 | `INILLUCENT_INTERNAL` | 13 | A defect in inillucent. Please report it |
 
 ### The three ownership rules
@@ -349,6 +349,12 @@ in SQLite, `changes()`, `total_changes()` and `last_insert_rowid()` answer for t
 asks: a statement on one session does not move another session's numbers. In C,
 `inillucent_connect` opens a session and the `inillucent_conn` handle keeps it. Every call on that
 handle runs in the same session.
+
+Two connections of one `Database` share one transaction. A `BEGIN` on either is joined by the
+other, and a write through the first is undone by a `ROLLBACK` on the second. Sessions separate
+`temp.` tables, `ATTACH`, pragmas and the counters. They do not separate transactions. An
+application that needs isolated connections opens a second `Database` on the same file, which takes
+the file lock the way a second process does.
 
 A Rust caller that holds a connection for a long time needs one more step. `Connection<'d>` borrows
 the `Database`, so one Rust struct cannot hold both. Such a caller holds the `Database`, makes a

@@ -521,3 +521,30 @@ fn a_full_pool_reads_again_after_it_is_discarded() {
         assert_eq!(page::read_u64(&guard, 32).unwrap(), page);
     }
 }
+
+/// A wait for a lock sleeps 1, 2, 4 and 8 ms and then no more than
+/// `crate::busy::LONGEST_BUSY_PAUSE` between tries, however long it has waited.
+///
+/// A sleep that kept growing let a process that had just begun waiting take
+/// the lock ahead of one that had waited seconds: with 16 processes running
+/// `BEGIN IMMEDIATE`, the slowest transaction waited 4.9 s of a 5 s busy
+/// timeout. With the short sleep it waited under 2 s.
+#[test]
+fn a_long_wait_for_a_lock_keeps_trying_every_few_milliseconds() {
+    let mut pause = 1u64;
+    let mut waited = 0u64;
+    let mut pauses = Vec::new();
+    while waited < 5_000 {
+        pauses.push(pause);
+        waited += pause;
+        pause = crate::busy::next_busy_pause(pause, waited);
+    }
+    assert_eq!(pauses.get(..4), Some(&[1, 2, 4, 8][..]));
+    assert!(
+        pauses
+            .iter()
+            .skip(4)
+            .all(|pause| *pause <= crate::busy::LONGEST_BUSY_PAUSE && *pause >= 2),
+        "a pause past the first four was outside 2 to 3 ms: {pauses:?}"
+    );
+}

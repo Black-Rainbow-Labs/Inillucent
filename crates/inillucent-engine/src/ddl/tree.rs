@@ -100,7 +100,9 @@ impl crate::ImportedDatabase {
                 session,
                 at,
             )?;
-            PagedTree::bulk_build_rows(
+            // The data file is synced by `commit_across` before the commit, once for every tree
+            // the transaction built.
+            PagedTree::bulk_build_rows_syncing(
                 database,
                 Some(&mut log),
                 // **The file's own number, not the connection's.** Every record
@@ -110,8 +112,13 @@ impl crate::ImportedDatabase {
                 columns,
                 key_columns,
                 rows,
+                false,
             )?
         };
+        // In a file that keeps its roots at the start, the root goes to the first
+        // page above the largest root before the catalog row names it.
+        let txn = self.current_txn();
+        let tree = self.place_root(at, txn, tree)?;
         let page = tree.root();
         self.schema.trees.insert(root, tree);
         self.schema.layouts.insert(root, std::rc::Rc::new(layout));
@@ -228,6 +235,7 @@ impl crate::ImportedDatabase {
                 });
             }
         }
+        self.writing.note_root_released(at);
         self.session_state.owner.remove(&root);
         self.schema.trees.remove(&root);
         self.schema.layouts.remove(&root);

@@ -301,11 +301,6 @@ impl Component {
 /// @param context - the surface, which may be confined
 /// @param arguments - what was asked for
 pub fn setup_embeddings(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
-    let root = match arguments.text("dir") {
-        Some(named) => context.confine(named)?,
-        None => install::home(),
-    };
-
     // A bare `inillucent setup-embeddings` reports and installs nothing.
     //
     // The command downloads about 620 MB, and a verb typed to find out what it
@@ -326,6 +321,9 @@ pub fn setup_embeddings(context: &mut Context, arguments: &Arguments) -> Result<
     };
 
     let machine = machine_settings(arguments)?;
+    let status_only =
+        (arguments.flag("status") || named.is_empty()) && residency.is_none() && !machine.any();
+    let root = install_root(context, arguments, status_only)?;
 
     if arguments.flag("status") || named.is_empty() {
         // Changing when the model is in memory, how many threads it uses or which
@@ -442,6 +440,46 @@ pub fn setup_embeddings(context: &mut Context, arguments: &Arguments) -> Result<
         outcome = outcome.with(&name, value);
     }
     Ok(outcome)
+}
+
+/// Returns the folder the embedder is installed under for this call.
+///
+/// **A server started with `--root` writes nowhere else.** With no `dir` this
+/// used the user's install directory under the profile, so a call over MCP
+/// changed the settings file there, or downloaded 620 MB into it, although the
+/// operator had confined the server to one directory. A confined surface now
+/// needs `dir`, which `confine` keeps inside the root. A call that only reports
+/// the status writes nothing and still reads the default.
+///
+/// @param context - the surface, which may be confined
+/// @param arguments - what was asked for
+/// @param status_only - whether the call writes nothing
+fn install_root(
+    context: &Context,
+    arguments: &Arguments,
+    status_only: bool,
+) -> Result<std::path::PathBuf, Failed> {
+    if let Some(named) = arguments.text("dir") {
+        return context.confine(named);
+    }
+    let home = install::home();
+    if context.confined() && !status_only {
+        context
+            .confine(&home.to_string_lossy())
+            .map_err(|refused| {
+                Failed::said(
+                    refused.status,
+                    format!(
+                        "with no 'dir', setup-embeddings installs under {}, which this \
+                         server is not allowed to write. Pass 'dir' naming a folder inside the \
+                         root. ({})",
+                        home.display(),
+                        refused.message
+                    ),
+                )
+            })?;
+    }
+    Ok(home)
 }
 
 /// Returns the folder `--from` names, refusing it for the runtime, which is always downloaded.

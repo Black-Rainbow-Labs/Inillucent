@@ -56,4 +56,5 @@ pub mod rowshape;
 pub mod state;
 pub mod statements;
 pub mod tables;
+pub mod undo;
 pub mod write;

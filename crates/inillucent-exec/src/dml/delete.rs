@@ -377,6 +377,7 @@ fn delete_unwatched(
             count_row(&mut changes, target, depth);
         }
     }
+    finish_deletes(target, table.root)?;
     for ((_, index), held) in maintained(table).zip(entries.iter()) {
         let ordered = sorted_by_tree(target, index.root, held.iter().map(Vec::as_slice).collect())?;
         let values: Vec<Datum<'_>> = ordered
@@ -400,8 +401,21 @@ fn delete_unwatched(
                 false,
             )?);
         }
+        finish_deletes(target, index.root)?;
     }
     Ok(changes)
+}
+/// Takes the leaves a tree's sorted deletes emptied out of the tree, now that the statement has
+/// no more keys for it (task-2226); see `PagedTree::finish_deletes`.
+///
+/// @param target - the file and its trees
+/// @param root - the tree
+fn finish_deletes(target: &mut dyn WriteTarget, root: u32) -> DbResult<()> {
+    let (database, trees, log) = target.parts_for(root)?;
+    match trees.get_mut(root) {
+        Some(tree) => tree.finish_deletes(database, log),
+        None => Ok(()),
+    }
 }
 /// Cuts a buffer of key values into one slice per key.
 ///
@@ -521,22 +535,32 @@ fn remove_then(
         return Ok(false);
     }
     remove_row(table, layout, target, key, row, indexes)?;
-    between(target)?;
-    fire(
-        triggers,
-        TriggerTime::After,
-        target,
-        &trigger::TriggerFiring {
-            rows: trigger::TriggerRows {
-                old: Some(row),
-                new: None,
-            },
-            slots: &layout.slots,
-            rowid: layout.rowid,
-            params,
-            depth,
+    let after = trigger::TriggerFiring {
+        rows: trigger::TriggerRows {
+            old: Some(row),
+            new: None,
         },
-    )?;
+        slots: &layout.slots,
+        rowid: layout.rowid,
+        params,
+        depth,
+    };
+    // **The keys' actions, then `RETURNING`, then the `AFTER` triggers.** That
+    // is SQLite's order for each row: a cascade has already removed the
+    // children when `RETURNING` is computed, and a user's `AFTER` trigger has
+    // not yet run. `RETURNING` used to be computed before the cascade, so a
+    // subquery in it counted children the statement was deleting.
+    let action = |held: &inillucent_sql::dml::BoundTrigger| {
+        held.foreign_key && inillucent_sql::dml::changes_rows(held)
+    };
+    trigger::fire_where(triggers, TriggerTime::After, target, &after, &|held| {
+        action(held) && (!replacing || held.foreign_key)
+    })?;
+    between(target)?;
+    let recursive = !replacing || params.recursive_triggers();
+    trigger::fire_where(triggers, TriggerTime::After, target, &after, &|held| {
+        !action(held) && (held.foreign_key || recursive)
+    })?;
     Ok(true)
 }
 /// Removes one row and every index entry that named it.

@@ -62,14 +62,25 @@ impl Sink for Filter {
     fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
         self.saw_rows = true;
         self.selection.clear();
-        for nth in 0..batch.live() {
-            // SQL's WHERE keeps a row only when the predicate is definitely
-            // true: NULL is not true, and the three-valued logic in `expr`
-            // produces NULL rather than false so the distinction survives to
-            // here.
-            let verdict = self.predicate.value(batch, nth)?;
-            if crate::expr::truth(&verdict.get()) == Some(true) {
-                self.selection.push(batch.row_at(nth) as u32);
+        // A predicate that can judge the whole batch in one loop does, and
+        // gives the verdicts `value` would; see `Eval::truths_over`.
+        let mut truths = Vec::new();
+        if self.predicate.truths_over(batch, &mut truths) && truths.len() == batch.live() {
+            for (nth, kept) in truths.iter().enumerate() {
+                if *kept {
+                    self.selection.push(batch.row_at(nth) as u32);
+                }
+            }
+        } else {
+            for nth in 0..batch.live() {
+                // SQL's WHERE keeps a row only when the predicate is definitely
+                // true: NULL is not true, and the three-valued logic in `expr`
+                // produces NULL rather than false so the distinction survives to
+                // here.
+                let verdict = self.predicate.value(batch, nth)?;
+                if crate::expr::truth(&verdict.get()) == Some(true) {
+                    self.selection.push(batch.row_at(nth) as u32);
+                }
             }
         }
         if self.selection.is_empty() {

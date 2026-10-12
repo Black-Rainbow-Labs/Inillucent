@@ -25,6 +25,9 @@ mod covering;
 mod describe;
 mod flatten;
 mod hint;
+mod implied;
+mod join_cost;
+mod limit_walk;
 mod order_constant;
 mod outer_paths;
 mod partial;
@@ -40,6 +43,7 @@ use covering::covering_slots;
 use describe::{index_seek_detail, range_detail};
 pub use hint::unanswerable_index_hint;
 use hint::{forced_path, index_usable, outer_terms};
+use join_cost::{joined_in_order, ordered_output_cost, residual_share};
 use outer_paths::{choose_term_path, derived_affinities, hold_terms_before_right_joins, TermPath};
 use partial::implies;
 pub use pushdown::{calls_a_volatile_function, is_repeatable_condition};
@@ -774,8 +778,17 @@ impl Levers {
     /// disables this one, and the outermost scan of a query with no `ORDER BY`
     /// then runs backwards, as SQLite's does.
     pub const FORWARD_UNORDERED: u32 = 128;
+    /// Read the table of a correlated subquery once into a hash table, when the
+    /// subquery compares one of its columns with a column of the enclosing query.
+    ///
+    /// Works only while `AUTOMATIC_INDEX` is on as well. It is a lever of its
+    /// own because the statements that change data do not carry the connection's
+    /// levers to the subqueries they run, and those subqueries keep scanning:
+    /// their plans are made with this one off, so the plan text says what runs.
+    pub const BLOCK_TABLE: u32 = 256;
     /// Every lever this build has.
-    pub const EVERY: u32 = Levers::FORWARD_UNORDERED
+    pub const EVERY: u32 = Levers::BLOCK_TABLE
+        | Levers::FORWARD_UNORDERED
         | Levers::PLAN_CACHE
         | Levers::COVERING_INDEX
         | Levers::INDEXED_WRITE
@@ -854,7 +867,8 @@ fn plan_block(select: BoundSelect, levers: Levers, in_compound: bool) -> Physica
     flatten::unshare_coroutines(&mut select);
     pushdown::push_into_derived_tables(&mut select);
     let compound_arms = core::mem::take(&mut select.compounds);
-    let (terms, owners) = hint::statement_terms_with_owners(&select);
+    let (mut terms, owners) = hint::statement_terms_with_owners(&select);
+    let stated_terms = implied::add_leading_bounds(&mut terms, owners.is_empty());
     let held_before = hint::terms_held_before_a_right_join(&select, &owners);
     // The order the terms are visited in is chosen before their paths are, and
     // then the paths are chosen in that order - because a path may use a value
@@ -925,7 +939,7 @@ fn plan_block(select: BoundSelect, levers: Levers, in_compound: bool) -> Physica
         });
     }
     hold_terms_before_right_joins(&select, &terms, &held_before, &mut consumed, &mut sources);
-    let (residuals, constant_filter) = distribute_residuals(&terms, &consumed, &ids);
+    let (residuals, constant_filter) = distribute_residuals(&terms, &consumed, &ids, stated_terms);
     let aggregation = if !select.group_by.is_empty() {
         AggregationMode::Grouped
     } else if !select.aggregates.is_empty() {
@@ -973,7 +987,8 @@ fn plan_block(select: BoundSelect, levers: Levers, in_compound: bool) -> Physica
         && select.windows.is_empty()
         && select.compounds.is_empty()
         && ((aggregation == AggregationMode::None && !select.distinct) || streamed_in_order);
-    let provided = if single {
+    let ordered_join = joined_in_order(&select, sources.len(), levers, aggregation);
+    let provided = if single || ordered_join {
         sources
             .first()
             .and_then(|outer| ordering_provided(&select, outer.id, &outer.table, &outer.path))
@@ -1468,16 +1483,21 @@ fn order_cost(select: &BoundSelect, terms: &[BoundExpr], order: &[usize], levers
     let mut consumed = vec![false; terms.len()];
     let mut total = 0.0f64;
     let mut outer_rows = 1.0f64;
+    let mut first_provides = false;
     for (level, position) in order.iter().enumerate() {
         let Some(source) = select.sources.get(*position) else {
             continue;
         };
         let path = choose_path(level, &ids, source, select, terms, &mut consumed, levers);
+        if level == 0 {
+            first_provides = ordering_provided(select, source.id, &source.table, &path).is_some();
+        }
         let (cost, rows) = path_cost(source, &path);
         total += outer_rows * cost;
-        outer_rows *= rows.max(1.0);
+        let kept = rows * residual_share(select, terms, &consumed, &ids, level, source);
+        outer_rows *= kept.max(1.0);
     }
-    total
+    ordered_output_cost(select, levers, total, outer_rows, first_provides)
 }
 
 /// Returns the vector probe a `TopN` over a distance can use, when it can.
@@ -1858,7 +1878,11 @@ fn distribute_residuals(
     terms: &[BoundExpr],
     consumed: &[bool],
     ids: &[usize],
+    stated: usize,
 ) -> (Vec<Option<BoundExpr>>, Option<BoundExpr>) {
+    // Terms past `stated` were implied by the statement's own and are only worth testing when an
+    // access path used them, which makes them consumed; the others are not tested again.
+    let terms = terms.get(..stated).unwrap_or(terms);
     let levels = ids.len();
     let mut residuals: Vec<Option<BoundExpr>> = vec![None; levels];
     let mut constant: Option<BoundExpr> = None;
@@ -2027,67 +2051,15 @@ fn choose_path(
     // one that does not by the whole cost of the sort it saves, which is how a
     // `LIMIT 50` over six hundred thousand rows becomes fifty rows read rather
     // than six hundred thousand read, sorted and thrown away.
-    let sort = sort_penalty(select, position, source, levers);
-    let mut best: Option<(f64, AccessPath, Vec<bool>)> = None;
-    for (path, trial) in candidates {
-        let (mut cost, _) = path_cost(source, &path);
-        if !levers.has(Levers::ORDERED_WALK)
-            || ordering_provided(select, id, table, &path).is_none()
-        {
-            cost += sort;
-        }
-        if best
-            .as_ref()
-            .is_none_or(|(existing, _, _)| cost < *existing - 1e-9)
-        {
-            best = Some((cost, path, trial));
-        }
-    }
-    match best {
-        Some((_, path, trial)) => {
-            consumed.copy_from_slice(&trial);
-            path
-        }
-        None => AccessPath::TableScan { root: table.root },
-    }
-}
-
-/// Returns what a sort would cost this term, or nothing when no path could
-/// avoid one anyway.
-///
-/// Only the outermost term of a single-term statement can answer an `ORDER BY`
-/// by walking: an inner loop restarts for every outer row, and the order it
-/// produces inside one of those runs is not the order of the result. Charging
-/// the sort anywhere else would tilt a plan towards an index for a saving it
-/// would not make.
-/// @param select - the bound statement
-/// @param position - which visiting position this term is at
-/// @param source - the term being priced
-fn sort_penalty(
-    select: &BoundSelect,
-    position: usize,
-    source: &BoundSource,
-    levers: Levers,
-) -> f64 {
-    // A grouped or DISTINCT statement that streams over the walk answers its
-    // ORDER BY the same way an ungrouped one does, so it is priced the same
-    // way. Charging it the sort regardless would hide the saving that makes the
-    // index path worth taking.
-    let streams = levers.has(Levers::STREAMING_GROUP)
-        && ((!select.group_by.is_empty() && !select.distinct)
-            || (select.distinct && select.group_by.is_empty() && select.aggregates.is_empty()));
-    let answerable = levers.has(Levers::ORDERED_WALK)
-        && position == 0
-        && select.sources.len() == 1
-        && select.windows.is_empty()
-        && select.compounds.is_empty()
-        && !select.order_by.is_empty()
-        && ((select.group_by.is_empty() && select.aggregates.is_empty() && !select.distinct)
-            || streams);
-    if !answerable {
-        return 0.0;
-    }
-    cost::sort_cost(estimated_rows(&source.table))
+    let term = limit_walk::PathChoice {
+        position,
+        id,
+        source,
+        select,
+        terms,
+        levers,
+    };
+    limit_walk::cheapest(&term, consumed, candidates)
 }
 
 /// Builds the offer a virtual table's module will be shown.
@@ -2556,6 +2528,8 @@ fn index_candidate(
     let mut collations = Vec::new();
     let mut descending = Vec::new();
     let mut columns: Vec<Option<u16>> = Vec::new();
+    // The terms an equality on a computed key consumed; see `needed_beyond_expressions`.
+    let mut expression_terms: Vec<usize> = Vec::new();
     let mut key = 0usize;
     while let Some(key_column) = index.columns.get(key) {
         let collation = collation_of(&key_column.collation);
@@ -2588,6 +2562,11 @@ fn index_candidate(
         }
         equalities.push(value);
         used.push(term_index);
+        // A key on a generated column is left out, as SQLite leaves it out: it counts the
+        // column as read, so the index does not cover it.
+        if key_column.plain_column().is_none() && key_column.column.is_none() {
+            expression_terms.push(term_index);
+        }
         collations.push(collation);
         descending.push(key_column.descending);
         columns.push(column);
@@ -2618,7 +2597,15 @@ fn index_candidate(
     } else {
         None
     };
-    let covering_need = beyond.as_ref().map_or(needed, |(reduced, _)| reduced);
+    let beyond_expressions = match beyond {
+        None => covering::needed_beyond_expressions(id, needed, terms, &expression_terms),
+        Some(_) => None,
+    };
+    let covering_need = beyond
+        .as_ref()
+        .map(|(reduced, _)| reduced)
+        .or(beyond_expressions.as_ref())
+        .unwrap_or(needed);
     let covering = levers
         .has(Levers::COVERING_INDEX)
         .then(|| covering_slots(table, index, covering_need, usable))

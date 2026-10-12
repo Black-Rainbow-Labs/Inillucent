@@ -162,7 +162,7 @@ fn queries_for(shape: &Shape) -> Vec<String> {
             // different structures and so different orders. Ordering the
             // input first is the only way to ask a question with one answer.
             format!(
-                "SELECT group_concat({quoted}, '-') FROM                  (SELECT {quoted} FROM \"{table}\" ORDER BY {quoted})"
+                "SELECT group_concat({quoted}, '-') FROM (SELECT {quoted} FROM \"{table}\" ORDER BY {quoted})"
             ),
             // Limits, including the zero that once returned a row.
             format!("SELECT * FROM \"{table}\" ORDER BY {quoted}, {all} LIMIT 0"),
@@ -173,7 +173,7 @@ fn queries_for(shape: &Shape) -> Vec<String> {
             // that caught the executor rendering `1e300` as three hundred and
             // one digits.
             format!(
-                "SELECT {quoted}, typeof({quoted}), length({quoted})                  FROM \"{table}\" ORDER BY 1, 2, 3"
+                "SELECT {quoted}, typeof({quoted}), length({quoted}) FROM \"{table}\" ORDER BY 1, 2, 3"
             ),
             format!("SELECT * FROM \"{table}\" WHERE {quoted} = {quoted}"),
         ]);

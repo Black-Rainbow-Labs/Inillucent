@@ -18,7 +18,7 @@ use inillucent_sql::plan::{PhysicalPlan, RecursiveQueue};
 use inillucent_tree::datum::OwnedDatum;
 use inillucent_value::collation::Collation;
 
-use crate::ops::{compare_by, SortKey};
+use crate::ops::{compare_by, Flow, Sink, SortKey};
 use crate::physical::{
     constant_count, prepare_any, run_any, run_any_prepared, Negative, Params, Prepared,
     TreeCatalog, WithQueue,
@@ -78,7 +78,7 @@ pub(crate) fn run_recursive(
     .flatten()
     .min();
     let produced = if queue.order_by.is_empty() {
-        fill_in_passes(recursion, wanted)?
+        fill_in_passes(recursion, wanted, None)?
     } else {
         fill_in_order(recursion, wanted)?
     };
@@ -89,13 +89,101 @@ pub(crate) fn run_recursive(
     })
 }
 
+/// Hands a recursion's rows to the operator above it while the recursion is still running.
+///
+/// **Why the rows are handed over early.** `WITH RECURSIVE r(n) AS (SELECT 1
+/// UNION ALL SELECT n+1 FROM r) SELECT n FROM r WHERE n>3 LIMIT 2` has no
+/// `LIMIT` the fill loop can see, because the `WHERE` sits between the
+/// recursion and the `LIMIT`. A fill that ran to its fixed point first never
+/// returned. SQLite runs the CTE as a coroutine that the outer query pulls
+/// from, so here the loop pushes its rows downstream in growing chunks and
+/// stops when the sink answers [`Flow::Stop`]. The chunks start at one row so
+/// a query that needs two rows computes about two, and double up to a batch
+/// so a long counter does not push a one row batch per pass.
+pub(crate) struct Streamer<'s> {
+    /// The operator chain that reads the rows.
+    sink: &'s mut dyn Sink,
+    /// How many rows of the answer the sink has already been given.
+    flushed: usize,
+    /// How many unsent rows are enough to send a chunk.
+    threshold: usize,
+}
+
+impl<'s> Streamer<'s> {
+    /// Returns a streamer that has sent nothing.
+    ///
+    /// @param sink - the operator chain that reads the rows
+    pub(crate) fn new(sink: &'s mut dyn Sink) -> Streamer<'s> {
+        Streamer {
+            sink,
+            flushed: 0,
+            threshold: 1,
+        }
+    }
+
+    /// Sends the rows not yet sent when there are enough of them, or when this is the last call.
+    ///
+    /// @param answer - every row the recursion has produced so far
+    /// @param last - whether the recursion has ended, which sends whatever is left
+    fn offer(&mut self, answer: &[Vec<OwnedDatum>], last: bool) -> DbResult<Flow> {
+        let pending = answer.len().saturating_sub(self.flushed);
+        if pending == 0 || (!last && pending < self.threshold) {
+            return Ok(Flow::Continue);
+        }
+        let flow = crate::ops::emit_rows(answer.get(self.flushed..).unwrap_or(&[]), self.sink)?;
+        self.flushed = answer.len();
+        self.threshold = self
+            .threshold
+            .saturating_mul(2)
+            .min(crate::batch::BATCH_ROWS);
+        Ok(flow)
+    }
+}
+
+/// Runs a recursive CTE that has no queue clauses and pushes its rows downstream as it goes.
+///
+/// @param recursion - what the CTE is filled from
+/// @param sink - the operator chain that reads the rows
+pub(crate) fn stream_recursive(recursion: &Recursion<'_>, sink: &mut dyn Sink) -> DbResult<()> {
+    let mut streamer = Streamer::new(sink);
+    fill_in_passes(recursion, None, Some(&mut streamer))?;
+    Ok(())
+}
+
+/// Sends the last rows of a finished recursion to the streamer, if there is one.
+///
+/// @param stream - the streamer, when the rows are being streamed
+/// @param answer - every row the recursion produced
+fn settle(stream: &mut Option<&mut Streamer<'_>>, answer: &[Vec<OwnedDatum>]) -> DbResult<()> {
+    match stream {
+        Some(stream) => stream.offer(answer, true).map(|_| ()),
+        None => Ok(()),
+    }
+}
+
+/// Offers the rows produced so far to the streamer and reports whether the sink wants no more.
+///
+/// @param stream - the streamer, when the rows are being streamed
+/// @param answer - every row the recursion has produced so far
+fn sink_is_full(
+    stream: &mut Option<&mut Streamer<'_>>,
+    answer: &[Vec<OwnedDatum>],
+) -> DbResult<bool> {
+    match stream {
+        Some(stream) => Ok(stream.offer(answer, false)? == Flow::Stop),
+        None => Ok(false),
+    }
+}
+
 /// Fills a recursive CTE whose queue is taken in the order rows were added.
 ///
 /// @param recursion - what the CTE is filled from
 /// @param limit - how many rows are needed, counting any offset, when known
+/// @param stream - where to push the rows as they are produced, when the caller reads them as a stream
 fn fill_in_passes(
     recursion: &Recursion<'_>,
     limit: Option<usize>,
+    mut stream: Option<&mut Streamer<'_>>,
 ) -> DbResult<Vec<Vec<OwnedDatum>>> {
     let Recursion {
         cte,
@@ -122,6 +210,9 @@ fn fill_in_passes(
     let mut seen = SetKeys::new(collations);
     if distinct {
         answer.retain(|row| seen.remember(row));
+    }
+    if sink_is_full(&mut stream, &answer)? {
+        return Ok(answer);
     }
     // **Each step arm is prepared once, not once a pass (task-2175).** The
     // structural choice reads the trees the arm names and not the queue,
@@ -171,6 +262,7 @@ fn fill_in_passes(
     loop {
         inillucent_base::budget::check()?;
         if working.is_empty() || enough(&answer) {
+            settle(&mut stream, &answer)?;
             return Ok(answer);
         }
         let queued = WithQueue {
@@ -193,6 +285,7 @@ fn fill_in_passes(
             fresh.retain(|row| seen.remember(row));
         }
         if fresh.is_empty() {
+            settle(&mut stream, &answer)?;
             return Ok(answer);
         }
         // **The answer accumulates across passes (task-1932, H6).** A
@@ -205,7 +298,11 @@ fn fill_in_passes(
         }
         let start = answer.len();
         answer.extend(fresh);
+        if sink_is_full(&mut stream, &answer)? {
+            return Ok(answer);
+        }
         if enough(&answer) {
+            settle(&mut stream, &answer)?;
             return Ok(answer);
         }
         working = start..answer.len();

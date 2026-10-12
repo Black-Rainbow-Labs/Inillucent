@@ -410,6 +410,11 @@ impl Vfs for CryptVfs {
         self.inner.access(path, mode)
     }
 
+    /// Passes the file number through: an encrypted file is the same file underneath.
+    fn file_number_by_name(&self, path: &DbPath) -> VfsResult<Option<u128>> {
+        self.inner.file_number_by_name(path)
+    }
+
     /// Passes path resolution through.
     fn full_pathname(&self, path: &DbPath) -> VfsResult<DbPath> {
         self.inner.full_pathname(path)

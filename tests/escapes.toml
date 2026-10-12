@@ -352,3 +352,14 @@ held_by = [
   "inillucent-compat::process_storm::a_storm_in_the_shape_of_the_2_0_7_damage_report_loses_nothing",
   "inillucent-compat::process_storm::a_storm_in_the_shape_of_the_2_0_7_damage_report_with_kills_loses_nothing",
 ]
+
+[[escape]]
+ref = "bug hunt, keys over a page"
+surface = "indexes and primary keys, the page layout"
+what = "a 50,000 character value in an indexed TEXT column was refused with `this row is larger than a page even with its large values stored outside it; a key column is never stored outside the page`, and an index over keys of about 17 KB could fail to split with `bad parameter or other API misuse`. SQLite accepts both. A key column was the one value never stored out of line, so a key over about 32 KB had no page to live on and two keys of about 17 KB could not share a leaf"
+found_by = "the bug hunt's schema survey, which only used keys of a few dozen bytes because no workload in the gate holds a key over 4,096 bytes"
+held_by = [
+  "inillucent-compat::new_engine_long_keys::a_fifty_thousand_character_indexed_value_is_stored_and_found",
+  "inillucent-compat::new_engine_long_keys::three_keys_of_seventeen_thousand_bytes_inserted_small_large_large",
+  "inillucent-compat::long_keys_at_every_page_size::a_thousand_keys_of_twenty_kilobytes_are_stored_found_and_given_back",
+]

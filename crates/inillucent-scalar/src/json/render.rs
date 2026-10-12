@@ -122,43 +122,52 @@ fn push_indent(out: &mut String, indent: &str, depth: usize) {
 
 /// Converts a JSON5 integer to its RFC-8259 spelling.
 pub fn integer5_to_json(text: &str) -> String {
-    match integer5_value(text) {
-        Some(value) => value.to_string(),
+    match integer5_parts(text) {
+        Some((negative, magnitude)) => {
+            let sign = if negative { "-" } else { "" };
+            match magnitude {
+                Some(magnitude) => format!("{sign}{magnitude}"),
+                // More than 16 significant hex digits is written as an overflowing real.
+                None => format!("{sign}9.0e999"),
+            }
+        }
         None => text.trim_start_matches('+').to_string(),
     }
 }
 
-/// Returns the value of a JSON5 integer literal.
+/// Splits a JSON5 integer literal into its sign and its magnitude.
 ///
-/// Hexadecimal wraps rather than saturating, which is what SQLite's own
-/// conversion does; a literal that does not fit is a strange thing to write
-/// and neither engine reports it.
-pub fn integer5_value(text: &str) -> Option<i64> {
+/// **The magnitude is an unsigned 64 bit number, and a hex literal wider than that has none.**
+/// SQLite writes `0x8000000000000000` as 9223372036854775808 and `0xFFFFFFFFFFFFFFFF` as
+/// 18446744073709551615. Wrapping the digits into a signed number gave -9223372036854775808
+/// and -1. Past 16 significant hex digits the magnitude is `None`, which SQLite writes as
+/// `9.0e999`. The sign stays beside it, so `-0x1` is -1 and `-0x0` is `-0`.
+///
+/// Returns `None` for a literal that is neither hex nor a decimal integer that fits.
+///
+/// @param text - the literal as written
+pub fn integer5_parts(text: &str) -> Option<(bool, Option<u64>)> {
     let (negative, digits) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, text.strip_prefix('+').unwrap_or(text)),
     };
-    let value = if let Some(hex) = digits
+    let Some(hex) = digits
         .strip_prefix("0x")
         .or_else(|| digits.strip_prefix("0X"))
-    {
-        let mut accumulator: u64 = 0;
-        if hex.is_empty() {
-            return None;
-        }
-        for digit in hex.chars() {
-            let digit = digit.to_digit(16)?;
-            accumulator = accumulator.wrapping_mul(16).wrapping_add(u64::from(digit));
-        }
-        accumulator as i64
-    } else {
-        digits.parse::<i64>().ok()?
+    else {
+        return Some((negative, Some(digits.parse::<u64>().ok()?)));
     };
-    Some(if negative {
-        value.wrapping_neg()
-    } else {
-        value
-    })
+    if hex.is_empty() {
+        return None;
+    }
+    let mut accumulator: u64 = 0;
+    let mut overflow = false;
+    for digit in hex.trim_start_matches('0').chars() {
+        let digit = digit.to_digit(16)?;
+        overflow |= accumulator >> 60 != 0;
+        accumulator = accumulator.wrapping_mul(16).wrapping_add(u64::from(digit));
+    }
+    Some((negative, (!overflow).then_some(accumulator)))
 }
 
 /// Converts a JSON5 float to its RFC-8259 spelling.

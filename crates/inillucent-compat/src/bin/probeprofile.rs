@@ -284,17 +284,17 @@ fn decompose(database: &ImportedDatabase, rows: u32) -> Result<(), String> {
         ),
         (
             "span + index probe",
-            "SELECT count(*) FROM main_table JOIN side_table ON side_table.owner =              main_table.id WHERE main_table.key BETWEEN ?1 AND ?1 + 200",
+            "SELECT count(*) FROM main_table JOIN side_table ON side_table.owner = main_table.id WHERE main_table.key BETWEEN ?1 AND ?1 + 200",
             true,
         ),
         (
             "span + probe + rowid lookup",
-            "SELECT count(side_table.note) FROM main_table JOIN side_table ON              side_table.owner = main_table.id WHERE main_table.key BETWEEN ?1 AND ?1 + 200",
+            "SELECT count(side_table.note) FROM main_table JOIN side_table ON side_table.owner = main_table.id WHERE main_table.key BETWEEN ?1 AND ?1 + 200",
             true,
         ),
         (
             "point probe + index probe",
-            "SELECT count(*) FROM main_table JOIN side_table ON side_table.owner =              main_table.id WHERE main_table.id = ?1",
+            "SELECT count(*) FROM main_table JOIN side_table ON side_table.owner = main_table.id WHERE main_table.id = ?1",
             true,
         ),
         ("full scan, count only", "SELECT count(*) FROM main_table", false),

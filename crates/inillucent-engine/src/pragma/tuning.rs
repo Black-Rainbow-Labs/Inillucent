@@ -14,6 +14,7 @@ use inillucent_sql::directive::PragmaArgument;
 use inillucent_tree::datum::OwnedDatum;
 use inillucent_wal::Synchronous;
 
+use crate::engine::state::{MetaChange, MetaField};
 use crate::Outcome;
 
 use super::*;
@@ -358,15 +359,74 @@ impl crate::ImportedDatabase {
         // number that does not fit in 32 bits: `4294967295` is stored as 0
         // and not as -1, and `abc` as 0.
         let value = sqlite_atoi(&argument_text(argument));
-        self.file_of_mut(at)?.set_user_version(value);
-        // **Checkpointed, because the meta page is not in the log.** Every
-        // other write here is replayed from the WAL on the next open; a meta
-        // field only reaches the file at a checkpoint, so one that was set and
-        // not checkpointed would be silently forgotten - which is the exact
-        // failure a migration framework cannot survive. SQLite pays a page
-        // write and a journal for the same four bytes.
-        self.checkpoint()?;
+        self.set_meta_field(at, MetaField::UserVersion, value)?;
         Ok(Outcome::empty())
+    }
+
+    /// Sets `user_version` or `application_id`, as part of the open transaction
+    /// when there is one.
+    ///
+    /// **Checkpointed, because the meta page is not in the log.** Every other
+    /// write is replayed from the log on the next open; a meta field only
+    /// reaches the file at a checkpoint, so one that was set and not
+    /// checkpointed would be silently forgotten - which is the exact failure a
+    /// migration framework cannot survive. SQLite pays a page write and a
+    /// journal for the same four bytes.
+    ///
+    /// **Inside a transaction the checkpoint waits for the commit**, and the
+    /// value before the change is recorded so a `ROLLBACK` or a `ROLLBACK TO`
+    /// puts it back. A migration sets `user_version` in the transaction that
+    /// changes the schema, and one that failed and rolled back used to leave the
+    /// file at the new version, so the migration was skipped on the next start.
+    ///
+    /// @param at - the attached database the pragma was qualified with
+    /// @param field - which field
+    /// @param value - the new value
+    fn set_meta_field(&mut self, at: Option<usize>, field: MetaField, value: i32) -> DbResult<()> {
+        let file = self.file_of_mut(at)?;
+        let before = match field {
+            MetaField::UserVersion => file.user_version(),
+            MetaField::ApplicationId => file.application_id(),
+        };
+        match field {
+            MetaField::UserVersion => file.set_user_version(value),
+            MetaField::ApplicationId => file.set_application_id(value),
+        }
+        if self.writing.batch().is_some() {
+            self.writing
+                .meta_changes()
+                .borrow_mut()
+                .push(MetaChange { at, field, before });
+            return Ok(());
+        }
+        self.checkpoint()
+    }
+
+    /// Puts back the meta fields the part of a transaction being abandoned
+    /// changed, newest first.
+    ///
+    /// @param floor - how many changes were recorded when that part began
+    pub(crate) fn restore_meta_changes(&mut self, floor: usize) -> DbResult<()> {
+        loop {
+            let popped = {
+                let mut changes = self.writing.meta_changes().borrow_mut();
+                match changes.len() > floor {
+                    true => changes.pop(),
+                    false => None,
+                }
+            };
+            let Some(change) = popped else {
+                return Ok(());
+            };
+            // An attachment detached since the change has nothing to restore.
+            let Ok(file) = self.file_of_mut(change.at) else {
+                continue;
+            };
+            match change.field {
+                MetaField::UserVersion => file.set_user_version(change.before),
+                MetaField::ApplicationId => file.set_application_id(change.before),
+            }
+        }
     }
     /// Reads or writes the four bytes that say what application owns the file.
     ///
@@ -386,8 +446,7 @@ impl crate::ImportedDatabase {
         // The same reading as `user_version`: `sqlite3Atoi`, so a number that
         // does not fit in 32 bits is stored as 0.
         let value = sqlite_atoi(&argument_text(argument));
-        self.file_of_mut(at)?.set_application_id(value);
-        self.checkpoint()?;
+        self.set_meta_field(at, MetaField::ApplicationId, value)?;
         Ok(Outcome::empty())
     }
     /// Reads or sets the ceiling on how large the file may grow.
@@ -401,16 +460,24 @@ impl crate::ImportedDatabase {
     pub(crate) fn pragma_max_page_count(
         &mut self,
         argument: Option<&PragmaArgument>,
+        at: Option<usize>,
     ) -> DbResult<Outcome> {
-        if let Some(argument) = argument {
-            let asked = argument_integer(argument);
-            let held = self.storage.database.pool().page_count() as i64;
-            self.pragmas
-                .set_max_page_count(asked.max(held).min(DEFAULT_MAX_PAGE_COUNT));
+        // A value that is not a positive integer - 0, -5, 'xyz' - leaves the
+        // ceiling as it is, as SQLite's `sqlite3BtreeMaxPageCount` does for
+        // anything not above 0. It used to lower the ceiling to the page count.
+        let asked = argument.map(argument_integer).filter(|asked| *asked > 0);
+        if let Some(asked) = asked {
+            // The ceiling is held by the file the pragma names, and the pool
+            // enforces it on every page a write of that file takes.
+            let file = self.file_of_mut(at)?;
+            let held = file.pool().page_count() as i64;
+            let limit = asked.max(held).min(DEFAULT_MAX_PAGE_COUNT);
+            file.set_max_page_count(u64::try_from(limit).unwrap_or(0));
         }
+        let limit = self.file_of(at)?.max_page_count();
         Ok(named_integer(
             "max_page_count",
-            self.pragmas.max_page_count(),
+            i64::try_from(limit).unwrap_or(i64::MAX),
         ))
     }
     /// Sets whether `LIKE` compares ASCII letters exactly.
@@ -530,113 +597,6 @@ impl crate::ImportedDatabase {
         }
         Ok(word_row("journal_mode", self.pragmas.journal_mode().word()))
     }
-    /// Reads or sets `auto_vacuum`.
-    ///
-    /// **The mode may only change while the database is empty**, which is
-    /// SQLite own rule and not a limitation invented here: the mode decides
-    /// whether the file carries the reverse-pointer map a vacuum walks, and a
-    /// file already full of pages has no map to fill in retrospectively. A set
-    /// on a database that already holds a table is accepted and *ignored*,
-    /// exactly as the reference accepts and ignores it, and the read afterwards
-    /// tells the truth about which mode is actually in force.
-    ///
-    /// @param argument - the mode, when one was given
-    /// @param at - the attached database the pragma was qualified with
-    pub(crate) fn pragma_auto_vacuum(
-        &mut self,
-        argument: Option<&PragmaArgument>,
-        at: Option<usize>,
-    ) -> DbResult<Outcome> {
-        if at.is_some_and(|number| number != MAIN) {
-            return self.pragma_attached_auto_vacuum(argument, at);
-        }
-        let Some(argument) = argument else {
-            return Ok(named_integer(
-                "auto_vacuum",
-                i64::from(self.pragmas.auto_vacuum()),
-            ));
-        };
-        let asked = match argument_text(argument).trim().to_ascii_lowercase().as_str() {
-            "0" | "none" => Some(0u8),
-            "1" | "full" => Some(1),
-            "2" | "incremental" => Some(2),
-            _ => None,
-        };
-        // An unrecognised word is a no-op in SQLite rather than an error.
-        if let Some(mode) = asked {
-            if self
-                .schema
-                .tables
-                .iter()
-                .all(|table| table.folded.starts_with(b"sqlite_"))
-            {
-                self.pragmas.set_auto_vacuum(mode);
-                // Into the file as well, and checkpointed for the reason
-                // `user_version` is: the meta page is not in the log, and
-                // SQLite reads the mode back on the next open.
-                if self.storage.database.auto_vacuum() != mode {
-                    self.storage.database.set_auto_vacuum(mode);
-                    self.checkpoint()?;
-                }
-            }
-        }
-        Ok(Outcome::empty())
-    }
-    /// Reads or sets `auto_vacuum` of an attached or temporary database.
-    ///
-    /// Each database file has its own mode, so `PRAGMA aux.auto_vacuum = FULL`
-    /// must leave `main` as it was. The same rule applies as for `main`: the
-    /// mode changes only while the database holds no table.
-    ///
-    /// @param argument - the mode, when one was given
-    /// @param at - the database the pragma was qualified with
-    fn pragma_attached_auto_vacuum(
-        &mut self,
-        argument: Option<&PragmaArgument>,
-        at: Option<usize>,
-    ) -> DbResult<Outcome> {
-        let Some(argument) = argument else {
-            return Ok(named_integer(
-                "auto_vacuum",
-                i64::from(self.file_of(at)?.auto_vacuum()),
-            ));
-        };
-        let asked = match argument_text(argument).trim().to_ascii_lowercase().as_str() {
-            "0" | "none" => Some(0u8),
-            "1" | "full" => Some(1),
-            "2" | "incremental" => Some(2),
-            _ => None,
-        };
-        let number = at.unwrap_or(MAIN);
-        let empty = self
-            .schema
-            .tables
-            .iter()
-            .all(|table| table.database != number || table.folded.starts_with(b"sqlite_"));
-        if let (Some(mode), true) = (asked, empty) {
-            self.file_of_mut(at)?.set_auto_vacuum(mode);
-        }
-        Ok(Outcome::empty())
-    }
-    /// Runs `incremental_vacuum`, which moves free pages off the end of a file.
-    ///
-    /// It does nothing unless `auto_vacuum` is `incremental`, which is the
-    /// reference behaviour and is why the whole thing is silent either way: the
-    /// pragma returns no rows, and the only way to see what it did is
-    /// `page_count`.
-    ///
-    /// @param argument - how many pages to move, or all of them
-    pub(crate) fn pragma_incremental_vacuum(
-        &mut self,
-        argument: Option<&PragmaArgument>,
-    ) -> DbResult<Outcome> {
-        if self.pragmas.auto_vacuum() != 2 {
-            return Ok(Outcome::empty());
-        }
-        let pages = argument.map(argument_integer).unwrap_or(i64::MAX).max(0);
-        self.reclaim_free_pages(usize::try_from(pages).unwrap_or(usize::MAX))?;
-        Ok(Outcome::empty())
-    }
     /// Reads or sets `secure_delete`.
     ///
     /// @param argument - the setting, when one was given
@@ -740,8 +700,12 @@ impl crate::ImportedDatabase {
         // feature probe's `prag.schema.switches`, which compares against that
         // shell rather than the matrix's own connections, where defensive
         // defaults off.
-        if !(asked && self.pragmas.defensive()) {
+        if !(asked && self.pragmas.defensive()) && asked != self.pragmas.writable_schema() {
             self.pragmas.set_writable_schema(asked);
+            // A plan is cached by its text, and the binder lets a reserved
+            // name through only while the pragma is on, so a plan bound either
+            // way must not outlive the setting.
+            self.forget_compiled_statements();
         }
         Ok(Outcome::empty())
     }
@@ -843,6 +807,15 @@ impl crate::ImportedDatabase {
 }
 
 impl crate::ImportedDatabase {
+    /// Reports whether a qualified pragma is about an attached or temporary schema that has no file.
+    ///
+    /// @param at - the attached database the pragma was qualified with, `None` for `main`
+    fn schema_has_no_file(&self, at: Option<usize>) -> bool {
+        at.filter(|schema| *schema != MAIN)
+            .and_then(|schema| self.session_state.schema_at(schema))
+            .is_some_and(|held| held.path.is_none())
+    }
+
     /// Reads one setting pragma's value, under `&self`.
     ///
     /// **The one read path for a setting, whichever way it is asked.** `PRAGMA
@@ -874,14 +847,12 @@ impl crate::ImportedDatabase {
                 "application_id",
                 i64::from(self.file_of(at)?.application_id()),
             )),
-            // Each database file has its own mode; `main`'s is the connection's.
-            b"auto_vacuum" if at.is_some_and(|number| number != MAIN) => Some(named_integer(
-                "auto_vacuum",
-                i64::from(self.file_of(at)?.auto_vacuum()),
-            )),
+            // Each database file has its own mode, and a read answers the file's: a
+            // mode asked for on a file that holds a table is only remembered, for
+            // `VACUUM` to apply.
             b"auto_vacuum" => Some(named_integer(
                 "auto_vacuum",
-                i64::from(self.pragmas.auto_vacuum()),
+                i64::from(self.file_of(at)?.auto_vacuum()),
             )),
             b"automatic_index" => flag("automatic_index", self.pragmas.automatic_index()),
             b"busy_timeout" => Some(named_integer(
@@ -910,17 +881,30 @@ impl crate::ImportedDatabase {
                 "ignore_check_constraints",
                 self.pragmas.ignore_check_constraints(),
             ),
+            // **A schema with no file reports what SQLite reports for one.** An
+            // attached `:memory:` database has a journal in memory, and it and
+            // `temp` hold an exclusive lock, whatever the connection's modes for
+            // `main` are. `temp` keeps the connection's journal mode.
+            b"journal_mode" if self.schema_has_no_file(at) && at != Some(crate::TEMP) => {
+                Some(word_row("journal_mode", "memory"))
+            }
+            b"locking_mode" if self.schema_has_no_file(at) => {
+                Some(word_row("locking_mode", "exclusive"))
+            }
             b"journal_mode" => Some(word_row("journal_mode", self.pragmas.journal_mode().word())),
             b"locking_mode" => Some(word_row("locking_mode", self.locking_word())),
             b"max_page_count" => Some(named_integer(
                 "max_page_count",
-                self.pragmas.max_page_count(),
+                i64::try_from(self.file_of(at)?.max_page_count()).unwrap_or(i64::MAX),
             )),
             b"page_count" => Some(named_integer(
                 "page_count",
                 self.file_of(at)?.pool().page_count() as i64,
             )),
-            b"page_size" => Some(named_integer("page_size", self.storage.page_size as i64)),
+            b"page_size" => Some(named_integer(
+                "page_size",
+                self.storage.database.page_size() as i64,
+            )),
             b"query_only" => flag("query_only", self.pragmas.query_only()),
             b"legacy_alter_table" => flag("legacy_alter_table", self.pragmas.legacy_alter_table()),
             b"recursive_triggers" => flag("recursive_triggers", self.pragmas.recursive_triggers()),

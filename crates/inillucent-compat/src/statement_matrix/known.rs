@@ -141,7 +141,7 @@ pub fn read_deliberate(path: &Path) -> Result<Vec<Deliberate>, String> {
         let contains = list("contains");
         if contains.is_empty() && text("detail").is_err() && list("cases").is_empty() {
             return Err(format!(
-                "{}: rule `{name}` has no `contains` and no `detail`, so it would cover every                  difference",
+                "{}: rule `{name}` has no `contains` and no `detail`, so it would cover every difference",
                 path.display()
             ));
         }

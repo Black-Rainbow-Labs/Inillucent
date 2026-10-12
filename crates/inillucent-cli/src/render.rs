@@ -10,8 +10,19 @@
 //! NULL as the empty string. That last one is a genuinely bad default and it is
 //! kept anyway, because a script written against `sqlite3` and pointed at this
 //! shell has to see the same bytes.
+//!
+//! **A mode is a set of defaults for the same settings the `.mode` options
+//! change.** `ascii`, `csv`, `tcl`, `quote` and `tabs` are all the `list` layout
+//! with a different separator, row separator and way of writing a value, so one
+//! function lays them out and the settings in [`Layout`] say how. The modes that
+//! draw columns are in [`columnar`].
 
 use inillucent_value::Value;
+
+mod columnar;
+pub mod text;
+
+use text::escape_controls;
 
 /// How rows are laid out.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -41,6 +52,26 @@ pub enum Mode {
     Box,
     /// An HTML table body.
     Html,
+    /// Columns and rows separated by the ASCII unit and record separators.
+    Ascii,
+    /// A box whose values are written as SQL literals.
+    Qbox,
+    /// Values quoted for Tcl, separated by spaces.
+    Tcl,
+    /// Values quoted as C strings, separated by commas.
+    C,
+    /// Only the number of rows.
+    Count,
+    /// Nothing.
+    Off,
+    /// Values written as JSON, separated by commas.
+    Jatom,
+    /// One JSON object per row, with no array around them.
+    Jobject,
+    /// A table in the style of `psql`.
+    Psql,
+    /// Columns separated by two spaces, like `column`.
+    Split,
 }
 
 impl Mode {
@@ -59,19 +90,17 @@ impl Mode {
             "table" => Some(Mode::Table),
             "box" => Some(Mode::Box),
             "html" => Some(Mode::Html),
+            "ascii" => Some(Mode::Ascii),
+            "qbox" => Some(Mode::Qbox),
+            "tcl" => Some(Mode::Tcl),
+            "c" => Some(Mode::C),
+            "count" => Some(Mode::Count),
+            "off" => Some(Mode::Off),
+            "jatom" => Some(Mode::Jatom),
+            "jobject" => Some(Mode::Jobject),
+            "psql" => Some(Mode::Psql),
+            "split" => Some(Mode::Split),
             _ => None,
-        }
-    }
-
-    /// Returns the column separator this mode starts with.
-    ///
-    /// Choosing a mode resets the separator, which is why `.mode csv` produces
-    /// commas without being told to. A `.separator` afterwards still wins.
-    pub fn separator(self) -> &'static str {
-        match self {
-            Mode::Csv | Mode::Quote => ",",
-            Mode::Tabs => "\t",
-            _ => "|",
         }
     }
 
@@ -90,8 +119,181 @@ impl Mode {
             Mode::Table => "table",
             Mode::Box => "box",
             Mode::Html => "html",
+            Mode::Ascii => "ascii",
+            Mode::Qbox => "qbox",
+            Mode::Tcl => "tcl",
+            Mode::C => "c",
+            Mode::Count => "count",
+            Mode::Off => "off",
+            Mode::Jatom => "jatom",
+            Mode::Jobject => "jobject",
+            Mode::Psql => "psql",
+            Mode::Split => "split",
         }
     }
+
+    /// Reports whether this mode draws columns.
+    pub fn is_columnar(self) -> bool {
+        matches!(
+            self,
+            Mode::Column
+                | Mode::Markdown
+                | Mode::Table
+                | Mode::Box
+                | Mode::Qbox
+                | Mode::Psql
+                | Mode::Split
+        )
+    }
+
+    /// Reports whether this mode writes one line per row, joined by a separator.
+    pub fn is_list(self) -> bool {
+        matches!(
+            self,
+            Mode::List
+                | Mode::Csv
+                | Mode::Tabs
+                | Mode::Quote
+                | Mode::Ascii
+                | Mode::Tcl
+                | Mode::C
+                | Mode::Jatom
+        )
+    }
+}
+
+/// How a text value is written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Quote {
+    /// As it is.
+    #[default]
+    Off,
+    /// As an SQL literal.
+    Sql,
+    /// The way CSV writes a field.
+    Csv,
+    /// With the characters HTML needs escaped.
+    Html,
+    /// Between double quotes with Tcl escapes.
+    Tcl,
+    /// As a JSON string.
+    Json,
+    /// As an SQL literal, leaving out quotes the reader does not need.
+    Relaxed,
+}
+
+impl Quote {
+    /// Returns the style a `--quote` argument names.
+    ///
+    /// @param word - the argument
+    pub fn from_name(word: &str) -> Option<Quote> {
+        match word.to_ascii_lowercase().as_str() {
+            "off" => Some(Quote::Off),
+            "on" | "sql" => Some(Quote::Sql),
+            "csv" => Some(Quote::Csv),
+            "html" => Some(Quote::Html),
+            "tcl" => Some(Quote::Tcl),
+            "json" => Some(Quote::Json),
+            "relaxed" => Some(Quote::Relaxed),
+            _ => None,
+        }
+    }
+
+    /// Returns the name `.mode` prints for a style.
+    ///
+    /// **`csv` prints as `hex` and `html` as `csv`**, because that is what the
+    /// pinned reference prints: its table of names is one entry out of step with
+    /// its list of styles from `csv` on. A script that reads the line back
+    /// through `.mode` gets the style it had either way, and one that compares
+    /// the text gets the same text.
+    pub fn printed(self) -> &'static str {
+        match self {
+            Quote::Off => "off",
+            Quote::Sql => "sql",
+            Quote::Csv => "hex",
+            Quote::Html => "csv",
+            Quote::Tcl => "tcl",
+            Quote::Json => "json",
+            Quote::Relaxed => "relaxed",
+        }
+    }
+}
+
+/// How a blob is written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlobQuote {
+    /// The way the text quoting writes one.
+    #[default]
+    Auto,
+    /// As the bytes.
+    Text,
+    /// As `x'..'`.
+    Sql,
+    /// As hexadecimal digits.
+    Hex,
+    /// As a Tcl string of octal escapes.
+    Tcl,
+    /// As a JSON string.
+    Json,
+    /// As its size.
+    Size,
+}
+
+impl BlobQuote {
+    /// Returns the style a `--blob-quote` argument names, and the name it prints as.
+    ///
+    /// @param word - the argument
+    pub fn from_name(word: &str) -> Option<BlobQuote> {
+        match word.to_ascii_lowercase().as_str() {
+            "auto" => Some(BlobQuote::Auto),
+            "text" => Some(BlobQuote::Text),
+            "sql" => Some(BlobQuote::Sql),
+            "hex" => Some(BlobQuote::Hex),
+            "tcl" => Some(BlobQuote::Tcl),
+            "json" => Some(BlobQuote::Json),
+            "size" => Some(BlobQuote::Size),
+            _ => None,
+        }
+    }
+
+    /// Returns the name a style prints as.
+    pub fn name(self) -> &'static str {
+        match self {
+            BlobQuote::Auto => "auto",
+            BlobQuote::Text => "text",
+            BlobQuote::Sql => "sql",
+            BlobQuote::Hex => "hex",
+            BlobQuote::Tcl => "tcl",
+            BlobQuote::Json => "json",
+            BlobQuote::Size => "size",
+        }
+    }
+}
+
+/// How a control character in a value is written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Escape {
+    /// Caret notation, which is what `ascii` is.
+    #[default]
+    Auto,
+    /// As the byte.
+    Off,
+    /// Caret notation.
+    Ascii,
+    /// As the picture character of the control.
+    Symbol,
+}
+
+/// Whether a long line is broken at word boundaries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WordWrap {
+    /// At word boundaries, which is what a wrap does until it is told otherwise.
+    #[default]
+    Auto,
+    /// At word boundaries, asked for.
+    On,
+    /// In the middle of whatever is there.
+    Off,
 }
 
 /// Everything a mode needs that is not the rows themselves.
@@ -107,21 +309,50 @@ pub struct Layout {
     pub null: String,
     /// Whether to print a header line.
     pub headers: bool,
-    /// The table name `insert` mode writes.
+    /// The table name `insert` mode writes; empty means `tab`.
     pub table: String,
-    /// The column widths `.width` fixed, if any.
-    pub widths: Vec<usize>,
+    /// The column widths `.width` fixed, if any. Negative aligns to the right and
+    /// zero means as wide as the widest value.
+    pub widths: Vec<i32>,
     /// Whether these lines are going to standard output.
     ///
     /// **Only `csv` reads it, and only on Windows**, where standard output is
     /// the one destination that translates a line feed on the way out. The
-    /// bytes are in the comment at the end of [`csv`]. A file and a collecting
-    /// caller both receive exactly what is written to them, so the second
-    /// carriage return that makes standard output match the reference is wrong
-    /// for both. The shell sets this from where its own output is currently
+    /// bytes are in the comment at the end of [`separated`]. A file and a
+    /// collecting caller both receive exactly what is written to them, so the
+    /// second carriage return that makes standard output match the reference is
+    /// wrong for both. The shell sets this from where its own output is currently
     /// going; the default is standard output, because that is where a `Layout`
     /// built by hand is printed.
     pub to_stdout: bool,
+    /// How a text value is written.
+    pub quote: Quote,
+    /// How a title is written, when it is not written as the values are.
+    pub title_quote: Option<Quote>,
+    /// How a blob is written.
+    pub blob_quote: BlobQuote,
+    /// How a control character is written.
+    pub escape: Escape,
+    /// Wraps a column wider than this many characters; zero means never.
+    pub wrap: usize,
+    /// Whether a wrap prefers a word boundary.
+    pub word_wrap: WordWrap,
+    /// The screen width the output is for; `None` means as wide as the terminal.
+    pub screen_width: Option<usize>,
+    /// One letter per column: `L`, `C` or `R`.
+    pub align: String,
+    /// Whether `box` and `table` draw their outer edge.
+    pub border: bool,
+    /// The most characters shown of a value; zero means all.
+    pub char_limit: usize,
+    /// The most lines shown of a value; zero means all.
+    pub line_limit: usize,
+    /// The most characters shown of a title; zero means all.
+    pub title_limit: usize,
+    /// How many bytes of rows go into one `INSERT`; zero means one row each.
+    pub multi_insert: usize,
+    /// Whether JSONB text is shown as JSON text.
+    pub text_jsonb: bool,
 }
 
 impl Default for Layout {
@@ -133,11 +364,52 @@ impl Default for Layout {
             row_separator: "\n".to_string(),
             null: String::new(),
             headers: false,
-            // "tab", not "table": the reference chose a name that is not
-            // a keyword, so the statements it writes can be pasted back.
-            table: "tab".to_string(),
+            table: String::new(),
             widths: Vec::new(),
             to_stdout: true,
+            quote: Quote::Off,
+            title_quote: None,
+            blob_quote: BlobQuote::Auto,
+            escape: Escape::Auto,
+            wrap: 0,
+            word_wrap: WordWrap::Auto,
+            screen_width: Some(0),
+            align: String::new(),
+            border: true,
+            char_limit: 0,
+            line_limit: 0,
+            title_limit: 0,
+            multi_insert: 0,
+            text_jsonb: false,
+        }
+    }
+}
+
+impl Layout {
+    /// Returns the table name `insert` mode writes.
+    pub fn table_name(&self) -> &str {
+        if self.table.is_empty() {
+            "tab"
+        } else {
+            &self.table
+        }
+    }
+
+    /// Returns whether the lines `render` returns end a line when printed.
+    ///
+    /// **A row separator that does not end in a newline is the whole of the
+    /// line's ending.** `render` hands back text with the separator on it, and the
+    /// caller writes a newline after it only when this is true. `-newline '|'`
+    /// and `.mode ascii` write no newline at all.
+    pub fn lines_end_in_newline(&self) -> bool {
+        !self.mode.is_list() || self.row_separator.ends_with('\n')
+    }
+
+    /// Returns what goes after a row of a list mode, short of the newline.
+    fn row_end(&self) -> String {
+        match self.row_separator.strip_suffix('\n') {
+            Some(before) => before.to_string(),
+            None => self.row_separator.clone(),
         }
     }
 }
@@ -151,59 +423,164 @@ impl Default for Layout {
 /// @param layout - the output settings
 /// @param columns - the result's column names
 /// @param rows - the result's rows
+///
+/// A row with no columns, which `PRAGMA incremental_vacuum` answers once per
+/// page, prints as an empty line in the list, tabs, quote, csv, insert, json
+/// and html modes, as the reference does. The column, line, markdown, table and
+/// box modes have no cells to draw, so they print nothing, as the reference
+/// does, and not an empty frame.
 pub fn render(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Vec<String> {
+    let drawn_from_cells = layout.mode.is_columnar() || layout.mode == Mode::Line;
+    if columns.is_empty() && drawn_from_cells {
+        return Vec::new();
+    }
     match layout.mode {
-        Mode::List | Mode::Tabs => separated(layout, columns, rows),
-        Mode::Csv => csv(layout, columns, rows),
-        Mode::Quote => quoted(layout, columns, rows),
+        mode if mode.is_list() => separated(layout, columns, rows),
         Mode::Line => lines(layout, columns, rows),
         Mode::Insert => inserts(layout, columns, rows),
         Mode::Json => json(layout, columns, rows),
-        Mode::Column => aligned(layout, columns, rows),
-        Mode::Markdown | Mode::Table | Mode::Box => drawn(layout, columns, rows),
+        Mode::Jobject => objects(columns, rows),
         Mode::Html => html(layout, columns, rows),
+        Mode::Count => vec![rows.len().to_string()],
+        Mode::Off => Vec::new(),
+        _ => columnar::render(layout, columns, rows),
     }
 }
 
-/// Returns the text a value prints as in the plain modes.
-fn plain(layout: &Layout, value: &Value<'static>) -> String {
+/// Returns a value as the settings write it, control characters made visible.
+///
+/// @param layout - the output settings
+/// @param value - the cell
+pub(crate) fn shown_cell(layout: &Layout, value: &Value<'static>) -> String {
+    escape_controls(&cell_text(layout, value), layout.escape)
+}
+
+/// Returns a value as the settings write it, before control characters are made
+/// visible.
+///
+/// A NULL is the `null` setting whatever the quoting. Text is written by `quote`,
+/// numbers as the engine writes them, and a blob by `blob_quote` or, when that is
+/// left to `auto`, in the style that goes with the text quoting.
+///
+/// @param layout - the output settings
+/// @param value - the cell
+fn cell_text(layout: &Layout, value: &Value<'static>) -> String {
     match value {
         Value::Null => layout.null.clone(),
         Value::Integer(number) => number.to_string(),
         Value::Real(_) => number_text(value),
-        Value::Text(text) => printable(text.raw()),
-        Value::Blob(blob) => printable(blob.raw()),
+        Value::Text(text) => quote_text(layout, text.raw()),
+        Value::Blob(blob) => quote_blob(layout, blob.raw()),
     }
 }
 
-/// Returns bytes as the shell prints them.
+/// Writes a text value in the quoting style.
 ///
-/// Two rules, both the reference's. A value is printed as a C string, so it
-/// stops at the first NUL; and a control character is printed in caret
-/// notation, because a shell that emitted raw control bytes could be made to
-/// drive a terminal by the contents of a database. A newline and a tab are
-/// left alone, since a multi-line or tabbed value is meant to look like one,
-/// and so is DELETE, which the reference prints raw. Printing the last two as
-/// `^I` and `^?` made every tab separated value differ from `sqlite3`.
-fn printable(bytes: &[u8]) -> String {
+/// @param layout - the output settings
+/// @param bytes - the text's bytes
+fn quote_text(layout: &Layout, bytes: &[u8]) -> String {
+    match layout.quote {
+        Quote::Off => until_nul(bytes),
+        Quote::Sql | Quote::Relaxed => sql_text(layout, bytes),
+        Quote::Csv => csv_field(&until_nul(bytes), &layout.separator),
+        Quote::Html => html_escape(&until_nul(bytes)),
+        Quote::Tcl => tcl_string(&until_nul(bytes)),
+        Quote::Json => format!(
+            "\"{}\"",
+            inillucent_base::json::escape_sql(&until_nul(bytes))
+        ),
+    }
+}
+
+/// Writes a text as an SQL literal.
+///
+/// With `--escape off` the text is written between plain quotes whatever it holds,
+/// so a newline stays a newline instead of becoming a `unistr()` call.
+///
+/// @param layout - the output settings
+/// @param bytes - the text's bytes
+fn sql_text(layout: &Layout, bytes: &[u8]) -> String {
+    if layout.escape == Escape::Off {
+        return format!("'{}'", until_nul(bytes).replace('\'', "''"));
+    }
+    quote_literal(&Value::owned_text(bytes).unwrap_or(Value::Null))
+}
+
+/// Writes a blob in the blob quoting style.
+///
+/// @param layout - the output settings
+/// @param bytes - the blob's bytes
+fn quote_blob(layout: &Layout, bytes: &[u8]) -> String {
+    let style = match layout.blob_quote {
+        BlobQuote::Auto => match layout.quote {
+            Quote::Sql | Quote::Relaxed => BlobQuote::Sql,
+            Quote::Tcl => BlobQuote::Tcl,
+            Quote::Json => BlobQuote::Json,
+            _ => BlobQuote::Text,
+        },
+        chosen => chosen,
+    };
+    match style {
+        BlobQuote::Sql => literal(&Value::owned_blob(bytes).unwrap_or(Value::Null)),
+        BlobQuote::Hex => bytes.iter().map(|byte| format!("{byte:02X}")).collect(),
+        BlobQuote::Tcl => tcl_octal(bytes),
+        BlobQuote::Json => {
+            let escaped: String = bytes.iter().map(|byte| format!("\\u{byte:04x}")).collect();
+            format!("\"{escaped}\"")
+        }
+        BlobQuote::Size => format!("({}-byte blob)", bytes.len()),
+        BlobQuote::Text | BlobQuote::Auto => {
+            let text = until_nul(bytes);
+            if layout.quote == Quote::Csv {
+                csv_field(&text, &layout.separator)
+            } else {
+                text
+            }
+        }
+    }
+}
+
+/// Writes a text as a Tcl string.
+///
+/// @param text - the text
+fn tcl_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            control if u32::from(control) < 0x20 => {
+                out.push_str(&format!("\\{:03o}", u32::from(control)));
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Writes bytes as a Tcl string of octal escapes.
+///
+/// @param bytes - the bytes
+fn tcl_octal(bytes: &[u8]) -> String {
+    let escapes: String = bytes.iter().map(|byte| format!("\\{byte:03o}")).collect();
+    format!("\"{escapes}\"")
+}
+
+/// Returns the bytes up to the first NUL as text.
+///
+/// A value is printed as a C string, so a text or a blob stops at its first NUL.
+///
+/// @param bytes - the value's bytes
+fn until_nul(bytes: &[u8]) -> String {
     let end = bytes
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
-    let visible = bytes.get(..end).unwrap_or(bytes);
-    let mut out = String::with_capacity(visible.len());
-    for chunk in String::from_utf8_lossy(visible).chars() {
-        let code = chunk as u32;
-        if chunk == '\n' || chunk == '\t' {
-            out.push(chunk);
-        } else if code < 0x20 {
-            out.push('^');
-            out.push(char::from_u32(code + 0x40).unwrap_or('?'));
-        } else {
-            out.push(chunk);
-        }
-    }
-    out
+    crate::raw::decode(bytes.get(..end).unwrap_or(bytes))
 }
 
 /// Returns the text the engine writes a number as.
@@ -226,7 +603,7 @@ pub fn literal(value: &Value<'static>) -> String {
         Value::Integer(number) => number.to_string(),
         Value::Real(_) => number_text(value),
         Value::Text(text) => {
-            let body = String::from_utf8_lossy(text.raw()).replace('\'', "''");
+            let body = crate::raw::decode(text.raw()).replace('\'', "''");
             format!("'{body}'")
         }
         Value::Blob(blob) => {
@@ -262,12 +639,7 @@ pub fn quote_literal(value: &Value<'static>) -> String {
     let Value::Text(text) = value else {
         return literal(value);
     };
-    let bytes = text.raw();
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(bytes.len());
-    let text = String::from_utf8_lossy(bytes.get(..end).unwrap_or(bytes));
+    let text = until_nul(text.raw());
     if !text.chars().any(|character| u32::from(character) < 0x20) {
         return format!("'{}'", text.replace('\'', "''"));
     }
@@ -286,49 +658,47 @@ pub fn quote_literal(value: &Value<'static>) -> String {
     out
 }
 
-/// Returns a column name as `.mode quote` writes it in the header line.
+/// Returns a column name as the layout writes it in a header line.
 ///
+/// **The style a title is written in is set by the mode** (`csv` writes them as
+/// CSV fields, `quote` as SQL strings) and is not changed by `--quote`. `--title`
+/// sets it.
+///
+/// @param layout - the output settings
 /// @param name - the column name
-fn quote_name(name: &str) -> String {
-    quote_literal(&Value::owned_text(name.as_bytes()).unwrap_or(Value::Null))
+pub(crate) fn title_text(layout: &Layout, name: &str) -> String {
+    let style = layout.title_quote.unwrap_or(Quote::Off);
+    let written = match style {
+        Quote::Off => name.to_string(),
+        Quote::Sql | Quote::Relaxed => {
+            quote_literal(&Value::owned_text(name.as_bytes()).unwrap_or(Value::Null))
+        }
+        Quote::Csv => csv_field(name, &layout.separator),
+        Quote::Html => html_escape(name),
+        Quote::Tcl => tcl_string(name),
+        Quote::Json => format!("\"{}\"", inillucent_base::json::escape_sql(name)),
+    };
+    escape_controls(&written, layout.escape)
 }
 
-/// `list` and `tabs`: values with a separator between them.
+/// `list` and the modes laid out like it: values with a separator between them.
 fn separated(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Vec<String> {
-    let separator = if layout.mode == Mode::Tabs {
-        "\t"
-    } else {
-        layout.separator.as_str()
-    };
+    let separator = layout.separator.as_str();
+    let end = layout.row_end();
     let mut out = Vec::with_capacity(rows.len() + 1);
     if layout.headers {
-        out.push(columns.join(separator));
+        let names: Vec<String> = columns
+            .iter()
+            .map(|name| title_text(layout, name))
+            .collect();
+        out.push(names.join(separator));
     }
     for row in rows {
-        let cells: Vec<String> = row.iter().map(|value| plain(layout, value)).collect();
+        let cells: Vec<String> = row.iter().map(|value| list_cell(layout, value)).collect();
         out.push(cells.join(separator));
     }
-    out
-}
-
-/// `csv`: a field is quoted when it holds a comma, a quote or a newline.
-fn csv(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Vec<String> {
-    let mut out = Vec::with_capacity(rows.len() + 1);
-    if layout.headers {
-        out.push(
-            columns
-                .iter()
-                .map(|name| csv_field(name))
-                .collect::<Vec<String>>()
-                .join(","),
-        );
-    }
-    for row in rows {
-        let cells: Vec<String> = row.iter().map(|value| csv_cell(layout, value)).collect();
-        out.push(cells.join(","));
-    }
-    // The caller writes a newline after each line, so a row separator of
-    // CR LF is a carriage return on the end of the line itself.
+    // **A carriage return on the end of the line itself when the row separator
+    // is CR LF**, because the caller writes the newline after each line.
     //
     // **And a second one, but only on standard output, and only on Windows.**
     // The reference writes its CR LF through a text-mode C stream, which
@@ -349,88 +719,40 @@ fn csv(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Vec
     // CR LF and nothing more. This shell wrote CR CR LF into the file and into
     // the text a collecting caller reads, which matched neither. That is what
     // `to_stdout` is for.
-    if layout.row_separator.ends_with(CRLF) {
-        for line in &mut out {
-            line.push(CR);
-            if cfg!(windows) && layout.to_stdout {
-                line.push(CR);
-            }
+    let doubled = cfg!(windows) && layout.to_stdout && layout.row_separator.ends_with("\r\n");
+    for line in &mut out {
+        line.push_str(&end);
+        if doubled {
+            line.push('\r');
         }
     }
     out
 }
 
-/// The row separator RFC 4180 gives a CSV record, and the reference writes.
-const CRLF: &str = "\r\n";
-
-/// The carriage return half of it.
-const CR: char = '\r';
-
-/// Renders one value as a CSV field.
+/// Returns one value as a list mode writes it.
 ///
-/// @param layout - the mode's settings, for `nullvalue`
+/// A NULL with no text to show is nothing at all in a CSV record, which is how
+/// it is told from an empty string: that one is written between quotes.
+///
+/// @param layout - the output settings
 /// @param value - the cell
-fn csv_cell(layout: &Layout, value: &Value<'static>) -> String {
-    let text = plain(layout, value);
-    // **An empty field that is not NULL is quoted, which is how the two are
-    // told apart** (task-2066 section 4.2, item 27). A BLOB is printed as a C
-    // string and stops at its first NUL, so a blob beginning with one rendered
-    // as nothing at all - and so does a NULL under the default `nullvalue`,
-    // which is the empty string. The reference writes two quotes for the
-    // first and nothing for the second, so an exported blob could be read back
-    // as a NULL.
-    if text.is_empty() && !value.is_null() {
-        return "\"\"".to_string();
-    }
-    csv_field(&text)
-}
-
-/// Quotes one CSV field, if it needs it.
-///
-/// The separator, a quote and a line break all force quoting, and so does a
-/// control character - it has already been turned into caret notation by the
-/// time this sees it, and quoting is how the reference marks that the field was
-/// not plain text to begin with.
-///
-/// @param text - the rendered field
-fn csv_field(text: &str) -> String {
-    let needs = text.contains(',')
-        || text.contains('"')
-        || text.contains('\n')
-        || text.contains('\r')
-        || text.contains('^');
-    if !needs {
-        return text.to_string();
-    }
-    format!("\"{}\"", text.replace('"', "\"\""))
-}
-
-/// `quote`: every value as the literal it would be written as.
-fn quoted(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Vec<String> {
-    let mut out = Vec::with_capacity(rows.len() + 1);
-    if layout.headers {
-        out.push(
-            columns
-                .iter()
-                .map(|name| quote_name(name))
-                .collect::<Vec<String>>()
-                .join(&layout.separator),
-        );
-    }
-    for row in rows {
-        let cells: Vec<String> = row.iter().map(quote_literal).collect();
-        out.push(cells.join(&layout.separator));
-    }
-    out
+fn list_cell(layout: &Layout, value: &Value<'static>) -> String {
+    escape_controls(&cell_text(layout, value), layout.escape)
 }
 
 /// `line`: one `name: value` per column, rows separated by a blank line.
 fn lines(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Vec<String> {
     let width = columns
         .iter()
-        .map(|name| name.chars().count())
+        .map(|name| text::text_width(name))
         .max()
         .unwrap_or(0);
+    let separator = if layout.separator.is_empty() {
+        ": "
+    } else {
+        layout.separator.as_str()
+    };
+    let indent = " ".repeat(width + text::text_width(separator));
     let mut out = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         if index > 0 {
@@ -438,7 +760,18 @@ fn lines(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> V
         }
         for (position, value) in row.iter().enumerate() {
             let name = columns.get(position).cloned().unwrap_or_default();
-            out.push(format!("{name:>width$}: {}", plain(layout, value)));
+            let shown = shown_cell(layout, value);
+            let mut pieces = shown
+                .split('\n')
+                .map(|piece| piece.strip_suffix('\r').unwrap_or(piece));
+            let first = pieces.next().unwrap_or_default();
+            out.push(format!(
+                "{}{name}{separator}{first}",
+                " ".repeat(width.saturating_sub(text::text_width(&name)))
+            ));
+            for piece in pieces {
+                out.push(format!("{indent}{piece}"));
+            }
         }
     }
     out
@@ -448,30 +781,48 @@ fn lines(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> V
 ///
 /// With headers on, SQLite names the columns after the table, each quoted only
 /// when its `quoteChar` says so: a name that is not a plain word, or that is a
-/// keyword.
+/// keyword. The table is quoted by the same rule.
 fn inserts(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Vec<String> {
+    let table = insert_column(layout.table_name());
     let target = if layout.headers {
         let names: Vec<String> = columns.iter().map(|name| insert_column(name)).collect();
-        format!("{}({})", layout.table, names.join(","))
+        format!("{table}({})", names.join(","))
     } else {
-        layout.table.clone()
+        table
     };
     rows.iter()
         .map(|row| {
-            let cells: Vec<String> = row.iter().map(quote_literal).collect();
+            let cells: Vec<String> = row
+                .iter()
+                .map(|value| insert_value(layout, value))
+                .collect();
             format!("INSERT INTO {target} VALUES({});", cells.join(","))
         })
         .collect()
 }
 
-/// Returns a column name as SQLite's shell writes it in `.mode insert`.
+/// Returns a value as an `INSERT` writes it.
+///
+/// @param layout - the output settings
+/// @param value - the cell
+fn insert_value(layout: &Layout, value: &Value<'static>) -> String {
+    match value {
+        Value::Text(text) => sql_text(layout, text.raw()),
+        Value::Blob(blob) if layout.quote == Quote::Off && layout.blob_quote == BlobQuote::Auto => {
+            format!("'{}'", until_nul(blob.raw()).replace('\'', "''"))
+        }
+        other => quote_literal(other),
+    }
+}
+
+/// Returns a name as SQLite's shell writes it in `.mode insert`.
 ///
 /// The rule is `quoteChar` in the shell's source: quote when the first
 /// character is not a letter or an underscore, when any character is not a
 /// letter, digit or underscore, or when the word is a keyword.
 ///
-/// @param name - the column name
-fn insert_column(name: &str) -> String {
+/// @param name - the table or column name
+pub(crate) fn insert_column(name: &str) -> String {
     let plain = name
         .chars()
         .next()
@@ -488,45 +839,79 @@ fn insert_column(name: &str) -> String {
 
 /// `json`: an array of objects, one per row.
 fn json(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Vec<String> {
-    let _ = layout;
     if rows.is_empty() {
         // An empty result prints nothing, not an empty array: the reference
         // writes the brackets around rows and there are none.
         return Vec::new();
     }
-    let mut out = Vec::with_capacity(rows.len());
-    for (index, row) in rows.iter().enumerate() {
-        let members: Vec<String> = row
-            .iter()
-            .enumerate()
-            .map(|(position, value)| {
-                let name = columns.get(position).cloned().unwrap_or_default();
-                format!(
-                    "\"{}\":{}",
-                    inillucent_base::json::escape_sql(&name),
-                    json_value(value)
-                )
-            })
-            .collect();
-        let open = if index == 0 { "[" } else { "" };
-        let close = if index + 1 == rows.len() { "]" } else { "," };
-        out.push(format!("{open}{{{}}}{close}", members.join(",")));
+    let mut out = object_lines(layout, columns, rows);
+    let last = out.len().saturating_sub(1);
+    for (index, line) in out.iter_mut().enumerate() {
+        if index == 0 {
+            line.insert(0, '[');
+        }
+        line.push(if index == last { ']' } else { ',' });
     }
     out
 }
 
+/// `jobject`: the objects, one to a line, with no array around them.
+fn objects(columns: &[String], rows: &[Vec<Value<'static>>]) -> Vec<String> {
+    object_lines(
+        &Layout {
+            quote: Quote::Json,
+            ..Layout::default()
+        },
+        columns,
+        rows,
+    )
+}
+
+/// Returns each row as a JSON object.
+fn object_lines(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Vec<String> {
+    rows.iter()
+        .map(|row| {
+            let members: Vec<String> = row
+                .iter()
+                .enumerate()
+                .map(|(position, value)| {
+                    let name = columns.get(position).cloned().unwrap_or_default();
+                    format!(
+                        "\"{}\":{}",
+                        inillucent_base::json::escape_sql(&name),
+                        json_value(layout, value)
+                    )
+                })
+                .collect();
+            format!("{{{}}}", members.join(","))
+        })
+        .collect()
+}
+
 /// Returns a value as JSON.
-fn json_value(value: &Value<'static>) -> String {
+fn json_value(layout: &Layout, value: &Value<'static>) -> String {
     match value {
+        Value::Blob(blob) if layout.quote == Quote::Off && layout.blob_quote == BlobQuote::Auto => {
+            format!(
+                "\"{}\"",
+                inillucent_base::json::escape_sql(&until_nul(blob.raw()))
+            )
+        }
+        Value::Blob(blob)
+            if matches!(layout.quote, Quote::Sql | Quote::Relaxed)
+                && layout.blob_quote == BlobQuote::Auto =>
+        {
+            literal(&Value::owned_blob(blob.raw()).unwrap_or(Value::Null))
+        }
         Value::Null => "null".to_string(),
         Value::Integer(number) => number.to_string(),
         Value::Real(_) => number_text(value),
         Value::Text(text) => format!(
             "\"{}\"",
-            inillucent_base::json::escape_sql(&String::from_utf8_lossy(text.raw()))
+            inillucent_base::json::escape_sql(&crate::raw::decode(text.raw()))
         ),
         // A blob's bytes, each as its own escape: the reference writes
-        // `"\u00ab"` rather than the hex a reader might expect, and a consumer
+        // `"«"` rather than the hex a reader might expect, and a consumer
         // of the JSON is reading whichever one it was given.
         Value::Blob(blob) => {
             let escaped: String = blob
@@ -539,260 +924,29 @@ fn json_value(value: &Value<'static>) -> String {
     }
 }
 
-/// Returns each column's width: the widest of its values, and of its name
-/// when the name is printed. With headers off SQLite sizes a column by its
-/// values alone.
-fn widths(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Vec<usize> {
-    let mut widths: Vec<usize> = columns
-        .iter()
-        .map(|name| {
-            if layout.headers {
-                name.chars().count()
-            } else {
-                0
-            }
-        })
-        .collect();
-    for row in rows {
-        for (index, value) in row.iter().enumerate() {
-            let width = plain(layout, value).chars().count();
-            match widths.get_mut(index) {
-                Some(existing) => *existing = (*existing).max(width),
-                None => widths.push(width),
-            }
-        }
-    }
-    for (index, fixed) in layout.widths.iter().enumerate() {
-        if *fixed == 0 {
-            continue;
-        }
-        if let Some(existing) = widths.get_mut(index) {
-            *existing = *fixed;
-        }
-    }
-    widths
-}
-
-/// `column`: fixed-width columns with two spaces between them.
-fn aligned(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Vec<String> {
-    let widths = widths(layout, columns, rows);
-    let mut out = Vec::with_capacity(rows.len() + 2);
-    if layout.headers {
-        let centred: Vec<String> = columns
-            .iter()
-            .enumerate()
-            .map(|(index, name)| centre(name, widths.get(index).copied().unwrap_or(0)))
-            .collect();
-        out.push(centred.join("  ").trim_end().to_string());
-        out.push(
-            widths
-                .iter()
-                .map(|width| "-".repeat(*width))
-                .collect::<Vec<String>>()
-                .join("  "),
-        );
-    }
-    for row in rows {
-        let cells: Vec<String> = row
-            .iter()
-            .enumerate()
-            .map(|(index, value)| align(layout, value, widths.get(index).copied().unwrap_or(0)))
-            .collect();
-        out.push(pad_row(&cells, &widths));
-    }
-    out
-}
-
-/// Returns one cell padded to its width, right-aligned when it is a number.
+/// Quotes one CSV field, if it needs it.
 ///
-/// A number is right-aligned and everything else is not, which is what makes a
-/// column of amounts line up on its digits.
-fn align(layout: &Layout, value: &Value<'static>, width: usize) -> String {
-    let text = plain(layout, value);
-    if matches!(value, Value::Integer(_) | Value::Real(_)) {
-        return format!("{text:>width$}");
-    }
-    text
-}
-
-/// Centres text in a field, leaning left when it cannot be even.
+/// The reference quotes text that is empty, that holds the mode's separator, or
+/// that holds a character from a fixed list: every control character, the
+/// space, the double quote, the single quote, DELETE and everything past ASCII.
+/// A comma, a semicolon or a vertical bar does not force quoting in `tabs`.
+/// The text is judged before control characters are made visible, so a
+/// caret in the data is not mistaken for one.
 ///
-/// Every tabular mode centres its headers over left-aligned values, which is
-/// the reference's choice and looks better than it sounds: a narrow numeric
-/// column under a long name is unreadable left-aligned.
-fn centre(text: &str, width: usize) -> String {
-    let length = text.chars().count();
-    if length >= width {
+/// @param text - the field's text
+/// @param separator - the mode's separator
+pub(crate) fn csv_field(text: &str, separator: &str) -> String {
+    let needs = text.is_empty()
+        || text.contains(separator)
+        || text.chars().any(|character| {
+            u32::from(character) <= 0x20
+                || matches!(character, '"' | '\'')
+                || u32::from(character) >= 0x7f
+        });
+    if !needs {
         return text.to_string();
     }
-    let left = (width - length) / 2;
-    let right = width - length - left;
-    format!("{}{text}{}", " ".repeat(left), " ".repeat(right))
-}
-
-/// Pads a row of cells to the given widths, trimming the trailing run.
-fn pad_row(cells: &[String], widths: &[usize]) -> String {
-    let padded: Vec<String> = cells
-        .iter()
-        .enumerate()
-        .map(|(index, cell)| {
-            let width = widths.get(index).copied().unwrap_or(0);
-            format!("{cell:<width$}")
-        })
-        .collect();
-    padded.join("  ").trim_end().to_string()
-}
-
-/// The characters one drawn table is made of.
-struct Frame {
-    left: &'static str,
-    middle: &'static str,
-    right: &'static str,
-    horizontal: &'static str,
-    vertical: &'static str,
-}
-
-/// `markdown`, `table` and `box`: a header, a rule, and the rows.
-fn drawn(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Vec<String> {
-    let widths = widths(layout, columns, rows);
-    let frame = match layout.mode {
-        Mode::Markdown => Frame {
-            left: "|",
-            middle: "|",
-            right: "|",
-            horizontal: "-",
-            vertical: "|",
-        },
-        // The reference draws its box with rounded corners and a double
-        // rule under the header. That is copied exactly rather than
-        // approximated: the whole value of the mode is that a person
-        // recognises the output.
-        Mode::Box => Frame {
-            left: "\u{256d}",
-            middle: "\u{252c}",
-            right: "\u{256e}",
-            horizontal: "\u{2500}",
-            vertical: "\u{2502}",
-        },
-        _ => Frame {
-            left: "+",
-            middle: "+",
-            right: "+",
-            horizontal: "-",
-            vertical: "|",
-        },
-    };
-    let mut out = Vec::with_capacity(rows.len() + 4);
-    let rule = rule_line(&frame, &widths);
-    if layout.mode != Mode::Markdown {
-        out.push(rule.clone());
-    }
-    if layout.headers {
-        drawn_header(layout, &frame, columns, &widths, &rule, &mut out);
-    }
-    for row in rows {
-        let cells: Vec<String> = row
-            .iter()
-            .enumerate()
-            .map(|(index, value)| align(layout, value, widths.get(index).copied().unwrap_or(0)))
-            .collect();
-        out.push(drawn_row(&frame, &cells, &widths, layout, false));
-    }
-    if layout.mode == Mode::Box {
-        out.push(rule_line(
-            &Frame {
-                left: "\u{2570}",
-                middle: "\u{2534}",
-                right: "\u{256f}",
-                ..frame
-            },
-            &widths,
-        ));
-    } else if layout.mode != Mode::Markdown {
-        out.push(rule);
-    }
-    out
-}
-
-/// Appends the header line of a drawn table and the rule under it.
-///
-/// With headers off SQLite draws neither, and a box or a table keeps only
-/// its top and bottom rules.
-///
-/// @param layout - the shell's output settings
-/// @param frame - the characters the mode draws with
-/// @param columns - the column names
-/// @param widths - each column's width
-/// @param rule - the mode's plain rule, which `table` repeats under the header
-/// @param out - the lines drawn so far
-fn drawn_header(
-    layout: &Layout,
-    frame: &Frame,
-    columns: &[String],
-    widths: &[usize],
-    rule: &str,
-    out: &mut Vec<String>,
-) {
-    let centred: Vec<String> = columns
-        .iter()
-        .enumerate()
-        .map(|(index, name)| centre(name, widths.get(index).copied().unwrap_or(0)))
-        .collect();
-    out.push(drawn_row(frame, &centred, widths, layout, true));
-    out.push(match layout.mode {
-        Mode::Markdown => markdown_rule(widths),
-        Mode::Box => rule_line(
-            &Frame {
-                left: "\u{255e}",
-                middle: "\u{256a}",
-                right: "\u{2561}",
-                horizontal: "\u{2550}",
-                ..*frame
-            },
-            widths,
-        ),
-        _ => rule.to_string(),
-    });
-}
-
-/// Returns one horizontal rule.
-fn rule_line(frame: &Frame, widths: &[usize]) -> String {
-    let parts: Vec<String> = widths
-        .iter()
-        .map(|width| frame.horizontal.repeat(width + 2))
-        .collect();
-    format!("{}{}{}", frame.left, parts.join(frame.middle), frame.right)
-}
-
-/// Returns the `|---|---|` line Markdown wants under its header.
-fn markdown_rule(widths: &[usize]) -> String {
-    let parts: Vec<String> = widths.iter().map(|width| "-".repeat(width + 2)).collect();
-    format!("|{}|", parts.join("|"))
-}
-
-/// Returns one drawn row, padded to the widths.
-fn drawn_row(
-    frame: &Frame,
-    cells: &[String],
-    widths: &[usize],
-    layout: &Layout,
-    header: bool,
-) -> String {
-    let _ = (layout, header);
-    let padded: Vec<String> = widths
-        .iter()
-        .enumerate()
-        .map(|(index, width)| {
-            let cell = cells.get(index).cloned().unwrap_or_default();
-            format!(" {cell:<width$} ")
-        })
-        .collect();
-    format!(
-        "{}{}{}",
-        frame.vertical,
-        padded.join(frame.vertical),
-        frame.vertical
-    )
+    format!("\"{}\"", text.replace('"', "\"\""))
 }
 
 /// `html`: a table body, which is what a caller pastes into a page.
@@ -812,19 +966,37 @@ fn html(layout: &Layout, columns: &[String], rows: &[Vec<Value<'static>>]) -> Ve
     for row in rows {
         out.push("<TR>".to_string());
         for value in row {
-            out.push(format!("<TD>{}", html_escape(&plain(layout, value))));
+            // **A NULL is `null` in `html`, whatever `.nullvalue` says**, as the
+            // reference writes it.
+            let text = match value {
+                Value::Null => "null".to_string(),
+                other => escape_controls(&until_value(other), layout.escape),
+            };
+            out.push(format!("<TD>{}", html_escape(&text)));
         }
         out.push("</TR>".to_string());
     }
     out
 }
 
-/// Escapes the four characters that mean something in HTML.
+/// Returns a value as plain text, for the modes that escape it themselves.
+fn until_value(value: &Value<'static>) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Integer(number) => number.to_string(),
+        Value::Real(_) => number_text(value),
+        Value::Text(text) => until_nul(text.raw()),
+        Value::Blob(blob) => until_nul(blob.raw()),
+    }
+}
+
+/// Escapes the five characters that mean something in HTML, as the reference does.
 fn html_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 #[cfg(test)]
@@ -877,6 +1049,7 @@ mod tests {
             mode: Mode::Csv,
             separator: ",".to_string(),
             row_separator: "\r\n".to_string(),
+            quote: Quote::Csv,
             to_stdout: false,
             ..Layout::default()
         };
@@ -893,12 +1066,24 @@ mod tests {
         assert_eq!(render(&to_the_terminal, &columns, &rows), vec![expected]);
     }
 
+    /// A row separator with no newline in it is the whole ending of the line.
+    #[test]
+    fn a_row_separator_without_a_newline_ends_the_line_itself() {
+        let (columns, rows) = sample();
+        let layout = Layout {
+            row_separator: "X".to_string(),
+            ..Layout::default()
+        };
+        assert_eq!(render(&layout, &columns, &rows), vec!["1|twoX"]);
+        assert!(!layout.lines_end_in_newline());
+    }
+
     /// A CSV field is quoted only when it has to be.
     #[test]
     fn csv_quotes_only_what_it_must() {
-        assert_eq!(csv_field("plain"), "plain");
-        assert_eq!(csv_field("a,b"), "\"a,b\"");
-        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field("plain", ","), "plain");
+        assert_eq!(csv_field("a,b", ","), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\"", ","), "\"say \"\"hi\"\"\"");
     }
 
     /// **An empty CSV field that is not NULL is quoted, and a NULL is not.**
@@ -921,6 +1106,7 @@ mod tests {
         let layout = Layout {
             mode: Mode::Csv,
             separator: ",".to_string(),
+            quote: Quote::Csv,
             ..Layout::default()
         };
         assert_eq!(
@@ -929,16 +1115,29 @@ mod tests {
         );
     }
 
-    /// A control character is escaped and a NUL ends the value.
+    /// A value is quoted for `tabs` and `csv` when it holds a character the
+    /// reference lists: a control character, a space, a double or single quote,
+    /// DELETE, anything past ASCII, or the mode's separator. Empty text is
+    /// quoted too.
     #[test]
-    fn control_characters_are_escaped() {
-        assert_eq!(printable(b"ab"), "ab");
-        assert_eq!(printable(&[0x01, 0x02]), "^A^B");
-        assert_eq!(printable(&[0x09, b't']), "\tt");
-        assert_eq!(printable(&[0x0d, b'r']), "^Mr");
-        assert_eq!(printable(&[0x7f]), "\u{7f}");
-        assert_eq!(printable(b"a\nb"), "a\nb");
-        assert_eq!(printable(&[b'a', 0, b'b']), "a");
+    fn csv_quotes_the_characters_the_reference_lists() {
+        for quoted in [
+            "a b",
+            "q\"",
+            "it's",
+            "caf\u{e9}",
+            "a\tb",
+            "a\nb",
+            "x\u{7f}",
+            "",
+        ] {
+            assert!(csv_field(quoted, ",").starts_with('"'), "{quoted:?}");
+        }
+        for plain in ["abc", "a^b", "semi;", "a|b", "12", "1.5"] {
+            assert_eq!(csv_field(plain, ","), plain);
+        }
+        assert_eq!(csv_field("a,b", ","), "\"a,b\"");
+        assert_eq!(csv_field("a,b", "\t"), "a,b");
     }
 
     /// Quote mode writes values as SQL literals, blobs included.
@@ -952,6 +1151,8 @@ mod tests {
         ];
         let layout = Layout {
             mode: Mode::Quote,
+            quote: Quote::Sql,
+            null: "NULL".to_string(),
             ..Layout::default()
         };
         let out = render(&layout, &columns, &rows);
@@ -974,10 +1175,33 @@ mod tests {
             Mode::Table,
             Mode::Box,
             Mode::Html,
+            Mode::Ascii,
+            Mode::Qbox,
+            Mode::Tcl,
+            Mode::C,
+            Mode::Count,
+            Mode::Off,
+            Mode::Jatom,
+            Mode::Jobject,
+            Mode::Psql,
+            Mode::Split,
         ] {
             assert_eq!(Mode::from_name(mode.name()), Some(mode), "{}", mode.name());
         }
         assert_eq!(Mode::from_name("nonsense"), None);
+    }
+
+    /// A control character is escaped and a NUL ends the value.
+    #[test]
+    fn control_characters_are_escaped() {
+        use super::text::escape_controls;
+        assert_eq!(escape_controls("ab", Escape::Auto), "ab");
+        assert_eq!(escape_controls("\u{1}\u{2}", Escape::Auto), "^A^B");
+        assert_eq!(escape_controls("\tt", Escape::Auto), "\tt");
+        assert_eq!(escape_controls("\rr", Escape::Auto), "^Mr");
+        assert_eq!(escape_controls("a\r\nb", Escape::Auto), "a\r\nb");
+        assert_eq!(escape_controls("\u{7f}", Escape::Auto), "\u{7f}");
+        assert_eq!(until_nul(&[b'a', 0, b'b']), "a");
     }
 
     /// A drawn table has a rule above and below its rows.
@@ -1007,5 +1231,20 @@ mod tests {
         assert_eq!(inillucent_base::json::escape("a\u{c}b"), "a\\fb");
         assert_eq!(inillucent_base::json::escape("a\u{7f}b"), "a\\u007fb");
         assert_eq!(inillucent_base::json::escape_sql("a\u{7f}b"), "a\u{7f}b");
+    }
+
+    /// The table name of an `INSERT` is quoted when it has to be.
+    #[test]
+    fn an_insert_quotes_a_table_name_that_needs_it() {
+        let (columns, rows) = sample();
+        let layout = Layout {
+            mode: Mode::Insert,
+            table: "x y".to_string(),
+            ..Layout::default()
+        };
+        assert_eq!(
+            render(&layout, &columns, &rows),
+            vec!["INSERT INTO \"x y\" VALUES(1,'two');"]
+        );
     }
 }

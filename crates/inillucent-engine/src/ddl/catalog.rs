@@ -61,6 +61,9 @@ impl crate::ImportedDatabase {
     /// cache is the bug this function exists to make unwriteable: the next
     /// execution would take a plan built against the tree that used to be there.
     pub(crate) fn refresh_catalog(&mut self) {
+        if self.refresh_catalog_for_appended_table() {
+            return;
+        }
         // **The keys are re-planned every time the schema changes**, and this
         // is the only place that can do it: a foreign key records the child's
         // side alone, so the parent's trigger is found by asking every table
@@ -68,11 +71,15 @@ impl crate::ImportedDatabase {
         // time. Doing it here rather than in `create_table` is also what makes
         // `CREATE TABLE child(... REFERENCES parent)` written *before* the
         // parent exists start being enforced when the parent arrives.
-        inillucent_sql::foreign_key::plan_schema(
-            &mut self.schema.tables,
-            b"main",
-            &inillucent_base::limits::Limits::default(),
-        );
+        // Planning copies every table, so it is skipped when no table has a key to plan and
+        // none holds a plan from an earlier schema.
+        if self.any_foreign_key() {
+            inillucent_sql::foreign_key::plan_schema(
+                &mut self.schema.tables,
+                b"main",
+                &inillucent_base::limits::Limits::default(),
+            );
+        }
         // **Before the snapshot, because the snapshot is what the planner
         // reads.** An index a module owns is published onto its table's
         // `indexes` list, and a catalog built before that happened describes a
@@ -168,6 +175,46 @@ impl crate::ImportedDatabase {
         // Last, after the catalog a module would read is the new one; see
         // `vtab::schema_changed_modules` (task-1932, M2).
         self.schema_changed_modules();
+    }
+    /// Reports whether any table declares a foreign key or holds the plan of one.
+    fn any_foreign_key(&self) -> bool {
+        self.schema
+            .tables
+            .iter()
+            .any(|table| !table.foreign_keys.is_empty() || !table.foreign_key_triggers.is_empty())
+    }
+    /// Refreshes the catalog after `define_table` appended one table, by adding that table to
+    /// the catalog already held, and reports whether it did.
+    ///
+    /// **Why.** The full refresh copies every table into a new catalog and plans every foreign
+    /// key, so each `CREATE TABLE` cost time in proportion to the tables that already existed.
+    /// Nothing else changes when a table with no foreign key joins a schema that has none, no
+    /// module-owned index, no imposter and no statistics to re-read, so the catalog is the held
+    /// one with the new table in the position it has in `tables`. It answers `false`, leaving
+    /// the full refresh to run, when anything else has happened since the table was appended.
+    fn refresh_catalog_for_appended_table(&mut self) -> bool {
+        let Some((position, length, generation)) = self.schema.appended.take() else {
+            return false;
+        };
+        // A generation of zero is a catalog no refresh has built yet, which has neither the
+        // eponymous tables nor `temp` for a table to be added to.
+        let unchanged = generation == self.schema.catalog_generation
+            && generation > 0
+            && length == self.schema.tables.len()
+            && self.session_state.virtual_tables.is_empty()
+            && self.schema.imposters.is_empty()
+            && !self.any_foreign_key();
+        let Some(table) = self.schema.tables.get(position).filter(|_| unchanged) else {
+            return false;
+        };
+        if self.schema.catalog.tables.len() < position {
+            return false;
+        }
+        let added = std::rc::Rc::new(table.clone());
+        self.schema.catalog.tables.insert(position, added);
+        self.forget_compiled_statements();
+        self.schema.catalog_generation = self.schema.catalog_generation.saturating_add(1);
+        true
     }
     /// Returns one `TableInfo` per eponymous module the registry holds.
     ///
@@ -696,8 +743,32 @@ impl crate::ImportedDatabase {
     /// @param rowid - the row's key
     /// @param entry - what it should now say
     pub(crate) fn rewrite(&mut self, rowid: i64, entry: SchemaEntry) -> DbResult<()> {
+        let (at, txn, ..) = self.catalog_write()?;
+        self.rewrite_in(at, txn, rowid, entry)
+    }
+    /// Replaces one catalog row of a file under a named transaction.
+    ///
+    /// The form `rewrite` calls once it has asked where the statement in flight
+    /// writes. The step that compacts roots at a commit calls it with the
+    /// committing transaction, which `current_txn` does not name once the
+    /// statement's number has been taken.
+    ///
+    /// @param at - the schema, as the binder numbers them
+    /// @param txn - the transaction the records belong to
+    /// @param rowid - the row's key
+    /// @param entry - what it should now say
+    pub(crate) fn rewrite_in(
+        &mut self,
+        at: usize,
+        txn: u64,
+        rowid: i64,
+        entry: SchemaEntry,
+    ) -> DbResult<()> {
         {
-            let (at, txn, _open, wal, uncommitted) = self.catalog_write()?;
+            let wal = self
+                .log_of(at)
+                .ok_or_else(|| refusal("a statement names a database that is not attached"))?;
+            let uncommitted = self.uncommitted_handle_of(at);
             let mut log = WalLog {
                 wal,
                 txn,
@@ -725,7 +796,6 @@ impl crate::ImportedDatabase {
             delete_entry(database, tree, &mut log, rowid)?;
             insert_entry(database, tree, &mut log, rowid, &entry)?;
         }
-        let at = self.schema.ddl_schema;
         for held in self.entries_of_mut(at).into_iter().flatten() {
             if held.rowid == rowid {
                 held.entry = entry.clone();

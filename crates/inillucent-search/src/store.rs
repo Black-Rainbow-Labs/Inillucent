@@ -819,6 +819,60 @@ impl Store {
         Ok(found)
     }
 
+    /// Removes the generations named by a set of ids.
+    ///
+    /// Called when a merge or a rebuild has replaced the segments that used them, so that a
+    /// table which takes updates for a long time does not keep every segment it ever wrote.
+    /// @param doomed - the segment ids to remove
+    pub fn drop_generations(&self, context: &mut Context<'_>, doomed: &[i64]) -> DbResult<usize> {
+        if doomed.is_empty() {
+            return Ok(0);
+        }
+        // **By rowid from the map where the map knows the generation.** Finding the rows by
+        // scanning `%_gen` reads every segment of the table, which is the cost the map exists to
+        // avoid, and this runs at the end of every merge.
+        let map = self.generation_rows(context)?;
+        let mut removed = 0usize;
+        let mut unmapped: Vec<i64> = doomed.to_vec();
+        if let Some(entries) = &map {
+            for (generation, first, parts) in entries {
+                if !doomed.contains(generation) {
+                    continue;
+                }
+                for ordinal in 0..*parts {
+                    self.tables
+                        .delete_row(context, b"gen", first.saturating_add(ordinal))?;
+                    removed = removed.saturating_add(1);
+                }
+                unmapped.retain(|held| held != generation);
+            }
+        }
+        // Only a table with no map is scanned. A generation the map does not list is one the
+        // map could not vouch for, and `drop-old-generations` is the way to reclaim those.
+        if map.is_none() && !unmapped.is_empty() {
+            let mut rowids = Vec::new();
+            self.tables.scan(context, b"gen", |rowid, values| {
+                if values
+                    .get(1)
+                    .and_then(Value::as_integer)
+                    .is_some_and(|generation| unmapped.contains(&generation))
+                {
+                    rowids.push(rowid);
+                }
+                Ok(true)
+            })?;
+            removed = removed.saturating_add(rowids.len());
+            for rowid in rowids {
+                self.tables.delete_row(context, b"gen", rowid)?;
+            }
+        }
+        if let Some(mut entries) = map {
+            entries.retain(|(generation, _, _)| !doomed.contains(generation));
+            self.set_state_blob(context, state::GEN_ROWS, &encode_generation_rows(&entries))?;
+        }
+        Ok(removed)
+    }
+
     /// Removes every generation not named by a set of ids to keep.
     ///
     /// Never called by a write, only by the explicit maintenance command. A

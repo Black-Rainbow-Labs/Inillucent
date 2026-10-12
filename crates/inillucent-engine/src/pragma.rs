@@ -77,9 +77,18 @@ mod integrity;
 mod remembered;
 mod schema;
 mod tuning;
+mod vacuum;
 pub(crate) use tuning::setting_function_column;
 
 impl ImportedDatabase {
+    /// Returns the page size of `main`'s file, which is what `PRAGMA page_size` reports.
+    ///
+    /// The file's own, not the size the connection was asked to open with: a file made at
+    /// another page size keeps it.
+    fn file_page_size(&self) -> i64 {
+        self.storage.database.page_size() as i64
+    }
+
     /// Runs one `PRAGMA`.
     ///
     /// **A qualifier names which attached database the pragma is about**
@@ -144,7 +153,7 @@ impl ImportedDatabase {
             // size, so the value is ignored (see docs/sql.md), but the statement still answers
             // nothing the way SQLite's does.
             b"page_size" if argument.is_some() => Ok(Outcome::empty()),
-            b"page_size" => Ok(named_integer("page_size", self.storage.page_size as i64)),
+            b"page_size" => Ok(named_integer("page_size", self.file_page_size())),
             b"page_count" => Ok(named_integer(
                 "page_count",
                 self.file_of(at)?.pool().page_count() as i64,
@@ -169,7 +178,7 @@ impl ImportedDatabase {
             // number is 1 and stays 1. It is reported rather than refused
             // because the answer is correct, not because the subject is absent.
             b"data_version" => Ok(named_integer("data_version", 1)),
-            b"max_page_count" => self.pragma_max_page_count(argument),
+            b"max_page_count" => self.pragma_max_page_count(argument, at),
             // **Remembered, and exceeded.** `analysis_limit` caps how many rows
             // `ANALYZE` samples per index; this engine's `ANALYZE` walks the
             // whole table, which is *more* than the cap asks for and so is
@@ -207,7 +216,7 @@ impl ImportedDatabase {
             // falling through to the refusal - a refusal would be a difference
             // invented by the rule rather than found by it. `PRAGMA optimize`
             // is answered by `pragma_rows_of`: no rows, and one column.
-            b"incremental_vacuum" => self.pragma_incremental_vacuum(argument),
+            b"incremental_vacuum" => self.pragma_incremental_vacuum(argument, at),
             //
             // **No rows is not the same as no columns.** SQLite's `pragma.h`
             // gives the two directory pragmas a result column named after
@@ -340,10 +349,12 @@ impl ImportedDatabase {
             b"integrity_check" => self.pragma_integrity_check(
                 "integrity_check",
                 crate::engine::integrity::CheckDepth::Full,
+                (argument, at),
             )?,
             b"quick_check" => self.pragma_integrity_check(
                 "quick_check",
                 crate::engine::integrity::CheckDepth::Quick,
+                (argument, at),
             )?,
             b"optimize" => list_of::<&str>("optimize", &[]),
             b"foreign_key_list" => self.pragma_foreign_key_list(argument, at)?,

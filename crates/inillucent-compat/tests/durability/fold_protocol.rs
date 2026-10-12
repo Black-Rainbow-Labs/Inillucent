@@ -302,7 +302,7 @@ fn a_fold_syncs_twice_and_writes_each_page_once() {
     let owed = (dirty as u64).saturating_mul(PAGE_SIZE as u64);
     assert!(
         asked.log_bytes >= owed,
-        "a fold of {dirty} dirty page(s) owes the log at least {owed} bytes of          after images and appended {}",
+        "a fold of {dirty} dirty page(s) owes the log at least {owed} bytes of after images and appended {}",
         asked.log_bytes
     );
 }

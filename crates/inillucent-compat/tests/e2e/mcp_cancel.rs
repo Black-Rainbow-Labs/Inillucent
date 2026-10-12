@@ -38,12 +38,15 @@ fn area() -> PathBuf {
 /// How many rows the table holds.
 ///
 /// The slow statement is a three way cross join over it, so the work is the
-/// cube of this: 200 rows is 8 million combinations. The test below checks
+/// cube of this: 600 rows is 216 million combinations. The test below checks
 /// that they take more than half a second, and they are far short of the
 /// sixty second deadline a served request runs under. That gap is what makes
 /// the timing assertion below mean something, and the number is kept small
 /// because the uncancelled arm has to run the whole thing to measure it.
-const ROWS: usize = 200;
+///
+/// It was 200 until task-2226 taught a filter to compare a batch of integers
+/// in one loop: the 8 million combinations of 200 rows then took 0.05 s.
+const ROWS: usize = 600;
 
 /// A database with enough rows that a statement over it takes a while.
 ///

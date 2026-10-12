@@ -44,6 +44,20 @@ pub fn log_size_queries() -> u64 {
     }
 }
 
+/// How many times this process asked the file system by name for a path's length or file number,
+/// through `Vfs::size_by_name` and `Vfs::file_number_by_name`.
+static NAME_QUERIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Returns how many times this process asked the file system by name for a path's length or file
+/// number.
+///
+/// For the tests that check a statement does not ask while the log segment's oplock holds
+/// (task-2226): each such question is a lookup by name, which cost about 20 us on the development
+/// machine.
+pub fn name_queries() -> u64 {
+    NAME_QUERIES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// What a path names, as [`path_state`] answers it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PathState {
@@ -328,6 +342,7 @@ impl Vfs for OsVfs {
     ///
     /// @param path - the file
     fn size_by_name(&self, path: &DbPath) -> VfsResult<Option<u64>> {
+        NAME_QUERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::confine::authorize(path)?;
         match platform::path_state(path.as_path()) {
             Ok(None) => Ok(None),
@@ -337,6 +352,13 @@ impl Vfs for OsVfs {
                 .map_err(|error| VfsError::from_io(VfsOperation::Access, &error)),
             Err(error) => Err(VfsError::from_io(VfsOperation::Access, &error)),
         }
+    }
+
+    fn file_number_by_name(&self, path: &DbPath) -> VfsResult<Option<u128>> {
+        NAME_QUERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::confine::authorize(path)?;
+        platform::file_number_by_name(path.as_path())
+            .map_err(|error| VfsError::from_io(VfsOperation::Access, &error))
     }
 
     fn access(&self, path: &DbPath, mode: AccessMode) -> VfsResult<bool> {
@@ -626,6 +648,15 @@ impl VfsFile for OsFile {
         }
         platform::file_len(&self.file)
             .map_err(|error| VfsError::from_io(VfsOperation::FileSize, &error))
+    }
+
+    /// Answers from the shared log segment's oplock; any other file cannot tell.
+    fn quiet_token(&self) -> Option<u64> {
+        #[cfg(windows)]
+        if let Some(share) = &self.log {
+            return share.quiet_token();
+        }
+        None
     }
 
     /// Sets the file's length.

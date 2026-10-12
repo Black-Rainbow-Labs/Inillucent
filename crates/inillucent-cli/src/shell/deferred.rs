@@ -49,7 +49,7 @@ struct Source {
     /// The line of input it started on.
     line: usize,
     /// The excerpt an error in it shows.
-    excerpt: Option<String>,
+    excerpt: Option<super::Excerpt>,
     /// Which line of input it arrived in; see `Shell::chunk_number`.
     chunk: u64,
 }
@@ -113,7 +113,8 @@ impl Shell {
             || self.explain_plan
             || self.auth
             || self.readonly
-            || self.output_is_once
+            || self.is_read_only()
+            || self.redirection.as_ref().is_some_and(|held| held.once)
             || self.trace.is_some()
             || self.progress_interval > 0
             || self.scanstats != "off")
@@ -138,7 +139,7 @@ impl Shell {
 
     /// Runs the held statements, as one statement when that works and one at a
     /// time when it does not.
-    pub(crate) fn run_held(&mut self) {
+    pub fn run_held(&mut self) {
         let Some(held) = self.deferred.take() else {
             return;
         };

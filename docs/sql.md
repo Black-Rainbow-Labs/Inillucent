@@ -139,7 +139,7 @@ otherwise.
 | Joins | inner, `LEFT`, `RIGHT` and `FULL OUTER`, `CROSS`, `NATURAL`, `USING`, self joins. The planner picks a hash join, an index nested loop or a scan |
 | Compound queries | `UNION`, `UNION ALL`, `EXCEPT`, `INTERSECT` |
 | Subqueries | in `WHERE`, `IN`, `EXISTS`, as a value, and as a table in `FROM`, correlated or not. Row values in comparisons and in `IN`, with a value list or a subquery, such as `(a, b) IN (SELECT x, y FROM s)`. Recursive CTEs with `ORDER BY`, `LIMIT` and `OFFSET` |
-| Common table expressions | `WITH`, `WITH RECURSIVE`, `MATERIALIZED` and `NOT MATERIALIZED`, and `WITH` on `INSERT`, `UPDATE` and `DELETE` |
+| Common table expressions | `WITH`, `WITH RECURSIVE`, `MATERIALIZED` and `NOT MATERIALIZED`, and `WITH` on `INSERT`, `UPDATE` and `DELETE`. A recursive CTE produces rows while the query above it reads them, so `WHERE n > 3 LIMIT 2` over a recursion with no end stops after two matching rows. A CTE that reads itself anywhere but the `FROM` clause of its last arm fails with `circular reference`, and two reads of itself in one arm fail with `multiple references to recursive table` or `multiple recursive references`, as in SQLite |
 | Window functions | all eleven window functions and every aggregate function, `json_group_array`, `json_group_object`, `median` and `percentile` included, `PARTITION BY`, `ROWS`, `RANGE` and `GROUPS` frames, every `EXCLUDE` clause, `FILTER`, and named `WINDOW` clauses |
 | Writes | `INSERT`, `UPDATE`, `DELETE` and `REPLACE`, every `OR` conflict clause, `RETURNING`, `UPDATE ... FROM`, and `ON CONFLICT ... DO UPDATE` and `DO NOTHING`, with a target that is a column list, a partial index (the `WHERE` must match the index) or an expression such as `ON CONFLICT(lower(name))`. `DO UPDATE` runs the `CHECK`, `NOT NULL` and `STRICT` checks and fires the table's `UPDATE` triggers |
 | Tables | `CREATE TABLE`, `CREATE TABLE ... AS SELECT`, `WITHOUT ROWID`, `STRICT`, `VIRTUAL` and `STORED` generated columns, `AUTOINCREMENT`. A generated column has its declared affinity and collation, takes `STRICT`, `NOT NULL`, `UNIQUE` and `ON CONFLICT`, and can be a foreign key parent or child |
@@ -147,13 +147,13 @@ otherwise.
 | Views and triggers | `CREATE VIEW`, which stores the body and reports an error in it when the view is read. `CREATE TRIGGER` with `BEFORE`, `AFTER` and `INSTEAD OF`, `UPDATE OF`, `WHEN`, `RAISE` with a message that is any expression, and recursive triggers. `UPDATE` and `DELETE` on a view run its `INSTEAD OF UPDATE` and `INSTEAD OF DELETE` triggers, and the triggers are still there after the file is closed and opened again |
 | `ALTER TABLE` | `RENAME TO`, `RENAME COLUMN`, `ADD COLUMN`, `DROP COLUMN`, and the SQLite 3.53 forms `ALTER COLUMN c SET NOT NULL`, `ALTER COLUMN c DROP NOT NULL`, `ADD CONSTRAINT n CHECK (...)` and `DROP CONSTRAINT`. `RENAME` rewrites `REFERENCES` in other tables, view and trigger bodies, `UPDATE OF` lists, upsert targets and indexes, and fails with SQLite's `error in view v` message when a dependent view or trigger would break. `DROP COLUMN` follows SQLite's rules and is refused when a view reads the column. `PRAGMA legacy_alter_table` changes `RENAME` as in SQLite |
 | Constraints | `NOT NULL`, `UNIQUE`, `PRIMARY KEY`, `CHECK`, `DEFAULT`, and foreign keys with all five actions, immediate or deferred, and `PRAGMA foreign_key_check`. A foreign key compares with the parent column's collation, and a row may reference itself |
-| Values | type affinity on write, `CAST`, the `BINARY`, `NOCASE` and `RTRIM` collations, `LIKE`, `GLOB`, values larger than a page |
+| Values | type affinity on write, `CAST`, the `BINARY`, `NOCASE` and `RTRIM` collations, `LIKE`, `GLOB`, values larger than a page, in a key or an index as well. A key or an indexed value is limited to 1,048,576 bytes once encoded, see [the key limit](#smaller-differences) |
 | Functions | 190 built in function names, including 30 JSON functions, the maths functions and the date and time functions. Functions, aggregates and collations an application defines |
 | Transactions | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`. A `ROLLBACK` also undoes `CREATE` and `DROP TABLE` |
 | Several databases | `ATTACH` and `DETACH`, joins across files, and one transaction that commits to two files or to neither. Temporary tables, views and triggers |
 | Schema and maintenance | `sqlite_schema` and `sqlite_master`, `VACUUM`, `VACUUM INTO`, `integrity_check` and `quick_check` |
-| Plans | `EXPLAIN QUERY PLAN` as SQLite's tree, with attached schema names, automatic index lines, `LEFT-JOIN` markers, `CO-ROUTINE` and `MATERIALIZE` nodes for derived tables and CTEs, `COMPOUND QUERY` and `MERGE` nodes for compound queries, and `SCALAR SUBQUERY` and `LIST SUBQUERY` nodes. A derived table is flattened into the query that reads it where SQLite flattens it. Some plans still differ, see [below](#how-inillucent-behaves-differently-from-sqlite). Plain `EXPLAIN` runs and prints a different program, see [below](#five-follow-from-how-inillucent-is-built) |
-| Table valued functions | `generate_series`, `chunk_text(text, size, overlap, heading)`, which cuts a document into windows of characters for embedding, `json_each`, `json_tree`, a `pragma_*` function for every pragma that returns a value, such as `pragma_table_info('t')`, `pragma_foreign_key_check` and `pragma_user_version`, which can take its argument from an earlier `FROM` term, as in `FROM sqlite_master m, pragma_index_list(m.name)`, and any module an application registers |
+| Plans | `EXPLAIN QUERY PLAN` as SQLite's tree, with attached schema names, automatic index lines for a join and for a correlated subquery, the loop SQLite turns a positive `EXISTS` into, `LEFT-JOIN` markers, `CO-ROUTINE` and `MATERIALIZE` nodes for derived tables and CTEs, `COMPOUND QUERY` and `MERGE` nodes for compound queries, and `SCALAR SUBQUERY` and `LIST SUBQUERY` nodes. A derived table is flattened into the query that reads it where SQLite flattens it. Some plans still differ, see [below](#how-inillucent-behaves-differently-from-sqlite). Plain `EXPLAIN` runs and prints a different program, see [below](#five-follow-from-how-inillucent-is-built) |
+| Table valued functions | `generate_series`, `chunk_text(text, size, overlap, heading)`, which cuts a document into windows of characters for embedding, `json_each`, `json_tree`, a `pragma_*` function for every pragma that returns a value, such as `pragma_table_info('t')`, `pragma_foreign_key_check` and `pragma_user_version`, which can take its argument from an earlier `FROM` term, as in `FROM sqlite_master m, pragma_index_list(m.name)`, and any module an application registers. A schema name in front of the function, as in `main.generate_series(1, 3)`, is accepted |
 
 ### Rules a reader asks about
 
@@ -181,6 +181,26 @@ is SQLite's message.
 - A view in `main` does not read a temporary table that shadows its base table.
 - `INDEXED BY` may name a partial index where SQLite accepts it.
 - `RETURNING` is evaluated right after each row is written, before `AFTER` triggers run.
+- A column of a derived table, a CTE or a view that is a compound query takes its affinity from the
+  first arm whose expression has one, as SQLite does. `SELECT 1 AS o UNION ALL SELECT x FROM r` over a
+  `REAL` column `x` makes `o` a `REAL` column, so the 1 reads as 1.0. An arm that can hold text next
+  to a numeric column, or a first arm that is a `CAST`, leaves the integers as they are.
+
+**Constraints and conflicts.**
+
+- A row that breaks two `UNIQUE` or `PRIMARY KEY` constraints of one table reports the one declared
+  last. This holds for the primary key of a `WITHOUT ROWID` table too: with `x UNIQUE, y PRIMARY
+  KEY` it reports `t.y`, and with `y PRIMARY KEY, x UNIQUE` it reports `t.x`.
+- A `UNIQUE` constraint on the same columns as the primary key of a `WITHOUT ROWID` table is the
+  same index, as in SQLite, and `PRAGMA index_list` shows one row for it.
+- A `STRICT` datatype failure inside a transaction leaves the rows an `INSERT OR FAIL`,
+  `OR IGNORE`, `OR REPLACE`, `UPDATE OR FAIL`, `OR IGNORE` or `OR REPLACE` wrote before the failing
+  row. Outside a transaction the whole statement is undone.
+- A `VIRTUAL` generated column is computed on every `INSERT` and `UPDATE`. A write is refused when
+  the expression fails, for example `abs(-9223372036854775808)` with `integer overflow`.
+- `GLOB`, `REGEXP` and `MATCH` take no `ESCAPE`. `a GLOB b ESCAPE c` fails with `wrong number of
+  arguments to function GLOB()`. An aggregate used as a window function keeps its argument count, so
+  `sum() OVER ()` fails the same way.
 
 **How a `WHERE` is searched.**
 
@@ -361,14 +381,16 @@ These differences change how an application runs, and they do not show up in a p
 | Threads | one. The engine is single threaded | serialised or multithreaded |
 | A transaction larger than the page cache | allowed under `delete`, `truncate` and `persist`. Under `wal`, `memory` and `off`, the transaction fails when it changes more pages than the cache holds | spills to the journal |
 | A `SELECT` result | computed when the first row is stepped. Later steps return rows already computed | computed one row per step |
+| `AND` and `OR` | both operands are evaluated, so an error in the operand SQLite would skip, such as `abs(-9223372036854775808)` after a true left side of `OR`, is raised | the right operand is skipped when the left side decides the result |
 | `DELETE ... LIMIT` and `UPDATE ... LIMIT` | accepted | accepted only in a build made with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`. The pinned `sqlite3` is built without it, and many distribution builds enable it |
 | `PRAGMA page_size` before the first write | ignored, because the page size is part of inillucent's file format. The default is 32768. `PRAGMA page_size = n` prints nothing, as in SQLite. `PRAGMA aux.page_size = n` is ignored too | sets the page size |
-| `PRAGMA page_count`, `freelist_count` and `max_page_count` | count pages of 32768 bytes, so the same data needs fewer pages, and a `max_page_count` limit is reached later | count pages of 4096 bytes |
+| `PRAGMA page_count`, `freelist_count` and `max_page_count` | count pages of 32768 bytes, so the same data needs fewer pages, and a `max_page_count` limit is reached later. `max_page_count` is enforced: a statement that would grow the file past it fails with `database or disk is full` and the status `full`, and only that statement is rolled back. The limit is held on the open file and is not written to it | count pages of 4096 bytes. A statement that meets the limit rolls back the whole transaction in the cases that were measured |
+| `PRAGMA auto_vacuum` and `incremental_vacuum` | `FULL` gives back the free pages at each commit and `INCREMENTAL` gives back up to N pages when `PRAGMA incremental_vacuum(N)` runs. On a file that has tables, a new mode takes effect when `VACUUM` rebuilds the file | the same |
 | `PRAGMA cache_size` default | `-131072`. A value outside 32 bits reads as 0 | `-2000` |
 | `PRAGMA busy_timeout` default | 5000 ms | 0 in the `sqlite3` shell |
 | `sqlite_schema.rootpage` | the first table has root page 4, because inillucent keeps its own catalog trees on the first pages. The other columns match | the first table has root page 2 |
 | a `WITHOUT ROWID` table whose primary key term is `DESC` | a query with no `ORDER BY` returns rows in ascending key order. Range predicates, seeks and `ORDER BY` on the key return the same rows as SQLite | the rows come back in descending key order |
-| `EXPLAIN QUERY PLAN` where the planners choose differently | the same tree, with the loops this planner chose. It does not seek an index by `IN (SELECT ...)`, so it prints `SCAN` and a bloom filter under the `LIST SUBQUERY` node. It does not turn `EXISTS` into a join, walk an index to avoid a sort, or sort only the last term of an `ORDER BY`. It may join a derived table in another order. An `OR` answered by one search per arm prints `MULTI-INDEX OR` with no line for each arm. The rows of the query match | `SEARCH` by the subquery's rows, an `EXISTS` loop, an index walk, `USE TEMP B-TREE FOR LAST TERM OF ORDER BY` |
+| `EXPLAIN QUERY PLAN` where the planners choose differently | the same tree, with the loops this planner chose. It does not seek an index by `IN (SELECT ...)`, so it prints `SCAN` and a bloom filter under the `LIST SUBQUERY` node. It does not turn `EXISTS` into a join, walk an index to avoid a sort, or sort only the last term of an `ORDER BY`. A positive `EXISTS` over one table with no index for its key prints the loop and automatic index lines SQLite prints for the join it makes, such as `SEARCH b EXISTS USING AUTOMATIC PARTIAL COVERING INDEX (k=?)`, and this engine reads that table once into a hash table. Any other correlated subquery over such a table keeps its node and prints the same two lines under it, where SQLite prints them once `ANALYZE` has given the tables row counts and prints `SCAN` before that. It may join a table or a derived table in another order. A join keyed on an expression, such as `a.k = b.k + 1`, prints the key as `(<expr>=?)`, where SQLite builds its index on the plain column of the other table and joins in the other order. An `OR` answered by one search per arm prints `MULTI-INDEX OR` with no line for each arm. The rows of the query match | `SEARCH` by the subquery's rows, an `EXISTS` loop, an index walk, `USE TEMP B-TREE FOR LAST TERM OF ORDER BY` |
 | `mmap_size`, `wal_autocheckpoint`, `journal_size_limit`, `temp_store = FILE`, `synchronous = EXTRA`, `threads`, the heap limits and `cache_spill` | stored and read back as SQLite reports them, and they do not change how inillucent runs. It maps no pages, has one thread, and folds the log at checkpoints | each changes how SQLite runs |
 | `$1`, `$2` placeholders | `$N` binds the Nth value, as `?N` does and as PostgreSQL does. `SET a = $2 WHERE id = $1` takes `a` from the second value | `$1` is a name, numbered by the order names first appear, so the same statement takes `a` from the first value |
 
@@ -428,6 +450,7 @@ commit writes it into the database file. Measured with a 64 page cache: one tran
 | `SELECT * FROM pragma_foreign_keys` | fails with `no such table: pragma_foreign_keys`. Use `PRAGMA foreign_keys` | returns one row with the setting |
 | `inillucent vector-search` result columns | the primary key appears twice: once as the table's column, and once as the column the search adds | no vector search |
 | an `inillucent_search` insert with a vector of the wrong length | fails with status `syntax` and the message `SQL logic error`, which does not name the vector | no vector search |
+| the longest key | a key of an index or a primary key is limited to 1,048,576 bytes once encoded. A longer one fails with `an index or primary key entry is longer than 1,048,576 bytes` before any page is written. A zero byte in a text or a blob takes two bytes once encoded | a key can be up to the gigabyte limit of a value |
 
 A vector written to an `inillucent_search` table as JSON text, such as `'[1,0,0,0]'`, is accepted
 and stored as a blob.

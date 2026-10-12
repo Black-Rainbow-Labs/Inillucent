@@ -159,6 +159,11 @@ use crate::ImportedDatabase;
 /// would make what a suite sees depend on how long it took to get there.
 pub(crate) const RECLAIM_BYTES: u64 = 4 << 20;
 
+/// How much log a temporary or in memory database gathers before
+/// [`ImportedDatabase::reclaim_scratch_logs`] folds it. Smaller than [`RECLAIM_BYTES`] because
+/// the log of such a database is memory, and nothing reads it back.
+pub(crate) const SCRATCH_RECLAIM_BYTES: u64 = 256 << 10;
+
 /// How large the open log segment grows before closing a connection also
 /// shrinks the log.
 ///
@@ -218,6 +223,77 @@ pub(crate) const FOLD_PATIENCE_MILLIS: u64 = 50;
 fn reclaim(wal: &inillucent_wal::writer::Wal, recovery_from: u64) -> DbResult<()> {
     wal.note_checkpoint(recovery_from, 0)?;
     wal.retire_segments_below(recovery_from)?;
+    Ok(())
+}
+
+/// Folds one attached or temporary file's pages into it and advances its log's recovery
+/// point, reclaiming the log when `asked` or when it has grown past [`RECLAIM_BYTES`].
+///
+/// Shared by [`ImportedDatabase::checkpoint_attached`], which folds the files that have a
+/// path, and [`ImportedDatabase::reclaim_scratch_logs`], which folds the ones that have none.
+///
+/// @param held - the file, with its pool and its own log
+/// @param asked - whether the log is reclaimed whatever its size
+fn fold_one_attached(held: &mut crate::Attached, asked: bool) -> DbResult<()> {
+    // Each file's log is reclaimed on its own terms, because each file has
+    // its own log and its own size. See `checkpoint_within`.
+    let reclaiming = asked || held.wal.since_checkpoint() >= RECLAIM_BYTES;
+    held.wal.sync()?;
+    if reclaiming {
+        held.wal.roll_segment()?;
+    }
+    // See `checkpoint`'s own comment: read before this file's free-map
+    // pages are touched below, and without an extra `flush()`.
+    let oldest_dirty = held.database.pool().oldest_dirty_lsn();
+    // The same after images `main`'s fold appends, for the same reason:
+    // an attached file's fold writes its pages in place too, and it has
+    // its own log to carry them. See `checkpoint_within`.
+    if held.database.pool().fold_is_protected_by_log() {
+        inillucent_txn::engine::log_dirty_page_images(&mut held.database, &held.wal)?;
+    }
+    inillucent_txn::engine::log_free_map_pages(&mut held.database, &held.wal)?;
+    held.wal.sync()?;
+    let durable = held.wal.write_ahead_point();
+    held.database.pool().set_durable_lsn(durable);
+    // See `checkpoint`'s own comment: zero is the absence of a stream
+    // position rather than one, and the point that covers everything is
+    // the stream's start.
+    let recovery_from = durable
+        .min(held.database.pool().uncommitted_lsn())
+        .min(oldest_dirty)
+        .max(inillucent_wal::FIRST_LSN);
+    // And the same doubt floor `main` has, read off this file's own
+    // markers rather than off `main`'s: a transaction may be undecided
+    // over the attachment and settled over the database the connection
+    // was opened on, or the other way round.
+    let recovery_from = match held.in_doubt {
+        true => recovery_from.min(
+            held.database
+                .meta()
+                .checkpoint_lsn
+                .max(inillucent_wal::FIRST_LSN),
+        ),
+        false => recovery_from,
+    };
+    // See `checkpoint`'s own comment: paired with the segment that
+    // actually holds `recovery_from`, not whichever one `roll_segment`
+    // just opened, and refused rather than guessed if none does.
+    let recovery_sequence = held.wal.sequence_containing(recovery_from)?;
+    held.database
+        .set_log_position(recovery_from, 0, recovery_sequence);
+    // Same reason as `checkpoint`'s own call: floors this file's own
+    // pool against this file's own recovery point, before segments
+    // below it are retired.
+    held.database.pool().set_retained_lsn(recovery_from);
+    held.database.checkpoint_after_free_map()?;
+    held.database.cut_to_page_count()?;
+    if reclaiming {
+        reclaim(&held.wal, recovery_from)?;
+    }
+    held.database
+        .pool()
+        .set_durable_lsn(held.wal.write_ahead_point());
+    held.wal.note_folded();
     Ok(())
 }
 
@@ -317,6 +393,32 @@ impl ImportedDatabase {
         self.counters.changed_ever.set(held.3);
         self.counters.total_changes.set(held.4);
         outcome
+    }
+
+    /// Folds the log of every temporary or in memory database that has grown past
+    /// [`SCRATCH_RECLAIM_BYTES`], so that a log nothing will ever replay stays small.
+    ///
+    /// **Why this exists.** `checkpoint_attached` skips a file that has no path, because it has
+    /// no file to fold a log into, and the temporary databases are not in that list at all.
+    /// Nothing else ever called `note_checkpoint` or `retire_segments_below` on their logs, so
+    /// every record of every `CREATE TEMP TABLE` and `DROP TABLE` stayed in memory until the
+    /// connection closed: about 1.3 KB for each create and drop pair, 266 MB after 200,000
+    /// of them. The fold here writes the same records the fold of an attached file does and
+    /// then retires the segments below the recovery point, which is the one thing a memory
+    /// database's log needs.
+    pub(crate) fn reclaim_scratch_logs(&mut self) -> DbResult<()> {
+        let scratch = self.session_state.temps.iter_mut().chain(
+            self.session_state
+                .attached
+                .iter_mut()
+                .filter(|held| held.path.is_none()),
+        );
+        for held in scratch {
+            if held.wal.since_checkpoint() >= SCRATCH_RECLAIM_BYTES {
+                fold_one_attached(held, true)?;
+            }
+        }
+        Ok(())
     }
 
     /// Folds every attached file and leaves `main` alone.
@@ -527,6 +629,12 @@ impl ImportedDatabase {
             self.note_where_the_log_ends(recovery_from)?;
         }
         self.storage.database.checkpoint_after_free_map()?;
+        // **The file is cut only by a checkpoint that moved the recovery point**, and
+        // this one just did: no record in the window the next recovery replays names a
+        // page past the end. A fold that did not move it, such as the one an open
+        // makes after a replay, would leave a file too short for records it still
+        // has to replay.
+        self.storage.database.cut_to_page_count()?;
         if reclaiming {
             reclaim(&self.storage.wal, recovery_from)?;
         }
@@ -689,64 +797,7 @@ impl ImportedDatabase {
             if held.database.lock_level() <= inillucent_vfs::FileLock::Shared {
                 continue;
             }
-            // Each file's log is reclaimed on its own terms, because each file has
-            // its own log and its own size. See `checkpoint_within`.
-            let reclaiming = asked || held.wal.since_checkpoint() >= RECLAIM_BYTES;
-            held.wal.sync()?;
-            if reclaiming {
-                held.wal.roll_segment()?;
-            }
-            // See `checkpoint`'s own comment: read before this file's free-map
-            // pages are touched below, and without an extra `flush()`.
-            let oldest_dirty = held.database.pool().oldest_dirty_lsn();
-            // The same after images `main`'s fold appends, for the same reason:
-            // an attached file's fold writes its pages in place too, and it has
-            // its own log to carry them. See `checkpoint_within`.
-            if held.database.pool().fold_is_protected_by_log() {
-                inillucent_txn::engine::log_dirty_page_images(&mut held.database, &held.wal)?;
-            }
-            inillucent_txn::engine::log_free_map_pages(&mut held.database, &held.wal)?;
-            held.wal.sync()?;
-            let durable = held.wal.write_ahead_point();
-            held.database.pool().set_durable_lsn(durable);
-            // See `checkpoint`'s own comment: zero is the absence of a stream
-            // position rather than one, and the point that covers everything is
-            // the stream's start.
-            let recovery_from = durable
-                .min(held.database.pool().uncommitted_lsn())
-                .min(oldest_dirty)
-                .max(inillucent_wal::FIRST_LSN);
-            // And the same doubt floor `main` has, read off this file's own
-            // markers rather than off `main`'s: a transaction may be undecided
-            // over the attachment and settled over the database the connection
-            // was opened on, or the other way round.
-            let recovery_from = match held.in_doubt {
-                true => recovery_from.min(
-                    held.database
-                        .meta()
-                        .checkpoint_lsn
-                        .max(inillucent_wal::FIRST_LSN),
-                ),
-                false => recovery_from,
-            };
-            // See `checkpoint`'s own comment: paired with the segment that
-            // actually holds `recovery_from`, not whichever one `roll_segment`
-            // just opened, and refused rather than guessed if none does.
-            let recovery_sequence = held.wal.sequence_containing(recovery_from)?;
-            held.database
-                .set_log_position(recovery_from, 0, recovery_sequence);
-            // Same reason as `checkpoint`'s own call: floors this file's own
-            // pool against this file's own recovery point, before segments
-            // below it are retired.
-            held.database.pool().set_retained_lsn(recovery_from);
-            held.database.checkpoint_after_free_map()?;
-            if reclaiming {
-                reclaim(&held.wal, recovery_from)?;
-            }
-            held.database
-                .pool()
-                .set_durable_lsn(held.wal.write_ahead_point());
-            held.wal.note_folded();
+            fold_one_attached(held, asked)?;
         }
         Ok(())
     }

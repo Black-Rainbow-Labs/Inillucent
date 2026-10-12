@@ -33,11 +33,22 @@
 //! answer some of them, and what it costs is a plan *execution* per row rather
 //! than a plan *compilation* per row.
 //!
+//! ## A block with no index to seek reads its table once
+//!
+//! When a block's only way to reach its rows is a scan of one table, with an
+//! equality between a column of that table and a value the outer row feeds, the
+//! first outer row reads the table into a hash table keyed on those columns and
+//! every outer row after it runs the block over its bucket only. `built.rs`
+//! decides when and does it. The block's chain still holds the whole residual, so
+//! the table chooses which rows the chain sees and not what it answers.
+//!
 //! ## What a statement with none pays
 //!
 //! Nothing. [`correlations_of`] returns an empty list the moment the planner's
 //! own `subqueries` flag is clear, and the pipeline then never builds this
 //! operator.
+
+mod built;
 
 use inillucent_base::DbResult;
 use inillucent_sql::bind::{BoundExpr, BoundSelect, SourceRows, SubqueryKind};
@@ -112,6 +123,14 @@ pub struct Correlation {
     /// The index probe an `EXISTS` block is answered by, once its chain has
     /// shown it has one; see [`Correlation::probe_directly`].
     direct: std::cell::RefCell<Option<DirectProbe>>,
+    /// How the block reads its table through a built table, when it does.
+    automatic: Option<built::AutomaticKey>,
+    /// The built table, read at the first outer row of an execution and
+    /// dropped at the end of it.
+    built: std::cell::RefCell<Option<crate::autoindex::HashTable>>,
+    /// Whether the block has stopped using the built table for this execution,
+    /// because the request budget could not hold it or its chain cannot be kept.
+    declined: std::cell::Cell<bool>,
 }
 
 /// An `EXISTS` block answered by probing one index with the outer row's values.
@@ -214,6 +233,53 @@ impl<'t> Correlated<'t> {
     }
 }
 
+impl Correlated<'_> {
+    /// Drops the built tables of the blocks, when this operator is the statement's own.
+    ///
+    /// A block's own chain can hold a correlation operator too, and it finishes
+    /// once for every outer row of the block it belongs to. Dropping the tables
+    /// there would read the inner table again for each of those rows, so an
+    /// operator that finishes while a block is being answered leaves them be.
+    /// The statement's operator finishes with none being answered and drops
+    /// them, with those of every block nested in them.
+    fn release_tables(&self) {
+        if answering_blocks() > 0 {
+            return;
+        }
+        for correlation in self.correlations.iter() {
+            correlation.drop_table();
+        }
+    }
+}
+
+thread_local! {
+    /// How many blocks are being answered on this thread, counting nested ones.
+    static ANSWERING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns how many blocks are being answered on this thread.
+fn answering_blocks() -> u32 {
+    ANSWERING.with(std::cell::Cell::get)
+}
+
+/// Counts a block as being answered until it is dropped.
+struct Answering;
+
+impl Answering {
+    /// Starts counting a block.
+    fn begin() -> Answering {
+        ANSWERING.with(|held| held.set(held.get().saturating_add(1)));
+        Answering
+    }
+}
+
+impl Drop for Answering {
+    /// Stops counting the block.
+    fn drop(&mut self) {
+        ANSWERING.with(|held| held.set(held.get().saturating_sub(1)));
+    }
+}
+
 impl Sink for Correlated<'_> {
     fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
         let width = batch.columns.len();
@@ -227,8 +293,15 @@ impl Sink for Correlated<'_> {
         // batch's own vectors under a one row selection, with the answers
         // appended as constants.
         let mut answers: Vec<OwnedDatum> = Vec::with_capacity(self.correlations.len());
+        // The gate judges the whole batch in one loop when every conjunct can (task-2226): it
+        // was two thirds of `correlated.exists.selective` asked a row at a time.
+        let judged = crate::expr::truths_of_all(&self.gate, batch);
         for nth in 0..batch.live() {
-            if !passes(&self.gate, batch, nth)? {
+            let kept = match &judged {
+                Some(truths) => truths.get(nth).copied().unwrap_or(false),
+                None => passes(&self.gate, batch, nth)?,
+            };
+            if !kept {
                 continue;
             }
             answers.clear();
@@ -279,11 +352,13 @@ impl Sink for Correlated<'_> {
     }
 
     fn finish(&mut self) -> DbResult<()> {
+        self.release_tables();
         self.downstream.finish()
     }
 
     fn reset(&mut self) -> DbResult<()> {
         self.bound = None;
+        self.release_tables();
         self.downstream.reset()
     }
 }
@@ -378,7 +453,9 @@ impl Correlation {
                 return Ok(kept);
             }
         }
+        let counting = Answering::begin();
         let answer = self.run(catalog, bound, feed)?;
+        drop(counting);
         if self.once {
             *self.kept.borrow_mut() = Some(answer.clone());
         }
@@ -574,6 +651,9 @@ impl Correlation {
         bound: &mut Params,
         feed: &dyn Fn(usize) -> DbResult<OwnedDatum>,
     ) -> DbResult<OwnedDatum> {
+        if let Some(answer) = self.answer_by_table(catalog, bound, feed)? {
+            return Ok(answer);
+        }
         if self.kind == SubqueryKind::Exists {
             if let Some(found) = self.probe_directly(catalog, feed)? {
                 return Ok(OwnedDatum::Int(i64::from(found != self.negated)));
@@ -598,10 +678,17 @@ impl Correlation {
                 run_any_prepared_limited(&self.plan, catalog, &self.prepared, bound, Some(1))?.0
             }
         };
+        Ok(self.answer_from_rows(rows))
+    }
+
+    /// Turns the rows a block produced into the one value it answers.
+    ///
+    /// @param rows - the rows the block's chain collected
+    fn answer_from_rows(&self, rows: Vec<Vec<OwnedDatum>>) -> OwnedDatum {
         let mut column = rows
             .into_iter()
             .map(|row| row.into_iter().next().unwrap_or(OwnedDatum::Null));
-        Ok(match self.kind {
+        match self.kind {
             SubqueryKind::Exists => {
                 OwnedDatum::Int(i64::from(column.next().is_some() != self.negated))
             }
@@ -611,7 +698,7 @@ impl Correlation {
             // Refused in `correlations_of`; stated here so a variant added
             // later is a compilation error rather than a NULL.
             SubqueryKind::In => OwnedDatum::Null,
-        })
+        }
     }
 }
 
@@ -643,6 +730,7 @@ impl KeptBlocks {
         if let Some(kept) = self.0.borrow().as_ref() {
             for correlation in kept.iter() {
                 correlation.forget();
+                correlation.drop_table();
             }
             return Ok(std::rc::Rc::clone(kept));
         }
@@ -680,7 +768,7 @@ pub fn correlations_in(
     for expr in exprs {
         gather_expression(expr, &mut found);
     }
-    prepare_blocks(found, catalog, resolve, None, Levers::default())
+    prepare_blocks(found, catalog, resolve, None, scanning_levers())
 }
 
 /// Finds every subquery a list of expressions holds, correlated or not, and
@@ -708,8 +796,18 @@ pub fn correlations_in_every(
         catalog,
         resolve,
         Some(target_root),
-        Levers::default(),
+        scanning_levers(),
     )
+}
+
+/// Returns the levers the blocks of a statement that changes data are planned with.
+///
+/// Those statements do not carry the connection's levers to their blocks, so a
+/// block is planned with every lever on except the built table, which would
+/// otherwise ignore `PRAGMA automatic_index = OFF`. The blocks scan, as they
+/// always did.
+fn scanning_levers() -> Levers {
+    Levers::without(Levers::BLOCK_TABLE)
 }
 
 /// Finds every correlated block in a plan and prepares it.
@@ -822,6 +920,7 @@ fn prepare_blocks(
         // the outer row.
         let plan = plan_select_with(block, levers);
         let choice = prepare_any(&plan, catalog)?;
+        let automatic = built::decide(&plan, &choice, catalog, &feeds, kind)?;
         prepared.push(Correlation {
             id,
             kind,
@@ -834,6 +933,9 @@ fn prepare_blocks(
             chain: std::cell::RefCell::new(None),
             tried: std::cell::Cell::new(false),
             direct: std::cell::RefCell::new(None),
+            automatic,
+            built: std::cell::RefCell::new(None),
+            declined: std::cell::Cell::new(false),
         });
     }
     Ok(prepared)

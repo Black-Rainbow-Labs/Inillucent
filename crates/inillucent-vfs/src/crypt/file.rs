@@ -535,6 +535,11 @@ impl VfsFile for CryptFile {
         self.inner.may_lease()
     }
 
+    /// Passes the token through; who else has the file open is a question about the file.
+    fn quiet_token(&self) -> Option<u64> {
+        self.inner.quiet_token()
+    }
+
     /// Passes the reserved lock check through.
     fn check_reserved_lock(&self) -> VfsResult<bool> {
         self.inner.check_reserved_lock()

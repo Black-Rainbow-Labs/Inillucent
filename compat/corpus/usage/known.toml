@@ -29,7 +29,7 @@ reason = "N2: page size. inillucent writes 32768 byte pages, fixed when the file
 [[known]]
 case = "holdout/indexes/724-pragma-max-page-count-and-index-balancing"
 kind = "deviation"
-reason = "N2: page size. inillucent writes 32768 byte pages, fixed when the file is created, and PRAGMA page_size before the first write is ignored; the pinned sqlite3 uses 4096 and honours the pragma. PRAGMA page_size = 512 is ignored, so the 96 rows need 6 pages and not 43, and PRAGMA page_count reads 6"
+reason = "N2: page size. inillucent writes 32768 byte pages, fixed when the file is created, and PRAGMA page_size before the first write is ignored; the pinned sqlite3 uses 4096 and honours the pragma. PRAGMA page_size = 512 is ignored, so the 96 rows need 6 pages and not 43, and PRAGMA page_count reads 6. PRAGMA max_page_count = 43 is enforced and both engines print 43 for it, and the 96 rows fit under it in both; every other line of the case matches"
 
 [[known]]
 case = "holdout/indexes/795-natural-scan-order-of-a-without-rowid-table-follow"
@@ -77,6 +77,16 @@ kind = "deviation"
 reason = "N1: UPDATE/DELETE ... LIMIT: the pinned sqlite3 shell is built without SQLITE_ENABLE_UPDATE_DELETE_LIMIT"
 
 [[known]]
-case = "bug-hunt/queries/recursive_trigger_replace_duplicate_unique"
-kind = "defect"
-reason = "Bug hunt (tasks/task-2201-bug-hunt-tdd.md section 6): with recursive_triggers on, INSERT OR REPLACE whose delete trigger reinserts the replaced key recurses until the trigger depth limit and reports too many levels of trigger recursion, where SQLite reports UNIQUE constraint failed. It overflowed the stack and killed the process before the depth check was added."
+case = "automatic-index/plan-of-statement-7"
+kind = "deviation"
+reason = "Plan text only. NOT EXISTS over a table with no index for its key is read once into a hash table, and the plan shows the BLOOM FILTER and SEARCH USING AUTOMATIC COVERING INDEX lines under the subquery node. The pinned sqlite3 prints SCAN b there until ANALYZE has given the table row counts, and scans the table for every row. The rows match"
+
+[[known]]
+case = "automatic-index/plan-of-statement-8"
+kind = "deviation"
+reason = "Plan text only. A correlated count(*) over a table with no index for its key is read once into a hash table, and the plan shows the BLOOM FILTER and SEARCH USING AUTOMATIC COVERING INDEX lines under the subquery node. The pinned sqlite3 prints SCAN b there until ANALYZE has given the table row counts, and scans the table for every row. The rows match"
+
+[[known]]
+case = "automatic-index/plan-of-statement-10"
+kind = "deviation"
+reason = "Plan text only. A join on a.k = b.k + 1 is keyed on the expression over b, shown as (<expr>=?), and this engine keeps the written join order. The pinned sqlite3 scans b and builds the index on the plain column a.k. The rows match"

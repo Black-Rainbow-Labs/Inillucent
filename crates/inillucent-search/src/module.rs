@@ -125,7 +125,13 @@ impl Module for SearchModule {
         arguments: &ModuleArguments,
         creating: bool,
     ) -> DbResult<Box<dyn VirtualTable>> {
-        let mut declared = options::parse(&arguments.arguments)?;
+        // A table being made is held to what a new declaration may say. One being reopened is
+        // read as it always was, so a file written before a refusal existed still opens.
+        let mut declared = if creating {
+            options::parse_new(&arguments.arguments)?
+        } else {
+            options::parse(&arguments.arguments)?
+        };
         // Only a table being created reads the tokenizer folder. A table being
         // reopened keeps the name until its `%_config` is read, so it opens
         // whether or not the pack is still installed.
@@ -421,7 +427,6 @@ impl SearchTable {
             "compact" => self.compact(context),
             "rebuild" => self.rebuild(context),
             "drop-old-generations" => {
-                let live = merge::live_segments(context, &self.store)?;
                 // **Every link of every live segment, not only its own id.** A
                 // merge that took more than one commit leaves a segment that is
                 // a chain: its id names the last link, and each link names the
@@ -429,10 +434,7 @@ impl SearchTable {
                 // the ids the manifest names deleted every earlier link, and the
                 // table could not be read again: `segment 42 is unreadable` on a
                 // table of 40 rows after one `drop-old-generations`.
-                let mut ids: Vec<i64> = Vec::new();
-                for segment in &live {
-                    ids.extend(merge::chain_ids(context, &self.store, segment.id)?);
-                }
+                //
                 // Every in-flight merge's checkpoint is a real segment that
                 // is not yet named by the manifest - dropping one here would
                 // strand its `state::MERGE` entry pointing at a `%_gen` id no
@@ -441,13 +443,7 @@ impl SearchTable {
                 // checkpoint can itself be a chain of small links each
                 // pointing at the one before it, so the whole chain has to
                 // be protected, not only the tip `MergeState` names.
-                for merge_state in self.store.read_merge_states(context)? {
-                    ids.extend(merge::chain_ids(
-                        context,
-                        &self.store,
-                        merge_state.accumulator,
-                    )?);
-                }
+                let ids = self.generations_in_use(context)?;
                 self.store.drop_generations_except(context, &ids)?;
                 Ok(())
             }
@@ -970,11 +966,65 @@ impl SearchTable {
         self.store.write_segments(context, &segments)?;
         self.store
             .set_state(context, state::CHUNKS, total_chunks(&segments))?;
+        // The inputs and the checkpoints that are not part of the new segment's chain are named
+        // by nothing now. They were left in `%_gen` for `drop-old-generations`, and an index
+        // that took updates for long enough grew without a bound nobody had asked for: the file
+        // held 24 segment rows for 5 live ones after twelve rounds of updates, and `VACUUM`
+        // could not shrink it because the rows were still there.
+        let superseded = self.generations_a_merge_supersedes(context, &state)?;
+        self.store.drop_generations(context, &superseded)?;
         // `state::MERGE` itself is not touched here: `merge_cascade` is what
         // owns the list of every in-flight merge, and this one's absence
         // from it is simply this merge never being added back to `kept`.
         self.cache.after_merge(&before, sorted_ids(&segments));
         Ok(())
+    }
+
+    /// Returns the `%_gen` ids that only the inputs of a finished merge used.
+    ///
+    /// Every link of every input's chain, minus the links the merged segment's own chain still
+    /// reads. The merged segment starts from its first input's own row, so that row and any
+    /// links under it stay. Nothing else is read: a live segment at another level has a chain of
+    /// its own that shares no link with these inputs, and reading it would load the largest
+    /// segment of the table on every merge.
+    ///
+    /// @param context - the module's reach into the database
+    /// @param state - the finished merge
+    fn generations_a_merge_supersedes(
+        &self,
+        context: &mut Context<'_>,
+        state: &MergeState,
+    ) -> DbResult<Vec<i64>> {
+        let kept: BTreeSet<i64> = merge::chain_ids(context, &self.store, state.accumulator)?
+            .into_iter()
+            .collect();
+        let mut superseded: BTreeSet<i64> = BTreeSet::new();
+        for input in &state.inputs {
+            for id in merge::chain_ids(context, &self.store, input.id)? {
+                if !kept.contains(&id) {
+                    superseded.insert(id);
+                }
+            }
+        }
+        Ok(superseded.into_iter().collect())
+    }
+
+    /// Returns every `%_gen` id the manifest and the merges in flight still read.
+    ///
+    /// @param context - the module's reach into the database
+    fn generations_in_use(&self, context: &mut Context<'_>) -> DbResult<Vec<i64>> {
+        let mut ids: Vec<i64> = Vec::new();
+        for segment in merge::live_segments(context, &self.store)? {
+            ids.extend(merge::chain_ids(context, &self.store, segment.id)?);
+        }
+        for merge_state in self.store.read_merge_states(context)? {
+            ids.extend(merge::chain_ids(
+                context,
+                &self.store,
+                merge_state.accumulator,
+            )?);
+        }
+        Ok(ids)
     }
 
     /// Builds a new segment in one pass over every row, discarding every
@@ -1520,6 +1570,15 @@ impl VirtualTable for SearchTable {
                 let new = new_rowid.as_integer().unwrap_or(old);
                 let row = self.row_of(values)?;
                 if new != old {
+                    // **Checked before the old row goes.** `UPDATE t SET rowid =
+                    // 5` onto a rowid the table already holds is a constraint
+                    // failure, as an insert of that rowid is; writing over the
+                    // row would lose it without a word.
+                    if self.store.read_row(context, new)?.is_some() {
+                        return Err(constraint(
+                            "UNIQUE constraint failed: the rowid is already in the index",
+                        ));
+                    }
                     self.remove(context, old)?;
                 }
                 let existed = self.store.read_row(context, new)?.is_some();
@@ -1531,6 +1590,30 @@ impl VirtualTable for SearchTable {
                 self.log(context, new, Op::Put, row.digest())?;
                 Ok(Some(new))
             }
+        }
+    }
+}
+
+/// Reads the number of rows `k` asks for.
+///
+/// A whole number of zero or more is accepted, as an integer, as a real with no fraction, or as
+/// text that reads as one. Anything else is refused: `k = -1` used to be raised to 1 and
+/// `k = 'abc'` or `k = 2.5` fell back to the default of 20, so a mistyped `k` was answered with
+/// rows the caller had not asked for. NULL keeps the default. The largest `k` is 1,000,000.
+///
+/// @param value - the value bound to the `k` column
+fn limit_of(value: &Value<'static>) -> DbResult<usize> {
+    let whole = match value {
+        Value::Null => return Ok(DEFAULT_K as usize),
+        Value::Integer(held) => Some(*held),
+        Value::Real(held) if held.is_finite() && held.fract() == 0.0 => Some(*held as i64),
+        other => text_of(Some(other)).and_then(|text| text.trim().parse::<i64>().ok()),
+    };
+    match whole {
+        Some(held) if held >= 0 => Ok(held.min(1_000_000) as usize),
+        _ => {
+            let said = "inillucent_search: k must be a whole number of zero or more";
+            Err(failure(said).with_message(said))
         }
     }
 }
@@ -1621,10 +1704,16 @@ impl VirtualCursor for SearchCursor {
         let mut wanted_rowid: Option<i64> = None;
         for (role, value) in plan.index_string.chars().zip(plan.arguments.iter()) {
             match role {
-                ROLE_QUERY => self.request.text = text_of(Some(value)),
+                ROLE_QUERY => {
+                    self.request.text = text_of(Some(value));
+                    if let Some(refused) = self.request.text.as_deref().and_then(|text| {
+                        crate::query_syntax::refuse_operator_syntax(text, &self.options.columns)
+                    }) {
+                        return Err(refused);
+                    }
+                }
                 ROLE_LIMIT => {
-                    let limit = value.as_integer().unwrap_or(DEFAULT_K);
-                    self.request.limit = limit.clamp(1, 1_000_000) as usize;
+                    self.request.limit = limit_of(value)?;
                 }
                 ROLE_VECTOR => {
                     self.request.vector = crate::store::vector_of(value, self.options.dims.max(1))?;
@@ -1662,6 +1751,11 @@ impl VirtualCursor for SearchCursor {
             return Err(crate::embed_refusal::nothing_to_rerank());
         }
         if plan.index_number & PLAN_SEARCH != 0 {
+            // `k = 0` asks for no rows. It used to be raised to 1, so a caller that computed its
+            // own k and got zero was handed a row it did not ask for.
+            if self.request.limit == 0 {
+                return Ok(());
+            }
             if !self.options.has_vectors() && !self.request.vector.is_empty() {
                 return Err(failure(
                     "inillucent_search: this table was declared without a vector width",

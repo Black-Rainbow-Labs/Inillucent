@@ -68,32 +68,37 @@ inillucent replaces all three with one library.
 | `DELETE ... LIMIT` and `UPDATE ... LIMIT`, which the pinned SQLite build refuses and inillucent runs | 2 |
 
 No case is refused. The storage engine is where inillucent differs from SQLite, and at 100,000 rows
-inillucent is 419% faster than SQLite 3.53.4.
+inillucent is 499% faster than SQLite 3.53.4 and faster on 110 of the 116 workloads its benchmark
+times.
 
 ## The measurements
 
-Each number below comes from the page linked beside it. The SQLite numbers are from the run on
-2026-09-26 at 100,000 rows: four runs of 30 paired rounds, both engines on the same performance
-cores. Each workload's answer is hashed and compared with SQLite's before its time counts. The
-pgvector numbers are from the graded run on 2026-09-20 over 185,078 passages at 768 dimensions,
-with both engines reading the same vectors.
+Each number below comes from the page linked beside it. The SQLite numbers are from the graded run on
+2026-10-11 with release 2.5.4 at 100,000 rows: three runs of 30 paired rounds, both engines on the
+same performance cores, SQLite within 2% of its idle reference in every run. Each workload's answer
+is hashed and compared with SQLite's before its time counts. The pgvector numbers are from the graded
+run on 2026-09-20 over 185,078 passages at 768 dimensions, with both engines reading the same
+vectors.
 
 | Result | Detail | Source |
 |---|---|---|
-| **419% faster than SQLite 3.53.4** | 5.19x, weighted over ten workload families | [Performance](performance.md) |
-| **484% faster than SQLite in the newest run** | 5.84x weighted, on 2026-10-07 with the build released as 2.3.0. Not graded: SQLite ran 7% slower than its idle reference, which makes this figure read high | [Performance](performance.md) |
-| **64% faster than SQLite called the way programs call it** | 25 workloads on 2026-10-06: 136% faster from Python, 207% from Node, 46% through scripts into the shell and 3% from the command line | [Performance](performance.md#how-programs-call-it) |
-| **67% less processor time** | 344 ms against 1,043 ms for one round of the same plan | [Performance](performance.md) |
-| **11.5% more memory** | 41.48 MiB against 37.21 MiB peak, with the same 128 MiB cache. SQLite uses less | [Performance](performance.md#memory) |
+| **Faster than SQLite on 110 of 116 workloads** | 31 of 34 through the engine's API, 32 of 34 through the `Connection` API, and 47 of 48 common and edge case workloads through the `Connection` API | [Performance](performance.md#the-workloads-that-are-slower) |
+| **499% faster than SQLite 3.53.4** | 5.99x, weighted over ten workload families, with a 95% lower bound of 459% | [Performance](performance.md) |
+| **297% faster than SQLite through the `Connection` API** | 48 common and edge case workloads: 297% faster on the 28 training workloads and 266% on the 20 held out | [Performance](performance.md#through-the-connection-api) |
+| **74% faster than SQLite called the way programs call it** | 25 workloads on 2026-10-08 with release 2.4.2: 418% faster from Node, 135% from Python, 49% through scripts into the shell and 6% from the command line | [Performance](performance.md#how-programs-call-it) |
+| **77% less processor time** | 234 ms against 1,039 ms for one round of the same plan. Through the `Connection` API, 641 ms against 1,906 ms on the 48 workloads, 66% less | [Performance](performance.md#memory) |
+| **16% more memory** | 43.80 MiB against 37.74 MiB peak, with the same 128 MiB cache. SQLite uses less | [Performance](performance.md#memory) |
 | **A file 3.6% larger** | 17,432,576 bytes against 16,830,464 bytes for the same imported data | [Performance](performance.md#disk) |
 | **402 of 416 SQL cases give SQLite's exact answer** | each case runs through both shells on a new database, and the output bytes are compared | [Feature comparison](feature-comparison.md) |
 | **Better than pgvector on 15 of 17 graded comparisons** | equivalent on 1, inconclusive on 1, worse on none | [Retrieval quality](retrieval-quality.md) |
 | **174% faster than pgvector without a filter** | median 0.8462 ms against 2.315 ms | [Retrieval quality](retrieval-quality.md#latency) |
 | **6,169% faster than pgvector with a filter** | median 0.5820 ms against 36.486 ms, for `source = slack` | [Retrieval quality](retrieval-quality.md#latency) |
 
-In the newest run one of the thirty weighted workloads is slower than SQLite: compiling `SELECT 1`
-on every call, 72% slower. One more, an autocommit insert, is level with it. The four correlated
-subquery workloads, which the performance contract does not weight, are all faster.
+Six of the 116 workloads are not faster than SQLite. A range `DELETE` in the 48 workload plan is
+212% slower because the log is folded into the database file during it; on its own it is level with
+SQLite. Compiling `SELECT 1` on every call through the engine's own API is 79% slower; through the
+`Connection` API, which keeps compiled plans, it is 66% faster. A join over an index range and an
+autocommit update are within 6% of SQLite in both APIs.
 [The workloads that are slower](performance.md#the-workloads-that-are-slower) gives the reason for
 each.
 

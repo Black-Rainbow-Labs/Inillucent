@@ -359,12 +359,14 @@ fn an_unknown_pragma_is_silent_on_the_new_engine() {
             .map(String::as_str),
         Some("1")
     );
-    // **`auto_vacuum` is settable now, and is silently ignored on a database
-    // that already has tables** - which is not this engine being lax, it is
-    // SQLite's own rule: the mode is a property of the file header and can only
-    // be chosen before the first table is created, or changed by a `VACUUM`.
-    // Asking for it here is accepted and does nothing, and the pragma keeps
-    // reporting what the file actually is.
+    // **`auto_vacuum` is settable, and a set on a database that already has
+    // tables is remembered and not applied.** The mode is a property of the
+    // file header. A set on a file with no table changes the mode at once, and
+    // so does a set between FULL and INCREMENTAL on a file in one of those two
+    // modes. Any other set waits for `VACUUM`, which rebuilds the file in the
+    // mode asked for. This file is in mode 0 and holds tables, so the set below
+    // is accepted, prints nothing, and the pragma keeps reporting the file's
+    // mode, which is still 0.
     assert!(ask(&mut engine, "PRAGMA auto_vacuum = FULL").is_empty());
     assert_eq!(
         ask(&mut engine, "PRAGMA auto_vacuum")
@@ -373,9 +375,9 @@ fn an_unknown_pragma_is_silent_on_the_new_engine() {
             .map(String::as_str),
         Some("0")
     );
-    // `incremental_vacuum` does nothing here and nothing observable in SQLite
-    // either, so it stays a silent no-op rather than becoming a refusal
-    // invented by the rule.
+    // `incremental_vacuum` answers no rows unless the file is in mode 2
+    // (INCREMENTAL), which is also what SQLite does. This file is in mode 0,
+    // so the pragma is a silent no-op and not a refusal.
     assert!(ask(&mut engine, "PRAGMA incremental_vacuum").is_empty());
     // And the statement after one still runs, which is the property a caller
     // relies on when a pragma is a hint.

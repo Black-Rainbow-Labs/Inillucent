@@ -388,7 +388,64 @@ fn expression_subqueries(plan: &PhysicalPlan, depth: u16, out: &mut Vec<PlanLine
     roots.extend(select.group_by.iter());
     roots.extend(select.having.iter());
     roots.extend(select.order_by.iter().map(|term| &term.expr));
-    subquery_nodes_into(select.filter.as_ref(), &roots, plan.levers, depth, out);
+    // A subquery used as an aggregate's argument, as in `sum((SELECT ...))`, is
+    // held by the aggregate and not by the result column that names it.
+    roots.extend(
+        select
+            .aggregates
+            .iter()
+            .flat_map(|aggregate| aggregate.arguments.iter()),
+    );
+    let looped = exists_loops(plan, depth, out);
+    subquery_nodes_into(
+        select.filter.as_ref(),
+        &roots,
+        plan.levers,
+        &looped,
+        depth,
+        out,
+    );
+}
+
+/// Appends the loop lines SQLite prints for each `EXISTS` it rewrites into a loop of the
+/// enclosing query, and returns the numbers of those subqueries.
+///
+/// SQLite does this for a positive `EXISTS` that is a conjunct of the top level `WHERE`, over
+/// one table, with no aggregate and no `LIMIT`. The lines are printed after the enclosing
+/// query's own loops, in place of a subquery node.
+///
+/// @param plan - the enclosing query's plan
+/// @param depth - the depth of the lines
+/// @param out - the lines so far
+fn exists_loops(plan: &PhysicalPlan, depth: u16, out: &mut Vec<PlanLine>) -> Vec<usize> {
+    let mut looped = Vec::new();
+    let Some(filter) = plan.select.filter.as_ref() else {
+        return looped;
+    };
+    for term in conjunction(filter) {
+        let BoundExpr::Subquery {
+            id,
+            kind: SubqueryKind::Exists,
+            negated: false,
+            block,
+            ..
+        } = &term
+        else {
+            continue;
+        };
+        if block.correlations.is_empty() {
+            continue;
+        }
+        let inner = plan_select_with((**block).clone(), plan.levers);
+        let shown = describe::shown_name(&inner, 0);
+        if let Some(lines) = describe::exists_loop_lines(&inner, &shown) {
+            looped.push(*id);
+            for line in lines {
+                push(out, depth, line);
+            }
+        }
+    }
+    looped
 }
 
 /// Returns the nodes for the subqueries a write uses as values: those in its
@@ -403,7 +460,10 @@ pub fn subquery_nodes(
     levers: Levers,
 ) -> Vec<PlanLine> {
     let mut out = Vec::new();
-    subquery_nodes_into(filter, others, levers, 0, &mut out);
+    // The statements that change data run their subqueries by scanning, so the
+    // plan of each is made with the built table off and says so.
+    let scanning = Levers::without(levers.disabled() | Levers::BLOCK_TABLE);
+    subquery_nodes_into(filter, others, scanning, &[], 0, &mut out);
     out
 }
 
@@ -417,12 +477,14 @@ pub fn subquery_nodes(
 /// @param filter - the `WHERE`
 /// @param others - the other expressions
 /// @param levers - which optimizations are on
+/// @param looped - the subqueries already printed as loops of the enclosing query
 /// @param depth - the depth of the nodes
 /// @param out - the lines so far
 fn subquery_nodes_into(
     filter: Option<&BoundExpr>,
     others: &[&BoundExpr],
     levers: Levers,
+    looped: &[usize],
     depth: u16,
     out: &mut Vec<PlanLine>,
 ) {
@@ -449,7 +511,7 @@ fn subquery_nodes_into(
         else {
             continue;
         };
-        if seen.contains(id) {
+        if seen.contains(id) || looped.contains(id) {
             continue;
         }
         seen.push(*id);
@@ -469,7 +531,10 @@ fn subquery_nodes_into(
         );
         let inner = plan_select_with((**block).clone(), levers);
         tree_of(&inner, depth + 1, out);
-        if *kind == SubqueryKind::In && in_filter.contains(id) {
+        // SQLite builds the filter once, over the rows of a list that does not
+        // change; a correlated list is read again for each row of the enclosing
+        // query, so there is nothing to build a filter over.
+        if *kind == SubqueryKind::In && in_filter.contains(id) && block.correlations.is_empty() {
             push(out, depth + 1, "CREATE BLOOM FILTER");
         }
     }

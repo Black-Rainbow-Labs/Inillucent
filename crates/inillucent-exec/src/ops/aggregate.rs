@@ -166,6 +166,14 @@ impl AggregateSpec {
             if marked {
                 marks |= 1u32.checked_shl(values.len() as u32).unwrap_or(0);
             }
+            // A bare column's third value is the filter of the `min` or `max`
+            // it follows, turned into a flag so the accumulator need not
+            // evaluate SQL truth.
+            if matches!(self.kind, AggregateKind::Bare(_)) && values.len() == 2 {
+                let passes = crate::expr::truth(&value.get()) == Some(true);
+                values.push(Value::Integer(i64::from(passes)));
+                continue;
+            }
             values.push(Value::from(&value.get()).into_owned()?);
         }
         // The sort keys go on the end, where `Accumulator::finish` knows to

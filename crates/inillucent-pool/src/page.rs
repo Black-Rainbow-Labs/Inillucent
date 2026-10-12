@@ -114,6 +114,24 @@ impl PageSize {
 /// The size of the header every page carries.
 pub const COMMON_HEADER: usize = 32;
 
+/// Bit 0 of an interior page's flag byte: at least one separator is stored out
+/// of line.
+///
+/// Interior pages used no flag bit before this one, so every page written
+/// earlier has it clear. A descent reads the byte once and takes the ordinary
+/// comparison when it is clear.
+pub const INTERIOR_HAS_EXTENTS: u8 = 0b0000_0001;
+
+/// Bit 1 of an extent page's flag byte: the page is in the owned layout.
+///
+/// An owned extent page records who refers to it (a previous page for a chain,
+/// an owner tree and key for a value), so the step that moves pages away from
+/// the end of the file can find the one place to rewrite. A page with the bit
+/// clear is in the layout files wrote before that step existed, and a reader
+/// handles both from the byte alone, so it never has to know the file's history.
+/// Leaf and interior pages never carry this bit.
+pub const EXTENT_OWNED: u8 = 0b0000_0010;
+
 /// Byte offsets inside the common header.
 pub mod header {
     /// The LSN of the last modification, 8 bytes.

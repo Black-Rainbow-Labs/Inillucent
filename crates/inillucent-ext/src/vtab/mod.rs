@@ -238,6 +238,19 @@ pub trait VirtualTable: Send {
         Ok(())
     }
 
+    /// Reports whether the module can put its own buffer back to a savepoint.
+    ///
+    /// **The engine flushes a module before it opens a savepoint, so that the buffer left after
+    /// it belongs entirely to the part that may be abandoned.** A flush writes every buffered
+    /// document, so a module that buffers an index whose size grows with the table paid for the
+    /// whole index at every statement of a bulk load, and the load took time that grew with the
+    /// square of the rows. A module that answers true here is not flushed at a savepoint. It is
+    /// told `savepoint`, `release` and `rollback_to`, and keeps what it needs to undo its own
+    /// buffer. The default is false, which keeps the flush.
+    fn undoes_its_own_buffer(&self) -> bool {
+        false
+    }
+
     /// Opens a savepoint, numbered from zero.
     fn savepoint(&mut self, _context: &mut Context<'_>, _number: i32) -> DbResult<()> {
         Ok(())

@@ -275,25 +275,16 @@ pub(super) fn hold_terms_before_right_joins(
 
 /// Returns the affinity each column of a derived table is stored with.
 ///
-/// The first arm decides, as it does for the column's declared type. A column
-/// only: a `CAST(i AS REAL)` in the first arm leaves the integers of the other
-/// arms as they are. Every arm must also agree that the column is numeric: an
-/// arm of a column with no declared type keeps its integers.
+/// SQLite's `sqlite3SubqueryColumnTypes` decides, through
+/// [`BoundSelect::derived_column_affinity`]: the first arm with an affinity
+/// gives it, so `SELECT 1 UNION ALL SELECT x FROM r` over a REAL `x` is a REAL
+/// column, while a `CAST(i AS REAL)` in the first arm makes it FLEXNUM and
+/// leaves the integers of the other arms as they are. An arm that can hold text
+/// next to a numeric affinity takes the affinity away.
 ///
 /// @param block - the derived table's query
 pub(super) fn derived_affinities(block: &BoundSelect) -> Vec<inillucent_value::Affinity> {
-    block
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(at, column)| match &column.expr {
-            BoundExpr::Column { affinity, .. }
-                if *affinity != inillucent_value::Affinity::Real
-                    || block.column_affinity(at).is_numeric() =>
-            {
-                *affinity
-            }
-            _ => inillucent_value::Affinity::Blob,
-        })
+    (0..block.columns.len())
+        .map(|at| block.derived_column_affinity(at))
         .collect()
 }

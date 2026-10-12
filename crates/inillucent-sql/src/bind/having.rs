@@ -13,8 +13,85 @@
 //! rewording. Deciding it here keeps the parser's job to shape and this one to
 //! meaning, and keeps the sentence in one place.
 
+use super::BoundExpr;
 use crate::diagnostic::ParseError;
 use crate::lexer::Span;
+
+/// Splits a `HAVING` into the terms that can filter rows before grouping and the rest.
+///
+/// **SQLite moves a `HAVING` term to the `WHERE` when it needs no aggregate and reads only
+/// `GROUP BY` columns or constants** (`havingToWhere`). The rows of a group a term removes are
+/// then never accumulated, so `SELECT sum(v) FROM t GROUP BY g HAVING g = 'a'` does not add up
+/// the `integer overflow` in a group the `HAVING` discards. Here every group was finished before
+/// the filter looked at it, and the overflow was raised for a row nobody asked for.
+///
+/// Only a plain list of node kinds that cannot differ between the rows of one group is moved. A
+/// column counts only when the `GROUP BY` holds exactly that column, so a `COLLATE` on the group
+/// term, a function call and a subquery all keep the term where it was.
+///
+/// @param having - the bound `HAVING`
+/// @param group - the bound `GROUP BY` terms
+pub(crate) fn split_for_where(
+    having: BoundExpr,
+    group: &[BoundExpr],
+) -> (Vec<BoundExpr>, Option<BoundExpr>) {
+    let mut terms = Vec::new();
+    flatten_and(having, &mut terms);
+    let (moved, kept): (Vec<_>, Vec<_>) = terms
+        .into_iter()
+        .partition(|term| is_group_constant(term, group));
+    let rest = kept
+        .into_iter()
+        .reduce(|left, right| BoundExpr::And(Box::new(left), Box::new(right)));
+    (moved, rest)
+}
+
+/// Lists the terms of an `AND` chain in the order they were written.
+///
+/// @param expr - the expression to split
+/// @param into - where the terms go
+fn flatten_and(expr: BoundExpr, into: &mut Vec<BoundExpr>) {
+    match expr {
+        BoundExpr::And(left, right) => {
+            flatten_and(*left, into);
+            flatten_and(*right, into);
+        }
+        other => into.push(other),
+    }
+}
+
+/// Reports whether an expression has the same value for every row of one group.
+///
+/// @param expr - the expression
+/// @param group - the bound `GROUP BY` terms
+fn is_group_constant(expr: &BoundExpr, group: &[BoundExpr]) -> bool {
+    match expr {
+        BoundExpr::Null
+        | BoundExpr::Integer(_)
+        | BoundExpr::Real(_)
+        | BoundExpr::Text(_)
+        | BoundExpr::Blob(_)
+        | BoundExpr::Parameter(_) => true,
+        BoundExpr::Column { .. } => group.contains(expr),
+        BoundExpr::Compare { .. }
+        | BoundExpr::Is { .. }
+        | BoundExpr::IsNull { .. }
+        | BoundExpr::Not(_)
+        | BoundExpr::And(..)
+        | BoundExpr::Or(..)
+        | BoundExpr::Arithmetic { .. }
+        | BoundExpr::Between { .. }
+        | BoundExpr::InList { .. }
+        | BoundExpr::Unary { .. }
+        | BoundExpr::Cast { .. }
+        | BoundExpr::Pattern { .. }
+        | BoundExpr::Case { .. } => expr
+            .children()
+            .into_iter()
+            .all(|child| is_group_constant(child, group)),
+        _ => false,
+    }
+}
 
 /// Refuses a `HAVING` on a statement that does not aggregate.
 ///
@@ -56,6 +133,33 @@ pub(crate) fn refuse_when_nothing_aggregates(
         ));
     }
     Ok(())
+}
+
+/// Moves the `HAVING` terms that read only group keys into `WHERE`, where they
+/// filter rows before the grouping; see [`split_for_where`].
+///
+/// @param having - the bound `HAVING`, left holding the terms that stay
+/// @param filter - the bound `WHERE`, which the moved terms are joined to
+/// @param group - the bound `GROUP BY` keys
+pub(crate) fn move_group_terms_to_where(
+    having: &mut Option<BoundExpr>,
+    filter: &mut Option<BoundExpr>,
+    group: &[BoundExpr],
+) {
+    let Some(having_expr) = having.as_ref() else {
+        return;
+    };
+    if group.is_empty() {
+        return;
+    }
+    let (moved, rest) = split_for_where(having_expr.clone(), group);
+    for term in moved {
+        *filter = Some(match filter.take() {
+            Some(existing) => BoundExpr::And(Box::new(existing), Box::new(term)),
+            None => term,
+        });
+    }
+    *having = rest;
 }
 
 #[cfg(test)]

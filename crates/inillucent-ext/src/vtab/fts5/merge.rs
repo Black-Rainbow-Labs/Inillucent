@@ -5,6 +5,8 @@
 //! flushed as one, so a reader never sees a term whose document is not there
 //! yet, or a document whose terms are gone.
 
+use std::collections::BTreeMap;
+
 use inillucent_base::DbResult;
 use inillucent_value::Value;
 
@@ -14,7 +16,59 @@ use super::doclist::{decode_doclist, encode_doclist, write_varint, DocEntry};
 use super::index::*;
 use super::*;
 
+/// Returns whether a command is `word=value`, ignoring case.
+///
+/// @param command - the text written to the table's own column
+/// @param word - the command name before the equals sign
+fn is_command_with_value(command: &str, word: &str) -> bool {
+    command
+        .split_once('=')
+        .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case(word))
+}
+
+/// Returns a command argument as a whole number above zero, or nothing.
+///
+/// @param value - the argument of the command
+fn positive_integer(value: &Value<'static>) -> Option<i64> {
+    let number = match value {
+        Value::Integer(number) => Some(*number),
+        Value::Text(text) => String::from_utf8_lossy(&text.utf8_bytes())
+            .trim()
+            .parse::<i64>()
+            .ok(),
+        _ => None,
+    };
+    number.filter(|number| *number > 0)
+}
+
 impl Fts5Table {
+    /// Returns the error for a write that names a rowid the index already holds.
+    ///
+    /// FTS3, FTS4 and FTS5 all report the message SQLite does, `constraint
+    /// failed`.
+    pub(super) fn rowid_taken(&self) -> inillucent_base::DbError {
+        constraint("constraint failed")
+    }
+
+    /// Returns the row number an FTS3 or FTS4 write names with `docid`.
+    ///
+    /// `docid` is the hidden column in the slot `rank` has in FTS5, and it is
+    /// another name for the rowid: `INSERT INTO t(docid, a)` stores the row
+    /// under that number and `UPDATE t SET docid = n` moves it. Both were
+    /// ignored, so every join on `docid` after an insert by `docid` (which is
+    /// what Android Room's sync triggers do) found nothing. An FTS5 table has no
+    /// such column, so it answers nothing there.
+    ///
+    /// @param values - the declared columns of the row being written
+    pub(super) fn named_docid(&self, values: &[Value<'static>]) -> Option<i64> {
+        if self.dialect != Dialect::Three {
+            return None;
+        }
+        values
+            .get(self.rank_column() as usize)
+            .and_then(Value::as_integer)
+    }
+
     /// Runs one of the module's special commands.
     ///
     /// `integrity-check` and `rebuild` do what they say. The merge family -
@@ -34,16 +88,51 @@ impl Fts5Table {
         let name = String::from_utf8_lossy(command).into_owned();
         let argument = argument.filter(|value| !matches!(value, Value::Null));
         match name.as_str() {
-            "integrity-check" => match self.integrity(context)? {
-                Some(problem) => Err(failure(problem)),
-                None => Ok(()),
-            },
+            "integrity-check" => {
+                if let Some(problem) = self.integrity(context)? {
+                    return Err(failure(problem));
+                }
+                // SQLite compares the index with the content for a table that
+                // owns its rows, and for an external content table only when
+                // the command's `rank` argument is not zero. A contentless
+                // table has nothing to compare with.
+                let asked = argument.as_ref().and_then(Value::as_integer).unwrap_or(0) != 0;
+                let compares = !self.contentless && (self.external.is_none() || asked);
+                if compares && !self.content_matches_index(context)? {
+                    return Err(failure(format!(
+                        "fts5: checksum mismatch for table \"{}\"",
+                        String::from_utf8_lossy(&self.name)
+                    )));
+                }
+                Ok(())
+            }
             "rebuild" => self.rebuild(context),
             // There is nothing to merge or flush: one doclist per term is the
             // whole index, so the segment machinery these ask about does not
             // exist here. They are accepted rather than refused so that an
             // application written against SQLite runs unchanged.
             "optimize" | "flush" => Ok(()),
+            // **FTS4 writes these two with the value inside the command.**
+            // `merge=2,4` and `automerge=8` only tune how segments are merged,
+            // and this index has none, so `merge` is accepted and `automerge` is
+            // kept as a setting the way FTS5's is.
+            _ if self.dialect == Dialect::Three && is_command_with_value(&name, "merge") => Ok(()),
+            _ if self.dialect == Dialect::Three && is_command_with_value(&name, "automerge") => {
+                let value = name
+                    .split_once('=')
+                    .map(|(_, value)| value.trim())
+                    .unwrap_or("");
+                let value = value
+                    .parse::<i64>()
+                    .map(Value::Integer)
+                    .unwrap_or(Value::Null);
+                self.shadows.write_keyed(
+                    context,
+                    b"config",
+                    1,
+                    &[Value::owned_text(b"automerge")?, value],
+                )
+            }
             "merge" => match argument {
                 Some(_) => Ok(()),
                 None => Err(unrecognized()),
@@ -53,9 +142,20 @@ impl Fts5Table {
             // value that was written and cannot be read back would be a
             // difference a reader can see.
             "automerge" | "crisismerge" | "deletemerge" | "pgsz" | "rank" | "secure-delete"
-            | "usermerge" => {
+            | "usermerge" | "hashsize" => {
                 let Some(value) = argument else {
                     return Err(unrecognized());
+                };
+                // `hashsize` is how many bytes of changes SQLite holds in memory
+                // before it writes them out. This index has its own buffer, so
+                // the number changes nothing here, but SQLite refuses a value
+                // that is not a positive integer and so does this.
+                // A number given as text is stored as the number, which is
+                // what SQLite's check leaves in `%_config`.
+                let value = match (name.as_str(), positive_integer(&value)) {
+                    ("hashsize", None) => return Err(unrecognized()),
+                    ("hashsize", Some(number)) => Value::Integer(number),
+                    _ => value,
                 };
                 self.shadows.write_keyed(
                     context,
@@ -99,9 +199,26 @@ impl Fts5Table {
         // because everything `rebuild` writes from here on goes through
         // `%_idx` directly.
         if let Ok(mut held) = self.pending.lock() {
-            held.doclists.clear();
-            held.bytes = 0;
+            held.discard_all();
         }
+        let rows = self.content_rows(context)?;
+        self.wipe_index(context)?;
+        for (rowid, values) in rows {
+            self.add(context, rowid, &values)?;
+        }
+        Ok(())
+    }
+
+    /// Reads every row of the content, as the declared columns in order.
+    ///
+    /// For an external content table these are the owner's rows, found by the
+    /// column names the full-text table declares.
+    ///
+    /// @param context - the running statement
+    fn content_rows(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> DbResult<Vec<(i64, Vec<Value<'static>>)>> {
         let offsets = self.offsets(context);
         let mut rows: Vec<(i64, Vec<Value<'static>>)> = Vec::new();
         let suffix = self.content.clone();
@@ -115,11 +232,76 @@ impl Fts5Table {
             ));
             Ok(true)
         })?;
-        self.wipe_index(context)?;
-        for (rowid, values) in rows {
-            self.add(context, rowid, &values)?;
+        Ok(rows)
+    }
+
+    /// Reports whether the index holds exactly the postings the content gives.
+    ///
+    /// This is the check `integrity-check` makes against the content, which
+    /// SQLite does for a table that owns its rows and, for an external content
+    /// table, when the command's `rank` argument is not zero. Every row of the
+    /// content is tokenised the way `add` does and the postings are compared
+    /// with what the term dictionary holds, so a changed row, a row the index
+    /// never saw and a row the index still has after the content lost it are
+    /// all mismatches.
+    ///
+    /// @param context - the running statement
+    fn content_matches_index(&mut self, context: &mut Context<'_>) -> DbResult<bool> {
+        flush_doclists(context, &self.shadows, &self.pending)?;
+        let mut expected: BTreeMap<Vec<u8>, BTreeMap<i64, Vec<(usize, Vec<u32>)>>> =
+            BTreeMap::new();
+        for (rowid, values) in self.content_rows(context)? {
+            for (term, columns) in self.postings_of(&values) {
+                expected.entry(term).or_default().insert(rowid, columns);
+            }
         }
-        Ok(())
+        let mut stored: Vec<(Vec<u8>, Vec<Value<'static>>)> = Vec::new();
+        self.shadows.scan_keyed(context, b"idx", 2, |values| {
+            if let Some(term) = values.get(1).and_then(Value::as_blob) {
+                stored.push((term.raw().to_vec(), values.to_vec()));
+            }
+            Ok(true)
+        })?;
+        let mut actual: BTreeMap<Vec<u8>, BTreeMap<i64, Vec<(usize, Vec<u32>)>>> = BTreeMap::new();
+        for (term, row) in stored {
+            let Some(bytes) = resolve_doclist(context, &self.shadows, &row)? else {
+                return Ok(false);
+            };
+            let entries = decode_doclist(&bytes)
+                .into_iter()
+                .map(|entry| (entry.rowid, entry.columns))
+                .collect();
+            actual.insert(term, entries);
+        }
+        Ok(expected == actual)
+    }
+
+    /// Returns where each term occurs in one row, as `add` would index it.
+    ///
+    /// @param values - the row's declared columns in order
+    fn postings_of(&self, values: &[Value<'static>]) -> BTreeMap<Vec<u8>, Vec<(usize, Vec<u32>)>> {
+        let mut postings: Vec<(Vec<u8>, usize, u32)> = Vec::new();
+        for (index, column) in self.options.columns.iter().enumerate() {
+            if column.unindexed {
+                continue;
+            }
+            let Some(text) = values.get(index).and_then(text_of) else {
+                continue;
+            };
+            for (position, token) in self.tokenizer.tokens(&text).into_iter().enumerate() {
+                postings.push((token, index, position as u32));
+            }
+        }
+        postings.sort_unstable();
+        let mut terms: BTreeMap<Vec<u8>, Vec<(usize, Vec<u32>)>> = BTreeMap::new();
+        for (term, column, position) in postings {
+            let columns = terms.entry(term).or_default();
+            match columns.last_mut() {
+                Some((held, positions)) if *held == column => positions.push(position),
+                _ => columns.push((column, vec![position])),
+            }
+        }
+        terms
     }
 
     /// Empties an index that stores no document text of its own.
@@ -133,8 +315,7 @@ impl Fts5Table {
     /// @param context - the running statement
     pub(crate) fn delete_all(&mut self, context: &mut Context<'_>) -> DbResult<()> {
         if let Ok(mut held) = self.pending.lock() {
-            held.doclists.clear();
-            held.bytes = 0;
+            held.discard_all();
         }
         self.wipe_index(context)
     }
@@ -196,6 +377,12 @@ impl Fts5Table {
         // exactly the claim an ordinary insert cannot make. It is also how an
         // application gets the record onto a file that predates it.
         layout::stamp(context, &self.shadows)?;
+        // **The buffered totals are reset along with the stored ones.** The
+        // buffer keeps the totals it last read for the life of the connection,
+        // and `add` counts on top of that copy. Resetting only the stored row
+        // let each `rebuild` add the table's rows and tokens to the totals it
+        // had already counted, so `bm25` scored differently after every rebuild.
+        stage_totals(&self.pending, Totals::empty(width));
         put_totals(context, &self.shadows, &Totals::empty(width))
     }
 
@@ -416,7 +603,7 @@ impl Fts5Table {
             Err(position) => entries.insert(position, entry),
         }
         let encoded = encode_doclist(&entries);
-        stage_doclist(&self.pending, term, encoded);
+        stage_doclist(&self.pending, term, encoded, true);
         if buffer_is_full(&self.pending) {
             flush_doclists(context, &self.shadows, &self.pending)?;
         }
@@ -508,51 +695,21 @@ impl Fts5Table {
         terms.sort();
         terms.dedup();
         for term in &terms {
-            // The buffer first: a term this transaction has already staged
-            // has no on-disk `%_idx` row to read, whether it is brand new or
-            // already rewritten in the inline form.
-            let staged = self
-                .pending
-                .lock()
-                .ok()
-                .and_then(|held| held.doclists.get(term.as_slice()).map(|s| s.bytes.clone()));
-            // The `%_data` page a legacy row still names, freed below only
-            // when this pass is the one that reads it - a row already staged
-            // this transaction was resolved, and its legacy page freed, the
-            // first time it was touched.
-            let (bytes, legacy_page) = match staged {
-                Some(bytes) => (bytes, None),
-                None => {
-                    let key = [Value::Integer(SEGMENT), Value::owned_blob(term)?];
-                    let Some(row) = self.shadows.read_keyed(context, b"idx", &key, 3)? else {
-                        continue;
-                    };
-                    let legacy_page = match term_value(&row) {
-                        Some(TermValue::Page(page)) => Some(page),
-                        _ => None,
-                    };
-                    let bytes = require_doclist(context, &self.shadows, term, &row)?;
-                    (bytes, legacy_page)
-                }
-            };
-            let mut entries = decode_doclist(&bytes);
-            entries.retain(|entry| entry.rowid != rowid);
-            if entries.is_empty() {
-                // Staged as well as stored: the row may exist only in the
-                // buffer, and a delete that left it there would write it back.
-                forget_doclist(&self.pending, term);
-                self.shadows.delete_keyed(
-                    context,
-                    b"idx",
-                    &[Value::Integer(SEGMENT), Value::owned_blob(term)?],
-                )?;
-                if let Some(page) = legacy_page {
-                    self.shadows.delete_row(context, b"data", page)?;
-                }
+            let removal = remove_row_from_term(context, &self.shadows, &self.pending, term, rowid)?;
+            let TermRemoval::Emptied { legacy_page } = removal else {
                 continue;
+            };
+            // The row was the last one in the doclist. The buffer has let the
+            // term go, so what is left is the stored row, and a delete that
+            // left it there would find the term again.
+            self.shadows.delete_keyed(
+                context,
+                b"idx",
+                &[Value::Integer(SEGMENT), Value::owned_blob(term)?],
+            )?;
+            if let Some(page) = legacy_page {
+                self.shadows.delete_row(context, b"data", page)?;
             }
-            let encoded = encode_doclist(&entries);
-            stage_doclist(&self.pending, term, encoded);
         }
 
         let sizes = match self.shadows.read_row(context, b"docsize", rowid)? {
@@ -567,6 +724,7 @@ impl Fts5Table {
         if !self.stores_no_rows() {
             self.shadows.delete_row(context, b"content", rowid)?;
         }
+        forget_content_rowid(&self.pending, rowid);
         let mut totals = buffered_totals(context, &self.shadows, &self.pending, width);
         totals.rows = (totals.rows - 1).max(0);
         totals.tokens.resize(width, 0);

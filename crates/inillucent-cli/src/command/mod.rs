@@ -60,6 +60,16 @@ impl Kind {
         }
     }
 
+    /// Returns the JSON Schema type with the article a sentence needs.
+    pub fn with_article(self) -> &'static str {
+        match self {
+            Kind::Text => "a string",
+            Kind::Integer => "an integer",
+            Kind::Boolean => "a boolean",
+            Kind::Values => "an array",
+        }
+    }
+
     /// Returns whether a JSON value has this parameter kind.
     ///
     /// @param value - the value a client supplied
@@ -138,8 +148,17 @@ pub struct Param {
 pub enum Writes {
     /// It only reads. `--readonly` admits it and it never creates a file.
     No,
-    /// It changes the database. `--readonly` refuses it by name.
+    /// It changes the database, and a database it is pointed at that is not
+    /// there is made. `--readonly` refuses it by name.
     Yes,
+    /// It changes a database that is already there. `--readonly` refuses it by
+    /// name, and a path with no file is `not_found`, as it is for a read.
+    ///
+    /// **`analyze`, `checkpoint`, `embed` and `restore`.** Each works on rows or
+    /// pages that already exist, so a typo in `--db` made an empty file and then
+    /// had nothing to work on. `exec`, `batch`, `run` and `import` stay on `Yes`
+    /// because a script that sets a database up in one line expects the file.
+    Existing,
     /// It may change the database, and refuses each statement that does.
     ///
     /// `--readonly` admits the verb and the shell underneath refuses the
@@ -151,7 +170,7 @@ pub enum Writes {
 impl Writes {
     /// Whether `--readonly` refuses this command before it runs.
     pub fn refused_when_read_only(self) -> bool {
-        self == Writes::Yes
+        matches!(self, Writes::Yes | Writes::Existing)
     }
 
     /// Whether this command may create the database file it was pointed at.
@@ -159,9 +178,11 @@ impl Writes {
     /// A read verb does not make the file it was pointed at, so
     /// `inillucent --db typo.rdb tables` reports a missing database rather
     /// than leaving an empty one behind. `run` may, because
-    /// `sqlite3 new.db ".read schema.sql"` does.
+    /// `sqlite3 new.db ".read schema.sql"` does. So do `exec`, `batch` and
+    /// `import`, which set a database up. A verb that changes a database that
+    /// must already exist does not.
     pub fn may_create(self) -> bool {
-        self != Writes::No
+        matches!(self, Writes::Yes | Writes::PerStatement)
     }
 }
 
@@ -254,8 +275,8 @@ impl Arguments {
             };
             if !param.kind.accepts(value) {
                 return Err(Failed::misuse(format!(
-                    "'{name}' has to be a {}.",
-                    param.kind.schema_type()
+                    "'{name}' has to be {}.",
+                    param.kind.with_article()
                 )));
             }
             if let Some(allowed) = command.allowed_values(name) {
@@ -393,6 +414,17 @@ pub struct Context {
     pub null: String,
 }
 
+/// The default database of a [`Context`], set aside while one call runs on the
+/// file its `db` argument named.
+pub struct Displaced {
+    /// The default database's connection, with any transaction it has open.
+    shell: Shell,
+    /// The path that connection is open on.
+    path: String,
+    /// The stray log segments found when it was opened.
+    strays: Vec<u64>,
+}
+
 /// Whether a command surface may write to the database it opens.
 ///
 /// **An enum rather than a bare `bool` (task-1962, A9).** `Context::open(path,
@@ -481,20 +513,8 @@ impl Context {
         // file and closes it again to ask, which is a second open of a file the
         // database's own open is about to make. `path_state` asks without a
         // handle.
-        if !may_create
-            && !opened.is_empty()
-            && opened != ":memory:"
-            && !matches!(
-                inillucent_driver::vfs::os::path_state(std::path::Path::new(&opened)),
-                Ok(Some(_))
-            )
-        {
-            return Err(Failed::said(
-                Status::NotFound,
-                format!(
-                    "there is no database at \"{opened}\". `inillucent create {opened}` makes one."
-                ),
-            ));
+        if !may_create {
+            Context::refuse_a_missing_file(&opened)?;
         }
         // **The engine's own status, not `io` for everything.** A file another
         // process holds is `busy`, which a caller can act on by retrying; a
@@ -534,25 +554,77 @@ impl Context {
         })
     }
 
-    /// Points this context at a different file, reopening only if it moved.
+    /// Refuses a database file that is not there.
     ///
-    /// **One open database at a time, and that is a decision rather than a
-    /// simplification.** One file is one buffer pool, and a server holding four
-    /// of them holds four pools whose sizes nobody asked about. A caller that
-    /// alternates pays a reopen; a caller that does not pays nothing.
-    ///
-    /// @param path - the file to use
-    pub fn use_database(&mut self, path: &str) -> Result<(), Failed> {
-        if path == self.path {
+    /// @param opened - the path after confinement, or an in-memory name
+    fn refuse_a_missing_file(opened: &str) -> Result<(), Failed> {
+        if opened.is_empty()
+            || opened == ":memory:"
+            || matches!(
+                inillucent_driver::vfs::os::path_state(std::path::Path::new(opened)),
+                Ok(Some(_))
+            )
+        {
             return Ok(());
+        }
+        Err(Failed::said(
+            Status::NotFound,
+            format!(
+                "there is no database at \"{opened}\". `inillucent create {opened}` makes one."
+            ),
+        ))
+    }
+
+    /// Points this context at the file one call named, for that call only.
+    ///
+    /// **The default database is set aside and handed back, not closed and
+    /// reopened.** The `db` argument used to reopen this context's connection on
+    /// the named file and leave it there, so one call that named another file
+    /// moved every later call that did not, rolled back a transaction the
+    /// default database had open, and (for the default `:memory:` database)
+    /// threw its contents away. Now the default connection stays open, with its
+    /// transaction, behind the call and is put back by
+    /// [`Context::leave_database`].
+    ///
+    /// **A missing file is refused with `not_found`, not made**, whatever the
+    /// command and whether or not the surface is read only. `create` is the
+    /// command that makes a file.
+    ///
+    /// @param path - the file the call named
+    pub fn enter_database(&mut self, path: &str) -> Result<Option<Displaced>, Failed> {
+        if path == self.path {
+            return Ok(None);
         }
         let confined = self.confine(path)?;
         let named = confined.to_string_lossy().into_owned();
-        self.shell.reopen(&named).map_err(|message| {
-            Failed::said(Status::Io, format!("could not open \"{named}\": {message}"))
+        if named == self.path {
+            return Ok(None);
+        }
+        Context::refuse_a_missing_file(&named)?;
+        let mut shell = Shell::open_reporting(&named, self.readonly).map_err(|error| {
+            let said = Failed::from_engine(&error);
+            Failed::said(
+                said.status,
+                format!("could not open \"{named}\": {}", said.message),
+            )
         })?;
-        self.path = named;
-        Ok(())
+        shell.safe = self.shell.safe;
+        let reported = shell.recovery();
+        let strays = Context::strays_beside(&named, reported.last_sequence, reported.last_lsn);
+        Ok(Some(Displaced {
+            shell: std::mem::replace(&mut self.shell, shell),
+            path: std::mem::replace(&mut self.path, named),
+            strays: std::mem::replace(&mut self.strays, strays),
+        }))
+    }
+
+    /// Puts the default database back and closes the one a call named.
+    ///
+    /// @param held - what [`Context::enter_database`] set aside
+    pub fn leave_database(&mut self, held: Displaced) {
+        self.shell = held.shell;
+        self.path = held.path;
+        self.strays = held.strays;
     }
 
     /// Refuses every shell command that reaches outside the database.
@@ -879,9 +951,29 @@ pub fn run(
     context: &mut Context,
     arguments: &Arguments,
 ) -> Result<Outcome, Failed> {
-    if let Some(path) = arguments.text("db") {
-        context.use_database(path)?;
+    // The default database is set aside for this call only, and put back on every
+    // path out, so a failure cannot leave the session pointed somewhere else.
+    let displaced = match arguments.text("db") {
+        Some(path) => context.enter_database(path)?,
+        None => None,
+    };
+    let outcome = run_here(command, context, arguments);
+    if let Some(held) = displaced {
+        context.leave_database(held);
     }
+    outcome
+}
+
+/// Runs a command on whichever database the context is on now.
+///
+/// @param command - what to run
+/// @param context - where to run it
+/// @param arguments - what it was given
+fn run_here(
+    command: &'static Command,
+    context: &mut Context,
+    arguments: &Arguments,
+) -> Result<Outcome, Failed> {
     if command.writes.refused_when_read_only() && context.readonly() {
         return Err(Failed::said(
             Status::ReadOnly,
@@ -925,8 +1017,11 @@ const DB: Param = Param {
     kind: Kind::Text,
     required: false,
     positional: false,
-    description: "The database file to run against. Defaults to the one this process was started \
-                  on, or :memory: for a scratch database that is discarded when the process ends.",
+    description: "The database file to run this one call against. It applies to this call only: \
+                  the next call without 'db' runs on the database the process was started on \
+                  (or :memory:, a scratch database discarded when the process ends), and a \
+                  transaction open there stays open. A file that is not there is not_found; \
+                  inillucent_create makes one.",
 };
 
 /// The parameter the row-producing commands take.

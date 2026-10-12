@@ -1044,8 +1044,15 @@ fn bare_columns(select: &BoundSelect) -> Vec<BoundExpr> {
 /// With no `min` or `max` this answers `None`, and the bare column keeps the
 /// first row of the group.
 ///
+/// **The call's `FILTER` comes with it.** `max(v) FILTER (WHERE v < 20), w`
+/// takes `w` from the row `max` chose among the rows that pass the filter. A
+/// row the filter drops never reaches `max`, so it cannot be the row `w` comes
+/// from either; without the filter here `w` followed the unfiltered maximum.
+///
 /// @param select - the bound statement
-fn bare_witness(select: &BoundSelect) -> Option<(BoundExpr, std::cmp::Ordering)> {
+fn bare_witness(
+    select: &BoundSelect,
+) -> Option<(BoundExpr, std::cmp::Ordering, Option<BoundExpr>)> {
     let only = select.aggregates.iter().rev().find(|call| {
         matches!(call.func, AggregateFunc::Min | AggregateFunc::Max) && !call.arguments.is_empty()
     })?;
@@ -1054,7 +1061,7 @@ fn bare_witness(select: &BoundSelect) -> Option<(BoundExpr, std::cmp::Ordering)>
     } else {
         std::cmp::Ordering::Greater
     };
-    Some((only.arguments.first()?.clone(), wanted))
+    Some((only.arguments.first()?.clone(), wanted, only.filter.clone()))
 }
 /// Builds the accumulator specifications for an aggregating query.
 ///
@@ -1180,20 +1187,43 @@ pub(crate) fn aggregate_specs(
             collation,
         });
     }
-    // **The bare columns, after the aggregates and in the same order
-    // `translate` looks them up in.** Each keeps one row's value; the witness
-    // is what says which row, and it is compiled once per bare column rather
-    // than shared, so an accumulator never has to see inside another.
+    specs.extend(bare_column_specs(select, space, params, types)?);
+    Ok(specs)
+}
+/// Builds the accumulator specifications for the bare columns of an aggregating query.
+///
+/// **They come after the aggregates and in the same order `translate` looks
+/// them up in.** Each keeps one row's value; the witness is what says which
+/// row, and it is compiled once per bare column rather than shared, so an
+/// accumulator never has to see inside another.
+///
+/// @param select - the bound statement
+/// @param space - the joined column space
+/// @param params - the bound parameters
+/// @param types - the scan's column types
+fn bare_column_specs(
+    select: &BoundSelect,
+    space: &Space<'_>,
+    params: &Params,
+    types: &[StaticType],
+) -> DbResult<Vec<AggregateSpec>> {
+    let mut specs = Vec::new();
     let witness = bare_witness(select);
     for expr in bare_columns(select) {
         let translated = translate_scan(&expr, space, params)?;
         let mut extra = Vec::new();
         let mut collation = Collation::Binary;
         let wanted = match &witness {
-            Some((seen, wanted)) => {
+            Some((seen, wanted, filter)) => {
                 let translated = translate_scan(seen, space, params)?;
                 extra.push(compile(&translated, types)?);
                 collation = expression_collation(seen);
+                // The call's own filter rides as the third value of the row;
+                // see `AggregateSpec::feed_row` and `Accumulator::push_values_marked`.
+                if let Some(filter) = filter {
+                    let translated = translate_scan(filter, space, params)?;
+                    extra.push(compile(&translated, types)?);
+                }
                 Some(*wanted)
             }
             None => None,

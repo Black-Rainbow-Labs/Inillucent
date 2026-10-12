@@ -67,7 +67,7 @@ use std::cell::RefCell;
 
 use inillucent_base::error::{corrupt, misuse};
 use inillucent_base::DbResult;
-use inillucent_pool::extent::{self, ExtentRef};
+use inillucent_pool::extent::ExtentRef;
 use inillucent_pool::interior::{InteriorBuilder, InteriorRef};
 use inillucent_pool::page::{self, PageKind};
 use inillucent_pool::{Database, PageId, Pool, Swip};
@@ -75,9 +75,12 @@ use inillucent_pool::{Database, PageId, Pool, Swip};
 use inillucent_value::collation::Collation;
 
 use crate::datum::{Datum, OwnedDatum};
+pub(crate) use crate::extents::log_allocated_page;
+pub use crate::extents::{chain_pages, free_extent, read_extent, write_extent, write_extent_owned};
 use crate::key;
 pub use crate::keyenc::KeyEncoding;
 use crate::leaf::{Extents, Hit, LeafBuilder, LeafRef, Spill};
+use crate::separator::{check_child_range, check_separator_order};
 use crate::tree::BULK_FILL;
 use crate::types::ColumnSpec;
 pub use occupancy::{released, PageShare, Released};
@@ -91,243 +94,6 @@ const RESTARTS: u32 = inillucent_pool::OPTIMISTIC_RETRIES;
 /// subtree holds no live row.
 pub type KeyRange = (Option<Vec<u8>>, Option<Vec<u8>>);
 
-/// Reads one out-of-line value.
-///
-/// The reference's length is checked against the lengths the pages themselves
-/// declare rather than trusted: the two disagreeing is a corruption, and reading
-/// the longer of the two would walk off the end of the chain.
-///
-/// @param pool - the buffer pool the file is open through
-/// @param reference - what the leaf holds
-pub fn read_extent(pool: &Pool, reference: ExtentRef) -> DbResult<Vec<u8>> {
-    // A value packed into a shared page is one slot of one page, so it is one
-    // fetch and one copy - there is no chain to follow and no length to
-    // reconcile beyond the one the slot itself declares.
-    if let Some(slot) = reference.slot {
-        let guard = pool.fetch(reference.first)?;
-        let held = extent::shared::read(guard.bytes(), slot)?;
-        if held.len() as u64 != reference.length {
-            return Err(corrupt(format!(
-                "a shared extent slot holds {} bytes where its reference says {}",
-                held.len(),
-                reference.length
-            )));
-        }
-        return Ok(held.to_vec());
-    }
-    let mut out = Vec::with_capacity(reference.length.min(1 << 20) as usize);
-    let mut page = reference.first;
-    let mut pages = 0u64;
-    while !page.is_none() {
-        let guard = pool.fetch(page)?;
-        // **The page number, because the message alone does not identify one.**
-        // A page whose kind is no longer `BlobExtent` is a page something else
-        // has taken over, and naming the page number is what tied a failing
-        // read to a `CREATE TABLE`'s root page landing on a page a recovery bug
-        // had left mismarked as free while it was still live. Reading it out of
-        // the reference costs nothing on the path that succeeds.
-        let (body, next) = extent::read_page(guard.bytes()).map_err(|error| {
-            corrupt(format!(
-                "{} at page {}, which is page {} of an extent starting at {} and {} bytes long",
-                error.detail().unwrap_or("an extent page is not readable"),
-                page.0,
-                pages.saturating_add(1),
-                reference.first.0,
-                reference.length,
-            ))
-        })?;
-        out.extend_from_slice(body);
-        page = next;
-        pages = pages.saturating_add(1);
-        if out.len() as u64 > reference.length {
-            return Err(corrupt(
-                "an extent holds more bytes than its reference says",
-            ));
-        }
-        // A chain that loops would otherwise read for ever. The bound is the
-        // most pages the declared length could possibly need, plus one for the
-        // zero-length case.
-        if pages > extent::pages_needed(reference.length, pool.page_size()).saturating_add(1) {
-            return Err(corrupt("an extent chain is longer than its length allows"));
-        }
-    }
-    if out.len() as u64 != reference.length {
-        return Err(corrupt(format!(
-            "an extent holds {} bytes where its reference says {}",
-            out.len(),
-            reference.length
-        )));
-    }
-    Ok(out)
-}
-
-/// Writes one value out of line, logging every page it takes.
-///
-/// The allocator asks the free map for a **contiguous run** big enough for the
-/// whole value, so the common case is one seek and one sequential read rather
-/// than SQLite's chain of dependent four-kilobyte reads. That is the whole of
-/// the `large.values` argument in the TDD.
-///
-/// @param database - the file the pages are allocated and installed in
-/// @param log - where the records go
-/// @param tree_id - the tree the value belongs to
-/// @param value - the bytes to store
-pub fn write_extent(
-    database: &mut Database,
-    log: &mut dyn crate::write::TreeLog,
-    tree_id: u64,
-    value: &[u8],
-) -> DbResult<ExtentRef> {
-    let page_size = database.page_size();
-    let pages = extent::pages_needed(value.len() as u64, page_size).max(1);
-    // **A value that fits inside one page shares one.** A run is
-    // whole pages, so a value one byte over the spill threshold used to cost a
-    // whole page: 4,200 bytes took 32,768, and the band from there to a full
-    // page is where extracted text, JSON payloads and rendered vectors live.
-    // Nikaya's 601,862 embeddings at 9,513 bytes each were 20.5 GB of a 25.66 GB
-    // staged file for exactly this reason.
-    //
-    // Anything longer than a page keeps its contiguous run. Packing would not
-    // help it - it needs every byte of the pages it takes - and the run is the
-    // whole of the `large.values` argument.
-    //
-    // **And it has to fit a shared page, which holds less than a page.** The
-    // count above is pages of *payload*; a shared page spends another fifty six
-    // bytes on its header and the directory entry, so a value between the two
-    // reached `shared::place` on a page made fresh for it and was refused with
-    // `a shared extent page has no room for this value` - which the caller read
-    // as `bad parameter or other API misuse`. Measured on the default page
-    // size: a bound TEXT of 32,000 bytes stored and one of 32,700 did not, and
-    // nothing in the tree had a test for a value between a shared page's
-    // capacity and a whole one (task-1979, section 10, D2).
-    if pages <= 1 && value.len() <= extent::shared::capacity(page_size) {
-        return write_packed_extent(database, log, tree_id, value);
-    }
-    let first = database.allocate(pages)?;
-    let images = extent::encode_run(value, first, page_size, tree_id)?;
-    for (id, mut image) in images {
-        log_allocated_page(&mut Some(log), database, id, &mut image)?;
-    }
-    Ok(ExtentRef::run(first, value.len() as u64))
-}
-
-/// Puts one small value into a shared extent page, allocating one if needed.
-///
-/// The page the last value went on is tried first - it is a hint on the
-/// `Database`, held only in memory - and a fresh page is allocated when it is
-/// full or there is none. Either way the whole page image is logged, so redo is
-/// a copy and no new record kind is needed for this.
-///
-/// @param database - the file the page is allocated and installed in
-/// @param log - where the records go
-/// @param tree_id - the tree the value belongs to
-/// @param value - the bytes to store
-fn write_packed_extent(
-    database: &mut Database,
-    log: &mut dyn crate::write::TreeLog,
-    tree_id: u64,
-    value: &[u8],
-) -> DbResult<ExtentRef> {
-    if let Some(page) = database.shared_extent() {
-        let held = {
-            let guard = database.pool().fetch(page)?;
-            let bytes = guard.bytes();
-            extent::shared::is_shared(bytes) && extent::shared::has_room(bytes, value.len())?
-        };
-        if held {
-            let mut image = {
-                let guard = database.pool().fetch(page)?;
-                guard.bytes().to_vec()
-            };
-            let slot = extent::shared::place(&mut image, value)?;
-            log_shared_page(log, database, page, &mut image, false)?;
-            return Ok(ExtentRef::packed(page, slot, value.len() as u64));
-        }
-    }
-    let page = database.allocate(1)?;
-    let mut image = vec![0u8; database.page_size()];
-    extent::shared::initialise(&mut image, tree_id)?;
-    let slot = extent::shared::place(&mut image, value)?;
-    log_shared_page(log, database, page, &mut image, true)?;
-    database.set_shared_extent(Some(page));
-    Ok(ExtentRef::packed(page, slot, value.len() as u64))
-}
-
-/// Logs and installs a shared extent page's whole image.
-///
-/// **The image, not the change.** A slot placed or cleared is a few bytes, but
-/// the record has to be replayable against a page recovery may be holding at any
-/// earlier state, and a whole image is the one form that always is - the same
-/// argument `WritePage` already rests on. A shared page is written once per
-/// value that lands on it, and a value that lands on it is at least four
-/// kilobytes, so the log is at most a page per four kilobytes of payload.
-///
-/// @param log - where the records go
-/// @param database - the file
-/// @param page - the page's number
-/// @param image - the page bytes, stamped with the record's LSN on return
-/// @param fresh - whether the page was just allocated
-fn log_shared_page(
-    log: &mut dyn crate::write::TreeLog,
-    database: &mut Database,
-    page: PageId,
-    image: &mut [u8],
-    fresh: bool,
-) -> DbResult<()> {
-    if fresh {
-        log.log(inillucent_wal::record::Body::AllocPage { page: page.0 })?;
-    }
-    let lsn = log.log(inillucent_wal::record::Body::WritePage {
-        page: page.0,
-        image,
-    })?;
-    page::write_u64(image, page::header::LSN, lsn)?;
-    database.install(page, image)
-}
-
-/// Gives one out-of-line value's pages back to the free map.
-///
-/// @param database - the file
-/// @param log - where the records go
-/// @param reference - what the leaf held
-pub fn free_extent(
-    database: &mut Database,
-    log: &mut dyn crate::write::TreeLog,
-    reference: ExtentRef,
-) -> DbResult<()> {
-    // **A packed value gives back a slot, and the page only when it is the
-    // last.** The bytes stay where they are: compacting the page
-    // would move a value whose reference is in some other leaf, and the space a
-    // dead slot holds is bounded by the page it is on.
-    if let Some(slot) = reference.slot {
-        let mut image = {
-            let guard = database.pool().fetch(reference.first)?;
-            guard.bytes().to_vec()
-        };
-        let remaining = extent::shared::clear(&mut image, slot)?;
-        if remaining > 0 {
-            return log_shared_page(log, database, reference.first, &mut image, false);
-        }
-        // Nothing on it is live, so it goes back to the free map - and the hint
-        // has to let go of it first, or the next small value would be placed on
-        // a page that is no longer this tree's.
-        if database.shared_extent() == Some(reference.first) {
-            database.set_shared_extent(None);
-        }
-        log.log(inillucent_wal::record::Body::FreePage {
-            page: reference.first.0,
-        })?;
-        return database.release(reference.first, 1);
-    }
-    let pages = extent::pages_needed(reference.length, database.page_size()).max(1);
-    for offset in 0..pages {
-        let page = PageId(reference.first.0.saturating_add(offset));
-        log.log(inillucent_wal::record::Body::FreePage { page: page.0 })?;
-        database.release(page, 1)?;
-    }
-    Ok(())
-}
-
 /// A [`Spill`] that allocates a run and describes it in the log.
 ///
 /// Held apart from the tree so that the builder, which knows nothing about
@@ -339,13 +105,37 @@ pub struct Extender<'a> {
     pub log: &'a mut dyn crate::write::TreeLog,
     /// The tree the values belong to.
     pub tree_id: u64,
+    /// How many leading columns are the key, whose values move the file to format 3.
+    pub key_columns: usize,
     /// Every run this spiller has written, so a failure can be traced.
     pub written: Vec<ExtentRef>,
+    /// Answers the owner key of the row being packed at a position, which a value
+    /// spilled from that row records on its first page. See [`no_owner`].
+    pub owner_of: &'a dyn Fn(usize) -> Vec<u8>,
+}
+
+/// The owner answer of a spiller that has no key to give: an empty key.
+///
+/// A value written with no owner key is read as usual and never moved.
+///
+/// @param _row - the row's position, unused
+pub fn no_owner(_row: usize) -> Vec<u8> {
+    Vec::new()
 }
 
 impl Spill for Extender<'_> {
-    fn spill(&mut self, _row: usize, _column: usize, value: &[u8]) -> DbResult<ExtentRef> {
-        let reference = write_extent(self.database, self.log, self.tree_id, value)?;
+    fn spill(&mut self, row: usize, column: usize, value: &[u8]) -> DbResult<ExtentRef> {
+        let owner = (self.owner_of)(row);
+        let reference = match column < self.key_columns {
+            true => crate::format::write_key_extent(
+                self.database,
+                self.log,
+                self.tree_id,
+                &owner,
+                value,
+            )?,
+            false => write_extent_owned(self.database, self.log, self.tree_id, &owner, value)?,
+        };
         self.written.push(reference);
         Ok(reference)
     }
@@ -383,43 +173,6 @@ impl Spill for Carrying<'_> {
         }
         self.inner.spill(row, column, value)
     }
-}
-
-/// Describes one freshly allocated page in the log, then installs it.
-///
-/// Two records rather than one: the allocation and the contents are separate
-/// facts and recovery needs both. `AllocPage` is what stops a later allocation
-/// handing the same page out twice after a crash; `WritePage` is what puts the
-/// bytes back. The image is stamped with the write's LSN before it is
-/// installed, so the page-LSN rule holds for it exactly as it does for a page a
-/// split wrote.
-///
-/// With no log the image is installed unstamped, which is the byte-for-byte
-/// behaviour the unlogged builder has always had.
-///
-/// **This is the out-of-line value run's path, and it is not the bulk builder's**
-/// (task-2000, design 2). A bulk build can write its pages past the log because
-/// it syncs the data file before the statement that names its root commits; an
-/// overflow run written in the middle of an ordinary statement has no such sync
-/// to hide behind, so its bytes are in the log like any other page's. See
-/// [`write_built_page`].
-///
-/// @param log - where the records go, when there is one
-/// @param database - the file the page is installed in
-/// @param id - the page, already allocated
-/// @param image - the page bytes, stamped in place with the LSN
-fn log_allocated_page(
-    log: &mut Option<&mut dyn crate::write::TreeLog>,
-    database: &mut Database,
-    id: PageId,
-    image: &mut [u8],
-) -> DbResult<()> {
-    if let Some(log) = log.as_mut() {
-        log.log(inillucent_wal::record::Body::AllocPage { page: id.0 })?;
-        let lsn = log.log(inillucent_wal::record::Body::WritePage { page: id.0, image })?;
-        page::write_u64(image, page::header::LSN, lsn)?;
-    }
-    database.install(id, image)
 }
 
 /// Returns the collation of each key column.
@@ -512,7 +265,7 @@ pub struct PagedTree {
     /// The identifier written into every page of this tree.
     tree_id: u64,
     /// The root page; a one-leaf tree's root is that leaf.
-    root: PageId,
+    pub(crate) root: PageId,
     /// How many interior levels sit above the leaves, and the leftmost leaf,
     /// once something has asked.
     ///
@@ -572,6 +325,11 @@ pub struct PagedTree {
     /// counter can be bumped from a `&self` method - the read side reports them
     /// and the write side is the only thing that moves them.
     pub(crate) stats: std::cell::Cell<crate::write::WriteStats>,
+    /// Live rows of each leaf at its last failed merge attempt; see `merge_backed_off`.
+    pub(crate) merge_backoff: RefCell<std::collections::HashMap<PageId, usize>>,
+    /// Leaves a sorted delete emptied and has not taken out of the tree yet, each with the
+    /// interior pages above it, root first; see `write::unlink`.
+    pub(crate) pending_unlinks: RefCell<Vec<(PageId, Vec<PageId>)>>,
     /// The leaf the last point probe of this tree landed on (task-2175).
     ///
     /// `PagedTree::update_in_place` looks here before descending from the root:
@@ -810,6 +568,8 @@ impl PagedTree {
             hint_victim: std::cell::Cell::new(0),
             largest_hint: std::cell::Cell::new(None),
             stats: std::cell::Cell::new(crate::write::WriteStats::default()),
+            merge_backoff: RefCell::new(std::collections::HashMap::new()),
+            pending_unlinks: RefCell::new(Vec::new()),
             last_leaf: std::cell::Cell::new(None),
         })
     }
@@ -1161,7 +921,8 @@ impl PagedTree {
                 if let Some(image) = self.merged_copy(pool, page, &leaf)? {
                     let packed = LeafRef::parse(&image)?
                         .with_collations(&self.collations)
-                        .with_directions(&self.directions);
+                        .with_directions(&self.directions)
+                        .with_pool(pool);
                     return visit(&packed);
                 }
             }
@@ -1215,6 +976,8 @@ impl PagedTree {
 
     /// Returns the references every out-of-line value in a leaf names.
     ///
+    /// A dead reference, which stands for a value already freed, is left out.
+    ///
     /// For the write path, which has to give a replaced value's pages back to
     /// the free map. Reading the references is cheap - they are in the leaf -
     /// where reading the values is not.
@@ -1230,7 +993,10 @@ impl PagedTree {
                 if leaf.column(column)?.class_at(row)? != crate::types::ValueClass::Extent {
                     continue;
                 }
-                refs.push(leaf.extent_at(row, column)?);
+                let reference = leaf.extent_at(row, column)?;
+                if !reference.is_dead() {
+                    refs.push(reference);
+                }
             }
         }
         for index in 0..leaf.delta_count() {
@@ -1288,6 +1054,7 @@ impl PagedTree {
         // array there cost `PointProbe` more than three times its budget. The
         // integrity checker is where an O(pages x slots) pass belongs.
         interior.validate()?;
+        check_separator_order(pool, &interior)?;
         if interior.level() != level {
             return Err(corrupt(format!(
                 "an interior page declares level {} where the tree says {level}",
@@ -1309,27 +1076,7 @@ impl PagedTree {
             // both ends, on every child, which is strictly *more* than the old
             // rule caught. The old one never looked at the upper bound at all.
             let (lowest, highest) = self.key_range_under(pool, target)?;
-            if let Some(lowest) = &lowest {
-                if child > 0 {
-                    let separator = interior.key(child.saturating_sub(1))?;
-                    if lowest.as_slice() < separator {
-                        return Err(corrupt(format!(
-                            "a key below separator {} is in the child above it",
-                            child.saturating_sub(1)
-                        )));
-                    }
-                }
-            }
-            if let Some(highest) = &highest {
-                if child < interior.count() {
-                    let separator = interior.key(child)?;
-                    if highest.as_slice() >= separator {
-                        return Err(corrupt(format!(
-                            "a key at or above separator {child} is in the child below it"
-                        )));
-                    }
-                }
-            }
+            check_child_range(pool, &interior, child, lowest.as_ref(), highest.as_ref())?;
             self.check_subtree(pool, target, level.saturating_sub(1))?;
         }
         Ok(())
@@ -1386,7 +1133,8 @@ impl PagedTree {
             if page::kind_of(&guard)? == PageKind::Leaf {
                 let leaf = LeafRef::parse(&guard)?
                     .with_collations(&self.collations)
-                    .with_directions(&self.directions);
+                    .with_directions(&self.directions)
+                    .with_pool(pool);
                 return self.with_leaf_extents(pool, None, leaf, |leaf| visit(leaf));
             }
             let interior = InteriorRef::parse(&guard)?;
@@ -2228,19 +1976,8 @@ mod tests {
         // The odd probes are total rather than correct-by-luck.
         assert_eq!(KeyEncoding::Rowid.encode(&[]).len(), 0);
         assert_eq!(KeyEncoding::Rowid.encode(&[Datum::Null]).len(), 8);
-        assert_eq!(
-            KeyEncoding::Rowid.encode(&[Datum::Text(b"x")]),
-            vec![0xFF; 8]
-        );
-        assert_eq!(KeyEncoding::Rowid.encode(&[Datum::Real(2.5)]).len(), 8);
-        assert_eq!(
-            KeyEncoding::Rowid.encode(&[Datum::Real(f64::MAX)]),
-            KeyEncoding::Rowid.encode(&[Datum::Int(i64::MAX)])
-        );
-        assert_eq!(
-            KeyEncoding::Rowid.encode(&[Datum::Real(f64::MIN)]),
-            KeyEncoding::Rowid.encode(&[Datum::Int(i64::MIN)])
-        );
+        // The classes a `WITHOUT ROWID` integer key can hold: `keyenc` tests the order.
+        assert!(KeyEncoding::Rowid.encode(&[Datum::Text(b"x")]).len() > 8);
     }
 
     /// A tree whose separators were corrupted is caught by the checker rather

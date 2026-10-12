@@ -93,11 +93,29 @@ fn fixture_format(version: &str) -> u32 {
     u32::from_le_bytes(format)
 }
 
-/// Reports whether a release reads the format this build writes.
+/// Returns the format version a file carries, from byte 8 of its meta page.
+///
+/// @param database - the database file
+fn file_format(database: &Path) -> u32 {
+    let bytes = std::fs::read(database)
+        .unwrap_or_else(|why| panic!("{} could not be read: {why}", database.display()));
+    let mut format = [0u8; 4];
+    format.copy_from_slice(
+        bytes
+            .get(8..12)
+            .expect("a database is longer than its header"),
+    );
+    u32::from_le_bytes(format)
+}
+
+/// Reports whether a release reads a file of a given format.
+///
+/// A release reads the format it writes and every one before it.
 ///
 /// @param version - the release
-fn reads_this_format(version: &str) -> bool {
-    fixture_format(version) >= inillucent_pool::meta::FORMAT_VERSION
+/// @param format - the format version the file carries
+fn reads_this_format(version: &str, format: u32) -> bool {
+    fixture_format(version) >= format
 }
 
 /// Asserts a release refused a file whose format it does not read, and refused
@@ -111,17 +129,22 @@ fn reads_this_format(version: &str) -> bool {
 /// @param version - the release
 /// @param question - what it was asked
 /// @param asked - what it said
-fn assert_refused_by_format(version: &str, question: &str, asked: &Result<String, String>) {
+/// @param format - the format version the file it was asked about carries
+fn assert_refused_by_format(
+    version: &str,
+    question: &str,
+    asked: &Result<String, String>,
+    format: u32,
+) {
     let complaint = match asked {
         Ok(got) => panic!(
-            "{version} writes format {} and this build writes format {}, and it answered \
+            "{version} writes format {} and the file carries format {format}, and it answered \
              `{question}` with `{got}` instead of refusing the file",
             fixture_format(version),
-            inillucent_pool::meta::FORMAT_VERSION
         ),
         Err(complaint) => complaint,
     };
-    let named = format!("format version {}", inillucent_pool::meta::FORMAT_VERSION);
+    let named = format!("format version {format}");
     if FORMAT_REFUSED_AS_DAMAGE.contains(&version) {
         assert!(
             complaint.contains("neither meta page is readable"),
@@ -202,9 +225,20 @@ fn ask_release(exe: &Path, database: &Path, sql: &str) -> Result<String, String>
 /// so the file handed to an older binary has a log segment to replay as well as
 /// pages to read.
 ///
+/// **The file starts as one an earlier release made.** A file this build creates says
+/// format 3 and writes owned extent pages, which no published release reads, so the
+/// empty file is rewritten to say format 2 before the statements run. A format 2 file
+/// stays format 2 through a write that stores no key out of line, which is what the
+/// statements here are, and that is the file every release from 0.1.8 reads.
+///
 /// @param into - a scratch directory
 fn write_the_current_format(into: &Path) -> PathBuf {
     let path = into.join("app.rdb");
+    {
+        let arm = default_arm();
+        drop(open(&arm, &path));
+    }
+    lower_to_format_two(&path);
     let sql = std::fs::read_to_string(interop::build_sql())
         .unwrap_or_else(|why| panic!("tests/interop/build.sql could not be read: {why}"));
     let arm = default_arm();
@@ -328,6 +362,15 @@ fn every_released_binary_reads_what_this_build_writes() {
 
     let area = scratch("backward");
     let database = write_the_current_format(&area);
+    // **The format this file carries, not the highest this build writes.** A file
+    // with no key stored out of line is byte for byte a format 2 file, which
+    // every release from 0.1.8 reads; the file with one is the next case.
+    let format = file_format(&database);
+    assert_eq!(
+        format,
+        inillucent_pool::meta::FORMAT_TWO,
+        "build.sql stores no key out of line, so the file it makes stays at format 2"
+    );
     let questions = interop::questions();
 
     // **This build's own answers first, so a failure below is about the older
@@ -360,9 +403,9 @@ fn every_released_binary_reads_what_this_build_writes() {
     for (version, exe) in &available {
         for (question, (name, wanted)) in questions.iter().zip(reference.iter()) {
             assert_eq!(&question.name, name, "expected.tsv is out of order");
-            if !reads_this_format(version) {
+            if !reads_this_format(version, format) {
                 let asked = ask_release(exe, &database, &question.sql);
-                assert_refused_by_format(version, name, &asked);
+                assert_refused_by_format(version, name, &asked, format);
                 checked = checked.saturating_add(1);
                 continue;
             }
@@ -411,13 +454,71 @@ fn every_released_binary_reads_what_this_build_writes() {
     let expected_gaps = KNOWN_GAPS
         .iter()
         .filter(|(version, _, _)| available.iter().any(|(had, _)| had == version))
-        .filter(|(version, _, _)| reads_this_format(version))
+        .filter(|(version, _, _)| reads_this_format(version, format))
         .count();
     assert_eq!(
         gaps_seen, expected_gaps,
         "KNOWN_GAPS names {expected_gaps} differences for the releases on disk and {gaps_seen} \
          happened"
     );
+}
+
+/// Writes `build.sql` and an index over a value too long to keep in a leaf, and
+/// returns the database.
+///
+/// The index entry is longer than `page_size / 8` at the default page size, so it
+/// is stored on pages of its own and the file moves to format 3.
+///
+/// @param into - a scratch directory
+fn write_a_file_holding_a_key_stored_out_of_line(into: &Path) -> PathBuf {
+    let path = write_the_current_format(into);
+    let arm = default_arm();
+    let database = open(&arm, &path);
+    let connection = database.session();
+    run(
+        &connection,
+        "CREATE TABLE longkeys (id INTEGER PRIMARY KEY, v TEXT); \
+         CREATE INDEX longkeys_v ON longkeys (v); \
+         INSERT INTO longkeys VALUES (1, replace(hex(zeroblob(5000)), '0', 'q'))",
+    );
+    drop(database);
+    path
+}
+
+/// Every released binary refuses a file that holds a key stored out of line, by
+/// name, and reads a file that does not.
+///
+/// **Format 3 is for exactly this file.** A key over `page_size / 8` is written on
+/// pages of its own with a prefix in the leaf, and a release before this one cannot
+/// read it. What matters is that none of them answers: each is asked a question
+/// the file can answer and must refuse it naming the format, as it refuses any
+/// format it does not read. The same releases read the file the case above wrote,
+/// which stores nothing out of line and so still says format 2.
+#[test]
+fn every_released_binary_refuses_a_file_that_holds_a_key_stored_out_of_line() {
+    let available: Vec<(String, PathBuf)> = interop::versions()
+        .iter()
+        .filter_map(|version| interop::release_binary(version).map(|exe| (version.clone(), exe)))
+        .collect();
+    if available.is_empty() {
+        skipping(
+            "no released binary is on disk; run `pwsh tools/build-interop-fixture.ps1 -Version \
+             <version>` for a published release",
+        );
+        return;
+    }
+    let area = scratch("key-stored-out-of-line");
+    let database = write_a_file_holding_a_key_stored_out_of_line(&area);
+    let format = file_format(&database);
+    assert_eq!(
+        format,
+        inillucent_pool::meta::FORMAT_VERSION,
+        "a key stored out of line moves the file to format 3, and the file says {format}"
+    );
+    for (version, exe) in &available {
+        let asked = ask_release(exe, &database, "SELECT count(*) FROM note");
+        assert_refused_by_format(version, "SELECT count(*) FROM note", &asked, format);
+    }
 }
 
 /// What an older release cannot ask of a search index this build wrote.
@@ -476,6 +577,7 @@ fn every_released_binary_searches_what_this_build_writes() {
 
     let area = scratch("retrieval");
     let database = write_the_current_format_with_a_graph(&area);
+    let format = file_format(&database);
     let questions = interop::retrieval_questions();
     assert!(
         !questions.is_empty(),
@@ -512,8 +614,8 @@ fn every_released_binary_searches_what_this_build_writes() {
             checked = checked.saturating_add(1);
             // A release of an older format refuses the whole file; see
             // `assert_refused_by_format`.
-            if !reads_this_format(version) {
-                assert_refused_by_format(version, &question.name, &asked);
+            if !reads_this_format(version, format) {
+                assert_refused_by_format(version, &question.name, &asked, format);
                 continue;
             }
 
@@ -558,11 +660,36 @@ fn every_released_binary_searches_what_this_build_writes() {
     let expected_gaps = KNOWN_RETRIEVAL_GAPS
         .iter()
         .filter(|(version, _, _)| available.iter().any(|(had, _)| had == version))
-        .filter(|(version, _, _)| reads_this_format(version))
+        .filter(|(version, _, _)| reads_this_format(version, format))
         .count();
     assert_eq!(
         gaps_seen, expected_gaps,
         "KNOWN_RETRIEVAL_GAPS names {expected_gaps} differences for the releases on disk and \
          {gaps_seen} happened"
     );
+}
+
+/// Rewrites both copies of a file's meta record to say format 2.
+///
+/// @param database - the database file
+fn lower_to_format_two(database: &Path) {
+    let mut bytes = std::fs::read(database)
+        .unwrap_or_else(|why| panic!("{} could not be read: {why}", database.display()));
+    let mut size = [0u8; 4];
+    size.copy_from_slice(
+        bytes
+            .get(12..16)
+            .expect("a database is longer than its header"),
+    );
+    let page_size = u32::from_le_bytes(size) as usize;
+    for slot in 0..2 {
+        let page = bytes
+            .get_mut(slot * page_size..(slot + 1) * page_size)
+            .expect("a meta page");
+        let mut meta = inillucent_pool::meta::Meta::decode(page).expect("a meta record");
+        meta.format = inillucent_pool::meta::FORMAT_TWO;
+        meta.encode(page).expect("the record encodes");
+    }
+    std::fs::write(database, bytes)
+        .unwrap_or_else(|why| panic!("{} could not be written: {why}", database.display()));
 }

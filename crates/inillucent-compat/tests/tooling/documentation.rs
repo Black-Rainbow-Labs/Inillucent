@@ -976,7 +976,7 @@ fn every_method_a_package_table_names_exists_in_its_binding() {
             .join("\n");
         assert!(
             !body.is_empty(),
-            "none of {sources:?} could be read, so {readme}'s table is checked against              nothing. A source a clone does not carry - anything under `.gitignore` - is              not the one to check a table against"
+            "none of {sources:?} could be read, so {readme}'s table is checked against nothing. A source a clone does not carry - anything under `.gitignore` - is not the one to check a table against"
         );
         for name in table_names(table) {
             checked = checked.saturating_add(1);

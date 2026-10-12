@@ -15,7 +15,8 @@ use super::super::Context;
 use crate::shadow::ShadowTables;
 
 use super::doclist::{
-    append_doclist_entry, last_doclist_rowid, read_varint, write_varint, DocEntry,
+    append_doclist_entry, last_doclist_rowid, read_varint, remove_entry_in_place, write_varint,
+    DocEntry,
 };
 use super::*;
 
@@ -55,6 +56,12 @@ pub struct BuildStages {
     pub dictionary_read: u128,
     /// Writing a new term's `%_idx` row.
     pub dictionary_write: u128,
+    /// How many bytes of doclists the flushes wrote.
+    ///
+    /// A count, so a test can check that a bulk load writes the index about once without a clock.
+    /// A load that writes every term it touched at every statement writes the index again for each
+    /// statement, and this grows with the square of the rows.
+    pub flushed_bytes: u64,
     /// Reading, updating and staging the corpus totals `bm25` needs.
     pub totals: u128,
     /// Writing the staged doclists out to `%_data`.
@@ -227,8 +234,17 @@ pub struct Pending {
     /// invisible to a scan, and the scans are `expr.rs`'s prefix search,
     /// `integrity`, `rebuild` and `remove`.
     pub(crate) doclists: BTreeMap<Vec<u8>, Staged>,
-    /// How many bytes the doclists hold, so the buffer can be bounded.
+    /// How many bytes the doclists have grown or been rewritten by since the last flush, so the
+    /// buffer can be bounded.
+    ///
+    /// **Changed bytes, not held bytes.** A list that was only read counts nothing. Counting the
+    /// lists a statement merely read made the buffer look full as soon as the hot terms of a large
+    /// index were staged, and it was written out after every statement.
     pub(crate) bytes: usize,
+    /// How many bytes every staged doclist holds, changed or not. Bounds memory.
+    pub(crate) resident: usize,
+    /// The savepoints that are open, innermost last, and how to put the buffer back to each.
+    pub(crate) epochs: Vec<Epoch>,
     /// The totals row, read once and written once per transaction.
     ///
     /// **One `%_data` row, and it was being rewritten per document.** `add`
@@ -284,12 +300,504 @@ pub struct Pending {
 /// `merge_term`'s own doc comment records the identical shape being fixed for
 /// the *unbuffered* path, by appending instead of decoding; the buffered path
 /// it introduced brought the walk back one level down.
-#[derive(Default)]
+///
+/// **Two forms, because the two jobs want different things.** A bulk load only
+/// ever adds a row after every row the list holds, and the bytes form appends
+/// to the encoded list without decoding anything. An `UPDATE` or a `DELETE`
+/// takes a row out of the middle, and in the bytes form that means decoding the
+/// whole list, dropping one entry and encoding it again, for every row touched.
+/// A term that is in every row of a table made an `UPDATE` of all its rows take
+/// time that grew as the square of the row count: 8,000 rows took 7.7 s where
+/// SQLite takes 0.04 s. The first edit in the middle of a list therefore
+/// decodes it once into a map keyed by rowid, every later edit of that list is
+/// a map operation, and the list is encoded once when it is read or flushed.
+#[derive(Clone, Default)]
 pub(crate) struct Staged {
-    /// The doclist as `%_idx` will hold it.
-    pub(crate) bytes: Vec<u8>,
+    /// Whether the list is exactly what `%_idx` holds, because it was only read.
+    ///
+    /// A clean list is not written at a flush. Reading a term to append to it and then not
+    /// changing it, which a query inside the transaction does, used to rewrite the whole row.
+    clean: bool,
+    /// The doclist as `%_idx` will hold it, while it has no edits in the middle.
+    bytes: Vec<u8>,
     /// The rowid the last entry names, when there is one.
     last: Option<i64>,
+    /// The entries by rowid, once an edit in the middle has decoded the list.
+    ///
+    /// `None` means `bytes` is the list. `Some` means this map is the list and
+    /// `bytes` and `last` are not used.
+    edited: Option<BTreeMap<i64, Vec<(usize, Vec<u32>)>>>,
+    /// The encoded length of the list in the edited form, kept up to date as
+    /// entries are added and removed so the buffer can be bounded.
+    edited_size: usize,
+    /// How many times a row has been cut out of the bytes since the list was
+    /// read, which decides when the list moves to the edited form.
+    cuts: u8,
+}
+
+/// How many rows are cut out of a list's bytes before it moves to the map.
+const MAX_CUTS_FROM_BYTES: u8 = 2;
+
+/// Returns how many bytes one entry takes once encoded, as an estimate.
+///
+/// Exact enough to bound the buffer: each number is counted as two bytes.
+///
+/// @param columns - the entry's positions by column
+fn entry_size(columns: &[(usize, Vec<u32>)]) -> usize {
+    let mut size = 4usize;
+    for (_, positions) in columns {
+        size = size.saturating_add(4);
+        size = size.saturating_add(positions.len().saturating_mul(2));
+    }
+    size
+}
+
+impl Staged {
+    /// Wraps a doclist read from `%_idx` or built from scratch.
+    ///
+    /// @param bytes - the encoded doclist
+    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Staged {
+        // The walk happens here, once per whole-list rewrite, rather than on
+        // every append: this is the path a list reaches when it is read back or
+        // built from scratch, and it is the only place the end is not already
+        // known.
+        let last = last_doclist_rowid(&bytes);
+        Staged {
+            clean: true,
+            bytes,
+            last,
+            edited: None,
+            edited_size: 0,
+            cuts: 0,
+        }
+    }
+
+    /// Reports whether the list is exactly what `%_idx` holds.
+    pub(crate) fn is_clean(&self) -> bool {
+        self.clean
+    }
+
+    /// Reports whether `put_row` would append this row to the end of the encoded bytes.
+    ///
+    /// That is the one change that can be undone by cutting the bytes back to where they were.
+    ///
+    /// @param rowid - the row about to be put
+    pub(crate) fn appends(&self, rowid: i64) -> bool {
+        self.edited.is_none() && self.last.is_some_and(|last| rowid > last)
+    }
+
+    /// Cuts a list that has only been appended to back to an earlier length.
+    ///
+    /// @param len - how many bytes the list had
+    /// @param last - the rowid its last entry named
+    fn truncate_appended(&mut self, len: usize, last: Option<i64>) {
+        self.bytes.truncate(len);
+        self.last = last;
+    }
+
+    /// Returns the encoded doclist.
+    pub(crate) fn encoded(&self) -> std::borrow::Cow<'_, [u8]> {
+        match &self.edited {
+            None => std::borrow::Cow::Borrowed(self.bytes.as_slice()),
+            Some(entries) => std::borrow::Cow::Owned(encode_entries(entries)),
+        }
+    }
+
+    /// Returns the encoded doclist, consuming the staged one.
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        match self.edited {
+            None => self.bytes,
+            Some(entries) => encode_entries(&entries),
+        }
+    }
+
+    /// Returns how many bytes the list takes, or about that many once edited.
+    pub(crate) fn size(&self) -> usize {
+        match self.edited {
+            None => self.bytes.len(),
+            Some(_) => self.edited_size,
+        }
+    }
+
+    /// Returns whether the list has no entries.
+    pub(crate) fn is_empty(&self) -> bool {
+        match &self.edited {
+            None => self.bytes.is_empty(),
+            Some(entries) => entries.is_empty(),
+        }
+    }
+
+    /// Decodes the list into the edited form, if it is not in it already.
+    fn edit(&mut self) -> &mut BTreeMap<i64, Vec<(usize, Vec<u32>)>> {
+        if self.edited.is_none() {
+            let decoded = decode_doclist(&self.bytes);
+            self.edited_size = self.bytes.len();
+            self.bytes = Vec::new();
+            self.last = None;
+            self.edited = Some(
+                decoded
+                    .into_iter()
+                    .map(|entry| (entry.rowid, entry.columns))
+                    .collect(),
+            );
+        }
+        self.edited.get_or_insert_with(BTreeMap::new)
+    }
+
+    /// Takes one row out of the list, wherever it is.
+    ///
+    /// @param rowid - the row to remove
+    pub(crate) fn remove_row(&mut self, rowid: i64) {
+        self.clean = false;
+        // The first removals cut the entry out of the bytes, which decodes
+        // nothing. A list that loses more than that in one transaction is being
+        // emptied row by row, and cutting from the bytes each time would walk
+        // the whole list each time, so it goes to the map.
+        if self.edited.is_none() && self.cuts < MAX_CUTS_FROM_BYTES {
+            self.cuts = self.cuts.saturating_add(1);
+            let cut = remove_entry_in_place(&mut self.bytes, &mut self.last, rowid);
+            if cut.is_some() {
+                return;
+            }
+        }
+        let removed = self.edit().remove(&rowid);
+        if let Some(columns) = removed {
+            self.edited_size = self.edited_size.saturating_sub(entry_size(&columns));
+        }
+    }
+
+    /// Puts one row into the list, replacing the row of the same rowid.
+    ///
+    /// Appends to the bytes when the row sorts after every row there, which is
+    /// the bulk load. Answers false, and changes nothing, when the list is in
+    /// the bytes form and its end is not known, so the caller takes the general
+    /// path that decodes it.
+    ///
+    /// @param rowid - the row
+    /// @param columns - the positions of the term in the row, by column
+    /// @param run - the same postings as a sorted run, when the caller has one
+    pub(crate) fn put_row(
+        &mut self,
+        rowid: i64,
+        columns: impl FnOnce() -> Vec<(usize, Vec<u32>)>,
+        run: Option<&[(Vec<u8>, usize, u32)]>,
+    ) -> bool {
+        self.clean = false;
+        if self.edited.is_none() {
+            let Some(last) = self.last else {
+                return false;
+            };
+            if rowid > last {
+                match run {
+                    Some(run) => append_run(&mut self.bytes, rowid.wrapping_sub(last), run),
+                    None => {
+                        let entry = DocEntry {
+                            rowid,
+                            columns: columns(),
+                        };
+                        append_doclist_entry(&mut self.bytes, rowid.wrapping_sub(last), &entry);
+                    }
+                }
+                self.last = Some(rowid);
+                return true;
+            }
+        }
+        let columns = columns();
+        let added = entry_size(&columns);
+        let replaced = self.edit().insert(rowid, columns);
+        self.edited_size = self
+            .edited_size
+            .saturating_add(added)
+            .saturating_sub(replaced.map(|held| entry_size(&held)).unwrap_or(0));
+        true
+    }
+}
+
+/// How to put one term's staged doclist back to what it was when a savepoint opened.
+#[derive(Clone)]
+pub(crate) enum Undo {
+    /// The term was not staged, so the way back is to remove it.
+    Absent,
+    /// Rows were appended to the end of the encoded bytes, so the way back is to cut them off.
+    ///
+    /// **Recorded this way because an append is the whole of a bulk load.** Keeping a copy of the
+    /// list would make every statement copy every term it touched, which is the cost of the index
+    /// again. The length and the last rowid are two numbers.
+    Appended {
+        /// How long the encoded list was.
+        len: usize,
+        /// The rowid its last entry named.
+        last: Option<i64>,
+    },
+    /// The list was changed in some other way, so the way back is the list as it was.
+    Whole(Staged),
+}
+
+/// The buffer's counters, which a savepoint has to bring back along with the doclists.
+#[derive(Clone, Default)]
+pub(crate) struct Counters {
+    /// `Pending::bytes`.
+    bytes: usize,
+    /// `Pending::resident`.
+    resident: usize,
+    /// `Pending::totals`.
+    totals: Option<Totals>,
+    /// `Pending::totals_dirty`.
+    totals_dirty: bool,
+    /// `Pending::content_highest`.
+    content_highest: Option<i64>,
+}
+
+/// The whole buffer as it stood at some moment.
+#[derive(Clone)]
+pub(crate) struct Snapshot {
+    /// The staged doclists.
+    doclists: BTreeMap<Vec<u8>, Staged>,
+    /// The counters.
+    counters: Counters,
+}
+
+/// What a savepoint needs to put the buffer back to where it was when the savepoint opened.
+///
+/// **Until a flush happens inside it, an epoch is a record of what changed.** A term's first
+/// change since the savepoint opened is recorded, and putting the buffer back replays the records.
+/// A flush writes the buffer out, so after one the records say nothing about the buffer that now
+/// exists. The flush first works out the whole buffer as it was when each open savepoint opened and
+/// keeps that in `restore`, and that is what rolling back to the savepoint uses.
+#[derive(Default)]
+pub(crate) struct Epoch {
+    /// Each term's way back, recorded the first time the term changes.
+    undo: BTreeMap<Vec<u8>, Undo>,
+    /// The counters when the savepoint opened.
+    counters: Counters,
+    /// The whole buffer when the savepoint opened, once a flush made `undo` useless.
+    restore: Option<Box<Snapshot>>,
+}
+
+/// Puts the staged doclists back, term by term, from an epoch's records.
+///
+/// @param doclists - the doclists as they are now, changed in place
+/// @param undo - the records of one epoch
+fn replay_undo(doclists: &mut BTreeMap<Vec<u8>, Staged>, undo: &BTreeMap<Vec<u8>, Undo>) {
+    for (term, way_back) in undo {
+        match way_back {
+            Undo::Absent => {
+                doclists.remove(term);
+            }
+            Undo::Appended { len, last } => {
+                if let Some(staged) = doclists.get_mut(term) {
+                    staged.truncate_appended(*len, *last);
+                }
+            }
+            Undo::Whole(staged) => {
+                doclists.insert(term.clone(), staged.clone());
+            }
+        }
+    }
+}
+
+impl Pending {
+    /// Returns the counters as they are now.
+    fn counters(&self) -> Counters {
+        Counters {
+            bytes: self.bytes,
+            resident: self.resident,
+            totals: self.totals.clone(),
+            totals_dirty: self.totals_dirty,
+            content_highest: self.content_highest,
+        }
+    }
+
+    /// Puts the counters back.
+    ///
+    /// @param counters - what `counters` answered earlier
+    fn set_counters(&mut self, counters: Counters) {
+        self.bytes = counters.bytes;
+        self.resident = counters.resident;
+        self.totals = counters.totals;
+        self.totals_dirty = counters.totals_dirty;
+        self.content_highest = counters.content_highest;
+    }
+
+    /// Opens a savepoint at a level.
+    ///
+    /// A level the buffer already holds is stale: a statement that failed leaves its savepoint
+    /// open, because nothing releases it, and the next one is numbered from the same level.
+    ///
+    /// @param level - how many savepoints were open before this one
+    pub(crate) fn open_epoch(&mut self, level: usize) {
+        self.epochs.truncate(level);
+        while self.epochs.len() < level {
+            let counters = self.counters();
+            self.epochs.push(Epoch {
+                counters,
+                ..Epoch::default()
+            });
+        }
+        let counters = self.counters();
+        self.epochs.push(Epoch {
+            counters,
+            ..Epoch::default()
+        });
+    }
+
+    /// Closes the savepoints from a level up, keeping what they changed.
+    ///
+    /// Their records pass to the savepoint below, which has none of its own for a term they
+    /// changed first: the record is the term as it was when that lower savepoint opened too.
+    ///
+    /// @param level - the lowest level released
+    pub(crate) fn close_epochs(&mut self, level: usize) {
+        while self.epochs.len() > level {
+            let Some(closed) = self.epochs.pop() else {
+                break;
+            };
+            if let Some(below) = self.epochs.last_mut() {
+                for (term, way_back) in closed.undo {
+                    below.undo.entry(term).or_insert(way_back);
+                }
+            }
+        }
+    }
+
+    /// Puts the buffer back to where it was when a savepoint opened.
+    ///
+    /// The savepoint stays open, empty, as a `ROLLBACK TO` leaves it. A buffer that holds no record
+    /// of the savepoint is thrown away, which is what happened to every rollback before the buffer
+    /// could be put back.
+    ///
+    /// @param level - the savepoint's level
+    pub(crate) fn rollback_epochs(&mut self, level: usize) {
+        if level >= self.epochs.len() {
+            *self = Pending {
+                layout: self.layout,
+                layout_writer: std::mem::take(&mut self.layout_writer),
+                ..Pending::default()
+            };
+            return;
+        }
+        let lowest_restore = self
+            .epochs
+            .get_mut(level)
+            .and_then(|epoch| epoch.restore.take());
+        let counters = self.epochs.get(level).map(|epoch| epoch.counters.clone());
+        match lowest_restore {
+            Some(snapshot) => self.doclists = snapshot.doclists,
+            None => {
+                for epoch in self.epochs.iter().skip(level).rev() {
+                    replay_undo(&mut self.doclists, &epoch.undo);
+                }
+            }
+        }
+        self.epochs.truncate(level);
+        if let Some(counters) = counters {
+            self.set_counters(counters);
+        }
+        let counters = self.counters();
+        self.epochs.push(Epoch {
+            counters,
+            ..Epoch::default()
+        });
+    }
+
+    /// Works out the buffer as it was when each open savepoint opened, before a flush empties it.
+    ///
+    /// Done once per savepoint: a savepoint that already has its copy keeps it, and so does every
+    /// savepoint below it. The records are dropped afterwards, because a flush leaves the buffer
+    /// empty and they describe a buffer that no longer exists.
+    pub(crate) fn keep_restores_before_a_flush(&mut self) {
+        if self.epochs.is_empty() {
+            return;
+        }
+        let mut state = Snapshot {
+            doclists: self.doclists.clone(),
+            counters: self.counters(),
+        };
+        for epoch in self.epochs.iter_mut().rev() {
+            if epoch.restore.is_some() {
+                break;
+            }
+            replay_undo(&mut state.doclists, &epoch.undo);
+            state.counters = epoch.counters.clone();
+            epoch.restore = Some(Box::new(state.clone()));
+        }
+        for epoch in self.epochs.iter_mut() {
+            epoch.undo.clear();
+        }
+    }
+
+    /// Records how to undo the next change to a term, the first time it changes in a savepoint.
+    ///
+    /// @param term - the term about to change
+    /// @param appending - whether the change is an append to the end of the encoded list
+    pub(crate) fn note_change(&mut self, term: &[u8], appending: bool) {
+        let Some(epoch) = self.epochs.last_mut() else {
+            return;
+        };
+        if epoch.restore.is_some() {
+            return;
+        }
+        let current = self.doclists.get(term);
+        match epoch.undo.get(term) {
+            // An append after an append needs nothing more.
+            Some(Undo::Appended { .. }) if appending => {}
+            Some(Undo::Appended { len, last }) => {
+                // Something other than an append is about to change a list that was appended to.
+                // The list as it was is the list as it is, cut back.
+                let before = current.map(|staged| {
+                    let mut before = staged.clone();
+                    before.truncate_appended(*len, *last);
+                    before
+                });
+                if let Some(before) = before {
+                    epoch.undo.insert(term.to_vec(), Undo::Whole(before));
+                }
+            }
+            Some(_) => {}
+            None => {
+                let way_back = match current {
+                    None => Undo::Absent,
+                    Some(staged) if appending && staged.edited.is_none() => Undo::Appended {
+                        len: staged.bytes.len(),
+                        last: staged.last,
+                    },
+                    Some(staged) => Undo::Whole(staged.clone()),
+                };
+                epoch.undo.insert(term.to_vec(), way_back);
+            }
+        }
+    }
+
+    /// Empties the buffer, keeping what a savepoint needs to bring it back.
+    pub(crate) fn discard_all(&mut self) {
+        self.keep_restores_before_a_flush();
+        self.doclists.clear();
+        self.bytes = 0;
+        self.resident = 0;
+    }
+}
+
+/// Encodes entries held by rowid, which is the order a doclist keeps them in.
+///
+/// @param entries - the entries, by rowid
+fn encode_entries(entries: &BTreeMap<i64, Vec<(usize, Vec<u32>)>>) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut previous = 0i64;
+    for (rowid, columns) in entries {
+        write_varint(&mut out, rowid.wrapping_sub(previous) as u64);
+        previous = *rowid;
+        write_varint(&mut out, columns.len() as u64);
+        for (column, positions) in columns {
+            write_varint(&mut out, *column as u64);
+            write_varint(&mut out, positions.len() as u64);
+            let mut last = 0u32;
+            for position in positions {
+                write_varint(&mut out, u64::from(position.wrapping_sub(last)));
+                last = *position;
+            }
+        }
+    }
+    out
 }
 /// A handle on the buffer, shared by a table and the cursors it opens.
 pub type Buffer = Arc<Mutex<Pending>>;
@@ -299,6 +807,8 @@ pub type Buffer = Arc<Mutex<Pending>>;
 /// corpus would hold the whole index in memory. Flushing early costs a rewrite
 /// of what is held, which is what the unbuffered path paid per document.
 pub(crate) const PENDING_BUDGET: usize = 8 * 1024 * 1024;
+/// How many bytes of staged doclists, read or changed, are held before the buffer is written out.
+pub(crate) const RESIDENT_BUDGET: usize = 512 * 1024 * 1024;
 /// Returns the rowid an insert that named none is given.
 ///
 /// The table is asked once per transaction and the mark rises from there.
@@ -332,7 +842,33 @@ pub(crate) fn next_content_rowid(
 /// @param rowid - the rowid that was written
 pub(crate) fn note_content_rowid(buffer: &Buffer, rowid: i64) {
     if let Ok(mut held) = buffer.lock() {
-        held.content_highest = Some(held.content_highest.unwrap_or(0).max(rowid));
+        // **Only a mark that exists is raised.** With no mark, the next
+        // allocation reads the highest rowid in the table, which includes this
+        // one. Creating a mark from the named rowid alone made the next
+        // allocated rowid one past it: after `INSERT ... (rowid, a) VALUES (0,
+        // ...)` inside a transaction, the next insert that named no rowid was
+        // given rowid 1 and replaced the row that was already there.
+        if let Some(highest) = held.content_highest {
+            held.content_highest = Some(highest.max(rowid));
+        }
+    }
+}
+/// Records that a row is gone, so the next rowid is worked out again if it was the highest.
+///
+/// SQLite gives a row inserted without a rowid one more than the highest rowid
+/// the table holds when it is inserted. The mark above keeps the highest rowid
+/// handed out this transaction, and when that row is deleted the highest rowid
+/// is lower, so the mark is dropped and the next insert reads the table. Keeping
+/// it gave the next row a rowid SQLite does not give it, and the two differ for
+/// as long as the table is used.
+///
+/// @param buffer - the staged rows
+/// @param rowid - the rowid that was deleted
+pub(crate) fn forget_content_rowid(buffer: &Buffer, rowid: i64) {
+    if let Ok(mut held) = buffer.lock() {
+        if held.content_highest == Some(rowid) {
+            held.content_highest = None;
+        }
     }
 }
 /// What a `%_idx` row's third column holds.
@@ -444,7 +980,7 @@ pub(crate) fn read_doclist(
 ) -> DbResult<Option<Vec<u8>>> {
     if let Ok(held) = buffer.lock() {
         if let Some(staged) = held.doclists.get(term) {
-            return Ok(Some(staged.bytes.clone()));
+            return Ok(Some(staged.encoded().into_owned()));
         }
     }
     let key = [Value::Integer(SEGMENT), Value::owned_blob(term)?];
@@ -491,23 +1027,35 @@ pub(crate) fn append_in_one_lock(
     let Ok(mut held) = buffer.lock() else {
         return Appended::No;
     };
+    let appending = match held.doclists.get(term) {
+        Some(staged) => staged.appends(rowid),
+        None => return Appended::No,
+    };
+    held.note_change(term, appending);
     let Some(staged) = held.doclists.get_mut(term) else {
         return Appended::No;
     };
-    let Some(last) = staged.last else {
-        return Appended::No;
-    };
-    if rowid <= last {
+    let was = staged.size();
+    if !staged.put_row(rowid, || columns_of(run), Some(run)) {
         return Appended::No;
     }
-    let was = staged.bytes.len();
-    append_run(&mut staged.bytes, rowid.wrapping_sub(last), run);
-    staged.last = Some(rowid);
-    let grew = staged.bytes.len().saturating_sub(was);
+    let grew = staged.size().saturating_sub(was);
     held.bytes = held.bytes.saturating_add(grew);
+    held.resident = held.resident.saturating_add(grew);
     Appended::Done {
-        full: held.bytes > PENDING_BUDGET,
+        full: is_over_budget(&held),
     }
+}
+
+/// Reports whether the buffer holds more than it should.
+///
+/// Two bounds. The changed bytes since the last flush are the budget a flush is for. The bytes of
+/// every staged list, changed or only read, bound memory, and are much larger because a hot term of
+/// a big index is a list as long as the index has rows.
+///
+/// @param held - the buffer
+fn is_over_budget(held: &Pending) -> bool {
+    held.bytes > PENDING_BUDGET || held.resident > RESIDENT_BUDGET
 }
 /// Writes one doclist entry straight out of a sorted run of postings.
 ///
@@ -586,21 +1134,22 @@ pub(crate) fn append_staged(buffer: &Buffer, term: &[u8], entry: &DocEntry) -> b
     let Ok(mut held) = buffer.lock() else {
         return false;
     };
+    let appending = match held.doclists.get(term) {
+        Some(staged) => staged.appends(entry.rowid),
+        None => return false,
+    };
+    held.note_change(term, appending);
     let Some(staged) = held.doclists.get_mut(term) else {
         return false;
     };
     // The remembered end, rather than a walk to find it. See `Staged`.
-    let Some(last) = staged.last else {
-        return false;
-    };
-    if entry.rowid <= last {
+    let was = staged.size();
+    if !staged.put_row(entry.rowid, || entry.columns.clone(), None) {
         return false;
     }
-    let was = staged.bytes.len();
-    append_doclist_entry(&mut staged.bytes, entry.rowid.wrapping_sub(last), entry);
-    staged.last = Some(entry.rowid);
-    let grew = staged.bytes.len().saturating_sub(was);
+    let grew = staged.size().saturating_sub(was);
     held.bytes = held.bytes.saturating_add(grew);
+    held.resident = held.resident.saturating_add(grew);
     true
 }
 /// Stages a doclist to be written when the buffer is next flushed.
@@ -608,31 +1157,131 @@ pub(crate) fn append_staged(buffer: &Buffer, term: &[u8], entry: &DocEntry) -> b
 /// @param buffer - the staged doclists
 /// @param term - the term it belongs to
 /// @param bytes - the whole doclist
-pub(crate) fn stage_doclist(buffer: &Buffer, term: &[u8], bytes: Vec<u8>) {
-    // The walk happens here, once per whole-list rewrite, rather than on every
-    // append: this is the path a list reaches when it is read back or built
-    // from scratch, and it is the only place the end is not already known.
-    let last = last_doclist_rowid(&bytes);
+/// @param changed - whether the list differs from `%_idx`, and so has to be written
+pub(crate) fn stage_doclist(buffer: &Buffer, term: &[u8], bytes: Vec<u8>, changed: bool) {
+    let mut staged = Staged::from_bytes(bytes);
+    staged.clean = !changed;
     if let Ok(mut held) = buffer.lock() {
-        let was = held
+        held.note_change(term, false);
+        let prior = held
             .doclists
             .get(term)
-            .map(|staged| staged.bytes.len())
-            .unwrap_or(0);
-        held.bytes = held.bytes.saturating_sub(was).saturating_add(bytes.len());
-        held.doclists.insert(term.to_vec(), Staged { bytes, last });
+            .map(|held| (held.size(), held.is_clean()));
+        let (was, was_clean) = prior.unwrap_or((0, true));
+        held.resident = held
+            .resident
+            .saturating_sub(was)
+            .saturating_add(staged.size());
+        if !was_clean {
+            held.bytes = held.bytes.saturating_sub(was);
+        }
+        if changed {
+            held.bytes = held.bytes.saturating_add(staged.size());
+        }
+        held.doclists.insert(term.to_vec(), staged);
     }
 }
-/// Forgets a staged doclist, for one whose row is being deleted.
+/// Returns every staged doclist whose term starts with a prefix.
+///
+/// A prefix query reads the terms `%_idx` holds that start with the prefix, and
+/// a term this transaction changed is only in the buffer or is newer there than
+/// in `%_idx`. The doclists come back encoded, by term.
 ///
 /// @param buffer - the staged doclists
+/// @param prefix - the start of the terms wanted
+pub(crate) fn staged_with_prefix(buffer: &Buffer, prefix: &[u8]) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let mut found = BTreeMap::new();
+    let Ok(held) = buffer.lock() else {
+        return found;
+    };
+    for (term, staged) in held.doclists.range(prefix.to_vec()..) {
+        if !term.starts_with(prefix) {
+            break;
+        }
+        found.insert(term.clone(), staged.encoded().into_owned());
+    }
+    found
+}
+/// What taking a row out of one term's doclist left.
+pub(crate) enum TermRemoval {
+    /// The term has no doclist, staged or stored.
+    Missing,
+    /// The doclist still has other rows, and is staged.
+    Kept,
+    /// The row was the last one in the doclist, which is gone from the buffer.
+    /// The `%_idx` row and any older page it names are for the caller to delete.
+    Emptied {
+        /// The `%_data` page an older build left the doclist in, when this
+        /// call is the one that read it.
+        legacy_page: Option<i64>,
+    },
+}
+/// Takes one row out of one term's doclist, staging the result.
+///
+/// **The staged doclist is edited in place.** Reading the stored row, decoding
+/// it, dropping an entry and encoding it again for every row of a multi row
+/// `UPDATE` made the statement quadratic; see [`Staged`].
+///
+/// @param context - the host
+/// @param shadows - the table's shadow tables
+/// @param buffer - the staged doclists
 /// @param term - the term
-pub(crate) fn forget_doclist(buffer: &Buffer, term: &[u8]) {
+/// @param rowid - the row to take out
+pub(crate) fn remove_row_from_term(
+    context: &mut Context<'_>,
+    shadows: &ShadowTables,
+    buffer: &Buffer,
+    term: &[u8],
+    rowid: i64,
+) -> DbResult<TermRemoval> {
+    // The buffer first: a term this transaction has already staged has no
+    // stored `%_idx` row to read, whether it is brand new or already rewritten
+    // in the inline form.
     if let Ok(mut held) = buffer.lock() {
-        if let Some(staged) = held.doclists.remove(term) {
-            held.bytes = held.bytes.saturating_sub(staged.bytes.len());
+        if held.doclists.contains_key(term) {
+            held.note_change(term, false);
+        }
+        let state = match held.doclists.get_mut(term) {
+            Some(staged) => {
+                let was = staged.size();
+                staged.remove_row(rowid);
+                Some((was, staged.size(), staged.is_empty()))
+            }
+            None => None,
+        };
+        if let Some((was, now, emptied)) = state {
+            held.bytes = held.bytes.saturating_sub(was.saturating_sub(now));
+            held.resident = held.resident.saturating_sub(was.saturating_sub(now));
+            if emptied {
+                held.doclists.remove(term);
+                held.resident = held.resident.saturating_sub(now);
+                return Ok(TermRemoval::Emptied { legacy_page: None });
+            }
+            return Ok(TermRemoval::Kept);
         }
     }
+    let key = [Value::Integer(SEGMENT), Value::owned_blob(term)?];
+    let Some(row) = shadows.read_keyed(context, b"idx", &key, 3)? else {
+        return Ok(TermRemoval::Missing);
+    };
+    // The `%_data` page a legacy row still names, freed by the caller when
+    // this pass is the one that reads it.
+    let legacy_page = match term_value(&row) {
+        Some(TermValue::Page(page)) => Some(page),
+        _ => None,
+    };
+    let mut staged = Staged::from_bytes(require_doclist(context, shadows, term, &row)?);
+    staged.remove_row(rowid);
+    if staged.is_empty() {
+        return Ok(TermRemoval::Emptied { legacy_page });
+    }
+    if let Ok(mut held) = buffer.lock() {
+        held.note_change(term, false);
+        held.bytes = held.bytes.saturating_add(staged.size());
+        held.resident = held.resident.saturating_add(staged.size());
+        held.doclists.insert(term.to_vec(), staged);
+    }
+    Ok(TermRemoval::Kept)
 }
 /// Reports whether the buffer is holding more than it should.
 ///
@@ -640,7 +1289,7 @@ pub(crate) fn forget_doclist(buffer: &Buffer, term: &[u8]) {
 pub(crate) fn buffer_is_full(buffer: &Buffer) -> bool {
     buffer
         .lock()
-        .map(|held| held.bytes > PENDING_BUDGET)
+        .map(|held| is_over_budget(&held))
         .unwrap_or(false)
 }
 /// Writes every staged doclist and empties the buffer.
@@ -680,13 +1329,23 @@ pub(crate) fn flush_doclists_timed(
     // tree rather than a descent per term into a growing one.
     let staged: Vec<(Vec<u8>, Staged)> = match buffer.lock() {
         Ok(mut held) => {
+            // A savepoint that is open when the buffer is written out can no longer be put back
+            // by replaying records, so what it needs is kept first. See `Epoch`.
+            held.keep_restores_before_a_flush();
             held.bytes = 0;
+            held.resident = 0;
             core::mem::take(&mut held.doclists).into_iter().collect()
         }
         Err(_) => return Ok(()),
     };
     let started = std::time::Instant::now();
     for (term, doclist) in staged {
+        // A list that was only read is what `%_idx` already holds.
+        if doclist.is_clean() {
+            continue;
+        }
+        let bytes = doclist.into_bytes();
+        let written = bytes.len() as u64;
         shadows.write_keyed(
             context,
             b"idx",
@@ -694,9 +1353,10 @@ pub(crate) fn flush_doclists_timed(
             &[
                 Value::Integer(SEGMENT),
                 Value::owned_blob(&term)?,
-                Value::owned_blob(&doclist.bytes)?,
+                Value::owned_blob(&bytes)?,
             ],
         )?;
+        record_stage(|stages| stages.flushed_bytes = stages.flushed_bytes.saturating_add(written));
     }
     let spent = started.elapsed().as_nanos();
     record_stage(|stages| stages.dictionary_write = stages.dictionary_write.saturating_add(spent));
@@ -757,7 +1417,7 @@ pub(crate) fn term_row(
     // empty doclist back over the term's row - so a term whose postings could
     // not be read lost the postings as well as the answer.
     let bytes = require_doclist(context, shadows, term, &row)?;
-    stage_doclist(buffer, term, bytes);
+    stage_doclist(buffer, term, bytes, false);
     Ok(Some(Term { fresh: false }))
 }
 /// Whether a term's dictionary row was found, and staged, by [`term_row`].

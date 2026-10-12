@@ -136,8 +136,10 @@ mod rebuild;
 pub mod recovery;
 mod schema_write;
 use recovery::OpenedFile;
+mod roots;
 /// Session-scoped `total_changes()` accounting.
 mod session_changes;
+mod shrink;
 mod spillfile;
 /// The engine's half of a vector index a module owns.
 mod vectors;
@@ -914,6 +916,44 @@ impl ImportedDatabase {
             .and_then(|held| held.handles.get(&local).copied())
     }
 
+    /// Returns how many tree handles the running session's temporary database remembers and how
+    /// many bytes of log it has gathered since its log was last folded.
+    ///
+    /// **Both must stay flat in a loop of `CREATE TEMP TABLE` and `DROP TABLE`.** They were the
+    /// two things that grew by one table's worth every cycle. Zero for a connection that has
+    /// made no temporary object.
+    pub fn temp_bookkeeping(&self) -> (usize, u64) {
+        self.session_state.schema_at(TEMP).map_or((0, 0), |held| {
+            (held.handles.len(), held.wal.since_checkpoint())
+        })
+    }
+
+    /// Forgets the handles of trees that were dropped, in the files that dropped one.
+    ///
+    /// **Why the map is pruned and not left to grow.** `allocate_in` records every tree a
+    /// temporary or attached file makes in that file's `handles` map, and nothing took an entry
+    /// out when the tree was dropped. A loop of `CREATE TEMP TABLE` and `DROP TABLE` therefore
+    /// grew the map by one entry a cycle, and `local_of` searches it linearly for every catalog
+    /// row it writes, so the loop slowed down as it ran: 200,000 cycles took 45 s where 50,000
+    /// took 2.6 s.
+    ///
+    /// **Only at a statement boundary.** A rollback that restores a dropped table, and the undo
+    /// records of rows written to it before it was dropped, still look the handle up. An entry is
+    /// removed only when no tree is registered under its handle, so a table that came back by
+    /// rollback keeps its entry.
+    pub(crate) fn prune_dropped_handles(&mut self) {
+        let stale = self.writing.take_handles_stale();
+        for at in schemas_in(stale) {
+            if at == MAIN {
+                continue;
+            }
+            let trees = &self.schema.trees;
+            if let Some(held) = self.session_state.schema_at_mut(at) {
+                held.handles.retain(|_, handle| trees.contains_key(handle));
+            }
+        }
+    }
+
     /// Returns the file-local identifier a handle's tree is known by in its own
     /// file.
     ///
@@ -1016,7 +1056,7 @@ impl TreeCatalog for ImportedDatabase {
         if !self.rows_of_module(table, path, params, needed, supplied, &mut sink)? {
             return Ok(None);
         }
-        let rows = collected.borrow().clone();
+        let rows = std::mem::take(&mut *collected.borrow_mut());
         Ok(Some(rows))
     }
 
@@ -1178,72 +1218,11 @@ impl ImportedDatabase {
         self.refresh_catalog();
     }
 
-    /// Rebuilds this database into a file that holds nothing spare.
-    ///
-    /// **What `VACUUM` and `VACUUM INTO` both do**, differing only in where the
-    /// result goes. See `crate::rebuild` for why it is a logical copy rather
-    /// than a page one - in short, because a page copy reproduces the free
-    /// space it was asked to remove.
-    ///
-    /// @param destination - the file to write, which must not already exist
-    pub(crate) fn rebuild_into(&mut self, destination: &std::path::Path) -> DbResult<()> {
-        self.checkpoint()?;
-        crate::rebuild::rebuild_into(
-            std::sync::Arc::clone(&self.storage.vfs),
-            self,
-            destination,
-            self.storage.page_size,
-            self.storage.frames,
-        )
-    }
-
-    /// Rebuilds this database into a database held in memory, and discards it.
-    ///
-    /// **What `VACUUM INTO ':memory:'` and `VACUUM INTO ''` do.** SQLite opens
-    /// the target as a private in memory or temporary database, copies into it,
-    /// and closes it, so the statement succeeds and leaves nothing behind. It is
-    /// still a full rebuild, which is what makes it a check that the schema and
-    /// every row can be replayed.
-    pub(crate) fn rebuild_into_memory(&mut self) -> DbResult<()> {
-        self.checkpoint()?;
-        let vfs: std::sync::Arc<dyn inillucent_vfs::Vfs> =
-            std::sync::Arc::new(inillucent_vfs::memory::MemoryVfs::new());
-        crate::rebuild::rebuild_into(
-            vfs,
-            self,
-            std::path::Path::new("vacuum-into-memory.rdb"),
-            self.storage.page_size,
-            self.storage.frames,
-        )
-    }
-
-    /// Gives free pages back to the filesystem, up to a budget.
-    ///
-    /// **What `PRAGMA incremental_vacuum` asks for, done the way this engine
-    /// can do it.** SQLite relocates the trailing free pages one at a time and
-    /// truncates, which its pointer map makes cheap; here free space is given
-    /// back by rebuilding, so the budget is a *threshold* rather than a
-    /// quantity: asked to reclaim `n` pages, it reclaims every free page or
-    /// none, and reclaiming more than was asked is never a wrong answer - only
-    /// a longer one. That is the same reasoning `analysis_limit` already uses.
-    ///
-    /// Doing nothing when there is nothing free is what keeps the pragma cheap
-    /// to call in a loop, which is how applications use it.
-    ///
-    /// @param pages - how many free pages the caller asked to see returned
-    pub(crate) fn reclaim_free_pages(&mut self, pages: usize) -> DbResult<()> {
-        let free = self.storage.database.free_pages();
-        if free == 0 || free < pages as u64 {
-            return Ok(());
-        }
-        self.vacuum_in_place()
-    }
-
     /// Rebuilds this database over itself, reclaiming everything nothing uses.
     ///
     /// The work is `crate::rebuild::vacuum_in_place`, which is where every other
     /// piece of the statement already lives; this is the method the directive
-    /// and `reclaim_free_pages` call.
+    /// calls.
     pub(crate) fn vacuum_in_place(&mut self) -> DbResult<()> {
         crate::rebuild::vacuum_in_place(self)
     }

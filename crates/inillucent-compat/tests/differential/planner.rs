@@ -1100,3 +1100,186 @@ fn indexed_by_reaches_writes_and_is_refused_in_triggers() {
         &["CREATE TRIGGER tr AFTER INSERT ON s BEGIN SELECT a FROM h INDEXED BY h_a; END"],
     );
 }
+
+/// Builds two 500 row tables with no index and gives them statistics, as the plan cases that
+/// follow need: the pinned shell reads an index of its own into a subquery node only once
+/// `ANALYZE` has told it the table is not tiny.
+///
+/// `a.k` is the row number modulo 500 and `b.k` is seven times the row number modulo 500, so
+/// every key of `a` has one partner. `b.active` is true for one row in three.
+/// @param tag - the scratch file name
+fn build_automatic(tag: &str) -> (Database, inillucent_compat::facade::Connection) {
+    let path = scratch(tag);
+    let database = Database::open(&path).expect("the database opens");
+    let connection = database.session().expect("the connection opens");
+    run_all(
+        &connection,
+        &[
+            "CREATE TABLE a(id INTEGER PRIMARY KEY, k INT, active INT, pad TEXT)",
+            "CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, active INT, pad TEXT)",
+            "INSERT INTO a SELECT value, value % 500, value % 2, 'a' FROM generate_series(1, 500)",
+            "INSERT INTO b SELECT value, (value * 7) % 500, value % 3 = 0, 'b' \
+             FROM generate_series(1, 500)",
+            "ANALYZE",
+        ],
+    );
+    (database, connection)
+}
+
+/// A correlated subquery whose table has no index for its key is shown as the index it reads.
+///
+/// A positive `EXISTS` is printed as the loop of the enclosing query that SQLite rewrites it
+/// into, with the word `EXISTS` after the table, and a key on a constant joins the key list.
+/// Every other block keeps its node and shows the same two lines under it, which the pinned
+/// shell prints once the tables have statistics. With `PRAGMA automatic_index = OFF` the
+/// block is a plain scan in both forms. Every line is the pinned 3.53.4 shell output.
+#[test]
+fn a_correlated_block_with_no_index_shows_the_table_it_reads() {
+    let (_database, connection) = build_automatic("automatic-block");
+    let exists = "SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)";
+    let filtered = "SELECT count(*) FROM a WHERE EXISTS \
+                    (SELECT 1 FROM b WHERE b.k = a.k AND b.active = 1)";
+    let flipped = "SELECT count(*) FROM a WHERE EXISTS \
+                   (SELECT 1 FROM b WHERE b.active = 1 AND a.k = b.k)";
+    let negated = "SELECT count(*) FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k)";
+    let scalar = "SELECT sum((SELECT count(*) FROM b WHERE b.k = a.k)) FROM a";
+    assert_plans(
+        &connection,
+        &[
+            (
+                exists,
+                &[
+                    "SCAN a",
+                    "BLOOM FILTER ON b (k=?)",
+                    "SEARCH b EXISTS USING AUTOMATIC PARTIAL COVERING INDEX (k=?)",
+                ],
+            ),
+            (
+                filtered,
+                &[
+                    "SCAN a",
+                    "BLOOM FILTER ON b (k=? AND active=?)",
+                    "SEARCH b EXISTS USING AUTOMATIC PARTIAL COVERING INDEX (k=? AND active=?)",
+                ],
+            ),
+            (
+                flipped,
+                &[
+                    "SCAN a",
+                    "BLOOM FILTER ON b (active=? AND k=?)",
+                    "SEARCH b EXISTS USING AUTOMATIC PARTIAL COVERING INDEX (active=? AND k=?)",
+                ],
+            ),
+            (
+                negated,
+                &[
+                    "SCAN a",
+                    "CORRELATED SCALAR SUBQUERY 1",
+                    "BLOOM FILTER ON b (k=?)",
+                    "SEARCH b USING AUTOMATIC COVERING INDEX (k=?)",
+                ],
+            ),
+            (
+                scalar,
+                &[
+                    "SCAN a",
+                    "CORRELATED SCALAR SUBQUERY 1",
+                    "BLOOM FILTER ON b (k=?)",
+                    "SEARCH b USING AUTOMATIC COVERING INDEX (k=?)",
+                ],
+            ),
+        ],
+    );
+    run_all(&connection, &["PRAGMA automatic_index = OFF"]);
+    assert_plans(
+        &connection,
+        &[
+            (exists, &["SCAN a", "SCAN b EXISTS"]),
+            (filtered, &["SCAN a", "SCAN b EXISTS"]),
+            (
+                negated,
+                &["SCAN a", "CORRELATED SCALAR SUBQUERY 1", "SCAN b"],
+            ),
+            (
+                scalar,
+                &["SCAN a", "CORRELATED SCALAR SUBQUERY 1", "SCAN b"],
+            ),
+        ],
+    );
+}
+
+/// A subquery used as an aggregate argument has a node, and a correlated list has no bloom filter.
+///
+/// `sum((SELECT ...))` printed no node at all, because the subquery is held by the aggregate and
+/// not by the result column. SQLite builds the bloom filter under an `IN` subquery once, over
+/// rows that do not change, so a correlated one has none.
+#[test]
+fn a_subquery_in_an_aggregate_has_a_node_and_a_correlated_list_has_no_filter() {
+    let (_database, connection) = build_automatic("automatic-nodes");
+    assert_plans(
+        &connection,
+        &[
+            (
+                "SELECT sum((SELECT count(*) FROM b WHERE b.k = a.k)) FROM a",
+                &[
+                    "SCAN a",
+                    "CORRELATED SCALAR SUBQUERY 1",
+                    "BLOOM FILTER ON b (k=?)",
+                    "SEARCH b USING AUTOMATIC COVERING INDEX (k=?)",
+                ],
+            ),
+            (
+                "SELECT count(*) FROM a WHERE a.k IN (SELECT k FROM b WHERE b.id > a.id)",
+                &[
+                    "SCAN a",
+                    "CORRELATED LIST SUBQUERY 1",
+                    "SEARCH b USING INTEGER PRIMARY KEY (rowid>?)",
+                ],
+            ),
+            (
+                "SELECT count(*) FROM a WHERE k IN (SELECT k FROM b)",
+                &["SCAN a", "LIST SUBQUERY 1", "SCAN b", "CREATE BLOOM FILTER"],
+            ),
+        ],
+    );
+}
+
+/// A join with more than a plain equality shows the index its hash join is keyed on.
+///
+/// A condition on the inner table beside the key makes the index `PARTIAL`, and a constant
+/// equality on it joins the key list. An expression on the inner side is a key written
+/// `<expr>`, which differs from SQLite: it builds its index on the plain column of the other
+/// table, so its lines name the tables the other way round.
+#[test]
+fn a_join_with_more_than_a_plain_equality_shows_the_index_it_is_keyed_on() {
+    let (_database, connection) = build_automatic("automatic-join");
+    assert_plans(
+        &connection,
+        &[
+            (
+                "SELECT count(*) FROM a JOIN b ON a.k = b.k AND a.id < b.id",
+                &[
+                    "SCAN a",
+                    "BLOOM FILTER ON b (k=?)",
+                    "SEARCH b USING AUTOMATIC COVERING INDEX (k=?)",
+                ],
+            ),
+            (
+                "SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND b.active = 1",
+                &[
+                    "SCAN a",
+                    "BLOOM FILTER ON b (active=? AND k=?)",
+                    "SEARCH b USING AUTOMATIC PARTIAL COVERING INDEX (active=? AND k=?) LEFT-JOIN",
+                ],
+            ),
+            (
+                "SELECT count(*) FROM a JOIN b ON a.k = b.k + 1",
+                &[
+                    "SCAN a",
+                    "BLOOM FILTER ON b (<expr>=?)",
+                    "SEARCH b USING AUTOMATIC COVERING INDEX (<expr>=?)",
+                ],
+            ),
+        ],
+    );
+}

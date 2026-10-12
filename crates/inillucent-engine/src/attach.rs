@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use inillucent_base::error::{refusal, statement_refusal};
+use inillucent_base::error::{confinement_refusal, refusal, statement_refusal};
 use inillucent_base::DbResult;
 use inillucent_pool::{Database, Options};
 use inillucent_vfs::memory::MemoryVfs;
@@ -125,7 +125,7 @@ impl ImportedDatabase {
                 None => DbPath::from(text.as_str()),
                 Some(root) => match root.admit(&text) {
                     Ok(inside) => DbPath::new(inside),
-                    Err(refused) => return Err(refusal(refused.message())),
+                    Err(refused) => return Err(confinement_refusal(refused.message())),
                 },
             };
             let held = path.as_path().to_path_buf();
@@ -181,16 +181,28 @@ impl ImportedDatabase {
     /// @param vfs - the file system the attachment lives on
     /// @param path - where it lives
     fn create_if_absent(&self, vfs: &dyn Vfs, path: &DbPath) -> DbResult<()> {
-        if vfs.access(path, inillucent_vfs::AccessMode::Exists)? {
+        if vfs.access(path, inillucent_vfs::AccessMode::Exists)?
+            && vfs.size_by_name(path)?.is_none_or(|length| length > 0)
+        {
             return Ok(());
         }
-        let mut fresh = Database::create(
+        // **Created only if it is still empty once the lock is held.** Two
+        // processes attaching the same new file both found nothing; the second
+        // used to truncate the database the first had just written, as the
+        // open of `main` did. The lock is held until `finish_new_file`, so
+        // another process never reads the file before its catalog exists; see
+        // `Database::create_held`.
+        let created = Database::create_held(
             vfs,
             path,
             Options::default()
                 .with_page_size(self.storage.page_size)
                 .with_frames(self.storage.frames.max(64)),
+            true,
         )?;
+        let Some(mut fresh) = created else {
+            return Ok(());
+        };
         let _ = inillucent_catalog::paged::write_new_catalog(&mut fresh)?;
         fresh.finish_new_file()?;
         drop(fresh);
@@ -316,7 +328,7 @@ impl ImportedDatabase {
         // **And this file's tail, now that its schema has been read**
         // (task-2070). See `engine::open::header_accounts_for_every_object`.
         if crate::engine::open::header_accounts_for_every_object(&entries, &database) {
-            database.give_back_the_unclaimed_tail()?;
+            database.trim_to_page_count()?;
         }
         for root in trees.keys() {
             self.session_state.owner.insert(*root, index);
@@ -382,9 +394,12 @@ impl ImportedDatabase {
                 String::from_utf8_lossy(name)
             )));
         }
-        if self.writing.batch().is_some() {
-            return Err(refusal("cannot DETACH database within transaction"));
-        }
+        // **A detach inside a transaction renumbers what the transaction recorded.** The
+        // transaction names the schemas it wrote by position, and detaching an earlier one
+        // moves every later one down; `Writing::schema_detached` moves the records with them.
+        // It was refused instead, while SQLite runs `BEGIN; INSERT INTO a2.t ...; DETACH a1`
+        // and commits the row. The schema being detached is never one the transaction wrote:
+        // that is refused above as SQLite refuses it.
         let Some(nth) = at.checked_sub(FIRST_ATTACHED) else {
             return Err(refusal("cannot detach database main"));
         };
@@ -430,10 +445,24 @@ impl ImportedDatabase {
         for (root, owner) in moved {
             self.session_state.owner.insert(root, owner);
         }
+        self.writing.schema_detached(at);
+        // **Each later file's own `sqlite_schema` moves with it.** Its declaration was
+        // built under the file's old number, and the binder matches `a2.sqlite_schema`
+        // by number, so without this `a2.sqlite_schema` is "no such table" once an
+        // earlier file is detached, while SQLite still answers it.
+        for later in self.session_state.attached.iter_mut().skip(nth) {
+            later.schema_info.database = later.schema_info.database.saturating_sub(1);
+        }
         // The log is folded into the file before the file goes, so that what is
         // left on disk is a database rather than a database and a log nobody
         // will open again.
-        held.database.checkpoint()?;
+        // **Only a database that has a file.** `ATTACH ':memory:'` keeps its pages and its log in
+        // memory and the drop below frees both, so folding the log into pages that are about to be
+        // freed was most of what a detach cost: 140 of 170 microseconds, which made 40,000
+        // attaches and detaches take 6.8 s against SQLite's 0.26 s.
+        if held.path.is_some() {
+            held.database.checkpoint()?;
+        }
         drop(held);
         self.rebuild_tables()?;
         self.refresh_catalog();

@@ -61,7 +61,10 @@ pub unsafe extern "C" fn inillucent_prepare(
             return misused("inillucent_prepare", error);
         }
         let connection = database.database.session_as(session_of(conn));
-        if let Err(why) = connection.prepare(sql) {
+        if let Err(why) = connection
+            .refuse_extra_statements(sql)
+            .and_then(|()| connection.prepare(sql).map(|_| ()))
+        {
             let status = why.status as i32;
             report(error, &why, false);
             return status;
@@ -156,6 +159,19 @@ pub unsafe extern "C" fn inillucent_bind_real(
 ) -> i32 {
     guarded_value(|| bind(stmt, index, Value::Real(value)), 0)
 }
+/// The most bytes one bound text or blob may be, which is what SQLite allows
+/// (`SQLITE_MAX_LENGTH` cannot be set above 2^31 - 1).
+///
+/// **A length past this is refused before the bytes are read** because
+/// `slice::from_raw_parts` aborts the process for a length above `isize::MAX`,
+/// and a length near it makes the copy read memory the caller never owned. The
+/// caller of a C function cannot be asked how long its buffer really is, so the
+/// only length that can be checked is one that no buffer could have.
+const MAX_BOUND_LENGTH: usize = i32::MAX as usize;
+
+/// The status a bind answers for a length past [`MAX_BOUND_LENGTH`].
+const BIND_TOO_BIG: i32 = 11;
+
 /// Binds text, copying it.
 ///
 /// @param stmt - the statement
@@ -177,6 +193,9 @@ pub unsafe extern "C" fn inillucent_bind_text(
         || {
             if value.is_null() {
                 return bind(stmt, index, Value::Null);
+            }
+            if len > MAX_BOUND_LENGTH {
+                return BIND_TOO_BIG;
             }
             let bytes = std::slice::from_raw_parts(value as *const u8, len);
             // Text that is not UTF-8 is bound as a blob rather than lossily converted,
@@ -211,6 +230,9 @@ pub unsafe extern "C" fn inillucent_bind_blob(
         || {
             if value.is_null() {
                 return bind(stmt, index, Value::Null);
+            }
+            if len > MAX_BOUND_LENGTH {
+                return BIND_TOO_BIG;
             }
             let bytes = std::slice::from_raw_parts(value, len);
             bind(stmt, index, Value::Blob(bytes.to_vec()))

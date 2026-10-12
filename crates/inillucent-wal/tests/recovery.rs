@@ -230,6 +230,14 @@ impl Redo for PageStore {
             // before this record was appended, so a page store has nothing to
             // put anywhere. See `Body::BulkBuilt`.
             Body::BulkBuilt { .. } => {}
+            // The file's format version, which a page store does not have.
+            // See `Body::Format`.
+            Body::Format { .. } => {}
+            // A page that moved is named by a field in some other page, which a
+            // page store with no tree cannot interpret. See `Body::Relink`.
+            Body::Relink { .. } => {}
+            // Where the file ends, which a page store does not have.
+            Body::PageCount { .. } => {}
         }
         Ok(())
     }

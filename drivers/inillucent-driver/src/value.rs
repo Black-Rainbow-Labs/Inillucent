@@ -156,10 +156,15 @@ impl Value {
     }
 
     /// Copies a value going into the engine.
+    ///
+    /// **A NaN becomes NULL**, which is what SQLite's `sqlite3_bind_double` does.
+    /// Without this the engine stored a REAL that is not equal to itself, so a
+    /// parameter bound to NaN gave a different answer from every SQLite binding.
     pub fn to_engine(&self) -> EngineValue {
         match self {
             Value::Null => EngineValue::Null,
             Value::Integer(number) => EngineValue::Int(*number),
+            Value::Real(number) if number.is_nan() => EngineValue::Null,
             Value::Real(number) => EngineValue::Real(*number),
             Value::Text(text) => EngineValue::Text(text.as_bytes().to_vec()),
             Value::Blob(bytes) => EngineValue::Blob(bytes.clone()),
@@ -174,6 +179,7 @@ impl Value {
         match self {
             Value::Null => EngineValue::Null,
             Value::Integer(number) => EngineValue::Int(number),
+            Value::Real(number) if number.is_nan() => EngineValue::Null,
             Value::Real(number) => EngineValue::Real(number),
             Value::Text(text) => EngineValue::Text(text.into_bytes()),
             Value::Blob(bytes) => EngineValue::Blob(bytes),
@@ -212,6 +218,7 @@ impl Value {
         match self {
             Value::Null => Ok(inillucent_engine::ExprValue::Null),
             Value::Integer(number) => Ok(inillucent_engine::ExprValue::Integer(*number)),
+            Value::Real(number) if number.is_nan() => Ok(inillucent_engine::ExprValue::Null),
             Value::Real(number) => Ok(inillucent_engine::ExprValue::Real(*number)),
             Value::Text(text) => inillucent_engine::ExprValue::owned_text(text.as_bytes()),
             Value::Blob(bytes) => inillucent_engine::ExprValue::owned_blob(bytes),

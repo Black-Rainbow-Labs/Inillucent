@@ -33,6 +33,15 @@
 //! slot is the value; for `Text` and `Blob` it is a `(u32 offset, u32 length)`
 //! into the page; for `Any` it is a `u32` offset of a tagged value.
 //!
+//! ## A key column may hold a value stored out of line
+//!
+//! A key column value longer than `page_size / EXTENT_DIVISOR` is written on
+//! pages of its own, like any other value. Its heap record is the sixteen byte
+//! reference, a `u16` prefix length and the first [`KEY_PREFIX_BYTES`] bytes of
+//! the value, and a comparison reads the prefix first and fetches the rest only
+//! when the prefix does not decide. A leaf reads the rest from the extents or
+//! the pool attached to it, and refuses with an error when it has neither.
+//!
 //! ## Why the class array is separate from the values
 //!
 //! The whole speed argument rests on one property: a scan that needs `sum(key)`
@@ -49,6 +58,7 @@ use inillucent_base::error::{corrupt, misuse};
 use inillucent_base::DbResult;
 
 use inillucent_pool::extent::EXTENT_REF_BYTES;
+use inillucent_pool::Pool;
 
 use crate::datum::Datum;
 use crate::page::{self, header, PageId, PageKind};
@@ -62,15 +72,23 @@ use crate::types::{
 // 5,026 lines, the largest file in the workspace, with `impl LeafRef` alone at
 // 1,470. The two modules that hold part of that `impl` reopen it, so no
 // signature changed.
+mod attach;
 mod compare;
 mod encode;
+mod key_extent;
 mod layout;
 mod read;
 
 pub use compare::{compare_rows, compare_rows_under, Hit, KeyView};
 pub use encode::{
-    encode_extent_tagged, Extents, ImageTiming, LeafBuilder, Packed, RowSlice, Rows, Spill,
+    encode_extent_tagged, encode_key_extent_tagged, key_prefix_of, Extents, ImageTiming,
+    LeafBuilder, Packed, RowSlice, Rows, Spill,
 };
+pub(crate) use key_extent::PoolHandle;
+pub use key_extent::{
+    key_extent_record_bytes, key_prefix_bytes, KEY_PREFIX_BYTES, KEY_PREFIX_LENGTH_BYTES,
+};
+pub(crate) use layout::wide_row_threshold;
 pub use layout::{
     class_bytes, extent_class_for, extent_datum, fits_frame, from_frame, tombstone_bytes,
     write_frame, Layout,
@@ -305,6 +323,9 @@ pub struct LeafRef<'p> {
     flags: u8,
     /// The out-of-line values, when a caller has read them.
     extents: Option<&'p Extents>,
+    /// The pool a comparison reads the rest of a key stored out of line through,
+    /// when the caller attached it. See [`LeafRef::with_pool`].
+    pool: Option<PoolHandle<'p>>,
 }
 
 impl<'p> LeafRef<'p> {
@@ -393,6 +414,7 @@ impl<'p> LeafRef<'p> {
             delta_start,
             flags,
             extents: None,
+            pool: None,
         };
 
         // What `parse` checks is the header: the counts are self-consistent,
@@ -432,6 +454,12 @@ impl<'p> LeafRef<'p> {
     /// 4. The delta area decodes, its rows fill it exactly, and its directory
     ///    is in key order.
     pub fn integrity(&self) -> DbResult<()> {
+        if let (None, true, Some(pool)) = (self.extents, self.has_extents(), self.pool) {
+            // A key stored out of line is compared by its whole value, so the
+            // check reads the key values through the pool it was given.
+            let held = self.read_key_extents(pool.0)?;
+            return self.with_extents(&held).integrity();
+        }
         self.validate_delta()?;
         // The mini-column extents: inside the page, inside the region between
         // the directory and the tombstone bitmap, and 8-byte aligned so the
@@ -493,6 +521,9 @@ impl<'p> LeafRef<'p> {
                 // sixteen bytes that run off the page are corruption a reader
                 // would otherwise meet as a failed fetch much later.
                 self.extent_at(row, column)?;
+                if column < self.key_columns {
+                    self.check_key_prefix(row, column)?;
+                }
             }
         }
         for row in 1..self.row_count {
@@ -520,73 +551,6 @@ impl<'p> LeafRef<'p> {
             }
         }
         Ok(())
-    }
-
-    /// Returns the same leaf, reading its key columns under these collations.
-    ///
-    /// @param collations - one per key column; short means BINARY for the rest
-    pub fn with_collations(
-        mut self,
-        collations: &'p [inillucent_value::collation::Collation],
-    ) -> LeafRef<'p> {
-        self.collations = collations;
-        self
-    }
-
-    /// Returns the same leaf, reading its key columns in these directions.
-    ///
-    /// @param directions - one per key column; short means ascending
-    pub fn with_directions(mut self, directions: &'p [bool]) -> LeafRef<'p> {
-        self.directions = directions;
-        self
-    }
-
-    /// Returns whether one key column is stored descending.
-    ///
-    /// @param index - the key column's position
-    pub fn descending_at(&self, index: usize) -> bool {
-        self.directions.get(index).copied().unwrap_or(false)
-    }
-
-    /// Returns a comparison with the column's direction applied.
-    ///
-    /// **One place, so a comparison cannot be written that forgets.** Every
-    /// order this leaf produces - the binary search, the bound tests, the row
-    /// comparison - goes through here, so a descending column is descending for
-    /// all of them or for none.
-    ///
-    /// @param order - the ascending comparison
-    /// @param index - which key column it was made on
-    fn directed(&self, order: std::cmp::Ordering, index: usize) -> std::cmp::Ordering {
-        if self.descending_at(index) {
-            order.reverse()
-        } else {
-            order
-        }
-    }
-
-    /// Attaches the out-of-line values a caller has read.
-    ///
-    /// Every accessor then answers for them exactly as it does for an inline
-    /// value, which is what keeps the extent out of the readers: a scan does not
-    /// branch on where a value is, only on whether the leaf has any.
-    ///
-    /// @param extents - the resolved values, which must outlive the view
-    pub fn with_extents(self, extents: &'p Extents) -> LeafRef<'p> {
-        LeafRef {
-            extents: Some(extents),
-            ..self
-        }
-    }
-
-    /// Returns the collation of one key column.
-    ///
-    /// @param index - the key column's position
-    pub fn collation_of(&self, index: usize) -> inillucent_value::collation::Collation {
-        self.collations
-            .get(index)
-            .copied()
-            .unwrap_or(inillucent_value::collation::Collation::Binary)
     }
 }
 
@@ -1698,6 +1662,7 @@ mod tests {
                 flags: 0,
                 collation: inillucent_value::collation::Collation::Binary,
                 descending: false,
+                mixed_key: false,
             },
         ];
         let builder = LeafBuilder::new(8192, 1, columns, 1).unwrap();

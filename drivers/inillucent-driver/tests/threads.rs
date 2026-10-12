@@ -314,7 +314,7 @@ fn a_temp_table_lasts_and_a_statement_opens_no_session() {
     let mut schema = String::new();
     for table in 0..30 {
         schema.push_str(&format!(
-            "CREATE TABLE t{table} (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b INTEGER REFERENCES t0(id),              c REAL CHECK (c >= 0), d TEXT GENERATED ALWAYS AS (upper(a)) STORED);              CREATE INDEX t{table}_b ON t{table} (b, a);              CREATE VIEW v{table} AS SELECT t.id, t.a, (SELECT count(*) FROM t0 WHERE t0.b = t.id) AS n FROM t{table} t;              CREATE TRIGGER g{table} BEFORE UPDATE ON t{table} WHEN NEW.c < 0 BEGIN SELECT RAISE(ABORT, 'negative'); END; "
+            "CREATE TABLE t{table} (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b INTEGER REFERENCES t0(id), c REAL CHECK (c >= 0), d TEXT GENERATED ALWAYS AS (upper(a)) STORED); CREATE INDEX t{table}_b ON t{table} (b, a); CREATE VIEW v{table} AS SELECT t.id, t.a, (SELECT count(*) FROM t0 WHERE t0.b = t.id) AS n FROM t{table} t; CREATE TRIGGER g{table} BEFORE UPDATE ON t{table} WHEN NEW.c < 0 BEGIN SELECT RAISE(ABORT, 'negative'); END; "
         ));
     }
     database

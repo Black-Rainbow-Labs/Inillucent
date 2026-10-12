@@ -225,14 +225,22 @@ pub fn schema_of(command: &Command) -> Json {
 /// the main thread. Nothing else is interpreted there - the protocol lives in
 /// `handle_with_session`, and a second reader of it would be a second server.
 ///
+/// **`ping` is answered on the reader thread too.** A `ping` that arrives while
+/// a tool call runs used to wait for the call to finish, up to the sixty second
+/// limit, and a client that treats a late ping answer as a dead server would
+/// drop a healthy connection. Both threads therefore write answers, through one
+/// lock, a whole line at a time.
+///
 /// @param settings - what the server was started with
 /// @param input - where requests arrive, owned so it can be read from a thread
-/// @param output - where answers go
-pub fn serve<R: BufRead + Send + 'static>(
+/// @param output - where answers go, owned so both threads can write to it
+pub fn serve<R: BufRead + Send + 'static, W: Write + Send + 'static>(
     settings: Settings,
     mut input: R,
-    output: &mut impl Write,
+    output: W,
 ) -> Result<(), String> {
+    let output: std::sync::Arc<std::sync::Mutex<W>> =
+        std::sync::Arc::new(std::sync::Mutex::new(output));
     // **A served database is one that exists.** A server makes no file: pointed
     // at a typo it used to create an empty database and answer every question
     // from it for the rest of its life (task-1979, E2).
@@ -285,6 +293,7 @@ pub fn serve<R: BufRead + Send + 'static>(
         std::sync::Arc::new(std::sync::Mutex::new(Cancellation::default()));
     let noted = std::sync::Arc::clone(&state);
     let (lines, arriving) = std::sync::mpsc::channel::<Arrival>();
+    let reader_output = std::sync::Arc::clone(&output);
     std::thread::spawn(move || {
         let mut line = String::new();
         loop {
@@ -292,14 +301,15 @@ pub fn serve<R: BufRead + Send + 'static>(
             let arrival = match read_request(&mut input, &mut line) {
                 Ok(0) => Arrival::Ended,
                 Ok(_) => {
-                    if let Some(id) = cancellation_target(&line) {
-                        if let Ok(mut held) = noted.lock() {
-                            if held.running.as_deref() == Some(id.as_str()) {
-                                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                            } else {
-                                held.cancelled.push(id);
-                            }
+                    if let Some(answer) = ping_answer(&line) {
+                        // Answered here and not handed on, so it is answered once.
+                        if write_answer(&reader_output, &answer).is_err() {
+                            return;
                         }
+                        continue;
+                    }
+                    if let Some(id) = cancellation_target(&line) {
+                        note_cancellation(id, &noted, &cancel);
                     }
                     Arrival::Line(line.clone())
                 }
@@ -323,19 +333,17 @@ pub fn serve<R: BufRead + Send + 'static>(
                 // The connection is not recoverable: the rest of an over-long
                 // line is still in the stream and would be read as the next
                 // request. Saying so and stopping is the honest end.
-                let _ = writeln!(
-                    output,
-                    "{}",
-                    error_response(
+                let _ = write_answer(
+                    &output,
+                    &error_response(
                         Json::Null,
                         -32600,
                         &format!(
                             "a request may not be longer than {MAX_REQUEST_BYTES} bytes, and this \
                              connection has sent one that is."
-                        )
-                    )
+                        ),
+                    ),
                 );
-                let _ = output.flush();
                 return Ok(());
             }
         }
@@ -351,8 +359,7 @@ pub fn serve<R: BufRead + Send + 'static>(
         match claim(&line, &state, &context) {
             Claim::Cancelled(id) => {
                 let answer = error_response(id, -32800, "this request was cancelled.");
-                writeln!(output, "{answer}").map_err(|error| error.to_string())?;
-                output.flush().map_err(|error| error.to_string())?;
+                write_answer(&output, &answer)?;
                 continue;
             }
             Claim::Running => {}
@@ -363,10 +370,90 @@ pub fn serve<R: BufRead + Send + 'static>(
         }
         if let Some(answer) = answered {
             let answer = enforce_response_budget(answer);
-            writeln!(output, "{answer}").map_err(|error| error.to_string())?;
-            output.flush().map_err(|error| error.to_string())?;
+            write_answer(&output, &answer)?;
         }
     }
+}
+
+/// The most cancellations for requests that have not started that are kept.
+const MAX_REMEMBERED_CANCELLATIONS: usize = 256;
+
+/// Records a cancellation: stops the running request it names, or remembers the
+/// id for a request that has not started.
+///
+/// **The remembered list is bounded.** A client that cancels ids that never run,
+/// or that already finished, would otherwise grow it for the life of the server.
+///
+/// @param id - the request id the notification named
+/// @param state - what the two threads agree about
+/// @param cancel - the flag that stops the running statement
+fn note_cancellation(
+    id: String,
+    state: &std::sync::Mutex<Cancellation>,
+    cancel: &std::sync::atomic::AtomicBool,
+) {
+    let Ok(mut held) = state.lock() else {
+        return;
+    };
+    if held.running.as_deref() == Some(id.as_str()) {
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    if held.cancelled.len() >= MAX_REMEMBERED_CANCELLATIONS {
+        held.cancelled.remove(0);
+    }
+    held.cancelled.push(id);
+}
+
+/// Writes one answer as a line, holding the lock for the whole line.
+///
+/// **One lock for both threads**, so a `ping` answered while a tool call is
+/// being answered cannot put its bytes inside the other's line.
+///
+/// @param output - the shared standard output
+/// @param answer - the JSON text of one answer
+fn write_answer<W: Write>(output: &std::sync::Mutex<W>, answer: &str) -> Result<(), String> {
+    let mut held = output
+        .lock()
+        .map_err(|_| "the output lock was poisoned".to_string())?;
+    writeln!(held, "{answer}").map_err(|error| error.to_string())?;
+    held.flush().map_err(|error| error.to_string())
+}
+
+/// Returns the answer to a well formed `ping`, so the reader thread can send it
+/// while a tool call runs.
+///
+/// A `ping` is answered whatever stage the handshake is at, which the protocol
+/// allows and which a client uses to check the process is alive before it has
+/// finished initializing. Anything that is not a plain valid request returns
+/// `None` and goes to `handle_with_session`, which gives it the same error it
+/// always has.
+///
+/// @param line - the request line as it arrived
+fn ping_answer(line: &str) -> Option<String> {
+    let request = json::parse(line).ok()?;
+    if request.get("method").and_then(Json::text) != Some("ping")
+        || request.get("jsonrpc").and_then(Json::text) != Some("2.0")
+    {
+        return None;
+    }
+    let id = request.get("id")?.clone();
+    if !matches!(id, Json::Int(_) | Json::Real(_) | Json::Text(_)) {
+        return None;
+    }
+    if let Some(params) = request.get("params") {
+        if !matches!(params, Json::Object(_) | Json::Array(_)) {
+            return None;
+        }
+    }
+    Some(
+        json::object(vec![
+            ("jsonrpc", json::text("2.0")),
+            ("id", id),
+            ("result", json::object(vec![])),
+        ])
+        .write(),
+    )
 }
 
 /// Replaces an oversized response with a JSON RPC error for the same request.
@@ -613,6 +700,11 @@ pub fn handle_with_session(
                 "notifications/initialized must follow initialize.",
             )),
         );
+    }
+    // A `ping` is answered before the handshake too: the protocol allows it, and
+    // a client uses it to see whether the process is alive.
+    if method == "ping" {
+        return response_for(id, is_notification, Ok(json::object(vec![])));
     }
     if !matches!(session.lifecycle, Lifecycle::Ready) {
         return Some(error_response(
@@ -1089,6 +1181,52 @@ mod tests {
         let replacement = enforce_response_budget(response);
         assert!(replacement.contains("\"id\":77"), "{replacement}");
         assert!(replacement.contains("\"code\":-32603"), "{replacement}");
+    }
+
+    /// A valid `ping` is answered by the reader thread whatever the handshake
+    /// stage, and anything that is not a plain valid one is left to the main
+    /// thread's error handling.
+    #[test]
+    fn a_plain_ping_is_answered_without_the_main_thread() {
+        let answer = ping_answer("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}");
+        assert_eq!(
+            answer.as_deref(),
+            Some("{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}")
+        );
+        for line in [
+            "{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}",
+            "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"ping\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":true,\"method\":\"ping\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":\"bad\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}",
+        ] {
+            assert!(ping_answer(line).is_none(), "{line}");
+        }
+    }
+
+    /// A `ping` before `initialize` is answered rather than refused.
+    #[test]
+    fn a_ping_before_initialize_is_answered() {
+        let mut session = Session::default();
+        let answer = handle_with_session(
+            &mut context(),
+            &mut session,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+        )
+        .unwrap_or_default();
+        assert!(answer.contains("\"result\":{}"), "{answer}");
+    }
+
+    /// An argument of the wrong type is named with the right article.
+    #[test]
+    fn a_wrong_type_is_named_with_an_article() {
+        let answer = handle(
+            &mut context(),
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\
+             \"inillucent_query\",\"arguments\":{\"sql\":\"SELECT 1\",\"limit\":\"one\"}}}",
+        )
+        .unwrap_or_default();
+        assert!(answer.contains("'limit' has to be an integer."), "{answer}");
     }
 
     /// A read-only server refuses a write and says why.

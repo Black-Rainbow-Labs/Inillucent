@@ -55,6 +55,13 @@ use crate::page;
 
 use super::{LeafRef, DELTA_ENTRY};
 
+/// Reports whether a tag byte names a value stored out of line, in either form.
+///
+/// @param kind - the tag byte
+fn is_extent_tag(kind: u8) -> bool {
+    kind == crate::datum::tag::EXTENT || kind == crate::datum::tag::KEY_EXTENT
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -185,9 +192,7 @@ impl<'p> LeafRef<'p> {
                 })?;
                 // An out-of-line delta value is checked the way the sorted
                 // region's are: the reference has to decode and name a page.
-                if Datum::tag_of(rest)? == crate::datum::tag::EXTENT {
-                    ExtentRef::decode(rest.get(1..).unwrap_or(&[]))?;
-                }
+                self.check_delta_extent(rest, column)?;
                 cursor = cursor.saturating_add(used);
             }
             if cursor != row.len() {
@@ -221,9 +226,45 @@ impl<'p> LeafRef<'p> {
         Ok(())
     }
 
+    /// Checks the out of line value at the front of a delta row's column, if it
+    /// is one.
+    ///
+    /// A key column holds the key extent tag and any other column holds the
+    /// plain one; the reference has to decode, and a key extent's prefix has to
+    /// be the length this page size keeps.
+    ///
+    /// @param rest - the row's bytes from the column's tag on
+    /// @param column - which column this is
+    fn check_delta_extent(&self, rest: &[u8], column: usize) -> DbResult<()> {
+        let kind = Datum::tag_of(rest)?;
+        let is_key = column < self.key_columns;
+        match (kind, is_key) {
+            (crate::datum::tag::EXTENT, false) => {
+                ExtentRef::decode(rest.get(1..).unwrap_or(&[]))?;
+            }
+            (crate::datum::tag::KEY_EXTENT, true) => {
+                ExtentRef::decode(rest.get(1..).unwrap_or(&[]))?;
+                let kept = Datum::key_extent_prefix_len(rest)?;
+                if kept != super::key_prefix_bytes(self.page.len()) {
+                    return Err(corrupt(
+                        "a delta key prefix is not the length this page keeps",
+                    ));
+                }
+            }
+            (crate::datum::tag::EXTENT, true) | (crate::datum::tag::KEY_EXTENT, false) => {
+                return Err(corrupt(format!(
+                    "column {column} of a delta row holds the wrong kind of out of line value"
+                )));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Returns one delta row's key columns.
     ///
-    /// A key column is never stored out of line, so this needs no extents.
+    /// A key value stored out of line is answered from the extents a caller
+    /// attached, so a caller that may meet one attaches them first.
     ///
     /// @param index - the row's position in the directory
     pub(super) fn delta_key(&self, index: usize) -> DbResult<Vec<Datum<'p>>> {
@@ -248,7 +289,7 @@ impl<'p> LeafRef<'p> {
         for position in 0..=column {
             let rest = row.get(cursor..).unwrap_or(&[]);
             if position == column {
-                if Datum::tag_of(rest)? != crate::datum::tag::EXTENT {
+                if !is_extent_tag(Datum::tag_of(rest)?) {
                     return Ok(None);
                 }
                 return ExtentRef::decode(rest.get(1..).unwrap_or(&[])).map(Some);
@@ -276,7 +317,7 @@ impl<'p> LeafRef<'p> {
         let mut cursor = 0usize;
         while cursor < row.len() {
             let rest = row.get(cursor..).unwrap_or(&[]);
-            if Datum::tag_of(rest)? == crate::datum::tag::EXTENT {
+            if is_extent_tag(Datum::tag_of(rest)?) {
                 return Ok(true);
             }
             cursor = cursor.saturating_add(Datum::tagged_span(rest)?);
@@ -321,7 +362,8 @@ impl<'p> LeafRef<'p> {
         column: usize,
     ) -> DbResult<(Datum<'p>, usize)> {
         let rest = row.get(cursor..).unwrap_or(&[]);
-        if Datum::tag_of(rest)? == crate::datum::tag::EXTENT {
+        if is_extent_tag(Datum::tag_of(rest)?) {
+            self.check_delta_extent(rest, column)?;
             let bytes = self
                 .extents
                 .and_then(|held| held.get_delta(index, column))
@@ -431,6 +473,15 @@ impl<'p> LeafRef<'p> {
         let row = self.delta_row(index)?;
         let mut cursor = 0usize;
         for (column, wanted) in probe.iter().enumerate().take(self.key_columns) {
+            let rest = row.get(cursor..).unwrap_or(&[]);
+            if Datum::tag_of(rest)? == crate::datum::tag::KEY_EXTENT {
+                let order = self.compare_delta_spilled(rest, index, column, wanted)?;
+                if order != std::cmp::Ordering::Equal {
+                    return Ok(order);
+                }
+                cursor = cursor.saturating_add(Datum::tagged_span(rest)?);
+                continue;
+            }
             let (held, next) = self.delta_column_at(row, cursor, index, column)?;
             cursor = next;
             let order = self.directed(
@@ -442,6 +493,33 @@ impl<'p> LeafRef<'p> {
             }
         }
         Ok(std::cmp::Ordering::Equal)
+    }
+
+    /// Compares a delta row's key value stored out of line against a probe value.
+    ///
+    /// The same three steps as the sorted region's: the class, then the prefix
+    /// the tag carries, then the whole value from the attached extents or the
+    /// pool.
+    ///
+    /// @param rest - the row's bytes from the column's tag on
+    /// @param index - the row's position in the directory
+    /// @param column - which key column this is
+    /// @param wanted - the probe's value for this column
+    fn compare_delta_spilled(
+        &self,
+        rest: &[u8],
+        index: usize,
+        column: usize,
+        wanted: &Datum<'_>,
+    ) -> DbResult<std::cmp::Ordering> {
+        self.check_delta_extent(rest, column)?;
+        let spilled = super::read::SpilledKey {
+            reference: ExtentRef::decode(rest.get(1..).unwrap_or(&[]))?,
+            prefix: Datum::key_extent_prefix(rest)?,
+            physical: self.spec(column)?.physical,
+        };
+        let whole = self.extents.and_then(|held| held.get_delta(index, column));
+        self.compare_spilled(&spilled, wanted, column, whole)
     }
 
     /// Binary-searches the directory for the first row whose key is not below a probe.
@@ -594,13 +672,26 @@ impl<'p> LeafRef<'p> {
         let begin = match self.delta_search(probe)? {
             Ok(at) | Err(at) => at,
         };
+        // **The run is walked, and bisected only past a few entries.** A probe into an index
+        // usually matches one to three delta entries, and the bisection over the rest of the
+        // area decoded a key per halving (eleven on a full leaf) to find that out. The same
+        // rule `equal_run` follows for the sorted region.
+        const RUN_SCAN: usize = 8;
         let mut low = begin;
-        let mut high = self.delta_count;
-        while low < high {
-            let middle = low.saturating_add(high.saturating_sub(low) / 2);
-            match self.compare_delta_key(middle, probe)? {
-                std::cmp::Ordering::Greater => high = middle,
-                _ => low = middle.saturating_add(1),
+        while low < self.delta_count
+            && low.saturating_sub(begin) < RUN_SCAN
+            && self.compare_delta_key(low, probe)? == std::cmp::Ordering::Equal
+        {
+            low = low.saturating_add(1);
+        }
+        if low.saturating_sub(begin) >= RUN_SCAN {
+            let mut high = self.delta_count;
+            while low < high {
+                let middle = low.saturating_add(high.saturating_sub(low) / 2);
+                match self.compare_delta_key(middle, probe)? {
+                    std::cmp::Ordering::Greater => high = middle,
+                    _ => low = middle.saturating_add(1),
+                }
             }
         }
         Ok((begin..low).collect())

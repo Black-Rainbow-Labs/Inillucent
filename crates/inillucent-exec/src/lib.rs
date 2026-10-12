@@ -55,6 +55,7 @@ pub mod inset;
 pub mod join;
 pub mod lateral;
 pub mod ops;
+pub mod packed;
 pub mod paged;
 pub mod physical;
 pub mod recursive;

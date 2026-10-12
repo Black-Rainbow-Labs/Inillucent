@@ -291,7 +291,7 @@ fn a_trigger_is_stored_and_fires() {
 
     connection
         .query(
-            "CREATE TRIGGER after_insert AFTER INSERT ON t BEGIN              INSERT INTO log(id, a) VALUES (NEW.id, NEW.b); END",
+            "CREATE TRIGGER after_insert AFTER INSERT ON t BEGIN INSERT INTO log(id, a) VALUES (NEW.id, NEW.b); END",
         )
         .expect("the trigger is stored");
 

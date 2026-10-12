@@ -70,7 +70,8 @@ pub fn insert(
 /// whatever it says. An `INSERT OR ROLLBACK` of text into a `STRICT INTEGER`
 /// column ended the transaction here where SQLite leaves it open, and an
 /// `INSERT OR FAIL` kept the rows before the failing one where SQLite keeps
-/// none.
+/// none. Inside a transaction SQLite does keep them for `FAIL`, `IGNORE` and
+/// `REPLACE`, which the datatype arm below passes on to the engine.
 pub(crate) fn outer_unwind(error: DbError, on_conflict: Option<ConflictAction>) -> DbError {
     use inillucent_sql::dml::codes;
     let resolved = matches!(
@@ -79,6 +80,16 @@ pub(crate) fn outer_unwind(error: DbError, on_conflict: Option<ConflictAction>) 
     );
     match on_conflict {
         Some(action) if resolved => error.with_outer_unwind(unwind_of(Some(action))),
+        // A datatype failure inside a transaction leaves the earlier rows of a
+        // statement that resolves its own constraints: SQLite opens no
+        // statement journal for `OR FAIL`, `OR IGNORE` or `OR REPLACE`, so
+        // there is nothing to roll back to. Outside a transaction the engine
+        // still undoes everything, as SQLite's implicit rollback does.
+        Some(ConflictAction::Fail | ConflictAction::Ignore | ConflictAction::Replace)
+            if error.extended().0 == codes::DATATYPE =>
+        {
+            error.with_rows_kept_in_transaction()
+        }
         _ => error,
     }
 }
@@ -884,29 +895,23 @@ fn write_one(
     } = request;
     let table = &statement.table;
     // **The common insert asks the table once.**
-    //
-    // Every uniqueness check still happens before anything is written - a
-    // constraint checked afterwards is one that has already corrupted the tree
-    // it was protecting - but for the ordinary case the check and the write are
-    // the same descent. `PagedTree::put_absent` finds the key, and if it is
-    // there it stops without writing; the constraint message is then built from
-    // a second probe, on the path that is about to fail anyway.
-    //
-    // It applies when the statement raises on a conflict and the table's only
-    // uniqueness is its own key. A table with a secondary `UNIQUE` index needs
-    // those probed too, and an `ON CONFLICT` clause needs to know *which* row
-    // it collided with, so both take the general path below.
-    // **The fast path is only for a statement that really will raise.** The
-    // probe has not happened yet, so the only constraint whose clause can be
-    // consulted here is the table's own key - which is the only one there is,
-    // since this arm is entered only when the table has no `UNIQUE` index. A
-    // key declared `ON CONFLICT IGNORE` or `ON CONFLICT REPLACE` has an arm to
-    // run and must take the general path below.
-    // **And only when no `ON CONFLICT` clause was written at all.** Which arm a
-    // conflict selects is decided from the constraint that fired, and that is
-    // not known here - so a statement with any clause takes the general path
-    // and lets the collision choose. `resolution_for` used to answer this by
-    // reading the single arm; with several, there is nothing to read yet.
+    // Every uniqueness check still happens before anything is written - a constraint checked
+    // afterwards is one that has already corrupted the tree it was protecting - but for the
+    // ordinary case the check and the write are the same descent. `PagedTree::put_absent` finds the
+    // key, and if it is there it stops without writing; the constraint message is then built from a
+    // second probe, on the path that is about to fail anyway.
+    // It applies when the statement raises on a conflict and the table's only uniqueness is its own
+    // key. A table with a secondary `UNIQUE` index needs those probed too, and an `ON CONFLICT`
+    // clause needs to know *which* row it collided with, so both take the general path below.
+    // **The fast path is only for a statement that really will raise.** The probe has not happened
+    // yet, so the only constraint whose clause can be consulted here is the table's own key - which
+    // is the only one there is, since this arm is entered only when the table has no `UNIQUE`
+    // index. A key declared `ON CONFLICT IGNORE` or `ON CONFLICT REPLACE` has an arm to run and
+    // must take the general path below.
+    // **And only when no `ON CONFLICT` clause was written at all.** Which arm a conflict selects is
+    // decided from the constraint that fired, and that is not known here - so a statement with any
+    // clause takes the general path and lets the collision choose. `resolution_for` used to answer
+    // this by reading the single arm; with several, there is nothing to read yet.
     if statement.upsert.is_empty()
         && resolution_for(statement, rowid_conflict(table)) == Resolution::Raise
         && unique_indexes(table).next().is_none()
@@ -923,6 +928,9 @@ fn write_one(
                 DbError::new(ExtendedCode(code)).with_message(message)
             })
             .or_unwind(unwind_of(statement.on_conflict.or(constraint))));
+    }
+    if replaces_in_place(statement, table) {
+        return replace_in_place(statement, layout, target, row, request);
     }
     // **Asked again after each deletion**, because one row can collide with a
     // *different* row on each of two unique indexes and `REPLACE` deletes every
@@ -1021,6 +1029,56 @@ fn write_one(
     place_row(table, layout, target, None, &row, indexes)?;
     Ok(Some(Stored::Inserted(row)))
 }
+/// Reports whether a conflict on the table's own key is answered by writing the new row over the
+/// old one.
+///
+/// **True when nothing else can collide and nothing watches the delete.** The statement has no
+/// upsert arm and resolves a rowid conflict by `REPLACE`, the table has no `UNIQUE` index whose
+/// entry could clash with a different row, and no trigger or foreign key action fires for the row
+/// `REPLACE` removes (`replace_triggers` holds exactly those). Then the delete and the insert a
+/// `REPLACE` is defined as leave the same table as one write of the new row over the old one.
+///
+/// @param statement - the bound insert
+/// @param table - the table being written
+fn replaces_in_place(statement: &BoundInsert, table: &TableInfo) -> bool {
+    statement.upsert.is_empty()
+        && resolution_for(statement, rowid_conflict(table)) == Resolution::Replace
+        && unique_indexes(table).next().is_none()
+        && statement.replace_triggers.is_empty()
+}
+
+/// Writes a row whose key may already be taken, replacing the row that holds it.
+///
+/// **Two tree operations where the general path made six.** A `REPLACE` onto an existing key went
+/// through: look for a clash, check the other constraints for a clash, read the old row, delete it
+/// with its triggers, look for a clash again, write the new row. For a table that
+/// [`replaces_in_place`] accepts that is a read of the old row and one `place_row` that carries
+/// it, which maintains only the index entries that changed and rewrites one changed column where
+/// it lies, as an `UPDATE` does. 100,000 replaces onto existing keys took 750 ms, against 69 ms
+/// for an `UPDATE` of the same rows and 20 ms in SQLite.
+///
+/// @param statement - the bound insert
+/// @param layout - the table tree's layout
+/// @param target - the file and its trees
+/// @param row - the row image about to be written
+/// @param request - the write's layout, parameters and depth
+fn replace_in_place(
+    statement: &BoundInsert,
+    layout: &SourceLayout,
+    target: &mut dyn WriteTarget,
+    row: Row,
+    request: WriteRequest<'_>,
+) -> DbResult<Option<Stored>> {
+    let table = &statement.table;
+    let indexes = request.indexes;
+    let previous = read_row(table, target, &key_of(layout, &row))?;
+    place_row(table, layout, target, previous.as_deref(), &row, indexes)?;
+    if previous.is_some() {
+        check_keys_after_replace(statement, target, &row, request)?;
+    }
+    Ok(Some(Stored::Inserted(row)))
+}
+
 /// Replaces one row and every index entry that changed with it.
 ///
 /// @param table - the table being written
@@ -1393,9 +1451,16 @@ pub(crate) fn declarations_are_met(
         // **A virtual generated column has no slot, and its value is computed.**
         // `NOT NULL` on one was never tested, because the loop only looked at
         // columns the row holds. The value tested is the one a read returns.
-        let value = match slot {
-            Some(slot) => row.get(slot).cloned(),
-            None => declarations.virtual_value(space, row, position as u16)?,
+        // **Borrowed, not cloned (task-2226).** Cloning every value of the row
+        // to ask whether it is NULL was a string copy per text value, 6% of
+        // `INSERT INTO copied SELECT ...` over 100,000 rows.
+        let computed;
+        let value: Option<&OwnedDatum> = match slot {
+            Some(slot) => row.get(slot),
+            None => {
+                computed = declarations.virtual_value(space, row, position as u16)?;
+                computed.as_ref()
+            }
         };
         if slot.is_none() && value.is_none() {
             continue;
@@ -1405,14 +1470,14 @@ pub(crate) fn declarations_are_met(
         // spelling of one and converted here, which is where a column's
         // affinity is applied to a value on its way in.
         if let (Some(slot), Some(width)) = (slot, column.vector_dimensions()) {
-            if let Some(converted) = vector_from_json(value.as_ref(), width) {
+            if let Some(converted) = vector_from_json(value, width) {
                 if let Some(cell) = row.get_mut(slot) {
                     *cell = converted.clone();
                 }
                 vector_column_is_met(&table.name, &column.name, width, Some(&converted))?;
                 continue;
             }
-            vector_column_is_met(&table.name, &column.name, width, value.as_ref())?;
+            vector_column_is_met(&table.name, &column.name, width, value)?;
         }
         if !column.not_null || Some(position as u16) == table.rowid_alias {
             continue;

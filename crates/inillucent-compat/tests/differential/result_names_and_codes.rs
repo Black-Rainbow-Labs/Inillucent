@@ -194,7 +194,7 @@ fn a_grouped_aggregate_in_a_later_compound_arm_answers_its_counts() {
             Step::Query("SELECT 1 UNION ALL SELECT count(*) FROM t GROUP BY g ORDER BY 1"),
             Step::Query("SELECT 0 UNION ALL SELECT count(*) FROM t GROUP BY g HAVING count(*) > 1"),
             Step::Query(
-                "SELECT g, count(*) FROM t GROUP BY g                  UNION ALL SELECT g, sum(a) FROM t GROUP BY g ORDER BY 1, 2",
+                "SELECT g, count(*) FROM t GROUP BY g UNION ALL SELECT g, sum(a) FROM t GROUP BY g ORDER BY 1, 2",
             ),
         ],
     );

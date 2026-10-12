@@ -40,6 +40,7 @@ mod view_term;
 pub use column_names::{subquery_columns, unique_column_names};
 pub use column_use::ColumnUse;
 pub use json_subtype::always_json;
+mod boolean_words;
 mod derived_note;
 mod having;
 mod json_subtype;
@@ -887,10 +888,10 @@ impl BoundSelect {
     pub fn columns_read(&self, source: usize) -> ColumnUse {
         let mut used = ColumnUse::default();
         self.gather_columns(source, &mut used, true);
-        // The reads outside the `WHERE` are only read by a partial index whose
-        // predicate the `WHERE` repeats, so the second walk is skipped for a
-        // table with no partial index: it cost an allocation on every compile
-        // of an ordinary point query.
+        // The reads outside the `WHERE` are only read by an index that can answer
+        // a `WHERE` term itself (`IndexInfo::answers_where_terms`), so the second
+        // walk is skipped for a table with none: it cost an allocation on every
+        // compile of an ordinary point query.
         let partial = self
             .sources
             .iter()
@@ -899,7 +900,7 @@ impl BoundSelect {
                 term.table
                     .indexes
                     .iter()
-                    .any(|index| index.partial_sql.is_some())
+                    .any(crate::catalog_view::IndexInfo::answers_where_terms)
             });
         // **A block with no `WHERE` still reads columns outside it.** The
         // predicate can be repeated by a join's `ON` clause, and leaving this
@@ -1197,6 +1198,9 @@ pub struct Binder<'a> {
     pub(crate) foreign_keys: bool,
     /// Whether `PRAGMA ignore_check_constraints` turned `CHECK` off.
     pub(crate) ignore_checks: bool,
+    /// Whether `PRAGMA writable_schema` is on, which lets a new object take a
+    /// name that begins `sqlite_`, as SQLite's `sqlite3CheckObjectName` does.
+    pub(crate) writable_schema: bool,
     /// The views being expanded, innermost last, as database and folded name.
     pub(crate) expanding_views: Vec<(usize, Vec<u8>)>,
     /// Whether every key's checks wait for the commit, which
@@ -1275,10 +1279,14 @@ pub struct Binder<'a> {
 
 /// How deeply query blocks may nest.
 ///
-/// SQLite's own limit is expression depth rather than a separate select depth,
-/// but a subquery per level costs a scope, a frame and a compiled subprogram,
-/// so the recursion is bounded here where the recursion happens.
-pub const MAX_SELECT_DEPTH: u32 = 64;
+/// SQLite has no separate limit for select depth, and accepts 70 chained common table expressions.
+/// A chain of them nests one level per link, because each link is bound where the next one names
+/// it. The bound is here because the recursion is, and it is sized to the stack, as the expression
+/// depth limit of 1000 is: the command line programs run a statement on a 64 MiB stack
+/// (`inillucent_cli::STATEMENT_STACK`), and a chain of 1600 links, 1600 nested derived tables and
+/// 800 nested scalar subqueries all ran on it in a development build. 64 was a guess that was
+/// never measured, and it refused a statement SQLite runs.
+pub const MAX_SELECT_DEPTH: u32 = 1000;
 
 /// How many arms a compound SELECT may have, which is `SQLITE_MAX_COMPOUND_SELECT`.
 pub const MAX_COMPOUND_SELECT: usize = 500;
@@ -1440,6 +1448,7 @@ impl<'a> Binder<'a> {
             shared_anonymous: 0,
             foreign_keys: false,
             ignore_checks: false,
+            writable_schema: false,
             expanding_views: Vec::new(),
             defer_foreign_keys: false,
             firing_foreign_keys: Vec::new(),
@@ -1483,6 +1492,21 @@ impl<'a> Binder<'a> {
     /// @param ignored - whether the pragma is on
     pub fn ignore_checks_if(&mut self, ignored: bool) {
         self.ignore_checks = ignored;
+    }
+
+    /// Lets a new object take a reserved name, for `PRAGMA writable_schema`.
+    ///
+    /// SQLite skips its check of a new object's name while the pragma is on,
+    /// and a `.dump` relies on it: the script ends with
+    /// `CREATE TABLE IF NOT EXISTS sqlite_sequence(name,seq)` under
+    /// `writable_schema`, and that statement was refused as a reserved name,
+    /// so reloading the dump of any database with an `AUTOINCREMENT` table
+    /// printed an error and exited 1. A setter, for the reason
+    /// [`Binder::ignore_checks_if`] gives.
+    ///
+    /// @param writable - whether the pragma is on
+    pub fn writable_schema_if(&mut self, writable: bool) {
+        self.writable_schema = writable;
     }
 
     /// Returns what the bound statement depends on.
@@ -1837,7 +1861,7 @@ impl<'a> Binder<'a> {
         }
         self.allow_aggregates = true;
         self.in_group_by = false;
-        let bound_having = match having {
+        let mut bound_having = match having {
             Some(expr) => Some(self.bind_expr(*expr)?),
             None => None,
         };
@@ -1846,6 +1870,7 @@ impl<'a> Binder<'a> {
             bound_group.len(),
             aggregates_in_columns,
         )?;
+        having::move_group_terms_to_where(&mut bound_having, &mut bound_filter, &bound_group);
         // The sources stay in the binder's scope: `ORDER BY` and `LIMIT` belong
         // to the whole statement and are bound after this returns, and
         // `ORDER BY b.id` needs the same scope the result columns had.
@@ -2454,13 +2479,7 @@ impl<'a> Binder<'a> {
             bound_arguments.push(self.bind_expr(argument)?);
         }
         let call = match function::lookup_window(&folded) {
-            Some(func) => {
-                let (least, most) = func.arity();
-                if bound_arguments.len() < least || bound_arguments.len() > most {
-                    return Err(wrong_arguments(&folded, span));
-                }
-                WindowCall::Plain(func)
-            }
+            Some(func) => WindowCall::Plain(func),
             None => match window_aggregate(&folded, bound_arguments.len()) {
                 Some(func) => WindowCall::Aggregate(func),
                 None if function::lookup_scalar(&folded).is_some() => {
@@ -2475,6 +2494,7 @@ impl<'a> Binder<'a> {
                 None => return Err(no_such_function(self.ast.text(name), span)),
             },
         };
+        self.check_call_arity(&call, bound_arguments.len(), star, name, span)?;
         if distinct {
             return Err(refused(
                 "DISTINCT is not supported for window functions",
@@ -2524,6 +2544,7 @@ impl<'a> Binder<'a> {
                 self.bind_frame_bound(end, span)?,
             ),
         };
+        let starts_after_end = window_rules::starts_after_end(&start, &end);
         if matches!(start, BoundFrameBound::UnboundedFollowing)
             || matches!(end, BoundFrameBound::UnboundedPreceding)
         {
@@ -2531,6 +2552,10 @@ impl<'a> Binder<'a> {
                 ParseErrorKind::Unsupported("unsupported frame specification"),
                 span,
             ));
+        }
+        if starts_after_end {
+            // Refused rather than unsupported: SQLite never accepts this frame either.
+            return Err(refused("unsupported frame specification", Span::default()));
         }
         // Only `RANGE` measures an offset in ordering values, so only `RANGE`
         // needs a single ordering term. A `GROUPS` offset counts peer groups,
@@ -2638,7 +2663,8 @@ impl<'a> Binder<'a> {
                     self.expand_star(qualifier.as_deref(), column.span, &mut bound)?;
                 }
                 _ => {
-                    let expr = self.bind_expr(column.expr)?;
+                    let value = self.skip_unknown_collations(column.expr);
+                    let expr = self.bind_expr(value)?;
                     let name = match column.alias {
                         Some(alias) => self.ast.text(alias).to_vec(),
                         None => self.default_column_name(column.expr, &expr, column.span),
@@ -3260,6 +3286,10 @@ impl<'a> Binder<'a> {
         // methods and need the owned names and sub-expression lists their variants hold -
         // but a literal needs neither.
         if let Expr::Literal(literal) = expr {
+            if let Literal::Boolean(_, name) = literal {
+                let name = *name;
+                return self.bind_true_or_false(name, span);
+            }
             return self.bind_literal(literal, span);
         }
         match expr.clone() {
@@ -3528,30 +3558,11 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Keeps the fact that a comparison operand was written `TRUE` or `FALSE`.
-    ///
-    /// SQLite stores those keywords as their own kind of node, so `flag = false` is not the
-    /// expression `flag = 0` when it decides whether a partial index declared `WHERE flag = 0`
-    /// holds every row the query wants, and the plan scans the table. The value is the same
-    /// integer. A unary plus around it keeps the two spellings apart for that comparison.
-    ///
-    /// @param written - the operand as the statement wrote it
-    /// @param bound - the operand after binding
-    fn keep_written_boolean(&self, written: ExprId, bound: BoundExpr) -> BoundExpr {
-        match (self.ast.expr(written), &bound) {
-            (Some(Expr::Literal(Literal::Boolean(_))), BoundExpr::Integer(_)) => BoundExpr::Unary {
-                op: UnaryOp::Identity,
-                operand: Box::new(bound),
-            },
-            _ => bound,
-        }
-    }
-
     /// Binds a literal, converting its written text into a value.
     fn bind_literal(&self, literal: &Literal, span: Span) -> Result<BoundExpr, ParseError> {
         match literal {
             Literal::Null => Ok(BoundExpr::Null),
-            Literal::Boolean(value) => Ok(BoundExpr::Integer(i64::from(*value))),
+            Literal::Boolean(value, _) => Ok(BoundExpr::Integer(i64::from(*value))),
             Literal::Integer(text) => checked_integer_literal(text, span),
             Literal::Float(text) => Ok(BoundExpr::Real(literal::real_literal(text))),
             Literal::String(text) => Ok(BoundExpr::Text(text.clone())),
@@ -3854,8 +3865,13 @@ impl<'a> Binder<'a> {
                     found = Some((id, index));
                     continue;
                 }
-                if source.table.is_rowid_name(&folded) && rowid_here.is_none() {
-                    rowid_here = Some(id);
+                if source.table.is_rowid_name(&folded) {
+                    // Two terms that both have a rowid make an unqualified one ambiguous.
+                    if rowid_here.is_some() && table_folded.is_none() {
+                        let written = self.written_reference(database, table, column);
+                        return Err(ambiguous_column(&written, span));
+                    }
+                    rowid_here = rowid_here.or(Some(id));
                 }
             }
             if coalesced.len() > 1 {

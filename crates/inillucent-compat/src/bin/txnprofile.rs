@@ -142,7 +142,7 @@ fn measure_inserts(root: &Path) -> Result<f64, String> {
     let database = Database::open(&path).map_err(|failure| failure.to_string())?;
     let connection = database.session();
     for statement in [
-        "CREATE TABLE main_table(id INTEGER PRIMARY KEY, key INTEGER NOT NULL,          category INTEGER NOT NULL, label TEXT NOT NULL, payload BLOB)",
+        "CREATE TABLE main_table(id INTEGER PRIMARY KEY, key INTEGER NOT NULL, category INTEGER NOT NULL, label TEXT NOT NULL, payload BLOB)",
         "CREATE INDEX main_key ON main_table(key)",
         "CREATE INDEX main_category ON main_table(category, key)",
     ] {
@@ -152,7 +152,7 @@ fn measure_inserts(root: &Path) -> Result<f64, String> {
     }
     let mut insert = connection
         .prepare(
-            "INSERT INTO main_table(id, key, category, label, payload)              VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO main_table(id, key, category, label, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .map_err(|failure| failure.to_string())?;
     connection

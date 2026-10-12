@@ -1253,6 +1253,7 @@ fn reads_after_a_write_keep_the_read_lease() {
         .prepare("SELECT bucket FROM t WHERE id = ?1")
         .expect("the statement prepares");
     let before = database.cache_stats();
+    let started = std::time::Instant::now();
     for id in 0..RUNS {
         statement.reset();
         statement
@@ -1260,12 +1261,26 @@ fn reads_after_a_write_keep_the_read_lease() {
             .expect("the id binds");
         assert!(statement.step().expect("the statement steps"));
     }
+    let elapsed = started.elapsed();
     let after = database.cache_stats();
     let meta_probes = after.meta_probes.saturating_sub(before.meta_probes);
-    println!("{RUNS} point reads after one autocommit write: {meta_probes} record read(s)");
+    // **One more probe is allowed for every `lease::MOST` (250 us) the loop
+    // took.** A lease is let go once it has been held that long in all, so the
+    // number of probes follows the time the reads took as well as their count.
+    // The Windows CI runner took long enough over 200 reads to make 29 probes
+    // against a bound of 20, with the lease working. A read that drops the
+    // lease every statement still makes about one probe a statement, which
+    // this bound is far below while each read takes under 250 us.
+    let expired = u64::try_from(elapsed.as_micros() / 250).unwrap_or(u64::MAX);
+    let bound = (RUNS / 10).saturating_add(expired);
+    println!(
+        "{RUNS} point reads after one autocommit write: {meta_probes} record read(s) in \
+         {elapsed:?}, bound {bound}"
+    );
     assert!(
-        meta_probes <= RUNS / 10,
-        "{RUNS} point reads after one write read the meta record {meta_probes} time(s); a read \
-         that keeps the lease reads it only when the lease has run out"
+        meta_probes <= bound,
+        "{RUNS} point reads after one write read the meta record {meta_probes} time(s) in \
+         {elapsed:?}; a read that keeps the lease reads it only when the lease has run out, \
+         about once every 250 us, so the bound was {bound}"
     );
 }

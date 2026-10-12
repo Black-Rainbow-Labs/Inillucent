@@ -266,6 +266,7 @@ impl crate::ImportedDatabase {
             (columns, 1, layout)
         };
         let page = self.build_tree(root, columns, key_columns, layout)?;
+        let stored = sql.clone();
         self.record(
             root,
             SchemaEntry {
@@ -327,8 +328,64 @@ impl crate::ImportedDatabase {
                 slot.root = index_root;
             }
         }
-        self.rebuild_tables()?;
+        if !self.append_defined_table(&stored, name, root, &info)? {
+            self.rebuild_tables()?;
+        }
         Ok(root)
+    }
+    /// Adds the table `define_table` just recorded to the connection's table list without
+    /// deriving every table again, and reports whether it did.
+    ///
+    /// **Why.** `rebuild_tables` parses the `CREATE` text of every table in the catalog, so each
+    /// `CREATE TABLE` cost time in proportion to the tables already there: 1,600 tables in one
+    /// transaction took 6.8 s against SQLite's 0.1 s. The new table is derived the way
+    /// `tables_from_entries` derives it, from its stored text, with the roots of its automatic
+    /// indexes taken from `defined`, and goes after the last table of its database, which is
+    /// where a full rebuild puts it. It answers `false`, and the caller rebuilds, when the
+    /// list holds anything a rebuild would arrange differently: an imposter, a temporary
+    /// trigger, or no table of that database yet.
+    ///
+    /// @param sql - the stored `CREATE` text
+    /// @param name - the table's name as stored
+    /// @param root - the handle the table's tree is registered under
+    /// @param defined - the table as `define_table` derived it, whose indexes have their roots
+    fn append_defined_table(
+        &mut self,
+        sql: &[u8],
+        name: &[u8],
+        root: u32,
+        defined: &inillucent_sql::catalog_view::TableInfo,
+    ) -> DbResult<bool> {
+        let at = self.schema.ddl_schema;
+        let has_temp_trigger = self
+            .entries_of(crate::TEMP)
+            .iter()
+            .any(|row| row.entry.kind == ObjectKind::Trigger);
+        let Some(last) = self
+            .schema
+            .tables
+            .iter()
+            .rposition(|held| held.database == at)
+        else {
+            return Ok(false);
+        };
+        if has_temp_trigger || !self.schema.imposters.is_empty() {
+            return Ok(false);
+        }
+        let mut info = table_from_create_sql(sql, at, root)?;
+        info.name = name.to_vec();
+        info.folded = name.to_ascii_lowercase();
+        for (index, known) in info.indexes.iter_mut().zip(&defined.indexes) {
+            index.root = known.root;
+        }
+        let position = last.saturating_add(1);
+        self.schema.tables.insert(position, info);
+        self.schema.appended = Some((
+            position,
+            self.schema.tables.len(),
+            self.schema.catalog_generation,
+        ));
+        Ok(true)
     }
 }
 

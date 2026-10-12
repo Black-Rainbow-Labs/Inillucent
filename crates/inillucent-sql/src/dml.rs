@@ -179,6 +179,55 @@ pub enum BoundTriggerStatement {
     Select(Box<BoundSelect>),
 }
 
+/// The triggers a write's foreign keys imply, split by where they fire among
+/// the triggers the user wrote.
+///
+/// **A key's action runs before the parent's own `AFTER` triggers.** SQLite
+/// deletes or updates the row, applies each key's action to the children at
+/// once (`sqlite3FkActions`), and then fires the `AFTER` triggers, so an
+/// `AFTER DELETE` trigger on the parent sees the children already gone and a
+/// cascade's own triggers on the child fire first. The actions used to be put
+/// after the user's triggers: an audit trigger on the parent counted children
+/// the cascade was about to delete, and the child's triggers fired after the
+/// parent's. The checks keep their place after the user's triggers, because
+/// SQLite counts a violation and judges it at the end of the statement, so an
+/// `AFTER` trigger that repairs a key in time is allowed to. Found by the bug
+/// hunt's ORM schemas.
+#[derive(Default)]
+struct KeyTriggers {
+    /// The actions that change rows after the write: `CASCADE`, `SET NULL`
+    /// and `SET DEFAULT`.
+    first: Vec<BoundTrigger>,
+    /// The checks, and the refusals that fire before the write.
+    last: Vec<BoundTrigger>,
+}
+
+/// Reports whether a bound trigger's body changes rows, as a key's `CASCADE`,
+/// `SET NULL` and `SET DEFAULT` do, rather than only checking and refusing with
+/// `RAISE` inside a `SELECT`, as `RESTRICT`, `NO ACTION` and a child's check
+/// do.
+///
+/// @param trigger - the bound trigger
+pub fn changes_rows(trigger: &BoundTrigger) -> bool {
+    trigger
+        .body
+        .iter()
+        .any(|statement| !matches!(statement, BoundTriggerStatement::Select(_)))
+}
+
+impl KeyTriggers {
+    /// Returns every trigger a write fires: the key actions, then the user's
+    /// triggers, then the checks.
+    ///
+    /// @param user - the triggers the schema declares on the table
+    fn around(self, user: Vec<BoundTrigger>) -> Vec<BoundTrigger> {
+        let mut all = self.first;
+        all.extend(user);
+        all.extend(self.last);
+        all
+    }
+}
+
 /// A trigger, bound against the write that fires it.
 ///
 /// It is bound per statement rather than once per schema because the body's
@@ -219,6 +268,14 @@ pub struct BoundTrigger {
     /// `ForeignKeyTrigger::self_referencing`, which is where the value comes
     /// from. Always false on a trigger the schema wrote.
     pub self_referencing: bool,
+    /// The write it fires on, with `UPDATE OF` folded.
+    ///
+    /// **Read by `PRAGMA recursive_triggers`.** A body statement that writes the trigger's own
+    /// table is handed the trigger back only when that statement is the kind of write the
+    /// trigger fires on. It used to be handed back whatever it was, so an `AFTER INSERT` trigger
+    /// that updated its own row fired itself for the `UPDATE`, again and again, and failed with
+    /// `too many levels of trigger recursion` where SQLite updates the row once.
+    pub event: crate::catalog_view::TriggerEventInfo,
 }
 
 /// A bound `INSERT`.
@@ -753,10 +810,12 @@ impl<'a> Binder<'a> {
         let upsert = self.bind_upsert(&table, insert)?;
         let returning = self.bind_returning(&insert.returning)?;
         let on_conflict = self.trigger_conflict.or(insert.on_conflict);
-        let mut triggers = self.with_trigger_conflict(on_conflict, |binder| {
+        let triggers = self.with_trigger_conflict(on_conflict, |binder| {
             binder.bind_triggers(&table, TriggerEventInfo::Insert, &[])
         })?;
-        triggers.extend(self.bind_foreign_keys(&table, TriggerEventInfo::Insert, &[])?);
+        let triggers = self
+            .bind_foreign_keys(&table, TriggerEventInfo::Insert, &[])?
+            .around(triggers);
         let replace_triggers = self.bind_replace_triggers(&table, insert.on_conflict)?;
         let sequence_root = if table.autoincrement {
             self.catalog
@@ -805,9 +864,10 @@ impl<'a> Binder<'a> {
         if !can_replace(table, on_conflict) {
             return Ok(Vec::new());
         }
-        let mut bound = self.bind_triggers(table, TriggerEventInfo::Delete, &[])?;
-        bound.extend(self.bind_foreign_keys(table, TriggerEventInfo::Delete, &[])?);
-        Ok(bound)
+        let bound = self.bind_triggers(table, TriggerEventInfo::Delete, &[])?;
+        Ok(self
+            .bind_foreign_keys(table, TriggerEventInfo::Delete, &[])?
+            .around(bound))
     }
 
     /// Binds an `UPDATE`.
@@ -978,16 +1038,21 @@ impl<'a> Binder<'a> {
             .collect();
         check_view_update_columns(&table, &changed)?;
         let on_conflict = self.trigger_conflict.or(update.on_conflict);
-        let mut triggers = self.with_trigger_conflict(on_conflict, |binder| {
+        let triggers = self.with_trigger_conflict(on_conflict, |binder| {
             binder.bind_triggers(&table, TriggerEventInfo::Update(Vec::new()), &changed)
         })?;
         // Foreign keys see the generated columns whose inputs were assigned.
-        let key_changes = self.changed_with_generated(&table, &changed)?;
-        triggers.extend(self.bind_foreign_keys(
-            &table,
-            TriggerEventInfo::Update(Vec::new()),
-            &key_changes,
-        )?);
+        // **Bound with the target alone in scope**, like the schema expressions
+        // above: a generated column's text names the target's columns, and with
+        // a `FROM` term that has a column of the same name (`FROM t0 AS u`) an
+        // unqualified `c0` in `AS (coalesce(c0, c1))` was ambiguous.
+        let saved_scopes = core::mem::replace(&mut self.scopes, vec![vec![source]]);
+        let key_changes = self.changed_with_generated(&table, &changed);
+        self.scopes = saved_scopes;
+        let key_changes = key_changes?;
+        let triggers = self
+            .bind_foreign_keys(&table, TriggerEventInfo::Update(Vec::new()), &key_changes)?
+            .around(triggers);
         let view_rows = self
             .view_rows(&table, filter.clone())
             .map(|rows| join_view_rows(rows, &joined, &assignments))
@@ -1058,10 +1123,12 @@ impl<'a> Binder<'a> {
         // A `DELETE` hands its triggers no conflict action (`sqlite3DeleteFrom`
         // passes `OE_Default`), so what an outer `INSERT OR IGNORE` named stops
         // here instead of reaching the bodies of the triggers a delete fires.
-        let mut triggers = self.with_trigger_conflict(None, |binder| {
+        let triggers = self.with_trigger_conflict(None, |binder| {
             binder.bind_triggers(&table, TriggerEventInfo::Delete, &[])
         })?;
-        triggers.extend(self.bind_foreign_keys(&table, TriggerEventInfo::Delete, &[])?);
+        let triggers = self
+            .bind_foreign_keys(&table, TriggerEventInfo::Delete, &[])?
+            .around(triggers);
         let view_rows = self
             .view_rows(&table, filter.clone())
             .map(|rows| limit_view_rows(rows, &order_by, &limit, &offset));
@@ -1228,16 +1295,16 @@ impl<'a> Binder<'a> {
         table: &TableInfo,
         event: TriggerEventInfo,
         changed: &[Vec<u8>],
-    ) -> Result<Vec<BoundTrigger>, ParseError> {
+    ) -> Result<KeyTriggers, ParseError> {
         if !self.foreign_keys || table.kind != TableKind::Table {
-            return Ok(Vec::new());
+            return Ok(KeyTriggers::default());
         }
         let catalog = self.catalog;
         let database = catalog.database_name(table.database).to_vec();
         let Some(live) = catalog.find_table(Some(database.as_slice()), &table.folded) else {
-            return Ok(Vec::new());
+            return Ok(KeyTriggers::default());
         };
-        let mut bound = Vec::new();
+        let mut bound = KeyTriggers::default();
         for planned in &live.foreign_key_triggers {
             if planned.is_check && (planned.deferred || self.defer_foreign_keys) {
                 continue;
@@ -1281,7 +1348,10 @@ impl<'a> Binder<'a> {
             {
                 continue;
             }
-            bound.push(one);
+            match trigger.time == ast::TriggerTime::After && changes_rows(&one) {
+                true => bound.first.push(one),
+                false => bound.last.push(one),
+            }
         }
         Ok(bound)
     }
@@ -1398,6 +1468,7 @@ impl<'a> Binder<'a> {
             body,
             foreign_key: false,
             self_referencing: false,
+            event: trigger.event.clone(),
         })
     }
 
@@ -1899,8 +1970,16 @@ impl<'a> Binder<'a> {
                 columns.push(ColumnSource::Generated(expr));
                 continue;
             }
+            // **An `INTEGER PRIMARY KEY` is the rowid, so `rowid`, `oid` and
+            // `_rowid_` name it too.** Only the column's own name was looked
+            // for, so `INSERT INTO new(rowid, a) SELECT rowid, a FROM old`
+            // dropped every key and numbered the rows from one, and a text
+            // rowid such as 'abc' was never checked for its type. The last of
+            // the names wins, as for a column named twice.
             let named = if table.rowid_alias == Some(position) {
-                targets.iter().rposition(|target| *target == position)
+                targets
+                    .iter()
+                    .rposition(|target| *target == position || *target == ROWID_TARGET)
             } else {
                 targets.iter().position(|target| *target == position)
             };
@@ -1975,10 +2054,14 @@ impl<'a> Binder<'a> {
 
     /// Binds the virtual generated columns a write has to test.
     ///
-    /// A column is included when it is `NOT NULL`, or when the table is
-    /// `STRICT` and so checks every column's type. Each is bound as a read of
-    /// the column, which is the expression converted by the column's affinity:
-    /// SQLite tests that value, and not the bare expression.
+    /// Every virtual column is included. A `NOT NULL` or `STRICT` column is
+    /// tested against its value, and any other column is still computed,
+    /// because SQLite computes a virtual column on every write and refuses the
+    /// write when the expression fails (`abs(-9223372036854775808)` reports
+    /// "integer overflow" on the `INSERT`, not on the first `SELECT`). Each is
+    /// bound as a read of the column, which is the expression converted by the
+    /// column's affinity: SQLite tests that value, and not the bare
+    /// expression.
     ///
     /// @param table - the table being written
     fn bind_virtual_columns(
@@ -1988,7 +2071,7 @@ impl<'a> Binder<'a> {
         let mut bound = Vec::new();
         for (position, column) in table.columns.iter().enumerate() {
             let virtual_column = column.generated && !column.stored;
-            if !virtual_column || !(column.not_null || table.strict) {
+            if !virtual_column {
                 continue;
             }
             let expr = self.bind_schema_expr(&crate::catalog_view::quoted_name(&column.name))?;
@@ -2338,15 +2421,11 @@ impl<'a> Binder<'a> {
         table: &TableInfo,
         changed: &[Vec<u8>],
     ) -> Result<Vec<BoundTrigger>, ParseError> {
-        let mut triggers =
-            self.bind_triggers(table, TriggerEventInfo::Update(Vec::new()), changed)?;
+        let triggers = self.bind_triggers(table, TriggerEventInfo::Update(Vec::new()), changed)?;
         let key_changes = self.changed_with_generated(table, changed)?;
-        triggers.extend(self.bind_foreign_keys(
-            table,
-            TriggerEventInfo::Update(Vec::new()),
-            &key_changes,
-        )?);
-        Ok(triggers)
+        Ok(self
+            .bind_foreign_keys(table, TriggerEventInfo::Update(Vec::new()), &key_changes)?
+            .around(triggers))
     }
 
     /// Adds to the assigned columns every generated column that reads one.

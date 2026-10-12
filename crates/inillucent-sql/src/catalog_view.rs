@@ -227,6 +227,18 @@ pub struct IndexInfo {
     pub metric: Option<IndexMetric>,
 }
 
+impl IndexInfo {
+    /// Reports whether the index can answer a `WHERE` term by itself, so the columns that term
+    /// reads need not be in the index for it to cover a query.
+    ///
+    /// A partial index whose predicate the `WHERE` repeats holds the predicate true for every
+    /// entry, and an index on an expression holds the value an equality on that expression
+    /// compares.
+    pub fn answers_where_terms(&self) -> bool {
+        self.partial_sql.is_some() || self.columns.iter().any(|key| key.plain_column().is_none())
+    }
+}
+
 /// What kind of schema object a name resolves to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableKind {

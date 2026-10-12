@@ -132,6 +132,40 @@ impl Query {
     }
 }
 
+impl Query {
+    /// Returns where each `NEAR` group sits in the list of phrases.
+    ///
+    /// Each answer is the index of the group's first phrase, how many phrases
+    /// the group has, and the distance it allows. The phrases of a group are
+    /// next to each other in [`Query::phrases`], because they are listed in
+    /// written order.
+    pub fn near_groups(&self) -> Vec<(usize, usize, u32)> {
+        let mut groups = Vec::new();
+        let mut counter = 0usize;
+        collect_near(&self.root, &mut counter, &mut groups);
+        groups
+    }
+}
+
+/// Finds the `NEAR` groups of an expression, numbering phrases as it goes.
+///
+/// @param node - the expression
+/// @param counter - the index of the next phrase, advanced past this node
+/// @param into - where each group's first phrase, size and distance go
+fn collect_near(node: &Match, counter: &mut usize, into: &mut Vec<(usize, usize, u32)>) {
+    match node {
+        Match::Phrase(_) => *counter = counter.saturating_add(1),
+        Match::Near { phrases, distance } => {
+            into.push((*counter, phrases.len(), *distance));
+            *counter = counter.saturating_add(phrases.len());
+        }
+        Match::And(left, right) | Match::Or(left, right) | Match::Not(left, right) => {
+            collect_near(left, counter, into);
+            collect_near(right, counter, into);
+        }
+    }
+}
+
 /// Adds every phrase of an expression to a list, in written order.
 fn collect_phrases(node: &Match, into: &mut Vec<Phrase>) {
     match node {
@@ -284,8 +318,13 @@ impl Parser<'_> {
     }
 
     /// Returns whether the cursor is on a keyword.
+    ///
+    /// **Upper case only.** FTS5 reads `AND`, `OR`, `NOT` and `NEAR` as operators when they are
+    /// written in capitals and as ordinary words otherwise, so `this and that` searches for
+    /// three words and `and*` is the prefix `and`. They were matched without regard to case, and
+    /// a query that held the word `not` in English was a syntax error.
     fn at_keyword(&self, keyword: &str) -> bool {
-        matches!(self.peek(), Some(Lexeme::Word(word)) if word.eq_ignore_ascii_case(keyword.as_bytes()))
+        matches!(self.peek(), Some(Lexeme::Word(word)) if word.as_slice() == keyword.as_bytes())
     }
 
     /// Parses an `OR` chain.
@@ -303,7 +342,9 @@ impl Parser<'_> {
     fn parse_and(&mut self, column: &ColumnFilter) -> DbResult<Match> {
         let mut left = self.parse_not(column)?;
         loop {
+            let mut written = false;
             if self.at_keyword("AND") {
+                written = true;
                 self.at = self.at.saturating_add(1);
             } else if self.at_keyword("OR")
                 || self.at_keyword("NOT")
@@ -315,7 +356,13 @@ impl Parser<'_> {
                 return Ok(left);
             }
             let right = self.parse_not(column)?;
-            left = Match::And(Box::new(left), Box::new(right));
+            // Only two strings side by side lose an empty one. With `AND` written, an empty
+            // string is a node that matches nothing, so `hello AND 😀` finds no rows.
+            left = if written {
+                Match::And(Box::new(left), Box::new(right))
+            } else {
+                join_implicit(left, right)
+            };
         }
     }
 
@@ -367,7 +414,9 @@ impl Parser<'_> {
             Some(Lexeme::OpenBrace) => {
                 self.at = self.at.saturating_add(1);
                 let mut named = Vec::new();
-                while let Some(Lexeme::Word(name)) = self.peek().cloned() {
+                // A column name may be quoted, which is how one holding a character such as `-`
+                // is written: `{"b-c"} : beta`.
+                while let Some(Lexeme::Word(name) | Lexeme::Quoted(name)) = self.peek().cloned() {
                     self.at = self.at.saturating_add(1);
                     named.push(self.column_index(&name)?);
                 }
@@ -380,7 +429,7 @@ impl Parser<'_> {
             // After a `-` the name is a column whether or not a colon
             // follows, which is how SQLite answers `co-operate` with
             // "no such column: operate" rather than with rows.
-            Some(Lexeme::Word(name))
+            Some(Lexeme::Word(name) | Lexeme::Quoted(name))
                 if negated || matches!(self.tokens.get(self.at + 1), Some(Lexeme::Colon)) =>
             {
                 self.at = self.at.saturating_add(1);
@@ -406,12 +455,8 @@ impl Parser<'_> {
     ///
     /// @param name - the column name as written
     fn column_index(&self, name: &[u8]) -> DbResult<usize> {
-        self.column_named(name).ok_or_else(|| {
-            syntax(format!(
-                "fts5: no such column: {}",
-                String::from_utf8_lossy(name)
-            ))
-        })
+        self.column_named(name)
+            .ok_or_else(|| syntax(format!("no such column: {}", String::from_utf8_lossy(name))))
     }
 
     /// Parses `NEAR(phrase phrase, distance)`.
@@ -439,6 +484,14 @@ impl Parser<'_> {
         if phrases.is_empty() {
             return Err(syntax("fts5: NEAR needs at least one phrase"));
         }
+        phrases.retain(|phrase| !phrase.terms.is_empty());
+        if phrases.is_empty() {
+            return Ok(Match::Phrase(Phrase {
+                terms: Vec::new(),
+                columns: column.clone(),
+                anchored: false,
+            }));
+        }
         Ok(Match::Near { phrases, distance })
     }
 
@@ -451,9 +504,13 @@ impl Parser<'_> {
             self.at = self.at.saturating_add(1);
         }
         let mut terms = Vec::new();
+        // Whether any string or word was read. A string the tokenizer reduces to nothing is a
+        // phrase with no terms and is left out of the query; no string at all is a syntax error.
+        let mut read_a_string = false;
         loop {
             match self.peek().cloned() {
                 Some(Lexeme::Quoted(text)) => {
+                    read_a_string = true;
                     self.at = self.at.saturating_add(1);
                     // **A quoted phrase may end in a prefix (task-1979, R7).**
                     // `"a b"*` is SQLite's phrase prefix and was refused here,
@@ -473,10 +530,11 @@ impl Parser<'_> {
                     }
                 }
                 Some(Lexeme::Word(word))
-                    if !word.eq_ignore_ascii_case(b"AND")
-                        && !word.eq_ignore_ascii_case(b"OR")
-                        && !word.eq_ignore_ascii_case(b"NOT") =>
+                    if word.as_slice() != b"AND"
+                        && word.as_slice() != b"OR"
+                        && word.as_slice() != b"NOT" =>
                 {
+                    read_a_string = true;
                     self.at = self.at.saturating_add(1);
                     let tokens = self.tokenizer.tokens(&word);
                     let last = tokens.len().saturating_sub(1);
@@ -499,7 +557,7 @@ impl Parser<'_> {
             }
             break;
         }
-        if terms.is_empty() {
+        if terms.is_empty() && !read_a_string {
             return Err(syntax("fts5: syntax error - a phrase has no terms"));
         }
         Ok(Phrase {
@@ -515,6 +573,34 @@ impl Parser<'_> {
             .iter()
             .position(|candidate| candidate.eq_ignore_ascii_case(name))
     }
+}
+
+/// Reports whether a node is a phrase that has no terms, which is what a string the tokenizer
+/// reduces to nothing becomes.
+///
+/// @param node - the parsed node
+fn is_empty_phrase(node: &Match) -> bool {
+    matches!(node, Match::Phrase(phrase) if phrase.terms.is_empty())
+}
+
+/// Joins two strings written side by side, leaving out one that has no tokens.
+///
+/// A string the tokenizer reduces to nothing is a node that matches no row. SQLite removes it
+/// when it sits next to another string with no operator between them, so `hello 😀` is `hello`
+/// and `😀 hello` is `hello`. With `AND`, `OR` or `NOT` written the node stays: `hello OR 😀`
+/// is `hello` because nothing is added, `hello AND 😀` finds nothing, and `😀 NOT hello` finds
+/// nothing. A query that is only empty strings matches no rows.
+///
+/// @param left - the node before
+/// @param right - the node after
+fn join_implicit(left: Match, right: Match) -> Match {
+    if is_empty_phrase(&right) {
+        return left;
+    }
+    if is_empty_phrase(&left) {
+        return right;
+    }
+    Match::And(Box::new(left), Box::new(right))
 }
 
 /// Where one phrase was found: a row, and the positions per column.
@@ -958,12 +1044,16 @@ fn term_doclists(
 ) -> DbResult<Vec<Vec<u8>>> {
     let mut doclists = Vec::new();
     if term.prefix {
-        // **The staged rows go out first.** A term this transaction created is
-        // held in the buffer and written in term order at the flush, so a scan
-        // that ran before it would not see it - and a prefix search inside the
-        // transaction that wrote the term would miss it. The point lookup
-        // below needs no flush, because the buffer answers it.
-        super::flush_doclists(context, shadows, buffer)?;
+        // **The staged doclists are read from the buffer, not flushed.** A
+        // term this transaction created is held in the buffer and written in
+        // term order at the flush, so the scan of `%_idx` below cannot see it.
+        // Flushing here fixed that and made every prefix query that follows a
+        // write in the same transaction fail with "a module wrote to a shadow
+        // table while answering a query", because a query may not write. The
+        // buffer's doclists that start with the prefix are added instead, and
+        // they replace the stored row of the same term, since the staged
+        // doclist is the newer one.
+        let staged = super::staged_with_prefix(buffer, &term.token);
         // A prefix reads every term the dictionary holds that starts with it.
         // The dictionary is in term order, so the run is contiguous - which is
         // what makes a prefix search cheaper than a scan of every term.
@@ -979,6 +1069,9 @@ fn term_doclists(
             if !candidate.starts_with(&term.token) {
                 return Ok(false);
             }
+            if staged.contains_key(candidate) {
+                return Ok(true);
+            }
             rows.push(values.to_vec());
             Ok(true)
         })?;
@@ -990,6 +1083,7 @@ fn term_doclists(
                 .unwrap_or_default();
             doclists.push(super::require_doclist(context, shadows, &candidate, &row)?);
         }
+        doclists.extend(staged.into_values());
     } else if let Some(bytes) = super::read_doclist(context, shadows, buffer, &term.token)? {
         doclists.push(bytes);
     }

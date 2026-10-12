@@ -63,16 +63,31 @@ pub fn configured_weights(
     shadows: &ShadowTables,
     columns: usize,
 ) -> DbResult<Vec<f64>> {
-    let mut weights = vec![1.0f64; columns];
     let key = [inillucent_value::Value::owned_text(b"rank")?];
     let Some(row) = shadows.read_keyed(context, b"config", &key, 2)? else {
-        return Ok(weights);
+        return Ok(vec![1.0f64; columns]);
     };
     let text = match row.get(1) {
         Some(inillucent_value::Value::Text(text)) => text.utf8_bytes().into_owned(),
-        _ => return Ok(weights),
+        _ => return Ok(vec![1.0f64; columns]),
     };
-    let text = String::from_utf8_lossy(&text);
+    Ok(weights_from_setting(
+        &String::from_utf8_lossy(&text),
+        columns,
+    ))
+}
+
+/// Returns the column weights a rank function setting names.
+///
+/// The text is what `rank` is set to, and what `rank MATCH '...'` in a `WHERE`
+/// clause supplies for one query: `bm25(10.0, 1.0)`. A column the setting gives
+/// no weight for scores at one. A setting that names another function, or that
+/// does not parse, leaves every weight at one.
+///
+/// @param text - the setting
+/// @param columns - how many columns the table declares
+pub fn weights_from_setting(text: &str, columns: usize) -> Vec<f64> {
+    let mut weights = vec![1.0f64; columns];
     let trimmed = text.trim();
     let Some(arguments) = trimmed
         .strip_prefix("bm25")
@@ -80,14 +95,14 @@ pub fn configured_weights(
         .and_then(|rest| rest.strip_prefix('('))
         .and_then(|rest| rest.strip_suffix(')'))
     else {
-        return Ok(weights);
+        return weights;
     };
     for (slot, argument) in weights.iter_mut().zip(arguments.split(',')) {
         if let Ok(weight) = argument.trim().parse::<f64>() {
             *slot = weight;
         }
     }
-    Ok(weights)
+    weights
 }
 
 /// Scores every matched row, returning `(rowid, score)` pairs.

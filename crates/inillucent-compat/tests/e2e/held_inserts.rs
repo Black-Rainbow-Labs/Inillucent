@@ -242,12 +242,12 @@ fn a_duplicate_among_held_inserts_is_reported_on_its_own_line() {
 }
 
 /// `.import` writes a file's rows as one statement, and a file with a row
-/// that will not go in reports that row's line and keeps none of them.
+/// that will not go in reports that row's line and keeps the rows around it.
 ///
 /// The import runs its rows at once when the engine allows it (task-2191) and
 /// one at a time when that fails, which is how it finds the line to report.
-/// A row shorter than the first is NULL in the rest, and a longer one is the
-/// error it always was.
+/// A row shorter than the table is NULL in the rest, with a warning that names
+/// its line, as SQLite does. The line is counted from the top of the file.
 #[test]
 fn an_import_reports_the_first_line_that_will_not_go_in() {
     let shell = program("inillucent-shell");
@@ -287,8 +287,8 @@ fn an_import_reports_the_first_line_that_will_not_go_in() {
             format!(
                 "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score);\n.import --csv {duplicate} t\nSELECT count(*) FROM t;\n"
             ),
-            "0",
-            format!("{duplicate}:30: UNIQUE constraint failed: t.id"),
+            "59",
+            format!("{duplicate}:30: INSERT failed: UNIQUE constraint failed: t.id"),
         ),
         (
             "short",
@@ -296,7 +296,9 @@ fn an_import_reports_the_first_line_that_will_not_go_in() {
                 "CREATE TABLE t (id, name, score);\n.import --csv {short} t\nSELECT id, name IS NULL, score IS NULL FROM t;\n"
             ),
             "1|0|0\n2|0|1\n3|1|1\n4|0|0",
-            String::new(),
+            format!(
+                "{short}:2: expected 3 columns but found 2 - filling the rest with NULL\n{short}:3: expected 3 columns but found 1 - filling the rest with NULL"
+            ),
         ),
     ] {
         let path = directory.join(format!("import-{name}.rdb"));

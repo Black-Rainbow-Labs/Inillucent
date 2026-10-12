@@ -171,8 +171,8 @@ target failed. Exit code 2 means the run did not happen, for example because the
 
 Each tier has a cadence. `change` tiers run on every change that can reach them. The `durability`,
 `perf` and `matrix_deep` tiers are `merge`: a change run selects one of their targets only when a
-crate that actually changed is in its `covers`. CI runs only on the public mirror,
-Black-Rainbow-Labs/Inillucent, at night and when started by hand, never on a push.
+crate that actually changed is in its `covers`. CI runs in Black-Rainbow-Labs/Inillucent, the one
+repository, at night and when started by hand, never on a push.
 `.github/workflows/tests.yml` runs the merge cadence on Windows and on Linux, as four jobs on Windows
 and three on Linux that each run a share of the targets with `inillucent-testrun --shard`. The
 `nightly` tier never runs on a change. `.github/workflows/nightly.yml` runs it once a day on Linux, at 03:00 UTC, as four
@@ -227,7 +227,7 @@ prerequisite in `tests/selection.toml` is missing from this table or has a diffe
 
 | prerequisite | rows | what provides it |
 |---|---:|---|
-| `oracle` | 82 | the pinned SQLite 3.53.4 comparison process: `pwsh tools/sqlite-reference.ps1` or `bash tools/sqlite-reference.sh` |
+| `oracle` | 84 | the pinned SQLite 3.53.4 comparison process: `pwsh tools/sqlite-reference.ps1` or `bash tools/sqlite-reference.sh` |
 | `shell` | 11 | the pinned `sqlite3` 3.53.4 shell, built by the same two scripts |
 | `embed` | 7 | a build with `inillucent-engine/embed` turned on. The runner builds it from the target's `features` row, and passes a row's `inillucent-cli/embed` to the build of the programs too. `tools/coverage.mjs` does not, because the feature needs `inillucent-core/onnx` and `inillucent-core` is left out of the coverage run |
 | `tracked-fixtures` | 5 | the files under `compat/fixtures/`, which are committed. A new clone has them. The row is for a checkout that has lost them |
@@ -263,8 +263,8 @@ a prerequisite and its suite cannot skip. Those two checks keep this table equal
 
 ## What the tests cover
 
-The workspace has 4,207 tests across 324 test targets, counted tier by tier in the tier table of
-`tests/inillucent-testing-tdd.md`. There are 324 rows in `tests/selection.toml`,
+The workspace has 4,159 tests across 356 test targets, counted tier by tier in the tier table of
+`tests/inillucent-testing-tdd.md`. There are 356 rows in `tests/selection.toml`,
 and each row is one `[[target]]` that the runner runs. `tools/doc-facts/check.mjs` fails when this
 page gives a different count from `tests/selection.toml`.
 

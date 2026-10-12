@@ -11,7 +11,7 @@
 //! `fmod` and so keeps the sign of its left operand - `mod(-7, 3)` is -1, not 2.
 
 use inillucent_sql::function::MathFunc;
-use inillucent_value::{cast, numeric as numeric_syntax, Value};
+use inillucent_value::{numeric as numeric_syntax, Value};
 
 // Compiled on every platform so its tests run everywhere; only Windows calls it.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -110,16 +110,16 @@ pub fn call(func: MathFunc, arguments: &[Value<'static>]) -> Value<'static> {
         MathFunc::Log2 => positive(first, f64::log2),
         // `log(x)` is base 10 and `log(b, x)` is base b, which is the one
         // built-in whose *meaning* changes with its argument count.
-        MathFunc::Log => match second {
-            Some(value) => {
-                if first <= 0.0 || first == 1.0 || value <= 0.0 {
-                    None
-                } else {
-                    Some(value.log(first))
-                }
-            }
-            None => positive(first, f64::log10),
-        },
+        //
+        // **With two arguments a second one that is not a number gives NULL.** It fell through
+        // to the one argument form, so `log(10, NULL)` was `log10(10)`. SQLite divides the
+        // natural log of the second argument by the natural log of the base, and answers NULL
+        // unless both are positive, so a base at or below 1 (`log(0.5, 2)`) is NULL as well.
+        MathFunc::Log if arguments.len() > 1 => second.and_then(|value| {
+            let base = first.ln();
+            (first > 0.0 && base > 0.0 && value > 0.0).then(|| value.ln() / base)
+        }),
+        MathFunc::Log => positive(first, f64::log10),
         MathFunc::Mod => second.and_then(|second| (second != 0.0).then(|| first % second)),
         MathFunc::Pow => second.map(|second| first.powf(second)),
         MathFunc::Radians => Some(first.to_radians()),
@@ -221,7 +221,10 @@ fn numeric(value: Option<&Value<'static>>) -> Option<Number> {
             if !numeric_syntax::looks_numeric(text.raw(), text.encoding()) {
                 return None;
             }
-            match cast::numerify(value.clone()) {
+            // **Numeric affinity without the narrowing a stored value gets.** `ceil('1e2')` is
+            // 100.0 in SQLite, because `sqlite3_value_numeric_type` converts the text without
+            // trying for an integer, and `numerify` made it the integer 100.
+            match inillucent_value::affinity::apply_numeric_affinity(value.clone(), false) {
                 Value::Integer(integer) => Some(Number {
                     real: integer as f64,
                     integer: Some(integer),

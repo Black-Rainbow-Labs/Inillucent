@@ -371,7 +371,7 @@ fn a_reader_with_a_timeout_waits_and_then_reads() {
     assert_eq!(
         rows_by(&binary, &database, "holder"),
         1,
-        "the holder's row is not in the table, so nothing was holding the file and this case          was not about contention at all"
+        "the holder's row is not in the table, so nothing was holding the file and this case was not about contention at all"
     );
 }
 

@@ -16,6 +16,7 @@
 //! `tests/selection.toml`. `selection::discover` finds a module file with no
 //! row, so `no_test_hides_outside_the_map` names one that was forgotten.
 
+mod free_map_page_at_the_end;
 mod matrix;
 mod matrix_random;
 mod release_format_history;

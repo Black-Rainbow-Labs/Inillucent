@@ -80,10 +80,14 @@
 // Every item is re-exported, so nothing outside this directory changed.
 use self::index::*;
 use self::query::*;
+mod fold;
+mod fts3_snippet;
 mod index;
 mod merge;
 mod query;
+mod snippet;
 
+pub use doclist::{doclist_entries_decoded, reset_doclist_entries_decoded};
 pub use index::{build_stages, decode_sizes, reset_build_stages, Buffer, BuildStages, Pending};
 
 pub mod bm25;
@@ -305,6 +309,9 @@ fn connect_with(
         // on reconnect would stop the database opening at all - so the refusal
         // moves to the queries, where a caller can still drop the table.
         if creating {
+            if dialect == Dialect::Five {
+                options::refuse_at_create(&options, &arguments.table)?;
+            }
             if let Some(what) = &options.unsupported {
                 return Err(unsupported_option(what));
             }
@@ -327,6 +334,7 @@ fn connect_with(
             layout_checked: false,
             pending: Buffer::default(),
             offsets: Vec::new(),
+            cursors: std::sync::atomic::AtomicI64::new(0),
         }))
     }
 }
@@ -339,14 +347,20 @@ const PLAN_ROWID: i32 = 1;
 const PLAN_MATCH: i32 = 2;
 /// The plan bit that says the rows come back ranked.
 const PLAN_RANKED: i32 = 4;
-/// Where a plan keeps the column a `MATCH` was written on, plus one.
+/// The plan bit that says a `rank MATCH '...'` constraint came after the match.
 ///
-/// **`body MATCH 'ships'` searches one column**, as SQLite's FTS5 does: it
-/// means `{body} : (ships)`. Only the table's own hidden column was accepted,
-/// so a match written on an indexed column was declined, and the engine,
-/// which cannot evaluate `MATCH` itself, refused the statement. The column
-/// travels in the plan number above the three plan bits.
-const PLAN_COLUMN_SHIFT: u32 = 8;
+/// The second argument of the plan is then the rank function for this query,
+/// such as `bm25(10.0, 1.0)`.
+const PLAN_RANK_FUNCTION: i32 = 8;
+// **What the plan string says about the arguments of a plan.**
+//
+// `body MATCH 'ships'` searches one column, as SQLite's FTS5 does: it means
+// `{body} : (ships)`. Only the table's own hidden column was accepted, so a match
+// written on an indexed column was declined, and the engine, which cannot
+// evaluate `MATCH` itself, refused the statement. The plan string holds one role
+// per argument, separated by commas: `t` is a match on the table's own column,
+// `c<n>` is a match on column n, and `r` is the rank function. `t,c1` is two
+// matches that must both hold.
 
 /// One connected FTS5 table.
 struct Fts5Table {
@@ -390,6 +404,8 @@ struct Fts5Table {
     /// Filled the first time a row is read, because it is read out of the
     /// *catalog* and a module is only shown one while a statement is running.
     offsets: Vec<usize>,
+    /// How many cursors this table has opened, which numbers the next one.
+    cursors: std::sync::atomic::AtomicI64,
 }
 
 /// Returns the shadow suffix a table's rows are reached under.
@@ -539,6 +555,13 @@ impl VirtualTable for Fts5Table {
                 && table_match(constraint)
                 && (0..=self.match_column()).contains(&constraint.column)
         });
+        // **Every MATCH constraint is used, and the plan string says what each argument is.**
+        // `f MATCH 'a' AND f MATCH 'b'` and `a MATCH 'x' AND b MATCH 'y'` are both ordinary
+        // statements, and SQLite ANDs the expressions. Only the first was claimed here, the
+        // second was left for the engine to test, and the engine cannot evaluate a MATCH, so the
+        // statement either returned nothing or failed. The roles are `t` for the table's own
+        // column, `c<n>` for indexed column n, and `r` for the rank function.
+        let mut roles: Vec<String> = Vec::new();
         for index in 0..query.constraints.len() {
             let Some(constraint) = query.constraints.get(index).copied() else {
                 continue;
@@ -548,16 +571,18 @@ impl VirtualTable for Fts5Table {
             }
             if table_match(&constraint) && constraint.column == self.match_column() {
                 query.use_constraint(index, true);
-                plan = PLAN_MATCH;
-                break;
+                plan |= PLAN_MATCH;
+                roles.push("t".to_string());
+                continue;
             }
-            // A match on one indexed column; see `PLAN_COLUMN_SHIFT`.
+            // A match on one indexed column.
             if constraint.op == ConstraintOp::Match
                 && (0..self.match_column()).contains(&constraint.column)
             {
                 query.use_constraint(index, true);
-                plan = PLAN_MATCH | (constraint.column.saturating_add(1) << PLAN_COLUMN_SHIFT);
-                break;
+                plan |= PLAN_MATCH;
+                roles.push(format!("c{}", constraint.column));
+                continue;
             }
             // **`docid` is the rowid**, so a predicate on it is a rowid
             // lookup rather than a filter over a scan. It shares the `rank`
@@ -575,10 +600,37 @@ impl VirtualTable for Fts5Table {
                 return Ok(());
             }
         }
+        // **`rank MATCH 'bm25(10.0, 1.0)'` chooses the rank function for this
+        // query**, as it does in SQLite. It is only meaningful beside a match,
+        // and it is taken after the match so that the match stays the first
+        // argument of the plan.
+        //
+        // **Beside no match at all it is still claimed**, and then it changes nothing, which is
+        // what SQLite does: `SELECT count(*) FROM f WHERE rank MATCH 'bm25(1,2)'` counts every row.
+        // Leaving it unclaimed made the engine refuse the statement with a cut off message.
+        if self.dialect == Dialect::Five {
+            let rank_matches: Vec<usize> = query
+                .constraints
+                .iter()
+                .enumerate()
+                .filter(|(_, constraint)| {
+                    constraint.usable
+                        && constraint.op == ConstraintOp::Match
+                        && constraint.column == self.rank_column()
+                })
+                .map(|(index, _)| index)
+                .collect();
+            for index in rank_matches {
+                query.use_constraint(index, true);
+                plan |= PLAN_RANK_FUNCTION;
+                roles.push("r".to_string());
+            }
+        }
+        query.index_string = roles.join(",");
         // `ORDER BY rank` is the reason the column exists: a match already
         // knows every row's score, so ordering by it costs a sort of the
         // matches rather than a sort of the table.
-        if plan == PLAN_MATCH {
+        if plan & !PLAN_RANK_FUNCTION == PLAN_MATCH {
             if let Some(order) = query.order_by.first() {
                 if query.order_by.len() == 1
                     && self.dialect == Dialect::Five
@@ -612,6 +664,10 @@ impl VirtualTable for Fts5Table {
             hits_built: false,
             pending: Arc::clone(&self.pending),
             held: None,
+            cursor_id: self
+                .cursors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1),
             totals: Totals::empty(self.options.columns.len()),
             columns: self.options.columns.len(),
             names: self
@@ -623,6 +679,7 @@ impl VirtualTable for Fts5Table {
             match_column: self.match_column(),
             rank_column: self.rank_column(),
             rank_weights: Vec::new(),
+            rank_setting: None,
             tokenizer: self.tokenizer.clone(),
             shadows: self.shadows.clone(),
             rows: Vec::new(),
@@ -633,6 +690,11 @@ impl VirtualTable for Fts5Table {
 
     /// Writes the configuration the first time the table is created.
     fn begin(&mut self, context: &mut Context<'_>) -> DbResult<()> {
+        // A new transaction has no savepoint open. A statement that failed leaves its savepoint
+        // behind, and so does a `COMMIT` with a savepoint still open.
+        if let Ok(mut held) = self.pending.lock() {
+            held.epochs.clear();
+        }
         if !self.creating {
             return Ok(());
         }
@@ -703,15 +765,13 @@ impl VirtualTable for Fts5Table {
                     self.command(context, &command, argument)?;
                     return Ok(None);
                 }
-                let key = match rowid.as_integer() {
+                let key = match rowid.as_integer().or_else(|| self.named_docid(values)) {
                     Some(key) => {
                         // A rowid the caller named may collide, so it is asked
                         // about; and it moves the mark, so the next allocated
                         // one is above it.
                         if self.holds_row(context, key)? {
-                            return Err(constraint(
-                                "UNIQUE constraint failed: the rowid is already in the index",
-                            ));
+                            return Err(self.rowid_taken());
                         }
                         note_content_rowid(&self.pending, key);
                         key
@@ -741,8 +801,17 @@ impl VirtualTable for Fts5Table {
                     return Ok(None);
                 };
                 let new = new_rowid.as_integer().unwrap_or(old);
+                let new = self.named_docid(values).unwrap_or(new);
+                // **Checked before the old row goes.** `UPDATE t SET rowid = 5`
+                // onto a rowid the table already holds is a constraint
+                // failure, and removing the old row first would leave the
+                // statement having deleted a row it then refused to move.
+                if new != old && self.holds_row(context, new)? {
+                    return Err(self.rowid_taken());
+                }
                 self.remove(context, old)?;
                 self.add(context, new, values)?;
+                note_content_rowid(&self.pending, new);
                 Ok(Some(new))
             }
         }
@@ -782,15 +851,44 @@ impl VirtualTable for Fts5Table {
         Ok(())
     }
 
+    /// Says that this module puts its own buffer back to a savepoint, so the engine does not
+    /// flush it when one opens.
+    ///
+    /// **The flush was the whole cost of a bulk load made of multi row statements.** Every
+    /// statement wrote out every term it touched, and a common word is a list as long as the
+    /// table, so the work of a statement grew with the rows already loaded. 40,000 rows took
+    /// 3.9 s, 80,000 took 24.8 s and 120,000 took 282 s, against 0.4, 0.7 and 1 s for SQLite.
+    fn undoes_its_own_buffer(&self) -> bool {
+        true
+    }
+
+    /// Opens a savepoint: from here the buffer records how to be put back.
+    fn savepoint(&mut self, _context: &mut Context<'_>, number: i32) -> DbResult<()> {
+        if let Ok(mut held) = self.pending.lock() {
+            held.open_epoch(usize::try_from(number).unwrap_or(0));
+        }
+        Ok(())
+    }
+
+    /// Releases the savepoints from a level up. What they changed stays, and a savepoint below
+    /// them can still put it back.
+    fn release(&mut self, _context: &mut Context<'_>, number: i32) -> DbResult<()> {
+        if let Ok(mut held) = self.pending.lock() {
+            held.close_epochs(usize::try_from(number).unwrap_or(0));
+        }
+        Ok(())
+    }
+
     /// Rolls back to a savepoint.
     ///
-    /// The same discard, and it is correct for the same reason it is correct
-    /// for a whole transaction: the engine flushes every module when a
-    /// savepoint is *taken*, so everything staged before the point is already
-    /// in the trees and under the undo log, and what is left in the buffer
-    /// belongs entirely to the part being abandoned.
-    fn rollback_to(&mut self, context: &mut Context<'_>, _number: i32) -> DbResult<()> {
-        self.rollback(context)
+    /// The buffer goes back to what it held when the savepoint opened. The engine puts the shadow
+    /// trees back from its own undo log, so the two agree. Before the buffer could be put back it
+    /// was thrown away, which was correct only because the engine had flushed it first.
+    fn rollback_to(&mut self, _context: &mut Context<'_>, number: i32) -> DbResult<()> {
+        if let Ok(mut held) = self.pending.lock() {
+            held.rollback_epochs(usize::try_from(number).unwrap_or(0));
+        }
+        Ok(())
     }
 
     fn sync(&mut self, context: &mut Context<'_>) -> DbResult<()> {
@@ -878,6 +976,7 @@ thread_local! {
             new_term_count: 0,
             dictionary_read: 0,
             dictionary_write: 0,
+            flushed_bytes: 0,
             totals: 0,
             flush: 0,
             whole: 0,
@@ -915,13 +1014,6 @@ fn phrase_counts(hits: &expr::Hits, rowid: i64, column: usize) -> (i64, i64, i64
     (here, every, rows)
 }
 
-/// Returns a text value, for a default an argument did not supply.
-///
-/// @param bytes - the text
-fn text_value(bytes: &[u8]) -> Value<'static> {
-    Value::owned_text(bytes).unwrap_or(Value::Null)
-}
-
 /// Returns a function argument as bytes, or nothing for a NULL.
 ///
 /// @param value - the argument, when there is one
@@ -951,117 +1043,4 @@ fn matches_a_term(token: &[u8], wanted: &[expr::Term]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::doclist::append_doclist_entry;
-    use super::*;
-
-    /// The totals round-trip.
-    #[test]
-    fn the_totals_round_trip() {
-        let totals = Totals {
-            rows: 17,
-            tokens: vec![100, 250],
-        };
-        assert_eq!(Totals::decode(&totals.encode()), totals);
-    }
-
-    /// A column list and the options are told apart by the equals sign.
-    #[test]
-    fn columns_and_options_are_told_apart() {
-        let options = parse_options(&[
-            b"title".to_vec(),
-            b"body".to_vec(),
-            b"meta UNINDEXED".to_vec(),
-            b"tokenize = 'ascii'".to_vec(),
-        ])
-        .expect("parses");
-        assert_eq!(options.columns.len(), 3);
-        assert_eq!(options.columns[0].name, b"title");
-        assert!(!options.columns[1].unindexed);
-        assert!(options.columns[2].unindexed);
-        assert_eq!(options.tokenizer, vec![b"ascii".to_vec()]);
-    }
-
-    /// A quoted column name keeps its spaces and loses its quotes.
-    #[test]
-    fn a_quoted_column_is_unquoted() {
-        let options = parse_options(&[b"\"a b\"".to_vec()]).expect("parses");
-        assert_eq!(options.columns[0].name, b"a b");
-        let flagged = parse_options(&[b"\"a b\" UNINDEXED".to_vec()]).expect("parses");
-        assert_eq!(flagged.columns[0].name, b"a b");
-        assert!(flagged.columns[0].unindexed);
-    }
-
-    /// A table with no columns is refused.
-    #[test]
-    fn a_table_needs_a_column() {
-        assert!(parse_options(&[b"tokenize = 'ascii'".to_vec()]).is_err());
-    }
-
-    /// The run appender writes the bytes the entry appender would.
-    ///
-    /// **Two ways to write a doclist entry is a format with two definitions**,
-    /// and the bulk-load path takes the one that never builds an entry - so if
-    /// the two ever disagree, an index built by a bulk load and one built a row
-    /// at a time hold different bytes for the same documents, and only one of
-    /// them decodes.
-    ///
-    /// The cases are the shapes that separate them: one column and one
-    /// position, one column and several, two columns, a gap between column
-    /// numbers, and a position of zero.
-    #[test]
-    fn a_run_appends_the_bytes_the_entry_would() {
-        let runs: Vec<Vec<(Vec<u8>, usize, u32)>> = vec![
-            vec![(b"a".to_vec(), 0, 0)],
-            vec![(b"a".to_vec(), 0, 3)],
-            vec![
-                (b"a".to_vec(), 0, 0),
-                (b"a".to_vec(), 0, 3),
-                (b"a".to_vec(), 0, 9),
-            ],
-            vec![
-                (b"a".to_vec(), 0, 2),
-                (b"a".to_vec(), 1, 0),
-                (b"a".to_vec(), 1, 1),
-            ],
-            vec![(b"a".to_vec(), 0, 1), (b"a".to_vec(), 3, 7)],
-            vec![
-                (b"a".to_vec(), 1, 0),
-                (b"a".to_vec(), 1, 4),
-                (b"a".to_vec(), 2, 2),
-                (b"a".to_vec(), 2, 3),
-            ],
-        ];
-        for run in &runs {
-            for delta in [1i64, 7, 300] {
-                let mut from_run = Vec::new();
-                append_run(&mut from_run, delta, run);
-                let mut from_entry = Vec::new();
-                append_doclist_entry(
-                    &mut from_entry,
-                    delta,
-                    &DocEntry {
-                        rowid: 0,
-                        columns: columns_of(run),
-                    },
-                );
-                assert_eq!(
-                    from_run, from_entry,
-                    "the two appenders disagree for {run:?} at delta {delta}"
-                );
-            }
-        }
-    }
-
-    /// A run groups into the per-column form an entry holds.
-    #[test]
-    fn a_run_groups_by_column() {
-        let run = vec![
-            (b"a".to_vec(), 0, 1),
-            (b"a".to_vec(), 0, 4),
-            (b"a".to_vec(), 2, 0),
-        ];
-        assert_eq!(columns_of(&run), vec![(0, vec![1, 4]), (2, vec![0])]);
-        assert!(columns_of(&[]).is_empty());
-    }
-}
+mod tests;

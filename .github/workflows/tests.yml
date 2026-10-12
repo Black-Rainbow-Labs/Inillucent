@@ -48,17 +48,15 @@
 # ## Once a night, and only on the public repository
 #
 # The suite runs on a schedule and when started by hand, never on a push. It
-# runs only in Black-Rainbow-Labs/Inillucent, the public mirror, where GitHub
-# gives every job four cores at no charge. In jasonmcaffee/inillucent, which is
-# private, each push cost about seven runner hours on two cores, and on
-# 2026-10-02 the account's Actions spending stopped every job there. The
-# workflows are disabled in that repository, and the `if:` on the job below
-# keeps them from running there even if somebody turns them back on.
+# runs only in Black-Rainbow-Labs/Inillucent, where GitHub gives every job four
+# cores at no charge. A private repository paid for each push, about seven
+# runner hours on two cores, and on 2026-10-02 the account's Actions spending
+# stopped every job there. The `if:` on the job below keeps a fork or a copy
+# from running it.
 #
-# `ship.ps1` starts this workflow by hand on the mirror after a release, through
+# `ship.ps1` starts this workflow by hand after a release, through
 # `packaging/ci-status.ps1`, and the release is not finished until it passes.
-# The mirror changes only at a release, so the nightly run grades the code that
-# was last published.
+# The nightly run grades `main` as it stands.
 
 name: tests
 

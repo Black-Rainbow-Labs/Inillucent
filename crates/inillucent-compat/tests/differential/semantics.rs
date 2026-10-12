@@ -760,6 +760,200 @@ PRAGMA table_list;",
         script: "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);\nINSERT INTO t VALUES (1,'x'),(2,'y');\nPRAGMA freelist_count;\nDELETE FROM t;\nPRAGMA freelist_count;",
         expect: Agrees,
     },
+    // The next ten cases (the ninth is at the end of the table, among the
+    // differences) are about `auto_vacuum`, `incremental_vacuum` and
+    // `max_page_count`. None prints a page number or a page count, because the
+    // page is 4096 bytes there and 32768 here. They print the mode (0, 1, 2),
+    // an empty line per step of `incremental_vacuum`, a comparison of two
+    // `freelist_count` values, and `freelist_count` where the answer is 0.
+    // Where a step count would differ between the engines (the number of free
+    // pages after a delete), the output of that statement is sent to a file.
+    //
+    // A set on a file that has no table changes the file's mode at once, a set
+    // between 1 and 2 on a file that has one does too, and anything else
+    // waits for `VACUUM`. A word that is not a mode and a number that is not
+    // 0, 1 or 2 leave the mode alone.
+    Case {
+        name: "prag.autovacuum.transitions",
+        kind: "pragma",
+        script: "PRAGMA auto_vacuum = FULL;
+PRAGMA auto_vacuum;
+CREATE TABLE t(a);
+PRAGMA auto_vacuum = NONE;
+PRAGMA auto_vacuum;
+PRAGMA auto_vacuum = INCREMENTAL;
+PRAGMA auto_vacuum;
+PRAGMA auto_vacuum = 2;
+PRAGMA auto_vacuum;
+PRAGMA auto_vacuum = bogus;
+PRAGMA auto_vacuum;
+PRAGMA auto_vacuum = 7;
+PRAGMA auto_vacuum;
+PRAGMA auto_vacuum = 'full';
+PRAGMA auto_vacuum;
+PRAGMA auto_vacuum = 0;
+PRAGMA auto_vacuum;",
+        expect: Agrees,
+    },
+    // A file in mode 0 that holds a table keeps reading 0 after the set and
+    // takes the new mode when `VACUUM` rebuilds it. The delete after that
+    // gives its pages back, so `freelist_count` is 0.
+    Case {
+        name: "prag.autovacuum.pending",
+        kind: "pragma",
+        script: "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB);
+WITH RECURSIVE c(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM c WHERE a<2000) INSERT INTO t SELECT a, zeroblob(5000) FROM c;
+PRAGMA auto_vacuum;
+PRAGMA auto_vacuum = FULL;
+PRAGMA auto_vacuum;
+VACUUM;
+PRAGMA auto_vacuum;
+DELETE FROM t WHERE a > 100;
+PRAGMA freelist_count;
+SELECT count(*) FROM t;
+PRAGMA integrity_check;",
+        expect: Agrees,
+    },
+    // `incremental_vacuum(3)` prints three empty lines. The free count is
+    // greater than 3 in both engines, so the comparison prints 1. The second
+    // call, which frees every free page, has its lines sent to a file because
+    // their number is the number of free pages, which depends on the page size.
+    Case {
+        name: "prag.incremental.vacuum.rows",
+        kind: "pragma",
+        script: "PRAGMA auto_vacuum = INCREMENTAL;
+CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB);
+WITH RECURSIVE c(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM c WHERE a<2000) INSERT INTO t SELECT a, zeroblob(5000) FROM c;
+DELETE FROM t WHERE a > 100;
+SELECT 'x';
+PRAGMA incremental_vacuum(3);
+SELECT 'y';
+SELECT freelist_count > 3 FROM pragma_freelist_count;
+.output sink.txt
+PRAGMA incremental_vacuum(0);
+.output stdout
+PRAGMA freelist_count;
+SELECT count(*) FROM t;
+PRAGMA integrity_check;",
+        expect: Agrees,
+    },
+    // A rolled back `incremental_vacuum` moves nothing, and a committed one
+    // lowers `freelist_count` by the number of steps asked for.
+    Case {
+        name: "prag.incremental.vacuum.rollback",
+        kind: "pragma",
+        script: "PRAGMA auto_vacuum = INCREMENTAL;
+CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB);
+WITH RECURSIVE c(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM c WHERE a<2000) INSERT INTO t SELECT a, zeroblob(5000) FROM c;
+DELETE FROM t WHERE a > 100;
+CREATE TEMP TABLE m AS SELECT freelist_count AS n FROM pragma_freelist_count;
+BEGIN;
+PRAGMA incremental_vacuum(2);
+ROLLBACK;
+SELECT n = (SELECT freelist_count FROM pragma_freelist_count) FROM m;
+BEGIN;
+PRAGMA incremental_vacuum(2);
+COMMIT;
+SELECT n - 2 = (SELECT freelist_count FROM pragma_freelist_count) FROM m;",
+        expect: Agrees,
+    },
+    // A row with no columns prints as an empty line in list mode and as
+    // nothing in the modes that draw a frame around the cells.
+    Case {
+        name: "prag.incremental.vacuum.modes",
+        kind: "pragma",
+        script: "PRAGMA auto_vacuum = INCREMENTAL;
+CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB);
+WITH RECURSIVE c(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM c WHERE a<2000) INSERT INTO t SELECT a, zeroblob(5000) FROM c;
+DELETE FROM t WHERE a > 100;
+.mode list
+PRAGMA incremental_vacuum(2);
+SELECT 'list';
+.mode column
+PRAGMA incremental_vacuum(2);
+SELECT 'column';
+.mode box
+PRAGMA incremental_vacuum(2);
+SELECT 'box';
+.mode table
+PRAGMA incremental_vacuum(2);
+SELECT 'table';
+.mode markdown
+PRAGMA incremental_vacuum(2);
+SELECT 'markdown';
+.mode csv
+PRAGMA incremental_vacuum(2);
+SELECT 'csv';
+.mode json
+PRAGMA incremental_vacuum(2);
+SELECT 'json';",
+        expect: Agrees,
+    },
+    // In mode 0 and in mode 1 the pragma answers no rows.
+    Case {
+        name: "prag.incremental.vacuum.silent",
+        kind: "pragma",
+        script: "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB);
+WITH RECURSIVE c(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM c WHERE a<2000) INSERT INTO t SELECT a, zeroblob(5000) FROM c;
+DELETE FROM t WHERE a > 100;
+PRAGMA incremental_vacuum(1);
+SELECT 'mode 0';
+PRAGMA auto_vacuum = FULL;
+VACUUM;
+PRAGMA auto_vacuum;
+PRAGMA incremental_vacuum(1);
+SELECT 'mode 1';",
+        expect: Agrees,
+    },
+    // The limit is raised to the page count when it is lower, so
+    // `max_page_count = 1` stops all growth. That statement's own answer is
+    // the page count, which differs with the page size, so it goes to a file.
+    // The failing insert leaves the rows it found, and both engines print the
+    // same text at the same line.
+    Case {
+        name: "prag.max.page.count.full",
+        kind: "pragma",
+        script: "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB);
+INSERT INTO t VALUES(1, zeroblob(10));
+.output sink.txt
+PRAGMA max_page_count = 1;
+.output stdout
+WITH RECURSIVE c(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM c WHERE a<2000) INSERT INTO t SELECT a+10, zeroblob(5000) FROM c;
+SELECT count(*) FROM t;",
+        expect: Agrees,
+    },
+    // A value that is not a positive integer leaves the limit where it was.
+    Case {
+        name: "prag.max.page.count.zero",
+        kind: "pragma",
+        script: "CREATE TABLE t(a);
+INSERT INTO t VALUES(1);
+PRAGMA max_page_count = 1000;
+PRAGMA max_page_count = 0;
+PRAGMA max_page_count = -5;
+PRAGMA max_page_count = 'xyz';
+PRAGMA max_page_count;",
+        expect: Agrees,
+    },
+    // The statement that needs a page past the limit fails in both engines
+    // with `database or disk is full`, and the rows the earlier statements in
+    // the same transaction wrote are still there afterwards, in both.
+    Case {
+        name: "prag.max.page.count.statement.journal",
+        kind: "pragma",
+        script: "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB);
+INSERT INTO t VALUES(1, zeroblob(10));
+.output sink.txt
+PRAGMA max_page_count = 1;
+.output stdout
+BEGIN;
+INSERT INTO t VALUES(2, zeroblob(10));
+WITH RECURSIVE c(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM c WHERE a<2000) INSERT INTO t SELECT a+10, zeroblob(5000) FROM c;
+SELECT count(*) FROM t;
+COMMIT;
+SELECT count(*) FROM t;",
+        expect: Agrees,
+    },
     // A pragma neither engine has heard of is silent in both, which is the
     // parity the refusal rule must not break.
     Case {
@@ -2248,6 +2442,29 @@ SELECT sqlite_offset(a) FROM t;",
         // depending on the plan, so it is opaque to a caller either way; what
         // both engines agree on is that a column of a real table has an offset
         // and a literal does not.
+        expect: Differs,
+    },
+    Case {
+        name: "prag.max.page.count.transaction",
+        kind: "differs",
+        script: "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB);
+INSERT INTO t VALUES(1, zeroblob(10));
+.output sink.txt
+PRAGMA max_page_count = 1;
+.output stdout
+BEGIN;
+INSERT INTO t VALUES(2, zeroblob(5000000));
+COMMIT;
+SELECT count(*) FROM t;",
+        // A single row insert that needs a page past the limit fails in both
+        // with `database or disk is full`. SQLite then rolls the whole
+        // transaction back, so its `COMMIT` prints `cannot commit - no
+        // transaction is active`. This engine undoes only the failing
+        // statement and leaves the transaction open, so its `COMMIT` succeeds
+        // and prints nothing. The row count afterwards is 1 in both. The same
+        // choice is why `prag.max.page.count.statement.journal` agrees: SQLite
+        // keeps the transaction open when the statement used a statement
+        // journal, and this engine always does.
         expect: Differs,
     },
 ];

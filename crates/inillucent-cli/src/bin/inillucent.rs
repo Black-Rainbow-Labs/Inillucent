@@ -100,10 +100,7 @@ fn run() -> ExitCode {
     }
     let invocation = match split(&arguments) {
         Ok(invocation) => invocation,
-        Err(message) => {
-            eprintln!("{message}");
-            return ExitCode::from(2);
-        }
+        Err(message) => return usage_failure(&message, asked_for_json(&arguments), "inillucent"),
     };
     // **The key is installed before anything is opened.** See
     // `inillucent_cli::keys` for where it comes from and why a key is never a
@@ -124,7 +121,7 @@ fn run() -> ExitCode {
         if names_a_database(&verb) {
             return shell_like(&arguments);
         }
-        return unknown_verb(&verb);
+        return unknown_verb(&verb, invocation.json);
     };
     match command.name {
         // **The database the caller named has to reach the shell (task-1969,
@@ -203,20 +200,58 @@ fn names_a_database(word: &str) -> bool {
 /// ran, so there is no statement that could have failed.
 ///
 /// @param word - what was written where a command was expected
-fn unknown_verb(word: &str) -> ExitCode {
-    eprintln!("inillucent: '{word}' is not a command, and it does not name a database file.");
+/// @param as_json - whether the caller asked for JSON
+fn unknown_verb(word: &str, as_json: bool) -> ExitCode {
+    let mut lines = vec![format!(
+        "inillucent: '{word}' is not a command, and it does not name a database file."
+    )];
     let nearest = nearest_commands(word);
     if !nearest.is_empty() {
-        eprintln!("  Did you mean: {}?", nearest.join(", "));
+        lines.push(format!("  Did you mean: {}?", nearest.join(", ")));
     }
-    eprintln!(
+    lines.push(format!(
         "  Run 'inillucent help' for the {} commands there are.",
         command::COMMANDS.len()
-    );
-    eprintln!(
+    ));
+    lines.push(format!(
         "  To open a file of that name as a database, write it as a path: inillucent ./{word}"
-    );
+    ));
+    usage_failure(&lines.join("\n"), as_json, "inillucent")
+}
+
+/// Reports a command line nobody could act on, in the form the caller asked for.
+///
+/// **With `--output json` the failure is JSON, as every other failure is.** A
+/// script that asked for JSON and reads standard output was given a usage
+/// message on standard error and nothing on standard output, so parsing the
+/// output failed with a different error from the one that happened. The exit
+/// code stays 2: it means the command line was not one that could be run, which
+/// is a different thing from a command that ran and failed with 1.
+///
+/// @param message - what was wrong with the command line
+/// @param as_json - whether the caller asked for JSON
+/// @param command - the verb, or `inillucent` when there was none
+fn usage_failure(message: &str, as_json: bool, command: &str) -> ExitCode {
+    if as_json {
+        println!("{}", Failed::misuse(message).to_json(command).pretty(0));
+    } else {
+        eprintln!("{message}");
+    }
     ExitCode::from(2)
+}
+
+/// Reports whether the command line asks for JSON output, before it is parsed.
+///
+/// Parsing is what failed when this is needed, so the answer cannot come from
+/// the parsed invocation. `--json` and `--output json` both count.
+///
+/// @param arguments - the whole command line, program name removed
+fn asked_for_json(arguments: &[String]) -> bool {
+    arguments.iter().any(|argument| argument == "--json")
+        || arguments.windows(2).any(|pair| {
+            pair.first().map(String::as_str) == Some("--output")
+                && pair.get(1).map(String::as_str) == Some("json")
+        })
 }
 
 /// Returns the command names closest to a word somebody mistyped.
@@ -411,8 +446,8 @@ fn dispatch(command: &'static Command, invocation: &Invocation) -> ExitCode {
     let arguments = match collect(command, &invocation.rest) {
         Ok(arguments) => arguments,
         Err(message) => {
-            eprintln!("{message}\nUsage: {}", command.usage());
-            return ExitCode::from(2);
+            let said = format!("{message}\nUsage: {}", command.usage());
+            return usage_failure(&said, invocation.json, command.name);
         }
     };
     // **`create` and `migrate` open no session database.** Each writes the file
@@ -589,8 +624,8 @@ fn serve(invocation: &Invocation) -> ExitCode {
         ..mcp::Settings::default()
     };
     let input = std::io::BufReader::new(std::io::stdin());
-    let mut output = std::io::stdout();
-    match mcp::serve(settings, input, &mut output) {
+    let output = std::io::stdout();
+    match mcp::serve(settings, input, output) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("inillucent-mcp: {message}");

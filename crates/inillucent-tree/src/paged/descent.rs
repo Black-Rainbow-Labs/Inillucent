@@ -13,6 +13,7 @@ use inillucent_pool::page::{self, PageKind};
 use inillucent_pool::{PageGuard, PageId, Pool, Swip};
 
 use super::*;
+use crate::separator::{child_in, separator_full};
 
 impl PagedTree {
     /// Encodes a key tuple without allocating when it fits inline.
@@ -31,12 +32,18 @@ impl PagedTree {
             return KeyBytes::Inline(inline, 8);
         }
         if self.encoding == KeyEncoding::General {
+            // **Through `encode_into`, so a descending column is inverted here
+            // too.** This loop used to encode each column itself and left the
+            // directions out, so every write into a `DESC` index descended with
+            // an ascending key while the separators it compared against were
+            // inverted. The write landed in whatever leaf that comparison
+            // picked, and once an index had more than one leaf its keys stopped
+            // increasing along the leaf chain: `integrity_check` failed and an
+            // indexed `WHERE c = 3` counted 85 rows of 428.
             let mut scratch = self.scratch.borrow_mut();
             scratch.clear();
-            for (index, value) in values.iter().enumerate() {
-                let collation = self.collations.get(index).copied().unwrap_or_default();
-                key::encode_into_with(value, collation, &mut scratch);
-            }
+            self.encoding
+                .encode_into(values, &self.collations, &self.directions, &mut scratch);
             return KeyBytes::from_slice(&scratch);
         }
         KeyBytes::from_slice(&self.encoding.encode_ordered(
@@ -123,7 +130,7 @@ impl PagedTree {
                 if page::kind_of(&guard)? == PageKind::Leaf {
                     return Ok(Descent { steps, leaf: page });
                 }
-                InteriorRef::parse(&guard)?.child_for(key)?.0
+                child_in(pool, &InteriorRef::parse(&guard)?, key)?.0
             };
             steps.push((page, child));
             page = self.take_child(pool, page, child)?;
@@ -161,12 +168,12 @@ impl PagedTree {
                     return Ok((Descent { steps, leaf: page }, low, high));
                 }
                 let interior = InteriorRef::parse(&guard)?;
-                let child = interior.child_for(key)?.0;
+                let child = child_in(pool, &interior, key)?.0;
                 if let Some(below) = child.checked_sub(1) {
-                    low = Some(interior.key(below)?.to_vec());
+                    low = Some(separator_full(pool, &interior, below)?);
                 }
                 if child < interior.count() {
-                    high = Some(interior.key(child)?.to_vec());
+                    high = Some(separator_full(pool, &interior, child)?);
                 }
                 child
             };
@@ -222,7 +229,7 @@ impl PagedTree {
             }
             let (swip, at) = {
                 let interior = InteriorRef::parse(&guard)?;
-                let (_, swip, at) = interior.child_for(key)?;
+                let (_, swip, at) = child_in(pool, &interior, key)?;
                 (swip, at)
             };
             if let Some(seen) = observed {

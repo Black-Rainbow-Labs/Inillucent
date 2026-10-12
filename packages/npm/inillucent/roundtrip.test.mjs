@@ -20,10 +20,10 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 
-import { inillucent, open, query, resolveBinary } from './index.mjs';
+import { inillucent, open, query, resolveBinary, Session } from './index.mjs';
 
 /** Whether a binary can be found at all, decided once. */
 let available = true;
@@ -287,4 +287,164 @@ withDatabase('a one shot statement that is not a read leaves nothing on a kept c
     0,
     'the insert ran on the connection the next read used',
   );
+});
+
+/**
+ * Runs a body against the three ways a call reaches a database, each given a
+ * function that runs one query and answers its rows.
+ *
+ * The routes are the ones a caller cannot tell apart and must not be able to:
+ * the addon (the default), the `inillucent` program (a call with a `key`, which
+ * the addon cannot open), and an `inillucent-mcp` session (an `open()` with a
+ * `root`, which the server enforces). Each reads the same table, so a value
+ * that differs between them is a defect in one route.
+ *
+ * @param name - the test's name
+ * @param body - what to run, given `{ addon, program, server, session }`: three
+ *   functions `(sql, params) => rows` and the addon's `open()` session
+ */
+function everyRoute(name, body) {
+  withDatabase(name, async (db) => {
+    const key = `x'${'5a'.repeat(32)}'`;
+    const encrypted = `${db}.encrypted`;
+    const made = await inillucent('exec', { db: encrypted, key, sql: 'CREATE TABLE seed (a)' });
+    assert.equal(made.ok, true, made.message);
+    const server = await open(db, { root: dirname(db) });
+    const session = await open(db);
+    try {
+      await body({
+        addon: (sql, params) => query(sql, { db, params }),
+        program: (sql, params) => query(sql, { db: encrypted, key, params }),
+        server: (sql, params) => server.query(sql, { params }),
+        session: (sql, params) => session.query(sql, { params }),
+      });
+    } finally {
+      await server.close();
+      await session.close();
+    }
+  });
+}
+
+/**
+ * Settles a promise or fails the test after five seconds, because a call that
+ * never settles is the defect several of these cases exist to catch.
+ *
+ * @param promise - the call
+ */
+function within(promise) {
+  let timer;
+  const late = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('no answer in 5 seconds')), 5000);
+  });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+}
+
+everyRoute('an integer past 2^53 is a BigInt on every route', async (routes) => {
+  const sql =
+    'SELECT 9223372036854775807 AS big, -9223372036854775808 AS small, 9007199254740993 AS past, ' +
+    '9007199254740991 AS edge, 123456789012345678 AS wide, 42 AS plain, 1.5 AS real';
+  for (const [route, run] of Object.entries(routes)) {
+    const [row] = await run(sql, []);
+    assert.equal(row.big, 9223372036854775807n, `${route}: the largest integer`);
+    assert.equal(row.small, -9223372036854775808n, `${route}: the smallest integer`);
+    assert.equal(row.past, 9007199254740993n, `${route}: 2^53 + 1 was rounded`);
+    assert.equal(row.wide, 123456789012345678n, `${route}: an 18 digit integer was rounded`);
+    assert.equal(row.edge, 9007199254740991, `${route}: 2^53 - 1 is a number`);
+    assert.equal(row.plain, 42, `${route}: a small integer is a number`);
+    assert.equal(row.real, 1.5, `${route}: a real is a number`);
+  }
+});
+
+everyRoute('a BigInt parameter is accepted on every route and stored exactly', async (routes) => {
+  for (const [route, run] of Object.entries(routes)) {
+    for (const value of [9223372036854775807n, -9223372036854775808n, 7n]) {
+      const [row] = await run('SELECT ?1 AS v, typeof(?1) AS t', [value]);
+      assert.equal(row.t, 'integer', `${route}: ${value} was bound as ${row.t}`);
+      assert.equal(BigInt(row.v), value, `${route}: ${value} did not survive`);
+    }
+    await assert.rejects(
+      within(run('SELECT ?1', [9223372036854775808n])),
+      (why) => why.status === 'invalid_state',
+      `${route}: a BigInt past 64 bits was accepted`,
+    );
+  }
+});
+
+everyRoute('a parameter the addon refuses is refused on every route', async (routes) => {
+  const refused = {
+    date: new Date(0),
+    array: [1, 2],
+    object: { a: 1 },
+    function: () => 1,
+    symbol: Symbol('x'),
+    nan: Number.NaN,
+    infinity: Number.POSITIVE_INFINITY,
+    stringObject: new String('x'),
+    int8: new Int8Array([1]),
+    loneSurrogate: 'a\ud800b',
+  };
+  for (const [route, run] of Object.entries(routes)) {
+    for (const [kind, value] of Object.entries(refused)) {
+      await assert.rejects(
+        within(run('SELECT ?1', [value])),
+        (why) => why.status === 'invalid_state',
+        `${route}: a ${kind} parameter was accepted`,
+      );
+    }
+    const accepted = [null, undefined, true, 1, 1.5, -0, 'text', 7n, new Uint8Array([1]), Buffer.from('b')];
+    for (const value of accepted) {
+      const rows = await within(run('SELECT ?1 AS v', [value]));
+      assert.equal(rows.length, 1, `${route}: ${String(value)} was refused`);
+    }
+  }
+});
+
+everyRoute('text that is not UTF-8 comes back as bytes on every route', async (routes) => {
+  for (const [route, run] of Object.entries(routes)) {
+    const [row] = await run("SELECT CAST(x'61ff62' AS TEXT) AS v, 'ok' AS t", []);
+    assert.deepEqual([...row.v], [0x61, 0xff, 0x62], `${route}: the bytes did not come back as bytes`);
+    assert.ok(row.v instanceof Uint8Array, `${route}: ${typeof row.v}`);
+    assert.equal(row.t, 'ok');
+  }
+});
+
+everyRoute('a column named __proto__ is kept on every route', async (routes) => {
+  for (const [route, run] of Object.entries(routes)) {
+    const [row] = await run('SELECT 1 AS "__proto__", 2 AS other', []);
+    assert.equal(Object.hasOwn(row, '__proto__'), true, `${route}: the column was dropped`);
+    assert.equal(Object.getOwnPropertyDescriptor(row, '__proto__').value, 1, route);
+    assert.equal(row.other, 2, route);
+    assert.equal(Object.getPrototypeOf(row), Object.prototype, `${route}: the row's prototype changed`);
+  }
+});
+
+withDatabase('a reply with no id settles the calls that are waiting', async (db) => {
+  // The server answers with an error and a null id when it cannot read a request
+  // well enough to find its id. Written to it directly, because the wrapper now
+  // refuses a lone surrogate before sending one.
+  await inillucent('exec', { db, sql: 'CREATE TABLE seed (a)' });
+  const session = new Session(resolveBinary('inillucent-mcp'), ['--db', db], process.env);
+  try {
+    await session.ready;
+    const sent = '{"name":"inillucent_query","arguments":{"sql":"SELECT ?1","params":["a\\ud800b"],"output":"json"}}';
+    await assert.rejects(within(session.request('tools/call', null, sent)));
+    const after = await within(session.query('SELECT 1 AS v'));
+    assert.deepEqual(after, [{ v: 1 }], 'the session did not keep working after the refusal');
+  } finally {
+    await session.close();
+  }
+});
+
+withDatabase('a session with an integer past 2^53 in a result keeps every digit', async (db) => {
+  const session = await open(db, { root: dirname(db) });
+  try {
+    const result = await session.inillucent('query', { sql: 'SELECT 9007199254740993 AS v' });
+    assert.equal(result.ok, true, result.message);
+    assert.equal(result.rows[0][0], 9007199254740993n);
+    const quoted = await session.query("SELECT '9007199254740993' AS v, 9007199254740993 AS n");
+    assert.equal(quoted[0].v, '9007199254740993', 'a string of digits is still a string');
+    assert.equal(quoted[0].n, 9007199254740993n);
+  } finally {
+    await session.close();
+  }
 });

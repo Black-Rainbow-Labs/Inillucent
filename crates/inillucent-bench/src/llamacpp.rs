@@ -160,7 +160,7 @@ impl LlamaCppEmbedder {
             "search_document: offer eligibility is evaluated against the member profile",
             "search_document: fn compute_offer_eligibility(member_id: u64) -> Result<Vec<Offer>>",
             "search_document: PROJ-4821 blocked on the redemption service returning 502s",
-            "search_document: a much longer passage, repeated a few times over, so the              comparison covers a sequence long enough for a tokenizer to disagree about              where its pieces begin and end, and not only a single short sentence",
+            "search_document: a much longer passage, repeated a few times over, so the comparison covers a sequence long enough for a tokenizer to disagree about where its pieces begin and end, and not only a single short sentence",
         ];
         for text in samples {
             let local = self
@@ -185,7 +185,7 @@ impl LlamaCppEmbedder {
             let drift = (local as i64 - served as i64).abs();
             anyhow::ensure!(
                 drift <= 2,
-                "the tokenizer in the model directory counts {local} tokens where the server                  counts {served} for the same text. The batch budget is denominated in the                  server's tokens, so a disagreement this size overflows its physical batch on                  some request and fails the whole batch"
+                "the tokenizer in the model directory counts {local} tokens where the server counts {served} for the same text. The batch budget is denominated in the server's tokens, so a disagreement this size overflows its physical batch on some request and fails the whole batch"
             );
         }
         Ok(())

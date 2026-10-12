@@ -697,6 +697,26 @@ fn ntile(
     }
 }
 
+/// Returns the row distance a `lag` or `lead` offset names, or `None` when it names no row.
+///
+/// **A NULL offset and an offset with a fractional part match no row.** SQLite
+/// requires the offset to be an integer, so `lag(a, NULL)` and `lead(a, 1.5, 9)`
+/// answer the default (or NULL) for every row, where this used to read NULL as 0
+/// and 1.5 as 1. Text and blobs are read as numbers first, so `'1'` is 1 and
+/// `'x'` is 0, and `1.0` is the integer 1.
+///
+/// @param value - the offset argument's value for the row
+fn offset_distance(value: &Datum<'_>) -> Option<i64> {
+    match value {
+        Datum::Int(held) => Some(*held),
+        Datum::Null => None,
+        other => {
+            let number = real_of(other);
+            (number.is_finite() && number.fract() == 0.0).then_some(number as i64)
+        }
+    }
+}
+
 /// Computes `lag` or `lead`, which read the partition and ignore the frame.
 fn offset_row(
     rows: &[Vec<OwnedDatum>],
@@ -709,10 +729,11 @@ fn offset_row(
         return OwnedDatum::Null;
     };
     let offset = match call.arguments.get(1) {
-        Some(column) => integer_of(&value_at(rows, row, *column)),
-        None => 1,
+        Some(column) => offset_distance(&value_at(rows, row, *column)),
+        None => Some(1),
     };
-    match frames::offset_row(partition, row, offset, backwards) {
+    let reached = offset.and_then(|offset| frames::offset_row(partition, row, offset, backwards));
+    match reached {
         Some(target) => OwnedDatum::from_datum(&value_at(rows, target, *value_column)),
         // Off the end of the partition, so the default if one was written.
         None => match call.arguments.get(2) {
@@ -731,7 +752,20 @@ fn nth_wanted(rows: &[Vec<OwnedDatum>], call: &WindowCall, row: usize) -> DbResu
     let Some(column) = call.arguments.get(1) else {
         return Ok(0);
     };
-    Ok(checked_argument(&value_at(rows, row, *column), Argument::NthValue)? as usize)
+    Ok(whole_number(checked_argument(
+        &value_at(rows, row, *column),
+        Argument::NthValue,
+    )?))
+}
+
+/// Returns a checked window argument as a count.
+///
+/// @param number - an argument `checked_argument` accepted
+fn whole_number(number: frames::Number) -> usize {
+    match number {
+        frames::Number::Int(held) => held as usize,
+        frames::Number::Real(held) => held as usize,
+    }
 }
 
 /// Computes `first_value`, `last_value` or `nth_value` over a frame.
@@ -751,7 +785,10 @@ fn positional(
             let Some(column) = call.arguments.get(1) else {
                 return Ok(OwnedDatum::Null);
             };
-            let nth = checked_argument(&value_at(rows, row, *column), Argument::NthValue)? as usize;
+            let nth = whole_number(checked_argument(
+                &value_at(rows, row, *column),
+                Argument::NthValue,
+            )?);
             frame.get(nth.saturating_sub(1)).copied()
         }
         _ => None,
@@ -774,7 +811,14 @@ fn aggregate(
     row: usize,
     kind: AggregateKind,
 ) -> DbResult<OwnedDatum> {
-    let frame = frame_of(rows, call, partition, row)?;
+    let mut frame = frame_of(rows, call, partition, row)?;
+    // **A sliding `min` or `max` keeps the last of several equal values.** SQLite rebuilds such a
+    // frame row by row from its end, so over 0.0 and 0 the answer is the integer 0, where a
+    // frame that grows from `UNBOUNDED PRECEDING` keeps the first, 0.0.
+    let slides = !matches!(call.frame.start, FrameEnd::UnboundedPreceding);
+    if slides && matches!(kind, AggregateKind::Minimum | AggregateKind::Maximum) {
+        frame.reverse();
+    }
     let whole_rows = keeps_whole_rows(&kind);
     let mut accumulator = Accumulator::new(kind);
     // `min` and `max` over a frame compare the way they do over a group.
@@ -870,13 +914,21 @@ fn frame_spec(
 /// @param rows - the buffered input
 /// @param call - the window call
 /// @param member - the row
-fn order_value(rows: &[Vec<OwnedDatum>], call: &WindowCall, member: usize) -> Option<f64> {
+fn order_value(
+    rows: &[Vec<OwnedDatum>],
+    call: &WindowCall,
+    member: usize,
+) -> Option<frames::Number> {
     match call.order.first().map(|term| term.column) {
-        Some(column) => real_or_null(&value_at(rows, member, column)),
+        Some(column) => match value_at(rows, member, column) {
+            // An integer stays exact; a double would round every value past 2^53.
+            Datum::Int(held) => Some(frames::Number::Int(held)),
+            other => real_or_null(&other).map(frames::Number::Real),
+        },
         // No ordering term at all, so no `RANGE` offset can be resolved
         // against one. Every row reads alike, which is what the frame
         // arithmetic did before there was a NULL to tell apart.
-        None => Some(0.0),
+        None => Some(frames::Number::Int(0)),
     }
 }
 
@@ -917,7 +969,10 @@ fn resolve(
         }
     } else {
         frames::Bound::Offset {
-            distance: distance as i64,
+            distance: match distance {
+                frames::Number::Int(held) => held,
+                frames::Number::Real(held) => held as i64,
+            },
             preceding,
         }
     })
@@ -950,7 +1005,7 @@ enum Argument {
 ///
 /// @param value - the evaluated argument
 /// @param argument - which argument it is
-fn checked_argument(value: &Datum<'_>, argument: Argument) -> DbResult<f64> {
+fn checked_argument(value: &Datum<'_>, argument: Argument) -> DbResult<frames::Number> {
     let message = match argument {
         Argument::RowsStart => "frame starting offset must be a non-negative integer",
         Argument::RowsEnd => "frame ending offset must be a non-negative integer",
@@ -961,17 +1016,16 @@ fn checked_argument(value: &Datum<'_>, argument: Argument) -> DbResult<f64> {
     let range = matches!(argument, Argument::RangeStart | Argument::RangeEnd);
     let number = match inillucent_value::affinity::apply_numeric_affinity(Value::from(value), true)
     {
-        Value::Integer(held) => Some(held as f64),
-        Value::Real(held) if range || (held.fract() == 0.0 && held.abs() < 9.2e18) => Some(held),
+        Value::Integer(held) => Some(frames::Number::Int(held)),
+        Value::Real(held) if range || (held.fract() == 0.0 && held.abs() < 9.2e18) => {
+            Some(frames::Number::Real(held))
+        }
         _ => None,
     };
-    let floor = if argument == Argument::NthValue {
-        1.0
-    } else {
-        0.0
-    };
+    let floor = if argument == Argument::NthValue { 1 } else { 0 };
     match number {
-        Some(held) if held >= floor => Ok(held),
+        Some(frames::Number::Int(held)) if held >= floor => Ok(frames::Number::Int(held)),
+        Some(frames::Number::Real(held)) if held >= floor as f64 => Ok(frames::Number::Real(held)),
         _ => Err(inillucent_base::error::statement_refusal(message)),
     }
 }

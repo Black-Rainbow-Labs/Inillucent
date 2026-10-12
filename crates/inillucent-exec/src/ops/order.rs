@@ -260,8 +260,13 @@ impl Sink for Sort {
             // unaffected.
             let bytes = owned_row_bytes(&row);
             inillucent_base::budget::materialise(bytes)?;
+            // **The run threshold counts what the row occupies, not only its
+            // values (bug hunt 9).** A row is a `Vec` of 32 byte values plus a
+            // heap allocation per text, so three million rows of an integer and a
+            // short text held about 120 bytes each against the 18 counted, and a
+            // sort that was meant to write a run at 64 MiB peaked at 650 MiB.
+            self.held = self.held.saturating_add(resident_row_bytes(&row));
             self.rows.push(row);
-            self.held = self.held.saturating_add(bytes);
             // **Only when there is somewhere to put it.** A sort with no spill
             // file holds everything, exactly as it did before this existed.
             if self.held >= self.threshold && self.spill.is_some() {
@@ -936,13 +941,43 @@ mod spill_tests {
         assert_eq!(never, 0, "a sort with nowhere to spill wrote a run");
         assert!(
             runs > 1,
-            "the threshold was never reached, so this compared an in-memory sort against an              in-memory sort and proved nothing: {runs} run(s)"
+            "the threshold was never reached, so this compared an in-memory sort against an in-memory sort and proved nothing: {runs} run(s)"
         );
         assert_eq!(in_memory.len(), rows.len(), "the in-memory sort lost rows");
         assert_eq!(
             spilled, in_memory,
             "the spilled sort and the in-memory sort disagree"
         );
+    }
+
+    /// **A run is written when the rows occupy the threshold, not when their values do.**
+    ///
+    /// Ten thousand rows of an integer and a five byte text hold 130,000 bytes of values and
+    /// more than a megabyte of vectors and allocations. Counting only the values let a sort meant
+    /// to write a run at 64 MiB peak at 650 MiB over three million such rows (bug hunt 9). At a
+    /// threshold of 256 KiB the old count wrote no run here.
+    #[test]
+    fn the_run_threshold_counts_what_a_row_occupies() {
+        let keys = vec![SortKey {
+            column: 0,
+            descending: false,
+            collation: Collation::Binary,
+            nulls_first: true,
+        }];
+        let rows: Vec<Vec<OwnedDatum>> = (0..10_000i64)
+            .map(|n| {
+                vec![
+                    OwnedDatum::Int((n * 7919) % 10_007),
+                    OwnedDatum::Text(b"short".to_vec()),
+                ]
+            })
+            .collect();
+        let (spilled, runs) = sorted(&rows, &keys, Some(256 * 1024));
+        assert!(
+            runs > 1,
+            "{runs} run(s) for about a megabyte held under a 256 KiB threshold"
+        );
+        assert_eq!(spilled.len(), rows.len());
     }
 
     /// Descending and NULLs travel through the merge unchanged.

@@ -103,10 +103,17 @@ impl ImportedDatabase {
             rebuilt?;
             self.writing
                 .set_touched(self.writing.touched() | crate::schema_bit(at));
-        }
-        if !done.is_empty() {
+            // **The next index is rebuilt from the table as it is now.** An
+            // index on an expression is filled by running a query over the
+            // table, and that query may scan any index the table list names.
+            // The index just rebuilt has a new tree and its old one is
+            // released, so a list still holding the old root sent the next
+            // rebuild into "no layout imported for root page ..." (a table
+            // with a `UNIQUE` column and an expression index).
             self.rebuild_tables()?;
             self.refresh_catalog();
+        }
+        if !done.is_empty() {
             self.seal()?;
         }
         Ok(Outcome::empty())

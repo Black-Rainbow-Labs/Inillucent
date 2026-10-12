@@ -457,3 +457,51 @@ fn a_changed_byte_is_reported_as_damage() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A `FULL` delete on an encrypted file moves pages through the encrypting
+/// file layer: the file gives pages back, nothing is on the disk in plaintext
+/// afterwards, and the rows read back after a reopen with the key.
+#[test]
+fn a_full_delete_on_an_encrypted_file_gives_pages_back_and_keeps_every_row() {
+    let dir = directory("auto_vacuum_full");
+    let path = dir.join("full.rdb");
+    let database = open(&path, KEY_A);
+    run(&database, "PRAGMA auto_vacuum = FULL");
+    fill(&database);
+    run(
+        &database,
+        "CREATE TABLE junk (id INTEGER PRIMARY KEY, pad TEXT);
+         INSERT INTO junk (pad) SELECT hex(randomblob(400)) FROM generate_series(1, 3000);",
+    );
+    let integer = |sql: &str| match rows(&database, sql).first().and_then(|row| row.first()) {
+        Some(OwnedDatum::Int(n)) => *n,
+        other => panic!("{sql}: {other:?}"),
+    };
+    let before = integer("PRAGMA page_count");
+    run(&database, "DELETE FROM junk WHERE id > 10");
+    let after = integer("PRAGMA page_count");
+    assert!(
+        after < before,
+        "no page was given back: {before} then {after}"
+    );
+    assert_eq!(integer("PRAGMA freelist_count"), 0);
+    assert_eq!(count(&database).0, 200);
+    drop(database);
+    assert_no_plaintext(&dir);
+    let reopened = open(&path, KEY_A);
+    assert_eq!(count(&reopened).0, 200);
+    assert_eq!(integer_of(&reopened, "SELECT count(*) FROM junk"), 10);
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Returns the one integer a query answers.
+///
+/// @param database - the connection
+/// @param sql - a query returning one integer
+fn integer_of(database: &Database, sql: &str) -> i64 {
+    match rows(database, sql).first().and_then(|row| row.first()) {
+        Some(OwnedDatum::Int(n)) => *n,
+        other => panic!("{sql}: {other:?}"),
+    }
+}

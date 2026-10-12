@@ -163,15 +163,22 @@ impl Parser<'_> {
                 }
                 Some(b'/') if self.peek_at(1) == Some(b'*') => {
                     self.used_json5 = true;
+                    let opened = self.at;
                     self.at += 2;
                     while self.peek().is_some()
                         && !(self.peek() == Some(b'*') && self.peek_at(1) == Some(b'/'))
                     {
                         self.at += 1;
                     }
-                    if self.peek().is_some() {
-                        self.at += 2;
+                    if self.peek().is_none() {
+                        // **A comment that never closes is an error.** Leaving the `/` where it
+                        // is makes the parser meet a character no value starts with, so the
+                        // document fails, where it used to be accepted with the comment run to
+                        // the end of the text.
+                        self.at = opened;
+                        return;
                     }
+                    self.at += 2;
                 }
                 // JSON5 counts the Unicode space separators as whitespace.
                 Some(0xc2) if self.peek_at(1) == Some(0xa0) => {
@@ -580,6 +587,11 @@ impl Parser<'_> {
                 // JSON5's own escapes: a line continuation, `\0`, `\v`, `\'`
                 // and a two-digit hexadecimal byte.
                 b'\n' | b'\'' | b'0' | b'v' | b'\r' => {
+                    // `\0` may not be followed by a decimal digit, which would read as an
+                    // octal escape that JSON5 does not have.
+                    if escape == b'0' && self.peek_at(1).is_some_and(|byte| byte.is_ascii_digit()) {
+                        return Err(self.fail());
+                    }
                     needs_json5 = true;
                     self.at += 1;
                 }

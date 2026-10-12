@@ -193,6 +193,18 @@ impl Pool {
     ///
     /// @param page - the page about to be overwritten
     pub(super) fn journal_page(&self, page: PageId) -> DbResult<bool> {
+        self.journal_page_within(page, None)
+    }
+
+    /// [`Pool::journal_page`], given the file's length when the caller already has it.
+    ///
+    /// **For the fold's first pass (task-2226), which saves a pre image for every dirty page
+    /// and asked the file its length once for each.** Nothing writes the file during that pass,
+    /// so one answer stands for all of them.
+    ///
+    /// @param page - the page about to be overwritten
+    /// @param known - the file's length, or `None` to ask
+    pub(super) fn journal_page_within(&self, page: PageId, known: Option<u64>) -> DbResult<bool> {
         let mut journal = self.journal.borrow_mut();
         let Some(journal) = journal.as_mut() else {
             return Ok(false);
@@ -215,10 +227,13 @@ impl Pool {
         // has no pre-image because it has no image, and restoring it would mean
         // writing zeros over a page the transaction created.
         let offset = page.0.saturating_mul(self.page_size as u64);
-        let length = self
-            .file
-            .file_size()
-            .map_err(|error| error.into_db_error())?;
+        let length = match known {
+            Some(length) => length,
+            None => self
+                .file
+                .file_size()
+                .map_err(|error| error.into_db_error())?,
+        };
         if offset.saturating_add(self.page_size as u64) > length {
             return Ok(false);
         }

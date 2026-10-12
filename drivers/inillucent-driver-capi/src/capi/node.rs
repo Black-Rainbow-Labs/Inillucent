@@ -84,7 +84,37 @@ struct Napi {
         unsafe extern "C" fn(Opaque, unsafe extern "C" fn(*mut c_void), *mut c_void) -> i32,
     open_handle_scope: unsafe extern "C" fn(Opaque, *mut Opaque) -> i32,
     close_handle_scope: unsafe extern "C" fn(Opaque, Opaque) -> i32,
+    define_properties:
+        unsafe extern "C" fn(Opaque, Opaque, usize, *const PropertyDescriptor) -> i32,
 }
+
+/// `napi_property_descriptor`, which `napi_define_properties` reads.
+///
+/// Only `name`, `value` and `attributes` are set by this module. The rest are
+/// null, which Node reads as "this is a plain data property".
+#[repr(C)]
+struct PropertyDescriptor {
+    /// The name as C text; null when `name` is used.
+    utf8name: *const c_char,
+    /// The name as a JavaScript string.
+    name: Opaque,
+    /// A method, or null.
+    method: *mut c_void,
+    /// A getter, or null.
+    getter: *mut c_void,
+    /// A setter, or null.
+    setter: *mut c_void,
+    /// The value of a data property.
+    value: Opaque,
+    /// `napi_property_attributes`.
+    attributes: i32,
+    /// Data handed to the callbacks, or null.
+    data: *mut c_void,
+}
+
+/// `napi_default_jsproperty`: writable, enumerable and configurable, which is
+/// what assigning a property in JavaScript makes.
+const DEFAULT_PROPERTY: i32 = 1 | 2 | 4;
 
 /// The table, resolved once when Node first loads the addon.
 static NAPI: OnceLock<Option<Napi>> = OnceLock::new();
@@ -189,6 +219,7 @@ unsafe fn resolve() -> Option<Napi> {
         add_env_cleanup_hook: find!(c"napi_add_env_cleanup_hook"),
         open_handle_scope: find!(c"napi_open_handle_scope"),
         close_handle_scope: find!(c"napi_close_handle_scope"),
+        define_properties: find!(c"napi_define_properties"),
     })
 }
 
@@ -798,7 +829,7 @@ unsafe fn js_value(api: &Napi, env: Opaque, value: &Value) -> Opaque {
     let mut made = std::ptr::null_mut();
     let status = match value {
         Value::Null => (api.get_null)(env, &mut made),
-        Value::Integer(number) if number.abs() <= SAFE_INTEGER => {
+        Value::Integer(number) if number.unsigned_abs() <= SAFE_INTEGER as u64 => {
             (api.create_double)(env, *number as f64, &mut made)
         }
         Value::Integer(number) => (api.create_bigint_int64)(env, *number, &mut made),
@@ -960,6 +991,14 @@ unsafe fn result_of(
         };
     }
     let mut keys = Vec::with_capacity(rows.columns.len());
+    // **A column named `__proto__` is defined, not assigned.** `set_property`
+    // assigns, and assigning `__proto__` sets the object's prototype, so a
+    // number was ignored and the column was missing from the row. Defining it
+    // makes an own property, as `Object.fromEntries` does.
+    let proto_column = rows
+        .columns
+        .iter()
+        .position(|column| column.name == "__proto__");
     let mut columns = std::ptr::null_mut();
     ok!((api.create_array_with_length)(
         env,
@@ -1006,10 +1045,24 @@ unsafe fn result_of(
                 }
                 false => {
                     ok!((api.create_object)(env, &mut item));
-                    for (key, value) in keys.iter().zip(row) {
+                    for (column, (key, value)) in keys.iter().zip(row).enumerate() {
                         let made = js_value(api, env, value);
                         if made.is_null() {
                             return std::ptr::null_mut();
+                        }
+                        if proto_column == Some(column) {
+                            let property = PropertyDescriptor {
+                                utf8name: std::ptr::null(),
+                                name: *key,
+                                method: std::ptr::null_mut(),
+                                getter: std::ptr::null_mut(),
+                                setter: std::ptr::null_mut(),
+                                value: made,
+                                attributes: DEFAULT_PROPERTY,
+                                data: std::ptr::null_mut(),
+                            };
+                            ok!((api.define_properties)(env, item, 1, &property));
+                            continue;
                         }
                         ok!((api.set_property)(env, item, *key, made));
                     }

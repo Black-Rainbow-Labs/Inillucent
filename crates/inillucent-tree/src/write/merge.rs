@@ -70,7 +70,68 @@ impl<'p> Rows<'p> for Joined<'_, 'p> {
     }
 }
 
+/// Returns the fill a merge packs to.
+///
+/// **A leaf with no rows left merges at `TIGHT_FILL`.** `COMPACT_FILL` leaves
+/// a merged leaf room for the writes that follow, but the merge of an emptied
+/// leaf is only the right sibling's own rows, and a sibling an ascending insert
+/// or a bulk build packed to `BULK_FILL` is fuller than `COMPACT_FILL` allows.
+/// So the merge said "does not fit", the empty leaf stayed in the tree, and a
+/// table deleted from the front never gave a page back. The merge is logged with
+/// its whole image, so recovery installs the same bytes whatever fill made them.
+///
+/// @param emptied - whether the leaf the delete reached holds no live row
+fn merge_fill(emptied: bool) -> f64 {
+    match emptied {
+        true => super::TIGHT_FILL,
+        false => COMPACT_FILL,
+    }
+}
+
+/// How many leaves the record of failed merges may hold before it is emptied.
+const MOST_BACKED_OFF_LEAVES: usize = 4096;
+
 impl PagedTree {
+    /// Reports whether a leaf should skip a merge attempt because its last one failed and it
+    /// has lost less than an eighth of its live rows since.
+    ///
+    /// **Why an attempt is not repeated on every delete.** A leaf below half full tries to merge
+    /// on each delete, and an attempt packs both leaves. Deleting rows scattered over the
+    /// table (the children of one parent, where the keys of a parent's children are far apart)
+    /// leaves every leaf below half full for a long time, next to a sibling that is also part
+    /// empty and still too full to take it. 8,569 attempts failed for 50,000 deletes, and they
+    /// were most of the time. A merge that is delayed leaves a part empty leaf in place a
+    /// little longer and changes no row.
+    ///
+    /// @param page - the leaf the delete reached
+    /// @param live - how many live rows it holds now
+    pub(super) fn merge_backed_off(&self, page: PageId, live: usize) -> bool {
+        match self.merge_backoff.borrow().get(&page) {
+            Some(failed_at) => live.saturating_mul(8) > failed_at.saturating_mul(7),
+            None => false,
+        }
+    }
+
+    /// Records that a leaf failed to merge while holding `live` live rows.
+    ///
+    /// @param page - the leaf
+    /// @param live - how many live rows it held
+    pub(super) fn note_failed_merge(&self, page: PageId, live: usize) {
+        let mut held = self.merge_backoff.borrow_mut();
+        if held.len() >= MOST_BACKED_OFF_LEAVES {
+            held.clear();
+        }
+        held.insert(page, live);
+    }
+
+    /// Forgets a leaf's failed merge, because the leaf was rewritten or merged and is not the
+    /// leaf the record was made for.
+    ///
+    /// @param page - the leaf
+    pub(super) fn forget_failed_merge(&self, page: PageId) {
+        self.merge_backoff.borrow_mut().remove(&page);
+    }
+
     /// Returns the image a merge of a leaf and its right sibling installs, or
     /// nothing when their live rows do not fit one page.
     ///
@@ -131,10 +192,12 @@ impl PagedTree {
             self.columns().to_vec(),
             self.key_columns(),
         )?;
-        Ok(match builder.pack_all_rows(&joined, COMPACT_FILL)? {
-            Some(image) => FromPages::Image(image),
-            None => FromPages::TooBig,
-        })
+        Ok(
+            match builder.pack_all_rows(&joined, merge_fill(left_rows.is_empty()))? {
+                Some(image) => FromPages::Image(image),
+                None => FromPages::TooBig,
+            },
+        )
     }
 
     /// Packs two leaves through owned copies of their rows, with a spiller that
@@ -152,6 +215,7 @@ impl PagedTree {
         right: PageId,
     ) -> DbResult<Option<MergedImage>> {
         let (mut rows, mut carried) = self.rows_to_repack(database.pool(), page)?;
+        let emptied = rows.is_empty();
         let (right_rows, right_carried) = self.rows_to_repack(database.pool(), right)?;
         rows.extend(right_rows);
         carried.extend(right_carried);
@@ -171,18 +235,25 @@ impl PagedTree {
         // `split` gives: a spiller in the measure would write runs the encode
         // then writes again.
         let fits = matches!(
-            builder.pack_with(&borrowed, COMPACT_FILL, Some(&mut Measuring))?,
+            builder.pack_with(&borrowed, merge_fill(emptied), Some(&mut Measuring))?,
             Packed::Filled { rows: packed, .. } if packed == borrowed.len()
         );
         if !fits {
             return Ok(None);
         }
+        let owner_of = |row: usize| {
+            let held = borrowed.get(row);
+            held.map(|values| self.owner_key_of(values))
+                .unwrap_or_default()
+        };
         let mut spiller = crate::paged::Carrying {
             inner: crate::paged::Extender {
+                key_columns: self.key_columns(),
                 database,
                 log,
                 tree_id: self.tree_id(),
                 written: Vec::new(),
+                owner_of: &owner_of,
             },
             carried,
             used: Vec::new(),

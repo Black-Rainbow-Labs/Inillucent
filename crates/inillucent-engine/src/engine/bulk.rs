@@ -36,6 +36,8 @@ use inillucent_base::DbResult;
 use inillucent_catalog::paged::SchemaEntry;
 use inillucent_exec::dml::bulk::BulkRows;
 use inillucent_exec::dml::{self, Changes, Row};
+use inillucent_exec::insert_plan::RowSource;
+use inillucent_exec::packed::PackedRows;
 use inillucent_exec::physical::Params;
 use inillucent_pool::PageId;
 use inillucent_sql::catalog_view::{IndexInfo, TableInfo};
@@ -62,13 +64,55 @@ use crate::*;
 /// so the numbers moved by up to 40% between runs; the crossover did not.
 const BULK_FLOOR: usize = 1_024;
 
+/// The rows an `INSERT`'s source produced, one vector a row or packed.
+///
+/// Packed when the source is a `SELECT` the bulk build could take (task-2226); see
+/// [`PackedRows`]. The ordinary insert takes rows one vector each, so a packed set the bulk
+/// build declines is unpacked for it.
+pub(crate) enum Collected {
+    /// One vector a row.
+    Rows(Vec<Row>),
+    /// Every row in two vectors.
+    Packed(PackedRows),
+}
+
+impl Collected {
+    /// Returns how many rows there are.
+    fn len(&self) -> usize {
+        match self {
+            Collected::Rows(rows) => rows.len(),
+            Collected::Packed(packed) => packed.len(),
+        }
+    }
+
+    /// Reports whether there are none.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the rows one vector each, for the ordinary insert.
+    fn into_rows(self) -> Vec<Row> {
+        match self {
+            Collected::Rows(rows) => rows,
+            Collected::Packed(packed) => packed.into_rows(),
+        }
+    }
+}
+
+/// Lends each row of a packed set to the bulk build, in order.
+///
+/// @param packed - the rows
+fn packed_sources(packed: &PackedRows) -> impl Iterator<Item = RowSource<'_>> {
+    (0..packed.len()).map(move |row| RowSource::Packed(packed, row))
+}
+
 /// What [`ImportedDatabase::insert_in_bulk`] did with a statement.
 enum Bulk {
     /// The rows were built into the table, and this is what the statement
     /// reports.
     Done(Outcome),
     /// The statement takes the ordinary insert, with its rows given back.
-    Declined(Vec<Row>),
+    Declined(Collected),
 }
 
 /// One index tree, ready to be built.
@@ -85,27 +129,6 @@ struct IndexBuild {
     order: Vec<u32>,
 }
 
-/// A slice of owned rows, read by the leaf builder without a borrowed copy of
-/// each row.
-///
-/// `ALTER TABLE` makes a `Vec<Datum>` per row to hand the builder, which is
-/// one allocation per row. Here that would be 100,000 allocations on the path
-/// this module exists to make fast.
-struct OwnedRows<'r>(&'r [Row]);
-
-impl<'r> inillucent_tree::leaf::Rows<'r> for OwnedRows<'r> {
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    fn value(&self, row: usize, column: usize) -> Datum<'r> {
-        self.0
-            .get(row)
-            .and_then(|held| held.get(column))
-            .map_or(Datum::Null, OwnedDatum::borrow)
-    }
-}
-
 impl ImportedDatabase {
     /// Runs an `INSERT` whose rows are already in hand, through the bulk build
     /// when the statement allows it and through the ordinary insert otherwise.
@@ -119,12 +142,12 @@ impl ImportedDatabase {
         &mut self,
         statement: &BoundInsert,
         params: &Params,
-        rows: Vec<Row>,
+        rows: Collected,
         cache: Option<&dml::insert::cached::InsertCache>,
     ) -> DbResult<Outcome> {
         let rows = match self.insert_in_bulk(statement, params, rows)? {
             Bulk::Done(outcome) => return Ok(outcome),
-            Bulk::Declined(rows) => rows,
+            Bulk::Declined(rows) => rows.into_rows(),
         };
         self.write(
             params,
@@ -136,6 +159,21 @@ impl ImportedDatabase {
                 None => dml::insert(statement, target, params, &rows),
             },
         )
+    }
+
+    /// Reports whether the bulk build could take an insert's rows, asked before its source runs.
+    ///
+    /// The statement's shape and an empty target, the two questions `insert_in_bulk` asks
+    /// first; the row count it asks too is not known yet. A yes collects the source's rows
+    /// packed (task-2226).
+    ///
+    /// @param statement - the bound insert
+    pub(crate) fn bulk_could_take(&mut self, statement: &BoundInsert) -> DbResult<bool> {
+        if !dml::bulk::bulk_shape_with(statement, true) {
+            return Ok(false);
+        }
+        let txn = self.current_txn();
+        self.with_write_view(txn, |view| dml::bulk::bulk_target_ready(statement, view))
     }
 
     /// Builds an empty table's tree from an `INSERT ... SELECT`'s rows, when
@@ -156,7 +194,7 @@ impl ImportedDatabase {
         &mut self,
         statement: &BoundInsert,
         params: &Params,
-        rows: Vec<Row>,
+        rows: Collected,
     ) -> DbResult<Bulk> {
         if rows.len() < BULK_FLOOR || !dml::bulk::bulk_shape_with(statement, !rows.is_empty()) {
             return Ok(Bulk::Declined(rows));
@@ -167,16 +205,22 @@ impl ImportedDatabase {
         }
         let table = &statement.table;
         let (built, kept) = if dml::bulk::has_unique_index(table) {
-            let built = self.with_write_view(txn, |view| {
-                dml::bulk::bulk_rows(statement, view, params, rows.iter())
+            let built = self.with_write_view(txn, |view| match &rows {
+                Collected::Rows(held) => dml::bulk::bulk_rows(statement, view, params, held.iter()),
+                Collected::Packed(packed) => {
+                    dml::bulk::bulk_rows(statement, view, params, packed_sources(packed))
+                }
             });
             match built {
                 Ok(built) => (built, Some(rows)),
                 Err(_) => return Ok(Bulk::Declined(rows)),
             }
         } else {
-            let built = self.with_write_view(txn, |view| {
-                dml::bulk::bulk_rows(statement, view, params, rows)
+            let built = self.with_write_view(txn, |view| match rows {
+                Collected::Rows(held) => dml::bulk::bulk_rows(statement, view, params, held),
+                Collected::Packed(packed) => {
+                    dml::bulk::bulk_rows(statement, view, params, packed_sources(&packed))
+                }
             });
             match built {
                 Ok(built) => (built, None),
@@ -332,7 +376,7 @@ impl ImportedDatabase {
     fn replace_trees(
         &mut self,
         table: &TableInfo,
-        rows: &[Row],
+        rows: &PackedRows,
         indexes: Vec<IndexBuild>,
     ) -> DbResult<()> {
         let root = table.root;
@@ -351,7 +395,7 @@ impl ImportedDatabase {
             .ok_or_else(|| refusal("no layout for the table being built"))?;
         let mut handles = vec![root];
         self.release_tree(root)?;
-        self.build_tree_rows(root, columns, key_columns, layout, &OwnedRows(rows))?;
+        self.build_tree_rows(root, columns, key_columns, layout, &rows)?;
         for build in indexes {
             let IndexBuild {
                 root: handle,
@@ -431,7 +475,7 @@ fn project_entries(
     entries: &mut EntrySet,
     index: &IndexInfo,
     layout: &SourceLayout,
-    rows: &[Row],
+    rows: &PackedRows,
 ) -> DbResult<()> {
     let mut slots: Vec<usize> = Vec::with_capacity(index.columns.len().saturating_add(1));
     for key in &index.columns {
@@ -447,13 +491,9 @@ fn project_entries(
             .ok_or_else(|| refusal("an index on a table that identifies no row"))?,
     );
     let mut entry: Vec<Datum<'_>> = Vec::with_capacity(slots.len());
-    for row in rows {
+    for row in 0..rows.len() {
         entry.clear();
-        entry.extend(
-            slots
-                .iter()
-                .map(|slot| row.get(*slot).map_or(Datum::Null, OwnedDatum::borrow)),
-        );
+        entry.extend(slots.iter().map(|slot| rows.value(row, *slot)));
         entries.push(&entry);
     }
     Ok(())

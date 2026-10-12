@@ -441,7 +441,10 @@ impl Database {
     /// @param options - how to open it
     pub fn open_with(path: impl AsRef<Path>, options: OpenOptions) -> Result<Database> {
         let path = path.as_ref().to_path_buf();
-        if !options.create && !inillucent_engine::connect::is_a_file(&path) {
+        // **A read only open never creates**, so a missing file is `NotFound`
+        // whether or not `create` was also set. Without the second condition the
+        // engine's own refusal reached the caller classified as `syntax`.
+        if (!options.create || options.read_only) && !inillucent_engine::connect::is_a_file(&path) {
             return Err(Error::said(
                 Status::NotFound,
                 format!("there is no database at {}.", path.display()),
@@ -903,6 +906,55 @@ impl Connection<'_> {
         self.engine
             .execute_batch(sql)
             .map_err(|error| self.database.classify(&error))
+    }
+
+    /// Refuses text that holds a second statement after the first.
+    ///
+    /// **`query` and `prepare` compile the first statement of the text and
+    /// ignore the rest**, so `INSERT ...; INSERT ...; garbage` ran one insert and
+    /// reported success. Python's `sqlite3` refuses it with "You can only
+    /// execute one statement at a time", and the bindings call this to do the
+    /// same. [`Connection::execute_batch`] is the call for several statements.
+    ///
+    /// Text with no `;` before its last statement cannot hold two, so the common
+    /// case costs one scan and no parse. Only text with a `;` inside it asks the
+    /// parser where the first statement ends, which is the same boundary
+    /// `execute_batch` splits on, so a trigger body with semicolons in it is one
+    /// statement here.
+    ///
+    /// @param sql - the text a caller handed to run as one statement
+    pub fn refuse_extra_statements(&self, sql: &str) -> Result<()> {
+        let body = sql.trim_end_matches(|c: char| c.is_whitespace() || c == ';');
+        if !body.contains(';') {
+            return Ok(());
+        }
+        let first = self
+            .engine
+            .prepare_with_tail(sql)
+            .map_err(|error| self.database.classify(&error))?;
+        let rest = sql.get(first.consumed..).unwrap_or("");
+        let skipped = inillucent_engine::connect::leading_trivia(rest);
+        if rest.get(skipped..).is_some_and(|tail| !tail.is_empty()) {
+            return Err(Error::said(
+                Status::InvalidState,
+                "this call runs one statement and the text holds more than one; use execute_batch to \
+                 run several.",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Runs one statement, refusing text that holds more than one.
+    ///
+    /// The call the C library's `execute` makes, so every binding gets the
+    /// refusal [`Connection::refuse_extra_statements`] describes.
+    ///
+    /// @param sql - the statement
+    /// @param params - the values bound to `?1`, `?2`, ...
+    /// @param limit - how many rows to hand back
+    pub fn query_one(&self, sql: &str, params: &[Value], limit: usize) -> Result<Rows> {
+        self.refuse_extra_statements(sql)?;
+        self.query(sql, params, limit)
     }
 
     /// Compiles a statement so it can be run more than once.

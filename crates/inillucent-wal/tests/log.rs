@@ -456,11 +456,11 @@ fn concurrent_committers_share_one_write_and_one_sync() {
     let write_count = writes.load(Ordering::SeqCst) - base_writes;
     assert_eq!(
         sync_count, 1,
-        "{threads} committers with everything already buffered took {sync_count} syncs,          which is not a group commit"
+        "{threads} committers with everything already buffered took {sync_count} syncs, which is not a group commit"
     );
     assert_eq!(
         write_count, 1,
-        "{threads} committers with everything already buffered took {write_count} writes,          which is not a group commit"
+        "{threads} committers with everything already buffered took {write_count} writes, which is not a group commit"
     );
     // Everything every thread committed is durable when the last one returns.
     assert_eq!(wal.durable_end(), wal.next_lsn());
@@ -858,5 +858,108 @@ fn the_open_segments_tail_follows_the_file_and_not_the_handle() {
         buffered.next_lsn, settled.next_lsn,
         "the tail moved for a record that is still in this handle's buffer, so it is reading the \
          handle rather than the file"
+    );
+}
+
+/// A roll by another writer shows as the next segment existing, though the
+/// segment this handle has open keeps the length it saw.
+///
+/// A connection asked only that length whether another process had committed,
+/// and a roll leaves it unchanged. One process checkpointed from pages that did
+/// not hold the commits another had made in the next segment, and they were
+/// lost: about one run in 150 of the bug hunt's crash scenario with a
+/// checkpointer beside four writers.
+#[test]
+fn a_roll_by_another_writer_shows_as_the_next_segment() {
+    let (vfs, path, other) = fresh(WalOptions::default());
+    other
+        .append(
+            1,
+            Body::InsertRow {
+                tree: 1,
+                page: 10,
+                row: b"a row",
+            },
+        )
+        .expect("a record");
+    other.commit(1, 1).expect("a commit");
+    let seen = other.next_lsn();
+    let this = Wal::open(
+        Arc::clone(&vfs),
+        &path,
+        0xABCD,
+        seen,
+        1,
+        WalOptions::default(),
+    )
+    .expect("a second handle on the same log");
+    assert!(
+        !this.next_segment_exists().expect("asked"),
+        "nothing has rolled yet"
+    );
+    assert!(
+        other.roll_segment().expect("the roll"),
+        "the other writer rolls"
+    );
+    other
+        .append(
+            2,
+            Body::InsertRow {
+                tree: 1,
+                page: 11,
+                row: b"a row",
+            },
+        )
+        .expect("a record");
+    other.commit(2, 2).expect("a commit in the next segment");
+    let tail = this.tail_of_open_segment().expect("the tail");
+    assert_eq!(
+        (tail.sequence, tail.next_lsn),
+        (1, this.written_end()),
+        "the open segment's length shows nothing"
+    );
+    assert!(
+        this.next_segment_exists().expect("asked"),
+        "the next segment shows the roll"
+    );
+}
+
+/// A segment another database left at the next name is not a roll.
+///
+/// The check above first asked only whether the next name existed. A database
+/// created again at a path whose old log was not removed then found the old
+/// database's second segment there, and every write after it was refused as a
+/// stale read. The full gate re-imports its fixture over the same path each
+/// round and stopped in its second round on this.
+#[test]
+fn a_segment_left_by_another_database_is_not_a_roll() {
+    let (vfs, path, old) = fresh(WalOptions::default());
+    old.append(
+        1,
+        Body::InsertRow {
+            tree: 1,
+            page: 10,
+            row: b"a row",
+        },
+    )
+    .expect("a record");
+    old.commit(1, 1).expect("a commit");
+    assert!(
+        old.roll_segment().expect("the roll"),
+        "the old database rolls"
+    );
+    drop(old);
+    let new = Wal::open(
+        Arc::clone(&vfs),
+        &path,
+        0x1234,
+        FIRST_LSN,
+        1,
+        WalOptions::default(),
+    )
+    .expect("a new database's log over the old one's");
+    assert!(
+        !new.next_segment_exists().expect("asked"),
+        "the old database's second segment is not this log rolling"
     );
 }

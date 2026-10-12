@@ -578,6 +578,59 @@ impl ImportedDatabase {
         drop(held);
         Ok(physical::run_any_prepared(plan, self, prepared, params)?.0)
     }
+
+    /// [`ImportedDatabase::run_cached_query`] for an `INSERT ... SELECT` the bulk build can
+    /// take, collecting into packed rows when the chain is compiled.
+    ///
+    /// The slot is tried and remembered exactly as `run_cached_query` does. A query that has
+    /// no compiled chain, or whose chain is in use, answers rows one vector each, as before
+    /// (task-2226).
+    ///
+    /// @param plan - the planner's output
+    /// @param prepared - the structural choice `prepare` made
+    /// @param slot - this query's compiled chain cache
+    /// @param params - the bound parameters
+    pub(crate) fn run_cached_query_packed(
+        &self,
+        plan: &PhysicalPlan,
+        prepared: &physical::Prepared,
+        slot: &std::cell::RefCell<physical::Slot>,
+        params: &Params,
+    ) -> DbResult<crate::engine::bulk::Collected> {
+        use crate::engine::bulk::Collected;
+        let Ok(mut held) = slot.try_borrow_mut() else {
+            let rows = physical::run_any_prepared(plan, self, prepared, params)?.0;
+            return Ok(Collected::Rows(rows));
+        };
+        if let physical::Slot::Reusable(compiled) = &*held {
+            if !compiled.built_under(params) {
+                *held = physical::Slot::Untried;
+            }
+        }
+        match &mut *held {
+            physical::Slot::Reusable(compiled) => {
+                return compiled
+                    .run_packed(plan, self, params)
+                    .map(Collected::Packed);
+            }
+            physical::Slot::Never => {}
+            physical::Slot::Untried => match physical::try_compile(plan, self, prepared, params)? {
+                Some(mut compiled) => {
+                    let packed = compiled.run_packed(plan, self, params)?;
+                    *held = if compiled.rebindable() {
+                        physical::Slot::Reusable(Box::new(compiled))
+                    } else {
+                        physical::Slot::Never
+                    };
+                    return Ok(Collected::Packed(packed));
+                }
+                None => *held = physical::Slot::Never,
+            },
+        }
+        drop(held);
+        let rows = physical::run_any_prepared(plan, self, prepared, params)?.0;
+        Ok(Collected::Rows(rows))
+    }
 }
 
 /// A plan and structural choice compiled once and reused through a slot - the

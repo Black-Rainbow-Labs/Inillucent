@@ -288,18 +288,88 @@ pub struct Database {
     /// across attached files and an exclusive connection keep the stronger lock
     /// they were built on.
     reserved_writes: bool,
+    /// The most pages `PRAGMA max_page_count` lets the file grow to; see
+    /// [`Database::set_max_page_count`].
+    max_page_count: u64,
     /// When this connection last took SHARED the ordinary way, for as long as
     /// it holds the file; see [`crate::lease::MOST`].
     held_since: Option<std::time::Instant>,
 }
 
+mod shrink;
+pub use shrink::MapMove;
+
 impl Database {
-    /// Creates a fresh, empty database.
+    /// Creates a fresh, empty database, replacing whatever the file held.
     ///
     /// @param vfs - the file system to create in
     /// @param path - where to create it
     /// @param options - the page size and pool size
     pub fn create(vfs: &dyn Vfs, path: &DbPath, options: Options) -> DbResult<Database> {
+        Self::create_within(vfs, path, options, false, false)?
+            .ok_or_else(|| misuse("a create that may replace a file declined to"))
+    }
+
+    /// Creates a fresh, empty database in a file that is missing or empty, and
+    /// creates nothing when the file already holds anything.
+    ///
+    /// **For an open that found nothing to open.** Two processes that both
+    /// found no database both get here. The second one waits for the exclusive
+    /// lock the first one holds while it writes, finds the database the first
+    /// one wrote, and answers `None` so its caller opens that database.
+    /// [`Database::create`] would truncate it, and with it every row the first
+    /// process had committed.
+    ///
+    /// @param vfs - the file system to create in
+    /// @param path - where to create it
+    /// @param options - the page size and pool size
+    pub fn create_if_empty(
+        vfs: &dyn Vfs,
+        path: &DbPath,
+        options: Options,
+    ) -> DbResult<Option<Database>> {
+        Self::create_within(vfs, path, options, true, false)
+    }
+
+    /// [`Database::create`] or [`Database::create_if_empty`], still holding the
+    /// file exclusively when it returns.
+    ///
+    /// **For a caller that writes the catalog before anybody may read the file.**
+    /// The two meta pages written here name no catalog tree, and the caller
+    /// writes one and then calls [`Database::finish_new_file`], which lets the
+    /// lock go. Let go here instead, another process that opened the path in
+    /// between read a database with no catalog and failed every statement with
+    /// "the database has no catalog tree": one shell in about 15 under load in
+    /// `durability::process_create`, and on the Linux CI runner unloaded.
+    ///
+    /// @param vfs - the file system to create in
+    /// @param path - where to create it
+    /// @param options - the page size and pool size
+    /// @param only_if_empty - whether a file that already holds bytes is left as it is
+    pub fn create_held(
+        vfs: &dyn Vfs,
+        path: &DbPath,
+        options: Options,
+        only_if_empty: bool,
+    ) -> DbResult<Option<Database>> {
+        Self::create_within(vfs, path, options, only_if_empty, true)
+    }
+
+    /// Creates a fresh, empty database: the body of [`Database::create`],
+    /// [`Database::create_if_empty`] and [`Database::create_held`].
+    ///
+    /// @param vfs - the file system to create in
+    /// @param path - where to create it
+    /// @param options - the page size and pool size
+    /// @param only_if_empty - whether a file that already holds bytes is left as it is
+    /// @param hold - whether the exclusive lock is kept for the caller to let go
+    fn create_within(
+        vfs: &dyn Vfs,
+        path: &DbPath,
+        options: Options,
+        only_if_empty: bool,
+        hold: bool,
+    ) -> DbResult<Option<Database>> {
         let file = vfs
             .open(path, OpenOptions::main_db())
             .map_err(|error| error.into_db_error())?;
@@ -308,9 +378,16 @@ impl Database {
         // record at all - so a second process reading it reports corruption
         // rather than waiting. Holding the file until the two meta pages exist
         // is what turns that race into a wait.
-        wait_for_lock(file.as_ref(), FileLock::Shared)?;
-        wait_for_lock(file.as_ref(), FileLock::Reserved)?;
-        wait_for_lock(file.as_ref(), FileLock::Exclusive)?;
+        //
+        // **A file another process has already written is found under SHARED.**
+        // Asking under EXCLUSIVE made a late process wait for every reader to
+        // let go, and with seven other processes reading and writing it waited
+        // out the whole busy timeout only to learn it had nothing to create.
+        // The question is asked again under EXCLUSIVE, because another process
+        // can write the file between the two locks.
+        if !take_the_file_to_create(file.as_ref(), only_if_empty)? {
+            return Ok(None);
+        }
         file.truncate(0).map_err(|error| error.into_db_error())?;
         let mut uuid = [0u8; 16];
         vfs.randomness(&mut uuid)
@@ -340,6 +417,7 @@ impl Database {
             replayed_by_its_owner: false,
             trusted: false,
             reserved_writes: false,
+            max_page_count: DEFAULT_MAX_PAGE_COUNT,
             held_since: None,
         };
         let mut next = FIRST_DATA_PAGE.0;
@@ -361,9 +439,12 @@ impl Database {
         // process to read; keeping it would make creating a database and then
         // opening it a deadlock with itself, which is what the pool's own tests
         // do. The connection takes whatever lock it needs at its first
-        // statement, exactly as an opened one does.
-        database.pool.unlock(FileLock::None)?;
-        Ok(database)
+        // statement, exactly as an opened one does. A caller that asked to hold
+        // it lets it go in `finish_new_file`.
+        if !hold {
+            database.pool.unlock(FileLock::None)?;
+        }
+        Ok(Some(database))
     }
 
     /// Opens an existing database.
@@ -386,6 +467,7 @@ impl Database {
             replayed_by_its_owner: false,
             trusted: false,
             reserved_writes: false,
+            max_page_count: DEFAULT_MAX_PAGE_COUNT,
             held_since: None,
         })
     }
@@ -426,6 +508,7 @@ impl Database {
             replayed_by_its_owner: false,
             trusted: false,
             reserved_writes: false,
+            max_page_count: DEFAULT_MAX_PAGE_COUNT,
             held_since: None,
         })
     }
@@ -478,6 +561,7 @@ impl Database {
             replayed_by_its_owner: false,
             trusted: false,
             reserved_writes: false,
+            max_page_count: DEFAULT_MAX_PAGE_COUNT,
             held_since: None,
         })
     }
@@ -641,12 +725,17 @@ impl Database {
     }
 
     /// Reports whether the file is longer than the pages the meta record
-    /// counts, which is what [`Database::give_back_the_unclaimed_tail`] trims.
+    /// counts, which is what [`Database::trim_to_page_count`] trims.
     ///
     /// One length query, with no lock: asked first, so that an open of a file
     /// with no unclaimed tail, which is nearly every open, does not take the
     /// write lock and read the meta again to find nothing to trim (task-2191).
     pub fn has_an_unclaimed_tail(&self) -> DbResult<bool> {
+        // A tail left by a lowered page count is the checkpoint's to cut, not the
+        // open's: the log may still name those pages.
+        if self.cut_is_pending() {
+            return Ok(false);
+        }
         let wanted = self
             .pool
             .page_count()
@@ -680,7 +769,7 @@ impl Database {
     /// `a_recovered_database_is_no_longer_than_its_header_says`, which crashes
     /// at every call of a growing transaction and measures the file against its
     /// own header (task-1980).
-    pub fn give_back_the_unclaimed_tail(&mut self) -> DbResult<()> {
+    pub fn trim_to_page_count(&mut self) -> DbResult<()> {
         let wanted = self
             .pool
             .page_count()
@@ -801,6 +890,28 @@ impl Database {
     /// Returns the pool, for a reader that wants a page.
     pub fn pool(&self) -> &Pool {
         &self.pool
+    }
+
+    /// Raises the format version the next meta record will say, and reports
+    /// whether it was raised.
+    ///
+    /// Nothing lowers it. A file that once held a key stored out of line stays at
+    /// the higher number, because lowering it would need a walk of every page. The
+    /// caller that gets `true` writes the log record that makes the move survive a
+    /// crash; see `inillucent_tree::write::require_format`.
+    ///
+    /// @param wanted - the version the file has to say
+    pub fn raise_format(&mut self, wanted: u32) -> bool {
+        if self.meta.format >= wanted {
+            return false;
+        }
+        self.meta.format = wanted;
+        true
+    }
+
+    /// Returns the format version the next meta record will say.
+    pub fn format(&self) -> u32 {
+        self.meta.format
     }
 
     /// Returns the meta record as it currently stands.
@@ -950,7 +1061,29 @@ impl Database {
         self.meta.uuid
     }
 
+    /// Returns the most pages the file may grow to.
+    pub fn max_page_count(&self) -> u64 {
+        self.max_page_count
+    }
+
+    /// Sets the most pages the file may grow to, which `PRAGMA max_page_count`
+    /// asks for.
+    ///
+    /// Enforced by [`Database::allocate`], which every page any part of the
+    /// engine takes comes through: a split, an extent, a bulk build, the free
+    /// map's own growth. Recovery's [`Database::claim`] does not check it,
+    /// because a committed transaction has to replay.
+    ///
+    /// @param limit - the ceiling in pages
+    pub fn set_max_page_count(&mut self, limit: u64) {
+        self.max_page_count = limit;
+    }
+
     /// Allocates a contiguous run of pages, growing the file if it must.
+    ///
+    /// Refuses with SQLite's `SQLITE_FULL` when the file would grow past
+    /// [`Database::max_page_count`], before anything is taken. The refusal rolls
+    /// the transaction back, as it does in SQLite.
     ///
     /// @param count - how many pages are wanted
     pub fn allocate(&mut self, count: u64) -> DbResult<PageId> {
@@ -958,8 +1091,14 @@ impl Database {
             return Err(misuse("an allocation of no pages"));
         }
         if let Some(page) = self.free.allocate_run(count)? {
-            self.pool
-                .set_page_count(self.pool.page_count().max(page.0.saturating_add(count)));
+            let end = self.pool.page_count().max(page.0.saturating_add(count));
+            if end > self.max_page_count {
+                // A run past the file's end, which the map describes but the
+                // file does not yet hold: taking it grows the file.
+                self.release(page, count)?;
+                return Err(file_is_full());
+            }
+            self.pool.set_page_count(end);
             return Ok(page);
         }
         // The map has no run that long, so the file grows. Growing the map
@@ -970,6 +1109,9 @@ impl Database {
             .max(self.free.described_pages())
             .max(FIRST_DATA_PAGE.0);
         let wanted = next.saturating_add(count);
+        if wanted > self.max_page_count {
+            return Err(file_is_full());
+        }
         self.free.ensure(wanted, &mut next)?;
         self.pool.set_page_count(next);
         let page = self
@@ -1028,6 +1170,23 @@ impl Database {
     ///
     /// Returns whether the cache was thrown away, which the caller reports.
     pub fn begin_read(&mut self) -> DbResult<bool> {
+        self.begin_read_unless(|| false)
+    }
+
+    /// Takes SHARED like [`Database::begin_read`], and skips the read of the meta record when
+    /// `unmoved`, asked once the lock is held, answers that nothing outside this process can have
+    /// moved it.
+    ///
+    /// **For the engine's quiet token (task-2226).** The meta record moves only at a fold, which
+    /// needs EXCLUSIVE, so nothing moves it while this connection holds SHARED; and a fold by
+    /// another process before the lock was taken opened the log segment this process holds the
+    /// oplock on. The question is asked after the lock is held for that reason: a fold that
+    /// lands between an earlier look and the lock is still seen. Reading the record was two
+    /// 116 byte reads, about 5 us on the development machine, for every statement that took the
+    /// lock fresh.
+    ///
+    /// @param unmoved - answers whether the record is known not to have moved
+    pub fn begin_read_unless(&mut self, unmoved: impl FnOnce() -> bool) -> DbResult<bool> {
         self.take_back_lease();
         // **Already holding the file means nothing has changed under it.**
         // Another process can only have written while this one held no lock, so
@@ -1057,6 +1216,9 @@ impl Database {
         // changes the answer.
         wait_for_lock_within(self.pool.file(), FileLock::Shared, self.busy_millis)?;
         self.held_since = Some(std::time::Instant::now());
+        if unmoved() {
+            return Ok(false);
+        }
         self.reload_if_moved()
     }
 
@@ -1174,9 +1336,10 @@ impl Database {
             let _ = self.pool.unlock(FileLock::None);
             std::thread::sleep(std::time::Duration::from_millis(pause));
             waited = waited.saturating_add(pause);
-            // Jittered, so two writers that started together do not keep
-            // colliding on the same schedule for ever.
-            pause = pause.saturating_mul(2).min(50).saturating_add(waited % 3);
+            // Short once it has grown, so this waiter keeps its turn against a
+            // process that has only just begun to want the lock; see
+            // `crate::busy::next_busy_pause`.
+            pause = crate::busy::next_busy_pause(pause, waited);
         }
     }
 
@@ -1677,6 +1840,11 @@ impl Database {
         self.pool.finish_new_file(&mut meta)?;
         self.meta = meta;
         self.disk_meta = meta;
+        // The file is whole now, so a create that held it lets it go; see
+        // `Database::create_held`.
+        if self.pool.lock_level() > FileLock::None {
+            self.pool.unlock(FileLock::None)?;
+        }
         Ok(())
     }
 
@@ -1811,7 +1979,7 @@ fn read_free_map(pool: &Pool, head: PageId) -> DbResult<FreeMap> {
     while !next.is_none() {
         if !seen.insert(next) {
             return Err(corrupt(
-                "a free map chain that does not terminate: it returns to a page it has already                  read",
+                "a free map chain that does not terminate: it returns to a page it has already read",
             ));
         }
         if seen.len() as u64 > pool.page_count().max(1) {
@@ -1828,6 +1996,63 @@ fn read_free_map(pool: &Pool, head: PageId) -> DbResult<FreeMap> {
         next = after;
     }
     Ok(free)
+}
+
+/// Takes a file exclusively to write a new database into it, or reports that
+/// another process has already written one there.
+///
+/// Returns `true` holding EXCLUSIVE, or `false` holding nothing when
+/// `only_if_empty` is set and the file holds bytes.
+///
+/// **A creator that cannot have RESERVED lets go of SHARED before it tries
+/// again.** Several processes opening one missing path all find it empty
+/// under SHARED. One takes RESERVED and waits for every SHARED to leave so it
+/// can take EXCLUSIVE; the rest, waiting for RESERVED while still holding
+/// SHARED, kept it waiting, and every one of them failed with `busy` after the
+/// whole busy timeout. Each time a creator holds SHARED again it asks the size
+/// again, so it finds the database the winner wrote and creates nothing.
+///
+/// @param file - the database file, open and unlocked
+/// @param only_if_empty - whether a file that already holds bytes is left as it is
+fn take_the_file_to_create(
+    file: &dyn inillucent_vfs::VfsFile,
+    only_if_empty: bool,
+) -> DbResult<bool> {
+    let written = || -> DbResult<bool> {
+        Ok(only_if_empty && file.file_size().map_err(|error| error.into_db_error())? > 0)
+    };
+    let let_go = || {
+        file.unlock(FileLock::None)
+            .map_err(|error| error.into_db_error())
+    };
+    let budget = default_busy_millis();
+    let mut waited = 0u64;
+    let mut pause = 1u64;
+    loop {
+        wait_for_lock(file, FileLock::Shared)?;
+        if written()? {
+            let_go()?;
+            return Ok(false);
+        }
+        if file.lock(FileLock::Reserved).is_ok() {
+            break;
+        }
+        let_go()?;
+        if waited >= budget {
+            return Err(file_is_busy(file, FileLock::Reserved, waited, budget));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(pause));
+        waited = waited.saturating_add(pause);
+        pause = crate::busy::next_busy_pause(pause, waited);
+    }
+    wait_for_lock(file, FileLock::Exclusive)?;
+    // Another process can have written the file between this process's last
+    // look under SHARED and its RESERVED.
+    if written()? {
+        let_go()?;
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Takes a lock on a file, waiting for whoever holds it to finish.
@@ -1868,8 +2093,24 @@ fn wait_for_lock_within(
         }
         std::thread::sleep(std::time::Duration::from_millis(pause));
         waited = waited.saturating_add(pause);
-        pause = pause.saturating_mul(2).min(50);
+        pause = crate::busy::next_busy_pause(pause, waited);
     }
+}
+
+/// The most pages a file may grow to when `PRAGMA max_page_count` has not been
+/// set, which is SQLite's own maximum.
+pub const DEFAULT_MAX_PAGE_COUNT: u64 = 4_294_967_294;
+
+/// Returns the refusal a write gets when the file would grow past
+/// `PRAGMA max_page_count`: SQLite's `SQLITE_FULL`, with its message.
+///
+/// It undoes the statement and keeps the open transaction, which is what
+/// SQLite does for a statement that writes more than one row: `BEGIN`, an
+/// insert that fits, then an insert of 5,000 rows past the ceiling leaves the
+/// first insert in place and the transaction open.
+fn file_is_full() -> inillucent_base::error::DbError {
+    inillucent_base::error::DbError::primary(inillucent_base::error::PrimaryCode::Full)
+        .with_message("database or disk is full")
 }
 
 /// Returns the refusal a caller that could not take the file is given.
@@ -2090,7 +2331,7 @@ mod tests {
         assert_eq!(
             crate::page::right_of(&image).unwrap(),
             PageId::NONE,
-            "the head of a one-page chain should point at nothing, so this is not the page              this test thinks it is"
+            "the head of a one-page chain should point at nothing, so this is not the page this test thinks it is"
         );
         crate::page::set_right(&mut image, head).unwrap();
         crate::page::checksum_page(&mut image).unwrap();

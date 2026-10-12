@@ -71,11 +71,22 @@ pub struct Refused {
     pub resolved: PathBuf,
     /// The root it had to be inside.
     pub root: PathBuf,
+    /// The path component Windows would treat as a device or a stream, when
+    /// that is why the path was refused.
+    pub reserved: Option<String>,
 }
 
 impl Refused {
     /// Returns the sentence a command surface prints.
     pub fn message(&self) -> String {
+        if let Some(component) = &self.reserved {
+            return format!(
+                "\"{}\" names \"{component}\", which Windows treats as a device or an alternate \
+                 data stream and not as a file in {}. Choose a different file name.",
+                self.named,
+                self.root.display()
+            );
+        }
         match self.resolved.as_os_str() == Path::new(&self.named).as_os_str() {
             true => format!(
                 "\"{}\" is outside {}, which this server is confined to.",
@@ -187,6 +198,21 @@ impl Root {
     /// @param named - the path text to report in a refusal
     /// @param path - the path to resolve
     pub fn admit_path(&self, named: &str, path: &Path) -> Result<PathBuf, Refused> {
+        // **Asked of the text before the path is resolved.** `canonicalize` on a
+        // device name opens the device, and what comes back is `\\.\CON`, which
+        // is outside every root and would be refused as a path outside the root
+        // with the wrong reason, or on some names not at all.
+        // Only the part below the root is asked about: the operator chose the
+        // root, and a name in it that Windows accepts as a directory is theirs.
+        let below_root = path.strip_prefix(&self.resolved).unwrap_or(path);
+        if let Some(component) = windows_special_component(below_root) {
+            return Err(Refused {
+                named: named.to_string(),
+                resolved: path.to_path_buf(),
+                root: self.resolved.clone(),
+                reserved: Some(component),
+            });
+        }
         let resolved = resolve_through_links(path);
         match resolved.starts_with(&self.resolved) {
             true => Ok(resolved),
@@ -194,6 +220,7 @@ impl Root {
                 named: named.to_string(),
                 resolved,
                 root: self.resolved.clone(),
+                reserved: None,
             }),
         }
     }
@@ -301,6 +328,53 @@ pub fn resolve_through_links(path: &Path) -> PathBuf {
     resolved
 }
 
+/// The names Windows opens as a device whatever directory they are in.
+const RESERVED_DEVICE_NAMES: [&str; 24] = [
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4", "COM5",
+    "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
+    "LPT9",
+];
+
+/// Returns the first component of a path that Windows would not treat as a
+/// plain file name.
+///
+/// **Windows only, and the check is on the text.** A device name such as `CON`,
+/// `NUL` or `COM1` opens the device whatever its extension (`nul.csv` is `NUL`)
+/// and whatever the directory, and a trailing dot or space is dropped before the
+/// comparison. A colon inside a name is an alternate data stream (`app.rdb:x`),
+/// which is a second hidden file the root check never sees. Neither is a file
+/// under the root, so both are refused. On other systems these are ordinary
+/// names and nothing is refused.
+///
+/// @param path - the path text a caller named
+pub fn windows_special_component(path: &Path) -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                if matches!(prefix.kind(), std::path::Prefix::DeviceNS(_)) {
+                    return Some(prefix.as_os_str().to_string_lossy().into_owned());
+                }
+            }
+            Component::Normal(name) => {
+                let text = name.to_string_lossy();
+                if text.contains(':') {
+                    return Some(text.into_owned());
+                }
+                let stem = text.split('.').next().unwrap_or_default().trim_end();
+                let upper = stem.to_ascii_uppercase();
+                if RESERVED_DEVICE_NAMES.contains(&upper.as_str()) {
+                    return Some(text.into_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Removes the verbatim prefix Windows canonicalisation adds.
 ///
 /// The same reason the one in `os` exists: the prefix is correct and it makes
@@ -370,9 +444,52 @@ mod tests {
             named: "inner/app.rdb".to_string(),
             resolved: PathBuf::from("/elsewhere/app.rdb"),
             root: PathBuf::from("/root"),
+            reserved: None,
         };
         assert!(refused.message().contains("resolves to"));
         assert!(refused.message().contains("elsewhere"));
+    }
+
+    /// On Windows a device name or an alternate data stream is refused as a file
+    /// name, with any extension and in any case, and an ordinary name is not.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_device_name_or_stream_is_refused() {
+        let directory = std::env::temp_dir().join("inillucent-confine-devices");
+        std::fs::create_dir_all(&directory).unwrap();
+        let root = Root::at(&directory).unwrap();
+        for name in [
+            "CON",
+            "nul.csv",
+            "aux.txt",
+            "COM1.rdb",
+            "lpt9",
+            "CONIN$",
+            "CONOUT$",
+            "prn.",
+            "app.rdb:x",
+            "sub/Con.db",
+        ] {
+            let refused = root.admit(name).unwrap_err();
+            assert!(
+                refused.reserved.is_some(),
+                "{name} was not refused as a device"
+            );
+            assert!(
+                refused.message().contains("device"),
+                "{}",
+                refused.message()
+            );
+        }
+        for name in [
+            "console.rdb",
+            "COM10",
+            "comma.rdb",
+            "app.rdb",
+            "auxiliary.txt",
+        ] {
+            assert!(root.admit(name).is_ok(), "{name} was refused");
+        }
     }
 
     /// With no process root installed, every path is authorized: the library

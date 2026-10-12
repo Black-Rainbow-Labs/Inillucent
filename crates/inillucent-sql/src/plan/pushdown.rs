@@ -101,6 +101,13 @@ fn push_filters(select: &mut BoundSelect) {
                     .cloned()
                     .collect();
                 push_into_arm(block, id, &on_groups);
+            } else if accepts_a_partition_filter(block) {
+                let on_partitions: Vec<BoundExpr> = conjuncts
+                    .iter()
+                    .filter(|conjunct| reads_only_partition_columns(conjunct, id, block))
+                    .cloned()
+                    .collect();
+                push_into_arm(block, id, &on_partitions);
             }
         } else if accepts_a_compound_filter(block) {
             push_into_compound(block, id, &conjuncts);
@@ -253,6 +260,66 @@ fn accepts_a_grouped_filter(block: &BoundSelect) -> bool {
         && !block.distinct
         && block.windows.is_empty()
         && block.values.is_empty()
+}
+
+/// Reports whether a derived table that computes window functions can take a
+/// filter on the columns every one of its windows partitions by.
+///
+/// **A window function is computed per partition, so a condition that keeps or
+/// removes whole partitions can be tested before the windows run.** That is what
+/// lets `SELECT * FROM (SELECT user_id, row_number() OVER (PARTITION BY user_id
+/// ORDER BY created_at DESC) rn FROM posts) WHERE rn <= 3 AND user_id < 50` read
+/// the 49 partitions the outer condition keeps through an index on `user_id`
+/// instead of numbering every row of the table first (152 ms against SQLite's
+/// 5.4 ms on 200,000 posts). SQLite pushes such a term the same way. Not with a
+/// `LIMIT`, `DISTINCT`, grouping or an aggregate, which work on rows the
+/// condition would remove.
+///
+/// @param block - the derived table's query
+fn accepts_a_partition_filter(block: &BoundSelect) -> bool {
+    block.compounds.is_empty()
+        && !block.windows.is_empty()
+        && block.limit.is_none()
+        && block.offset.is_none()
+        && !block.distinct
+        && block.group_by.is_empty()
+        && block.aggregates.is_empty()
+        && block.having.is_none()
+        && block.values.is_empty()
+}
+
+/// Reports whether every derived table column a condition reads is computed by
+/// an expression that every window of the derived table partitions by, under
+/// the binary collation.
+///
+/// The collation matters because a partition holds the rows that are equal under
+/// the window's collation, and a condition that compares under another one could
+/// keep some rows of a partition and drop others.
+///
+/// @param conjunct - the condition, over the derived table's columns
+/// @param id - the derived table's statement-wide number
+/// @param block - the derived table's query
+fn reads_only_partition_columns(conjunct: &BoundExpr, id: usize, block: &BoundSelect) -> bool {
+    let mut partitioned = true;
+    let mut probe = conjunct.clone();
+    crate::rewrite::rewrite_expr(&mut probe, &mut |expr: &mut BoundExpr| {
+        if let BoundExpr::Column { source, column, .. } = expr {
+            if *source == id {
+                let computed = block
+                    .columns
+                    .get(usize::from(*column))
+                    .map(|held| &held.expr);
+                partitioned &= computed.is_some_and(|inner| {
+                    crate::bind::result_collation(inner) == Collation::Binary
+                        && block
+                            .windows
+                            .iter()
+                            .all(|window| window.partition_by.iter().any(|key| key == inner))
+                });
+            }
+        }
+    });
+    partitioned
 }
 
 /// Reports whether every derived table column a condition reads is computed

@@ -83,6 +83,27 @@ inillucent help migrate         # one command and every parameter it takes
 
 ## 2. Changing inillucent
 
+### Where the code lives
+
+One repository: https://github.com/Black-Rainbow-Labs/Inillucent, the `origin` remote. Commits,
+tags, releases and CI all go there. Until 2026-10-11 development happened in a private repository,
+jasonmcaffee/inillucent, and the public one held one commit per release. That private repository
+is now the `archive` remote, read only, with pushing disabled. Its history was not published: the
+public `main` continues from its own release commits through one commit that carries the private
+`main`'s tree (`tasks/task-2245-single-repository-tdd.md` has the design).
+
+**A branch made before that commit is based on the archive's history.** `git merge --ff-only` of
+it into `main` is refused, and an ordinary merge would join the two histories and push the
+archive's history to the public repository, so never merge one. Move it onto `main` first:
+
+```sh
+git fetch archive
+git rebase --onto main archive/main <branch>
+```
+
+`archive/main` is the private `main` the cutover commit was made from. Pushing to `archive` is
+disabled, so that ref does not move.
+
 ### The five rules a test checks
 
 Read the file for a rule before you write the code it covers. Each file is short.
@@ -195,12 +216,10 @@ quietly. CI passes `--absent` for what a runner cannot have, per operating syste
 `.github/workflows/tests.yml`. `--summary <file>` writes the verdict, the failures and the declared
 absences as JSON.
 
-**Two workflows, two cadences, both only at night and only on the public mirror.** Neither
-workflow runs on a push. Both run at 03:00 UTC and when started by hand, and only in
-Black-Rainbow-Labs/Inillucent: the job's `if:` checks the repository, and both workflows are
-disabled in jasonmcaffee/inillucent, which is private and whose Actions spending stopped every job
-there on 2026-10-02. The mirror changes only at a release, so a night grades the code that was last
-published, and `ship.ps1` starts a run there for each release. Run the suite locally before you push.
+**Two workflows, two cadences, both only at night.** Neither workflow runs on a push. Both run at
+03:00 UTC and when started by hand, and only in Black-Rainbow-Labs/Inillucent: the job's `if:`
+checks the repository, so a fork does not spend its owner's minutes. A night grades `main` as it
+stands, and `ship.ps1` starts a run for each release. Run the suite locally before you push.
 
 `.github/workflows/tests.yml` runs the merge cadence, every tier but `nightly`, on Windows and on
 Linux. It runs as four jobs on Windows and three on Linux, each a share of the targets from
@@ -354,7 +373,7 @@ Read three neighbouring files before you write a new one. Then follow these rule
      published at https://inillucent.com/docs.
 7. `node tools/doc-style/check.mjs` reports no problems, and
    `cargo test -p inillucent-compat --test tooling documentation::` passes.
-8. If the change was deployed in any way (a release, a push to the mirror, a site publish),
+8. If the change was deployed in any way (a release, a push to `main`, a site publish),
    `pwsh packaging/ci-status.ps1` exits 0. Section 3 says why.
 
 ---
@@ -417,7 +436,8 @@ moved to `origin/main`, and:
    target directory, still with fat LTO and one codegen unit;
 3. runs `inillucent-fullgate`, `inillucent-writegate` and `inillucent-scorecard` on the medium
    fixture, built with the release profile;
-4. replaces the rolling `nightly` pre release on the public mirror. It never publishes to a registry;
+4. replaces the rolling `nightly` pre release on GitHub, at the commit it built. It never
+   publishes to a registry;
 5. commits `tests/timings.toml`, `tests/nightly-history.tsv` and `compat/perf/nightly/` to `main`;
 6. writes `_agent_output/nightly/latest.json` in the main checkout: the commit, the date, the result
    of each step, and the declared absences;
@@ -437,15 +457,14 @@ packaging/tests`.
 
 ### The routes
 
-`ship.ps1` publishes through fifteen routes, named as the plan prints them:
+`ship.ps1` publishes through fourteen routes, named as the plan prints them:
 
 | Route | What it publishes |
 |---|---|
 | `build` | the five targets: Windows x86-64, Linux x86-64 and aarch64, macOS aarch64 and x86-64 |
 | `linux-packages` | the `.deb` and the `.rpm` |
 | `signature` | the minisign signature over `SHA256SUMS` |
-| `tag` | the commit, the tag and the push |
-| `mirror` | the public source mirror on GitHub |
+| `tag` | the commit, the tag and the push to `origin` |
 | `github` | the GitHub release with every asset |
 | `interop` | `tests/interop/<version>`, built by the binary this release publishes |
 | `site` | inillucent.com: the files, then the links |
@@ -455,7 +474,7 @@ packaging/tests`.
 | `go` | the Go module tag |
 | `packagist` | Composer, which reads the tags again |
 | `homebrew` | the Homebrew formula in the tap |
-| `ci` | nothing: it starts the tests workflow on the mirror's `main`, which is now the release, waits for it, and fails the release unless it passed |
+| `ci` | nothing: it starts the tests workflow on `main`, which is now the release, waits for it, and fails the release unless it passed |
 
 A route with no credential is skipped, and the skip message says how to fix it. The script does not
 fail for a missing credential, because a script that needs all of them would never be run.
@@ -486,11 +505,11 @@ Installer.app or a macOS binary. If that matters, say so in those words after th
 ### Five release mistakes to avoid
 
 - **A registry records a version's commit the first time it sees the tag, and never changes it.**
-  proxy.golang.org and Packagist both do this. `gh release create` against a tag the mirror does not
-  have yet creates the tag at the mirror's current HEAD, which is the previous release. Both
-  registries then serve the previous release's source under the new version, permanently. So
-  `mirror` runs before `github`, and `packagist` runs after both. inillucent's Go module at v0.1.5 and
-  Composer package at v0.1.6 are wrong for this reason.
+  proxy.golang.org and Packagist both do this. `gh release create` against a tag GitHub does not
+  have yet creates the tag at the current HEAD, which is the previous release. Both registries then
+  serve the previous release's source under the new version, permanently. So `tag` runs before
+  `github`, and `packagist` runs after both. inillucent's Go module at v0.1.5 and Composer package
+  at v0.1.6 are wrong for this reason.
 - **The version is written in eight files.** `Get-VersionCarriers` in `ship.ps1` lists them. If you
   add a file that carries the version, add it there. Two of the eight carry the version in code: the
   PHP installer's `NATIVE_VERSION` and the Go wrapper's `nativeVersion`. The scan for leftover
@@ -512,12 +531,11 @@ Installer.app or a macOS binary. If that matters, say so in those words after th
 pwsh packaging/ci-status.ps1
 ```
 
-It reads the head of `main` on the public mirror, starts the `tests` workflow there when that commit
-has no run yet, waits for it, and exits 0 only when it passed. `ship.ps1` runs the same check as its
-`ci` route. Run it yourself after any other deploy to the mirror, before you report the work as
-finished. A run still in progress is waited for, up to three hours. A red, cancelled or missing run
-is a failure: fix it, release again, and run the check again. The private development repository
-has no CI, so `-Remote origin` reports nothing new.
+It reads the head of `main` on `origin`, starts the `tests` workflow there when that commit has no
+run yet, waits for it, and exits 0 only when it passed. `ship.ps1` runs the same check as its `ci`
+route. Run it yourself after any other push to `main`, before you report the work as finished. A run
+still in progress is waited for, up to three hours. A red, cancelled or missing run is a failure:
+fix it, push again, and run the check again.
 
 From 2026-09-24 `tests.yml` did not parse, so every run on both repositories failed with no
 job. Eight releases, 1.0.30 to 2.0.4, were cut and reported finished over those runs, because

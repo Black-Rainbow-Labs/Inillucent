@@ -81,7 +81,7 @@ flowchart LR
 | Program | What it is for |
 |---|---|
 | `inillucent` | The command line. It has 35 commands, such as `query`, `exec`, `describe`, `import`, `export`, `search`, `explain`, `backup`, `migrate` and `setup-embeddings`. Every command takes `--output json`. |
-| `inillucent-shell` | An interactive shell that works like `sqlite3`. It answers 63 of its 65 dot commands. It knows all 49 of its command line options: the 48 that `sqlite3` has, and `-key-file` for an encrypted database. It acts on 31 and refuses 18 by name, because the engine has nothing they could control. |
+| `inillucent-shell` | An interactive shell that works like `sqlite3`. It answers 63 of its 65 dot commands. It knows all 49 of its command line options: the 48 that `sqlite3` has, and `-key-file` for an encrypted database. It acts on 35 and refuses 14 by name, because the engine has nothing they could control. |
 | `inillucent-mcp` | 30 of the same commands served to an AI agent over MCP, on standard input and output. |
 | `inillucent-migrate` | Builds a database from a SQLite file, a running PostgreSQL or MySQL server, or a retrieval index saved by an older version. `inillucent migrate` does the same job from the command line. |
 
@@ -101,6 +101,10 @@ inillucent --db app.rdb describe note
 `create` makes an empty file. `exec` runs a statement that changes something and prints how many
 rows changed. `query` runs a `SELECT` and prints the rows. `describe` prints a table's columns,
 indexes, row count and `CREATE` statement.
+
+The commands that set a database up, `exec`, `batch`, `run` and `import`, create the file when
+`--db` names one that is missing. Every other command answers `not_found` and creates nothing,
+`analyze`, `checkpoint`, `embed` and `restore` included. An empty file opens as an empty database.
 
 To see every command, or every option of one command:
 
@@ -244,11 +248,45 @@ inillucent: 'qeury' is not a command, and it does not name a database file.
 one of its options is refused, as `sqlite3` refuses it:
 
 ```text
-Error: unknown option: --db
+inillucent-shell: Error: unknown option: -db
 Use -help for a list of options.
 ```
 
-To open a file whose name starts with a dash, put `--` before it: `inillucent-shell -- -ledger.rdb`.
+The exit code is 1. To open a file whose name starts with a dash, put `--` before it:
+`inillucent-shell -- -ledger.rdb`.
+
+The shell follows `sqlite3` in these ways:
+
+- Each statement or dot command given after the file name runs on its own. The first one that
+  fails ends the run with exit code 1 and an error that says `in 3rd command line argument`.
+- `.exit N` ends the process with status N, from standard input, from a `.read` file or from
+  `-cmd`. `.quit` ends the input it is in and exits with 0.
+- `-init FILE` runs before any `-cmd`. A missing file prints `cannot open: "FILE"` and the run
+  goes on. Errors in `-init` and `-cmd` do not change the exit code, unless `-bail` is given.
+- A text or a file that is not UTF-8 is read and written byte for byte. A byte order mark at the
+  start of standard input or of a `.read` file is skipped.
+- `-readonly`, `.open --readonly` and a `file:` URI with `mode=ro` open the file read only and
+  fail when it is missing instead of creating it. `.open --new` empties the file. `.open --append`,
+  `--deserialize`, `--zip` and `--hexdb` are refused by name, because the engine has nothing they
+  could control.
+- `.backup`, `.save` and `.clone` work on a database held in memory, and `.backup aux FILE` copies
+  the attached database named `aux`. `.clone` refuses a file that exists.
+- `.tables`, `.indexes` and `.schema` list the objects of `temp` and of every attached database
+  as `schema.name`.
+- `.mode` takes `ascii`, `qbox`, `tcl` and the other modes `sqlite3` 3.53 has, and the options
+  `--wrap`, `--ww`, `--quote`, `--noquote`, `--null`, `--colsep`, `--rowsep`, `--align`,
+  `--widths`, `--escape`, `--tablename` and `--once`. `.mode` with no argument prints the command
+  that recreates the settings. A word it does not know is an error.
+- `.output` and `.once` accept `stdout`, `stderr`, `off`, `memory`, `--bom` and a file name that
+  begins with `|` for a program. `.once` covers the next line of input.
+- A word between double quotes in a dot command resolves backslash escapes (`"a\tb"`, `"\x1f"`).
+  A word with no quotes, or between single quotes, is taken as written.
+- A dot command that is given the wrong arguments prints its usage line and the exit code is 1.
+  `.system` and `.shell` print `System command returns N` when the program fails.
+- `.read` stops at 25 files nested inside one another instead of overflowing the stack.
+
+`.limit trigger_depth` shows 1000, where the downloaded Windows `sqlite3.exe` shows 100 because it
+was built with a lower limit.
 
 ## Ask the engine what it can do
 

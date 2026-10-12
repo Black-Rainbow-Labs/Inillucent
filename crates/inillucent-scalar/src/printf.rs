@@ -388,9 +388,7 @@ fn integer(spec: &Spec, value: i64) -> Vec<u8> {
     };
     let mut digits = magnitude.into_bytes();
     if let Some(precision) = spec.precision {
-        while digits.len() < precision {
-            digits.insert(0, b'0');
-        }
+        digits = zero_filled(&digits, precision);
     }
     let sign = if negative {
         Some(b'-')
@@ -410,11 +408,9 @@ fn integer(spec: &Spec, value: i64) -> Vec<u8> {
     // the answer is fifteen characters wide. Doing it the other way round -
     // group, then pad to twelve - gives `0001,234,567`, which is what this
     // answered before and is not what SQLite answers.
-    if spec.group && spec.zero && !spec.left {
+    if spec.group && spec.zero {
         let room = spec.width.saturating_sub(usize::from(sign.is_some()));
-        while digits.len() < room {
-            digits.insert(0, b'0');
-        }
+        digits = zero_filled(&digits, room);
     }
     if spec.group {
         digits = grouped(&digits);
@@ -424,6 +420,22 @@ fn integer(spec: &Spec, value: i64) -> Vec<u8> {
         out.push(sign);
     }
     out.extend_from_slice(&digits);
+    out
+}
+
+/// Returns digits with zeros in front of them to make them `width` long.
+///
+/// **One allocation, where it used to be one shift of the whole run per zero.** The padding was
+/// an insert at the front in a loop, so `printf('%.1000000d', 1)` moved a growing string a
+/// million times and took 8.9 s where SQLite takes 0.04 s (bug hunt 9).
+///
+/// @param digits - the digits, without a sign
+/// @param width - how long the result is at least
+fn zero_filled(digits: &[u8], width: usize) -> Vec<u8> {
+    let zeros = width.saturating_sub(digits.len());
+    let mut out = Vec::with_capacity(digits.len().saturating_add(zeros));
+    out.resize(zeros, b'0');
+    out.extend_from_slice(digits);
     out
 }
 
@@ -455,9 +467,7 @@ fn based(spec: &Spec, value: i64, base: u32, upper: bool) -> Vec<u8> {
         _ => unsigned.to_string(),
     };
     if let Some(precision) = spec.precision {
-        while text.len() < precision {
-            text.insert(0, '0');
-        }
+        text = String::from_utf8_lossy(&zero_filled(text.as_bytes(), precision)).into_owned();
     }
     if spec.alternate && unsigned != 0 {
         match base {
@@ -592,6 +602,9 @@ fn quoted(
         };
     }
     let text = limited(text_of(argument, encoding), spec);
+    if spec.alternate {
+        return quoted_with_controls(&text, wrap);
+    }
     let mut out = Vec::new();
     if wrap {
         out.push(b'\'');
@@ -605,6 +618,44 @@ fn quoted(
     if wrap {
         out.push(b'\'');
     }
+    out
+}
+
+/// Renders `%#q` and `%#Q`, which escape the control characters so `unistr` can read them back.
+///
+/// A byte below 0x20 becomes `\u` and four hex digits, and a backslash is doubled so that
+/// `unistr` reads it as one. `%#Q` wraps the text in `unistr('...')` only when it holds a
+/// control character, and otherwise writes the ordinary quoted text with its backslashes as
+/// they are. `%#q` never wraps, and always doubles the backslashes. Measured against 3.53.4:
+/// `printf('%#q', 'a\b')` is `a\\b` and `printf('%#Q', 'a\b')` is `'a\b'`.
+///
+/// @param text - the argument after the precision cut
+/// @param wrap - whether this is `%Q`
+fn quoted_with_controls(text: &[u8], wrap: bool) -> Vec<u8> {
+    let has_control = text.iter().any(|byte| *byte < 0x20);
+    let double_backslash = !wrap || has_control;
+    let mut body = Vec::with_capacity(text.len());
+    for byte in text {
+        match *byte {
+            b'\'' => body.extend_from_slice(b"''"),
+            b'\\' if double_backslash => body.extend_from_slice(b"\\\\"),
+            control if control < 0x20 => {
+                body.extend_from_slice(format!("\\u{control:04x}").as_bytes());
+            }
+            other => body.push(other),
+        }
+    }
+    if !wrap {
+        return body;
+    }
+    let (open, close): (&[u8], &[u8]) = if has_control {
+        (b"unistr('", b"')")
+    } else {
+        (b"'", b"'")
+    };
+    let mut out = open.to_vec();
+    out.extend_from_slice(&body);
+    out.extend_from_slice(close);
     out
 }
 
@@ -647,7 +698,12 @@ fn pad(out: &mut Vec<u8>, body: &[u8], spec: &Spec) {
         return;
     }
     let fill = spec.width.saturating_sub(measured);
-    if spec.left {
+    // **The `0` flag wins over `-` for an integer conversion.** SQLite raises the precision to
+    // the width before it justifies anything, so `printf('%-0*d|', 6, 42)` is `000042|`. Floats
+    // and text keep the left justification, as `%-06.2f` shows.
+    let zero_fills_integer =
+        spec.zero && matches!(spec.conversion, b'd' | b'i' | b'u' | b'x' | b'X' | b'o');
+    if spec.left && !zero_fills_integer {
         out.extend_from_slice(body);
         out.extend(core::iter::repeat_n(b' ', fill));
         return;
@@ -725,6 +781,27 @@ mod tests {
         assert_eq!(
             run("%q", vec![Value::owned_text(b"it's").expect("text")]),
             "it''s"
+        );
+    }
+
+    /// A precision of a million zeros is one allocation, not a million shifts.
+    ///
+    /// The old padding inserted one zero at the front at a time and took 8.9 s here.
+    #[test]
+    fn a_huge_precision_pads_in_linear_time() {
+        let started = std::time::Instant::now();
+        let text = run("%.1000000d", vec![Value::Integer(7)]);
+        assert_eq!(text.len(), 1_000_000);
+        assert!(text.starts_with("000") && text.ends_with("07"));
+        let hex = run(
+            "%#.20x|%,.8d",
+            vec![Value::Integer(255), Value::Integer(1234)],
+        );
+        assert_eq!(hex, "0x000000000000000000ff|00,001,234");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
         );
     }
 }

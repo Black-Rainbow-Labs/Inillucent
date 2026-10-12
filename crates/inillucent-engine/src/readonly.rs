@@ -92,11 +92,13 @@ pub const CONNECTION_PRAGMAS: &[&str] = &[
 
 /// The pragmas a read only connection may not set.
 ///
-/// **Each one reaches the file.** Six write a field of the header
-/// (`application_id`, `schema_version`, `user_version`, `encoding`,
-/// `page_size`, `max_page_count`), two change the file's layout (`auto_vacuum`,
-/// `default_cache_size`), and four make the engine write pages
-/// (`incremental_vacuum`, `journal_mode`, `optimize`, `wal_checkpoint`).
+/// **Each one reaches the file, except `max_page_count`.** Five write a field of the header
+/// (`application_id`, `schema_version`, `user_version`, `encoding`, `page_size`),
+/// two change the file's layout (`auto_vacuum`, `default_cache_size`), and four
+/// make the engine write pages (`incremental_vacuum`, `journal_mode`, `optimize`,
+/// `wal_checkpoint`). `max_page_count` writes nothing: the limit is held on the
+/// open file in memory and is not written to the file. A read only connection
+/// cannot grow the file, so setting a limit on it has no use and it is refused too.
 ///
 /// It is stated rather than derived so that a pragma added to the register and
 /// to neither list fails `crates/inillucent-compat/tests/engine/readonly_pragmas.rs`

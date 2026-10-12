@@ -657,6 +657,22 @@ fn capability_case(
     Ok(case)
 }
 
+/// Whether a statement's answer depends on the time it runs.
+///
+/// The matrix runs a case in inillucent and in SQLite one after the other, so
+/// the two read the clock at different moments. `SELECT CURRENT_TIMESTAMP`
+/// gave 03:40:30 in one and 03:40:29 in the other on a CI run, and the case
+/// failed with every other value equal. Such an example is written as a
+/// statement that must succeed, and its rows are not compared.
+///
+/// @param sql - the statement
+fn reads_the_clock(sql: &str) -> bool {
+    let upper = sql.to_ascii_uppercase();
+    ["CURRENT_DATE", "CURRENT_TIME", "'NOW'"]
+        .iter()
+        .any(|word| upper.contains(word))
+}
+
 /// Converts one syntax example into a case, asking the oracle what it does.
 fn syntax_case(
     oracle: &mut Driver,
@@ -700,7 +716,10 @@ fn syntax_case(
         });
     }
     let sql = scratch_paths(example);
-    let record = observed_record(oracle, &local(&sql), sql)?;
+    let record = match observed_record(oracle, &local(&sql), sql.clone())? {
+        Record::Query { .. } if reads_the_clock(&sql) => Record::ok(sql),
+        other => other,
+    };
     case.records.push(record);
     let closed = oracle.send(&Op::Close)?;
     if !closed.ok {

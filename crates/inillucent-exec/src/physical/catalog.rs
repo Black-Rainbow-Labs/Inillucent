@@ -611,7 +611,7 @@ mod tests {
         let error = refused.expect_err("an unknown operator is refused");
         assert!(
             error.message().contains("nonsense"),
-            "the refusal should name the operator it did not know, in the              message a person reads; it said {:?}",
+            "the refusal should name the operator it did not know, in the message a person reads; it said {:?}",
             error.message()
         );
         assert_eq!(

@@ -18,12 +18,13 @@
 use std::collections::HashSet;
 
 use inillucent_base::DbResult;
-use inillucent_pool::extent::{self, ExtentRef};
+use inillucent_pool::extent::ExtentRef;
 use inillucent_pool::interior::InteriorRef;
 use inillucent_pool::page::{self, PageKind};
 use inillucent_pool::{PageId, Pool};
 
 use crate::leaf::LeafRef;
+use crate::separator::separator_references;
 
 use super::PagedTree;
 
@@ -103,9 +104,17 @@ pub fn released(pool: &Pool, root: PageId) -> DbResult<Released> {
                 for child in 0..interior.children() {
                     children.push(interior.swip(child)?);
                 }
+                // A separator stored out of line is a value of the tree, freed
+                // with it.
+                let separators = separator_references(&interior)?;
                 drop(guard);
                 for swip in children {
                     frontier.push(pool.page_of_swip(swip)?);
+                }
+                for reference in separators {
+                    if held.insert((reference.first.0, reference.slot)) {
+                        found.values.push(reference);
+                    }
                 }
                 continue;
             }
@@ -142,7 +151,6 @@ impl PagedTree {
     ///
     /// @param pool - the buffer pool the file is open through
     pub fn pages_occupied(&self, pool: &Pool) -> DbResult<Vec<(PageId, PageShare)>> {
-        let page_size = pool.page_size();
         let mut found: Vec<(PageId, PageShare)> = Vec::new();
         let mut seen: HashSet<PageId> = HashSet::new();
         let mut frontier: Vec<PageId> = vec![self.root];
@@ -166,32 +174,47 @@ impl PagedTree {
                     for child in 0..interior.children() {
                         children.push(interior.swip(child)?);
                     }
+                    let separators = separator_references(&interior)?;
                     drop(guard);
                     for swip in children {
                         frontier.push(pool.page_of_swip(swip)?);
                     }
+                    Self::note_value_pages(pool, &separators, &mut found)?;
                     continue;
                 }
                 let leaf = LeafRef::parse(bytes)?;
                 PagedTree::extent_refs(&leaf)?
             };
-            for reference in references {
-                if reference.slot.is_some() {
-                    found.push((reference.first, PageShare::Shared));
-                    continue;
-                }
-                // A run is contiguous from its first page, and `free_extent`
-                // gives back exactly this many - so the two agree about which
-                // pages the value holds by computing it the same way.
-                let pages = extent::pages_needed(reference.length, page_size).max(1);
-                for offset in 0..pages {
-                    found.push((
-                        PageId(reference.first.0.saturating_add(offset)),
-                        PageShare::Owned,
-                    ));
-                }
-            }
+            Self::note_value_pages(pool, &references, &mut found)?;
         }
         Ok(found)
+    }
+
+    /// Adds the pages out of line values sit on to a list of pages occupied.
+    ///
+    /// A value stored as a chain is followed from its first page, because the pages
+    /// of a chain are not consecutive once one of them has moved.
+    ///
+    /// @param pool - the buffer pool the file is open through
+    /// @param references - the values, which may be separators or leaf values
+    /// @param found - the pages occupied so far
+    fn note_value_pages(
+        pool: &Pool,
+        references: &[ExtentRef],
+        found: &mut Vec<(PageId, PageShare)>,
+    ) -> DbResult<()> {
+        for reference in references {
+            if reference.is_dead() {
+                continue;
+            }
+            if reference.slot.is_some() {
+                found.push((reference.first, PageShare::Shared));
+                continue;
+            }
+            for page in crate::extents::chain_pages(pool, *reference)? {
+                found.push((page, PageShare::Owned));
+            }
+        }
+        Ok(())
     }
 }

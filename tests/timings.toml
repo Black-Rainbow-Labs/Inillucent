@@ -189,6 +189,10 @@ target = "inillucent-compat::differential::usage_corpus"
 milliseconds = 331769
 
 [[timing]]
+target = "inillucent-compat::durability::auto_vacuum_crash"
+milliseconds = 646740
+
+[[timing]]
 target = "inillucent-compat::durability::btree_model"
 milliseconds = 13820
 

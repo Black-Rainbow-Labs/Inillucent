@@ -948,6 +948,62 @@ covers = ["inillucent-engine", "inillucent-catalog", "inillucent-sql"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "auto_vacuum"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-pool", "inillucent-tree", "inillucent-wal", "inillucent-txn"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "automatic_index_answers"
+tier = "engine"
+covers = ["inillucent-exec", "inillucent-sql"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "automatic_index_speed"
+tier = "engine"
+covers = ["inillucent-exec", "inillucent-sql"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "order_limit_walk"
+tier = "engine"
+covers = ["inillucent-exec", "inillucent-sql"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "planner_choices"
+tier = "engine"
+covers = ["inillucent-exec", "inillucent-sql"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "expression_index_covering"
+tier = "engine"
+covers = ["inillucent-exec", "inillucent-sql"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "scratch_memory_flat"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-tree"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "autoindex_reopen"
 tier = "engine"
 covers = ["inillucent-engine"]
@@ -1097,6 +1153,14 @@ name = "engine"
 module = "page_sizes"
 tier = "engine"
 covers = ["inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "long_keys_at_every_page_size"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool"]
 
 [[target]]
 package = "inillucent-compat"
@@ -1445,6 +1509,14 @@ kind = "test"
 name = "write_campaign"
 tier = "engine"
 
+# Keys longer than the spill threshold, bulk built, written into and deleted
+# from, with separators long enough to be stored out of line.
+[[target]]
+package = "inillucent-tree"
+kind = "test"
+name = "long_keys"
+tier = "engine"
+
 # The one datum-to-value conversion, both directions, on bytes that are not
 # valid UTF-8 - the case the five hand-written copies disagreed about.
 [[target]]
@@ -1504,6 +1576,57 @@ tier = "engine"
 # A page the log carries whole, torn and read by a record that is not the one
 # that would have fixed it; and a page the log carries nothing for, which is
 # refused by name (task-1962, roadmap item 6).
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "maintenance_speed"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-exec"]
+# VACUUM and VACUUM INTO copy rows in one transaction: 20,000 rows took 72
+# seconds when each row was its own commit.
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "max_page_count"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-pool"]
+# PRAGMA max_page_count stops a write that would grow the file past it, with
+# SQLITE_FULL and a rollback; it used to change nothing.
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "space_reuse"
+tier = "engine"
+covers = ["inillucent-tree", "inillucent-engine", "inillucent-pool"]
+# A table trimmed from the front reuses the pages its deletes empty: the merge of
+# an emptied leaf with a full sibling was refused, and no page came back.
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "write_speed"
+tier = "engine"
+covers = ["inillucent-tree", "inillucent-engine", "inillucent-exec", "inillucent-sql"]
+# Upserts, cascading deletes, many CREATE TABLE statements in one transaction,
+# a join with a one table term, and long text values finish near SQLite's time.
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "unique_leaf_boundary"
+tier = "engine"
+covers = ["inillucent-tree", "inillucent-exec", "inillucent-engine"]
+# A UNIQUE index refuses a duplicate of the first key of every leaf: the
+# uniqueness probe uses the key without its rowid, and that prefix lands on
+# the leaf before the one holding the key.
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"
@@ -1600,6 +1723,18 @@ tier = "differential"
 covers = ["inillucent-engine", "inillucent-exec"]
 requires = ["oracle"]
 
+# An index nested loop that joins the rest of a large outer side with one walk
+# of the inner index, against SQLite, with awkward keys and the shapes that must
+# keep the probes (task-2226).
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "differential"
+module = "merge_join"
+tier = "differential"
+covers = ["inillucent-engine", "inillucent-exec", "inillucent-tree"]
+requires = ["oracle"]
+
 # Rowids allocated while the largest key is remembered, after writes of every
 # kind, against SQLite (task-2209).
 [[target]]
@@ -1660,6 +1795,14 @@ requires = ["oracle"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "fts5_bulk_edits"
+tier = "engine"
+covers = ["inillucent-ext", "inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "fts5_legacy_layout"
 tier = "engine"
 covers = ["inillucent-ext"]
@@ -1712,6 +1855,16 @@ module = "migrate_realistic"
 tier = "e2e"
 covers = ["inillucent-migrate"]
 requires = ["oracle", "tracked-fixtures"]
+
+# The file format moves to 3 the first time a file stores a key out of line, and
+# not before; the built binary writes the file and the test reads its bytes.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "e2e"
+module = "format_three"
+tier = "e2e"
+covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool", "inillucent-cli"]
 
 # A database from every release we have shipped, read by the build under test
 # (task-2036). `tests/interop/<version>/` holds a file that release's own binary
@@ -1816,6 +1969,15 @@ name = "differential"
 module = "new_engine_extents"
 tier = "differential"
 covers = ["inillucent-engine"]
+requires = ["oracle"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "differential"
+module = "new_engine_long_keys"
+tier = "differential"
+covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool"]
 requires = ["oracle"]
 
 [[target]]
@@ -1980,6 +2142,14 @@ requires = ["oracle"]
 package = "inillucent-compat"
 kind = "test"
 name = "durability"
+module = "auto_vacuum_crash"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim", "inillucent-vfs"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
 module = "btree_model"
 tier = "durability"
 # `every_retained_sequence_still_passes` replays `compat/corpus/btree/`, which
@@ -2101,9 +2271,33 @@ covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-p
 package = "inillucent-compat"
 kind = "test"
 name = "durability"
+module = "long_key_crash"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
 module = "reindex_crash"
 tier = "durability"
 covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "reused_key_extent"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "read_only_connection"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-driver", "inillucent-pool", "inillucent-wal"]
 
 # Encryption at rest through the connection: no plaintext on disk, key
 # refusals, rekey, ATTACH KEY, VACUUM, backup and export.
@@ -2540,6 +2734,16 @@ covers = ["inillucent-cli", "inillucent-engine"]
 package = "inillucent-compat"
 kind = "test"
 name = "e2e"
+module = "cli_round_trips"
+tier = "e2e"
+covers = ["inillucent-cli", "inillucent-engine"]
+# Backup, batch, export and a parameters file each round trip through the
+# command line, and a refusal leaves the database as it was.
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "e2e"
 module = "cli_commands"
 tier = "e2e"
 covers = ["inillucent-cli"]
@@ -2748,6 +2952,48 @@ covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-p
 # present must equal commits acknowledged, under both locking modes, through
 # ATTACH, and with a read only process reading a file a writer holds
 # (task-1979, section 4).
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "process_schema_change"
+tier = "durability"
+covers = ["inillucent-driver", "inillucent-engine", "inillucent-sql", "inillucent-wal", "inillucent-pool", "inillucent-vfs"]
+# A process that keeps a database open runs each statement against the schema
+# another process last committed: a plan compiled before the lock was taken is
+# compiled again once the lock rereads the catalog.
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "process_create"
+tier = "durability"
+covers = ["inillucent-driver", "inillucent-engine", "inillucent-pool", "inillucent-vfs", "inillucent-cli"]
+# Processes that create one database together all open it and keep their rows,
+# and an empty file opens as an empty database.
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "process_maintenance"
+tier = "durability"
+covers = ["inillucent-driver", "inillucent-engine", "inillucent-pool", "inillucent-vfs", "inillucent-cli"]
+# A backup, VACUUM INTO and wal_checkpoint beside another process's open
+# transaction: the copies run and the checkpoint answers a busy row. A VACUUM
+# beside a process inserting rows loses none of them.
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "process_deferred"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-pool", "inillucent-cli"]
+# Processes that read and then open a deferred transaction take turns rather
+# than wait out the busy timeout beside each other.
 
 [[target]]
 package = "inillucent-compat"
@@ -3172,6 +3418,16 @@ tier = "e2e"
 # It runs `inillucent setup-embeddings` as a child process.
 covers = ["inillucent-cli"]
 
+# The shell's command line, exit status and bytes: arguments, `.exit`, input and
+# output that is not UTF-8, and files an option must not create.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "e2e"
+module = "shell_command_line"
+tier = "e2e"
+covers = ["inillucent-cli"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"
@@ -3212,6 +3468,17 @@ module = "mcp_cancel"
 tier = "e2e"
 # It starts the MCP server as a child process and cancels a request in flight.
 covers = ["inillucent-cli"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "e2e"
+module = "mcp_per_call"
+tier = "e2e"
+# It starts the MCP server and the command line as child processes: a `db`
+# argument for one call, the read tool refusing a write, paths a root refuses,
+# and `ping` answered while a call runs.
+covers = ["inillucent-cli", "inillucent-vfs", "inillucent-engine"]
 
 [[target]]
 package = "inillucent-compat"
@@ -3363,6 +3630,16 @@ share_with = ["inillucent-driver::conformance", "inillucent-driver-capi::python_
 package = "inillucent-compat"
 kind = "test"
 name = "tooling"
+module = "string_literals"
+tier = "tooling"
+covers = ["inillucent-compat"]
+# No ordinary string literal holds the indentation of a line that was joined
+# onto it without its continuation backslash: 110 messages and help texts had such a run of spaces.
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "tooling"
 module = "escapes"
 tier = "tooling"
 covers = ["inillucent-compat"]
@@ -3388,3 +3665,28 @@ name = "tooling"
 module = "selection"
 tier = "tooling"
 covers = ["inillucent-compat"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "vector_edges"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-search", "inillucent-ext"]
+
+# Moving one page to another number: a leaf, an interior page, a chain page, a
+# shared extent page, a root, and a free map page, and the pages that must stay.
+[[target]]
+package = "inillucent-tree"
+kind = "test"
+name = "relocate"
+tier = "engine"
+
+# A file past one free map page at 8,192 byte pages, shrunk by a FULL commit.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "nightly"
+module = "free_map_page_at_the_end"
+tier = "nightly"
+covers = ["inillucent-engine", "inillucent-pool", "inillucent-tree"]

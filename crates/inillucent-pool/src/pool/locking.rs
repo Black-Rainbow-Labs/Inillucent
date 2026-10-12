@@ -132,6 +132,27 @@ impl Pool {
     /// can reach - one being created, or one a test opened without the
     /// protocol - and a pool holding EXCLUSIVE has nothing to raise.
     pub fn hold_for_writing(&self) -> DbResult<()> {
+        self.hold_for_writing_within(self.write_lock_millis.get())
+    }
+
+    /// Raises a shared lock to the exclusive one only if that can be done
+    /// almost at once, for a write the caller may leave to a later statement.
+    ///
+    /// **For the writes an open makes on its own account**: giving back the
+    /// file's unclaimed tail, and folding what its replay grew. Each is
+    /// skipped when the lock is refused, and a later statement does it. They
+    /// used to wait the whole busy timeout for EXCLUSIVE first, so a process
+    /// that opened the file while another held a read transaction waited ten
+    /// seconds to answer `SELECT count(*)`, and one beside a write transaction
+    /// five, where SQLite answers at once.
+    pub fn try_hold_for_writing(&self) -> DbResult<()> {
+        self.hold_for_writing_within(RESERVED_PATIENCE_MILLIS.min(self.write_lock_millis.get()))
+    }
+
+    /// The body of [`Pool::hold_for_writing`] and [`Pool::try_hold_for_writing`].
+    ///
+    /// @param exclusive_millis - how long to wait for EXCLUSIVE once RESERVED is held
+    fn hold_for_writing_within(&self, exclusive_millis: u64) -> DbResult<()> {
         self.lease.settle();
         let level = self.file.lock_level();
         if level == FileLock::None || level == FileLock::Exclusive || !self.writable.get() {
@@ -150,11 +171,7 @@ impl Pool {
                 )
             })?;
         }
-        lock_with_wait(
-            self.file.as_ref(),
-            FileLock::Exclusive,
-            self.write_lock_millis.get(),
-        )
+        lock_with_wait(self.file.as_ref(), FileLock::Exclusive, exclusive_millis)
     }
 
     /// Reports whether `writeback` may write a dirty page, raising the lock

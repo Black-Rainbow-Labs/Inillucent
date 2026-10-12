@@ -13,7 +13,7 @@
 //! able to hold spaces.
 
 use crate::render::{literal, Layout};
-use crate::shell::{drive, mode_named, Shell};
+use crate::shell::{drive, Shell};
 use inillucent_value::Value;
 
 /// Refuses a path outside `--root`, and returns it when there is no root.
@@ -92,53 +92,62 @@ pub fn run(shell: &mut Shell, line: &str) {
     if shell.bail && shell.failed && !failed_before {
         return;
     }
-    let words = split(without_terminator(line));
-    let Some(name) = words
+    let parsed = split(without_terminator(line));
+    let Some(name) = parsed
         .first()
-        .map(|word| word.trim_start_matches('.').to_string())
+        .map(|(word, _)| word.trim_start_matches('.').to_string())
     else {
         return;
     };
-    let arguments: Vec<&str> = words.iter().skip(1).map(String::as_str).collect();
+    shell.dot_line = without_terminator(line).to_string();
+    shell.dot_offsets = parsed.iter().map(|(_, at)| *at).collect();
+    let arguments: Vec<&str> = parsed
+        .iter()
+        .skip(1)
+        .map(|(word, _)| word.as_str())
+        .collect();
     if refused_by_safe_mode(shell, &name) {
         return;
     }
     match name.as_str() {
-        "quit" | "exit" => shell.done = true,
+        "headers" => settings(shell, &name, &arguments),
+        "bail" => settings(shell, &name, &arguments),
+        "changes" => settings(shell, &name, &arguments),
+        "echo" => settings(shell, &name, &arguments),
+        "timer" => settings(shell, &name, &arguments),
+        "eqp" => settings(shell, &name, &arguments),
+        "nullvalue" => settings(shell, &name, &arguments),
+        "separator" => settings(shell, &name, &arguments),
+        "log" => settings(shell, &name, &arguments),
+        "quit" => shell.done = true,
+        "exit" => {
+            // **`.exit` ends the process with the status it was given, from any
+            // depth** (a `.read` file, a `-cmd` or a statement argument). The
+            // status is read the way C's `atoi` reads it: a leading number, and
+            // zero when there is none, so `.exit abc` is 0 and `.exit 3x` is 3.
+            // A second argument is ignored.
+            shell.exit_code = Some(arguments.first().map_or(0, |word| c_atoi(word)));
+            shell.done = true;
+        }
         "help" => help(shell, &arguments),
-        "open" => open(shell, &arguments),
+        "open" => crate::opening::open(shell, &arguments),
         "databases" => databases(shell),
         "tables" => tables(shell, &arguments),
         "indexes" | "indices" => indexes(shell, &arguments),
         "schema" => schema(shell, &arguments),
         "fullschema" => full_schema(shell),
-        "headers" => {
-            let on = truthy(arguments.first().copied());
-            shell.headers_chosen = Some(on);
-            shell.layout.headers = on;
-        }
-        "mode" => mode(shell, &arguments),
-        "separator" => separator(shell, &arguments),
-        "nullvalue" => match arguments.first() {
-            Some(text) => shell.layout.null = resolve_backslashes(text),
-            None => shell.complain("Usage: .nullvalue STRING"),
-        },
+        "mode" => crate::modes::mode(shell, &arguments),
         "width" => width(shell, &arguments),
-        "output" => output(shell, &arguments, false),
-        "once" => output(shell, &arguments, true),
+        "output" => crate::redirecting::output(shell, ".output", &arguments, false),
+        "once" => crate::redirecting::output(shell, ".once", &arguments, true),
         "print" => {
             let text = arguments.join(" ");
             shell.say(&text);
         }
-        "echo" => shell.echo = truthy(arguments.first().copied()),
-        "bail" => shell.bail = truthy(arguments.first().copied()),
-        "timer" => shell.timer = truthy(arguments.first().copied()),
         "archive" | "ar" => crate::archive::archive(shell, &arguments),
         "stats" => crate::diagnose::stats(shell, &arguments),
         "vfslist" => crate::diagnose::vfs_list(shell),
         "vfsinfo" | "vfsname" => crate::diagnose::vfs_info(shell, name == "vfsname"),
-        "changes" => shell.show_changes = truthy(arguments.first().copied()),
-        "eqp" => shell.explain_plan = truthy(arguments.first().copied()),
         "read" => read(shell, &arguments),
         "dump" => dump(shell, &arguments),
         // `.import` reads its file with `std::fs`, so its path is confined
@@ -148,13 +157,12 @@ pub fn run(shell: &mut Shell, line: &str) {
         // what `.backup` does. SQLite's `.clone` rebuilds the target object by
         // object where `.backup` copies the file; the result is the same
         // database, and this engine has one way of producing a verified copy.
-        "backup" | "save" => backup(shell, &arguments),
-        "clone" => clone(shell, &arguments),
+        "backup" | "save" => crate::copy::backup(shell, &format!(".{name}"), &arguments),
+        "clone" => crate::copy::clone(shell, &arguments),
         "timeout" => timeout(shell, &arguments),
-        "log" => log(shell, &arguments),
         "load" => load_extension(shell, &arguments),
         "progress" => progress(shell, &arguments),
-        "restore" => restore(shell, &arguments),
+        "restore" => crate::copy::restore(shell, &arguments),
         "parameter" => parameter(shell, &arguments),
         "recover" => crate::diagnose::recover(shell, &arguments),
         "sha3sum" => crate::diagnose::sha3sum(shell, &arguments),
@@ -192,24 +200,38 @@ pub fn run(shell: &mut Shell, line: &str) {
     }
 }
 
-/// `.clone FILE`: the database written somewhere else, object by object.
-///
-/// The copy is `.backup`'s - one verified file copy rather than a row-by-row
-/// rebuild, because this engine is single threaded and one file is one pool, so
-/// there is no second writer to race. What the reference's own `.clone` gives a
-/// person besides the file is the running commentary, and that is reproduced:
-/// each table and index it carried, as it carries it.
+/// Runs one of the commands that set a single value; see `crate::settings`.
 ///
 /// @param shell - the shell
-/// @param arguments - the words after the command
-fn clone(shell: &mut Shell, arguments: &[&str]) {
-    let named = shell.column(
-        "SELECT name FROM sqlite_master WHERE type IN ('table','index')          AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
-    );
-    backup(shell, arguments);
-    for name in named {
-        shell.say(&format!("{name}... done"));
+/// @param name - the command without its dot
+/// @param arguments - the words after it
+fn settings(shell: &mut Shell, name: &str, arguments: &[&str]) {
+    crate::settings::run(shell, name, arguments);
+}
+
+/// Reads a number the way C's `atoi` does.
+///
+/// Leading white space, an optional sign, then digits up to the first character
+/// that is not one. No digits is zero. A value outside the range of an `i32`
+/// wraps, which is what a process exit status does with it.
+///
+/// @param word - the text after `.exit`
+pub(crate) fn c_atoi(word: &str) -> i32 {
+    let trimmed = word.trim_start();
+    let (negative, digits) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    let mut value: i64 = 0;
+    for digit in digits.chars().map_while(|character| character.to_digit(10)) {
+        value = value.wrapping_mul(10).wrapping_add(i64::from(digit));
     }
+    let signed = if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    };
+    signed as i32
 }
 
 /// `.timeout MS`: how long a writer waits for the writer slot.
@@ -226,21 +248,6 @@ fn timeout(shell: &mut Shell, arguments: &[&str]) {
         .unwrap_or(0)
         .max(0);
     let _ = shell.collect(&format!("PRAGMA busy_timeout = {milliseconds}"));
-}
-
-/// `.log FILE|off|stdout|stderr`: where the engine's own log goes.
-///
-/// **Accepted and recorded, and nothing is written to it.** This engine emits
-/// no log messages at all - there is no `sqlite3_log` equivalent behind it - so
-/// a destination is a place nothing arrives. That is the same thing the
-/// reference produces for a session that logs nothing, which is why this is
-/// accepted rather than refused: the observable behaviour is identical, and
-/// refusing would stop a script that sets it out of habit.
-///
-/// @param shell - the shell
-/// @param arguments - the words after the command
-fn log(shell: &mut Shell, arguments: &[&str]) {
-    shell.log_to = arguments.first().map(|word| (*word).to_string());
 }
 
 /// `.load FILE ?ENTRY?`: load a runtime extension.
@@ -339,6 +346,26 @@ fn parameter_value(shell: &Shell, word: &str) -> Result<Value<'static>, String> 
         .unwrap_or(Value::Null))
 }
 
+/// Returns a bound value as `.parameter list` prints it, which is SQL's `quote()`.
+///
+/// `quote()` writes a blob as `X'..'` with an upper case `X` and upper case
+/// digits, where the literal the rest of the shell writes is lower case.
+///
+/// @param value - the bound value
+fn quoted_parameter(value: &Value<'static>) -> String {
+    match value {
+        Value::Blob(blob) => {
+            let digits: String = blob
+                .raw()
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect();
+            format!("X'{digits}'")
+        }
+        other => literal(other),
+    }
+}
+
 /// `.parameter init | list | set NAME VALUE | unset NAME | clear`.
 ///
 /// **The one dot command with no substitute.** A bound parameter could not be
@@ -354,6 +381,22 @@ fn parameter_value(shell: &Shell, word: &str) -> Result<Value<'static>, String> 
 /// @param shell - the shell
 /// @param arguments - the words after the command
 fn parameter(shell: &mut Shell, arguments: &[&str]) {
+    // **The shape of the command is checked before it is read.** The reference
+    // runs `clear`, `list` and `init` with nothing after them, `set` with a name
+    // and one value, and `unset` with a name, and prints the help for the
+    // command for anything else. A second value was dropped here, so
+    // `.parameter set :f 'it''s'` bound `it` and said nothing about the `s`.
+    let words = arguments.len();
+    let shaped = match arguments.first().copied() {
+        Some("clear" | "list" | "init") => words == 1,
+        Some("set") => words == 3,
+        Some("unset") => words == 2,
+        _ => false,
+    };
+    if !shaped {
+        help(shell, &["parameter"]);
+        return;
+    }
     match arguments.first().copied().unwrap_or("list") {
         "init" => {}
         "clear" => shell.parameters.clear(),
@@ -361,7 +404,7 @@ fn parameter(shell: &mut Shell, arguments: &[&str]) {
             let listed: Vec<(String, String)> = shell
                 .parameters
                 .iter()
-                .map(|(name, value)| (name.clone(), literal(value)))
+                .map(|(name, value)| (name.clone(), quoted_parameter(value)))
                 .collect();
             // The reference pads the name column to the widest name, which is
             // what makes a list of several read as a table.
@@ -414,40 +457,82 @@ fn without_terminator(line: &str) -> &str {
     trimmed.strip_suffix(';').unwrap_or(trimmed)
 }
 
-fn split(line: &str) -> Vec<String> {
+/// Splits a dot command into its words the way the reference does, and notes
+/// where each word starts.
+///
+/// **A quote opens a word only at the start of that word.** A word that begins
+/// with `'` or `"` runs to the next quote of the same kind, and a word that
+/// begins with anything else runs to the next white space, quotes and all. The
+/// first reading is what lets `.print "a b"` print `a b`; the second is what lets
+/// `.parameter set :b x'0102'` hand `x'0102'` to the expression reader as one
+/// word, where a quote in the middle of a word used to end it and start another,
+/// and the parameter was bound to the text `x`.
+///
+/// **A backslash means something only inside double quotes.** Between double quotes
+/// `\"`, `\`, `\n`, `\t`, `\x41` and `\101` are one character each. A word
+/// outside quotes, or between single quotes, is taken exactly as written, so
+/// `.separator \t` is a backslash and a `t`, and `.separator "\t"` is a tab. A
+/// quote with no closing partner runs to the end of the line.
+///
+/// There is no doubled quote: `'it''s'` is the word `it` followed by the word
+/// `s`, as it is in the reference, which then refuses the `.parameter set` for
+/// having too many words.
+///
+/// The offset is where the word's text begins, counted in characters from the start
+/// of the line, which is where an error points its caret.
+///
+/// @param line - the dot command, leading dot included
+fn split(line: &str) -> Vec<(String, usize)> {
+    let characters: Vec<char> = line.chars().collect();
     let mut words = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut started = false;
-    for character in line.chars() {
-        match quote {
-            Some(open) if character == open => {
-                quote = None;
-                words.push(core::mem::take(&mut current));
-                started = false;
-            }
-            Some(_) => current.push(character),
-            None if character == '\'' || character == '"' => {
-                if started {
-                    words.push(core::mem::take(&mut current));
+    let mut at = 0usize;
+    loop {
+        while characters
+            .get(at)
+            .is_some_and(|character| character.is_whitespace())
+        {
+            at += 1;
+        }
+        let Some(&first) = characters.get(at) else {
+            break;
+        };
+        let mut word = String::new();
+        let quoted = first == '\'' || first == '"';
+        if quoted {
+            at += 1;
+        }
+        let start = at;
+        if quoted {
+            while let Some(&character) = characters.get(at) {
+                if character == first {
+                    break;
                 }
-                quote = Some(character);
-                started = true;
-            }
-            None if character.is_whitespace() => {
-                if started {
-                    words.push(core::mem::take(&mut current));
-                    started = false;
+                if character == '\\' && first == '"' && characters.get(at + 1).is_some() {
+                    word.push(character);
+                    at += 1;
                 }
+                if let Some(&escaped) = characters.get(at) {
+                    word.push(escaped);
+                }
+                at += 1;
             }
-            None => {
-                current.push(character);
-                started = true;
+            // The closing quote.
+            if characters.get(at) == Some(&first) {
+                at += 1;
+            }
+            if first == '"' {
+                word = resolve_backslashes(&word);
+            }
+        } else {
+            while let Some(&character) = characters.get(at) {
+                if character.is_whitespace() {
+                    break;
+                }
+                word.push(character);
+                at += 1;
             }
         }
-    }
-    if started {
-        words.push(current);
+        words.push((word, start));
     }
     words
 }
@@ -487,28 +572,6 @@ fn help(shell: &mut Shell, arguments: &[&str]) {
     }
 }
 
-/// `.open`: closes the current database and opens another.
-fn open(shell: &mut Shell, arguments: &[&str]) {
-    let named = arguments.first().copied().unwrap_or(":memory:");
-    // **The reference refuses the file, not the command.** `sqlite3 -safe`
-    // answers `cannot open disk-based database files in safe mode` and still
-    // allows `.open :memory:`, so `.open` is not in `REFUSED_IN_SAFE_MODE` and
-    // says this instead.
-    if shell.safe && named != ":memory:" && !named.is_empty() {
-        shell.complain("Error: cannot open disk-based database files in safe mode");
-        return;
-    }
-    let Some(path) = confine_path(shell, named) else {
-        return;
-    };
-    let path = path.as_str();
-    if let Err(message) = shell.reopen(path) {
-        shell.complain(&format!(
-            "Error: unable to open database \"{path}\": {message}"
-        ));
-    }
-}
-
 /// `.databases`: what is attached, and where each came from.
 fn databases(shell: &mut Shell) {
     let Ok((_, rows)) = shell.collect("PRAGMA database_list") else {
@@ -518,11 +581,23 @@ fn databases(shell: &mut Shell) {
     for row in rows {
         let name = text_of(row.get(1));
         let file = text_of(row.get(2));
-        // The reference states what it opened the file as. This engine opens
-        // every database for reading and writing - there is no `.open --readonly`
-        // - so the suffix is always the same one, and leaving it off made every
-        // `.databases` line differ from the reference's.
-        shell.say(&format!("{name}: {file} r/w"));
+        // The reference writes `""` for a database with no file, and states what
+        // it opened the file as: `r/w`, or `r/o` after `--readonly`.
+        let shown = if file.is_empty() || file == ":memory:" {
+            "\"\"".to_string()
+        } else {
+            // The full path, as the reference reports it, whatever the file was
+            // opened as.
+            std::path::absolute(&file)
+                .map(|full| full.to_string_lossy().into_owned())
+                .unwrap_or(file)
+        };
+        let mode = if name == "main" && shell.is_read_only() {
+            "r/o"
+        } else {
+            "r/w"
+        };
+        shell.say(&format!("{name}: {shown} {mode}"));
     }
 }
 
@@ -537,21 +612,48 @@ fn text_of(value: Option<&Value<'static>>) -> String {
 
 /// `.tables`: the tables and views, in one space-separated block.
 fn tables(shell: &mut Shell, arguments: &[&str]) {
-    let mut sql = String::from(
-        "SELECT name FROM sqlite_master WHERE type IN ('table','view') \
-         AND name NOT LIKE 'sqlite_%'",
-    );
+    let mut condition = String::from("type IN ('table','view') AND name NOT LIKE 'sqlite_%'");
     if let Some(pattern) = arguments.first() {
-        sql.push_str(&format!(" AND name LIKE {}", literal_text(pattern)));
+        condition.push_str(&format!(" AND name LIKE {}", literal_text(pattern)));
     }
-    sql.push_str(" ORDER BY name");
-    let names = shell.column(&sql);
-    if names.is_empty() {
-        return;
-    }
+    let names = names_in_every_schema(shell, &condition);
     for line in columnise(&names) {
         shell.say(&line);
     }
+}
+
+/// Returns the quoted name of a schema's catalog table.
+///
+/// @param schema - `main`, `temp` or an attached name
+fn catalog_of(schema: &str) -> String {
+    format!("{}.sqlite_master", quote_identifier(schema))
+}
+
+/// Returns the names of the objects that meet a condition in every schema.
+///
+/// **Every schema the connection has, not only `main`.** `.tables` and `.indexes`
+/// on a connection with a temporary table or an attached database listed
+/// `main` alone, so `CREATE TEMP TABLE t(a)` followed by `.tables` answered
+/// nothing. The reference lists the objects of `temp` and of every attached
+/// database too, writes `schema.name` for the ones outside `main`, and sorts the
+/// whole list by what it writes.
+///
+/// @param shell - the shell
+/// @param condition - a `WHERE` condition over `name`, `type` and `tbl_name`
+fn names_in_every_schema(shell: &Shell, condition: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for (schema, _) in shell.database_list() {
+        let sql = format!("SELECT name FROM {} WHERE {condition}", catalog_of(&schema));
+        for name in shell.column(&sql) {
+            if schema.eq_ignore_ascii_case("main") {
+                names.push(name);
+            } else {
+                names.push(format!("{schema}.{name}"));
+            }
+        }
+    }
+    names.sort();
+    names
 }
 
 /// How wide the reference lays a name list out for.
@@ -639,7 +741,7 @@ fn columnise(names: &[String]) -> Vec<String> {
 
 /// `.indexes`: the indexes, optionally on one table.
 fn indexes(shell: &mut Shell, arguments: &[&str]) {
-    let mut sql = String::from("SELECT name FROM sqlite_master WHERE type = 'index'");
+    let mut condition = String::from("type = 'index'");
     if let Some(pattern) = arguments.first() {
         // **The argument is a substring of the *index* name, not the table's.**
         // Measured against the reference rather than read off the help text:
@@ -647,58 +749,188 @@ fn indexes(shell: &mut Shell, arguments: &[&str]) {
         // too, and `.indexes t` - the table an index called `ia` is on -
         // answers nothing. `.tables` is the other rule and is left alone:
         // `.tables people` answers `people` and not `peoples`.
-        sql.push_str(&format!(
+        condition.push_str(&format!(
             " AND name LIKE {}",
             literal_text(&format!("%{pattern}%"))
         ));
     }
-    sql.push_str(" AND name NOT LIKE 'sqlite_%' ORDER BY name");
-    let names = shell.column(&sql);
-    if names.is_empty() {
-        return;
-    }
+    condition.push_str(" AND name NOT LIKE 'sqlite_%'");
+    let names = names_in_every_schema(shell, &condition);
     for line in columnise(&names) {
         shell.say(&line);
     }
 }
 
-/// `.schema`: the statements that would rebuild what is there.
-fn schema(shell: &mut Shell, arguments: &[&str]) {
-    let mut sql = String::from("SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL");
-    if let Some(pattern) = arguments.first() {
-        let quoted = literal_text(pattern);
-        sql.push_str(&format!(
-            " AND (name LIKE {quoted} OR tbl_name LIKE {quoted})"
-        ));
+/// What `.schema` was asked for.
+#[derive(Default)]
+struct SchemaOptions<'a> {
+    /// `--indent`: put each column of a table on a line of its own.
+    indent: bool,
+    /// `--nosys`: leave out the objects whose names begin with `sqlite_`.
+    nosys: bool,
+    /// The `LIKE` pattern naming the objects to show, if one was given.
+    pattern: Option<&'a str>,
+}
+
+/// Reads the options and the pattern after `.schema`.
+///
+/// **An option is read as an option.** The first word was taken as the pattern
+/// whatever it was, so `.schema --indent` matched no object and printed nothing.
+/// The reference accepts one or two dashes, refuses an option it does not know
+/// by name, and refuses a second pattern with the usage line.
+///
+/// @param shell - where a complaint goes
+/// @param arguments - the words after `.schema`
+fn schema_options<'a>(shell: &mut Shell, arguments: &[&'a str]) -> Option<SchemaOptions<'a>> {
+    let mut options = SchemaOptions::default();
+    for argument in arguments {
+        let flag = argument
+            .strip_prefix('-')
+            .map(|rest| rest.strip_prefix('-').unwrap_or(rest));
+        match flag {
+            Some("indent") => options.indent = true,
+            Some("nosys") => options.nosys = true,
+            Some(_) => {
+                shell.complain(&format!("Unknown option: \"{argument}\""));
+                return None;
+            }
+            None if options.pattern.is_none() => options.pattern = Some(argument),
+            None => {
+                shell.complain("Usage: .schema ?--indent? ?--nosys? ?LIKE-PATTERN?");
+                return None;
+            }
+        }
     }
-    sql.push_str(" ORDER BY rowid");
-    let Ok((_, rows)) = shell.collect(&sql) else {
+    Some(options)
+}
+
+/// `.schema`: the statements that would rebuild what is there.
+///
+/// **Every schema, in the order `PRAGMA database_list` gives them.** `main` first,
+/// then `temp`, then the attached databases. An object outside `main` is written
+/// with its schema name after the keywords, as `CREATE TABLE temp.tt(c);`, which is
+/// what makes the statement rebuild it in the right place.
+///
+/// @param shell - the shell
+/// @param arguments - the words after the command
+fn schema(shell: &mut Shell, arguments: &[&str]) {
+    let Some(options) = schema_options(shell, arguments) else {
         return;
     };
-    for row in rows {
-        let kind = text_of(row.first());
-        let name = text_of(row.get(1));
-        let statement = text_of(row.get(2));
-        if kind == "view" {
-            // A view's text does not say what columns it produces, so the
-            // columns go underneath in a comment - which is what makes
-            // `.schema` on a view worth reading.
-            let listed = view_columns(shell, &name);
-            shell.say(&format!("{statement}\n/* {name}({listed}) */;"));
-            continue;
+    let schemas: Vec<String> = shell
+        .database_list()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    list_schemas(shell, &options, &schemas);
+}
+
+/// Prints the `CREATE` statements of the objects in some schemas.
+///
+/// @param shell - the shell
+/// @param options - what `.schema` was asked for
+/// @param schemas - the schemas to list, in order
+fn list_schemas(shell: &mut Shell, options: &SchemaOptions<'_>, schemas: &[String]) {
+    for schema_name in schemas.iter().map(String::as_str) {
+        let mut sql = format!(
+            "SELECT type, name, sql FROM {} WHERE sql IS NOT NULL",
+            catalog_of(schema_name)
+        );
+        if let Some(pattern) = options.pattern {
+            let quoted = literal_text(pattern);
+            sql.push_str(&format!(
+                " AND (name LIKE {quoted} OR tbl_name LIKE {quoted})"
+            ));
         }
-        shell.say(&format!("{statement};"));
+        if options.nosys {
+            sql.push_str(" AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'");
+        }
+        sql.push_str(" ORDER BY rowid");
+        let Ok((_, rows)) = shell.collect(&sql) else {
+            continue;
+        };
+        for row in rows {
+            let kind = text_of(row.first());
+            let name = text_of(row.get(1));
+            let statement = qualified_statement(&text_of(row.get(2)), schema_name);
+            if kind == "view" {
+                // A view's text does not say what columns it produces, so the
+                // columns go underneath in a comment - which is what makes
+                // `.schema` on a view worth reading.
+                let listed = view_columns(shell, schema_name, &name);
+                let shown = shown_name(schema_name, &name);
+                shell.say(&format!("{statement}\n/* {shown}({listed}) */;"));
+                continue;
+            }
+            if options.indent && kind != "trigger" {
+                shell.say(&crate::schema_indent::indented(&statement));
+                continue;
+            }
+            shell.say(&format!("{statement};"));
+        }
     }
 }
 
-/// Returns a view's column names, comma-separated.
-fn view_columns(shell: &Shell, name: &str) -> String {
-    let sql = format!("PRAGMA table_info({})", quote_identifier(name));
+/// Returns an object's name as the reference writes it: bare in `main`, and
+/// after its schema's name anywhere else.
+///
+/// @param schema - the schema the object is in
+/// @param name - the object's name
+fn shown_name(schema: &str, name: &str) -> String {
+    if schema.eq_ignore_ascii_case("main") {
+        name.to_string()
+    } else {
+        format!("{schema}.{name}")
+    }
+}
+
+/// Puts a schema's name after the keywords of a stored `CREATE` statement.
+///
+/// The catalog stores `CREATE TABLE tt(c)` for a table in `temp`, and the
+/// reference prints `CREATE TABLE temp.tt(c)`. A statement in `main` is left as
+/// it is.
+///
+/// @param statement - the text the catalog holds
+/// @param schema - the schema the object is in
+fn qualified_statement(statement: &str, schema: &str) -> String {
+    if schema.eq_ignore_ascii_case("main") {
+        return statement.to_string();
+    }
+    for prefix in [
+        "CREATE VIRTUAL TABLE ",
+        "CREATE UNIQUE INDEX ",
+        "CREATE TABLE ",
+        "CREATE INDEX ",
+        "CREATE VIEW ",
+        "CREATE TRIGGER ",
+    ] {
+        let Some(head) = statement.get(..prefix.len()) else {
+            continue;
+        };
+        if head.eq_ignore_ascii_case(prefix) {
+            let rest = statement.get(prefix.len()..).unwrap_or_default();
+            return format!("{head}{schema}.{rest}");
+        }
+    }
+    statement.to_string()
+}
+
+/// Returns a view's column names, comma-separated, each quoted when it needs to be.
+///
+/// @param shell - the shell
+/// @param schema - the schema the view is in
+/// @param name - the view
+fn view_columns(shell: &Shell, schema: &str, name: &str) -> String {
+    let sql = format!(
+        "PRAGMA {}.table_info({})",
+        quote_identifier(schema),
+        quote_identifier(name)
+    );
     let Ok((_, rows)) = shell.collect(&sql) else {
         return String::new();
     };
     rows.iter()
-        .map(|row| text_of(row.get(1)))
+        .map(|row| crate::render::insert_column(&text_of(row.get(1))))
         .collect::<Vec<String>>()
         .join(",")
 }
@@ -710,7 +942,7 @@ fn quote_identifier(name: &str) -> String {
 
 /// `.fullschema`: the schema, then whatever `ANALYZE` recorded.
 fn full_schema(shell: &mut Shell) {
-    schema(shell, &[]);
+    list_schemas(shell, &SchemaOptions::default(), &["main".to_string()]);
     let exists = shell.scalar("SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_stat1'");
     if exists.as_deref() == Some("0") || exists.is_none() {
         shell.say("/* No STAT tables available */");
@@ -733,81 +965,21 @@ fn literal_text(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
-/// `.mode`: how results are laid out.
-fn mode(shell: &mut Shell, arguments: &[&str]) {
-    let Some(name) = arguments.first() else {
-        let current = format!("current output mode: {}", shell.layout.mode.name());
-        shell.say(&current);
-        return;
-    };
-    match mode_named(name) {
-        Err(message) => shell.complain(&message),
-        Ok(mode) => {
-            shell.layout.mode = mode;
-            shell.layout.separator = mode.separator().to_string();
-            // **CSV ends a record with CR LF**, which is what RFC 4180 says and
-            // what the reference writes; every other mode ends a line with LF.
-            // Choosing a mode resets both separators, exactly as it resets the
-            // column one.
-            shell.layout.row_separator = if mode == crate::render::Mode::Csv {
-                "\r\n".to_string()
-            } else {
-                "\n".to_string()
-            };
-            // The tabular modes default to headers and the others do not,
-            // unless `.headers` has been used, whose choice wins in every
-            // mode. That is SQLite's shell, asked of the pinned 3.53.4.
-            let tabular = matches!(
-                mode,
-                crate::render::Mode::Column
-                    | crate::render::Mode::Markdown
-                    | crate::render::Mode::Table
-                    | crate::render::Mode::Box
-                    | crate::render::Mode::Html
-            );
-            shell.layout.headers = shell.headers_chosen.unwrap_or(tabular);
-            if let Some(table) = arguments.get(1) {
-                shell.layout.table = (*table).to_string();
-            }
-        }
-    }
-}
-
-/// `.separator`: what goes between columns, and optionally between rows.
+/// Resolves the backslash escapes inside a double quoted dot command argument.
 ///
-/// A command that needs an argument and was given none answers with its usage
-/// line rather than doing nothing, which is what SQLite's shell does and what
-/// makes `.separator ;` - whose only argument is the terminator this shell has
-/// just dropped - say so instead of silently keeping the separator it had.
-fn separator(shell: &mut Shell, arguments: &[&str]) {
-    let Some(column) = arguments.first() else {
-        shell.complain("Usage: .separator COL ?ROW?");
-        return;
-    };
-    shell.layout.separator = resolve_backslashes(column);
-    if let Some(row) = arguments.get(1) {
-        shell.layout.row_separator = resolve_backslashes(row);
-    }
-}
-
-/// Resolves the backslash escapes a separator or a null placeholder may carry.
-///
-/// **A port of `shell.c`'s `resolve_backslashes`, and it was missing.** Without
-/// it `.separator "\t"` set the column separator to a backslash followed by a
-/// `t`, so `sqlite3 :memory: '.separator "\t"' 'SELECT 1,2'` answered `1<tab>2`
-/// and this shell answered `1\t2` - a wrong answer rather than a refusal, in
-/// the class this repository counts. It was invisible because the separator is
-/// a *setting*: nothing in the 183-case differential probe changes one, so
-/// every comparison ran on the default and agreed.
-///
-/// The reference's rule for an unknown escape is to keep the character that
-/// followed the backslash and drop the backslash, and that is reproduced here
-/// rather than corrected: a script that writes `\q` gets `q` from both shells.
+/// **A port of `shell.c`'s `resolve_backslashes`.** `\a \b \f \n \r \t \v`, `\"`,
+/// `\'` and a doubled backslash are one character each, `\x` and up to two
+/// hexadecimal digits is a byte, and a backslash and up to three octal digits is
+/// a byte. The
+/// reference's rule for an unknown escape is to keep the character that followed
+/// the backslash and drop the backslash, so a script that writes `\q` gets `q`
+/// from both shells. A byte of 0x80 or more is carried as that byte, which is
+/// what `.separator "\x1f"` and a Latin 1 `\xe9` ask for.
 ///
 /// @param text - what the caller wrote, escapes and all
 fn resolve_backslashes(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut characters = text.chars();
+    let mut characters = text.chars().peekable();
     while let Some(character) = characters.next() {
         if character != '\\' {
             out.push(character);
@@ -821,23 +993,19 @@ fn resolve_backslashes(text: &str) -> String {
             Some('r') => out.push('\r'),
             Some('t') => out.push('\t'),
             Some('v') => out.push('\u{b}'),
-            Some('x') => {
-                // Two hexadecimal digits, and a `\x` with fewer keeps what was
-                // written - which is the reference's behaviour and is what
-                // makes a half-typed escape visible rather than silently one
-                // character shorter.
-                let digits: String = characters.clone().take(2).collect();
-                match u32::from_str_radix(&digits, 16)
-                    .ok()
-                    .and_then(char::from_u32)
-                {
-                    Some(resolved) if digits.len() == 2 => {
-                        out.push(resolved);
-                        characters.next();
-                        characters.next();
+            Some('x') => push_numbered_byte(&mut out, &mut characters, 16, 2, 'x'),
+            Some(digit @ '0'..='7') => {
+                let mut value = digit.to_digit(8).unwrap_or(0);
+                for _ in 0..2 {
+                    match characters.peek().and_then(|next| next.to_digit(8)) {
+                        Some(more) => {
+                            value = value * 8 + more;
+                            characters.next();
+                        }
+                        None => break,
                     }
-                    _ => out.push('x'),
                 }
+                push_byte(&mut out, (value & 0xff) as u8);
             }
             Some(other) => out.push(other),
             None => out.push('\\'),
@@ -846,107 +1014,203 @@ fn resolve_backslashes(text: &str) -> String {
     out
 }
 
-/// `.width`: minimum widths for the columnar modes.
-fn width(shell: &mut Shell, arguments: &[&str]) {
-    shell.layout.widths = arguments
-        .iter()
-        .map(|word| word.parse::<usize>().unwrap_or(0))
-        .collect();
+/// Reads up to `most` digits in a radix and pushes the byte they make.
+///
+/// With no digits at all the escape keeps the letter that introduced it.
+///
+/// @param out - the text being built
+/// @param characters - the rest of the argument
+/// @param radix - 16 for a hexadecimal escape
+/// @param most - how many digits at most
+/// @param letter - what to write when there are no digits
+fn push_numbered_byte(
+    out: &mut String,
+    characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    radix: u32,
+    most: usize,
+    letter: char,
+) {
+    let mut value = 0u32;
+    let mut count = 0usize;
+    while count < most {
+        match characters.peek().and_then(|next| next.to_digit(radix)) {
+            Some(digit) => {
+                value = value * radix + digit;
+                characters.next();
+                count += 1;
+            }
+            None => break,
+        }
+    }
+    if count == 0 {
+        out.push(letter);
+    } else {
+        push_byte(out, (value & 0xff) as u8);
+    }
 }
 
-/// `.output` and `.once`: where results go.
-fn output(shell: &mut Shell, arguments: &[&str], once: bool) {
-    let named = arguments.first().copied().filter(|path| *path != "stdout");
-    let confined = match named {
-        None => None,
-        Some(named) => match confine_path(shell, named) {
-            Some(path) => Some(path),
-            None => return,
-        },
-    };
-    if let Err(message) = shell.redirect(confined.as_deref(), once) {
-        shell.complain(&format!(
-            "Error: cannot open \"{}\": {message}",
-            confined.unwrap_or_default()
-        ));
-    }
+/// Pushes one byte: as itself when it is ASCII, and as the stand in for a byte
+/// that is not text otherwise (see `crate::raw`).
+///
+/// @param out - the text being built
+/// @param byte - the byte
+fn push_byte(out: &mut String, byte: u8) {
+    out.push_str(&crate::raw::decode(&[byte]));
+}
+
+/// `.width`: minimum widths for the columnar modes.
+///
+/// Each word is read the way C's `atoi` reads it, so a word that is not a number is
+/// zero, which is as wide as the widest value. A negative width right aligns the
+/// column. `.width` with nothing after it clears them.
+///
+/// @param shell - the shell
+/// @param arguments - the words after the command
+fn width(shell: &mut Shell, arguments: &[&str]) {
+    shell.layout.widths = arguments.iter().map(|word| c_atoi(word)).collect();
 }
 
 /// `.read`: runs a script as though it had been typed.
 fn read(shell: &mut Shell, arguments: &[&str]) {
-    let Some(named) = arguments.first() else {
-        shell.complain("Error: .read requires a file name");
+    let [named] = arguments else {
+        shell.complain("Usage: .read FILE");
         return;
     };
-    let Some(path) = confine_path(shell, named) else {
+    let Some(bytes) = read_source(shell, named) else {
         return;
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        shell.complain(&format!("Error: cannot open \"{path}\""));
+    run_script_bytes(shell, named, &bytes);
+}
+
+/// How many files `.read` may have open inside one another.
+///
+/// The reference's limit is 25 and it refuses the 25th, so 24 run.
+const MAX_INPUT_NESTING: usize = 25;
+
+/// Returns the bytes `.read` reads for a name: a file, or what a command prints.
+///
+/// **A name that begins with `|` is a command**, as it is in the reference: its
+/// standard output is the script. Anything else is a path, which goes through
+/// `--root` confinement. A failure is reported here, in the reference's words.
+///
+/// @param shell - where a complaint goes
+/// @param named - the file name, or `|` and a command
+fn read_source(shell: &mut Shell, named: &str) -> Option<Vec<u8>> {
+    if let Some(command) = named.strip_prefix('|') {
+        return match crate::commands::capture_output(command) {
+            Some(bytes) => Some(bytes),
+            None => {
+                shell.complain(&format!("Error: cannot open \"{named}\""));
+                None
+            }
+        };
+    }
+    let path = confine_path(shell, named)?;
+    match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            shell.complain(&format!("Error: cannot open \"{path}\""));
+            None
+        }
+    }
+}
+
+/// Runs the lines of a script as though they had been typed.
+///
+/// **A file is one level of nesting, and 25 levels is an error** instead of a
+/// stack overflow: a file that reads itself would otherwise run until the process
+/// ended. The error names the file and the line that asked for it. `.quit` ends
+/// this file only, so the `done` flag is cleared when the file ends, and `.exit`
+/// ends everything. Errors in the file say `of FILE` after the line number.
+///
+/// @param shell - the shell
+/// @param named - the file name as typed, which errors name
+/// @param bytes - the file's contents
+pub fn run_script_bytes(shell: &mut Shell, named: &str, bytes: &[u8]) {
+    if shell.depth.saturating_add(1) >= MAX_INPUT_NESTING {
+        let line = shell.line;
+        shell.complain(&format!(
+            "{named}: Input nesting limit ({MAX_INPUT_NESTING}) reached at line {line}. Check recursion."
+        ));
         return;
-    };
-    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+    }
+    let lines = crate::raw::split_lines(bytes);
+    let outer_source = shell.source.replace(named.to_string());
+    let outer_argument = shell.argument.take();
+    let outer_line = shell.line;
+    shell.depth = shell.depth.saturating_add(1);
     drive(shell, lines.into_iter());
+    shell.depth = shell.depth.saturating_sub(1);
+    shell.source = outer_source;
+    shell.argument = outer_argument;
+    shell.line = outer_line;
+    if shell.exit_code.is_none() {
+        shell.done = false;
+    }
+}
+
+/// Reports a mistake in one word of the dot command being run, in the reference's form.
+///
+/// Two lines: the command as it was typed, and a caret under the first character
+/// of the word with the reason after it, each starting `line N: `.
+///
+/// @param shell - where the complaint goes
+/// @param word - which word, counting the command itself as word 0
+/// @param reason - what is wrong with it, such as `unknown option`
+pub(crate) fn word_error(shell: &mut Shell, word: usize, reason: &str) {
+    let line = shell.line;
+    let column = shell.dot_offsets.get(word).copied().unwrap_or(0);
+    let typed = shell.dot_line.clone();
+    shell.complain(&format!("line {line}: {typed}"));
+    shell.complain(&format!("line {line}: {}^--- {reason}", " ".repeat(column)));
+}
+
+/// Reports an option a dot command does not know.
+///
+/// @param shell - where the complaint goes
+/// @param command - the command with its dot, such as `.dump`
+/// @param arguments - every word after the command
+/// @param option - the word that was not understood
+pub(crate) fn unknown_option(shell: &mut Shell, command: &str, arguments: &[&str], option: &str) {
+    let _ = command;
+    let position = arguments
+        .iter()
+        .position(|word| *word == option)
+        .map_or(1, |at| at + 1);
+    word_error(shell, position, "unknown option");
 }
 
 /// `.dump`: the SQL that would rebuild the database.
 fn dump(shell: &mut Shell, arguments: &[&str]) {
-    let confined = match arguments.first().copied() {
-        None => None,
-        Some(named) => match confine_path(shell, named) {
-            Some(path) => Some(path),
-            None => return,
-        },
-    };
-    crate::dump::dump(shell, confined.as_deref());
-}
-
-/// `.backup`: copies a database into a file.
-fn backup(shell: &mut Shell, arguments: &[&str]) {
-    let (_, named) = database_and_file(arguments);
-    let Some(named) = named else {
-        shell.complain("Error: .backup requires a file name");
-        return;
-    };
-    let Some(path) = confine_path(shell, named) else {
-        return;
-    };
-    let path = path.as_str();
-    // A checkpoint and a file copy, which is what a backup of this format is:
-    // one file is one database, and there is no second writer to race.
-    if let Err(message) = shell.backup_to(path) {
-        shell.complain(&format!("Error: {message}"));
+    let mut options = crate::dump::DumpOptions::default();
+    for argument in arguments {
+        if let Some(flag) = argument.strip_prefix('-') {
+            // **An option is read as an option.** The first word after `.dump`
+            // was taken as the pattern whatever it was, so `.dump --nosys`
+            // matched no table whose name looked like `--nosys` and dumped
+            // nothing, and `inillucent dump --data-only` was an empty dump.
+            // One or two dashes both work, as they do in the reference.
+            match flag.strip_prefix('-').unwrap_or(flag) {
+                "data-only" => options.data_only = true,
+                "nosys" => options.nosys = true,
+                "newlines" => {}
+                "preserve-rowids" => {
+                    shell.complain("Error: .dump --preserve-rowids is not built");
+                    return;
+                }
+                _ => {
+                    unknown_option(shell, ".dump", arguments, argument);
+                    return;
+                }
+            }
+            continue;
+        }
+        let Some(pattern) = confine_path(shell, argument) else {
+            return;
+        };
+        options.patterns.push(pattern);
     }
-}
-
-/// `.restore`: replaces a database with the contents of a file.
-fn restore(shell: &mut Shell, arguments: &[&str]) {
-    let (_, named) = database_and_file(arguments);
-    let Some(named) = named else {
-        shell.complain("Error: .restore requires a file name");
-        return;
-    };
-    let Some(path) = confine_path(shell, named) else {
-        return;
-    };
-    let path = path.as_str();
-    // **Restoring is opening the other file, not copying it over this one.**
-    // The old engine's restore wrote the source's pages into the open database
-    // in place. This engine's databases are whole files, so the honest restore
-    // is to point the shell at the file the caller named - which is also what a
-    // person means by it, and it does not destroy the database they were in.
-    if let Err(message) = shell.reopen(path) {
-        shell.complain(&format!("Error: {message}"));
-    }
-}
-
-/// Splits `?DB? FILE` into its two halves.
-fn database_and_file<'a>(arguments: &[&'a str]) -> (&'a str, Option<&'a str>) {
-    match arguments {
-        [file] => ("main", Some(file)),
-        [database, file, ..] => (database, Some(file)),
-        _ => ("main", None),
-    }
+    crate::dump::dump(shell, &options);
 }
 
 /// `.version`: what this is and what it implements.
@@ -973,14 +1237,23 @@ fn version(shell: &mut Shell) {
 fn show(shell: &mut Shell) {
     let lines = vec![
         format!("        echo: {}", on_off(shell.echo)),
-        format!("         eqp: {}", on_off(shell.explain_plan)),
+        format!("         eqp: {}", shell.eqp_name),
         format!("     explain: {}", shell.explain_mode.name()),
         format!("     headers: {}", on_off(shell.layout.headers)),
         format!("        mode: {}", shell.layout.mode.name()),
-        format!("   nullvalue: \"{}\"", shell.layout.null),
+        format!(
+            "   nullvalue: {}",
+            crate::modes::c_quoted(&shell.layout.null)
+        ),
         format!("      output: {}", shell.output_target()),
-        format!("colseparator: \"{}\"", shell.layout.separator),
-        format!("rowseparator: \"{}\"", escape(&shell.layout.row_separator)),
+        format!(
+            "colseparator: {}",
+            crate::modes::c_quoted(&shell.layout.separator)
+        ),
+        format!(
+            "rowseparator: {}",
+            crate::modes::c_quoted(&shell.layout.row_separator)
+        ),
         format!("       stats: {}", on_off(shell.stats)),
         format!("       width: {}", widths_text(&shell.layout.widths)),
         format!("    filename: {}", shell.path().to_string()),
@@ -999,18 +1272,9 @@ fn on_off(value: bool) -> &'static str {
     }
 }
 
-/// Escapes a separator for display.
-fn escape(text: &str) -> String {
-    text.replace('\n', "\\n").replace('\t', "\\t")
-}
-
-/// Renders the fixed column widths.
-fn widths_text(widths: &[usize]) -> String {
-    widths
-        .iter()
-        .map(usize::to_string)
-        .collect::<Vec<String>>()
-        .join(" ")
+/// Renders the fixed column widths, each followed by a space as the reference writes them.
+fn widths_text(widths: &[i32]) -> String {
+    widths.iter().map(|width| format!("{width} ")).collect()
 }
 
 #[cfg(test)]
@@ -1020,13 +1284,44 @@ mod tests {
     /// Quotes hold a word together, and whitespace between words splits them.
     #[test]
     fn arguments_split_the_way_a_shell_splits_them() {
-        assert_eq!(split(".mode csv"), vec![".mode", "csv"]);
+        let words =
+            |line: &str| -> Vec<String> { split(line).into_iter().map(|(word, _)| word).collect() };
+        assert_eq!(words(".mode csv"), vec![".mode", "csv"]);
         assert_eq!(
-            split(".output \"my file.txt\""),
+            words(".output \"my file.txt\""),
             vec![".output", "my file.txt"]
         );
-        assert_eq!(split(".separator \" | \""), vec![".separator", " | "]);
-        assert_eq!(split(".print"), vec![".print"]);
+        assert_eq!(words(".separator \" | \""), vec![".separator", " | "]);
+        assert_eq!(words(".print"), vec![".print"]);
+    }
+
+    /// A backslash is an escape only between double quotes, and each word knows
+    /// where it begins.
+    #[test]
+    fn a_backslash_means_something_only_inside_double_quotes() {
+        let words =
+            |line: &str| -> Vec<String> { split(line).into_iter().map(|(word, _)| word).collect() };
+        assert_eq!(words(r#".print a\tb"#), vec![".print", r"a\tb"]);
+        assert_eq!(words(r#".print 'a\tb'"#), vec![".print", r"a\tb"]);
+        assert_eq!(words(r#".print "a\tb""#), vec![".print", "a\tb"]);
+        assert_eq!(words(r#".print "a\"b""#), vec![".print", "a\"b"]);
+        assert_eq!(words(r#".print "x\x41y\101""#), vec![".print", "xAyA"]);
+        assert_eq!(words(r#".print "a\qb""#), vec![".print", "aqb"]);
+        let at: Vec<usize> = split(".print \"ab\" c")
+            .into_iter()
+            .map(|(_, at)| at)
+            .collect();
+        assert_eq!(at, vec![0, 8, 12]);
+    }
+
+    /// `.exit` reads its status the way C's `atoi` does.
+    #[test]
+    fn an_exit_status_is_read_like_atoi() {
+        assert_eq!(c_atoi("3"), 3);
+        assert_eq!(c_atoi("3x"), 3);
+        assert_eq!(c_atoi("abc"), 0);
+        assert_eq!(c_atoi("-1"), -1);
+        assert_eq!(c_atoi("  7"), 7);
     }
 
     /// A missing argument means on, which is what a bare `.headers` needs.

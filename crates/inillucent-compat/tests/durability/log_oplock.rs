@@ -193,6 +193,128 @@ fn the_oplock_takes_the_length_query_off_a_read_and_gives_it_back() {
     );
 }
 
+/// Runs a hundred point reads and answers how many lookups by name they made.
+///
+/// @param statement - the prepared point read
+#[cfg(windows)]
+fn name_lookups_over_a_hundred_reads(
+    statement: &mut inillucent_engine::connect::Statement<'_>,
+) -> u64 {
+    let before = inillucent_vfs::os::name_queries();
+    for id in 0..100i64 {
+        statement.reset();
+        statement
+            .bind_integer(1, id % 50 + 1)
+            .expect("the id binds");
+        assert!(statement.step().expect("the read runs"));
+    }
+    inillucent_vfs::os::name_queries().saturating_sub(before)
+}
+
+/// The oplock takes the lookups by name off a read: whether the file was replaced and whether the
+/// log rolled are asked by name only while another handle has the segment open.
+///
+/// Those three lookups were 71% of an autocommit point read through the `Connection` after the
+/// change that made a statement ask whether `VACUUM` had replaced its file (task-2226).
+#[cfg(windows)]
+#[test]
+fn the_oplock_takes_the_lookups_by_name_off_a_read() {
+    let directory = area("lookups");
+    let path = directory.join("shared.rdb");
+    let database = Database::open(&path).expect("the database opens");
+    let connection = database.session();
+    connection
+        .execute_batch(
+            "CREATE TABLE note (n INTEGER PRIMARY KEY); \
+             WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 50) \
+             INSERT INTO note SELECT i FROM c;",
+        )
+        .expect("the table is filled");
+    let mut statement = connection
+        .prepare("SELECT n FROM note WHERE n = ?1")
+        .expect("the read prepares");
+    assert!(
+        becomes_solo(&mut statement),
+        "reads kept asking the log its length with no other handle open"
+    );
+    // The first statement after the oplock was taken asks once, to know the answers stand.
+    let _ = name_lookups_over_a_hundred_reads(&mut statement);
+    let quiet = name_lookups_over_a_hundred_reads(&mut statement);
+    assert_eq!(
+        quiet, 0,
+        "a hundred reads under the oplock asked the file system by name {quiet} times"
+    );
+    let foreign = std::fs::File::open(newest_segment(&path)).expect("a second handle opens");
+    let open = name_lookups_over_a_hundred_reads(&mut statement);
+    assert!(
+        open >= 100,
+        "with another handle on the segment a hundred reads asked by name only {open} times"
+    );
+    drop(foreign);
+}
+
+/// `VACUUM` in another process is found by a connection that was reading under the oplock, so a
+/// row it writes afterwards lands in the file the path names.
+///
+/// The check that the file was replaced is skipped while the oplock holds. That is sound only
+/// because `VACUUM` deletes the old log segments before it renames the rebuilt file into place,
+/// and the delete breaks the oplock. Without the check, the insert below went to the old file,
+/// which no path names, and the reopen counted 50 rows (the loss task-2217 measured as 265 of 502
+/// acknowledged inserts).
+#[cfg(windows)]
+#[test]
+fn a_vacuum_by_another_process_is_found_under_the_oplock() {
+    let directory = area("vacuum");
+    let path = directory.join("shared.rdb");
+    {
+        let database = Database::open(&path).expect("the database opens");
+        let connection = database.session();
+        connection
+            .execute_batch(
+                "CREATE TABLE note (n INTEGER PRIMARY KEY); \
+                 WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 50) \
+                 INSERT INTO note SELECT i FROM c;",
+            )
+            .expect("the table is filled");
+        let mut statement = connection
+            .prepare("SELECT n FROM note WHERE n = ?1")
+            .expect("the read prepares");
+        assert!(
+            becomes_solo(&mut statement),
+            "reads kept asking the log its length with no other handle open"
+        );
+        let _ = name_lookups_over_a_hundred_reads(&mut statement);
+        assert_eq!(
+            name_lookups_over_a_hundred_reads(&mut statement),
+            0,
+            "the reads were not skipping the lookups, so this test would not test the skip"
+        );
+        drop(statement);
+        let output = Command::new(program("inillucent"))
+            .arg("--db")
+            .arg(&path)
+            .arg("exec")
+            .arg("VACUUM")
+            .output()
+            .expect("the command line starts");
+        assert!(
+            output.status.success(),
+            "VACUUM failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        connection
+            .execute_batch("INSERT INTO note (n) VALUES (51)")
+            .expect("the insert after VACUUM runs");
+        assert_eq!(count(&connection), 51);
+    }
+    let reopened = Database::open(&path).expect("the database opens again");
+    assert_eq!(
+        count(&reopened.session()),
+        51,
+        "the row written after another process's VACUUM is not in the file the path names"
+    );
+}
+
 /// A database opened at a path whose files were deleted while an older database still holds
 /// them writes its log to the new segment on disk, not to the deleted one.
 ///

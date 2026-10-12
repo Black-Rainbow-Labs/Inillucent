@@ -340,7 +340,7 @@ fn the_default_ceiling_is_the_engines() {
     assert_eq!(
         inillucent_engine::DEFAULT_STATEMENT_CACHE,
         1_000,
-        "the default ceiling moved; the note on `OpenOptions::statement_cache` has to move          with it"
+        "the default ceiling moved; the note on `OpenOptions::statement_cache` has to move with it"
     );
 }
 
@@ -409,4 +409,102 @@ fn execute_many_keeps_the_rows_before_a_failure() {
             connection.execute_batch("COMMIT").expect("commit");
         }
     }
+}
+
+/// A NaN bound as a parameter is stored as NULL, which is what SQLite's
+/// `sqlite3_bind_double` stores.
+///
+/// It was stored as a REAL that is not equal to itself, so a binding of this
+/// driver gave a different answer from every other SQLite binding.
+#[test]
+fn a_nan_parameter_is_stored_as_null() {
+    let database = peopled("nan_is_null");
+    let connection = database.session();
+    connection
+        .execute(
+            "INSERT INTO people VALUES (4, 'Nan', ?1)",
+            &[Value::Real(f64::NAN)],
+        )
+        .expect("the insert runs");
+    let rows = connection
+        .query("SELECT typeof(age), age FROM people WHERE id = 4", &[], 10)
+        .expect("the select runs");
+    assert_eq!(rows.value(0, 0).and_then(Value::text), Some("null"));
+    assert_eq!(rows.value(0, 1), Some(&Value::Null));
+    let infinity = connection
+        .query("SELECT typeof(?1)", &[Value::Real(f64::INFINITY)], 10)
+        .expect("infinity binds");
+    assert_eq!(infinity.value(0, 0).and_then(Value::text), Some("real"));
+}
+
+/// `query_one` refuses text that holds a second statement and runs nothing, and
+/// accepts one statement with a trailing semicolon, a comment or a trigger body
+/// that holds semicolons.
+///
+/// `query` compiles the first statement of its text and ignores the rest, so
+/// `INSERT ...; INSERT ...; garbage` ran one insert and reported success.
+#[test]
+fn text_with_a_second_statement_is_refused_by_query_one() {
+    let database = peopled("one_statement");
+    let connection = database.session();
+    let refused = connection
+        .query_one(
+            "INSERT INTO people VALUES (4, 'A', 1); INSERT INTO people VALUES (5, 'B', 2); nonsense",
+            &[],
+            0,
+        )
+        .expect_err("two statements are refused");
+    assert_eq!(refused.status, Status::InvalidState);
+    let count = connection
+        .query("SELECT count(*) FROM people", &[], 10)
+        .expect("the count runs");
+    assert_eq!(
+        count.value(0, 0),
+        Some(&Value::Integer(3)),
+        "the first insert ran"
+    );
+    for accepted in [
+        "INSERT INTO people VALUES (4, 'A', 1);",
+        "INSERT INTO people VALUES (5, 'B', 2); -- done\n",
+        "CREATE TABLE audit (n); ",
+        "CREATE TRIGGER t AFTER INSERT ON people BEGIN INSERT INTO audit VALUES (new.id); INSERT INTO audit VALUES (new.id); END",
+    ] {
+        connection
+            .query_one(accepted, &[], 0)
+            .unwrap_or_else(|why| panic!("{accepted:?} was refused: {why}"));
+    }
+}
+
+/// `BEGIN` inside a transaction and `COMMIT` or `ROLLBACK` with none open are
+/// `invalid_state`; they answered `syntax`, which told a caller its SQL was
+/// wrong.
+#[test]
+fn a_transaction_statement_in_the_wrong_state_is_invalid_state() {
+    let database = peopled("wrong_state");
+    let connection = database.session();
+    for sql in ["COMMIT", "ROLLBACK"] {
+        let refused = connection.query(sql, &[], 0).expect_err("nothing to end");
+        assert_eq!(refused.status, Status::InvalidState, "{sql}");
+    }
+    connection.query("BEGIN", &[], 0).expect("begins");
+    let nested = connection.query("BEGIN", &[], 0).expect_err("cannot nest");
+    assert_eq!(nested.status, Status::InvalidState);
+    connection.query("ROLLBACK", &[], 0).expect("ends");
+}
+
+/// A read only open of a file that is not there is `not_found`, whether or not
+/// `create` is also set.
+#[test]
+fn a_missing_file_opened_read_only_is_not_found() {
+    let path = scratch("missing_read_only");
+    for create in [true, false] {
+        let options = OpenOptions {
+            read_only: true,
+            create,
+            ..OpenOptions::default()
+        };
+        let refused = Database::open_with(&path, options).expect_err("there is no file");
+        assert_eq!(refused.status, Status::NotFound, "create = {create}");
+    }
+    assert!(!path.exists(), "a read only open made the file");
 }

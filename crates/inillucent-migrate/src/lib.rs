@@ -542,7 +542,7 @@ fn structure_probe(database: &Path) -> Check {
             name: "structure.integrity".to_string(),
             passed: true,
             detail: format!(
-                "every tree walks in key order; a fresh open reads {chunks} rows out of chunk                  and {content} out of the search index's own storage"
+                "every tree walks in key order; a fresh open reads {chunks} rows out of chunk and {content} out of the search index's own storage"
             ),
         },
         (Err(detail), _) | (_, Err(detail)) => Check {

@@ -95,6 +95,43 @@ pub(super) fn prefer_shown(source: &BoundSource, hits: Vec<u16>, unqualified: bo
     }
 }
 
+/// Returns where a column of a parenthesised join sorts: its table's position, then whether it leads.
+///
+/// **SQLite lists a `USING` column before the other columns of the table on its
+/// left.** In `a, (b JOIN c USING (y))` the nested join expands to `y`, `b.x`,
+/// `c.z`, so `SELECT *` gives `a.x, y, b.x, c.z`. A column leads when the next
+/// table of the join has it as a `USING` column and it is shown rather than
+/// hidden.
+///
+/// @param bound - the block built for the parenthesised join
+/// @param origin - the column's source and position
+fn using_lead_rank(bound: &BoundSelect, origin: &Origin) -> (usize, u8) {
+    let Some(at) = bound
+        .sources
+        .iter()
+        .position(|source| source.id == origin.source)
+    else {
+        return (usize::MAX, 1);
+    };
+    let leads = !origin.hidden
+        && bound.sources.get(at + 1).is_some_and(|next| {
+            let name = bound
+                .sources
+                .get(at)
+                .and_then(|source| source.table.columns.get(usize::from(origin.column)))
+                .map(|column| column.name.as_slice());
+            name.is_some_and(|name| {
+                next.suppressed.iter().any(|position| {
+                    next.table
+                        .columns
+                        .get(usize::from(*position))
+                        .is_some_and(|held| held.name.eq_ignore_ascii_case(name))
+                })
+            })
+        });
+    (at, u8::from(!leads))
+}
+
 impl Binder<'_> {
     /// Puts the columns a parenthesised join's `USING` terms hide back into its
     /// result, after the column each one follows in the join.
@@ -135,15 +172,22 @@ impl Binder<'_> {
             return Ok(Vec::new());
         }
         let mut old = std::mem::take(&mut bound.columns).into_iter();
-        let mut origins = Vec::with_capacity(plan.len());
+        let mut paired: Vec<(Origin, Option<BoundResultColumn>)> = Vec::with_capacity(plan.len());
         for origin in plan {
             if origin.hidden {
+                paired.push((origin, None));
+            } else if let Some(result) = old.next() {
+                paired.push((origin, Some(result)));
+            }
+        }
+        // A stable sort keeps every other column where the join put it.
+        paired.sort_by_key(|(origin, _)| using_lead_rank(bound, origin));
+        let mut origins = Vec::with_capacity(paired.len());
+        for (origin, result) in paired {
+            let Some(result) = result else {
                 let result = self.hidden_result_column(origin.source, origin.column)?;
                 bound.columns.push(result);
                 origins.push(origin);
-                continue;
-            }
-            let Some(result) = old.next() else {
                 continue;
             };
             // A `RIGHT` or `FULL` join makes the shown column the merged value,

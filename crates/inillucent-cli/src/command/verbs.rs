@@ -40,15 +40,27 @@ pub fn value_to_json(value: &Value<'static>) -> Json {
         Value::Null => Json::Null,
         Value::Integer(number) => Json::Int(*number),
         Value::Real(number) => Json::Real(*number),
-        Value::Text(text) => json::text(String::from_utf8_lossy(text.raw()).into_owned()),
-        Value::Blob(bytes) => {
-            let mut hex = String::with_capacity(bytes.raw().len().saturating_mul(2));
-            for byte in bytes.raw() {
-                hex.push_str(&format!("{byte:02x}"));
-            }
-            json::object(vec![("blob", json::text(hex))])
-        }
+        // **Text that is not UTF-8 leaves as a blob**, the way the driver and the
+        // addon hand it over. A lossy conversion wrote a replacement character
+        // that was never stored, so Node's command line and server routes
+        // returned a string where the addon route returned bytes.
+        Value::Text(text) => match std::str::from_utf8(text.raw()) {
+            Ok(said) => json::text(said.to_owned()),
+            Err(_) => blob_json(text.raw()),
+        },
+        Value::Blob(bytes) => blob_json(bytes.raw()),
     }
+}
+
+/// Writes bytes as the `{"blob": "<hex>"}` envelope a result carries.
+///
+/// @param bytes - the bytes
+fn blob_json(bytes: &[u8]) -> Json {
+    let mut hex = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    json::object(vec![("blob", json::text(hex))])
 }
 
 /// Turns one JSON value into the SQL literal that reproduces it.
@@ -131,7 +143,9 @@ fn blob_literal(fields: &[(String, Json)]) -> Result<String, Failed> {
              for a vector, or {\"blob\": \"<hex>\"} for bytes.",
         ));
     };
-    if hex.is_empty() || hex.len() % 2 != 0 || !hex.chars().all(|digit| digit.is_ascii_hexdigit()) {
+    // An empty string is no digits, which is an even number of them: it names
+    // the empty blob, the same value `x''` is and `zeroblob(0)` returns.
+    if hex.len() % 2 != 0 || !hex.chars().all(|digit| digit.is_ascii_hexdigit()) {
         return Err(Failed::misuse(
             "the value of \"blob\" has to be an even number of hexadecimal digits.",
         ));
@@ -204,18 +218,61 @@ fn produce(
             .unwrap_or(Value::Null);
         bound.push(inillucent_tree::datum::OwnedDatum::from(&held));
     }
+    let counters = write_counters(context);
     let started = std::time::Instant::now();
     let collected = context.shell().collect_bound(sql, &bound);
     let elapsed = started.elapsed().as_secs_f64() * 1000.0;
     let (names, rows) = collected.map_err(|failure| Failed::from_shell(&failure))?;
-    Ok(rows_to_outcome(
-        context, command, names, rows, limit, elapsed,
-    ))
+    let mut produced = rows_to_outcome(context, command, names, rows, limit, elapsed);
+    let (changes, rowid) = write_counters(context);
+    produced.changes = (changes - counters.0).max(0);
+    produced.last_insert_rowid = rowid_this_statement_assigned(sql, &produced, counters.1, rowid);
+    Ok(produced)
+}
+
+/// Returns the connection's running count of changed rows and its last rowid.
+///
+/// @param context - the open database
+fn write_counters(context: &mut Context) -> (i64, i64) {
+    let connection = context.shell().connection();
+    (
+        connection.total_changes().unwrap_or_default(),
+        connection.last_insert_rowid().unwrap_or_default(),
+    )
+}
+
+/// Returns the rowid a statement assigned, or zero when it assigned none.
+///
+/// **The connection remembers the last insert for as long as it is open**, and
+/// the MCP server keeps one connection for the whole session, so a `SELECT` after
+/// an `INSERT` reported the insert's rowid as its own. A fresh process
+/// reports zero for a `SELECT`, and so does this: a statement that changed no
+/// rows assigned nothing, and one that did reports the rowid only when it moved
+/// or when it is an `INSERT` or `REPLACE` (which can assign the rowid the last
+/// one did, after a delete).
+///
+/// @param sql - the statement
+/// @param produced - what it produced, whose `changes` was set from the counter
+/// @param before - the connection's last rowid before the statement ran
+/// @param after - the connection's last rowid after it ran
+fn rowid_this_statement_assigned(sql: &str, produced: &Outcome, before: i64, after: i64) -> i64 {
+    if produced.changes == 0 {
+        return 0;
+    }
+    let head = sql.trim_start().to_ascii_uppercase();
+    let inserts = head.starts_with("INSERT") || head.starts_with("REPLACE");
+    match after != before || inserts {
+        true => after,
+        false => 0,
+    }
 }
 
 /// Turns collected rows into an outcome, cut to the caller's limit.
 ///
-/// @param context - for the null placeholder and the change counters
+/// The change counters are left at zero: `produce` knows what the statement
+/// changed and sets them, and a listing changes nothing.
+///
+/// @param context - for the null placeholder
 /// @param command - the verb
 /// @param names - the column names
 /// @param rows - every row the statement produced
@@ -237,10 +294,6 @@ fn rows_to_outcome(
         .map(|row| row.iter().map(value_to_json).collect())
         .collect();
     let columns = columns_from(&names, &cells);
-    let connection = context.shell().connection();
-    let changes = connection.total_changes().unwrap_or_default();
-    let rowid = connection.last_insert_rowid().unwrap_or_default();
-    let _ = connection;
     let mut text = table(&columns, &cells, &context.null);
     if kept < total {
         text.push_str(&format!("\n({kept} of {total} rows)"));
@@ -251,8 +304,8 @@ fn rows_to_outcome(
         rows: cells,
         total,
         more: kept < total,
-        changes,
-        last_insert_rowid: rowid,
+        changes: 0,
+        last_insert_rowid: 0,
         elapsed_ms: elapsed,
         text,
         extra: Vec::new(),
@@ -339,12 +392,16 @@ fn bound_values(context: &Context, arguments: &Arguments) -> Result<Vec<Json>, F
         // §4.1.5), and over MCP reading it would make the server consume its
         // own JSON-RPC stream. `resolve_source` already refuses `-` for the
         // same reason and in the same words.
-        "-" if context.confined() => {
+        // **Also refused by a server that has no `--root`.** The MCP server turns
+        // safe mode on whether or not a root was given, and its standard input is
+        // the protocol: reading it here swallowed the next request as the
+        // parameters, or blocked the server until the client closed the pipe.
+        "-" if context.confined() || context.shell.safe => {
             return Err(Failed::said(
                 Status::InvalidState,
-                "this surface is confined to a directory with --root, and '-' reads the \
-                 parameters from standard input, which such a surface does not have to itself. \
-                 Write them with 'params', or name a file inside the root.",
+                "this surface does not read standard input (it is served over MCP or \
+                 confined to a directory with --root, and standard input is not the caller's \
+                 to give). Write the values with 'params', or name a file inside the root.",
             ))
         }
         "-" => {
@@ -382,6 +439,9 @@ fn bound_values(context: &Context, arguments: &Arguments) -> Result<Vec<Json>, F
             ),
         ));
     }
+    // A byte order mark is not JSON, and Notepad and PowerShell's `Out-File`
+    // write one, so a parameters file saved there was refused as "not JSON".
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
     let parsed = json::parse(text.trim())
         .map_err(|why| Failed::misuse(format!("'params-file' is not JSON: {why}")))?;
     match parsed {
@@ -400,6 +460,19 @@ const MAX_PARAMS_FILE_BYTES: usize = 1024 * 1024;
 /// `query`: runs a statement that returns rows.
 pub fn query(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
     let sql = arguments.required_text("sql")?.to_string();
+    // **The read verb refuses a statement that writes.** `query` ran INSERT,
+    // DELETE and DDL like `exec` does, so a client that lets the model call
+    // `inillucent_query` without asking and asks first for `inillucent_exec` was
+    // bypassed by choosing the other tool. The class is the parser's, the same
+    // one `--readonly` uses.
+    context.refuse_if_it_writes(&sql)?;
+    if !inillucent_driver::readonly::admits(&sql) {
+        return Err(Failed::said(
+            Status::ReadOnly,
+            "query only reads, and that statement changes something or controls a \
+             transaction. Run it with exec (inillucent_exec), or with batch for several.",
+        ));
+    }
     let params = bound_values(context, arguments)?;
     let limit = limit_of(context, arguments)?;
     produce(context, "query", &sql, &params, limit)
@@ -455,11 +528,18 @@ pub fn exec(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fai
 pub fn batch(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
     let sql = arguments.required_text("sql")?.to_string();
     context.refuse_if_it_writes(&sql)?;
-    let joined = !context
+    let already_open = !context
         .shell()
         .connection()
         .autocommit()
         .map_err(|error| Failed::from_engine(&error))?;
+    // **A script with its own BEGIN and COMMIT runs as written.** Wrapping it
+    // made its BEGIN fail with "cannot start a transaction within a
+    // transaction", so the output of `.dump` could not be loaded with
+    // `batch`. Its own transaction makes it atomic, and a failure inside it
+    // rolls that transaction back below.
+    let own = !already_open && crate::shell::controls_its_own_transaction(context.shell(), &sql);
+    let joined = already_open || own;
     let before = context
         .shell()
         .connection()
@@ -499,6 +579,12 @@ pub fn batch(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fa
                 });
             }
         }
+        // A script that opened its own transaction and failed inside it does
+        // not leave the session holding that transaction.
+        let left_open = !context.shell().connection().autocommit().unwrap_or(true);
+        if own && left_open {
+            let _ = context.shell().execute("ROLLBACK");
+        }
         return Err(failed);
     }
     if !joined {
@@ -525,7 +611,9 @@ pub fn batch(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fa
     produced.extra.push((
         "transaction".to_string(),
         Json::Text(
-            if joined {
+            if own {
+                "the script's own"
+            } else if joined {
                 "joined the open transaction; not committed"
             } else {
                 "committed"
@@ -602,14 +690,23 @@ pub fn create(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
         ));
     }
     let named = confined.to_string_lossy().into_owned();
-    context.use_database(&named)?;
+    // **A connection of its own, closed when this returns.** `create` used to
+    // point the session at the file it made, so an MCP client that created a
+    // second database found every later call running there and its open
+    // transaction on the first one rolled back.
+    let mut made = crate::shell::Shell::open_reporting(&named, false).map_err(|error| {
+        let said = Failed::from_engine(&error);
+        Failed::said(
+            said.status,
+            format!("could not open \"{named}\": {}", said.message),
+        )
+    })?;
     // A database file with no objects in it is not written until something is,
     // so the file a caller asked for has to be brought into existence by an
     // actual write. `user_version` is the smallest one that changes no schema.
-    context
-        .shell()
-        .execute("PRAGMA user_version = 0")
+    made.execute("PRAGMA user_version = 0")
         .map_err(|message| Failed::said(Status::Io, message))?;
+    drop(made);
     Ok(Outcome::said("create", format!("created {named}")).with("path", json::text(&named)))
 }
 
@@ -801,7 +898,7 @@ pub fn schema(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
 pub fn describe(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
     let name = arguments.required_text("table")?.to_string();
     let info = format!(
-        "SELECT cid, name, type, \"notnull\", dflt_value, pk,          CASE hidden WHEN 1 THEN 'hidden' WHEN 2 THEN 'generated virtual'          WHEN 3 THEN 'generated stored' ELSE '' END AS kind          FROM pragma_table_xinfo({})",
+        "SELECT cid, name, type, \"notnull\", dflt_value, pk, CASE hidden WHEN 1 THEN 'hidden' WHEN 2 THEN 'generated virtual' WHEN 3 THEN 'generated stored' ELSE '' END AS kind FROM pragma_table_xinfo({})",
         quoted_text(&name)
     );
     let mut produced = produce(context, "describe", &info, &[], 0)?;
@@ -912,11 +1009,28 @@ pub fn dump(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fai
     dot(context, "dump", &line)
 }
 
+/// Writes a word the way a dot command line reads it back as that word.
+///
+/// Between single quotes when it holds none, because nothing inside them is an
+/// escape. Between double quotes a backslash starts an escape, so a Windows path
+/// written there lost its separators. A word with a single quote in it goes between
+/// double quotes with its backslashes and quotes escaped.
+///
+/// @param text - the word
+fn dot_word(text: &str) -> String {
+    if !text.contains('\'') {
+        return format!("'{text}'");
+    }
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// `import`: reads a delimited file into a table.
 pub fn import(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
     let file = arguments.required_text("file")?.to_string();
     let table_name = arguments.required_text("table")?.to_string();
     let confined = context.confine(&file)?;
+    ensure_readable_file(&file, &confined)?;
+    ensure_utf8_file(&confined)?;
     let mut line = String::from(".import");
     match arguments.text("format").unwrap_or("csv") {
         "csv" => line.push_str(" --csv"),
@@ -932,8 +1046,9 @@ pub fn import(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
         line.push_str(&format!(" --skip {skip}"));
     }
     line.push_str(&format!(
-        " \"{}\" \"{table_name}\"",
-        confined.to_string_lossy()
+        " {} {}",
+        dot_word(&confined.to_string_lossy()),
+        dot_word(&table_name)
     ));
     // Counted two ways, because neither alone is right. `total_changes` is what
     // an ordinary table's insert moves and it is exact. A **virtual** table's
@@ -959,10 +1074,67 @@ pub fn import(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
     if produced.changes == 0 {
         produced.changes = row_count(context, &table_name).saturating_sub(before_rows);
     }
-    if produced.text.is_empty() {
-        produced.text = format!("imported {} rows into {table_name}", produced.changes);
-    }
+    // The warnings about rows with too few or too many fields come back as the
+    // text, so the count goes after them instead of replacing them.
+    let counted = format!("imported {} rows into {table_name}", produced.changes);
+    produced.text = match produced.text.is_empty() {
+        true => counted,
+        false => format!("{}\n{counted}", produced.text),
+    };
     Ok(produced)
+}
+
+/// Refuses a path that is not a file the command can read, naming the cause.
+///
+/// **The shell's complaint about a file it could not open has no status of its
+/// own, so a missing file was reported as `syntax`.** That is the status for a
+/// statement that is wrong, and it sends a script looking at its SQL. A file
+/// that is not there is `not_found`, and one that is there and cannot be read is
+/// `io`.
+///
+/// @param named - the path as the caller wrote it, for the message
+/// @param path - the path after confinement
+fn ensure_readable_file(named: &str, path: &std::path::Path) -> Result<(), Failed> {
+    match std::fs::metadata(path) {
+        Ok(found) if found.is_file() => Ok(()),
+        Ok(_) => Err(Failed::said(
+            Status::Io,
+            format!("\"{named}\" is not a file, so there is nothing to read rows from."),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(Failed::said(
+            Status::NotFound,
+            format!("there is no file at \"{named}\"."),
+        )),
+        Err(error) => Err(Failed::said(
+            Status::Io,
+            format!("cannot read \"{named}\": {error}"),
+        )),
+    }
+}
+
+/// Refuses a file that is not UTF-8, naming the byte that does not decode.
+///
+/// **The command reads UTF-8 text, and the shell's `.import` does not.** `.import` keeps the
+/// bytes of a cp1252 file, as `sqlite3` does, because a shell script expects that. The
+/// `import` command is what a program calls and parses the answer of, and storing text that does
+/// not decode would hand that program back values its JSON cannot carry. So the command checks the
+/// file first and says which byte stopped the decode.
+///
+/// @param path - the confined path of the file
+fn ensure_utf8_file(path: &std::path::Path) -> Result<(), Failed> {
+    let bytes = std::fs::read(path).map_err(|error| Failed::said(Status::Io, error.to_string()))?;
+    let text = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    let Err(error) = std::str::from_utf8(text) else {
+        return Ok(());
+    };
+    let at = error.valid_up_to();
+    let byte = text
+        .get(at)
+        .map(|held| format!("0x{held:02X}"))
+        .unwrap_or_else(|| "the end of the file".to_string());
+    Err(Failed::misuse(format!(
+        "it is not valid UTF-8; byte {at} is {byte}, which does not begin a character. This reads UTF-8 text only; convert the file first, with `iconv -f cp1252 -t utf-8` or the encoding it was written in."
+    )))
 }
 
 /// Returns how many rows a table holds, or zero when it holds none or is absent.
@@ -1025,11 +1197,19 @@ pub fn export(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
         let named = path.to_string_lossy().into_owned();
         context
             .shell()
-            .redirect(Some(&named), true)
+            .redirect(Some(&named), false)
             .map_err(|message| {
                 Failed::said(Status::Io, format!("cannot open \"{named}\": {message}"))
             })?;
     }
+    // **`insert` names the table the rows came from.** `.mode insert` alone
+    // writes `INSERT INTO tab(...)`, SQLite's placeholder, so an export of the
+    // table `people` could not be loaded back without editing every line. A
+    // query has no one table, and keeps the placeholder, as in `sqlite3`.
+    let mode = match (mode.as_str(), arguments.text("table")) {
+        ("insert", Some(table)) => format!("insert {}", dot_word(table)),
+        _ => mode,
+    };
     let script = format!(".mode {mode}\n.headers on\n{sql};");
     // An export of nothing still writes its header, so a reader of the file
     // learns the columns. The shell prints no header for an empty result,
@@ -1093,7 +1273,7 @@ pub fn backup(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
     context
         .shell()
         .backup_to(&named)
-        .map_err(|message| Failed::said(Status::Io, message))?;
+        .map_err(|error| Failed::from_engine(&error))?;
     Ok(Outcome::said("backup", format!("wrote {named}")).with("wrote", json::text(&named)))
 }
 
@@ -1202,7 +1382,7 @@ pub fn restore(context: &mut Context, arguments: &Arguments) -> Result<Outcome, 
     dot(
         context,
         "restore",
-        &format!(".restore \"{}\"", confined.to_string_lossy()),
+        &format!(".restore {}", dot_word(&confined.to_string_lossy())),
     )
 }
 
@@ -1374,6 +1554,12 @@ pub fn vector_search(context: &mut Context, arguments: &Arguments) -> Result<Out
                 "every element of 'vector' has to be a number.",
             ));
         };
+        if !(number as f32).is_finite() {
+            return Err(Failed::misuse(format!(
+                "every element of 'vector' has to be a finite number, and {number} is not \
+                 (a 32 bit float holds at most about 3.4e38)."
+            )));
+        }
         for byte in (number as f32).to_bits().to_le_bytes() {
             blob.push_str(&format!("{byte:02x}"));
         }
@@ -1392,13 +1578,31 @@ pub fn vector_search(context: &mut Context, arguments: &Arguments) -> Result<Out
         }
     };
     let shape = searched_table_shape(context, &name);
+    // **Said here, because the engine's own answer is "SQL logic error".** A
+    // vector of the wrong width reached the distance function and failed with
+    // no sentence about which width was expected.
+    let declared = shape
+        .dimensions
+        .iter()
+        .find(|(held, _)| *held == column.to_ascii_lowercase())
+        .map(|(_, width)| *width);
+    if let Some(width) = declared.filter(|width| *width != numbers.len()) {
+        return Err(Failed::misuse(format!(
+            "column \"{column}\" of \"{name}\" is VECTOR({width}): expected dimension {width}, \
+             got {}.",
+            numbers.len()
+        )));
+    }
     // **The rowid only when the table has no key of its own.** `SELECT rowid, *`
     // on a table with an `INTEGER PRIMARY KEY` printed that key twice, because
     // the engine names the rowid after the key and `*` includes it again.
     let rowid = if shape.integer_key { "" } else { "rowid, " };
+    // The inner product grows as vectors get closer, where the two distances shrink, so the
+    // nearest rows for `dot` are the ones with the largest value and come first.
+    let direction = if measure == "dot" { " DESC" } else { "" };
     let sql = format!(
         "SELECT {rowid}*, {function}({1}, {blob}) AS distance FROM {0} \
-         WHERE {1} IS NOT NULL ORDER BY {function}({1}, {blob}) LIMIT {k}",
+         WHERE {1} IS NOT NULL ORDER BY {function}({1}, {blob}){direction} LIMIT {k}",
         quoted(&name),
         quoted(&column)
     );
@@ -1428,6 +1632,8 @@ struct SearchedTable {
     integer_key: bool,
     /// The positions, among the table's own columns, of every `VECTOR` column.
     vectors: Vec<usize>,
+    /// Each `VECTOR(N)` column's lowercase name and its declared N.
+    dimensions: Vec<(String, usize)>,
 }
 
 /// Reads the table's columns to decide how `vector-search` lays out a row.
@@ -1460,9 +1666,19 @@ fn searched_table_shape(context: &mut Context, name: &str) -> SearchedTable {
         .filter(|(_, row)| text_of(row.get(2)).starts_with("VECTOR"))
         .map(|(nth, _)| nth)
         .collect();
+    let dimensions = info
+        .iter()
+        .filter_map(|row| {
+            let declared = text_of(row.get(2));
+            let inside = declared.strip_prefix("VECTOR(")?.split(')').next()?;
+            let width = inside.trim().parse::<usize>().ok()?;
+            Some((text_of(row.get(1)).to_ascii_lowercase(), width))
+        })
+        .collect();
     SearchedTable {
         integer_key,
         vectors,
+        dimensions,
     }
 }
 
@@ -1706,6 +1922,7 @@ pub fn migrate(context: &mut Context, arguments: &Arguments) -> Result<Outcome, 
             format!("\"{destination}\" already exists. This tool never overwrites."),
         ));
     }
+    ensure_folder_exists(&destination, &to)?;
     match kind.as_str() {
         "sqlite" => migrate_sqlite_file(&from, &to),
         "index" => Err(Failed::unsupported(
@@ -1717,6 +1934,32 @@ pub fn migrate(context: &mut Context, arguments: &Arguments) -> Result<Outcome, 
             "'{other}' is not a migration kind. Use sqlite, postgres, mysql or index."
         ))),
     }
+}
+
+/// Refuses a destination whose folder is not there, as `not_found`.
+///
+/// **The migration stages its file beside the destination, and the failure to
+/// create that file was reported as `corrupt`** with the message "database disk
+/// image is malformed", which says the source is damaged when the destination
+/// folder was never made. Asking first names the folder and the right status.
+///
+/// @param named - the destination as the caller wrote it
+/// @param path - the destination after confinement
+fn ensure_folder_exists(named: &str, path: &std::path::Path) -> Result<(), Failed> {
+    let folder = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => return Ok(()),
+    };
+    if folder.is_dir() {
+        return Ok(());
+    }
+    Err(Failed::said(
+        Status::NotFound,
+        format!(
+            "there is no folder \"{}\" to write \"{named}\" in. Make the folder first.",
+            folder.display()
+        ),
+    ))
 }
 
 /// The environment variable a source may be given in instead of an argument.
@@ -1829,6 +2072,7 @@ fn migrate_remote(
             format!("\"{destination}\" already exists. This tool never overwrites."),
         ));
     }
+    ensure_folder_exists(destination, &to)?;
     let mut plan = inillucent_remote::Plan::new(url, &to);
     // The surface's own ceiling. `command::run` has already armed it on this
     // thread, so this is belt and braces rather than the only bound - but a

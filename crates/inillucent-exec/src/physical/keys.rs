@@ -364,6 +364,7 @@ pub(super) fn range_union_bounds<'t>(
     let (table_root, index_root, without_rowid) = (*table_root, *index_root, *without_rowid);
     let mut scans = Vec::with_capacity(branches.len());
     let mut starts: Vec<Vec<OwnedDatum>> = Vec::with_capacity(branches.len());
+    let mut ends: Vec<Option<Vec<OwnedDatum>>> = Vec::with_capacity(branches.len());
     for branch in branches {
         let branch_path = AccessPath::IndexSeek {
             table_root,
@@ -386,6 +387,7 @@ pub(super) fn range_union_bounds<'t>(
             continue;
         }
         starts.push(bounds.low.clone().unwrap_or_default());
+        ends.push(bounds.high.clone());
         scans.push(SpanScan::new(
             tree,
             projection.clone(),
@@ -400,8 +402,34 @@ pub(super) fn range_union_bounds<'t>(
     // branches are already in the order they have to run in.
     if *dedup {
         let order = index_key_order(collations, descending, starts.first().map_or(0, Vec::len));
-        let mut paired: Vec<_> = starts.into_iter().zip(scans).collect();
-        paired.sort_by(|(left, _), (right, _)| compare_by(left, right, &order));
+        let mut paired: Vec<_> = starts.into_iter().zip(ends).zip(scans).collect();
+        paired.sort_by(|((left, _), _), ((right, _), _)| compare_by(left, right, &order));
+        // **Two values the plan could not tell apart can name one key.** A
+        // repeated literal is folded when the plan is built, but `1` and `'1'`
+        // become the same key only once the column's affinity is applied, and
+        // `'a@x.com'` and `'A@X.COM'` only under the column's `NOCASE`. Both
+        // branches then walked the same span, so the row came back twice and an
+        // `UPDATE ... WHERE n IN (1, '1')` added to it twice. The bounds here
+        // are the converted ones, compared under the index's own collations, so
+        // a branch equal to the one before it is the same span and is dropped.
+        let order_end = index_key_order(
+            collations,
+            descending,
+            paired
+                .first()
+                .and_then(|((_, end), _)| end.as_ref())
+                .map_or(0, Vec::len),
+        );
+        paired.dedup_by(|((low, high), _), ((kept_low, kept_high), _)| {
+            compare_by(low, kept_low, &order) == std::cmp::Ordering::Equal
+                && match (high.as_ref(), kept_high.as_ref()) {
+                    (Some(high), Some(kept)) => {
+                        compare_by(high, kept, &order_end) == std::cmp::Ordering::Equal
+                    }
+                    (None, None) => true,
+                    _ => false,
+                }
+        });
         scans = paired.into_iter().map(|(_, scan)| scan).collect();
     }
     Ok(scans)

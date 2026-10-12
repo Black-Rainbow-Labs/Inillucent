@@ -18,7 +18,8 @@
        minisign signature when the release published one. A release that fails
        either check is not run.
     3. **Build** by running `build.sql` with that release's `inillucent.exe`,
-       then checkpointing, then writing one more row - so the fixture's newest
+       then `build-long-keys.sql` when the release writes format 3, then
+       checkpointing, then writing one more row - so the fixture's newest
        row exists only in the log segment and a reader that ignores the log
        gives a different answer rather than the same one.
     4. **Ask** every question in `tests/interop/verify.sql` and record the
@@ -38,6 +39,11 @@
 .PARAMETER Force
     Download and extract again even when the files are already there.
 
+.PARAMETER Binary
+    Build with this `inillucent.exe` instead of downloading the release. For
+    trying a change to `build.sql` or this script with a local build; a fixture
+    that is checked in is always built from the published release.
+
 .EXAMPLE
     pwsh tools/build-interop-fixture.ps1 -Version 0.1.1
 
@@ -48,7 +54,8 @@
 param(
     [Parameter(Mandatory)] [string] $Version,
     [string] $Repository = 'Black-Rainbow-Labs/Inillucent',
-    [switch] $Force
+    [switch] $Force,
+    [string] $Binary
 )
 
 $ErrorActionPreference = 'Stop'
@@ -275,6 +282,25 @@ function Invoke-ReleaseQuery {
     return [string] $value
 }
 
+function Get-FileFormat {
+    <#
+    .SYNOPSIS
+        Returns the format version a database file carries, from byte 8.
+
+    .PARAMETER Database
+        The database file.
+    #>
+    param([string] $Database)
+    $stream = [System.IO.File]::OpenRead($Database)
+    try {
+        $header = New-Object byte[] 12
+        if ($stream.Read($header, 0, 12) -lt 12) { throw "$Database is shorter than its header" }
+    } finally {
+        $stream.Dispose()
+    }
+    return [System.BitConverter]::ToUInt32($header, 8)
+}
+
 function Build-Fixture {
     <#
     .SYNOPSIS
@@ -293,15 +319,28 @@ function Build-Fixture {
     .PARAMETER Build
         `tests/interop/build.sql`.
 
+    .PARAMETER LongKeys
+        `tests/interop/build-long-keys.sql`, run after `build.sql` when the file
+        the release created says format 3. A release that writes format 2
+        refuses its keys, so its fixture is built from `build.sql` alone.
+
     .PARAMETER Into
         A scratch directory to build in.
     #>
-    param([string] $Exe, [string] $Build, [string] $Into)
+    param([string] $Exe, [string] $Build, [string] $LongKeys, [string] $Into)
     $database = Join-Path $Into 'app.rdb'
     & $Exe create $database | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "the release could not create $database" }
     & $Exe run ".read $Build" --db $database | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'the release refused build.sql' }
+    $format = Get-FileFormat -Database $database
+    if ($format -ge 3) {
+        & $Exe run ".read $LongKeys" --db $database | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'the release refused build-long-keys.sql' }
+        Write-Host "  format          $format, so build-long-keys.sql ran too"
+    } else {
+        Write-Host "  format          $format, so build.sql alone"
+    }
     & $Exe checkpoint --db $database | Out-Null
     $row = "INSERT INTO note (id, title, body, weight, tag) VALUES (9001, " +
            "'the row that only the log holds', " +
@@ -314,30 +353,35 @@ function Build-Fixture {
 
 # ---------------------------------------------------------------------------
 
-$archiveName = "inillucent-$Version-x86_64-pc-windows-msvc.zip"
-$into = Get-ReleaseDirectory -Root $root -Version $Version
-New-Item -ItemType Directory -Force -Path $into | Out-Null
-
 Write-Host "inillucent $Version -> tests/interop/$Version"
 
-$archive = Save-ReleaseAsset -Repository $Repository -Version $Version -Name $archiveName -Into $into -Force:$Force
-if (-not $archive) { throw "v$Version published no $archiveName." }
-$sums = Save-ReleaseAsset -Repository $Repository -Version $Version -Name 'SHA256SUMS' -Into $into -Force:$Force
-if (-not $sums) { throw "v$Version published no SHA256SUMS, so nothing about the archive can be checked." }
-$signature = Save-ReleaseAsset -Repository $Repository -Version $Version -Name 'SHA256SUMS.minisig' -Into $into -Force:$Force
+if ($Binary) {
+    $exe = (Resolve-Path -LiteralPath $Binary).Path
+    Write-Host "  binary          $exe, a local build rather than the release"
+} else {
+    $archiveName = "inillucent-$Version-x86_64-pc-windows-msvc.zip"
+    $into = Get-ReleaseDirectory -Root $root -Version $Version
+    New-Item -ItemType Directory -Force -Path $into | Out-Null
 
-Test-ArchiveDigest -Archive $archive -Sums $sums
-Test-SumsSignature -Sums $sums -Signature $signature -Root $root
+    $archive = Save-ReleaseAsset -Repository $Repository -Version $Version -Name $archiveName -Into $into -Force:$Force
+    if (-not $archive) { throw "v$Version published no $archiveName." }
+    $sums = Save-ReleaseAsset -Repository $Repository -Version $Version -Name 'SHA256SUMS' -Into $into -Force:$Force
+    if (-not $sums) { throw "v$Version published no SHA256SUMS, so nothing about the archive can be checked." }
+    $signature = Save-ReleaseAsset -Repository $Repository -Version $Version -Name 'SHA256SUMS.minisig' -Into $into -Force:$Force
 
-$exe = Expand-Release -Archive $archive -Into (Join-Path $into 'extract') -Force:$Force
-Write-Host "  binary          $exe"
+    Test-ArchiveDigest -Archive $archive -Sums $sums
+    Test-SumsSignature -Sums $sums -Signature $signature -Root $root
+
+    $exe = Expand-Release -Archive $archive -Into (Join-Path $into 'extract') -Force:$Force
+    Write-Host "  binary          $exe"
+}
 
 $scratch = Join-Path ([System.IO.Path]::GetTempPath()) "inillucent-interop-$Version-$PID"
 if (Test-Path -LiteralPath $scratch) { Remove-Item -LiteralPath $scratch -Recurse -Force -Confirm:$false }
 New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 
 try {
-    $database = Build-Fixture -Exe $exe -Build (Join-Path $root 'tests/interop/build.sql') -Into $scratch
+    $database = Build-Fixture -Exe $exe -Build (Join-Path $root 'tests/interop/build.sql') -LongKeys (Join-Path $root 'tests/interop/build-long-keys.sql') -Into $scratch
 
     $queries = Read-VerifyQueries -Path (Join-Path $root 'tests/interop/verify.sql')
     $answers = foreach ($query in $queries) {

@@ -404,6 +404,10 @@ fn subtract(
         compactions: after.compactions.saturating_sub(before.compactions),
         splits: after.splits.saturating_sub(before.splits),
         merges: after.merges.saturating_sub(before.merges),
+        merge_attempts: after.merge_attempts.saturating_sub(before.merge_attempts),
+        parents_dissolved: after
+            .parents_dissolved
+            .saturating_sub(before.parents_dissolved),
         room_nanos: after.room_nanos.saturating_sub(before.room_nanos),
         hinted: after.hinted.saturating_sub(before.hinted),
         descended: after.descended.saturating_sub(before.descended),
@@ -626,7 +630,7 @@ fn print_report(label: &str, round: &Round) {
     println!("## {label}");
     println!(
         "  wall {:>8.2} ms   find {:>8.2} ms   apply {:>8.2} ms   \
-         inserted {:>6}   compactions {:>5}   splits {:>4}   merges {:>4}",
+         inserted {:>6}   compactions {:>5}   splits {:>4}   merges {:>4}   dissolved {:>3}",
         round.wall_ms,
         round.find_ms,
         round.apply_ms,
@@ -634,6 +638,7 @@ fn print_report(label: &str, round: &Round) {
         round.after.compactions,
         round.after.splits,
         round.after.merges,
+        round.after.parents_dissolved,
     );
     println!(
         "  log: {} bytes over {} records ({:.1} KiB)",

@@ -215,6 +215,7 @@ impl crate::ImportedDatabase {
             )
             .with_scratch(self.compiled.take_binder_scratch());
         binder.ignore_checks_if(self.pragmas.ignore_check_constraints());
+        binder.writable_schema_if(self.pragmas.writable_schema());
         let outcome = binder.bind_statement(&parsed.statement);
         self.compiled.recycle_binder(binder.into_scratch());
         let bound = outcome.map_err(refused)?;
@@ -326,6 +327,7 @@ impl ImportedDatabase {
             )
             .with_scratch(self.compiled.take_binder_scratch());
         binder.ignore_checks_if(self.pragmas.ignore_check_constraints());
+        binder.writable_schema_if(self.pragmas.writable_schema());
         let outcome = binder.bind_statement(&parsed.statement);
         // Before the `?`, so a statement that fails to bind still hands its
         // vectors back: a connection whose application sends a syntax error
@@ -470,6 +472,7 @@ impl ImportedDatabase {
             .in_schema()
             .with_scratch(self.compiled.take_binder_scratch());
         binder.ignore_checks_if(self.pragmas.ignore_check_constraints());
+        binder.writable_schema_if(self.pragmas.writable_schema());
         let bound = binder.bind_statement(&parsed.statement).map_err(refused);
         self.compiled.recycle_binder(binder.into_scratch());
         self.compiled.recycle(parsed);
@@ -487,6 +490,29 @@ impl ImportedDatabase {
     /// @param params - the values bound to `?1`, `?2`, ...
     pub fn execute_any(&mut self, sql: &str, params: &Params) -> DbResult<Outcome> {
         self.refuse_a_write_on_a_read_only_file(sql)?;
+        let mut retries = 0usize;
+        loop {
+            match self.execute_any_once(sql, params) {
+                Err(error)
+                    if super::compiled::is_schema_moved(&error)
+                        && retries < super::compiled::SCHEMA_RETRIES =>
+                {
+                    retries = retries.saturating_add(1);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Compiles one statement, or finds it compiled, and runs it once.
+    ///
+    /// Fails with `PrimaryCode::Schema` when another process changed the schema
+    /// between the compile and the lock; [`ImportedDatabase::execute_any`]
+    /// compiles it again and reruns it.
+    ///
+    /// @param sql - the statement text
+    /// @param params - the values bound to `?1`, `?2`, ...
+    fn execute_any_once(&mut self, sql: &str, params: &Params) -> DbResult<Outcome> {
         // The same plan for statements that differ only in their literals, as
         // `prepare_statement` gives (task-2191). Only when nothing was bound:
         // the lift refuses a statement that has parameters of its own.
@@ -497,8 +523,37 @@ impl ImportedDatabase {
                 }
             }
         }
-        let cached = self.compiled(sql)?;
+        let cached = match self.compiled(sql) {
+            Ok(cached) => cached,
+            Err(error) => {
+                if !self.schema_moved_elsewhere()? {
+                    return Err(error);
+                }
+                self.compiled(sql)?
+            }
+        };
         self.execute_compiled(&cached, params)
+    }
+
+    /// Compiles one statement against the schema the file holds now.
+    ///
+    /// [`ImportedDatabase::prepare_statement`], and when that fails, the check
+    /// [`ImportedDatabase::schema_moved_elsewhere`] makes and one more compile if
+    /// another process changed the schema. What a connection's `prepare` calls,
+    /// so a table another process created is found by a process that was
+    /// already open.
+    ///
+    /// @param sql - the statement text
+    pub fn prepare_current_statement(&mut self, sql: &str) -> DbResult<Statement> {
+        match self.prepare_statement(sql) {
+            Ok(statement) => Ok(statement),
+            Err(error) => {
+                if !self.schema_moved_elsewhere()? {
+                    return Err(error);
+                }
+                self.prepare_statement(sql)
+            }
+        }
     }
 
     /// Refuses a statement that would change the file on a connection that
@@ -575,6 +630,32 @@ impl ImportedDatabase {
         params: &Params,
     ) -> DbResult<Outcome> {
         self.refuse_a_write_on_a_read_only_file(&statement.sql)?;
+        // `current_plan` compiles again whenever the generation moved, so a
+        // rerun after another process's schema change takes the new plan.
+        let mut retries = 0usize;
+        loop {
+            match self.execute_statement_once(statement, params) {
+                Err(error)
+                    if super::compiled::is_schema_moved(&error)
+                        && retries < super::compiled::SCHEMA_RETRIES =>
+                {
+                    retries = retries.saturating_add(1);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Runs a prepared statement once with the plan current for this
+    /// connection's schema.
+    ///
+    /// @param statement - the handle
+    /// @param params - the values bound to `?1`, `?2`, ...
+    fn execute_statement_once(
+        &mut self,
+        statement: &Statement,
+        params: &Params,
+    ) -> DbResult<Outcome> {
         let held = self.current_plan(statement)?;
         match &statement.lifted {
             Some(lifted) => {

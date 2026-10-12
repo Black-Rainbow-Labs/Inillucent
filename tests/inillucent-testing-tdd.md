@@ -162,16 +162,16 @@ check a run against.
 |---|---:|---:|---|---|
 | `smoke` | 1 | 10 | `change` | the ten-second answer: a real file opened, written, reopened, read |
 | `unit` | 31 | 1,477 | `change` | every crate's own `#[cfg(test)]` modules |
-| `engine` | 83 | 513 | `change` | SQL and storage behaviour over real database files |
-| `differential` | 38 | 366 | `change` | graded against the pinned SQLite 3.53.4 |
-| `durability` | 45 | 276 | `merge` | crashes, injected faults, corruption and concurrency |
-| `e2e` | 39 | 451 | `change` | the public surfaces an application binds to, end to end |
+| `engine` | 99 | 505 | `change` | SQL and storage behaviour over real database files |
+| `differential` | 40 | 366 | `change` | graded against the pinned SQLite 3.53.4 |
+| `durability` | 53 | 276 | `merge` | crashes, injected faults, corruption and concurrency |
+| `e2e` | 43 | 447 | `change` | the public surfaces an application binds to, end to end |
 | `perf` | 2 | 12 | `merge` | the cost guards, and the check that a run stays on its share of the processors — **runs alone**, see §5 |
-| `retrieval` | 12 | 606 | `change` | the embedding and retrieval engine, and its graded harness |
-| `tooling` | 18 | 153 | `change` | the checks that keep the repository's own rules true |
+| `retrieval` | 12 | 570 | `change` | the embedding and retrieval engine, and its graded harness |
+| `tooling` | 19 | 153 | `change` | the checks that keep the repository's own rules true |
 | `matrix` | 24 | 187 | `change` | the SQL statement matrix: every statement form with every pair of contexts, graded against the pinned SQLite |
 | `matrix_deep` | 24 | 54 | `merge` | the statement matrix at every configuration arm, every triple of contexts, and the driver's other surfaces |
-| `nightly` | 7 | 107 | `nightly` | the long forms, run on a schedule rather than on a change |
+| `nightly` | 8 | 107 | `nightly` | the long forms, run on a schedule rather than on a change |
 
 The map that assigns them is `tests/selection.toml`, and it is data rather than
 code so that a person can read the whole arrangement in one file.

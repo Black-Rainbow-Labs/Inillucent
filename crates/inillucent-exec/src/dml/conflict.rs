@@ -4,7 +4,7 @@
 //! upsert that wrote first and repaired afterwards would be visible to a
 //! trigger in a state the statement never meant to produce.
 
-use index::{distinct_prefix, index_entry, key_of, maintained, unique_indexes};
+use index::{distinct_prefix, index_entry, key_of, maintained};
 
 use inillucent_base::error::{misuse, Unwind};
 use inillucent_base::{DbError, DbResult, ExtendedCode};
@@ -246,14 +246,24 @@ pub(crate) fn conflicting_row(
         }
         return Ok(None);
     }
-    for named in [true, false] {
-        for check in checks(table) {
-            if targets.contains(&check.constraint()) != named {
-                continue;
-            }
-            if let Some(found) = probe.ask(check, target)? {
-                return Ok(Some(found));
-            }
+    // **The constraints the clauses name are asked in the order the clauses were written.** A
+    // row that collides with two of them runs the first clause. The rowid of a rowid table is
+    // still asked before every index, as SQLite does.
+    let mut named: Vec<Check<'_>> = checks(table)
+        .filter(|check| targets.contains(&check.constraint()))
+        .collect();
+    let rowid_table = !table.without_rowid;
+    named.sort_by_key(|check| match check {
+        Check::OwnKey if rowid_table => 0,
+        _ => targets
+            .iter()
+            .position(|named| *named == check.constraint())
+            .map_or(usize::MAX, |at| at.saturating_add(1)),
+    });
+    let rest = checks(table).filter(|check| !targets.contains(&check.constraint()));
+    for check in named.into_iter().chain(rest) {
+        if let Some(found) = probe.ask(check, target)? {
+            return Ok(Some(found));
         }
     }
     Ok(None)
@@ -306,12 +316,36 @@ enum Check<'t> {
 ///
 /// @param table - the table being written
 fn checks(table: &TableInfo) -> impl Iterator<Item = Check<'_>> {
+    // **A `WITHOUT ROWID` table's primary key is checked where it was declared.**
+    // SQLite walks its indexes newest first, and the primary key is one of them
+    // (`sqlite_autoindex_t_N`), so `x UNIQUE, y PRIMARY KEY` over a row that
+    // repeats both reports `t.y`, and `y PRIMARY KEY, x UNIQUE` reports `t.x`.
+    // A rowid table's `INTEGER PRIMARY KEY` is no index and is asked first.
     let key_first = !table.without_rowid;
+    let is_key = |index: &IndexInfo| {
+        table.without_rowid && index.origin == IndexOrigin::PrimaryKey && index.root == table.root
+    };
+    let key_listed = table.indexes.iter().any(is_key);
     key_first
         .then_some(Check::OwnKey)
         .into_iter()
-        .chain(unique_indexes(table).map(|(position, index)| Check::Index(position, index)))
-        .chain((!key_first).then_some(Check::OwnKey))
+        .chain(
+            table
+                .indexes
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(move |(position, index)| {
+                    if is_key(index) {
+                        Some(Check::OwnKey)
+                    } else if index.unique && index.root != 0 && index.root != table.root {
+                        Some(Check::Index(position, index))
+                    } else {
+                        None
+                    }
+                }),
+        )
+        .chain((table.without_rowid && !key_listed).then_some(Check::OwnKey))
 }
 
 impl Check<'_> {
@@ -570,7 +604,11 @@ pub(crate) fn upsert_row(
         }
     }
     // The stored generated columns, against the row the arm produced - see
-    // `InsertPlan::apply_generated` (task-1913).
+    // `InsertPlan::apply_generated` (task-1913). **The ordinary columns take
+    // their affinity first**, as `convert_after` does for an `UPDATE`: a
+    // generated column reads the value that will be stored, and `SET c0 = 5`
+    // over a `FLOAT` column stores 5.0, so `c0 || '|'` is `5.0|` and not `5|`.
+    request.declarations.apply_affinity(&mut after);
     plan.apply_generated(space, &mut after, excluded)?;
     // **The column's affinity applies to what the arm assigns**, so `SET n =
     // '7'` over an `INTEGER` column stores 7, before the uniqueness probe asks
@@ -611,6 +649,7 @@ pub(crate) fn upsert_row(
                 });
             let written = |slot: usize| assigned.contains(&slot);
             take_unassigned_columns(layout, &written, &current, &mut after);
+            request.declarations.apply_affinity(&mut after);
             plan.apply_generated(space, &mut after, excluded)?;
             request.declarations.apply_affinity(&mut after);
             current

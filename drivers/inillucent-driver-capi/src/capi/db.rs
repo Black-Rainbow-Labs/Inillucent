@@ -515,7 +515,7 @@ pub unsafe extern "C" fn inillucent_execute(
             return misused("inillucent_execute", error);
         }
         let connection = database.database.session_as(session_of(conn));
-        match connection.query(sql, &[], capped(limit)) {
+        match connection.query_one(sql, &[], capped(limit)) {
             Ok(rows) => {
                 *out = publish(Box::new(built(rows)));
                 INILLUCENT_OK
@@ -786,7 +786,7 @@ pub unsafe extern "C" fn inillucent_txn_execute(
             return INILLUCENT_INVALID_STATE;
         }
         let connection = database.database.session_as(transaction.connection.session);
-        match connection.query(sql, &[], 0) {
+        match connection.query_one(sql, &[], 0) {
             Ok(rows) => {
                 if !affected.is_null() {
                     *affected = rows.affected.unwrap_or(0);

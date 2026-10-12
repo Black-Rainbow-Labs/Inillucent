@@ -227,7 +227,23 @@ fn decide(
     *held = Held::Nothing;
     let table = &statement.table;
     let layout = &*setup.layout;
-    let mut after = before.to_vec();
+    // A column an assignment writes is not copied first: its copy was thrown
+    // away by the assignment, one string a row for `SET note = note || '!'`
+    // (task-2226). Every assignment still reads the before image.
+    let mut after: Vec<OwnedDatum> = before
+        .iter()
+        .enumerate()
+        .map(|(slot, value)| {
+            match setup
+                .assignments
+                .iter()
+                .any(|(assigned, _)| *assigned == slot)
+            {
+                true => OwnedDatum::Null,
+                false => value.clone(),
+            }
+        })
+        .collect();
     for (slot, eval) in &setup.assignments {
         // Every assignment reads the before image, as the row at a time path.
         let value = setup.space.evaluate_with(eval.as_ref(), &[before], &[])?;
@@ -266,11 +282,18 @@ fn decide(
     match difference(before, &after) {
         Difference::Nothing => Ok(Rewrite::Unchanged),
         Difference::One(column) if column >= layout.identity.len() => {
-            let Some(value) = after.get(column).cloned() else {
+            // **Moved out of the new image, not copied twice (task-2226).** The
+            // value was cloned for the answer and again for `held`, two string
+            // copies a row for `SET note = note || '!'`. The run hands the value
+            // back in `UpdateRun::pending_column` when it cannot write it, so
+            // `held` is not needed for this answer.
+            let Some(cell) = after.get_mut(column) else {
                 return Err(misuse("a changed column is not in the row"));
             };
-            *held = Held::Column(column, value.clone());
-            Ok(Rewrite::Column(column, value))
+            Ok(Rewrite::Column(
+                column,
+                std::mem::replace(cell, OwnedDatum::Null),
+            ))
         }
         _ => {
             *held = Held::Row(after);

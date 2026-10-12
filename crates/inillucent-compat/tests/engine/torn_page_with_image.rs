@@ -339,7 +339,7 @@ fn a_page_the_log_holds_whole_is_rebuilt_after_a_record_reads_it() {
         .map(|(page, _)| *page)
         .unwrap_or_else(|| {
             panic!(
-                "no page is both carried whole and read by a record, so the ordering this                  test is about is not in the window: {:?}",
+                "no page is both carried whole and read by a record, so the ordering this test is about is not in the window: {:?}",
                 said.iter()
                     .map(|(page, held)| (*page, held.image, held.logical))
                     .collect::<Vec<_>>()

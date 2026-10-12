@@ -19,7 +19,25 @@ use crate::PageId;
 /// The eight bytes that begin every inillucent data file.
 pub const MAGIC: [u8; 8] = *b"RDB2\0\0\0\0";
 
-/// The format version this build writes.
+/// The highest format version this build reads and writes.
+///
+/// **Three means a file may hold either of two things a format 2 file cannot.**
+/// One is a key or a separator stored out of line: a key over the spill threshold
+/// is written on pages of its own with a prefix in the leaf, and a separator that
+/// is still long after it is shortened is stored out of line in the interior page.
+/// The other is an extent page in the owned layout, which names the page or the
+/// row that refers to it so `PRAGMA auto_vacuum` can move it. A build before this
+/// cannot read either, and the number is what makes it say so by name.
+///
+/// **A file created by this build says three and writes owned extent pages.**
+/// A format 2 file keeps writing extent pages in the older layout, and says three
+/// from the moment it first stores a key out of line or is rebuilt by `VACUUM`;
+/// extent pages it writes after that are owned. Every extent page says in its own
+/// flag byte which layout it is in, so a reader never has to know the file's
+/// history, and pages of both layouts can sit in one file. A format 2 file that
+/// is opened and written without a long key stays format 2, so every release from
+/// 0.1.8 still reads it. `Database::raise_format` is the one place the number
+/// moves.
 ///
 /// **The compatibility rule, which `docs/relational-architecture.md` states in
 /// full.** A point release reads every file an earlier point release of the
@@ -39,7 +57,15 @@ pub const MAGIC: [u8; 8] = *b"RDB2\0\0\0\0";
 /// says which layout it is in, and a page's checksum is accepted under either
 /// rule. A format 1 file becomes format 2 the first time this build writes its
 /// meta record, which a checkpoint does.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
+
+/// The format version of a file that holds neither a key stored out of line nor
+/// an extent page in the owned layout.
+///
+/// Every release from 0.1.8 reads it. A format 1 file is rewritten as this at its
+/// first checkpoint, as it always has been, and it stays this until a key is
+/// stored out of line or `VACUUM` rebuilds it.
+pub const FORMAT_TWO: u32 = 2;
 
 /// The oldest format version this build reads.
 ///
@@ -201,10 +227,21 @@ mod at {
     /// writes; the open then reads the log as it always did. Every change to
     /// the log position resets it (`Database::set_log_position`), so it never
     /// describes a segment the meta record no longer names.
-    ///
-    /// The last field named here; the region continues at 128 for whatever
-    /// comes next.
     pub const LOG_END_AT_CHECKPOINT: usize = 120;
+    /// The highest page number that is the root of a tree, 8 bytes.
+    ///
+    /// **Kept for `PRAGMA auto_vacuum`, which moves pages away from the end of
+    /// the file and cannot move a root.** A root is named by a catalog row, and
+    /// rewriting a row is a schema change every other connection has to notice.
+    /// So in mode 1 or 2 every root sits at the start of the file, at or below this
+    /// number, and the step that lowers the file's end never meets one. SQLite
+    /// keeps the same number at offset 52 of its header.
+    ///
+    /// Zero means roots are not kept at the start of the file: mode 0, and a file
+    /// whose mode was set before the step existed. The step pins at a root it
+    /// meets in such a file, and `VACUUM` rebuilds the file with the roots low and
+    /// sets this.
+    pub const LARGEST_ROOT: usize = 128;
 }
 
 /// The smallest a meta page can be and still hold every field.
@@ -225,11 +262,17 @@ pub const META_BYTES: usize = at::RESERVED;
 /// `every_field_lives_below_the_record_length` fails when one is added past
 /// it, because a check that read 120 bytes of a record 128 bytes long would
 /// answer "unchanged" about a change it could not see.
-pub const META_RECORD_BYTES: usize = at::LOG_END_AT_CHECKPOINT + 8;
+pub const META_RECORD_BYTES: usize = at::LARGEST_ROOT + 8;
 
 /// What the meta page says about the database.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Meta {
+    /// The format version the file says it is.
+    ///
+    /// Raised by `Database::require_format` the first time a key or a separator
+    /// is stored out of line, and written at every checkpoint. A record that says
+    /// 1 is written back as 2.
+    pub format: u32,
     /// The page size in bytes.
     pub page_size: u32,
     /// How many pages the file holds, including the two meta pages.
@@ -275,6 +318,9 @@ pub struct Meta {
     /// The segment's length when the checkpoint left nothing to replay, or
     /// zero - see `at::LOG_END_AT_CHECKPOINT`.
     pub log_end_at_checkpoint: u64,
+    /// The highest page number that is a root, or zero when roots are not kept
+    /// at the start of the file - see `at::LARGEST_ROOT`.
+    pub largest_root: u64,
 }
 
 impl Meta {
@@ -284,6 +330,7 @@ impl Meta {
     /// @param uuid - the database's identity
     pub fn fresh(page_size: u32, uuid: u128) -> Meta {
         Meta {
+            format: FORMAT_VERSION,
             page_size,
             page_count: FIRST_DATA_PAGE.0,
             catalog_root: PageId::NONE,
@@ -300,6 +347,7 @@ impl Meta {
             high_water_lsn: 0,
             auto_vacuum: 0,
             log_end_at_checkpoint: 0,
+            largest_root: 0,
         }
     }
 
@@ -317,7 +365,7 @@ impl Meta {
             *byte = 0;
         }
         put(page, at::MAGIC, &MAGIC)?;
-        put(page, at::FORMAT, &FORMAT_VERSION.to_le_bytes())?;
+        put(page, at::FORMAT, &self.format.max(FORMAT_TWO).to_le_bytes())?;
         put(page, at::PAGE_SIZE, &self.page_size.to_le_bytes())?;
         put(page, at::PAGE_COUNT, &self.page_count.to_le_bytes())?;
         put(page, at::CATALOG_ROOT, &self.catalog_root.0.to_le_bytes())?;
@@ -352,6 +400,9 @@ impl Meta {
                 &self.log_end_at_checkpoint.to_le_bytes(),
             )?;
         }
+        if page.len() >= at::LARGEST_ROOT.saturating_add(8) {
+            put(page, at::LARGEST_ROOT, &self.largest_root.to_le_bytes())?;
+        }
         let sum = checksum(page)?;
         put(page, at::CHECKSUM, &sum.to_le_bytes())?;
         Ok(())
@@ -380,6 +431,7 @@ impl Meta {
             )));
         }
         Ok(Meta {
+            format,
             page_size: u32(page, at::PAGE_SIZE)?,
             page_count: u64v(page, at::PAGE_COUNT)?,
             catalog_root: PageId(u64v(page, at::CATALOG_ROOT)?),
@@ -398,6 +450,7 @@ impl Meta {
             high_water_lsn: u64_or_zero(page, at::HIGH_WATER_LSN),
             auto_vacuum: u8::try_from(i32v(page, at::AUTO_VACUUM)).unwrap_or(0),
             log_end_at_checkpoint: u64_or_zero(page, at::LOG_END_AT_CHECKPOINT),
+            largest_root: u64_or_zero(page, at::LARGEST_ROOT),
         })
     }
 
@@ -545,6 +598,7 @@ mod tests {
     #[test]
     fn a_meta_record_round_trips() {
         let meta = Meta {
+            format: 3,
             page_size: 32_768,
             page_count: 4_096,
             catalog_root: PageId(7),
@@ -566,6 +620,7 @@ mod tests {
             // And the vacuum mode, which a reopen reads back.
             auto_vacuum: 2,
             log_end_at_checkpoint: 0,
+            largest_root: 0,
         };
         let mut page = vec![0u8; 32_768];
         meta.encode(&mut page).unwrap();
@@ -584,6 +639,7 @@ mod tests {
     #[test]
     fn every_field_lives_below_the_record_length() {
         let base = Meta {
+            format: 2,
             page_size: 8_192,
             page_count: 4_096,
             catalog_root: PageId(7),
@@ -600,8 +656,10 @@ mod tests {
             high_water_lsn: 900_000,
             auto_vacuum: 2,
             log_end_at_checkpoint: 0,
+            largest_root: 0,
         };
-        let moved: [(&str, Meta); 15] = [
+        let moved: [(&str, Meta); 17] = [
+            ("format", Meta { format: 3, ..base }),
             (
                 "page_size",
                 Meta {
@@ -693,6 +751,14 @@ mod tests {
                 Meta {
                     auto_vacuum: 1,
                     log_end_at_checkpoint: 0,
+                    largest_root: 0,
+                    ..base
+                },
+            ),
+            (
+                "largest_root",
+                Meta {
+                    largest_root: 9,
                     ..base
                 },
             ),
@@ -780,9 +846,50 @@ mod tests {
         let read = Meta::decode(&page).expect("a format 1 record reads");
         let mut again = vec![0u8; 8_192];
         read.encode(&mut again).unwrap();
-        assert_eq!(u32(&again, at::FORMAT).unwrap(), FORMAT_VERSION);
-        assert!(reads_format(1) && reads_format(2));
-        assert!(!reads_format(0) && !reads_format(3));
+        assert_eq!(u32(&again, at::FORMAT).unwrap(), FORMAT_TWO);
+        assert!(reads_format(1) && reads_format(2) && reads_format(3));
+        assert!(!reads_format(0) && !reads_format(4));
+    }
+
+    /// A file this build creates says 3, and a record that says 2 is read and
+    /// written back as 2.
+    ///
+    /// The number is what makes an earlier release refuse a file it cannot read
+    /// by name, and stamping it on a format 2 file that needs nothing from it
+    /// would make every release from 0.1.8 refuse a file it reads correctly.
+    #[test]
+    fn a_new_file_says_3_and_a_format_two_file_stays_2() {
+        let mut meta = Meta::fresh(8_192, 1);
+        assert_eq!(meta.format, FORMAT_VERSION);
+        let mut page = vec![0u8; 8_192];
+        meta.encode(&mut page).unwrap();
+        assert_eq!(u32(&page, at::FORMAT).unwrap(), 3);
+        let read = Meta::decode(&page).expect("a format 3 record reads");
+        assert_eq!(read.format, 3);
+        meta.format = FORMAT_TWO;
+        meta.encode(&mut page).unwrap();
+        assert_eq!(u32(&page, at::FORMAT).unwrap(), 2);
+        let read = Meta::decode(&page).expect("a format 2 record reads");
+        let mut again = vec![0u8; 8_192];
+        read.encode(&mut again).unwrap();
+        assert_eq!(u32(&again, at::FORMAT).unwrap(), 2);
+    }
+
+    /// Format 4 is refused by name, and the refusal says what to do.
+    #[test]
+    fn format_four_is_refused_by_name() {
+        let mut page = vec![0u8; 8_192];
+        Meta::fresh(8_192, 1).encode(&mut page).unwrap();
+        put(&mut page, at::FORMAT, &4u32.to_le_bytes()).unwrap();
+        let sum = checksum(&page).unwrap();
+        put(&mut page, at::CHECKSUM, &sum.to_le_bytes()).unwrap();
+        let error = Meta::decode(&page).unwrap_err();
+        assert!(
+            error.message().contains("format version 4"),
+            "{:?}",
+            error.message()
+        );
+        assert!(error.unsupported().is_some());
     }
 
     /// The newer generation wins, a damaged copy is ignored, and two damaged

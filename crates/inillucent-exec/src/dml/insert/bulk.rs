@@ -35,7 +35,7 @@ use inillucent_sql::ast::ConflictAction;
 use inillucent_sql::bind::BoundExpr;
 use inillucent_sql::catalog_view::{IndexInfo, TableInfo, TableKind};
 use inillucent_sql::dml::{rowid_message, BoundInsert, BoundInsertSource};
-use inillucent_tree::datum::OwnedDatum;
+use inillucent_tree::datum::{Datum, OwnedDatum};
 
 use super::{compile_insert, declarations_are_met, CompiledInsert};
 use crate::declared::IndexExprs;
@@ -43,13 +43,18 @@ use crate::dml::index::{index_entry, maintained};
 use crate::dml::target::holds_no_row;
 use crate::dml::*;
 use crate::insert_plan::{RowSource, RowidKeys};
+use crate::packed::PackedRows;
 use crate::physical::Params;
 
 /// The rows a bulk build writes, already checked and in key order.
 #[derive(Debug)]
 pub struct BulkRows {
     /// The table rows, sorted by rowid, in tree column order.
-    pub rows: Vec<Row>,
+    ///
+    /// **Packed, not a vector a row** (task-2226). See [`PackedRows`]: each image is copied in
+    /// as it is built and its own vector freed at once, so a 100,000 row copy holds three
+    /// buffers instead of 200,000 allocations until it ends.
+    pub rows: PackedRows,
     /// The entries of each index whose key or predicate is an expression, by
     /// the index's position in `TableInfo::indexes`, unsorted.
     ///
@@ -266,7 +271,7 @@ pub fn bulk_rows<'r, S: Into<RowSource<'r>>>(
     let compiled = compile_insert(statement, target, params).map_err(|error| fail(error, None))?;
     let supplied = supplied.into_iter();
     let mut built = Building {
-        rows: Vec::with_capacity(supplied.size_hint().0),
+        rows: PackedRows::new(),
         computed: computed_indexes(&statement.table),
         kept: KeptKeys::default(),
         next_rowid: None,
@@ -280,10 +285,12 @@ pub fn bulk_rows<'r, S: Into<RowSource<'r>>>(
     let last_rowid = built.kept.last();
     let mut rows = built.rows;
     if !built.kept.increasing() {
-        rows.sort_unstable_by_key(|row| match row.first() {
-            Some(OwnedDatum::Int(rowid)) => *rowid,
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        order.sort_unstable_by_key(|row| match rows.value(*row, 0) {
+            Datum::Int(rowid) => rowid,
             _ => i64::MIN,
         });
+        rows.reorder(&order);
     }
     Ok(BulkRows {
         rows,
@@ -306,7 +313,7 @@ fn computed_indexes(table: &TableInfo) -> Vec<(usize, Vec<Row>)> {
 /// The rows built so far, and what the next one is checked against.
 struct Building {
     /// The images kept, in input order.
-    rows: Vec<Row>,
+    rows: PackedRows,
     /// The computed indexes' entries, in input order.
     computed: Vec<(usize, Vec<Row>)>,
     /// The rowids of the kept images.
@@ -377,7 +384,11 @@ impl Building {
             }
         }
         self.kept.push(rowid);
-        self.rows.push(image);
+        if !self.rows.push_owned(&image) {
+            return Err(inillucent_base::error::misuse(
+                "a row built for a bulk insert is not as wide as the rows before it",
+            ));
+        }
         Ok(())
     }
 }

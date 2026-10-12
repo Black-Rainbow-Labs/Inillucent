@@ -1754,7 +1754,7 @@ mod text_arena_tests {
         assert_eq!(
             places.len(),
             1,
-            "the sixteen-byte length is not the only sixteen in the file, so this case              would be editing the wrong number"
+            "the sixteen-byte length is not the only sixteen in the file, so this case would be editing the wrong number"
         );
         let at = places.first().copied().unwrap_or(0);
         if let Some(slot) = bytes.get_mut(at..at.saturating_add(8)) {

@@ -1234,12 +1234,11 @@ impl Wal {
     /// wrote, and a connection asking whether another process has committed
     /// cannot ask its own cache.
     ///
-    /// **It answers for the open segment only, which is enough because a new
-    /// segment cannot appear without the meta record moving first.** Only
-    /// `roll_now` creates a segment, only a checkpoint rolls one, and a
-    /// checkpoint bumps the meta record's generation before it releases the
-    /// file lock. A caller therefore sees the generation move first, and
-    /// `ImportedDatabase::the_meta_moved` is asked before this is.
+    /// **It answers for the open segment only, and that is not enough on its
+    /// own.** This said a new segment could not appear without the meta record
+    /// moving first, because only a checkpoint rolled one. An append rolls too,
+    /// when the segment reaches its size, and that writes no meta record, so a
+    /// caller also asks [`Wal::next_segment_exists`].
     pub fn tail_of_open_segment(&self) -> DbResult<LogTail> {
         let mut segment = self.io_lock()?;
         let size = match (&segment.file, segment.tails_by_name) {
@@ -1274,6 +1273,50 @@ impl Wal {
                 .first_lsn
                 .saturating_add(size.saturating_sub(segment::HEADER_BYTES as u64)),
         })
+    }
+
+    /// Returns a value that stays the same while no other process has had the open segment open,
+    /// or `None` when the segment is not open here or its file system cannot tell.
+    ///
+    /// See `VfsFile::quiet_token`. The sequence is folded in, so a token from one segment never
+    /// equals a token from the next.
+    pub fn quiet_token(&self) -> Option<u64> {
+        let segment = self.io_lock().ok()?;
+        let token = segment.file.as_ref()?.quiet_token()?;
+        Some(token ^ segment.sequence.rotate_left(16))
+    }
+
+    /// Reports whether the segment after the open one exists, which means another process rolled
+    /// the log on and may have committed there.
+    ///
+    /// **The open segment's length alone does not show a roll.** A process rolls the log when a
+    /// segment fills and at housekeeping, and not every roll writes the meta record. The rolled
+    /// segment keeps its length, so a connection that last saw it at that length asked
+    /// [`Wal::tail_of_open_segment`], found nothing moved, and checkpointed from pages that did not
+    /// hold the commits made in the next segment. The checkpoint moved the recovery point past
+    /// them, and they were gone: one run in about 150 of the crash hunter's checkpoint scenario,
+    /// traced to a process that checkpointed with no resynchronisation since another process's
+    /// roll.
+    ///
+    /// **A file at that name does not count when its header names another database or another
+    /// sequence.** The first version asked whether the name existed, so a segment left behind by
+    /// an earlier database at the same path, such as a file deleted without its log and then
+    /// created again, made every later write refuse as a stale read, forever. The full gate
+    /// re-imports its fixture over the same path each round and stopped in its second round on
+    /// exactly that. A file whose header cannot be read yet still counts: another process that
+    /// is rolling has created the file before it wrote the header, and answering "not rolled"
+    /// then is the case this check exists for. The name is asked first, so the usual answer
+    /// still costs one lookup.
+    pub fn next_segment_exists(&self) -> DbResult<bool> {
+        let next = self.io_lock()?.sequence.saturating_add(1);
+        let path = self.segment_path(next);
+        let there = self
+            .shared
+            .vfs
+            .size_by_name(&path)
+            .map_err(inillucent_vfs::VfsError::into_db_error)?
+            .is_some();
+        Ok(there && !belongs_elsewhere(self.shared.vfs.as_ref(), &path, self.shared.uuid, next))
     }
 
     /// Returns the open segment's length when the file ends exactly at `lsn`,
@@ -1599,6 +1642,30 @@ pub fn tail_on_disk(
             None => return Ok(found),
         }
         sequence = sequence.saturating_add(1);
+    }
+}
+
+/// Reports whether a segment file's header reads cleanly and names another
+/// database or another sequence, so the file is left over from something else.
+///
+/// Any failure to open or read the header answers no, because a file another
+/// process is still creating looks the same as an unreadable one.
+///
+/// @param vfs - the file system
+/// @param path - the segment file
+/// @param uuid - the database's identity
+/// @param sequence - the sequence the file's name gives it
+fn belongs_elsewhere(vfs: &dyn Vfs, path: &DbPath, uuid: u128, sequence: u64) -> bool {
+    let Ok(file) = vfs.open(path, OpenOptions::of_kind(FileKind::Wal)) else {
+        return false;
+    };
+    let mut head = vec![0u8; segment::HEADER_BYTES];
+    if file.read_exact_at(0, &mut head).is_err() {
+        return false;
+    }
+    match SegmentHeader::decode(&head) {
+        Ok(header) => header.uuid != uuid || header.sequence != sequence,
+        Err(_) => false,
     }
 }
 

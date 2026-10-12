@@ -332,6 +332,29 @@ pub fn materialise(bytes: u64) -> DbResult<()> {
     })
 }
 
+/// Reports whether holding `bytes` more would stay within the armed byte limit.
+///
+/// Charges nothing. A caller that can do its work another way asks first and
+/// takes the other way when the answer is no, which leaves the running total
+/// of what the request holds where it was; [`materialise`] adds to the total
+/// before it refuses, so a refused charge would count against everything the
+/// request does after it. `true` when nothing is armed or the request has no
+/// byte limit.
+///
+/// @param bytes - roughly how many bytes the caller is about to hold
+pub fn fits(bytes: u64) -> bool {
+    ACTIVE.with(|held| {
+        let borrowed = held.borrow();
+        let Some(spending) = borrowed.as_ref() else {
+            return true;
+        };
+        match spending.limits.bytes {
+            Some(most) => spending.bytes.saturating_add(bytes) <= most,
+            None => true,
+        }
+    })
+}
+
 /// Returns what the armed request has spent so far, as `(rows, bytes)`.
 ///
 /// Zero when nothing is armed, which is the same answer a request that has
@@ -437,6 +460,23 @@ mod tests {
         assert!(spend(1_000_000, 99).is_ok());
         let refused = spend(0, 2).expect_err("101 bytes is past 100");
         assert_eq!(exceeded_kind(&refused), Some(Exceeded::Bytes));
+    }
+
+    /// `fits` answers without charging, so a refusal it predicts leaves the total where it was.
+    #[test]
+    fn fits_asks_without_charging() {
+        assert!(fits(u64::MAX));
+        let _guard = arm(
+            Limits::unbounded().with_bytes(Some(100)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(fits(100));
+        assert!(!fits(101));
+        assert_eq!(spent(), (0, 0));
+        assert!(spend(0, 60).is_ok());
+        assert!(fits(40));
+        assert!(!fits(41));
+        assert_eq!(spent(), (0, 60));
     }
 
     /// A deadline that has passed refuses.

@@ -56,6 +56,8 @@ pub struct CteBinding {
 pub(super) struct RecursiveTarget {
     /// The CTE's folded name.
     pub(super) folded: Vec<u8>,
+    /// The CTE's name as the `WITH` wrote it, for an error message.
+    name: Vec<u8>,
     /// The statement-wide number of the FROM term that will hold its store.
     id: usize,
     /// The columns a reference to it exposes, taken from the seed arm.
@@ -63,6 +65,9 @@ pub(super) struct RecursiveTarget {
     /// Whether any arm bound so far referred to it.
     referenced: bool,
 }
+
+/// A recursive CTE's compound arms, bound, each with the operator before it.
+type BoundArms = Vec<(CompoundOp, crate::bind::BoundSelect)>;
 
 impl Binder<'_> {
     /// Pushes the CTEs of a `WITH` prefix, returning whether it pushed any.
@@ -297,6 +302,86 @@ impl Binder<'_> {
         })
     }
 
+    /// Counts the FROM terms of one compound arm that name a CTE directly, not through a subquery.
+    ///
+    /// @param core - the arm
+    /// @param folded - the CTE's folded name
+    fn core_direct_references(&self, core: ast::SelectCoreId, folded: &[u8]) -> usize {
+        match self.ast.core(core).map(|arm| &arm.body) {
+            Some(ast::SelectBody::Select { from, .. }) => {
+                self.terms_direct_references(from, folded)
+            }
+            _ => 0,
+        }
+    }
+
+    /// Counts the FROM terms that name a CTE, looking inside parenthesized joins but not inside subqueries.
+    ///
+    /// @param terms - the FROM terms
+    /// @param folded - the CTE's folded name
+    fn terms_direct_references(&self, terms: &[ast::FromTermId], folded: &[u8]) -> usize {
+        terms
+            .iter()
+            .map(
+                |id| match self.ast.from_term(*id).map(|term| &term.source) {
+                    Some(ast::FromSource::Table { database, name, .. }) => {
+                        usize::from(database.is_none() && self.ast.folded(*name) == folded)
+                    }
+                    Some(ast::FromSource::Join(inner)) => {
+                        self.terms_direct_references(inner, folded)
+                    }
+                    _ => 0,
+                },
+            )
+            .sum()
+    }
+
+    /// Refuses the shapes of recursive CTE that SQLite refuses before it binds a name.
+    ///
+    /// **SQLite takes the CTE as recursive only when its last arm reads the CTE in its own
+    /// FROM clause and every operator from there back is `UNION` or `UNION ALL`.** A CTE that
+    /// names itself in any other way is a `circular reference`: in the first arm, in an arm
+    /// before a non recursive last arm, under another set operator, or only inside a derived
+    /// table. An arm that lists the CTE twice in its FROM clause is `multiple references to
+    /// recursive table`. This was accepted and run, which for the last arm of
+    /// `SELECT 1 UNION ALL SELECT n+1 FROM r UNION ALL SELECT 100` meant the recursion fed
+    /// the steps and the extra seed through the same queue.
+    ///
+    /// @param cte - the expression being bound
+    /// @param arms - the compound arms after the first, with their operators
+    /// @param direct - for each arm, how many FROM terms name the CTE directly
+    fn refuse_invalid_recursion(
+        &self,
+        cte: &CteBinding,
+        arms: &[(CompoundOp, ast::SelectCoreId)],
+        direct: &[usize],
+    ) -> Result<(), ParseError> {
+        if !self.select_names_itself(cte.select, &cte.folded) {
+            return Ok(());
+        }
+        let last_op = arms.last().map(|(op, _)| *op);
+        let last_is_step = matches!(last_op, Some(CompoundOp::Union | CompoundOp::UnionAll))
+            && direct.last().copied().unwrap_or(0) > 0;
+        if !last_is_step {
+            return Err(circular_reference(&cte.name));
+        }
+        for ((op, _), count) in arms.iter().zip(direct).rev() {
+            if Some(*op) != last_op {
+                break;
+            }
+            if *count > 1 {
+                return Err(ParseError::new(
+                    ParseErrorKind::Refused(format!(
+                        "multiple references to recursive table: {}",
+                        String::from_utf8_lossy(&cte.name)
+                    )),
+                    Span::default(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Registers a reference to the recursive CTE currently being bound.
     pub(super) fn push_recursive_self(
         &mut self,
@@ -307,6 +392,19 @@ impl Binder<'_> {
         let Some(target) = self.recursing.get_mut(position) else {
             return Err(unsupported("unknown recursive reference", Span::default()));
         };
+        // **One arm reads the recursive table once.** The direct references in a
+        // FROM clause are counted before anything is bound, so a second one
+        // that arrives here is inside a subquery of the arm, which SQLite
+        // refuses as `multiple recursive references`.
+        if target.referenced {
+            return Err(ParseError::new(
+                ParseErrorKind::Refused(format!(
+                    "multiple recursive references: {}",
+                    String::from_utf8_lossy(&target.name)
+                )),
+                Span::default(),
+            ));
+        }
         target.referenced = true;
         let cte = target.id;
         let table = target.table.clone();
@@ -362,6 +460,11 @@ impl Binder<'_> {
             );
         }
         let arms: Vec<(CompoundOp, ast::SelectCoreId)> = select.compounds.clone();
+        let direct: Vec<usize> = arms
+            .iter()
+            .map(|(_, arm)| self.core_direct_references(*arm, &cte.folded))
+            .collect();
+        self.refuse_invalid_recursion(cte, &arms, &direct)?;
         let order_by = select.order_by.clone();
         let limit = select.limit;
         let offset = select.offset;
@@ -388,51 +491,17 @@ impl Binder<'_> {
         let seed = self.bind_isolated_arm(first)?;
         let table = subquery_table(&alias, &cte.columns, &seed);
         named_columns_fit(&alias, &cte.columns, seed.columns.len(), span)?;
-        self.recursing.push(RecursiveTarget {
+        let target = RecursiveTarget {
             folded: cte.folded.clone(),
+            name: cte.name.clone(),
             id,
             table: table.clone(),
             referenced: false,
-        });
+        };
+        let (extra_seeds, steps) =
+            self.bind_recursive_arms(target, &arms, &direct, (&alias, span))?;
         let mut seeds = vec![(CompoundOp::UnionAll, seed)];
-        let mut steps = Vec::new();
-        let mut outcome = Ok(());
-        for (op, arm) in &arms {
-            if !matches!(op, CompoundOp::Union | CompoundOp::UnionAll) {
-                outcome = Err(ParseError::new(
-                    ParseErrorKind::Unsupported("recursive query does not use UNION or UNION ALL"),
-                    span,
-                ));
-                break;
-            }
-            if let Some(target) = self.recursing.last_mut() {
-                target.referenced = false;
-            }
-            let bound = match self.bind_isolated_arm(*arm) {
-                Ok(bound) => bound,
-                Err(reason) => {
-                    outcome = Err(reason);
-                    break;
-                }
-            };
-            let referenced = self
-                .recursing
-                .last()
-                .is_some_and(|target| target.referenced);
-            if let Err(refusal) =
-                arm_refusal(&bound, table.columns.len(), referenced, *op, &alias, span)
-            {
-                outcome = Err(refusal);
-                break;
-            }
-            if referenced {
-                steps.push((*op, bound));
-            } else {
-                seeds.push((*op, bound));
-            }
-        }
-        self.recursing.pop();
-        outcome?;
+        seeds.extend(extra_seeds);
         // The ORDER BY, LIMIT and OFFSET belong to the whole recursive query:
         // SQLite orders its queue by them and stops the recursion at the limit,
         // so they are kept on the body rather than on the seed arm.
@@ -487,6 +556,72 @@ impl Binder<'_> {
             scope.push(id);
         }
         Ok(())
+    }
+
+    /// Binds the arms of a recursive CTE after the first, sorting them into seeds and steps.
+    ///
+    /// An arm that reads the CTE is a step and one that does not is another seed. The CTE is
+    /// registered as the recursion being bound for as long as the arms are, and removed again
+    /// whether they bind or not.
+    ///
+    /// @param target - the CTE, as a reference to it inside its own arms sees it
+    /// @param arms - the compound arms after the first, with their operators
+    /// @param direct - for each arm, how many FROM terms name the CTE directly
+    /// @param alias_and_span - the CTE's name at this use, and where the use is, for an error
+    fn bind_recursive_arms(
+        &mut self,
+        target: RecursiveTarget,
+        arms: &[(CompoundOp, ast::SelectCoreId)],
+        direct: &[usize],
+        alias_and_span: (&[u8], Span),
+    ) -> Result<(BoundArms, BoundArms), ParseError> {
+        let (alias, span) = alias_and_span;
+        let (width, name) = (target.table.columns.len(), target.name.clone());
+        self.recursing.push(target);
+        let mut seeds = Vec::new();
+        let mut steps = Vec::new();
+        let mut outcome = Ok(());
+        for (position, (op, arm)) in arms.iter().enumerate() {
+            if !matches!(op, CompoundOp::Union | CompoundOp::UnionAll) {
+                outcome = Err(ParseError::new(
+                    ParseErrorKind::Unsupported("recursive query does not use UNION or UNION ALL"),
+                    span,
+                ));
+                break;
+            }
+            if let Some(target) = self.recursing.last_mut() {
+                target.referenced = false;
+            }
+            let bound = match self.bind_isolated_arm(*arm) {
+                Ok(bound) => bound,
+                Err(reason) => {
+                    outcome = Err(reason);
+                    break;
+                }
+            };
+            let referenced = self
+                .recursing
+                .last()
+                .is_some_and(|target| target.referenced);
+            // An arm that reads the table only from inside a subquery is not a
+            // recursive step in SQLite, so the name is a circular reference.
+            if referenced && direct.get(position).copied().unwrap_or(0) == 0 {
+                outcome = Err(circular_reference(&name));
+                break;
+            }
+            if let Err(refusal) = arm_refusal(&bound, width, referenced, *op, alias, span) {
+                outcome = Err(refusal);
+                break;
+            }
+            if referenced {
+                steps.push((*op, bound));
+            } else {
+                seeds.push((*op, bound));
+            }
+        }
+        self.recursing.pop();
+        outcome?;
+        Ok((seeds, steps))
     }
 }
 
@@ -588,7 +723,12 @@ impl<'a> Binder<'a> {
         folded: &[u8],
     ) -> (Option<&'a TableInfo>, Option<Vec<u8>>) {
         let found = self.catalog.find_table(database_name.as_deref(), folded);
-        if found.is_none() && database.is_none() && database_name.is_some() {
+        // **A schema written on the term does not stop the fallback.** SQLite
+        // looks a name up in the schema first and tries the modules when that
+        // finds nothing, so `main.generate_series(1, 3)` works as
+        // `generate_series(1, 3)` does.
+        let _ = database;
+        if found.is_none() && database_name.is_some() {
             let eponymous = self
                 .catalog
                 .find_table(None, folded)
@@ -599,6 +739,19 @@ impl<'a> Binder<'a> {
         }
         (found, database_name)
     }
+}
+
+/// Returns SQLite's refusal of a common table expression that reads itself where it may not.
+///
+/// @param name - the expression's name as the `WITH` wrote it
+fn circular_reference(name: &[u8]) -> ParseError {
+    ParseError::new(
+        ParseErrorKind::Refused(format!(
+            "circular reference: {}",
+            String::from_utf8_lossy(name)
+        )),
+        Span::default(),
+    )
 }
 
 /// Refuses a recursive common table expression that names a different number

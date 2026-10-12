@@ -150,3 +150,33 @@ refuses the file and returns no answer from it:
 answers against the released binaries. The test reads each release's format from byte 8 of that
 release's own fixture. A release that writes format 2 is graded on its answers, with nothing to
 edit.
+
+## Format 3: long keys, and every new file
+
+2.5.0 is the first release that creates every new file at format 3. A format 3 file stores a key
+longer than `page_size / 8` on pages of its own, and stores an extent page with the tree and key of
+the row that owns it, so `auto_vacuum` can move the page. No release before 2.5.0 opens a format 3
+file. Releases from 0.1.5 refuse it with `this database is format version 3`.
+
+A file that a release before 2.5.0 created stays at format 2 until it stores a long key or is
+rebuilt by `VACUUM`. `release_format.rs` checks that the newest format 2 fixture is still format 2
+after the current build opens it, writes a row and checkpoints.
+
+`build-long-keys.sql` adds a `long_key` table to a fixture. Its index holds 83 keys of about 5,000
+bytes that share their first 4,992 bytes, so the keys and the separators between the index's
+leaves are both stored out of line. `tools/build-interop-fixture.ps1` runs it after `build.sql`
+when the file the release created says format 3 in byte 8. A release that writes format 2 refuses
+those keys, so its fixture is built from `build.sql` alone. `verify.sql` does not read `long_key`,
+so every release still records the same `expected.tsv`.
+`release_format.rs::every_format_three_fixture_reads_its_long_keys` reads the keys back through
+the index from every format 3 fixture.
+
+`release_format_history.rs` gives the older binaries a file that the current build created and then
+rewrote to say format 2 before it ran `build.sql`. That is the file a release before 2.5.0 created,
+and it stays at format 2 through `build.sql`. A file the current build creates is format 3, so
+every release before 2.5.0 refuses it.
+
+`pwsh tools/build-interop-fixture.ps1 -Version <version> -Binary <path to inillucent.exe>` builds a
+fixture with a local build instead of the downloaded release. Use it to try a change to
+`build.sql`, `build-long-keys.sql` or the script. A fixture that is checked in is always built from
+the published release.

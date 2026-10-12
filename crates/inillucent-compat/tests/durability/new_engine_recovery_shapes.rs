@@ -333,7 +333,7 @@ fn a_table_created_and_dropped_inside_the_window_replays_without_a_drop() {
     );
     assert_eq!(
         report.dropped, 0,
-        "a table created and dropped inside the window produced {} dropped record(s). That is          not wrong on its own, but it is a change in when the engine tolerates a record, and          this arm exists to notice it.",
+        "a table created and dropped inside the window produced {} dropped record(s). That is not wrong on its own, but it is a change in when the engine tolerates a record, and this arm exists to notice it.",
         report.dropped
     );
 }
@@ -497,4 +497,99 @@ fn label(nth: i64, moved: bool) -> String {
 /// the leaf it left.
 fn rows_offset() -> i64 {
     1_777
+}
+
+/// Returns the one value a query answers.
+///
+/// @param engine - the database
+/// @param sql - a query answering one row of one column
+fn single(engine: &mut ImportedDatabase, sql: &str) -> OwnedDatum {
+    let outcome = engine
+        .execute_any(sql, &Params::new())
+        .unwrap_or_else(|error| panic!("{sql}: {}", error.message()));
+    outcome
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .cloned()
+        .unwrap_or_else(|| panic!("{sql} answered no row"))
+}
+
+/// A trim that freed interior pages replays after a crash.
+///
+/// At 4,096 byte pages a table trimmed from the front leaves interior pages with one
+/// child, and each is handed to a neighbour and freed: two `WritePage` records for the
+/// rewritten interior pages and a `FreePage` for the freed one. Two rounds of trim and
+/// refill run in one transaction after the last checkpoint, the process is forgotten
+/// and the file crashes, and the reopen has to hold the rows, pass the integrity check
+/// and keep the freed pages on the free map.
+#[test]
+fn a_trim_that_dissolved_a_parent_replays() {
+    let vfs = Arc::new(SimVfs::new(SimConfig::default()));
+    let path = PathBuf::from("dissolve-replay.rdb");
+    {
+        let mut engine = ImportedDatabase::create_on(
+            Arc::clone(&vfs) as Arc<dyn Vfs>,
+            path.clone(),
+            PAGE_SIZE,
+            FRAMES,
+        )
+        .expect("the database is created");
+        run(
+            &mut engine,
+            "CREATE TABLE q(id INTEGER PRIMARY KEY, payload TEXT)",
+        );
+        run(
+            &mut engine,
+            "INSERT INTO q(payload) SELECT printf('%.*c', 400, 'x') FROM generate_series(1, 2000)",
+        );
+        engine.checkpoint().expect("the fixture checkpoints");
+        run(&mut engine, "BEGIN");
+        for _ in 0..2 {
+            run(
+                &mut engine,
+                "DELETE FROM q WHERE id <= (SELECT max(id) FROM q) - 100",
+            );
+            run(
+                &mut engine,
+                "INSERT INTO q(payload) SELECT printf('%.*c', 400, 'y') FROM generate_series(1, 2000)",
+            );
+        }
+        run(
+            &mut engine,
+            "DELETE FROM q WHERE id <= (SELECT max(id) FROM q) - 100",
+        );
+        run(&mut engine, "COMMIT");
+        let dissolved = engine.write_stats().parents_dissolved;
+        assert!(
+            dissolved > 0,
+            "the trim dissolved no parent, so this replays nothing new"
+        );
+        std::mem::forget(engine);
+    }
+    let snapshot = vfs.crash();
+    let recovered: Arc<dyn Vfs> = Arc::new(SimVfs::recovered(SimConfig::default(), &snapshot));
+    let mut engine = ImportedDatabase::open_on(recovered, path, PAGE_SIZE, FRAMES)
+        .unwrap_or_else(|error| panic!("the database did not reopen: {}", error.message()));
+    assert_eq!(
+        single(&mut engine, "SELECT count(*) FROM q"),
+        OwnedDatum::Int(100)
+    );
+    assert_eq!(
+        single(&mut engine, "PRAGMA integrity_check"),
+        OwnedDatum::Text(b"ok".to_vec())
+    );
+    let free = match single(&mut engine, "PRAGMA freelist_count") {
+        OwnedDatum::Int(count) => count,
+        other => panic!("freelist_count answered {other:?}"),
+    };
+    assert!(
+        free > 100,
+        "only {free} pages are free after trimming 5,900 rows"
+    );
+    assert_eq!(
+        engine.recovery_report().dropped,
+        0,
+        "the replay dropped records"
+    );
 }

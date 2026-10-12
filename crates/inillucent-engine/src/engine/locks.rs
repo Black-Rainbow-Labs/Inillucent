@@ -13,6 +13,9 @@
 
 use crate::*;
 
+/// How long a close that wrote nothing waits for the write lock to fold what it replayed,
+/// in milliseconds. See `ImportedDatabase::fold_on_close`.
+pub(crate) const BRIEF_FOLD_MILLIS: u64 = 100;
 impl ImportedDatabase {
     /// Chooses whether the file lock is kept between transactions.
     ///
@@ -123,11 +126,16 @@ impl ImportedDatabase {
         // that held RESERVED and waited for every SHARED to leave so it could
         // fold: both waited out the busy timeout and one was refused.
         let may_release = !inside || held_before == inillucent_vfs::FileLock::None;
-        let reloaded = if writing {
-            self.storage.database.begin_write_within(may_release)?
-        } else {
-            self.storage.database.begin_read()?
-        };
+        // Read before any check by name, so a break that lands during the checks gives a token
+        // that differs from this one. See `quiet_since_checked`.
+        let quiet = self.storage.wal.quiet_token();
+        if self.replaced_since_open(taking, writing, held_before) {
+            return self.reopen_the_replaced_file(writing, inside);
+        }
+        let reloaded = self.take_the_lock(writing, may_release)?;
+        if self.replaced_since_open(taking, writing, held_before) {
+            return self.reopen_the_replaced_file(writing, inside);
+        }
         if writing && inside && held_before == inillucent_vfs::FileLock::Shared && reserved {
             self.refuse_a_write_on_a_stale_read()?;
         }
@@ -173,15 +181,26 @@ impl ImportedDatabase {
         // transaction has no commit record, so recovery treats its records as
         // unfinished, and the next write starts where the valid log ends.
         let poisoned = !inside && self.storage.wal.is_poisoned();
+        // Asked now that the lock is held: an unchanged token means no other process
+        // folded, so the meta record is as last read (task-2226).
+        let meta_quiet = self.quiet_since_checked();
         let moved = reloaded
             || poisoned
-            || (taking && settles && (self.the_meta_moved()? || self.the_log_moved()?));
+            || (taking
+                && settles
+                && ((!meta_quiet && self.the_meta_moved()?) || self.the_log_moved()?));
         if moved && settles {
             self.settle_a_journal_left_by_the_dead(writing)?;
             self.resync_from_file()?;
         }
         if taking && settles {
             self.storage.database.mark_trusted();
+        }
+        // Both questions by name were answered for this statement - asked, skipped on an equal
+        // token, or made moot by the resynchronisation - so the token read before them stands
+        // for "nothing replaced, nothing rolled" until the oplock next breaks.
+        if taking && settles && held_before < inillucent_vfs::FileLock::Reserved {
+            self.storage.quiet_checked.set(quiet);
         }
         // **Every attached file takes its own lock, for the same reason `main`
         // does (task-1979, C2).** An attachment was the one file this engine
@@ -198,19 +217,181 @@ impl ImportedDatabase {
         // process just built - which is a lost table rather than a stale read.
         // `reload_catalog` is the same reread `ATTACH` does.
         if (moved && !inside) || (main_moved && settles) {
-            self.reload_catalog()?;
-            self.reattach_every_tree()?;
-            // **And the modules hear that somebody else committed
-            // (task-1932, M2).** A module's own state is derived from its
-            // shadow tables, which are ordinary trees another connection can
-            // have written; this is the one moment the engine knows that
-            // happened.
-            self.committed_elsewhere_modules();
+            self.reload_after_another_commit()?;
         }
         if !inside {
             self.writing.set_entry_mark(self.statement_entry());
         }
         Ok(())
+    }
+
+    /// Takes the lock a statement needs and reports whether the file's cache was thrown away.
+    ///
+    /// A read does not read the meta record when the quiet token, asked once SHARED is held,
+    /// says no other process has had the log segment open since the last full check; see
+    /// `Database::begin_read_unless` and `quiet_since_checked` (task-2226).
+    ///
+    /// @param writing - whether the statement changes the database
+    /// @param may_release - whether the lock may be let go while the write waits for it
+    fn take_the_lock(&mut self, writing: bool, may_release: bool) -> DbResult<bool> {
+        if writing {
+            return self.storage.database.begin_write_within(may_release);
+        }
+        let wal = std::rc::Rc::clone(&self.storage.wal);
+        let checked = self.storage.quiet_checked.get();
+        self.storage.database.begin_read_unless(|| {
+            let now = wal.quiet_token();
+            now.is_some() && now == checked
+        })
+    }
+
+    /// Rereads the schema after another process committed, and tells the modules.
+    ///
+    /// **A reload that found the same catalog keeps the generation.** Another
+    /// process committing rows moves the file without moving the schema, and
+    /// `execute_compiled` reads a moved generation as a plan compiled against a
+    /// schema that is gone. After a crash left the log for this connection to
+    /// recover, every statement found the file moved, every reload bumped the
+    /// generation, and `SELECT id FROM doc` failed fifty retries with "database
+    /// schema has changed". SQLite compares its schema cookie, which a commit of
+    /// rows does not change; comparing the rows themselves is the same question.
+    ///
+    /// **And the modules hear that somebody else committed (task-1932, M2).** A
+    /// module's own state is derived from its shadow tables, which are ordinary
+    /// trees another connection can have written; this is the one moment the
+    /// engine knows that happened.
+    fn reload_after_another_commit(&mut self) -> DbResult<()> {
+        let before = self.catalog_rows();
+        let generation = self.schema_generation();
+        self.reload_catalog()?;
+        self.reattach_every_tree()?;
+        if self.catalog_rows() == before {
+            self.schema.catalog_generation = generation;
+        }
+        self.committed_elsewhere_modules();
+        Ok(())
+    }
+
+    /// Reports whether a statement about to take, or just having taken, the lock finds its file
+    /// replaced, so it has to reopen before it reads or writes anything.
+    ///
+    /// **Asked after the lock is held, because only then is the answer kept.** `VACUUM` and a
+    /// backup rename a new file over the database while they hold the write lock on the old one,
+    /// and `VACUUM` takes it EXCLUSIVE first, so no file can be replaced while this connection
+    /// holds a lock on it. A connection that still had the old file open read and wrote it after
+    /// the rename: a process running `VACUUM` beside one inserting rows lost 265 of 502
+    /// acknowledged inserts, with no error and a clean `integrity_check`.
+    ///
+    /// **And once before the lock.** Taking the lock can flush this connection's log, and a log
+    /// whose segment was never opened opens it by name, where the rebuilt file's segment now is.
+    /// A file replaced before this statement began is found before that can happen.
+    ///
+    /// Asked whenever a lock is taken fresh or a write starts, which is one call by name of about
+    /// 3 us on this Windows. A connection that already held RESERVED or more kept every `VACUUM`
+    /// out, so it is not asked: that is every write after the first under
+    /// `locking_mode = exclusive`. A transaction is asked too, whether or not it has read, and the
+    /// answer inside one is `busy`, because the transaction read the old file. The writers that
+    /// truncated the rebuilt file's log in the crash hunter's runs were each inside one.
+    ///
+    /// @param taking - whether this statement takes the lock fresh
+    /// @param writing - whether the statement changes the database
+    /// @param held_before - the lock the connection held before the statement
+    fn replaced_since_open(
+        &self,
+        taking: bool,
+        writing: bool,
+        held_before: inillucent_vfs::FileLock,
+    ) -> bool {
+        (taking || writing)
+            && held_before < inillucent_vfs::FileLock::Reserved
+            && !self.quiet_since_checked()
+            && self.file_was_replaced()
+    }
+
+    /// Reports whether no other process has had the open log segment open since a statement last
+    /// asked by name whether the file was replaced or the log rolled, and found neither.
+    ///
+    /// **Why that answers both questions without asking** (task-2226). Each question is one
+    /// lookup by name, about 20 us apiece on the development machine with its file system
+    /// filters, and the two came to 71% of an autocommit point read. Neither can happen without
+    /// another process opening the segment this connection has open:
+    ///
+    /// - `VACUUM` and a backup remove the replaced database's log segments before the rename
+    ///   (`crate::rebuild::remove_log_segments`), and a delete opens the file.
+    /// - A roll that `Wal::next_segment_exists` is there to find comes after records the other
+    ///   process appended to this segment, which opens it. A roll with nothing to append is a
+    ///   checkpoint's, and a checkpoint moves the meta record, which `the_meta_moved` asks of the
+    ///   file on every statement regardless, and then deletes this segment.
+    ///
+    /// While this process holds the batch oplock on the segment, no other handle to it exists,
+    /// and any open breaks it; the watcher moves the token before it lets that open proceed
+    /// (`inillucent_vfs::os::windows_log`). So an equal token means none of the above happened.
+    /// Where there is no oplock - Linux, macOS, `INILLUCENT_LOG_OPLOCK=0`, a segment not opened
+    /// yet - the token is `None` and every check runs as before.
+    fn quiet_since_checked(&self) -> bool {
+        let now = self.storage.wal.quiet_token();
+        now.is_some() && now == self.storage.quiet_checked.get()
+    }
+
+    /// Reports whether the file at this connection's path is no longer the file it opened.
+    ///
+    /// Compares the number the file system gives the path now with the one it gave at open.
+    /// A path with nothing at it, and a file system that has no such number, answer no: there
+    /// is no other file to move to.
+    pub(crate) fn file_was_replaced(&self) -> bool {
+        let Some(opened) = self.storage.opened_as else {
+            return false;
+        };
+        matches!(
+            crate::engine::open::file_number(self.storage.vfs.as_ref(), &self.storage.path),
+            Some(now) if now != opened
+        )
+    }
+
+    /// Lets go of a file another process replaced, opens the one at the path now, and takes the
+    /// lock there instead.
+    ///
+    /// **Outside a transaction the statement then compiles again.** The new file's trees are
+    /// under new roots, so the generation moves and `execute_compiled` answers
+    /// `PrimaryCode::Schema`, which its callers retry. A transaction that has read or written
+    /// nothing yet is refused instead: reopening throws away the writer state that says a
+    /// transaction is open, and the caller rolls back and runs it again, as after any `busy`.
+    ///
+    /// @param writing - whether the statement changes the database
+    /// @param inside - whether a transaction is open
+    fn reopen_the_replaced_file(&mut self, writing: bool, inside: bool) -> DbResult<()> {
+        let _ = self
+            .storage
+            .database
+            .pool()
+            .unlock(inillucent_vfs::FileLock::None);
+        if inside {
+            return Err(
+                inillucent_base::error::DbError::primary(inillucent_base::error::PrimaryCode::Busy)
+                    .with_message(
+                        "another process replaced the database file, with VACUUM or a backup, after this transaction began; roll it back and run it again",
+                    ),
+            );
+        }
+        let running = self.writing.running();
+        let generation = self.schema_generation();
+        crate::rebuild::reopen_in_place(self)?;
+        self.writing.set_running(running);
+        self.schema.catalog_generation = self
+            .schema
+            .catalog_generation
+            .max(generation)
+            .saturating_add(1);
+        self.enter_within(writing)
+    }
+
+    /// Returns every schema's catalog rows, for telling a reload that changed the schema from
+    /// one that read the same rows again.
+    fn catalog_rows(&self) -> Vec<Vec<crate::Recorded>> {
+        self.schema_numbers()
+            .into_iter()
+            .map(|at| self.entries_of(at).to_vec())
+            .collect()
     }
 
     /// Returns where the log and the pool stand now, for comparing a statement's end with its start.
@@ -263,7 +444,7 @@ impl ImportedDatabase {
             .unlock(inillucent_vfs::FileLock::Shared);
         Err(inillucent_base::error::DbError::primary(inillucent_base::error::PrimaryCode::Busy)
             .with_message(
-                "another process committed after this transaction began reading, so it cannot                  write; roll it back and run it again, or start it with BEGIN IMMEDIATE",
+                "another process committed after this transaction began reading, so it cannot write; roll it back and run it again, or start it with BEGIN IMMEDIATE",
             ))
     }
 
@@ -536,8 +717,13 @@ impl ImportedDatabase {
             return Ok(false);
         }
         let tail = self.storage.wal.tail_of_open_segment()?;
+        // **And whether the log rolled on past it.** A roll leaves the segment
+        // this connection had open at the length it last saw, so the length
+        // alone answered "not moved" while another process committed in the
+        // next segment; see `Wal::next_segment_exists`.
         Ok(tail.sequence != self.storage.wal.sequence()
-            || tail.next_lsn != self.storage.wal.written_end())
+            || tail.next_lsn != self.storage.wal.written_end()
+            || (!self.quiet_since_checked() && self.storage.wal.next_segment_exists()?))
     }
 
     /// Puts back the pages a process that died holding the file left in it,
@@ -768,6 +954,8 @@ impl ImportedDatabase {
         // asking `main` alone answered "nothing was written" and released every
         // file with the attachment's pages still dirty - which lost 116 of 599
         // acknowledged inserts through `ATTACH` under load.
+        self.reclaim_scratch_logs()?;
+        self.prune_dropped_handles();
         let wrote = self.wrote_anything();
         if wrote
             && self.storage.database.pool().lock_level() != inillucent_vfs::FileLock::None
@@ -1060,6 +1248,38 @@ impl ImportedDatabase {
         if !holding {
             return Ok(());
         }
+        // **A connection that wrote nothing folds only if the file is free.**
+        // Its dirty pages are other processes' commits it replayed, which are in
+        // the log and are those processes' to fold, so it waited the whole busy
+        // timeout for the write lock on its way out of `inillucent query`
+        // whenever another process held a transaction open: five seconds for a
+        // `SELECT count(*)`. A hot journal is this connection's own and still
+        // waits, because it must not outlive the lock.
+        let wrote_nothing =
+            self.storage.wal.since_fold() == 0
+                && !self.storage.database.pool().journal_is_hot()
+                && self.session_state.attached.iter().all(|held| {
+                    held.wal.since_fold() == 0 && !held.database.pool().journal_is_hot()
+                });
+        if !wrote_nothing {
+            return self.fold_under_the_write_lock();
+        }
+        let budget = self.storage.database.busy_millis();
+        self.storage
+            .database
+            .set_busy_millis(BRIEF_FOLD_MILLIS.min(budget));
+        let folded = self.fold_under_the_write_lock();
+        self.storage.database.set_busy_millis(budget);
+        match folded {
+            Err(error) if error.code() == inillucent_base::error::PrimaryCode::Busy => Ok(()),
+            other => other,
+        }
+    }
+
+    /// Takes the write lock, folds, and lets the lock go: the close's fold.
+    ///
+    /// The lock is let go whether the fold worked or not.
+    fn fold_under_the_write_lock(&mut self) -> DbResult<()> {
         self.enter(true)?;
         // **The fold, and the log's housekeeping only when the log has grown**
         // (task-2191). The flush and the meta record are what make the closed

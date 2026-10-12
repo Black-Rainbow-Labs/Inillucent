@@ -654,7 +654,7 @@ fn a_subquery_in_a_where_changes_the_rows_sqlite_changes() {
     );
     compare(
         &mut pair,
-        "SELECT id FROM members WHERE id IN (SELECT id FROM members WHERE score >= 20)          ORDER BY id",
+        "SELECT id FROM members WHERE id IN (SELECT id FROM members WHERE score >= 20) ORDER BY id",
         &mut failures,
     );
 
@@ -1231,7 +1231,7 @@ fn a_table_level_check_takes_a_conflict_clause_and_ignores_it() {
     );
     if reference.is_none() || ours.is_none() {
         failures.push(format!(
-            "a column-level CHECK's conflict clause was not refused by both:              sqlite {reference:?}, ours {ours:?}"
+            "a column-level CHECK's conflict clause was not refused by both: sqlite {reference:?}, ours {ours:?}"
         ));
     }
     {

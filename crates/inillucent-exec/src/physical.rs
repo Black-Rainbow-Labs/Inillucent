@@ -97,15 +97,18 @@ mod translate;
 mod catalog;
 
 pub use catalog::{ForcePlan, SourceLayout, TreeCatalog};
-pub(crate) use chain::Listing;
 pub use chain::{build, build_prepared, build_prepared_described, build_statement, Statement};
+pub(crate) use chain::{entering_predicate, HeldBefore, Listing};
 pub use params::{Params, Slots, ENGINE_PARAMETER_BASE};
 pub use run::{
     keep_partial_rows, prepare_any, rowid_seek_key, run, run_any, run_any_prepared,
     run_any_prepared_limited, run_compound, run_prepared, run_prepared_limited, take_partial_rows,
 };
 pub use stages::prepare;
-pub use stages::{AccessKind, Pipeline, Prepared, PreparedStage, Shape, Source, VirtualScanSource};
+pub use stages::{
+    AccessKind, Pipeline, Prepared, PreparedStage, RecursiveSource, Shape, Source,
+    VirtualScanSource,
+};
 // The crate-internal names, re-exported so the seven modules reach each other
 // through the paths they used when they were one file.
 pub(crate) use catalog::WithQueue;

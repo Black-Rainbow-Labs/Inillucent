@@ -176,6 +176,7 @@ impl crate::ImportedDatabase {
     /// @param name - the table's name as written
     /// @param folded - the same name, folded, which the catalog is searched by
     fn drop_table(&mut self, name: &[u8], folded: &[u8]) -> DbResult<()> {
+        self.drop_vector_index_stores(folded)?;
         let at = self.schema.ddl_schema;
         let position = self
             .schema
@@ -238,6 +239,37 @@ impl crate::ImportedDatabase {
             self.forget_sequence(&owner.name)?;
         }
         let _ = position;
+        Ok(())
+    }
+
+    /// Drops the stores of the vector indexes a table carries, before the table goes.
+    ///
+    /// A `CREATE INDEX ... USING inillucent_hnsw` records a virtual table and its five backing
+    /// tables, none of which name the indexed table in their `tbl_name`. `DROP TABLE` collected
+    /// rows by that name, so it left every store behind, and creating the table and the index
+    /// again failed because the index's name was taken.
+    ///
+    /// @param folded - the folded name of the table about to be dropped
+    fn drop_vector_index_stores(&mut self, folded: &[u8]) -> DbResult<()> {
+        let at = self.schema.ddl_schema;
+        let stores: Vec<Vec<u8>> = self
+            .schema
+            .tables
+            .iter()
+            .filter(|held| held.database == at && held.folded == folded && held.module.is_none())
+            .flat_map(|held| held.indexes.iter())
+            .filter(|index| index.origin == inillucent_sql::catalog_view::IndexOrigin::Module)
+            .map(|index| index.name.clone())
+            .collect();
+        if stores.is_empty() {
+            return Ok(());
+        }
+        for store in &stores {
+            self.drop_module_table(store)?;
+        }
+        self.rebuild_tables()?;
+        self.refresh_catalog();
+        self.refresh_vector_indexes();
         Ok(())
     }
 
@@ -388,6 +420,9 @@ impl crate::ImportedDatabase {
             self.refuse_a_column_past_the_limit(at, &folded)?;
             self.refuse_an_unaddable_column(at, &folded, risk)?;
         }
+        if let AlterKind::DropColumn { name, position } = action {
+            self.refuse_dropping_a_vector_indexed_column(at, &folded, name, *position)?;
+        }
         self.check_schema_before(at, action)?;
         self.check_constraint_names(at, &folded, action)?;
         let updates = self.altered_entries(at, source, table, &folded, action)?;
@@ -419,6 +454,42 @@ impl crate::ImportedDatabase {
         self.seal()?;
         Ok(Outcome::empty())
     }
+    /// Refuses `DROP COLUMN` of a column a vector index is built over.
+    ///
+    /// SQLite refuses to drop a column an index names. The vector index's store is a virtual
+    /// table, so the check for ordinary indexes never saw it: the column went, the store stayed
+    /// pointing at a column that no longer existed, and every later write to the table failed.
+    ///
+    /// @param at - which attached database the table is in
+    /// @param folded - the table's folded name
+    /// @param name - the column's name
+    /// @param position - the column's declared position
+    fn refuse_dropping_a_vector_indexed_column(
+        &self,
+        at: usize,
+        folded: &[u8],
+        name: &[u8],
+        position: u16,
+    ) -> DbResult<()> {
+        let indexed = self
+            .schema
+            .tables
+            .iter()
+            .filter(|held| held.database == at && held.folded == folded)
+            .flat_map(|held| held.indexes.iter())
+            .any(|index| {
+                index.origin == inillucent_sql::catalog_view::IndexOrigin::Module
+                    && index.columns.iter().any(|key| key.column == Some(position))
+            });
+        if indexed {
+            return Err(refusal(format!(
+                "cannot drop column \"{}\": indexed",
+                String::from_utf8_lossy(name)
+            )));
+        }
+        Ok(())
+    }
+
     /// Writes the temporary triggers and views a rename in another schema changed.
     ///
     /// The rows live in the temporary database, so the write is made with that

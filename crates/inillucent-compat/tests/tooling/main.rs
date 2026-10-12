@@ -31,4 +31,5 @@ mod matrix_inventory;
 mod policy;
 mod scenarios;
 mod selection;
+mod string_literals;
 mod workload_freshness;

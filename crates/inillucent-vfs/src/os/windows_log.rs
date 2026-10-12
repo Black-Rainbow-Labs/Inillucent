@@ -84,9 +84,37 @@ pub struct LogShare {
     solo: AtomicBool,
     /// The segment's length as this process's own writes and truncations left it.
     len: AtomicU64,
+    /// A number no other share in this process has, so a token from one share never equals one
+    /// from another.
+    id: u64,
+    /// How many times the oplock was broken or lost, raised before `solo` is trusted again.
+    breaks: AtomicU64,
 }
 
+/// The source of `LogShare::id`.
+static NEXT_SHARE_ID: AtomicU64 = AtomicU64::new(1);
+
 impl LogShare {
+    /// Returns a value that stays the same while no handle to this segment has existed outside
+    /// this process, or `None` when the oplock is not held now.
+    ///
+    /// **For skipping the checks that ask the file system by name what another process did**
+    /// (task-2226). Two equal tokens mean the oplock was held at both moments and never broken
+    /// in between, so no other process opened, wrote, renamed or deleted the segment in that
+    /// time. The watcher raises `breaks` before it acknowledges a break, so the process that broke
+    /// the oplock cannot reach the file before this count has moved.
+    ///
+    /// `breaks` is read on both sides of `solo`: a break that lands between the reads gives two
+    /// different counts, and the answer is `None`.
+    pub fn quiet_token(&self) -> Option<u64> {
+        let before = self.breaks.load(Ordering::SeqCst);
+        if !self.solo.load(Ordering::SeqCst) {
+            return None;
+        }
+        let after = self.breaks.load(Ordering::SeqCst);
+        (before == after).then_some((self.id << 32) ^ after)
+    }
+
     /// Returns the shared file.
     pub fn file(&self) -> &Arc<File> {
         &self.file
@@ -322,6 +350,8 @@ pub fn open_log_share(
         writable,
         solo: AtomicBool::new(false),
         len: AtomicU64::new(0),
+        id: NEXT_SHARE_ID.fetch_add(1, Ordering::Relaxed),
+        breaks: AtomicU64::new(0),
     });
     shares.push((key, Arc::downgrade(&share)));
     drop(shares);
@@ -387,6 +417,7 @@ fn watch_oplock(watched: &Weak<LogShare>) {
             return;
         };
         share.solo.store(false, Ordering::SeqCst);
+        share.breaks.fetch_add(1, Ordering::SeqCst);
         acknowledge_break(&share.file);
         drop(share);
         std::thread::sleep(OPLOCK_RETRY);

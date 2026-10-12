@@ -46,18 +46,62 @@ static ALLOCATOR: inillucent_alloc::Carved = inillucent_alloc::Carved;
 use inillucent_cli::shell::{drive, Shell};
 use inillucent_cli::{commands, dot};
 
+/// One thing the command line asks the shell to do before it reads input.
+///
+/// **In the order the words were written.** The reference runs each `-cmd` and each
+/// option the moment it reaches it, so `-csv -cmd ".mode box"` ends in `box` and
+/// `-cmd ".mode box" -csv` ends in `csv`.
+enum Step {
+    /// A dot command the shell builds for an option, such as `.mode csv`.
+    Dot(String),
+    /// The text of `-cmd`: a dot command or SQL, with the position it was given at.
+    Command {
+        /// What the person wrote.
+        text: String,
+        /// Where it was on the command line, counted from the program name.
+        index: usize,
+    },
+    /// `-separator`, `-newline` or `-nullvalue`, whose text is used as written.
+    ///
+    /// The dot commands resolve a backslash escape and the options do not:
+    /// `-separator '\t'` is a backslash and a `t`.
+    Setting(Setting),
+}
+
+/// A setting an option gives literally.
+enum Setting {
+    /// What goes between columns.
+    ColumnSeparator(String),
+    /// What goes after a row.
+    RowSeparator(String),
+    /// What a NULL prints as.
+    NullValue(String),
+}
+
 /// What the command line asked for.
 struct Invocation {
+    /// How the program was started, which an error names.
+    program: String,
     /// The database to open.
     path: String,
-    /// Statements given on the command line, run in order.
-    statements: Vec<String>,
-    /// Settings to apply before anything runs.
-    commands: Vec<String>,
+    /// The database as it was typed, which an error names.
+    typed: String,
+    /// Whether the file has to be there already, from `mode=ro` or `mode=rw` in a URI.
+    must_exist: bool,
+    /// Statements and dot commands given as arguments, with their positions.
+    statements: Vec<(usize, String)>,
+    /// Settings and `-cmd`s to apply before anything else runs.
+    steps: Vec<Step>,
+    /// The file `-init` named.
+    init: Option<String>,
+    /// Whether `-noinit` was given, which cancels `-init` too.
+    no_init: bool,
     /// Whether to print the version and stop.
     version: bool,
     /// Whether to print usage and stop.
     help: bool,
+    /// Whether to stop at the first failing command.
+    bail: bool,
     /// Whether every statement that changes something is refused.
     readonly: bool,
     /// Whether the commands that reach outside the database are refused.
@@ -70,6 +114,8 @@ struct Invocation {
     refused: Vec<(String, &'static str)>,
     /// The words that are shaped like an option and are not one of them.
     unknown: Vec<String>,
+    /// An option that needs a value and was the last word on the line.
+    missing: Option<String>,
     /// The file `-key-file` named, holding the key databases are opened with.
     key_file: Option<String>,
 }
@@ -149,40 +195,40 @@ const REFUSED: &[(&str, bool, &str)] = &[
         "this engine has no legacy rowid-in-view behaviour to switch off.",
     ),
     (
-        "-escape",
-        true,
-        "the output escaping modes are not implemented: .mode has no --escape.",
-    ),
-    (
-        "-screenwidth",
-        true,
-        "the columnar modes do not wrap to a screen width: .mode has no --sw.",
-    ),
-    (
         "-interactive",
         false,
         "this shell never prompts, so there is nothing to force on. It is always -batch.",
     ),
-    // These two are refused for one reason, and it is a real limitation rather
-    // than a missing switch. The output path writes a line and then a newline;
-    // the row separator is honoured only where it *ends* in one, which is why
-    // `-csv` works and is byte-identical to the reference. `-ascii` wants a
-    // record separator with no newline after it at all, and `-newline` wants
-    // an arbitrary one. Accepting either would set the column separator, drop
-    // the row separator, and produce output that differs from `sqlite3` in a
-    // way a caller would find in their own parser rather than here.
-    (
-        "-ascii",
-        false,
-        "the row separator is honoured only when it ends in a newline, and the ASCII record \
-         separator does not. -separator sets the column separator on its own.",
-    ),
-    (
-        "-newline",
-        true,
-        "the row separator is honoured only when it ends in a newline. -separator sets the \
-         column separator on its own.",
-    ),
+];
+
+/// The options that take one word after them, which is never the file name.
+const TAKES_A_VALUE: &[&str] = &[
+    "-cmd",
+    "-init",
+    "-separator",
+    "-nullvalue",
+    "-newline",
+    "-nonce",
+    "-key-file",
+    "-escape",
+    "-screenwidth",
+    "-heap",
+];
+
+/// The `-mode` style options and the dot command each one is.
+const MODE_OPTIONS: &[(&str, &str)] = &[
+    ("-ascii", ".mode ascii"),
+    ("-box", ".mode box"),
+    ("-column", ".mode column"),
+    ("-csv", ".mode csv"),
+    ("-html", ".mode html"),
+    ("-json", ".mode json"),
+    ("-line", ".mode line"),
+    ("-list", ".mode list"),
+    ("-markdown", ".mode markdown"),
+    ("-quote", ".mode quote"),
+    ("-table", ".mode table"),
+    ("-tabs", ".mode tabs"),
 ];
 
 /// Parses the command line the way `sqlite3` does.
@@ -196,127 +242,148 @@ const REFUSED: &[(&str, bool, &str)] = &[
 /// named `--`, `-d` and `--db` turned up in a repository from exactly that.
 /// `--` still ends the options, so a file whose name begins with a dash can be
 /// opened by writing it after one.
+///
+/// @param arguments - the words after the program name
 fn parse(arguments: impl Iterator<Item = String>) -> Invocation {
     let mut invocation = Invocation {
+        program: String::new(),
         path: ":memory:".to_string(),
+        typed: ":memory:".to_string(),
+        must_exist: false,
         statements: Vec::new(),
-        commands: Vec::new(),
+        steps: Vec::new(),
+        init: None,
+        no_init: false,
         version: false,
         help: false,
+        bail: false,
         readonly: false,
         safe: false,
         if_exists: false,
         no_follow: false,
         refused: Vec::new(),
         unknown: Vec::new(),
+        missing: None,
         key_file: None,
     };
     let mut named = false;
     let mut only_positional = false;
-    let mut arguments = arguments.peekable();
-    while let Some(argument) = arguments.next() {
+    let mut arguments = arguments.enumerate().map(|(at, word)| (at + 1, word));
+    while let Some((index, argument)) = arguments.next() {
         if only_positional {
-            take_positional(&mut invocation, argument, &mut named);
+            take_positional(&mut invocation, index, argument, &mut named);
             continue;
         }
-        if let Some((option, takes_value, why)) = REFUSED
-            .iter()
-            .find(|(option, _, _)| is_option(&argument, option))
+        if !argument.starts_with('-') || argument == "-" {
+            take_positional(&mut invocation, index, argument, &mut named);
+            continue;
+        }
+        // The reference reads `--name` as `-name`.
+        let option = argument
+            .strip_prefix("--")
+            .map_or(argument.clone(), |rest| format!("-{rest}"));
+        if option == "-" {
+            only_positional = true;
+            continue;
+        }
+        if let Some((name, takes_value, why)) = REFUSED.iter().find(|(name, _, _)| *name == option)
         {
             if *takes_value {
                 let _ = arguments.next();
             }
-            invocation.refused.push(((*option).to_string(), *why));
+            invocation.refused.push(((*name).to_string(), *why));
             continue;
         }
-        match argument.as_str() {
-            "--" => only_positional = true,
-            "-version" | "--version" => invocation.version = true,
-            "-help" | "--help" => invocation.help = true,
-            "-header" | "--header" => invocation.commands.push(".headers on".to_string()),
-            "-noheader" | "--noheader" => invocation.commands.push(".headers off".to_string()),
-            "-echo" | "--echo" => invocation.commands.push(".echo on".to_string()),
-            "-bail" | "--bail" => invocation.commands.push(".bail on".to_string()),
-            "-csv" | "--csv" => invocation.commands.push(".mode csv".to_string()),
-            "-json" | "--json" => invocation.commands.push(".mode json".to_string()),
-            "-line" | "--line" => invocation.commands.push(".mode line".to_string()),
-            "-list" | "--list" => invocation.commands.push(".mode list".to_string()),
-            "-html" | "--html" => invocation.commands.push(".mode html".to_string()),
-            "-box" | "--box" => invocation.commands.push(".mode box".to_string()),
-            "-table" | "--table" => invocation.commands.push(".mode table".to_string()),
-            "-markdown" | "--markdown" => invocation.commands.push(".mode markdown".to_string()),
-            "-quote" | "--quote" => invocation.commands.push(".mode quote".to_string()),
-            "-column" | "--column" => invocation.commands.push(".mode column".to_string()),
-            "-tabs" | "--tabs" => invocation.commands.push(".mode tabs".to_string()),
-            "-stats" | "--stats" => invocation.commands.push(".stats on".to_string()),
-            "-batch" | "--batch" | "-noinit" | "--noinit" => {}
-            "-readonly" | "--readonly" => invocation.readonly = true,
-            "-key-file" | "--key-file" => invocation.key_file = arguments.next(),
-            "-safe" | "--safe" => invocation.safe = true,
-            "-ifexists" | "--ifexists" => invocation.if_exists = true,
-            "-nofollow" | "--nofollow" => invocation.no_follow = true,
-            "-init" | "--init" => {
-                if let Some(value) = arguments.next() {
-                    invocation.commands.push(format!(".read \"{value}\""));
-                }
-            }
-            "-nonce" | "--nonce" => {
-                if let Some(value) = arguments.next() {
-                    invocation.commands.push(format!(".nonce {value}"));
-                }
-            }
-            "-separator" | "--separator" => {
-                if let Some(value) = arguments.next() {
-                    invocation.commands.push(format!(".separator \"{value}\""));
-                }
-            }
-            "-nullvalue" | "--nullvalue" => {
-                if let Some(value) = arguments.next() {
-                    invocation.commands.push(format!(".nullvalue \"{value}\""));
-                }
-            }
-            "-cmd" | "--cmd" => {
-                if let Some(value) = arguments.next() {
-                    invocation.commands.push(value);
-                }
-            }
-            // Reaching here means no option matched, so a word still carrying
-            // a leading dash is a mistyped option rather than a file name.
-            // Everything after `--` skips this arm entirely, which is how a
-            // file whose name begins with a dash is still opened.
-            _ if argument.starts_with('-') => invocation.unknown.push(argument),
-            _ => take_positional(&mut invocation, argument, &mut named),
+        if TAKES_A_VALUE.contains(&option.as_str()) {
+            let Some((value_index, value)) = arguments.next() else {
+                invocation.missing = Some(option);
+                break;
+            };
+            apply_value_option(&mut invocation, &option, value_index, value);
+            continue;
+        }
+        if let Some((_, dot)) = MODE_OPTIONS.iter().find(|(name, _)| *name == option) {
+            invocation.steps.push(Step::Dot((*dot).to_string()));
+            continue;
+        }
+        match option.as_str() {
+            "-version" => invocation.version = true,
+            "-help" => invocation.help = true,
+            "-header" => invocation.steps.push(Step::Dot(".headers on".to_string())),
+            "-noheader" => invocation.steps.push(Step::Dot(".headers off".to_string())),
+            "-echo" => invocation.steps.push(Step::Dot(".echo on".to_string())),
+            "-eqp" => invocation.steps.push(Step::Dot(".eqp on".to_string())),
+            "-bail" => invocation.bail = true,
+            "-stats" => invocation.steps.push(Step::Dot(".stats on".to_string())),
+            "-batch" => {}
+            "-noinit" => invocation.no_init = true,
+            "-readonly" => invocation.readonly = true,
+            "-safe" => invocation.safe = true,
+            "-ifexists" => invocation.if_exists = true,
+            "-nofollow" => invocation.no_follow = true,
+            // Reached only when nothing matched, so a word still carrying a
+            // leading dash is a mistyped option and not a file name.
+            _ => invocation.unknown.push(option),
         }
     }
     invocation
 }
 
+/// Applies an option that carries a value.
+///
+/// @param invocation - what is being built
+/// @param option - the option, with one leading dash
+/// @param index - where the value was on the command line
+/// @param value - the word after the option
+fn apply_value_option(invocation: &mut Invocation, option: &str, index: usize, value: String) {
+    match option {
+        "-cmd" => invocation.steps.push(Step::Command { text: value, index }),
+        "-init" => invocation.init = Some(value),
+        "-separator" => invocation
+            .steps
+            .push(Step::Setting(Setting::ColumnSeparator(value))),
+        "-newline" => invocation
+            .steps
+            .push(Step::Setting(Setting::RowSeparator(value))),
+        "-nullvalue" => invocation
+            .steps
+            .push(Step::Setting(Setting::NullValue(value))),
+        "-nonce" => invocation.steps.push(Step::Dot(format!(".nonce {value}"))),
+        "-key-file" => invocation.key_file = Some(value),
+        // `-escape` and `-screenwidth` set a mode option each.
+        "-escape" => invocation
+            .steps
+            .push(Step::Dot(format!(".mode --escape {value}"))),
+        "-screenwidth" => invocation
+            .steps
+            .push(Step::Dot(format!(".mode --screenwidth {value}"))),
+        // `-heap` sizes SQLite's own allocator, which this engine does not have;
+        // the reference accepts it and so does this.
+        _ => {}
+    }
+}
+
 /// Records a word that is not an option: the first is the file, the rest SQL.
 ///
 /// @param invocation - what is being built
+/// @param index - where the word was on the command line
 /// @param argument - the word
 /// @param named - whether the file has already been named
-fn take_positional(invocation: &mut Invocation, argument: String, named: &mut bool) {
+fn take_positional(invocation: &mut Invocation, index: usize, argument: String, named: &mut bool) {
     if *named {
-        invocation.statements.push(argument);
+        invocation.statements.push((index, argument));
     } else {
+        invocation.typed = argument.clone();
         invocation.path = argument;
         *named = true;
     }
 }
 
-/// Returns whether a command-line word is a given option, in either spelling.
+/// Refuses to open a file that does not satisfy `-ifexists`, `-nofollow` or `-readonly`.
 ///
-/// @param argument - the word
-/// @param option - the option, with one leading dash
-fn is_option(argument: &str, option: &str) -> bool {
-    argument == option
-        || argument
-            .strip_prefix("--")
-            .is_some_and(|rest| Some(rest) == option.strip_prefix('-'))
-}
-
-/// Refuses to open a file that does not satisfy `-ifexists` or `-nofollow`.
+/// A read only open of a file that is not there fails and creates nothing, as
+/// the reference's does: opening a missing file read only must not leave an
+/// empty database behind.
 ///
 /// @param invocation - what the command line asked for
 fn openable(invocation: &Invocation) -> Result<(), String> {
@@ -324,11 +391,12 @@ fn openable(invocation: &Invocation) -> Result<(), String> {
         return Ok(());
     }
     let path = std::path::Path::new(&invocation.path);
-    if invocation.if_exists && !path.exists() {
-        return Err(format!(
-            "Error: cannot open \"{}\": it does not exist, and -ifexists was given",
-            invocation.path
-        ));
+    let refused = format!(
+        "Error: unable to open database \"{}\": unable to open database file",
+        invocation.typed
+    );
+    if (invocation.if_exists || invocation.readonly || invocation.must_exist) && !path.exists() {
+        return Err(refused);
     }
     // Asked of the link itself rather than of what it points at, which is the
     // whole of the check: `exists()` follows a link, so a check written that way
@@ -336,14 +404,39 @@ fn openable(invocation: &Invocation) -> Result<(), String> {
     if invocation.no_follow {
         if let Ok(about) = std::fs::symlink_metadata(path) {
             if about.file_type().is_symlink() {
-                return Err(format!(
-                    "Error: cannot open \"{}\": it is a symbolic link, and -nofollow was given",
-                    invocation.path
-                ));
+                return Err(refused);
             }
         }
     }
     Ok(())
+}
+
+/// Reads a `file:` name given on the command line as the URI it is.
+///
+/// `file:app.db?mode=ro` opens `app.db` read only, and has to find it there.
+/// `mode=memory` is a database in memory. A name that is not a URI is left alone.
+///
+/// @param invocation - what the command line asked for
+fn resolve_uri(invocation: &mut Invocation) {
+    match inillucent_cli::opening::parse_uri(&invocation.path) {
+        Some(Ok(uri)) => {
+            invocation.readonly |= uri.read_only;
+            invocation.must_exist |= uri.must_exist;
+            invocation.path = if uri.path.is_empty() {
+                ":memory:".to_string()
+            } else {
+                uri.path
+            };
+        }
+        Some(Err(message)) => {
+            eprintln!(
+                "Error: unable to open database \"{}\": {message}",
+                invocation.typed
+            );
+            std::process::exit(1);
+        }
+        None => {}
+    }
 }
 
 /// Opens the database, applies the settings, and runs whatever was asked for.
@@ -352,12 +445,32 @@ fn main() {
     inillucent_cli::on_a_sized_stack(run)
 }
 
+/// Prints an error line the way the reference prints a command line mistake.
+///
+/// @param program - how the program was started
+/// @param message - what was wrong
+fn command_line_error(program: &str, message: &str) -> ! {
+    eprintln!("{program}: Error: {message}");
+    std::process::exit(1)
+}
+
 /// Everything `main` does, on the sized thread.
 fn run() {
     inillucent_cli::shell::output::flush_on_panic();
-    let invocation = parse(std::env::args().skip(1));
+    let mut words = std::env::args_os().map(|word| word.to_string_lossy().into_owned());
+    let program = words
+        .next()
+        .unwrap_or_else(|| "inillucent-shell".to_string());
+    let mut invocation = parse(words);
+    invocation.program = program;
+    if let Some(option) = &invocation.missing {
+        command_line_error(
+            &invocation.program,
+            &format!("missing argument to {option}"),
+        );
+    }
     if invocation.help {
-        usage();
+        usage(&invocation.program);
         return;
     }
     // Before anything is opened, and before the refusals below: a word that is
@@ -365,12 +478,10 @@ fn run() {
     // probably misread too. The file name is the word after it, so carrying on
     // would create a database under the typo's name and run the real file name
     // as a statement.
-    if !invocation.unknown.is_empty() {
-        for option in &invocation.unknown {
-            eprintln!("Error: unknown option: {option}");
-        }
+    if let Some(option) = invocation.unknown.first() {
+        eprintln!("{}: Error: unknown option: {option}", invocation.program);
         eprintln!("Use -help for a list of options.");
-        std::process::exit(2);
+        std::process::exit(1);
     }
     // Before anything is opened: an option nobody can honour means the command
     // line was misunderstood, and running most of it would be worse than
@@ -382,6 +493,7 @@ fn run() {
         }
         std::process::exit(1);
     }
+    resolve_uri(&mut invocation);
     if let Err(message) = openable(&invocation) {
         eprintln!("{message}");
         std::process::exit(1);
@@ -392,7 +504,7 @@ fn run() {
         eprintln!("Error: {message}");
         std::process::exit(1);
     }
-    let mut shell = match Shell::open(&invocation.path) {
+    let mut shell = match Shell::open_following(&invocation.path, invocation.readonly) {
         Ok(shell) => shell,
         Err(message) => {
             eprintln!(
@@ -411,14 +523,119 @@ fn run() {
         inillucent_cli::shell::output::flush();
         return;
     }
-    // The settings run before safe mode is armed, because `-init` names a
-    // script the caller chose and `-safe` is about what that script may then
-    // do. Arming first would refuse the caller's own `.read`.
-    for command in &invocation.commands {
-        drive(&mut shell, std::iter::once(command.clone()));
+    shell.bail = invocation.bail;
+    let code = match run_setup(&mut shell, &invocation) {
+        Some(code) => code,
+        None => {
+            shell.readonly = invocation.readonly;
+            shell.safe = invocation.safe;
+            run_input(&mut shell, &invocation)
+        }
+    };
+    // `.testcase`/`.check` report their tally once, at the end, and only when
+    // some ran - which is what makes the line invisible to an ordinary script.
+    commands::report_tests(&mut shell);
+    // The shell is dropped before the process ends, because the drop runs the
+    // statements it is still holding and closes the database.
+    drop(shell);
+    inillucent_cli::shell::output::flush();
+    if code != 0 {
+        std::process::exit(code);
     }
-    shell.readonly = invocation.readonly;
-    shell.safe = invocation.safe;
+}
+
+/// Runs the start up file, then each option and `-cmd` in the order given.
+///
+/// The settings run before safe mode is armed, because `-init` names a script
+/// the caller chose and `-safe` is about what that script may then do. Arming
+/// first would refuse the caller's own `.read`.
+///
+/// **A failure here does not decide the exit status.** The reference reports the
+/// error and goes on, and the status is that of the input read afterwards. With
+/// `-bail`, the first failure ends the run with status 1 instead.
+///
+/// @param shell - the shell
+/// @param invocation - what the command line asked for
+fn run_setup(shell: &mut Shell, invocation: &Invocation) -> Option<i32> {
+    if let (Some(file), false) = (&invocation.init, invocation.no_init) {
+        run_init_file(shell, file);
+        if let Some(code) = settle(shell, invocation.bail) {
+            return Some(code);
+        }
+    }
+    for step in &invocation.steps {
+        match step {
+            Step::Dot(text) => drive(shell, std::iter::once(text.clone())),
+            Step::Command { text, index } => {
+                shell.argument = Some(*index);
+                drive(shell, std::iter::once(text.clone()));
+                shell.argument = None;
+            }
+            Step::Setting(setting) => apply_setting(shell, setting),
+        }
+        if let Some(code) = settle(shell, invocation.bail) {
+            return Some(code);
+        }
+    }
+    None
+}
+
+/// Runs the file `-init` named, or says it could not be opened.
+///
+/// @param shell - the shell
+/// @param file - the name as given
+fn run_init_file(shell: &mut Shell, file: &str) {
+    match std::fs::read(file) {
+        Ok(bytes) => dot::run_script_bytes(shell, file, &bytes),
+        Err(_) => eprintln!("cannot open: \"{file}\""),
+    }
+}
+
+/// Applies a setting given as an option, without resolving escapes.
+///
+/// @param shell - the shell
+/// @param setting - which setting and its text
+fn apply_setting(shell: &mut Shell, setting: &Setting) {
+    match setting {
+        Setting::ColumnSeparator(text) => shell.layout.separator = text.clone(),
+        Setting::RowSeparator(text) => shell.layout.row_separator = text.clone(),
+        Setting::NullValue(text) => shell.layout.null = text.clone(),
+    }
+}
+
+/// Decides what a finished step means for the run.
+///
+/// `.exit` ends the process with its status. `.quit` ends it with 0, without
+/// reading any input. A failure with `-bail` ends it with 1. Otherwise the
+/// failure is forgotten, because only the input read last sets the status.
+/// Returns the status to end with, or none to go on.
+///
+/// @param shell - the shell
+/// @param bail - whether `-bail` was given
+fn settle(shell: &mut Shell, bail: bool) -> Option<i32> {
+    if let Some(code) = shell.exit_code {
+        return Some(code);
+    }
+    if shell.done {
+        return Some(0);
+    }
+    if shell.failed && bail {
+        return Some(1);
+    }
+    shell.failed = false;
+    None
+}
+
+/// Runs the statements given as arguments, or reads standard input.
+///
+/// **Each argument is run on its own and the first failure ends the run.** An
+/// argument is a statement or a dot command. A failing one is reported as
+/// `in 3rd command line argument`, nothing after it runs, and the status is 1.
+/// When any argument was given, standard input is not read. Returns the exit status.
+///
+/// @param shell - the shell
+/// @param invocation - what the command line asked for
+fn run_input(shell: &mut Shell, invocation: &Invocation) -> i32 {
     if invocation.statements.is_empty() {
         // Through `FlushingStdin`, so the answers printed so far are written
         // out before the shell waits for more input; see `shell::output`.
@@ -426,68 +643,81 @@ fn run() {
             64 << 10,
             inillucent_cli::shell::output::FlushingStdin,
         );
-        let lines = std::io::BufRead::lines(input).map_while(Result::ok);
-        drive(&mut shell, lines);
+        // Bytes, not text: a line that is not UTF-8 is a line (see `raw`).
+        let lines = inillucent_cli::raw::LineReader::new(input);
+        drive(shell, lines);
     } else {
-        let statements = invocation.statements.clone();
-        drive(&mut shell, statements.into_iter());
+        for (index, text) in &invocation.statements {
+            shell.argument = Some(*index);
+            drive(shell, std::iter::once(text.clone()));
+            shell.argument = None;
+            if shell.exit_code.is_some() || shell.done || shell.failed {
+                break;
+            }
+        }
     }
-    // `.testcase`/`.check` report their tally once, at the end, and only when
-    // some ran - which is what makes the line invisible to an ordinary script.
-    commands::report_tests(&mut shell);
-    inillucent_cli::shell::output::flush();
-    if shell.failed {
-        std::process::exit(1);
+    match shell.exit_code {
+        Some(code) => code,
+        None if shell.failed => 1,
+        None => 0,
     }
 }
 
-/// Prints what the command line accepts.
+/// Prints what the command line accepts, to standard error as the reference does.
 ///
-/// Every option the reference shell has appears here, including the sixteen
-/// this engine refuses: an option missing from the usage text reads as an
-/// option that was forgotten, and a caller who reads "not supported, and here
-/// is why" has learned something a silent omission would not have told them.
-fn usage() {
-    println!("Usage: inillucent-shell [OPTIONS] FILENAME [SQL...]");
-    println!("Options:");
+/// Every option the reference shell has appears here, including the ones this
+/// engine refuses: an option missing from the usage text reads as an option that
+/// was forgotten, and a caller who reads "not supported, and here is why" has
+/// learned something a silent omission would not have told them.
+///
+/// @param program - how the program was started
+fn usage(program: &str) {
+    eprintln!("Usage: {program} [OPTIONS] [FILENAME [SQL...]]");
+    eprintln!("FILENAME is the name of an SQLite database. A new database is created");
+    eprintln!("if the file does not previously exist. Defaults to :memory:.");
+    eprintln!("OPTIONS include:");
     for line in [
-        "   --                   treat every later argument as a file or a statement",
+        "   --                   treat no subsequent arguments as options",
+        "   -ascii               set output mode to 'ascii'",
         "   -bail                stop after hitting an error",
         "   -batch               force batch input (this shell is always batch)",
         "   -box                 set output mode to 'box'",
         "   -column              set output mode to 'column'",
-        "   -cmd COMMAND         run COMMAND before reading stdin",
+        "   -cmd COMMAND         run \"COMMAND\" before reading stdin",
         "   -csv                 set output mode to 'csv'",
-        "   -echo                print commands before execution",
+        "   -echo                print inputs before execution",
         "   -header              turn headers on",
+        "   -noheader            turn headers off",
+        "   -escape T            ctrl-char escape; T is one of: symbol, ascii, off",
+        "   -screenwidth N       use N as the default screenwidth",
         "   -help                show this message",
         "   -html                set output mode to HTML",
-        "   -ifexists            only open FILENAME if it already exists",
-        "   -init FILENAME       read and run FILENAME before anything else",
+        "   -ifexists            only open if database already exists",
+        "   -init FILENAME       read/process named file",
         "   -json                set output mode to 'json'",
         "   -line                set output mode to 'line'",
         "   -list                set output mode to 'list'",
         "   -markdown            set output mode to 'markdown'",
-        "   -nofollow            refuse to open FILENAME if it is a symbolic link",
-        "   -noheader            turn headers off",
-        "   -noinit              do not read a start-up file (none is read anyway)",
-        "   -nonce STRING        suspend safe mode for a command that matches STRING",
-        "   -nullvalue TEXT      set text string for NULL values",
+        "   -newline SEP         set output row separator. Default: '\\n'",
+        "   -nofollow            refuse to open symbolic links to database files",
+        "   -noinit              Do not read the ~/.sqliterc file at startup",
+        "   -nonce STRING        set the safe-mode escape nonce",
+        "   -nullvalue TEXT      set text string for NULL values. Default ''",
         "   -quote               set output mode to 'quote'",
-        "   -readonly            refuse every statement that changes the database",
+        "   -readonly            open the database read-only",
         "   -key-file FILE       open databases encrypted, with the key in FILE",
         "                        (or $INILLUCENT_KEY)",
-        "   -safe                refuse .cd, .load, .shell, .system, .excel and .www",
-        "   -separator SEP       set output column separator",
-        "   -stats               print memory and page-cache statistics",
+        "   -safe                enable safe-mode",
+        "   -separator SEP       set output column separator. Default: '|'",
+        "   -stats               print memory stats before each finalize",
         "   -table               set output mode to 'table'",
         "   -tabs                set output mode to 'tabs'",
-        "   -version             show the version and exit",
+        "   -version             show SQLite version",
     ] {
-        println!("{line}");
+        eprintln!("{line}");
     }
-    println!();
-    println!("Refused, because this engine has no equivalent - each says why when used:");
+    eprintln!();
+    eprintln!("Refused, because this engine has no equivalent - each says why when used:");
     let width = REFUSED
         .iter()
         .map(|(option, _, _)| option.len())
@@ -496,7 +726,7 @@ fn usage() {
     for (option, takes_value, _) in REFUSED {
         let value = if *takes_value { " N" } else { "" };
         let padding = " ".repeat(width.saturating_sub(option.len()));
-        println!("   {option}{padding}{value}");
+        eprintln!("   {option}{padding}{value}");
     }
 }
 
@@ -504,65 +734,67 @@ fn usage() {
 mod tests {
     use super::*;
 
+    /// Parses a list of words as a command line.
+    fn parsed(words: &[&str]) -> Invocation {
+        parse(words.iter().map(|word| (*word).to_string()))
+    }
+
     /// The first bare word is the file and the rest are statements.
     #[test]
     fn the_first_word_is_the_file() {
-        let parsed = parse(
-            ["db.sqlite", "SELECT 1", "SELECT 2"]
-                .iter()
-                .map(|word| (*word).to_string()),
-        );
+        let parsed = parsed(&["db.sqlite", "SELECT 1", "SELECT 2"]);
         assert_eq!(parsed.path, "db.sqlite");
-        assert_eq!(parsed.statements, vec!["SELECT 1", "SELECT 2"]);
+        let statements: Vec<(usize, &str)> = parsed
+            .statements
+            .iter()
+            .map(|(at, text)| (*at, text.as_str()))
+            .collect();
+        assert_eq!(statements, vec![(2, "SELECT 1"), (3, "SELECT 2")]);
     }
 
     /// An option before the file sets a dot command.
     #[test]
     fn options_become_dot_commands() {
-        let parsed = parse(
-            ["-csv", "-header", "db.sqlite"]
-                .iter()
-                .map(|word| (*word).to_string()),
-        );
-        assert_eq!(parsed.commands, vec![".mode csv", ".headers on"]);
+        let parsed = parsed(&["-csv", "-header", "db.sqlite"]);
+        let dots: Vec<&str> = parsed
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Dot(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dots, vec![".mode csv", ".headers on"]);
         assert_eq!(parsed.path, "db.sqlite");
     }
 
     /// With no file at all, the database is in memory.
     #[test]
     fn no_file_means_memory() {
-        let parsed = parse(std::iter::empty());
+        let parsed = parsed(&[]);
         assert_eq!(parsed.path, ":memory:");
     }
 
     /// A word shaped like an option and matching none of them is not the file.
     #[test]
     fn an_unknown_option_is_not_the_file_name() {
-        let parsed = parse(
-            ["--db", "app.rdb", "SELECT 1"]
-                .iter()
-                .map(|word| (*word).to_string()),
-        );
-        assert_eq!(parsed.unknown, vec!["--db"]);
+        let parsed = parsed(&["--db", "app.rdb", "SELECT 1"]);
+        assert_eq!(parsed.unknown, vec!["-db"]);
         assert_eq!(parsed.path, "app.rdb");
-        assert_eq!(parsed.statements, vec!["SELECT 1"]);
+        assert_eq!(parsed.statements.len(), 1);
     }
 
     /// The short spellings that turned up on disk are caught the same way.
     #[test]
     fn every_dashed_word_that_is_not_an_option_is_reported() {
-        let parsed = parse(
-            ["-d", "app.rdb", "--nonsense"]
-                .iter()
-                .map(|word| (*word).to_string()),
-        );
-        assert_eq!(parsed.unknown, vec!["-d", "--nonsense"]);
+        let parsed = parsed(&["-d", "app.rdb", "--nonsense"]);
+        assert_eq!(parsed.unknown, vec!["-d", "-nonsense"]);
     }
 
     /// After `--`, a name that begins with a dash is a file again.
     #[test]
     fn the_separator_still_opens_a_dashed_file() {
-        let parsed = parse(["--", "-weird.rdb"].iter().map(|word| (*word).to_string()));
+        let parsed = parsed(&["--", "-weird.rdb"]);
         assert!(parsed.unknown.is_empty());
         assert_eq!(parsed.path, "-weird.rdb");
     }
@@ -570,25 +802,38 @@ mod tests {
     /// A refused option is still a refusal rather than an unknown word.
     #[test]
     fn a_refused_option_is_not_reported_as_unknown() {
-        let parsed = parse(
-            ["-mmap", "268435456", "app.rdb"]
-                .iter()
-                .map(|word| (*word).to_string()),
-        );
+        let parsed = parsed(&["-mmap", "268435456", "app.rdb"]);
         assert!(parsed.unknown.is_empty());
         assert_eq!(parsed.refused.len(), 1);
         assert_eq!(parsed.path, "app.rdb");
     }
 
-    /// An option that takes a value consumes the next word.
+    /// An option that takes a value consumes the next word, and its text is kept
+    /// as written.
     #[test]
     fn an_option_can_take_a_value() {
-        let parsed = parse(
-            ["-separator", ",", "db.sqlite"]
-                .iter()
-                .map(|word| (*word).to_string()),
-        );
-        assert_eq!(parsed.commands, vec![".separator \",\""]);
+        let parsed = parsed(&["-separator", "\\t", "db.sqlite"]);
+        assert!(matches!(
+            parsed.steps.first(),
+            Some(Step::Setting(Setting::ColumnSeparator(text))) if text == "\\t"
+        ));
         assert_eq!(parsed.path, "db.sqlite");
+    }
+
+    /// A `-cmd` remembers which word of the command line it was.
+    #[test]
+    fn a_command_knows_its_position() {
+        let parsed = parsed(&["-bail", "-cmd", "select 1", "db.sqlite"]);
+        assert!(parsed.bail);
+        assert!(matches!(
+            parsed.steps.first(),
+            Some(Step::Command { index: 3, .. })
+        ));
+    }
+
+    /// An option that needs a value and is last on the line is reported.
+    #[test]
+    fn a_missing_value_is_reported() {
+        assert_eq!(parsed(&["-cmd"]).missing.as_deref(), Some("-cmd"));
     }
 }

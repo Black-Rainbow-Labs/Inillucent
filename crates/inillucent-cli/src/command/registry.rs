@@ -398,7 +398,7 @@ const REKEY_PARAMS: &[Param] = &[
         kind: Kind::Text,
         required: false,
         positional: false,
-        description: "A file holding the new key. Without it the new key is read from the                       INILLUCENT_NEW_KEY environment variable. A key is never taken as a word                       on the command line, where every user of the machine can read it.",
+        description: "A file holding the new key. Without it the new key is read from the INILLUCENT_NEW_KEY environment variable. A key is never taken as a word on the command line, where every user of the machine can read it.",
     },
     DB,
 ];
@@ -669,7 +669,9 @@ const SETUP_PARAMS: &[Param] = &[
         required: false,
         positional: false,
         description: "Install somewhere other than the per-user directory. INILLUCENT_HOME does the \
-                      same thing for every command at once.",
+                      same thing for every command at once. A server started with --root \
+                      installs nothing outside the root, so it needs 'dir' naming a folder \
+                      inside the root.",
     },
     Param {
         name: "from",
@@ -724,7 +726,9 @@ pub static COMMANDS: &[Command] = &[
     Command {
         name: "query",
         summary: "Run a SELECT and get its rows back.",
-        detail: "Use this for anything that reads. The rows come back as a table, or as typed \
+        detail: "Use this for anything that reads. A statement that writes (INSERT, UPDATE, \
+                 DELETE, DDL, a PRAGMA that sets something, BEGIN or COMMIT) is refused with \
+                 status readonly; run it with exec. The rows come back as a table, or as typed \
                  JSON with output=json. 'total' is exact even when 'limit' cut the rows handed \
                  back, because the engine materialises the whole result - so a limit of 10 on a \
                  million-row query still costs what the million rows cost. Put a LIMIT in the SQL \
@@ -867,7 +871,7 @@ pub static COMMANDS: &[Command] = &[
                  'inillucent setup-embeddings runtime --gpu' for a card.",
         params: EMBED_PARAMS,
         cli_only: None,
-        writes: Writes::Yes,
+        writes: Writes::Existing,
         run: crate::bulk_embed::embed_table,
     },
     Command {
@@ -894,7 +898,9 @@ pub static COMMANDS: &[Command] = &[
         name: "backup",
         summary: "Write a copy of the database to another file.",
         detail: "A consistent copy taken while the database is open. The copy is a database, not \
-                 a text dump.",
+                 a text dump. A file already at the destination is replaced, but only after the \
+                 copy has been written beside it and checked; the database being copied is \
+                 refused as the destination.",
         params: BACKUP_PARAMS,
         cli_only: None,
         writes: Writes::No,
@@ -903,10 +909,10 @@ pub static COMMANDS: &[Command] = &[
     Command {
         name: "encrypt",
         summary: "Write an encrypted copy of a plaintext database.",
-        detail: "The copy is encrypted with the key from --key-file or INILLUCENT_KEY, and                  holds every row, index, view and trigger of the database --db names, which is                  read without the key. The source is left as it was: replace it with the copy                  once you have checked the copy opens.",
+        detail: "The copy is encrypted with the key from --key-file or INILLUCENT_KEY, and holds every row, index, view and trigger of the database --db names, which is read without the key. The source is left as it was: replace it with the copy once you have checked the copy opens.",
         params: COPY_PARAMS,
         cli_only: Some(
-            "it takes its key from the program's own --key-file or environment, and an MCP              client has neither. Encrypt a database before serving it.",
+            "it takes its key from the program's own --key-file or environment, and an MCP client has neither. Encrypt a database before serving it.",
         ),
         writes: Writes::No,
         run: verbs::encrypt,
@@ -914,10 +920,10 @@ pub static COMMANDS: &[Command] = &[
     Command {
         name: "decrypt",
         summary: "Write a plaintext copy of an encrypted database.",
-        detail: "Opens the database --db names with the key from --key-file or INILLUCENT_KEY                  and writes every row, index, view and trigger to a file that is not                  encrypted. The encrypted database is left as it was.",
+        detail: "Opens the database --db names with the key from --key-file or INILLUCENT_KEY and writes every row, index, view and trigger to a file that is not encrypted. The encrypted database is left as it was.",
         params: COPY_PARAMS,
         cli_only: Some(
-            "it writes every row of an encrypted database to disk unprotected, which is a              decision for the person who holds the key and not for an agent the database              is served to.",
+            "it writes every row of an encrypted database to disk unprotected, which is a decision for the person who holds the key and not for an agent the database is served to.",
         ),
         writes: Writes::No,
         run: verbs::decrypt,
@@ -925,7 +931,7 @@ pub static COMMANDS: &[Command] = &[
     Command {
         name: "rekey",
         summary: "Change the key an encrypted database is encrypted with.",
-        detail: "Opens the database with the key from --key-file or INILLUCENT_KEY and moves it                  to the new key from --new-key-file or INILLUCENT_NEW_KEY. Only the header of                  each file is rewritten, so it takes the same time whatever the database's                  size, and the old key stops opening the database when it returns. PRAGMA                  rekey does the same from SQL.",
+        detail: "Opens the database with the key from --key-file or INILLUCENT_KEY and moves it to the new key from --new-key-file or INILLUCENT_NEW_KEY. Only the header of each file is rewritten, so it takes the same time whatever the database's size, and the old key stops opening the database when it returns. PRAGMA rekey does the same from SQL.",
         params: REKEY_PARAMS,
         cli_only: Some(
             "an agent that could change the key could lock the database's owner out of it.",
@@ -945,17 +951,18 @@ pub static COMMANDS: &[Command] = &[
                  backup file that is not there is refused rather than created empty.",
         params: RESTORE_PARAMS,
         cli_only: None,
-        writes: Writes::Yes,
+        writes: Writes::Existing,
         run: verbs::restore,
     },
     Command {
         name: "checkpoint",
         summary: "Fold the write-ahead log back into the database file.",
         detail: "Writes go to a log first and are folded in later. Doing it now shrinks the log \
-                 and is what you want before copying the file by hand.",
+                 and is what you want before copying the file by hand. The database has to \
+                 exist: a path with no file answers not_found and makes nothing.",
         params: DB_ONLY,
         cli_only: None,
-        writes: Writes::Yes,
+        writes: Writes::Existing,
         run: verbs::checkpoint,
     },
     Command {
@@ -973,10 +980,11 @@ pub static COMMANDS: &[Command] = &[
         summary: "Gather the statistics the query planner reads.",
         detail: "Run it after loading a lot of data. Without statistics the planner guesses at \
                  how selective an index is, and a wrong guess is the usual reason a query that \
-                 should use an index does not.",
+                 should use an index does not. The database has to exist: a path with no file \
+                 answers not_found and makes nothing.",
         params: ANALYZE_PARAMS,
         cli_only: None,
-        writes: Writes::Yes,
+        writes: Writes::Existing,
         run: verbs::analyze,
     },
     Command {

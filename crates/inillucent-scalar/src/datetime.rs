@@ -156,7 +156,14 @@ pub fn call(
             let Some(first) = arguments.first() else {
                 return Value::Null;
             };
-            let Some(text) = modifier_bytes(first) else {
+            // **A number is a format too.** SQLite reads the format with `sqlite3_value_text`,
+            // so `strftime(5, ...)` is the text `5`; only NULL has no text.
+            let text = match first {
+                Value::Integer(integer) => Some(numeric::integer_to_text(*integer)),
+                Value::Real(real) => Some(numeric::real_to_text(*real)),
+                other => modifier_bytes(other),
+            };
+            let Some(text) = text else {
                 return Value::Null;
             };
             (Some(text), arguments.get(1..))
@@ -860,9 +867,9 @@ fn render(day: f64, civil: Civil, format: &[u8], years: YearStyle) -> Value<'sta
             out.push(byte);
             continue;
         }
+        // A `%` that ends the format names no specifier, which SQLite counts as an unknown one.
         let Some(code) = format.get(index).copied() else {
-            out.push(b'%');
-            break;
+            return Value::Null;
         };
         index = index.saturating_add(1);
         match code {
@@ -913,7 +920,11 @@ fn render(day: f64, civil: Civil, format: &[u8], years: YearStyle) -> Value<'sta
                 let text = format!("{hour:2}");
                 out.extend_from_slice(text.as_bytes());
             }
-            b'g' => push_padded(&mut out, iso_week(day).0.rem_euclid(100), 2),
+            // C's `%` keeps the sign, so the ISO year -30 prints `-30` and not `70`.
+            b'g' => {
+                let text = format!("{:02}", iso_week(day).0 % 100);
+                out.extend_from_slice(text.as_bytes());
+            }
             b'm' => push_padded(&mut out, civil.month, 2),
             b'M' => push_padded(&mut out, civil.minute, 2),
             b'p' => out.extend_from_slice(if civil.hour < 12 { b"AM" } else { b"PM" }),

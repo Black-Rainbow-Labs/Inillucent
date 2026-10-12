@@ -175,11 +175,25 @@ impl Json {
 /// Renders a double the way JSON allows, which is never `NaN` or `Infinity`.
 ///
 /// Neither has a JSON spelling, and a writer that emits the bare word produces
-/// a document no parser will read back. A value the grammar cannot hold becomes
-/// `null`, which is what every other JSON writer does with them.
+/// a document no parser will read back. `NaN` becomes `null`. An infinity is
+/// written as `1e999` or `-1e999`, a number the grammar allows and the SQL
+/// parser reads back as the same infinity; a reader in Python or JavaScript
+/// parses it as one. Writing `null` there made a column typed `real` hold a
+/// value that was not a number, and lost the sign.
+///
+/// A number is written in exponent form when its decimal form would be long:
+/// 1e100 is `1e100` and not a one followed by a hundred zeros, and 5e-324 is not
+/// 325 digits. The thresholds are the ones SQLite's own text conversion uses.
 ///
 /// @param number - the value to render
 fn real(number: f64) -> String {
+    if number.is_infinite() {
+        return if number > 0.0 { "1e999" } else { "-1e999" }.to_string();
+    }
+    let magnitude = number.abs();
+    if number.is_finite() && magnitude != 0.0 && !(1e-4..1e15).contains(&magnitude) {
+        return format!("{number:e}");
+    }
     if number.is_finite() {
         let rendered = format!("{number}");
         // `1` must not be written where `1.0` was meant: a reader that types
@@ -605,11 +619,22 @@ mod tests {
         assert!(parse("{} {}").is_err());
     }
 
-    /// A value JSON cannot hold is written as null rather than as a bare word.
+    /// NaN is null and an infinity is a number that reads back as an infinity.
     #[test]
-    fn a_non_finite_double_becomes_null() {
+    fn a_non_finite_double_is_written_as_json_allows() {
         assert_eq!(Json::Real(f64::NAN).write(), "null");
-        assert_eq!(Json::Real(f64::INFINITY).write(), "null");
+        assert_eq!(Json::Real(f64::INFINITY).write(), "1e999");
+        assert_eq!(Json::Real(f64::NEG_INFINITY).write(), "-1e999");
+    }
+
+    /// A very large or very small double is written with an exponent.
+    #[test]
+    fn extreme_doubles_are_written_with_an_exponent() {
+        assert_eq!(Json::Real(1e100).write(), "1e100");
+        assert_eq!(Json::Real(5e-324).write(), "5e-324");
+        assert_eq!(Json::Real(-2.5e-7).write(), "-2.5e-7");
+        assert_eq!(Json::Real(123456789.123).write(), "123456789.123");
+        assert_eq!(Json::Real(0.0).write(), "0.0");
     }
 
     /// Whitespace anywhere the grammar allows it is skipped.

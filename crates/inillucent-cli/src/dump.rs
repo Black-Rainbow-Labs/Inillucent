@@ -9,32 +9,60 @@
 
 use inillucent_value::Value;
 
-use crate::render::literal;
+use crate::dump_virtual::{self, Kind};
+use crate::render::{literal, quote_literal};
 use crate::shell::Shell;
 
-/// Writes the whole database, or one table, as SQL.
+/// What `.dump` was asked to leave out or to limit itself to.
+#[derive(Default)]
+pub struct DumpOptions {
+    /// `LIKE` patterns naming the objects to dump. Empty means all of them.
+    pub patterns: Vec<String>,
+    /// `--data-only`: the rows, with no schema, no transaction and no indexes.
+    pub data_only: bool,
+    /// `--nosys`: no table whose name begins with `sqlite_`.
+    pub nosys: bool,
+}
+
+/// Writes the whole database, or the objects the options name, as SQL.
 ///
 /// The order and the special cases are the reference's, because a dump is
 /// compared to the reference's byte for byte: tables first with their rows,
 /// `sqlite_sequence` last among them, then the indexes, triggers and views in
 /// the order they were created.
-pub fn dump(shell: &mut Shell, pattern: Option<&str>) {
-    let tables = table_objects(shell, pattern);
+///
+/// @param shell - where the lines go
+/// @param options - the patterns and flags `.dump` was given
+pub fn dump(shell: &mut Shell, options: &DumpOptions) {
+    let pattern = like_clause(&options.patterns);
+    let tables: Vec<(String, String)> = table_objects(shell, pattern.as_deref())
+        .into_iter()
+        .filter(|(name, _)| !(options.nosys && is_reserved(name)))
+        .collect();
     // The warning goes above everything, including the `PRAGMA`, because a
     // virtual table is restored by writing `sqlite_schema` directly and a
     // defensive connection refuses that. The reference prints it first and so
-    // does this.
-    if tables
-        .iter()
-        .any(|(_, sql)| sql.starts_with("CREATE VIRTUAL TABLE"))
-    {
+    // does this. FTS5, `inillucent_search` and vector index tables are written as
+    // statements and need no such write; see `dump_virtual`.
+    if tables.iter().any(|(_, sql)| is_written_to_the_schema(sql)) {
         shell.say("/* WARNING: Script requires that SQLITE_DBCONFIG_DEFENSIVE be disabled */");
     }
-    shell.say("PRAGMA foreign_keys=OFF;");
-    shell.say("BEGIN TRANSACTION;");
+    if !options.data_only {
+        shell.say("PRAGMA foreign_keys=OFF;");
+        shell.say("BEGIN TRANSACTION;");
+    }
     let mut writable = false;
+    let left_out = dump_virtual::private_tables_left_out(&tables);
     for (name, sql) in &tables {
-        say_definition(shell, name, sql, &mut writable);
+        if left_out.contains(&name.to_ascii_lowercase()) {
+            continue;
+        }
+        let kind = virtual_kind(sql);
+        if kind != Kind::Other {
+            dump_virtual::write_table(shell, name, sql, &kind, options.data_only);
+            continue;
+        }
+        say_definition(shell, name, sql, &mut writable, options.data_only);
         // A virtual table's rows live in its shadow tables, which are dumped as
         // the ordinary tables they are. Dumping them here as well would insert
         // every row a second time, through a module that is about to rebuild
@@ -44,13 +72,92 @@ pub fn dump(shell: &mut Shell, pattern: Option<&str>) {
         }
         write_rows(shell, name, sql);
     }
-    for sql in other_objects(shell, pattern) {
-        shell.say(&format!("{sql};"));
+    write_indexes_over_tables(shell, &tables, options.data_only);
+    if !options.data_only {
+        for sql in other_objects(shell, pattern.as_deref()) {
+            shell.say(&format!("{sql};"));
+        }
     }
     if writable {
         shell.say("PRAGMA writable_schema=OFF;");
     }
-    shell.say("COMMIT;");
+    if !options.data_only {
+        shell.say("COMMIT;");
+    }
+}
+
+/// Returns what a table's `CREATE` says it is, for a virtual table, and `Other` for the rest.
+///
+/// @param sql - the `CREATE` text the schema holds
+fn virtual_kind(sql: &str) -> Kind {
+    if sql.starts_with("CREATE VIRTUAL TABLE") {
+        return dump_virtual::classify(sql);
+    }
+    Kind::Other
+}
+
+/// Reports whether a table is restored by writing `sqlite_schema` directly.
+///
+/// @param sql - the `CREATE` text the schema holds
+fn is_written_to_the_schema(sql: &str) -> bool {
+    sql.starts_with("CREATE VIRTUAL TABLE") && virtual_kind(sql) == Kind::Other
+}
+
+/// Writes what has to come after every table: the vector indexes and the FTS5 rebuilds.
+///
+/// A vector index is built from the rows of the table it indexes, and an FTS5 table that reads
+/// its text from another table is built from that table's rows, so both wait for every row.
+///
+/// @param shell - where the lines go
+/// @param tables - every table the dump covers, with its `CREATE` text
+/// @param data_only - whether `--data-only` was given, which writes no index
+fn write_indexes_over_tables(shell: &mut Shell, tables: &[(String, String)], data_only: bool) {
+    for statement in dump_virtual::rebuild_statements(tables) {
+        shell.say(&statement);
+    }
+    if data_only {
+        return;
+    }
+    for (name, sql) in tables {
+        if let Some(statement) = dump_virtual::index_statement(name, &virtual_kind(sql)) {
+            shell.say(&statement);
+        }
+    }
+}
+
+/// Returns the SQL condition that selects the objects the patterns name.
+///
+/// **A pattern matches the object's own name,** and also the shadow tables of a
+/// virtual table the pattern names, which are the tables whose names begin with
+/// the virtual table's name and an underscore. So `.dump docs` writes the
+/// `docs` table and its shadow tables, and does not write the indexes on
+/// `docs`, because an index has a name of its own. That is the reference's
+/// rule. Several patterns are alternatives. `None` means every object. The
+/// objects are read from `sqlite_master AS o`.
+///
+/// @param patterns - the `LIKE` patterns `.dump` was given
+fn like_clause(patterns: &[String]) -> Option<String> {
+    if patterns.is_empty() {
+        return None;
+    }
+    let alternatives: Vec<String> = patterns
+        .iter()
+        .map(|pattern| {
+            let quoted = format!("'{}'", pattern.replace('\'', "''"));
+            format!(
+                "o.name LIKE {quoted} ESCAPE '\\' OR EXISTS (SELECT 1 FROM sqlite_master WHERE name LIKE {quoted} ESCAPE '\\' AND sql LIKE 'CREATE VIRTUAL TABLE%' AND substr(o.name, 1, length(name) + 1) = (name || '_'))"
+            )
+        })
+        .collect();
+    Some(alternatives.join(" OR "))
+}
+
+/// Reports whether a table name is one SQLite reserves for itself.
+///
+/// @param name - the table's name
+fn is_reserved(name: &str) -> bool {
+    name.get(..7)
+        .is_some_and(|start| start.eq_ignore_ascii_case("sqlite_"))
 }
 
 /// Returns the tables a dump covers, `sqlite_sequence` last.
@@ -62,16 +169,13 @@ pub fn dump(shell: &mut Shell, pattern: Option<&str>) {
 /// form, and so does this.
 ///
 /// @param shell - the shell to ask
-/// @param pattern - the `LIKE` pattern `.dump ?OBJECTS?` named, if any
-fn table_objects(shell: &Shell, pattern: Option<&str>) -> Vec<(String, String)> {
+/// @param condition - the condition `like_clause` built from `.dump ?OBJECTS?`, if any
+fn table_objects(shell: &Shell, condition: Option<&str>) -> Vec<(String, String)> {
     let mut sql = String::from(
-        "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND sql IS NOT NULL",
+        "SELECT name, sql FROM sqlite_master AS o WHERE type = 'table' AND sql IS NOT NULL",
     );
-    if let Some(pattern) = pattern {
-        let quoted = format!("'{}'", pattern.replace('\'', "''"));
-        sql.push_str(&format!(
-            " AND (name LIKE {quoted} OR tbl_name LIKE {quoted})"
-        ));
+    if let Some(condition) = condition {
+        sql.push_str(&format!(" AND ({condition})"));
     }
     sql.push_str(" ORDER BY tbl_name = 'sqlite_sequence', rowid");
     let Ok((_, rows)) = shell.collect(&sql) else {
@@ -89,17 +193,14 @@ fn table_objects(shell: &Shell, pattern: Option<&str>) -> Vec<(String, String)> 
 /// trigger may name a view.
 ///
 /// @param shell - the shell to ask
-/// @param pattern - the `LIKE` pattern `.dump ?OBJECTS?` named, if any
-fn other_objects(shell: &Shell, pattern: Option<&str>) -> Vec<String> {
+/// @param condition - the condition `like_clause` built from `.dump ?OBJECTS?`, if any
+fn other_objects(shell: &Shell, condition: Option<&str>) -> Vec<String> {
     let mut sql = String::from(
-        "SELECT sql FROM sqlite_master \
+        "SELECT sql FROM sqlite_master AS o \
          WHERE sql IS NOT NULL AND type IN ('index', 'trigger', 'view')",
     );
-    if let Some(pattern) = pattern {
-        let quoted = format!("'{}'", pattern.replace('\'', "''"));
-        sql.push_str(&format!(
-            " AND (name LIKE {quoted} OR tbl_name LIKE {quoted})"
-        ));
+    if let Some(condition) = condition {
+        sql.push_str(&format!(" AND ({condition})"));
     }
     sql.push_str(" ORDER BY type DESC, rowid");
     let Ok((_, rows)) = shell.collect(&sql) else {
@@ -138,12 +239,18 @@ fn plain(value: Option<&Value<'static>>) -> String {
 /// @param name - the table's name
 /// @param sql - the `CREATE` text the schema holds
 /// @param writable - whether `PRAGMA writable_schema=ON` has been written yet
-fn say_definition(shell: &mut Shell, name: &str, sql: &str, writable: &mut bool) {
+/// @param data_only - whether `--data-only` was given, which writes no definition
+fn say_definition(shell: &mut Shell, name: &str, sql: &str, writable: &mut bool, data_only: bool) {
     /// What `CREATE TABLE ` occupies, which is what the rewrite skips.
     const CREATE_TABLE: usize = 13;
 
     if is_statistics_table(name) {
-        shell.say("ANALYZE sqlite_schema;");
+        if !data_only {
+            shell.say("ANALYZE sqlite_schema;");
+        }
+        return;
+    }
+    if data_only && !is_reserved(name) {
         return;
     }
     if name.len() >= 7 && name[..7].eq_ignore_ascii_case("sqlite_") {
@@ -271,14 +378,25 @@ fn write_rows(shell: &mut Shell, table: &str, sql: &str) {
     // The table name is quoted here too, for the same reason and independently
     // of how it is emitted: `SELECT * FROM select` does not parse either.
     let reading = format!("SELECT {projection} FROM {}", always_quoted(table));
-    let Ok((_, rows)) = shell.collect(&reading) else {
-        shell.complain(&format!(
-            "-- the rows of {table} could not be read, so none are in this dump"
-        ));
-        return;
+    let rows = match shell.collect(&reading) {
+        Ok((_, rows)) => rows,
+        Err(failure) => {
+            // **The engine's error is kept, so the command line reports the
+            // cause.** A dump of a damaged file failed with the status for a
+            // bad statement because only the complaint below was recorded, and
+            // a complaint has no engine error behind it. With the error kept,
+            // a damaged page is `corrupt` and a failed read is `io`.
+            if shell.first_error.is_none() {
+                shell.first_error = failure.error.clone();
+            }
+            shell.complain(&format!(
+                "-- the rows of {table} could not be read, so none are in this dump"
+            ));
+            return;
+        }
     };
     for row in rows {
-        let values: Vec<String> = row.iter().map(literal).collect();
+        let values: Vec<String> = row.iter().map(quote_literal).collect();
         shell.say(&format!(
             "INSERT INTO {quoted} VALUES({});",
             values.join(",")

@@ -142,7 +142,9 @@ fn tells_a_syntax_error_from_an_unsupported_construct(session: &mut Session) {
     // a window function or a row value against a subquery: those were the obvious
     // choices and they answer now, so a case written against them would have
     // asserted `unsupported` about something that works.
-    let not_built = session.tool("inillucent_query", "{\"sql\":\"ATTACH ? AS other\"}");
+    // Through `inillucent_exec`: `inillucent_query` refuses a statement that
+    // writes before the engine is asked, and `ATTACH` is one.
+    let not_built = session.tool("inillucent_exec", "{\"sql\":\"ATTACH ? AS other\"}");
     assert!(
         not_built.contains("unsupported"),
         "a construct the engine has not built answered without saying so. An agent that cannot \
