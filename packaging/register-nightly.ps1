@@ -49,7 +49,7 @@ $arguments = "-NoProfile -File `"$script`" -Worktree `"$Worktree`""
 $directory = if (Test-Path -LiteralPath $Worktree) { $Worktree } else { $main }
 
 if ($WhatIf) {
-    Write-Host "would register '$taskName' at $At every day: pwsh $arguments"
+    Write-Host "would register '$taskName' at $At every day: $(Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe') $arguments"
     Write-Host "   working directory $directory, as $([System.Environment]::UserName)"
     if (Get-ScheduledTask -TaskName $olderTask -ErrorAction SilentlyContinue) {
         Write-Host "would remove the older task '$olderTask'"
@@ -65,7 +65,15 @@ foreach ($name in @($taskName, $olderTask)) {
 }
 if ($Unregister) { return }
 
-$action = New-ScheduledTaskAction -Execute 'pwsh.exe' -Argument $arguments -WorkingDirectory $directory
+# The task names pwsh by its full path. On this machine pwsh is the Microsoft Store package, which
+# puts only an alias under %LOCALAPPDATA%\Microsoft\WindowsApps on the user's PATH, and the task
+# scheduler does not search that PATH: with -Execute 'pwsh.exe' every start ended with 0x80070002,
+# file not found, so no nightly ran on schedule from 2026-09-25 to 2026-10-12. The alias's own path
+# works and stays the same when the Store updates PowerShell. The resolved path under
+# C:\Program Files\WindowsApps names the package version and would break at the next update.
+$alias = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe'
+$pwsh = if (Test-Path -LiteralPath $alias) { $alias } else { (Get-Command pwsh.exe).Source }
+$action = New-ScheduledTaskAction -Execute $pwsh -Argument $arguments -WorkingDirectory $directory
 $trigger = New-ScheduledTaskTrigger -Daily -At $At
 # Eight hours: the suite, five release builds, notarisation and three gates take most of a night on
 # a busy machine, and a run still going at the next night's start is one to stop, not to stack.
