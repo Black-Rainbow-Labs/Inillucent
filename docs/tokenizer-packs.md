@@ -130,6 +130,11 @@ The fold table covers the lowercase Latin letters from U+00E0 to U+017F, and the
 `ț`. Each letter becomes one plain letter: `ç` becomes `c`, `ø` becomes `o`, `ł`
 becomes `l`. A letter of its own is left as it is: `ß`, `æ`, `œ`, `ð`, `þ` and `ı`.
 
+The fold table reads a letter written as one code point. A letter written as a plain letter
+followed by a combining accent, such as `c` followed by U+0327, is not folded, so that spelling of
+`notificação` does not match the usual one. Text copied from macOS file names and from some PDF
+extractors is written that way. Normalize such text to NFC before it is inserted.
+
 ## Errors
 
 | When | Status | Exit code | Message |
@@ -149,10 +154,15 @@ folder is outside the root, and under `--readonly`. `list` always answers.
 
 ## Older releases
 
-A release from before tokenizer packs cannot open a database that holds a table with a pack. It
-reads `tokenize = 'pt-br'` from the table's `CREATE` statement, does not know the name, and the open
-fails with `SQL logic error`. Measured with release 2.4.2 on a database this build wrote. A
-database whose search tables all use `porter` opens in both.
+A release from before tokenizer packs reads `tokenize = 'pt-br'` from the table's `CREATE`
+statement and does not know the name.
+
+- Release 2.5.5 and later open the database. Every other table reads and writes as before, and a
+  statement that uses the pack table fails with `no such tokenizer: pt-br`.
+- Releases up to 2.5.4 cannot open the database at all. Every statement fails, even one that reads
+  only a plain table. 2.4.2 says `SQL logic error`, and 2.5.3 says `no such tokenizer: pt-br`.
+
+A database whose search tables all use `porter` opens in every release.
 
 ## Where to go next
 

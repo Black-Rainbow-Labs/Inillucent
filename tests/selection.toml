@@ -217,6 +217,15 @@ prefix = ".sqlite-ref/"
 packages = ["*"]
 reason = "the pinned reference binaries themselves"
 
+# The example tokenizer pack. Tests in these crates read it with
+# `include_str!`, and nothing else in `examples/` is read by a test, so without
+# this row a change to the pack is an unmatched top level directory and selects
+# every target.
+[[path]]
+prefix = "examples/tokenizers/"
+packages = ["inillucent-core", "inillucent-search", "inillucent-cli", "inillucent-compat"]
+reason = "the example tokenizer pack, which the tokenizer tests read"
+
 [[path]]
 prefix = "scripts/"
 packages = ["inillucent-bench"]
@@ -2444,7 +2453,7 @@ kind = "test"
 name = "engine"
 module = "search_tokenizer"
 tier = "engine"
-covers = ["inillucent-search", "inillucent-core", "inillucent-engine"]
+covers = ["inillucent-search", "inillucent-core", "inillucent-engine", "inillucent-ext"]
 
 [[target]]
 package = "inillucent-compat"

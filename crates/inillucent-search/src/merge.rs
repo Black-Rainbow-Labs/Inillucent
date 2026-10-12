@@ -73,6 +73,7 @@ use inillucent_core::filter::{AttributeFilter, Filter};
 use inillucent_core::index::{Index, IndexConfig};
 use inillucent_core::rank::{AdaptiveWeights, Fusion, HitOrigin, RRF_K};
 use inillucent_core::store::ChunkInput;
+use inillucent_core::tokenize::pack::Pack;
 use inillucent_core::tokenize::Tokenizer;
 use inillucent_ext::vtab::{failure, Context};
 
@@ -268,16 +269,62 @@ impl Cache {
 /// been read. Searching with the built in English tokenizer then would answer
 /// a Portuguese table in English, find nothing, and look like an empty result.
 ///
+/// **The tokenizer is built once and shared.** Every `new_index` and every
+/// segment load calls this, and building a tokenizer creates its stemmer,
+/// hashes its stopwords and sorts its suffix rules. `Index`'s `tokenizer` field
+/// says the indexes of one table share one tokenizer, and this cache is what
+/// makes that true. `porter` is built once per process. A pack's tokenizer is
+/// kept by pack content in [`PACK_TOKENIZERS`].
+///
 /// @param options - the table's declaration
 pub fn tokenizer_of(options: &Options) -> DbResult<Arc<Tokenizer>> {
     match &options.tokenizer {
-        TokenizerChoice::Porter => Ok(Arc::new(Tokenizer::default())),
-        TokenizerChoice::Pack(pack) => Ok(Arc::new(Tokenizer::from_pack(pack))),
+        TokenizerChoice::Porter => Ok(Arc::clone(
+            PORTER_TOKENIZER.get_or_init(|| Arc::new(Tokenizer::default())),
+        )),
+        TokenizerChoice::Pack(pack) => Ok(pack_tokenizer(pack)),
         TokenizerChoice::Named(name) => Err(statement_refusal(format!(
             "inillucent_search: the tokenizer pack {name} has not been read from the table's \
              configuration"
         ))),
     }
+}
+
+/// The built in `porter` tokenizer, built the first time a table needs it.
+static PORTER_TOKENIZER: std::sync::OnceLock<Arc<Tokenizer>> = std::sync::OnceLock::new();
+
+/// The tokenizers built from packs, most recent last.
+///
+/// Matched by pack content, because two tables that copied the same pack into
+/// their `%_config` hold two equal packs in two allocations. Bounded by
+/// [`PACK_TOKENIZER_LIMIT`] so a process that opens many tables with many
+/// different packs does not keep every tokenizer for ever.
+static PACK_TOKENIZERS: std::sync::Mutex<Vec<(Arc<Pack>, Arc<Tokenizer>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// How many pack tokenizers [`PACK_TOKENIZERS`] keeps.
+const PACK_TOKENIZER_LIMIT: usize = 16;
+
+/// Returns the tokenizer for a pack, from the cache when an equal pack has
+/// been built before.
+///
+/// A poisoned lock is read through, because the list holds only finished
+/// tokenizers and a panic elsewhere cannot leave one half built.
+///
+/// @param pack - the pack the table holds
+fn pack_tokenizer(pack: &Arc<Pack>) -> Arc<Tokenizer> {
+    let mut held = PACK_TOKENIZERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((_, tokenizer)) = held.iter().find(|(cached, _)| **cached == **pack) {
+        return Arc::clone(tokenizer);
+    }
+    let tokenizer = Arc::new(Tokenizer::from_pack(pack));
+    if held.len() >= PACK_TOKENIZER_LIMIT {
+        held.remove(0);
+    }
+    held.push((Arc::clone(pack), Arc::clone(&tokenizer)));
+    tokenizer
 }
 
 /// Returns an empty index for this table: its configuration, and its tokenizer.
@@ -1577,6 +1624,29 @@ mod tests {
         assert!(new_index(&reopened).is_err());
         let porter = tokenizer_of(&declaration(&["body"])).expect("porter needs nothing");
         assert_eq!(porter.name(), "porter");
+    }
+
+    /// Two indexes of one table get the same tokenizer, and so do two tables
+    /// that hold equal copies of one pack.
+    ///
+    /// Before the cache every `new_index` and every segment load built the
+    /// tokenizer again, while `Index`'s comment said it was shared.
+    #[test]
+    fn a_tokenizer_is_built_once_and_shared() {
+        let porter = declaration(&["body"]);
+        let first = tokenizer_of(&porter).expect("porter");
+        let second = tokenizer_of(&porter).expect("porter");
+        assert!(Arc::ptr_eq(&first, &second), "porter was built twice");
+        let text = include_str!("../../../examples/tokenizers/pt-br.json");
+        let mut one = declaration(&["body"]);
+        one.tokenizer = TokenizerChoice::Pack(Arc::new(Pack::parse(text).expect("the pack reads")));
+        let mut other = declaration(&["body"]);
+        other.tokenizer =
+            TokenizerChoice::Pack(Arc::new(Pack::parse(text).expect("the pack reads")));
+        let one = tokenizer_of(&one).expect("pack");
+        let other = tokenizer_of(&other).expect("pack");
+        assert!(Arc::ptr_eq(&one, &other), "an equal pack was built twice");
+        assert_eq!(one.name(), "pt-br");
     }
 
     /// An exact table is configured never to traverse the graph.

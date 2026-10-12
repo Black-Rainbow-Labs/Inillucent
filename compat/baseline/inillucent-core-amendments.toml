@@ -218,13 +218,13 @@ sha256 = "4f7f5de8ef8a032a4b1c63ae71a3dee623c315263f3ac51ffde5ef4b59abfc26"
 
 [[amendment]]
 path = "crates/inillucent-core/src/index.rs"
-ticket = "tokenizer-packs"
+ticket = "task-2248"
 reason = "Tokenizer packs: Index holds an Arc<Tokenizer>; Index::new keeps the built in porter, with_tokenizer takes one, set_tokenizer gives one to an index read back from bytes. Three tests: a pack index finds a Portuguese plural, the BM25 ceiling reads the query with the index tokenizer, and a loaded index searches with the tokenizer it is set to."
 sha256 = "9ab31d3d3a9ac703d640ed5a13d1725ba95009357d35512ec063a91c1426304d"
 
 [[amendment]]
 path = "crates/inillucent-core/src/install.rs"
-ticket = "tokenizer-packs"
+ticket = "task-2248"
 reason = "Tokenizer packs: the tokenizer folder (INILLUCENT_TOKENIZER_DIR when set, and only it, else <home>/tokenizers), the lookup by name that refuses a file naming another pack, the size checked read, and the sorted list of installed names. Two tests under env_guard."
 sha256 = "6d4363c67591748a4389df6ef1aba9b4d7a71557c730ddddbe189ccee532d038"
 
@@ -278,31 +278,31 @@ sha256 = "0788bef043d67c3ae8d5f563e5c9c2252635bfc03766463dd5c4468bfc3db42a"
 
 [[amendment]]
 path = "crates/inillucent-core/src/tokenize.rs"
-ticket = "tokenizer-packs"
+ticket = "task-2248"
 reason = "Tokenizer packs: the tokenizer is built from data (a stemmer, a stopword set, a fold flag and suffix rewrites). Tokenizer::default() is the built in porter and produces exactly the terms it produced at 18f1a38, which tokenize/golden.rs records over 61 lines and pack_tests.rs checks. The per word steps moved into Tokenizer::word; splitting, identifiers, addresses and the 64 byte limit are unchanged."
 sha256 = "a93f9126858bf28f097538a2af678b908286b1b2eb7f96df313a935c5cb19da7"
 
 [[amendment]]
 path = "crates/inillucent-core/src/tokenize/fold.rs"
-ticket = "tokenizer-packs"
+ticket = "task-2248"
 reason = "Tokenizer packs: new file. fold.rs is the accent folding table; pack.rs is the pack format and its checks; golden.rs is the record of the terms 18f1a38 produced; pack_tests.rs checks a pack tokenizer against porter and the example pack."
 sha256 = "197661c03c1acbe7a709cbd2f94d62a411ef33f5264fd2ee2b9d582df5d46735"
 
 [[amendment]]
 path = "crates/inillucent-core/src/tokenize/golden.rs"
-ticket = "tokenizer-packs"
+ticket = "task-2248"
 reason = "Tokenizer packs: new file. fold.rs is the accent folding table; pack.rs is the pack format and its checks; golden.rs is the record of the terms 18f1a38 produced; pack_tests.rs checks a pack tokenizer against porter and the example pack."
 sha256 = "67abe9e5d190acdeecfde54868b0050d1c0dce9410b1ef379d41083494fa4f85"
 
 [[amendment]]
 path = "crates/inillucent-core/src/tokenize/pack.rs"
-ticket = "tokenizer-packs"
+ticket = "task-2248"
 reason = "Tokenizer packs: new file. fold.rs is the accent folding table; pack.rs is the pack format and its checks; golden.rs is the record of the terms 18f1a38 produced; pack_tests.rs checks a pack tokenizer against porter and the example pack."
 sha256 = "a391ab54fa0878ff217f7a59e44e7f0f6266af0020b01e3edf9506cecec2a872"
 
 [[amendment]]
 path = "crates/inillucent-core/src/tokenize/pack_tests.rs"
-ticket = "tokenizer-packs"
+ticket = "task-2248"
 reason = "Tokenizer packs: new file. fold.rs is the accent folding table; pack.rs is the pack format and its checks; golden.rs is the record of the terms 18f1a38 produced; pack_tests.rs checks a pack tokenizer against porter and the example pack."
 sha256 = "689184215601d4c4541bf2d612c06a5e93e26e3adcf0539051562c9ff6502cd8"
 
