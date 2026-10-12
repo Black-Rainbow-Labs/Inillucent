@@ -8,6 +8,33 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
+## Not yet released
+
+**An `inillucent_search` table can tokenize a language other than English.** Until now every table
+stemmed with Snowball English and dropped English stopwords, so Portuguese text was indexed as if it
+were English: `notificações` did not reach `notificação`, and `notificacao`, typed without accents,
+never found it.
+
+- `tokenize = '<name>'` names a tokenizer pack: a JSON file that gives a Snowball stemmer (any of
+  the 18 that `rust-stemmers` links, or none), a stopword list, accent folding and suffix rules.
+  `porter`, the built in English tokenizer, stays the default, and a table that names no tokenizer
+  produces exactly the terms it produced before. A test compares 61 lines of text against the terms
+  recorded before the change.
+- `inillucent tokenizer list`, `install --file` and `remove --name` manage the installed packs, and
+  `inillucent-mcp` serves the same command as `inillucent_tokenizer`. That is 35 commands and 30 MCP
+  tools.
+- `examples/tokenizers/pt-br.json` is a Brazilian Portuguese pack: the Snowball Portuguese stemmer,
+  PostgreSQL 17.5's `portuguese.stop`, accent folding, and 12 suffix rules. On 2,311 Portuguese
+  words it gives PostgreSQL's folded stem for 2,297, and for 376 of the 389 accented ones.
+- A table copies its pack into its `%_config` when it is created, and every later open reads that
+  copy. Removing the installed pack does not affect the table, and the file opens on a machine that
+  never installed it.
+- A name that is not installed is refused with the status `invalid_state`, and the message lists
+  `porter` and the installed packs. A stored pack in a later format is refused as `unsupported`.
+- An older release from 2.5.5 on opens a database that holds a pack table, and only a statement
+  that uses the pack table fails, with `no such tokenizer`. Releases up to 2.5.4 cannot open such a
+  file at all. `docs/tokenizer-packs.md` has the details.
+
 ## 2.5.5, 12 October 2026
 
 **A virtual table whose module refuses to connect no longer stops the whole file from opening.**
@@ -254,31 +281,6 @@ on the training set and 261% on the held out set with 67% less processor time, a
 called the way programs call them are 74% faster (69% for 2.3.0 in the same rounds). None of the
 engine runs was graded, because SQLite ran 4% slower than its idle reference. `docs/performance.md`
 has every figure.
-
-**An `inillucent_search` table can tokenize a language other than English.** Until now every table
-stemmed with Snowball English and dropped English stopwords, so Portuguese text was indexed as if it
-were English: `notificações` did not reach `notificação`, and `notificacao`, typed without accents,
-never found it.
-
-- `tokenize = '<name>'` names a tokenizer pack: a JSON file that gives a Snowball stemmer (any of
-  the 18 that `rust-stemmers` links, or none), a stopword list, accent folding and suffix rules.
-  `porter`, the built in English tokenizer, stays the default, and a table that names no tokenizer
-  produces exactly the terms it produced before. A test compares 61 lines of text against the terms
-  recorded before the change.
-- `inillucent tokenizer list`, `install --file` and `remove --name` manage the installed packs, and
-  `inillucent-mcp` serves the same command as `inillucent_tokenizer`. That is 35 commands and 30 MCP
-  tools.
-- `examples/tokenizers/pt-br.json` is a Brazilian Portuguese pack: the Snowball Portuguese stemmer,
-  PostgreSQL 17.5's `portuguese.stop`, accent folding, and 12 suffix rules. On 2,311 Portuguese
-  words it gives PostgreSQL's folded stem for 2,297, and for 376 of the 389 accented ones.
-- A table copies its pack into its `%_config` when it is created, and every later open reads that
-  copy. Removing the installed pack does not affect the table, and the file opens on a machine that
-  never installed it.
-- A name that is not installed is refused with the status `invalid_state`, and the message lists
-  `porter` and the installed packs. A stored pack in a later format is refused as `unsupported`.
-- Known limit: a release from before this change cannot open a database that holds a table with a
-  pack. Release 2.4.2 fails the open with `SQL logic error`. `docs/tokenizer-packs.md` has the
-  details.
 
 **Common operations are 51.5% faster than in 2.3.4, and search much more than that.** Measured by
 the gate's 82 workloads through the `Connection` API against 2.3.4, with SQLite timed in the same
