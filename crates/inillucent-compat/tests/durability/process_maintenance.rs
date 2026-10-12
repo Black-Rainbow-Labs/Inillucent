@@ -21,6 +21,8 @@
 //! other is the `inillucent` command line.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use inillucent_compat::cliproc::{program, rows, run};
@@ -211,12 +213,14 @@ fn reading_pragmas_answer_beside_another_processes_write_transaction() {
 ///
 /// @param database - the file
 /// @param stop - set when the inserts should end
-fn insert_until(database: &Path, stop: &std::sync::atomic::AtomicBool) -> Vec<i64> {
+/// @param progress - raised by one for each acknowledged insert, so the
+///   maintenance loop can see how far the writer has got
+fn insert_until(database: &Path, stop: &AtomicBool, progress: &AtomicUsize) -> Vec<i64> {
     let opened = Database::open(database).expect("the database opens");
     let session = opened.session();
     let mut acknowledged = Vec::new();
     let mut next = 1i64;
-    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+    while !stop.load(Ordering::SeqCst) {
         if session
             .execute(
                 "INSERT INTO t(id, v) VALUES (?1, 'x')",
@@ -225,6 +229,7 @@ fn insert_until(database: &Path, stop: &std::sync::atomic::AtomicBool) -> Vec<i6
             .is_ok()
         {
             acknowledged.push(next);
+            progress.fetch_add(1, Ordering::SeqCst);
         }
         next += 1;
         // An application leaves a moment between statements; a loop that
@@ -232,6 +237,69 @@ fn insert_until(database: &Path, stop: &std::sync::atomic::AtomicBool) -> Vec<i6
         std::thread::sleep(Duration::from_millis(2));
     }
     acknowledged
+}
+
+/// How many inserts the writer must have acknowledged beside the maintenance
+/// steps before a case trusts its count. Fewer means the writer barely ran, and
+/// a count of rows that were never at risk proves nothing.
+const WRITER_FLOOR: usize = 50;
+
+/// Runs one maintenance statement in another process, again and again, while
+/// the writer inserts beside it, and returns how many steps ran.
+///
+/// The cases first ran a fixed number of steps and expected more than 50
+/// inserts in that time. A quiet machine makes about 150 to 220. A two core CI
+/// runner with three other suites beside it made 23 to 31, so the case failed
+/// on the load of the machine and not on the engine. The loop now keeps
+/// stepping until the writer is past the floor, so the inserts still happen
+/// beside the steps however slow the machine is. It stops after two minutes,
+/// and the case's own floor check then fails.
+///
+/// @param database - the file
+/// @param statement - the maintenance statement, run through `inillucent exec`
+/// @param minimum_steps - steps to run even when the writer is already past the floor
+/// @param pause - the time left between steps for the writer
+/// @param progress - the writer's count of acknowledged inserts
+fn maintain_beside_writer(
+    database: &Path,
+    statement: &str,
+    minimum_steps: usize,
+    pause: Duration,
+    progress: &AtomicUsize,
+) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut steps = 0;
+    while steps < minimum_steps
+        || (progress.load(Ordering::SeqCst) <= WRITER_FLOOR && Instant::now() < deadline)
+    {
+        let (ran, _) = other_process(database, &["exec", statement]);
+        assert_eq!(ran.code, 0, "{statement} runs: {}", ran.stderr);
+        steps += 1;
+        std::thread::sleep(pause);
+    }
+    steps
+}
+
+/// Starts the writer thread on a database and returns its stop flag, its
+/// progress count and the thread.
+///
+/// @param database - the file
+fn start_writer(
+    database: &Path,
+) -> (
+    Arc<AtomicBool>,
+    Arc<AtomicUsize>,
+    std::thread::JoinHandle<Vec<i64>>,
+) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(AtomicUsize::new(0));
+    let writer = {
+        let database = database.to_path_buf();
+        let stop = Arc::clone(&stop);
+        let progress = Arc::clone(&progress);
+        std::thread::spawn(move || insert_until(&database, &stop, &progress))
+    };
+    (stop, progress, writer)
 }
 
 /// A `VACUUM` in one process loses no row another process inserted beside it.
@@ -252,22 +320,19 @@ fn vacuum_in_another_process_loses_no_acknowledged_insert() {
             .execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
             .expect("the table is made");
     }
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let writer = {
-        let database = database.clone();
-        let stop = std::sync::Arc::clone(&stop);
-        std::thread::spawn(move || insert_until(&database, &stop))
-    };
+    let (stop, progress, writer) = start_writer(&database);
     std::thread::sleep(Duration::from_millis(300));
-    for _ in 0..4 {
-        let (ran, _) = other_process(&database, &["exec", "VACUUM"]);
-        assert_eq!(ran.code, 0, "VACUUM runs: {}", ran.stderr);
-        std::thread::sleep(Duration::from_millis(150));
-    }
-    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    maintain_beside_writer(
+        &database,
+        "VACUUM",
+        4,
+        Duration::from_millis(150),
+        &progress,
+    );
+    stop.store(true, Ordering::SeqCst);
     let acknowledged = writer.join().expect("the writer finishes");
     assert!(
-        acknowledged.len() > 50,
+        acknowledged.len() > WRITER_FLOOR,
         "the writer made progress: {}",
         acknowledged.len()
     );
@@ -316,19 +381,16 @@ fn incremental_vacuum_in_another_process_loses_no_acknowledged_row() {
         rows(&ran.stdout)[0][0].parse().expect("a page count")
     };
     let pages_before = pages_of(&database);
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let writer = {
-        let database = database.clone();
-        let stop = std::sync::Arc::clone(&stop);
-        std::thread::spawn(move || insert_until(&database, &stop))
-    };
+    let (stop, progress, writer) = start_writer(&database);
     std::thread::sleep(Duration::from_millis(300));
-    for _ in 0..6 {
-        let (ran, _) = other_process(&database, &["exec", "PRAGMA incremental_vacuum(40)"]);
-        assert_eq!(ran.code, 0, "incremental_vacuum runs: {}", ran.stderr);
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    maintain_beside_writer(
+        &database,
+        "PRAGMA incremental_vacuum(40)",
+        6,
+        Duration::from_millis(100),
+        &progress,
+    );
+    stop.store(true, Ordering::SeqCst);
     let acknowledged = writer.join().expect("the writer finishes");
     let pages_after = pages_of(&database);
     assert!(
@@ -336,7 +398,7 @@ fn incremental_vacuum_in_another_process_loses_no_acknowledged_row() {
         "the steps gave back no pages: {pages_before} before, {pages_after} after"
     );
     assert!(
-        acknowledged.len() > 50,
+        acknowledged.len() > WRITER_FLOOR,
         "the writer made progress: {}",
         acknowledged.len()
     );
