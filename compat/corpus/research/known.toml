@@ -11,11 +11,6 @@ kind = "deviation"
 reason = "The module list names the modules this build has. json_each is registered as a module here and is not listed by the pinned shell."
 
 [[known]]
-case = "research/mine/collate-unknown"
-kind = "defect"
-reason = "SELECT 'a' COLLATE nosuch is refused when it is bound; SQLite refuses an unknown collation only where one is used to compare."
-
-[[known]]
 case = "research/sqlite-forum/left_join_fts5_case_match"
 kind = "deviation"
 reason = "Both engines refuse the statement. SQLite says no query solution and this engine says unable to use function MATCH in the requested context."
@@ -84,16 +79,6 @@ reason = "contentless_delete=1 is refused with exit code 3; the index cannot yet
 case = "research/sqlite-forum/insert_or_fail_fk_unique"
 kind = "defect"
 reason = "INSERT OR FAIL of two rows where the second breaks a UNIQUE constraint and the first an immediate foreign key: SQLite reports the foreign key and keeps nothing; this engine reports the UNIQUE constraint and keeps the first row."
-
-[[known]]
-case = "research/sqlite-forum/recursive_trigger_replace_duplicate_unique"
-kind = "defect"
-reason = "With recursive_triggers on, INSERT OR REPLACE whose delete trigger reinserts the replaced key recurses until the trigger depth limit; SQLite reports the UNIQUE constraint."
-
-[[known]]
-case = "research/sqlite-forum/trigger_replace_between_case"
-kind = "defect"
-reason = "The same recursion as recursive_trigger_replace_duplicate_unique, through REPLACE INTO with a delete trigger."
 
 [[known]]
 case = "research/sqlite-forum/insert_error_midway_statement_journal"
