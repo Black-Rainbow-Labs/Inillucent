@@ -1189,20 +1189,22 @@ impl ImportedDatabase {
         &mut self,
         module: std::sync::Arc<dyn inillucent_ext::vtab::Module>,
     ) -> DbResult<()> {
-        self.register_modules(vec![module]);
-        Ok(())
+        self.register_modules(vec![module])
     }
 
     /// Adds virtual-table modules to this connection, and refreshes the catalog
     /// once for all of them.
     ///
+    /// A table in the file that names one of the new modules is connected
+    /// now, because the open that tried it ran before the module was here.
+    ///
     /// @param modules - the modules to add
     pub(crate) fn register_modules(
         &mut self,
         modules: Vec<std::sync::Arc<dyn inillucent_ext::vtab::Module>>,
-    ) {
+    ) -> DbResult<()> {
         if modules.is_empty() {
-            return;
+            return Ok(());
         }
         for module in modules {
             let name = module.name().to_string();
@@ -1215,7 +1217,13 @@ impl ImportedDatabase {
             self.session_state.only_builtin_modules = false;
             self.add_module_eponymous_table(&name);
         }
+        // The same two steps the open takes after it connects a module, since
+        // a connected module changes the tables the catalog lists.
+        if self.connect_unconnected()? {
+            self.rebuild_tables()?;
+        }
         self.refresh_catalog();
+        Ok(())
     }
 
     /// Rebuilds this database over itself, reclaiming everything nothing uses.

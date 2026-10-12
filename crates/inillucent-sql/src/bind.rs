@@ -23,7 +23,8 @@ pub(crate) use refusal::{
     ambiguous_column, compound_order_unmatched, compound_width_mismatch, group_out_of_range,
     no_query_solution, no_such_collation, no_such_column, no_such_column_quoted, no_such_function,
     no_such_index, no_such_table, order_out_of_range, qualify_missing_table, schema_refused,
-    subquery_width_mismatch, unsupported, values_width_mismatch, wrong_arguments,
+    subquery_width_mismatch, unconnected_module, unsupported, values_width_mismatch,
+    wrong_arguments,
 };
 mod aggregate;
 mod collation;
@@ -2075,7 +2076,7 @@ impl<'a> Binder<'a> {
             // A virtual table with no declared columns is one whose module this
             // build does not have. The schema still loaded - every other table
             // in the file works - and naming this one is what fails.
-            return Err(unsupported("that virtual table's module", span));
+            return Err(unconnected_module(&written, span));
         }
         if table.kind == TableKind::View {
             return self.bind_view_term(table, alias, join, span);

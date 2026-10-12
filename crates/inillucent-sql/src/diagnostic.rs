@@ -13,6 +13,14 @@ use inillucent_base::{DbError, PrimaryCode};
 
 use crate::lexer::{LexError, LexErrorKind, Span};
 
+/// The start of the message for a virtual table whose module is not
+/// connected. The table's name follows it.
+///
+/// Public because the engine reads it back: a table whose module refused to
+/// connect at open has its error kept, and the engine gives that error in
+/// place of this one for the table this message names.
+pub const UNCONNECTED_MODULE: &str = "no module is connected for virtual table: ";
+
 /// Why a parse failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParseErrorKind {

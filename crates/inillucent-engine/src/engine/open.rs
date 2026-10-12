@@ -273,6 +273,7 @@ impl crate::ImportedDatabase {
                 eponymous: Vec::new(),
                 only_builtin_modules: true,
                 virtual_tables: HashMap::new(),
+                unconnected: HashMap::new(),
                 vector_indexes: HashMap::new(),
                 attached: Vec::new(),
                 temps: Vec::new(),
@@ -799,6 +800,7 @@ impl crate::ImportedDatabase {
                 eponymous: Vec::new(),
                 only_builtin_modules: true,
                 virtual_tables: HashMap::new(),
+                unconnected: HashMap::new(),
                 vector_indexes: HashMap::new(),
             },
         };

@@ -1564,7 +1564,7 @@ impl<'a> Binder<'a> {
                 // a module at all - a virtual table this build has no module
                 // for has no columns either, and nothing can be written to it.
                 if table.columns.is_empty() {
-                    return Err(unsupported("that virtual table's module", span));
+                    return Err(crate::bind::unconnected_module(&table.name, span));
                 }
                 self.record_write_dependency(table.database);
                 return Ok(table);

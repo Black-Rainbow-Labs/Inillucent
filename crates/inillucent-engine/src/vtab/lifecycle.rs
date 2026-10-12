@@ -37,6 +37,34 @@ impl crate::ImportedDatabase {
     /// second remembered copy of a declaration is a second thing that can
     /// disagree with the file.
     pub(crate) fn reconnect_modules(&mut self) -> DbResult<()> {
+        // Every declaration is connected again, so an error recorded by an
+        // earlier pass is an error about a catalog that may have changed.
+        self.session_state.unconnected.clear();
+        self.connect_declared(false)
+    }
+
+    /// Connects the virtual tables that could not be connected before, and
+    /// reports whether any of them now is.
+    ///
+    /// **A module an application registers arrives after the open.**
+    /// `Database::register_module` adds it once the open has finished, and the
+    /// open had already tried every table, so a table made with that module
+    /// was never connected again after a reopen. Only the tables in
+    /// `unconnected` are tried, because connecting a table that is already
+    /// connected would replace a module that may be holding a transaction.
+    pub(crate) fn connect_unconnected(&mut self) -> DbResult<bool> {
+        if self.session_state.unconnected.is_empty() {
+            return Ok(false);
+        }
+        let before = self.session_state.virtual_tables.len();
+        self.connect_declared(true)?;
+        Ok(self.session_state.virtual_tables.len() > before)
+    }
+
+    /// Connects the virtual tables the catalog declares.
+    ///
+    /// @param only_unconnected - true to try only the tables in `unconnected`
+    fn connect_declared(&mut self, only_unconnected: bool) -> DbResult<()> {
         let declarations: Vec<Vec<u8>> = self
             .schema
             .entries
@@ -70,13 +98,30 @@ impl crate::ImportedDatabase {
                 continue;
             };
             let name = parsed.ast.text(*name).to_vec();
+            if only_unconnected
+                && self
+                    .session_state
+                    .unconnected
+                    .remove(&name.to_ascii_lowercase())
+                    .is_none()
+            {
+                continue;
+            }
             let module = parsed.ast.text(*module).to_vec();
             let arguments: Vec<Vec<u8>> = arguments.clone();
             let Some(found) = self.session_state.registry.module(&module) else {
                 // A file naming a module this build does not have is a file
                 // this build cannot answer for. It is skipped rather than
-                // refused so the rest of the database still opens, and the
-                // table itself will say "no such table" if anybody asks.
+                // refused so the rest of the database still opens. A statement
+                // that uses the table gets "no such module", which is what
+                // SQLite answers, through `refuse_unconnected`.
+                self.session_state.unconnected.insert(
+                    name.to_ascii_lowercase(),
+                    inillucent_base::error::statement_refusal(format!(
+                        "no such module: {}",
+                        String::from_utf8_lossy(&module)
+                    )),
+                );
                 continue;
             };
             let mut connect = ModuleArguments {
@@ -118,7 +163,26 @@ impl crate::ImportedDatabase {
                     root: recorded.root,
                 });
             }
-            let table = found.connect(&connect, false)?;
+            // **A module that refuses to connect refuses its own table, and
+            // the rest of the file still opens.** The open used to stop here,
+            // so a file holding one search table with an option an older build
+            // does not know could not be read at all, even its plain tables.
+            // SQLite opens such a file and reports the module error to the
+            // statement that uses the table. The error is kept for
+            // `refuse_unconnected` to report, so that statement hears the
+            // module's own reason instead of "no such table".
+            //
+            // A missing shadow table above still refuses the whole open,
+            // because that is a catalog that has lost rows.
+            let table = match found.connect(&connect, false) {
+                Ok(table) => table,
+                Err(error) => {
+                    self.session_state
+                        .unconnected
+                        .insert(name.to_ascii_lowercase(), error);
+                    continue;
+                }
+            };
             self.session_state.virtual_tables.insert(
                 name.to_ascii_lowercase(),
                 Connected {

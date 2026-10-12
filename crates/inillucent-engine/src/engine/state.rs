@@ -589,6 +589,16 @@ pub(crate) struct SessionState {
     pub(crate) only_builtin_modules: bool,
     /// The virtual tables that have been connected, by folded name.
     pub(crate) virtual_tables: HashMap<Vec<u8>, vtab::Connected>,
+    /// The virtual tables whose module refused to connect at open, by folded
+    /// name, with the error the module gave.
+    ///
+    /// **One table a module cannot connect is refused alone.** The open used
+    /// to stop at the first module that refused, so a file holding one table
+    /// an older build could not read was a file whose plain tables it could
+    /// not read either. SQLite opens such a file and reports the module error
+    /// only to a statement that uses the table, and this map is how the
+    /// statement finds the error to report.
+    pub(crate) unconnected: HashMap<Vec<u8>, inillucent_base::error::DbError>,
     /// The indexes a module owns, by the root page of the table they index.
     ///
     /// **A vector index is a store plus a promise to keep it in step.** The
