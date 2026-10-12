@@ -1425,6 +1425,14 @@ covers = ["inillucent-engine", "inillucent-ext"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "vtab_refused_connect"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-ext"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "vtab"
 tier = "engine"
 # Its `json_each` and `json_tree` cases are compared against the pinned

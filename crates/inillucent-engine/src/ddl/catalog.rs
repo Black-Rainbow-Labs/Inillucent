@@ -895,6 +895,37 @@ impl crate::ImportedDatabase {
         let participants = self.writing.replace_touched(0) | crate::schema_bit(at);
         self.commit_across(txn, participants)
     }
+
+    /// Commits the undo of a schema change that failed after it had written to
+    /// the log, outside a transaction.
+    ///
+    /// **A failed DML statement already does this, and a failed directive did
+    /// not.** `abandon` commits a failed autocommit write together with its
+    /// undo, because both are logged and have to replay together. The
+    /// directive path undid its writes and committed nothing, so the records
+    /// stayed open in the log. When another statement followed, its commit
+    /// carried them. When none did, every later open counted a loser and
+    /// discarded it: a `CREATE VIRTUAL TABLE` whose module refused to connect
+    /// after its shadow tables were written, as the only statement before the
+    /// close, was reported by every open after it. The commit is the one `seal`
+    /// makes, with the same catalog record, so recovery reads the catalog the
+    /// undo put back.
+    ///
+    /// @param at - the schema the directive wrote into
+    /// @param logged_from - the log's next position before the directive ran
+    pub(crate) fn commit_failed_directive(&mut self, at: usize, logged_from: u64) -> DbResult<()> {
+        let Some(wal) = self.log_of(at) else {
+            return Ok(());
+        };
+        if wal.next_lsn() <= logged_from {
+            return Ok(());
+        }
+        let previous = self.schema.ddl_schema;
+        self.schema.ddl_schema = at;
+        let sealed = self.seal();
+        self.schema.ddl_schema = previous;
+        sealed
+    }
 }
 
 /// Returns `sqlite_temp_schema` and `sqlite_temp_master` for a connection that

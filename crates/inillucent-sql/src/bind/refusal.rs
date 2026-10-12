@@ -31,6 +31,29 @@ pub(crate) fn unsupported(what: &'static str, span: Span) -> ParseError {
     ParseError::new(ParseErrorKind::Unsupported(what), span)
 }
 
+/// Returns the failure for a virtual table whose module is not connected.
+///
+/// **The table is named in the message**, because the engine replaces this
+/// failure with the module's own error, and the name is how it finds which
+/// table's error to give. The status stays `unsupported`: this build cannot
+/// answer for the table. See `UNCONNECTED_MODULE`.
+///
+/// @param name - the table as the statement wrote it
+/// @param span - where the statement named it
+pub(crate) fn unconnected_module(name: &[u8], span: Span) -> ParseError {
+    ParseError::new(
+        ParseErrorKind::RefusedNotBuilt {
+            said: format!(
+                "{}{}",
+                crate::diagnostic::UNCONNECTED_MODULE,
+                String::from_utf8_lossy(name)
+            ),
+            feature: "that virtual table's module",
+        },
+        span,
+    )
+}
+
 /// Returns a "no such table" failure in SQLite's wording.
 ///
 /// It deliberately carries no position. SQLite reports one for `no such

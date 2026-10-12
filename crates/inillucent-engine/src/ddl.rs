@@ -178,6 +178,7 @@ impl ImportedDatabase {
         let autocommit = self.writing.batch().is_none();
         let mark = self.statement_mark();
         let txn = self.current_txn();
+        let logged_from = self.log_of(at).map(|wal| wal.next_lsn());
         let outcome = self.run_directive(*directive, sql);
         self.schema.ddl_schema = previous;
         let outcome = match outcome {
@@ -188,6 +189,9 @@ impl ImportedDatabase {
                     self.writing.undo().borrow_mut().clear();
                     self.writing.pending_frees().borrow_mut().clear();
                     self.writing.built().borrow_mut().clear();
+                    if let (true, Some(from)) = (undone.is_ok(), logged_from) {
+                        self.commit_failed_directive(at, from)?;
+                    }
                 }
                 // **The undo's own failure is the one worth reporting.** A
                 // "no such function" describing a database that is now in a

@@ -98,5 +98,6 @@ mod vector_edges;
 mod vector_metric;
 mod vtab;
 mod vtab_lifecycle;
+mod vtab_refused_connect;
 mod wal;
 mod write_speed;

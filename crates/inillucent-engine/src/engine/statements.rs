@@ -333,7 +333,7 @@ impl ImportedDatabase {
         // vectors back: a connection whose application sends a syntax error
         // now and then would otherwise be re-allocating them for ever.
         self.compiled.recycle_binder(binder.into_scratch());
-        let mut bound = outcome.map_err(refused)?;
+        let mut bound = outcome.map_err(|error| self.refuse_unconnected(refused(error)))?;
         // **A correlated `IN` becomes `EXISTS` before anything plans it.** The
         // physical pass computes a correlated block once per outer row and
         // hands the operator one column, which is not a list, so it refused one
@@ -344,6 +344,39 @@ impl ImportedDatabase {
         self.refuse_shadow_write(&bound)?;
         self.refuse_schema_write(&bound)?;
         Ok(bound)
+    }
+
+    /// Gives the module's own error for a virtual table whose module refused
+    /// to connect at open, or is not in this build.
+    ///
+    /// The binder knows such a table only by its catalog row, which has no
+    /// columns until a module declares them, so it refuses the statement with
+    /// `UNCONNECTED_MODULE` and the table's name. The reason the table cannot
+    /// be read is the module's. SQLite reports the module's error here, such as
+    /// "no such tokenizer" or "no such module", and so does this. Only the main
+    /// database is checked, because `reconnect_modules` connects only its
+    /// tables.
+    ///
+    /// @param error - the error the bind failed with
+    fn refuse_unconnected(
+        &self,
+        error: inillucent_base::error::DbError,
+    ) -> inillucent_base::error::DbError {
+        if self.session_state.unconnected.is_empty() {
+            return error;
+        }
+        let Some(missing) = error
+            .message()
+            .strip_prefix(inillucent_sql::diagnostic::UNCONNECTED_MODULE)
+        else {
+            return error;
+        };
+        let folded = missing.to_ascii_lowercase();
+        let table = folded.strip_prefix("main.").unwrap_or(&folded);
+        match self.session_state.unconnected.get(table.as_bytes()) {
+            Some(stored) => stored.clone(),
+            None => error,
+        }
     }
 
     /// Refuses a write of `sqlite_schema` the connection has not asked for.

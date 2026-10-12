@@ -8,6 +8,24 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
+## 2.5.5, 12 October 2026
+
+**A virtual table whose module refuses to connect no longer stops the whole file from opening.**
+The open used to fail at the first module that refused, so a file holding one search table with an
+option this build does not know could not be read at all, plain tables included. Now the file
+opens, every other table reads and writes, and a statement that uses the refused table fails with
+the module's own error, such as `no such tokenizer: pt-br`. A table whose module this build does
+not have answers `no such module: <name>`, as SQLite does. This is what lets a release from
+before tokenizer packs read a database that holds a table with a pack.
+
+- A module an application registers with `Database::register_module` now connects the tables in
+  the file that use it. The open ran before the module was registered, so such a table was never
+  connected after a reopen and every statement on it failed.
+- A `CREATE VIRTUAL TABLE` that a module refused after its shadow tables were written left its
+  undone writes open in the log when nothing else followed it, and every later open reported a
+  discarded transaction. A failed schema change now commits its undo, as a failed `INSERT`,
+  `UPDATE` or `DELETE` already did.
+
 ## 2.5.0 to 2.5.4, 10 and 11 October 2026
 
 **The shell now matches `sqlite3` 3.53 on its command line, exit codes, bytes and modes.** Text

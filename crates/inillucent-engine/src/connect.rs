@@ -768,13 +768,15 @@ impl Database {
                     .map(|mut held| std::mem::take(&mut *held))
                     .unwrap_or_default();
                 *slot = match ImportedDatabase::finish_open(*pending, shared) {
-                    Ok(mut engine) => {
-                        engine.register_modules(waiting);
-                        if self.commits_wait_for_fold.get() {
-                            engine.hold_commits_for_the_fold();
+                    Ok(mut engine) => match engine.register_modules(waiting) {
+                        Ok(()) => {
+                            if self.commits_wait_for_fold.get() {
+                                engine.hold_commits_for_the_fold();
+                            }
+                            Slot::Ready(Box::new(engine))
                         }
-                        Slot::Ready(Box::new(engine))
-                    }
+                        Err(error) => Slot::Failed(error),
+                    },
                     Err(error) => Slot::Failed(error),
                 };
             }

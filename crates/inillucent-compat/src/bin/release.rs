@@ -438,7 +438,10 @@ fn render(
          `inillucent_search` table is read by any build - the index lives in ordinary tables - but it \
          is *queried* only by a build that has the module. An older build opens the file, reads \
          every relational table, and reports `no such module: inillucent_search` for the search table \
-         alone.\n\n\
+         alone. A search table that names an option an older build does not have, such as a \
+         tokenizer it does not know, is refused the same way: the file opens, and only a statement \
+         that uses that table fails, with the module's own error. Builds up to 2.5.4 refused the \
+         whole open for such a table instead.\n\n\
          Legacy retrieval indexes migrate with `inillucent-migrate`, which never writes to the \
          source. Going back is not an undo; it is pointing the application at the directory that \
          never changed.\n",
