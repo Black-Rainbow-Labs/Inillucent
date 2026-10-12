@@ -485,15 +485,25 @@ fn write_a_file_holding_a_key_stored_out_of_line(into: &Path) -> PathBuf {
     path
 }
 
-/// Every released binary refuses a file that holds a key stored out of line, by
-/// name, and reads a file that does not.
+/// Finds the long key through its index; a release that reads format 3 must answer
+/// with the row's id and the key's length.
+const LONG_KEY_LOOKUP: &str =
+    "SELECT id, length(v) FROM longkeys WHERE v = replace(hex(zeroblob(5000)), '0', 'q')";
+
+/// Every released binary before format 3 refuses a file that holds a key stored
+/// out of line, by name, and every release from format 3 on reads it.
 ///
 /// **Format 3 is for exactly this file.** A key over `page_size / 8` is written on
-/// pages of its own with a prefix in the leaf, and a release before this one cannot
-/// read it. What matters is that none of them answers: each is asked a question
-/// the file can answer and must refuse it naming the format, as it refuses any
-/// format it does not read. The same releases read the file the case above wrote,
-/// which stores nothing out of line and so still says format 2.
+/// pages of its own with a prefix in the leaf, and a release that writes format 2
+/// or earlier cannot read it. What matters is that none of those answers: each is
+/// asked a question the file can answer and must refuse it naming the format, as
+/// it refuses any format it does not read. The same releases read the file the
+/// case above wrote, which stores nothing out of line and so still says format 2.
+///
+/// **2.5.0 was the first release to write format 3.** This case was written before
+/// it was published and asked every release on disk to refuse, so from 2.5.0 on it
+/// failed for the releases that read the file correctly. A release that reads
+/// format 3 is now asked to find the long key through its index instead.
 #[test]
 fn every_released_binary_refuses_a_file_that_holds_a_key_stored_out_of_line() {
     let available: Vec<(String, PathBuf)> = interop::versions()
@@ -516,6 +526,16 @@ fn every_released_binary_refuses_a_file_that_holds_a_key_stored_out_of_line() {
         "a key stored out of line moves the file to format 3, and the file says {format}"
     );
     for (version, exe) in &available {
+        if reads_this_format(version, format) {
+            let asked = ask_release(exe, &database, LONG_KEY_LOOKUP);
+            assert_eq!(
+                asked,
+                Ok("1|10000".to_string()),
+                "{version} writes format {} and should find the key stored out of line",
+                fixture_format(version)
+            );
+            continue;
+        }
         let asked = ask_release(exe, &database, "SELECT count(*) FROM note");
         assert_refused_by_format(version, "SELECT count(*) FROM note", &asked, format);
     }
