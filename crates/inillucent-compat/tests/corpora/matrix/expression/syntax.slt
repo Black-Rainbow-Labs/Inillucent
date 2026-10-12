@@ -158,7 +158,10 @@ SELECT x'00ff', 1.5e10, 0x1f, .5, 1_000
 
 case syntax-expr-p16
 
-query TTT rowsort
+query IIII rowsort
+SELECT length(CURRENT_DATE), length(CURRENT_TIME), length(CURRENT_TIMESTAMP), CURRENT_TIMESTAMP GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+
+statement ok
 SELECT CURRENT_DATE, CURRENT_TIME, CURRENT_TIMESTAMP
 
 case syntax-expr-p17
@@ -183,7 +186,10 @@ SELECT CASE END
 
 case syntax-literal-value-p0
 
-query IRTTTIIT rowsort
+query IRTTTIII rowsort
+SELECT 1, 1.5, 'text', x'0a', NULL, TRUE, FALSE, length(CURRENT_TIMESTAMP)
+
+statement ok
 SELECT 1, 1.5, 'text', x'0a', NULL, TRUE, FALSE, CURRENT_TIMESTAMP
 
 case syntax-literal-value-n1
