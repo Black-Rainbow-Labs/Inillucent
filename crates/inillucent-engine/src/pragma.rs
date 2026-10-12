@@ -349,10 +349,12 @@ impl ImportedDatabase {
             b"integrity_check" => self.pragma_integrity_check(
                 "integrity_check",
                 crate::engine::integrity::CheckDepth::Full,
+                (argument, at),
             )?,
             b"quick_check" => self.pragma_integrity_check(
                 "quick_check",
                 crate::engine::integrity::CheckDepth::Quick,
+                (argument, at),
             )?,
             b"optimize" => list_of::<&str>("optimize", &[]),
             b"foreign_key_list" => self.pragma_foreign_key_list(argument, at)?,

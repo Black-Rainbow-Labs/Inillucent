@@ -140,7 +140,7 @@ impl crate::ImportedDatabase {
             // from one, so the identifier alone is ambiguous the moment a
             // connection holds a second file - and a rollback that guessed
             // would put a row back into the wrong database, silently.
-            let at = entry.schema;
+            let at = entry.schema();
             let wal = self
                 .log_of(at)
                 .ok_or_else(|| refusal("a rollback names a database that is not attached"))?;
@@ -179,7 +179,7 @@ impl crate::ImportedDatabase {
                 session,
                 at,
             )?;
-            let from_page = match &entry.page {
+            let from_page = match entry.page.as_deref() {
                 Some(crate::engine::write::FromPage::One(page, located)) => {
                     Some(inillucent_tree::write::row_from_page(page, *located)?)
                 }
@@ -199,10 +199,19 @@ impl crate::ImportedDatabase {
                     let values: Vec<Datum<'_>> = row.iter().map(OwnedDatum::borrow).collect();
                     tree.put(database, &mut log, &values)?;
                 }
-                None => {
-                    let key = entry.key.values();
-                    tree.delete(database, &mut log, &key)?;
-                }
+                None => match &entry.key {
+                    // The keys of a run of inserts, deleted newest first as their own records
+                    // would have been.
+                    crate::engine::write::KeyCopy::Rowids { first, last } => {
+                        for rowid in (*first..=*last).rev() {
+                            tree.delete(database, &mut log, &[Datum::Int(rowid)])?;
+                        }
+                    }
+                    other => {
+                        let key = other.values();
+                        tree.delete(database, &mut log, &key)?;
+                    }
+                },
             }
         }
         // **Cut before the schema is rebuilt below.** `reload_entries` attaches
@@ -714,6 +723,9 @@ impl crate::ImportedDatabase {
     /// part way through, and every `ALTER TABLE` that rebuilds a tree and then
     /// refuses.
     pub(crate) fn statement_mark(&self) -> crate::engine::state::StatementMark {
+        // The newest record ends here, so a record pushed later may not be folded into it.
+        // See `Before::sealed`.
+        self.writing.undo().borrow_mut().begin_statement();
         crate::engine::state::StatementMark {
             undo: self.writing.undo().borrow().len(),
             dropped: self.writing.pending_frees().borrow().len(),

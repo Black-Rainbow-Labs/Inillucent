@@ -398,6 +398,8 @@ impl Module for RTreeModule {
             },
             creating,
             rowid_name: names.first().cloned().unwrap_or_else(|| b"id".to_vec()),
+            table_name: arguments.table.clone(),
+            coordinate_names: names.clone(),
             pending: Buffer::default(),
         }))
     }
@@ -415,6 +417,10 @@ struct RTreeTable {
     declaration: Declaration,
     creating: bool,
     rowid_name: Vec<u8>,
+    /// The table's own name, which SQLite writes in front of a constraint failure.
+    table_name: Vec<u8>,
+    /// The names of the id column and the coordinate columns, in declaration order.
+    coordinate_names: Vec<Vec<u8>>,
     /// The shadow rows this transaction has written but not yet flushed.
     pending: Buffer,
 }
@@ -620,7 +626,8 @@ impl VirtualTable for RTreeTable {
                 self.remember_auxiliary(key, values);
                 if self.find_leaf(context, key)?.is_some() {
                     return Err(constraint(format!(
-                        "UNIQUE constraint failed: {}",
+                        "UNIQUE constraint failed: {}.{}",
+                        String::from_utf8_lossy(&self.table_name),
                         String::from_utf8_lossy(&self.rowid_name)
                     )));
                 }
@@ -895,9 +902,20 @@ impl RTreeTable {
             let low = coordinate(values.get(1 + dimension * 2), self.coordinates, Edge::Low);
             let high = coordinate(values.get(2 + dimension * 2), self.coordinates, Edge::High);
             if low > high {
-                return Err(constraint(
-                    "rtree constraint failed: a minimum is greater than its maximum",
-                ));
+                // SQLite names the table and the two columns whose order is wrong:
+                // `rtree constraint failed: r.(a0<=a1)`.
+                let name_at = |position: usize| {
+                    self.coordinate_names
+                        .get(position)
+                        .map(|name| String::from_utf8_lossy(name).into_owned())
+                        .unwrap_or_default()
+                };
+                return Err(constraint(format!(
+                    "rtree constraint failed: {}.({}<={})",
+                    String::from_utf8_lossy(&self.table_name),
+                    name_at(1 + dimension * 2),
+                    name_at(2 + dimension * 2)
+                )));
             }
             box_.push(low);
             box_.push(high);
@@ -1228,7 +1246,11 @@ fn coordinate(value: Option<&Value<'static>>, coordinates: Coordinates, edge: Ed
         _ => 0.0,
     };
     if coordinates == Coordinates::Integer {
-        return number.round();
+        // **`rtree_i32` reads a coordinate with `sqlite3_value_int`, which drops
+        // the fraction toward zero** and keeps the low 32 bits of a value
+        // that is out of range. `1.9` is 1 and `-1.9` is -1; rounding made
+        // them 2 and -2, so a box held rows it did not hold in SQLite.
+        return f64::from(number as i64 as i32);
     }
     // The format stores 32-bit coordinates, so the value the file can hold is
     // the value everything downstream compares against.

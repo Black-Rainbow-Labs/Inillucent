@@ -39,6 +39,11 @@ pub fn system(shell: &mut Shell, arguments: &[&str]) {
         return;
     }
     let line = arguments.join(" ");
+    // **Everything printed so far reaches the terminal before the command's own
+    // output.** The shell holds its output in a block when it is not a terminal
+    // (see `shell::output`), and the child writes straight to the same stream, so
+    // without this the child's text came out ahead of rows that were printed first.
+    crate::shell::output::flush();
     let status = if cfg!(windows) {
         std::process::Command::new("cmd")
             .arg("/C")
@@ -50,15 +55,44 @@ pub fn system(shell: &mut Shell, arguments: &[&str]) {
             .arg(&line)
             .status()
     };
-    if let Ok(status) = status {
-        if !status.success() {
-            // The reference reports the child's own exit code and nothing else,
-            // because the child has already said whatever it had to say.
-            shell.failed = true;
+    match status {
+        Ok(status) => {
+            // **A command that fails is reported and the shell carries on with a
+            // status of zero**, as the reference does: it prints the command's
+            // exit code and nothing about the shell itself failing.
+            let code = status.code().unwrap_or(1);
+            if code != 0 {
+                let failed = shell.failed;
+                shell.complain(&format!("System command returns {code}"));
+                shell.failed = failed;
+            }
         }
-    } else {
-        shell.complain("Error: cannot run the system shell");
+        Err(_) => shell.complain("Error: cannot run the system shell"),
     }
+}
+
+/// Runs a command line and returns what it wrote to standard output.
+///
+/// For `.read |COMMAND` and `.import |COMMAND`, which treat the command's output
+/// as their input. Returns none when the command could not be started.
+///
+/// @param command - the command line, without the leading `|`
+pub fn capture_output(command: &str) -> Option<Vec<u8>> {
+    crate::shell::output::flush();
+    let output = if cfg!(windows) {
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg(command)
+            .stderr(std::process::Stdio::inherit())
+            .output()
+    } else {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .stderr(std::process::Stdio::inherit())
+            .output()
+    };
+    output.ok().map(|finished| finished.stdout)
 }
 
 /// `.crlf ?on|off?`: whether output lines end `\r\n`.
@@ -77,10 +111,12 @@ pub fn crlf(shell: &mut Shell, arguments: &[&str]) {
     // The state is still printed on every platform, because the reference prints
     // it on every platform.
     if let Some(word) = arguments.first() {
-        shell.crlf = cfg!(windows) && crate::dot::truthy(Some(word));
+        let wanted = crate::settings::boolean(shell, word);
+        shell.crlf = cfg!(windows) && wanted;
     }
     let state = if shell.crlf { "ON" } else { "OFF" };
-    shell.say(&format!("crlf is {state}"));
+    // **To standard error**, as the reference's report is.
+    shell.note(&format!("crlf is {state}"));
 }
 
 /// `.prompt MAIN CONTINUE`: the two strings an interactive session prints.
@@ -107,10 +143,10 @@ pub fn prompt(shell: &mut Shell, arguments: &[&str]) {
 /// @param shell - the shell
 /// @param arguments - the words after the command
 pub fn explain(shell: &mut Shell, arguments: &[&str]) {
-    shell.explain_mode = match arguments.first().map(|word| word.to_ascii_lowercase()) {
+    shell.explain_mode = match arguments.first() {
         None => ExplainMode::On,
-        Some(word) if word == "auto" => ExplainMode::Auto,
-        Some(word) if crate::dot::truthy(Some(&word)) => ExplainMode::On,
+        Some(word) if word.eq_ignore_ascii_case("auto") => ExplainMode::Auto,
+        Some(word) if crate::settings::boolean(shell, word) => ExplainMode::On,
         Some(_) => ExplainMode::Off,
     };
 }

@@ -88,6 +88,7 @@ pub(crate) use key_extent::PoolHandle;
 pub use key_extent::{
     key_extent_record_bytes, key_prefix_bytes, KEY_PREFIX_BYTES, KEY_PREFIX_LENGTH_BYTES,
 };
+pub(crate) use layout::wide_row_threshold;
 pub use layout::{
     class_bytes, extent_class_for, extent_datum, fits_frame, from_frame, tombstone_bytes,
     write_frame, Layout,
@@ -1661,6 +1662,7 @@ mod tests {
                 flags: 0,
                 collation: inillucent_value::collation::Collation::Binary,
                 descending: false,
+                mixed_key: false,
             },
         ];
         let builder = LeafBuilder::new(8192, 1, columns, 1).unwrap();

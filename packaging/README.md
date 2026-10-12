@@ -20,7 +20,6 @@ detail for each destination. [`macos/README.md`](macos/README.md) covers the mac
 | Mach-O | The executable file format macOS uses. |
 | minisign | A small signing tool. It signs `SHA256SUMS`, and the signature is published as `SHA256SUMS.minisig`. |
 | OpenPGP | The signing standard `apt` and `dnf` check on a `.deb` or `.rpm`. |
-| mirror | The public GitHub repository `Black-Rainbow-Labs/Inillucent`. It holds one commit per release. Development happens in a separate repository. |
 | tap | A GitHub repository Homebrew reads formulas from. This project's tap is `Black-Rainbow-Labs/homebrew-inillucent`. |
 
 ## Cut a release
@@ -68,14 +67,14 @@ flowchart LR
     A["preflight: read credentials, print the plan"] --> B["tests: read the nightly evidence"]
     B --> C["version: write the new version into every file"]
     C --> D["build: compile, sign, package, notarise"]
-    D --> E["publish: tag, mirror, GitHub, site, registries, ci"]
+    D --> E["publish: tag, GitHub, site, registries, ci"]
     E --> F["report: each route published, skipped or failed"]
 ```
 
 | Phase | What happens | Why it is in this place |
 |---|---|---|
 | preflight | Decrypts the credentials, checks each route's needs, and prints `[run ]` or `[skip]` for every route with the reason. For npm and GitHub it prints the account it will publish as. | A tag cannot be taken back quietly, so the plan is known before anything is written. |
-| tests | Reads `_agent_output/nightly/latest.json` in the main checkout. Green for this commit: no suite runs, and the notes name the nightly run. Green for an older commit: runs `inillucent-testrun --changed <that commit> --cadence merge --strict`. Red or missing: refuses. Exit code 1 or 2 from that run stops the release. | A red suite stops the release before the version phase has changed any file. The development repository has no CI, so GitHub is read after publishing, by the `ci` route. |
+| tests | Reads `_agent_output/nightly/latest.json` in the main checkout. Green for this commit: no suite runs, and the notes name the nightly run. Green for an older commit: runs `inillucent-testrun --changed <that commit> --cadence merge --strict`. Red or missing: refuses. Exit code 1 or 2 from that run stops the release. | A red suite stops the release before the version phase has changed any file. CI runs only at night and by hand, so GitHub is read after publishing, by the `ci` route. |
 | version | Writes the new version into every file that carries it and refreshes `Cargo.lock`. Warns about any other tracked file that still names the old version. | Every later route reads the version this phase writes. |
 | build | The `build`, `linux-packages` and `signature` routes. Nothing has left the machine yet. | A build failure leaves nothing published. |
 | publish | The routes from `tag` to `ci`, in the order in the table below. After each route, `ship.ps1` asks the destination whether the release arrived. | Some destinations read what an earlier route wrote. |
@@ -93,32 +92,30 @@ The routes run in this order.
 | `build` | Windows x86-64, Linux x86-64 and aarch64, and a universal macOS build, signed and notarised. Runs `release-all.ps1 -Targets all`. | `tools/cross/bin`, filled by `pwsh tools/cross/fetch-toolchain.ps1`. The Apple credentials in [`macos/README.md`](macos/README.md). | The build smoke test (below) |
 | `linux-packages` | A `.deb` and an `.rpm` for x86-64 and for aarch64, signed with OpenPGP. Runs `linux/package-linux.ps1`. | `INILLUCENT_GPG_KEY` | none |
 | `signature` | `SHA256SUMS.minisig`. Runs `sign-sums.ps1`. | `INILLUCENT_MINISIGN_KEY`, and `packaging/inillucent.pub` | none |
-| `tag` | Commits the version files, creates the annotated tag `v<version>`, and pushes both to the development repository. | nothing | none |
-| `mirror` | One commit on the mirror whose tree is the tag's tree, and the tag `v<version>` on it. Runs `mirror-github.ps1 -Push`. | the `brl` git remote | none |
-| `github` | A GitHub release on the mirror with every artifact attached. A draft release is made public. | `gh`, and a GitHub token | The release exists and has assets |
+| `tag` | Commits the version files, creates the annotated tag `v<version>`, and pushes both to `origin`, which is `Black-Rainbow-Labs/Inillucent`. | nothing | none |
+| `github` | A GitHub release on `origin` with every artifact attached. A draft release is made public. | `gh`, and a GitHub token | The release exists and has assets |
 | `interop` | `tests/interop/<version>/`, a database written by the Windows binary this release published. Committed and pushed. | nothing | `app.rdb`, `expected.tsv` and a log segment exist |
 | `site` | The downloads on inillucent.com, then the links on its home page, then a rebuild and deploy of the site. | The site checkout. `install.sh` and `macos/verify-macos.sh` must parse and contain no carriage return. | `downloads/VERSION`, a link for each of the nine downloads, every name in `SHA256SUMS` served at the built size, and the smallest file hashed in full |
 | `crates` | Every publishable workspace crate on crates.io. Runs `cargo-publish.ps1 -Execute -Confirmed`. | `CARGO_REGISTRY_TOKEN` | crates.io names the version for `inillucent-cli` |
 | `npm` | The five platform packages `@blackrainbowlabs/cli-*`, then the `inillucent` wrapper. | `npm`, and a credential `npm whoami` accepts | The npm registry names the version |
 | `pypi` | Four wheels: Windows, macOS, and Linux x86-64 and aarch64. | a PyPI token, `python` and `twine` | PyPI names the version |
-| `go` | The tag `packages/go/v<version>` on the mirror. | nothing | `proxy.golang.org` names the version |
-| `packagist` | Asks Packagist to read the mirror's tags again. | a Packagist token | Packagist names the version |
+| `go` | The tag `packages/go/v<version>`, on the local `v<version>` commit, pushed to `origin`. | nothing | `proxy.golang.org` names the version |
+| `packagist` | Asks Packagist to read the repository's tags again. | a Packagist token | Packagist names the version |
 | `homebrew` | `Formula/inillucent.rb` in the tap, committed and pushed. | the tap checkout | The formula on GitHub names the version |
-| `ci` | Nothing. It starts the tests workflow on the mirror's `main`, which the `mirror` route set to the release, and waits up to four hours for it. | nothing | The run passed. A red, cancelled or missing run fails the release |
+| `ci` | Nothing. It starts the tests workflow on `main`, which the `tag` route pushed the release to, and waits up to four hours for it. | nothing | The run passed. A red, cancelled or missing run fails the release |
 
 Each registry check retries for three minutes, because npm, PyPI and crates.io show a new version a
 little after the upload returns.
 
 ### Why the order matters
 
-- **`ci` runs after `mirror`.** CI runs only on the public mirror, at night and by hand, so the
-  release commit has no run until `ci` starts one on the mirror's `main`. It is the last route
-  because it takes the longest. `pwsh packaging/ci-status.ps1` is the same check on its own.
-
-- **`mirror` runs before `github`.** The GitHub release is created on the mirror. When
+- **`ci` runs last.** CI runs at night and by hand, never on a push, so the release commit has no
+  run until `ci` starts one on `main`. It is the last route because it takes the longest.
+  `pwsh packaging/ci-status.ps1` is the same check on its own.
+- **`tag` runs before `github`.** The GitHub release is created on `origin`. When
   `gh release create` names a tag that does not exist, GitHub creates the tag at the repository's
-  current commit. Before the `mirror` route runs, that commit is the previous release.
-- **`go` and `packagist` run after `mirror`.** `proxy.golang.org` and Packagist record which commit a
+  current commit. Before the `tag` route runs, that commit is the previous release.
+- **`go` and `packagist` run after `tag`.** `proxy.golang.org` and Packagist record which commit a
   version names the first time they see the tag, and never change it. The Go module at v0.1.5 and
   the Composer package at v0.1.6 serve 0.1.3's source for this reason, and cannot be
   corrected.
@@ -250,7 +247,7 @@ tagged and left half published for four days, with its GitHub release still a dr
 | `macos/release-macos.ps1` | Builds, signs and notarises the macOS half |
 | `linux/package-linux.ps1` | Builds the `.deb` and `.rpm` files with `nfpm` and signs them |
 | `sign-sums.ps1` | Signs `SHA256SUMS` with minisign |
-| `mirror-github.ps1` | Builds, pushes or checks the mirror commit for a release |
+| `mirror-github.ps1` | No longer called by `ship.ps1`. Only checks old release tags with `-Verify` |
 | `publish-site.ps1` | `-Stage` copies the downloads to the site, `-Link` adds the links |
 | `deploy-site.ps1` | Builds the site and deploys it to Cloudflare and the `brl-sites` origin with `tools/deploy.mjs` from the `black-rainbow-labs-sites` repository |
 | `cargo-publish.ps1` | Publishes the workspace to crates.io. Without `-Execute` it is a dry run |

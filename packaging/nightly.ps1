@@ -14,8 +14,8 @@
         4. gates      inillucent-fullgate, inillucent-writegate and inillucent-scorecard, built with the
                       release profile, against the medium fixture. A missed bar listed in
                       compat/perf/known-misses.txt does not make the night red
-        5. publish    the archives and SHA256SUMS on a rolling `nightly` pre release on the public
-                      mirror. Never a registry: a published version is permanent
+        5. publish    the archives and SHA256SUMS on a rolling `nightly` pre release on
+                      Black-Rainbow-Labs/Inillucent. Never a registry: a published version is permanent
         6. commit     tests/timings.toml, tests/nightly-history.tsv and compat/perf/nightly, pushed
         7. evidence   _agent_output/nightly/latest.json in the main checkout, which ship.ps1 reads
         8. ticket     when red, one on the board with the report, unless one for the same failures is
@@ -284,7 +284,8 @@ function Invoke-Gate {
 function Publish-NightlyPrerelease {
     <#
     .SYNOPSIS
-        Replaces the rolling `nightly` pre release on the public mirror with tonight's archives.
+        Replaces the rolling `nightly` pre release on Black-Rainbow-Labs/Inillucent with tonight's
+        archives.
 
     .DESCRIPTION
         The tag is `nightly`, which no registry reads as a version: the Go proxy and Packagist take
@@ -296,9 +297,9 @@ function Publish-NightlyPrerelease {
         The commit the archives were built from.
     #>
     param([string] $Commit)
-    $url = (& git -C $main remote get-url brl 2>$null)
+    $url = (& git -C $main remote get-url origin 2>$null)
     if (-not $url -or $url -notmatch 'github\.com[:/](?<owner>[^/]+)/(?<name>[^/.]+)') {
-        return 'skipped: this checkout has no brl remote naming the public mirror'
+        return 'skipped: this checkout has no origin remote on GitHub'
     }
     $mirror = "$($Matches.owner)/$($Matches.name)"
     $dist = Join-Path $Worktree 'dist'
@@ -316,8 +317,7 @@ function Publish-NightlyPrerelease {
         'nightly archive and a release archive can have the same name. Take a release unless you need',
         'what changed since it.',
         '',
-        'The mirror holds only release commits, so the `nightly` tag points at the newest release commit',
-        'there. The commit named above is the one the archives were built from.'
+        'The `nightly` tag points at the commit named above, the one the archives were built from.'
     ) -join "`n"
     # gh is not logged in on this machine; the token is the one `git push` already uses.
     $previousToken = $env:GH_TOKEN
@@ -329,7 +329,7 @@ function Publish-NightlyPrerelease {
             & gh release delete nightly --repo $mirror --cleanup-tag --yes | Out-Host
             if ($LASTEXITCODE -ne 0) { return 'red: the previous nightly pre release could not be removed' }
         }
-        & gh release create nightly @assets --repo $mirror --prerelease --title "nightly $date" --notes $notes | Out-Host
+        & gh release create nightly @assets --repo $mirror --target $Commit --prerelease --title "nightly $date" --notes $notes | Out-Host
         if ($LASTEXITCODE -ne 0) { return 'red: gh release create failed' }
         return 'green'
     } finally {
@@ -506,7 +506,7 @@ if ($WhatIf) {
     Write-Host '   would run: inillucent-testrun --cadence nightly --strict --record --summary'
     if (-not $SkipRelease) { Write-Host '   would run: release-all.ps1 -Targets all (five builds in parallel, fat LTO, signed and notarised)' }
     if (-not $SkipRelease -and -not $SkipGates) { Write-Host '   would run: inillucent-fullgate, inillucent-writegate, inillucent-scorecard on the medium fixture' }
-    if (-not $SkipRelease -and -not $SkipPublish) { Write-Host '   would replace the rolling nightly pre release on the public mirror' }
+    if (-not $SkipRelease -and -not $SkipPublish) { Write-Host '   would replace the rolling nightly pre release on GitHub, at the commit it built' }
     if (-not $NoCommit) { Write-Host "   would commit tests/timings.toml, tests/nightly-history.tsv and compat/perf/nightly, and push to $Branch" }
     Write-Host '   would write latest.json, and file a ticket if the night is red'
     Write-Host ''

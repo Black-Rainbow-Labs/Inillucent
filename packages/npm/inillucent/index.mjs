@@ -22,39 +22,269 @@ import { resolveBinary, resolveLibrary, PROGRAMS, platformPackage } from './reso
 const run = promisify(execFile);
 
 /**
- * Encodes one bound value as the JSON text the command line reads.
+ * The largest integer a JavaScript number holds exactly, as a number.
+ */
+const SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
+
+/**
+ * Whether a string has a UTF-16 surrogate with no partner, which has no UTF-8
+ * spelling.
  *
- * **`JSON.stringify` loses three things a parameter can be (task-1979, D13 and
- * D16).** A NaN and an Infinity both become `null`, so a REAL column silently
- * stored NULL and nothing said so; `-0` becomes `0`, so the sign of negative
- * zero was gone before the value left Node; and a byte string has no JSON form
- * at all, so there was no way to bind a BLOB.
+ * **A lone surrogate hung a session.** `JSON.stringify` writes it as the escape
+ * `\ud800`, `inillucent-mcp` cannot decode that into text, and it answered with
+ * an error whose id is null, so the call that sent it never settled. The addon
+ * route replaced it with U+FFFD without saying so. Every route now refuses it
+ * before anything is sent.
  *
- * What is written instead: a non-finite number throws here, where the caller
- * can see which value it was, rather than turning into a NULL nobody asked for.
- * Negative zero is written `-0.0`, which JSON's own grammar carries and the
- * command line's parser reads back as a negative zero. Bytes are written
- * `{"blob":"<hex>"}`.
+ * @param text - the string
+ */
+function hasLoneSurrogate(text) {
+  return /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(text);
+}
+
+/**
+ * Says why a bound value cannot be bound, or answers null when it can.
+ *
+ * **One rule for every route.** The addon refused a `Date`, an array, a
+ * function and a `Symbol`, while the process and server routes bound a `Date`
+ * as its ISO text, an array as a vector or a blob, and threw an unrelated error
+ * for a `Symbol`. The messages are the addon's, because the addon is the route
+ * a call takes by default.
  *
  * @param value - one element of `params`
  */
+function paramError(value) {
+  if (value === undefined || value === null || typeof value === 'boolean') {
+    return null;
+  }
+  switch (typeof value) {
+    case 'string':
+      return hasLoneSurrogate(value)
+        ? 'a string parameter holds a lone surrogate, which has no UTF-8 spelling'
+        : null;
+    case 'number':
+      return Number.isFinite(value)
+        ? null
+        : `a parameter cannot be ${value}: SQL has no spelling for it`;
+    case 'bigint':
+      return value >= -(2n ** 63n) && value < 2n ** 63n
+        ? null
+        : 'a bigint parameter does not fit in 64 bits';
+    case 'object':
+      if (Object.prototype.toString.call(value) === '[object Uint8Array]') {
+        return null;
+      }
+      return 'an object parameter must be a Uint8Array';
+    default:
+      return 'a parameter must be null, a boolean, a number, a bigint, a string or a Uint8Array';
+  }
+}
+
+/**
+ * Says why a call's options cannot be sent, or answers null when they can.
+ *
+ * Checks `params` as a list of bindable values, and every string option for a
+ * lone surrogate, because `sql` travels as JSON to a session and as an argument
+ * to a process and neither can carry one.
+ *
+ * @param options - the options the caller passed to `inillucent()`
+ */
+function optionsError(options) {
+  for (const [name, value] of Object.entries(options)) {
+    if (name === 'params') {
+      if (value === undefined || value === null) {
+        continue;
+      }
+      if (!Array.isArray(value)) {
+        return 'params must be an array';
+      }
+      for (const item of value) {
+        const why = paramError(item);
+        if (why !== null) {
+          return why;
+        }
+      }
+    } else if (typeof value === 'string' && hasLoneSurrogate(value)) {
+      return `the ${name} option holds a lone surrogate, which has no UTF-8 spelling`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Answers the result object a refused call returns, or null when it was not.
+ *
+ * The same object the addon route returns for a parameter it refuses, so a
+ * caller handles one shape whichever route a call took.
+ *
+ * @param command - the verb
+ * @param options - the options the caller passed
+ */
+function refusal(command, options) {
+  const message = optionsError(options);
+  return message === null ? null : { ok: false, command, status: 'invalid_state', message };
+}
+
+/**
+ * Encodes one bound value as the JSON text the command line reads.
+ *
+ * **`JSON.stringify` loses three things a parameter can be.** A NaN and an
+ * Infinity both become `null`, so a REAL column silently stored NULL and
+ * nothing said so; `-0` becomes `0`, so the sign of negative zero was gone
+ * before the value left Node; and a byte string has no JSON form at all, so
+ * there was no way to bind a BLOB. `paramError` has already refused a
+ * non-finite number, so what is written here is finite. Negative zero is
+ * written `-0.0`, which JSON's own grammar carries and the command line's parser
+ * reads back as a negative zero. Bytes are written `{"blob":"<hex>"}`.
+ *
+ * A whole number past 2^53 is written with an exponent. It is a REAL, as it is
+ * through the addon, and written as digits the command line would read as an
+ * integer too wide for 64 bits. A `BigInt` is written as its digits.
+ *
+ * @param value - one element of `params`, which `paramError` accepted
+ */
 function encodeParam(value) {
   if (typeof value === 'number') {
-    if (!Number.isFinite(value)) {
-      throw new TypeError(
-        `a parameter cannot be ${value}: SQL has no spelling for NaN or Infinity.`,
-      );
+    if (Object.is(value, -0)) {
+      return '-0.0';
     }
-    return Object.is(value, -0) ? '-0.0' : JSON.stringify(value);
+    if (Number.isInteger(value) && Math.abs(value) > SAFE_INTEGER) {
+      return value.toExponential();
+    }
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'bigint') {
+    return value.toString();
   }
   if (value instanceof Uint8Array) {
-    const hex = Buffer.from(value).toString('hex');
+    const hex = Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('hex');
     return JSON.stringify({ blob: hex });
   }
-  if (Array.isArray(value)) {
-    return `[${value.map(encodeParam).join(',')}]`;
-  }
   return JSON.stringify(value === undefined ? null : value);
+}
+
+/**
+ * Parses the JSON a program or the server wrote, keeping every integer.
+ *
+ * **`JSON.parse` rounds an integer past 2^53 to a double**, so a 64 bit key came
+ * back from the process and server routes as a different number, while the
+ * addon returned it as a `BigInt`. An integer past 2^53 - 1 is a `BigInt` here
+ * too. A number with a fraction or an exponent stays a number.
+ *
+ * Text with no run of sixteen digits cannot hold such an integer and goes to
+ * `JSON.parse` unchanged, which is nearly every result.
+ *
+ * @param text - the JSON text
+ */
+function parseJson(text) {
+  if (!/\d{16,}/.test(text)) {
+    return JSON.parse(text);
+  }
+  const numberPattern = /-?(?:0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?/y;
+  let at = 0;
+  const skip = () => {
+    while (at < text.length && ' \t\n\r'.includes(text[at])) {
+      at += 1;
+    }
+  };
+  const expect = (character) => {
+    skip();
+    if (text[at] !== character) {
+      throw new SyntaxError(`expected ${character} at position ${at} of the result`);
+    }
+    at += 1;
+  };
+  const stringValue = () => {
+    const start = at;
+    at += 1;
+    while (at < text.length && text[at] !== '"') {
+      at += text[at] === '\\' ? 2 : 1;
+    }
+    at += 1;
+    return JSON.parse(text.slice(start, at));
+  };
+  const numberValue = () => {
+    numberPattern.lastIndex = at;
+    const found = numberPattern.exec(text);
+    if (found === null) {
+      throw new SyntaxError(`unexpected character at position ${at} of the result`);
+    }
+    at += found[0].length;
+    if (found[1] === undefined && found[2] === undefined && found[0].length >= 16) {
+      const whole = BigInt(found[0]);
+      if (whole > BigInt(SAFE_INTEGER) || whole < -BigInt(SAFE_INTEGER)) {
+        return whole;
+      }
+    }
+    return Number(found[0]);
+  };
+  const value = () => {
+    skip();
+    const character = text[at];
+    if (character === '{') {
+      at += 1;
+      const made = {};
+      skip();
+      if (text[at] === '}') {
+        at += 1;
+        return made;
+      }
+      for (;;) {
+        skip();
+        const key = stringValue();
+        expect(':');
+        const held = value();
+        Object.defineProperty(made, key, {
+          value: held,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+        skip();
+        if (text[at] === ',') {
+          at += 1;
+          continue;
+        }
+        expect('}');
+        return made;
+      }
+    }
+    if (character === '[') {
+      at += 1;
+      const made = [];
+      skip();
+      if (text[at] === ']') {
+        at += 1;
+        return made;
+      }
+      for (;;) {
+        made.push(value());
+        skip();
+        if (text[at] === ',') {
+          at += 1;
+          continue;
+        }
+        expect(']');
+        return made;
+      }
+    }
+    if (character === '"') {
+      return stringValue();
+    }
+    for (const [word, held] of [['true', true], ['false', false], ['null', null]]) {
+      if (text.startsWith(word, at)) {
+        at += word.length;
+        return held;
+      }
+    }
+    return numberValue();
+  };
+  const parsed = value();
+  skip();
+  if (at !== text.length) {
+    throw new SyntaxError(`unexpected text after the result at position ${at}`);
+  }
+  return parsed;
 }
 
 /**
@@ -147,6 +377,10 @@ function childEnvironment(key) {
  *   (the key of an encrypted database, sent in `INILLUCENT_KEY`)
  */
 export async function inillucent(command, options = {}) {
+  const refused = refusal(command, options);
+  if (refused !== null) {
+    return refused;
+  }
   // `query`, `exec` and `batch` run in this process when the addon is there; see
   // `nativeAddon`. Everything else, and an encrypted database, starts a program.
   if (runsNatively(command, options)) {
@@ -186,13 +420,13 @@ export async function inillucent(command, options = {}) {
   const binary = resolveBinary('inillucent');
   try {
     const { stdout } = await spawnWith(binary, args, stdin, childEnvironment(key));
-    return JSON.parse(stdout);
+    return parseJson(stdout);
   } catch (why) {
     // A non-zero exit still prints the result object on standard output when
     // `--output json` was asked for, so the failure the caller wants is in
     // there. Only a truly broken invocation has nothing to parse.
     if (typeof why.stdout === 'string' && why.stdout.trim().startsWith('{')) {
-      return JSON.parse(why.stdout);
+      return parseJson(why.stdout);
     }
     throw new Error(
       `inillucent ${command} could not be run: ${why.stderr || why.message}`,
@@ -252,7 +486,8 @@ function decodeValue(value) {
     return value;
   }
   if (typeof value.blob === 'string') {
-    return Uint8Array.from(Buffer.from(value.blob, 'hex'));
+    // A `Buffer`, which is what the addon returns and is a `Uint8Array`.
+    return Buffer.from(value.blob, 'hex');
   }
   return value;
 }
@@ -362,6 +597,10 @@ export class Session {
    * @param options - the named arguments the verb takes
    */
   async inillucent(command, options = {}) {
+    const refused = refusal(command, options);
+    if (refused !== null) {
+      return refused;
+    }
     await this.ready;
     const { params, ...rest } = options;
     const named = {};
@@ -387,7 +626,7 @@ export class Session {
     if (typeof text !== 'string' || !text.trim().startsWith('{')) {
       throw new Error(`inillucent ${command} did not answer with a result: ${text}`);
     }
-    return JSON.parse(text);
+    return parseJson(text);
   }
 
   /**
@@ -459,6 +698,18 @@ export class Session {
         continue;
       }
       const message = JSON.parse(line);
+      // **An answer with no id belongs to no call**, and the server writes one
+      // when it cannot read a request well enough to find its id. The call that
+      // sent it would never settle, so every call still waiting is refused with
+      // what the server said.
+      if ((message.id === null || message.id === undefined) && message.error) {
+        const why = new Error(message.error.message);
+        for (const pending of this.waiting.values()) {
+          pending.reject(why);
+        }
+        this.waiting.clear();
+        continue;
+      }
       const waiter = this.waiting.get(message.id);
       if (!waiter) {
         continue;
@@ -769,6 +1020,10 @@ export class NativeSession {
    * @param options - the named arguments the verb takes
    */
   async inillucent(command, options = {}) {
+    const refused = refusal(command, options);
+    if (refused !== null) {
+      return refused;
+    }
     if (command === 'query' || command === 'exec') {
       return nativeCall(this.native, this.conn, command, options);
     }
@@ -789,6 +1044,10 @@ export class NativeSession {
    * @param options - `params`, `limit`
    */
   async query(sql, options = {}) {
+    const refused = refusal('query', { sql, ...options });
+    if (refused !== null) {
+      throw Object.assign(new Error(refused.message), { status: refused.status });
+    }
     let result;
     try {
       result = this.native.query(this.conn, String(sql), options.params, false);

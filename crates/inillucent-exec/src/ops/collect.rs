@@ -352,6 +352,27 @@ pub(crate) fn owned_row_bytes(row: &[OwnedDatum]) -> u64 {
         .map(|value| datum_bytes(&value.borrow()))
         .fold(0u64, u64::saturating_add)
 }
+/// Returns roughly how many bytes one owned row occupies in memory.
+///
+/// [`owned_row_bytes`] counts the values, which is what a budget is stated in. A buffer that
+/// decides when to write to disk has to count the row as it is held: the vector, a fixed size slot
+/// per value, and an allocation per text or blob, which the allocator rounds up to 16 bytes.
+///
+/// @param row - the row to measure
+pub(crate) fn resident_row_bytes(row: &[OwnedDatum]) -> u64 {
+    let slots = std::mem::size_of::<Vec<OwnedDatum>>()
+        .saturating_add(row.len().saturating_mul(std::mem::size_of::<OwnedDatum>()));
+    let heap: u64 = row
+        .iter()
+        .map(|value| match value {
+            OwnedDatum::Text(bytes) | OwnedDatum::Blob(bytes) => {
+                (bytes.capacity() as u64).div_ceil(16) * 16 + 16
+            }
+            _ => 0,
+        })
+        .fold(0u64, u64::saturating_add);
+    (slots as u64).saturating_add(heap)
+}
 /// Returns roughly how many bytes one value holds.
 ///
 /// @param value - the value to measure

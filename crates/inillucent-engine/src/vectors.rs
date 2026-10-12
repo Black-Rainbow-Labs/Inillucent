@@ -75,6 +75,14 @@ impl ImportedDatabase {
                     continue;
                 };
                 let value = inillucent_value::Value::from(&vector.borrow()).into_owned()?;
+                // The row this one replaces is removed first, whether or not the statement
+                // reported it: `INSERT OR REPLACE`, `REPLACE` and `ON CONFLICT DO UPDATE` write a
+                // rowid the index already holds, and the store refuses a second insert of one.
+                // Removing a rowid the store does not hold does nothing.
+                self.change_module(
+                    &index.name,
+                    &inillucent_sql::vtab::Change::Delete(inillucent_value::Value::Integer(*rowid)),
+                )?;
                 if matches!(value, inillucent_value::Value::Null) {
                     continue;
                 }
@@ -157,6 +165,7 @@ impl ImportedDatabase {
             _ => None,
         };
         let bytes = converted.as_deref().unwrap_or(bytes);
+        refuse_a_probe_the_scan_would_refuse(connected, bytes)?;
         let candidates = self.probe_module(connected, bytes, depth)?;
         // **An index that holds nothing answers an empty list, and an empty list is an answer.**
         // `None` means there is no index of that name, and the executor refuses the statement for
@@ -261,7 +270,9 @@ impl ImportedDatabase {
             catalog: None,
         };
         cursor.filter(&mut context, &plan)?;
-        let mut found = Vec::with_capacity(depth);
+        // The capacity is capped because `depth` is the statement's LIMIT: a LIMIT of
+        // 9223372036854775807 asked for an allocation no machine has, and aborted the process.
+        let mut found = Vec::with_capacity(depth.min(4096));
         while !cursor.eof() {
             found.push(cursor.rowid()?);
             cursor.next(&mut context)?;
@@ -579,6 +590,36 @@ impl ImportedDatabase {
         self.seal()?;
         Ok(Outcome::empty())
     }
+}
+
+/// Refuses a query vector with the words the same query gets when no index answers it.
+///
+/// The store's own check says "this index has 3 dimensions, and the vector has 2", which names
+/// a table the person never wrote. Without the index the statement says
+/// `different vector dimensions 3 and 2`, so adding an index changed the message of an error.
+///
+/// @param connected - the index's store
+/// @param probe - the query vector's bytes, already converted from a JSON array
+fn refuse_a_probe_the_scan_would_refuse(connected: &vtab::Connected, probe: &[u8]) -> DbResult<()> {
+    let function = match declared_metric(connected) {
+        inillucent_sql::catalog_view::IndexMetric::L2 => "vector_distance_l2",
+        _ => "vector_distance_cos",
+    };
+    if !probe.len().is_multiple_of(4) {
+        return Err(refusal(format!("{function}: argument 2 is not a vector")));
+    }
+    let Some(dims) = argument_of(&connected.arguments.arguments, b"dims")
+        .and_then(|raw| String::from_utf8_lossy(&raw).trim().parse::<usize>().ok())
+    else {
+        return Ok(());
+    };
+    let width = probe.len() / 4;
+    if width != dims {
+        return Err(refusal(format!(
+            "different vector dimensions {dims} and {width}"
+        )));
+    }
+    Ok(())
 }
 
 /// The mode an `inillucent_hnsw` index gets when its `WITH ( ... )` names none.

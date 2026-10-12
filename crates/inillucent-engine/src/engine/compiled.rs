@@ -1370,7 +1370,7 @@ impl crate::ImportedDatabase {
                 // which fails on its third row, moves `total_changes()` by 4
                 // and `changes()` to 0. The statement's own rows are the only
                 // ones it leaves out.
-                if error.unwind() == Unwind::Nothing {
+                if error.unwind_in(autocommit) == Unwind::Nothing {
                     self.record_changes(counted.0, counted.1);
                 } else {
                     self.record_changes(0, counted.1.saturating_sub(counted.0));
@@ -1398,6 +1398,12 @@ impl crate::ImportedDatabase {
             // a commit which fails leaves nothing behind for the next
             // statement's mark to sit on top of.
             self.writing.undo().borrow_mut().clear();
+        } else if self.writing.running() <= 1 {
+            // **A statement that is not inside another has no floor but its own.** The records
+            // it wrote for a row an older statement already holds are not needed by any
+            // rollback now, so they are dropped here rather than kept for the life of the
+            // transaction. See `crate::engine::undo`.
+            self.writing.undo().borrow_mut().finish_statement(mark.undo);
         }
         self.remember_rowid(changes.last_rowid);
         // **Read off the view rather than off `Changes`**, so the success path
@@ -1618,7 +1624,7 @@ impl crate::ImportedDatabase {
         wrote: u16,
         txn: u64,
     ) -> DbError {
-        let unwind = error.unwind();
+        let unwind = error.unwind_in(autocommit);
         let undone = match unwind {
             Unwind::Nothing => Ok(()),
             Unwind::Statement => self.undo_to_floor(mark, false, txn),

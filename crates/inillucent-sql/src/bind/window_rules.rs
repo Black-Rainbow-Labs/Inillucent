@@ -7,12 +7,53 @@
 //! `likelihood()` is checked here as well, because it is the other thing the
 //! binder reads from a literal's spelling.
 
-use super::{no_such_window, refused, unsupported, wrong_arguments, Binder, MAX_COMPOUND_SELECT};
+use super::{
+    no_such_window, refused, unsupported, wrong_arguments, Binder, WindowCall, MAX_COMPOUND_SELECT,
+};
 use crate::ast::{self, ExprId};
 use crate::diagnostic::ParseError;
+use crate::function::AggregateFunc;
 use crate::lexer::Span;
 
 impl Binder<'_> {
+    /// Refuses a window call with the wrong number of arguments.
+    ///
+    /// **An aggregate keeps its arity when it has an `OVER` clause.** `sum() OVER
+    /// ()` and `sum(*) OVER ()` ran, and the first answered the number of rows;
+    /// SQLite refuses both with `wrong number of arguments to function sum()`.
+    /// `count()` is `count(*)`, and a registered aggregate declared its arity
+    /// when it was registered.
+    ///
+    /// @param call - the window function or aggregate being called
+    /// @param count - how many arguments were written
+    /// @param star - whether the call was written `f(*)`
+    /// @param name - the function's name as written
+    /// @param span - where the call was written
+    pub(super) fn check_call_arity(
+        &self,
+        call: &WindowCall,
+        count: usize,
+        star: bool,
+        name: ast::NameId,
+        span: Span,
+    ) -> Result<(), ParseError> {
+        let fits = match call {
+            WindowCall::Plain(func) => {
+                let (least, most) = func.arity();
+                count >= least && count <= most
+            }
+            WindowCall::Aggregate(AggregateFunc::External) => true,
+            WindowCall::Aggregate(func) => {
+                (*func == AggregateFunc::Count && count == 0)
+                    || crate::function::aggregate_arity_ok(*func, count, star)
+            }
+        };
+        if fits {
+            return Ok(());
+        }
+        Err(wrong_arguments(self.ast.text(name), span))
+    }
+
     /// Checks the arguments of `likelihood(x, y)`, `likely(x)` and `unlikely(x)`.
     ///
     /// The three share one function here, but SQLite gives each its own count:

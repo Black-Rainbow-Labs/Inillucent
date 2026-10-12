@@ -171,8 +171,8 @@ target failed. Exit code 2 means the run did not happen, for example because the
 
 Each tier has a cadence. `change` tiers run on every change that can reach them. The `durability`,
 `perf` and `matrix_deep` tiers are `merge`: a change run selects one of their targets only when a
-crate that actually changed is in its `covers`. CI runs only on the public mirror,
-Black-Rainbow-Labs/Inillucent, at night and when started by hand, never on a push.
+crate that actually changed is in its `covers`. CI runs in Black-Rainbow-Labs/Inillucent, the one
+repository, at night and when started by hand, never on a push.
 `.github/workflows/tests.yml` runs the merge cadence on Windows and on Linux, as four jobs on Windows
 and three on Linux that each run a share of the targets with `inillucent-testrun --shard`. The
 `nightly` tier never runs on a change. `.github/workflows/nightly.yml` runs it once a day on Linux, at 03:00 UTC, as four
@@ -263,8 +263,8 @@ a prerequisite and its suite cannot skip. Those two checks keep this table equal
 
 ## What the tests cover
 
-The workspace has 4,159 tests across 348 test targets, counted tier by tier in the tier table of
-`tests/inillucent-testing-tdd.md`. There are 348 rows in `tests/selection.toml`,
+The workspace has 4,159 tests across 356 test targets, counted tier by tier in the tier table of
+`tests/inillucent-testing-tdd.md`. There are 356 rows in `tests/selection.toml`,
 and each row is one `[[target]]` that the runner runs. `tools/doc-facts/check.mjs` fails when this
 page gives a different count from `tests/selection.toml`.
 

@@ -709,7 +709,7 @@ impl crate::ImportedDatabase {
             self.session_state.modules_begun.set(true);
             self.begin_modules()?;
         }
-        self.sync_modules()?;
+        self.sync_modules_before_savepoint()?;
         let level = i32::try_from(self.writing.marks().borrow().len()).unwrap_or(i32::MAX);
         self.savepoint_modules(level)?;
         Ok(Some(ModuleStatement {
@@ -771,11 +771,31 @@ impl crate::ImportedDatabase {
     /// per row against SQLite's 5.5. SQLite syncs its modules at the end of the
     /// statement's transaction and so does this.
     pub(crate) fn sync_modules(&mut self) -> DbResult<()> {
+        self.sync_modules_matching(false)
+    }
+
+    /// Flushes the modules that cannot put their own buffer back, before a savepoint opens.
+    ///
+    /// A module that can (see `VirtualTable::undoes_its_own_buffer`) is left holding its buffer.
+    /// The flush used to be unconditional, and a bulk load made of multi row statements paid for
+    /// the whole of a full text index once per statement.
+    pub(crate) fn sync_modules_before_savepoint(&mut self) -> DbResult<()> {
+        self.sync_modules_matching(true)
+    }
+
+    /// Flushes the connected modules, all of them or only those that cannot undo their buffer.
+    ///
+    /// @param skip_self_undoing - whether a module that undoes its own buffer is left alone
+    fn sync_modules_matching(&mut self, skip_self_undoing: bool) -> DbResult<()> {
         let names: Vec<Vec<u8>> = self.session_state.virtual_tables.keys().cloned().collect();
         for name in names {
             let Some(mut connected) = self.session_state.virtual_tables.remove(&name) else {
                 continue;
             };
+            if skip_self_undoing && connected.table.undoes_its_own_buffer() {
+                self.session_state.virtual_tables.insert(name, connected);
+                continue;
+            }
             let outcome = {
                 let txn = self.current_txn();
                 let at = self.schema.ddl_schema;

@@ -159,6 +159,26 @@ pub fn subquery_columns(select: &BoundSelect, names: &[Vec<u8>]) -> Vec<ColumnIn
 }
 
 impl super::Binder<'_> {
+    /// Returns the expression a result column computes, without any `COLLATE` the connection has no collation for.
+    ///
+    /// **SQLite looks a collation up only when something compares with it.**
+    /// `SELECT 'a' COLLATE bogus` answers `a`, and `SELECT 'a' COLLATE bogus =
+    /// 'a'` fails with `no such collation sequence: bogus`. A result column is
+    /// not compared with anything, so the unknown name is dropped here. Every
+    /// other place a `COLLATE` is bound still refuses an unknown name.
+    ///
+    /// @param id - the result column's expression
+    pub(super) fn skip_unknown_collations(&self, id: crate::ast::ExprId) -> crate::ast::ExprId {
+        let mut current = id;
+        while let Some(crate::ast::Expr::Collate { operand, collation }) = self.ast.expr(current) {
+            if self.collation_named(self.ast.text(*collation)).is_some() {
+                break;
+            }
+            current = *operand;
+        }
+        current
+    }
+
     /// Returns the name a bare column reference was written with, looking
     /// through `COLLATE`.
     ///

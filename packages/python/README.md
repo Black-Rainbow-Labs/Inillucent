@@ -179,12 +179,19 @@ print(query("SELECT * FROM notes WHERE id > ?1", db="notes.rdb", params=[3]))
 
 | Helper | What it does |
 |---|---|
-| `run(command, db, **arguments)` | runs one `inillucent` command with `--output json` and returns the result as a `dict`. `table="notes"` becomes `--table notes`. A refusal is returned with `ok` set to `False`. It raises `RuntimeError` only when the program could not be run |
+| `run(command, db, **arguments)` | runs one `inillucent` command with `--output json` and returns the result as a `dict`. `table="notes"` becomes `--table notes`. A refusal is returned with `ok` set to `False`. It raises `RuntimeError` only when the program could not be run. The program's output is read as UTF-8 on every platform |
 | `query(sql, db, params, limit)` | runs one query and returns its rows as a list of `dict` keyed by column name. Raises `DriverError` or `Unsupported` on a refusal |
 | `binary(program)` | returns the path of one of the four programs in the wheel |
 
 Each helper call starts a process, so use the driver for anything that runs often. `query()` returns
 at most 200 rows, the default of the `query` command. Pass `limit=0` for every row.
+
+`params` reaches the program on standard input, so the number of values and the size of a value have
+no limit from the command line. `bytes`, `bytearray` and `memoryview` are bound as a BLOB. A NaN is
+bound as NULL, as the driver binds it. Infinity raises `ValueError`, because the command line has no
+spelling for it, and a list, a dict or any other type raises `TypeError`. The statement is an
+argument, so a statement longer than about 32,000 characters on Windows raises `ValueError`; open a
+`Database` and call `execute` for that.
 
 ## For an AI agent
 
@@ -213,15 +220,15 @@ reads this table and fails if a name in the first column is not declared in the 
 
 | what | one line |
 |---|---|
-| `Database(path, create=True, read_only=False, diagnostics=False)` | opens a database file. `create=True` makes the file when it is missing. A file that is not a database, has a newer format or needs a key is refused here; a damaged log is reported by the first statement, which is when the log is read. |
-| `Database.connect()` | returns a new `Connection`. Each connection is its own session, and `temp.` tables and `ATTACH` belong to one session. |
+| `Database(path, create=True, read_only=False, diagnostics=False)` | opens a database file. `path` is a `str`, `bytes` or any `os.PathLike`, and a path holding a NUL character raises `ValueError`. `create=True` makes the file when it is missing. A missing file opened with `read_only=True` raises `DriverError` with the status `NOT_FOUND`, whatever `create` says. A file that is not a database, has a newer format or needs a key is refused here; a damaged log is reported by the first statement, which is when the log is read. |
+| `Database.connect()` | returns a new `Connection`. Each connection is its own session, and `temp.` tables and `ATTACH` belong to one session. **Two connections of one `Database` share one transaction.** A write through one is undone by a `ROLLBACK` on the other. An application that needs isolated connections opens a second `Database` on the same file, which takes the file lock the way a second process does. |
 | `Database.path` | a property: the path of the database file. |
 | `Database.checkpoint()` | copies everything written so far into the database file. |
 | `Database.integrity_check()` | checks every table and index, and raises on the first problem. |
 | `Database.backup_to(path)` | copies the database to `path`, then opens and checks the copy. |
-| `Database.close()` | closes every connection, writes everything to the file and closes it. Leaving a `with` block calls it. |
-| `Connection.execute(sql, params, limit)` | runs one statement and returns `Rows`. A statement with parameters is prepared once and kept, up to 128 of them, the way Python's `sqlite3` keeps its statements. |
-| `Connection.execute_many(sql, rows)` | runs one statement once for each list of parameters, in one call to the library, and returns the rows changed in all. It opens no transaction; wrap it in one to write the rows together. Under CPython the library reads a list or tuple of rows of `None`, `int`, `bool`, `float`, `str` and `bytes` straight from the Python objects; any other batch crosses as JSON. |
+| `Database.close()` | closes every connection, writes everything to the file and closes it. Leaving a `with` block calls it. A `Statement` or `Transaction` that is still open makes the close raise `DriverError` with the status `INVALID_STATE`. The database stays open and a later `close()` works once the statement or transaction is closed. |
+| `Connection.execute(sql, params, limit)` | runs one statement and returns `Rows`. Text that holds a second statement raises `DriverError` with the status `INVALID_STATE` and runs nothing, as Python's `sqlite3` refuses it; `execute_batch` runs several. `params` is a list or tuple bound by position to `?1`, `?2`, and so on. A dict raises `TypeError`, because named parameters are not supported, and so does a `str` or `bytes`. `limit` is a count from 0 to 18446744073709551615, a negative number means every row, and a larger number raises `ValueError`. A statement with parameters is prepared once and kept, up to 128 of them, the way Python's `sqlite3` keeps its statements. A float parameter that is NaN is stored as NULL, as SQLite stores it. |
+| `Connection.execute_many(sql, rows)` | runs one statement once for each list of parameters, taken from any iterable, a generator included, in one call to the library, and returns the rows changed in all. It opens no transaction; wrap it in one to write the rows together. Under CPython the library reads a list or tuple of rows of `None`, `int`, `bool`, `float`, `str` and `bytes` straight from the Python objects; any other batch crosses as JSON. |
 | `Connection.execute_batch(sql)` | runs several statements separated by semicolons, for their effect. |
 | `Connection.prepare(sql)` | compiles a statement and returns a `Statement` you can run many times. |
 | `Connection.transaction()` | begins a transaction and returns a `Transaction`. |

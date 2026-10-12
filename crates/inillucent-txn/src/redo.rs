@@ -451,6 +451,32 @@ fn resolved_key(pool: &Pool, shape: &RedoTree, row: &[u8]) -> DbResult<Vec<Owned
     Ok(key)
 }
 
+/// Reports whether a row's key extent starts on a page a write after this record stamped.
+///
+/// @param pool - the pool the pages are read through
+/// @param shape - the tree's column directory and key width
+/// @param row - the record's row bytes
+/// @param lsn - the record's LSN
+fn key_extent_reused_after(pool: &Pool, shape: &RedoTree, row: &[u8], lsn: u64) -> DbResult<bool> {
+    let mut at = 0usize;
+    for _ in 0..shape.key_columns {
+        let rest = row.get(at..).unwrap_or(&[]);
+        if rest.is_empty() {
+            break;
+        }
+        at = at.saturating_add(Datum::tagged_span(rest)?);
+        if Datum::tag_of(rest)? != inillucent_tree::datum::tag::KEY_EXTENT {
+            continue;
+        }
+        let reference = ExtentRef::decode(rest.get(1..).unwrap_or(&[]))?;
+        let guard = pool.fetch(reference.first)?;
+        if page::lsn_of(&guard)? > lsn {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Finds where a key sits in a leaf, before the leaf is modified.
 ///
 /// The search compares a key stored out of line through the pool, so it reads
@@ -607,7 +633,24 @@ impl RowRedo for TreeRows {
         // back verbatim. A key column stored out of line is read through the
         // pool: the pages of a key extent were applied before the record that
         // names them, so the read answers.
-        let key = resolved_key(database.pool(), &shape, row)?;
+        //
+        // **Unless a later write reused the extent's pages (bug hunt 9).** A key
+        // extent is freed only when its row is deleted or replaced, and a page freed
+        // that way can be allocated again before the next checkpoint. The page then
+        // holds a newer stamp than this record, its extent records are skipped by the
+        // page LSN rule, and the key cannot be read. The row it named was removed
+        // later in this same log, so the insert is skipped: replaying it was what left
+        // a database that had freed and reused such a page unopenable, with "page is
+        // not a blob extent".
+        let key = match resolved_key(database.pool(), &shape, row) {
+            Ok(key) => key,
+            Err(error) => {
+                if key_extent_reused_after(database.pool(), &shape, row, lsn)? {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
         let key: Vec<Datum<'_>> = key.iter().map(OwnedDatum::borrow).collect();
         let spilled = holds_extent(row, shape.columns.len())?;
         let (collations, directions) = key_order(&shape);

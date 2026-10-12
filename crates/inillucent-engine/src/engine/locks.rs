@@ -954,6 +954,8 @@ impl ImportedDatabase {
         // asking `main` alone answered "nothing was written" and released every
         // file with the attachment's pages still dirty - which lost 116 of 599
         // acknowledged inserts through `ATTACH` under load.
+        self.reclaim_scratch_logs()?;
+        self.prune_dropped_handles();
         let wrote = self.wrote_anything();
         if wrote
             && self.storage.database.pool().lock_level() != inillucent_vfs::FileLock::None

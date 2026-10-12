@@ -257,6 +257,17 @@ struct ErrorContext {
     /// any clause written on a constraint - so "set if absent" gets two of the
     /// three right and this flag gets the third.
     unwind_explicit: bool,
+    /// Whether the rows written before this failure stay when the statement is
+    /// inside a transaction.
+    ///
+    /// **SQLite opens a statement journal only for a statement with a
+    /// constraint that can abort it.** `INSERT OR FAIL`, `OR IGNORE` and `OR
+    /// REPLACE` resolve every constraint themselves, so a `STRICT` datatype
+    /// failure in a later row finds no journal to roll back to, and the earlier
+    /// rows stay in the open transaction. Outside a transaction the same failure
+    /// rolls the implicit transaction back, so the engine reads this flag only
+    /// when the statement is not its own transaction.
+    kept_in_transaction: bool,
 }
 
 /// A inillucent error: a stable code plus the context a caller may safely see.
@@ -414,6 +425,29 @@ impl DbError {
             context.unwind = Some(unwind);
         }
         self
+    }
+
+    /// Records that the rows written before this failure stay inside a transaction.
+    ///
+    /// @see `ErrorContext::kept_in_transaction` for when SQLite does this
+    pub fn with_rows_kept_in_transaction(mut self) -> DbError {
+        self.context_mut().kept_in_transaction = true;
+        self
+    }
+
+    /// Returns how much of what has been written this failure undoes, given
+    /// whether the statement was its own transaction.
+    ///
+    /// @param autocommit - whether the failing statement ran outside a transaction
+    pub fn unwind_in(&self, autocommit: bool) -> Unwind {
+        let kept = self
+            .context
+            .as_ref()
+            .is_some_and(|context| context.kept_in_transaction);
+        if kept && !autocommit && self.unwind() == Unwind::Statement {
+            return Unwind::Nothing;
+        }
+        self.unwind()
     }
 
     /// Returns how much of what has been written this failure undoes.
@@ -621,6 +655,26 @@ pub fn refusal(said: impl Into<String>) -> DbError {
 pub fn statement_refusal(said: impl Into<String>) -> DbError {
     let said = said.into();
     DbError::primary(PrimaryCode::Error)
+        .with_message(said.clone())
+        .with_detail(said)
+}
+
+/// Builds the refusal for a path a confined process may not reach.
+///
+/// **`SQLITE_PERM`, because that is the code the file system layer refuses the
+/// same path with.** `ATTACH` and `VACUUM INTO` name the refusal themselves so
+/// the sentence can say which path and which root, and built it with
+/// [`refusal`], which is `SQLITE_MISUSE`. The command surfaces classify that as
+/// `syntax`, so an agent was told a statement about a file outside `--root` was
+/// a typing mistake while every other tool said `invalid_state`.
+///
+/// The sentence names the path the caller typed and the root, as the command
+/// surfaces' own refusals do.
+///
+/// @param said - the sentence, naming the path and the root
+pub fn confinement_refusal(said: impl Into<String>) -> DbError {
+    let said = said.into();
+    DbError::primary(PrimaryCode::Perm)
         .with_message(said.clone())
         .with_detail(said)
 }

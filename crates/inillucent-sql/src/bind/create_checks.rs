@@ -301,10 +301,17 @@ impl Binder<'_> {
         if_not_exists: bool,
     ) -> Result<bool, ParseError> {
         let name = String::from_utf8_lossy(written);
-        if self
+        // A vector index is stored as a virtual table of its own name, so the table that is found
+        // here is the index itself when the catalog also lists an index of that name.
+        let is_the_stores_own_index = self
             .catalog
-            .find_table(Some(database_name), folded)
-            .is_some()
+            .find_index(Some(database_name), folded)
+            .is_some();
+        if !is_the_stores_own_index
+            && self
+                .catalog
+                .find_table(Some(database_name), folded)
+                .is_some()
         {
             return Err(refused(
                 format!("there is already a table named {name}"),

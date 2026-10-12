@@ -1120,7 +1120,9 @@ pub fn scalar_arity_ok(func: ScalarFunc, count: usize) -> bool {
         ScalarFunc::Concat => count >= 1,
         ScalarFunc::ConcatWs => count >= 2,
         ScalarFunc::Version => count == 0,
-        ScalarFunc::Printf => count >= 1,
+        // `printf()` and `format()` with no arguments answer NULL in SQLite, as
+        // a NULL format does, rather than failing to parse.
+        ScalarFunc::Printf => true,
         ScalarFunc::OctetLength | ScalarFunc::RandomBlob => count == 1,
         ScalarFunc::Random
         | ScalarFunc::Changes

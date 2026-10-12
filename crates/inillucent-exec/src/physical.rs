@@ -105,7 +105,10 @@ pub use run::{
     run_any_prepared_limited, run_compound, run_prepared, run_prepared_limited, take_partial_rows,
 };
 pub use stages::prepare;
-pub use stages::{AccessKind, Pipeline, Prepared, PreparedStage, Shape, Source, VirtualScanSource};
+pub use stages::{
+    AccessKind, Pipeline, Prepared, PreparedStage, RecursiveSource, Shape, Source,
+    VirtualScanSource,
+};
 // The crate-internal names, re-exported so the seven modules reach each other
 // through the paths they used when they were one file.
 pub(crate) use catalog::WithQueue;

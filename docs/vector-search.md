@@ -258,11 +258,17 @@ CREATE INDEX passage_l2 ON passage USING inillucent_hnsw (v) WITH (metric = 'l2'
 |---|---|---|
 | `mode` | `'approximate'` walks the HNSW graph. `'exact'` compares the query with every stored vector | `'approximate'` |
 | `metric` (or `distance`) | the distance the index is built for: `'cosine'` (also written `'cos'`) or `'l2'`. Any other name is refused and the message lists these | `'cosine'` |
-| `m` | how many neighbors each node of the HNSW graph links to | 16 |
+| `m` | how many neighbors each node of the HNSW graph links to. A number below 2 is refused when the index is created | 16 |
 | `ef_construction` | how many candidates the graph build considers for each new node | 64 |
 | `ef_search` | how many candidates a graph walk keeps. A larger number raises recall and costs time. An index in exact mode does not walk the graph, so it ignores this | 64 |
 | `threads` | how many threads a build uses | every core |
 | `compact` | how many pending changes a commit collects before it writes them into the index | 1,024 |
+
+A setting written twice in one `WITH` list is refused. An index follows its table: `INSERT OR
+REPLACE`, `REPLACE` and `ON CONFLICT DO UPDATE` replace a row and its vector in the index, `DROP
+TABLE` drops the index with the table, and `ALTER TABLE ... DROP COLUMN` is refused for the column
+an index is built over. `CREATE INDEX IF NOT EXISTS` on an index that exists does nothing. A
+`LIMIT` larger than the number of rows returns every row the index holds.
 
 An `ivfflat` index takes `lists` and `probes` instead. Any other name fails with
 `no such index setting`. The defaults come from `HnswParams::default` in
@@ -478,7 +484,7 @@ models already return vectors of length 1. `l2_normalize(v)` scales any other ve
 |---|---|---|
 | the table's own name | `docs MATCH 'text'` | the keyword query, as plain words. See [The keyword query](#the-keyword-query) |
 | `vector` | `vector = ?1`, or `vector = embed('search_query: ' \|\| ?1)` | the query vector |
-| `k` | `k = 20` | how many hits the search collects. Defaults to 10 |
+| `k` | `k = 20` | how many hits the search collects. Defaults to 10. `k = 0` returns no rows. A `k` that is negative or is not a whole number is refused. The largest `k` is 1,000,000 |
 | `recall` | `recall = 0.9` | in approximate mode, widens the graph walk to reach this recall. Exact mode ignores it |
 | `question` | `question = 'plain words'` | the question in plain words. Naming it reranks the search with a cross encoder. See [Reranking a search](#reranking-a-search) |
 | `rank` | `ORDER BY rank` | the combined ranking. Ascending order is best first, as in FTS5 |
@@ -524,18 +530,20 @@ Three functions describe each hit:
 
 | Option | What it does | Default |
 |---|---|---|
-| `dims = N` | the vector width. Without it the table is keyword only and refuses a vector | none |
+| `dims = N` | the vector width, from 1. Without it the table is keyword only and refuses a vector. `dims = 0` is refused | none |
 | `mode` | `'exact'` compares every vector. `'approximate'` walks the HNSW graph | `'exact'` |
 | `vector_weight` | a fixed weight from 0 to 1 for the vector list in a search with both parts. See [How the two rankings are combined](#how-the-two-rankings-are-combined) | chosen for each query |
 | `fusion` | how the keyword list and the vector list are combined: `'adaptive'`, `'rrf'` or `'weighted'`. See [How the two rankings are combined](#how-the-two-rankings-are-combined) | `'adaptive'` |
 | `rerank_depth` | how many rows of the combined list the reranker scores, from 1 to 1,000. See [Reranking a search](#reranking-a-search) | 60 |
 | `metric` (or `distance`) | `'cosine'` or `'l2'`. Any other value is refused | `'cosine'` |
 | `m`, `ef_construction`, `ef_search` | the HNSW graph settings, as in [Index settings](#index-settings) | 16, 64, 64 |
-| `tokenize` | the tokenizer. `porter` is the only one | `porter` |
+| `tokenize` | the tokenizer. `porter` is the only one. Any other name fails with `no such tokenizer` | `porter` |
 | `compact` | how many pending changes a commit collects before it writes them into the index | 1,024 |
 | `segment_merge` | how many segments of one size are merged into one larger segment | 4 |
 | `merge_budget` | how many rows one commit may merge before it leaves the rest for a later commit | 8,192 |
 | `threads` | how many threads a build uses | every core |
+
+An option written twice in one declaration is refused.
 
 The table records its options in the `<table>_config` table, so you can read back what a table was
 declared with: `SELECT k, v FROM docs_config`.
@@ -792,7 +800,7 @@ INSERT INTO docs(docs) VALUES('compact');
 |---|---|
 | `compact` | builds one clean index from every row in one pass, and drops deleted rows from the graph |
 | `rebuild` | rebuilds the whole index from the stored rows and discards every older version. Use it when an index segment cannot be read |
-| `drop-old-generations` | frees the space held by index versions no reader needs. Before version 2.0.7 it also deleted parts of segments a merge had built over several commits, and the table could no longer be read; `rebuild` repairs such a table |
+| `drop-old-generations` | frees the space held by index versions nothing names. A merge of segments frees the versions it replaces when it finishes, so an index that takes many updates does not keep every segment it wrote. `compact` and `rebuild` keep the versions they replace until this command runs. Before version 2.0.7 it also deleted parts of segments a merge had built over several commits, and the table could no longer be read; `rebuild` repairs such a table |
 | `integrity-check` | checks the index against the rows and fails with the problem it found |
 
 An `inillucent_hnsw` index takes the same commands through its own name:
@@ -860,6 +868,10 @@ id  body         v                                             distance
 | `--k` | how many results. Defaults to 10 | how many results. Defaults to 10 |
 | `--measure` | | `cos` (the default), `l2` or `dot` |
 | `--output json` | the result as JSON | the result as JSON |
+
+With `--measure cos` or `l2` the `distance` column holds a distance and the smallest comes first.
+With `--measure dot` the column holds the inner product, which is largest for the nearest row, so
+the largest comes first.
 
 The MCP server has the same two commands as the tools `inillucent_search` and
 `inillucent_vector_search`.

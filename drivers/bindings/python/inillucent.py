@@ -36,6 +36,8 @@ import ctypes
 import json
 import os
 import sys
+import weakref
+from collections.abc import Mapping
 from ctypes import (
     POINTER,
     c_char_p,
@@ -639,6 +641,85 @@ def _refuse_type(value: Any) -> None:
     )
 
 
+def _sql_bytes(sql: Any) -> bytes:
+    """Return a statement's text as the UTF-8 bytes the library takes.
+
+    **The text is checked before it reaches a C string.** A ``bytes`` or ``None``
+    used to fail with ``AttributeError`` from ``.encode``, and a NUL character
+    ended the statement early at the C boundary, so the text after it was never
+    run. Python's ``sqlite3`` raises ``TypeError`` and ``ValueError`` for these.
+
+    :param sql: the statement a caller passed
+    """
+    if not isinstance(sql, str):
+        raise TypeError(f"sql must be a str, not {type(sql).__name__}")
+    raw = sql.encode("utf-8")
+    if b"\x00" in raw:
+        raise ValueError("the SQL holds a NUL character, which would end the statement early")
+    return raw
+
+
+def _path_text(path: Any) -> str:
+    """Return a database path as text, accepting what ``open`` accepts.
+
+    ``str``, ``bytes`` and anything with ``__fspath__`` are paths. A NUL
+    character is refused, because the library reads the path as a C string and
+    would open the file named by the text before it.
+
+    :param path: the path a caller passed
+    """
+    try:
+        text = os.fspath(path)
+    except TypeError:
+        raise TypeError(
+            f"path must be a str or an os.PathLike, not {type(path).__name__}"
+        ) from None
+    if isinstance(text, bytes):
+        text = os.fsdecode(text)
+    if "\x00" in text:
+        raise ValueError("the path holds a NUL character")
+    return text
+
+
+def _row_limit(limit: Any) -> int:
+    """Return a ``limit`` as the unsigned 64 bit count the library takes.
+
+    **A limit past 2**64 - 1 used to wrap**: ``2**64`` arrived as ``0`` and
+    handed back no rows with a success status. A negative limit means every row,
+    as it does in SQLite, and anything that is not an integer is refused.
+
+    :param limit: the limit a caller passed, which is not None
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise TypeError(f"limit must be an int or None, not {type(limit).__name__}")
+    if limit < 0:
+        return _ALL_ROWS
+    if limit > _ALL_ROWS:
+        raise ValueError(f"limit must be at most {_ALL_ROWS}; pass None for every row")
+    return limit
+
+
+def _positional(params: Any) -> Any:
+    """Return parameters that are a sequence of values, or raise.
+
+    **A dict was bound by its keys and a string by its characters.** Neither is
+    what the caller meant, and the C library binds by position only, so a
+    mapping is refused with a message that says so rather than guessed at.
+
+    :param params: the values a caller passed for ``?1``, ``?2``, ...
+    """
+    if isinstance(params, Mapping):
+        raise TypeError(
+            "parameters are bound by position, so pass a list or tuple for ?1, ?2, ...; "
+            "named parameters (:name, @name, $name) are not supported"
+        )
+    if isinstance(params, (str, bytes, bytearray, memoryview)):
+        raise TypeError(
+            f"parameters must be a sequence of values, not a {type(params).__name__}"
+        )
+    return params
+
+
 def _raise(error: c_void_p) -> None:
     """Turn a C error into an exception and free it.
 
@@ -894,7 +975,7 @@ class Transaction:
         changed = c_uint64()
         error = c_void_p()
         status = _LIB.inillucent_txn_execute(
-            self._handle, sql.encode("utf-8"), ctypes.byref(changed), ctypes.byref(error)
+            self._handle, _sql_bytes(sql), ctypes.byref(changed), ctypes.byref(error)
         )
         _check(status, error)
         self.affected.append(changed.value)
@@ -961,6 +1042,8 @@ class Connection:
         recompile is the cost of being wrong, and tracking which statement was
         used last would be a cost on every call.
         """
+        if not isinstance(sql, str):
+            raise TypeError(f"sql must be a str, not {type(sql).__name__}")
         statement = self._statements.get(sql)
         if statement is None:
             if len(self._statements) >= self.STATEMENT_CACHE:
@@ -990,9 +1073,14 @@ class Connection:
 
         ``limit`` caps the rows handed back, not the rows produced:
         :attr:`Rows.total` is exact either way, because the engine materialises
-        and the count was taken rather than estimated.
+        and the count was taken rather than estimated. A limit above 2**64 - 1
+        raises ``ValueError``, and a negative one means every row.
+
+        The text is one statement. A second statement after the first raises
+        :class:`DriverError` with the status ``INVALID_STATE``, as Python's
+        ``sqlite3`` refuses it; :meth:`execute_batch` runs several.
         """
-        capped = _ALL_ROWS if limit is None else limit
+        capped = _ALL_ROWS if limit is None else _row_limit(limit)
         if not params:
             if _CONN_EXECUTE is not None and self._handle:
                 got = _CONN_EXECUTE(self._handle, sql, capped)
@@ -1001,7 +1089,7 @@ class Connection:
             rows = c_void_p()
             error = c_void_p()
             status = _LIB.inillucent_execute(
-                self._handle, sql.encode("utf-8"), capped, ctypes.byref(rows), ctypes.byref(error)
+                self._handle, _sql_bytes(sql), capped, ctypes.byref(rows), ctypes.byref(error)
             )
             _check(status, error)
             return Rows(rows)
@@ -1010,7 +1098,7 @@ class Connection:
     def execute_batch(self, sql: str) -> None:
         """Run several statements separated by semicolons, for their effect."""
         error = c_void_p()
-        status = _LIB.inillucent_execute_batch(self._handle, sql.encode("utf-8"), ctypes.byref(error))
+        status = _LIB.inillucent_execute_batch(self._handle, _sql_bytes(sql), ctypes.byref(error))
         _check(status, error)
 
     def prepare(self, sql: str) -> "Statement":
@@ -1018,7 +1106,7 @@ class Connection:
         handle = c_void_p()
         error = c_void_p()
         status = _LIB.inillucent_prepare(
-            self._handle, sql.encode("utf-8"), ctypes.byref(handle), ctypes.byref(error)
+            self._handle, _sql_bytes(sql), ctypes.byref(handle), ctypes.byref(error)
         )
         _check(status, error)
         return Statement(self, handle)
@@ -1087,11 +1175,17 @@ class Statement:
         self._handle = handle
 
     def execute(self, params: Sequence[Any] = (), limit: Optional[int] = None) -> Rows:
-        """Bind these values and run it."""
+        """Bind these values and run it.
+
+        ``params`` is a sequence of values bound by position. A mapping or a
+        string raises ``TypeError``.
+        """
+        capped = _ALL_ROWS if limit is None else _row_limit(limit)
         if _STMT_EXECUTE is not None and self._handle:
-            got = _STMT_EXECUTE(self._handle, params, _ALL_ROWS if limit is None else limit)
+            got = _STMT_EXECUTE(self._handle, params, capped)
             if got is not None:
                 return Rows._answer(got)
+        params = _positional(params)
         if _JSON:
             wire = _to_wire(params)
             error = c_void_p()
@@ -1100,7 +1194,6 @@ class Statement:
             _LIB.inillucent_clear_bindings(self._handle)
             for nth, value in enumerate(params, start=1):
                 self._bind(nth, value)
-        capped = (1 << 64) - 1 if limit is None else limit
         rows = c_void_p()
         error = c_void_p()
         status = _LIB.inillucent_stmt_execute(
@@ -1116,7 +1209,12 @@ class Statement:
         One foreign call for every execution when the library has
         ``inillucent_stmt_execute_many`` (ABI 1.3.0), where binding and running
         each one was a call a value and two more a row. No transaction is opened.
+
+        ``rows`` is any iterable of sequences, a generator included. Each row is
+        a sequence of values: a string or a mapping as a row raises ``TypeError``.
         """
+        if not isinstance(rows, (list, tuple)):
+            rows = list(rows)
         if not _JSON:
             changed = 0
             for row in rows:
@@ -1134,6 +1232,8 @@ class Statement:
                 )
                 _check(status, error)
                 return changed.value
+        for row in rows:
+            _positional(row)
         wire = _rows_to_wire(rows)
         changed = c_uint64()
         error = c_void_p()
@@ -1199,13 +1299,14 @@ class Database:
 
     def __init__(
         self,
-        path: str,
+        path: "str | os.PathLike[str]",
         create: bool = True,
         read_only: bool = False,
         diagnostics: bool = False,
         key: "str | None" = None,
         busy_timeout_ms: "int | None" = None,
     ) -> None:
+        path = _path_text(path)
         flags = 0
         if create:
             flags |= OPEN_CREATE
@@ -1247,7 +1348,9 @@ class Database:
             )
         _check(status, error)
         self._handle = handle
-        self._connections: "list[Connection]" = []
+        # Weak, so a connection nobody holds is collected and closed by its own
+        # finaliser. A list kept every connection ever made, closed or not.
+        self._connections: "weakref.WeakSet[Connection]" = weakref.WeakSet()
 
     def connect(self) -> Connection:
         """Open a connection."""
@@ -1256,7 +1359,7 @@ class Database:
         status = _LIB.inillucent_connect(self._handle, ctypes.byref(handle), ctypes.byref(error))
         _check(status, error)
         connection = Connection(self, handle)
-        self._connections.append(connection)
+        self._connections.add(connection)
         return connection
 
     @property
@@ -1273,11 +1376,13 @@ class Database:
         error = c_void_p()
         _check(_LIB.inillucent_integrity_check(self._handle, ctypes.byref(error)), error)
 
-    def backup_to(self, path: str) -> None:
+    def backup_to(self, path: "str | os.PathLike[str]") -> None:
         """Copy the database, opening and checking the copy before returning."""
         error = c_void_p()
         _check(
-            _LIB.inillucent_backup_to(self._handle, path.encode("utf-8"), ctypes.byref(error)),
+            _LIB.inillucent_backup_to(
+                self._handle, _path_text(path).encode("utf-8"), ctypes.byref(error)
+            ),
             error,
         )
 
@@ -1287,15 +1392,24 @@ class Database:
         Every connection is closed first, because the C library refuses to close
         a database with connections still open - deliberately, since freeing it
         then would leave them pointing at freed memory.
+
+        **A refused close keeps the handle.** A live :class:`Statement` or
+        :class:`Transaction` holds its connection open, and the library answers
+        ``INVALID_STATE`` without freeing the database. The handle used to be
+        dropped anyway, so the database stayed open for the life of the process
+        with nothing left that could close it. Now the error is raised, the
+        handle stays, and a ``close`` after the statement or transaction is
+        released succeeds. Any other status means the library freed the handle.
         """
         if not self._handle:
             return
-        for connection in self._connections:
+        for connection in list(self._connections):
             connection.close()
-        self._connections.clear()
         error = c_void_p()
         status = _LIB.inillucent_close(self._handle, ctypes.byref(error))
-        self._handle = None
+        if status != INVALID_STATE:
+            self._handle = None
+            self._connections.clear()
         _check(status, error)
 
     def __enter__(self) -> "Database":

@@ -40,15 +40,27 @@ pub fn value_to_json(value: &Value<'static>) -> Json {
         Value::Null => Json::Null,
         Value::Integer(number) => Json::Int(*number),
         Value::Real(number) => Json::Real(*number),
-        Value::Text(text) => json::text(String::from_utf8_lossy(text.raw()).into_owned()),
-        Value::Blob(bytes) => {
-            let mut hex = String::with_capacity(bytes.raw().len().saturating_mul(2));
-            for byte in bytes.raw() {
-                hex.push_str(&format!("{byte:02x}"));
-            }
-            json::object(vec![("blob", json::text(hex))])
-        }
+        // **Text that is not UTF-8 leaves as a blob**, the way the driver and the
+        // addon hand it over. A lossy conversion wrote a replacement character
+        // that was never stored, so Node's command line and server routes
+        // returned a string where the addon route returned bytes.
+        Value::Text(text) => match std::str::from_utf8(text.raw()) {
+            Ok(said) => json::text(said.to_owned()),
+            Err(_) => blob_json(text.raw()),
+        },
+        Value::Blob(bytes) => blob_json(bytes.raw()),
     }
+}
+
+/// Writes bytes as the `{"blob": "<hex>"}` envelope a result carries.
+///
+/// @param bytes - the bytes
+fn blob_json(bytes: &[u8]) -> Json {
+    let mut hex = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    json::object(vec![("blob", json::text(hex))])
 }
 
 /// Turns one JSON value into the SQL literal that reproduces it.
@@ -206,18 +218,61 @@ fn produce(
             .unwrap_or(Value::Null);
         bound.push(inillucent_tree::datum::OwnedDatum::from(&held));
     }
+    let counters = write_counters(context);
     let started = std::time::Instant::now();
     let collected = context.shell().collect_bound(sql, &bound);
     let elapsed = started.elapsed().as_secs_f64() * 1000.0;
     let (names, rows) = collected.map_err(|failure| Failed::from_shell(&failure))?;
-    Ok(rows_to_outcome(
-        context, command, names, rows, limit, elapsed,
-    ))
+    let mut produced = rows_to_outcome(context, command, names, rows, limit, elapsed);
+    let (changes, rowid) = write_counters(context);
+    produced.changes = (changes - counters.0).max(0);
+    produced.last_insert_rowid = rowid_this_statement_assigned(sql, &produced, counters.1, rowid);
+    Ok(produced)
+}
+
+/// Returns the connection's running count of changed rows and its last rowid.
+///
+/// @param context - the open database
+fn write_counters(context: &mut Context) -> (i64, i64) {
+    let connection = context.shell().connection();
+    (
+        connection.total_changes().unwrap_or_default(),
+        connection.last_insert_rowid().unwrap_or_default(),
+    )
+}
+
+/// Returns the rowid a statement assigned, or zero when it assigned none.
+///
+/// **The connection remembers the last insert for as long as it is open**, and
+/// the MCP server keeps one connection for the whole session, so a `SELECT` after
+/// an `INSERT` reported the insert's rowid as its own. A fresh process
+/// reports zero for a `SELECT`, and so does this: a statement that changed no
+/// rows assigned nothing, and one that did reports the rowid only when it moved
+/// or when it is an `INSERT` or `REPLACE` (which can assign the rowid the last
+/// one did, after a delete).
+///
+/// @param sql - the statement
+/// @param produced - what it produced, whose `changes` was set from the counter
+/// @param before - the connection's last rowid before the statement ran
+/// @param after - the connection's last rowid after it ran
+fn rowid_this_statement_assigned(sql: &str, produced: &Outcome, before: i64, after: i64) -> i64 {
+    if produced.changes == 0 {
+        return 0;
+    }
+    let head = sql.trim_start().to_ascii_uppercase();
+    let inserts = head.starts_with("INSERT") || head.starts_with("REPLACE");
+    match after != before || inserts {
+        true => after,
+        false => 0,
+    }
 }
 
 /// Turns collected rows into an outcome, cut to the caller's limit.
 ///
-/// @param context - for the null placeholder and the change counters
+/// The change counters are left at zero: `produce` knows what the statement
+/// changed and sets them, and a listing changes nothing.
+///
+/// @param context - for the null placeholder
 /// @param command - the verb
 /// @param names - the column names
 /// @param rows - every row the statement produced
@@ -239,10 +294,6 @@ fn rows_to_outcome(
         .map(|row| row.iter().map(value_to_json).collect())
         .collect();
     let columns = columns_from(&names, &cells);
-    let connection = context.shell().connection();
-    let changes = connection.total_changes().unwrap_or_default();
-    let rowid = connection.last_insert_rowid().unwrap_or_default();
-    let _ = connection;
     let mut text = table(&columns, &cells, &context.null);
     if kept < total {
         text.push_str(&format!("\n({kept} of {total} rows)"));
@@ -253,8 +304,8 @@ fn rows_to_outcome(
         rows: cells,
         total,
         more: kept < total,
-        changes,
-        last_insert_rowid: rowid,
+        changes: 0,
+        last_insert_rowid: 0,
         elapsed_ms: elapsed,
         text,
         extra: Vec::new(),
@@ -341,12 +392,16 @@ fn bound_values(context: &Context, arguments: &Arguments) -> Result<Vec<Json>, F
         // §4.1.5), and over MCP reading it would make the server consume its
         // own JSON-RPC stream. `resolve_source` already refuses `-` for the
         // same reason and in the same words.
-        "-" if context.confined() => {
+        // **Also refused by a server that has no `--root`.** The MCP server turns
+        // safe mode on whether or not a root was given, and its standard input is
+        // the protocol: reading it here swallowed the next request as the
+        // parameters, or blocked the server until the client closed the pipe.
+        "-" if context.confined() || context.shell.safe => {
             return Err(Failed::said(
                 Status::InvalidState,
-                "this surface is confined to a directory with --root, and '-' reads the \
-                 parameters from standard input, which such a surface does not have to itself. \
-                 Write them with 'params', or name a file inside the root.",
+                "this surface does not read standard input (it is served over MCP or \
+                 confined to a directory with --root, and standard input is not the caller's \
+                 to give). Write the values with 'params', or name a file inside the root.",
             ))
         }
         "-" => {
@@ -405,6 +460,19 @@ const MAX_PARAMS_FILE_BYTES: usize = 1024 * 1024;
 /// `query`: runs a statement that returns rows.
 pub fn query(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
     let sql = arguments.required_text("sql")?.to_string();
+    // **The read verb refuses a statement that writes.** `query` ran INSERT,
+    // DELETE and DDL like `exec` does, so a client that lets the model call
+    // `inillucent_query` without asking and asks first for `inillucent_exec` was
+    // bypassed by choosing the other tool. The class is the parser's, the same
+    // one `--readonly` uses.
+    context.refuse_if_it_writes(&sql)?;
+    if !inillucent_driver::readonly::admits(&sql) {
+        return Err(Failed::said(
+            Status::ReadOnly,
+            "query only reads, and that statement changes something or controls a \
+             transaction. Run it with exec (inillucent_exec), or with batch for several.",
+        ));
+    }
     let params = bound_values(context, arguments)?;
     let limit = limit_of(context, arguments)?;
     produce(context, "query", &sql, &params, limit)
@@ -622,14 +690,23 @@ pub fn create(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
         ));
     }
     let named = confined.to_string_lossy().into_owned();
-    context.use_database(&named)?;
+    // **A connection of its own, closed when this returns.** `create` used to
+    // point the session at the file it made, so an MCP client that created a
+    // second database found every later call running there and its open
+    // transaction on the first one rolled back.
+    let mut made = crate::shell::Shell::open_reporting(&named, false).map_err(|error| {
+        let said = Failed::from_engine(&error);
+        Failed::said(
+            said.status,
+            format!("could not open \"{named}\": {}", said.message),
+        )
+    })?;
     // A database file with no objects in it is not written until something is,
     // so the file a caller asked for has to be brought into existence by an
     // actual write. `user_version` is the smallest one that changes no schema.
-    context
-        .shell()
-        .execute("PRAGMA user_version = 0")
+    made.execute("PRAGMA user_version = 0")
         .map_err(|message| Failed::said(Status::Io, message))?;
+    drop(made);
     Ok(Outcome::said("create", format!("created {named}")).with("path", json::text(&named)))
 }
 
@@ -932,12 +1009,28 @@ pub fn dump(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fai
     dot(context, "dump", &line)
 }
 
+/// Writes a word the way a dot command line reads it back as that word.
+///
+/// Between single quotes when it holds none, because nothing inside them is an
+/// escape. Between double quotes a backslash starts an escape, so a Windows path
+/// written there lost its separators. A word with a single quote in it goes between
+/// double quotes with its backslashes and quotes escaped.
+///
+/// @param text - the word
+fn dot_word(text: &str) -> String {
+    if !text.contains('\'') {
+        return format!("'{text}'");
+    }
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// `import`: reads a delimited file into a table.
 pub fn import(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Failed> {
     let file = arguments.required_text("file")?.to_string();
     let table_name = arguments.required_text("table")?.to_string();
     let confined = context.confine(&file)?;
     ensure_readable_file(&file, &confined)?;
+    ensure_utf8_file(&confined)?;
     let mut line = String::from(".import");
     match arguments.text("format").unwrap_or("csv") {
         "csv" => line.push_str(" --csv"),
@@ -953,8 +1046,9 @@ pub fn import(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
         line.push_str(&format!(" --skip {skip}"));
     }
     line.push_str(&format!(
-        " \"{}\" \"{table_name}\"",
-        confined.to_string_lossy()
+        " {} {}",
+        dot_word(&confined.to_string_lossy()),
+        dot_word(&table_name)
     ));
     // Counted two ways, because neither alone is right. `total_changes` is what
     // an ordinary table's insert moves and it is exact. A **virtual** table's
@@ -1018,6 +1112,31 @@ fn ensure_readable_file(named: &str, path: &std::path::Path) -> Result<(), Faile
     }
 }
 
+/// Refuses a file that is not UTF-8, naming the byte that does not decode.
+///
+/// **The command reads UTF-8 text, and the shell's `.import` does not.** `.import` keeps the
+/// bytes of a cp1252 file, as `sqlite3` does, because a shell script expects that. The
+/// `import` command is what a program calls and parses the answer of, and storing text that does
+/// not decode would hand that program back values its JSON cannot carry. So the command checks the
+/// file first and says which byte stopped the decode.
+///
+/// @param path - the confined path of the file
+fn ensure_utf8_file(path: &std::path::Path) -> Result<(), Failed> {
+    let bytes = std::fs::read(path).map_err(|error| Failed::said(Status::Io, error.to_string()))?;
+    let text = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    let Err(error) = std::str::from_utf8(text) else {
+        return Ok(());
+    };
+    let at = error.valid_up_to();
+    let byte = text
+        .get(at)
+        .map(|held| format!("0x{held:02X}"))
+        .unwrap_or_else(|| "the end of the file".to_string());
+    Err(Failed::misuse(format!(
+        "it is not valid UTF-8; byte {at} is {byte}, which does not begin a character. This reads UTF-8 text only; convert the file first, with `iconv -f cp1252 -t utf-8` or the encoding it was written in."
+    )))
+}
+
 /// Returns how many rows a table holds, or zero when it holds none or is absent.
 ///
 /// @param context - the open database
@@ -1078,7 +1197,7 @@ pub fn export(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
         let named = path.to_string_lossy().into_owned();
         context
             .shell()
-            .redirect(Some(&named), true)
+            .redirect(Some(&named), false)
             .map_err(|message| {
                 Failed::said(Status::Io, format!("cannot open \"{named}\": {message}"))
             })?;
@@ -1088,7 +1207,7 @@ pub fn export(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
     // table `people` could not be loaded back without editing every line. A
     // query has no one table, and keeps the placeholder, as in `sqlite3`.
     let mode = match (mode.as_str(), arguments.text("table")) {
-        ("insert", Some(table)) => format!("insert \"{}\"", table.replace('"', "\"\"")),
+        ("insert", Some(table)) => format!("insert {}", dot_word(table)),
         _ => mode,
     };
     let script = format!(".mode {mode}\n.headers on\n{sql};");
@@ -1263,7 +1382,7 @@ pub fn restore(context: &mut Context, arguments: &Arguments) -> Result<Outcome, 
     dot(
         context,
         "restore",
-        &format!(".restore \"{}\"", confined.to_string_lossy()),
+        &format!(".restore {}", dot_word(&confined.to_string_lossy())),
     )
 }
 
@@ -1435,6 +1554,12 @@ pub fn vector_search(context: &mut Context, arguments: &Arguments) -> Result<Out
                 "every element of 'vector' has to be a number.",
             ));
         };
+        if !(number as f32).is_finite() {
+            return Err(Failed::misuse(format!(
+                "every element of 'vector' has to be a finite number, and {number} is not \
+                 (a 32 bit float holds at most about 3.4e38)."
+            )));
+        }
         for byte in (number as f32).to_bits().to_le_bytes() {
             blob.push_str(&format!("{byte:02x}"));
         }
@@ -1453,13 +1578,31 @@ pub fn vector_search(context: &mut Context, arguments: &Arguments) -> Result<Out
         }
     };
     let shape = searched_table_shape(context, &name);
+    // **Said here, because the engine's own answer is "SQL logic error".** A
+    // vector of the wrong width reached the distance function and failed with
+    // no sentence about which width was expected.
+    let declared = shape
+        .dimensions
+        .iter()
+        .find(|(held, _)| *held == column.to_ascii_lowercase())
+        .map(|(_, width)| *width);
+    if let Some(width) = declared.filter(|width| *width != numbers.len()) {
+        return Err(Failed::misuse(format!(
+            "column \"{column}\" of \"{name}\" is VECTOR({width}): expected dimension {width}, \
+             got {}.",
+            numbers.len()
+        )));
+    }
     // **The rowid only when the table has no key of its own.** `SELECT rowid, *`
     // on a table with an `INTEGER PRIMARY KEY` printed that key twice, because
     // the engine names the rowid after the key and `*` includes it again.
     let rowid = if shape.integer_key { "" } else { "rowid, " };
+    // The inner product grows as vectors get closer, where the two distances shrink, so the
+    // nearest rows for `dot` are the ones with the largest value and come first.
+    let direction = if measure == "dot" { " DESC" } else { "" };
     let sql = format!(
         "SELECT {rowid}*, {function}({1}, {blob}) AS distance FROM {0} \
-         WHERE {1} IS NOT NULL ORDER BY {function}({1}, {blob}) LIMIT {k}",
+         WHERE {1} IS NOT NULL ORDER BY {function}({1}, {blob}){direction} LIMIT {k}",
         quoted(&name),
         quoted(&column)
     );
@@ -1489,6 +1632,8 @@ struct SearchedTable {
     integer_key: bool,
     /// The positions, among the table's own columns, of every `VECTOR` column.
     vectors: Vec<usize>,
+    /// Each `VECTOR(N)` column's lowercase name and its declared N.
+    dimensions: Vec<(String, usize)>,
 }
 
 /// Reads the table's columns to decide how `vector-search` lays out a row.
@@ -1521,9 +1666,19 @@ fn searched_table_shape(context: &mut Context, name: &str) -> SearchedTable {
         .filter(|(_, row)| text_of(row.get(2)).starts_with("VECTOR"))
         .map(|(nth, _)| nth)
         .collect();
+    let dimensions = info
+        .iter()
+        .filter_map(|row| {
+            let declared = text_of(row.get(2));
+            let inside = declared.strip_prefix("VECTOR(")?.split(')').next()?;
+            let width = inside.trim().parse::<usize>().ok()?;
+            Some((text_of(row.get(1)).to_ascii_lowercase(), width))
+        })
+        .collect();
     SearchedTable {
         integer_key,
         vectors,
+        dimensions,
     }
 }
 

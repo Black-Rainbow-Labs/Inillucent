@@ -916,6 +916,44 @@ impl ImportedDatabase {
             .and_then(|held| held.handles.get(&local).copied())
     }
 
+    /// Returns how many tree handles the running session's temporary database remembers and how
+    /// many bytes of log it has gathered since its log was last folded.
+    ///
+    /// **Both must stay flat in a loop of `CREATE TEMP TABLE` and `DROP TABLE`.** They were the
+    /// two things that grew by one table's worth every cycle. Zero for a connection that has
+    /// made no temporary object.
+    pub fn temp_bookkeeping(&self) -> (usize, u64) {
+        self.session_state.schema_at(TEMP).map_or((0, 0), |held| {
+            (held.handles.len(), held.wal.since_checkpoint())
+        })
+    }
+
+    /// Forgets the handles of trees that were dropped, in the files that dropped one.
+    ///
+    /// **Why the map is pruned and not left to grow.** `allocate_in` records every tree a
+    /// temporary or attached file makes in that file's `handles` map, and nothing took an entry
+    /// out when the tree was dropped. A loop of `CREATE TEMP TABLE` and `DROP TABLE` therefore
+    /// grew the map by one entry a cycle, and `local_of` searches it linearly for every catalog
+    /// row it writes, so the loop slowed down as it ran: 200,000 cycles took 45 s where 50,000
+    /// took 2.6 s.
+    ///
+    /// **Only at a statement boundary.** A rollback that restores a dropped table, and the undo
+    /// records of rows written to it before it was dropped, still look the handle up. An entry is
+    /// removed only when no tree is registered under its handle, so a table that came back by
+    /// rollback keeps its entry.
+    pub(crate) fn prune_dropped_handles(&mut self) {
+        let stale = self.writing.take_handles_stale();
+        for at in schemas_in(stale) {
+            if at == MAIN {
+                continue;
+            }
+            let trees = &self.schema.trees;
+            if let Some(held) = self.session_state.schema_at_mut(at) {
+                held.handles.retain(|_, handle| trees.contains_key(handle));
+            }
+        }
+    }
+
     /// Returns the file-local identifier a handle's tree is known by in its own
     /// file.
     ///
@@ -1018,7 +1056,7 @@ impl TreeCatalog for ImportedDatabase {
         if !self.rows_of_module(table, path, params, needed, supplied, &mut sink)? {
             return Ok(None);
         }
-        let rows = collected.borrow().clone();
+        let rows = std::mem::take(&mut *collected.borrow_mut());
         Ok(Some(rows))
     }
 

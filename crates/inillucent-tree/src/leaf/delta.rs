@@ -672,13 +672,26 @@ impl<'p> LeafRef<'p> {
         let begin = match self.delta_search(probe)? {
             Ok(at) | Err(at) => at,
         };
+        // **The run is walked, and bisected only past a few entries.** A probe into an index
+        // usually matches one to three delta entries, and the bisection over the rest of the
+        // area decoded a key per halving (eleven on a full leaf) to find that out. The same
+        // rule `equal_run` follows for the sorted region.
+        const RUN_SCAN: usize = 8;
         let mut low = begin;
-        let mut high = self.delta_count;
-        while low < high {
-            let middle = low.saturating_add(high.saturating_sub(low) / 2);
-            match self.compare_delta_key(middle, probe)? {
-                std::cmp::Ordering::Greater => high = middle,
-                _ => low = middle.saturating_add(1),
+        while low < self.delta_count
+            && low.saturating_sub(begin) < RUN_SCAN
+            && self.compare_delta_key(low, probe)? == std::cmp::Ordering::Equal
+        {
+            low = low.saturating_add(1);
+        }
+        if low.saturating_sub(begin) >= RUN_SCAN {
+            let mut high = self.delta_count;
+            while low < high {
+                let middle = low.saturating_add(high.saturating_sub(low) / 2);
+                match self.compare_delta_key(middle, probe)? {
+                    std::cmp::Ordering::Greater => high = middle,
+                    _ => low = middle.saturating_add(1),
+                }
             }
         }
         Ok((begin..low).collect())

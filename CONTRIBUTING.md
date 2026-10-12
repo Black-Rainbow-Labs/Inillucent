@@ -67,14 +67,14 @@ builds the oracle and the fixtures first, then runs:
 
 ## What runs after you push
 
-Nothing runs on a push. CI runs only on the public mirror, Black-Rainbow-Labs/Inillucent, once a
-night and when started by hand, so the gate above is the check a change gets before it merges.
+Nothing runs on a push. CI runs in Black-Rainbow-Labs/Inillucent once a night and when started by
+hand, so the gate above is the check a change gets before it merges.
 `.github/workflows/tests.yml` runs the merge cadence, on Windows and on Linux, split into four jobs
-on Windows and three on Linux with `inillucent-testrun --shard`. A release starts it on the mirror
+on Windows and three on Linux with `inillucent-testrun --shard`. A release starts it on `main`
 and is not finished until it passes; `pwsh packaging/ci-status.ps1` is that check on its own.
 
 The nightly cadence, which a change never runs, runs on two schedules of its own.
-`.github/workflows/nightly.yml` runs it once a day on Linux, on the mirror, as four jobs that each take a quarter
+`.github/workflows/nightly.yml` runs it once a day on Linux, as four jobs that each take a quarter
 of the targets with `inillucent-testrun --shard`, and uploads each summary as a workflow artifact.
 `packaging/nightly.ps1` runs it a second time, once a night on the maintainer's Windows machine, and
 also builds that night's release and runs the performance gates.

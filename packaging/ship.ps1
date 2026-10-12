@@ -19,9 +19,9 @@
         3. version     write the new version into every file that carries it, in one step, and
                        refuse to continue if a seventh file is found holding the old one.
         4. build       compile, sign, package, notarise. Local; nothing has left the machine.
-        5. publish     tag, push, GitHub, the mirror, the site, the registries, and last the
-                       `ci` route, which starts the tests workflow on the public mirror's main,
-                       now the release, and fails the release when it does not pass.
+        5. publish     tag, push, GitHub, the site, the registries, and last the `ci` route,
+                       which starts the tests workflow on main, now the release, and fails the
+                       release when it does not pass.
         6. report      route by route: published, skipped or failed, and why.
 
     Preflight is first and separate because a tag is the one step that cannot be taken back quietly.
@@ -49,10 +49,9 @@
     From 2026-09-24 `.github/workflows/tests.yml` was not valid YAML, so every run on both
     repositories failed with no job, and every release from 1.0.30 to 2.0.4 was cut over those red
     runs. The nightly cannot see that: it runs on this machine, on Windows, without clippy and
-    without the workflow file. CI now runs only on the public mirror, at night and by hand, because
-    the development repository is private and its Actions spending stopped every job there on
-    2026-10-02. So the `ci` route starts the tests workflow on the mirror once the `mirror` route has
-    pushed the release, waits for it, and fails the release unless it passes.
+    without the workflow file. CI runs at night and by hand, not on a push. So the `ci` route starts
+    the tests workflow on main once the `tag` route has pushed the release, waits for it, and fails
+    the release unless it passes.
     packaging/ci-evidence.ps1 has the rules.
 
     `-Only` selects routes, and the tests are not a route, so `-Only site` still runs them. The one
@@ -634,26 +633,12 @@ function Get-Routes {
             Needs = { $null }
             Run   = { Publish-Tag -Version $Version }
         },
-        # **The mirror goes first, and the order is load bearing (task-1995).** The GitHub
-        # release is created on the public repository, and `gh release create` against a tag
-        # that does not exist makes one at that repository's current HEAD - which, before the
-        # mirror route has run, is the previous release's commit. The release would then carry
-        # this version's artifacts on last version's source. The Go module tag has the same
-        # dependency and already ran after this.
-        @{
-            Name  = 'mirror'
-            What  = 'the public source mirror'
-            Needs = { $null }
-            # **-Push alone. -Verify means "check the mirror as it stands and exit".** Passing both
-            # made this route print a tidy report of the mirror's existing tags and push nothing,
-            # every time, while reporting success - so the public source mirror was never updated by
-            # a release. The damage showed up two routes later: `gh release create` against a tag
-            # that does not exist makes one at the repository's current HEAD, which was the previous
-            # release's commit, and the Go module tag then followed it. proxy.golang.org caches a
-            # module version permanently on first fetch, so v0.1.5 of the Go module serves 0.1.3's
-            # source and cannot be corrected.
-            Run   = { & (Join-Path $script:Packaging 'mirror-github.ps1') -Version $Version -Push }
-        },
+        # **`tag` goes before `github`, and the order is load bearing (task-1995).** The GitHub
+        # release is created on the public repository, and `gh release create` against a tag that
+        # does not exist there makes one at the repository's current HEAD, which is the previous
+        # release's commit. The `tag` route pushes the release commit and `v<version>` to
+        # `origin`, the public repository, first. Until task-2245 a `mirror` route between the two
+        # built the public repository's one commit per release from the tag's tree.
         @{
             Name   = 'github'
             What   = 'the GitHub release, with every asset'
@@ -824,11 +809,11 @@ function Get-Routes {
             }
             # **Told, rather than left to notice (task-1995).** Packagist crawls on its own schedule,
             # and it pins a version's commit the first time it sees the tag and never moves it -
-            # the same immutability the Go proxy has. v0.1.6 was crawled while the mirror's tag
+            # the same immutability the Go proxy has. v0.1.6 was crawled while the public tag
             # still pointed at the previous release's commit, so `composer require
             # black-rainbow-labs/inillucent:0.1.6` installs 0.1.3's source and cannot be corrected.
-            # Asking for the crawl here, after the mirror route has pushed, is what makes the commit
-            # it reads the right one.
+            # Asking for the crawl here, after the tag route has pushed, is what makes the commit it
+            # reads the right one.
             Run    = {
                 $token = Unprotect-AppleSecret -Path (Join-Path $env:LOCALAPPDATA 'inillucent\signing\packagist.token.sealed')
                 $url = "https://packagist.org/api/update-package?username=$script:PackagistUser&apiToken=$token"
@@ -870,15 +855,15 @@ function Get-Routes {
                 Test-Registry -Url $url -Version $Version
             }
         },
-        # **After `mirror`, and last because it takes the longest.** CI runs only on the public
-        # mirror and never on a push, so this starts the tests workflow on the mirror's `main`,
-        # which the `mirror` route set to the release, waits for it, and fails the release when it
-        # does not pass. A release whose own CI is red is not finished.
+        # **After `tag`, and last because it takes the longest.** CI never runs on a push, so this
+        # starts the tests workflow on `main`, which the `tag` route set to the release, waits for
+        # it, and fails the release when it does not pass. A release whose own CI is red is not
+        # finished.
         @{
             Name   = 'ci'
-            What   = "GitHub's tests run of the release, on the public mirror"
+            What   = "GitHub's tests run of the release"
             Needs  = { $null }
-            Run    = { Write-Host '   starting and waiting for the tests run on the mirror; it takes about an hour.' }
+            Run    = { Write-Host '   starting and waiting for the tests run on main; it takes about an hour.' }
             Verify = { Test-PublishedCi }
         }
     )
@@ -934,15 +919,16 @@ function Publish-Tag {
 function Test-PublishedCi {
     <#
     .SYNOPSIS
-        Starts the tests workflow on the public mirror's `main`, which the mirror route has just set
-        to the release, waits for it, and returns $null when it passed or the reason when it did not.
+        Starts the tests workflow on `main` of the public repository, which the tag route has just
+        set to the release, waits for it, and returns $null when it passed or the reason when it did
+        not.
 
     .DESCRIPTION
-        Only the mirror: the development repository is private, its workflows are disabled, and its
-        Actions spending stopped every job there on 2026-10-02.
+        The public repository is `origin`. The private repository development used until task-2245
+        has its workflows disabled.
     #>
     $problems = @()
-    foreach ($remote in @('brl')) {
+    foreach ($remote in @('origin')) {
         try {
             $repo = Get-RepoFromRemote -Root $script:Root -Remote $remote
             $sha = Get-BranchHead -Repo $repo -Branch 'main'
@@ -1045,23 +1031,26 @@ function Get-PosixBash {
     return 'bash'
 }
 
-function Get-MirrorRepo {
+function Get-PublicRepo {
     <#
     .SYNOPSIS
-        The owner/name of the public repository, read off the `brl` remote.
+        The owner/name of the public repository, read off the `origin` remote.
 
     .DESCRIPTION
-        **The release belongs where the published URLs point.** This checkout has two remotes:
-        `origin` is jasonmcaffee/inillucent, where the work happens, and `brl` is
-        Black-Rainbow-Labs/Inillucent, which is what inillucent.com links, what the Go module path
+        **The release belongs where the published URLs point.** That is Black-Rainbow-Labs/Inillucent:
+        what inillucent.com links, what the Go module path
         `github.com/Black-Rainbow-Labs/Inillucent/packages/go` resolves through, and the account the
-        product is published under. `gh` with no `--repo` uses the current directory's `origin`, so
-        every release would have landed on the development repository while the public one showed
-        nothing newer than 0.1.2.
+        product is published under. Since task-2245 it is also where the work happens, so it is
+        `origin`. The name is still read off the remote and checked, because `gh` is told the
+        repository explicitly: a release cut from a checkout whose `origin` is anything else must
+        not land there.
     #>
-    $url = (& git -C $script:Root remote get-url brl 2>$null)
-    if (-not $url) { throw 'this checkout has no `brl` remote, so the public repository is unknown.' }
-    if ($url -notmatch 'github\.com[:/](?<owner>[^/]+)/(?<name>[^/.]+)') { throw "the brl remote is $url, which is not a GitHub URL." }
+    $url = (& git -C $script:Root remote get-url origin 2>$null)
+    if (-not $url) { throw 'this checkout has no `origin` remote, so the public repository is unknown.' }
+    if ($url -notmatch 'github\.com[:/](?<owner>[^/]+)/(?<name>[^/.]+)') { throw "the origin remote is $url, which is not a GitHub URL." }
+    if ("$($Matches.owner)/$($Matches.name)" -ne 'Black-Rainbow-Labs/Inillucent') {
+        throw "the origin remote is $url, and a release is published only to Black-Rainbow-Labs/Inillucent."
+    }
     return "$($Matches.owner)/$($Matches.name)"
 }
 
@@ -1249,7 +1238,7 @@ function Publish-GitHubRelease {
         ForEach-Object { $_.FullName })
     if ($assets.Count -eq 0) { throw "dist/ holds no artifact naming $Version" }
 
-    $repo = @('--repo', (Get-MirrorRepo))
+    $repo = @('--repo', (Get-PublicRepo))
     $exists = & gh release view "v$Version" @repo --json tagName 2>$null
     if ($exists) {
         & gh release upload "v$Version" @assets @repo --clobber
@@ -1296,23 +1285,19 @@ function Publish-GoModule {
         throw "packages/go/go.mod must declare module github.com/Black-Rainbow-Labs/Inillucent/packages/go$suffix for version $Version. Go refuses a module at major version 2 or higher whose path does not end in /v<major>."
     }
     $tag = "packages/go/v$Version"
-    # **On the mirror, at the mirror's own release commit (task-1995).** The module path is
+    # **At the release commit, on the public repository.** The module path is
     # `github.com/Black-Rainbow-Labs/Inillucent/packages/go`, so proxy.golang.org reads this tag off
-    # the mirror and nowhere else - pushing it to `origin` published nothing, and inillucent 0.1.3
-    # sat on the site and on PyPI while `go get` still resolved 0.1.2.
-    #
-    # It points at the mirror's v<version> commit rather than at a local one. The mirror is one
-    # commit per release, built from the release tag's tree and checked to equal it, so that commit
-    # carries the same packages/go as the tag does. Pushing a local tag instead pushes the local
-    # commit with it, which is how the 0.1.0, 0.1.1 and 0.1.2 Go tags came to point at development
-    # history inside a repository whose whole design is one commit per release.
-    $mirrorCommit = (& git -C $root ls-remote brl "refs/tags/v$Version^{}" | ForEach-Object { ($_ -split '\s+')[0] } | Select-Object -First 1)
-    if (-not $mirrorCommit) {
-        $mirrorCommit = (& git -C $root ls-remote brl "refs/tags/v$Version" | ForEach-Object { ($_ -split '\s+')[0] } | Select-Object -First 1)
+    # that repository and nowhere else (task-1995). Until task-2245 the tag had to point at a
+    # separate snapshot commit there, because the release commit was private history. Now the
+    # release commit is on `origin`, so the tag is made at `v<version>` and pushed there.
+    $releaseCommit = (& git -C $root rev-parse --verify --quiet "v$Version^{commit}")
+    if (-not $releaseCommit) { throw "there is no v$Version tag yet, so the Go module cannot be tagged. Run the tag route first." }
+    if (-not (& git -C $root tag --list $tag)) {
+        & git -C $root tag $tag $releaseCommit
+        if ($LASTEXITCODE -ne 0) { throw "tagging $tag failed" }
     }
-    if (-not $mirrorCommit) { throw "the mirror has no v$Version tag yet, so the Go module cannot be tagged. Run the mirror route first." }
-    & git -C $root push brl "${mirrorCommit}:refs/tags/$tag"
-    if ($LASTEXITCODE -ne 0) { throw "pushing $tag to the mirror failed" }
+    & git -C $root push origin "refs/tags/$tag"
+    if ($LASTEXITCODE -ne 0) { throw "pushing $tag failed" }
 }
 
 # ---------------------------------------------------------------------------
@@ -1328,7 +1313,7 @@ function Test-GitHubRelease {
         The version being released.
     #>
     param([string] $Version)
-    $repo = Get-MirrorRepo
+    $repo = Get-PublicRepo
     $names = & gh release view "v$Version" --repo $repo --json assets --jq '.assets[].name' 2>$null
     if (-not $names) { return "$repo has no assets on the v$Version release" }
     return $null

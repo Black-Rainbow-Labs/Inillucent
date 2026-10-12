@@ -978,6 +978,18 @@ impl Parser<'_> {
         } else {
             None
         };
+        // **Only `LIKE` takes an `ESCAPE`.** SQLite reads `a GLOB b ESCAPE c` as a
+        // call `glob(b, a, c)` and the function takes two arguments, so it
+        // refuses the statement and names the operator the way it was written.
+        if escape.is_some() && op != PatternOp::Like {
+            return Err(ParseError::new(
+                ParseErrorKind::Refused(format!(
+                    "wrong number of arguments to function {}()",
+                    String::from_utf8_lossy(token.text(self.source()))
+                )),
+                token.span,
+            ));
+        }
         let span = self.ast.expr_span(left).to(end);
         Ok(Some(self.ast.add_expr(
             Expr::Pattern {

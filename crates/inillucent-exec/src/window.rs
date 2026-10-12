@@ -697,6 +697,26 @@ fn ntile(
     }
 }
 
+/// Returns the row distance a `lag` or `lead` offset names, or `None` when it names no row.
+///
+/// **A NULL offset and an offset with a fractional part match no row.** SQLite
+/// requires the offset to be an integer, so `lag(a, NULL)` and `lead(a, 1.5, 9)`
+/// answer the default (or NULL) for every row, where this used to read NULL as 0
+/// and 1.5 as 1. Text and blobs are read as numbers first, so `'1'` is 1 and
+/// `'x'` is 0, and `1.0` is the integer 1.
+///
+/// @param value - the offset argument's value for the row
+fn offset_distance(value: &Datum<'_>) -> Option<i64> {
+    match value {
+        Datum::Int(held) => Some(*held),
+        Datum::Null => None,
+        other => {
+            let number = real_of(other);
+            (number.is_finite() && number.fract() == 0.0).then_some(number as i64)
+        }
+    }
+}
+
 /// Computes `lag` or `lead`, which read the partition and ignore the frame.
 fn offset_row(
     rows: &[Vec<OwnedDatum>],
@@ -709,10 +729,11 @@ fn offset_row(
         return OwnedDatum::Null;
     };
     let offset = match call.arguments.get(1) {
-        Some(column) => integer_of(&value_at(rows, row, *column)),
-        None => 1,
+        Some(column) => offset_distance(&value_at(rows, row, *column)),
+        None => Some(1),
     };
-    match frames::offset_row(partition, row, offset, backwards) {
+    let reached = offset.and_then(|offset| frames::offset_row(partition, row, offset, backwards));
+    match reached {
         Some(target) => OwnedDatum::from_datum(&value_at(rows, target, *value_column)),
         // Off the end of the partition, so the default if one was written.
         None => match call.arguments.get(2) {

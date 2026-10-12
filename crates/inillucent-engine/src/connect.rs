@@ -932,6 +932,16 @@ impl Database {
         self.session_as(session)
     }
 
+    /// Returns what the temporary database holds in memory that grows with its history.
+    ///
+    /// See [`ImportedDatabase::temp_bookkeeping`]. A test reads it to check that creating and
+    /// dropping a table in a loop leaves it where it started.
+    pub fn temp_bookkeeping(&self) -> (usize, u64) {
+        self.ready()
+            .map(|engine| engine.temp_bookkeeping())
+            .unwrap_or((0, 0))
+    }
+
     /// Returns the file this database is in.
     pub fn path(&self) -> &Path {
         &self.path

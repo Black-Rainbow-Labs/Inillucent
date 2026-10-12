@@ -381,6 +381,13 @@ pub(crate) fn keyed_table_shape(
             Some(column) => physical_of(column),
             None => (PhysicalType::Any, StaticType::Unknown),
         };
+        // **A lone INTEGER key of a WITHOUT ROWID table is not a rowid.** The
+        // tree keeps the rowid key encoding, so a file written before this
+        // reads the same, but a probe for a text, a real or a blob is looked
+        // up instead of being answered "not found". INTEGER affinity leaves
+        // such a value as it is and SQLite keeps the row, so `DELETE`, `UPDATE`
+        // and a point read of a row keyed `'x'` or `3.14` found nothing.
+        let mixed_key = position == 0 && key_columns == 1 && physical == PhysicalType::Int64;
         let collation = primary_key_term_collation(info, position, key_columns)
             .or_else(|| {
                 info.columns
@@ -393,7 +400,7 @@ pub(crate) fn keyed_table_shape(
         } else {
             ColumnSpec::new(physical)
         };
-        columns.push(spec.with_collation(collation));
+        columns.push(spec.with_collation(collation).with_mixed_key(mixed_key));
         types.push(static_type);
         if let Some(slot) = slots.get_mut(*declared) {
             *slot = Some(position);

@@ -122,7 +122,9 @@ When a query is slower than you expect, check the metric first.
 inillucent --db app.rdb vector-search embedding --column v --vector '[0.01, -0.42, 0.33]' --k 10 --measure cos
 ```
 
-`--measure` takes `cos` (the default), `l2` or `dot`. The result has a `distance` column.
+`--measure` takes `cos` (the default), `l2` or `dot`. The result has a `distance` column. For `cos`
+and `l2` the smallest distance comes first. For `dot` the column holds the inner product and the
+largest comes first.
 
 ## Keyword search with FTS5
 

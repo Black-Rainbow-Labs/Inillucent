@@ -247,6 +247,8 @@ impl<'p> LeafRef<'p> {
             collation: inillucent_value::collation::Collation::Binary,
             // Nor a direction, for the same reason.
             descending: false,
+            // Nor whether a key may be a non integer.
+            mixed_key: false,
         })
     }
     /// Returns one column's directory entry, eight or sixteen bytes.
@@ -876,6 +878,26 @@ impl<'p> LeafRef<'p> {
         scan_cap: usize,
     ) -> DbResult<Vec<Vec<Datum<'p>>>> {
         let (begin, end) = self.equal_run(probe, scan_cap)?;
+        self.live_matching_run(probe, begin, end)
+    }
+
+    /// Materialises the live rows whose key matches a probe, given the sorted run it matched.
+    ///
+    /// **For a caller that already ran [`LeafRef::equal_run`].** An equality walk finds the
+    /// sorted run to decide whether the leaf is worth visiting, and then asked for it again
+    /// here: two binary searches of the sorted region per probe for the same answer. On a
+    /// leaf whose rows sit in the delta area the sorted region is searched for nothing and the
+    /// delta area is the cost, so the repeat was pure overhead on every probe.
+    ///
+    /// @param probe - the key, one value per column it names
+    /// @param begin - the first sorted row the probe matches
+    /// @param end - one past the last sorted row the probe matches
+    pub fn live_matching_run(
+        &self,
+        probe: &[Datum<'_>],
+        begin: usize,
+        end: usize,
+    ) -> DbResult<Vec<Vec<Datum<'p>>>> {
         let mut sorted: Vec<Vec<Datum<'p>>> = Vec::new();
         for row in begin..end {
             if self.is_tombstoned(row)? {

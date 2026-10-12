@@ -669,7 +669,9 @@ const SETUP_PARAMS: &[Param] = &[
         required: false,
         positional: false,
         description: "Install somewhere other than the per-user directory. INILLUCENT_HOME does the \
-                      same thing for every command at once.",
+                      same thing for every command at once. A server started with --root \
+                      installs nothing outside the root, so it needs 'dir' naming a folder \
+                      inside the root.",
     },
     Param {
         name: "from",
@@ -694,7 +696,9 @@ pub static COMMANDS: &[Command] = &[
     Command {
         name: "query",
         summary: "Run a SELECT and get its rows back.",
-        detail: "Use this for anything that reads. The rows come back as a table, or as typed \
+        detail: "Use this for anything that reads. A statement that writes (INSERT, UPDATE, \
+                 DELETE, DDL, a PRAGMA that sets something, BEGIN or COMMIT) is refused with \
+                 status readonly; run it with exec. The rows come back as a table, or as typed \
                  JSON with output=json. 'total' is exact even when 'limit' cut the rows handed \
                  back, because the engine materialises the whole result - so a limit of 10 on a \
                  million-row query still costs what the million rows cost. Put a LIMIT in the SQL \
@@ -864,7 +868,9 @@ pub static COMMANDS: &[Command] = &[
         name: "backup",
         summary: "Write a copy of the database to another file.",
         detail: "A consistent copy taken while the database is open. The copy is a database, not \
-                 a text dump.",
+                 a text dump. A file already at the destination is replaced, but only after the \
+                 copy has been written beside it and checked; the database being copied is \
+                 refused as the destination.",
         params: BACKUP_PARAMS,
         cli_only: None,
         writes: Writes::No,

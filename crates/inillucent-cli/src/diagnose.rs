@@ -653,7 +653,12 @@ pub fn stats(shell: &mut Shell, arguments: &[&str]) {
                 shell.say(&line);
             }
         }
-        Some(word) => shell.stats = crate::dot::truthy(Some(word)),
+        // `stmt` and `vmstep` are the reference's two other states. This engine has
+        // no per statement counters to print for either, so they are accepted and
+        // print nothing. Any other word is read as a boolean, and reported when it
+        // is not one.
+        Some("stmt" | "vmstep") => shell.stats = false,
+        Some(word) => shell.stats = crate::settings::boolean(shell, word),
     }
 }
 
@@ -872,9 +877,36 @@ fn counted(shell: &Shell, kind: &str) -> i64 {
 /// @param shell - the shell
 pub fn dbtotxt(shell: &mut Shell) {
     let path = shell.path().to_string();
-    let Ok(bytes) = std::fs::read(&path) else {
-        shell.complain(&format!("Error: cannot read \"{path}\""));
-        return;
+    // **A database held in memory has no file to read**, and `.dbtotxt` failed on
+    // it with "cannot read". The reference writes the image it holds, under the
+    // name `unk.db`; here the database is written to a scratch file and that file
+    // is transcribed.
+    let (bytes, path) = if path.is_empty() || path == ":memory:" {
+        let scratch = std::env::temp_dir()
+            .join(format!("inillucent-dbtotxt-{}.rdb", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        crate::copy::remove_database_files(&scratch);
+        let written = shell
+            .export_to(&scratch, crate::keys::for_opening())
+            .map_err(|error| error.message().to_string())
+            .and_then(|()| std::fs::read(&scratch).map_err(|error| error.to_string()));
+        crate::copy::remove_database_files(&scratch);
+        match written {
+            Ok(bytes) => (bytes, "unk.db".to_string()),
+            Err(message) => {
+                shell.complain(&format!("Error: cannot read the database: {message}"));
+                return;
+            }
+        }
+    } else {
+        match std::fs::read(&path) {
+            Ok(bytes) => (bytes, path),
+            Err(_) => {
+                shell.complain(&format!("Error: cannot read \"{path}\""));
+                return;
+            }
+        }
     };
     let page_size = usize::try_from(integer_of(shell, "PRAGMA page_size;"))
         .ok()

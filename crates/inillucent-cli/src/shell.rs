@@ -12,16 +12,15 @@
 //! wrong and the engine's own parser has to be the one that says when a
 //! statement is finished.
 
-use std::io::Write;
-
 use inillucent_engine::connect::{Connection, Database};
 use inillucent_tree::datum::{owned_row_values, OwnedDatum};
 use inillucent_value::Value;
 
-use crate::render::{render, Layout, Mode};
+use crate::render::{render, Layout};
 
 mod deferred;
 pub mod output;
+pub mod redirect;
 
 /// Everything the shell remembers between lines.
 /// One open database and the session statements on it belong to.
@@ -47,6 +46,8 @@ pub struct Opened {
     session: u64,
     /// Where the database came from, for `.databases` and the prompt.
     path: String,
+    /// Whether the file was opened read only, which `.databases` reports as `r/o`.
+    read_only: bool,
 }
 
 /// How many databases `.connection` can hold open at once.
@@ -91,23 +92,33 @@ pub struct Shell {
     /// for its one statement, so an exported file always names its columns.
     pub header_when_empty: bool,
     /// Where output goes, when it is not standard output.
-    output: Option<std::fs::File>,
-    /// The name of that file, for `.show` to report.
     ///
-    /// **A second field rather than asking the `File`**, because a `File` does
-    /// not carry the path it was opened with on any platform this builds for.
-    /// Before it existed `.show` printed `output: stdout` while a `.output`
-    /// redirect was open, which is the one line of that report a person reads
-    /// when they cannot find where their rows went.
-    output_name: Option<String>,
-    /// Whether `.once` set that file for one statement only.
-    output_is_once: bool,
+    /// It carries the name `.show` reports: a `File` does not carry the path it
+    /// was opened with on any platform this builds for, and before the name was
+    /// kept `.show` printed `output: stdout` while a `.output` redirect was
+    /// open, which is the one line of that report a person reads when they
+    /// cannot find where their rows went.
+    redirection: Option<redirect::Redirection>,
     /// Whether a failing statement stops the script.
     pub bail: bool,
     /// Whether each statement is echoed before it runs.
     pub echo: bool,
     /// Whether to print how long each statement took.
     pub timer: bool,
+    /// Whether `.timer once` was given, which turns the timer off after one statement.
+    pub timer_once: bool,
+    /// What `.eqp` was set to, as `.show` prints it: `off`, `on`, `trigger` or `full`.
+    pub eqp_name: &'static str,
+    /// The settings `.mode --once` puts back after the next statement.
+    pub mode_once: Option<crate::modes::Snapshot>,
+    /// The layouts `.mode --tag NAME` saved, by name.
+    pub mode_tags: std::collections::HashMap<String, Layout>,
+    /// Whether a statement has run since the last command ended.
+    statement_ran: bool,
+    /// The text of the dot command being run, which an error under it quotes.
+    pub dot_line: String,
+    /// Where each word of that command begins, counted in characters.
+    pub dot_offsets: Vec<usize>,
     /// Whether the page cache's counters are printed after each statement.
     pub stats: bool,
     /// Whether to print the change count after each statement.
@@ -149,8 +160,26 @@ pub struct Shell {
     /// refuse rather than take effect, and a shell that left it off answered
     /// those two differently from the reference on a fresh database.
     pub defensive: bool,
-    /// Whether the shell should stop.
+    /// Whether the shell should stop reading the input it is reading now.
+    ///
+    /// `.quit` sets it. A `.read` clears it when its file ends, because `.quit`
+    /// inside a file stops that file and not the session; `.exit` sets
+    /// `exit_code` as well, and that is never cleared.
     pub done: bool,
+    /// The status `.exit` asked the process to end with.
+    pub exit_code: Option<i32>,
+    /// The file being read by `.read` or `-init`, which an error names.
+    ///
+    /// The reference ends an error heading with `of FILE` for a statement that
+    /// came from a file, and not for one typed on standard input.
+    pub source: Option<String>,
+    /// Which command line argument is being run, counted from the program name.
+    ///
+    /// The reference says `in 3rd command line argument` instead of
+    /// `near line N` for a statement given as an argument.
+    pub argument: Option<usize>,
+    /// How many `.read` files are open inside one another.
+    pub depth: usize,
     /// Whether anything has failed, which decides the exit code.
     pub failed: bool,
     /// Whether a chunk of input is being run, so that the error of a statement that
@@ -281,6 +310,22 @@ impl Drop for Shell {
     }
 }
 
+/// Returns a count as an English ordinal: 1st, 2nd, 3rd, 4th, 11th, 21st.
+///
+/// The reference's `%r` format, which it uses to name a command line argument.
+///
+/// @param number - the position, counted from one
+pub fn ordinal(number: usize) -> String {
+    let suffix = match (number % 100, number % 10) {
+        (11..=13, _) => "th",
+        (_, 1) => "st",
+        (_, 2) => "nd",
+        (_, 3) => "rd",
+        _ => "th",
+    };
+    format!("{number}{suffix}")
+}
+
 /// Returns an error as a sentence, with its detail when it carries one.
 ///
 /// @param error - the failure
@@ -340,6 +385,45 @@ impl Shell {
         path: &str,
         read_only: bool,
     ) -> Result<Opened, inillucent_base::DbError> {
+        Shell::open_one_with(path, read_only, read_only)
+    }
+
+    /// Opens one database for a person at the shell, which follows other processes' commits.
+    ///
+    /// **The engine connection is opened for writing even when the person asked
+    /// for read only, and the shell refuses the writes itself.** A connection the
+    /// engine opened read only does not see what another process commits after
+    /// the first statement: a long lived `inillucent-shell -readonly` kept
+    /// answering from the state it first read, even across `BEGIN; COMMIT;`.
+    /// A shell stays open and is read again and again, which is the case where
+    /// that matters. `-readonly` was a flag the shell enforced on a connection
+    /// opened for writing until the open was changed to ask the engine for read
+    /// only, and `process_journal_handoff` caught the change. Only when the file
+    /// cannot be opened for writing at all (a read only file or folder) does the
+    /// connection fall back to the engine's own read only mode.
+    ///
+    /// @param path - the file, or an in-memory name
+    /// @param read_only - whether the shell refuses statements that write
+    pub fn open_one_following(
+        path: &str,
+        read_only: bool,
+    ) -> Result<Opened, inillucent_base::DbError> {
+        match Shell::open_one_with(path, read_only, false) {
+            Err(_) if read_only => Shell::open_one_with(path, read_only, true),
+            other => other,
+        }
+    }
+
+    /// Opens one database with the engine connection read only or not, whatever the shell reports.
+    ///
+    /// @param path - the file, or an in-memory name
+    /// @param read_only - whether the shell reports and enforces read only
+    /// @param engine_read_only - whether the engine connection itself is read only
+    fn open_one_with(
+        path: &str,
+        read_only: bool,
+        engine_read_only: bool,
+    ) -> Result<Opened, inillucent_base::DbError> {
         // **The detail, not only the code.** An open that fails with "bad
         // parameter or other API misuse" and nothing else is an error nobody
         // can act on; the detail says which part of the file could not be read.
@@ -350,7 +434,7 @@ impl Shell {
             path,
             inillucent_driver::PAGE_SIZE,
             inillucent_driver::DEFAULT_FRAMES,
-            read_only,
+            engine_read_only,
             crate::keys::for_opening(),
         )?;
         // **The shell adds `fsdir`, and the library does not.** A table-valued
@@ -380,6 +464,7 @@ impl Shell {
             database,
             session,
             path: path.to_string(),
+            read_only,
         })
     }
 
@@ -407,23 +492,48 @@ impl Shell {
     /// @param path - the file, or an in-memory name
     /// @param read_only - whether this connection may write the file
     pub fn open_reporting(path: &str, read_only: bool) -> Result<Shell, inillucent_base::DbError> {
+        let first = Shell::open_one_reporting(path, read_only)?;
+        Ok(Shell::around(first))
+    }
+
+    /// Opens a shell for a person at the program, which follows other processes' commits.
+    ///
+    /// See [`Shell::open_one_following`] for why `read_only` is enforced by the
+    /// shell and not by the engine connection.
+    ///
+    /// @param path - the file, or an in-memory name
+    /// @param read_only - whether statements that write are refused
+    pub fn open_following(path: &str, read_only: bool) -> Result<Shell, String> {
+        let first = Shell::open_one_following(path, read_only).map_err(described)?;
+        Ok(Shell::around(first))
+    }
+
+    /// Builds a shell around its first open database.
+    ///
+    /// @param first - the database statements run on
+    fn around(first: Opened) -> Shell {
         let mut connections: Vec<Option<Opened>> = (0..CONNECTIONS).map(|_| None).collect();
-        if let Some(first) = connections.first_mut() {
-            *first = Some(Shell::open_one_reporting(path, read_only)?);
+        if let Some(slot) = connections.first_mut() {
+            *slot = Some(first);
         }
-        Ok(Shell {
+        Shell {
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             connections,
             active: 0,
             layout: Layout::default(),
             headers_chosen: None,
             header_when_empty: false,
-            output: None,
-            output_name: None,
-            output_is_once: false,
+            redirection: None,
             bail: false,
             echo: false,
             timer: false,
+            timer_once: false,
+            eqp_name: "off",
+            mode_once: None,
+            mode_tags: std::collections::HashMap::new(),
+            statement_ran: false,
+            dot_line: String::new(),
+            dot_offsets: Vec::new(),
             stats: false,
             show_changes: false,
             explain_plan: false,
@@ -443,6 +553,10 @@ impl Shell {
             scanstats: "off".to_string(),
             defensive: true,
             done: false,
+            exit_code: None,
+            source: None,
+            argument: None,
+            depth: 0,
             failed: false,
             holding: false,
             held_error: None,
@@ -463,7 +577,7 @@ impl Shell {
             line: 1,
             deferred: None,
             chunk_number: 0,
-        })
+        }
     }
 
     /// Returns the connection statements run on.
@@ -560,6 +674,43 @@ impl Shell {
     /// @param path - where the copy goes
     pub fn backup_to(&self, path: &str) -> Result<(), inillucent_base::DbError> {
         self.open_slot().database.backup_to(path)
+    }
+
+    /// Copies a database file that statements are not running on.
+    ///
+    /// **For `.backup SCHEMA FILE` where `SCHEMA` is an attached file.** The engine's
+    /// own backup copies the file the connection was opened on, which is `main`; an
+    /// attached database is another file, and is opened here a second time to be
+    /// checkpointed and copied the way any file is.
+    ///
+    /// @param source - the attached database's file
+    /// @param destination - where the copy goes
+    pub fn backup_file(source: &str, destination: &str) -> Result<(), inillucent_base::DbError> {
+        let other = Database::open_keyed(
+            source,
+            inillucent_driver::PAGE_SIZE,
+            inillucent_driver::DEFAULT_FRAMES,
+            false,
+            crate::keys::for_opening(),
+        )?;
+        other.backup_to(destination)
+    }
+
+    /// Returns every database the connection has, as its name and its file.
+    ///
+    /// The file is empty for `temp` and for a database held in memory. `main` of
+    /// a shell opened on `:memory:` reports `:memory:`.
+    pub fn database_list(&self) -> Vec<(String, String)> {
+        let Ok((_, rows)) = self.collect("PRAGMA database_list") else {
+            return Vec::new();
+        };
+        let text = |value: Option<&Value<'static>>| match value {
+            Some(Value::Text(text)) => crate::raw::decode(text.raw()),
+            _ => String::new(),
+        };
+        rows.iter()
+            .map(|row| (text(row.get(1)), text(row.get(2))))
+            .collect()
     }
 
     /// Writes a copy of the database, encrypted with `key` or in plaintext.
@@ -691,12 +842,25 @@ impl Shell {
 
     /// Closes the current database and opens another.
     pub fn reopen(&mut self, path: &str) -> Result<(), String> {
-        let replacement = Shell::open_one(path)?;
+        self.reopen_as(path, false)
+    }
+
+    /// Closes the current database and opens another, read only when asked.
+    ///
+    /// @param path - the file, or an in-memory name
+    /// @param read_only - whether the file is opened read only
+    pub fn reopen_as(&mut self, path: &str, read_only: bool) -> Result<(), String> {
+        let replacement = Shell::open_one_following(path, read_only).map_err(described)?;
         let active = self.active;
         if let Some(place) = self.connections.get_mut(active) {
             *place = Some(replacement);
         }
         Ok(())
+    }
+
+    /// Returns whether the database statements run on was opened read only.
+    pub fn is_read_only(&self) -> bool {
+        self.open_slot().read_only
     }
 
     /// Returns the layout to render with, told where its lines are going.
@@ -707,19 +871,45 @@ impl Shell {
     /// write a carriage return too many into a file.
     fn rendering_layout(&self) -> crate::render::Layout {
         let mut layout = self.layout.clone();
-        layout.to_stdout = self.output.is_none() && self.sink.is_none() && self.testcase.is_none();
+        layout.to_stdout =
+            self.redirection.is_none() && self.sink.is_none() && self.testcase.is_none();
         layout
     }
 
     /// Prints one line to wherever output is currently going.
     pub fn say(&mut self, line: &str) {
+        self.emit(line, true);
+    }
+
+    /// Prints rows the renderer laid out, ending each as the layout says.
+    ///
+    /// **A row separator without a newline is the line's whole ending.** `-newline X`
+    /// and `.mode ascii` write the separator after each row and nothing else, so
+    /// a newline written here as well would be one the reference does not write.
+    ///
+    /// @param lines - the rendered lines
+    /// @param layout - the settings they were rendered with
+    fn print_rendered(&mut self, lines: Vec<String>, layout: &Layout) {
+        let terminated = layout.lines_end_in_newline();
+        for line in lines {
+            self.emit(&line, terminated);
+        }
+    }
+
+    /// Prints one line, with or without the newline after it.
+    ///
+    /// @param line - the text
+    /// @param terminated - whether a newline follows it
+    fn emit(&mut self, line: &str, terminated: bool) {
         // **A `.testcase` captures instead of printing.** `.check` compares the
         // output of the commands between the two, and a passing case prints
         // nothing at all - which is what makes a test script's output the list
         // of the cases that failed.
         if self.testcase.is_some() {
             self.captured.push_str(line);
-            self.captured.push('\n');
+            if terminated {
+                self.captured.push('\n');
+            }
             return;
         }
         // **A redirect outranks a collecting caller, and used to lose to one
@@ -738,14 +928,22 @@ impl Shell {
         // was not redirected. `complain` is deliberately the other way round -
         // an error goes to the sink even while a redirect is open, because an
         // error belongs in the report rather than in the middle of the rows.
-        let ending = if self.crlf { "\r\n" } else { "\n" };
-        if let Some(file) = self.output.as_mut() {
-            let _ = write!(file, "{line}{ending}");
+        let ending = match (terminated, self.crlf) {
+            (false, _) => "",
+            (true, true) => "\r\n",
+            (true, false) => "\n",
+        };
+        if let Some(redirection) = self.redirection.as_mut() {
+            let mut bytes = crate::raw::encode(line).into_owned();
+            bytes.extend_from_slice(ending.as_bytes());
+            redirection.write(&bytes);
             return;
         }
         if let Some(sink) = self.sink.as_mut() {
             sink.push_str(line);
-            sink.push('\n');
+            if terminated {
+                sink.push('\n');
+            }
             return;
         }
         output::write_line(line, ending);
@@ -766,11 +964,22 @@ impl Shell {
             None => {
                 // Everything printed before the error reaches the terminal or
                 // the pipe before it, as it did when every line was flushed.
-                output::flush();
-                eprintln!("{message}");
+                output::write_error_line(message);
             }
         }
         self.failed = true;
+    }
+
+    /// Prints a line to standard error without marking the run as failed.
+    ///
+    /// For what the reference prints and carries on after: a word that is not a
+    /// boolean, the state `.crlf` reports, a warning about a row of a file.
+    ///
+    /// @param message - the line
+    pub fn note(&mut self, message: &str) {
+        let failed = self.failed;
+        self.complain(message);
+        self.failed = failed;
     }
 
     /// Refuses a command that safe mode does not allow, and says which it was.
@@ -793,18 +1002,55 @@ impl Shell {
     /// @param path - the file to write, or none to go back to standard output
     /// @param once - whether the redirect ends after the next SQL statement
     pub fn redirect(&mut self, path: Option<&str>, once: bool) -> Result<(), String> {
-        self.rows_since_redirect = 0;
         let Some(path) = path else {
-            self.output = None;
-            self.output_name = None;
-            self.output_is_once = false;
+            self.stop_redirection();
             return Ok(());
         };
         let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
-        self.output = Some(file);
-        self.output_name = Some(path.to_string());
-        self.output_is_once = once;
+        self.start_redirection(redirect::Destination::File(file), path, once, false);
         Ok(())
+    }
+
+    /// Ends whatever `.output` or `.once` set up, and goes back to standard output.
+    pub fn stop_redirection(&mut self) {
+        self.rows_since_redirect = 0;
+        if let Some(redirection) = self.redirection.take() {
+            redirection.close();
+        }
+    }
+
+    /// Sends output to a destination, ending the redirection that was in force.
+    ///
+    /// @param destination - where the bytes go
+    /// @param name - what `.show` calls it
+    /// @param once - whether it ends after the next command
+    /// @param bom - whether a byte order mark is written first
+    pub fn start_redirection(
+        &mut self,
+        destination: redirect::Destination,
+        name: &str,
+        once: bool,
+        bom: bool,
+    ) {
+        self.stop_redirection();
+        let mut redirection = redirect::Redirection {
+            destination,
+            name: name.to_string(),
+            once,
+            arming: once,
+        };
+        if bom {
+            redirection.write(&[0xEF, 0xBB, 0xBF]);
+        }
+        self.redirection = Some(redirection);
+    }
+
+    /// Returns what a `.output --show` prints: the text kept for `memory`.
+    pub fn remembered_output(&self) -> Option<String> {
+        match self.redirection.as_ref().map(|held| &held.destination) {
+            Some(redirect::Destination::Memory(bytes)) => Some(crate::raw::decode(bytes)),
+            _ => None,
+        }
     }
 
     /// Where output is going, as `.show` names it.
@@ -812,20 +1058,45 @@ impl Shell {
     /// `stdout` when nothing is redirecting, and the file name when `.output`
     /// or `.once` is.
     pub fn output_target(&self) -> &str {
-        self.output_name.as_deref().unwrap_or("stdout")
+        self.redirection
+            .as_ref()
+            .map_or("stdout", |held| held.name.as_str())
     }
 
-    /// Returns output to the terminal after a `.once`.
-    fn finish_once(&mut self) {
-        if self.output_is_once {
-            self.output = None;
-            self.output_name = None;
-            self.output_is_once = false;
+    /// Called when a command, a dot command or a line of SQL, has finished.
+    ///
+    /// **A `.once` lasts for one command.** The reference ends it after the next
+    /// line of input whatever the line was, so `.once out.txt` then `.mode csv`
+    /// leaves the file empty and the statement after it prints to the terminal,
+    /// and a line holding two statements sends both to the file. The `.once` that
+    /// set the redirection is not the command it applies to.
+    pub fn end_command(&mut self) {
+        // **`.mode --once` lasts for one statement.** The settings it changed come
+        // back once a statement has run, not after a dot command.
+        if self.statement_ran {
+            self.statement_ran = false;
+            if let Some(saved) = self.mode_once.take() {
+                self.layout = saved.layout;
+                self.headers_chosen = saved.headers_chosen;
+            }
+        }
+        let ending = match self.redirection.as_mut() {
+            Some(held) if held.once && held.arming => {
+                held.arming = false;
+                false
+            }
+            Some(held) => held.once,
+            None => false,
+        };
+        if ending {
+            self.stop_redirection();
         }
         // `.excel` and `.www` hand the file to whatever the system opens that
         // kind with, and only once it is closed and complete.
-        if let Some(path) = self.viewer.take() {
-            crate::commands::open_viewer(&path);
+        if self.redirection.is_none() {
+            if let Some(path) = self.viewer.take() {
+                crate::commands::open_viewer(&path);
+            }
         }
     }
 
@@ -843,6 +1114,7 @@ impl Shell {
     /// (task-2191), as one statement, before anything that could see it; see
     /// the `deferred` module for when and why the output is the same.
     pub fn run(&mut self, sql: &str) {
+        self.statement_ran = true;
         if self.hold_if_it_joins(sql) {
             return;
         }
@@ -860,8 +1132,17 @@ impl Shell {
     ///
     /// @param sql - the statement
     fn run_as_written(&mut self, sql: &str) {
-        if self.readonly && self.writes(sql) {
-            self.complain("Error: attempt to write a readonly database");
+        if (self.readonly || self.is_read_only()) && self.writes(sql) {
+            // Reported as the reference reports it, with the line the statement
+            // began on, because that is the error a script's author searches for.
+            let failure = Failure {
+                message: "attempt to write a readonly database".to_string(),
+                offset: None,
+                compiling: false,
+                error: None,
+                partial: None,
+            };
+            self.report(sql, &failure);
             return;
         }
         if self.echo {
@@ -890,9 +1171,8 @@ impl Shell {
             Err(failure) => {
                 if let Some((columns, rows)) = &failure.partial {
                     let layout = self.rendering_layout();
-                    for line in render(&layout, columns, rows) {
-                        self.say(&line);
-                    }
+                    let lines = render(&layout, columns, rows);
+                    self.print_rendered(lines, &layout);
                 }
                 self.report(sql, &failure);
             }
@@ -916,7 +1196,6 @@ impl Shell {
                     for line in plan_tree(&rows) {
                         self.say(&line);
                     }
-                    self.finish_once();
                     return;
                 }
                 // **And the bytecode form is a table with fixed columns.** The
@@ -934,7 +1213,6 @@ impl Shell {
                     for line in explain_table(&columns, &rows) {
                         self.say(&line);
                     }
-                    self.finish_once();
                     return;
                 }
                 // A statement that returned no rows prints nothing, headers
@@ -942,15 +1220,13 @@ impl Shell {
                 // callback. Printing it here put an empty line after every
                 // `CREATE` and `INSERT` once `.headers on` was set. `export`
                 // renders through the same function and keeps its header.
+                let layout = self.rendering_layout();
                 let lines = if rows.is_empty() && !self.header_when_empty {
                     Vec::new()
                 } else {
-                    let layout = self.rendering_layout();
                     render(&layout, &columns, &rows)
                 };
-                for line in lines {
-                    self.say(&line);
-                }
+                self.print_rendered(lines, &layout);
                 if self.show_changes {
                     let changes = self.connection().changes().unwrap_or_default();
                     // The reference prints both counters, aligned with three
@@ -967,9 +1243,15 @@ impl Shell {
         }
         if self.timer {
             let elapsed = started.elapsed();
-            self.say(&format!("Run Time: real {:.3}", elapsed.as_secs_f64()));
+            self.say(&format!(
+                "Run Time: real {:.6} user 0.000000 sys 0.000000",
+                elapsed.as_secs_f64()
+            ));
+            if self.timer_once {
+                self.timer = false;
+                self.timer_once = false;
+            }
         }
-        self.finish_once();
     }
 
     /// Prints a failure the way the reference prints it.
@@ -981,12 +1263,17 @@ impl Shell {
         if self.first_error.is_none() {
             self.first_error = failure.error.clone();
         }
-        let line = self.line;
-        let heading = if failure.compiling {
-            format!("Parse error near line {line}: {}", failure.message)
+        let kind = if failure.compiling {
+            "Parse error"
         } else {
-            format!("Error near line {line}: {}", failure.message)
+            "Error"
         };
+        let place = match (&self.argument, &self.source) {
+            (Some(index), _) => format!("in {} command line argument", ordinal(*index)),
+            (None, Some(file)) => format!("near line {} of {file}", self.line),
+            (None, None) => format!("near line {}", self.line),
+        };
+        let heading = format!("{kind} {place}: {}", failure.message);
         let mut lines = vec![heading];
         if let Some(offset) = failure.offset {
             let shown = self.excerpt.as_ref().map_or(sql, Excerpt::text);
@@ -1305,12 +1592,13 @@ fn drive_lines(shell: &mut Shell, input: impl Iterator<Item = String>) {
             started = number;
         }
         shell.line = started;
-        if pending.trim().is_empty() && line.trim_start().starts_with('.') {
+        if pending.trim().is_empty() && line.starts_with('.') {
             if shell.echo {
                 let text = line.trim().to_string();
                 shell.say(&text);
             }
-            crate::dot::run(shell, line.trim());
+            crate::dot::run(shell, line.trim_start());
+            shell.end_command();
             if shell.done || (shell.failed && shell.bail) {
                 return;
             }
@@ -1334,6 +1622,7 @@ fn drive_lines(shell: &mut Shell, input: impl Iterator<Item = String>) {
         // next statement grew a new one from nothing.
         if let Some(first_end) = ends_in_complete_statement(shell, &pending) {
             run_chunk_from(shell, &pending, Some(first_end));
+            shell.end_command();
             pending.clear();
             if shell.done || (shell.failed && shell.bail) {
                 return;
@@ -1345,6 +1634,7 @@ fn drive_lines(shell: &mut Shell, input: impl Iterator<Item = String>) {
         // shell does at end of input, and it is what makes `echo "SELECT 1" |
         // inillucent-shell` work without a semicolon.
         run_chunk(shell, &pending);
+        shell.end_command();
     }
 }
 
@@ -1717,14 +2007,6 @@ fn word_end(bytes: &[u8], at: usize) -> usize {
     }
     scan
 }
-
-/// Returns the mode a `.mode` argument selects, or a message.
-pub fn mode_named(name: &str) -> Result<Mode, String> {
-    Mode::from_name(name).ok_or_else(|| format!("Error: mode should be one of: {}", MODE_NAMES))
-}
-
-/// Every mode name, for the message above and for `.help`.
-pub const MODE_NAMES: &str = "box column csv html insert json line list markdown quote table tabs";
 
 /// Reports whether a statement is an `EXPLAIN QUERY PLAN`.
 ///

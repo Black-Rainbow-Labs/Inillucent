@@ -130,9 +130,6 @@ pub enum AggregateKind {
 /// enough to be exact by itself. This is the constant SQLite uses.
 const SPLIT_I64: i64 = 16_384;
 
-/// The same, for the `i128` seed.
-const SPLIT: i128 = 16_384;
-
 /// The magnitude below which a double holds an integer exactly.
 ///
 /// 2^52. SQLite uses the same bound to decide whether a value needs splitting.
@@ -234,6 +231,103 @@ pub struct Accumulator {
     rare: Option<Box<Rare>>,
 }
 
+/// A hasher for integers that mixes one multiplication, for the set of integers a `DISTINCT`
+/// aggregate has seen.
+///
+/// The standard hasher is built to resist chosen keys and spends about 20 ns on eight bytes. The
+/// keys here are values a query read from its own table, and 500,000 of them made the set the
+/// largest cost of `count(DISTINCT post_id)`.
+#[derive(Clone, Copy, Debug, Default)]
+struct IntegerHasher(u64);
+
+impl std::hash::Hasher for IntegerHasher {
+    /// Returns the hash of everything written so far.
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    /// Mixes bytes in one at a time; only a key that is not an `i64` reaches it.
+    ///
+    /// @param bytes - the bytes to mix in
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    /// Mixes one integer in with a multiplication and a shift.
+    ///
+    /// @param number - the integer
+    fn write_i64(&mut self, number: i64) {
+        let mixed = (number as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = mixed ^ (mixed >> 29);
+    }
+}
+
+/// The values a `DISTINCT` aggregate has already folded in.
+///
+/// **Integers are kept as integers until something else arrives.** The general form is a set of
+/// encoded keys, one allocation per new value and a hash over its bytes, and it is what makes a
+/// real `1.0` and an integer `1` the same value under the encoding. A column of integers, which
+/// is nearly every `count(DISTINCT id)`, never meets that question, so its values go in a set of
+/// `i64`. The first value that is not an integer moves every integer seen so far into the
+/// encoded set, and from then on every value goes there, so the answer is the one the encoded
+/// set alone gives.
+#[derive(Clone, Debug)]
+struct DistinctSet {
+    /// The collation the argument is compared under.
+    collation: Collation,
+    /// The integers seen, while nothing else has been.
+    integers: HashSet<i64, std::hash::BuildHasherDefault<IntegerHasher>>,
+    /// Every value seen, once a value that is not an integer has arrived.
+    encoded: HashSet<Vec<u8>>,
+    /// Whether the integers have moved into `encoded`.
+    moved: bool,
+}
+
+impl DistinctSet {
+    /// Returns an empty set for values compared under a collation.
+    ///
+    /// @param collation - the collation the argument is compared under
+    fn new(collation: Collation) -> DistinctSet {
+        DistinctSet {
+            collation,
+            integers: HashSet::default(),
+            encoded: HashSet::new(),
+            moved: false,
+        }
+    }
+
+    /// Records a value and says whether it had not been seen before.
+    ///
+    /// @param value - the argument's value for this row
+    /// @param scratch - a buffer the encoded key is built in, reused between rows
+    fn first_sight(&mut self, value: &Datum<'_>, scratch: &mut Vec<u8>) -> bool {
+        if !self.moved {
+            if let Datum::Int(number) = value {
+                return self.integers.insert(*number);
+            }
+            self.moved = true;
+            for number in std::mem::take(&mut self.integers) {
+                scratch.clear();
+                inillucent_tree::key::encode_into_with(
+                    &Datum::Int(number),
+                    self.collation,
+                    scratch,
+                );
+                self.encoded.insert(scratch.clone());
+            }
+        }
+        scratch.clear();
+        inillucent_tree::key::encode_into_with(value, self.collation, scratch);
+        if self.encoded.contains(scratch.as_slice()) {
+            return false;
+        }
+        self.encoded.insert(scratch.clone());
+        true
+    }
+}
+
 /// What only some aggregate calls keep, apart from the fields every call uses.
 ///
 /// See [`Accumulator`]'s `rare` field for why these are boxed.
@@ -251,7 +345,7 @@ struct Rare {
     /// `inillucent_tree::key` encoding `DISTINCT` and the set operations use, so
     /// `count(DISTINCT team)` over a `NOCASE` column agrees with `SELECT DISTINCT
     /// team` over it.
-    seen: Option<(Collation, HashSet<Vec<u8>>)>,
+    seen: Option<DistinctSet>,
     /// The encoded key `seen` is asked about, reused between rows.
     ///
     /// One buffer rather than one allocation per row; see the note in `push`
@@ -359,7 +453,7 @@ impl Accumulator {
     /// @param collation - the collation the argument is compared under
     pub fn distinct(kind: AggregateKind, collation: Collation) -> Accumulator {
         let mut accumulator = Accumulator::new(kind);
-        accumulator.rare_mut().seen = Some((collation, HashSet::new()));
+        accumulator.rare_mut().seen = Some(DistinctSet::new(collation));
         accumulator
     }
 
@@ -458,6 +552,19 @@ impl Accumulator {
                 .cloned()
                 .unwrap_or(inillucent_value::value::Value::Null);
             let seen = OwnedDatum::from(seen);
+            // **A row the `min` or `max` call's `FILTER` drops is not a candidate.**
+            // It can still be the row the bare column falls back to when no
+            // row passes at all, which SQLite answers with the first row.
+            let filtered_out = matches!(
+                values.get(2),
+                Some(inillucent_value::value::Value::Integer(0))
+            );
+            if filtered_out {
+                if self.chosen.is_none() {
+                    self.chosen = Some(OwnedDatum::from(value));
+                }
+                return;
+            }
             // A NULL never wins a `min` or a `max`, so a row whose witness is
             // NULL cannot be the row the bare column comes from - unless no row
             // has yet been chosen at all.
@@ -523,20 +630,14 @@ impl Accumulator {
             return true;
         };
         let Rare { seen, scratch, .. } = rare;
-        let Some((collation, seen)) = seen else {
+        let Some(seen) = seen else {
             return true;
         };
         let Some(value) = value else {
             return true;
         };
         let datum = OwnedDatum::from(value.clone());
-        scratch.clear();
-        inillucent_tree::key::encode_into_with(&datum.borrow(), *collation, scratch);
-        if seen.contains(scratch.as_slice()) {
-            return false;
-        }
-        seen.insert(scratch.clone());
-        true
+        seen.first_sight(&datum.borrow(), scratch)
     }
 
     /// Folds a whole batch's worth of rows into a `count(*)`.
@@ -687,7 +788,7 @@ impl Accumulator {
             return;
         }
         if let Some(Rare {
-            seen: Some((collation, seen)),
+            seen: Some(seen),
             scratch,
             ..
         }) = self.rare.as_deref_mut()
@@ -697,12 +798,9 @@ impl Accumulator {
             // few distinct values allocated one key per *row* and dropped
             // almost all of them - `count(DISTINCT status)` over a million rows
             // with six statuses allocated a million times to keep six.
-            scratch.clear();
-            inillucent_tree::key::encode_into_with(value, *collation, scratch);
-            if seen.contains(scratch.as_slice()) {
+            if !seen.first_sight(value, scratch) {
                 return;
             }
-            seen.insert(scratch.clone());
         }
         self.count = self.count.saturating_add(1);
         match &self.kind {
@@ -944,25 +1042,31 @@ impl Accumulator {
                     }
                     return;
                 }
-                // Accumulate in i128 so one pass can be taken without a
-                // checked_add per element, then fall back to the double sum
-                // only if the exact total does not fit. The result is the same
-                // value the per-row path produces, which the agreement test
-                // asserts.
-                let mut wide: i128 = i128::from(self.integer_sum);
-                slots.for_each(|value| wide += i128::from(value));
-                match i64::try_from(wide) {
-                    Ok(exact) => self.integer_sum = exact,
-                    Err(_) => {
-                        // The exact total left `i64`, so the sum becomes a
-                        // double from here. Seeding it needs the same split
-                        // `seed_real` uses, applied to the wider value.
-                        self.is_real = true;
-                        self.overflowed = true;
-                        let low = (wide % SPLIT) as f64;
-                        self.real_sum = (wide - i128::from(low as i64)) as f64;
-                        self.compensation = low;
+                // **A checked add per value, in row order, because the
+                // overflow SQLite reports is the running total's and not the
+                // final one's.** This used to add the run in `i128` and look
+                // only at the total, so 1, 2^63 - 1, -2^63 and 0 summed to 0
+                // where SQLite raises `integer overflow` at the second row.
+                // The per row path gets that right, and a long lived session
+                // takes this path on a second read of the same table, so the
+                // same statement answered 0 once and failed once. The values
+                // from the one that overflows onwards go through `push_numeric`,
+                // the per row path.
+                let mut running = self.integer_sum;
+                let mut rest: Vec<i64> = Vec::new();
+                slots.for_each(|value| {
+                    if !rest.is_empty() {
+                        rest.push(value);
+                        return;
                     }
+                    match running.checked_add(value) {
+                        Some(next) => running = next,
+                        None => rest.push(value),
+                    }
+                });
+                self.integer_sum = running;
+                for value in rest {
+                    self.push_numeric(&Datum::Int(value));
                 }
             }
             AggregateKind::Minimum => {
@@ -1581,8 +1685,11 @@ mod tests {
     /// This is what licenses the fast path to exist: it is only a speed change.
     #[test]
     fn the_dense_path_agrees_with_the_per_row_path() {
-        let runs: [Vec<i64>; 5] = [
+        let runs: [Vec<i64>; 6] = [
             vec![],
+            // The running total overflows at the second value and the last two
+            // bring it back: SQLite still raises `integer overflow`.
+            vec![1, i64::MAX, i64::MIN, 0],
             vec![7],
             (0..1000).collect(),
             vec![i64::MAX, 1, 1],

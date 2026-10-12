@@ -795,11 +795,24 @@ fn unhex(arguments: &[Value<'static>], encoding: TextEncoding) -> Value<'static>
     if value.is_null() {
         return Value::Null;
     }
+    // A NULL list of ignored characters makes the answer NULL, as a NULL first
+    // argument does; it used to be read as an empty list.
+    if arguments.get(1).is_some_and(Value::is_null) {
+        return Value::Null;
+    }
     let ignored = arguments
         .get(1)
         .map(|value| eval::text_bytes(value, encoding))
         .unwrap_or_default();
-    let bytes = eval::text_bytes(value, encoding);
+    let all_bytes = eval::text_bytes(value, encoding);
+    // **SQLite reads the argument as a C string, so a zero byte ends it.**
+    // `unhex(x'00')` is the empty blob, where the zero byte read as an invalid
+    // digit answered NULL.
+    let end = all_bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(all_bytes.len());
+    let bytes = all_bytes.get(..end).unwrap_or(&all_bytes);
     // **An ignored character may stand between two bytes and not inside one.** The two digits of
     // a byte must be next to each other, so `unhex('4 142', ' ')` is NULL, where removing the
     // ignored characters first made it the bytes 41 42.
@@ -1051,13 +1064,15 @@ fn substring(arguments: &[Value<'static>], encoding: TextEncoding) -> Value<'sta
         return Value::Null;
     }
     // A blob counts in bytes and text counts in characters, which is SQLite's
-    // rule. Both borrow from `bytes`, so neither allocates per unit.
-    let units: Vec<&[u8]> = if is_blob {
-        bytes.chunks(1).collect()
+    // rule. **Counted and then walked, never collected (bug hunt 9).** A slice per
+    // character is sixteen bytes a character, so `substr` of a 100 MB text held
+    // 1.6 GB of slices and peaked at 2.7 GB where SQLite takes 390 MB.
+    let total = if is_blob {
+        bytes.len()
     } else {
-        characters(&bytes)
+        character_count(&bytes)
     };
-    let total = units.len() as i64;
+    let total_units = total as i64;
     let Some(start_value) = arguments.get(1) else {
         return Value::Null;
     };
@@ -1074,21 +1089,24 @@ fn substring(arguments: &[Value<'static>], encoding: TextEncoding) -> Value<'sta
         // is empty because the limit plus the start is below zero.
         None => DEFAULT_VALUE_LENGTH_LIMIT,
     };
-    let (first, count) = substring_span(start, count, total);
-    let first = usize::try_from(first)
-        .unwrap_or(usize::MAX)
-        .min(units.len());
+    let (first, count) = substring_span(start, count, total_units);
+    let first = usize::try_from(first).unwrap_or(usize::MAX).min(total);
     let last = first
         .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
-        .min(units.len());
-    let mut out = Vec::new();
-    for unit in units.get(first.min(units.len())..last).unwrap_or(&[]) {
-        out.extend_from_slice(unit);
-    }
+        .min(total);
+    let (from, to) = if is_blob {
+        (first, last)
+    } else {
+        (
+            character_offset(&bytes, first),
+            character_offset(&bytes, last),
+        )
+    };
+    let out = bytes.get(from..to.max(from)).unwrap_or(&[]);
     if is_blob {
-        return Value::owned_blob(&out).unwrap_or(Value::Null);
+        return Value::owned_blob(out).unwrap_or(Value::Null);
     }
-    Value::owned_text(&out).unwrap_or(Value::Null)
+    Value::owned_text(out).unwrap_or(Value::Null)
 }
 
 /// The value length limit SQLite starts from for `substr` with no length.
@@ -1167,23 +1185,60 @@ fn characters(bytes: &[u8]) -> Vec<&[u8]> {
     let mut units = Vec::new();
     let mut at = 0usize;
     while at < bytes.len() {
-        let mut end = at.saturating_add(1);
-        // Only a leader of 0xC0 or more takes continuation bytes with it
-        // (`SQLITE_SKIP_UTF8`); a stray 0x80 is a character of its own.
-        let leader = bytes.get(at).copied().unwrap_or(0) >= 0xc0;
-        while leader
-            && bytes
-                .get(end)
-                .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
-        {
-            end = end.saturating_add(1);
-        }
+        let end = character_end(bytes, at);
         if let Some(unit) = bytes.get(at..end) {
             units.push(unit);
         }
         at = end;
     }
     units
+}
+
+/// Returns where the character that starts at `at` ends, by the rule [`characters`] states.
+///
+/// @param bytes - the value's bytes
+/// @param at - where a character starts
+fn character_end(bytes: &[u8], at: usize) -> usize {
+    let mut end = at.saturating_add(1);
+    // Only a leader of 0xC0 or more takes continuation bytes with it
+    // (`SQLITE_SKIP_UTF8`); a stray 0x80 is a character of its own.
+    let leader = bytes.get(at).copied().unwrap_or(0) >= 0xc0;
+    while leader
+        && bytes
+            .get(end)
+            .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
+    {
+        end = end.saturating_add(1);
+    }
+    end
+}
+
+/// Returns how many characters a value holds, by the rule [`characters`] states.
+///
+/// @param bytes - the value's bytes
+fn character_count(bytes: &[u8]) -> usize {
+    let mut count = 0usize;
+    let mut at = 0usize;
+    while at < bytes.len() {
+        at = character_end(bytes, at);
+        count = count.saturating_add(1);
+    }
+    count
+}
+
+/// Returns the byte offset of the `nth` character, or the length when there are fewer.
+///
+/// @param bytes - the value's bytes
+/// @param nth - which character, counting from zero
+fn character_offset(bytes: &[u8], nth: usize) -> usize {
+    let mut at = 0usize;
+    for _ in 0..nth {
+        if at >= bytes.len() {
+            break;
+        }
+        at = character_end(bytes, at);
+    }
+    at.min(bytes.len())
 }
 
 /// `trim(x[, chars])`, and its one-sided forms.
@@ -1212,20 +1267,34 @@ fn trim(
     };
     let subject_bytes = eval::text_bytes(subject, encoding);
     let cutset = characters(&cutset_bytes);
-    let mut units = characters(&subject_bytes);
-    if left {
-        while units.first().is_some_and(|unit| cutset.contains(unit)) {
-            units.remove(0);
+    // **One walk and one copy (bug hunt 9).** This collected a slice per character
+    // and removed the first one in a loop, so `ltrim` was quadratic and `trim` of
+    // a 100 MB text peaked at 2.6 GB. The walk keeps two offsets: where the kept
+    // text starts, and where the last character not in the cut set ends.
+    let mut start = 0usize;
+    let mut at = 0usize;
+    let mut trimming = left;
+    let mut end = 0usize;
+    while at < subject_bytes.len() {
+        let next = character_end(&subject_bytes, at);
+        let unit = subject_bytes.get(at..next).unwrap_or(&[]);
+        let cut = cutset.contains(&unit);
+        if trimming && cut {
+            start = next;
+        } else {
+            trimming = false;
+            if !cut || !right {
+                end = next;
+            }
         }
+        at = next;
     }
-    if right {
-        while units.last().is_some_and(|unit| cutset.contains(unit)) {
-            units.pop();
-        }
-    }
-    let out: Vec<u8> = units.concat();
-    Value::owned_text(&out).unwrap_or(Value::Null)
+    let out = subject_bytes.get(start..end.max(start)).unwrap_or(&[]);
+    Value::owned_text(out).unwrap_or(Value::Null)
 }
+
+/// The magnitude past which a double has no fractional part, 2^52, as `round()` tests it.
+const EXACT_INTEGER_LIMIT: f64 = 4_503_599_627_370_496.0;
 
 /// `round(x[, digits])`, which rounds half away from zero.
 fn round(arguments: &[Value<'static>]) -> Value<'static> {
@@ -1262,21 +1331,18 @@ fn round(arguments: &[Value<'static>]) -> Value<'static> {
     // own formatting is exact for the same reason SQLite's `%!.*f` is, so the
     // transcription is one line.
     if digits == 0 {
-        let factor = 10f64.powi(0);
-        let scaled = real * factor;
-        // **Scaling a large value past the end of the range is not a
-        // rounding.** `round(1e308, 2)` multiplied by 100, got infinity,
-        // divided it by 100 and answered `Inf` - a value the source never held
-        // and that SQLite never produces.
-        if !scaled.is_finite() {
+        // **SQLite's own arithmetic, step for step.** It adds one half with the
+        // sign of the value and truncates through a 64 bit integer, so
+        // 0.49999999999999994 + 0.5 rounds up to exactly 1.0 in the addition and
+        // the answer is 1.0. `f64::round` looks at the value's own fraction and
+        // answered 0.0. A value past 2^52 has no fractional part and is its own
+        // answer, and a result of zero is a positive zero because the integer
+        // has no sign of zero.
+        if !(-EXACT_INTEGER_LIMIT..=EXACT_INTEGER_LIMIT).contains(&real) {
             return Value::Real(real);
         }
-        // `f64::round` already rounds half away from zero, which is what
-        // SQLite's own zero-places branch does with `(sqlite_int64)(r+0.5)`.
-        // That branch goes through an integer, so a value that rounds to zero
-        // is a positive zero: `round(-0.4)` is 0.0 there, and adding 0.0 is
-        // what turns Rust's -0.0 into it.
-        return Value::Real(scaled.round() / factor + 0.0);
+        let half = if real < 0.0 { -0.5 } else { 0.5 };
+        return Value::Real((real + half) as i64 as f64);
     }
     let places = usize::try_from(digits).unwrap_or(0);
     match rounded_text(real, places).parse::<f64>() {

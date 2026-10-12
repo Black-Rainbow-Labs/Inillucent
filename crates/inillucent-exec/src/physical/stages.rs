@@ -254,6 +254,12 @@ pub enum Source<'t> {
     /// 4,294,967,295 rows, and materialising it before the `LIMIT` above it runs
     /// is a query that does not return.
     Virtual(Box<VirtualScanSource<'t>>),
+    /// A recursive CTE that is filled while the query above it reads it.
+    ///
+    /// The rows exist only as the passes produce them, so a `LIMIT` above a
+    /// `WHERE` above an unbounded recursion can end it. Materialising the
+    /// recursion first never returned for such a query.
+    Recursive(Box<RecursiveSource<'t>>),
     /// A fixed number of rows of no columns at all.
     ///
     /// What drives `SELECT 1`, `SELECT date('now')` and every other query with
@@ -285,6 +291,26 @@ pub struct VirtualScanSource<'t> {
     /// Which of the term's columns the query reads.
     pub needed: inillucent_sql::bind::ColumnUse,
 }
+/// Everything a recursive CTE's fill needs, kept so it can be driven at run time.
+///
+/// Boxed inside [`Source::Recursive`] for the same reason [`VirtualScanSource`] is.
+pub struct RecursiveSource<'t> {
+    /// Where the trees and layouts come from.
+    pub catalog: &'t dyn TreeCatalog,
+    /// The FROM term whose queue this is.
+    pub cte: usize,
+    /// The arms that do not reference the CTE.
+    pub seeds: Vec<(inillucent_sql::ast::CompoundOp, PhysicalPlan)>,
+    /// The arms that do.
+    pub steps: Vec<(inillucent_sql::ast::CompoundOp, PhysicalPlan)>,
+    /// How many columns a row holds.
+    pub width: usize,
+    /// The CTE's own `ORDER BY`, `LIMIT` and `OFFSET`; always empty for a streamed fill.
+    pub queue: inillucent_sql::plan::RecursiveQueue,
+    /// The values this execution bound.
+    pub params: Params,
+}
+
 /// Reads one catalog's `case_sensitive_like`, as a function `is_some_and` takes.
 ///
 /// @param catalog - the catalog the statement is compiled against
@@ -406,6 +432,21 @@ impl Source<'_> {
                 )?;
                 downstream.finish()
             }
+            Source::Recursive(fill) => {
+                crate::recursive::stream_recursive(
+                    &crate::recursive::Recursion {
+                        cte: fill.cte,
+                        seeds: &fill.seeds,
+                        steps: &fill.steps,
+                        width: fill.width,
+                        queue: &fill.queue,
+                        catalog: fill.catalog,
+                        params: &fill.params,
+                    },
+                    downstream,
+                )?;
+                downstream.finish()
+            }
             Source::Constant(rows) => {
                 if *rows > 0 {
                     let batch = Batch::new(*rows, Vec::new());
@@ -430,6 +471,7 @@ impl Source<'_> {
             Source::Vector(_, _) => "VECTOR SEARCH",
             Source::Rows(_) => "SCAN SUBQUERY",
             Source::Virtual(_) => "SCAN VIRTUAL TABLE",
+            Source::Recursive(_) => "SCAN SUBQUERY",
             Source::Constant(_) => "CONSTANT ROW",
         }
     }
@@ -539,7 +581,11 @@ pub fn prepare(
             plan.sources.first().map(|source| &source.path),
             Some(AccessPath::TableScan { .. })
         );
-    if single_scan && !forced.table_scan && !order_sensitive(&plan.select) {
+    // A statement whose `ORDER BY` the table walk already answers keeps the table: an index
+    // tree holds the rows in the index's order, so swapping it in made the sorter run and read
+    // every row, where a `LIMIT` would have stopped the walk after the first few.
+    let walk_answers_order = !plan.select.order_by.is_empty() && !plan.needs_sort;
+    if single_scan && !forced.table_scan && !order_sensitive(&plan.select) && !walk_answers_order {
         let table_root = stages.first().map(|stage| stage.root).unwrap_or(0);
         for candidate in catalog.covering_candidates(table_root) {
             // SQLite walks an index in place of the table only when its
@@ -1080,7 +1126,17 @@ fn index_stages(
             // 124.25, because the corpus holds `-1e300` and `+1e300` and the
             // small values vanish between them. SQLite reads the table here,
             // and so must this.
-            if unbounded && covering.is_some() && term.outermost() && term.sensitive {
+            //
+            // **Only for an aggregate over the whole table.** A `GROUP BY`
+            // planned over the index's order streams its groups on the promise
+            // that the walk keeps each group's rows together, and SQLite walks
+            // the index there too. Swapping in the table broke that promise:
+            // `SELECT p.cat, sum(oi.price) FROM p JOIN oi ... GROUP BY p.cat`
+            // over the index on `cat` read `p` in rowid order and returned one
+            // group per run of equal `cat` values, four groups where there are
+            // two.
+            let whole = term.plan.aggregation == inillucent_sql::plan::AggregationMode::Whole;
+            if unbounded && covering.is_some() && term.outermost() && term.sensitive && whole {
                 let request = term.reads(*table_root, AccessKind::Full);
                 push_stage(stages, term.catalog, request, offset)?;
                 return Ok(true);

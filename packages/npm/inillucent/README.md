@@ -131,14 +131,23 @@ transaction, use the `batch` command: `inillucent('batch', { db, sql: 'INSERT ..
 | JavaScript value | Bound as |
 |---|---|
 | `null` or `undefined` | `NULL` |
+| a boolean | `INTEGER` 1 or 0 |
 | a number | `INTEGER` or `REAL`. `-0` keeps its sign |
-| `NaN`, `Infinity` | refused with a `TypeError`, because SQL has no value for them |
+| a `BigInt` that fits in 64 bits | `INTEGER` |
 | a string | `TEXT` |
-| a `Uint8Array` | `BLOB` |
+| a `Uint8Array`, including a `Buffer` | `BLOB` |
 
-`query()` returns a BLOB column as a `Uint8Array`, so bytes read by one query can be bound into the
-next. Through the C library an integer beyond 2^53 comes back as a `BigInt`, so it is exact; through
-a process it is a number, which JSON rounds.
+Every other value is refused: `NaN`, `Infinity`, a `BigInt` past 64 bits, a string with a lone
+surrogate, a `Date`, an array, a plain object, a function, a `Symbol` and a typed array that is not a
+`Uint8Array`. `inillucent()` returns `{ ok: false, status: 'invalid_state', message }` and `query()`
+throws an `Error` with that `status`. The refusal is the same whichever way the call is made: in this
+process, through a program, or through a session.
+
+`query()` returns a BLOB column as a `Buffer`, which is a `Uint8Array`, so bytes read by one query can
+be bound into the next. Text that is not valid UTF-8 also comes back as a `Buffer`, because a string
+would have to replace the bytes it cannot spell. An integer beyond 9007199254740991 comes back as a `BigInt`
+and a smaller one as a number, on every route, so no integer is rounded. A column named `__proto__`
+is an own property of the row.
 
 ## Encrypted databases
 

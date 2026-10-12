@@ -646,12 +646,10 @@ impl Probing<'_, '_> {
             // throw most of it away. On an index built before its rows were
             // loaded - the ordinary application order - every leaf is delta,
             // and that ran per probe.
-            // The same cap `PagedTree::visit_equal` gives `equal_run`, so the
-            // span this merges and the span the visitor matched are found the
-            // same way.
-            const RUN_SCAN: usize = 8;
+            // The sorted run is the one the visitor already found, passed on
+            // so it is not searched for a second time.
             let merged: Vec<Vec<Datum<'_>>> = if leaf.needs_materialising() {
-                leaf.live_matching(probe, RUN_SCAN)?
+                leaf.live_matching_run(probe, start, end)?
             } else {
                 Vec::new()
             };
@@ -1092,8 +1090,11 @@ pub(crate) fn keeps(condition: Option<&dyn Eval>, joined: &[OwnedDatum]) -> DbRe
         let columns: Vec<Vector<'_>> = borrowed.iter().map(|value| Vector::Const(*value)).collect();
         let batch = Batch::new(1, columns);
         // SQL's three-valued logic: only a true keeps the row, so a NULL
-        // condition drops it exactly as a false does.
+        // condition drops it exactly as a false does. **True by SQLite's rule,
+        // not only a non zero integer (bug hunt 9).** A bare column holding 2.5
+        // or the text '5' is true, and this kept only integers, so
+        // `FROM y JOIN x ON x.c1 = y.c1 WHERE x.c2` lost every such row.
         let verdict = condition.value(&batch, 0)?;
-        Ok(matches!(verdict.get(), Datum::Int(number) if number != 0))
+        Ok(crate::expr::truth(&verdict.get()) == Some(true))
     }
 }

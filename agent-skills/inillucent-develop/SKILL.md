@@ -130,9 +130,10 @@ A new git worktree is missing two gitignored folders:
 
 ### CI and the nightly
 
-CI runs only on the public mirror, Black-Rainbow-Labs/Inillucent, at 03:00 UTC and when started by
-hand, never on a push; both workflows are disabled in the private jasonmcaffee/inillucent. So run the
-suite locally before you push. `.github/workflows/tests.yml` runs the merge cadence, on Windows and
+The repository is Black-Rainbow-Labs/Inillucent, the `origin` remote. CI runs there at 03:00 UTC
+and when started by hand, never on a push. So run the suite locally before you push. A branch made
+before 2026-10-11 is based on the old private history: move it with `git rebase --onto` as
+AGENTS.md section 2 says, and never merge it. `.github/workflows/tests.yml` runs the merge cadence, on Windows and
 on Linux, as four jobs on Windows and three on Linux that each run one
 `inillucent-testrun --shard <k>/<n>` share. `.github/workflows/nightly.yml` runs the nightly cadence once a day, on Linux
 only, as four jobs that each run `inillucent-testrun --shard <k>/4`, and uploads each summary as a

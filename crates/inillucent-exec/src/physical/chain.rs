@@ -2054,6 +2054,32 @@ pub(crate) fn source_for_run<'t>(
                     needed,
                 })));
             }
+            // **A plain recursion is streamed to the operators above it.** One
+            // with its own `ORDER BY`, `LIMIT` or `OFFSET` needs every row
+            // before the first, and one under a known `LIMIT` stops by itself.
+            if let AccessPath::Recursive {
+                seeds,
+                steps,
+                width,
+                queue,
+            } = &term.path
+            {
+                let plain =
+                    queue.order_by.is_empty() && queue.limit.is_none() && queue.offset.is_none();
+                if plain && limit.is_none() {
+                    return Ok(Source::Recursive(Box::new(
+                        crate::physical::RecursiveSource {
+                            catalog,
+                            cte: term.id,
+                            seeds: seeds.clone(),
+                            steps: steps.clone(),
+                            width: *width,
+                            queue: queue.clone(),
+                            params: params.clone(),
+                        },
+                    )));
+                }
+            }
             let rows = materialise_stage(plan, catalog, params, stage, limit)?;
             Ok(Source::Rows(rows))
         }
@@ -2222,6 +2248,14 @@ fn build_source<'t>(
             // `embed('search_query: ...')` - a registered function, whose body
             // only this can resolve. See `literal_value_in`.
             let wanted = literal_value_in(probe, params, Some(catalog))?;
+            // A NULL query vector makes every distance NULL, so the rows are equal under the
+            // ORDER BY and come out in table order, which is what the statement returns with no
+            // index. The index has no nearest row to a NULL, and answered with none.
+            if matches!(wanted.borrow(), inillucent_tree::datum::Datum::Null) {
+                return Ok(Source::Scan(
+                    FullScan::new(tree, projection).with_needed(stage.needed),
+                ));
+            }
             let probe_over = PointProbe::new(tree, projection);
             let scan = super::joins::CandidateProbe {
                 plan,

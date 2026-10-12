@@ -32,12 +32,18 @@ impl PagedTree {
             return KeyBytes::Inline(inline, 8);
         }
         if self.encoding == KeyEncoding::General {
+            // **Through `encode_into`, so a descending column is inverted here
+            // too.** This loop used to encode each column itself and left the
+            // directions out, so every write into a `DESC` index descended with
+            // an ascending key while the separators it compared against were
+            // inverted. The write landed in whatever leaf that comparison
+            // picked, and once an index had more than one leaf its keys stopped
+            // increasing along the leaf chain: `integrity_check` failed and an
+            // indexed `WHERE c = 3` counted 85 rows of 428.
             let mut scratch = self.scratch.borrow_mut();
             scratch.clear();
-            for (index, value) in values.iter().enumerate() {
-                let collation = self.collations.get(index).copied().unwrap_or_default();
-                key::encode_into_with(value, collation, &mut scratch);
-            }
+            self.encoding
+                .encode_into(values, &self.collations, &self.directions, &mut scratch);
             return KeyBytes::from_slice(&scratch);
         }
         KeyBytes::from_slice(&self.encoding.encode_ordered(

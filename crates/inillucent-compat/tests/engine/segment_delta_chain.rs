@@ -31,9 +31,9 @@
 //! reach `segment_merge` and start a *second* merge, which is not what this
 //! suite is about.
 
-use inillucent_compat::differential::start_inillucent;
+use inillucent_compat::differential::{scratch, start_inillucent};
 use inillucent_compat::rendering::datum_text as render;
-use inillucent_engine::connect::Connection;
+use inillucent_engine::connect::{Connection, Database};
 
 /// Where this suite's scratch databases live.
 const AREA: &str = "segment-delta-chain";
@@ -201,8 +201,8 @@ fn a_merge_finished_through_a_segment_delta_chain_answers_like_a_full_compact() 
     );
     assert!(
         stored_segment_count(&chained, "docs") > 1,
-        "a finished merge's chain leaves its own earlier checkpoints behind \
-         until drop-old-generations reclaims them"
+        "a finished merge's chain keeps its own earlier checkpoints, and the \
+         segments the table holds are more than one"
     );
 
     // Genuinely readable end to end, not merely "happens to work": this
@@ -356,14 +356,22 @@ fn drop_old_generations_keeps_every_link_of_a_finished_merge() {
     for id in 1..=N {
         insert_row(&connection, id, DIMS);
     }
+    // A merge frees the segments it replaces when it finishes, so there is nothing left for the
+    // command to reclaim. The table used to keep every segment it ever wrote until asked, and an
+    // index that took updates for long enough grew without a bound.
     let before = stored_segment_count(&connection, "docs");
     exec(
         &connection,
         "INSERT INTO docs(docs) VALUES ('drop-old-generations')",
     );
+    assert_eq!(
+        stored_segment_count(&connection, "docs"),
+        before,
+        "every segment a merge replaced was already freed"
+    );
     assert!(
-        stored_segment_count(&connection, "docs") < before,
-        "the reclaim removed something"
+        before < N as usize,
+        "{before} stored segments for {N} one row commits means the merges freed nothing"
     );
     exec(
         &connection,
@@ -438,4 +446,65 @@ fn a_segment_reads_back_without_its_row_map() {
         column(&connection, "SELECT rowid FROM docs ORDER BY rowid"),
         expected
     );
+}
+
+/// A reader that is inside a transaction while another connection merges and frees segments is not
+/// broken by it.
+///
+/// The rows of a replaced segment used to stay in the file until `drop-old-generations` ran, on the
+/// argument that a reader may still need them. A reader loads the manifest and the segments it
+/// names in one statement, from the committed state at that moment, so it never holds the name of
+/// a segment a merge has freed. This opens a transaction on one connection, lets a second
+/// connection finish several merges, and then runs the first search on the first, which loads
+/// every segment of the table.
+#[test]
+fn a_reader_open_across_a_merge_is_not_broken_by_the_freed_segments() {
+    const DIMS: usize = 4;
+    const BEFORE: i64 = 6;
+    const AFTER: i64 = 40;
+
+    let path = scratch(AREA, "reader-across-merge", "inillucent");
+    let database = Database::open(&path).expect("it opens");
+    let writer = database.session();
+    let reader = database.session();
+    exec(&writer, "PRAGMA busy_timeout = 5000");
+    exec(&reader, "PRAGMA busy_timeout = 5000");
+    exec(
+        &writer,
+        &format!(
+            "CREATE VIRTUAL TABLE docs USING inillucent_search(title, body, dims = {DIMS}, \
+             mode = 'exact', compact = 1, segment_merge = 2)"
+        ),
+    );
+    for id in 1..=BEFORE {
+        insert_row(&writer, id, DIMS);
+    }
+
+    // The reader's snapshot: a transaction that has read the table's state and nothing of its index.
+    exec(&reader, "BEGIN");
+    let seen = column(&reader, "SELECT count(*) FROM docs_gen");
+    assert!(!seen.is_empty());
+
+    let stored_before = stored_segment_count(&writer, "docs");
+    for id in (BEFORE + 1)..=AFTER {
+        insert_row(&writer, id, DIMS);
+    }
+    assert!(
+        stored_segment_count(&writer, "docs") < stored_before + (AFTER - BEFORE) as usize,
+        "the merges freed nothing, so the reader had no deleted segment to depend on"
+    );
+
+    let query = hex(&vector_for(3, DIMS));
+    let found = column(
+        &reader,
+        &format!("SELECT rowid FROM docs WHERE vector = x'{query}' AND k = 100 ORDER BY rank"),
+    );
+    assert_eq!(
+        found.len(),
+        AFTER as usize,
+        "the reader loads the manifest and the segments it names from the same committed state, \
+         and the merged segment holds every row: {found:?}"
+    );
+    exec(&reader, "COMMIT");
+    exec(&reader, "INSERT INTO docs(docs) VALUES ('integrity-check')");
 }

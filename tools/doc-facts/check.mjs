@@ -150,7 +150,8 @@ function shellOptions() {
   if (out === null) return null;
   const [accepted, refused] = out.split(/Refused, because this engine has no equivalent[^\n]*\r?\n/);
   const count = (text) => (text ? text.split(/\r?\n/).filter((line) => /^\s{2,}(--?[a-z-]+|--)(\s|$)/.test(line)).length : 0);
-  const acted = count(accepted?.split(/Options:\r?\n/)[1]);
+  // `sqlite3` heads its list `OPTIONS include:`, and the shell prints the same words.
+  const acted = count(accepted?.split(/(?:Options|OPTIONS include):\r?\n/)[1]);
   const declined = count(refused);
   return { acted, declined, total: acted + declined };
 }

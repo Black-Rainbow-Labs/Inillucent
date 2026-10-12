@@ -1,15 +1,14 @@
 <#
 .SYNOPSIS
-    Reads what GitHub's `tests` workflow said about a commit, on the development repository and on
-    the public mirror, and decides whether that commit may be released or called deployed.
+    Reads what GitHub's `tests` workflow said about a commit on Black-Rainbow-Labs/Inillucent, and
+    decides whether that commit may be released or called deployed.
 
 .DESCRIPTION
-    Dot sourced by `ship.ps1`, whose last route waits for the run of the release on the public
-    mirror, and by `ci-status.ps1`, the command an agent runs after any deploy before it calls the
+    Dot sourced by `ship.ps1`, whose last route waits for the run of the release, and by `ci-status.ps1`, the command an agent runs after any deploy before it calls the
     work finished.
 
-    Since task-2168 the workflows run only on the public mirror, on a schedule and by hand: the
-    private development repository's Actions spending stopped every job there on 2026-10-02. So a
+    Since task-2168 the workflows run only on Black-Rainbow-Labs/Inillucent, on a schedule and by
+    hand, never on a push; since task-2245 that is also where development happens. So a
     commit a release has just pushed has no run until one is started, and `Wait-CiVerdict -StartOn`
     starts it.
 
@@ -129,7 +128,7 @@ function Get-RepoFromRemote {
         A checkout of the repository.
 
     .PARAMETER Remote
-        The remote: `origin` is jasonmcaffee/inillucent, `brl` is the public mirror.
+        The remote, normally `origin`, which is Black-Rainbow-Labs/Inillucent.
     #>
     param([string] $Root, [string] $Remote)
     $url = (& git -C $Root remote get-url $Remote 2>$null)

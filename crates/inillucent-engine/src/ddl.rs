@@ -36,7 +36,7 @@
 //! cache and bumps the generation. Emptying the cache is the invalidation; the
 //! generation is what a test can read to prove it happened.
 
-use inillucent_base::error::{refusal, statement_refusal};
+use inillucent_base::error::{confinement_refusal, refusal, statement_refusal};
 use inillucent_base::DbResult;
 use inillucent_catalog::paged::{ObjectKind, SchemaEntry};
 use inillucent_exec::dml::Changes;
@@ -530,7 +530,7 @@ impl ImportedDatabase {
                     None => path,
                     Some(root) => match root.admit(&path) {
                         Ok(inside) => inside.to_string_lossy().into_owned(),
-                        Err(refused) => return Err(refusal(refused.message())),
+                        Err(refused) => return Err(confinement_refusal(refused.message())),
                     },
                 };
                 if std::path::Path::new(&path).exists() {

@@ -42,8 +42,9 @@ pub enum Tokenizer {
     Porter(Box<Tokenizer>),
     /// `unicode61`: Unicode letters and numbers are tokens.
     Unicode61 {
-        /// Whether diacritics are removed, which `remove_diacritics` decides.
-        remove_diacritics: bool,
+        /// What `remove_diacritics` asked for: 0 keeps diacritics, 1 removes them and 2 also
+        /// removes the ranges SQLite only removes at that setting.
+        remove_diacritics: u8,
         /// Characters that are part of a token although their category is not.
         extra_tokens: Vec<char>,
         /// Characters that separate although their category says otherwise.
@@ -79,7 +80,15 @@ impl Tokenizer {
             // Whatever follows `porter` is the tokenizer it wraps, and nothing
             // following it means the default one.
             let inner = specification.get(1..).unwrap_or(&[]);
-            return Ok(Tokenizer::Porter(Box::new(Tokenizer::named(inner)?)));
+            // SQLite reports a wrapped tokenizer it cannot find with the wrapper's own words.
+            let wrapped = Tokenizer::named(inner).map_err(|error| {
+                if error.unsupported().is_some() {
+                    return error;
+                }
+                let said = "error in tokenizer constructor".to_string();
+                crate::vtab::failure(said.clone()).with_message(said)
+            })?;
+            return Ok(Tokenizer::Porter(Box::new(wrapped)));
         }
         if name == "ascii" {
             return Ok(Tokenizer::Ascii);
@@ -87,6 +96,18 @@ impl Tokenizer {
         // An empty name is the default, which is `unicode61`; anything else has
         // to be a name this build implements.
         if !name.is_empty() && name != "unicode61" {
+            // A name SQLite has never heard of is a mistake in the statement, which SQLite
+            // reports as `no such tokenizer`. Only a name SQLite does have, and this build
+            // does not, is `unsupported`.
+            if name != "trigram" {
+                let said = format!(
+                    "no such tokenizer: {}",
+                    String::from_utf8_lossy(
+                        specification.first().map(Vec::as_slice).unwrap_or(&[])
+                    )
+                );
+                return Err(crate::vtab::failure(said.clone()).with_message(said));
+            }
             let said = format!("the fts5 tokenizer {name}");
             return Err(inillucent_base::error::misuse(format!(
                 "the new engine's physical pass does not handle {said} yet"
@@ -96,7 +117,7 @@ impl Tokenizer {
             ))
             .with_unsupported(said));
         }
-        let mut remove_diacritics = true;
+        let mut remove_diacritics = 1u8;
         let mut extra_tokens = Vec::new();
         let mut separators = Vec::new();
         let mut arguments = specification.iter().skip(1);
@@ -107,7 +128,13 @@ impl Tokenizer {
             };
             let value = String::from_utf8_lossy(value).into_owned();
             match key.as_str() {
-                "remove_diacritics" => remove_diacritics = value.trim() != "0",
+                "remove_diacritics" => {
+                    remove_diacritics = match value.trim() {
+                        "0" => 0,
+                        "2" => 2,
+                        _ => 1,
+                    }
+                }
                 "tokenchars" => extra_tokens.extend(value.chars()),
                 "separators" => separators.extend(value.chars()),
                 _ => {}
@@ -150,7 +177,7 @@ impl Tokenizer {
         let mut at = 0usize;
         for character in text.chars() {
             let width = character.len_utf8();
-            if self.is_token_character(character) {
+            if self.is_token_character(character, !current.is_empty()) {
                 if current.is_empty() {
                     start = at;
                 }
@@ -182,7 +209,7 @@ impl Tokenizer {
         let mut tokens = Vec::new();
         let mut current = String::new();
         for character in text.chars() {
-            if self.is_token_character(character) {
+            if self.is_token_character(character, !current.is_empty()) {
                 self.fold_into(character, &mut current);
                 continue;
             }
@@ -197,11 +224,15 @@ impl Tokenizer {
     }
 
     /// Returns whether a character is part of a token.
-    fn is_token_character(&self, character: char) -> bool {
+    ///
+    /// @param character - the character
+    /// @param inside - whether a token is already being read, which is when a combining mark
+    ///   belongs to it. A mark never starts a token.
+    fn is_token_character(&self, character: char, inside: bool) -> bool {
         match self {
             // Unreachable: `tokens` answers a porter tokenizer from the
             // tokenizer it wraps and never walks the text itself.
-            Tokenizer::Porter(inner) => inner.is_token_character(character),
+            Tokenizer::Porter(inner) => inner.is_token_character(character, inside),
             Tokenizer::Ascii => !character.is_ascii() || character.is_ascii_alphanumeric(),
             Tokenizer::Unicode61 {
                 extra_tokens,
@@ -215,6 +246,7 @@ impl Tokenizer {
                     return true;
                 }
                 character.is_alphanumeric()
+                    || (inside && super::fold::is_diacritic(u32::from(character)))
             }
         }
     }
@@ -243,12 +275,10 @@ impl Tokenizer {
             Tokenizer::Unicode61 {
                 remove_diacritics, ..
             } => {
-                for folded in character.to_lowercase() {
-                    out.push(if *remove_diacritics {
-                        strip_diacritic(folded)
-                    } else {
-                        folded
-                    });
+                // SQLite's own table, which a code point of zero leaves out of the token.
+                let folded = super::fold::fold(u32::from(character), *remove_diacritics);
+                if let Some(folded) = char::from_u32(folded).filter(|_| folded != 0) {
+                    out.push(folded);
                 }
             }
         }
@@ -280,48 +310,6 @@ fn clipped(mut token: String) -> Vec<u8> {
         token.truncate(end);
     }
     token.into_bytes()
-}
-
-/// Returns a Latin character with its diacritic removed.
-///
-/// The table is the Latin-1 and Latin Extended-A range, which is what
-/// `remove_diacritics=1` covers in practice and what makes `café` and `cafe`
-/// the same word. Anything outside it is left alone rather than guessed at:
-/// stripping a mark from a script whose marks change the word would be worse
-/// than not stripping it.
-fn strip_diacritic(character: char) -> char {
-    const FOLDED: &str = "aaaaaaaceeeeiiiidnooooo\u{f7}ouuuuypy";
-    let code = character as u32;
-    if (0xe0..=0xff).contains(&code) {
-        let index = (code - 0xe0) as usize;
-        if let Some(replacement) = FOLDED.chars().nth(index) {
-            return replacement;
-        }
-    }
-    // Latin Extended-A alternates an accented letter with its plain form in
-    // several runs; the ones that matter are handled by lower-casing first.
-    match character {
-        '\u{101}' | '\u{103}' | '\u{105}' => 'a',
-        '\u{107}' | '\u{109}' | '\u{10b}' | '\u{10d}' => 'c',
-        '\u{10f}' | '\u{111}' => 'd',
-        '\u{113}' | '\u{115}' | '\u{117}' | '\u{119}' | '\u{11b}' => 'e',
-        '\u{11d}' | '\u{11f}' | '\u{121}' | '\u{123}' => 'g',
-        '\u{125}' | '\u{127}' => 'h',
-        '\u{129}' | '\u{12b}' | '\u{12d}' | '\u{12f}' | '\u{131}' => 'i',
-        '\u{135}' => 'j',
-        '\u{137}' => 'k',
-        '\u{13a}' | '\u{13c}' | '\u{13e}' | '\u{140}' | '\u{142}' => 'l',
-        '\u{144}' | '\u{146}' | '\u{148}' => 'n',
-        '\u{14d}' | '\u{14f}' | '\u{151}' => 'o',
-        '\u{155}' | '\u{157}' | '\u{159}' => 'r',
-        '\u{15b}' | '\u{15d}' | '\u{15f}' | '\u{161}' => 's',
-        '\u{163}' | '\u{165}' | '\u{167}' => 't',
-        '\u{169}' | '\u{16b}' | '\u{16d}' | '\u{16f}' | '\u{171}' | '\u{173}' => 'u',
-        '\u{175}' => 'w',
-        '\u{177}' | '\u{17a}' => 'y',
-        '\u{17c}' | '\u{17e}' => 'z',
-        other => other,
-    }
 }
 
 /// Reads a `tokenize = '...'` specification into its words.
@@ -511,15 +499,22 @@ mod tests {
     /// it answered a different question with no error anywhere.
     #[test]
     fn a_tokenizer_this_build_has_not_got_is_refused() {
-        for name in ["trigram", "icu", "porter2", "nonsense"] {
+        // `trigram` is a tokenizer SQLite has and this build does not, so it is `unsupported`.
+        let refused = Tokenizer::named(&[b"trigram".to_vec()])
+            .err()
+            .unwrap_or_else(|| panic!("trigram must be refused, not substituted"));
+        assert_eq!(
+            refused.unsupported(),
+            Some("the fts5 tokenizer trigram"),
+            "the refusal must name the tokenizer it refused"
+        );
+        // A name SQLite has never heard of is a mistake, and is refused in SQLite's words.
+        for name in ["icu", "porter2", "nonsense"] {
             let refused = Tokenizer::named(&[name.as_bytes().to_vec()])
                 .err()
                 .unwrap_or_else(|| panic!("{name} must be refused, not substituted"));
-            assert_eq!(
-                refused.unsupported(),
-                Some(format!("the fts5 tokenizer {name}").as_str()),
-                "the refusal must name the tokenizer it refused"
-            );
+            assert_eq!(refused.unsupported(), None);
+            assert_eq!(refused.message(), format!("no such tokenizer: {name}"));
         }
         // The names this build does have, and the wrapper, still work - which
         // is the half a refusal that turned everything away would break.

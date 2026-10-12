@@ -128,12 +128,30 @@ impl KeyEncoding {
                     number.floor() as i64
                 };
                 out.extend_from_slice(&key::order_preserving_int(clamped));
+                // **The real itself follows, so two reals between the same
+                // pair of integers still sort the way they compare.** An
+                // integer is the eight bytes alone, which is a prefix of this
+                // and sorts below it: 3 < 3.14 < 4. A rowid tree never holds a
+                // real and ignores the tail; a `WITHOUT ROWID` table keyed by
+                // an `INTEGER` column can.
+                let collation = collations.first().copied().unwrap_or(Collation::Binary);
+                key::encode_into_with(&Datum::Real(*number), collation, out);
             }
             (KeyEncoding::Rowid, Some(Datum::Null)) => {
                 out.extend_from_slice(&key::order_preserving_int(i64::MIN));
             }
             (KeyEncoding::Rowid, None) => {}
-            (KeyEncoding::Rowid, Some(_)) => out.extend_from_slice(&[0xFF; 8]),
+            // **Text and blobs follow the largest integer, in the general
+            // order.** The eight bytes of `i64::MAX` are every integer's
+            // upper bound, and the general encoding after them puts a text
+            // above a number and a blob above a text, which is the order SQLite
+            // keeps. Without the tail every text of the tree was one key, and a
+            // probe for one text landed in a leaf that held another.
+            (KeyEncoding::Rowid, Some(other)) => {
+                out.extend_from_slice(&[0xFF; 8]);
+                let collation = collations.first().copied().unwrap_or(Collation::Binary);
+                key::encode_into_with(other, collation, out);
+            }
             (KeyEncoding::General, _) => {
                 for (index, value) in values.iter().enumerate() {
                     let collation = collations.get(index).copied().unwrap_or(Collation::Binary);
@@ -213,5 +231,31 @@ mod tests {
         // Not a case a split produces, but the answer is still the right key.
         assert_eq!(shorten_separator(b"b", b"a"), b"a");
         assert_eq!(shorten_separator(b"a", b"a"), b"a");
+    }
+
+    /// A `WITHOUT ROWID` table keyed by an `INTEGER` column can hold a real, a
+    /// text or a blob. Each is the eight bytes of the integer it sits against
+    /// followed by the general encoding of the value, so integers keep their
+    /// eight bytes and the whole order is integers with reals between them,
+    /// then text, then blobs, as SQLite compares them.
+    #[test]
+    fn a_rowid_encoding_orders_reals_text_and_blobs_around_the_integers() {
+        let encode = |datum: Datum<'_>| KeyEncoding::Rowid.encode(&[datum]);
+        assert!(encode(Datum::Text(b"x")).starts_with(&[0xFF; 8]));
+        assert!(encode(Datum::Real(2.5)).starts_with(&encode(Datum::Int(2))));
+        let ascending = [
+            encode(Datum::Int(i64::MIN)),
+            encode(Datum::Int(2)),
+            encode(Datum::Real(2.5)),
+            encode(Datum::Int(3)),
+            encode(Datum::Int(i64::MAX)),
+            encode(Datum::Real(f64::MAX)),
+            encode(Datum::Text(b"x")),
+            encode(Datum::Text(b"y")),
+            encode(Datum::Blob(b"a")),
+        ];
+        for pair in ascending.windows(2) {
+            assert!(pair[0] < pair[1], "{:?} below {:?}", pair[0], pair[1]);
+        }
     }
 }

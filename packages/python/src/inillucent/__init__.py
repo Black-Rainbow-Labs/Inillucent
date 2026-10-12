@@ -123,6 +123,63 @@ def binary(program: str = "inillucent") -> Path:
     )
 
 
+#: The commands that read their parameter values from ``--params-file``.
+_PARAMS_FILE_COMMANDS = frozenset({"query", "exec"})
+
+#: The longest command line this platform takes. Windows refuses one past 32,767
+#: characters in total; Linux refuses a single argument past 131,072 bytes.
+_COMMAND_LINE_LIMIT = 32000 if os.name == "nt" else 100000
+
+
+def _wire_value(value: Any) -> Any:
+    """Return one parameter as the JSON value the command line reads.
+
+    **Bytes, NaN and the wrong types were all mishandled here.** ``json.dumps``
+    wrote ``NaN`` and ``Infinity``, which are not JSON; it wrote a list or a dict
+    as JSON, which the program binds as a vector or as a blob; and it could not
+    write bytes at all. The rules are the driver's, so the two halves of the
+    package agree on what a parameter may be:
+
+    - bytes, ``bytearray`` and ``memoryview`` become ``{"blob": "<hex>"}``;
+    - NaN becomes null, which is what ``sqlite3_bind_double`` stores;
+    - infinity raises ``ValueError``, because the command line has no spelling
+      for it and :class:`Database` binds it;
+    - a list, dict or any other type raises ``TypeError``;
+    - text that is not valid Unicode, such as a lone surrogate, raises
+      ``ValueError`` because it has no UTF-8 spelling.
+
+    :param value: one parameter a caller passed
+    """
+    if value is None or isinstance(value, (bool, int, str)):
+        if isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValueError("a text parameter holds a lone surrogate") from None
+        return value
+    if isinstance(value, float):
+        if value != value:
+            return None
+        if value in (float("inf"), float("-inf")):
+            raise ValueError(
+                "the command line cannot bind infinity; open a Database to bind it"
+            )
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"blob": bytes(value).hex()}
+    _driver._refuse_type(value)
+    return None
+
+
+def _params_json(params: Any) -> bytes:
+    """Return a list of parameters as the UTF-8 JSON array ``--params-file`` reads.
+
+    :param params: the values a caller passed for ``?1``, ``?2``, ...
+    """
+    values = [_wire_value(value) for value in _driver._positional(params)]
+    return json.dumps(values, ensure_ascii=False).encode("utf-8")
+
+
 def run(
     command: str,
     db: str | os.PathLike[str] | None = None,
@@ -148,13 +205,22 @@ def run(
     :param arguments: the named arguments that verb takes
     """
     argv: list[str] = [str(binary()), command, "--output", "json"]
+    standard_input: bytes | None = None
     if db is not None:
         argv += ["--db", str(db)]
     for name, value in arguments.items():
         if value is None or value is False:
             continue
         flag = "--" + name.replace("_", "-")
-        if value is True:
+        if name == "params" and command in _PARAMS_FILE_COMMANDS:
+            # Through standard input, so the values have no length ceiling and
+            # reach the program as UTF-8 whatever the console's code page is.
+            standard_input = _params_json(value)
+            if standard_input != b"[]":
+                argv += ["--params-file", "-"]
+            else:
+                standard_input = None
+        elif value is True:
             argv.append(flag)
         elif isinstance(value, (list, tuple)):
             # `params` and `vector` are JSON arguments, and the command line
@@ -163,14 +229,43 @@ def run(
         else:
             argv += [flag, str(value)]
     environment = None if key is None else {**os.environ, "INILLUCENT_KEY": key}
-    finished = subprocess.run(argv, capture_output=True, text=True, env=environment)
-    output = finished.stdout.strip()
+    _refuse_a_long_command_line(argv)
+    # Bytes in and bytes out, decoded as UTF-8 here. `text=True` decoded with the
+    # console's code page, which is cp1252 on Windows: any character outside it
+    # raised UnicodeDecodeError, and any character inside it came back as the
+    # wrong one.
+    finished = subprocess.run(
+        argv, capture_output=True, input=standard_input, env=environment
+    )
+    output = finished.stdout.decode("utf-8", "replace").strip()
     if output.startswith("{"):
         return json.loads(output)
     raise RuntimeError(
         f"inillucent {command} could not be run "
-        f"(exit {finished.returncode}): {finished.stderr.strip() or output}"
+        f"(exit {finished.returncode}): "
+        f"{finished.stderr.decode('utf-8', 'replace').strip() or output}"
     )
+
+
+def _refuse_a_long_command_line(argv: list[str]) -> None:
+    """Raise a clear error for a command line the operating system would refuse.
+
+    The statement travels as an argument, and the program has no way to read it
+    from a file. Without this check the failure was an ``OSError`` from the
+    operating system that said nothing about SQL.
+
+    :param argv: the program and its arguments
+    """
+    if os.name == "nt":
+        length = sum(len(argument) + 3 for argument in argv)
+    else:
+        length = max(len(argument.encode("utf-8")) for argument in argv)
+    if length > _COMMAND_LINE_LIMIT:
+        raise ValueError(
+            f"the command line is {length} characters, past the {_COMMAND_LINE_LIMIT} this "
+            "platform allows. Parameters are sent through standard input, so the statement "
+            "is what is too long: open a Database and call execute instead."
+        )
 
 
 def query(

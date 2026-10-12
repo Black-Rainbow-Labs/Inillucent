@@ -139,7 +139,7 @@ otherwise.
 | Joins | inner, `LEFT`, `RIGHT` and `FULL OUTER`, `CROSS`, `NATURAL`, `USING`, self joins. The planner picks a hash join, an index nested loop or a scan |
 | Compound queries | `UNION`, `UNION ALL`, `EXCEPT`, `INTERSECT` |
 | Subqueries | in `WHERE`, `IN`, `EXISTS`, as a value, and as a table in `FROM`, correlated or not. Row values in comparisons and in `IN`, with a value list or a subquery, such as `(a, b) IN (SELECT x, y FROM s)`. Recursive CTEs with `ORDER BY`, `LIMIT` and `OFFSET` |
-| Common table expressions | `WITH`, `WITH RECURSIVE`, `MATERIALIZED` and `NOT MATERIALIZED`, and `WITH` on `INSERT`, `UPDATE` and `DELETE` |
+| Common table expressions | `WITH`, `WITH RECURSIVE`, `MATERIALIZED` and `NOT MATERIALIZED`, and `WITH` on `INSERT`, `UPDATE` and `DELETE`. A recursive CTE produces rows while the query above it reads them, so `WHERE n > 3 LIMIT 2` over a recursion with no end stops after two matching rows. A CTE that reads itself anywhere but the `FROM` clause of its last arm fails with `circular reference`, and two reads of itself in one arm fail with `multiple references to recursive table` or `multiple recursive references`, as in SQLite |
 | Window functions | all eleven window functions and every aggregate function, `json_group_array`, `json_group_object`, `median` and `percentile` included, `PARTITION BY`, `ROWS`, `RANGE` and `GROUPS` frames, every `EXCLUDE` clause, `FILTER`, and named `WINDOW` clauses |
 | Writes | `INSERT`, `UPDATE`, `DELETE` and `REPLACE`, every `OR` conflict clause, `RETURNING`, `UPDATE ... FROM`, and `ON CONFLICT ... DO UPDATE` and `DO NOTHING`, with a target that is a column list, a partial index (the `WHERE` must match the index) or an expression such as `ON CONFLICT(lower(name))`. `DO UPDATE` runs the `CHECK`, `NOT NULL` and `STRICT` checks and fires the table's `UPDATE` triggers |
 | Tables | `CREATE TABLE`, `CREATE TABLE ... AS SELECT`, `WITHOUT ROWID`, `STRICT`, `VIRTUAL` and `STORED` generated columns, `AUTOINCREMENT`. A generated column has its declared affinity and collation, takes `STRICT`, `NOT NULL`, `UNIQUE` and `ON CONFLICT`, and can be a foreign key parent or child |
@@ -153,7 +153,7 @@ otherwise.
 | Several databases | `ATTACH` and `DETACH`, joins across files, and one transaction that commits to two files or to neither. Temporary tables, views and triggers |
 | Schema and maintenance | `sqlite_schema` and `sqlite_master`, `VACUUM`, `VACUUM INTO`, `integrity_check` and `quick_check` |
 | Plans | `EXPLAIN QUERY PLAN` as SQLite's tree, with attached schema names, automatic index lines for a join and for a correlated subquery, the loop SQLite turns a positive `EXISTS` into, `LEFT-JOIN` markers, `CO-ROUTINE` and `MATERIALIZE` nodes for derived tables and CTEs, `COMPOUND QUERY` and `MERGE` nodes for compound queries, and `SCALAR SUBQUERY` and `LIST SUBQUERY` nodes. A derived table is flattened into the query that reads it where SQLite flattens it. Some plans still differ, see [below](#how-inillucent-behaves-differently-from-sqlite). Plain `EXPLAIN` runs and prints a different program, see [below](#five-follow-from-how-inillucent-is-built) |
-| Table valued functions | `generate_series`, `chunk_text(text, size, overlap, heading)`, which cuts a document into windows of characters for embedding, `json_each`, `json_tree`, a `pragma_*` function for every pragma that returns a value, such as `pragma_table_info('t')`, `pragma_foreign_key_check` and `pragma_user_version`, which can take its argument from an earlier `FROM` term, as in `FROM sqlite_master m, pragma_index_list(m.name)`, and any module an application registers |
+| Table valued functions | `generate_series`, `chunk_text(text, size, overlap, heading)`, which cuts a document into windows of characters for embedding, `json_each`, `json_tree`, a `pragma_*` function for every pragma that returns a value, such as `pragma_table_info('t')`, `pragma_foreign_key_check` and `pragma_user_version`, which can take its argument from an earlier `FROM` term, as in `FROM sqlite_master m, pragma_index_list(m.name)`, and any module an application registers. A schema name in front of the function, as in `main.generate_series(1, 3)`, is accepted |
 
 ### Rules a reader asks about
 
@@ -181,6 +181,26 @@ is SQLite's message.
 - A view in `main` does not read a temporary table that shadows its base table.
 - `INDEXED BY` may name a partial index where SQLite accepts it.
 - `RETURNING` is evaluated right after each row is written, before `AFTER` triggers run.
+- A column of a derived table, a CTE or a view that is a compound query takes its affinity from the
+  first arm whose expression has one, as SQLite does. `SELECT 1 AS o UNION ALL SELECT x FROM r` over a
+  `REAL` column `x` makes `o` a `REAL` column, so the 1 reads as 1.0. An arm that can hold text next
+  to a numeric column, or a first arm that is a `CAST`, leaves the integers as they are.
+
+**Constraints and conflicts.**
+
+- A row that breaks two `UNIQUE` or `PRIMARY KEY` constraints of one table reports the one declared
+  last. This holds for the primary key of a `WITHOUT ROWID` table too: with `x UNIQUE, y PRIMARY
+  KEY` it reports `t.y`, and with `y PRIMARY KEY, x UNIQUE` it reports `t.x`.
+- A `UNIQUE` constraint on the same columns as the primary key of a `WITHOUT ROWID` table is the
+  same index, as in SQLite, and `PRAGMA index_list` shows one row for it.
+- A `STRICT` datatype failure inside a transaction leaves the rows an `INSERT OR FAIL`,
+  `OR IGNORE`, `OR REPLACE`, `UPDATE OR FAIL`, `OR IGNORE` or `OR REPLACE` wrote before the failing
+  row. Outside a transaction the whole statement is undone.
+- A `VIRTUAL` generated column is computed on every `INSERT` and `UPDATE`. A write is refused when
+  the expression fails, for example `abs(-9223372036854775808)` with `integer overflow`.
+- `GLOB`, `REGEXP` and `MATCH` take no `ESCAPE`. `a GLOB b ESCAPE c` fails with `wrong number of
+  arguments to function GLOB()`. An aggregate used as a window function keeps its argument count, so
+  `sum() OVER ()` fails the same way.
 
 **How a `WHERE` is searched.**
 
@@ -361,6 +381,7 @@ These differences change how an application runs, and they do not show up in a p
 | Threads | one. The engine is single threaded | serialised or multithreaded |
 | A transaction larger than the page cache | allowed under `delete`, `truncate` and `persist`. Under `wal`, `memory` and `off`, the transaction fails when it changes more pages than the cache holds | spills to the journal |
 | A `SELECT` result | computed when the first row is stepped. Later steps return rows already computed | computed one row per step |
+| `AND` and `OR` | both operands are evaluated, so an error in the operand SQLite would skip, such as `abs(-9223372036854775808)` after a true left side of `OR`, is raised | the right operand is skipped when the left side decides the result |
 | `DELETE ... LIMIT` and `UPDATE ... LIMIT` | accepted | accepted only in a build made with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`. The pinned `sqlite3` is built without it, and many distribution builds enable it |
 | `PRAGMA page_size` before the first write | ignored, because the page size is part of inillucent's file format. The default is 32768. `PRAGMA page_size = n` prints nothing, as in SQLite. `PRAGMA aux.page_size = n` is ignored too | sets the page size |
 | `PRAGMA page_count`, `freelist_count` and `max_page_count` | count pages of 32768 bytes, so the same data needs fewer pages, and a `max_page_count` limit is reached later. `max_page_count` is enforced: a statement that would grow the file past it fails with `database or disk is full` and the status `full`, and only that statement is rolled back. The limit is held on the open file and is not written to it | count pages of 4096 bytes. A statement that meets the limit rolls back the whole transaction in the cases that were measured |

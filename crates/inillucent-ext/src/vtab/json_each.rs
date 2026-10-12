@@ -36,6 +36,9 @@ pub enum Walk {
 pub struct JsonWalkModule {
     walk: Walk,
     name: &'static str,
+    /// The ten declared columns, built once: a lateral join connects the module for
+    /// every outer row, and building them took about twenty allocations each time.
+    declaration: std::sync::Arc<Declaration>,
 }
 
 impl JsonWalkModule {
@@ -44,6 +47,7 @@ impl JsonWalkModule {
         JsonWalkModule {
             walk: Walk::Each,
             name: "json_each",
+            declaration: std::sync::Arc::new(declaration()),
         }
     }
 
@@ -52,6 +56,7 @@ impl JsonWalkModule {
         JsonWalkModule {
             walk: Walk::Tree,
             name: "json_tree",
+            declaration: std::sync::Arc::new(declaration()),
         }
     }
 }
@@ -102,7 +107,7 @@ impl Module for JsonWalkModule {
     ) -> DbResult<Box<dyn VirtualTable>> {
         Ok(Box::new(JsonWalkTable {
             walk: self.walk,
-            declaration: declaration(),
+            declaration: std::sync::Arc::clone(&self.declaration),
         }))
     }
 }
@@ -129,7 +134,7 @@ fn declaration() -> Declaration {
 /// One connected `json_each` or `json_tree`.
 struct JsonWalkTable {
     walk: Walk,
-    declaration: Declaration,
+    declaration: std::sync::Arc<Declaration>,
 }
 
 impl VirtualTable for JsonWalkTable {
@@ -328,7 +333,7 @@ impl JsonWalkCursor {
     fn each(&mut self, node: &Node, value_at: i64, node_id: i64, prefix: &str) {
         for child in children(node, value_at) {
             self.rows.push(WalkRow {
-                key: child.key.clone(),
+                key: child.key(),
                 node: child.node.clone(),
                 id: child.id,
                 parent: None,
@@ -362,7 +367,7 @@ impl JsonWalkCursor {
         for child in children(node, value_at) {
             let fullkey = child.fullkey(prefix);
             self.rows.push(WalkRow {
-                key: child.key.clone(),
+                key: child.key(),
                 node: child.node.clone(),
                 id: child.id,
                 parent: Some(reported),
@@ -376,8 +381,6 @@ impl JsonWalkCursor {
 
 /// One child of a container, with everything the walk needs about it.
 struct Child<'tree> {
-    /// The label or index, as the `key` column reports it.
-    key: Option<Value<'static>>,
     /// The label as text, for the path.
     label: Option<String>,
     /// The index, for the path.
@@ -391,6 +394,18 @@ struct Child<'tree> {
 }
 
 impl Child<'_> {
+    /// Returns the label or index as the `key` column reports it.
+    ///
+    /// Built when asked for: finding a path's member walks the children of every container on
+    /// the way and reports none of their keys.
+    fn key(&self) -> Option<Value<'static>> {
+        match (&self.label, self.index) {
+            (Some(label), _) => Value::owned_text(label.as_bytes()).ok(),
+            (None, Some(index)) => Some(Value::Integer(index as i64)),
+            _ => None,
+        }
+    }
+
     /// Returns the path to this child.
     fn fullkey(&self, prefix: &str) -> String {
         match (&self.label, self.index) {
@@ -414,7 +429,6 @@ fn children(node: &Node, node_id: i64) -> Vec<Child<'_>> {
         Node::Array(items) => {
             for (index, item) in items.iter().enumerate() {
                 out.push(Child {
-                    key: Some(Value::Integer(index as i64)),
                     label: None,
                     index: Some(index),
                     node: item,
@@ -429,7 +443,6 @@ fn children(node: &Node, node_id: i64) -> Vec<Child<'_>> {
                 let name = render::unescape(label);
                 let value_at = cursor.saturating_add(encoded_length(label));
                 out.push(Child {
-                    key: Value::owned_text(name.as_bytes()).ok(),
                     label: Some(name),
                     index: None,
                     node: value,
@@ -505,14 +518,13 @@ fn locate_from<'tree>(
 
 /// Returns how many bytes one node's whole encoding takes.
 fn encoded_length(node: &Node) -> i64 {
-    let mut out = Vec::new();
-    binary::encode(node, &mut out);
-    i64::try_from(out.len()).unwrap_or(0)
+    i64::try_from(binary::encoded_len(node)).unwrap_or(0)
 }
 
 /// Returns how many bytes one node's header takes, payload excluded.
 fn header_length(node: &Node) -> i64 {
-    encoded_length(node).saturating_sub(payload_length(node))
+    let payload = usize::try_from(payload_length(node)).unwrap_or(0);
+    i64::try_from(binary::header_len(payload)).unwrap_or(0)
 }
 
 /// Returns how many bytes one node's payload takes, header excluded.

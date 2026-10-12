@@ -268,6 +268,14 @@ pub struct BoundTrigger {
     /// `ForeignKeyTrigger::self_referencing`, which is where the value comes
     /// from. Always false on a trigger the schema wrote.
     pub self_referencing: bool,
+    /// The write it fires on, with `UPDATE OF` folded.
+    ///
+    /// **Read by `PRAGMA recursive_triggers`.** A body statement that writes the trigger's own
+    /// table is handed the trigger back only when that statement is the kind of write the
+    /// trigger fires on. It used to be handed back whatever it was, so an `AFTER INSERT` trigger
+    /// that updated its own row fired itself for the `UPDATE`, again and again, and failed with
+    /// `too many levels of trigger recursion` where SQLite updates the row once.
+    pub event: crate::catalog_view::TriggerEventInfo,
 }
 
 /// A bound `INSERT`.
@@ -1034,7 +1042,14 @@ impl<'a> Binder<'a> {
             binder.bind_triggers(&table, TriggerEventInfo::Update(Vec::new()), &changed)
         })?;
         // Foreign keys see the generated columns whose inputs were assigned.
-        let key_changes = self.changed_with_generated(&table, &changed)?;
+        // **Bound with the target alone in scope**, like the schema expressions
+        // above: a generated column's text names the target's columns, and with
+        // a `FROM` term that has a column of the same name (`FROM t0 AS u`) an
+        // unqualified `c0` in `AS (coalesce(c0, c1))` was ambiguous.
+        let saved_scopes = core::mem::replace(&mut self.scopes, vec![vec![source]]);
+        let key_changes = self.changed_with_generated(&table, &changed);
+        self.scopes = saved_scopes;
+        let key_changes = key_changes?;
         let triggers = self
             .bind_foreign_keys(&table, TriggerEventInfo::Update(Vec::new()), &key_changes)?
             .around(triggers);
@@ -1453,6 +1468,7 @@ impl<'a> Binder<'a> {
             body,
             foreign_key: false,
             self_referencing: false,
+            event: trigger.event.clone(),
         })
     }
 
@@ -2038,10 +2054,14 @@ impl<'a> Binder<'a> {
 
     /// Binds the virtual generated columns a write has to test.
     ///
-    /// A column is included when it is `NOT NULL`, or when the table is
-    /// `STRICT` and so checks every column's type. Each is bound as a read of
-    /// the column, which is the expression converted by the column's affinity:
-    /// SQLite tests that value, and not the bare expression.
+    /// Every virtual column is included. A `NOT NULL` or `STRICT` column is
+    /// tested against its value, and any other column is still computed,
+    /// because SQLite computes a virtual column on every write and refuses the
+    /// write when the expression fails (`abs(-9223372036854775808)` reports
+    /// "integer overflow" on the `INSERT`, not on the first `SELECT`). Each is
+    /// bound as a read of the column, which is the expression converted by the
+    /// column's affinity: SQLite tests that value, and not the bare
+    /// expression.
     ///
     /// @param table - the table being written
     fn bind_virtual_columns(
@@ -2051,7 +2071,7 @@ impl<'a> Binder<'a> {
         let mut bound = Vec::new();
         for (position, column) in table.columns.iter().enumerate() {
             let virtual_column = column.generated && !column.stored;
-            if !virtual_column || !(column.not_null || table.strict) {
+            if !virtual_column {
                 continue;
             }
             let expr = self.bind_schema_expr(&crate::catalog_view::quoted_name(&column.name))?;

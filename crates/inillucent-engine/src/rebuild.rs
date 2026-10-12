@@ -246,17 +246,48 @@ fn copy_rows(
         false => "INSERT INTO",
     };
     let insert = format!("{verb} {name} ({names}) VALUES ({placeholders})");
-    for row in rows {
-        let mut params = inillucent_exec::physical::Params::new();
-        for (slot, at) in kept.iter().enumerate() {
-            if let Some(value) = row.get(*at) {
-                params.set(slot.saturating_add(1) as u32, value.clone());
-            }
+    let statement = fresh.prepare_statement(&insert)?;
+    let at_once = fresh.runs_rows_at_once(&statement)?;
+    let mut rows = rows.into_iter().peekable();
+    while rows.peek().is_some() {
+        let chunk: Vec<Vec<inillucent_tree::datum::OwnedDatum>> = rows
+            .by_ref()
+            .take(ROWS_PER_STATEMENT)
+            .map(|row| {
+                kept.iter()
+                    .map(|at| {
+                        row.get(*at)
+                            .cloned()
+                            .unwrap_or(inillucent_tree::datum::OwnedDatum::Null)
+                    })
+                    .collect()
+            })
+            .collect();
+        if at_once
+            && fresh
+                .execute_rows_at_once(&statement, chunk.clone())?
+                .is_some()
+        {
+            continue;
         }
-        fresh.execute_any(&insert, &params)?;
+        for row in chunk {
+            let mut params = inillucent_exec::physical::Params::new();
+            for (slot, value) in row.into_iter().enumerate() {
+                params.set(slot.saturating_add(1) as u32, value);
+            }
+            fresh.execute_any(&insert, &params)?;
+        }
     }
     Ok(())
 }
+
+/// How many rows one `INSERT` of a rebuild carries when the engine can run rows at once.
+///
+/// **One statement per chunk where the copy ran one per row.** A rebuild of two tables of
+/// 500,000 rows made a million statements, each paying for the lock check, the counters and the
+/// undo mark that `execute_rows_at_once` pays once. The chunk bounds the copy of the rows a
+/// failed chunk would be run again from.
+const ROWS_PER_STATEMENT: usize = 20_000;
 
 /// Carries every `AUTOINCREMENT` table's high water mark across a rebuild.
 ///

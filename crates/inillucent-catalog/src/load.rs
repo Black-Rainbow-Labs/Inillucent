@@ -531,7 +531,7 @@ pub fn table_from_create_sql(sql: &[u8], database: usize, root: u32) -> DbResult
     info.autoincrement = info.rowid_alias.is_some() && declares_autoincrement(columns, constraints);
     let (automatic, rowid_key_conflict) =
         automatic_indexes(&info, &parsed.ast, columns, constraints);
-    info.indexes = automatic;
+    info.indexes = merge_duplicate_keys(&info.name, info.without_rowid, automatic);
     // A table-level `PRIMARY KEY(id) ON CONFLICT REPLACE` over a rowid alias
     // has no index of its own, so its clause is recorded on the column - the
     // same place a column-level one lands.
@@ -1091,6 +1091,66 @@ fn automatic_indexes(
         });
     }
     (indexes, rowid_key_conflict)
+}
+
+/// Folds the automatic indexes of a `WITHOUT ROWID` table that repeat an earlier one's key.
+///
+/// **SQLite creates one index for a key however many constraints name it.** `c0
+/// UNIQUE` with `PRIMARY KEY(c0)` is one index: the later constraint is
+/// dropped, a `PRIMARY KEY` that follows a `UNIQUE` turns the kept index into
+/// the primary key, and the survivors are numbered from one in order. Keeping
+/// both here left a second index with no tree behind it, and the table failed
+/// with "no layout imported for root page 0" on `count(*)`, `DELETE` and every
+/// scan, and an upsert on `ON CONFLICT(c0)` reported a unique failure.
+///
+/// A rowid table's indexes are returned as they were: they have trees of their
+/// own and have always been kept.
+///
+/// @param table - the table's name, for the automatic names
+/// @param without_rowid - whether the table is `WITHOUT ROWID`
+/// @param indexes - the indexes the constraints declare, in declaration order
+fn merge_duplicate_keys(
+    table: &[u8],
+    without_rowid: bool,
+    indexes: Vec<IndexInfo>,
+) -> Vec<IndexInfo> {
+    if !without_rowid {
+        return indexes;
+    }
+    let mut kept: Vec<IndexInfo> = Vec::with_capacity(indexes.len());
+    for index in indexes {
+        let same = |held: &IndexInfo| {
+            held.columns.len() == index.columns.len()
+                && held
+                    .columns
+                    .iter()
+                    .zip(&index.columns)
+                    .all(|(left, right)| {
+                        left.column.is_some()
+                            && left.column == right.column
+                            && left.collation.eq_ignore_ascii_case(&right.collation)
+                            && left.declared_descending == right.declared_descending
+                    })
+        };
+        let Some(earlier) = kept.iter_mut().find(|held| same(held)) else {
+            kept.push(index);
+            continue;
+        };
+        if index.origin == IndexOrigin::PrimaryKey {
+            earlier.origin = IndexOrigin::PrimaryKey;
+        }
+        if earlier.conflict.is_none() {
+            earlier.conflict = index.conflict;
+        }
+    }
+    for (position, index) in kept.iter_mut().enumerate() {
+        let ordinal = u32::try_from(position)
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        index.name = automatic_name(table, ordinal);
+        index.folded = index.name.to_ascii_lowercase();
+    }
+    kept
 }
 
 /// Returns the expression an index key computes, when the key is a `VIRTUAL`

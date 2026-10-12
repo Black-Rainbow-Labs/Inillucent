@@ -512,7 +512,7 @@ pub unsafe extern "C" fn inillucent_py_execute(
             answer_for(api, || {
                 let database = database_of(conn)?;
                 let connection = database.database.session_as(session_of(conn));
-                Some(connection.query(text, &[], crate::capi::value::capped(limit)))
+                Some(connection.query_one(text, &[], crate::capi::value::capped(limit)))
             })
         },
         std::ptr::null_mut(),

@@ -44,6 +44,9 @@ impl crate::ImportedDatabase {
     ) -> DbResult<Outcome> {
         let only = argument.map(|argument| argument_text(argument).to_ascii_lowercase());
         let database = self.database_to_check(only.as_deref(), at)?;
+        if let Some(message) = self.schema.foreign_key_mismatch(only.as_deref(), database) {
+            return Err(inillucent_base::error::refusal(message));
+        }
         let queries =
             self.schema
                 .foreign_key_checks(only.as_deref(), database, &self.schema_label(database));
@@ -72,13 +75,14 @@ impl crate::ImportedDatabase {
             changes: Default::default(),
         })
     }
-    /// Refuses a pragma whose table argument does not exist, when the statement is prepared.
+    /// Refuses a check pragma whose table does not exist or whose key has no parent key, when the statement is prepared.
     ///
-    /// SQLite looks the table up while compiling `PRAGMA foreign_key_check(missing)`, so the
-    /// shell reports `Parse error` and a prepared statement fails before any step. Checking
+    /// SQLite looks the table up while compiling `PRAGMA foreign_key_check(missing)` and
+    /// `PRAGMA integrity_check(missing)`, and finds each foreign key's parent index there too, so
+    /// the shell reports `Parse error` and a prepared statement fails before any step. Checking
     /// again at run time is still done by [`Self::pragma_foreign_key_check`].
     ///
-    /// @param directive - the bound statement; only a `foreign_key_check` with a name is checked
+    /// @param directive - the bound statement; only the three check pragmas are looked at
     pub(crate) fn check_pragma_at_prepare(
         &self,
         directive: &inillucent_sql::directive::Directive,
@@ -86,16 +90,27 @@ impl crate::ImportedDatabase {
         let inillucent_sql::directive::Directive::Pragma {
             database,
             name,
-            argument: Some(argument),
+            argument,
         } = directive
         else {
             return Ok(());
         };
-        if name.as_slice() != b"foreign_key_check" {
-            return Ok(());
+        match name.as_slice() {
+            b"foreign_key_check" => {
+                let only = argument
+                    .as_ref()
+                    .map(|argument| argument_text(argument).to_ascii_lowercase());
+                let checked = self.database_to_check(only.as_deref(), *database)?;
+                match self.schema.foreign_key_mismatch(only.as_deref(), checked) {
+                    Some(message) => Err(inillucent_base::error::refusal(message)),
+                    None => Ok(()),
+                }
+            }
+            b"integrity_check" | b"quick_check" => {
+                self.check_named_table(argument.as_ref(), *database)
+            }
+            _ => Ok(()),
         }
-        let only = argument_text(argument).to_ascii_lowercase();
-        self.database_to_check(Some(&only), *database).map(|_| ())
     }
 
     /// Returns the database a `foreign_key_check` looks in.
@@ -190,11 +205,14 @@ impl crate::ImportedDatabase {
     /// @param column - which of the two names asked for this, and so which one
     ///   the answer is reported under
     /// @param depth - how much of the file that name reads
+    /// @param named - the pragma's argument and the database it was qualified with
     pub(crate) fn pragma_integrity_check(
         &self,
         column: &str,
         depth: CheckDepth,
+        named: (Option<&PragmaArgument>, Option<usize>),
     ) -> DbResult<Outcome> {
+        self.check_named_table(named.0, named.1)?;
         let answer = match self.check_trees_to(depth) {
             Ok(()) => b"ok".to_vec(),
             Err(error) => error
@@ -209,6 +227,32 @@ impl crate::ImportedDatabase {
             changes: Default::default(),
         })
     }
+    /// Refuses an `integrity_check` or `quick_check` argument that names a table that does not exist.
+    ///
+    /// **The argument is a table name unless it reads as an integer.** SQLite
+    /// reads `integrity_check(10)` as the most errors to report and anything
+    /// else as the one table to check, which it looks up while compiling, so
+    /// `integrity_check(nosuch)` fails with `no such table: nosuch` and used to
+    /// answer `ok` here.
+    ///
+    /// @param argument - the pragma's argument, when it has one
+    /// @param at - the database the pragma was qualified with, when it was
+    fn check_named_table(
+        &self,
+        argument: Option<&PragmaArgument>,
+        at: Option<usize>,
+    ) -> DbResult<()> {
+        let Some(argument) = argument else {
+            return Ok(());
+        };
+        let text = argument_text(argument);
+        if text.trim().parse::<i32>().is_ok() {
+            return Ok(());
+        }
+        self.database_to_check(Some(&text.to_ascii_lowercase()), at)
+            .map(|_| ())
+    }
+
     /// Checkpoints the log into the data file.
     ///
     /// SQLite answers three integers: whether it was blocked, how many frames

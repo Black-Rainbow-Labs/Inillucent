@@ -972,6 +972,38 @@ covers = ["inillucent-exec", "inillucent-sql"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "order_limit_walk"
+tier = "engine"
+covers = ["inillucent-exec", "inillucent-sql"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "planner_choices"
+tier = "engine"
+covers = ["inillucent-exec", "inillucent-sql"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "expression_index_covering"
+tier = "engine"
+covers = ["inillucent-exec", "inillucent-sql"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "scratch_memory_flat"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-tree"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "autoindex_reopen"
 tier = "engine"
 covers = ["inillucent-engine"]
@@ -2251,6 +2283,22 @@ module = "reindex_crash"
 tier = "durability"
 covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim"]
 
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "reused_key_extent"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "read_only_connection"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-driver", "inillucent-pool", "inillucent-wal"]
+
 # Encryption at rest through the connection: no plaintext on disk, key
 # refusals, rekey, ATTACH KEY, VACUUM, backup and export.
 [[target]]
@@ -3362,6 +3410,16 @@ tier = "e2e"
 # It runs `inillucent setup-embeddings` as a child process.
 covers = ["inillucent-cli"]
 
+# The shell's command line, exit status and bytes: arguments, `.exit`, input and
+# output that is not UTF-8, and files an option must not create.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "e2e"
+module = "shell_command_line"
+tier = "e2e"
+covers = ["inillucent-cli"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"
@@ -3402,6 +3460,17 @@ module = "mcp_cancel"
 tier = "e2e"
 # It starts the MCP server as a child process and cancels a request in flight.
 covers = ["inillucent-cli"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "e2e"
+module = "mcp_per_call"
+tier = "e2e"
+# It starts the MCP server and the command line as child processes: a `db`
+# argument for one call, the read tool refusing a write, paths a root refuses,
+# and `ping` answered while a call runs.
+covers = ["inillucent-cli", "inillucent-vfs", "inillucent-engine"]
 
 [[target]]
 package = "inillucent-compat"

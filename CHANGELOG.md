@@ -10,6 +10,13 @@ fails the build when any copy of it disagrees.
 
 ## 2.5.0 to 2.5.4, 10 and 11 October 2026
 
+**The shell now matches `sqlite3` 3.53 on its command line, exit codes, bytes and modes.** Text
+and files that are not UTF-8 pass through unchanged, `.exit N` sets the exit code, statement
+arguments run one at a time, `.open` takes its options, `.backup`, `.save`, `.clone` and
+`.dbtotxt` work on a database in memory, `.backup aux FILE` copies `aux`, `.tables`, `.schema`
+and `.indexes` list `temp` and attached databases, and `.mode` has `ascii`, `qbox`, `tcl` and the
+options `sqlite3` has. `docs/getting-started.md` lists what changed.
+
 **A bug hunt driven by real applications found about 100 defects, and this fixes most of them.**
 Eight hunts ran: application schemas the way ORMs write them, messy real data, speed against
 SQLite, the command line's round trips, two processes on one file, processes killed while they

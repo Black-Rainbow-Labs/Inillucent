@@ -386,3 +386,346 @@ fn fts5_operators_are_refused_instead_of_read_as_words() {
         assert!(!found.is_empty(), "{query}");
     }
 }
+
+/// Creates a table of two vectors with an index of one declaration over it.
+///
+/// @param connection - the connection to use
+/// @param declaration - what follows `CREATE INDEX vt_v ON vt`
+fn indexed_pair(connection: &Connection<'_>, declaration: &str) {
+    exec(
+        connection,
+        "CREATE TABLE vt (id INTEGER PRIMARY KEY, v VECTOR(3))",
+    );
+    exec(
+        connection,
+        "INSERT INTO vt VALUES (1,'[1,0,0]'),(2,'[0,1,0]')",
+    );
+    exec(
+        connection,
+        &format!("CREATE INDEX vt_v ON vt {declaration}"),
+    );
+}
+
+/// A `LIMIT` larger than any memory is answered with the rows there are, and does not abort.
+///
+/// `LIMIT 9223372036854775807` asked for an allocation of that many rowids and ended the process
+/// with a capacity overflow; `LIMIT 99999999999` asked for 800 GB.
+#[test]
+fn a_huge_limit_is_answered_with_the_rows_the_index_holds() {
+    for (at, declaration) in INDEXES.iter().enumerate() {
+        let connection = start_inillucent(AREA, &format!("huge-limit-{at}"));
+        indexed_pair(&connection, declaration);
+        for limit in ["9223372036854775807", "99999999999", "100000000"] {
+            let sql = format!(
+                "SELECT id FROM vt ORDER BY vector_distance_cos(v,'[1,0,0]') LIMIT {limit}"
+            );
+            let found = column(&connection, &sql);
+            // `ivfflat` reads the lists nearest the query and no more, so it may hold back a row.
+            if declaration.contains("ivfflat") {
+                assert_eq!(
+                    found.first().map(String::as_str),
+                    Some("1"),
+                    "{declaration}"
+                );
+            } else {
+                assert_eq!(found, vec!["1", "2"], "{declaration} {limit}");
+            }
+        }
+    }
+}
+
+/// A graph degree below two is refused when the index or the table is made.
+///
+/// A degree of 1 makes the graph's level multiplier infinite, and building the index then asked for
+/// a capacity no machine has. Zero was refused already; one was not.
+#[test]
+fn a_graph_degree_below_two_is_refused_at_create() {
+    let connection = start_inillucent(AREA, "degree-one");
+    exec(
+        &connection,
+        "CREATE TABLE vt (id INTEGER PRIMARY KEY, v VECTOR(3))",
+    );
+    exec(
+        &connection,
+        "INSERT INTO vt SELECT value, '[' || sin(value) || ',' || cos(value) || ',' || (value%7) || ']' FROM generate_series(1,300)",
+    );
+    for degree in ["0", "1"] {
+        let said = refusal(
+            &connection,
+            &format!("CREATE INDEX vt_v ON vt USING inillucent_hnsw (v) WITH (m = {degree})"),
+        );
+        assert!(said.contains("m must be"), "m = {degree}: {said}");
+        let said = refusal(
+            &connection,
+            &format!(
+                "CREATE VIRTUAL TABLE s{degree} USING inillucent_search(body, dims=3, m={degree})"
+            ),
+        );
+        assert!(said.contains("m must be"), "m = {degree}: {said}");
+    }
+    exec(
+        &connection,
+        "CREATE INDEX vt_v ON vt USING inillucent_hnsw (v) WITH (m = 2)",
+    );
+    assert_eq!(
+        column(
+            &connection,
+            "SELECT id FROM vt ORDER BY vector_distance_cos(v,'[0,1,1]') LIMIT 1"
+        )
+        .len(),
+        1
+    );
+}
+
+/// An `inillucent_search` table refuses a width of zero, a repeated option and an unknown tokenizer.
+#[test]
+fn a_search_table_refuses_what_has_no_meaning() {
+    let connection = start_inillucent(AREA, "search-options");
+    assert!(refusal(
+        &connection,
+        "CREATE VIRTUAL TABLE s USING inillucent_search(body, dims=0)"
+    )
+    .contains("dims must be greater than zero"));
+    assert!(refusal(
+        &connection,
+        "CREATE VIRTUAL TABLE s USING inillucent_search(body, dims=3, m=8, m=16)"
+    )
+    .contains("more than once"));
+    assert!(refusal(
+        &connection,
+        "CREATE VIRTUAL TABLE s USING inillucent_search(body, dims=3, dims=4)"
+    )
+    .contains("more than once"));
+    assert_eq!(
+        refusal(
+            &connection,
+            "CREATE VIRTUAL TABLE s USING inillucent_search(body, tokenize='nosuch')"
+        ),
+        "no such tokenizer: nosuch"
+    );
+    exec(
+        &connection,
+        "CREATE TABLE vt (id INTEGER PRIMARY KEY, v VECTOR(3))",
+    );
+    assert!(refusal(
+        &connection,
+        "CREATE INDEX vt_v ON vt USING inillucent_hnsw (v) WITH (m = 8, m = 16)"
+    )
+    .contains("more than once"));
+}
+
+/// `k = 0` returns no rows, and a `k` that is not a whole number of zero or more is refused.
+#[test]
+fn k_is_taken_as_a_row_count() {
+    let connection = start_inillucent(AREA, "k-values");
+    exec(
+        &connection,
+        "CREATE VIRTUAL TABLE s USING inillucent_search(body, dims=2)",
+    );
+    exec(
+        &connection,
+        "INSERT INTO s(rowid,body,vector) VALUES (1,'alpha beta','[1,0]'),(2,'alpha gamma','[0,1]'),(3,'alpha delta','[1,1]')",
+    );
+    for query in ["s MATCH 'alpha' AND k=0", "vector='[1,0]' AND k=0"] {
+        assert_eq!(
+            column(
+                &connection,
+                &format!("SELECT count(*) FROM s WHERE {query}")
+            ),
+            vec!["0"],
+            "{query}"
+        );
+    }
+    for query in [
+        "s MATCH 'alpha' AND k=2",
+        "vector='[1,0]' AND k='2'",
+        "vector='[1,0]' AND k=2.0",
+    ] {
+        assert_eq!(
+            column(
+                &connection,
+                &format!("SELECT count(*) FROM s WHERE {query}")
+            ),
+            vec!["2"],
+            "{query}"
+        );
+    }
+    for query in [
+        "s MATCH 'alpha' AND k=-1",
+        "vector='[1,0]' AND k='abc'",
+        "vector='[1,0]' AND k=2.5",
+    ] {
+        let said = refusal(
+            &connection,
+            &format!("SELECT count(*) FROM s WHERE {query}"),
+        );
+        assert!(said.contains("k must be a whole number"), "{query}: {said}");
+    }
+}
+
+/// `INSERT OR REPLACE`, `REPLACE` and an upsert replace a row and its vector in the index.
+///
+/// They failed with `UNIQUE constraint failed: the rowid is already in the index`, because the
+/// index was only told to insert the new row and not to remove the one it replaced.
+#[test]
+fn a_replaced_row_moves_in_the_index() {
+    for (at, declaration) in INDEXES.iter().enumerate() {
+        let connection = start_inillucent(AREA, &format!("replace-{at}"));
+        indexed_pair(&connection, declaration);
+        // The planner answers from an index only for the function that is the index's own metric.
+        let distance = if declaration.contains("l2") {
+            "vector_distance_l2"
+        } else {
+            "vector_distance_cos"
+        };
+        let nearest = |probe: &str, limit: usize| {
+            column(
+                &connection,
+                &format!("SELECT id FROM vt ORDER BY {distance}(v,'{probe}') LIMIT {limit}"),
+            )
+        };
+        exec(
+            &connection,
+            "INSERT OR REPLACE INTO vt VALUES (1,'[0,0,1]')",
+        );
+        assert_eq!(
+            nearest("[0,0,1]", 1),
+            vec!["1"],
+            "{declaration}: OR REPLACE"
+        );
+        exec(&connection, "REPLACE INTO vt VALUES (2,'[0,0,1]')");
+        exec(
+            &connection,
+            "INSERT INTO vt VALUES (2,'[1,0,0]') ON CONFLICT(id) DO UPDATE SET v='[0,1,0]'",
+        );
+        assert_eq!(nearest("[0,1,0]", 1), vec!["2"], "{declaration}: upsert");
+        // The index holds each row once. `ivfflat` reads only the nearest list, so it is asked
+        // for the row it must find rather than for both.
+        if !declaration.contains("ivfflat") {
+            assert_eq!(
+                nearest("[0,0,1]", 2),
+                vec!["1", "2"],
+                "{declaration}: two rows"
+            );
+        }
+        exec(&connection, "REPLACE INTO vt VALUES (1,NULL)");
+        assert_eq!(
+            nearest("[0,0,1]", 5),
+            vec!["2"],
+            "{declaration}: a NULL vector leaves the index"
+        );
+    }
+}
+
+/// Dropping a table drops the indexes on it, and the table and index can be made again.
+#[test]
+fn dropping_a_table_drops_its_vector_indexes() {
+    for (at, declaration) in INDEXES.iter().enumerate() {
+        let connection = start_inillucent(AREA, &format!("drop-table-{at}"));
+        indexed_pair(&connection, declaration);
+        exec(&connection, "DROP TABLE vt");
+        assert_eq!(
+            column(&connection, "SELECT name FROM sqlite_schema ORDER BY name"),
+            Vec::<String>::new(),
+            "{declaration}: nothing is left behind"
+        );
+        indexed_pair(&connection, declaration);
+        let found = column(&connection, NEAREST);
+        // `ivfflat` reads the lists nearest the query and no more, so it may hold back a row.
+        assert_eq!(
+            found.first().map(String::as_str),
+            Some("1"),
+            "{declaration}"
+        );
+        if !declaration.contains("ivfflat") {
+            assert_eq!(found, vec!["1", "2"], "{declaration}");
+        }
+    }
+}
+
+/// A column a vector index is built over cannot be dropped.
+#[test]
+fn a_column_a_vector_index_uses_cannot_be_dropped() {
+    let connection = start_inillucent(AREA, "drop-column");
+    indexed_pair(&connection, "USING inillucent_hnsw (v)");
+    exec(&connection, "ALTER TABLE vt ADD COLUMN x INT");
+    let said = refusal(&connection, "ALTER TABLE vt DROP COLUMN v");
+    assert!(said.contains("indexed"), "{said}");
+    exec(&connection, "ALTER TABLE vt DROP COLUMN x");
+    assert_eq!(column(&connection, NEAREST), vec!["1", "2"]);
+}
+
+/// `CREATE INDEX IF NOT EXISTS` on a vector index that exists does nothing.
+#[test]
+fn creating_a_vector_index_that_exists_is_a_no_op_when_asked() {
+    let connection = start_inillucent(AREA, "if-not-exists");
+    indexed_pair(&connection, "USING inillucent_hnsw (v)");
+    exec(
+        &connection,
+        "CREATE INDEX IF NOT EXISTS vt_v ON vt USING inillucent_hnsw (v)",
+    );
+    let said = refusal(
+        &connection,
+        "CREATE INDEX vt_v ON vt USING inillucent_hnsw (v)",
+    );
+    assert!(said.contains("already exists"), "{said}");
+    assert_eq!(column(&connection, NEAREST), vec!["1", "2"]);
+}
+
+/// A query vector the index cannot use is refused in the words the same query has without an index.
+#[test]
+fn a_bad_query_vector_gets_the_message_the_scan_gives() {
+    let scanned = start_inillucent(AREA, "bad-query-scan");
+    exec(
+        &scanned,
+        "CREATE TABLE vt (id INTEGER PRIMARY KEY, v VECTOR(3))",
+    );
+    exec(
+        &scanned,
+        "INSERT INTO vt VALUES (1,'[1,0,0]'),(2,'[0,1,0]')",
+    );
+    for (at, declaration) in INDEXES.iter().enumerate() {
+        let indexed = start_inillucent(AREA, &format!("bad-query-{at}"));
+        indexed_pair(&indexed, declaration);
+        for tail in ["LIMIT 2", ""] {
+            let sql = format!("SELECT id FROM vt ORDER BY vector_distance_cos(v,'[1,0]') {tail}");
+            let from_scan = refusal(&scanned, &sql);
+            assert_eq!(from_scan, "different vector dimensions 3 and 2");
+            assert_eq!(refusal(&indexed, &sql), from_scan, "{declaration} {tail}");
+        }
+    }
+}
+
+/// A NULL query vector orders every row equal, so a limit returns the first rows by rowid.
+#[test]
+fn a_null_query_vector_answers_like_a_scan() {
+    let scanned = start_inillucent(AREA, "null-query-scan");
+    exec(
+        &scanned,
+        "CREATE TABLE vt (id INTEGER PRIMARY KEY, v VECTOR(3))",
+    );
+    exec(
+        &scanned,
+        "INSERT INTO vt VALUES (1,'[1,0,0]'),(2,'[0,1,0]'),(3,'[0,0,1]')",
+    );
+    for (at, declaration) in INDEXES.iter().enumerate() {
+        let indexed = start_inillucent(AREA, &format!("null-query-{at}"));
+        exec(
+            &indexed,
+            "CREATE TABLE vt (id INTEGER PRIMARY KEY, v VECTOR(3))",
+        );
+        exec(
+            &indexed,
+            "INSERT INTO vt VALUES (1,'[1,0,0]'),(2,'[0,1,0]'),(3,'[0,0,1]')",
+        );
+        exec(&indexed, &format!("CREATE INDEX vt_v ON vt {declaration}"));
+        for tail in ["LIMIT 2", ""] {
+            let sql = format!("SELECT id FROM vt ORDER BY vector_distance_cos(v,NULL) {tail}");
+            assert_eq!(
+                column(&indexed, &sql),
+                column(&scanned, &sql),
+                "{declaration} {tail}"
+            );
+        }
+    }
+}

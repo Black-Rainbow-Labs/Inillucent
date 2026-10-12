@@ -888,10 +888,10 @@ impl BoundSelect {
     pub fn columns_read(&self, source: usize) -> ColumnUse {
         let mut used = ColumnUse::default();
         self.gather_columns(source, &mut used, true);
-        // The reads outside the `WHERE` are only read by a partial index whose
-        // predicate the `WHERE` repeats, so the second walk is skipped for a
-        // table with no partial index: it cost an allocation on every compile
-        // of an ordinary point query.
+        // The reads outside the `WHERE` are only read by an index that can answer
+        // a `WHERE` term itself (`IndexInfo::answers_where_terms`), so the second
+        // walk is skipped for a table with none: it cost an allocation on every
+        // compile of an ordinary point query.
         let partial = self
             .sources
             .iter()
@@ -900,7 +900,7 @@ impl BoundSelect {
                 term.table
                     .indexes
                     .iter()
-                    .any(|index| index.partial_sql.is_some())
+                    .any(crate::catalog_view::IndexInfo::answers_where_terms)
             });
         // **A block with no `WHERE` still reads columns outside it.** The
         // predicate can be repeated by a join's `ON` clause, and leaving this
@@ -2479,13 +2479,7 @@ impl<'a> Binder<'a> {
             bound_arguments.push(self.bind_expr(argument)?);
         }
         let call = match function::lookup_window(&folded) {
-            Some(func) => {
-                let (least, most) = func.arity();
-                if bound_arguments.len() < least || bound_arguments.len() > most {
-                    return Err(wrong_arguments(&folded, span));
-                }
-                WindowCall::Plain(func)
-            }
+            Some(func) => WindowCall::Plain(func),
             None => match window_aggregate(&folded, bound_arguments.len()) {
                 Some(func) => WindowCall::Aggregate(func),
                 None if function::lookup_scalar(&folded).is_some() => {
@@ -2500,6 +2494,7 @@ impl<'a> Binder<'a> {
                 None => return Err(no_such_function(self.ast.text(name), span)),
             },
         };
+        self.check_call_arity(&call, bound_arguments.len(), star, name, span)?;
         if distinct {
             return Err(refused(
                 "DISTINCT is not supported for window functions",
@@ -2668,7 +2663,8 @@ impl<'a> Binder<'a> {
                     self.expand_star(qualifier.as_deref(), column.span, &mut bound)?;
                 }
                 _ => {
-                    let expr = self.bind_expr(column.expr)?;
+                    let value = self.skip_unknown_collations(column.expr);
+                    let expr = self.bind_expr(value)?;
                     let name = match column.alias {
                         Some(alias) => self.ast.text(alias).to_vec(),
                         None => self.default_column_name(column.expr, &expr, column.span),
@@ -3869,8 +3865,13 @@ impl<'a> Binder<'a> {
                     found = Some((id, index));
                     continue;
                 }
-                if source.table.is_rowid_name(&folded) && rowid_here.is_none() {
-                    rowid_here = Some(id);
+                if source.table.is_rowid_name(&folded) {
+                    // Two terms that both have a rowid make an unqualified one ambiguous.
+                    if rowid_here.is_some() && table_folded.is_none() {
+                        let written = self.written_reference(database, table, column);
+                        return Err(ambiguous_column(&written, span));
+                    }
+                    rowid_here = rowid_here.or(Some(id));
                 }
             }
             if coalesced.len() > 1 {

@@ -82,7 +82,7 @@ impl Parser<'_> {
                 };
                 misplaced = Some((clause, op));
             }
-            if compounds.len() as i64 >= self.limits.get(Limit::CompoundSelect) {
+            if compounds.len() as i64 + 1 >= self.limits.get(Limit::CompoundSelect) {
                 return Err(ParseError::new(
                     ParseErrorKind::LimitExceeded("too many terms in compound SELECT"),
                     Span::at(self.cursor()),

@@ -390,7 +390,7 @@ pub(crate) struct WalLog<'a> {
     /// pays nothing for the possibility. The buffer is handed in by the caller
     /// rather than owned here because it has to outlive the log: the log lives
     /// for one statement and the transaction for many.
-    pub(crate) undo: Option<&'a std::cell::RefCell<Vec<Before>>>,
+    pub(crate) undo: Option<&'a std::cell::RefCell<crate::engine::undo::UndoBuffer>>,
     /// This schema's own no-steal watermark - `u64::MAX` until something is
     /// open, or the open transaction's first record.
     ///
@@ -456,17 +456,29 @@ impl TreeLog for WalLog<'_> {
             // restore that has a row calls `put`, which reads the key columns
             // out of the row itself; copying them a second time allocated a
             // vector per write and threw it away on every update and delete.
+            let datums = key;
             let key = match before {
                 Some(_) => KeyCopy::Empty,
-                None => KeyCopy::of(key),
+                None => KeyCopy::of(datums),
             };
-            buffer.borrow_mut().push(Before {
-                schema: self.schema,
+            let schema = schema_byte(self.schema);
+            let mut records = buffer.borrow_mut();
+            if before.is_none() && extend_rowid_run(&mut records, schema, tree, &key) {
+                return Ok(());
+            }
+            let imaged = before.is_some() && !datums.is_empty();
+            let record = Before {
+                schema,
                 tree,
                 key,
                 row: before,
                 page: None,
-            });
+                sealed: false,
+            };
+            match imaged {
+                true => records.push_image(record, datums),
+                false => records.push(record),
+            }
         }
         Ok(())
     }
@@ -482,11 +494,12 @@ impl TreeLog for WalLog<'_> {
             // The copy is shared by every row of its run; the row is read out
             // of it only by a rollback. See `TreeLog::undo_from_page`.
             buffer.borrow_mut().push(Before {
-                schema: self.schema,
+                schema: schema_byte(self.schema),
                 tree,
                 key: KeyCopy::Empty,
                 row: None,
-                page: Some(FromPage::One(std::rc::Rc::clone(page), located)),
+                page: Some(Box::new(FromPage::One(std::rc::Rc::clone(page), located))),
+                sealed: false,
             });
         }
         Ok(())
@@ -502,11 +515,15 @@ impl TreeLog for WalLog<'_> {
         if let Some(buffer) = self.undo {
             // One record for the run; see `TreeLog::undo_run_from_page`.
             buffer.borrow_mut().push(Before {
-                schema: self.schema,
+                schema: schema_byte(self.schema),
                 tree,
                 key: KeyCopy::Empty,
                 row: None,
-                page: Some(FromPage::Run(std::rc::Rc::clone(page), located.into())),
+                page: Some(Box::new(FromPage::Run(
+                    std::rc::Rc::clone(page),
+                    located.into(),
+                ))),
+                sealed: false,
             });
         }
         Ok(())
@@ -545,7 +562,21 @@ pub(crate) struct Before {
     /// Two databases each number their own trees from one, so an undo record
     /// naming tree 7 says nothing until it also says which file - and a rollback
     /// that guessed would restore a row into the wrong database.
-    pub(crate) schema: usize,
+    ///
+    /// A byte and not a `usize`, because a connection holds at most sixteen schemas and the
+    /// record is kept once for every row a transaction writes. Read it through
+    /// [`Before::schema`].
+    pub(crate) schema: u8,
+    /// Whether a statement or a savepoint began after this record was pushed, so that a later
+    /// record must not be folded into it.
+    ///
+    /// **Why a record is ever folded into the one before it.** An insert of a million rows with
+    /// consecutive rowids pushed a million records of about 160 bytes each, held until the
+    /// statement ended: 866 MB for five million rows. [`extend_rowid_run`] folds each new rowid
+    /// into the previous record, which is safe only while no floor sits between the two,
+    /// because a rollback to a floor pops whole records. `statement_mark` sets this on the
+    /// newest record, and every savepoint is a statement mark.
+    pub(crate) sealed: bool,
     /// The tree the row is in, by the identifier its own file knows it by.
     pub(crate) tree: u64,
     /// The row's key columns, and empty when `row` carries them.
@@ -560,7 +591,60 @@ pub(crate) struct Before {
     ///
     /// Set instead of `row` by a run that removes many rows of one leaf
     /// (task-2183); see `TreeLog::undo_from_page`.
-    pub(crate) page: Option<FromPage>,
+    ///
+    /// Boxed so that the common record, which has no such place, does not carry the room for one.
+    pub(crate) page: Option<Box<FromPage>>,
+}
+
+impl Before {
+    /// Returns the schema the record came out of, as the binder numbers them.
+    pub(crate) fn schema(&self) -> usize {
+        usize::from(self.schema)
+    }
+}
+
+/// Narrows a schema number to the byte a [`Before`] keeps.
+///
+/// @param at - the schema, as the binder numbers them
+fn schema_byte(at: usize) -> u8 {
+    u8::try_from(at).unwrap_or(u8::MAX)
+}
+
+/// Folds the key of a new insert undo record into the newest record when the two are
+/// consecutive integer keys of one tree.
+///
+/// **Why this exists.** Undoing an insert deletes the key, so the records of ten million rows
+/// with ascending rowids say nothing more than "delete rowids a through b". Keeping one record
+/// for each of them cost 145 bytes a row until the statement ended. A record that was sealed by
+/// a statement mark or a savepoint, that carries a row or a place in a page, or that names
+/// another tree or schema is left alone.
+///
+/// @param records - the undo buffer, newest last
+/// @param schema - the schema of the record being added
+/// @param tree - the tree of the record being added
+/// @param key - the key of the record being added
+fn extend_rowid_run(records: &mut [Before], schema: u8, tree: u64, key: &KeyCopy) -> bool {
+    let KeyCopy::One(OwnedDatum::Int(next)) = key else {
+        return false;
+    };
+    let Some(last) = records.last_mut() else {
+        return false;
+    };
+    if last.sealed
+        || last.schema != schema
+        || last.tree != tree
+        || last.row.is_some()
+        || last.page.is_some()
+    {
+        return false;
+    }
+    let first = match &last.key {
+        KeyCopy::One(OwnedDatum::Int(held)) if held.checked_add(1) == Some(*next) => *held,
+        KeyCopy::Rowids { first, last } if last.checked_add(1) == Some(*next) => *first,
+        _ => return false,
+    };
+    last.key = KeyCopy::Rowids { first, last: *next };
+    true
 }
 
 /// The key an undo record keeps, held without a vector when it is one value or two.
@@ -578,7 +662,15 @@ pub(crate) enum KeyCopy {
     /// A key of one value.
     One(OwnedDatum),
     /// A key of two values.
-    Two(OwnedDatum, OwnedDatum),
+    Two(Box<(OwnedDatum, OwnedDatum)>),
+    /// The integer keys `first` through `last`, consecutive and ascending, each of which a
+    /// rollback deletes, newest first. See [`extend_rowid_run`].
+    Rowids {
+        /// The first key of the run.
+        first: i64,
+        /// The last key of the run.
+        last: i64,
+    },
     /// A longer key.
     Many(Vec<OwnedDatum>),
 }
@@ -591,10 +683,10 @@ impl KeyCopy {
         match key {
             [] => KeyCopy::Empty,
             [only] => KeyCopy::One(OwnedDatum::from_datum(only)),
-            [first, second] => KeyCopy::Two(
+            [first, second] => KeyCopy::Two(Box::new((
                 OwnedDatum::from_datum(first),
                 OwnedDatum::from_datum(second),
-            ),
+            ))),
             longer => KeyCopy::Many(longer.iter().map(OwnedDatum::from_datum).collect()),
         }
     }
@@ -604,7 +696,9 @@ impl KeyCopy {
         match self {
             KeyCopy::Empty => Vec::new(),
             KeyCopy::One(only) => vec![only.borrow()],
-            KeyCopy::Two(first, second) => vec![first.borrow(), second.borrow()],
+            KeyCopy::Two(pair) => vec![pair.0.borrow(), pair.1.borrow()],
+            // A run has no single key; the rollback walks it with `rowid_run`.
+            KeyCopy::Rowids { first, .. } => vec![Datum::Int(*first)],
             KeyCopy::Many(values) => values.iter().map(OwnedDatum::borrow).collect(),
         }
     }

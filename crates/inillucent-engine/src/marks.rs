@@ -31,7 +31,7 @@ impl ImportedDatabase {
     ///
     /// @param name - the savepoint's name
     pub fn savepoint(&mut self, name: &[u8]) -> DbResult<()> {
-        self.sync_modules()?;
+        self.sync_modules_before_savepoint()?;
         // **Told after the flush and before the mark (task-1932, M2).** The
         // level a module is given is how many savepoints were already open,
         // which is the same number `rollback_to` later hands it: a module
@@ -43,6 +43,7 @@ impl ImportedDatabase {
         // which is exactly what `statement_mark` reads, so the savepoint and
         // the statement boundary record the same thing.
         let mark = self.statement_mark();
+        self.writing.undo().borrow_mut().begin_savepoint();
         self.writing
             .marks()
             .borrow_mut()

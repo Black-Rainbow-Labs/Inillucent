@@ -471,11 +471,16 @@ impl LeafBuilder {
         let mut shapes: Vec<Shape> = vec![Shape::new(); self.columns.len()];
         let mut heap = 0usize;
         for row in 0..total {
+            let wide = self.row_threshold(rows, row, spilling);
             for (index, column) in self.columns.iter().enumerate() {
                 let value = rows.value(row, index);
                 // One classification per value, as in `fit_widths`: the heap cost
                 // and the column's shape are both functions of the class.
-                let class = classify_at(column.physical, &value, self.threshold(spilling));
+                let class = classify_at(
+                    column.physical,
+                    &value,
+                    self.column_threshold(index, wide, spilling),
+                );
                 heap = heap.saturating_add(heap_cost_of(
                     column.physical,
                     &value,
@@ -563,6 +568,7 @@ impl LeafBuilder {
         while row < total {
             let mut row_heap = 0usize;
             wanted.copy_from_slice(&shapes);
+            let wide = self.row_threshold(rows, row, spilling);
             for (index, column) in self.columns.iter().enumerate() {
                 let value = rows.value(row, index);
                 // **One classification per value, not two.** The heap cost and
@@ -570,7 +576,11 @@ impl LeafBuilder {
                 // asking for them separately classified every value of every
                 // column twice - on the path a compaction and a bulk build
                 // both take.
-                let class = classify_at(column.physical, &value, self.threshold(spilling));
+                let class = classify_at(
+                    column.physical,
+                    &value,
+                    self.column_threshold(index, wide, spilling),
+                );
                 row_heap = row_heap.saturating_add(heap_cost_of(
                     column.physical,
                     &value,
@@ -683,6 +693,43 @@ impl LeafBuilder {
         self.page_size / EXTENT_DIVISOR
     }
 
+    /// Returns the longest value one row's non key columns keep in the leaf.
+    ///
+    /// See [`wide_row_threshold`]: the page's threshold for an ordinary row, lower for a row
+    /// too wide for half a page.
+    ///
+    /// @param rows - the rows
+    /// @param row - which row
+    /// @param spilling - whether the caller gave a spiller
+    pub(crate) fn row_threshold<'d>(
+        &self,
+        rows: &dyn Rows<'d>,
+        row: usize,
+        spilling: bool,
+    ) -> usize {
+        if !spilling {
+            return usize::MAX;
+        }
+        let columns = self.columns.len();
+        let first = self.key_columns.min(columns);
+        wide_row_threshold(self.page_size, || {
+            (first..columns)
+                .filter_map(move |index| rows.value(row, index).as_bytes().map(<[u8]>::len))
+        })
+    }
+
+    /// Returns the longest value one column of a row keeps in the leaf.
+    ///
+    /// @param index - which column
+    /// @param wide - the row's threshold for its non key columns
+    /// @param spilling - whether the caller gave a spiller
+    fn column_threshold(&self, index: usize, wide: usize, spilling: bool) -> usize {
+        match index < self.key_columns {
+            true => self.threshold(spilling),
+            false => wide,
+        }
+    }
+
     /// Returns the heap bytes one value stored out of line costs in a column.
     ///
     /// The sixteen byte reference for an ordinary column. A key column adds the
@@ -753,12 +800,17 @@ impl LeafBuilder {
     ) -> Layout {
         let mut shapes: Vec<Shape> = vec![Shape::new(); self.columns.len()];
         for row in 0..count {
+            let wide = self.row_threshold(rows, at.saturating_add(row), spilling);
             for (index, column) in self.columns.iter().enumerate() {
                 let Some(shape) = shapes.get_mut(index) else {
                     continue;
                 };
                 let value = rows.value(at.saturating_add(row), index);
-                let class = classify_at(column.physical, &value, self.threshold(spilling));
+                let class = classify_at(
+                    column.physical,
+                    &value,
+                    self.column_threshold(index, wide, spilling),
+                );
                 shape.observe(column.physical, &value, class, self.page_size);
             }
         }
@@ -925,15 +977,21 @@ impl LeafBuilder {
         // values. The builder is walking every value anyway, so recording the
         // answer costs a branch and saves every later reader the walk.
         let mut all_typed: Vec<bool> = vec![true; self.columns.len()];
+        // Each row's threshold for its non key columns, worked out once: this loop walks a
+        // column at a time. See `wide_row_threshold`.
+        let wide: Vec<usize> = (0..count)
+            .map(|row| self.row_threshold(rows, at.saturating_add(row), spill.is_some()))
+            .collect();
 
         for (index, column) in self.columns.iter().enumerate() {
             let base = offsets.get(index).copied().unwrap_or(0);
             let values_at = base.saturating_add(class_bytes(count));
-            let threshold = self.threshold(spill.is_some());
             let width = layout.width(index, column);
             let frame = layout.base(index);
             for row in 0..count {
                 let value = rows.value(at.saturating_add(row), index);
+                let row_wide = wide.get(row).copied().unwrap_or(usize::MAX);
+                let threshold = self.column_threshold(index, row_wide, spill.is_some());
                 let class = classify_at(column.physical, &value, threshold);
                 if class == ValueClass::Exception {
                     has_exceptions = true;

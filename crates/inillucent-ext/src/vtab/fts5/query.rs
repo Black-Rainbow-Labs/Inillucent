@@ -99,6 +99,11 @@ pub(crate) struct Fts5Cursor {
     /// two-column table read `%_content` twice per matched row and a
     /// ten-column table ten times. The row is the same row each time.
     pub(crate) held: Option<(i64, Vec<Value<'static>>)>,
+    /// The number of this cursor among those opened on the table, from 1.
+    ///
+    /// Reading the hidden column that carries the table's name answers this number, which is
+    /// what SQLite answers: `SELECT f FROM f` is not NULL, it identifies the cursor.
+    pub(crate) cursor_id: i64,
 }
 /// Reads one `bm25()` weight argument the way `sqlite3_value_double` does.
 ///
@@ -612,6 +617,72 @@ impl Fts5Cursor {
         Ok(())
     }
 }
+/// Returns an error whose own words reach the caller, for a misuse of an auxiliary function.
+///
+/// @param said - the message SQLite gives for the same misuse
+fn function_refusal(said: &str) -> inillucent_base::DbError {
+    crate::vtab::failure(said.to_string()).with_message(said.to_string())
+}
+
+/// Joins the MATCH arguments of a plan into the one query that is run, and finds the rank setting.
+///
+/// Each argument has a role in the plan string: `t` is a query on the table's own column, `c<n>`
+/// is a query on column n alone, which is the column filter `{"name"} : (query)`, and `r` is the
+/// rank function a `rank MATCH` named. Several queries are ANDed, as SQLite does, each in its own
+/// parentheses so that an `OR` inside one cannot bind to its neighbour. The column name is
+/// quoted, which is what lets a column called `b-c` be filtered.
+///
+/// Answers `None` when a query is NULL, because a MATCH against NULL matches nothing.
+///
+/// @param plan - the plan `best_index` chose and the values it was given
+/// @param names - the table's indexed column names
+fn combined_pattern(plan: &FilterPlan, names: &[Vec<u8>]) -> Option<(Vec<u8>, Option<String>)> {
+    let roles: Vec<&str> = plan.index_string.split(',').collect();
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    let mut rank_setting: Option<String> = None;
+    for (position, argument) in plan.arguments.iter().enumerate() {
+        let role = roles.get(position).copied().unwrap_or("t");
+        let text = text_of(argument);
+        if role == "r" {
+            if rank_setting.is_none() {
+                rank_setting = text.map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+            }
+            continue;
+        }
+        let text = text?;
+        let column = role
+            .strip_prefix('c')
+            .and_then(|digits| digits.parse::<usize>().ok())
+            .and_then(|at| names.get(at));
+        match column {
+            Some(name) => {
+                let mut filtered = b"{\"".to_vec();
+                filtered.extend(name.iter().flat_map(|byte| match byte {
+                    b'"' => vec![b'"', b'"'],
+                    other => vec![*other],
+                }));
+                filtered.extend_from_slice(b"\"} : (");
+                filtered.extend_from_slice(&text);
+                filtered.push(b')');
+                parts.push(filtered);
+            }
+            None => parts.push(text),
+        }
+    }
+    let pattern = match parts.len() {
+        0 => return None,
+        1 => parts.swap_remove(0),
+        _ => {
+            let wrapped: Vec<Vec<u8>> = parts
+                .into_iter()
+                .map(|part| [b"(".as_slice(), &part, b")".as_slice()].concat())
+                .collect();
+            wrapped.join(&b" AND "[..])
+        }
+    };
+    Some((pattern, rank_setting))
+}
+
 impl VirtualCursor for Fts5Cursor {
     /// Runs the query and collects every row it matched.
     fn filter(&mut self, context: &mut Context<'_>, plan: &FilterPlan) -> DbResult<()> {
@@ -656,25 +727,9 @@ impl VirtualCursor for Fts5Cursor {
         // the `MATCH` with nothing. The refusal belongs on the one query whose
         // answer depends on the dictionary. See `layout.rs`.
         super::layout::readable(context, &self.shadows, &self.pending, &self.table)?;
-        let Some(mut pattern) = plan.arguments.first().and_then(text_of) else {
+        let Some((pattern, rank_setting)) = combined_pattern(plan, &self.names) else {
             return Ok(());
         };
-        // A match written on one column searches that column alone, which is
-        // the column filter `{name} : (query)`; see `PLAN_COLUMN_SHIFT`.
-        let column = (plan.index_number >> PLAN_COLUMN_SHIFT).saturating_sub(1);
-        if plan.index_number >> PLAN_COLUMN_SHIFT != 0 {
-            if let Some(name) = usize::try_from(column)
-                .ok()
-                .and_then(|at| self.names.get(at))
-            {
-                let mut filtered = b"{".to_vec();
-                filtered.extend_from_slice(name);
-                filtered.extend_from_slice(b"} : (");
-                filtered.extend_from_slice(&pattern);
-                filtered.push(b')');
-                pattern = filtered;
-            }
-        }
         self.pattern = pattern.clone();
         let query = Query::parse(&pattern, &self.tokenizer, &self.names)?;
         // **The buffered totals, not the row.** A score is computed from the
@@ -686,10 +741,7 @@ impl VirtualCursor for Fts5Cursor {
         let ranked = plan.index_number & PLAN_RANKED != 0;
         // Read only when a score is: most matches never ask for one.
         self.rank_weights.clear();
-        self.rank_setting = (plan.index_number & PLAN_RANK_FUNCTION != 0)
-            .then(|| plan.arguments.get(1).and_then(text_of))
-            .flatten()
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        self.rank_setting = rank_setting;
         if ranked {
             self.rank_weights = self.load_rank_weights(context)?;
         }
@@ -781,8 +833,8 @@ impl VirtualCursor for Fts5Cursor {
             }
             if self.phrases.is_empty() {
                 // A row reached without a `MATCH` has nothing to score against,
-                // which is what SQLite answers zero for.
-                return Ok(Value::Real(0.0));
+                // which SQLite answers NULL for.
+                return Ok(Value::Null);
             }
             // The same arithmetic `bm25::score` would have done in `filter`,
             // for this row alone, with the weights the `rank` setting names,
@@ -803,8 +855,11 @@ impl VirtualCursor for Fts5Cursor {
             )));
         }
         if index as i32 == self.match_column {
-            // The hidden column that carries the query is NULL when it is read
-            // as a value; it exists to be *constrained*, not to be selected.
+            // The hidden column that carries the query exists to be constrained, and read as a
+            // value it is the number of the cursor, as it is in SQLite.
+            if self.dialect == Dialect::Five {
+                return Ok(Value::Integer(self.cursor_id));
+            }
             return Ok(Value::Null);
         }
         if self.contentless {
@@ -847,12 +902,26 @@ impl VirtualCursor for Fts5Cursor {
         arguments: &[Value<'static>],
     ) -> DbResult<Value<'static>> {
         if name == b"highlight" {
+            if arguments.len() != 3 {
+                return Err(function_refusal(
+                    "wrong number of arguments to function highlight()",
+                ));
+            }
             return self.highlight(context, arguments);
         }
         if name == b"snippet" {
             // FTS3 and FTS4 choose and write fragments by their own routine.
             if self.dialect == Dialect::Three {
                 return self.snippet_three(context, arguments);
+            }
+            if arguments.len() != 5 {
+                return Err(function_refusal(
+                    "wrong number of arguments to function snippet()",
+                ));
+            }
+            let column = arguments.first().and_then(Value::as_integer).unwrap_or(0);
+            if column >= i64::try_from(self.columns).unwrap_or(i64::MAX) {
+                return Err(function_refusal("column index out of range"));
             }
             return self.snippet(context, arguments);
         }

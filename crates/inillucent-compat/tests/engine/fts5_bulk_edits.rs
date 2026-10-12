@@ -383,3 +383,69 @@ fn tokens_are_cut_at_the_longest_the_index_stores() {
         "a token under the cap is stored whole"
     );
 }
+
+/// A bulk load made of many multi row statements in one transaction writes the index about once.
+///
+/// The engine flushed a full text table before every multi row statement, and a flush writes the
+/// whole doclist of every term the statement touched. A word that is in every row has a doclist as
+/// long as the table, so statement number n wrote about n statements' worth of that word, and the
+/// load took time that grew with the square of its rows: 40,000 rows took 3.9 s, 80,000 took
+/// 24.8 s and 120,000 took 282 s, where SQLite takes 0.4, 0.7 and 1 s. A clock does not belong in a
+/// test, so this counts the bytes of doclists the flushes wrote and compares them with the bytes
+/// the finished index holds. Written once, the ratio is 1. Written at every statement it is about
+/// half the number of statements.
+#[test]
+fn a_load_of_many_statements_writes_the_index_about_once() {
+    const STATEMENTS: usize = 24;
+    const PER_STATEMENT: usize = 500;
+
+    let database = Database::open(scratch()).expect("opens");
+    let connection = database.session().expect("connects");
+    connection
+        .execute("CREATE VIRTUAL TABLE ft USING fts5(a)")
+        .expect("creates the table");
+    inillucent_ext::vtab::fts5::reset_build_stages();
+    connection.execute("BEGIN").expect("begins");
+    for statement in 0..STATEMENTS {
+        let rows: Vec<String> = (0..PER_STATEMENT)
+            .map(|at| {
+                let id = statement * PER_STATEMENT + at;
+                format!(
+                    "({},'the body of all rows has word{} and uniq{id}')",
+                    id + 1,
+                    id % 40
+                )
+            })
+            .collect();
+        connection
+            .execute(&format!(
+                "INSERT INTO ft(rowid, a) VALUES {}",
+                rows.join(",")
+            ))
+            .expect("inserts");
+    }
+    connection.execute("COMMIT").expect("commits");
+
+    let written = inillucent_ext::vtab::fts5::build_stages().flushed_bytes;
+    let held = column(&connection, "SELECT sum(length(doclist)) FROM ft_idx");
+    let held: u64 = held.first().and_then(|text| text.parse().ok()).unwrap_or(0);
+    assert!(held > 0, "the index holds something");
+    assert!(
+        written <= 3 * held,
+        "{STATEMENTS} statements wrote {written} bytes of doclists to build an index of {held}; a \
+         load that writes it about once writes {held}, and one that writes it at every statement \
+         writes about {}",
+        held * (STATEMENTS as u64) / 2
+    );
+    assert_eq!(
+        column(&connection, "SELECT count(*) FROM ft WHERE ft MATCH 'body'"),
+        vec![(STATEMENTS * PER_STATEMENT).to_string()]
+    );
+    assert_eq!(
+        column(
+            &connection,
+            "SELECT count(*) FROM ft WHERE ft MATCH 'word7'"
+        ),
+        vec![(STATEMENTS * PER_STATEMENT / 40).to_string()]
+    );
+}

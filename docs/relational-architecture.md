@@ -785,7 +785,13 @@ layouts on every page. There is no format 4. Nothing lowers the number again: th
 reader has to be able to read, and lowering it would need a walk of every page.
 
 A value over `page_size / 8` bytes, 4,096 at the default page size, goes out of line in any column,
-an indexed column and a primary key included. The first time a transaction writes one, it moves the
+an indexed column and a primary key included. A row whose values are each under that size but
+together more than half a page moves its longest values that are not key columns out of line,
+longest first, until half a page or less is left inline, so seventeen text columns of 2,000 bytes
+fit as they do in SQLite. `wide_row_threshold` in `crates/inillucent-tree/src/leaf/layout.rs` holds
+the rule, and the write path and the leaf builder both use it. A row of thousands of numbers can
+still be larger than a page, because a number is shorter than the reference that would replace it.
+The first time a transaction writes one, it moves the
 file to format 3 in memory and writes one log record, `Format` (kind 19), before the first page of the
 value. That record belongs to no transaction, so recovery replays it whether or not the transaction
 that wrote it committed. The next checkpoint writes the meta page with the new number. The rule that
@@ -1113,9 +1119,11 @@ that difference or `folds` is large, run `compact`.
 ### What a failure leaves
 
 Publishing a generation is a set of ordinary writes inside the caller's transaction. A crash during
-a publish leaves the old generation current and the delta log unchanged. The replaced generation's
-rows stay in the file until `drop-old-generations` runs, because a snapshot opened before the switch
-may still read them.
+a publish leaves the old generation current and the delta log unchanged. The generation a `compact`
+or `rebuild` replaces stays in the file until `drop-old-generations` runs, because a snapshot opened
+before the switch may still read it. A merge of segments deletes the rows of the segments it
+replaces in the same transaction that names the merged segment, so a reader sees the segments
+before the merge or the merged one, and never the name of a segment that was freed.
 
 A merge that takes more than one commit leaves a segment stored as a chain: the segment's id names
 its last link, and each link names the one before it. `drop-old-generations` keeps every link of

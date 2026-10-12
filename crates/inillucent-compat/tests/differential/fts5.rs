@@ -372,17 +372,22 @@ fn a_tokenizer_this_build_has_not_got_is_refused_rather_than_substituted() {
     inillucent_base::testing::remove_database(&path);
     let database = Database::open(&path).expect("the database opens");
     let connection = database.session().expect("the connection opens");
+    // `trigram` is one SQLite has and this build has not, so it is `unsupported`; `icu` and
+    // `porter2` are names the pinned SQLite does not know either, and it says `no such tokenizer`.
     for name in ["trigram", "icu", "porter2"] {
         let refused = connection
             .execute(&format!(
                 "CREATE VIRTUAL TABLE t_{name} USING fts5(body, tokenize='{name}')"
             ))
             .expect_err("a tokenizer this build has not got must be refused");
-        assert_eq!(
-            refused.unsupported(),
-            Some(format!("the fts5 tokenizer {name}").as_str()),
-            "the refusal must name the tokenizer: {refused:?}"
-        );
+        match name {
+            "trigram" => assert_eq!(
+                refused.unsupported(),
+                Some(format!("the fts5 tokenizer {name}").as_str()),
+                "the refusal must name the tokenizer: {refused:?}"
+            ),
+            _ => assert_eq!(refused.message(), format!("no such tokenizer: {name}")),
+        }
         assert!(
             connection
                 .query(&format!("SELECT rowid FROM t_{name}"))

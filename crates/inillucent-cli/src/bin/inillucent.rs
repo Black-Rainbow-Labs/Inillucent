@@ -624,8 +624,8 @@ fn serve(invocation: &Invocation) -> ExitCode {
         ..mcp::Settings::default()
     };
     let input = std::io::BufReader::new(std::io::stdin());
-    let mut output = std::io::stdout();
-    match mcp::serve(settings, input, &mut output) {
+    let output = std::io::stdout();
+    match mcp::serve(settings, input, output) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("inillucent-mcp: {message}");

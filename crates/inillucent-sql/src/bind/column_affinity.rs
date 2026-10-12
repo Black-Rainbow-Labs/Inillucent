@@ -131,6 +131,129 @@ impl BoundSelect {
     }
 }
 
+impl BoundSelect {
+    /// Returns the affinity SQLite gives result column `index` once the block is
+    /// a derived table, a CTE or a view, with "none" reported as `Blob`.
+    ///
+    /// This is `sqlite3SubqueryColumnTypes`. The leftmost arm's expression gives
+    /// the affinity, and while it has none the next arm's is taken, the arms
+    /// passed over adding what they can hold to a mask. An affinity found then
+    /// meets the arms that are left: text affinity next to an arm that can hold
+    /// a number, and numeric affinity next to an arm that can hold text, both
+    /// become `Blob`, and a numeric affinity whose leftmost expression is a
+    /// `CAST` becomes `FlexNum`. Only `Real` changes a value on the way out of
+    /// the table, so `SELECT 1 AS o UNION ALL SELECT x FROM r` over a REAL `x`
+    /// reads `o` as 1.0 while `SELECT CAST(1 AS REAL) UNION ALL SELECT 1` leaves
+    /// the second row an integer.
+    ///
+    /// @param index - which result column
+    pub fn derived_column_affinity(&self, index: usize) -> Affinity {
+        let mut arms: Vec<&BoundExpr> = Vec::new();
+        self.collect_arm_columns(index, &mut arms);
+        let Some(first) = arms.first().copied() else {
+            return Affinity::Blob;
+        };
+        let mut at = 0usize;
+        let mut mask = 0u8;
+        let mut found = first.affinity();
+        while found.is_none() && at.saturating_add(1) < arms.len() {
+            mask |= data_type_mask(arms.get(at).copied());
+            at = at.saturating_add(1);
+            found = arms.get(at).and_then(|arm| arm.affinity());
+        }
+        let Some(mut affinity) = found else {
+            return Affinity::Blob;
+        };
+        let later = at.saturating_add(1) < arms.len();
+        if affinity != Affinity::Blob && (later || at != 0) {
+            for arm in arms.iter().skip(at.saturating_add(1)) {
+                mask |= data_type_mask(Some(arm));
+            }
+            let numeric = affinity.is_numeric();
+            if (affinity == Affinity::Text && mask & 0x01 != 0) || (numeric && mask & 0x02 != 0) {
+                affinity = Affinity::Blob;
+            }
+            if affinity.is_numeric() && matches!(first, BoundExpr::Cast { .. }) {
+                affinity = Affinity::FlexNum;
+            }
+        }
+        // **A multi row `VALUES` arm keeps its own values (bug hunt 9).** SQLite codes such an arm
+        // as a co routine that writes its rows without the REAL conversion, so
+        // `SELECT x FROM r UNION ALL VALUES (1), (2)` over a REAL `x` reads the two values as
+        // integers while `... UNION ALL SELECT 1` reads 1.0. The affinity here applies to every row
+        // of the column, so a column that has such an arm keeps a numeric affinity for comparisons
+        // and is not converted.
+        if affinity == Affinity::Real && self.has_multi_row_values() {
+            affinity = Affinity::Numeric;
+        }
+        affinity
+    }
+
+    /// Reports whether this block or one of its compound arms is a `VALUES` list of several rows.
+    fn has_multi_row_values(&self) -> bool {
+        self.values.len() > 1
+            || self
+                .compounds
+                .iter()
+                .any(|(_, arm)| arm.has_multi_row_values())
+    }
+}
+
+/// Returns what an expression may produce, as SQLite's `sqlite3ExprDataType`
+/// reports it: 0x01 for a number, 0x02 for text, 0x04 for a blob.
+///
+/// @param expr - the expression, or `None` for no arm
+fn data_type_mask(expr: Option<&BoundExpr>) -> u8 {
+    let Some(expr) = expr else {
+        return 0;
+    };
+    match expr {
+        BoundExpr::Null => 0,
+        BoundExpr::Text(_) => 0x02,
+        BoundExpr::Blob(_) => 0x04,
+        BoundExpr::Arithmetic {
+            op: BinaryOp::Concat,
+            ..
+        } => 0x06,
+        BoundExpr::Parameter(_)
+        | BoundExpr::Function { .. }
+        | BoundExpr::External { .. }
+        | BoundExpr::Json { .. }
+        | BoundExpr::Math { .. }
+        | BoundExpr::Time { .. }
+        | BoundExpr::Aggregate { .. }
+        | BoundExpr::WindowRef { .. } => 0x07,
+        BoundExpr::Column { .. }
+        | BoundExpr::Cast { .. }
+        | BoundExpr::Generated { .. }
+        | BoundExpr::Subquery {
+            kind: SubqueryKind::Scalar,
+            ..
+        } => match expr.affinity() {
+            Some(held) if held.is_numeric() => 0x05,
+            Some(Affinity::Text) => 0x06,
+            _ => 0x07,
+        },
+        BoundExpr::Case {
+            branches,
+            otherwise,
+            ..
+        } => {
+            let mut mask = 0u8;
+            for (_, then) in branches {
+                mask |= data_type_mask(Some(then));
+            }
+            mask | data_type_mask(otherwise.as_deref())
+        }
+        BoundExpr::Collate { operand, .. }
+        | BoundExpr::Unary {
+            op: UnaryOp::Identity,
+            operand,
+        } => data_type_mask(Some(operand)),
+        _ => 0x01,
+    }
+}
+
 /// Combines the arms of a compound into the affinity of their column.
 ///
 /// @param arms - the expression each arm puts in the column, first arm first

@@ -458,6 +458,65 @@ pub(crate) fn write_tagged(page: &mut [u8], heap_end: usize, value: &Datum<'_>) 
     Ok(start)
 }
 
+/// The fewest bytes a value has to have before a wide row moves it out of line.
+///
+/// A reference costs sixteen bytes in the leaf, so moving anything shorter would make the row
+/// longer, and moving a value only a little longer saves almost nothing.
+pub(crate) const WIDE_ROW_MINIMUM: usize = 64;
+
+/// Returns the longest value a row's non key columns keep in the leaf.
+///
+/// **The page's threshold for an ordinary row, and a lower one for a row too wide for half a
+/// page.** Every value over an eighth of the page goes out of line, which used to be the whole
+/// rule, and it let a row of values each just under the eighth fill more than a page between
+/// them: seventeen text columns of 2,000 bytes at a 32 KiB page were refused with `this row is
+/// larger than a page`, where SQLite stores the row (bug hunt 9). Such a row now moves its
+/// longest values out of line, longest first, until what stays inline is at most half a page,
+/// so two rows still fit a page and a split always has two rows to divide.
+///
+/// The answer depends only on the page size and the row's own values, so the write path that
+/// spills a row before placing it and the builder that classifies it again when it repacks the
+/// leaf agree about which values are out of line. A key column keeps the page's threshold: a
+/// key's place in the leaf is what a search compares, and a key extent is a different record.
+///
+/// @param page_size - the page size
+/// @param lengths - yields the byte length of each non key text or blob value of the row, each
+///   time it is called
+pub(crate) fn wide_row_threshold<I: Iterator<Item = usize>>(
+    page_size: usize,
+    lengths: impl Fn() -> I,
+) -> usize {
+    let base = page_size / super::EXTENT_DIVISOR;
+    let limit = page_size / 2;
+    let reference = inillucent_pool::extent::EXTENT_REF_BYTES;
+    let inline = |threshold: usize| -> usize {
+        lengths()
+            .map(|length| {
+                if length > threshold {
+                    reference
+                } else {
+                    length
+                }
+            })
+            .fold(0usize, usize::saturating_add)
+    };
+    if inline(base) <= limit {
+        return base;
+    }
+    let mut candidates: Vec<usize> = lengths()
+        .filter(|length| *length > WIDE_ROW_MINIMUM && *length <= base)
+        .collect();
+    candidates.sort_unstable_by(|left, right| right.cmp(left));
+    candidates.dedup();
+    for length in candidates {
+        let threshold = length.saturating_sub(1);
+        if inline(threshold) <= limit {
+            return threshold;
+        }
+    }
+    WIDE_ROW_MINIMUM
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,5 +663,37 @@ mod tests {
         }
         assert_eq!(key_prefix_bytes(32_768), 512);
         assert_eq!(key_prefix_bytes(512), 64);
+    }
+
+    /// An ordinary row keeps the page's threshold; a row of many values each under it moves its
+    /// longest values out until half a page is left inline, and never moves a short one.
+    #[test]
+    fn a_wide_row_moves_its_longest_values_out_until_half_a_page_is_left() {
+        use super::{wide_row_threshold, WIDE_ROW_MINIMUM};
+        let page = 32_768;
+        let small = [10usize, 200, 3_000];
+        assert_eq!(wide_row_threshold(page, || small.iter().copied()), page / 8);
+        let even = [2_000usize; 17];
+        let threshold = wide_row_threshold(page, || even.iter().copied());
+        assert!(
+            threshold < 2_000,
+            "seventeen values of 2,000 bytes kept {threshold}"
+        );
+        let mixed: Vec<usize> = (0..20).map(|n| 500 + n * 100).collect();
+        let threshold = wide_row_threshold(page, || mixed.iter().copied());
+        let inline: usize = mixed
+            .iter()
+            .map(|length| if *length > threshold { 16 } else { *length })
+            .sum();
+        assert!(
+            inline <= page / 2,
+            "{inline} bytes stayed inline at threshold {threshold}"
+        );
+        assert!(threshold >= WIDE_ROW_MINIMUM);
+        let tiny = [40usize; 2_000];
+        assert_eq!(
+            wide_row_threshold(page, || tiny.iter().copied()),
+            WIDE_ROW_MINIMUM
+        );
     }
 }

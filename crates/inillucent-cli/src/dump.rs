@@ -9,6 +9,7 @@
 
 use inillucent_value::Value;
 
+use crate::dump_virtual::{self, Kind};
 use crate::render::{literal, quote_literal};
 use crate::shell::Shell;
 
@@ -41,11 +42,9 @@ pub fn dump(shell: &mut Shell, options: &DumpOptions) {
     // The warning goes above everything, including the `PRAGMA`, because a
     // virtual table is restored by writing `sqlite_schema` directly and a
     // defensive connection refuses that. The reference prints it first and so
-    // does this.
-    if tables
-        .iter()
-        .any(|(_, sql)| sql.starts_with("CREATE VIRTUAL TABLE"))
-    {
+    // does this. FTS5, `inillucent_search` and vector index tables are written as
+    // statements and need no such write; see `dump_virtual`.
+    if tables.iter().any(|(_, sql)| is_written_to_the_schema(sql)) {
         shell.say("/* WARNING: Script requires that SQLITE_DBCONFIG_DEFENSIVE be disabled */");
     }
     if !options.data_only {
@@ -53,7 +52,16 @@ pub fn dump(shell: &mut Shell, options: &DumpOptions) {
         shell.say("BEGIN TRANSACTION;");
     }
     let mut writable = false;
+    let left_out = dump_virtual::private_tables_left_out(&tables);
     for (name, sql) in &tables {
+        if left_out.contains(&name.to_ascii_lowercase()) {
+            continue;
+        }
+        let kind = virtual_kind(sql);
+        if kind != Kind::Other {
+            dump_virtual::write_table(shell, name, sql, &kind, options.data_only);
+            continue;
+        }
         say_definition(shell, name, sql, &mut writable, options.data_only);
         // A virtual table's rows live in its shadow tables, which are dumped as
         // the ordinary tables they are. Dumping them here as well would insert
@@ -64,6 +72,7 @@ pub fn dump(shell: &mut Shell, options: &DumpOptions) {
         }
         write_rows(shell, name, sql);
     }
+    write_indexes_over_tables(shell, &tables, options.data_only);
     if !options.data_only {
         for sql in other_objects(shell, pattern.as_deref()) {
             shell.say(&format!("{sql};"));
@@ -74,6 +83,45 @@ pub fn dump(shell: &mut Shell, options: &DumpOptions) {
     }
     if !options.data_only {
         shell.say("COMMIT;");
+    }
+}
+
+/// Returns what a table's `CREATE` says it is, for a virtual table, and `Other` for the rest.
+///
+/// @param sql - the `CREATE` text the schema holds
+fn virtual_kind(sql: &str) -> Kind {
+    if sql.starts_with("CREATE VIRTUAL TABLE") {
+        return dump_virtual::classify(sql);
+    }
+    Kind::Other
+}
+
+/// Reports whether a table is restored by writing `sqlite_schema` directly.
+///
+/// @param sql - the `CREATE` text the schema holds
+fn is_written_to_the_schema(sql: &str) -> bool {
+    sql.starts_with("CREATE VIRTUAL TABLE") && virtual_kind(sql) == Kind::Other
+}
+
+/// Writes what has to come after every table: the vector indexes and the FTS5 rebuilds.
+///
+/// A vector index is built from the rows of the table it indexes, and an FTS5 table that reads
+/// its text from another table is built from that table's rows, so both wait for every row.
+///
+/// @param shell - where the lines go
+/// @param tables - every table the dump covers, with its `CREATE` text
+/// @param data_only - whether `--data-only` was given, which writes no index
+fn write_indexes_over_tables(shell: &mut Shell, tables: &[(String, String)], data_only: bool) {
+    for statement in dump_virtual::rebuild_statements(tables) {
+        shell.say(&statement);
+    }
+    if data_only {
+        return;
+    }
+    for (name, sql) in tables {
+        if let Some(statement) = dump_virtual::index_statement(name, &virtual_kind(sql)) {
+            shell.say(&statement);
+        }
     }
 }
 

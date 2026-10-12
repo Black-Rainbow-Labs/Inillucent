@@ -199,8 +199,7 @@ impl Fts5Table {
         // because everything `rebuild` writes from here on goes through
         // `%_idx` directly.
         if let Ok(mut held) = self.pending.lock() {
-            held.doclists.clear();
-            held.bytes = 0;
+            held.discard_all();
         }
         let rows = self.content_rows(context)?;
         self.wipe_index(context)?;
@@ -316,8 +315,7 @@ impl Fts5Table {
     /// @param context - the running statement
     pub(crate) fn delete_all(&mut self, context: &mut Context<'_>) -> DbResult<()> {
         if let Ok(mut held) = self.pending.lock() {
-            held.doclists.clear();
-            held.bytes = 0;
+            held.discard_all();
         }
         self.wipe_index(context)
     }
@@ -605,7 +603,7 @@ impl Fts5Table {
             Err(position) => entries.insert(position, entry),
         }
         let encoded = encode_doclist(&entries);
-        stage_doclist(&self.pending, term, encoded);
+        stage_doclist(&self.pending, term, encoded, true);
         if buffer_is_full(&self.pending) {
             flush_doclists(context, &self.shadows, &self.pending)?;
         }

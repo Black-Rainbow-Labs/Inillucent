@@ -388,9 +388,7 @@ fn integer(spec: &Spec, value: i64) -> Vec<u8> {
     };
     let mut digits = magnitude.into_bytes();
     if let Some(precision) = spec.precision {
-        while digits.len() < precision {
-            digits.insert(0, b'0');
-        }
+        digits = zero_filled(&digits, precision);
     }
     let sign = if negative {
         Some(b'-')
@@ -412,9 +410,7 @@ fn integer(spec: &Spec, value: i64) -> Vec<u8> {
     // answered before and is not what SQLite answers.
     if spec.group && spec.zero {
         let room = spec.width.saturating_sub(usize::from(sign.is_some()));
-        while digits.len() < room {
-            digits.insert(0, b'0');
-        }
+        digits = zero_filled(&digits, room);
     }
     if spec.group {
         digits = grouped(&digits);
@@ -424,6 +420,22 @@ fn integer(spec: &Spec, value: i64) -> Vec<u8> {
         out.push(sign);
     }
     out.extend_from_slice(&digits);
+    out
+}
+
+/// Returns digits with zeros in front of them to make them `width` long.
+///
+/// **One allocation, where it used to be one shift of the whole run per zero.** The padding was
+/// an insert at the front in a loop, so `printf('%.1000000d', 1)` moved a growing string a
+/// million times and took 8.9 s where SQLite takes 0.04 s (bug hunt 9).
+///
+/// @param digits - the digits, without a sign
+/// @param width - how long the result is at least
+fn zero_filled(digits: &[u8], width: usize) -> Vec<u8> {
+    let zeros = width.saturating_sub(digits.len());
+    let mut out = Vec::with_capacity(digits.len().saturating_add(zeros));
+    out.resize(zeros, b'0');
+    out.extend_from_slice(digits);
     out
 }
 
@@ -455,9 +467,7 @@ fn based(spec: &Spec, value: i64, base: u32, upper: bool) -> Vec<u8> {
         _ => unsigned.to_string(),
     };
     if let Some(precision) = spec.precision {
-        while text.len() < precision {
-            text.insert(0, '0');
-        }
+        text = String::from_utf8_lossy(&zero_filled(text.as_bytes(), precision)).into_owned();
     }
     if spec.alternate && unsigned != 0 {
         match base {
@@ -771,6 +781,27 @@ mod tests {
         assert_eq!(
             run("%q", vec![Value::owned_text(b"it's").expect("text")]),
             "it''s"
+        );
+    }
+
+    /// A precision of a million zeros is one allocation, not a million shifts.
+    ///
+    /// The old padding inserted one zero at the front at a time and took 8.9 s here.
+    #[test]
+    fn a_huge_precision_pads_in_linear_time() {
+        let started = std::time::Instant::now();
+        let text = run("%.1000000d", vec![Value::Integer(7)]);
+        assert_eq!(text.len(), 1_000_000);
+        assert!(text.starts_with("000") && text.ends_with("07"));
+        let hex = run(
+            "%#.20x|%,.8d",
+            vec![Value::Integer(255), Value::Integer(1234)],
+        );
+        assert_eq!(hex, "0x000000000000000000ff|00,001,234");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
         );
     }
 }

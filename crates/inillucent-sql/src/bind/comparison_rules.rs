@@ -83,6 +83,11 @@ pub(super) fn seen_affinity_among(sources: &[BoundSource], expr: &BoundExpr) -> 
                     SourceRows::Subquery(block) => {
                         block.column_affinity_if_any(usize::from(*column)).is_none()
                     }
+                    // A recursive CTE's columns come from its seed, as SQLite reads
+                    // them from the leftmost arm: `SELECT 1 UNION ALL ...` has none.
+                    SourceRows::Recursive(body) => body.seeds.first().is_some_and(|(_, seed)| {
+                        seed.column_affinity_if_any(usize::from(*column)).is_none()
+                    }),
                     _ => false,
                 });
         if nothing {

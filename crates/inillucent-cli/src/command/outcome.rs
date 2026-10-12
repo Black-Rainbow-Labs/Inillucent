@@ -92,7 +92,11 @@ impl Failed {
             // A value with no marker to bind to is reported by the shell with the
             // number of markers the statement has, which the engine's own
             // sentence, "column index out of range", does not say.
+            // The caller bound more values than the statement has markers, which
+            // is a mistake in the request and not in the SQL, so it is
+            // `invalid_state` and not `syntax`.
             Some(error) if error.code() == inillucent_base::PrimaryCode::Range => Failed {
+                status: Status::InvalidState,
                 message: failure.message.clone(),
                 ..Failed::from_engine(error)
             },

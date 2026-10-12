@@ -58,36 +58,31 @@ mod sorted;
 mod unlink;
 pub use sorted::{Rewrite, UpdateRun};
 
-/// Reports whether a key sorts after a row's key.
+/// Reports whether a key sorts after a row's key, in the order the tree is stored in.
+///
+/// **In the stored order, which is the directions as well as the collations.** A
+/// `DESC` column compared ascending here called a row arriving at the left edge of
+/// the tree an append and a row arriving at the right edge not one, so the split
+/// that packs the left half for rows that will never come back was taken on the
+/// wrong side.
 ///
 /// @param key - the key arriving
 /// @param row - the row to compare against
 /// @param collations - the key columns' collations
+/// @param directions - whether each key column is stored descending
 /// @param key_columns - how many leading columns form the key
 fn is_above(
     key: &[Datum<'_>],
     row: &[Datum<'_>],
     collations: &[inillucent_value::collation::Collation],
+    directions: &[bool],
     key_columns: usize,
 ) -> bool {
-    for column in 0..key_columns {
-        let Some(wanted) = key.get(column) else {
-            return false;
-        };
-        let Some(held) = row.get(column) else {
-            return false;
-        };
-        let collation = collations
-            .get(column)
-            .copied()
-            .unwrap_or(inillucent_value::collation::Collation::Binary);
-        match crate::types::compare_under(wanted, held, collation) {
-            core::cmp::Ordering::Greater => return true,
-            core::cmp::Ordering::Less => return false,
-            core::cmp::Ordering::Equal => {}
-        }
+    if key.len() < key_columns || row.len() < key_columns {
+        return false;
     }
-    false
+    crate::leaf::compare_rows_under(key, row, key_columns, collations, directions)
+        == core::cmp::Ordering::Greater
 }
 
 /// Returns how many of a split's rows go to the left half.
@@ -181,12 +176,12 @@ enum Fit {
 /// was the sentence that said why. A value of any class now goes out
 /// of line whatever the column says, so what reaches this is a row
 /// that is too large for a page with every one of its values already
-/// outside it: enough columns just under the spill threshold to fill a page
-/// between them. A key column is not one of them, since a key over the
-/// threshold is stored outside the page like any other value.
+/// outside it. Since a row too wide for half a page moves its longest values
+/// out of line as well (see `leaf::wide_row_threshold`), that is a row of
+/// values too short to be worth a reference: thousands of numbers.
 fn row_larger_than_a_page() -> inillucent_base::error::DbError {
     inillucent_base::error::statement_refusal(
-        "this row is larger than a page even with its large values stored outside it; a row of many values just under the page's eighth has to be split across tables",
+        "this row is larger than a page even with its large values stored outside it; a row of thousands of numbers has to be split across tables",
     )
 }
 
@@ -984,8 +979,20 @@ impl PagedTree {
         // it is recorded on the first page of each, so a page that moves can find
         // the leaf that holds the reference.
         let mut owner: Option<Vec<u8>> = None;
+        // The same per row threshold the builder classifies with, so the two agree about which
+        // values of a wide row are out of line; see `leaf::wide_row_threshold`.
+        let key_columns = self.key_columns().min(row.len());
+        let wide = crate::leaf::wide_row_threshold(self.page_size(), || {
+            row.iter()
+                .skip(key_columns)
+                .filter_map(|value| value.as_bytes().map(<[u8]>::len))
+        });
         for (column, value) in row.iter().enumerate() {
-            match self.out_of_line(value) {
+            let threshold = match column < key_columns {
+                true => self.page_size() / crate::leaf::EXTENT_DIVISOR,
+                false => wide,
+            };
+            match self.out_of_line(value, threshold) {
                 Some(bytes) => {
                     let key = owner.get_or_insert_with(|| self.owner_key_of(row));
                     let reference = match column < self.key_columns() {
@@ -1580,11 +1587,12 @@ impl PagedTree {
     /// keeps a prefix of a key stored out of line, so a comparison reads the
     /// other pages only when the prefix does not decide. The threshold is the
     /// same one the builder packs to, so a value spilled here is one a repack
-    /// would have spilled anyway.
+    /// would have spilled anyway: the page's eighth, or less for a row too wide for half a
+    /// page (see `leaf::wide_row_threshold`).
     ///
     /// @param value - the value
-    fn out_of_line<'v>(&self, value: &Datum<'v>) -> Option<&'v [u8]> {
-        let threshold = self.page_size() / crate::leaf::EXTENT_DIVISOR;
+    /// @param threshold - the longest value this column of this row keeps in the leaf
+    fn out_of_line<'v>(&self, value: &Datum<'v>, threshold: usize) -> Option<&'v [u8]> {
         // **Any text or blob over the threshold, whatever the column is
         // declared.** It used to be only a text in a column declared `TEXT` or
         // bytes in one declared `BLOB`, because an extent reference said
@@ -2132,9 +2140,13 @@ impl PagedTree {
         Ok(leaf.right_sibling().is_none()
             && order.len() >= 2
             && match (arriving, last_row.as_deref()) {
-                (Some(key), Some(last)) => {
-                    is_above(key, last, self.collations(), self.key_columns())
-                }
+                (Some(key), Some(last)) => is_above(
+                    key,
+                    last,
+                    self.collations(),
+                    self.directions(),
+                    self.key_columns(),
+                ),
                 _ => false,
             })
     }

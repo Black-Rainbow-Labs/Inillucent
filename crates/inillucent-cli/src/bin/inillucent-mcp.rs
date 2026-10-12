@@ -80,8 +80,8 @@ fn run() -> ExitCode {
     // output is a JSON-RPC frame the client cannot parse, and the failure it
     // reports is "the server is broken" rather than whatever was printed.
     let input = std::io::BufReader::new(std::io::stdin());
-    let mut output = std::io::stdout();
-    match mcp::serve(settings, input, &mut output) {
+    let output = std::io::stdout();
+    match mcp::serve(settings, input, output) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("inillucent-mcp: {message}");

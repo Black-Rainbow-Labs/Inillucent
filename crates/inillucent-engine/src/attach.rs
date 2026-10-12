@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use inillucent_base::error::{refusal, statement_refusal};
+use inillucent_base::error::{confinement_refusal, refusal, statement_refusal};
 use inillucent_base::DbResult;
 use inillucent_pool::{Database, Options};
 use inillucent_vfs::memory::MemoryVfs;
@@ -125,7 +125,7 @@ impl ImportedDatabase {
                 None => DbPath::from(text.as_str()),
                 Some(root) => match root.admit(&text) {
                     Ok(inside) => DbPath::new(inside),
-                    Err(refused) => return Err(refusal(refused.message())),
+                    Err(refused) => return Err(confinement_refusal(refused.message())),
                 },
             };
             let held = path.as_path().to_path_buf();
@@ -456,7 +456,13 @@ impl ImportedDatabase {
         // The log is folded into the file before the file goes, so that what is
         // left on disk is a database rather than a database and a log nobody
         // will open again.
-        held.database.checkpoint()?;
+        // **Only a database that has a file.** `ATTACH ':memory:'` keeps its pages and its log in
+        // memory and the drop below frees both, so folding the log into pages that are about to be
+        // freed was most of what a detach cost: 140 of 170 microseconds, which made 40,000
+        // attaches and detaches take 6.8 s against SQLite's 0.26 s.
+        if held.path.is_some() {
+            held.database.checkpoint()?;
+        }
         drop(held);
         self.rebuild_tables()?;
         self.refresh_catalog();

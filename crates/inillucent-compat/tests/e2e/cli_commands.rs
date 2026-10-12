@@ -387,7 +387,7 @@ fn run_writes_the_file_a_once_in_the_script_names() {
         .map(|directory| directory.join("redirected.txt"))
         .expect("the fixture is in a directory");
     let script = format!(
-        ".once \"{}\"\nSELECT body FROM note ORDER BY id;\n.print done",
+        ".once '{}'\nSELECT body FROM note ORDER BY id;\n.print done",
         file.to_string_lossy()
     );
     let ran = run(
@@ -2237,6 +2237,58 @@ fn vector_search_prints_each_column_once_and_vectors_as_numbers() {
         ],
         "a table with no key of its own keeps the rowid"
     );
+}
+
+/// `vector-search --measure dot` returns the largest inner product first, as `cos` and `l2` return
+/// the smallest distance first.
+///
+/// It sorted the inner product ascending, so the nearest row came last and `--k 1` returned the
+/// farthest.
+#[test]
+fn vector_search_by_dot_product_returns_the_nearest_row_first() {
+    let binary = program("inillucent");
+    let database = populated(&binary, "vector-search-dot");
+    let path = database.to_string_lossy().to_string();
+    let ran = run(
+        &binary,
+        &[
+            "--db",
+            path.as_str(),
+            "exec",
+            "INSERT INTO point (id, at) VALUES (1, '[1,0,0]'), (2, '[0,1,0]'), (3, '[0.9,0.1,0]')",
+        ],
+    );
+    succeeded("exec", &ran);
+    for (measure, first_three) in [
+        ("cos", ["1", "3", "2"]),
+        ("l2", ["1", "3", "2"]),
+        ("dot", ["1", "3", "2"]),
+    ] {
+        let ran = run(
+            &binary,
+            &[
+                "--db",
+                path.as_str(),
+                "vector-search",
+                "--table",
+                "point",
+                "--column",
+                "at",
+                "--vector",
+                "[1,0,0]",
+                "--measure",
+                measure,
+                "--output",
+                "json",
+            ],
+        );
+        succeeded("vector-search", &ran);
+        let ids: Vec<String> = rows(&ran.stdout)
+            .into_iter()
+            .filter_map(|row| row.into_iter().next())
+            .collect();
+        assert_eq!(ids, first_three, "--measure {measure}");
+    }
 }
 
 /// Opening a SQLite file names the command that copies one.

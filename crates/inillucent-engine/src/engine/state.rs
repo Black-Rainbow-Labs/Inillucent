@@ -946,7 +946,7 @@ pub(crate) struct Writing {
     /// log, and all of them append here - so they hold it shared and take the
     /// cell when they have something to record, rather than one of them holding
     /// it mutably and the others going without.
-    undo: std::cell::RefCell<Vec<Before>>,
+    undo: std::cell::RefCell<crate::engine::undo::UndoBuffer>,
     /// Which schemas the open transaction has written, one bit per schema.
     ///
     /// **The participant set a cross-file commit is decided over.** A
@@ -1017,6 +1017,12 @@ pub(crate) struct Writing {
     /// Read at the commit, where the roots the drops left holes in are filled. See
     /// `ImportedDatabase::compact_roots`.
     roots_released: std::cell::Cell<u16>,
+    /// The files in which a tree was dropped since their handle maps were last pruned.
+    ///
+    /// Kept apart from `roots_released`, which the commit takes and clears, because the
+    /// prune has to wait for a statement boundary at which no undo record or rollback can
+    /// still name the dropped tree.
+    handles_stale: std::cell::Cell<u16>,
     /// Meta fields the open transaction changed, each with its value before.
     ///
     /// **A `ROLLBACK` used to leave `PRAGMA user_version` as the transaction
@@ -1344,6 +1350,47 @@ impl Schema {
         Ok(queries)
     }
 
+    /// Returns SQLite's `foreign key mismatch` message when a key in scope names parent columns that are no key.
+    ///
+    /// **`PRAGMA foreign_key_check` refuses a key whose parent columns are neither
+    /// the primary key nor a unique index**, whether or not the child has any
+    /// rows. SQLite finds the parent's index while it compiles the pragma, so a
+    /// parent that has none fails the whole statement. A key whose parent table
+    /// does not exist is not refused: every child row is reported instead.
+    ///
+    /// @param only - the folded name of the one table to check, or none for all
+    /// @param database - the schema to check, by number
+    pub(crate) fn foreign_key_mismatch(
+        &self,
+        only: Option<&str>,
+        database: usize,
+    ) -> Option<String> {
+        for child in &self.tables {
+            if child.kind != inillucent_sql::catalog_view::TableKind::Table
+                || child.folded.starts_with(b"sqlite_")
+                || child.database != database
+                || only.is_some_and(|name| child.folded != name.as_bytes())
+            {
+                continue;
+            }
+            for key in &child.foreign_keys {
+                let parent = self.tables.iter().find(|candidate| {
+                    candidate.folded == key.parent_folded && candidate.database == database
+                });
+                if parent.is_some_and(|parent| {
+                    !inillucent_sql::foreign_key::parent_key_is_unique(parent, key)
+                }) {
+                    return Some(format!(
+                        "foreign key mismatch - \"{}\" referencing \"{}\"",
+                        String::from_utf8_lossy(&child.name),
+                        String::from_utf8_lossy(&key.parent)
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     /// Returns the queries `PRAGMA foreign_key_check` runs, one per foreign key.
     ///
     /// **Unlike [`Schema::violation_queries`], a key whose parent table does not
@@ -1485,6 +1532,13 @@ impl Writing {
     pub(crate) fn note_root_released(&self, at: usize) {
         self.roots_released
             .set(self.roots_released.get() | crate::schema_bit(at));
+        self.handles_stale
+            .set(self.handles_stale.get() | crate::schema_bit(at));
+    }
+
+    /// Returns the files whose handle maps hold the handle of a dropped tree, and forgets them.
+    pub(crate) fn take_handles_stale(&self) -> u16 {
+        self.handles_stale.replace(0)
     }
 
     /// Returns the files in which trees were dropped, and forgets them.
@@ -1512,7 +1566,7 @@ impl Writing {
     ///
     /// The cell rather than a borrow of it, because a caller that hands this to
     /// another type needs the cell itself.
-    pub(crate) fn undo(&self) -> &std::cell::RefCell<Vec<Before>> {
+    pub(crate) fn undo(&self) -> &std::cell::RefCell<crate::engine::undo::UndoBuffer> {
         &self.undo
     }
 
@@ -1529,13 +1583,14 @@ impl Writing {
             next_txn: std::cell::Cell::new(next_txn),
             statement_txn: std::cell::Cell::new(None),
             batch: std::cell::Cell::new(None),
-            undo: std::cell::RefCell::new(Vec::new()),
+            undo: std::cell::RefCell::new(crate::engine::undo::UndoBuffer::default()),
             touched: std::cell::Cell::new(0),
             decided_over: std::cell::Cell::new(0),
             marks: std::cell::RefCell::new(Vec::new()),
             pending_frees: std::cell::RefCell::new(Vec::new()),
             incremental_steps: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             roots_released: std::cell::Cell::new(0),
+            handles_stale: std::cell::Cell::new(0),
             meta_changes: std::cell::RefCell::new(Vec::new()),
             built: std::cell::RefCell::new(Vec::new()),
             implicit_transaction: std::cell::Cell::new(false),
@@ -1696,7 +1751,7 @@ impl Writing {
             .unwrap_or(0);
         self.touched.set(below | above);
         for record in self.undo.borrow_mut().iter_mut() {
-            record.schema = moved(record.schema);
+            record.schema = u8::try_from(moved(record.schema())).unwrap_or(u8::MAX);
         }
         for free in self.pending_frees.borrow_mut().iter_mut() {
             free.schema = moved(free.schema);

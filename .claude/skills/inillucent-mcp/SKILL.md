@@ -92,7 +92,16 @@ when it opens the file.
 `--root` covers every file a request opens: the served database, `create`, `import`, `export`,
 `backup`, `restore`, `migrate`, and the SQL statements `ATTACH DATABASE` and `VACUUM INTO`. The check
 is in the file system layer, which opens every file, so a command added later is covered too.
-Temporary files are made inside `DIR`.
+Temporary files are made inside `DIR`. A path outside `DIR` is `invalid_state` for every tool and
+for `ATTACH` and `VACUUM INTO` alike.
+
+On Windows, `--root` also refuses a file name that Windows opens as a device (`CON`, `PRN`, `AUX`,
+`NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`, `CONIN$`, `CONOUT$`, with any extension) and a name that
+holds a colon, which Windows reads as an alternate data stream. The status is `invalid_state`.
+
+`inillucent_setup_embeddings` installs under the user's profile by default, which is outside
+`DIR`. On a server with `--root` it needs `dir` naming a folder inside `DIR`, and it is refused
+with `invalid_state` without one. A call that only reports the install status still works.
 
 `--root` also refuses a migration from a PostgreSQL or MySQL server, because such a migration
 connects to a host and a port. The refusal says so by name, with the status `invalid_state`. Run a
@@ -132,6 +141,14 @@ reporting database without giving it every file the user can read.
   rows, and `more` is `true` when rows were cut.
 - **`output` is `text` by default.** Pass `"output": "json"` to get the result object as the text
   of the tool result.
+- **`inillucent_query` only reads.** A statement that writes (`INSERT`, `UPDATE`, `DELETE`, DDL, a
+  `PRAGMA` that sets something, `BEGIN` or `COMMIT`) is refused with the status `readonly`. Run it
+  with `inillucent_exec`. A client can then approve the two tools separately.
+- **`db` names another file for that one call.** The next call without `db` runs on the database
+  the server was started on, and a transaction open there stays open while a call runs on the other
+  file. A file that is not there is `not_found`. `inillucent_create` is the tool that makes one, and
+  it does not move the session to the new file.
+- **`ping` is answered while a call runs**, and before `initialize`.
 
 With `"output": "json"`, the text of the tool result is this object:
 
@@ -182,7 +199,7 @@ Branch on `status`, not on the message. `status` is one of thirteen names:
 | `syntax` | the statement did not parse. The message gives the byte offset |
 | `not_found` | the file, table or other object does not exist |
 | `constraint` | the data was refused. The message names the constraint |
-| `readonly` | the server was started with `--readonly` and the statement writes |
+| `readonly` | the server was started with `--readonly` and the statement writes, or `inillucent_query` was given a statement that writes |
 | `invalid_state` | the request cannot run here: a path outside `--root`, a destination that already exists, a migration from a server under `--root` |
 | `busy` | another writer holds the database. Try again |
 

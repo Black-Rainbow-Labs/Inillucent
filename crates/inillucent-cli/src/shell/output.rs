@@ -52,18 +52,32 @@ fn write_now(bytes: &[u8]) {
 /// @param line - the text, without its ending
 /// @param ending - `\n`, or `\r\n` under `.crlf on`
 pub fn write_line(line: &str, ending: &str) {
+    // The bytes the line was decoded from, so a value that was not UTF-8 is
+    // written as the bytes it holds (see `crate::raw`).
+    let bytes = crate::raw::encode(line);
     if is_terminal() {
         let mut out = std::io::stdout().lock();
-        let _ = write!(out, "{line}{ending}");
+        let _ = out.write_all(&bytes);
+        let _ = out.write_all(ending.as_bytes());
         return;
     }
     let mut held = held();
-    held.extend_from_slice(line.as_bytes());
+    held.extend_from_slice(&bytes);
     held.extend_from_slice(ending.as_bytes());
     if held.len() >= BLOCK {
         write_now(&held);
         held.clear();
     }
+}
+
+/// Writes a line to standard error, after everything held for standard output.
+///
+/// @param line - the text, without its ending
+pub fn write_error_line(line: &str) {
+    flush();
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(&crate::raw::encode(line));
+    let _ = err.write_all(b"\n");
 }
 
 /// Writes out everything held.

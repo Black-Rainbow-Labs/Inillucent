@@ -57,6 +57,7 @@ use inillucent_base::error::misuse;
 use inillucent_base::DbResult;
 use inillucent_sql::ast::TriggerTime;
 use inillucent_sql::bind::{BoundExpr, BoundSelect, NEW_SOURCE, OLD_SOURCE};
+use inillucent_sql::catalog_view::TriggerEventInfo;
 use inillucent_sql::dml::{BoundDelete, BoundInsert, BoundTrigger, BoundTriggerStatement};
 use inillucent_sql::plan::{plan_select_with, Levers};
 use inillucent_tree::datum::OwnedDatum;
@@ -249,6 +250,63 @@ pub fn fire(
     firing: &TriggerFiring<'_>,
 ) -> DbResult<Fired> {
     fire_where(triggers, time, target, firing, &|_| true)
+}
+
+/// Reports whether an `INSERT` in a trigger's body fires the trigger again.
+///
+/// Under `PRAGMA recursive_triggers`, when it writes the trigger's own table and the trigger fires
+/// on inserts.
+///
+/// @param trigger - the trigger whose body holds the insert
+/// @param recursive - whether `PRAGMA recursive_triggers` is on
+/// @param insert - the body's insert
+fn insert_fires_again(trigger: &BoundTrigger, recursive: bool, insert: &BoundInsert) -> bool {
+    recursive && insert.table.folded == trigger.table && trigger.event == TriggerEventInfo::Insert
+}
+
+/// Reports whether an `UPDATE` in a trigger's body fires the trigger again.
+///
+/// @param trigger - the trigger whose body holds the update
+/// @param recursive - whether `PRAGMA recursive_triggers` is on
+/// @param update - the body's update
+fn update_fires_again(
+    trigger: &BoundTrigger,
+    recursive: bool,
+    update: &inillucent_sql::dml::BoundUpdate,
+) -> bool {
+    recursive && update.table.folded == trigger.table && fires_for_update(trigger, update)
+}
+
+/// Reports whether a `DELETE` in a trigger's body fires the trigger again.
+///
+/// @param trigger - the trigger whose body holds the delete
+/// @param recursive - whether `PRAGMA recursive_triggers` is on
+/// @param delete - the body's delete
+fn delete_fires_again(trigger: &BoundTrigger, recursive: bool, delete: &BoundDelete) -> bool {
+    recursive && delete.table.folded == trigger.table && trigger.event == TriggerEventInfo::Delete
+}
+
+/// Reports whether an `UPDATE` in a trigger's body is a write the trigger fires on.
+///
+/// `UPDATE OF` names columns, and the update fires it only when it assigns one of them. A rowid
+/// assignment names no column.
+///
+/// @param trigger - the trigger whose body holds the update
+/// @param update - the body's update
+fn fires_for_update(trigger: &BoundTrigger, update: &inillucent_sql::dml::BoundUpdate) -> bool {
+    let changed: Vec<Vec<u8>> = update
+        .assignments
+        .iter()
+        .filter(|assignment| !assignment.rowid)
+        .filter_map(|assignment| update.table.columns.get(usize::from(assignment.column)))
+        .map(|column| column.folded.clone())
+        .collect();
+    match &trigger.event {
+        TriggerEventInfo::Update(of) => {
+            of.is_empty() || of.iter().any(|name| changed.contains(name))
+        }
+        _ => false,
+    }
 }
 
 /// Runs the triggers of one timing for a row that `REPLACE` is removing.
@@ -583,9 +641,6 @@ fn run_body(
     // limit is that it re-fires *this* trigger rather than every trigger the
     // table has, which is what an inlined body can reach.
     let recursive = params.recursive_triggers();
-    let same_table = |table: &inillucent_sql::catalog_view::TableInfo| {
-        recursive && table.folded == trigger.table
-    };
     if let Some(write) = module_write(statement, target, firing, params)? {
         return target.defer_module_write(write);
     }
@@ -605,7 +660,7 @@ fn run_body(
         BoundTriggerStatement::Insert(insert) => {
             let mut insert = (**insert).clone();
             insert.on_conflict = depth.1.or(insert.on_conflict);
-            if insert.triggers.is_empty() && same_table(&insert.table) {
+            if insert.triggers.is_empty() && insert_fires_again(trigger, recursive, &insert) {
                 insert.triggers = vec![trigger.clone()];
             }
             inillucent_sql::rewrite::rewrite_insert(
@@ -646,7 +701,7 @@ fn run_body(
         BoundTriggerStatement::Update(update) => {
             let mut update = (**update).clone();
             update.on_conflict = depth.1.or(update.on_conflict);
-            if update.triggers.is_empty() && same_table(&update.table) {
+            if update.triggers.is_empty() && update_fires_again(trigger, recursive, &update) {
                 update.triggers = vec![trigger.clone()];
             }
             inillucent_sql::rewrite::rewrite_update(
@@ -674,7 +729,7 @@ fn run_body(
         }
         BoundTriggerStatement::Delete(delete) => {
             let mut delete = (**delete).clone();
-            if delete.triggers.is_empty() && same_table(&delete.table) {
+            if delete.triggers.is_empty() && delete_fires_again(trigger, recursive, &delete) {
                 delete.triggers = vec![trigger.clone()];
             }
             inillucent_sql::rewrite::rewrite_delete(

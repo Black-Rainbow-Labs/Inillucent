@@ -681,3 +681,78 @@ fn a_dump_of_a_damaged_database_reports_a_status_that_names_the_damage() {
         ran.stdout
     );
 }
+
+/// A dump of the tables that have a search index behind them loads into a new database and
+/// answers the same searches.
+///
+/// The dump wrote a virtual table as an `INSERT INTO sqlite_schema` under `PRAGMA
+/// writable_schema=ON`, which a defensive connection refuses, so a dump of an FTS5 table, an
+/// `inillucent_search` table or a vector index could not be loaded: the load stopped at that line
+/// and the tables after it were lost. Each is now written as the statements that make it again.
+#[test]
+fn a_dump_of_search_tables_loads_into_a_new_database_that_answers_the_same_searches() {
+    let directory = area("dump-search-tables");
+    let database = directory.join("app.rdb");
+    let made = on(
+        &database,
+        &[
+            "batch",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v VECTOR(3), body TEXT); \
+             INSERT INTO t VALUES (1,'[1,0,0]','a'),(2,'[0,1,0]','b'),(3,'[0.9,0.1,0]','c'); \
+             CREATE INDEX ti ON t USING inillucent_hnsw(v) WITH (m = 8, metric = 'l2'); \
+             CREATE VIRTUAL TABLE f USING fts5(a, b); \
+             INSERT INTO f(a,b) VALUES ('hello world','x'),('foo bar hello','y z'); \
+             INSERT INTO f(f,rank) VALUES ('rank','bm25(5,1)'); \
+             CREATE TABLE docs(id INTEGER PRIMARY KEY, title, body); \
+             INSERT INTO docs VALUES (1,'one','red green'),(2,'two','blue green'); \
+             CREATE VIRTUAL TABLE fe USING fts5(title, body, content='docs', content_rowid='id'); \
+             INSERT INTO fe(fe) VALUES ('rebuild'); \
+             CREATE VIRTUAL TABLE s USING inillucent_search(body, dims=2, m=8); \
+             INSERT INTO s(rowid,body,vector) VALUES (1,'alpha beta','[1,0]'),(2,'alpha gamma','[0,1]'),(3,'delta','[1,1]');",
+        ],
+    );
+    assert_eq!(made.code, 0, "the fixture was not made:\n{}", made.said());
+
+    let dumped = on(&database, &["dump"]);
+    assert_eq!(dumped.code, 0, "{}", dumped.said());
+    assert!(
+        !dumped.stdout.contains("writable_schema"),
+        "the dump writes the schema table directly:\n{}",
+        dumped.stdout
+    );
+    let copy = directory.join("copy.rdb");
+    let loaded = on(&copy, &["batch", dumped.stdout.trim()]);
+    assert_eq!(
+        loaded.code,
+        0,
+        "the dump did not load into a new database:\n{}",
+        loaded.said()
+    );
+
+    for sql in [
+        "SELECT rowid, a, b FROM f ORDER BY rowid",
+        "SELECT rowid FROM f WHERE f MATCH 'hello' ORDER BY rank",
+        "SELECT k, v FROM f_config ORDER BY k",
+        "SELECT rowid, title FROM fe WHERE fe MATCH 'green' ORDER BY rowid",
+        "SELECT rowid, body, hex(vector) FROM s ORDER BY rowid",
+        "SELECT rowid FROM s WHERE s MATCH 'alpha' ORDER BY rank",
+        "SELECT id FROM t ORDER BY vector_distance_l2(v,'[1,0,0]') LIMIT 2",
+        "SELECT type, name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+    ] {
+        assert_eq!(query(&copy, sql), query(&database, sql), "{sql}");
+    }
+    let plan = on(
+        &copy,
+        &[
+            "query",
+            "EXPLAIN QUERY PLAN SELECT id FROM t ORDER BY vector_distance_l2(v,'[1,0,0]') LIMIT 2",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        plan.stdout.contains("VECTOR INDEX ti"),
+        "the loaded database does not use the vector index:\n{}",
+        plan.stdout
+    );
+}

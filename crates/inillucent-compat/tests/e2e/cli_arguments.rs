@@ -143,14 +143,14 @@ fn a_mistyped_option_creates_no_database() {
         "mistyped-option",
         &["--db", "app.rdb", "SELECT 1"],
     );
-    assert_eq!(ran.code, Some(2), "printed: {}", ran.printed);
+    assert_eq!(ran.code, Some(1), "printed: {}", ran.printed);
     assert!(
         ran.left_behind.is_empty(),
         "a mistyped option left {:?} behind",
         ran.left_behind
     );
     assert!(
-        ran.printed.contains("unknown option: --db"),
+        ran.printed.contains("unknown option: -db"),
         "printed: {}",
         ran.printed
     );

@@ -77,11 +77,6 @@ kind = "deviation"
 reason = "N1: UPDATE/DELETE ... LIMIT: the pinned sqlite3 shell is built without SQLITE_ENABLE_UPDATE_DELETE_LIMIT"
 
 [[known]]
-case = "bug-hunt/queries/recursive_trigger_replace_duplicate_unique"
-kind = "defect"
-reason = "Bug hunt (tasks/task-2201-bug-hunt-tdd.md section 6): with recursive_triggers on, INSERT OR REPLACE whose delete trigger reinserts the replaced key recurses until the trigger depth limit and reports too many levels of trigger recursion, where SQLite reports UNIQUE constraint failed. It overflowed the stack and killed the process before the depth check was added."
-
-[[known]]
 case = "automatic-index/plan-of-statement-7"
 kind = "deviation"
 reason = "Plan text only. NOT EXISTS over a table with no index for its key is read once into a hash table, and the plan shows the BLOOM FILTER and SEARCH USING AUTOMATIC COVERING INDEX lines under the subquery node. The pinned sqlite3 prints SCAN b there until ANALYZE has given the table row counts, and scans the table for every row. The rows match"
@@ -90,11 +85,6 @@ reason = "Plan text only. NOT EXISTS over a table with no index for its key is r
 case = "automatic-index/plan-of-statement-8"
 kind = "deviation"
 reason = "Plan text only. A correlated count(*) over a table with no index for its key is read once into a hash table, and the plan shows the BLOOM FILTER and SEARCH USING AUTOMATIC COVERING INDEX lines under the subquery node. The pinned sqlite3 prints SCAN b there until ANALYZE has given the table row counts, and scans the table for every row. The rows match"
-
-[[known]]
-case = "automatic-index/plan-of-statement-9"
-kind = "deviation"
-reason = "Plan text only. This engine keeps the join order the statement wrote and builds the index on the inner table b, where the pinned sqlite3 scans b because of the condition on it and builds the index on a. The rows match"
 
 [[known]]
 case = "automatic-index/plan-of-statement-10"

@@ -807,6 +807,15 @@ impl crate::ImportedDatabase {
 }
 
 impl crate::ImportedDatabase {
+    /// Reports whether a qualified pragma is about an attached or temporary schema that has no file.
+    ///
+    /// @param at - the attached database the pragma was qualified with, `None` for `main`
+    fn schema_has_no_file(&self, at: Option<usize>) -> bool {
+        at.filter(|schema| *schema != MAIN)
+            .and_then(|schema| self.session_state.schema_at(schema))
+            .is_some_and(|held| held.path.is_none())
+    }
+
     /// Reads one setting pragma's value, under `&self`.
     ///
     /// **The one read path for a setting, whichever way it is asked.** `PRAGMA
@@ -872,6 +881,16 @@ impl crate::ImportedDatabase {
                 "ignore_check_constraints",
                 self.pragmas.ignore_check_constraints(),
             ),
+            // **A schema with no file reports what SQLite reports for one.** An
+            // attached `:memory:` database has a journal in memory, and it and
+            // `temp` hold an exclusive lock, whatever the connection's modes for
+            // `main` are. `temp` keeps the connection's journal mode.
+            b"journal_mode" if self.schema_has_no_file(at) && at != Some(crate::TEMP) => {
+                Some(word_row("journal_mode", "memory"))
+            }
+            b"locking_mode" if self.schema_has_no_file(at) => {
+                Some(word_row("locking_mode", "exclusive"))
+            }
             b"journal_mode" => Some(word_row("journal_mode", self.pragmas.journal_mode().word())),
             b"locking_mode" => Some(word_row("locking_mode", self.locking_word())),
             b"max_page_count" => Some(named_integer(

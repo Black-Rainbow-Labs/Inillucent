@@ -596,8 +596,27 @@ impl Options {
 /// `FACET` - or an option, written `name = value`. That is FTS5's grammar and
 /// there is no reason to invent a second one; a caller who knows one virtual
 /// table's argument syntax knows this one's.
+/// A table that already exists is read leniently, so a file written by an earlier release still
+/// opens; see [`parse_new`] for what a new declaration may not say.
 /// @param arguments - the raw argument slices, as written
 pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
+    parse_with(arguments, false)
+}
+
+/// Reads the arguments of a table that is being created.
+///
+/// Refuses what only makes sense to refuse in a new declaration: a vector width of zero, a graph
+/// degree below two, and an option written twice. A table already in a file may have been made
+/// before these were refused, and has to go on opening.
+/// @param arguments - the raw argument slices, as written
+pub fn parse_new(arguments: &[Vec<u8>]) -> DbResult<Options> {
+    parse_with(arguments, true)
+}
+
+/// Reads the arguments, strictly when the table is new.
+/// @param arguments - the raw argument slices, as written
+/// @param strict - whether this is a declaration being made now
+fn parse_with(arguments: &[Vec<u8>], strict: bool) -> DbResult<Options> {
     let mut columns: Vec<Vec<u8>> = Vec::new();
     let mut facets: Vec<usize> = Vec::new();
     let mut dims = 0usize;
@@ -615,6 +634,7 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
     let mut compact: Option<u64> = None;
     let mut segment_merge: Option<usize> = None;
     let mut merge_budget: Option<u64> = None;
+    let mut seen_options: Vec<String> = Vec::new();
     for argument in arguments {
         let text = String::from_utf8_lossy(argument).trim().to_string();
         if text.is_empty() {
@@ -624,7 +644,7 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
             let (column, facet) = split_facet(&text)?;
             if facet {
                 if columns.len() >= MAX_FACET_COLUMN {
-                    return Err(failure(format!(
+                    return Err(refused(format!(
                         "inillucent_search: a facet may be declared on the first \
                          {MAX_FACET_COLUMN} columns, and {column} is number {}",
                         columns.len().saturating_add(1)
@@ -636,15 +656,23 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
             continue;
         };
         let value = unquote(&value);
+        if strict {
+            refuse_repeated_option(&mut seen_options, &name)?;
+        }
         match name.to_ascii_lowercase().as_str() {
             "dims" | "dimensions" => {
                 dims = value.parse::<usize>().map_err(|_| {
-                    failure(format!(
+                    refused(format!(
                         "inillucent_search: dims must be a number, not {value}"
                     ))
                 })?;
+                if strict && dims == 0 {
+                    return Err(refused(
+                        "inillucent_search: dims must be greater than zero; leave dims out for a table with no vectors",
+                    ));
+                }
                 if dims > MAX_DIMS {
-                    return Err(failure(format!(
+                    return Err(refused(format!(
                         "inillucent_search: dims must be at most {MAX_DIMS}"
                     )));
                 }
@@ -652,7 +680,7 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
             "source" => source = Some(value.clone().into_bytes()),
             "threads" => {
                 threads = Some(value.parse::<usize>().map_err(|_| {
-                    failure(format!(
+                    refused(format!(
                         "inillucent_search: threads must be a number, not {value}"
                     ))
                 })?)
@@ -662,6 +690,7 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
             // The three graph parameters, spelled as pgvector spells them. A
             // zero is refused rather than taken: a graph with no neighbours is
             // a list, and a search that looks at nothing finds nothing.
+            "m" if strict => m = Some(at_least_two(&value, "m")?),
             "m" => m = Some(positive(&value, "m")?),
             "ef_construction" => ef_construction = Some(positive(&value, "ef_construction")?),
             "ef_search" => ef_search = Some(positive(&value, "ef_search")?),
@@ -673,14 +702,12 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
             "rerank_depth" => rerank_depth = Some(depth(&value)?),
             "tokenize" | "tokenizer" => {
                 if !value.eq_ignore_ascii_case(TOKENIZER) {
-                    return Err(failure(format!(
-                        "inillucent_search: the only tokenizer this build has is {TOKENIZER}, not {value}"
-                    )));
+                    return Err(refused(format!("no such tokenizer: {value}")));
                 }
             }
             "compact" => {
                 compact = Some(value.parse::<u64>().map_err(|_| {
-                    failure(format!(
+                    refused(format!(
                         "inillucent_search: compact must be a number, not {value}"
                     ))
                 })?);
@@ -688,25 +715,25 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
             "segment_merge" => segment_merge = Some(positive(&value, "segment_merge")?),
             "merge_budget" => {
                 merge_budget = Some(value.parse::<u64>().map_err(|_| {
-                    failure(format!(
+                    refused(format!(
                         "inillucent_search: merge_budget must be a number, not {value}"
                     ))
                 })?);
             }
             other => {
-                return Err(failure(format!(
+                return Err(refused(format!(
                     "inillucent_search: no such option: {other}"
                 )))
             }
         }
     }
     if columns.is_empty() {
-        return Err(failure(
+        return Err(refused(
             "inillucent_search: a search table needs at least one column",
         ));
     }
     if facets.len() >= columns.len() {
-        return Err(failure(
+        return Err(refused(
             "inillucent_search: a search table needs at least one column that is not a facet, \
              because a facet is not indexed and a table of facets alone answers nothing",
         ));
@@ -733,6 +760,47 @@ pub fn parse(arguments: &[Vec<u8>]) -> DbResult<Options> {
     })
 }
 
+/// Refuses an option that a declaration names twice, under either of its spellings.
+///
+/// Taking the last value silently meant `WITH (m = 8, m = 16)` built a graph the
+/// first number did not describe, and nothing said so.
+///
+/// @param seen - the canonical option names already read from this declaration
+/// @param name - the option as written
+fn refuse_repeated_option(seen: &mut Vec<String>, name: &str) -> DbResult<()> {
+    let lowered = name.to_ascii_lowercase();
+    let canonical = match lowered.as_str() {
+        "dimensions" => "dims".to_string(),
+        "distance" => "metric".to_string(),
+        "tokenizer" => "tokenize".to_string(),
+        _ => lowered,
+    };
+    if seen.contains(&canonical) {
+        return Err(refused(format!(
+            "inillucent_search: the option {canonical} is given more than once"
+        )));
+    }
+    seen.push(canonical);
+    Ok(())
+}
+
+/// Reads the graph degree `m`, which must be a whole number of at least 2.
+///
+/// A degree of 1 gives the graph's level multiplier 1 / ln(1), which is infinite, and the build
+/// then asked for a capacity no machine has and aborted the process.
+///
+/// @param value - the text the option was given
+/// @param name - the option's name, for the message
+fn at_least_two(value: &str, name: &str) -> DbResult<usize> {
+    let held = positive(value, name)?;
+    if held < 2 {
+        return Err(refused(format!(
+            "inillucent_search: {name} must be at least 2, not {value}"
+        )));
+    }
+    Ok(held)
+}
+
 /// Reads a rerank depth, refusing one that is not a whole number from 1 to 1,000.
 ///
 /// @param value - the text the option was given
@@ -742,7 +810,7 @@ fn depth(value: &str) -> DbResult<usize> {
         .ok()
         .filter(|held| (1..=MAX_RERANK_DEPTH).contains(held));
     held.ok_or_else(|| {
-        failure(format!(
+        refused(format!(
             "inillucent_search: rerank_depth must be a whole number from 1 to {MAX_RERANK_DEPTH}, \
              not {value}"
         ))
@@ -766,11 +834,11 @@ fn resolve_fusion(
     match (named, vector_weight) {
         (None, None) => Ok(FusionChoice::Adaptive),
         (None, Some(_)) | (Some(FusionChoice::Weighted), Some(_)) => Ok(FusionChoice::Weighted),
-        (Some(FusionChoice::Weighted), None) => Err(failure(
+        (Some(FusionChoice::Weighted), None) => Err(refused(
             "inillucent_search: fusion = 'weighted' needs vector_weight, the fixed share from 0 to 1 \
              that the vector list counts for. Add vector_weight = 0.5, or use fusion = 'adaptive'",
         )),
-        (Some(other), Some(_)) => Err(failure(format!(
+        (Some(other), Some(_)) => Err(refused(format!(
             "inillucent_search: fusion = '{}' has no weight, so vector_weight cannot be set with it. \
              Remove vector_weight, or use fusion = 'weighted'",
             other.name()
@@ -792,7 +860,7 @@ fn weight(value: &str) -> DbResult<u16> {
         .ok()
         .filter(|held| (0.0..=1.0).contains(held));
     let Some(held) = held else {
-        return Err(failure(format!(
+        return Err(refused(format!(
             "inillucent_search: vector_weight must be a number from 0 to 1, not {value}"
         )));
     };
@@ -805,16 +873,27 @@ fn weight(value: &str) -> DbResult<u16> {
 /// @param name - the option's name, for the message
 fn positive(value: &str, name: &str) -> DbResult<usize> {
     let held = value.parse::<usize>().map_err(|_| {
-        failure(format!(
+        refused(format!(
             "inillucent_search: {name} must be a number, not {value}"
         ))
     })?;
     if held == 0 {
-        return Err(failure(format!(
+        return Err(refused(format!(
             "inillucent_search: {name} must be greater than zero"
         )));
     }
     Ok(held)
+}
+
+/// Returns a refusal whose own words reach the caller.
+///
+/// `failure` keeps its text inside the process, and a caller is told `SQL logic error`. A mistake
+/// in a declaration is the caller's to fix, so the text is the message as well.
+///
+/// @param said - what is wrong
+fn refused(said: impl Into<String>) -> inillucent_base::DbError {
+    let said = said.into();
+    failure(said.clone()).with_message(said)
 }
 
 /// Refuses when the stored configuration names a format this build does not

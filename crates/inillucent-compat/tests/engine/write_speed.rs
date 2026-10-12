@@ -21,6 +21,12 @@
 //! - A `WHERE` term that reads one table was tested after the join, once for every
 //!   pair of rows, instead of before it.
 //! - A line of 20,000 statements gave each statement a copy of the rest of the line.
+//! - An index nested loop join that probed more than 64 leaves of a written index in no particular
+//!   order built a packed copy of a leaf for most probes and kept none: 540 ms against 75 ms.
+//! - `INSERT OR REPLACE` onto existing keys ran six tree operations per row: 750 ms against 130 ms
+//!   onto new keys.
+//! - `count(DISTINCT x)` over integers allocated an encoded key for every new value.
+//! - `VACUUM` ran one statement for every row it copied.
 //!
 //! The limits are wide on purpose: they are about ten times what the fixed code
 //! takes on a loaded machine, and several times less than the old code took, so
@@ -278,6 +284,215 @@ fn a_term_on_one_table_of_a_join_filters_before_the_join() {
     assert!(
         took < Duration::from_millis(3_000),
         "the two joins took {took:?}; the term on x was tested for every pair"
+    );
+}
+
+/// Times one query, returning its answer and how long it took.
+///
+/// @param database - the database
+/// @param sql - a query returning integers
+fn timed(database: &Database, sql: &str) -> (Vec<i64>, Duration) {
+    let started = Instant::now();
+    let answer = integers(database, sql);
+    (answer, started.elapsed())
+}
+
+/// Probing a written index in no particular order costs about what probing it in key order does.
+///
+/// The index is created before the rows are inserted, and a row is already in the table when they are
+/// (an insert into an empty table builds clean leaves), so the leaves hold their entries in the
+/// delta area. The pool kept 64 packed copies of such leaves and built a copy for most probes once
+/// the index had more leaves than that. For 60,000 probes into 300,000 entries the old code took
+/// 3.7 s in key order and 185 ms shuffled, and the fixed code about 150 ms for both.
+#[test]
+fn probes_into_a_written_index_in_any_order_cost_the_same() {
+    let (_, database) = fresh("shuffled_probes");
+    let session = database.session();
+    session
+        .execute_batch(
+            "CREATE TABLE posts(id INTEGER PRIMARY KEY, user_id INT, note TEXT); \
+             CREATE INDEX posts_user ON posts(user_id, note); \
+             INSERT INTO posts VALUES (0, -1, 'seed'); \
+             INSERT INTO posts SELECT value, (value * 7919) % 60000, printf('%040d', value) \
+             FROM generate_series(1, 300000); \
+             CREATE TABLE in_order(id INT); \
+             INSERT INTO in_order SELECT value FROM generate_series(0, 59999); \
+             CREATE TABLE shuffled(id INT); \
+             INSERT INTO shuffled SELECT (value * 7907) % 60000 FROM generate_series(0, 59999);",
+        )
+        .expect("the tables are built");
+    let probe = |outer: &str| {
+        timed(
+            &database,
+            &format!(
+                "SELECT count(*) FROM {outer} o LEFT JOIN posts p ON p.user_id = o.id WHERE p.id IS NULL"
+            ),
+        )
+    };
+    let (_, warm) = probe("in_order");
+    let (ordered_answer, ordered) = probe("in_order");
+    let (shuffled_answer, shuffled) = probe("shuffled");
+    assert_eq!(ordered_answer, vec![0]);
+    assert_eq!(shuffled_answer, vec![0]);
+    println!("probes in key order: {ordered:?} (first {warm:?}), shuffled: {shuffled:?}");
+    assert!(
+        shuffled < ordered * 3 + Duration::from_millis(50)
+            && ordered < shuffled * 3 + Duration::from_millis(50),
+        "60,000 probes took {shuffled:?} shuffled and {ordered:?} in key order; a packed copy of a \
+         leaf was built for most of the probes of one of the two orders"
+    );
+}
+
+/// `INSERT OR REPLACE` onto keys that exist costs about what it does onto keys that do not.
+///
+/// A replace of an existing row used to look for a clash, check the other constraints, read the old
+/// row, delete it, look for a clash again and write the new row.
+#[test]
+fn replacing_existing_keys_costs_about_what_adding_new_ones_does() {
+    let (_, database) = fresh("replace_existing");
+    let session = database.session();
+    session
+        .execute_batch(
+            "CREATE TABLE k(id INTEGER PRIMARY KEY, n INT); \
+             CREATE TABLE fresh_0(id INTEGER PRIMARY KEY, n INT); \
+             CREATE TABLE fresh_1(id INTEGER PRIMARY KEY, n INT); \
+             CREATE TABLE fresh_2(id INTEGER PRIMARY KEY, n INT); \
+             INSERT INTO k SELECT value, 0 FROM generate_series(1, 60000);",
+        )
+        .expect("the tables are built");
+    // The best of three runs of each, so a busy machine does not decide the comparison.
+    let mut existing = Duration::MAX;
+    let mut new_keys = Duration::MAX;
+    for round in 0..3 {
+        let started = Instant::now();
+        session
+            .execute_batch(&format!(
+                "INSERT OR REPLACE INTO k SELECT value, {} FROM generate_series(1, 60000);",
+                5 + round
+            ))
+            .expect("the replaces run");
+        existing = existing.min(started.elapsed());
+        let started = Instant::now();
+        session
+            .execute_batch(&format!(
+                "INSERT OR REPLACE INTO fresh_{round} SELECT value, 5 FROM generate_series(1, 60000);"
+            ))
+            .expect("the inserts run");
+        new_keys = new_keys.min(started.elapsed());
+    }
+    assert_eq!(
+        integers(&database, "SELECT count(*), sum(n), min(n) FROM k"),
+        vec![60_000, 420_000, 7]
+    );
+    println!("60,000 replaces onto existing keys: {existing:?}, onto new keys: {new_keys:?}");
+    assert!(
+        existing < new_keys * 3 + Duration::from_millis(50),
+        "60,000 replaces onto existing keys took {existing:?}, against {new_keys:?} onto new keys"
+    );
+}
+
+/// `INSERT OR REPLACE` keeps every index in step with the row it replaces.
+#[test]
+fn replacing_a_row_moves_its_index_entries() {
+    let (_, database) = fresh("replace_indexes");
+    let session = database.session();
+    session
+        .execute_batch(
+            "CREATE TABLE r(id INTEGER PRIMARY KEY, a INT, b TEXT); \
+             CREATE INDEX r_a ON r(a); CREATE INDEX r_b ON r(b); \
+             INSERT INTO r VALUES (1, 10, 'x'), (2, 20, 'y'); \
+             INSERT OR REPLACE INTO r VALUES (1, 11, 'z'), (3, 30, 'w');",
+        )
+        .expect("the statements run");
+    assert_eq!(
+        integers(
+            &database,
+            "SELECT (SELECT count(*) FROM r WHERE a = 10), (SELECT count(*) FROM r WHERE a = 11), \
+             (SELECT count(*) FROM r WHERE b = 'x'), (SELECT count(*) FROM r WHERE b = 'z'), \
+             (SELECT count(*) FROM r)"
+        ),
+        vec![0, 1, 0, 1, 3]
+    );
+}
+
+/// `count(DISTINCT x)` over integers is not slower than the same count over their text.
+///
+/// The integers go in a set of integers. The text of the same values goes through the encoded
+/// key set the integers used to share: 15 ms against 100 ms for 500,000 rows.
+#[test]
+fn counting_distinct_integers_is_faster_than_counting_distinct_text() {
+    let (_, database) = fresh("count_distinct");
+    let session = database.session();
+    session
+        .execute_batch(
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, post_id INT); \
+             INSERT INTO c SELECT value, (value * 7919) % 200000 FROM generate_series(1, 400000);",
+        )
+        .expect("the table is built");
+    let (_, _) = timed(&database, "SELECT count(DISTINCT post_id) FROM c");
+    let (integers_answer, integer_time) = timed(&database, "SELECT count(DISTINCT post_id) FROM c");
+    let (text_answer, text_time) = timed(&database, "SELECT count(DISTINCT post_id || '') FROM c");
+    assert_eq!(integers_answer, vec![200_000]);
+    assert_eq!(text_answer, vec![200_000]);
+    println!("count(DISTINCT) of integers: {integer_time:?}, of their text: {text_time:?}");
+    assert!(
+        integer_time < text_time,
+        "count(DISTINCT) of integers took {integer_time:?}, no less than {text_time:?} for their text"
+    );
+}
+
+/// `count(DISTINCT x)` treats an integer and a real with the same value as one value.
+#[test]
+fn count_distinct_merges_an_integer_with_the_real_of_the_same_value() {
+    let (_, database) = fresh("count_distinct_mixed");
+    let session = database.session();
+    session
+        .execute_batch(
+            "CREATE TABLE m(v); \
+             INSERT INTO m VALUES (1), (2), (2), (3.0), (1.0), (4.5), ('2'), (NULL);",
+        )
+        .expect("the table is built");
+    assert_eq!(
+        integers(&database, "SELECT count(DISTINCT v) FROM m"),
+        vec![5]
+    );
+}
+
+/// `VACUUM` keeps every row and index entry, and copies rows in chunks.
+///
+/// The copy ran one statement per row. Timing cannot tell the two apart by a wide margin, so this
+/// checks the answers the rebuild must keep and bounds the time by the time a table copy takes.
+#[test]
+fn vacuum_keeps_every_row_and_finishes_in_time() {
+    let (_, database) = fresh("vacuum_rows");
+    let session = database.session();
+    session
+        .execute_batch(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b TEXT); \
+             CREATE INDEX t_a ON t(a); \
+             INSERT INTO t SELECT value, value * 7, 'row' || value FROM generate_series(1, 100000);",
+        )
+        .expect("the table is built");
+    let started = Instant::now();
+    session
+        .execute_batch("CREATE TABLE copy_of_t AS SELECT * FROM t;")
+        .expect("the copy runs");
+    let copy = started.elapsed();
+    let started = Instant::now();
+    session.execute_batch("VACUUM;").expect("the vacuum runs");
+    let vacuum = started.elapsed();
+    assert_eq!(
+        integers(
+            &database,
+            "SELECT (SELECT count(*) FROM t), (SELECT sum(a) FROM t), (SELECT count(*) FROM t WHERE a = 700), \
+             (SELECT count(*) FROM copy_of_t)"
+        ),
+        vec![100_000, 35_000_350_000, 1, 100_000]
+    );
+    println!("copy of 100,000 rows: {copy:?}, VACUUM of two such tables: {vacuum:?}");
+    assert!(
+        vacuum < copy * 20 + Duration::from_millis(500),
+        "VACUUM took {vacuum:?} against {copy:?} for a table copy"
     );
 }
 

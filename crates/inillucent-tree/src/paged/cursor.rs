@@ -409,14 +409,22 @@ impl PagedTree {
         // The landed leaf is read through the guard the descent already holds.
         // Dropping it and calling `visit_from` re-fetched and re-parsed the
         // page a probe had just finished descending to, once per outer row.
+        //
+        // **No packed copy of a written leaf is made for an equality walk.** A
+        // walk finds its few rows in a written leaf by two searches, in well under
+        // a microsecond. Building the copy packs the whole leaf, 113 us for one
+        // with 3,000 index entries, and the pool keeps 64 copies. A join that
+        // probes more than 64 leaves in no particular order built a copy for most
+        // probes and kept none: `users u LEFT JOIN posts p ON p.user_id = u.id`
+        // over 100,000 users took 540 ms, and 75 ms without the copies.
         let encoded = self.encode_key_small(key);
-        let (guard, page) = self.descend_guard(pool, encoded.as_slice())?;
+        let (guard, _) = self.descend_guard(pool, encoded.as_slice())?;
         let mut next = {
             let leaf = LeafRef::parse(&guard)?
                 .with_collations(&self.collations)
                 .with_directions(&self.directions)
                 .with_pool(pool);
-            match self.with_leaf_extents(pool, Some(page), leaf, |leaf| {
+            match self.with_leaf_extents(pool, None, leaf, |leaf| {
                 Self::equal_span(leaf, key, RUN_SCAN, visit)
             })? {
                 Some(right) => right,
@@ -431,7 +439,7 @@ impl PagedTree {
                 .with_collations(&self.collations)
                 .with_directions(&self.directions)
                 .with_pool(pool);
-            match self.with_leaf_extents(pool, Some(next), leaf, |leaf| {
+            match self.with_leaf_extents(pool, None, leaf, |leaf| {
                 Self::equal_span(leaf, key, RUN_SCAN, visit)
             })? {
                 Some(right) => next = right,
@@ -625,7 +633,13 @@ impl PagedTree {
         // row at the floor of the table where SQLite returns nothing
         // (task-1932, H7). Text, a blob and NULL land here for the same
         // reason: none of them is ever equal to a rowid.
-        if self.encoding == KeyEncoding::Rowid && !matches!(probe, [Datum::Int(_)]) {
+        //
+        // **Unless the key is an `INTEGER` column of a `WITHOUT ROWID` table**,
+        // which can hold a text, a blob or a real: the key encoding orders them
+        // after the integers and the leaf search compares exactly, so the probe
+        // is looked up like any other.
+        let mixed = self.columns.first().is_some_and(|column| column.mixed_key);
+        if self.encoding == KeyEncoding::Rowid && !mixed && !matches!(probe, [Datum::Int(_)]) {
             return Ok(None);
         }
         let key = self.encode_key_small(probe);

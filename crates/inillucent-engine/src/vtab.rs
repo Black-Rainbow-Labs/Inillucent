@@ -1093,7 +1093,9 @@ fn drive_cursor(
     downstream: &mut dyn inillucent_exec::ops::Sink,
 ) -> DbResult<inillucent_exec::ops::Flow> {
     {
-        let mut rows: Vec<Vec<OwnedDatum>> = Vec::with_capacity(inillucent_exec::batch::BATCH_ROWS);
+        // Grown as rows arrive: a lateral join runs this once per outer row, and a table
+        // function usually answers a handful of rows.
+        let mut rows: Vec<Vec<OwnedDatum>> = Vec::new();
         cursor.filter(context, plan)?;
         while !cursor.eof() {
             let row = read_row(cursor, context, shape, params)?;

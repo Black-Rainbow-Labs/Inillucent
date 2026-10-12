@@ -3,7 +3,7 @@
 //! Invariant: **a path is covering only when every column the query reads sits in the entry**, so
 //! a scan of the index never has to fetch the table row.
 
-use super::{ColumnUse, IndexInfo, TableInfo, ROWID_ENTRY_SLOT};
+use super::{BoundExpr, ColumnUse, IndexInfo, TableInfo, ROWID_ENTRY_SLOT};
 
 /// Returns where each column the query reads sits in one index's entries.
 ///
@@ -36,23 +36,31 @@ pub(super) fn covering_slots(
     };
     let mut slots = Vec::with_capacity(needed.columns.len());
     for slot in &needed.columns {
+        // **`needed` names record slots and an index names declared columns.**
+        // For a `WITHOUT ROWID` table the record starts with the primary key,
+        // so with `PRIMARY KEY(c)` over `(a, b, c)` record slot 2 is `b` and
+        // declared column 2 is `c`. Comparing the two directly made an index on
+        // `a` look like it held `b` (as the key's `c`), and `SELECT c FROM t
+        // WHERE b = 2` was planned as a covering scan of that index and failed
+        // with "the tree read for FROM term 0 does not carry column 1".
+        let column = declared_column(table, *slot)?;
         // The rowid alias is a column of the table and the *rowid* of the
         // entry, so it is covered whatever the index holds - but it is read
         // with `IdxRowid` rather than out of the entry's record, so it is not
         // in the list.
-        if table.rowid_alias == Some(*slot) && !table.without_rowid {
+        if table.rowid_alias == Some(column) && !table.without_rowid {
             slots.push((*slot, ROWID_ENTRY_SLOT));
             continue;
         }
         let held = index
             .columns
             .iter()
-            .position(|column| column.plain_column() == Some(*slot));
+            .position(|held| held.plain_column() == Some(column));
         // The primary key fields follow the index's own columns in a WITHOUT ROWID entry.
         let position = match held {
             Some(position) => position,
             None if table.without_rowid => {
-                let offset = key.iter().position(|column| column == slot)?;
+                let offset = key.iter().position(|held| *held == column)?;
                 index.columns.len().saturating_add(offset)
             }
             None => return None,
@@ -60,4 +68,68 @@ pub(super) fn covering_slots(
         slots.push((*slot, position));
     }
     Some(slots)
+}
+
+/// Returns the declared column a record slot holds.
+///
+/// A `WITHOUT ROWID` table's record puts the primary key first, and a rowid
+/// table's record leaves out its `VIRTUAL` generated columns, so a record slot
+/// is not a declared position. `None` when the slot is past the record.
+///
+/// @param table - the table being read
+/// @param slot - a record slot a query reads
+fn declared_column(table: &TableInfo, slot: u16) -> Option<u16> {
+    if table.without_rowid {
+        return table.record_order().get(usize::from(slot)).copied();
+    }
+    let mut remaining = usize::from(slot);
+    for (position, info) in table.columns.iter().enumerate() {
+        if info.generated && !info.stored {
+            continue;
+        }
+        if remaining == 0 {
+            return u16::try_from(position).ok();
+        }
+        remaining = remaining.saturating_sub(1);
+    }
+    None
+}
+
+/// Returns what a query reads of a term once the equalities a computed key enforces are left out.
+///
+/// **An index on an expression covers a query whose only use of a column is inside that
+/// expression.** `SELECT count(*) FROM events WHERE json_extract(payload, '$.type') = 'buy'` over
+/// an index on `json_extract(payload, '$.type')` reads `payload` only in the term the seek
+/// answers, and SQLite counts the index entries. This read `payload` as needed, found the index
+/// did not hold it, and scanned the table: 129 ms against 11 ms on 300,000 events (bug hunt 9).
+/// The term is answered by the seek and not tested again, so the columns it reads are not read.
+///
+/// `None` when no such equality was used, so the caller keeps what the query reads.
+///
+/// @param id - the statement wide number of the FROM term
+/// @param needed - what the whole query reads of the term
+/// @param terms - the statement's terms
+/// @param answered - the terms the computed keys' equalities consumed
+pub(super) fn needed_beyond_expressions(
+    id: usize,
+    needed: &ColumnUse,
+    terms: &[BoundExpr],
+    answered: &[usize],
+) -> Option<ColumnUse> {
+    if answered.is_empty() {
+        return None;
+    }
+    let mut reduced = ColumnUse {
+        columns: needed.outside_filter.clone(),
+        rowid: needed.rowid,
+        opaque: needed.opaque,
+        functions: needed.functions.clone(),
+        outside_filter: needed.outside_filter.clone(),
+    };
+    for (position, term) in terms.iter().enumerate() {
+        if !answered.contains(&position) {
+            term.columns_read(id, &mut reduced);
+        }
+    }
+    Some(reduced)
 }
