@@ -8,7 +8,7 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
-## Not yet released
+## 2.6.0, 13 October 2026
 
 **An `inillucent_search` table can tokenize a language other than English.** Until now every table
 stemmed with Snowball English and dropped English stopwords, so Portuguese text was indexed as if it
