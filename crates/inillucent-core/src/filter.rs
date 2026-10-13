@@ -24,7 +24,8 @@ use crate::store::{Store, NO_TIMESTAMP};
 /// `any_of` is overlap, the same semantics `labels` has. `contains` is the
 /// substring form the baseline writes as `address ILIKE '%x%' OR display_name
 /// ILIKE '%x%'`, which only works because both spellings of a person are interned
-/// into the same attribute set. Setting both requires a document to satisfy each.
+/// into the same attribute set. `range` admits a value between two bounds.
+/// Setting more than one requires a document to satisfy each.
 #[derive(Debug, Clone, Default)]
 pub struct AttributeFilter {
     /// Which attribute set this constrains, such as `participant`.
@@ -34,6 +35,41 @@ pub struct AttributeFilter {
     pub any_of: Vec<String>,
     /// A substring, matched without case against every value in the set.
     pub contains: Option<String>,
+    /// Bounds a value must lie between, compared byte by byte.
+    pub range: Option<ValueRange>,
+}
+
+/// Bounds on an attribute value, compared byte by byte as SQLite's `BINARY`
+/// collation compares text.
+///
+/// Byte order is what `WHERE day >= '2026-06-01'` means on a `TEXT` column,
+/// so an ISO date, a zero padded number or any other value written to sort as
+/// text selects the rows SQL would select.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ValueRange {
+    /// The lower bound, and whether a value equal to it is admitted.
+    pub lower: Option<(String, bool)>,
+    /// The upper bound, and whether a value equal to it is admitted.
+    pub upper: Option<(String, bool)>,
+}
+
+impl ValueRange {
+    /// Reports whether a value lies between the bounds.
+    ///
+    /// @param value - the attribute value
+    pub fn admits(&self, value: &str) -> bool {
+        let above = match &self.lower {
+            Some((bound, true)) => value >= bound.as_str(),
+            Some((bound, false)) => value > bound.as_str(),
+            None => true,
+        };
+        let below = match &self.upper {
+            Some((bound, true)) => value <= bound.as_str(),
+            Some((bound, false)) => value < bound.as_str(),
+            None => true,
+        };
+        above && below
+    }
 }
 
 impl AttributeFilter {
@@ -45,6 +81,7 @@ impl AttributeFilter {
             name: name.to_string(),
             any_of: Vec::new(),
             contains: Some(needle.to_string()),
+            range: None,
         }
     }
 
@@ -56,6 +93,24 @@ impl AttributeFilter {
             name: name.to_string(),
             any_of: values.iter().map(|v| v.to_string()).collect(),
             contains: None,
+            range: None,
+        }
+    }
+
+    /// Reports whether this constraint has no clause, and so admits everything.
+    pub fn constrains_nothing(&self) -> bool {
+        self.any_of.is_empty() && self.contains.is_none() && self.range.is_none()
+    }
+
+    /// A filter on `name` matching any value between two bounds.
+    /// @param name - the attribute set
+    /// @param range - the bounds
+    pub fn within(name: &str, range: ValueRange) -> Self {
+        AttributeFilter {
+            name: name.to_string(),
+            any_of: Vec::new(),
+            contains: None,
+            range: Some(range),
         }
     }
 }
@@ -309,7 +364,7 @@ impl CompiledFilter {
         for constraint in &filter.attributes {
             // A constraint that constrains nothing is absent, not a match on
             // everything and not a reason to select nothing.
-            if constraint.any_of.is_empty() && constraint.contains.is_none() {
+            if constraint.constrains_nothing() {
                 continue;
             }
             match compile_attribute(constraint, store) {
@@ -554,6 +609,22 @@ fn compile_attribute(constraint: &AttributeFilter, store: &Store) -> Option<Comp
     }
     if let Some(needle) = &constraint.contains {
         let ids = dictionary.find_containing(needle);
+        if ids.is_empty() {
+            return None;
+        }
+        clauses.push(ids);
+    }
+    if let Some(range) = &constraint.range {
+        // One pass over the distinct values, once per query, so the per chunk
+        // test stays a binary search over ids. The ids come out ascending
+        // because they are the values' positions.
+        let ids: Vec<u32> = dictionary
+            .values()
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| range.admits(value))
+            .filter_map(|(id, _)| u32::try_from(id).ok())
+            .collect();
         if ids.is_empty() {
             return None;
         }
@@ -986,6 +1057,7 @@ mod tests {
             name: "participant".into(),
             any_of: Vec::new(),
             contains: None,
+            range: None,
         });
         let c = CompiledFilter::compile(&f, &s);
         assert!(!c.is_dead());
@@ -999,6 +1071,7 @@ mod tests {
             name: "participant".into(),
             any_of: vec!["jason@example.com".into()],
             contains: Some("Terri".into()),
+            range: None,
         });
         // Only m1 both includes jason and names Terri.
         assert_eq!(passing(&f, &s), vec![0]);
@@ -1115,6 +1188,50 @@ mod tests {
             ],
         ));
         assert_eq!(passing(&f, &s), vec![0, 1, 2]);
+    }
+
+    /// A range admits the values between its bounds in byte order, which is
+    /// the order SQL compares a `TEXT` value in, and each bound is inclusive
+    /// or exclusive as written.
+    #[test]
+    fn a_range_admits_the_values_between_its_bounds() {
+        let s = mail_store();
+        let bounds = |lower: Option<(&str, bool)>, upper: Option<(&str, bool)>| {
+            Filter::default().with_attribute(AttributeFilter::within(
+                "participant",
+                ValueRange {
+                    lower: lower.map(|(v, inclusive)| (v.to_string(), inclusive)),
+                    upper: upper.map(|(v, inclusive)| (v.to_string(), inclusive)),
+                },
+            ))
+        };
+        // Lower case sorts after upper case in byte order, and every message
+        // has an address at or after "jason@example.com".
+        assert_eq!(
+            passing(&bounds(Some(("jason@example.com", true)), None), &s),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(
+            passing(&bounds(Some(("jean@example.net", false)), None), &s),
+            vec![0, 2, 3],
+            "an exclusive bound drops the value equal to it"
+        );
+        assert_eq!(
+            passing(&bounds(None, Some(("Jean Platt", true))), &s),
+            vec![1]
+        );
+        assert_eq!(
+            passing(&bounds(Some(("t", true)), Some(("u", false))), &s),
+            vec![0, 2]
+        );
+        let none = bounds(Some(("zzz", true)), None);
+        assert!(CompiledFilter::compile(&none, &s).is_dead());
+        assert!(passing(&none, &s).is_empty());
+        let open = bounds(Some(("t", true)), None);
+        assert_eq!(
+            CompiledFilter::compile(&open, &s).pass_count(),
+            passing(&open, &s).len()
+        );
     }
 
     #[test]

@@ -69,7 +69,7 @@ use std::sync::{Arc, Mutex};
 
 use inillucent_base::error::statement_refusal;
 use inillucent_base::DbResult;
-use inillucent_core::filter::{AttributeFilter, Filter};
+use inillucent_core::filter::{AttributeFilter, Filter, ValueRange};
 use inillucent_core::index::{Index, IndexConfig};
 use inillucent_core::rank::{AdaptiveWeights, Fusion, HitOrigin, RRF_K};
 use inillucent_core::store::ChunkInput;
@@ -124,12 +124,31 @@ pub struct Request {
     /// rows to be reranked. It is not part of what the keyword and vector branches search for.
     pub question: Option<String>,
     /// The facet constraints the statement carried, as the facet's column
-    /// position and the value that column must hold.
+    /// position and the test that column's value must pass.
     ///
     /// Positions rather than names because that is what the access path can
     /// record in one character, and the name is read back from the declaration
     /// where the value has to agree with what the build filed it under.
-    pub facets: Vec<(usize, String)>,
+    pub facets: Vec<(usize, FacetTest)>,
+}
+
+/// One test on a facet's value, applied inside the search.
+///
+/// The search chooses its `k` rows from the rows that pass every test. A test
+/// applied to the `k` rows afterwards removes rows from them and leaves the
+/// answer short, which is what `IN` and the range operators did before they
+/// were tests here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FacetTest {
+    /// `facet = value`.
+    Equal(String),
+    /// `facet IN (values)`. An empty list matches nothing.
+    AnyOf(Vec<String>),
+    /// `facet > a`, `facet >= a`, `facet < b`, `facet <= b` and
+    /// `BETWEEN`, compared byte by byte as SQL compares text.
+    Within(ValueRange),
+    /// A test no value passes, such as a comparison with NULL.
+    Nothing,
 }
 
 /// The index one connection is currently answering from.
@@ -1513,7 +1532,10 @@ fn live_rows_of(index: &Index) -> usize {
 /// @returns the hits, or the index's refusal of a query it cannot compare
 fn run(index: &Index, options: &Options, request: &Request) -> DbResult<Vec<Hit>> {
     let limit = request.limit.max(1);
-    let filter = index.compile(&filter_of(options, request)?);
+    let Some(facets) = filter_of(options, request)? else {
+        return Ok(Vec::new());
+    };
+    let filter = index.compile(&facets);
     let ef = traversal_width(options, request, limit);
     let text = request.text.clone().unwrap_or_default();
     let has_text = !text.trim().is_empty();
@@ -1551,6 +1573,10 @@ fn run(index: &Index, options: &Options, request: &Request) -> DbResult<Vec<Hit>
 /// as in SQL and what `CompiledFilter` does with a list of attribute
 /// constraints.
 ///
+/// `None` means no row can pass, because a test was an empty `IN` list or a
+/// comparison with NULL. An `AttributeFilter` with no values constrains
+/// nothing, so such a test cannot be written as one.
+///
 /// A constraint naming a column the declaration does not call a facet is a
 /// refusal rather than a constraint that is quietly dropped. The access path
 /// claims a facet constraint, which tells the engine not to evaluate it again,
@@ -1559,20 +1585,27 @@ fn run(index: &Index, options: &Options, request: &Request) -> DbResult<Vec<Hit>
 ///
 /// @param options - the table's declaration
 /// @param request - what was asked for
-fn filter_of(options: &Options, request: &Request) -> DbResult<Filter> {
+fn filter_of(options: &Options, request: &Request) -> DbResult<Option<Filter>> {
     let mut filter = Filter::default();
-    for (position, value) in &request.facets {
+    for (position, test) in &request.facets {
         let Some(name) = options.facet_name(*position) else {
             return Err(failure(format!(
                 "inillucent_search: column {position} is not a facet of this table, so a search \
                  cannot rank over it"
             )));
         };
-        filter
-            .attributes
-            .push(AttributeFilter::any_of(&name, &[value.as_str()]));
+        let attribute = match test {
+            FacetTest::Equal(value) => AttributeFilter::any_of(&name, &[value.as_str()]),
+            FacetTest::AnyOf(values) if !values.is_empty() => {
+                let values: Vec<&str> = values.iter().map(String::as_str).collect();
+                AttributeFilter::any_of(&name, &values)
+            }
+            FacetTest::Within(range) => AttributeFilter::within(&name, range.clone()),
+            FacetTest::AnyOf(_) | FacetTest::Nothing => return Ok(None),
+        };
+        filter.attributes.push(attribute);
     }
-    Ok(filter)
+    Ok(Some(filter))
 }
 
 /// Returns the traversal width one request asks for.
@@ -1766,10 +1799,12 @@ mod tests {
     fn a_facet_constraint_becomes_an_attribute_predicate() {
         let options = declaration(&["body", "live facet"]);
         let request = Request {
-            facets: vec![(1, "1".to_string())],
+            facets: vec![(1, FacetTest::Equal("1".to_string()))],
             ..Request::default()
         };
-        let filter = filter_of(&options, &request).expect("compiled");
+        let filter = filter_of(&options, &request)
+            .expect("compiled")
+            .expect("a filter");
         assert_eq!(filter.attributes.len(), 1);
         assert_eq!(
             filter.attributes.first().map(|held| held.name.as_str()),
@@ -1781,6 +1816,50 @@ mod tests {
         );
     }
 
+    /// An `IN` list and a range each compile into one predicate on the facet,
+    /// and a test no value passes compiles into no filter at all, which the
+    /// search answers with no rows.
+    #[test]
+    fn a_list_and_a_range_become_attribute_predicates() {
+        let options = declaration(&["body", "day facet"]);
+        let request = Request {
+            facets: vec![
+                (1, FacetTest::AnyOf(vec!["a".to_string(), "b".to_string()])),
+                (
+                    1,
+                    FacetTest::Within(ValueRange {
+                        lower: Some(("a".to_string(), true)),
+                        upper: None,
+                    }),
+                ),
+            ],
+            ..Request::default()
+        };
+        let filter = filter_of(&options, &request)
+            .expect("compiled")
+            .expect("a filter");
+        assert_eq!(filter.attributes.len(), 2);
+        assert_eq!(
+            filter.attributes.first().map(|held| held.any_of.len()),
+            Some(2)
+        );
+        assert!(filter
+            .attributes
+            .get(1)
+            .is_some_and(|held| held.range.is_some()));
+
+        for nothing in [FacetTest::AnyOf(Vec::new()), FacetTest::Nothing] {
+            let request = Request {
+                facets: vec![(1, nothing.clone())],
+                ..Request::default()
+            };
+            assert!(
+                filter_of(&options, &request).expect("compiled").is_none(),
+                "{nothing:?} matches no row"
+            );
+        }
+    }
+
     /// A constraint on a column the declaration does not call a facet refuses.
     ///
     /// It cannot be dropped: the access path claims the constraint, which tells
@@ -1790,7 +1869,7 @@ mod tests {
     fn a_constraint_on_a_column_that_is_not_a_facet_refuses() {
         let options = declaration(&["body", "live facet"]);
         let request = Request {
-            facets: vec![(0, "1".to_string())],
+            facets: vec![(0, FacetTest::Equal("1".to_string()))],
             ..Request::default()
         };
         let failed = filter_of(&options, &request).expect_err("refused");

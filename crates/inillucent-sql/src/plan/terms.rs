@@ -287,9 +287,9 @@ pub(super) fn virtual_constraint(
     None
 }
 
-/// Returns the column and the values when a term is `IN (values)` on this
-/// term's rowid or on one of its hidden columns, with every value known before
-/// the scan starts.
+/// Returns the column, the values, and whether the module may be run once per
+/// value, when a term is `IN (values)` on one of this term's columns or its
+/// rowid, with every value known before the scan starts.
 ///
 /// A value that reads any column is refused, so the list never depends on where
 /// the term sits in a join. `NOT IN` is refused because it is not an equality.
@@ -298,11 +298,20 @@ pub(super) fn virtual_constraint(
 /// argument of a table valued function: SQLite runs `generate_series` and
 /// `json_each` once per value of `stop IN (5, 6)` or `json IN (...)`, and a scan
 /// that took the default argument instead would never finish. A declared column
-/// brings its own affinity and collation into the comparison, so it is refused,
-/// unless it has neither: a column with no declared type and the default
-/// collation compares a value exactly as the list wrote it, which is how
-/// `generate_series` declares `value`, and SQLite offers `value IN ('3', '5')`
-/// to the module one value at a time.
+/// brings its own affinity and collation into the comparison, so it is not run
+/// once per value, unless it has neither: a column with no declared type and
+/// the default collation compares a value exactly as the list wrote it, which
+/// is how `generate_series` declares `value`, and SQLite offers
+/// `value IN ('3', '5')` to the module one value at a time.
+///
+/// **Any other column is offered too, for a module that takes the whole list
+/// in one call.** An `inillucent_search` facet is declared `TEXT`, so before
+/// this `channel IN ('C1', 'C2')` was never offered: the search chose its `k`
+/// rows without it, and the list then removed rows from those `k`, so a query
+/// returned fewer rows than it asked for, or none, while matching rows
+/// existed. The third value is `false` for such a column, and the engine
+/// takes the constraint back from a module that claims it without asking for
+/// the whole list, so the list is tested as it was before.
 /// A list written as `IN (SELECT ...)` is kept as the subquery itself, whose
 /// values are read when the statement runs.
 ///
@@ -313,7 +322,7 @@ pub(super) fn constant_in_list(
     id: usize,
     table: &TableInfo,
     term: &BoundExpr,
-) -> Option<(i32, Vec<BoundExpr>)> {
+) -> Option<(i32, Vec<BoundExpr>, bool)> {
     let (operand, list) = match term {
         BoundExpr::InList {
             negated: false,
@@ -340,11 +349,12 @@ pub(super) fn constant_in_list(
         return None;
     }
     match operand.as_ref() {
-        BoundExpr::Rowid { source } if *source == id => Some((crate::vtab::ROWID_COLUMN, list)),
-        BoundExpr::Column { source, column, .. }
-            if *source == id && table.column(*column).is_some_and(compares_as_written) =>
-        {
-            Some((i32::from(*column), list))
+        BoundExpr::Rowid { source } if *source == id => {
+            Some((crate::vtab::ROWID_COLUMN, list, true))
+        }
+        BoundExpr::Column { source, column, .. } if *source == id => {
+            let info = table.column(*column)?;
+            Some((i32::from(*column), list, compares_as_written(info)))
         }
         _ => None,
     }

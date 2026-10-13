@@ -938,20 +938,17 @@ fn install_model(
         ))
     })?;
 
-    match from {
-        Some(folder) => copy_model_files(folder, &directory, spec, force)?,
-        None => {
-            for file in spec.files {
-                let destination = directory.join(file.local);
-                if destination.exists() && !force && already_correct(&destination, file) {
-                    continue;
-                }
-                let url = format!("{}/{}", spec.base, file.remote);
-                let mut progress = bar();
-                http::download(&url, &destination, Some(file.sha256), &mut progress)
-                    .map_err(|error| Failed::misuse(format!("{error}")))?;
-            }
-        }
+    let fetched = match from {
+        Some(folder) => copy_model_files(folder, &directory, spec, force),
+        None => download_model_files(&directory, spec, force),
+    };
+    if let Err(failed) = fetched {
+        // A failure says "Nothing was installed", so a model folder this run
+        // created and left empty goes too. `remove_dir` refuses a folder that
+        // holds anything, which keeps an earlier install and a partial file the
+        // built in client will resume.
+        let _ = std::fs::remove_dir(&directory);
+        return Err(failed);
     }
 
     // The manifest is this repository's contract rather than the model author's,
@@ -982,6 +979,25 @@ fn install_model(
         source: spec.source.to_string(),
         verified: true,
     })
+}
+
+/// Downloads every file of a model that is not already installed and correct.
+///
+/// @param directory - the model's install directory
+/// @param spec - which files, where they come from and what they must hash to
+/// @param force - fetch again even when the installed file is already correct
+fn download_model_files(directory: &Path, spec: &ModelSpec, force: bool) -> Result<(), Failed> {
+    for file in spec.files {
+        let destination = directory.join(file.local);
+        if destination.exists() && !force && already_correct(&destination, file) {
+            continue;
+        }
+        let url = format!("{}/{}", spec.base, file.remote);
+        let mut progress = bar();
+        http::download(&url, &destination, Some(file.sha256), &mut progress)
+            .map_err(|error| Failed::misuse(format!("{error}")))?;
+    }
+    Ok(())
 }
 
 /// Installs a model's files from a folder already on this machine.
@@ -1317,6 +1333,33 @@ mod tests {
             !untouched.join("a.txt").exists(),
             "a file was copied while another was missing"
         );
+    }
+
+    /// **A model download that fails leaves no model folder behind.** The
+    /// error says "Nothing was installed", and before this an empty folder
+    /// with a `.part` file in it stayed on disk after a proxy refused the URL.
+    #[test]
+    fn a_failed_model_download_leaves_no_folder() {
+        const UNREACHABLE: ModelSpec = ModelSpec {
+            id: "unreachable-model",
+            base: "http://127.0.0.1:1",
+            source: "",
+            files: FAKE_FILES,
+            manifest: EMBEDDER.manifest,
+        };
+        let root = scratch("unreachable");
+        let refused = install_model(&root, &UNREACHABLE, false, None);
+        assert!(
+            refused.is_err(),
+            "a port nothing listens on cannot be fetched"
+        );
+        let folder = install::models_root(&root).join("unreachable-model");
+        assert!(!folder.exists(), "{} was left behind", folder.display());
+
+        let missing = scratch("missing-from");
+        let refused = install_model(&root, &UNREACHABLE, false, Some(&missing));
+        assert!(refused.is_err(), "an empty folder holds none of the files");
+        assert!(!folder.exists(), "{} was left behind", folder.display());
     }
 
     /// Every platform this ships on has an archive, and every pinned digest is

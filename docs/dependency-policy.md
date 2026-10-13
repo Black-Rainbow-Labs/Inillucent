@@ -217,8 +217,11 @@ These are not supported, and each is refused by name when it appears:
 Two rules protect the files on disk:
 
 - **A file that fails its digest is never left in place.** The download goes to `<destination>.part`
-  and is renamed only after the digest matches. An interrupted run leaves a `.part` file that the
-  next run continues.
+  and is renamed only after the digest matches. When the built in client is interrupted after some
+  bytes arrived, it leaves a `.part` file that the next run continues with a `Range` request. Every
+  other failed download removes its `.part` file: an empty one, and every one the `curl` transport
+  wrote, since curl always fetches the whole file again. `setup-embeddings` also removes a model
+  folder that the failed run left empty.
 - **An archive member whose name leaves the destination folder stops the extraction.** A name such
   as `../escape` is refused, and the name is never cleaned into a different file name. A test in
   `archive.rs` checks this.

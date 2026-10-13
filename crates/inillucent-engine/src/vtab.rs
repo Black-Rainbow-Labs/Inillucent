@@ -504,13 +504,13 @@ impl ImportedDatabase {
         let mut rechecks: Vec<Recheck> = Vec::with_capacity(lists.len());
         for held in &lists {
             if let Ok(column) = usize::try_from(held.spec.column) {
-                rechecks.push((
+                rechecks.push(list_recheck(
+                    held,
                     column,
-                    inillucent_sql::vtab::ConstraintOp::Eq,
-                    in_list_items(held, params, self)?,
                     inillucent_value::collation::Collation::Binary,
-                    None,
-                ));
+                    params,
+                    self,
+                )?);
             }
         }
         let mut tested = InListFilter {
@@ -646,40 +646,15 @@ pub(crate) fn scan_module(
                 &held
             }
         };
-        let mut specs: Vec<inillucent_sql::vtab::ConstraintSpec> =
-            offer.iter().map(|held| held.spec).collect();
-        let mut ordering = order_by.clone();
-        let mut query = IndexQuery::new(specs.clone(), ordering.clone());
-        connected.table.best_index(&mut query)?;
-        prefer_the_plan_without_other_tables(connected, offer, &ordering, &mut specs, &mut query);
-        // **An order the module promised does not hold across several runs of
-        // `filter`.** With an `IN` list to drive, the module is asked again
-        // without the ordering, and the statement sorts the rows itself.
-        if query.ordered && supplied.is_empty() && !claimed_in_lists(&query, offer).is_empty() {
-            ordering.clear();
-            query = IndexQuery::new(specs.clone(), ordering.clone());
-            connected.table.best_index(&mut query)?;
-        }
-        let driving = in_lists_to_drive(&query, offer, params, supplied, reach.folding)?;
-        if driving.is_none() {
-            // An `IN` the module claimed and this scan cannot run once per value
-            // is taken back, and the statement's own filter tests it.
-            let claimed = claimed_in_lists(&query, offer);
-            if !claimed.is_empty() {
-                for at in claimed {
-                    if let Some(spec) = specs.get_mut(at) {
-                        spec.usable = false;
-                    }
-                }
-                query = IndexQuery::new(specs, ordering);
-                connected.table.best_index(&mut query)?;
-            }
-        }
+        let (query, driving) =
+            choose_module_plan(connected, offer, order_by, params, supplied, reach.folding)?;
         let mut plan = FilterPlan {
             index_number: query.index_number,
             index_string: query.index_string.clone(),
             arguments: filter_arguments(&query, offer, params, supplied, reach.folding)?,
+            lists: Vec::new(),
         };
+        take_whole_lists(&query, offer, params, supplied, reach.folding, &mut plan)?;
         let width = connected.table.declaration().columns.len();
         let shape = RowShape {
             width,
@@ -749,6 +724,141 @@ pub(crate) fn scan_module(
     }
 }
 
+/// Asks the module for its plan, and settles how each `IN` list it claimed runs.
+///
+/// A list the module took whole goes to one `filter` call. Any other list it
+/// claimed is run once per value, and when that is not possible it is taken
+/// back and the module is asked again, so the scan tests the list itself.
+///
+/// @param connected - the module's connection
+/// @param offer - the constraints the planner offered
+/// @param order_by - the ordering the planner offered
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param supplied - a lateral join's values, empty for an ordinary scan
+/// @param catalog - where a value's function calls are folded
+fn choose_module_plan(
+    connected: &Connected,
+    offer: &[inillucent_sql::plan::VirtualConstraint],
+    order_by: &[inillucent_sql::vtab::OrderSpec],
+    params: &inillucent_exec::physical::Params,
+    supplied: &[OwnedDatum],
+    catalog: &dyn inillucent_exec::physical::TreeCatalog,
+) -> DbResult<(IndexQuery, Option<Vec<DrivenList>>)> {
+    let mut specs: Vec<inillucent_sql::vtab::ConstraintSpec> =
+        offer.iter().map(|held| held.spec).collect();
+    let mut ordering = order_by.to_vec();
+    let mut query = ask_module(connected, offer, &specs, &ordering, supplied)?;
+    prefer_the_plan_without_other_tables(
+        connected, offer, &ordering, &mut specs, &mut query, supplied,
+    );
+    // **An order the module promised does not hold across several runs of
+    // `filter`.** With an `IN` list to drive, the module is asked again
+    // without the ordering, and the statement sorts the rows itself.
+    if query.ordered && supplied.is_empty() && !claimed_in_lists(&query, offer).is_empty() {
+        ordering.clear();
+        query = ask_module(connected, offer, &specs, &ordering, supplied)?;
+    }
+    let driving = in_lists_to_drive(&query, offer, params, supplied, catalog)?;
+    if driving.is_none() {
+        // An `IN` the module claimed and this scan cannot run once per value
+        // is taken back, and the statement's own filter tests it.
+        let claimed = claimed_in_lists(&query, offer);
+        if !claimed.is_empty() {
+            for at in claimed {
+                if let Some(spec) = specs.get_mut(at) {
+                    spec.usable = false;
+                }
+            }
+            query = ask_module(connected, offer, &specs, &ordering, supplied)?;
+        }
+    }
+    Ok((query, driving))
+}
+
+/// Puts a question to the module's `best_index`, saying which constraints are
+/// `IN` lists and which collation each compares under.
+///
+/// A list is described as one only on an ordinary scan. A lateral join hands
+/// the module one value per constraint, so there is no list to take whole.
+///
+/// @param connected - the module's connection
+/// @param offer - the constraints the planner offered
+/// @param specs - the constraints as the module is shown them
+/// @param ordering - the ordering offered
+/// @param supplied - a lateral join's values, empty for an ordinary scan
+fn ask_module(
+    connected: &Connected,
+    offer: &[inillucent_sql::plan::VirtualConstraint],
+    specs: &[inillucent_sql::vtab::ConstraintSpec],
+    ordering: &[inillucent_sql::vtab::OrderSpec],
+    supplied: &[OwnedDatum],
+) -> DbResult<IndexQuery> {
+    let mut query = IndexQuery::new(specs.to_vec(), ordering.to_vec());
+    for (at, held) in offer.iter().enumerate() {
+        if let Some(flag) = query.in_lists.get_mut(at) {
+            *flag = supplied.is_empty() && !held.in_list.is_empty();
+        }
+        let column_collation = match usize::try_from(held.spec.column) {
+            Ok(column) => connected.table.collation(column),
+            Err(_) => inillucent_value::collation::Collation::Binary,
+        };
+        if let Some(collation) = query.collations.get_mut(at) {
+            *collation = comparison_collation(&held.predicate)
+                .or_else(|| list_collation(&held.predicate))
+                .unwrap_or(column_collation);
+        }
+    }
+    connected.table.best_index(&mut query)?;
+    Ok(query)
+}
+
+/// Gives the module every value of each `IN` list it took whole.
+///
+/// The list's argument holds its first value, or NULL when every value was
+/// NULL, so a module that reads only the arguments sees an ordinary `=`.
+///
+/// @param query - what `best_index` answered
+/// @param offer - the constraints the planner offered
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param supplied - a lateral join's values, empty for an ordinary scan
+/// @param catalog - where a value's function calls are folded
+/// @param plan - the plan `filter` is handed; its lists are filled in
+fn take_whole_lists(
+    query: &IndexQuery,
+    offer: &[inillucent_sql::plan::VirtualConstraint],
+    params: &inillucent_exec::physical::Params,
+    supplied: &[OwnedDatum],
+    catalog: &dyn inillucent_exec::physical::TreeCatalog,
+    plan: &mut FilterPlan,
+) -> DbResult<()> {
+    if !supplied.is_empty() {
+        return Ok(());
+    }
+    for (slot, position) in query.argument_order().into_iter().enumerate() {
+        let whole = query
+            .usage
+            .get(position)
+            .is_some_and(|usage| usage.whole_list);
+        let Some(held) = offer.get(position).filter(|held| !held.in_list.is_empty()) else {
+            continue;
+        };
+        if !whole {
+            continue;
+        }
+        let values = list_values(held, params, catalog)?.unwrap_or_default();
+        if let Some(argument) = plan.arguments.get_mut(slot) {
+            *argument = values.first().cloned().unwrap_or(Value::Null);
+        }
+        if plan.lists.len() <= slot {
+            plan.lists.resize(slot.saturating_add(1), None);
+        }
+        if let Some(list) = plan.lists.get_mut(slot) {
+            *list = Some(values);
+        }
+    }
+    Ok(())
+}
+
 /// One `IN` list the scan runs `filter` for once per value.
 struct DrivenList {
     /// Where the list's value goes among `filter`'s arguments.
@@ -790,12 +900,14 @@ fn advance_counters(lists: &[DrivenList], counters: &mut [usize]) -> bool {
 /// @param ordering - the ordering offered
 /// @param specs - the constraints as the module is shown them, narrowed in place
 /// @param query - the module's answer, replaced when the narrower plan is kept
+/// @param supplied - a lateral join's values, empty for an ordinary scan
 fn prefer_the_plan_without_other_tables(
     connected: &Connected,
     offer: &[inillucent_sql::plan::VirtualConstraint],
     ordering: &[inillucent_sql::vtab::OrderSpec],
     specs: &mut Vec<inillucent_sql::vtab::ConstraintSpec>,
     query: &mut IndexQuery,
+    supplied: &[OwnedDatum],
 ) {
     let lateral: Vec<usize> = offer
         .iter()
@@ -816,16 +928,16 @@ fn prefer_the_plan_without_other_tables(
             spec.usable = false;
         }
     }
-    let mut without = IndexQuery::new(narrowed.clone(), ordering.to_vec());
-    if connected.table.best_index(&mut without).is_ok()
-        && query.estimated_cost >= without.estimated_cost
-    {
-        *specs = narrowed;
-        *query = without;
+    if let Ok(without) = ask_module(connected, offer, &narrowed, ordering, supplied) {
+        if query.estimated_cost >= without.estimated_cost {
+            *specs = narrowed;
+            *query = without;
+        }
     }
 }
 
-/// Returns the offer positions of the `IN` lists the module claimed.
+/// Returns the offer positions of the `IN` lists the module claimed to be run
+/// once per value, which is every claimed list it did not take whole.
 ///
 /// @param query - what `best_index` answered
 /// @param offer - the constraints the planner offered
@@ -837,7 +949,10 @@ fn claimed_in_lists(
         .iter()
         .enumerate()
         .filter(|(at, held)| {
-            let claimed = query.usage.get(*at).is_some_and(|usage| usage.argument > 0);
+            let claimed = query
+                .usage
+                .get(*at)
+                .is_some_and(|usage| usage.argument > 0 && !usage.whole_list);
             claimed && !held.in_list.is_empty()
         })
         .map(|(at, _)| at)
@@ -850,8 +965,9 @@ fn claimed_in_lists(
 /// `None` when no `IN` list was claimed, and also when one was and the scan
 /// cannot be split: the module promised an order, which holds within one
 /// `filter` and not across several; a lateral join supplies its own values; or
-/// a value is not an integer, which a rowid never equals. In every one of those
-/// cases the statement's own filter still tests the list.
+/// the list is on a column whose declared type or collation changes how a value
+/// compares, which only a module taking the whole list may claim. In every one
+/// of those cases the statement's own filter still tests the list.
 ///
 /// @param query - what `best_index` answered
 /// @param offer - the constraints the planner offered
@@ -871,7 +987,7 @@ fn in_lists_to_drive(
     }
     let mut lists = Vec::with_capacity(claimed.len());
     for at in claimed {
-        let Some(held) = offer.get(at) else {
+        let Some(held) = offer.get(at).filter(|held| held.per_value) else {
             return Ok(None);
         };
         let Some(slot) = query
@@ -1363,13 +1479,9 @@ fn rechecks_of(
                 Err(_) => inillucent_value::collation::Collation::Binary,
             };
             let column = usize::try_from(constraint.spec.column).unwrap_or(width);
-            rechecks.push((
-                column,
-                inillucent_sql::vtab::ConstraintOp::Eq,
-                in_list_items(constraint, params, catalog)?,
-                collation,
-                None,
-            ));
+            rechecks.push(list_recheck(
+                constraint, column, collation, params, catalog,
+            )?);
             continue;
         }
         // A negative column is the rowid. It is not one of the module's
@@ -1397,6 +1509,71 @@ fn rechecks_of(
         ));
     }
     Ok(rechecks)
+}
+
+/// Returns the recheck for one `IN` list the module did not promise to apply.
+///
+/// A list the module may be run once per value, on the rowid or on a column
+/// with no declared type, compares its values as written, under the column's
+/// collation, which is what SQLite's own recheck of a virtual table does. A
+/// list on a typed column is tested the way the statement's own filter would
+/// have tested it before such a list was offered: under the affinity and the
+/// collation the binder gave the `IN`. `channel IN (1, 2)` on a facet declared
+/// `TEXT` then finds the rows holding `'1'` and `'2'`.
+///
+/// @param held - the constraint carrying the list
+/// @param column - where the tested value sits in a produced row
+/// @param column_collation - the collation of that column
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param catalog - where a value's function calls are folded
+fn list_recheck(
+    held: &inillucent_sql::plan::VirtualConstraint,
+    column: usize,
+    column_collation: inillucent_value::collation::Collation,
+    params: &inillucent_exec::physical::Params,
+    catalog: &dyn inillucent_exec::physical::TreeCatalog,
+) -> DbResult<Recheck> {
+    let (collation, affinity) = if held.per_value {
+        (column_collation, None)
+    } else {
+        (
+            list_collation(&held.predicate).unwrap_or(column_collation),
+            list_affinity(&held.predicate),
+        )
+    };
+    Ok((
+        column,
+        inillucent_sql::vtab::ConstraintOp::Eq,
+        in_list_items(held, params, catalog)?,
+        collation,
+        affinity,
+    ))
+}
+
+/// Returns the affinity an `IN` predicate was bound with.
+///
+/// @param predicate - the whole predicate the list was taken from
+fn list_affinity(
+    predicate: &inillucent_sql::bind::BoundExpr,
+) -> Option<inillucent_value::affinity::Affinity> {
+    match predicate {
+        inillucent_sql::bind::BoundExpr::InList { affinity, .. }
+        | inillucent_sql::bind::BoundExpr::Subquery { affinity, .. } => *affinity,
+        _ => None,
+    }
+}
+
+/// Returns the collation an `IN` predicate was bound with.
+///
+/// @param predicate - the whole predicate the list was taken from
+fn list_collation(
+    predicate: &inillucent_sql::bind::BoundExpr,
+) -> Option<inillucent_value::collation::Collation> {
+    match predicate {
+        inillucent_sql::bind::BoundExpr::InList { collation, .. }
+        | inillucent_sql::bind::BoundExpr::Subquery { collation, .. } => Some(*collation),
+        _ => None,
+    }
 }
 
 /// Returns the affinity a comparison predicate was bound with.

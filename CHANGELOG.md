@@ -8,6 +8,40 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
+## Unreleased
+
+**`IN` and range filters on an `inillucent_search` facet are applied inside the search.** Before,
+only `facet = value` was. `facet IN (...)`, `>`, `>=`, `<`, `<=` and `BETWEEN` were applied by the
+engine to the `k` rows the search had already chosen, so `day >= '2026-06-01' AND k = 1` returned no
+row whenever the best row was older, while newer matching rows existed. No error said so. An
+application filtering a Slack archive by date and by several channels found it.
+
+- The search now chooses its `k` rows from the rows that pass the filter. A range compares the facet
+  as text, byte by byte, which is what SQL does with a `TEXT` column, so ISO dates and zero padded
+  numbers select the rows SQL would select.
+- An `IN` list runs as one search, so `k` counts the whole answer and `ORDER BY rank` holds across
+  every value. A virtual table module can now ask for an `IN` list's values all at once, the way
+  SQLite's `sqlite3_vtab_in` works: `IndexQuery::take_whole_list` in `best_index`, and
+  `FilterPlan::list` in `filter`. `IndexQuery::collation` tells a module which collation a
+  constraint compares under.
+- Any other test on a facet, such as `!=`, `NOT IN`, `LIKE`, an `OR`, or a comparison under
+  `COLLATE NOCASE`, is still applied to the `k` rows the search returns. `docs/vector-search.md`
+  lists which tests run where.
+
+**The published `inillucent` crate builds with the `embed` feature in a new project.**
+`inillucent-core` asked for `ort` version `2.0.0-rc.10`, which cargo reads as any later release
+candidate. With no lock file, cargo picked `2.0.0-rc.14`, which changed `Session::builder` and removed
+`EnvironmentBuilder::commit`, so the first build failed. The requirement is now `=2.0.0-rc.13`, the
+version this workspace builds and tests with. A project that depends on 2.6.0 or earlier with the
+`embed` feature can add `ort = "=2.0.0-rc.13"` to its own `[dependencies]` to get the same result.
+
+**A failed model download no longer leaves a `.part` file and an empty folder.** `inillucent
+setup-embeddings` said "Nothing was installed" when a proxy refused the download, and left
+`model.onnx.part` in a new model folder. The partial file is now removed whenever a later run could
+not continue it: always for the `curl` transport that macOS uses, and when it is empty for the built
+in client, which resumes a partial file with a `Range` request. A model folder the failed run left
+empty is removed too.
+
 ## 2.6.0, 13 October 2026
 
 **An `inillucent_search` table can tokenize a language other than English.** Until now every table

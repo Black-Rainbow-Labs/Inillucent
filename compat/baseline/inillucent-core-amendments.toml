@@ -200,9 +200,9 @@ sha256 = "80ecbf5612bce08ee18b8f4a7c0d64116a4ced774190e3cedccf7d304e4587de"
 
 [[amendment]]
 path = "crates/inillucent-core/src/filter.rs"
-ticket = "task-1932"
-reason = "M4: the 33rd flag name is an error rather than an abort, so add_chunks and the four Index methods over it answer a Result"
-sha256 = "4182ddd2da345204712e76afd00077e777825676aa04d99225ce55fbc798345c"
+ticket = "task-2262"
+reason = "AttributeFilter gains a range clause, ValueRange, so an inillucent_search facet compared with >, >=, <, <= or BETWEEN is applied inside the search. compile_attribute resolves the range against the dictionary once per query into an ascending id clause, like the substring clause. A filter without a range compiles exactly as before; the new test checks the range bounds and that the pass count agrees with a scan."
+sha256 = "c1c16dcb7d765bdf32aa3e0664f9e21a572f90037f56ef8849cfc4a6e30a2f52"
 
 [[amendment]]
 path = "crates/inillucent-core/src/flat.rs"

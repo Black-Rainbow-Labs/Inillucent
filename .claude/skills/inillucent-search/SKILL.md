@@ -228,6 +228,21 @@ removes rows after the search gives a different answer. The keyword ranking resc
 row corpus measured for [Vector search](../../docs/vector-search.md), the two methods shared one hit
 of the top ten. Filtering afterwards also returns fewer rows than `k`.
 
+These tests on a facet run inside the search: `=`, `IN (...)`, `>`, `>=`, `<`, `<=` and
+`BETWEEN`. An `IN` list runs as one search, so `k` counts the whole answer.
+
+```sql
+SELECT rowid FROM messages
+ WHERE messages MATCH 'budget' AND day >= '2026-06-01' AND channel IN ('C1', 'C2') AND k = 10
+ ORDER BY rank;
+```
+
+**Every other test on a facet runs on the `k` rows the search returned**: `!=`, `NOT IN`, `LIKE`,
+`GLOB`, a test inside an `OR`, a function of the facet, and a comparison under a `COLLATE` other than
+`BINARY`. Such a query can return fewer than `k` rows, or none, with no error. Rewrite the test as
+one of the forms above. A range compares the facet as text, so write dates as `YYYY-MM-DD` and
+numbers zero padded to one width. Release 2.6.0 and earlier ran only `=` inside the search.
+
 A facet is also an ordinary column. It comes back from a `SELECT`, and `WHERE live = '0'` works on a
 query that is not a search. A facet is stored as text and has text affinity, so `email_id = 3` and
 `email_id = '3'` select the same rows in a search, a `SELECT`, an `UPDATE` and a `DELETE`. Release 2.0.1

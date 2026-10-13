@@ -624,9 +624,38 @@ When the filtering change was measured on a 400 row corpus, a filter applied aft
 one hit of the top ten with the same filter applied inside it. A filter after the search can also
 return fewer rows than `k`.
 
+These tests on a facet run inside the search, so the search returns `k` rows that pass them:
+
+| Test | Example |
+|---|---|
+| `=` | `region = 'us'` |
+| `IN` with a list of values, or with a subquery that reads no column of the outer query | `channel IN ('C1', 'C2')`, `channel IN (?1, ?2)` |
+| `>`, `>=`, `<`, `<=` | `day >= '2026-06-01'` |
+| `BETWEEN` | `day BETWEEN '2026-06-01' AND '2026-06-30'` |
+
+```sql
+SELECT rowid, day, channel FROM messages
+WHERE messages MATCH 'budget' AND day >= '2026-06-01' AND channel IN ('C1', 'C2') AND k = 10
+ORDER BY rank;
+```
+
+Any other test on a facet runs after the search, on the `k` rows it returned. That covers `!=`,
+`NOT IN`, `LIKE`, `GLOB`, a test inside an `OR`, a function such as `substr(day, 1, 7) = '2026-06'`,
+and any comparison written with a `COLLATE` other than `BINARY`. Such a query can return fewer rows
+than `k`, or none, while matching rows exist, and no error says so. Rewrite the test as one of the
+forms in the table, or ask for a larger `k` and cut the answer with `LIMIT`.
+
+Release 2.6.0 and earlier ran only `=` inside the search. On those releases `IN` and the range tests
+ran after the search, with the same result.
+
 Rules for facet columns:
 
 - Several facet constraints joined by `AND` must all hold.
+- A range compares the facet as text, byte by byte, as SQL compares a `TEXT` column. Write dates as
+  `YYYY-MM-DD` and numbers with leading zeros to the same width, so their text order is their real
+  order. `'10' < '9'` is true for text.
+- An `IN` list runs as one search, so `k` counts the whole answer and `ORDER BY rank` holds across
+  every value in the list.
 - A facet value is stored as text, and a facet column has text affinity. `region = 1` and
   `region = '1'` select the same rows, inside a search and in a plain `SELECT`, `UPDATE` or
   `DELETE`. A join against an integer column, `ON e.id = docs.email_id`, matches too. Before

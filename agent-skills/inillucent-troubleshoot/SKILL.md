@@ -114,7 +114,9 @@ Error [unsupported]: could not open "app.rdb": this database is format version 3
 ```
 
 Every file that 2.5.0 or a later release creates is format 3, and releases from 0.1.5 to 2.4.2
-refuse it with this message. Upgrade the program that opens the file. Nothing converts a format 3
+refuse it with this message. Upgrade the program that opens the file. This happens most often when
+an application built with the `inillucent` crate writes the file and an older `inillucent` command
+line, installed separately, is used to look at it. Install the command line at the crate's version. Nothing converts a format 3
 file back to format 2. A file that an earlier release created stays at format 2 until it stores a
 key longer than `page_size / 8` or is rebuilt by `VACUUM`, so the earlier release can still open it.
 

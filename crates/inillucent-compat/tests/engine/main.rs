@@ -77,6 +77,7 @@ mod schema_function_policy;
 mod scratch_memory_flat;
 mod search;
 mod search_facet_compare;
+mod search_facet_filter;
 mod search_fusion;
 mod search_recall;
 mod search_rerank;

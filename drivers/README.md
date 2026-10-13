@@ -150,6 +150,16 @@ The feature forwards to `inillucent-engine`. Releases up to 1.0.29 have no `embe
 turns the feature on for the engine the driver uses. The model is not part of the build.
 `docs/embeddings.md` says how to install it.
 
+Releases 2.6.0 and earlier ask for `ort` `2.0.0-rc.10`, which cargo reads as any later release
+candidate. A new project has no lock file, so cargo picks `2.0.0-rc.14`, and `inillucent-core` does
+not compile against it. With those releases, add `ort = "=2.0.0-rc.13"` to your own
+`[dependencies]`. Later releases ask for exactly `=2.0.0-rc.13`.
+
+The `inillucent` command line has to be at least as new as the crate that wrote a file. A file that
+2.5.0 or later creates is format 3, and command lines from 2.4.2 and earlier refuse it with
+`this database is format version 3 and this build reads version 2`. Install the command line at the
+crate's version, or run the query through a program built with the crate.
+
 Rust calls the driver directly. It does not go through the C library. Going through the C library
 would add a pointer conversion and a panic guard to every call, and would turn Rust errors into C
 integers and back.

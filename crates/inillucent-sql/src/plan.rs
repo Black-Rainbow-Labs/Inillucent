@@ -399,6 +399,14 @@ pub struct VirtualConstraint {
     /// promised `omit`, as SQLite does: `generate_series(1) WHERE stop IN ('3')`
     /// stops at the integer 3.
     pub in_list: Vec<BoundExpr>,
+    /// Whether the engine may run the module once per value of `in_list`.
+    ///
+    /// False for a column whose declared type or collation changes how a value
+    /// compares, such as an `inillucent_search` facet declared `TEXT`. Only a
+    /// module that takes the whole list in one call may claim such a list, and
+    /// the engine tests it under the list's own affinity and collation. True for
+    /// every constraint that is not an `IN` list.
+    pub per_value: bool,
 }
 
 impl AccessPath {
@@ -2093,6 +2101,7 @@ fn virtual_path(
             value,
             predicate: term.clone(),
             in_list: Vec::new(),
+            per_value: true,
         });
         // **Only a usable constraint is this term's to answer.** In `FROM
         // json_each(...) s, json_each(s.value) r`, `s` took `s.value = r.json`
@@ -2106,15 +2115,16 @@ fn virtual_path(
     // `VirtualConstraint::in_list`. The scan tests the list itself, unless the
     // module was run once per value and promised `omit`, which is when SQLite
     // does not test it either.
-    let lists: Vec<(usize, i32, Vec<BoundExpr>, &BoundExpr)> = terms
+    let lists: Vec<(usize, i32, Vec<BoundExpr>, bool, &BoundExpr)> = terms
         .iter()
         .enumerate()
         .filter(|(index, _)| !consumed.get(*index).copied().unwrap_or(false))
         .filter_map(|(index, term)| {
-            constant_in_list(id, table, term).map(|(column, list)| (index, column, list, term))
+            constant_in_list(id, table, term)
+                .map(|(column, list, per_value)| (index, column, list, per_value, term))
         })
         .collect();
-    for (index, column, list, term) in lists {
+    for (index, column, list, per_value, term) in lists {
         if let Some(slot) = consumed.get_mut(index) {
             *slot = true;
         }
@@ -2135,6 +2145,7 @@ fn virtual_path(
                 value: first,
                 predicate: term.clone(),
                 in_list: list,
+                per_value,
             });
         }
     }

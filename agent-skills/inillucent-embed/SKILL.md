@@ -99,6 +99,16 @@ deprecated. Rust calls the driver directly and does not go through the C library
 `inillucent-engine = { version = "1.0.29", features = ["embed"] }` beside it. The model is loaded
 when `embed(TEXT)` is first called, from the folder `inillucent setup-embeddings all` installs it in.
 
+Releases 2.6.0 and earlier ask for `ort` `2.0.0-rc.10`, which cargo reads as any later release
+candidate. A new project has no lock file, so cargo picks `2.0.0-rc.14`, and `inillucent-core` does
+not compile against it. With those releases, add `ort = "=2.0.0-rc.13"` to your own
+`[dependencies]`. Later releases ask for exactly `=2.0.0-rc.13`.
+
+The `inillucent` command line has to be at least as new as the crate that wrote a file. A file that
+2.5.0 or later creates is format 3, and command lines from 2.4.2 and earlier refuse it with
+`this database is format version 3 and this build reads version 2`. Install the command line at the
+crate's version, or run the query through a program built with the crate.
+
 `Database::open` uses these defaults from `OpenOptions`:
 
 | Option | Default |

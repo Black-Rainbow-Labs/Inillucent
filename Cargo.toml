@@ -229,5 +229,13 @@ windows-sys = { version = "0.59", features = [
 # embedded on a GPU rather than on the processor. It changes no linkage: the EP is
 # registered through onnxruntime.dll at run time like everything else under
 # load-dynamic, so a machine without CUDA still builds and runs on the CPU.
-ort = { version = "2.0.0-rc.10", default-features = false, features = ["ndarray", "std", "load-dynamic", "cuda"] }
+#
+# The version is exact. ort's release candidates change its API between
+# candidates, and a requirement of "2.0.0-rc.10" accepts every later one. A
+# program that depends on the published crate has no Cargo.lock from this
+# workspace, so cargo picked rc.14, where `Session::builder` takes an argument
+# and `EnvironmentBuilder::commit` is gone, and `inillucent-core` failed to
+# compile with the `embed` feature. Move this pin only together with
+# `embed_onnx.rs`, after building against the new candidate.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["ndarray", "std", "load-dynamic", "cuda"] }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }

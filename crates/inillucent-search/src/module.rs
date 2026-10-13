@@ -40,6 +40,8 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
 use inillucent_base::DbResult;
+use inillucent_core::filter::ValueRange;
+use inillucent_value::collation::Collation;
 use inillucent_value::Value;
 
 use inillucent_ext::vtab::{
@@ -47,7 +49,7 @@ use inillucent_ext::vtab::{
     IndexQuery, Module, ModuleArguments, ShadowTable, VirtualCursor, VirtualTable, ROWID_COLUMN,
 };
 
-use crate::merge::{self, Cache, Hit, Request};
+use crate::merge::{self, Cache, FacetTest, Hit, Request};
 use crate::options::{self, Options, TokenizerChoice, DEFAULT_K};
 use crate::store::{state, Delta, MergeState, Op, Row, SegmentMeta, Store};
 
@@ -80,7 +82,131 @@ const ROLE_ROWID: char = 'i';
 /// than having to guess it from the order the constraints were claimed in. The
 /// range is upper case and every other role is lower case, so the two cannot
 /// collide; `options::MAX_FACET_COLUMN` is what keeps a position inside it.
+/// This band is `facet = value`.
 const ROLE_FACET_FIRST: u8 = b'A';
+
+/// The first character of the band for each facet test other than `=`.
+///
+/// Each band holds `options::MAX_FACET_COLUMN` characters and a role is the
+/// band's first character plus the column's position, as for `=`. The bands
+/// start above ASCII and are 64 apart, so no band overlaps another or a lower
+/// case role, and the plan string still holds one character per argument.
+const FACET_BANDS: [(FacetRole, u32); 5] = [
+    (FacetRole::AnyOf, 0x100),
+    (FacetRole::Above, 0x140),
+    (FacetRole::AtLeast, 0x180),
+    (FacetRole::Below, 0x1C0),
+    (FacetRole::AtMost, 0x200),
+];
+
+/// Which test a claimed facet constraint applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FacetRole {
+    /// `facet = value`.
+    Equal,
+    /// `facet IN (values)`, taken as a whole list.
+    AnyOf,
+    /// `facet > value`.
+    Above,
+    /// `facet >= value`.
+    AtLeast,
+    /// `facet < value`.
+    Below,
+    /// `facet <= value`.
+    AtMost,
+}
+
+/// Returns the plan character a facet test on one column is recorded under.
+///
+/// @param kind - the test
+/// @param position - the facet's column position, below `options::MAX_FACET_COLUMN`
+fn facet_role(kind: FacetRole, position: usize) -> Option<char> {
+    let position = u32::try_from(position).ok()?;
+    let first = match kind {
+        FacetRole::Equal => u32::from(ROLE_FACET_FIRST),
+        other => FACET_BANDS
+            .iter()
+            .find(|(band, _)| *band == other)
+            .map(|(_, first)| *first)?,
+    };
+    char::from_u32(first.checked_add(position)?)
+}
+
+/// Reads a facet test and its column position back out of a plan character.
+///
+/// @param role - one character of the plan string
+fn read_facet_role(role: char) -> Option<(FacetRole, usize)> {
+    let code = u32::from(role);
+    let width = options::MAX_FACET_COLUMN as u32;
+    let bands = std::iter::once((FacetRole::Equal, u32::from(ROLE_FACET_FIRST)))
+        .chain(FACET_BANDS.iter().copied());
+    for (kind, first) in bands {
+        if code >= first && code < first.saturating_add(width) {
+            return Some((kind, (code - first) as usize));
+        }
+    }
+    None
+}
+
+/// Returns the test one claimed facet constraint applies inside the search.
+///
+/// The value is compared as text, because a facet is declared `TEXT` and SQL
+/// gives a number compared with it that affinity: `live = 1` and
+/// `live = '1'` select the same rows. A NULL selects no row, as a comparison
+/// with NULL does in SQL. A blob is never equal to text and sorts after every
+/// text value, so `facet < x'00'` admits every row and `facet > x'00'` none.
+///
+/// @param kind - the test the plan recorded
+/// @param value - the constraint's argument
+/// @param list - every value of an `IN` list the module took whole
+fn facet_test(
+    kind: FacetRole,
+    value: &Value<'static>,
+    list: Option<&[Value<'static>]>,
+) -> FacetTest {
+    let bound = |inclusive: bool| sql_text(value).map(|text| (text, inclusive));
+    let blob = matches!(value, Value::Blob(_));
+    match kind {
+        FacetRole::Equal => sql_text(value).map_or(FacetTest::Nothing, FacetTest::Equal),
+        FacetRole::AnyOf => match list {
+            Some(values) => FacetTest::AnyOf(values.iter().filter_map(sql_text).collect()),
+            None => sql_text(value).map_or(FacetTest::Nothing, FacetTest::Equal),
+        },
+        FacetRole::Below | FacetRole::AtMost if blob => FacetTest::Within(ValueRange::default()),
+        FacetRole::Above | FacetRole::AtLeast => match bound(kind == FacetRole::AtLeast) {
+            Some(lower) => FacetTest::Within(ValueRange {
+                lower: Some(lower),
+                upper: None,
+            }),
+            None => FacetTest::Nothing,
+        },
+        FacetRole::Below | FacetRole::AtMost => match bound(kind == FacetRole::AtMost) {
+            Some(upper) => FacetTest::Within(ValueRange {
+                lower: None,
+                upper: Some(upper),
+            }),
+            None => FacetTest::Nothing,
+        },
+    }
+}
+
+/// Returns a value as SQL's `TEXT` affinity would hold it, or `None` for NULL
+/// and for a blob, which that affinity does not convert.
+///
+/// A real is written the way SQL writes it, so `1.0` is `'1.0'` and not the
+/// `'1'` Rust's own formatting gives.
+///
+/// @param value - the value compared with a facet
+fn sql_text(value: &Value<'static>) -> Option<String> {
+    match value {
+        Value::Text(text) => Some(String::from_utf8_lossy(text.raw()).into_owned()),
+        Value::Integer(number) => Some(number.to_string()),
+        Value::Real(number) => Some(
+            String::from_utf8_lossy(&inillucent_value::numeric::real_to_text(*number)).into_owned(),
+        ),
+        _ => None,
+    }
+}
 
 /// Returns the ids of a segment manifest in ascending order, the order the cache keys by.
 ///
@@ -1193,6 +1319,62 @@ fn highest_of(pending: &[Delta], covered: i64) -> i64 {
         .unwrap_or(covered)
 }
 
+impl SearchTable {
+    /// Claims the facet constraints a search applies while it chooses its rows.
+    ///
+    /// `=`, an `IN` list taken whole, and `>`, `>=`, `<` and `<=` (which is
+    /// also what `BETWEEN` arrives as) are applied inside the search, so the
+    /// search returns `k` rows that pass them. Before, only `=` was: the
+    /// others removed rows from the `k` the search had already chosen, so a
+    /// query returned fewer rows than it asked for, or none, while matching
+    /// rows existed. Anything else on a facet, and any comparison under a
+    /// collation other than `BINARY`, is not claimed; the engine applies it to
+    /// the `k` rows the search returns, as it does every other predicate.
+    ///
+    /// `=` is promised (`omit`), as it always was. The list and the range
+    /// tests are not, so the engine also tests each row the search returns
+    /// under SQL's own affinity rules.
+    ///
+    /// @param query - the question `best_index` was put
+    /// @param roles - the plan string, one character added per claimed constraint
+    fn claim_facets(&self, query: &mut IndexQuery, roles: &mut String) {
+        for index in 0..query.constraints.len() {
+            let Some(spec) = query.constraints.get(index).copied() else {
+                continue;
+            };
+            let Ok(position) = usize::try_from(spec.column) else {
+                continue;
+            };
+            // A position past `MAX_FACET_COLUMN` is left unclaimed rather than
+            // encoded wrongly, so the engine evaluates the predicate itself.
+            if !spec.usable
+                || !self.options.is_facet(position)
+                || position >= options::MAX_FACET_COLUMN
+                || query.collation(index) != Collation::Binary
+            {
+                continue;
+            }
+            let kind = match spec.op {
+                ConstraintOp::Eq if query.is_in_list(index) => FacetRole::AnyOf,
+                ConstraintOp::Eq => FacetRole::Equal,
+                ConstraintOp::Gt => FacetRole::Above,
+                ConstraintOp::Ge => FacetRole::AtLeast,
+                ConstraintOp::Lt => FacetRole::Below,
+                ConstraintOp::Le => FacetRole::AtMost,
+                _ => continue,
+            };
+            let Some(role) = facet_role(kind, position) else {
+                continue;
+            };
+            if kind == FacetRole::AnyOf && !query.take_whole_list(index) {
+                continue;
+            }
+            query.use_constraint(index, kind == FacetRole::Equal);
+            roles.push(role);
+        }
+    }
+}
+
 impl VirtualTable for SearchTable {
     /// Returns the text columns, then the query, count, vector, recall and rank.
     fn declaration(&self) -> &Declaration {
@@ -1269,26 +1451,7 @@ impl VirtualTable for SearchTable {
         // there is no ranking, and claiming it would take the predicate away
         // from the engine that was about to evaluate it correctly.
         if searching {
-            for index in 0..query.constraints.len() {
-                let Some(spec) = query.constraints.get(index).copied() else {
-                    continue;
-                };
-                if !spec.usable || spec.op != ConstraintOp::Eq || spec.column < 0 {
-                    continue;
-                }
-                let position = spec.column as usize;
-                if !self.options.is_facet(position) || position >= options::MAX_FACET_COLUMN {
-                    continue;
-                }
-                // The cast cannot truncate: the line above bounds the position
-                // by `MAX_FACET_COLUMN`, which is what the one character of
-                // plan string can hold. A position past it is left unclaimed
-                // rather than encoded wrongly, so the engine evaluates the
-                // predicate itself and the answer is still the right rows.
-                let role = ROLE_FACET_FIRST.saturating_add(position as u8);
-                query.use_constraint(index, true);
-                roles.push(char::from(role));
-            }
+            self.claim_facets(query, &mut roles);
         }
         let mut plan = if searching { PLAN_SEARCH } else { PLAN_SCAN };
         if plan == PLAN_SEARCH {
@@ -1702,7 +1865,8 @@ impl VirtualCursor for SearchCursor {
             ..Request::default()
         };
         let mut wanted_rowid: Option<i64> = None;
-        for (role, value) in plan.index_string.chars().zip(plan.arguments.iter()) {
+        let roles = plan.index_string.chars().zip(plan.arguments.iter());
+        for (argument, (role, value)) in roles.enumerate() {
             match role {
                 ROLE_QUERY => {
                     self.request.text = text_of(Some(value));
@@ -1726,17 +1890,14 @@ impl VirtualCursor for SearchCursor {
                 }
                 ROLE_QUESTION => self.request.question = text_of(Some(value)),
                 ROLE_ROWID => wanted_rowid = value.as_integer(),
-                // A facet, whose role character carries its column's position.
-                // The value is read as text because a facet's stored value is
-                // text, so `live = 1` and `live = '1'` constrain the same rows
-                // rather than one of them matching nothing.
-                facet if facet.is_ascii_uppercase() => {
-                    let position = (facet as u8).saturating_sub(ROLE_FACET_FIRST) as usize;
-                    self.request
-                        .facets
-                        .push((position, text_of(Some(value)).unwrap_or_default()));
+                // A facet, whose role character carries the test and its
+                // column's position. See `facet_test` for how the value is read.
+                facet => {
+                    if let Some((kind, position)) = read_facet_role(facet) {
+                        let test = facet_test(kind, value, plan.list(argument));
+                        self.request.facets.push((position, test));
+                    }
                 }
-                _ => {}
             }
         }
         if plan.index_number == PLAN_ROWID {
@@ -1902,6 +2063,68 @@ fn text_of(value: Option<&Value<'static>>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every facet test on every facet position reads back as itself, and no
+    /// facet character is one of the lower case roles.
+    #[test]
+    fn a_facet_role_reads_back_as_the_test_and_column_it_was_written_for() {
+        let kinds = [
+            FacetRole::Equal,
+            FacetRole::AnyOf,
+            FacetRole::Above,
+            FacetRole::AtLeast,
+            FacetRole::Below,
+            FacetRole::AtMost,
+        ];
+        for kind in kinds {
+            for position in 0..options::MAX_FACET_COLUMN {
+                let role = facet_role(kind, position).expect("a character");
+                assert_eq!(read_facet_role(role), Some((kind, position)));
+                assert!(!role.is_ascii_lowercase(), "{role:?} collides with a role");
+            }
+        }
+        for role in [
+            ROLE_QUERY,
+            ROLE_LIMIT,
+            ROLE_VECTOR,
+            ROLE_RECALL,
+            ROLE_QUESTION,
+            ROLE_ROWID,
+        ] {
+            assert_eq!(read_facet_role(role), None);
+        }
+    }
+
+    /// A facet test reads its value as SQL's `TEXT` affinity would, and a
+    /// NULL selects nothing.
+    #[test]
+    fn a_facet_value_is_read_as_text_affinity_reads_it() {
+        assert_eq!(
+            facet_test(FacetRole::Equal, &Value::Integer(3), None),
+            FacetTest::Equal("3".to_string())
+        );
+        assert_eq!(
+            facet_test(FacetRole::Equal, &Value::Real(1.0), None),
+            FacetTest::Equal("1.0".to_string())
+        );
+        assert_eq!(
+            facet_test(FacetRole::AtLeast, &Value::Null, None),
+            FacetTest::Nothing
+        );
+        assert_eq!(
+            facet_test(
+                FacetRole::Below,
+                &Value::Blob(inillucent_value::BlobValue::borrowed(&[0u8])),
+                None
+            ),
+            FacetTest::Within(ValueRange::default())
+        );
+        let list = [Value::Integer(1), Value::Null, Value::Real(2.5)];
+        assert_eq!(
+            facet_test(FacetRole::AnyOf, &Value::Integer(1), Some(&list)),
+            FacetTest::AnyOf(vec!["1".to_string(), "2.5".to_string()])
+        );
+    }
 
     /// The hidden columns come in the order a table-valued call passes them.
     #[test]

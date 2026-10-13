@@ -13,6 +13,7 @@
 //! run-time state.
 
 use inillucent_base::DbResult;
+use inillucent_value::collation::Collation;
 use inillucent_value::{Affinity, Value};
 
 /// The comparison a constraint applies.
@@ -121,6 +122,15 @@ pub struct ConstraintUsage {
     /// and then does not apply the constraint returns wrong rows, which is why
     /// the default is to test it twice.
     pub omit: bool,
+    /// Whether the module takes an `IN` list's values all at once.
+    ///
+    /// SQLite's `sqlite3_vtab_in(info, i, 1)`. Set through
+    /// [`IndexQuery::take_whole_list`], and only on a constraint that is an
+    /// `IN` list. The engine then runs `filter` once, with every value in
+    /// [`FilterPlan::lists`], instead of once per value. A search needs this:
+    /// run once per value it answers `k` rows for each value, which is not the
+    /// best `k` rows of the list.
+    pub whole_list: bool,
 }
 
 /// The question put to a module's `best_index`, and the answer written back.
@@ -142,12 +152,27 @@ pub struct IndexQuery {
     pub estimated_cost: f64,
     /// How many rows the module thinks it will produce.
     pub estimated_rows: i64,
+    /// Which constraints are an `IN` list offered as `=`, in the same order
+    /// as `constraints`.
+    ///
+    /// SQLite's `sqlite3_vtab_in(info, i, -1)`. Filled by the engine. A
+    /// module that does not read it sees an ordinary `=`.
+    pub in_lists: Vec<bool>,
+    /// The collation each constraint compares under, in the same order as
+    /// `constraints`.
+    ///
+    /// SQLite's `sqlite3_vtab_collation`. Filled by the engine. A module that
+    /// compares text itself has to know whether `x = 'a' COLLATE NOCASE`
+    /// asked for a comparison it does not make.
+    pub collations: Vec<Collation>,
 }
 
 impl IndexQuery {
     /// Returns a question with every answer at its default.
     pub fn new(constraints: Vec<ConstraintSpec>, order_by: Vec<OrderSpec>) -> IndexQuery {
         let usage = vec![ConstraintUsage::default(); constraints.len()];
+        let in_lists = vec![false; constraints.len()];
+        let collations = vec![Collation::Binary; constraints.len()];
         IndexQuery {
             constraints,
             order_by,
@@ -160,6 +185,45 @@ impl IndexQuery {
             // no claim to.
             estimated_cost: 5.0e98,
             estimated_rows: 25,
+            in_lists,
+            collations,
+        }
+    }
+
+    /// Reports whether one constraint is an `IN` list offered as `=`.
+    ///
+    /// @param index - the constraint's position
+    pub fn is_in_list(&self, index: usize) -> bool {
+        self.in_lists.get(index).copied().unwrap_or(false)
+    }
+
+    /// Returns the collation one constraint compares under.
+    ///
+    /// @param index - the constraint's position
+    pub fn collation(&self, index: usize) -> Collation {
+        self.collations
+            .get(index)
+            .copied()
+            .unwrap_or(Collation::Binary)
+    }
+
+    /// Asks for an `IN` list's values all at once, and reports whether the
+    /// constraint is one.
+    ///
+    /// The constraint still has to be claimed with [`IndexQuery::use_constraint`],
+    /// before or after. A constraint that is not an `IN` list is left as it is.
+    ///
+    /// @param index - the constraint's position
+    pub fn take_whole_list(&mut self, index: usize) -> bool {
+        if !self.is_in_list(index) {
+            return false;
+        }
+        match self.usage.get_mut(index) {
+            Some(usage) => {
+                usage.whole_list = true;
+                true
+            }
+            None => false,
         }
     }
 
@@ -202,6 +266,26 @@ pub struct FilterPlan {
     pub index_string: String,
     /// The constraint values, in the argument order `best_index` assigned.
     pub arguments: Vec<Value<'static>>,
+    /// The values of each `IN` list the module took whole, at its argument's
+    /// position, and `None` for every other argument.
+    ///
+    /// The values are distinct and none is NULL, since NULL is in no list. An
+    /// `IN` list whose values were all NULL is an empty list, which matches
+    /// nothing. The argument itself holds the first value, or NULL when there is
+    /// none, so a module that reads only `arguments` sees an ordinary `=`.
+    pub lists: Vec<Option<Vec<Value<'static>>>>,
+}
+
+impl FilterPlan {
+    /// Returns the values of the `IN` list at one argument position, when the
+    /// module took that list whole.
+    ///
+    /// @param argument - the argument's position, from zero
+    pub fn list(&self, argument: usize) -> Option<&[Value<'static>]> {
+        self.lists
+            .get(argument)
+            .and_then(|values| values.as_deref())
+    }
 }
 
 /// One column a module declares.

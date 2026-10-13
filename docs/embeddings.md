@@ -58,7 +58,15 @@ The reranker is a separate download of about 600 MB, so `all` does not include i
 The download is about 620 MB the first time. A later run finds the files and downloads nothing.
 Every file is checked against a SHA-256 digest written into the inillucent source. A file with the
 wrong digest is deleted, and the error names both digests. A download goes to a `.part` file that is
-renamed only after its digest matches.
+renamed only after its digest matches. A download that fails before any byte arrives, such as one a
+proxy refuses, removes its `.part` file and the empty model folder. On macOS, where downloads go
+through `curl`, every failed download removes its `.part` file. On Windows and Linux a download
+interrupted partway keeps its `.part` file, and the next run continues it from where it stopped.
+
+If a proxy blocks `huggingface.co` for command line programs, download the files another way and
+install them with `--from <folder>`, as
+[Installing without Hugging Face](#installing-without-hugging-face) describes. Each file is checked
+against the same digest.
 
 After `inillucent setup-embeddings all`, `embed(TEXT)` works with no environment variable set:
 
@@ -194,6 +202,16 @@ installs it in. Release 1.0.29 and earlier have no `embed` feature on the `inill
 those, add `inillucent-engine = { version = "1.0.29", features = ["embed"] }` beside `inillucent`.
 Cargo turns a feature on for every user of a crate in the build, so the engine that `inillucent`
 uses gets it too.
+
+Releases 2.6.0 and earlier ask for `ort` `2.0.0-rc.10`, which cargo reads as any later release
+candidate. A new project has no lock file, so cargo picks `2.0.0-rc.14`, and `inillucent-core` does
+not compile against it. With those releases, add `ort = "=2.0.0-rc.13"` to your own
+`[dependencies]`. Later releases ask for exactly `=2.0.0-rc.13`.
+
+The `inillucent` command line has to be at least as new as the crate that wrote a file. A file that
+2.5.0 or later creates is format 3, and command lines from 2.4.2 and earlier refuse it with
+`this database is format version 3 and this build reads version 2`. Install the command line at the
+crate's version, or run the query through a program built with the crate.
 
 ## Using `embed(TEXT)` in SQL
 

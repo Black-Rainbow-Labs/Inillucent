@@ -529,6 +529,7 @@ mod tests {
             .filter(
                 &mut context,
                 &FilterPlan {
+                    lists: Vec::new(),
                     index_number: plan,
                     index_string: String::new(),
                     arguments: arguments

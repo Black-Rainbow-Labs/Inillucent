@@ -282,15 +282,94 @@ fn download_on(
         .unwrap_or_else(|| parsed.path.clone());
 
     let opened = open_body(url, &parsed, already, through_curl)?;
+    let received = receive(
+        &parsed,
+        &partial,
+        &name,
+        opened,
+        already,
+        expect_sha256,
+        progress,
+    );
+    let (done, actual, resumed, restarted) = match received {
+        Ok(received) => received,
+        Err(error) => {
+            discard_unresumable(&partial, through_curl);
+            return Err(error);
+        }
+    };
+
+    // Rename last. Everything before this point can be repeated; after it, the
+    // file is what a later run will treat as installed.
+    let _ = std::fs::remove_file(destination);
+    std::fs::rename(&partial, destination).map_err(|error| {
+        refusal(format!(
+            "{} could not be moved to {}: {error}",
+            partial.display(),
+            destination.display()
+        ))
+    })?;
+    progress.finished(done);
+
+    Ok(Fetched {
+        path: destination.to_path_buf(),
+        bytes: done,
+        sha256: actual,
+        resumed: resumed > 0,
+        restarted,
+    })
+}
+
+/// Removes a partial file that a later run could not continue.
+///
+/// A failed download says "Nothing was installed", and a `.part` file left
+/// behind made that untrue on disk: a proxy that refused the URL left an empty
+/// `model.onnx.part` in a model folder that `setup-embeddings --status` then
+/// reported as not installed. The built in client resumes a partial file with a
+/// `Range` request, so a non empty one is kept for the next run. The curl
+/// transport always fetches the whole file again, and an empty file holds
+/// nothing to resume, so in those two cases the file is removed.
+///
+/// @param partial - the partial file the download was writing
+/// @param through_curl - whether the `curl` program was fetching the bytes
+fn discard_unresumable(partial: &Path, through_curl: bool) {
+    let length = std::fs::metadata(partial).map(|m| m.len()).unwrap_or(0);
+    if through_curl || length == 0 {
+        let _ = std::fs::remove_file(partial);
+    }
+}
+
+/// Reads a body into the partial file and checks its length and digest.
+///
+/// Returns the bytes on disk, the digest, the bytes that were resumed and
+/// whether the server sent the whole file again. On an error the partial file
+/// may still be on disk, and [`download_on`] decides whether it stays.
+///
+/// @param parsed - the URL, for messages
+/// @param partial - the partial file to write
+/// @param name - the file name the progress bar shows
+/// @param opened - the body, from [`open_body`]
+/// @param already - bytes of a partial file that were on disk before the request
+/// @param expect_sha256 - the digest the bytes must have, when one is known
+/// @param progress - told how it is going
+fn receive(
+    parsed: &Url,
+    partial: &Path,
+    name: &str,
+    opened: Opened,
+    already: u64,
+    expect_sha256: Option<&str>,
+    progress: &mut dyn Progress,
+) -> DbResult<(u64, String, u64, bool)> {
     let mut response = opened.body;
     let restarted = opened.restarted;
     let resumed = if restarted { 0 } else { already };
     if restarted {
-        let _ = std::fs::remove_file(&partial);
+        let _ = std::fs::remove_file(partial);
     }
 
     let total = opened.total;
-    progress.started(&name, total, resumed);
+    progress.started(name, total, resumed);
 
     let mut digest = Sha256::new();
     let mut file = if resumed > 0 {
@@ -298,7 +377,7 @@ fn download_on(
         // back rather than assumed. Reading 400 MB back costs a second; trusting
         // them costs a wrong digest on a file that was truncated by whatever
         // interrupted the first run.
-        let existing = std::fs::File::open(&partial).map_err(|error| {
+        let existing = std::fs::File::open(partial).map_err(|error| {
             refusal(format!(
                 "{} could not be reopened: {error}",
                 partial.display()
@@ -307,7 +386,7 @@ fn download_on(
         feed(&mut digest, existing)?;
         std::fs::OpenOptions::new()
             .append(true)
-            .open(&partial)
+            .open(partial)
             .map_err(|error| {
                 refusal(format!(
                     "{} could not be appended to: {error}",
@@ -315,7 +394,7 @@ fn download_on(
                 ))
             })?
     } else {
-        std::fs::File::create(&partial).map_err(|error| {
+        std::fs::File::create(partial).map_err(|error| {
             refusal(format!(
                 "{} could not be created: {error}",
                 partial.display()
@@ -358,7 +437,7 @@ fn download_on(
 
     if let Some(expected) = total {
         if done != expected {
-            let _ = std::fs::remove_file(&partial);
+            let _ = std::fs::remove_file(partial);
             return Err(refusal(format!(
                 "{} ended after {done} bytes and announced {expected}. Nothing was installed; \
                  run the command again",
@@ -370,7 +449,7 @@ fn download_on(
     let actual = to_hex(&digest.finish());
     if let Some(expected) = expect_sha256 {
         if !expected.eq_ignore_ascii_case(&actual) {
-            let _ = std::fs::remove_file(&partial);
+            let _ = std::fs::remove_file(partial);
             return Err(refusal(format!(
                 "{} does not have the digest this build expects.\n  expected {expected}\n  \
                  received {actual}\nNothing was installed. Either the file was replaced upstream \
@@ -380,25 +459,7 @@ fn download_on(
         }
     }
 
-    // Rename last. Everything before this point can be repeated; after it, the
-    // file is what a later run will treat as installed.
-    let _ = std::fs::remove_file(destination);
-    std::fs::rename(&partial, destination).map_err(|error| {
-        refusal(format!(
-            "{} could not be moved to {}: {error}",
-            partial.display(),
-            destination.display()
-        ))
-    })?;
-    progress.finished(done);
-
-    Ok(Fetched {
-        path: destination.to_path_buf(),
-        bytes: done,
-        sha256: actual,
-        resumed: resumed > 0,
-        restarted,
-    })
+    Ok((done, actual, resumed, restarted))
 }
 
 /// Fetches a URL into memory, for something small enough to hold.
@@ -1111,7 +1172,70 @@ mod tests {
         )
         .expect_err("a connection that fails is an error");
         assert!(missing.to_string().contains("curl ended with"), "{missing}");
+        assert!(
+            !partial_path(&into.join("missing.bin")).exists(),
+            "a failed curl download leaves no partial file, because curl never resumes one"
+        );
         let _ = std::fs::remove_dir_all(&into);
+    }
+
+    /// A download through the built in client that fails before a byte
+    /// arrives leaves no empty partial file, and one that fails after bytes
+    /// arrived keeps them for the next run to resume.
+    #[test]
+    fn a_failed_download_keeps_only_a_partial_file_it_can_resume() {
+        let into = std::env::temp_dir().join(format!("inillucent-part-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&into);
+
+        let empty = into.join("empty.bin");
+        let url = serve_short(b"");
+        let failed = download_on(&url, &empty, None, &mut Silent, false)
+            .expect_err("a body that stops before its length is an error");
+        assert!(!empty.exists(), "{failed}");
+        assert!(
+            !partial_path(&empty).exists(),
+            "an empty partial file is removed: {failed}"
+        );
+
+        let some = into.join("some.bin");
+        let url = serve_short(b"the first bytes");
+        let failed = download_on(&url, &some, None, &mut Silent, false)
+            .expect_err("a body that stops before its length is an error");
+        assert!(!some.exists(), "{failed}");
+        assert_eq!(
+            std::fs::read(partial_path(&some)).expect("the partial file is kept"),
+            b"the first bytes",
+            "the bytes that arrived are kept for a Range request: {failed}"
+        );
+        let _ = std::fs::remove_dir_all(&into);
+    }
+
+    /// Serves a response that announces 1000 bytes, sends `sent` and closes, to
+    /// any number of requests, and returns the URL.
+    ///
+    /// @param sent - the bytes sent before the connection closes
+    fn serve_short(sent: &'static [u8]) -> String {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let address = listener.local_addr().expect("the bound address");
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                let Ok(mut connection) = connection else {
+                    return;
+                };
+                let mut reader = BufReader::new(connection.try_clone().expect("a second handle"));
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let head = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n";
+                let _ = connection.write_all(head.as_bytes());
+                let _ = connection.write_all(sent);
+            }
+        });
+        format!("http://{address}/weights.bin")
     }
 
     /// A socket that is connected to nothing, for a test that never reads it.

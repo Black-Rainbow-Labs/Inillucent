@@ -253,6 +253,7 @@ impl ImportedDatabase {
             arguments.push(value.clone());
         }
         let plan = inillucent_ext::vtab::FilterPlan {
+            lists: Vec::new(),
             index_number: query_plan.index_number,
             index_string: query_plan.index_string.clone(),
             arguments,
