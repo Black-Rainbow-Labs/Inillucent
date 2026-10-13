@@ -84,7 +84,9 @@ PostgreSQL comparison, and no shipped program links `inillucent-bench`.
 
 `rust-stemmers` implements Snowball English, which `inillucent-core` uses. It is not allowed in
 `inillucent-ext`, because the FTS5 `porter` tokenizer has to give the stems SQLite gives and SQLite
-runs the original Porter algorithm. `inillucent-ext` holds its own port of that code.
+runs the original Porter algorithm. `inillucent-ext` holds its own port of that code. In
+`inillucent-core` `rust-stemmers` is also the stemmer a tokenizer pack names: a pack chooses one of
+the 18 Snowball algorithms the crate already links, and adds no dependency.
 
 The lowest crates take almost nothing. `inillucent-base` has no third party dependency.
 `inillucent-vfs` has only the operating system boundary. Every other crate builds on these two, so

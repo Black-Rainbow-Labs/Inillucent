@@ -22,6 +22,7 @@
 //!   models/<model id>/                                  weights, tokenizer, manifest
 //!   embeddings.json                                     what is installed, and the profile
 //!   downloads/                                          partial fetches, removed on success
+//!   tokenizers/<name>.json                              tokenizer packs, found by name
 //! ```
 //!
 //! `<home>` is `INILLUCENT_HOME` when it is set, and otherwise the directory the
@@ -35,6 +36,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::model::ModelManifest;
+use crate::tokenize::pack::{valid_name, Pack, PackError, MAX_PACK_BYTES};
 
 /// The environment variable that overrides the install root.
 pub const HOME_VAR: &str = "INILLUCENT_HOME";
@@ -63,6 +65,16 @@ pub const THREADS_VAR: &str = "INILLUCENT_EMBED_THREADS";
 /// The environment variable that names the processor the embedding and reranking sessions run on:
 /// `cpu`, `cuda` or `cuda:N`.
 pub const DEVICE_VAR: &str = "INILLUCENT_EMBED_DEVICE";
+
+/// The environment variable naming the one folder tokenizer packs are read from.
+///
+/// **When it is set, it is the only folder, unlike [`MODEL_DIR_VAR`].** The
+/// model variable falls through to the install root, because a missing model is
+/// a smaller surprise than a refused query. A pack decides what every term of a
+/// table is, so a test or a deployment that names a folder gets that folder's
+/// packs and nothing from the install root behind it: a pack somebody installed
+/// on the machine cannot change the answer.
+pub const TOKENIZER_DIR_VAR: &str = "INILLUCENT_TOKENIZER_DIR";
 
 /// The model the setup command installs when it is not told otherwise.
 pub const DEFAULT_MODEL: &str = "nomic-embed-text-v1.5";
@@ -201,6 +213,90 @@ pub fn runtime_dir(root: &Path, version: &str) -> PathBuf {
 /// @param root - the install root
 pub fn models_root(root: &Path) -> PathBuf {
     root.join("models")
+}
+
+/// Where tokenizer packs go, one `<name>.json` file each.
+///
+/// @param root - the install root
+pub fn tokenizers_root(root: &Path) -> PathBuf {
+    root.join("tokenizers")
+}
+
+/// The folder tokenizer packs are read from: the one [`TOKENIZER_DIR_VAR`]
+/// names, or the install root's.
+pub fn tokenizer_folder() -> PathBuf {
+    match non_empty_var(TOKENIZER_DIR_VAR) {
+        Some(named) => PathBuf::from(named),
+        None => tokenizers_root(&home()),
+    }
+}
+
+/// Reads the installed pack with this name.
+///
+/// `Ok(None)` when the folder or the file is not there, which is the ordinary
+/// answer for a name nobody installed. A file that is there and does not read
+/// is an error and not `None`, because "not installed" would send somebody to
+/// install a pack that is already installed and broken.
+///
+/// @param name - the name a table declared, checked against the naming rule
+///   before it becomes part of a path
+pub fn tokenizer_pack(name: &str) -> Result<Option<Pack>, PackError> {
+    if !valid_name(name) {
+        return Err(PackError::Name(name.to_string()));
+    }
+    let path = tokenizer_folder().join(format!("{name}.json"));
+    let Some(text) = read_pack_file(&path)? else {
+        return Ok(None);
+    };
+    let pack = Pack::parse(&text)?;
+    if pack.name != name {
+        return Err(PackError::Misnamed {
+            file: name.to_string(),
+            pack: pack.name,
+        });
+    }
+    Ok(Some(pack))
+}
+
+/// Reads a pack file's text, or `None` when there is no file.
+///
+/// The size is checked before the text is read, so a large file that happens to
+/// be named `.json` is refused without being loaded.
+///
+/// @param path - the file
+pub fn read_pack_file(path: &Path) -> Result<Option<String>, PackError> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(PackError::Read(error.to_string())),
+    };
+    if metadata.len() > MAX_PACK_BYTES as u64 {
+        return Err(PackError::TooLarge(metadata.len()));
+    }
+    std::fs::read_to_string(path)
+        .map(Some)
+        .map_err(|error| PackError::Read(error.to_string()))
+}
+
+/// The names of the installed packs, sorted.
+///
+/// A name is listed when a `<name>.json` file with a valid name is in the
+/// folder, whether or not it reads, so a refusal that lists the packs there are
+/// names the broken one too. An empty list when the folder is not there.
+pub fn installed_tokenizers() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(tokenizer_folder()) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file = entry.file_name();
+            let name = file.to_str()?.strip_suffix(".json")?;
+            valid_name(name).then(|| name.to_string())
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 /// Where partial downloads go while they are being fetched.
@@ -815,5 +911,92 @@ mod tests {
             Some(value) => std::env::set_var(HOME_VAR, value),
             None => std::env::remove_var(HOME_VAR),
         }
+    }
+
+    /// Points `TOKENIZER_DIR_VAR` at a folder for one test, and puts back what
+    /// was there when it is dropped.
+    struct TokenizerDir(Option<String>);
+
+    impl TokenizerDir {
+        /// Sets the variable.
+        ///
+        /// @param folder - the folder packs are read from
+        fn set(folder: &Path) -> TokenizerDir {
+            let previous = std::env::var(TOKENIZER_DIR_VAR).ok();
+            std::env::set_var(TOKENIZER_DIR_VAR, folder);
+            TokenizerDir(previous)
+        }
+    }
+
+    impl Drop for TokenizerDir {
+        /// Restores the variable.
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var(TOKENIZER_DIR_VAR, value),
+                None => std::env::remove_var(TOKENIZER_DIR_VAR),
+            }
+        }
+    }
+
+    /// A pack is found by name in the folder the variable names, and only
+    /// there.
+    #[test]
+    fn a_pack_is_found_by_name() {
+        let _held = env_guard();
+        let folder = std::env::temp_dir().join("inillucent-install-tokenizers");
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let example = include_str!("../../../examples/tokenizers/pt-br.json");
+        std::fs::write(folder.join("pt-br.json"), example).unwrap();
+        std::fs::write(folder.join("notes.txt"), "not a pack").unwrap();
+        {
+            let _named = TokenizerDir::set(&folder);
+            assert_eq!(tokenizer_folder(), folder);
+            assert_eq!(
+                tokenizer_pack("pt-br"),
+                Ok(Some(Pack::parse(example).unwrap()))
+            );
+            assert_eq!(tokenizer_pack("absent"), Ok(None));
+            assert_eq!(installed_tokenizers(), vec!["pt-br".to_string()]);
+            assert_eq!(
+                tokenizer_pack("../pt-br"),
+                Err(PackError::Name("../pt-br".to_string()))
+            );
+        }
+        {
+            let _named = TokenizerDir::set(&folder.join("missing"));
+            assert_eq!(tokenizer_pack("pt-br"), Ok(None));
+            assert!(installed_tokenizers().is_empty());
+        }
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    /// A file installed under one name that holds a pack named another is
+    /// refused, rather than read as the name the table asked for.
+    #[test]
+    fn a_file_that_names_another_pack_is_refused() {
+        let _held = env_guard();
+        let folder = std::env::temp_dir().join("inillucent-install-misnamed");
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("x.json"),
+            r#"{"format":1,"name":"y","stemmer":"none"}"#,
+        )
+        .unwrap();
+        std::fs::write(folder.join("broken.json"), "{").unwrap();
+        {
+            let _named = TokenizerDir::set(&folder);
+            assert_eq!(
+                tokenizer_pack("x"),
+                Err(PackError::Misnamed {
+                    file: "x".to_string(),
+                    pack: "y".to_string()
+                })
+            );
+            assert!(matches!(tokenizer_pack("broken"), Err(PackError::Json(_))));
+            assert_eq!(installed_tokenizers(), vec!["broken", "x"]);
+        }
+        std::fs::remove_dir_all(&folder).unwrap();
     }
 }

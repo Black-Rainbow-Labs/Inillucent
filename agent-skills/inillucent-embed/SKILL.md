@@ -179,5 +179,5 @@ sees:
 inillucent --db app.rdb query "SELECT * FROM note" --output json
 ```
 
-`inillucent` has all 34 commands, and `inillucent-mcp` serves 29 of those commands over MCP. See
+`inillucent` has all 35 commands, and `inillucent-mcp` serves 30 of those commands over MCP. See
 [`inillucent-mcp`](../inillucent-mcp/SKILL.md).

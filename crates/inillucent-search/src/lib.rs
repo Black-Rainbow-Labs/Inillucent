@@ -30,8 +30,10 @@
 //!   answer that is correct by construction.
 //! - **the distance.** Cosine, and a `CREATE` naming another one is refused
 //!   rather than accepted and ignored.
-//! - **the tokenizer.** One name, `porter`, matching the one tokenizer this
-//!   build has - so a table records which analysis produced its terms.
+//! - **the tokenizer.** `porter`, the built in English tokenizer, or the name
+//!   of an installed tokenizer pack, whose whole definition the table stores
+//!   beside the name - so a table records which analysis produced its terms,
+//!   and every later reader rebuilds that analysis from the table alone.
 //!
 //! ## What the planner may use it for
 //!

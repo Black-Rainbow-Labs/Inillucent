@@ -243,10 +243,10 @@ filters on a `VECTOR(N)` column.
 
 ### Preparing the text
 
-The tokenizer is named `porter` in the table's configuration. It lowercases the text, splits it into
-words, drops English stopwords, and reduces each word to its root with the Snowball English stemmer.
-The stopword list is PostgreSQL's English list. The result goes into an inverted index: a table from
-each root to the rows that contain it.
+A table's tokenizer is `porter` unless the table names a tokenizer pack. `porter` lowercases the
+text, splits it into words, drops English stopwords, and reduces each word to its root with the
+Snowball English stemmer. The stopword list is PostgreSQL's English list. The result goes into an
+inverted index: a table from each root to the rows that contain it.
 
 ```text
 releas   -> row 1, row 3
@@ -260,6 +260,12 @@ The tokenizer also keeps identifiers whole. A word with a letter and a digit, mo
 separator, or an underscore is kept as one term and also split into its parts. `PROJ-1932`,
 `author_id` and `v1.5.2` are kept this way. Plain English with one hyphen, such as `well-known`, is
 not. An email address is kept whole and is not stemmed.
+
+A table declared with `tokenize = 'pt-br'` uses the tokenizer pack named `pt-br` instead. A pack names
+a different stemmer and stopword list, and can fold accents and rewrite suffixes before the stemmer
+runs. The splitting, the identifiers and the email addresses stay as described above. The table
+copies the pack into its configuration when it is created, and every later reader rebuilds the
+tokenizer from that copy. [Tokenizer packs](tokenizer-packs.md) has the details.
 
 ### Scoring
 
@@ -448,7 +454,7 @@ An `inillucent_search` table keeps all of its data in five shadow tables in the 
 
 | Shadow table | What it holds |
 |---|---|
-| `<name>_config` | The table's definition: columns, `dims`, `metric`, `mode`, the tokenizer, the format number and the release that wrote it |
+| `<name>_config` | The table's definition: columns, `dims`, `metric`, `mode`, the tokenizer and, for a table that names a tokenizer pack, the whole pack, the format number and the release that wrote it |
 | `<name>_content` | Every row: its text columns and its vector. The index can be rebuilt from this table alone |
 | `<name>_delta` | The changes since the last stored segment, one row per change |
 | `<name>_gen` | The stored segments: the built graph and keyword index, cut into rows |

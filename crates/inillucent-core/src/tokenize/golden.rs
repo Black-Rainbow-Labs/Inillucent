@@ -1,0 +1,76 @@
+//! The terms the built in tokenizer produced before tokenizer packs existed,
+//! captured from commit 18f1a38 before any line of the tokenizer changed.
+//!
+//! Invariant: **this file is a record, not a specification.** Each pair is one
+//! input line and the terms `Tokenizer::default().terms` returned for it at that
+//! commit, joined by single spaces. A difference is a change to every existing
+//! table's terms, and is never fixed by editing this file to match.
+//!
+//! The lines cover stopwords, stems, accented words the English tokenizer must
+//! not fold, identifiers, addresses, the 64 byte limit on both sides, a 200
+//! character run, Cyrillic, Greek, Arabic and CJK text, and a decomposed accent.
+
+/// Each input line, and the terms it produced at 18f1a38, joined by spaces.
+pub(super) const GOLDEN: &[(&str, &str)] = &[
+    ("How does the offer work?", "offer work"),
+    ("I am not sure what this is about, but it should be here.", "sure"),
+    ("eligibility eligible offers offering redeemed redeeming", "elig elig offer offer redeem redeem"),
+    ("Running runners ran quickly through the generously sized rooms.", "run runner ran quick generous size room"),
+    ("OFFERS Offers offers", "offer offer offer"),
+    ("The connection was connected and then disconnected again.", "connect connect disconnect"),
+    ("Universities universal universe university", "univers univers univers univers"),
+    ("caresses ponies ties caress cats", "caress poni tie caress cat"),
+    ("happiness relational conditional rational", "happi relat condit ration"),
+    ("author_id, space-key", "author_id author id space key"),
+    ("ENX-1932 (ENX-1932) ENX-1932, [ENX-1932].", "enx-1932 enx 1932 enx-1932 enx 1932 enx-1932 enx 1932 enx-1932 enx 1932"),
+    ("v1.5.2 src/search/vector getUserProfile parse_headers", "v1.5.2 v1 5 2 src/search/vector src search vector getuserprofil parse_headers pars header"),
+    ("snake_case_name a.b.c path/to/file.rs C:\\Users\\docs", "snake_case_name snake case name a.b.c b c path/to/file.rs path file rs c user doc"),
+    ("well-known long-running so-called state-of-the-art", "well known long run call state-of-the-art state art"),
+    ("whitmore@example.com dana@3rivers.example.com", "whitmore@example.com whitmor exampl com dana@3rivers.example.com dana 3river exampl com"),
+    ("Terri.Shaw@example.org first+tag@sub.example.co.uk", "terri.shaw@example.org terri shaw exampl org first+tag@sub.example.co.uk first tag sub exampl co uk"),
+    ("<jason@example.com> jason@example.com, (jason@example.com)", "jason@example.com jason exampl com jason@example.com jason exampl com jason@example.com jason exampl com"),
+    ("@mentions cost@10 a@b x@y.1 two@@ats.com user@localhost", "mention cost 10 b x@y.1 x y 1 two at com user localhost"),
+    ("From: ana.souza@exemplo.com.br Assunto: reembolso", "ana.souza@exemplo.com.br ana souza exemplo com br assunto reembolso"),
+    ("SC-1522 parse_headers ana.souza@exemplo.com.br", "sc-1522 sc 1522 parse_headers pars header ana.souza@exemplo.com.br ana souza exemplo com br"),
+    ("café naïve résumé façade coöperate", "café naïv résumé façad coöper"),
+    ("Ação notificação reembolsos informações", "ação notificação reembolso informaçõ"),
+    ("Política de reembolso e notificações enviadas", "política de reembolso e notificaçõ enviada"),
+    ("Não é você que está aqui, é ele.", "não é você que está aqui é ele"),
+    ("São Paulo Ångström Straße Œuvre Ærø", "são paulo ångström straße œuvr ærø"),
+    ("Привет мир Москва поиск", "привет мир москва поиск"),
+    ("中文 検索 日本語テキスト", "中文 検索 日本語テキスト"),
+    ("Καλημέρα κόσμε αναζήτηση", "καλημέρα κόσμε αναζήτηση"),
+    ("مرحبا بالعالم", "مرحبا بالعالم"),
+    ("İstanbul ışık DİKKAT", "i\u{307}stanbul ışık di\u{307}kkat"),
+    ("2026-10-10 12:30 3.14 1,000,000 v2 007 1932", "2026-10-10 2026 10 10 12 30 3 14 1 000 000 v2 007 1932"),
+    ("don't can't it's O'Brien's", "o brien"),
+    ("https://example.com/path?q=1&lang=en", "https://example.com/path?q=1&lang=en https exampl com path q 1 lang en"),
+    ("🎉 party time 🚀 launch", "parti time launch"),
+    ("--- ... ,,, !!! ???", ""),
+    ("hello,world foo;bar baz|qux", "hello world foo bar baz qux"),
+    ("tab\tseparated\twords and   extra   spaces", "tab separ word extra space"),
+    ("x", "x"),
+    ("ab", "ab"),
+    ("a i s t", ""),
+    ("the and of to in", ""),
+    ("supercalifragilisticexpialidocious", "supercalifragilisticexpialidoci"),
+    ("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl", "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl"),
+    ("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklm", ""),
+    ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ""),
+    ("éééééééééééééééééééééééééééééééééééé", ""),
+    ("ID-0001 ID_0001 id.0001 id/0001 id:0001", "id-0001 id 0001 id_0001 id 0001 id.0001 id 0001 id/0001 id 0001 id:0001 id 0001"),
+    ("key:value namespace::item", "key valu namespace::item namespac item"),
+    ("user_name@example.com x_y@z.io", "user_name@example.com user name exampl com x_y@z.io x y z io"),
+    ("a-b a_b ab-12 ab_12", "b b ab-12 ab 12 ab_12 ab 12"),
+    ("README.md Cargo.toml main.rs", "readm md cargo toml main rs"),
+    ("SELECT * FROM note WHERE id = 1;", "select note id 1"),
+    ("The quick brown fox jumps over the lazy dog.", "quick brown fox jump lazi dog"),
+    ("Generalizations generalization generalize generalized", "general general general general"),
+    ("argued arguing argues argument arguments", "argu argu argu argument argument"),
+    ("nationalization nationalize national nation", "nation nation nation nation"),
+    ("fishing fished fisher fishes", "fish fish fisher fish"),
+    ("dying lying tying", "die lie tie"),
+    ("skies sky skying", "sky sky ski"),
+    ("news newsy", "news newsi"),
+    ("cafe\u{301} nai\u{308}ve decomposed accents", "cafe nai ve decompos accent"),
+];

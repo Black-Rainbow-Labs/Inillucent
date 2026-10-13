@@ -259,7 +259,7 @@ const NOT_BUILT: &str = "CREATE INDEX unbuilt_i ON unbuilt_t USING btree (a)";
 ///
 /// The paths are placeholders replaced per run: `{dir}` is this run's scratch
 /// directory and `{copy}` is a backup this session writes before it reads.
-const CALLS: [(&str, &str, &str); 29] = [
+const CALLS: [(&str, &str, &str); 30] = [
     // The order matters, and it is not alphabetical. **Three tools change which
     // database the session is on**: `create` opens the file it makes,
     // `restore` opens the file it is given, and `migrate` writes a new one.
@@ -322,6 +322,8 @@ const CALLS: [(&str, &str, &str); 29] = [
     ("inillucent_capabilities", "{}", "ddl"),
     ("inillucent_functions", "{}", "substr"),
     ("inillucent_setup_embeddings", "{}", "nomic-embed-text-v1.5"),
+    // With no action it lists, and the built in tokenizer is always there.
+    ("inillucent_tokenizer", "{}", "porter"),
     // A table that is not there is refused by name before any model is opened, so this answers on
     // a machine with no model. The row in `tests/selection.toml` builds the program with `embed`.
     (
@@ -354,9 +356,9 @@ const CALLS: [(&str, &str, &str); 29] = [
 
 /// One handshake, then every tool once, then the unsupported statement.
 ///
-/// **One case rather than twenty-nine**, because the handshake and the process
+/// **One case rather than thirty**, because the handshake and the process
 /// are the expensive part and because what is being asserted is that a client
-/// can hold one session open and use the whole surface through it. Twenty-nine
+/// can hold one session open and use the whole surface through it. Thirty
 /// cases would each start a server, and a server that can only answer its first
 /// tool call would pass all of them.
 #[test]

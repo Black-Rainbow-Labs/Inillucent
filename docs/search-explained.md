@@ -89,7 +89,7 @@ A keyword search never compares the raw text. It first runs the text through a *
 splits it into words and cleans each word up. The same tokenizer runs on the stored rows and on the
 query, so both sides are cleaned the same way.
 
-This is what the tokenizer of an `inillucent_search` table does to one sentence:
+This is what `porter`, the default tokenizer of an `inillucent_search` table, does to one sentence:
 
 | Step | Result |
 |---|---|
@@ -107,6 +107,12 @@ more than one separator is stored as itself and also split into its parts. So `P
 as `proj-1932`, `proj` and `1932`, and `parse_headers` as `parse_headers`, `pars` and `header`. A
 query for the whole identifier then matches it exactly. An email address is kept whole and is not
 stemmed.
+
+`porter` is English: it stems English words and drops English stopwords. A table can name a
+tokenizer pack for another language instead. `tokenize = 'pt-br'` is Brazilian Portuguese. It stems
+Portuguese words and also folds accents, so `notificação`, `notificacao` and `notificações` all
+become the token `notific`. [Tokenizer packs](tokenizer-packs.md) explains how to install one and what
+each step does.
 
 An FTS5 table has its own tokenizers, the ones SQLite's FTS5 has. The default, `unicode61`,
 lowercases and splits but does not stem or drop stopwords. `fts5(title, body, tokenize = 'porter')`

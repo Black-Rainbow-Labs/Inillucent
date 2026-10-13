@@ -102,6 +102,7 @@ If a word on another page is not here and should be, add it.
 | Term | What it means |
 |---|---|
 | **Abstention** | Returning no result when nothing in the data answers the query. inillucent decides to abstain by comparing each hit's confidence with a threshold. |
+| **Accent folding** | Replacing a letter that carries an accent with the plain letter, so `notificação` and `notificacao` become the same word. A tokenizer pack can turn it on. |
 | **Approximate search** | Finding nearest neighbors by checking only part of the data, through an index such as HNSW. It is much faster than exact search and can miss a correct answer. |
 | **BM25** | The standard formula for scoring how well a piece of text matches a set of query words. It rewards rare words and words that appear often in a short text. |
 | **Candidate depth** | How many rows of a first search a reranker scores. inillucent's `rerank_depth` option sets it, and the default is 60. |
@@ -125,6 +126,10 @@ If a word on another page is not here and should be, add it.
 | **Reciprocal rank fusion** | A way to combine two ranked lists by adding one divided by each hit's rank in each list. inillucent offers it as an option. The default fusion adds the two scores after scaling each list to the same range. Also called **RRF**. |
 | **Reranker** | A cross encoder that reads the rows a first search found, each together with the question, and puts them in a new order. `rerank(question, passage)` and the `question` column of `inillucent_search` use one. See [Retrieval for RAG, explained from the start](rag-explained.md). |
 | **Semantic search** | Finding the chunks whose embeddings are close to the query's embedding, which matches meaning instead of words. Also called **vector search**. |
+| **Stemming** | Cutting a word down to its stem, so `releasing` and `released` both become `releas`. A tokenizer stems every word it keeps. |
+| **Stopword** | A word so common that the tokenizer drops it, such as `the` in English or `de` in Portuguese. |
+| **Tokenizer** | The code that splits text into words and turns each word into a term, the same way for a stored row and for a query. `porter`, which is English, is the default. |
+| **Tokenizer pack** | A JSON file that tells an `inillucent_search` table how to tokenize another language: a stemmer, a stopword list, accent folding and suffix rules. See [Tokenizer packs](tokenizer-packs.md). |
 | **Vector** | A list of numbers. In a `VECTOR(N)` column every value is a list of N 32 bit floats. |
 
 ## Programs, testing and measurement

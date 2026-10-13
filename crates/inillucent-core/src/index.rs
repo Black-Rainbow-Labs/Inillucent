@@ -8,6 +8,8 @@
 //! advanced some of them and not others would return a neighbour list whose
 //! text belongs to different rows.
 
+use std::sync::Arc;
+
 use crate::bm25::{Bm25Index, LexicalHit, LexicalParams};
 use crate::distance::Metric;
 use crate::filter::{CompiledFilter, Filter};
@@ -209,7 +211,13 @@ pub struct Index {
     quantized: Option<QuantizedSet>,
     graph: Option<Hnsw>,
     lexical: Option<Bm25Index>,
-    tokenizer: Tokenizer,
+    /// The tokenizer appends, queries and the BM25 score ceiling read.
+    ///
+    /// Shared rather than owned, because a search table builds several indexes
+    /// for one table (a segment, a merge, a rebuilt base) and they must all
+    /// tokenize the same way. Building the tokenizer once per table and handing
+    /// each index the same one is how they do.
+    tokenizer: Arc<Tokenizer>,
     force_graph: bool,
 }
 
@@ -257,20 +265,49 @@ pub struct AppendStats {
 }
 
 impl Index {
-    /// Returns an empty index built to this configuration.
+    /// Returns an empty index built to this configuration, with the built in
+    /// `porter` tokenizer.
     ///
     /// @param config - how it is built and queried
     pub fn new(config: IndexConfig) -> Self {
+        Index::with_tokenizer(config, Arc::new(Tokenizer::default()))
+    }
+
+    /// Returns an empty index built to this configuration that tokenizes with
+    /// the given tokenizer.
+    ///
+    /// @param config - how it is built and queried
+    /// @param tokenizer - what turns its text and its queries into terms
+    pub fn with_tokenizer(config: IndexConfig, tokenizer: Arc<Tokenizer>) -> Self {
         Index {
             store: Store::default(),
             vectors: VectorSet::with_metric(config.dims, config.metric),
             quantized: None,
             graph: None,
             lexical: None,
-            tokenizer: Tokenizer::default(),
+            tokenizer,
             force_graph: false,
             config,
         }
+    }
+
+    /// Replaces the tokenizer, for an index read back from bytes.
+    ///
+    /// **A loaded index's postings are already terms, so this re-tokenizes
+    /// nothing.** It decides how later appends and queries are tokenized, and
+    /// the BM25 score ceiling with them. The bytes do not record a tokenizer,
+    /// because the table that owns them does, so a reader that loads an index
+    /// and forgets this searches a Portuguese table in English and finds
+    /// nothing.
+    ///
+    /// @param tokenizer - the tokenizer the index's terms were made with
+    pub fn set_tokenizer(&mut self, tokenizer: Arc<Tokenizer>) {
+        self.tokenizer = tokenizer;
+    }
+
+    /// Returns the tokenizer this index reads text with.
+    pub fn tokenizer(&self) -> &Arc<Tokenizer> {
+        &self.tokenizer
     }
 
     /// Always walk the graph rather than routing a selective filter to an
@@ -464,7 +501,7 @@ impl Index {
                 config.metric
             );
         }
-        let tokenizer = Tokenizer::default();
+        let tokenizer = Arc::new(Tokenizer::default());
         let lexical = lexical.unwrap_or_else(|| Bm25Index::build(&store, &tokenizer));
         let quantized = if config.quantized {
             Some(QuantizedSet::from_vectors(&vectors))
@@ -2539,5 +2576,98 @@ mod tests {
         }
         let recall = total / probes as f32;
         assert!(recall > 0.9, "recall after 30 appends fell to {recall}");
+    }
+
+    /// The Brazilian Portuguese example pack the repository ships, as a
+    /// tokenizer.
+    fn portuguese() -> Arc<Tokenizer> {
+        let pack = crate::tokenize::pack::Pack::parse(include_str!(
+            "../../../examples/tokenizers/pt-br.json"
+        ))
+        .expect("the example pack reads");
+        Arc::new(Tokenizer::from_pack(&pack))
+    }
+
+    /// Two documents in Portuguese, committed, with the given tokenizer.
+    fn two_documents(tokenizer: Arc<Tokenizer>) -> Index {
+        let config = IndexConfig {
+            dims: 4,
+            ..IndexConfig::default()
+        };
+        let mut index = Index::with_tokenizer(config, tokenizer);
+        index
+            .add(
+                vec![
+                    chunk("refund", 0, "Política de reembolso"),
+                    chunk("notice", 0, "Notificação enviada"),
+                ],
+                &[vector(4, 1.0), vector(4, 2.0)],
+            )
+            .expect("the chunks are added");
+        index.commit();
+        index
+    }
+
+    /// Returns the text of every chunk a keyword search finds, best first.
+    fn found(index: &Index, query: &str) -> Vec<String> {
+        let filter = index.compile(&Filter::default());
+        index
+            .lexical_search(query, &filter, 10)
+            .iter()
+            .map(|hit| index.store().content(hit.chunk).into_owned())
+            .collect()
+    }
+
+    /// An index searches with the tokenizer it was given, and `Index::new`
+    /// still searches in English.
+    #[test]
+    fn an_index_searches_with_the_tokenizer_it_was_given() {
+        let index = two_documents(portuguese());
+        assert_eq!(index.tokenizer().name(), "pt-br");
+        assert_eq!(found(&index, "reembolsos"), vec!["Política de reembolso"]);
+        assert_eq!(found(&index, "notificacao"), vec!["Notificação enviada"]);
+
+        let config = IndexConfig {
+            dims: 4,
+            ..IndexConfig::default()
+        };
+        let porter = two_documents(Index::new(config).tokenizer().clone());
+        assert_eq!(porter.tokenizer().name(), "porter");
+        // English stems the accent and the Portuguese plural apart from the
+        // singular: `notificação` stays, `notificações` becomes `notificaçõ`.
+        assert!(found(&porter, "notificacao").is_empty());
+        assert!(found(&porter, "notificações").is_empty());
+        // English drops a final s from any word, so this plural meets its
+        // singular under `porter` too. It is asserted so nobody reads the
+        // Portuguese result above as the only way to get it.
+        assert_eq!(found(&porter, "reembolsos"), vec!["Política de reembolso"]);
+        assert_eq!(found(&index, "notificações"), vec!["Notificação enviada"]);
+    }
+
+    /// The BM25 ceiling reads the query with the index's own tokenizer, so a
+    /// plural has the ceiling of its singular rather than none.
+    #[test]
+    fn the_score_ceiling_uses_the_index_tokenizer() {
+        let index = two_documents(portuguese());
+        let plural = index.lexical_score_ceiling("reembolsos");
+        assert!(plural > 0.0, "{plural}");
+        assert_eq!(plural, index.lexical_score_ceiling("reembolso"));
+    }
+
+    /// An index read back from bytes searches with the tokenizer it is set to,
+    /// and in English until it is set.
+    #[test]
+    fn a_loaded_index_uses_the_tokenizer_it_is_set_to() {
+        let index = two_documents(portuguese());
+        let mut bytes = Vec::new();
+        crate::persist::write_index(&index, &mut bytes).expect("the index writes");
+
+        let unset = crate::persist::read_index_bytes(&bytes).expect("the index reads");
+        assert!(found(&unset, "notificacao").is_empty());
+
+        let mut loaded = crate::persist::read_index_bytes(&bytes).expect("the index reads");
+        loaded.set_tokenizer(portuguese());
+        assert_eq!(found(&loaded, "notificacao"), vec!["Notificação enviada"]);
+        assert_eq!(found(&loaded, "notificações"), vec!["Notificação enviada"]);
     }
 }

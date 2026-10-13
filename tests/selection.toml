@@ -217,6 +217,15 @@ prefix = ".sqlite-ref/"
 packages = ["*"]
 reason = "the pinned reference binaries themselves"
 
+# The example tokenizer pack. Tests in these crates read it with
+# `include_str!`, and nothing else in `examples/` is read by a test, so without
+# this row a change to the pack is an unmatched top level directory and selects
+# every target.
+[[path]]
+prefix = "examples/tokenizers/"
+packages = ["inillucent-core", "inillucent-search", "inillucent-cli", "inillucent-compat"]
+reason = "the example tokenizer pack, which the tokenizer tests read"
+
 [[path]]
 prefix = "scripts/"
 packages = ["inillucent-bench"]
@@ -2449,6 +2458,14 @@ covers = ["inillucent-search", "inillucent-sql", "inillucent-engine"]
 [[target]]
 package = "inillucent-compat"
 kind = "test"
+name = "engine"
+module = "search_tokenizer"
+tier = "engine"
+covers = ["inillucent-search", "inillucent-core", "inillucent-engine", "inillucent-ext"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
 name = "durability"
 module = "search_crash"
 tier = "durability"
@@ -2787,7 +2804,7 @@ module = "mcp_wire"
 tier = "e2e"
 covers = ["inillucent-cli"]
 # One `initialize` handshake over real pipes and one `tools/call` of each of
-# the 29 MCP tools. `command_parity` keeps the tool set equal to the registry;
+# the 30 MCP tools. `command_parity` keeps the tool set equal to the registry;
 # nothing called a tool by name over the wire.
 # `inillucent_embed` is called with a table that is not there, which a build with embedding
 # support refuses by name and a build without it refuses as unsupported, so the row builds the

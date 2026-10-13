@@ -176,6 +176,7 @@ bind the bytes.
 | `dims = N` | makes the table hold vectors of N numbers. Without `dims`, an insert with a vector is refused with the status `constraint` |
 | `mode = 'exact'` or `mode = 'approximate'` | how the vector half searches. The default is `exact` |
 | `vector_weight = 0.5` | fixes the vector list's weight, from 0 to 1, in place of the weight chosen for each query. Added in 1.0.30 |
+| `tokenize = 'pt-br'` | tokenizes the keyword half with an installed tokenizer pack in place of `porter`, which is English. See [Text that is not English](#text-that-is-not-english) |
 | `store MATCH '...'` | the keyword query, as plain words. A row scores for any word it holds. FTS5 operators fail with the status `unsupported` (exit code 3): a double quote, a word ending in `*`, capital `AND`, `NOT` or `NEAR` between words, and `column:word` |
 | `vector = ?` | the query vector |
 | `k = 10` | how many results to retrieve |
@@ -189,6 +190,23 @@ made `confidence` separate answerable questions from unrelated ones. [Vector sea
 are combined and the `confidence` value each hit has.
 
 `inillucent search` also works on an `inillucent_search` table.
+
+### Text that is not English
+
+```sh
+inillucent tokenizer install --file examples/tokenizers/pt-br.json
+```
+
+```sql
+CREATE VIRTUAL TABLE docs USING inillucent_search(body, tokenize = 'pt-br');
+```
+
+The keyword half stems English by default. A table that names a tokenizer pack stems the pack's
+language and can fold accents: under `pt-br`, the query `notificacoes` finds `Notificação`. The
+table keeps its own copy of the pack, so it opens on a machine that never installed it. A name that
+is not installed is refused with the status `invalid_state`, and the message lists the packs there
+are. A release from before tokenizer packs cannot open a file that holds such a table. See
+[Tokenizer packs](../../docs/tokenizer-packs.md).
 
 ### Filtering inside the search with facets
 

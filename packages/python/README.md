@@ -151,9 +151,9 @@ write an unusual statement.
 
 | Program | What it is |
 |---|---|
-| `inillucent` | the command line: 34 commands, each with `--output json` |
+| `inillucent` | the command line: 35 commands, each with `--output json` |
 | `inillucent-shell` | an interactive shell that works like `sqlite3`, with 63 of its 65 dot commands |
-| `inillucent-mcp` | an MCP server: 29 of the same commands served to an AI agent |
+| `inillucent-mcp` | an MCP server: 30 of the same commands served to an AI agent |
 | `inillucent-migrate` | builds a database from a legacy retrieval index. `inillucent migrate` copies a SQLite file or a PostgreSQL or MySQL database |
 
 ```sh
@@ -209,7 +209,7 @@ client's configuration:
 }
 ```
 
-`inillucent-mcp` serves 29 of the command line's commands as MCP tools. The tools are generated from
+`inillucent-mcp` serves 30 of the command line's commands as MCP tools. The tools are generated from
 the same command table as the command line. `--readonly` refuses every statement that changes data.
 `--root DIR` refuses every path outside `DIR`.
 

@@ -15,6 +15,7 @@ so you can copy any folder out of the repository and it still works.
 | [`rag-agent/corpus/`](rag-agent/corpus/ATTRIBUTION.md) | 80 Wikipedia articles, one per line of `greek-philosophy.jsonl`, with their licence and sources | read by both examples |
 | [`coffee-shop/`](coffee-shop/README.md) | a coffee shop's till and back office, written in Rust. Orders with sizes and modifiers, promotion codes, loyalty points, split payments, refunds, deliveries, waste, stock counts, a tip pool and closing the day, with the stock and a double entry ledger kept by triggers. The README shows each use case's SQL and its answer | the `inillucent` crate from crates.io |
 | [`encrypted-notes/`](encrypted-notes/README.md) | a notes database encrypted at rest: a key file, the refusal without it, a plaintext copy, an encrypted copy and a changed key, with the files searched for the row | the `inillucent` command line |
+| [`tokenizers/`](tokenizers/README.md) | a tokenizer pack for Brazilian Portuguese, which an `inillucent_search` table names with `tokenize = 'pt-br'`, and how to write one for another language | the `inillucent` command line |
 | [`todo-mvc/`](todo-mvc/README.md) | a todo service with a REST API, written in Rust. Lists, todos with subtasks to any depth, tags, comments, a history written by triggers, keyword search and reports, with the SQL for each explained | the `inillucent` crate from crates.io |
 
 ## Which one to start with

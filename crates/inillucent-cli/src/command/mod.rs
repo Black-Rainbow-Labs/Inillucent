@@ -241,6 +241,7 @@ impl Command {
         match (self.name, name) {
             (_, "output") => Some(&["text", "json"]),
             ("import", "format") => Some(&["csv", "tabs", "ascii"]),
+            ("tokenizer", "action") => Some(&["list", "install", "remove"]),
             ("export", "format") => Some(&[
                 "csv", "json", "tabs", "markdown", "insert", "quote", "line", "html",
             ]),

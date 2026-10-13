@@ -1,6 +1,7 @@
-//! Term normalization built to match PostgreSQL's `english` text search
-//! configuration, so the lexical comparison measures ranking rather than
-//! tokenization.
+//! Term normalization. The built in tokenizer, `porter`, matches PostgreSQL's
+//! `english` text search configuration, so the lexical comparison measures
+//! ranking rather than tokenization. A table may name a tokenizer pack instead:
+//! see [`pack`] for the file and the steps it controls.
 //!
 //! The live `rag` database confirms `english` stems with `english_stem`, which is
 //! the Snowball English stemmer: `to_tsvector('english', 'eligibility eligible
@@ -11,9 +12,23 @@
 //! Invariant: **the same text produces the same terms on the way in and on the
 //! way out.** This is the one function the index and the query both call,
 //! because a corpus stemmed one way and a query stemmed another is a search
-//! that silently finds nothing.
+//! that silently finds nothing. A pack changes what one word becomes and
+//! nothing else: splitting, identifiers, addresses and the 64 byte limit are
+//! here, in [`Tokenizer::terms`], for every tokenizer.
+
+pub mod fold;
+#[cfg(test)]
+mod golden;
+pub mod pack;
+#[cfg(test)]
+mod pack_tests;
+
+use std::borrow::Cow;
+use std::collections::HashSet;
 
 use rust_stemmers::{Algorithm, Stemmer};
+
+use pack::{Pack, PORTER};
 
 /// PostgreSQL's English stopword list, from `share/tsearch_data/english.stop`.
 /// Reproduced rather than referenced because term parity with the baseline is the
@@ -149,21 +164,112 @@ pub const ENGLISH_STOPWORDS: &[&str] = &[
 ];
 
 /// The one normalizer both indexing and searching call.
+///
+/// Built from data: a stemmer, a stopword set, whether accents fold, and suffix
+/// rewrites. [`Tokenizer::default`] is the built in `porter`, and
+/// [`Tokenizer::from_pack`] builds one from a tokenizer pack.
 pub struct Tokenizer {
-    stemmer: Stemmer,
-    stopwords: std::collections::HashSet<&'static str>,
+    /// `porter`, or the pack's name.
+    name: String,
+    /// The stemmer, or `None` for a pack that names `none`.
+    stemmer: Option<Stemmer>,
+    /// Words that produce no term, folded when `fold` is true.
+    stopwords: HashSet<String>,
+    /// Whether a word is folded before it is compared and after it is stemmed.
+    fold: bool,
+    /// Suffix rewrites as `(ending, becomes)`, longest ending first, so the
+    /// first that matches is the longest.
+    suffixes: Vec<(String, String)>,
 }
 
 impl Default for Tokenizer {
+    /// Returns the built in `porter`: Snowball English, PostgreSQL's English
+    /// stopwords, no folding and no suffix rules, which is every term this
+    /// engine produced before tokenizer packs existed.
     fn default() -> Self {
         Tokenizer {
-            stemmer: Stemmer::create(Algorithm::English),
-            stopwords: ENGLISH_STOPWORDS.iter().copied().collect(),
+            name: PORTER.to_string(),
+            stemmer: Some(Stemmer::create(Algorithm::English)),
+            stopwords: ENGLISH_STOPWORDS
+                .iter()
+                .map(|word| word.to_string())
+                .collect(),
+            fold: false,
+            suffixes: Vec::new(),
         }
     }
 }
 
+/// Returns the Snowball algorithm a pack's stemmer name means, or `None` for
+/// `none` and for a name this build does not link.
+///
+/// @param name - a stemmer name from a pack
+fn stemmer_algorithm(name: &str) -> Option<Algorithm> {
+    Some(match name {
+        "arabic" => Algorithm::Arabic,
+        "danish" => Algorithm::Danish,
+        "dutch" => Algorithm::Dutch,
+        "english" => Algorithm::English,
+        "finnish" => Algorithm::Finnish,
+        "french" => Algorithm::French,
+        "german" => Algorithm::German,
+        "greek" => Algorithm::Greek,
+        "hungarian" => Algorithm::Hungarian,
+        "italian" => Algorithm::Italian,
+        "norwegian" => Algorithm::Norwegian,
+        "portuguese" => Algorithm::Portuguese,
+        "romanian" => Algorithm::Romanian,
+        "russian" => Algorithm::Russian,
+        "spanish" => Algorithm::Spanish,
+        "swedish" => Algorithm::Swedish,
+        "tamil" => Algorithm::Tamil,
+        "turkish" => Algorithm::Turkish,
+        _ => return None,
+    })
+}
+
 impl Tokenizer {
+    /// Builds the tokenizer a pack describes.
+    ///
+    /// Infallible because [`Pack::parse`] has already checked the pack. The
+    /// stopwords are folded here, once, when the pack folds, so `não` in the
+    /// file and `nao` in a document are the same stopword.
+    ///
+    /// @param pack - a pack that [`Pack::parse`] accepted
+    pub fn from_pack(pack: &Pack) -> Tokenizer {
+        let stopwords = pack
+            .stopwords
+            .iter()
+            .map(|word| {
+                if pack.fold {
+                    fold::fold(word).into_owned()
+                } else {
+                    word.clone()
+                }
+            })
+            .collect();
+        let mut suffixes: Vec<(String, String)> = pack
+            .suffixes
+            .iter()
+            .map(|rule| (rule.ending.clone(), rule.becomes.clone()))
+            .collect();
+        // Longest first. Two endings of one length cannot both end one word,
+        // so the order among them changes nothing.
+        suffixes.sort_by_key(|rule| std::cmp::Reverse(rule.0.len()));
+        Tokenizer {
+            name: pack.name.clone(),
+            stemmer: stemmer_algorithm(&pack.stemmer).map(Stemmer::create),
+            stopwords,
+            fold: pack.fold,
+            suffixes,
+        }
+    }
+
+    /// Returns `porter` or the pack's name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Split on anything that is not alphanumeric, lowercase, drop stopwords,
     /// then stem. Identifiers such as `author_id` are also emitted split into
     /// their parts, because a query for `author` should match them.
@@ -198,20 +304,70 @@ impl Tokenizer {
                 if raw.is_empty() {
                     continue;
                 }
-                let lower = raw.to_lowercase();
-                if self.stopwords.contains(lower.as_str()) {
-                    continue;
-                }
-                // A very long run of characters is almost always a base64 blob or
-                // a hash rather than a word; indexing it costs a dictionary entry
-                // and buys nothing.
-                if lower.len() > 64 {
-                    continue;
-                }
-                out.push(self.stemmer.stem(&lower).to_string());
+                self.word(&raw.to_lowercase(), &mut out);
             }
         }
         out
+    }
+
+    /// Turns one lowercase run of letters and digits into its term, or into
+    /// nothing.
+    ///
+    /// The steps, in order: fold, drop a stopword, drop a word over 64 bytes,
+    /// rewrite a suffix, stem, fold again. Under `porter` only the stopword, the
+    /// length and the stem steps do anything, in the order they always ran.
+    ///
+    /// **Folding happens on both sides of the stemmer** because Snowball
+    /// Portuguese reads accents in its suffixes. Measured against PostgreSQL
+    /// 17.5: folding first loses the plural, so `notificações` became
+    /// `notificaco`, and folding only after leaves `notificacao` at
+    /// `notificaca`. Folding, restoring the accented ending, stemming and folding
+    /// again sends all three spellings to `notific`.
+    ///
+    /// @param lower - one word, lowercased
+    /// @param out - the terms so far
+    fn word(&self, lower: &str, out: &mut Vec<String>) {
+        let folded = if self.fold {
+            fold::fold(lower)
+        } else {
+            Cow::Borrowed(lower)
+        };
+        if self.stopwords.contains(folded.as_ref()) {
+            return;
+        }
+        // A very long run of characters is almost always a base64 blob or
+        // a hash rather than a word; indexing it costs a dictionary entry
+        // and buys nothing.
+        if folded.len() > 64 {
+            return;
+        }
+        let restored = self.restore(&folded);
+        let stemmed = match &self.stemmer {
+            Some(stemmer) => stemmer.stem(&restored),
+            None => restored,
+        };
+        let term = if self.fold {
+            fold::fold(&stemmed).into_owned()
+        } else {
+            stemmed.into_owned()
+        };
+        out.push(term);
+    }
+
+    /// Rewrites the longest suffix rule's ending the word ends with, when the
+    /// word is longer than that ending.
+    ///
+    /// @param word - one word, folded when the pack folds
+    fn restore<'a>(&self, word: &'a str) -> Cow<'a, str> {
+        for (ending, becomes) in &self.suffixes {
+            if word.len() <= ending.len() {
+                continue;
+            }
+            if let Some(stem) = word.strip_suffix(ending.as_str()) {
+                return Cow::Owned(format!("{stem}{becomes}"));
+            }
+        }
+        Cow::Borrowed(word)
     }
 
     /// Query terms, which are normalized identically. Kept as a separate entry

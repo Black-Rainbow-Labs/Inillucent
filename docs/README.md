@@ -39,18 +39,19 @@ this index.
 | 10 | [Search explained from the start](search-explained.md) | Keyword search, search by meaning and hybrid search for a reader who has never built a search, with every term defined and examples to run |
 | 11 | [Retrieval for RAG, explained from the start](rag-explained.md) | What a RAG system is, each step and the choices at each step, and how to set it up in inillucent: chunking, a reranker, reciprocal rank fusion and bulk embedding |
 | 12 | [Vector search](vector-search.md) | `VECTOR(N)` columns, HNSW indexes, the `inillucent_search` table, and how hybrid search ranks results |
-| 13 | [Embeddings](embeddings.md) | Running the embedding model inside your process, installing it, and choosing a model |
-| 14 | [Migrating](migrating.md) | Copying a SQLite file, a PostgreSQL database or a MySQL database into inillucent |
-| 15 | [Encryption at rest](encryption.md) | Keys, what is encrypted, how to encrypt a database you already have, and what it costs |
+| 13 | [Tokenizer packs](tokenizer-packs.md) | Searching text in another language: the tokenizer pack file, how a table keeps its pack, and the errors |
+| 14 | [Embeddings](embeddings.md) | Running the embedding model inside your process, installing it, and choosing a model |
+| 15 | [Migrating](migrating.md) | Copying a SQLite file, a PostgreSQL database or a MySQL database into inillucent |
+| 16 | [Encryption at rest](encryption.md) | Keys, what is encrypted, how to encrypt a database you already have, and what it costs |
 
 ## Measurements
 
 | | Page | What it covers |
 |---|---|---|
-| 16 | [Performance](performance.md) | Current speed, processor time, memory and file size against SQLite 3.53.4, overall and by category, and the workloads that are slower. Every earlier run and each hill climb is in [Performance history](performance-history.md) |
-| 17 | [Feature comparison](feature-comparison.md) | The full 416 case differential probe against SQLite, feature by feature, and the retrieval engine against pgvector |
-| 18 | [Retrieval quality](retrieval-quality.md) | The 17 graded comparisons with PostgreSQL and pgvector, and how a measurement becomes a verdict |
-| 19 | [Synthetic corpus](../tests/synthetic-corpus.md) | How to build the public corpus that every retrieval number is measured on |
+| 17 | [Performance](performance.md) | Current speed, processor time, memory and file size against SQLite 3.53.4, overall and by category, and the workloads that are slower. Every earlier run and each hill climb is in [Performance history](performance-history.md) |
+| 18 | [Feature comparison](feature-comparison.md) | The full 416 case differential probe against SQLite, feature by feature, and the retrieval engine against pgvector |
+| 19 | [Retrieval quality](retrieval-quality.md) | The 17 graded comparisons with PostgreSQL and pgvector, and how a measurement becomes a verdict |
+| 20 | [Synthetic corpus](../tests/synthetic-corpus.md) | How to build the public corpus that every retrieval number is measured on |
 
 `inillucent-scorecard.md` in the repository root is the full score card from the grading run. It has
 every interval, every p-value and every diagnostic. `inillucent-bench grade` writes
@@ -65,19 +66,19 @@ of each result. The same studies are at [inillucent.com/research](https://inillu
 
 | | Page | What it covers |
 |---|---|---|
-| 20 | [Research](research/README.md) | The list of studies, newest first |
-| 21 | [Which retrieval techniques find the right text for RAG](research/rag-retrieval-study.md) | Chunking, headings, embedding models, fusion, rerankers and language model helpers, measured on 67,369 emails, and the features each result led to |
-| 22 | [How inillucent was made faster than SQLite](research/performance-hill-climbing.md) | The hill climbs that took the engine from 432% slower than SQLite to 505% faster, how each benchmark was made trustworthy, the changes that moved the numbers most, and the advice taken and not taken |
+| 21 | [Research](research/README.md) | The list of studies, newest first |
+| 22 | [Which retrieval techniques find the right text for RAG](research/rag-retrieval-study.md) | Chunking, headings, embedding models, fusion, rerankers and language model helpers, measured on 67,369 emails, and the features each result led to |
+| 23 | [How inillucent was made faster than SQLite](research/performance-hill-climbing.md) | The hill climbs that took the engine from 432% slower than SQLite to 505% faster, how each benchmark was made trustworthy, the changes that moved the numbers most, and the advice taken and not taken |
 
 ## Working on it
 
 | | Page | What it covers |
 |---|---|---|
-| 23 | [Repository and building](repository.md) | The crates and what each one does, building, running the tests, and the test coverage table |
-| 24 | [Dependency policy](dependency-policy.md) | Which crates a production crate may use, and why the allowed list is short |
-| 25 | [Writing style](writing-style.md) | How to write and check a page in this folder or a chapter on inillucent.com |
-| 26 | [Roadmap](roadmap.md) | What is not built yet, in the order it is being worked on |
-| 27 | [Closed items](closed-items.md) | What came off the roadmap, and the measurement that closed each item |
+| 24 | [Repository and building](repository.md) | The crates and what each one does, building, running the tests, and the test coverage table |
+| 25 | [Dependency policy](dependency-policy.md) | Which crates a production crate may use, and why the allowed list is short |
+| 26 | [Writing style](writing-style.md) | How to write and check a page in this folder or a chapter on inillucent.com |
+| 27 | [Roadmap](roadmap.md) | What is not built yet, in the order it is being worked on |
+| 28 | [Closed items](closed-items.md) | What came off the roadmap, and the measurement that closed each item |
 | | [`AGENTS.md`](../AGENTS.md) | The starting page for an AI agent that uses or changes this repository |
 | | [`agent-skills/`](../agent-skills/README.md) | One page for each common job, readable by any AI agent |
 
