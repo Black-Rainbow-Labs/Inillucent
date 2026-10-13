@@ -522,9 +522,9 @@ they are touching do not collide; two that have not, do.
   `cargo test -p inillucent-compat --test engine` runs all 59 engine suites in one process, which is
   not how the runner runs them (one process per suite, `--exact` names). If a suite behaves
   differently under plain cargo, suspect shared process state first, and use the runner.
-- **The nightly lives in `J:/build/nightly` and writes `_agent_output/nightly/latest.json` in the
+- **The nightly lives in `C:/build/nightly` and writes `_agent_output/nightly/latest.json` in the
   main checkout.** `ship.ps1` reads that file instead of running a suite. Do not edit or build in
-  `J:/build/nightly`: the scheduled task forces it to `origin/main` every night. (task-2125)
+  `C:/build/nightly`: the scheduled task forces it to `origin/main` every night. (task-2125)
 - **Copy `.sqlite-ref/` into the worktree rather than junctioning it.** task-2048 records a
   recursive delete of a junction emptying the one shared copy for every worktree at once.
   `Copy-Item -Recurse <main-checkout>\.sqlite-ref <worktree>\.sqlite-ref` costs about four

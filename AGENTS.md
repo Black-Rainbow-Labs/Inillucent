@@ -427,7 +427,7 @@ A release runs no full suite of its own. `.github/workflows/nightly.yml` also ru
 cadence once a day, on Linux, but that run writes no evidence a release reads: it only uploads its
 summary as a workflow artifact. The evidence a release reads comes from `packaging/nightly.ps1`,
 which runs every night at 02:00 as the scheduled task `inillucent nightly`, which
-`pwsh packaging/register-nightly.ps1` registers. It works in its own worktree, `J:/build/nightly`,
+`pwsh packaging/register-nightly.ps1` registers. It works in its own worktree, `C:/build/nightly`,
 moved to `origin/main`, and:
 
 1. runs `inillucent-testrun --cadence nightly --strict --record`, with this machine's declared

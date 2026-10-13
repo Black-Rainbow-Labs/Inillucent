@@ -19,7 +19,9 @@
     The time of day. Default 02:00.
 
 .PARAMETER Worktree
-    The nightly worktree, passed through to nightly.ps1.
+    The nightly worktree, passed through to nightly.ps1. Default C:/build/nightly. It was on J:
+    until 2026-10-12. The run of that day took eight hours on J:, which answered at 34 to 37 ms a
+    transfer, and eight targets failed their time limits there and passed when run alone on D:.
 
 .PARAMETER Unregister
     Remove the task and exit.
@@ -34,7 +36,7 @@
 [CmdletBinding()]
 param(
     [string] $At = '02:00',
-    [string] $Worktree = 'J:/build/nightly',
+    [string] $Worktree = 'C:/build/nightly',
     [switch] $Unregister,
     [switch] $WhatIf
 )

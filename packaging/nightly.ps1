@@ -7,7 +7,7 @@
     A change is tested by what it touched (`inillucent-testrun --changed`), and a push is tested by
     the merge cadence in CI. Everything else happens here, once a night, on the development machine:
 
-        1. worktree   a dedicated checkout of origin/main (J:/build/nightly by default), fetched fresh
+        1. worktree   a dedicated checkout of origin/main (C:/build/nightly by default), fetched fresh
         2. suite      inillucent-testrun --cadence nightly --strict --record --summary
         3. release    release-all.ps1 for all five targets, built in parallel with fat LTO, signed and
                       notarised, so a build or signing failure is found the night it happens
@@ -73,7 +73,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $Worktree = 'J:/build/nightly',
+    [string] $Worktree = 'C:/build/nightly',
     [string] $Branch = 'main',
     [switch] $Force,
     [switch] $SkipRelease,
