@@ -150,7 +150,7 @@ otherwise.
 | Values | type affinity on write, `CAST`, the `BINARY`, `NOCASE` and `RTRIM` collations, `LIKE`, `GLOB`, values larger than a page, in a key or an index as well. A key or an indexed value is limited to 1,048,576 bytes once encoded, see [the key limit](#smaller-differences) |
 | Functions | 190 built in function names, including 30 JSON functions, the maths functions and the date and time functions. Functions, aggregates and collations an application defines |
 | Transactions | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`. A `ROLLBACK` also undoes `CREATE` and `DROP TABLE` |
-| Several databases | `ATTACH` and `DETACH`, joins across files, and one transaction that commits to two files or to neither. Temporary tables, views and triggers |
+| Several databases | `ATTACH` and `DETACH`, where the file name may be a parameter or any other expression, joins across files, and one transaction that commits to two files or to neither. Temporary tables, views and triggers |
 | Schema and maintenance | `sqlite_schema` and `sqlite_master`, `VACUUM`, `VACUUM INTO`, `integrity_check` and `quick_check` |
 | Plans | `EXPLAIN QUERY PLAN` as SQLite's tree, with attached schema names, automatic index lines for a join and for a correlated subquery, the loop SQLite turns a positive `EXISTS` into, `LEFT-JOIN` markers, `CO-ROUTINE` and `MATERIALIZE` nodes for derived tables and CTEs, `COMPOUND QUERY` and `MERGE` nodes for compound queries, and `SCALAR SUBQUERY` and `LIST SUBQUERY` nodes. A derived table is flattened into the query that reads it where SQLite flattens it. Some plans still differ, see [below](#how-inillucent-behaves-differently-from-sqlite). Plain `EXPLAIN` runs and prints a different program, see [below](#five-follow-from-how-inillucent-is-built) |
 | Table valued functions | `generate_series`, `chunk_text(text, size, overlap, heading)`, which cuts a document into windows of characters for embedding, `json_each`, `json_tree`, a `pragma_*` function for every pragma that returns a value, such as `pragma_table_info('t')`, `pragma_foreign_key_check` and `pragma_user_version`, which can take its argument from an earlier `FROM` term, as in `FROM sqlite_master m, pragma_index_list(m.name)`, and any module an application registers. A schema name in front of the function, as in `main.generate_series(1, 3)`, is accepted |
@@ -332,7 +332,6 @@ exit code 3.
 
 | Construct | Example | What to write instead |
 |---|---|---|
-| `ATTACH` with a file name that is not a literal | `ATTACH ? AS k` | the file name as a string literal |
 | a full text `MATCH` under an `OR` whose pattern reads another table's row | `f MATCH q.w OR rowid = 3` | a constant or bound pattern, or two queries joined with `UNION` |
 | a correlated `IN` subquery with `GROUP BY`, `LIMIT` or a compound query | `a IN (SELECT a FROM t i WHERE i.id = o.id LIMIT 1)` | `EXISTS` with the condition written out |
 | an FTS5 tokenizer inillucent does not have | `tokenize='trigram'` | `ascii`, `unicode61` or `porter` |

@@ -988,8 +988,8 @@ The 24 that answer differently with no arguments:
 
 ## Constructs the probe does not reach
 
-`inillucent capabilities` lists 57 capabilities reported by the engine. 13 of them are `no`: the
-engine refuses the construct. Eight are refused with status `unsupported` and exit code 3. Five are
+`inillucent capabilities` lists 57 capabilities reported by the engine. 12 of them are `no`: the
+engine refuses the construct. Seven are refused with status `unsupported` and exit code 3. Five are
 refused with status `syntax` and exit code 1: `load_extension`, `compound_ordered_by_expression`,
 `writing_to_a_view`, `returning_inside_a_trigger` and `changing_a_schema_row`. None of these is one
 of the 416 cases. Most of them run in SQLite. One, writing to a view, is refused by SQLite too, with
@@ -997,7 +997,6 @@ the same message and exit code 1.
 
 | Capability | What is refused |
 |---|---|
-| `attach_computed_path` | `ATTACH ? AS other`: a file name that is not a string literal |
 | `match_in_an_or_reading_a_row` | a full text `MATCH` under an `OR` whose pattern reads another table's row, such as `f MATCH q.w OR rowid = 3` |
 | `load_extension` | `load_extension()`. There is no C extension interface |
 | `compound_ordered_by_expression` | a compound select ordered by an expression |

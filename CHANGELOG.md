@@ -10,6 +10,15 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**`ATTACH` takes any expression as its file name.** `ATTACH ?1 AS x`, `ATTACH 'a' || 'b' AS x` and
+`ATTACH (SELECT path FROM p) AS x` exited 3 with `unsupported`. The engine now evaluates the
+expression when the statement runs, with the statement's bound parameters, and reads the value as
+text as SQLite does, so a NULL names a private temporary database. `--root` confines the evaluated
+name the same way it confines a literal one. `VACUUM INTO ?1` takes its parameter the same way.
+The `attach_computed_path` row of `inillucent capabilities` is now `yes`. The examples of the
+`unsupported` status in the documentation, the skills and the conformance suite use
+`EXPLAIN EXPLAIN SELECT 1`.
+
 **`ROLLBACK` restores everything a transaction changed, including after `DROP` and `ALTER TABLE`.**
 Bug hunt 10 found rollbacks that lost or kept rows. With foreign keys on, `BEGIN; DROP TABLE p;
 ROLLBACK` brought `p` back with no rows, because the rows `DROP TABLE` deletes first were put back

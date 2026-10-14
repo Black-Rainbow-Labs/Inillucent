@@ -670,7 +670,7 @@ impl crate::ImportedDatabase {
             // whole bound statement copied per execution, and for a module
             // insert that is once per row.
             Cached::Nothing => Ok(Outcome::empty()),
-            Cached::Ddl(sql) => self.execute_ddl(sql),
+            Cached::Ddl(sql) => self.execute_ddl_with(sql, params),
             Cached::QueryPlan(lines) => Ok(query_plan_rows(lines)),
             Cached::Program(rows) => Ok(program_rows(rows)),
             Cached::VirtualInsert(statement, holds_subquery, source) => {

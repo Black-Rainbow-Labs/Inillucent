@@ -44,7 +44,7 @@ The statuses you will see most often, each produced by the release build:
 
 | Status | What caused it | An example message |
 |---|---|---|
-| `unsupported` | a construct the engine has not built | `unsupported: ATTACH with a file name that is not a literal` |
+| `unsupported` | a construct the engine has not built | `unsupported: nested EXPLAIN` |
 | `syntax` | the statement is not valid SQL | `near "SELEC": syntax error` |
 | `not_found` | no such table, column, index, function or capability | `no such table: nothere` |
 | `constraint` | a constraint refused the write | `UNIQUE constraint failed: t.a` |
@@ -85,17 +85,17 @@ can change between releases.
 ## "It says unsupported" or "it exited 3"
 
 ```sh
-inillucent --db app.rdb exec "ATTACH ? AS other" --params '["other.rdb"]'
+inillucent --db app.rdb exec "EXPLAIN EXPLAIN SELECT 1"
 ```
 
 ```text
-Error [unsupported]: unsupported: ATTACH with a file name that is not a literal
-  not built yet: ATTACH with a file name that is not a literal
+Error [unsupported]: unsupported: nested EXPLAIN
+  not built yet: nested EXPLAIN
 ```
 
 The SQL is correct. The engine has not built that construct, so rewording the same construct gets
-the same answer. Write the statement another way: here, pass the file name to `ATTACH` as a
-string literal. Ask what the engine supports before you write an unusual statement:
+the same answer. Write the statement another way: here, run `EXPLAIN` on the inner statement
+alone. Ask what the engine supports before you write an unusual statement:
 
 ```sh
 inillucent capabilities                  # the whole table
