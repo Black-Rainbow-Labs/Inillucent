@@ -2649,7 +2649,7 @@ fn index_candidate(
     if equalities.is_empty()
         && low.is_none()
         && high.is_none()
-        && covering.is_none()
+        && (covering.is_none() || walk_saves_nothing(table, index))
         && !partial_walk
         && !(forced && usable)
     {
@@ -2682,6 +2682,20 @@ fn index_candidate(
         },
         used,
     ))
+}
+
+/// Reports whether walking a covering index whole saves nothing over reading a `WITHOUT ROWID`
+/// table.
+///
+/// **A whole walk of an index that holds every column of a `WITHOUT ROWID` table saves nothing
+/// (bug hunt 10).** SQLite reads the table, in key order, when no entry is narrower than the row,
+/// and this walked the index in its own order instead, so `SELECT *` and the rows an
+/// `INSERT ... SELECT` reads came out in a different order.
+///
+/// @param table - the table
+/// @param index - a covering index over it
+fn walk_saves_nothing(table: &TableInfo, index: &IndexInfo) -> bool {
+    table.without_rowid && index.root != table.root && !cost::index_is_narrower(table, index)
 }
 
 /// The entry slot that stands for the row's own key rather than a field.

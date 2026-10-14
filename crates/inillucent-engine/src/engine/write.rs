@@ -112,6 +112,10 @@ pub(crate) struct WriteView<'a> {
     /// Whether the statement is a single row `INSERT ... VALUES` with no
     /// triggers of its own. See `WriteTarget::defer_key_check`.
     pub(crate) single_row: std::cell::Cell<bool>,
+    /// Whether the key trigger of a single row `INSERT` found the row without a
+    /// parent. The statement raises the foreign key error when it ends, if the
+    /// row was written. See `WriteTarget::defer_key_check`.
+    pub(crate) row_time_violation: std::cell::Cell<bool>,
     /// Which index trees cover which table, so a query a trigger body runs
     /// inside the write reaches the same covering indexes a typed one does.
     pub(crate) covering: &'a HashMap<u32, Vec<u32>>,
@@ -213,8 +217,23 @@ impl WriteTarget for WriteView<'_> {
     }
 
     fn defer_key_check(&self, trigger: &[u8], top_level: bool) -> bool {
+        // **A single row `INSERT` defers too (bug hunt 10).** SQLite raises its
+        // key error at the row, but only after `NOT NULL`, `CHECK` and `UNIQUE`
+        // had their say, and the key trigger runs before all of them. Raising
+        // here reported the foreign key for a row that also broke one of those,
+        // and for a row `OR IGNORE` was about to skip. The statement checks the
+        // key when it ends instead, and `write` leaves `last_insert_rowid()`
+        // alone when the statement was a single row.
+        //
+        // The key trigger has already decided that the row has no parent, with
+        // the comparison SQLite makes at the row (for a self referencing key,
+        // the child's own value against the row's, with no affinity). The end
+        // of statement query compares columns with their affinities, which
+        // answers differently for an integer key and a text reference, so the
+        // decision is kept and not asked again.
         if top_level && self.single_row.get() {
-            return false;
+            self.row_time_violation.set(true);
+            return true;
         }
         let mut pending = self.pending_keys.borrow_mut();
         if !pending.iter().any(|held| held == trigger) {

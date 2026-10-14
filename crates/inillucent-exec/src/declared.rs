@@ -539,6 +539,26 @@ impl WriteDeclarations {
         }
     }
 
+    /// Turns an integer in a `REAL` column into a real, and leaves every other value as it is.
+    ///
+    /// **What reading a `REAL` column does in SQLite, without the rest of the column's
+    /// affinity (bug hunt 10).** An upsert's `excluded` row holds the values as the statement
+    /// supplied them, so a `TEXT` column given 21 reads as the integer 21; only a `REAL`
+    /// column widens on the way out, so `excluded.c` over a `REAL` column given 22 reads 22.0.
+    ///
+    /// @param row - the row as supplied, widened in place
+    pub fn widen_real_columns(&self, row: &mut [OwnedDatum]) {
+        for (slot, affinity) in &self.affinities {
+            if *affinity != Affinity::Real {
+                continue;
+            }
+            if let Some(cell @ OwnedDatum::Int(_)) = row.get_mut(*slot) {
+                let taken = std::mem::replace(cell, OwnedDatum::Null);
+                *cell = convert(taken, Affinity::Real);
+            }
+        }
+    }
+
     /// Refuses a value outside a `STRICT` column's type class, for a table
     /// with a generated column, before `NOT NULL` is checked.
     ///

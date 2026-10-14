@@ -183,7 +183,35 @@ pub fn index_is_narrower(
     index: &crate::catalog_view::IndexInfo,
 ) -> bool {
     if table.without_rowid {
-        return true;
+        // **A secondary index of a `WITHOUT ROWID` table ends with the primary
+        // key columns it does not already hold (bug hunt 10).** It is narrower
+        // than the table's row only when some column is in neither, which this
+        // used to assume for every such table. `SELECT *` from
+        // `t(a, b UNIQUE, PRIMARY KEY (c, a))` then walked the `b` index, and
+        // returned the rows in `b` order where SQLite reads the table in key
+        // order, the order of a `INSERT ... SELECT`'s rows as well.
+        //
+        // An index as wide as the row still wins when it was created after the
+        // primary key. SQLite lists the newest index first and keeps the first
+        // of two equal costs, so every `CREATE INDEX` over all the columns is
+        // walked in place of the table, and a `UNIQUE` column constraint is
+        // walked only when it comes after the `PRIMARY KEY` in the table.
+        let position_of = |wanted: u32| table.indexes.iter().position(|held| held.root == wanted);
+        if let (Some(key_at), Some(index_at)) = (position_of(table.root), position_of(index.root)) {
+            if index_at > key_at {
+                return true;
+            }
+        }
+        let key = table.primary_key();
+        return table.columns.iter().enumerate().any(|(at, column)| {
+            let at = at as u16;
+            !(column.generated && !column.stored)
+                && !key.contains(&at)
+                && !index
+                    .columns
+                    .iter()
+                    .any(|held| held.plain_column() == Some(at))
+        });
     }
     let row: u32 = table
         .columns

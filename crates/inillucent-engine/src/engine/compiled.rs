@@ -515,11 +515,20 @@ impl crate::ImportedDatabase {
     ///
     /// @param pending - the triggers whose immediate check failed
     /// @param autocommit - whether the statement is its own transaction
+    /// @param row_time_violation - whether a single row `INSERT` wrote a row its key trigger
+    ///   found no parent for
     fn check_keys_at_statement_end(
         &mut self,
         pending: &[Vec<u8>],
         autocommit: bool,
+        row_time_violation: bool,
     ) -> DbResult<()> {
+        // A single row `INSERT` whose key trigger found no parent and whose row
+        // was written: the statement fails here, after `NOT NULL`, `CHECK` and
+        // `UNIQUE` had their say, with the answer the trigger gave.
+        if row_time_violation {
+            return Err(crate::engine::keys::foreign_key_violation());
+        }
         if !pending.is_empty() {
             self.check_pending_keys(pending)?;
         }
@@ -527,6 +536,42 @@ impl crate::ImportedDatabase {
             self.check_deferred_foreign_keys()?;
         }
         Ok(())
+    }
+
+    /// Replaces the failure of a statement that kept its rows with the foreign key error, when a
+    /// row it wrote broke an immediate key.
+    ///
+    /// **A key a row of this statement broke is checked even when the statement fails on another
+    /// constraint (bug hunt 10).** SQLite counts immediate foreign key violations as rows are
+    /// written and looks at the count when the statement halts. An `INSERT OR FAIL` that kept a
+    /// row breaking a key and then failed `NOT NULL` on a later row therefore ended with the
+    /// foreign key error and nothing kept. A statement that undoes its own rows anyway has
+    /// nothing to change by looking.
+    ///
+    /// Only a failure the `FAIL` algorithm itself raised. A `STRICT` datatype failure inside a
+    /// transaction also keeps the rows (`unwind_in`), but SQLite raises it without the halt that
+    /// looks at the count, so it is reported as it is.
+    ///
+    /// @param error - what the statement failed with
+    /// @param key_checks - the immediate keys the statement's rows broke
+    /// @param autocommit - whether the statement is its own transaction
+    fn fail_error_counts_keys(
+        &mut self,
+        error: DbError,
+        key_checks: &KeyChecks,
+        autocommit: bool,
+    ) -> DbError {
+        if error.unwind() != Unwind::Nothing {
+            return error;
+        }
+        let pending = self.check_pending_keys(&key_checks.pending);
+        // An autocommit statement that keeps its rows commits them, and the commit checks the
+        // deferred keys the rows broke, so those fail the statement too.
+        let deferred = match autocommit {
+            true => self.check_deferred_foreign_keys(),
+            false => Ok(()),
+        };
+        pending.and(deferred).err().unwrap_or(error)
     }
 
     /// Clears `PRAGMA defer_foreign_keys` where SQLite clears it.
@@ -1215,6 +1260,23 @@ impl crate::ImportedDatabase {
         select.order_by = kept.order_by.to_vec();
         dml::hint_target(&mut select, hint, index_exprs);
         let mut plan = plan_select_with(select, self.pragmas.levers());
+        // **A write with no `WHERE` walks the table, not a covering index
+        // (bug hunt 10).** The keys query projects only the key, so the read
+        // planner chose the narrowest index that holds it, and `UPDATE t SET
+        // ...` and `DELETE FROM t` visited rows in that index's order. SQLite
+        // scans the table itself, so `RETURNING`, trigger and `rowid` order all
+        // follow the rowid (the primary key for a `WITHOUT ROWID` table). An
+        // `INDEXED BY` clause, an `ORDER BY` and a `WHERE` keep the plan's own
+        // choice, since each of them is what SQLite plans around.
+        let walks_the_table = filter.is_none()
+            && kept.order_by.is_empty()
+            && table.kind == inillucent_sql::catalog_view::TableKind::Table
+            && !matches!(hint, inillucent_sql::bind::IndexChoice::Only(_));
+        if walks_the_table {
+            for planned in &mut plan.sources {
+                planned.path = inillucent_sql::plan::AccessPath::TableScan { root: table.root };
+            }
+        }
         // **The one place `Levers::INDEXED_WRITE` has to be applied by hand.**
         // `plan_select_with` is the ordinary read planner, shared with every
         // `SELECT`, so nothing in it ever consulted this lever -
@@ -1238,7 +1300,32 @@ impl crate::ImportedDatabase {
                 *residual = filter.cloned();
             }
         }
-        let prepared = physical::prepare_any(&plan, self)?;
+        // The physical pass swaps a plain table scan for a scan of the
+        // narrowest index that holds the columns read, which is the same
+        // change of order again, so the scan is forced to stay on the table.
+        // That covers a `WHERE` no index answers as well: `DELETE FROM t WHERE
+        // a > 7 OR b < 9` visited rows in the order of an index that held `a`
+        // and `b`, where SQLite scans the table.
+        let stays_on_the_table = table.kind == inillucent_sql::catalog_view::TableKind::Table
+            && !matches!(hint, inillucent_sql::bind::IndexChoice::Only(_))
+            && !plan.sources.is_empty()
+            && plan.sources.iter().all(|planned| {
+                matches!(
+                    planned.path,
+                    inillucent_sql::plan::AccessPath::TableScan { .. }
+                )
+            });
+        let prepared = match walks_the_table || stays_on_the_table {
+            true => physical::prepare(
+                &plan,
+                self,
+                physical::ForcePlan {
+                    table_scan: true,
+                    ..physical::ForcePlan::default()
+                },
+            )?,
+            false => physical::prepare_any(&plan, self)?,
+        };
         Ok((plan, prepared))
     }
 
@@ -1360,7 +1447,7 @@ impl crate::ImportedDatabase {
         // Where this statement's writes begin, in both of the transaction's
         // records. See `statement_mark` for why it costs nothing.
         let mark = self.statement_mark();
-        let (applied, wrote, counted, deferred, pending_keys) = self.with_write_view(txn, |view| {
+        let (applied, wrote, counted, deferred, key_checks) = self.with_write_view(txn, |view| {
             // **Not `?`.** A failed statement has writes of its own to put
             // back, and the borrow of the trees has to end before anything can.
             let applied = apply(view, params);
@@ -1376,12 +1463,16 @@ impl crate::ImportedDatabase {
             // it - so the counters have to see it.
             let counted = view.rows_written();
             let deferred = std::mem::take(&mut view.deferred);
-            let pending_keys = view.pending_keys.take();
-            (applied, wrote, counted, deferred, pending_keys)
+            let key_checks = KeyChecks {
+                pending: view.pending_keys.take(),
+                row_time_violation: view.row_time_violation.get(),
+            };
+            (applied, wrote, counted, deferred, key_checks)
         });
         let changes = match applied {
             Ok(changes) => changes,
             Err(error) => {
+                let error = self.fail_error_counts_keys(error, &key_checks, autocommit);
                 // **The rowid moves even though the row does not.** SQLite
                 // documents `last_insert_rowid()` as the last rowid
                 // *attempted*, and measures out that way: an `INSERT` of two
@@ -1411,10 +1502,27 @@ impl crate::ImportedDatabase {
             }
         };
         self.writing.set_touched(self.writing.touched() | wrote);
-        if let Err(error) = self.check_keys_at_statement_end(&pending_keys, autocommit) {
+        let row_time = key_checks.row_time_violation && changes.rows > 0;
+        if let Err(error) =
+            self.check_keys_at_statement_end(&key_checks.pending, autocommit, row_time)
+        {
+            // **`RETURNING` rows come out before a deferred key's failure
+            // (bug hunt 10).** SQLite hands the rows out as the statement runs
+            // and finds the deferred key broken only at the commit, which for
+            // an autocommit statement is the end of the same call, so a reader
+            // gets the rows and then the error.
+            if autocommit && key_checks.pending.is_empty() && !row_time {
+                physical::keep_partial_rows(changes.returned.clone());
+            }
             // The rows were written before the check failed, and SQLite leaves
-            // `last_insert_rowid()` on the last of them.
-            self.remember_rowid(changes.last_rowid);
+            // `last_insert_rowid()` on the last of them. An immediate key a single
+            // row `INSERT` broke is the exception: SQLite raises that error before
+            // it writes the row, and it is checked here only so the other
+            // constraints can fail first (bug hunt 10), so the rowid does not
+            // move. A deferred key fails at the commit, after the rowid moved.
+            if !row_time {
+                self.remember_rowid(changes.last_rowid);
+            }
             self.record_changes(0, counted.1.saturating_sub(counted.0));
             return Err(self.abandon(error, mark, autocommit, wrote, txn));
         }
@@ -1561,6 +1669,7 @@ impl crate::ImportedDatabase {
             deferred: Vec::new(),
             pending_keys: std::cell::RefCell::new(Vec::new()),
             single_row: std::cell::Cell::new(false),
+            row_time_violation: std::cell::Cell::new(false),
         };
         work(&mut view)
     }
@@ -1723,6 +1832,14 @@ impl crate::ImportedDatabase {
         self.writing.set_statement_txn(None);
         undone.err().unwrap_or(error)
     }
+}
+
+/// What a statement's key triggers found while it wrote, read off the write view when it ends.
+struct KeyChecks {
+    /// The foreign key triggers whose immediate check failed, each checked again at the end.
+    pending: Vec<Vec<u8>>,
+    /// Whether the key trigger of that single row found the row without a parent.
+    row_time_violation: bool,
 }
 
 /// The three clauses that decide which of a write's matching rows it changes.

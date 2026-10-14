@@ -3624,7 +3624,8 @@ impl<'a> Binder<'a> {
                 // `excluded` is a row in registers rather than a record, so the
                 // compiler substitutes it wholesale and the slot is never read.
                 slot: position,
-                affinity: info.affinity,
+                // No affinity: the row holds the values as supplied (bug hunt 10).
+                affinity: inillucent_value::affinity::Affinity::Blob,
                 collation,
             });
         }
@@ -3685,7 +3686,8 @@ impl<'a> Binder<'a> {
                 // The row lives in registers rather than in a record, so the
                 // compiler substitutes it wholesale and the slot is never read.
                 slot: position,
-                affinity: info.affinity,
+                // No affinity: `new.c0 = 7` over a `TEXT` column holding '7' is false (bug hunt 10).
+                affinity: inillucent_value::affinity::Affinity::Blob,
                 collation,
             });
         }

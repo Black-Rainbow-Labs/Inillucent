@@ -183,6 +183,15 @@ impl ImportedDatabase {
     }
 }
 
+/// Returns the error a statement fails with when a foreign key is broken.
+pub(crate) fn foreign_key_violation() -> DbError {
+    DbError::new(inillucent_base::ExtendedCode(
+        inillucent_sql::dml::codes::FOREIGN_KEY,
+    ))
+    .with_message("FOREIGN KEY constraint failed")
+    .with_detail("FOREIGN KEY constraint failed")
+}
+
 /// How many times the cyclic sweep repeats before it gives up.
 ///
 /// One pass per level of the deepest chain in the data. A tree deeper than this

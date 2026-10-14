@@ -1072,6 +1072,23 @@ impl Statement {
     pub(crate) fn query_names(&self) -> Option<std::rc::Rc<Vec<String>>> {
         match &**self.cached.borrow() {
             Cached::Select(_, _, _, names) => Some(std::rc::Rc::clone(names)),
+            // A write with `RETURNING` also hands out rows, and a deferred
+            // foreign key can fail it after them (bug hunt 10).
+            Cached::Insert(statement, _, _, _) if !statement.returning.is_empty() => {
+                Some(std::rc::Rc::new(crate::engine::explain::returning_names(
+                    &statement.returning,
+                )))
+            }
+            Cached::Update(statement, _, _, _) if !statement.returning.is_empty() => {
+                Some(std::rc::Rc::new(crate::engine::explain::returning_names(
+                    &statement.returning,
+                )))
+            }
+            Cached::Delete(statement, _) if !statement.returning.is_empty() => {
+                Some(std::rc::Rc::new(crate::engine::explain::returning_names(
+                    &statement.returning,
+                )))
+            }
             _ => None,
         }
     }

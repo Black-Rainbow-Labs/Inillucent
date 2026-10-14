@@ -2418,8 +2418,11 @@ impl<'a> Binder<'a> {
         // `excluded`.
         self.excluded = Some(table.clone());
         let mut bound = Vec::with_capacity(insert.upserts.len());
-        for upsert in &insert.upserts {
-            match self.bind_upsert_body(table, upsert) {
+        // SQLite numbers the clause in its refusal only when it has to tell
+        // several apart.
+        let several = insert.upserts.len() > 1;
+        for (nth, upsert) in insert.upserts.iter().enumerate() {
+            match self.bind_upsert_body(table, upsert, several.then_some(nth)) {
                 Ok(Some(one)) => bound.push(one),
                 Ok(None) => {}
                 Err(error) => {
@@ -2433,12 +2436,18 @@ impl<'a> Binder<'a> {
     }
 
     /// Binds an upsert's target, assignments and filter.
+    ///
+    /// @param table - the table being inserted into
+    /// @param upsert - the clause
+    /// @param nth - the clause's place among several, counted from zero, when
+    ///   the statement has more than one
     fn bind_upsert_body(
         &mut self,
         table: &TableInfo,
         upsert: &ast::Upsert,
+        nth: Option<usize>,
     ) -> Result<Option<BoundUpsert>, ParseError> {
-        let constraint = self.upsert_constraint(table, upsert)?;
+        let constraint = self.upsert_constraint(table, upsert, nth)?;
         let mut assignments = Vec::new();
         for (names, value) in &upsert.assignments {
             let values = self.assigned_values(names, *value)?;
@@ -2576,10 +2585,13 @@ impl<'a> Binder<'a> {
     ///
     /// @param table - the table being inserted into
     /// @param upsert - the clause
+    /// @param nth - the clause's place among several, counted from zero, when
+    ///   the statement has more than one: the refusal names it, as SQLite's does
     fn upsert_constraint(
         &mut self,
         table: &TableInfo,
         upsert: &ast::Upsert,
+        nth: Option<usize>,
     ) -> Result<UpsertConstraint, ParseError> {
         if upsert.target.is_empty() {
             return Ok(UpsertConstraint::Any);
@@ -2593,7 +2605,7 @@ impl<'a> Binder<'a> {
             return Ok(UpsertConstraint::OwnKey);
         }
         for (position, index) in table.indexes.iter().enumerate() {
-            if !self.index_matches_target(index, &terms, target_where.as_ref())? {
+            if !self.index_matches_target(table, index, &terms, target_where.as_ref())? {
                 continue;
             }
             return Ok(if index.root == table.root {
@@ -2602,8 +2614,14 @@ impl<'a> Binder<'a> {
                 UpsertConstraint::Index(position)
             });
         }
+        let which = match nth {
+            Some(nth) => format!("{} ", ordinal(nth.saturating_add(1))),
+            None => String::new(),
+        };
         Err(crate::bind::schema_refused(
-            "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+            format!(
+                "{which}ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"
+            ),
             Span::default(),
         ))
     }
@@ -2649,11 +2667,20 @@ impl<'a> Binder<'a> {
 
     /// Reports whether a conflict target names exactly one unique index.
     ///
+    /// **An index that holds the rowid alias is never named by a target
+    /// (bug hunt 10).** SQLite resolves the alias in the target to the rowid,
+    /// and the index stores it as the column it is declared as, so the two
+    /// never compare equal: `ON CONFLICT (c, a)` over `UNIQUE (c, a)` with `a
+    /// INTEGER PRIMARY KEY` is refused. The table's own key is matched before
+    /// this is asked.
+    ///
+    /// @param table - the table being inserted into
     /// @param index - the candidate
     /// @param terms - the bound target
     /// @param target_where - the target's own `WHERE`, bound
     fn index_matches_target(
         &mut self,
+        table: &TableInfo,
         index: &IndexInfo,
         terms: &[TargetTerm],
         target_where: Option<&BoundExpr>,
@@ -2674,10 +2701,13 @@ impl<'a> Binder<'a> {
             // that names the column is the same constraint even though the index
             // computes its entries (`column` is set on both kinds of key).
             let found = match (key.column, key.expr_sql.as_ref()) {
-                (Some(position), _) => terms.iter().any(|term| {
-                    matches!(term, TargetTerm::Column(held, named)
-                        if *held == position && collation_fits(named, &key.collation))
-                }),
+                (Some(position), _) => {
+                    table.rowid_alias != Some(position)
+                        && terms.iter().any(|term| {
+                            matches!(term, TargetTerm::Column(held, named)
+                                if *held == position && collation_fits(named, &key.collation))
+                        })
+                }
                 (None, Some(sql)) => {
                     let bound = self.bind_schema_expr(sql)?;
                     terms.iter().any(|term| {
@@ -2829,6 +2859,20 @@ fn target_operand(ast: &crate::Ast, column: &ast::IndexedColumn) -> ast::ExprId 
         Some(ast::Expr::Collate { operand, .. }) => *operand,
         _ => column.expr,
     }
+}
+
+/// Writes a number as SQLite's `%r` does: `1st`, `2nd`, `3rd`, `4th`, `11th`.
+///
+/// @param number - a count from one
+fn ordinal(number: usize) -> String {
+    let suffix = match (number % 100, number % 10) {
+        (11..=13, _) => "th",
+        (_, 1) => "st",
+        (_, 2) => "nd",
+        (_, 3) => "rd",
+        _ => "th",
+    };
+    format!("{number}{suffix}")
 }
 
 /// Reports whether a bound conflict target names the table's own key.

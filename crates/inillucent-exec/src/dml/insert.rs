@@ -201,6 +201,7 @@ pub(super) fn insert_rows(
     let mut high_water = sequence_mark.as_ref().map_or(0, |mark| mark.seq);
     let mut changes = Changes::default();
     let captured = target.captures(table.root);
+    let request = request_for(compiled, params, depth);
     for supplied_row in rows.iter() {
         // See `give_back`: a skipped row hands its rowid back.
         let rowid_before = next_rowid;
@@ -216,6 +217,7 @@ pub(super) fn insert_rows(
         // so `typeof(NEW.a)` over a `REAL` column reads `real` for a `42`.
         if !statement.triggers.is_empty() {
             declarations.apply_affinity(&mut image);
+            check_types_before_triggers(statement, declarations, space, &image)?;
         }
         // **`BEFORE` fires on the row as it will be written**, which is where
         // every foreign-key check on the child's side lives: the binder turns
@@ -226,8 +228,7 @@ pub(super) fn insert_rows(
         //
         // A key the statement left out is -1 in a `BEFORE INSERT` body, as in
         // SQLite, which fires it before the key is allocated.
-        let unassigned =
-            !statement.triggers.is_empty() && plan.rowid_is_unassigned(supplied_row, space)?;
+        let unassigned = key_is_unassigned(statement, layout, (plan, space), supplied_row)?;
         let firing = trigger::TriggerFiring {
             rows: trigger::TriggerRows {
                 old: None,
@@ -274,6 +275,7 @@ pub(super) fn insert_rows(
         // **Affinity first, then the constraints.** `NOT NULL`, `STRICT` and
         // `CHECK` all test the value that will actually be stored, and after
         // affinity `'42'` in an `INTEGER` column *is* the integer 42.
+        let supplied_image = supplied_for_upsert(statement, declarations, &image);
         plan.convert(declarations, space, &mut image)?;
         // **The statement's own `OR` algorithm, not the upsert's arm.** A
         // `NOT NULL` or a `CHECK` is not a key collision, and an
@@ -282,11 +284,10 @@ pub(super) fn insert_rows(
         // constraint silently not enforced on the ordinary
         // `INSERT ... ON CONFLICT DO NOTHING`.
         let declared = resolution_of(statement.on_conflict);
-        if !declarations_are_met(table, layout, declarations, space, &mut image, declared)? {
+        if !meet_declarations(statement, target, request, (plan, space), &mut image)? {
             give_back(table, &mut next_rowid, rowid_before);
             continue;
         }
-        declarations.types_are_met(table, space, &image)?;
         if !declarations.checks_are_met(space, &image, declared == Resolution::Skip)? {
             give_back(table, &mut next_rowid, rowid_before);
             continue;
@@ -297,13 +298,8 @@ pub(super) fn insert_rows(
             plan,
             target,
             image,
-            WriteRequest {
-                layout,
-                params,
-                depth,
-                indexes: IndexExprs::new(declarations, space),
-                declarations,
-            },
+            request,
+            &supplied_image,
         )?
         else {
             give_back(table, &mut next_rowid, rowid_before);
@@ -340,6 +336,192 @@ pub(super) fn insert_rows(
     close_sequence(statement, target, sequence_mark.as_ref(), high_water)?;
     Ok(changes)
 }
+/// Fires the foreign key triggers again for a row whose `NULL` a default replaced.
+///
+/// **The key triggers fire before `NOT NULL` is met, and `INSERT OR REPLACE` meets it by writing
+/// the column's default (bug hunt 10).** A `NULL` in a child column passes the key check, and the
+/// default that replaces it afterwards was never checked: `INSERT OR REPLACE INTO c(k) VALUES
+/// (NULL)` over `k NOT NULL DEFAULT 2 REFERENCES p` stored a row with no parent, where SQLite
+/// fails the statement. Nothing runs when the default changed nothing.
+///
+/// @param statement - the bound insert
+/// @param target - the file and its trees
+/// @param request - the layout, parameters and depth of the write
+/// @param images - the row before the defaults went in (empty when none could), and the row after
+fn recheck_keys_after_defaults(
+    statement: &BoundInsert,
+    target: &mut dyn WriteTarget,
+    request: WriteRequest<'_>,
+    images: (&[OwnedDatum], &[OwnedDatum]),
+) -> DbResult<()> {
+    let (before, after) = images;
+    if before.is_empty() || before == after {
+        return Ok(());
+    }
+    let firing = trigger::TriggerFiring {
+        rows: trigger::TriggerRows {
+            old: None,
+            new: Some(after),
+        },
+        slots: &request.layout.slots,
+        rowid: request.layout.rowid,
+        params: request.params,
+        depth: request.depth,
+    };
+    trigger::fire_where(
+        &statement.triggers,
+        TriggerTime::Before,
+        target,
+        &firing,
+        &|held| held.foreign_key,
+    )?;
+    Ok(())
+}
+
+/// Builds what every row of an insert is written under.
+///
+/// @param compiled - the plan, row space, layout and declarations the insert compiled
+/// @param params - the bound parameters
+/// @param depth - how many triggers deep the insert is
+fn request_for<'a>(
+    compiled: &'a CompiledInsert,
+    params: &'a Params,
+    depth: Depth,
+) -> WriteRequest<'a> {
+    WriteRequest {
+        layout: &compiled.layout,
+        params,
+        depth,
+        indexes: IndexExprs::new(&compiled.declarations, &compiled.space),
+        declarations: &compiled.declarations,
+    }
+}
+
+/// Meets the table's declarations for one row about to be written.
+///
+/// `NOT NULL` first, which `OR REPLACE` meets by writing a column's default; then the key
+/// triggers again for a row a default changed, the stored generated columns it feeds, and the
+/// `STRICT` types. Returns false when the statement's `OR` clause skips the row.
+///
+/// @param statement - the bound insert
+/// @param target - the file and its trees
+/// @param request - the layout, parameters, depth and declarations of the write
+/// @param planned - the compiled plan and the row space it evaluates in
+/// @param image - the row, completed in place
+fn meet_declarations(
+    statement: &BoundInsert,
+    target: &mut dyn WriteTarget,
+    request: WriteRequest<'_>,
+    planned: (&InsertPlan, &RowSpace),
+    image: &mut [OwnedDatum],
+) -> DbResult<bool> {
+    let (plan, space) = planned;
+    let (table, declarations) = (&statement.table, request.declarations);
+    let declared = resolution_of(statement.on_conflict);
+    let before_defaults = image_before_defaults(statement, declared, image);
+    if !declarations_are_met(table, request.layout, declarations, space, image, declared)? {
+        return Ok(false);
+    }
+    recheck_keys_after_defaults(statement, target, request, (&before_defaults, image))?;
+    // **`OR REPLACE` may have put a column's default where a NULL was (bug hunt 10).** The
+    // stored generated columns were computed from the NULL, so the row stored a generated value
+    // that disagreed with the column it is computed from.
+    if declared == Resolution::Replace && plan.has_stored_generated() {
+        plan.convert(declarations, space, image)?;
+    }
+    declarations.types_are_met(table, space, image)?;
+    Ok(true)
+}
+
+/// Returns the row to hold on to while `OR REPLACE` may fill in defaults, empty when it cannot.
+///
+/// @param statement - the bound insert
+/// @param declared - the statement's conflict algorithm
+/// @param image - the row as it is before the declarations are met
+fn image_before_defaults(
+    statement: &BoundInsert,
+    declared: Resolution,
+    image: &[OwnedDatum],
+) -> Vec<OwnedDatum> {
+    match declared == Resolution::Replace && statement.triggers.iter().any(|held| held.foreign_key)
+    {
+        true => image.to_vec(),
+        false => Vec::new(),
+    }
+}
+
+/// Type checks a `STRICT` table's row before its `BEFORE` triggers fire.
+///
+/// **SQLite checks the types of the row it hands the trigger (bug hunt 10)**, so a row with a
+/// wrong type and a missing `NOT NULL` value reports the type. Without a `BEFORE` trigger the
+/// check follows `NOT NULL`. A key trigger is not a `BEFORE` trigger of the table's own.
+///
+/// @param statement - the bound insert
+/// @param declarations - the table's compiled declarations
+/// @param space - the row space the expressions read
+/// @param image - the row the triggers will see
+fn check_types_before_triggers(
+    statement: &BoundInsert,
+    declarations: &WriteDeclarations,
+    space: &RowSpace,
+    image: &[OwnedDatum],
+) -> DbResult<()> {
+    let before_trigger = statement
+        .triggers
+        .iter()
+        .any(|held| held.time == TriggerTime::Before && !held.foreign_key);
+    match statement.table.strict && before_trigger {
+        true => declarations.types_are_met(&statement.table, space, image),
+        false => Ok(()),
+    }
+}
+
+/// Reports whether the statement leaves the table's key to be allocated, as a trigger sees it.
+///
+/// **A table with no rowid has no key to leave unassigned (bug hunt 10).** Asking anyway made a
+/// `WITHOUT ROWID` table with a trigger allocate a rowid, which reads the table's largest integer
+/// key; once a long text key was in the leaf, that read failed with "this value is stored out of
+/// line" on that insert and on every later one.
+///
+/// @param statement - the bound insert
+/// @param layout - the layout of the table being written
+/// @param planned - the compiled plan and the row space it evaluates in
+/// @param supplied - the values the statement's source produced
+fn key_is_unassigned(
+    statement: &BoundInsert,
+    layout: &SourceLayout,
+    planned: (&InsertPlan, &RowSpace),
+    supplied: &[OwnedDatum],
+) -> DbResult<bool> {
+    if statement.triggers.is_empty() || layout.rowid.is_none() {
+        return Ok(false);
+    }
+    planned.0.rowid_is_unassigned(supplied, planned.1)
+}
+
+/// Returns the row as the statement supplied it, for an upsert arm to read as `excluded`.
+///
+/// **`excluded` is the row before the column's affinity changes it (bug hunt 10).** So
+/// `typeof(excluded.c1)` over a `TEXT` column given 21 is `integer` and `excluded.c1 > 3`
+/// compares a number. A `REAL` column still widens an integer, because SQLite does that when
+/// the column is read. Empty when the statement has no upsert arm to read it.
+///
+/// @param statement - the bound insert
+/// @param declarations - the table's compiled declarations
+/// @param image - the row before the affinity is applied
+fn supplied_for_upsert(
+    statement: &BoundInsert,
+    declarations: &WriteDeclarations,
+    image: &[OwnedDatum],
+) -> Vec<OwnedDatum> {
+    if statement.upsert.is_empty() {
+        return Vec::new();
+    }
+    let mut supplied = image.to_vec();
+    declarations.widen_real_columns(&mut supplied);
+    supplied
+}
+
 /// Fires a written row's `AFTER INSERT` triggers and counts the row, and answers whether a
 /// trigger ignored the row.
 ///
@@ -953,6 +1135,9 @@ fn insert_into_view(
 /// @param plan - the compiled statement
 /// @param target - the file and its trees
 /// @param row - the row image, in tree-column order
+/// @param request - the layout, parameters, depth and declarations of the write
+/// @param supplied - the row as the statement supplied it, which an upsert arm reads as
+///   `excluded`; empty when the statement has no upsert arm
 fn write_one(
     statement: &BoundInsert,
     space: &RowSpace,
@@ -960,6 +1145,7 @@ fn write_one(
     target: &mut dyn WriteTarget,
     row: Row,
     request: WriteRequest<'_>,
+    supplied: &[OwnedDatum],
 ) -> DbResult<Option<Stored>> {
     let WriteRequest {
         layout, indexes, ..
@@ -1075,7 +1261,7 @@ fn write_one(
                     target,
                     &Upsert {
                         clash: &clash,
-                        excluded: &row,
+                        excluded: if supplied.is_empty() { &row } else { supplied },
                         arm,
                     },
                     request,

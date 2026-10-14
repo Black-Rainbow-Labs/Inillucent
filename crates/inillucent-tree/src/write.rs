@@ -779,6 +779,28 @@ impl std::ops::Add for WriteStats {
     }
 }
 
+/// Gives back the out of line values a refused row had already written.
+///
+/// **The row is refused after its wide values were written (bug hunt 10).** Nothing names those
+/// pages once the insert stops at a duplicate key, so a refused insert of a long text left them
+/// allocated and unreachable: `integrity_check` reported `Page 5: never used` and ten refused
+/// inserts grew the file by four pages. The references freed are the ones this call wrote, and
+/// none that a stored row holds.
+///
+/// @param database - the file
+/// @param log - where the records go
+/// @param runs - the run each value of the refused row went into, one entry per column
+fn free_refused_values(
+    database: &mut Database,
+    log: &mut dyn TreeLog,
+    runs: &[Option<ExtentRef>],
+) -> DbResult<()> {
+    for reference in runs.iter().flatten() {
+        crate::paged::free_extent(database, log, *reference)?;
+    }
+    Ok(())
+}
+
 impl PagedTree {
     /// Returns what the write path has done to this tree.
     pub fn write_stats(&self) -> WriteStats {
@@ -1525,7 +1547,7 @@ impl PagedTree {
             // A caller that refuses a duplicate is told so before anything is
             // written, which is the whole point of asking.
             if !replace && previous.is_some() {
-                return Ok(previous);
+                return free_refused_values(database, log, &arriving_runs).map(|()| previous);
             }
             let Some(costed) = costed else {
                 // Attempt 1 has already had room made for it and a `Stuck`

@@ -355,6 +355,11 @@ impl Building {
         let declared = resolution_of(statement.on_conflict);
         let met = declarations_are_met(table, layout, declarations, space, &mut image, declared)?;
         if met {
+            // A default `OR REPLACE` put where a NULL was changes what a stored
+            // generated column computes to (bug hunt 10); see `insert_rows`.
+            if declared == Resolution::Replace && plan.has_stored_generated() {
+                plan.convert(declarations, space, &mut image)?;
+            }
             declarations.types_are_met(table, space, &image)?;
         }
         if !met || !declarations.checks_are_met(space, &image, declared == Resolution::Skip)? {

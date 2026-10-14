@@ -271,6 +271,17 @@ fn decide(
     )? {
         return Ok(Rewrite::Skip);
     }
+    // A default `OR REPLACE` put where a NULL was changes what a stored
+    // generated column computes to (bug hunt 10); see `insert_rows`.
+    if resolution == Resolution::Replace && !setup.generated.is_empty() {
+        convert_after(
+            &setup.space,
+            &setup.generated,
+            &setup.declarations,
+            &[],
+            &mut after,
+        )?;
+    }
     declarations.types_are_met(table, &setup.space, &after)?;
     if !declarations.checks_are_met(&setup.space, &after, resolution == Resolution::Skip)? {
         return Ok(Rewrite::Skip);

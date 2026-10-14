@@ -112,7 +112,7 @@ pub fn delete_at(
         // without this row and without the rows before it, as SQLite's does; a
         // row a `BEFORE` trigger skipped is not returned.
         let mut returned: Option<Vec<OwnedDatum>> = None;
-        if remove_then(
+        let removed = remove_then(
             table,
             target,
             key,
@@ -138,7 +138,15 @@ pub fn delete_at(
                 returned = Some(out);
                 Ok(())
             },
-        )? {
+        );
+        let removed = match removed {
+            Ok(removed) => removed,
+            Err(error) => {
+                count_row_gone_before_failure(table, target, key, depth, &mut changes);
+                return Err(error);
+            }
+        };
+        if removed {
             count_row(&mut changes, target, depth);
             if let Some(out) = returned {
                 changes.returned.push(out);
@@ -473,6 +481,30 @@ pub(crate) fn remove_with_triggers(
         replacing,
         &mut |_| Ok(()),
     )
+}
+/// Counts a row that was removed before an `AFTER` trigger failed the statement.
+///
+/// **A row the statement removed is counted even when its own `AFTER DELETE`
+/// trigger raises (bug hunt 10).** `RAISE(FAIL)` keeps the rows the statement
+/// removed, and SQLite counts the row whose trigger failed among them, so
+/// `changes()` and `total_changes()` were each one short. A failure before the
+/// removal, from a `BEFORE` trigger, leaves the row in place and counts nothing.
+///
+/// @param table - the table being written
+/// @param target - the file and its trees
+/// @param key - the row's key
+/// @param depth - how many triggers deep this write already is
+/// @param changes - what the statement has changed so far
+fn count_row_gone_before_failure(
+    table: &TableInfo,
+    target: &mut dyn WriteTarget,
+    key: &[OwnedDatum],
+    depth: Depth,
+    changes: &mut Changes,
+) {
+    if let Ok(false) = row_exists(table, target, key) {
+        count_row(changes, target, depth);
+    }
 }
 /// Removes one row like [`remove_with_triggers`], running a step between the
 /// removal and the `AFTER` triggers.

@@ -51,6 +51,34 @@ application filtering a Slack archive by date and by several channels found it.
   `COLLATE NOCASE`, is still applied to the `k` rows the search returns. `docs/vector-search.md`
   lists which tests run where.
 
+**A bug hunt over random write workloads found 21 more differences from SQLite 3.53.4, and this
+fixes them.** The workloads were compared with SQLite after every block, including
+`PRAGMA integrity_check` and a reopen.
+
+- An `INSERT` refused for a duplicate key no longer leaves the pages of a long value it had already
+  written. Ten refused inserts of a 9,000 byte text grew the file by four pages, and
+  `integrity_check` reported `Page 5: never used`. `integrity_check` inside a transaction also no
+  longer reports the pages of an index that `REINDEX` replaced, or of a dropped table, before the
+  commit gives them back.
+- An immediate foreign key is checked after `NOT NULL`, `UNIQUE` and `CHECK`, so a row that breaks
+  one of those reports that error. `INSERT OR IGNORE` of a row skipped by one of them no longer
+  raises the foreign key error. `INSERT OR FAIL` of several rows keeps nothing when a row it wrote
+  broke a key and a later row failed another constraint. A deferred key that fails an autocommit
+  `INSERT ... RETURNING` returns the rows and then the error.
+- `UPDATE` and `DELETE` visit rows in the order SQLite does: the table in rowid order, for a
+  statement with no `WHERE` or with a `WHERE` no index answers. They used the narrowest index that
+  held the columns the statement read. A `WITHOUT ROWID` table is read in key order unless a
+  covering index was created after its primary key, as SQLite does.
+- `INSERT OR REPLACE` and `UPDATE OR REPLACE` recompute a `STORED` generated column after a default
+  replaced a `NULL`. A `WITHOUT ROWID` table with a `UNIQUE` column that is also a `DESC` primary
+  key column opens and updates, and an `ON CONFLICT` target on a unique index that holds the rowid
+  alias is refused. The refusal names the clause by position when there are several.
+- An upsert's `excluded.col` and `new.col` and `old.col` in a trigger compare without the column's
+  affinity: `excluded.c1 > 3` over a `TEXT` column given 21 is true, and `new.c0 = 7` over a `TEXT`
+  column holding `'7'` is false.
+- `changes()` and `total_changes()` count the row whose `AFTER` trigger raised `RAISE(FAIL)`.
+  A `STRICT` table is type checked before its `BEFORE INSERT` triggers fire.
+
 **The published `inillucent` crate builds with the `embed` feature in a new project.**
 `inillucent-core` asked for `ort` version `2.0.0-rc.10`, which cargo reads as any later release
 candidate. With no lock file, cargo picked `2.0.0-rc.14`, which changed `Session::builder` and removed

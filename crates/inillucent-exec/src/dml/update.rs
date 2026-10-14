@@ -222,6 +222,16 @@ pub fn update_at_cached(
         }
         convert_after(space, generated, declarations, &answers, &mut after)?;
         check_key_is_integer(&layout, &mut after)?;
+        // A `STRICT` table is type checked before a `BEFORE` trigger fires, as an
+        // insert is (bug hunt 10): a trigger's own writes are not made, or counted,
+        // for a row the table refuses.
+        let before_trigger = statement
+            .triggers
+            .iter()
+            .any(|held| held.time == TriggerTime::Before && !held.foreign_key);
+        if table.strict && before_trigger {
+            declarations.types_are_met(table, space, &after)?;
+        }
         if trigger::fire(
             &statement.triggers,
             TriggerTime::Before,
@@ -270,6 +280,11 @@ pub fn update_at_cached(
         let resolution = resolution_of(statement.on_conflict);
         if !declarations_are_met(table, &layout, declarations, space, &mut after, resolution)? {
             continue;
+        }
+        // A default `OR REPLACE` put where a NULL was changes what a stored
+        // generated column computes to (bug hunt 10); see `insert_rows`.
+        if resolution == Resolution::Replace && !generated.is_empty() {
+            convert_after(space, generated, declarations, &answers, &mut after)?;
         }
         declarations.types_are_met(table, space, &after)?;
         if !declarations.checks_are_met(space, &after, resolution == Resolution::Skip)? {
