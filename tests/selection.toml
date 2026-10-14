@@ -1646,6 +1646,17 @@ covers = ["inillucent-tree", "inillucent-engine", "inillucent-pool"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "append_load_density"
+tier = "engine"
+covers = ["inillucent-tree", "inillucent-engine", "inillucent-exec"]
+# Rows loaded in key order take about the pages a bulk build gives them, and
+# VACUUM does not give back a looser file: an append split kept a narrow row's
+# leaf at 40% full.
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "write_speed"
 tier = "engine"
 covers = ["inillucent-tree", "inillucent-engine", "inillucent-exec", "inillucent-sql"]
@@ -2337,6 +2348,16 @@ covers = ["inillucent-engine", "inillucent-driver", "inillucent-pool"]
 # ROLLBACK, a COMMIT that wrote nothing and a connection PRAGMA take no lock, and
 # a transaction that touched nothing goes on after another connection's VACUUM.
 # Each was refused busy and could leave a transaction open (task-2264).
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "restored_copy_under_newer_log"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool"]
+# An older copy of the data file beside the log of the newer file opens as the
+# copy was, and a log that belongs to the file is still replayed.
 
 [[target]]
 package = "inillucent-compat"

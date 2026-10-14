@@ -301,6 +301,24 @@ impl Outcome {
                     self.text, recovery.dropped
                 );
         }
+        // **A log set aside is said, because the file is not what its log said
+        // it was.** An older copy of the data file was put back beside the log
+        // segments of a newer one; the file opened as the copy was and the
+        // segments are kept under names ending `.foreign`.
+        if recovery.set_aside > 0 {
+            self.extra.push((
+                "log_segments_set_aside".to_string(),
+                Json::Int(recovery.set_aside as i64),
+            ));
+            self.text = format!(
+                "{}{}{} log segment(s) beside this database were written against a different state of \
+                 the file, so they were not replayed. They were renamed with `.foreign` added to their \
+                 names. The database is as it was when the data file was copied.",
+                self.text,
+                if self.text.is_empty() { "" } else { "\n" },
+                recovery.set_aside
+            );
+        }
         if !strays.is_empty() {
             let named: Vec<Json> = strays
                 .iter()

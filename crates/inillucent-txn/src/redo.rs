@@ -1149,6 +1149,66 @@ impl<'a, R: RowRedo> Applier<'a, R> {
         };
         Ok(held.max(self.database.pool().page_count()))
     }
+
+    /// Refuses a committed bulk build whose root page is not the one the build wrote.
+    ///
+    /// **The one record that proves the log was written against a different
+    /// state of this file (bug hunt 10).** A bulk build writes its pages straight
+    /// into the data file and syncs it before the transaction commits, so the log
+    /// carries no image of them and every later row record for that tree assumes
+    /// they are there. A file restored from an older copy, with the log segments
+    /// the newer file wrote still beside it, does not have them. Replaying on
+    /// anyway either failed with `read 0 of 32768 bytes` on the first row record,
+    /// or wrote rows into a page that was never the leaf and reported nothing
+    /// until `integrity_check`.
+    ///
+    /// Two things say the page is not the build's. It is past the end of the file,
+    /// or it carries a stamp from before the checkpoint the replay starts at: a
+    /// logged build stamps its pages with the LSN of their `AllocPage` record
+    /// (`write_built_page`), and that record is in the window being replayed, so
+    /// a page stamped earlier is whatever the older file kept there. A page that
+    /// cannot be read at all says nothing, because a torn page is what the log
+    /// repairs and a build's root can be torn by a later flush in the same window.
+    ///
+    /// @param root - the root page the build named
+    fn refuse_a_build_the_file_does_not_hold(&mut self, root: u64) -> DbResult<()> {
+        let held = self.pages_the_file_holds()?;
+        let window = self
+            .database
+            .meta()
+            .checkpoint_lsn
+            .max(inillucent_wal::FIRST_LSN);
+        let stamped = match root < held {
+            true => self.page_lsn(root)?,
+            false => None,
+        };
+        match stamped {
+            Some(lsn) if lsn >= window => Ok(()),
+            None if root < held => Ok(()),
+            _ => Err(corrupt(format!(
+                "{FOREIGN_LOG}: a committed bulk build names root page {root}, which the file \
+                 holds as {held} pages and stamps {stamped:?}, and the replay starts at {window}"
+            ))),
+        }
+    }
+}
+
+/// What a replay says when the log it was given was written against a different
+/// state of the file than the one it is being applied to.
+///
+/// A phrase inside the error's detail rather than an error kind, because the
+/// replay reports through [`DbError`] and the caller that can act on it, the
+/// open, is three layers up and needs only to recognise it. See
+/// [`is_foreign_log`].
+pub const FOREIGN_LOG: &str = "the log does not belong to this file";
+
+/// Reports whether a failed replay failed because the log is not this file's.
+///
+/// @param error - what the replay returned
+pub fn is_foreign_log(error: &inillucent_base::DbError) -> bool {
+    error
+        .detail()
+        .is_some_and(|said| said.contains(FOREIGN_LOG))
 }
 
 impl<R: RowRedo> Redo for Applier<'_, R> {
@@ -1398,7 +1458,8 @@ impl<R: RowRedo> Applier<'_, R> {
             // `inillucent_wal::record::Body::BulkBuilt` for the commit order that
             // makes that true. It is counted so a recovery report can say a build
             // happened in the window, which is the only reason the record exists.
-            Body::BulkBuilt { count, .. } => {
+            Body::BulkBuilt { root, count, .. } => {
+                self.refuse_a_build_the_file_does_not_hold(root)?;
                 self.stats.bulk_built = self.stats.bulk_built.saturating_add(count)
             }
             Body::Format { version } => drop(self.database.raise_format(version)),

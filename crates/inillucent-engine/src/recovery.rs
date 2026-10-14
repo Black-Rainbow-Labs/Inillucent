@@ -88,6 +88,14 @@ pub struct RecoveryReport {
     /// holds positions the chain has already passed; a genuine later segment
     /// starts at or above this number.
     pub last_lsn: u64,
+    /// How many log segments this open set aside because they were written
+    /// against a different state of the file.
+    ///
+    /// **Not zero only after an older copy of the data file was put back under
+    /// a newer log (bug hunt 10).** The segments are renamed with `.foreign`
+    /// added to their names, so nothing replays them and nothing deletes them;
+    /// the file opens as the copy was when it was made.
+    pub set_aside: u64,
 }
 
 /// One database file, opened, recovered, and ready to be read.
@@ -307,6 +315,7 @@ fn open_with_nothing_to_replay(
         losers: 0,
         last_sequence: sequence,
         last_lsn: next_lsn,
+        set_aside: 0,
     };
     Ok(OpenedFile {
         database,
@@ -597,6 +606,11 @@ fn replay_with_repair(
         keep,
     ) {
         Ok(replayed) => Ok(replayed),
+        // **Not for a log that is another state of the file's** (bug hunt 10).
+        // The pages it needs are missing, not torn, and applying its images to
+        // the file would only build a copy of the wrong file; the caller,
+        // `replay_unless_foreign`, decides what to do about it.
+        Err(error) if inillucent_txn::redo::is_foreign_log(&error) => Err(error),
         // **A page the log holds whole, torn, and read by a record that is
         // not the one that would have fixed it (task-1962, roadmap item
         // 6).** Redo reads the page a row record changes, so a crash that
@@ -634,6 +648,105 @@ fn replay_with_repair(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Replays the log, and when it turns out to belong to another state of the
+/// file, sets it aside and opens the file as it is.
+///
+/// **A log that does not belong to the file is ignored, not applied and not
+/// deleted (bug hunt 10).** A segment names the database by uuid and its place
+/// in the chain by sequence, and a copy of the file has both, so an older copy
+/// put back over a newer file passes every check the header offers. What it
+/// lacks is the pages the newer file's bulk builds wrote straight into it, and
+/// `inillucent_txn::redo::is_foreign_log` recognises the first record that
+/// needs one. SQLite's WAL salts catch the same mistake by refusing frames that
+/// do not carry the database's salt. Here the replay stops without having
+/// written anything to the file, the pool is thrown away, the segments are
+/// renamed so nothing replays them again, and the open goes on from the file's
+/// own checkpoint. The renamed segments are kept for someone to look at.
+///
+/// A log that does belong is untouched: this path is taken only for that one
+/// error, and a read only connection cannot rename anything, so it reports the
+/// error as it always has.
+///
+/// @param database - the file being opened
+/// @param vfs - the file system the log lives on
+/// @param db_path - the database file
+/// @param start - where in the log to replay from
+/// @param checkpointed - the catalog the row decoder is seeded with
+/// @param tolerant - whether a record naming an unknown tree is skipped
+/// @param keep - whether to keep the last segment open, and where it goes; a
+///   connection that may not write beside the file keeps nothing writable
+fn replay_unless_foreign(
+    database: &mut Database,
+    vfs: &std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    db_path: &DbPath,
+    start: inillucent_wal::RecoveryStart,
+    checkpointed: &[SchemaEntry],
+    tolerant: bool,
+    keep: &mut Keep,
+) -> DbResult<(
+    inillucent_wal::recover::Recovered,
+    Vec<inillucent_txn::redo::FreeMapChange>,
+    u64,
+)> {
+    let as_opened = *database.meta();
+    let again = start.clone();
+    let may_write = keep.writable;
+    match replay_with_repair(database, vfs, db_path, start, checkpointed, tolerant, keep) {
+        Err(error) if may_write && inillucent_txn::redo::is_foreign_log(&error) => {
+            let set_aside = set_aside_the_log(vfs, db_path, again.sequence);
+            database.adopt_from_file(as_opened)?;
+            keep.segment = None;
+            let (outcome, changes) =
+                replay_with_repair(database, vfs, db_path, again, checkpointed, tolerant, keep)?;
+            Ok((outcome, changes, set_aside))
+        }
+        replayed => replayed.map(|(outcome, changes)| (outcome, changes, 0)),
+    }
+}
+
+/// Renames every log segment from a sequence upward so nothing replays it.
+///
+/// **Renamed rather than deleted**, because the file the log was written against
+/// may be the one somebody meant to keep, and the segments hold its commits. The
+/// new name adds `.foreign`, which `sequence_of_segment_name` does not read as a
+/// segment. A segment already set aside under that name is replaced.
+///
+/// The walk stops after sixteen sequence numbers in a row with no file, as
+/// `remove_log_segments` does, because the numbers are dense in practice and an
+/// unbounded walk over a `u64` is not a walk.
+///
+/// @param vfs - the file system the log lives on
+/// @param db_path - the database file the segments are named after
+/// @param from - the first sequence number that belongs to the log being set aside
+fn set_aside_the_log(
+    vfs: &std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    db_path: &DbPath,
+    from: u64,
+) -> u64 {
+    const TOLERATED_GAP: u64 = 16;
+    let name = db_path.as_path().to_string_lossy().to_string();
+    let directory = db_path.as_path().parent().map(std::path::Path::to_path_buf);
+    let (mut moved, mut missed, mut sequence) = (0u64, 0u64, from.max(1));
+    while missed < TOLERATED_GAP {
+        let path = inillucent_wal::writer::segment_path(&name, directory.as_deref(), sequence);
+        sequence = sequence.saturating_add(1);
+        if !matches!(
+            vfs.access(&path, inillucent_vfs::AccessMode::Exists),
+            Ok(true)
+        ) {
+            missed = missed.saturating_add(1);
+            continue;
+        }
+        missed = 0;
+        let aside = DbPath::new(format!("{}.foreign", path.as_path().to_string_lossy()));
+        let _ = vfs.delete(&aside, false);
+        if vfs.rename(&path, &aside).is_ok() {
+            moved = moved.saturating_add(1);
+        }
+    }
+    moved
 }
 
 /// Whether recovery keeps the last log segment it read open, and the segment
@@ -1070,7 +1183,7 @@ pub(crate) fn recover_the_open_file(
         writable: !read_only,
         segment: None,
     };
-    let (outcome, free_map) = replay_with_repair(
+    let (outcome, free_map, set_aside) = replay_unless_foreign(
         &mut database,
         vfs,
         db_path,
@@ -1170,6 +1283,7 @@ pub(crate) fn recover_the_open_file(
         losers: outcome.losers,
         last_sequence: sequence.max(outcome.sequence),
         last_lsn: next_lsn,
+        set_aside,
     };
     Ok(OpenedFile {
         database,

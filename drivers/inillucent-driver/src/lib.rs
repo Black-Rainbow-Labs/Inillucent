@@ -410,6 +410,13 @@ pub struct Recovery {
     pub last_sequence: u64,
     /// The stream position the chain ended at.
     pub last_lsn: u64,
+    /// How many log segments the open set aside because they were written
+    /// against a different state of the file.
+    ///
+    /// Not zero only after an older copy of the data file was put back beside
+    /// a newer file's log segments. They are renamed with `.foreign` added to
+    /// the name and not replayed, and the file opens as the copy was.
+    pub set_aside: u64,
 }
 
 impl Database {
@@ -498,6 +505,7 @@ impl Database {
             losers: report.losers,
             last_sequence: report.last_sequence,
             last_lsn: report.last_lsn,
+            set_aside: report.set_aside,
         }
     }
 

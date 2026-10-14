@@ -54,6 +54,7 @@ mod process_schema_change;
 mod process_storm;
 mod read_only_connection;
 mod reindex_crash;
+mod restored_copy_under_newer_log;
 mod reused_key_extent;
 mod search_crash;
 mod storage_failure;

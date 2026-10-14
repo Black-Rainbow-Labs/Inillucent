@@ -815,6 +815,7 @@ impl Shell {
             losers: report.losers,
             last_sequence: report.last_sequence,
             last_lsn: report.last_lsn,
+            set_aside: report.set_aside,
         }
     }
 

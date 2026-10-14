@@ -10,6 +10,29 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**A table loaded in key order takes about the pages a bulk build gives it, and `VACUUM` keeps that.**
+Twenty thousand rows of two integer columns loaded in 500 row `INSERT ... VALUES` statements took 25
+pages of 32 KiB. The same rows copied by one `INSERT ... SELECT` took 10, and SQLite's file for them
+was 2.3 to 2.5 times smaller than this engine's. A row of two integers takes about 30 bytes in a
+leaf's delta area and about 12 bytes once the leaf is packed. A full leaf that rows were being
+appended to was split at once, so it kept the 40% of a page its rows packed to. It is now packed
+again first when that frees a third of the page, and split when it does not, which is what a wide
+row does. The same 20,000 rows now take 11 pages. `VACUUM` reloads a table in chunks of 20,000 rows
+and only the first chunk is built in one pass, so a table of 2,000,000 rows came out of `VACUUM` at
+1,898 pages from 1,910. A file already written keeps its layout until `VACUUM` rewrites it. Loading
+400,000 rows of two integers in 500 row statements took 13% to 16% more processor time in the
+shell, and the wall time stayed within the 8% spread between runs.
+
+**An older copy of the database file, put back beside the log segments of the newer file, opens.**
+A segment names its database by uuid, and a copy of the file has the same uuid. The open replayed the
+newer file's log into the copy, which lacks the pages the newer file's bulk builds wrote straight into
+it, and failed with `replaying the log: record kind 18 ... read 0 of 32768 bytes`, or, when the pages
+held something else, wrote rows into them and left `integrity_check` failing. The open now stops
+before it writes anything when a committed bulk build names a root page the file does not hold or
+holds from before the checkpoint, renames the segments with `.foreign` added to their names, and opens
+the file as the copy was. The command line says so, and `--output json` carries
+`log_segments_set_aside`. A log that belongs to the file is replayed as before.
+
 **`IN` and range filters on an `inillucent_search` facet are applied inside the search.** Before,
 only `facet = value` was. `facet IN (...)`, `>`, `>=`, `<`, `<=` and `BETWEEN` were applied by the
 engine to the `k` rows the search had already chosen, so `day >= '2026-06-01' AND k = 1` returned no

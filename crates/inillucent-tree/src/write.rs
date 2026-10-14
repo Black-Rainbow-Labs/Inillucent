@@ -2048,30 +2048,47 @@ impl PagedTree {
             // without one.
             return Ok(Fit::Repack(appending));
         }
-        // **An append splits at once, and packs the leaf a single time
-        // (task-2191).** A splice or a repack here frees the room the rows in
-        // the delta area took beyond their packed size, the next appends fill
-        // it, and the leaf is packed again: about twenty splices and five
-        // repacks per leaf of the Python benchmark's table before the split
-        // that always came. Rows that arrive in key order never come back to
-        // this leaf, so the split's left half, packed at `APPEND_FILL` from
-        // every row but the last, is the pack the leaf will keep, and the
-        // right half starts with the whole page free for the delta area. This
-        // is SQLite's `balance_quick` with one pass added, the one that packs
-        // the delta rows into the sorted region.
-        if appending {
-            return Ok(Fit::Split(leaf.bytes().to_vec(), true));
-        }
+        // **An append packs the leaf only when that frees a worthwhile part of
+        // the page, and splits otherwise (task-2191, then bug hunt 10).** Rows
+        // that arrive in key order never come back to the leaf they left, so
+        // the split's left half, packed at `APPEND_FILL`, is the pack the leaf
+        // keeps and the right half starts with the whole page free. That is
+        // SQLite's `balance_quick` with one pass added, the one that packs the
+        // delta rows into the sorted region, and it is why an append no longer
+        // splices or repacks a leaf every few rows: that took about twenty
+        // splices and five repacks per leaf of the Python benchmark's table.
+        //
+        // The rule was measured on rows as wide as the delta area makes them.
+        // A narrow row costs about 30 bytes in the delta area and about 12 in
+        // the sorted region, so a leaf that was full of appended rows held 40%
+        // of a page once packed, and the split kept it that way. A table of two
+        // integer columns loaded by appends took 25 pages where a bulk build
+        // took 10, and `VACUUM` rebuilt it the same way because it loads its
+        // rows by appends too. So a full leaf that is being appended to is
+        // packed when the pack leaves a third of the page free (`room_gap`),
+        // which a narrow row does, and splits when it does not, which a wide
+        // row does. A wide row packs to about its delta size, so it takes the
+        // split as before and pays one failed sizing pass for finding that out.
+        // The third is the processor time against density choice, measured as
+        // the shell's processor time loading 400,000 rows of two integers in
+        // 500 row statements, against splitting at once (386 pages): a half
+        // took 3% to 10% more and 132 pages, a third 13% to 16% more and 106
+        // pages, a quarter 12% to 19% more and 99 pages. A table of an integer
+        // key, a short text, an integer and a real did not shrink at a half and
+        // went from 285 pages to 203 at a third, which is why it is not a half.
+        // Wall time was within the run to run spread of 8% for all of them.
+        //
         // **A splice first, when the page allows one** (task-2074). It keeps
         // the page's widths and heap and writes only the delta rows' values,
         // so it skips the sizing pass, the materialising pass and most of the
         // encode. Whether it is allowed is a question about the page alone -
         // see `leaf/splice.rs` - which is what lets recovery make the same
         // choice from the same page.
+        let gap = self.room_gap(appending);
         let spliced = self.timed_splice(&leaf, &order)?;
         let splice_allowed = spliced.is_some();
         if let Some(mut image) = spliced {
-            if LeafMut::new(&mut image)?.room_for(needed.saturating_add(self.gap_for_growth()))? {
+            if LeafMut::new(&mut image)?.room_for(needed.saturating_add(gap))? {
                 return Ok(Fit::Compact(
                     image,
                     leaf.right_sibling(),
@@ -2190,7 +2207,7 @@ impl PagedTree {
         // arriving row is therefore not a tighter compaction, it is a split.
         let mut compacted = self.timed_compact_image(&builder, &source)?;
         if let Some(image) = compacted.as_mut() {
-            if !LeafMut::new(image)?.room_for(needed.saturating_add(self.gap_for_growth()))? {
+            if !LeafMut::new(image)?.room_for(needed.saturating_add(self.room_gap(appending)))? {
                 compacted = None;
             }
         }
@@ -3439,11 +3456,31 @@ impl PagedTree {
     /// leaf a bulk build packed full would split on it and stay half empty.
     /// That is the case `TIGHT_FILL` exists for, and the first version of this
     /// gap, applied to every write, doubled such a tree from 17 leaves to 33.
-    /// Appends do not reach this; `choose_fit` splits them at once.
+    /// An append does not use this gap; see [`Tree::room_gap`].
     fn gap_for_growth(&self) -> usize {
         match self.growing {
             true => self.page_size() / 8,
             false => 0,
+        }
+    }
+
+    /// How much of the page a compaction has to leave free beyond the arriving
+    /// row, for a write that may be an append.
+    ///
+    /// **A third of the page for an append, whatever the write was called
+    /// with (bug hunt 10).** Appends arrive through `put_absent`, which does not
+    /// say it adds a key, so [`Tree::gap_for_growth`] was zero for them. A
+    /// compaction that left room for only the one row was repeated every few
+    /// rows, so a leaf that is being appended to is packed only when the pack
+    /// frees a good part of the page, and is split otherwise. A third packs a
+    /// narrow row's leaf twice before it splits, and leaves the pages it
+    /// finally splits about 70% full. `choose_fit` has the measurements.
+    ///
+    /// @param appending - whether the rows are arriving in key order past the leaf
+    fn room_gap(&self, appending: bool) -> usize {
+        match appending {
+            true => self.page_size() / 3,
+            false => self.gap_for_growth(),
         }
     }
 

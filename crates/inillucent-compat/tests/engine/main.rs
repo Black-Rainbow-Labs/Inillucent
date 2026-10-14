@@ -18,6 +18,7 @@
 
 mod analyze_reopen;
 mod analyze_same_session;
+mod append_load_density;
 mod auto_vacuum;
 mod autoindex_reopen;
 mod automatic_index_answers;

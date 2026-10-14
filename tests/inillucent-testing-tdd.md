@@ -162,9 +162,9 @@ check a run against.
 |---|---:|---:|---|---|
 | `smoke` | 1 | 10 | `change` | the ten-second answer: a real file opened, written, reopened, read |
 | `unit` | 31 | 1,485 | `change` | every crate's own `#[cfg(test)]` modules |
-| `engine` | 105 | 522 | `change` | SQL and storage behaviour over real database files |
+| `engine` | 106 | 527 | `change` | SQL and storage behaviour over real database files |
 | `differential` | 40 | 366 | `change` | graded against the pinned SQLite 3.53.4 |
-| `durability` | 54 | 276 | `merge` | crashes, injected faults, corruption and concurrency |
+| `durability` | 55 | 278 | `merge` | crashes, injected faults, corruption and concurrency |
 | `e2e` | 44 | 451 | `change` | the public surfaces an application binds to, end to end |
 | `perf` | 2 | 12 | `merge` | the cost guards, and the check that a run stays on its share of the processors — **runs alone**, see §5 |
 | `retrieval` | 12 | 607 | `change` | the embedding and retrieval engine, and its graded harness |

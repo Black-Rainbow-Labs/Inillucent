@@ -488,6 +488,14 @@ again. The first rows stay on the leaf, the rest move to a new page, and the par
 points at the new page. When rows arrive in key order the leaf keeps 95% of a page. Otherwise the
 rows are split evenly.
 
+A full leaf that rows are being appended to is packed again before it is split, when packing frees a
+third of the page. A row of two integers takes about 30 bytes in the delta area and about 12 bytes
+once the leaf is packed, so a leaf that was full of appended rows has room again after it is packed,
+and it is packed again each time it fills. A wide row packs to about the size it had, frees no
+third, and splits as before. Twenty thousand rows of two integers loaded in 500 row `INSERT`
+statements take 11 pages, and one `INSERT ... SELECT` takes 10. Without the repack they took 25.
+`VACUUM` reloads a table in chunks of 20,000 rows, so it depends on this too.
+
 The log describes most splits by what they did, in one `SplitLeaf` record. Recovery rebuilds each of
 the three pages from that page's own state:
 
@@ -586,6 +594,17 @@ recovered the log: 3 records scanned, 2 applied, 1 transactions committed, 1 dis
 ```
 
 With `--output json`, both cases carry the same `recovered` member with the five counts.
+
+**A log that belongs to an older copy of the file is set aside.** A segment names its database by
+uuid and its place in the chain by sequence number, and a copy of the file has both. An older copy
+put back over the file it was copied from, with the newer file's segments still beside it, passes
+every check in the segment header. What the copy lacks is the pages that a bulk build of the newer
+file wrote straight into it. When a committed bulk build names a root page that the file does not
+hold, or holds with a stamp from before the checkpoint the replay starts at, the open stops the
+replay before it writes anything, renames every segment from the checkpoint's sequence upward with
+`.foreign` added to its name, and opens the file as the copy was. The command line says so in the
+same place it reports a replay, and `--output json` carries `log_segments_set_aside`. A log that
+belongs to the file is replayed as before.
 
 Four rules make recovery safe:
 
