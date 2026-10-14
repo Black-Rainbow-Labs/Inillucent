@@ -10,6 +10,16 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**A row of 2,000 integer columns fits a 32 KiB page.** A row of about 1,940 integer columns or more
+failed with `a row of N columns does not fit one page`, where SQLite allows 2,000. A leaf spends eight
+bytes on each column's directory entry and the tagged form of an integer took nine. A row whose numbers
+take more than half a page in that form is now written with each integer in the fewest bytes that hold
+it: two bytes under 128, three under 32,768, five under 2,147,483,648. That holds about 3,200 such
+columns. A row of integers that need eight bytes each still holds about 1,925, and a longer one is
+refused as before. The first wide row moves the file to format 4, with the `FormatRaised` log record, and
+a release that stops at format 3 refuses the file by name. Tables with narrower rows, and files that
+hold none, are written exactly as before.
+
 **`ALTER TABLE ... ADD COLUMN` takes time that does not depend on the number of rows.** It read every
 row, built a new tree from them and freed the old one: 783 ms for `ADD COLUMN e DEFAULT 5` on 800,000
 rows, where SQLite takes 19, and 1,841 ms with a `CHECK`. It now writes the catalog row and no leaf

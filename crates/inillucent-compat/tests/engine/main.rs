@@ -108,4 +108,5 @@ mod vtab;
 mod vtab_lifecycle;
 mod vtab_refused_connect;
 mod wal;
+mod wide_rows;
 mod write_speed;

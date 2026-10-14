@@ -63,3 +63,4 @@ mod story_nikaya_crash;
 mod two_connections_end_a_transaction;
 mod vacuum_crash;
 mod wal_crash;
+mod wide_row_crash;

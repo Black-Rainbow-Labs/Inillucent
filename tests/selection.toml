@@ -957,6 +957,14 @@ covers = ["inillucent-engine", "inillucent-catalog", "inillucent-sql"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "wide_rows"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool", "inillucent-wal"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "add_column_without_rewrite"
 tier = "engine"
 covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool", "inillucent-wal"]
@@ -2613,6 +2621,14 @@ covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-p
 # Power loss at every cut point of an `INSERT ... SELECT` into an empty table,
 # which builds the table and its index with the bulk builder and rewrites their
 # catalog rows: the copy comes back whole or not at all.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "wide_row_crash"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"

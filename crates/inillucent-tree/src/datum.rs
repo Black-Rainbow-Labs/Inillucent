@@ -95,6 +95,17 @@ pub mod tag {
     /// know how long the value is.** The prefix is what lets a comparison decide
     /// most orderings without reading the pages the value is on.
     pub const KEY_EXTENT: u8 = 6;
+    /// An integer that fits eight bits: the tag and one little-endian byte.
+    ///
+    /// **Written only in a row too wide to fit a leaf with every integer at nine bytes**
+    /// (see [`super::Datum::row_is_wide`]), and read wherever a tagged value is read. A file
+    /// that holds one says format 4, so a release that stops at format 3 refuses the file by
+    /// name and never meets this tag in a page.
+    pub const INT8: u8 = 7;
+    /// An integer that fits sixteen bits: the tag and two little-endian bytes. See [`INT8`].
+    pub const INT16: u8 = 8;
+    /// An integer that fits thirty two bits: the tag and four little-endian bytes. See [`INT8`].
+    pub const INT32: u8 = 9;
 }
 
 /// How many bytes a tagged extent reference occupies.
@@ -205,6 +216,78 @@ impl<'p> Datum<'p> {
         }
     }
 
+    /// Writes this value as a tagged value, an integer in the fewest bytes that hold it.
+    ///
+    /// **The encoding of a wide row.** The tagged form spends nine bytes on every
+    /// integer, and a leaf spends eight more on the column's directory entry, so a row of
+    /// 1,925 integers fills a 32 KiB page whatever they are. Here an integer that fits a byte
+    /// takes two, one that fits sixteen bits three and one that fits thirty two bits five,
+    /// which holds about 3,200 small integers, and a row of 2,000 integers up to 2,147,483,647.
+    /// Everything that is not an integer is written as [`Datum::encode_tagged`] writes it,
+    /// and [`Datum::decode_tagged`] reads both.
+    ///
+    /// @param out - the buffer the encoding is appended to
+    pub fn encode_tagged_compact(&self, out: &mut Vec<u8>) {
+        match self {
+            Datum::Int(number) => {
+                if let Ok(small) = i8::try_from(*number) {
+                    out.push(tag::INT8);
+                    out.extend_from_slice(&small.to_le_bytes());
+                } else if let Ok(medium) = i16::try_from(*number) {
+                    out.push(tag::INT16);
+                    out.extend_from_slice(&medium.to_le_bytes());
+                } else if let Ok(narrow) = i32::try_from(*number) {
+                    out.push(tag::INT32);
+                    out.extend_from_slice(&narrow.to_le_bytes());
+                } else {
+                    self.encode_tagged(out);
+                }
+            }
+            other => other.encode_tagged(out),
+        }
+    }
+
+    /// Returns the number of bytes [`Datum::encode_tagged_compact`] would write.
+    pub fn tagged_len_compact(&self) -> usize {
+        match self {
+            Datum::Int(number) if i8::try_from(*number).is_ok() => 2,
+            Datum::Int(number) if i16::try_from(*number).is_ok() => 3,
+            Datum::Int(number) if i32::try_from(*number).is_ok() => 5,
+            other => other.tagged_len(),
+        }
+    }
+
+    /// Reports whether a row is written in the compact encoding.
+    ///
+    /// **A rule of the row and the page size and of nothing else**, so the write path, the
+    /// leaf builder and a replay that re-encodes a row all choose the same bytes. A row is
+    /// wide when its numbers and NULLs, in the ordinary encoding, take more than half a page.
+    /// A text or a blob is not counted: the encoding changes only integers, and a row of a
+    /// few columns with a long text in it is not a row this is for. Such a row cannot share
+    /// a leaf with another, so there is no cost in making it smaller, and every other row is
+    /// written exactly as it always was.
+    ///
+    /// @param row - the row's values
+    /// @param page_size - the database's page size
+    pub fn row_is_wide(row: &[Datum<'_>], page_size: usize) -> bool {
+        // No number takes more than nine bytes, so a row of fewer values than this cannot be
+        // wide, and the write of an ordinary row does not walk its values to find out.
+        if row.len().saturating_mul(9) <= page_size / 2 {
+            return false;
+        }
+        let mut total = 0usize;
+        for value in row {
+            if matches!(value, Datum::Text(_) | Datum::Blob(_)) {
+                continue;
+            }
+            total = total.saturating_add(value.tagged_len());
+            if total > page_size / 2 {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Returns the number of bytes [`Datum::encode_tagged`] would write.
     pub fn tagged_len(&self) -> usize {
         match self {
@@ -234,6 +317,27 @@ impl<'p> Datum<'p> {
             tag::REAL => {
                 let raw = read_eight(rest, "tagged real")?;
                 Ok((Datum::Real(f64::from_bits(u64::from_le_bytes(raw))), 9))
+            }
+            tag::INT8 => {
+                let raw = rest
+                    .first()
+                    .copied()
+                    .ok_or_else(|| corrupt("tagged integer runs past the buffer"))?;
+                Ok((Datum::Int(i64::from(raw as i8)), 2))
+            }
+            tag::INT16 => {
+                let raw: [u8; 2] = rest
+                    .get(..2)
+                    .and_then(|raw| raw.try_into().ok())
+                    .ok_or_else(|| corrupt("tagged integer runs past the buffer"))?;
+                Ok((Datum::Int(i64::from(i16::from_le_bytes(raw))), 3))
+            }
+            tag::INT32 => {
+                let raw: [u8; 4] = rest
+                    .get(..4)
+                    .and_then(|raw| raw.try_into().ok())
+                    .ok_or_else(|| corrupt("tagged integer runs past the buffer"))?;
+                Ok((Datum::Int(i64::from(i32::from_le_bytes(raw))), 5))
             }
             tag::TEXT | tag::BLOB => {
                 let length_bytes = rest
@@ -277,6 +381,17 @@ impl<'p> Datum<'p> {
         match kind {
             tag::NULL => Ok(1),
             tag::INT | tag::REAL => Ok(9),
+            tag::INT8 | tag::INT16 | tag::INT32 => {
+                let span = match kind {
+                    tag::INT8 => 2,
+                    tag::INT16 => 3,
+                    _ => 5,
+                };
+                if bytes.len() < span {
+                    return Err(corrupt("tagged integer runs past the buffer"));
+                }
+                Ok(span)
+            }
             tag::EXTENT => {
                 if rest.len() < EXTENT_TAG_BYTES - 1 {
                     return Err(corrupt("tagged extent runs past the buffer"));
@@ -630,10 +745,81 @@ mod tests {
         }
     }
 
+    /// The compact integer encodings round trip at every width, and are the size they say.
+    #[test]
+    fn compact_integers_round_trip_in_the_fewest_bytes() {
+        let cases: [(i64, usize); 14] = [
+            (0, 2),
+            (1, 2),
+            (-1, 2),
+            (127, 2),
+            (-128, 2),
+            (128, 3),
+            (-129, 3),
+            (32_767, 3),
+            (-32_768, 3),
+            (32_768, 5),
+            (2_147_483_647, 5),
+            (-2_147_483_648, 5),
+            (2_147_483_648, 9),
+            (i64::MIN, 9),
+        ];
+        for (number, size) in cases {
+            let value = Datum::Int(number);
+            let mut buffer = Vec::new();
+            value.encode_tagged_compact(&mut buffer);
+            assert_eq!(buffer.len(), size, "{number}");
+            assert_eq!(value.tagged_len_compact(), size, "{number}");
+            let (back, used) = Datum::decode_tagged(&buffer).unwrap();
+            assert_eq!(used, size, "{number}");
+            assert_eq!(Datum::tagged_span(&buffer).unwrap(), size, "{number}");
+            assert_eq!(back.as_int(), Some(number));
+            for cut in 0..buffer.len() {
+                assert!(
+                    Datum::decode_tagged(&buffer[..cut]).is_err(),
+                    "{number} cut at {cut}"
+                );
+                // The ordinary eight byte integer has never bounds checked its span.
+                if size < 9 {
+                    assert!(
+                        Datum::tagged_span(&buffer[..cut]).is_err(),
+                        "{number} cut at {cut}"
+                    );
+                }
+            }
+        }
+        let mut other = Vec::new();
+        Datum::Text(b"abc").encode_tagged_compact(&mut other);
+        let mut plain = Vec::new();
+        Datum::Text(b"abc").encode_tagged(&mut plain);
+        assert_eq!(
+            other, plain,
+            "a value that is not an integer is written as before"
+        );
+    }
+
+    /// A row is wide when its numbers in the ordinary encoding take more than half a page.
+    #[test]
+    fn a_row_is_wide_past_half_a_page_of_the_ordinary_encoding() {
+        let text = vec![0u8; 3_000];
+        let few: Vec<Datum<'_>> = vec![Datum::Int(1), Datum::Text(&text), Datum::Blob(&text)];
+        assert!(
+            !Datum::row_is_wide(&few, 4_096),
+            "a long text is not a wide row"
+        );
+        let narrow: Vec<Datum<'_>> = vec![Datum::Int(1); 100];
+        assert!(!Datum::row_is_wide(&narrow, 4_096));
+        let wide: Vec<Datum<'_>> = vec![Datum::Int(1); 300];
+        assert!(Datum::row_is_wide(&wide, 4_096));
+        assert!(!Datum::row_is_wide(&wide, 32_768));
+        let wider: Vec<Datum<'_>> = vec![Datum::Int(1); 1_900];
+        assert!(Datum::row_is_wide(&wider, 32_768));
+    }
+
     /// Every tag byte outside the set is refused.
     #[test]
     fn unknown_tags_are_refused() {
-        for tag in 5u8..=255 {
+        for tag in (5u8..=255).filter(|tag| !(7..=9).contains(tag)) {
             let buffer = [tag, 0, 0, 0, 0, 0, 0, 0, 0];
             assert!(Datum::decode_tagged(&buffer).is_err(), "tag {tag}");
         }

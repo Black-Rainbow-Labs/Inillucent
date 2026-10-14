@@ -997,6 +997,13 @@ impl PagedTree {
         row: &[Datum<'_>],
     ) -> DbResult<(Vec<u8>, bool, Vec<Option<ExtentRef>>)> {
         let mut spilled = false;
+        // **A row of many integers is written with each in the fewest bytes**, so the leaf
+        // that holds it alone has room for about 3,200 columns instead of 1,925. The file moves
+        // to format 4 first, because a release that stops at 3 cannot read the tags.
+        let compact = Datum::row_is_wide(row, self.page_size());
+        if compact {
+            crate::format::require_compact_rows(database, log)?;
+        }
         // Sized once from the values: growing it a value at a time was a
         // reallocation or two a row, 4% of an indexed insert (task-2191).
         let mut encoded_row = Vec::with_capacity(row.iter().map(Datum::tagged_len).sum());
@@ -1061,6 +1068,7 @@ impl PagedTree {
                     }
                     spilled = true;
                 }
+                None if compact => value.encode_tagged_compact(&mut encoded_row),
                 None => value.encode_tagged(&mut encoded_row),
             }
         }

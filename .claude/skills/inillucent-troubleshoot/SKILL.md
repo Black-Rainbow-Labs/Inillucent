@@ -119,7 +119,8 @@ an application built with the `inillucent` crate writes the file and an older `i
 line, installed separately, is used to look at it. Install the command line at the crate's version. Nothing converts a format 3
 file back to format 2. A file that an earlier release created stays at format 2 until it stores a
 key longer than `page_size / 8` or is rebuilt by `VACUUM`, so the earlier release can still open it.
-A file becomes format 4 when `ALTER TABLE ... ADD COLUMN` is run on a table that has rows. Releases 2.5.0 to this one refuse it with
+A file becomes format 4 when `ALTER TABLE ... ADD COLUMN` is run on a table that has rows or a row of
+more than about 1,900 integers is stored. Releases 2.5.0 to this one refuse it with
 `this database is format version 4 and this build reads version 3`.
 
 [`docs/feature-comparison.md`](../../docs/feature-comparison.md) compares inillucent with the pinned

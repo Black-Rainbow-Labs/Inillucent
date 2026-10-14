@@ -825,9 +825,10 @@ still be larger than a page, because a number is shorter than the reference that
 A leaf spends a directory entry, a class array and an aligned slot array on every column, about 24
 to 32 bytes, so a row of more than about a thousand columns does not fit the sorted part of a
 32 KiB leaf. Such a row is kept alone in the delta area of its own leaf, which costs the directory
-entry and the row's tagged values (`crates/inillucent-tree/src/leaf/encode/oversize.rs`). That holds
-a row of about 1,900 numbers. A row of more values than that fails with `a row of N columns does
-not fit one page`.
+entry and the row's tagged values (`crates/inillucent-tree/src/leaf/encode/oversize.rs`). A row of
+integers that each need eight bytes holds about 1,925 of them. A row whose integers fit 32 bits is
+written more compactly, see "Format 4" below, and holds about 3,200. A row of more values than
+fits fails with `a row of N columns does not fit one page`.
 The first time a transaction writes one, it moves the
 file to format 3 in memory and writes one log record, `Format` (kind 19), before the first page of the
 value. That record belongs to no transaction, so recovery replays it whether or not the transaction
@@ -844,7 +845,23 @@ page says 2 and its log holds no `Format` record.
 
 ### Format 4, and when a file moves to it
 
-Format 4 means that the file may hold a leaf with fewer columns than its table.
+Format 4 means that the file may hold a leaf with fewer columns than its table, or a row in the
+compact integer encoding. A file moves to it at the first of those two events.
+
+**The compact integer encoding.** A leaf spends eight bytes on every column's directory entry, and a
+tagged integer took nine, so a row of 1,940 integer columns filled a 32 KiB page and SQLite's limit of
+2,000 columns could not be reached. A row whose numbers and NULLs take more than half a page in the
+ordinary encoding (`Datum::row_is_wide`, in `crates/inillucent-tree/src/datum.rs`) is written with
+each integer in the fewest bytes that hold it: the tag `7` and one byte for a number from -128 to
+127, the tag `8` and two bytes up to 16 bits, the tag `9` and four bytes up to 32 bits, and the
+ordinary nine bytes beyond. A text or a blob is not counted, so a row with a long text in it is
+written as before. A row of 2,000 integers up to 2,147,483,647 takes 10,000 bytes of directory and 10,000
+of values at most, and fits one page. A row of integers that each need eight bytes still holds about
+1,925. A reader decodes both encodings in every delta row, so a leaf needs no flag. The file moves to
+format 4 with the same `FormatRaised` record before the first such row is written, in the write
+path and in a bulk build, and a replay writes the logged bytes as they were.
+
+**A leaf with fewer columns than its table.**
 `ALTER TABLE ... ADD COLUMN` on a table that has rows writes no leaf: it writes the catalog row, and
 the table's tree takes the longer column list. A leaf written before that holds one column fewer, and
 every reader of it is given the new column's default, which is the same for all of its rows. The
@@ -872,8 +889,8 @@ the file after a checkpoint reads the number in the meta page and refuses it wit
 
 | File | This build | Releases 2.5.0 to this one |
 |---|---|---|
-| format 3, none of the events below yet | opens, stays 3 | opens |
-| format 4, a table gained a column while it had rows | opens | refuses by name: `format version 4`, status `unsupported`, exit code 3 |
+| format 3, neither of those events yet | opens, stays 3 | opens |
+| format 4, a table gained a column while it had rows, or a row of many integers was stored | opens | refuses by name: `format version 4`, status `unsupported`, exit code 3 |
 | format 3 in the file, and a log holding a `FormatRaised` record after a crash | recovers | refuses: `a log record has kind 22, which this format does not define` |
 
 The longest key is 1,048,576 bytes of encoded key. A longer one is refused before any page is touched,

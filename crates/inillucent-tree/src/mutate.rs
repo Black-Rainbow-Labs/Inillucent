@@ -344,8 +344,17 @@ impl<'p> LeafMut<'p> {
             )));
         }
         let mut encoded = Vec::new();
-        for value in row {
-            value.encode_tagged(&mut encoded);
+        // A row too wide for the ordinary encoding to fit a leaf is written with its integers
+        // in the fewest bytes; see `Datum::encode_tagged_compact`. The rule is the row's and
+        // the page's, so a replay that writes the logged bytes and a build that encodes
+        // the values agree.
+        match Datum::row_is_wide(row, self.page.len()) {
+            true => row
+                .iter()
+                .for_each(|value| value.encode_tagged_compact(&mut encoded)),
+            false => row
+                .iter()
+                .for_each(|value| value.encode_tagged(&mut encoded)),
         }
         let leaf = LeafRef::parse(self.page)?;
         let key = row.get(..leaf.key_columns()).unwrap_or(row);
