@@ -472,11 +472,10 @@ rowid  title             score  confidence  origin
 2      Parser notes      0.0    0.0         vector
 ```
 
-**Give a cosine table a query vector of length 1.** The table scales the stored vectors to length 1,
-and the query vector is used as you pass it. The order of the hits does not change with the query
-vector's length, but `confidence(docs)` does. On the table above, the query `'[0.2, 0, 0]'` returns
-the same order with a confidence of 0.517 for row 3, against 0.753 for `'[1, 0, 0]'`. Most embedding
-models already return vectors of length 1. `l2_normalize(v)` scales any other vector to length 1.
+**A cosine table accepts a query vector of any length.** The table scales the stored vectors and the
+query vector to length 1, so the order of the hits and `confidence(docs)` are the same for
+`'[0.2, 0, 0]'` and `'[1, 0, 0]'`. A query vector of length 0 is used as given. An `l2` table uses the
+query vector as given, because length is part of an L2 distance.
 
 ### What a search query can name
 
