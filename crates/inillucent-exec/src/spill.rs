@@ -485,7 +485,7 @@ impl<'a> RunMerge<'a> {
     }
 
     /// Returns the next row in order, or `None` when every run is exhausted.
-    pub fn next(&mut self) -> DbResult<Option<Vec<OwnedDatum>>> {
+    pub fn next_row(&mut self) -> DbResult<Option<Vec<OwnedDatum>>> {
         let Some(top) = self.heap.first().copied() else {
             return Ok(None);
         };
@@ -667,7 +667,7 @@ impl SortedRows {
             return Ok(());
         };
         let mut merge = writer.merge(Box::new(move |left, right| order(left, right)))?;
-        while let Some(row) = merge.next()? {
+        while let Some(row) = merge.next_row()? {
             inillucent_base::budget::check()?;
             if each(row)? == crate::ops::Flow::Stop {
                 break;

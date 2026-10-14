@@ -15,6 +15,17 @@ use inillucent_tree::PagedTree;
 
 use crate::*;
 
+/// Writes the pages of a tree and returns it: the file, where the log records go, the tree's number in
+/// the file, the column directory, and how many leading columns form the key.
+type TreeConstructor<'a> = dyn FnMut(
+        &mut inillucent_pool::Database,
+        Option<&mut dyn inillucent_tree::write::TreeLog>,
+        u64,
+        Vec<ColumnSpec>,
+        usize,
+    ) -> DbResult<PagedTree>
+    + 'a;
+
 impl crate::ImportedDatabase {
     /// Builds one empty tree and registers it.
     ///
@@ -150,13 +161,7 @@ impl crate::ImportedDatabase {
         columns: Vec<ColumnSpec>,
         key_columns: usize,
         layout: SourceLayout,
-        construct: &mut dyn FnMut(
-            &mut inillucent_pool::Database,
-            Option<&mut dyn inillucent_tree::write::TreeLog>,
-            u64,
-            Vec<ColumnSpec>,
-            usize,
-        ) -> DbResult<PagedTree>,
+        construct: &mut TreeConstructor<'_>,
     ) -> DbResult<PageId> {
         let at = self.schema.ddl_schema;
         let local = self.local_of(at, root);

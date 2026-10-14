@@ -259,19 +259,12 @@ pub(super) fn insert_row_feed(
         // A key the statement left out is -1 in a `BEFORE INSERT` body, as in
         // SQLite, which fires it before the key is allocated.
         let unassigned = key_is_unassigned(statement, layout, (plan, space), supplied_row)?;
-        let firing = trigger::TriggerFiring {
-            rows: trigger::TriggerRows {
-                old: None,
-                new: Some(image.as_slice()),
-            },
-            slots: &layout.slots,
-            rowid: layout.rowid,
-            params,
-            depth,
-        };
-        if trigger::fire_before_insert(&statement.triggers, target, &firing, unassigned)?
-            == trigger::Fired::SkipRow
-        {
+        if before_triggers_skip_the_row(
+            (statement, compiled, params, depth),
+            target,
+            &image,
+            unassigned,
+        )? {
             give_back(table, &mut next_rowid, rowid_before);
             continue;
         }
@@ -346,11 +339,8 @@ pub(super) fn insert_row_feed(
             high_water = high_water.max(assigned);
         }
         finish_stored_row(
-            statement,
+            (statement, compiled, params, depth),
             target,
-            params,
-            depth,
-            compiled,
             &stored,
             captured,
             &mut changes,
@@ -360,27 +350,52 @@ pub(super) fn insert_row_feed(
     Ok(changes)
 }
 
+/// Fires the `BEFORE INSERT` triggers on the row about to be written, and reports whether one skipped it.
+///
+/// @param write - the bound insert, the plan, the row space, the layout and the declarations, the
+///   bound parameters, and how many triggers deep this write already is
+/// @param target - the file and its trees
+/// @param image - the row as it will be written
+/// @param unassigned - whether the statement left the row's key out
+fn before_triggers_skip_the_row(
+    write: (&BoundInsert, &CompiledInsert, &Params, Depth),
+    target: &mut dyn WriteTarget,
+    image: &[OwnedDatum],
+    unassigned: bool,
+) -> DbResult<bool> {
+    let (statement, compiled, params, depth) = write;
+    let firing = trigger::TriggerFiring {
+        rows: trigger::TriggerRows {
+            old: None,
+            new: Some(image),
+        },
+        slots: &compiled.layout.slots,
+        rowid: compiled.layout.rowid,
+        params,
+        depth,
+    };
+    Ok(
+        trigger::fire_before_insert(&statement.triggers, target, &firing, unassigned)?
+            == trigger::Fired::SkipRow,
+    )
+}
+
 /// Fires the `AFTER` triggers for a row that was written, and records it in the tally.
 ///
-/// @param statement - the bound insert
+/// @param write - the bound insert, the plan, the row space, the layout and the declarations, the
+///   bound parameters, and how many triggers deep this write already is
 /// @param target - the file and its trees
-/// @param params - the bound parameters
-/// @param depth - how many triggers deep this write already is
-/// @param compiled - the plan, the row space, the layout and the declarations
 /// @param stored - what the write did
 /// @param captured - whether the target keeps the rows written
 /// @param changes - the statement's tally
-#[allow(clippy::too_many_arguments)]
 fn finish_stored_row(
-    statement: &BoundInsert,
+    write: (&BoundInsert, &CompiledInsert, &Params, Depth),
     target: &mut dyn WriteTarget,
-    params: &Params,
-    depth: Depth,
-    compiled: &CompiledInsert,
     stored: &Stored,
     captured: bool,
     changes: &mut Changes,
 ) -> DbResult<()> {
+    let (statement, compiled, params, depth) = write;
     let CompiledInsert {
         layout,
         space,

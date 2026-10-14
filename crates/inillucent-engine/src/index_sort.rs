@@ -304,7 +304,7 @@ impl ExternalEntries {
     fn has_duplicate(&self, compared: usize) -> DbResult<bool> {
         let mut merge = self.merge()?;
         let mut previous: Option<Vec<OwnedDatum>> = None;
-        while let Some(row) = merge.next()? {
+        while let Some(row) = merge.next_row()? {
             if let Some(held) = previous.as_deref() {
                 if shares_key_prefix(held, &row, compared, &self.collations) {
                     return Ok(true);
@@ -418,7 +418,7 @@ impl RowChunks for EntryChunks<'_> {
                 Vec::with_capacity(per_chunk.saturating_mul(self.width));
             let mut rows = 0usize;
             while rows < per_chunk {
-                let Some(mut entry) = self.merge.next()? else {
+                let Some(mut entry) = self.merge.next_row()? else {
                     break;
                 };
                 // An entry is exactly `width` values; a run is written from entries of that
