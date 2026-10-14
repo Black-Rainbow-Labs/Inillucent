@@ -703,3 +703,8 @@ SELECT name FROM m.sqlite_schema; SELECT count(*) FROM n.sqlite_schema; SELECT *
 CREATE TABLE a(x); CREATE TEMP TRIGGER tr AFTER INSERT ON a BEGIN SELECT 1; END;
 BEGIN; DROP TRIGGER tr; COMMIT;
 SELECT name FROM temp.sqlite_schema;
+-- case: bug-hunt-10/engine/alter-missing-attached-table-names-the-database
+ATTACH ':memory:' AS m;
+ALTER TABLE m.nosuch RENAME TO other;
+ALTER TABLE main.nosuch ADD COLUMN x;
+ALTER TABLE nosuch DROP COLUMN x;

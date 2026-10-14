@@ -1497,7 +1497,12 @@ impl<'a> Binder<'a> {
             .find_table(written.as_deref(), &folded)
             .cloned()
         else {
-            return Err(no_such_table(self.ast.text(table), Span::default()));
+            // Named as written, `m.t` included, which is what SQLite prints.
+            let named = match database {
+                Some(qualifier) => [self.ast.text(qualifier), b".", self.ast.text(table)].concat(),
+                None => self.ast.text(table).to_vec(),
+            };
+            return Err(no_such_table(&named, Span::default()));
         };
         let index = target.database;
         let database_name = self.catalog.database_name(index).to_vec();
