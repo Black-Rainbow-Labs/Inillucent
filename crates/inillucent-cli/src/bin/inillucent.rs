@@ -520,7 +520,18 @@ fn dispatch(command: &'static Command, invocation: &Invocation) -> ExitCode {
 fn report(failure: &Failed, as_json: bool, command: &str) -> ExitCode {
     match as_json {
         true => println!("{}", failure.to_json(command).pretty(0)),
-        false => eprintln!("{}", failure.to_text()),
+        false => {
+            // The rows before the failure go to standard output and the error to
+            // standard error, as the reference shell prints them.
+            if let Some(rows) = failure
+                .partial
+                .as_ref()
+                .filter(|rows| !rows.text.is_empty())
+            {
+                println!("{}", rows.text);
+            }
+            eprintln!("{}", failure.to_text())
+        }
     }
     ExitCode::from(failure.exit_code() as u8)
 }

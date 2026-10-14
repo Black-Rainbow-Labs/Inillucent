@@ -65,6 +65,7 @@ impl Sink for Filter {
         // A predicate that can judge the whole batch in one loop does, and
         // gives the verdicts `value` would; see `Eval::truths_over`.
         let mut truths = Vec::new();
+        let mut failed: Option<inillucent_base::DbError> = None;
         if self.predicate.truths_over(batch, &mut truths) && truths.len() == batch.live() {
             for (nth, kept) in truths.iter().enumerate() {
                 if *kept {
@@ -77,21 +78,36 @@ impl Sink for Filter {
                 // true: NULL is not true, and the three-valued logic in `expr`
                 // produces NULL rather than false so the distinction survives to
                 // here.
-                let verdict = self.predicate.value(batch, nth)?;
+                let verdict = match self.predicate.value(batch, nth) {
+                    Ok(verdict) => verdict,
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
+                };
                 if crate::expr::truth(&verdict.get()) == Some(true) {
                     self.selection.push(batch.row_at(nth) as u32);
                 }
             }
         }
         if self.selection.is_empty() {
-            return Ok(Flow::Continue);
+            return match failed {
+                Some(error) => Err(error),
+                None => Ok(Flow::Continue),
+            };
         }
         let filtered = Batch {
             rows: batch.rows,
             selection: Some(&self.selection),
             columns: batch.columns.clone(),
         };
-        self.downstream.push(&filtered)
+        let flow = self.downstream.push(&filtered)?;
+        // The rows that passed ahead of the failing one went on first; SQLite
+        // returns them and then reports the error (bug 28).
+        match (failed, flow) {
+            (Some(error), Flow::Continue) => Err(error),
+            _ => Ok(flow),
+        }
     }
 
     fn finish(&mut self) -> DbResult<()> {
@@ -107,6 +123,60 @@ impl Sink for Filter {
     fn reset(&mut self) -> DbResult<()> {
         self.selection.clear();
         self.saw_rows = false;
+        self.downstream.reset()
+    }
+}
+/// Evaluates the constant operands of `AND` and `OR` once, before the first row goes on.
+///
+/// **SQLite evaluates a constant once, the first time a row reaches it, and not
+/// once per row.** `SELECT a, a AND abs(-9223372036854775808) FROM t` fails
+/// before it returns any row, even when the first row's `a` is 0 and the `AND`
+/// would not look at its right side. Evaluating the operand per row, with the
+/// short circuit, raised the error on the first row that needed it, and now that
+/// the rows before a failing one are returned, the rows before that one came out
+/// first. The guards are compiled from the operands and run on the first batch
+/// that reaches this operator.
+///
+/// **Only the result columns are guarded.** A `WHERE` term is different in
+/// SQLite: `SELECT a FROM t WHERE (a = 1) OR abs(-9223372036854775808)` returns
+/// the first row when its `a` is 1 and fails on the next, so the constant there
+/// is evaluated when a row first needs it and the filters are left as they are.
+pub struct Hoisted {
+    guards: Vec<Box<dyn Eval>>,
+    ran: bool,
+    downstream: Box<dyn Sink>,
+}
+impl Hoisted {
+    /// Returns an operator that runs guards before its first batch.
+    ///
+    /// @param guards - the compiled constant operands, which read no column
+    /// @param downstream - what to push each batch into afterwards
+    pub fn new(guards: Vec<Box<dyn Eval>>, downstream: Box<dyn Sink>) -> Hoisted {
+        Hoisted {
+            guards,
+            ran: false,
+            downstream,
+        }
+    }
+}
+impl Sink for Hoisted {
+    fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
+        if !self.ran && batch.live() > 0 {
+            self.ran = true;
+            for guard in &self.guards {
+                guard.value(batch, 0)?;
+            }
+        }
+        self.downstream.push(batch)
+    }
+
+    fn finish(&mut self) -> DbResult<()> {
+        self.downstream.finish()
+    }
+
+    /// Returns this operator and everything below it to its pre-input state.
+    fn reset(&mut self) -> DbResult<()> {
+        self.ran = false;
         self.downstream.reset()
     }
 }
@@ -184,6 +254,9 @@ impl Sink for Project {
         let mut computed: Vec<Vec<crate::expr::Computed<'_>>> =
             Vec::with_capacity(self.expressions.len());
         let mut passthrough: Vec<Option<usize>> = Vec::with_capacity(self.expressions.len());
+        // The first row an expression failed on, and what it said. Rows before
+        // it are still good for every column, and are delivered (bug 28).
+        let mut failed: Option<(usize, inillucent_base::DbError)> = None;
         for expression in &self.expressions {
             match expression.column() {
                 Some(index) if batch.is_dense() => {
@@ -192,14 +265,22 @@ impl Sink for Project {
                 }
                 _ => {
                     passthrough.push(None);
-                    let mut values = Vec::with_capacity(live);
-                    for nth in 0..live {
-                        values.push(expression.value(batch, nth)?);
+                    let reach = failed.as_ref().map_or(live, |(row, _)| *row);
+                    let mut values = Vec::with_capacity(reach);
+                    for nth in 0..reach {
+                        match expression.value(batch, nth) {
+                            Ok(value) => values.push(value),
+                            Err(error) => {
+                                failed = Some((nth, error));
+                                break;
+                            }
+                        }
                     }
                     computed.push(values);
                 }
             }
         }
+        let live = failed.as_ref().map_or(live, |(row, _)| *row);
         let borrowed: Vec<Vec<Datum<'_>>> = computed
             .iter()
             .map(|column| column.iter().map(crate::expr::Computed::get).collect())
@@ -216,7 +297,19 @@ impl Sink for Project {
             });
         }
         let projected = Batch::new(live, columns);
-        self.downstream.push(&projected)
+        let Some((_, error)) = failed else {
+            return self.downstream.push(&projected);
+        };
+        // SQLite evaluates a row's columns before it starts the next row, so the
+        // rows ahead of the one that failed are answered and the failure comes
+        // after them. A failure further down the pipeline belongs to an earlier
+        // row than this one, so it is the one reported.
+        // A downstream that already has all the rows it wants (a `LIMIT`) never
+        // reaches the failing row, as in SQLite.
+        if live > 0 && self.downstream.push(&projected)? == Flow::Stop {
+            return Ok(Flow::Stop);
+        }
+        Err(error)
     }
 
     fn finish(&mut self) -> DbResult<()> {

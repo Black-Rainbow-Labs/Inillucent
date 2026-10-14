@@ -568,7 +568,6 @@ pub struct Distinct {
     /// here has to resist a chosen key - see `inillucent_base::table_hash` for what
     /// that buys and what it gives up.
     seen: inillucent_base::table_hash::TableSet<Vec<u8>>,
-    pub(crate) rows: Vec<Vec<OwnedDatum>>,
     downstream: Box<dyn Sink>,
 }
 impl Distinct {
@@ -594,13 +593,23 @@ impl Distinct {
             collations,
             compared,
             seen: inillucent_base::table_hash::TableSet::default(),
-            rows: Vec::new(),
             downstream,
         }
     }
 }
-impl Sink for Distinct {
-    fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
+impl Distinct {
+    /// Finds the rows of one batch that no earlier row duplicates.
+    ///
+    /// Stops at the first row it cannot judge and hands back the rows found
+    /// before it with the failure, so the caller can deliver them first.
+    ///
+    /// @param batch - the rows arriving
+    /// @param fresh - where the surviving rows are added
+    fn collect_fresh(
+        &mut self,
+        batch: &Batch<'_>,
+        fresh: &mut Vec<Vec<OwnedDatum>>,
+    ) -> DbResult<()> {
         let mut encoded = Vec::with_capacity(32);
         let columns = batch.columns.len();
         // A carried column is kept in the row and left out of the key, so it
@@ -634,29 +643,48 @@ impl Sink for Distinct {
             for column in 0..columns {
                 row.push(OwnedDatum::from_datum(&batch.value(nth, column)?));
             }
-            // **Both halves are charged (task-1932, H6).** `DISTINCT` holds
-            // the key set *and* every surviving row until `finish`, so its
-            // memory is decided by how many rows are distinct - which is
-            // the input size whenever they all are.
+            // **Both halves are charged (task-1932, H6).** `DISTINCT` holds the
+            // key set, so its memory is decided by how many rows are distinct -
+            // which is the input size whenever they all are. The row is charged
+            // too, as it was when the rows were held until `finish`, so the limit
+            // a statement hits does not move.
             inillucent_base::budget::materialise(
                 owned_row_bytes(&row).saturating_add(encoded.len() as u64),
             )?;
             self.seen.insert(encoded.clone());
-            self.rows.push(row);
+            fresh.push(row);
         }
-        Ok(Flow::Continue)
+        Ok(())
+    }
+}
+impl Sink for Distinct {
+    /// Passes each row on the first time it is seen.
+    ///
+    /// **Rows go downstream as they arrive and are not held until `finish`.**
+    /// SQLite answers a `DISTINCT` row as soon as it is found, so a statement
+    /// that fails on a later row has already returned the rows before it, and a
+    /// `LIMIT` stops the scan once it has enough. Holding every row until the end
+    /// lost the first and read all of the input for the second. The rows found
+    /// before a failing one are delivered, and then the failure is returned.
+    ///
+    /// @param batch - the rows arriving
+    fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
+        let mut fresh = Vec::new();
+        let found = self.collect_fresh(batch, &mut fresh);
+        let flow = emit_rows(&fresh, self.downstream.as_mut())?;
+        match (found, flow) {
+            (Err(error), Flow::Continue) => Err(error),
+            (_, flow) => Ok(flow),
+        }
     }
 
     fn finish(&mut self) -> DbResult<()> {
-        let rows = std::mem::take(&mut self.rows);
-        emit_rows(&rows, self.downstream.as_mut())?;
         self.downstream.finish()
     }
 
     /// Returns this operator and everything below it to its pre-input state.
     fn reset(&mut self) -> DbResult<()> {
         self.seen.clear();
-        self.rows.clear();
         self.downstream.reset()
     }
 }

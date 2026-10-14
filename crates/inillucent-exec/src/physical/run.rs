@@ -168,7 +168,11 @@ pub fn run_compound(
     let folded = crate::subquery::fold(plan, catalog, params)?;
     let params = folded.as_ref().unwrap_or(params);
     let collations = compound_collations(plan);
-    let (mut rows, shape) = run_arm(plan, catalog, params)?;
+    let streams = compound_streams(plan);
+    let (mut rows, shape) = match run_arm(plan, catalog, params) {
+        Ok(answer) => answer,
+        Err(error) => return compound_failure(plan, params, streams, Vec::new(), error),
+    };
     for (op, arm) in &plan.compounds {
         if !arm.compounds.is_empty() {
             // The binder flattens a chain of compounds onto the head, so an arm
@@ -176,11 +180,74 @@ pub fn run_compound(
             // is what the physical pass does with a shape it has not seen.
             return unsupported("a compound query nested inside a compound arm");
         }
-        let (right, _) = run_arm(arm, catalog, params)?;
+        let right = match run_arm(arm, catalog, params) {
+            Ok((right, _)) => right,
+            Err(error) => return compound_failure(plan, params, streams, rows, error),
+        };
         rows = combine(kind_of(*op), &collations, rows, right)?;
     }
     let ordered = order_compound(&plan.select, rows, params)?;
     Ok((ordered, shape))
+}
+/// Says whether a compound hands its rows out as each arm produces them.
+///
+/// **Only `UNION ALL` with no `ORDER BY` does.** SQLite sends the rows of each
+/// arm of such a compound to the caller as they are found, so an arm that fails
+/// has already returned the rows before it. `UNION`, `EXCEPT` and `INTERSECT`
+/// build a table of the whole answer first, and a sorted compound sorts it first,
+/// so a failure there returns no rows at all.
+///
+/// @param plan - the head arm, carrying the rest in `compounds`
+fn compound_streams(plan: &PhysicalPlan) -> bool {
+    plan.select.order_by.is_empty()
+        && plan
+            .compounds
+            .iter()
+            .all(|(op, _)| *op == inillucent_sql::ast::CompoundOp::UnionAll)
+}
+/// Reports an arm of a compound that failed, with the rows SQLite would have returned first.
+///
+/// For a compound that streams, those are the rows of the arms before the one
+/// that failed and the rows that arm produced before it failed, with the
+/// compound's `OFFSET` and `LIMIT` applied. When the `LIMIT` is already met by
+/// them, SQLite never reaches the failing row and the answer is those rows.
+/// Otherwise they are kept for [`take_partial_rows`] and the failure is returned.
+///
+/// @param plan - the head arm, carrying the rest in `compounds`
+/// @param params - the bound parameters
+/// @param streams - whether the compound hands out rows as each arm produces them
+/// @param earlier - the rows of the arms that finished
+/// @param error - what the failing arm said
+fn compound_failure(
+    plan: &PhysicalPlan,
+    params: &Params,
+    streams: bool,
+    mut earlier: Vec<Vec<OwnedDatum>>,
+    error: inillucent_base::DbError,
+) -> DbResult<(Vec<Vec<OwnedDatum>>, Shape)> {
+    let tail = take_partial_rows();
+    if !streams {
+        keep_partial_rows(Vec::new());
+        return Err(error);
+    }
+    earlier.extend(tail);
+    let wanted = constant_count(plan.select.limit.as_ref(), params, Negative::NoLimit)?;
+    let skipped = constant_count(plan.select.offset.as_ref(), params, Negative::Zero)?;
+    let enough =
+        wanted.is_some_and(|wanted| earlier.len() >= skipped.unwrap_or(0).saturating_add(wanted));
+    let kept = order_compound(&plan.select, earlier, params)?;
+    if enough {
+        let names = plan.select.columns.iter().map(|column| column.name.clone());
+        return Ok((
+            kept,
+            Shape {
+                names: names.collect(),
+                operators: Vec::new(),
+            },
+        ));
+    }
+    keep_partial_rows(kept);
+    Err(error)
 }
 /// Returns the collation each result column of a compound is compared under.
 ///

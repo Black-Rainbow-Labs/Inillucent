@@ -864,7 +864,7 @@ fn call(context: &mut Context, params: &Json) -> Result<Json, Failed> {
         Err(failure) => {
             let body = match wants_json {
                 true => failure.to_json(command.name).pretty(0),
-                false => failure.to_text(),
+                false => failure.to_text_with_rows(),
             };
             Ok(content(&body, true))
         }

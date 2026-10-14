@@ -43,6 +43,7 @@ mod new_engine_writes;
 mod numeric_text;
 mod oracle;
 mod ordering;
+mod partial_rows;
 mod planner;
 mod pragma;
 mod registers;

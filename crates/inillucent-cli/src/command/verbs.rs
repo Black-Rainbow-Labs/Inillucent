@@ -222,12 +222,45 @@ fn produce(
     let started = std::time::Instant::now();
     let collected = context.shell().collect_bound(sql, &bound);
     let elapsed = started.elapsed().as_secs_f64() * 1000.0;
-    let (names, rows) = collected.map_err(|failure| Failed::from_shell(&failure))?;
+    let (names, rows) = match collected {
+        Ok(answer) => answer,
+        Err(failure) => {
+            return Err(failed_after_rows(
+                context, command, &failure, limit, elapsed,
+            ))
+        }
+    };
     let mut produced = rows_to_outcome(context, command, names, rows, limit, elapsed);
     let (changes, rowid) = write_counters(context);
     produced.changes = (changes - counters.0).max(0);
     produced.last_insert_rowid = rowid_this_statement_assigned(sql, &produced, counters.1, rowid);
     Ok(produced)
+}
+
+/// Builds the failure of a statement that produced rows before it failed.
+///
+/// SQLite returns every row ahead of the one that raised the error and then
+/// reports the error. The rows are kept on the failure so the command line, the
+/// shell and MCP can print them first.
+///
+/// @param context - the open database
+/// @param command - the verb that ran
+/// @param failure - what the shell reported, with the rows it had collected
+/// @param limit - how many rows to hand back, zero meaning all of them
+/// @param elapsed - how long the statement ran, in milliseconds
+fn failed_after_rows(
+    context: &mut Context,
+    command: &str,
+    failure: &crate::shell::Failure,
+    limit: usize,
+    elapsed: f64,
+) -> Failed {
+    let mut failed = Failed::from_shell(failure);
+    if let Some((names, rows)) = failure.partial.clone() {
+        let before = rows_to_outcome(context, command, names, rows, limit, elapsed);
+        failed.partial = Some(Box::new(before));
+    }
+    failed
 }
 
 /// Returns the connection's running count of changed rows and its last rowid.

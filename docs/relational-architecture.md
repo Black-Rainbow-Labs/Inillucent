@@ -91,6 +91,20 @@ A statement moves down this picture in five steps.
 5. **Run.** Batches of column values flow up the chain. A statement runs to the end on its first
    step and keeps the rows it produced. That is why `total` in a result is an exact count.
 
+**A runtime error in the middle of a result.** SQLite evaluates a result one row at a time, so a row that raises an error is preceded by every row
+before it. The engine evaluates a batch of up to 2048 rows at a time. `Project` and `Filter` stop at
+the first row that fails and push the rows before it downstream before they return the error, and the
+`DISTINCT` operator sends each new row on when it is found instead of holding the rows until the end.
+A `LIMIT` that is satisfied by those rows ends the statement without the error, as SQLite does,
+because the failing row is never reached. A compound query made only of `UNION ALL` arms with no
+`ORDER BY` hands out each arm's rows as it goes. `UNION`, `EXCEPT`, `INTERSECT`, a sort and an
+aggregate build their whole answer first, so no row comes out before the error in those. The rows are
+kept beside the error. A constant right operand of `AND` or `OR` in a result column, such as
+`abs(-9223372036854775808)`, is evaluated before the first row of the result is projected, because SQLite
+evaluates it once up front and fails before it returns anything. `Statement::step` returns them and then the error, `inillucent-shell` prints them
+before the error line, the driver puts them in `Error::partial`, and `inillucent query` and the MCP
+server put them in the failure's `rows` member.
+
 **Checked by:** the `engine` and `differential` test tiers. The `differential` tier runs the same SQL
 through inillucent and a pinned SQLite 3.53.4 and compares the answers.
 
