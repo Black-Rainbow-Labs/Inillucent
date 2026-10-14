@@ -79,6 +79,24 @@ impl PackedRows {
         self.width
     }
 
+    /// Returns roughly how many bytes the rows occupy in memory.
+    ///
+    /// The chunks' capacities, which is what the allocator has been asked for, so a limit that
+    /// moves rows to a file counts what the process holds.
+    pub fn resident_bytes(&self) -> u64 {
+        let cells: usize = self
+            .cells
+            .iter()
+            .map(|chunk| chunk.capacity().saturating_mul(std::mem::size_of::<Cell>()))
+            .fold(0usize, usize::saturating_add);
+        let bytes: usize = self
+            .bytes
+            .iter()
+            .map(Vec::capacity)
+            .fold(0usize, usize::saturating_add);
+        cells.saturating_add(bytes) as u64
+    }
+
     /// Appends one cell.
     ///
     /// @param cell - the cell

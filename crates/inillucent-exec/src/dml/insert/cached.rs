@@ -80,6 +80,41 @@ pub fn insert_cached(
     written.map_err(|error| outer_unwind_for_insert(error, statement))
 }
 
+/// Applies an `INSERT ... SELECT` whose source rows are read back one at a time.
+///
+/// **For a source too large to hold.** The rows come from a transient file, so a copy of millions
+/// of rows is never in memory at once; see `crate::gather`. The statement is the one
+/// [`insert_cached`] runs for the same rows in a slice: the same setup, one sequence mark, one
+/// tally, and a failure on any row undoes what the statement wrote through the same write view.
+/// A view is not written this way, because its `INSTEAD OF` trigger takes the rows as a slice.
+///
+/// @param statement - the bound insert, whose target is not a view
+/// @param target - the file and its trees
+/// @param params - the bound parameters
+/// @param rows - the rows the source produced, in order
+/// @param cache - where the setup is kept between executions, or `None` when this execution's
+///   parameters were folded and its setup is its own
+pub fn insert_streamed(
+    statement: &BoundInsert,
+    target: &mut dyn WriteTarget,
+    params: &Params,
+    rows: &mut dyn Iterator<Item = DbResult<Row>>,
+    cache: Option<&InsertCache>,
+) -> DbResult<Changes> {
+    let depth = Depth::outermost(statement.on_conflict);
+    note_single_row(statement, target, depth, &[]);
+    let mut feed = rows.map(|row| row.map(std::borrow::Cow::Owned));
+    let written = match cache {
+        Some(cache) => insert_setup(cache, statement, target, params).and_then(|setup| {
+            insert_row_feed(statement, target, params, &mut feed, depth, &setup.compiled)
+        }),
+        None => compile_insert(statement, target, params).and_then(|compiled| {
+            insert_row_feed(statement, target, params, &mut feed, depth, &compiled)
+        }),
+    };
+    written.map_err(|error| outer_unwind_for_insert(error, statement))
+}
+
 /// Returns the setup kept for this statement when it is still valid, and
 /// builds and keeps a new one when it is not.
 ///
@@ -87,7 +122,7 @@ pub fn insert_cached(
 /// @param statement - the bound insert
 /// @param target - the file and its trees
 /// @param params - the bound parameters
-fn insert_setup(
+pub(super) fn insert_setup(
     cache: &InsertCache,
     statement: &BoundInsert,
     target: &dyn WriteTarget,

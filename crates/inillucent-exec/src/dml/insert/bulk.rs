@@ -340,33 +340,12 @@ impl Building {
         compiled: &CompiledInsert,
         source: RowSource<'_>,
     ) -> DbResult<()> {
-        let table = &statement.table;
-        let CompiledInsert {
-            layout,
-            space,
-            plan,
-            declarations,
-        } = compiled;
-        let before = self.next_rowid;
         let mut keys = BulkKeys { kept: &self.kept };
-        let mut image =
-            plan.build_row_from(source, space, &mut self.next_rowid, &mut keys, None)?;
-        plan.convert(declarations, space, &mut image)?;
-        let declared = resolution_of(statement.on_conflict);
-        let met = declarations_are_met(table, layout, declarations, space, &mut image, declared)?;
-        if met {
-            // A default `OR REPLACE` put where a NULL was changes what a stored
-            // generated column computes to (bug hunt 10); see `insert_rows`.
-            if declared == Resolution::Replace && plan.has_stored_generated() {
-                plan.convert(declarations, space, &mut image)?;
-            }
-            declarations.types_are_met(table, space, &image)?;
-        }
-        if !met || !declarations.checks_are_met(space, &image, declared == Resolution::Skip)? {
-            // See `give_back`: a skipped row hands its rowid back.
-            self.next_rowid = before;
+        let Some(image) =
+            checked_image(statement, compiled, source, &mut self.next_rowid, &mut keys)?
+        else {
             return Ok(());
-        }
+        };
         let Some(OwnedDatum::Int(rowid)) = image.first() else {
             return Err(inillucent_base::error::misuse(
                 "a row built for a bulk insert has no rowid",
@@ -374,18 +353,11 @@ impl Building {
         };
         let rowid = *rowid;
         if self.kept.contains(rowid) {
-            let (code, message) = rowid_message(table);
-            return Err(DbError::new(ExtendedCode(code))
-                .with_message(message)
-                .or_unwind(unwind_of(statement.on_conflict.or(rowid_conflict(table)))));
+            return Err(rowid_collision(statement));
         }
-        let indexes = IndexExprs::new(declarations, space);
-        for (position, entries) in &mut self.computed {
-            let Some(index) = table.indexes.get(*position) else {
-                continue;
-            };
-            if indexes.holds(*position, &image)? {
-                entries.push(index_entry(*position, index, layout, &image, indexes)?);
+        for (position, entry) in computed_entries(statement, compiled, &image)? {
+            if let Some((_, entries)) = self.computed.iter_mut().find(|(at, _)| *at == position) {
+                entries.push(entry);
             }
         }
         self.kept.push(rowid);
@@ -395,6 +367,241 @@ impl Building {
             ));
         }
         Ok(())
+    }
+}
+
+/// Builds one image from a source row and runs the checks that need only that row.
+///
+/// The steps are the ordinary insert's, in its order: build, convert, `NOT NULL`, `STRICT` and
+/// `CHECK`. `None` when a clause says to skip the row, which hands its rowid back as `give_back`
+/// does for the ordinary insert.
+///
+/// @param statement - the bound insert
+/// @param compiled - the plan and the declarations
+/// @param source - one row the `SELECT` produced, lent or handed over
+/// @param next_rowid - the largest rowid handed out so far, as `InsertPlan::build_row` keeps it
+/// @param keys - what a rowid allocation asks about the rows kept
+fn checked_image(
+    statement: &BoundInsert,
+    compiled: &CompiledInsert,
+    source: RowSource<'_>,
+    next_rowid: &mut Option<i64>,
+    keys: &mut dyn RowidKeys,
+) -> DbResult<Option<Row>> {
+    let table = &statement.table;
+    let CompiledInsert {
+        layout,
+        space,
+        plan,
+        declarations,
+    } = compiled;
+    let before = *next_rowid;
+    let mut image = plan.build_row_from(source, space, next_rowid, keys, None)?;
+    plan.convert(declarations, space, &mut image)?;
+    let declared = resolution_of(statement.on_conflict);
+    let met = declarations_are_met(table, layout, declarations, space, &mut image, declared)?;
+    if met {
+        // A default `OR REPLACE` put where a NULL was changes what a stored
+        // generated column computes to (bug hunt 10); see `insert_rows`.
+        if declared == Resolution::Replace && plan.has_stored_generated() {
+            plan.convert(declarations, space, &mut image)?;
+        }
+        declarations.types_are_met(table, space, &image)?;
+    }
+    if !met || !declarations.checks_are_met(space, &image, declared == Resolution::Skip)? {
+        *next_rowid = before;
+        return Ok(None);
+    }
+    Ok(Some(image))
+}
+
+/// Returns the failure for a rowid an earlier row of the statement already took.
+///
+/// @param statement - the bound insert
+fn rowid_collision(statement: &BoundInsert) -> DbError {
+    let table = &statement.table;
+    let (code, message) = rowid_message(table);
+    DbError::new(ExtendedCode(code))
+        .with_message(message)
+        .or_unwind(unwind_of(statement.on_conflict.or(rowid_conflict(table))))
+}
+
+/// Returns the entry each computed index takes from one image, by the index's position.
+///
+/// A partial index takes none from a row its predicate rejects.
+///
+/// @param statement - the bound insert
+/// @param compiled - the plan and the declarations
+/// @param image - the row's image
+fn computed_entries(
+    statement: &BoundInsert,
+    compiled: &CompiledInsert,
+    image: &Row,
+) -> DbResult<Vec<(usize, Row)>> {
+    let table = &statement.table;
+    let CompiledInsert {
+        layout,
+        space,
+        declarations,
+        ..
+    } = compiled;
+    let indexes = IndexExprs::new(declarations, space);
+    let mut out = Vec::new();
+    for (position, index) in maintained(table) {
+        if !index_is_computed(index) {
+            continue;
+        }
+        if indexes.holds(position, image)? {
+            out.push((
+                position,
+                index_entry(position, index, layout, image, indexes)?,
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Why a streaming bulk build stopped on a row.
+#[derive(Debug)]
+pub enum StreamFailure {
+    /// The row's rowid is not larger than every rowid before it, so the rows cannot be written in
+    /// the order they arrive. Nothing is wrong with the statement.
+    NotIncreasing,
+    /// The statement fails on this row, with the error the ordinary insert reports.
+    Failed(BulkFailure),
+}
+
+/// One row of a streaming bulk build: the image, and the entries the computed indexes take.
+#[derive(Debug)]
+pub struct StreamedRow {
+    /// The table row, in tree column order.
+    pub image: Row,
+    /// The entry each computed index takes from the row, by the index's position.
+    pub entries: Vec<(usize, Row)>,
+}
+
+/// Builds the images of an `INSERT ... SELECT` one at a time, for a source too large to hold.
+///
+/// **The checks are the bulk build's, in the bulk build's order, and the rows must arrive with
+/// increasing rowids.** The images are handed on as they are built and none is kept, so there is
+/// nothing to sort and no set of the rowids taken. A row whose rowid is not larger than the one
+/// before stops the stream with [`StreamFailure::NotIncreasing`], and the caller takes the ordinary
+/// insert, which needs no order.
+pub struct BulkStream {
+    /// The plan and the declarations.
+    compiled: CompiledInsert,
+    /// The largest rowid handed out so far.
+    next_rowid: Option<i64>,
+    /// The rowid of the last row kept.
+    largest: Option<i64>,
+    /// How many rows were kept.
+    kept: u64,
+}
+
+/// What a rowid allocation asks about the rows kept, when only the largest rowid is known.
+struct StreamKeys<'k> {
+    /// The largest rowid kept.
+    largest: Option<i64>,
+    /// Set when a question needed more than the largest rowid to answer.
+    tripped: &'k std::cell::Cell<bool>,
+}
+
+impl RowidKeys for StreamKeys<'_> {
+    fn highest(&mut self) -> DbResult<i64> {
+        Ok(self.largest.unwrap_or(0))
+    }
+
+    fn holds(&mut self, rowid: i64) -> DbResult<bool> {
+        // Rowids above the largest are not held; any other answer would need the set, which a
+        // stream does not keep, so the stream stops.
+        if self.largest.is_some_and(|largest| rowid <= largest) {
+            self.tripped.set(true);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+impl BulkStream {
+    /// Compiles the statement for a stream.
+    ///
+    /// @param statement - the bound insert, which `bulk_shape` accepted
+    /// @param target - the file and its trees, which `bulk_target_ready` accepted
+    /// @param params - the bound parameters
+    pub fn open(
+        statement: &BoundInsert,
+        target: &mut dyn WriteTarget,
+        params: &Params,
+    ) -> Result<BulkStream, BulkFailure> {
+        let compiled = compile_insert(statement, target, params).map_err(|error| BulkFailure {
+            error,
+            last_rowid: None,
+        })?;
+        Ok(BulkStream {
+            compiled,
+            next_rowid: None,
+            largest: None,
+            kept: 0,
+        })
+    }
+
+    /// Builds and checks one row.
+    ///
+    /// @param statement - the bound insert
+    /// @param source - one row the `SELECT` produced
+    pub fn add(
+        &mut self,
+        statement: &BoundInsert,
+        source: Vec<OwnedDatum>,
+    ) -> Result<Option<StreamedRow>, StreamFailure> {
+        let tripped = std::cell::Cell::new(false);
+        let mut keys = StreamKeys {
+            largest: self.largest,
+            tripped: &tripped,
+        };
+        let last = self.largest;
+        let failed = |error: DbError| {
+            StreamFailure::Failed(BulkFailure {
+                error,
+                last_rowid: last,
+            })
+        };
+        let built = checked_image(
+            statement,
+            &self.compiled,
+            RowSource::Given(source),
+            &mut self.next_rowid,
+            &mut keys,
+        );
+        if tripped.get() {
+            return Err(StreamFailure::NotIncreasing);
+        }
+        let Some(image) = built.map_err(failed)? else {
+            return Ok(None);
+        };
+        let Some(OwnedDatum::Int(rowid)) = image.first() else {
+            return Err(failed(inillucent_base::error::misuse(
+                "a row built for a bulk insert has no rowid",
+            )));
+        };
+        let rowid = *rowid;
+        if self.largest.is_some_and(|largest| rowid <= largest) {
+            return Err(StreamFailure::NotIncreasing);
+        }
+        let entries = computed_entries(statement, &self.compiled, &image).map_err(failed)?;
+        self.largest = Some(rowid);
+        self.kept = self.kept.saturating_add(1);
+        Ok(Some(StreamedRow { image, entries }))
+    }
+
+    /// Returns how many rows were kept.
+    pub fn kept(&self) -> u64 {
+        self.kept
+    }
+
+    /// Returns the rowid of the last row kept, which is what `last_insert_rowid()` reports.
+    pub fn last_rowid(&self) -> Option<i64> {
+        self.largest
     }
 }
 

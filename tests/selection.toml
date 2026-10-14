@@ -3680,6 +3680,15 @@ tier = "differential"
 covers = ["inillucent-engine", "inillucent-exec", "inillucent-tree"]
 requires = ["oracle"]
 
+# INSERT ... SELECT whose source rows moved to a transient file, against SQLite, with the limit lowered.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "differential"
+module = "insert_select_spill"
+tier = "differential"
+covers = ["inillucent-engine", "inillucent-exec", "inillucent-tree"]
+requires = ["oracle"]
 
 # The coverage ratchet (task-2066 section 4.4.13). `docs/repository.md` carries
 # what `tools/coverage.mjs` measured, the measurement takes about an hour, and

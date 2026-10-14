@@ -183,6 +183,34 @@ pub(super) fn insert_rows(
     depth: Depth,
     compiled: &CompiledInsert,
 ) -> DbResult<Changes> {
+    let mut feed = rows.iter().map(|row| Ok(std::borrow::Cow::Borrowed(row)));
+    insert_row_feed(statement, target, params, &mut feed, depth, compiled)
+}
+
+/// Writes the rows an insert's source produces, as they are handed over one at a time.
+///
+/// **The body of [`insert_rows`], over an iterator instead of a slice.** A statement whose source
+/// rows are too many to hold (an `INSERT ... SELECT` of millions of rows, read back from a
+/// transient file) takes them a row at a time. Everything the statement keeps between rows is
+/// kept here, for the whole feed: the sequence mark of an `AUTOINCREMENT` table is opened once and
+/// written once, the next rowid carries from row to row, and the changes are one tally. So a feed is
+/// the same statement as a slice of the same rows, and a failure on any row ends it exactly where
+/// the slice would have ended it.
+///
+/// @param statement - the bound insert
+/// @param target - the file and its trees
+/// @param params - the bound parameters
+/// @param rows - one row of supplied values per row to write, lent or handed over
+/// @param depth - how many triggers deep this write already is
+/// @param compiled - the plan, the row space, the layout and the declarations
+pub(super) fn insert_row_feed(
+    statement: &BoundInsert,
+    target: &mut dyn WriteTarget,
+    params: &Params,
+    rows: &mut dyn Iterator<Item = DbResult<std::borrow::Cow<'_, Row>>>,
+    depth: Depth,
+    compiled: &CompiledInsert,
+) -> DbResult<Changes> {
     let table = &statement.table;
     let CompiledInsert {
         layout,
@@ -202,7 +230,9 @@ pub(super) fn insert_rows(
     let mut changes = Changes::default();
     let captured = target.captures(table.root);
     let request = request_for(compiled, params, depth);
-    for supplied_row in rows.iter() {
+    for supplied in rows {
+        let supplied = supplied?;
+        let supplied_row: &Row = &supplied;
         // See `give_back`: a skipped row hands its rowid back.
         let rowid_before = next_rowid;
         let mut image = plan.build_row(

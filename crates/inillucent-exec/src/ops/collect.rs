@@ -198,12 +198,15 @@ impl Sink for Reversed {
 pub struct CollectInto {
     rows: std::rc::Rc<std::cell::RefCell<Vec<Vec<OwnedDatum>>>>,
     limit: Option<usize>,
-    /// Where the rows go instead, while the caller has put a packed set here (task-2226).
-    packed: Option<Packing>,
+    /// Where the rows go instead, while the caller has put a collection here (task-2226).
+    gathering: Option<Gather>,
 }
 
-/// The packed set a [`CollectInto`] fills while the caller has put one in the cell.
-pub type Packing = std::rc::Rc<std::cell::RefCell<Option<crate::packed::PackedRows>>>;
+/// The collection a [`CollectInto`] fills while the caller has put one in the cell.
+///
+/// Packed or one vector a row, moving to a transient file past a byte limit; see
+/// [`crate::gather::Gathering`].
+pub type Gather = std::rc::Rc<std::cell::RefCell<Option<crate::gather::Gathering>>>;
 impl CollectInto {
     /// Returns a sink appending into a shared buffer.
     ///
@@ -212,52 +215,22 @@ impl CollectInto {
         CollectInto {
             rows,
             limit: None,
-            packed: None,
+            gathering: None,
         }
     }
 
-    /// Returns the sink appending into a packed set instead whenever the cell holds one.
+    /// Returns the sink collecting into a [`crate::gather::Gathering`] instead whenever the cell
+    /// holds one.
     ///
-    /// **For an `INSERT ... SELECT` the bulk build will take** (task-2226). Its rows are read
-    /// once each and then copied into the images, so a vector a row and a copy of each text
-    /// were 200,000 allocations for a 100,000 row copy. See [`crate::packed::PackedRows`].
+    /// **For an `INSERT ... SELECT`** (task-2226). Its rows are read once each and then copied
+    /// into the images, so a vector a row and a copy of each text were 200,000 allocations for a
+    /// 100,000 row copy. The collection packs them, and moves them to a transient file when they
+    /// pass a byte limit, so a copy of millions of rows is not held in memory whole.
     ///
-    /// @param packing - the cell; empty, the sink collects into `rows` as before
-    pub fn with_packed(mut self, packing: Packing) -> CollectInto {
-        self.packed = Some(packing);
+    /// @param gathering - the cell; empty, the sink collects into `rows` as before
+    pub fn with_gathering(mut self, gathering: Gather) -> CollectInto {
+        self.gathering = Some(gathering);
         self
-    }
-
-    /// Appends a batch's live rows to a packed set, stopping at the limit.
-    ///
-    /// @param packed - the set
-    /// @param batch - the rows
-    /// @param limit - how many rows to keep
-    fn push_packed(
-        packed: &mut crate::packed::PackedRows,
-        batch: &Batch<'_>,
-        limit: Option<usize>,
-    ) -> DbResult<Flow> {
-        let width = batch.columns.len();
-        let mut row: Vec<inillucent_tree::datum::Datum<'_>> = Vec::with_capacity(width);
-        for nth in 0..batch.live() {
-            if limit.is_some_and(|limit| packed.len() >= limit) {
-                return Ok(Flow::Stop);
-            }
-            row.clear();
-            for column in 0..width {
-                row.push(batch.value(nth, column)?);
-            }
-            if !packed.push(row.iter().copied()) {
-                return Err(inillucent_base::error::misuse(
-                    "a row collected for an insert is not as wide as the rows before it",
-                ));
-            }
-        }
-        match limit {
-            Some(limit) if packed.len() >= limit => Ok(Flow::Stop),
-            _ => Ok(Flow::Continue),
-        }
     }
 
     /// Returns a sink that stops the pipeline after `limit` rows.
@@ -271,15 +244,15 @@ impl CollectInto {
         CollectInto {
             rows,
             limit: Some(limit),
-            packed: None,
+            gathering: None,
         }
     }
 }
 impl Sink for CollectInto {
     fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
-        if let Some(packing) = &self.packed {
-            if let Some(packed) = packing.borrow_mut().as_mut() {
-                return CollectInto::push_packed(packed, batch, self.limit);
+        if let Some(cell) = &self.gathering {
+            if let Some(gathering) = cell.borrow_mut().as_mut() {
+                return gathering.push_batch(batch, self.limit);
             }
         }
         let mut held = self.rows.borrow_mut();

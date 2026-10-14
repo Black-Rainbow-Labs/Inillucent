@@ -10,6 +10,8 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**`INSERT ... SELECT` no longer holds every source row in memory.** The statement still reads all of its source before it writes a row, so no row it writes is read back by its own source. Source rows past 32 MiB are now appended to a temporary file as they arrive and read back in order. Into a table that holds rows or has a `UNIQUE` index, the rows are written one at a time inside the same statement, so a failure on any row puts every earlier row back and names the same constraint as before. Into an empty table the rows are built and checked twice from the file and written a chunk at a time while the indexes sort in runs; a source whose rowids do not increase takes the row by row insert. Copying 3,000,000 rows peaked at 622 MB into a table that held a row and 527 MB into an empty one, and peaks at 167 MB and 142 MB now.
+
 **`CREATE INDEX` and `REINDEX` no longer hold every entry in memory.** The entries were scanned into one arena of about 105 bytes an entry and sorted there, so an index over 5,000,000 rows peaked at 543 to 616 MB where SQLite stays near 10 MB. The arena now holds at most 32 MiB. When it fills, the entries held are sorted and written to a temporary file as a run, and the runs are merged into the tree builder a chunk at a time. A `UNIQUE` index is checked over the merge before any page is written, so a failure leaves nothing behind. An index over 3,000,000 rows peaked at 321 MB before and 132 MB after.
 
 **`ROLLBACK` restores everything a transaction changed, including after `DROP` and `ALTER TABLE`.**
