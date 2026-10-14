@@ -473,8 +473,12 @@ impl<'p> LeafRef<'p> {
         let row = self.delta_row(index)?;
         let mut cursor = 0usize;
         for (column, wanted) in probe.iter().enumerate().take(self.key_columns) {
-            let rest = row.get(cursor..).unwrap_or(&[]);
-            if Datum::tag_of(rest)? == crate::datum::tag::KEY_EXTENT {
+            // **One byte test beforehand, and the row is sliced only for the rare spilled key.**
+            // A search of the delta area makes this test for each key column of each probe,
+            // and a slice and a `Result` built for the common key were part of the cost of an
+            // indexed insert.
+            if row.get(cursor).copied() == Some(crate::datum::tag::KEY_EXTENT) {
+                let rest = row.get(cursor..).unwrap_or(&[]);
                 let order = self.compare_delta_spilled(rest, index, column, wanted)?;
                 if order != std::cmp::Ordering::Equal {
                     return Ok(order);

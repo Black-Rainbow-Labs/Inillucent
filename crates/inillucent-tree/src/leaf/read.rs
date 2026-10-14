@@ -1472,6 +1472,14 @@ pub(crate) struct SpilledKey<'p> {
     /// The layout of the column the value is in.
     pub(crate) physical: PhysicalType,
 }
+#[cfg(test)]
+thread_local! {
+    /// How many times a key column's class array was read to find out whether a key is stored
+    /// out of line, on this thread. A unit test reads it to check that a leaf of ordinary keys
+    /// is searched without a single such read.
+    pub(crate) static STORED_KEY_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// A view over one column's class array and value slots.
 #[derive(Clone, Copy, Debug)]
 pub struct MiniColumn<'p> {
@@ -1779,10 +1787,26 @@ impl<'p> MiniColumn<'p> {
     /// values pays for the class lookup.
     ///
     /// @param row - the row's position in the sorted region
+    #[inline]
     pub(crate) fn spilled_key(&self, row: usize) -> DbResult<Option<SpilledKey<'p>>> {
+        // **The flag test is all a binary search over a leaf of ordinary keys runs**, once for
+        // each key column of each comparison, so it is inlined into the comparison and the
+        // reading of the class array is a call of its own. As one function the test cost a
+        // call and a returned `Result` of several words for every comparison (an indexed
+        // insert makes about fifteen), about 5% of `write.insert.batch`.
         if self.flags & (COLUMN_ALL_TYPED | COLUMN_KEY) != COLUMN_KEY {
             return Ok(None);
         }
+        self.spilled_key_stored(row)
+    }
+
+    /// Reads the class of a row's key value and returns its reference and prefix when the
+    /// value is stored out of line; see [`MiniColumn::spilled_key`].
+    ///
+    /// @param row - the row's position in the sorted region
+    fn spilled_key_stored(&self, row: usize) -> DbResult<Option<SpilledKey<'p>>> {
+        #[cfg(test)]
+        STORED_KEY_READS.with(|count| count.set(count.get().saturating_add(1)));
         if self.class_at(row)? != ValueClass::Extent {
             return Ok(None);
         }
