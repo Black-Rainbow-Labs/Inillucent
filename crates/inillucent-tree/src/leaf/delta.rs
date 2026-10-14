@@ -185,7 +185,7 @@ impl<'p> LeafRef<'p> {
             starts.push(at);
             covered = covered.saturating_add(row.len()).saturating_add(2);
             let mut cursor = 0usize;
-            for column in 0..self.column_count {
+            for column in 0..self.page_columns {
                 let rest = row.get(cursor..).unwrap_or(&[]);
                 let used = Datum::tagged_span(rest).map_err(|_| {
                     corrupt(format!("delta row {index} column {column} is corrupt"))
@@ -284,7 +284,7 @@ impl<'p> LeafRef<'p> {
     /// @param index - the row's position in the directory
     /// @param column - which column
     pub fn delta_extent_at(&self, index: usize, column: usize) -> DbResult<Option<ExtentRef>> {
-        if column >= self.column_count {
+        if column >= self.page_columns {
             // A column the page does not hold has no out-of-line value in it.
             return Ok(None);
         }
@@ -401,7 +401,7 @@ impl<'p> LeafRef<'p> {
     /// @param column - which column to decode
     pub fn delta_value(&self, index: usize, column: usize) -> DbResult<Datum<'p>> {
         let row = self.delta_row(index)?;
-        if column >= self.column_count {
+        if column >= self.page_columns {
             return self.padded_value(column);
         }
         let mut cursor = 0usize;
@@ -427,12 +427,12 @@ impl<'p> LeafRef<'p> {
         let row = self.delta_row(index)?;
         let mut cursor = 0usize;
         let mut values = Vec::with_capacity(self.width);
-        for column in 0..self.column_count {
+        for column in 0..self.page_columns {
             let (value, next) = self.delta_column_at(row, cursor, index, column)?;
             values.push(value);
             cursor = next;
         }
-        for column in self.column_count..self.width {
+        for column in self.page_columns..self.width {
             values.push(self.padded_value(column)?);
         }
         Ok(values)
@@ -467,12 +467,12 @@ impl<'p> LeafRef<'p> {
     ) -> DbResult<()> {
         let row = self.delta_row(index)?;
         let mut cursor = 0usize;
-        for column in 0..decode.min(self.column_count) {
+        for column in 0..decode.min(self.page_columns) {
             let (value, next) = self.delta_column_at(row, cursor, index, column)?;
             out.push(value);
             cursor = next;
         }
-        for column in self.column_count..decode.min(self.width) {
+        for column in self.page_columns..decode.min(self.width) {
             out.push(self.padded_value(column)?);
         }
         Ok(())

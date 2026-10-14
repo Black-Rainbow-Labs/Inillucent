@@ -161,6 +161,14 @@ fn assert_row(engine: &mut ImportedDatabase, row: i64, columns: usize) {
     }
 }
 
+/// Returns what the bulk insert writes in column `column` of row `row`.
+///
+/// @param row - the row's number
+/// @param column - the column's position, from 1
+fn bulk_cell(row: i64, column: i64) -> i64 {
+    (row * 7 + column) % (100 + column * 13)
+}
+
 /// 2,000 columns of numbers up to two billion are stored and read back.
 #[test]
 fn a_row_of_two_thousand_integers_is_stored_and_read_back() {
@@ -240,11 +248,11 @@ fn a_bulk_insert_of_wide_rows_is_stored_and_read_back() {
     assert_eq!(count(&mut engine, "SELECT count(*) FROM w"), 1_100);
     assert_eq!(
         count(&mut engine, "SELECT c1 FROM w WHERE k = 500"),
-        (500 * 7 + 1) % 113
+        bulk_cell(500, 1)
     );
     assert_eq!(
         count(&mut engine, "SELECT c1999 FROM w WHERE k = 1100"),
-        (1100 * 7 + 1999) % (100 + 1999 * 13)
+        bulk_cell(1100, 1999)
     );
     engine.checkpoint().expect("the fold runs");
     assert_eq!(case.format(), 4);
@@ -253,7 +261,7 @@ fn a_bulk_insert_of_wide_rows_is_stored_and_read_back() {
     assert_eq!(count(&mut engine, "SELECT count(*) FROM w"), 1_100);
     assert_eq!(
         count(&mut engine, "SELECT c777 FROM w WHERE k = 321"),
-        (321 * 7 + 777) % (100 + 777 * 13)
+        bulk_cell(321, 777)
     );
     assert_eq!(
         run(&mut engine, "PRAGMA integrity_check"),

@@ -320,12 +320,12 @@ pub struct LeafRef<'p> {
     delta_count: usize,
     /// How many columns the page holds. Everything that walks the page's own
     /// structure (the column directory, the delta rows) uses this one.
-    column_count: usize,
-    /// How many columns the leaf reads as: `column_count`, or more when the tree
+    page_columns: usize,
+    /// How many columns the leaf reads as: `page_columns`, or more when the tree
     /// has gained columns since this leaf was written and the view was given
     /// [`LeafRef::with_pad`].
     width: usize,
-    /// What the columns past `column_count` read as, when the view has any.
+    /// What the columns past `page_columns` read as, when the view has any.
     pad: Option<&'p TreePad>,
     key_columns: usize,
     heap_start: usize,
@@ -418,7 +418,7 @@ impl<'p> LeafRef<'p> {
             entry_size,
             row_count,
             delta_count,
-            column_count,
+            page_columns: column_count,
             width: column_count,
             pad: None,
             key_columns,
@@ -477,10 +477,10 @@ impl<'p> LeafRef<'p> {
         // the directory and the tombstone bitmap, and 8-byte aligned so the
         // value array a vectorised scan reads is aligned.
         let directory_end = leaf_header::DIRECTORY
-            .checked_add(self.column_count.saturating_mul(self.entry_size))
+            .checked_add(self.page_columns.saturating_mul(self.entry_size))
             .ok_or_else(|| corrupt("the column directory overflows"))?;
         let columns_end = self.tombstones_start()?;
-        for index in 0..self.column_count {
+        for index in 0..self.page_columns {
             let column = self.column(index)?;
             let start = self.column_offset(index)?;
             let end = start
@@ -500,7 +500,7 @@ impl<'p> LeafRef<'p> {
         }
         let mut seen_exception = false;
         let mut seen_extent = false;
-        for index in 0..self.column_count {
+        for index in 0..self.page_columns {
             let column = self.column(index)?;
             seen_exception = seen_exception || column.any_exception()?;
             seen_extent = seen_extent || column.any_extent()?;
@@ -525,7 +525,7 @@ impl<'p> LeafRef<'p> {
             ));
         }
         for row in 0..self.row_count {
-            for column in 0..self.column_count {
+            for column in 0..self.page_columns {
                 if self.column(column)?.class_at(row)? != ValueClass::Extent {
                     continue;
                 }

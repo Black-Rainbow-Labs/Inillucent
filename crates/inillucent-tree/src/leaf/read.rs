@@ -38,14 +38,14 @@ impl<'p> LeafRef<'p> {
     /// Fewer than [`LeafRef::column_count`] for a leaf written before its tree
     /// gained a column, when the view was given [`LeafRef::with_pad`].
     pub fn physical_column_count(&self) -> usize {
-        self.column_count
+        self.page_columns
     }
 
     /// Reports whether the page holds fewer columns than the tree it is in.
     ///
     /// Only a view given [`LeafRef::with_pad`] can say yes.
     pub fn is_short(&self) -> bool {
-        self.width > self.column_count
+        self.width > self.page_columns
     }
     /// Returns how many leading columns form the key.
     pub fn key_columns(&self) -> usize {
@@ -98,7 +98,7 @@ impl<'p> LeafRef<'p> {
         if !self.has_extents() {
             return Ok(refs);
         }
-        for column in self.key_columns()..self.column_count {
+        for column in self.key_columns()..self.page_columns {
             let mini = self.column(column)?;
             if mini.class_at(row)? == ValueClass::Extent {
                 refs.push(mini.extent(row)?);
@@ -236,7 +236,7 @@ impl<'p> LeafRef<'p> {
     ///
     /// @param index - the column's position in the directory
     pub fn spec(&self, index: usize) -> DbResult<ColumnSpec> {
-        if index >= self.column_count {
+        if index >= self.page_columns {
             return match self.pad.and_then(|pad| pad.spec(index)) {
                 Some(spec) => Ok(spec),
                 None => Err(misuse(format!("column {index} does not exist"))),
@@ -273,7 +273,7 @@ impl<'p> LeafRef<'p> {
     ///
     /// @param index - the column's position in the directory
     fn directory_entry(&self, index: usize) -> DbResult<&'p [u8]> {
-        if index >= self.column_count {
+        if index >= self.page_columns {
             return Err(misuse(format!("column {index} does not exist")));
         }
         let entry = leaf_header::DIRECTORY
@@ -300,7 +300,7 @@ impl<'p> LeafRef<'p> {
     ///
     /// @param index - the column's position in the directory
     pub fn column(&self, index: usize) -> DbResult<MiniColumn<'p>> {
-        if index >= self.column_count {
+        if index >= self.page_columns {
             return self.padded_column(index);
         }
         let entry = self.directory_entry(index)?;
@@ -731,7 +731,7 @@ impl<'p> LeafRef<'p> {
         if self.delta_count == 0 {
             return Ok(sorted_live);
         }
-        let key_width = self.key_columns.min(self.column_count);
+        let key_width = self.key_columns.min(self.page_columns);
         let mut keys: Vec<Datum<'p>> =
             Vec::with_capacity(self.delta_count.saturating_mul(key_width));
         for index in 0..self.delta_count {
@@ -901,7 +901,7 @@ impl<'p> LeafRef<'p> {
         // key columns and the projected ones are decoded, as before the merge
         // was shared. The rows are visited in key order, which the callers do
         // not need and which costs nothing more than visiting them out of it.
-        let key_width = self.key_columns.min(self.column_count);
+        let key_width = self.key_columns.min(self.page_columns);
         let mut delta_keys: Vec<Datum<'p>> =
             Vec::with_capacity(self.delta_count.saturating_mul(key_width));
         for index in 0..self.delta_count {

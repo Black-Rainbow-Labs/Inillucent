@@ -651,6 +651,24 @@ type Located2 = (
     Option<crate::mutate::DeltaOffsets>,
 );
 
+/// The leaf a write goes into and what one search of it found.
+struct WriteTarget {
+    /// The leaf.
+    page: PageId,
+    /// The interior pages above it, when the search built the path.
+    path: Vec<PageId>,
+    /// Whether the leaf hint answered.
+    hinted: bool,
+    /// Where the key sits.
+    located: Located,
+    /// The directory slot a new row for it takes.
+    slot: usize,
+    /// The row that was there, when the caller wanted it.
+    previous: Option<Vec<OwnedDatum>>,
+    /// The room the row has, or `None` when the leaf has to make room first.
+    costed: Option<crate::mutate::DeltaOffsets>,
+}
+
 /// Where a write's key sits in its leaf, and where its row will go.
 ///
 /// The two answers one search of the leaf gives, carried together from the
@@ -1551,15 +1569,22 @@ impl PagedTree {
         // When it cannot - a leaf with fewer than two live rows, or a row the
         // delta area will not hold at any fill - the write is packed instead.
         for attempt in 0..2 {
-            let (page, mut path, hinted, located, slot, mut previous, costed) = self
-                .leaf_to_write_into(
-                    database,
-                    log,
-                    encoded_key,
-                    (key, new_key),
-                    (want_previous, encoded_row.len(), attempt),
-                    &mut timing,
-                )?;
+            let WriteTarget {
+                page,
+                mut path,
+                hinted,
+                located,
+                slot,
+                mut previous,
+                costed,
+            } = self.leaf_to_write_into(
+                database,
+                log,
+                encoded_key,
+                (key, new_key),
+                (want_previous, encoded_row.len(), attempt),
+                &mut timing,
+            )?;
             from_hint = from_hint || hinted;
             // A caller that refuses a duplicate is told so before anything is
             // written, which is the whole point of asking.
@@ -3950,15 +3975,7 @@ impl PagedTree {
         key: (&[Datum<'_>], bool),
         how: (bool, usize, usize),
         timing: &mut crate::stages::PutStages,
-    ) -> DbResult<(
-        PageId,
-        Vec<PageId>,
-        bool,
-        Located,
-        usize,
-        Option<Vec<OwnedDatum>>,
-        Option<crate::mutate::DeltaOffsets>,
-    )> {
+    ) -> DbResult<WriteTarget> {
         let (want_previous, encoded_len, attempt) = how;
         for _ in 0..5 {
             let (page, path, hinted) =
@@ -3974,7 +3991,15 @@ impl PagedTree {
                 timing,
             )?;
             if !short {
-                return Ok((page, path, hinted, located, slot, previous, costed));
+                return Ok(WriteTarget {
+                    page,
+                    path,
+                    hinted,
+                    located,
+                    slot,
+                    previous,
+                    costed,
+                });
             }
             self.widen_short_leaf(database, log, page, key.0)?;
         }

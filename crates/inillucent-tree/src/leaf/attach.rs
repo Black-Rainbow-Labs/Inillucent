@@ -90,7 +90,7 @@ impl<'p> LeafRef<'p> {
     ///
     /// @param pad - the tree's columns and what a leaf without them reads as
     pub fn with_pad(self, pad: &'p TreePad) -> LeafRef<'p> {
-        if pad.width() <= self.column_count {
+        if pad.width() <= self.page_columns {
             return self;
         }
         LeafRef {
