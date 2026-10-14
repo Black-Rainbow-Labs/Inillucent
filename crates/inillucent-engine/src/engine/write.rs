@@ -109,6 +109,12 @@ pub(crate) struct WriteView<'a> {
     /// statement, each checked again when it ends. See
     /// `WriteTarget::defer_key_check`.
     pub(crate) pending_keys: std::cell::RefCell<Vec<Vec<u8>>>,
+    /// The root of the first table this statement wrote that has a vector index on it.
+    ///
+    /// A statement's row images are not labelled with the table they came from, so the engine
+    /// needs this to apply them to that table's indexes and to no other table's. Set by
+    /// `captures`, which every write asks before it stores its first row.
+    pub(crate) captured_root: std::cell::Cell<Option<u32>>,
     /// Whether the statement is a single row `INSERT ... VALUES` with no
     /// triggers of its own. See `WriteTarget::defer_key_check`.
     pub(crate) single_row: std::cell::Cell<bool>,
@@ -277,7 +283,11 @@ impl WriteTarget for WriteView<'_> {
     }
 
     fn captures(&self, root: u32) -> bool {
-        self.indexed.contains_key(&root)
+        let indexed = self.indexed.contains_key(&root);
+        if indexed && self.captured_root.get().is_none() {
+            self.captured_root.set(Some(root));
+        }
+        indexed
     }
 
     fn defer_module_write(&mut self, write: inillucent_exec::dml::ModuleWrite) -> DbResult<()> {

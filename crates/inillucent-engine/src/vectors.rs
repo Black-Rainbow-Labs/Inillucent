@@ -44,18 +44,32 @@ impl ImportedDatabase {
     /// Returns whether it reached a module at all, so a caller knows whether
     /// there is anything to flush.
     ///
+    /// **Only the indexes of the table the images came from.** The images carry no table name,
+    /// and applying them to every index read another table's column positions out of them: with
+    /// vector indexes on two tables, an insert into the first table was refused with "it is not
+    /// a vector of the declared width" whenever the second table's vector column sat at a
+    /// position that held text in the first.
+    ///
     /// @param changes - what the statement stored and removed
-    pub(crate) fn follow_vector_indexes(&mut self, changes: &Changes) -> DbResult<bool> {
+    /// @param root - the root of the table the images came from; `None` means no table with a
+    ///   vector index was written, so there is nothing to follow
+    pub(crate) fn follow_vector_indexes(
+        &mut self,
+        changes: &Changes,
+        root: Option<u32>,
+    ) -> DbResult<bool> {
+        let Some(root) = root else {
+            return Ok(false);
+        };
         if changes.written.is_empty() && changes.removed.is_empty() {
             return Ok(false);
         }
         let indexes: Vec<VectorIndex> = self
             .session_state
             .vector_indexes
-            .values()
-            .flatten()
+            .get(&root)
             .cloned()
-            .collect();
+            .unwrap_or_default();
         let reached = !indexes.is_empty();
         for index in indexes {
             for row in &changes.removed {
@@ -565,7 +579,7 @@ impl ImportedDatabase {
             owner.root,
             vec![super::VectorIndex::at(name.to_ascii_lowercase(), 1, 0)],
         )]);
-        let outcome = self.follow_vector_indexes(&changes);
+        let outcome = self.follow_vector_indexes(&changes, Some(owner.root));
         self.session_state.vector_indexes = held;
         outcome?;
         // **Folded before it is sealed**, so a `CREATE INDEX` over a full table
