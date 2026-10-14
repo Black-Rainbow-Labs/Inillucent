@@ -10,6 +10,23 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**A correlated lookup into a grouped view or derived table reads the view once.** A query such as
+`SELECT (SELECT g FROM agg WHERE agg.s = o.v) FROM o`, where `agg` is a view with a `GROUP BY`,
+ran the view's query again for every row of `o`. `EXPLAIN` already printed the automatic index
+SQLite builds there, and the engine built it only for a plain table. A correlated subquery whose one
+table is a derived table or a view that reads nothing from the outer row now runs the view's query
+once and probes the rows. Doubling the rows of `o` from 400 to 800 changes the pages fetched from 225
+to 226. A comparison against an expression of the outer row, such as `agg.s = o.v * 5`, still runs the
+view's query for each outer row.
+
+**Two tests count the work of a range `DELETE` and of a key comparison.** A `DELETE` of 40,000 rows
+of a table with an integer primary key writes 81 `DeleteRows` records and fetches about 1,700 pages,
+at every release from 2.1.5 to this one, and the new tests fail if it writes a record for each row
+or fetches more. The test that a key is stored out of line is now inlined into the comparison of a
+leaf's key with a probe, and the delta area tests one tag byte before it slices a row. Each was a
+function call and a returned `Result` for every key column of every comparison, and together they
+were about 5% of `write.insert.batch` once keys could be stored out of line.
+
 **`ROLLBACK` restores everything a transaction changed, including after `DROP` and `ALTER TABLE`.**
 Bug hunt 10 found rollbacks that lost or kept rows. With foreign keys on, `BEGIN; DROP TABLE p;
 ROLLBACK` brought `p` back with no rows, because the rows `DROP TABLE` deletes first were put back
