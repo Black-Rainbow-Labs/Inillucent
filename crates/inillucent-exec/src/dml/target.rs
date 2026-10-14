@@ -320,6 +320,18 @@ pub trait WriteTarget {
         false
     }
 
+    /// Takes the row images a trigger body's write produced, with the root of the table written.
+    ///
+    /// A trigger body is a statement of its own, and the engine follows a table's vector
+    /// indexes from the row images a write reports. The outer statement's images name one
+    /// table, so what a body wrote to another table has to arrive with that table's root, or
+    /// the other table's vector index is never told. The default drops them, which is right
+    /// for a target that has no vector indexes to follow.
+    ///
+    /// @param _root - the root page id of the table the body wrote
+    /// @param _changes - what the body's write reported
+    fn report_body_changes(&mut self, _root: u32, _changes: Changes) {}
+
     /// Takes a trigger body's write to a virtual table, to be made after the
     /// write this target is holding.
     ///

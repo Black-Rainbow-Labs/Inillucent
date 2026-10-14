@@ -115,6 +115,8 @@ pub(crate) struct WriteView<'a> {
     /// needs this to apply them to that table's indexes and to no other table's. Set by
     /// `captures`, which every write asks before it stores its first row.
     pub(crate) captured_root: std::cell::Cell<Option<u32>>,
+    /// What trigger bodies wrote, each with the root of the table it was written to.
+    pub(crate) body_changes: Vec<(u32, Changes)>,
     /// Whether the statement is a single row `INSERT ... VALUES` with no
     /// triggers of its own. See `WriteTarget::defer_key_check`.
     pub(crate) single_row: std::cell::Cell<bool>,
@@ -288,6 +290,12 @@ impl WriteTarget for WriteView<'_> {
             self.captured_root.set(Some(root));
         }
         indexed
+    }
+
+    fn report_body_changes(&mut self, root: u32, changes: Changes) {
+        if self.indexed.contains_key(&root) {
+            self.body_changes.push((root, changes));
+        }
     }
 
     fn defer_module_write(&mut self, write: inillucent_exec::dml::ModuleWrite) -> DbResult<()> {

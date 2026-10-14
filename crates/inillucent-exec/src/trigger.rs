@@ -684,6 +684,7 @@ fn run_body(
             let params = folded.as_ref().unwrap_or(params);
             // The clause this statement runs with is what the triggers it
             // fires are handed, as SQLite does; see `Depth`.
+            let body_root = insert.table.root;
             let changes = dml::insert_at(
                 &insert,
                 target,
@@ -696,6 +697,7 @@ fn run_body(
             if let Some(rowid) = changes.last_rowid {
                 firing.params.set_last_insert_rowid(rowid);
             }
+            target.report_body_changes(body_root, changes);
             Ok(())
         }
         BoundTriggerStatement::Update(update) => {
@@ -718,13 +720,14 @@ fn run_body(
                 .collect();
             let folded = crate::subquery::fold_expressions(&assigned, target.catalog(), params)?;
             let params = folded.as_ref().unwrap_or(params);
-            dml::update_at(
+            let changes = dml::update_at(
                 &update,
                 target,
                 params,
                 &keys,
                 Depth(depth.0, update.on_conflict),
             )?;
+            target.report_body_changes(update.table.root, changes);
             Ok(())
         }
         BoundTriggerStatement::Delete(delete) => {
@@ -739,7 +742,8 @@ fn run_body(
             let keys = keys_for_delete(&delete, target, params)?;
             // A `DELETE` has no conflict clause to pass on, so the triggers it
             // fires start again from their own statements' clauses.
-            dml::delete_at(&delete, target, params, &keys, Depth(depth.0, None))?;
+            let changes = dml::delete_at(&delete, target, params, &keys, Depth(depth.0, None))?;
+            target.report_body_changes(delete.table.root, changes);
             Ok(())
         }
     }

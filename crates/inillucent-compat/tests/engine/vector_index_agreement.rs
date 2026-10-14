@@ -156,3 +156,85 @@ fn integrity_check_reports_a_search_table_whose_index_lost_a_row() {
     );
     assert!(said[0].contains("search table s"), "{said:?}");
 }
+
+/// Two tables with a vector index each, and `b` follows `a` through a trigger.
+///
+/// @param connection - the connection
+/// @param trigger - the `CREATE TRIGGER` statement that writes `b` when `a` is written
+fn two_tables_with_a_trigger(connection: &Connection<'_>, trigger: &str) {
+    exec(
+        connection,
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, v VECTOR(3));
+         CREATE TABLE b (id INTEGER PRIMARY KEY, v VECTOR(3));
+         INSERT INTO b VALUES (2, '[0.6, 0.8, 0]');
+         CREATE INDEX ia ON a USING inillucent_hnsw (v);
+         CREATE INDEX ib ON b USING inillucent_hnsw (v);",
+    );
+    exec(connection, trigger);
+}
+
+/// A row a trigger body inserts into a second indexed table reaches that table's index.
+#[test]
+fn a_trigger_insert_reaches_the_second_tables_index() {
+    let connection = start_inillucent(AREA, "trigger_insert");
+    two_tables_with_a_trigger(
+        &connection,
+        "CREATE TRIGGER t AFTER INSERT ON a BEGIN INSERT INTO b VALUES (new.id, new.v); END",
+    );
+    exec(&connection, "INSERT INTO a VALUES (1, '[0, 1, 0]')");
+    for table in ["a", "b"] {
+        let sql =
+            format!("SELECT id FROM {table} ORDER BY vector_distance_cos(v, '[0, 1, 0]') LIMIT 1");
+        assert_eq!(column(&connection, &sql), vec!["1".to_string()], "{table}");
+    }
+    assert_eq!(
+        column(&connection, "SELECT count(*) FROM ib_content"),
+        vec!["2".to_string()]
+    );
+    assert_eq!(column(&connection, "PRAGMA integrity_check"), vec!["ok"]);
+}
+
+/// A row a trigger body updates in a second indexed table has its new vector in that table's index.
+#[test]
+fn a_trigger_update_reaches_the_second_tables_index() {
+    let connection = start_inillucent(AREA, "trigger_update");
+    two_tables_with_a_trigger(
+        &connection,
+        "CREATE TRIGGER t AFTER UPDATE ON a BEGIN UPDATE b SET v = new.v WHERE id = new.id; END",
+    );
+    exec(
+        &connection,
+        "INSERT INTO a VALUES (1, '[1, 0, 0]'); INSERT INTO b VALUES (1, '[1, 0, 0]');
+         UPDATE a SET v = '[0, 1, 0]' WHERE id = 1;",
+    );
+    assert_eq!(
+        column(
+            &connection,
+            "SELECT (SELECT v FROM ib_content WHERE id = 1) = (SELECT v FROM b WHERE id = 1)"
+        ),
+        vec!["1".to_string()],
+        "the index holds the old vector"
+    );
+    assert_eq!(column(&connection, "PRAGMA integrity_check"), vec!["ok"]);
+}
+
+/// A row a trigger body deletes from a second indexed table leaves that table's index.
+#[test]
+fn a_trigger_delete_reaches_the_second_tables_index() {
+    let connection = start_inillucent(AREA, "trigger_delete");
+    two_tables_with_a_trigger(
+        &connection,
+        "CREATE TRIGGER t AFTER DELETE ON a BEGIN DELETE FROM b WHERE id = old.id; END",
+    );
+    exec(
+        &connection,
+        "INSERT INTO a VALUES (1, '[1, 0, 0]'); INSERT INTO b VALUES (1, '[1, 0, 0]');
+         DELETE FROM a WHERE id = 1;",
+    );
+    assert_eq!(
+        column(&connection, "SELECT count(*) FROM ib_content"),
+        vec!["1".to_string()],
+        "the deleted row is still in the index"
+    );
+    assert_eq!(column(&connection, "PRAGMA integrity_check"), vec!["ok"]);
+}
