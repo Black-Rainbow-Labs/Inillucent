@@ -198,7 +198,7 @@ fn fill_in_passes(
         .iter()
         .chain(steps.iter())
         .any(|(op, _)| *op == inillucent_sql::ast::CompoundOp::Union);
-    let collations = vec![Collation::Binary; width.max(1)];
+    let collations = queue_collations(seeds, steps, width);
     let mut answer: Vec<Vec<OwnedDatum>> = Vec::new();
     for (_, arm) in seeds {
         let (rows, _) = run_any(arm, catalog, params)?;
@@ -307,6 +307,33 @@ fn fill_in_passes(
         }
         working = start..answer.len();
     }
+}
+
+/// Returns the collation each column of a recursive CTE is de-duplicated under.
+///
+/// **`UNION` removes repeats under the column's collation, not under BINARY.** With a `NOCASE`
+/// column in the seed, `SELECT nc FROM t UNION SELECT 'A' FROM c` keeps one of `a` and `A` in
+/// SQLite, and comparing the rows as bytes kept both (bug hunt 10). The leftmost arm whose
+/// column carries a collation of its own decides, the rule a plain compound uses.
+///
+/// @param seeds - the arms that do not reference the CTE
+/// @param steps - the arms that do
+/// @param width - how many columns a row holds
+fn queue_collations(
+    seeds: &[(inillucent_sql::ast::CompoundOp, PhysicalPlan)],
+    steps: &[(inillucent_sql::ast::CompoundOp, PhysicalPlan)],
+    width: usize,
+) -> Vec<Collation> {
+    (0..width.max(1))
+        .map(|at| {
+            let arms = seeds
+                .iter()
+                .chain(steps.iter())
+                .filter_map(|(_, arm)| arm.select.columns.get(at))
+                .map(|column| &column.expr);
+            inillucent_sql::bind::compound_collation(arms)
+        })
+        .collect()
 }
 
 /// One recursive arm, prepared once and compiled into a reusable chain when it can be.
@@ -615,7 +642,7 @@ fn fill_in_order(
         .iter()
         .chain(steps.iter())
         .any(|(op, _)| *op == inillucent_sql::ast::CompoundOp::Union);
-    let mut seen = SetKeys::new(vec![Collation::Binary; width.max(1)]);
+    let mut seen = SetKeys::new(queue_collations(seeds, steps, width));
     let mut waiting: Vec<Vec<OwnedDatum>> = Vec::new();
     for (_, arm) in seeds {
         let (rows, _) = run_any(arm, catalog, params)?;

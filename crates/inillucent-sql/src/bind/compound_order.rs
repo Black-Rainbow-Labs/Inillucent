@@ -47,23 +47,33 @@ impl Binder<'_> {
                     _ => return Err(order_out_of_range(position, columns.len(), span)),
                 },
                 None => {
-                    let Some(Expr::Column {
-                        database: None,
-                        table: None,
-                        column,
-                    }) = self.ast.expr(target)
-                    else {
-                        return Err(compound_order_unmatched(position, span));
+                    let by_name = match self.ast.expr(target) {
+                        Some(Expr::Column {
+                            database: None,
+                            table: None,
+                            column,
+                        }) => {
+                            let folded = self.ast.folded(*column).to_vec();
+                            let named_in = |result: &[BoundResultColumn]| {
+                                result.iter().position(|candidate| {
+                                    candidate.name.eq_ignore_ascii_case(&folded)
+                                })
+                            };
+                            named_in(columns)
+                                .or_else(|| arms.iter().find_map(|(_, arm)| named_in(&arm.columns)))
+                        }
+                        _ => None,
                     };
-                    let folded = self.ast.folded(*column).to_vec();
-                    let named_in = |result: &[BoundResultColumn]| {
-                        result
-                            .iter()
-                            .position(|candidate| candidate.name.eq_ignore_ascii_case(&folded))
+                    // A term that names no column is still accepted when it is the same
+                    // expression some arm writes as a result column (bug hunt 10). A term
+                    // with its own `COLLATE` is not: SQLite compares the expression with
+                    // the collation still on it, and finds no match.
+                    let matched = match (by_name, named) {
+                        (Some(index), _) => Some(index),
+                        (None, None) => self.column_written_as(target, columns, arms),
+                        (None, Some(_)) => None,
                     };
-                    let Some(index) = named_in(columns)
-                        .or_else(|| arms.iter().find_map(|(_, arm)| named_in(&arm.columns)))
-                    else {
+                    let Some(index) = matched else {
                         return Err(compound_order_unmatched(position, span));
                     };
                     index
@@ -98,6 +108,55 @@ impl Binder<'_> {
             });
         }
         Ok(bound)
+    }
+
+    /// Finds the result column an `ORDER BY` term repeats, by binding the term
+    /// in each arm's own FROM clause and comparing it with that arm's result
+    /// columns.
+    ///
+    /// **Why each arm and not the first only.** SQLite resolves the term in every
+    /// arm in turn, so `SELECT a FROM t UNION SELECT a FROM u ORDER BY t.a` and
+    /// `... ORDER BY u.a` both sort the one result column. `ORDER BY a+1` over
+    /// `SELECT a+1` and `ORDER BY upper(b)` over `SELECT upper(b)` match in the
+    /// same way. A term that binds in no arm, or binds to something no arm
+    /// selects, is not an error here: the caller reports it as unmatched.
+    ///
+    /// @param term - the `ORDER BY` term as written, without a `COLLATE`
+    /// @param columns - the first arm's result columns
+    /// @param arms - the other arms
+    fn column_written_as(
+        &mut self,
+        term: ExprId,
+        columns: &[BoundResultColumn],
+        arms: &[(ast::CompoundOp, BoundSelect)],
+    ) -> Option<usize> {
+        let first_scope = self.scope().to_vec();
+        let mut candidates: Vec<(Vec<usize>, &[BoundResultColumn])> = vec![(first_scope, columns)];
+        for (_, arm) in arms {
+            let ids = arm.sources.iter().map(|source| source.id).collect();
+            candidates.push((ids, arm.columns.as_slice()));
+        }
+        for (ids, result) in candidates {
+            // Binding the term must leave nothing behind in the statement being bound.
+            let kept = (
+                self.aggregates.len(),
+                self.windows.len(),
+                self.correlations.len(),
+            );
+            self.scopes.push(ids);
+            let bound = self.bind_expr(term);
+            self.scopes.pop();
+            self.aggregates.truncate(kept.0);
+            self.windows.truncate(kept.1);
+            self.correlations.truncate(kept.2);
+            let Ok(bound) = bound else {
+                continue;
+            };
+            if let Some(index) = result.iter().position(|column| column.expr == bound) {
+                return Some(index);
+            }
+        }
+        None
     }
 
     /// Splits a compound `ORDER BY` term into the term itself and the

@@ -77,6 +77,15 @@ fn may_drop_columns(block: &BoundSelect) -> bool {
     {
         return false;
     }
+    // **A `LIMIT` or `OFFSET` keeps the first rows the block produces, and which rows those
+    // are depends on how the block is read.** With a column left out, an index that holds
+    // only the columns still read covers the scan, the scan walks that index instead of
+    // the table, and the limit keeps different rows: `SELECT a FROM (SELECT a, b FROM t
+    // LIMIT 3) WHERE a = 1` returned three rows where SQLite returns the one among the
+    // first three rows of the table (bug hunt 10).
+    if block.limit.is_some() || block.offset.is_some() {
+        return false;
+    }
     let arms = core::iter::once(block).chain(block.compounds.iter().map(|(_, arm)| arm));
     let plain = |arm: &BoundSelect| {
         !arm.distinct

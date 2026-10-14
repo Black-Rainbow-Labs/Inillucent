@@ -82,6 +82,12 @@ impl Parser<'_> {
             return self.parse_create_table(temporary);
         }
         if self.at_keyword(Keyword::UNIQUE)? || self.at_keyword(Keyword::INDEX)? {
+            // SQLite's grammar has `TEMP` only before TABLE, VIEW and TRIGGER, so
+            // `CREATE TEMP INDEX` is a syntax error at the word `INDEX`; an index
+            // lives in its table's database (bug hunt 10).
+            if temporary {
+                return Err(self.unexpected(&["TABLE", "VIEW", "TRIGGER"])?);
+            }
             let unique = self.eat_keyword(Keyword::UNIQUE)?;
             self.expect_keyword(Keyword::INDEX)?;
             return self.parse_create_index(unique);
@@ -344,6 +350,10 @@ impl Parser<'_> {
             }
             Keyword::NULL => {
                 self.bump()?;
+                // SQLite's grammar is `ccons ::= NULL onconf`, so `NULL ON CONFLICT FAIL`
+                // is accepted. The action has no effect on a NULL constraint, and is
+                // read and dropped (bug hunt 10).
+                self.parse_on_conflict()?;
                 ColumnConstraint::Null
             }
             Keyword::UNIQUE => {

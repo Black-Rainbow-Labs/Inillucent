@@ -75,24 +75,61 @@ pub(super) fn seen_affinity_among(sources: &[BoundSource], expr: &BoundExpr) -> 
         ..
     } = expr
     {
-        let nothing =
-            sources
-                .iter()
-                .find(|held| held.id == *source)
-                .is_some_and(|held| match &held.rows {
-                    SourceRows::Subquery(block) => {
-                        block.column_affinity_if_any(usize::from(*column)).is_none()
-                    }
-                    // A recursive CTE's columns come from its seed, as SQLite reads
-                    // them from the leftmost arm: `SELECT 1 UNION ALL ...` has none.
-                    SourceRows::Recursive(body) => body.seeds.first().is_some_and(|(_, seed)| {
-                        seed.column_affinity_if_any(usize::from(*column)).is_none()
-                    }),
-                    _ => false,
-                });
-        if nothing {
+        if column_has_no_affinity(sources, *source, usize::from(*column)) {
             return None;
         }
     }
     expr.affinity()
+}
+
+/// Reports whether a column of a derived table, a CTE or a recursive CTE has no affinity.
+///
+/// **A derived table that only passes a column through keeps the answer of the table it reads.**
+/// `SELECT x FROM (SELECT 1 AS x)` has a column that is a bare reference to the inner table's
+/// `x`, and the inner `x` has no affinity. Asking only whether the outer block's own expression
+/// has one found the reference's stored BLOB affinity, read as a declared column with no type,
+/// so `n.parent = s.x` over two nested derived tables or a CTE read through another one applied
+/// nothing to the other side and found a text `'1'` different from the integer 1 (bug hunt 10).
+///
+/// @param sources - the FROM terms the column number is looked up in
+/// @param source - the number of the term the column belongs to
+/// @param column - the column's position in that term
+fn column_has_no_affinity(sources: &[BoundSource], source: usize, column: usize) -> bool {
+    let Some(held) = sources.iter().find(|held| held.id == source) else {
+        return false;
+    };
+    match &held.rows {
+        SourceRows::Subquery(block) => {
+            block.column_affinity_if_any(column).is_none()
+                || passes_through_unaffined(sources, block, column)
+        }
+        // A recursive CTE's columns come from its seed, as SQLite reads
+        // them from the leftmost arm: `SELECT 1 UNION ALL ...` has none.
+        SourceRows::Recursive(body) => body
+            .seeds
+            .first()
+            .is_some_and(|(_, seed)| seed.column_affinity_if_any(column).is_none()),
+        _ => false,
+    }
+}
+
+/// Reports whether a one arm block's result column is a bare reference to a column that has no
+/// affinity.
+///
+/// @param sources - the FROM terms the reference is looked up in
+/// @param block - the derived table's query
+/// @param column - the result column's position
+fn passes_through_unaffined(
+    sources: &[BoundSource],
+    block: &super::BoundSelect,
+    column: usize,
+) -> bool {
+    if !block.compounds.is_empty() || !block.values.is_empty() {
+        return false;
+    }
+    matches!(
+        block.columns.get(column).map(|held| &held.expr),
+        Some(BoundExpr::Column { source, column, affinity: Affinity::Blob, .. })
+            if column_has_no_affinity(sources, *source, usize::from(*column))
+    )
 }

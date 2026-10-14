@@ -2571,10 +2571,11 @@ impl<'a> Binder<'a> {
             )
             && order_by.len() != 1
         {
-            return Err(ParseError::new(
-                ParseErrorKind::Unsupported(
-                    "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY expression",
-                ),
+            // SQLite refuses this at parse time with its own sentence; it is not a
+            // feature this build lacks, so it must not carry the `unsupported:` prefix
+            // or the unsupported status (bug hunt 10).
+            return Err(refused(
+                "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression",
                 span,
             ));
         }
@@ -2734,7 +2735,16 @@ impl<'a> Binder<'a> {
             })
             .collect();
         if arguments.len() > hidden.len() {
-            return Err(wrong_arguments(&source.table.name.clone(), span));
+            // SQLite words this for any table-valued function as `too many arguments on
+            // NAME() - max N`, where N counts the hidden columns (bug hunt 10).
+            return Err(refused(
+                format!(
+                    "too many arguments on {}() - max {}",
+                    String::from_utf8_lossy(&source.table.name),
+                    hidden.len()
+                ),
+                span,
+            ));
         }
         for (position, argument) in arguments.iter().enumerate() {
             let Some((column, affinity, collation)) = hidden.get(position).copied() else {
@@ -3448,7 +3458,10 @@ impl<'a> Binder<'a> {
                 for item in &items {
                     list.push(self.bind_expr(*item)?);
                 }
-                let (affinity, collation) = in_list_rules(&operand, &list);
+                let (mut affinity, collation) = in_list_rules(&operand, &list);
+                if let Some(step) = self.step_column_affinity(&operand) {
+                    affinity = step;
+                }
                 Ok(BoundExpr::InList {
                     negated,
                     operand: Box::new(operand),
@@ -3722,6 +3735,9 @@ impl<'a> Binder<'a> {
     ///
     /// @param expr - the operand
     fn seen_affinity(&self, expr: &BoundExpr) -> Option<Affinity> {
+        if let Some(step) = self.step_column_affinity(expr) {
+            return step;
+        }
         comparison_rules::seen_affinity_among(&self.sources, expr)
     }
 

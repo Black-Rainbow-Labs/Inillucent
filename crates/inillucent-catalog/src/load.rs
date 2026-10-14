@@ -575,10 +575,18 @@ pub fn table_from_create_sql(sql: &[u8], database: usize, root: u32) -> DbResult
 fn column_info(source: &[u8], ast: &Ast, column: &inillucent_sql::ast::ColumnDef) -> ColumnInfo {
     let name = ast.text(column.name).to_vec();
     let declared = column.declared_type.clone().unwrap_or_default();
+    // A type written as an empty quoted name (`""`, `''`, `[]`) is a declared type that
+    // holds no keyword, so SQLite gives it NUMERIC affinity. Only a column with no type
+    // at all is BLOB, and `for_column` cannot tell the two apart from the bytes (bug hunt 10).
+    let declared_affinity = if column.declared_type.is_some() && declared.is_empty() {
+        affinity::Affinity::Numeric
+    } else {
+        affinity::for_column(&declared)
+    };
     let mut info = ColumnInfo {
         folded: name.to_ascii_lowercase(),
         name,
-        affinity: affinity::for_column(&declared),
+        affinity: declared_affinity,
         declared_type: declared,
         collation: b"binary".to_vec(),
         not_null: false,

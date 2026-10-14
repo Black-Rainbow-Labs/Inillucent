@@ -1111,7 +1111,10 @@ fn in_list_items(
     for item in &held.in_list {
         match item {
             inillucent_sql::bind::BoundExpr::Subquery { id, .. } => match params.subquery(*id) {
-                Some(answer) => items.extend(answer.column.iter().cloned()),
+                Some(answer) => match &answer.failure {
+                    Some(error) => return Err(error.clone()),
+                    None => items.extend(answer.column.iter().cloned()),
+                },
                 None => return Err(inillucent_base::error::misuse(
                     "an IN list on a virtual table reads a subquery the statement did not answer",
                 )),

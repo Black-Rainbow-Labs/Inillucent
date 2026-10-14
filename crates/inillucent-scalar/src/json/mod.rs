@@ -330,7 +330,18 @@ fn error_position(arguments: &[Argument<'_>]) -> DbResult<Answer> {
             };
             Ok(Answer::plain(Value::Integer(match parse::parse(source) {
                 Ok(_) => 0,
-                Err(failure) => failure.position as i64,
+                // The parser counts bytes; SQLite reports characters, so a multi byte
+                // character before the error counts once (bug hunt 10).
+                Err(failure) => {
+                    let before = failure.position.saturating_sub(1);
+                    let characters = source
+                        .as_bytes()
+                        .iter()
+                        .take(before)
+                        .filter(|byte| (**byte & 0xc0) != 0x80)
+                        .count();
+                    characters.saturating_add(1) as i64
+                }
             })))
         }
         _ => Ok(Answer::plain(Value::Integer(0))),

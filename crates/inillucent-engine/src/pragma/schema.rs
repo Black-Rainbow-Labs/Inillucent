@@ -681,6 +681,17 @@ impl crate::ImportedDatabase {
             .tables
             .iter()
             .find(|table| table.folded == wanted && at.is_none_or(|named| table.database == named))
+            // An eponymous module (`generate_series`, `json_each`) is a table to
+            // `PRAGMA table_info`, but it is listed in no database, so it comes after
+            // every real table of the same name (bug hunt 10).
+            .or_else(|| {
+                self.schema
+                    .catalog
+                    .eponymous
+                    .iter()
+                    .find(|table| table.folded == wanted)
+                    .map(|table| &**table)
+            })
             .or(
                 if matches!(
                     wanted.as_slice(),

@@ -175,7 +175,9 @@ fn resolve_in_frame(expr: &BoundExpr, frame: Frame<'_>) -> DbResult<Option<Expr>
             return Ok(Some(Expr::Column(group_width.saturating_add(*slot))));
         }
         if let Some(position) = select.group_by.iter().position(|key| key == expr) {
-            return Ok(Some(Expr::Column(position)));
+            if !reads_from_extreme_row(select, expr) {
+                return Ok(Some(Expr::Column(position)));
+            }
         }
         // **A bare column is one SQLite answers, by a rule rather than by
         // luck.** `SELECT id, max(a) FROM t` gives the `id` of the row that
@@ -806,6 +808,17 @@ fn translate_call(
             let Some(value) = params.subquery(*id) else {
                 return unsupported("a correlated subquery used as a value");
             };
+            // The block failed when it was folded. The statement fails only if this
+            // expression is evaluated, as it does in SQLite, which runs the subquery
+            // the first time an expression reaches it.
+            if let Some(error) = &value.failure {
+                return Ok(Some(Expr::Raise {
+                    code: error.extended().value(),
+                    message: error.message().as_bytes().to_vec(),
+                    computed: None,
+                    unwind: error.unwind(),
+                }));
+            }
             match kind {
                 SubqueryKind::Exists => {
                     Expr::Literal(OwnedDatum::Int(i64::from(value.exists() != *negated)))
@@ -995,11 +1008,15 @@ fn bare_columns(select: &BoundSelect) -> Vec<BoundExpr> {
             // `SELECT key % 50000, count(*) ... GROUP BY 1` found `key` under the
             // term and kept it as a bare column, an accumulator fed a copy of
             // every row for a value nothing reads.
-            if select.group_by.contains(&node) {
+            // Except when a `min` or `max` picks the row the bare columns come from: then a
+            // column is read from that row even when it is also a `GROUP BY` term.
+            let from_key =
+                !reads_from_extreme_row(select, &node) && select.group_by.contains(&node);
+            if from_key {
                 continue;
             }
             if matches!(node, BoundExpr::Column { .. } | BoundExpr::Rowid { .. }) {
-                if !select.group_by.contains(&node) && !found.contains(&node) {
+                if !from_key && !found.contains(&node) {
                     found.push(node);
                 }
                 continue;
@@ -1035,6 +1052,26 @@ fn bare_columns(select: &BoundSelect) -> Vec<BoundExpr> {
     }
     found
 }
+/// Reports whether a term that matches a `GROUP BY` term is a column read from the row a `min`
+/// or `max` chose, instead of from the group's key.
+///
+/// **SQLite does this for a plain column, and only for a column.** The key decides which rows
+/// share a group. With `CREATE TABLE t(a,c)` holding `(1,10), (1.0,70), ('1',60)`, `SELECT a,
+/// max(c) FROM t GROUP BY a` answers `1.0` for the group the first two rows form, because `a`
+/// is read from the row with the maximum `c`. Reading the group's key answered `1`, the value
+/// of the first row (bug hunt 10). `a+0` as a `GROUP BY` term and as a result column is still
+/// read from the key, and so is every term when the query has no `min` or `max`.
+///
+/// @param select - the bound statement
+/// @param term - the term that matches one of the statement's `GROUP BY` terms
+fn reads_from_extreme_row(select: &BoundSelect, term: &BoundExpr) -> bool {
+    matches!(term, BoundExpr::Column { .. } | BoundExpr::Rowid { .. })
+        && select.aggregates.iter().any(|call| {
+            matches!(call.func, AggregateFunc::Min | AggregateFunc::Max)
+                && !call.arguments.is_empty()
+        })
+}
+
 /// Returns the witness a bare column follows: the last `min` or `max` call.
 ///
 /// SQLite's rule, measured against the pinned 3.53.4: every `min` or `max`

@@ -15,11 +15,14 @@
 //! and the ten items here were the only ones asking it. Nothing moved changed
 //! in the move.
 
-use super::{subquery_table, unsupported, Binder, BoundSource, RecursiveBody, SourceRows};
+use super::{
+    subquery_table, unsupported, Binder, BoundExpr, BoundSource, RecursiveBody, SourceRows,
+};
 use crate::ast::{self, CompoundOp, JoinKind, SelectId};
 use crate::catalog_view::TableInfo;
 use crate::diagnostic::{ParseError, ParseErrorKind};
 use crate::lexer::Span;
+use inillucent_value::Affinity;
 
 /// The first number a derived table inside a correlated subquery keeps its rows
 /// under, which is past any number a common table expression can have.
@@ -64,10 +67,32 @@ pub(super) struct RecursiveTarget {
     table: TableInfo,
     /// Whether any arm bound so far referred to it.
     referenced: bool,
+    /// The affinity each column has when a step arm reads it, `None` when it has none.
+    ///
+    /// SQLite gives the recursive table the affinity a compound select gives its column, which
+    /// reads every arm and not only the seed (see `Binder::step_column_affinity`).
+    affinities: Vec<Option<Affinity>>,
 }
 
 /// A recursive CTE's compound arms, bound, each with the operator before it.
 type BoundArms = Vec<(CompoundOp, crate::bind::BoundSelect)>;
+
+/// Returns the affinity each column of a recursive CTE has once every arm is bound.
+///
+/// @param seed - the first arm
+/// @param extra_seeds - the other arms that do not read the CTE
+/// @param steps - the arms that do
+fn settled_affinities(
+    seed: &crate::bind::BoundSelect,
+    extra_seeds: &BoundArms,
+    steps: &BoundArms,
+) -> Vec<Option<Affinity>> {
+    let mut probe = seed.clone();
+    probe.compounds = extra_seeds.iter().chain(steps.iter()).cloned().collect();
+    (0..seed.columns.len())
+        .map(|column| probe.column_affinity_if_any(column))
+        .collect()
+}
 
 impl Binder<'_> {
     /// Pushes the CTEs of a `WITH` prefix, returning whether it pushed any.
@@ -382,6 +407,31 @@ impl Binder<'_> {
         Ok(())
     }
 
+    /// Returns the affinity a comparison applies for a column of a recursive CTE read from
+    /// inside one of its own step arms, or `None` when the expression is not such a column.
+    ///
+    /// **The column has the affinity a compound select gives it, which reads every arm.**
+    /// Measured against 3.53.4 with `b.v` an untyped column holding `1`, `'1'`, `'1.0'` and
+    /// `1.0`: `s.x = b.v` in the step matches all four when the seed is `SELECT 1` and the step
+    /// is `SELECT k` over an INTEGER key (both arms are numbers and one has INTEGER affinity),
+    /// and matches only `1` and `1.0` when the step is `SELECT k+0` or the seed is `SELECT '1'`.
+    /// The binder read the column as one with a declared type of nothing, which applies
+    /// nothing to the other side, so `n.parent = s.x` with a TEXT `parent` compared the text
+    /// `'1'` with the integer 1 and found them different (bug hunt 10).
+    ///
+    /// @param expr - the operand of a comparison
+    pub(super) fn step_column_affinity(&self, expr: &BoundExpr) -> Option<Option<Affinity>> {
+        let BoundExpr::Column { source, column, .. } = expr else {
+            return None;
+        };
+        let held = self.sources.iter().find(|held| held.id == *source)?;
+        let SourceRows::RecursiveSelf { cte } = held.rows else {
+            return None;
+        };
+        let target = self.recursing.iter().find(|target| target.id == cte)?;
+        target.affinities.get(usize::from(*column)).copied()
+    }
+
     /// Registers a reference to the recursive CTE currently being bound.
     pub(super) fn push_recursive_self(
         &mut self,
@@ -491,15 +541,30 @@ impl Binder<'_> {
         let seed = self.bind_isolated_arm(first)?;
         let table = subquery_table(&alias, &cte.columns, &seed);
         named_columns_fit(&alias, &cte.columns, seed.columns.len(), span)?;
-        let target = RecursiveTarget {
+        // **The step arms are bound against the seed's affinities first, and again when the
+        // other arms change them.** A step arm compares the recursive table's column, and the
+        // column's affinity is the one a compound select gives it, which depends on the step
+        // arms that are not bound yet. The first pass finds them; a second pass binds the steps
+        // with them when they differ from what the seed alone gave (bug hunt 10).
+        let provisional: Vec<Option<Affinity>> = (0..seed.columns.len())
+            .map(|column| seed.column_affinity_if_any(column))
+            .collect();
+        let mut target = RecursiveTarget {
             folded: cte.folded.clone(),
             name: cte.name.clone(),
             id,
             table: table.clone(),
             referenced: false,
+            affinities: provisional.clone(),
         };
-        let (extra_seeds, steps) =
-            self.bind_recursive_arms(target, &arms, &direct, (&alias, span))?;
+        let (mut extra_seeds, mut steps) =
+            self.bind_recursive_arms(target.clone(), &arms, &direct, (&alias, span))?;
+        let settled = settled_affinities(&seed, &extra_seeds, &steps);
+        if settled != provisional && !steps.is_empty() {
+            target.affinities = settled;
+            (extra_seeds, steps) =
+                self.bind_recursive_arms(target, &arms, &direct, (&alias, span))?;
+        }
         let mut seeds = vec![(CompoundOp::UnionAll, seed)];
         seeds.extend(extra_seeds);
         // The ORDER BY, LIMIT and OFFSET belong to the whole recursive query:

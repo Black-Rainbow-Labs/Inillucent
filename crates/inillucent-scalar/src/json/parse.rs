@@ -66,10 +66,16 @@ pub fn parse_pruned(text: &str, steps: &[Step]) -> Result<Parsed, ParseFailure> 
         skipping: false,
     };
     parser.skip_space();
+    // SQLite leaves the error offset at zero for a document with nothing in it and for
+    // text after a complete value, so `json_error_position()` answers 1 for both,
+    // wherever the text is (bug hunt 10).
+    if parser.at == parser.bytes.len() {
+        return Err(parser.fail_at(0));
+    }
     let node = parser.value_pruned(steps)?;
     parser.skip_space();
     if parser.at != parser.bytes.len() {
-        return Err(parser.fail());
+        return Err(parser.fail_at(0));
     }
     Ok(Parsed {
         node,
@@ -105,6 +111,20 @@ impl Parser<'_> {
     fn fail(&self) -> ParseFailure {
         ParseFailure {
             position: self.at.saturating_add(1),
+        }
+    }
+
+    /// Returns the failure for the byte at `index`.
+    ///
+    /// SQLite points a malformed number at a byte other than the one the parser
+    /// stopped on: the exponent letter or its sign, the `x` of a hexadecimal
+    /// number with no digits, the second digit of a number with a leading zero,
+    /// and the start of a number that has no digits at all (bug hunt 10).
+    ///
+    /// @param index - the zero based byte offset of the error
+    fn fail_at(&self, index: usize) -> ParseFailure {
+        ParseFailure {
+            position: index.saturating_add(1),
         }
     }
 
@@ -651,7 +671,7 @@ impl Parser<'_> {
                 self.at += 1;
             }
             if self.at == digits {
-                return Err(self.fail());
+                return Err(self.fail_at(digits.saturating_sub(1)));
             }
             self.used_json5 = true;
             return Ok(Node::Int5(self.slice(start, self.at)?));
@@ -659,23 +679,23 @@ impl Parser<'_> {
         let mut is_float = false;
         let integer_digits = self.digits();
         if integer_digits == 0 && self.peek() != Some(b'.') {
-            return Err(self.fail());
+            return Err(self.fail_at(start));
         }
         // RFC-8259 forbids a leading zero on a multi-digit integer; JSON5 does
         // too, so this is a parse failure in both dialects.
-        let first = self.bytes.get(start.saturating_add(usize::from(matches!(
+        let first_at = start.saturating_add(usize::from(matches!(
             self.bytes.get(start),
             Some(b'-' | b'+')
-        ))));
-        if integer_digits > 1 && first == Some(&b'0') {
-            return Err(self.fail());
+        )));
+        if integer_digits > 1 && self.bytes.get(first_at) == Some(&b'0') {
+            return Err(self.fail_at(first_at.saturating_add(1)));
         }
         if self.peek() == Some(b'.') {
             is_float = true;
             self.at += 1;
             let fraction_digits = self.digits();
             if integer_digits == 0 && fraction_digits == 0 {
-                return Err(self.fail());
+                return Err(self.fail_at(start));
             }
             if integer_digits == 0 || fraction_digits == 0 {
                 // `.5` and `5.` are JSON5 spellings of a float.
@@ -684,12 +704,15 @@ impl Parser<'_> {
         }
         if matches!(self.peek(), Some(b'e' | b'E')) {
             is_float = true;
+            // The error points at the exponent letter, or at its sign when it has one.
+            let mut marked = self.at;
             self.at += 1;
             if matches!(self.peek(), Some(b'+' | b'-')) {
+                marked = self.at;
                 self.at += 1;
             }
             if self.digits() == 0 {
-                return Err(self.fail());
+                return Err(self.fail_at(marked));
             }
         }
         let text = self.slice(start, self.at)?;

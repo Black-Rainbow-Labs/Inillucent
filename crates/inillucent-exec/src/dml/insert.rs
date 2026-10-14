@@ -291,7 +291,19 @@ pub(super) fn insert_rows(
             Stored::Inserted(_) => &statement.triggers,
         };
         let returned = returned_for_row(statement, plan, space, params, target, &stored, layout)?;
-        if fire_after_insert(after_insert, target, stored.row(), layout, params, depth)? {
+        let ignored =
+            match fire_after_insert(after_insert, target, stored.row(), layout, params, depth) {
+                Ok(ignored) => ignored,
+                Err(error) => {
+                    // SQLite adds the row to the change counters when it writes the row, which
+                    // is before an `AFTER INSERT` trigger runs. A trigger that fails with
+                    // `RAISE(FAIL)` keeps the row, so `changes()` and `total_changes()` must
+                    // already include it (bug hunt 10).
+                    count_row(&mut changes, target, depth);
+                    return Err(error);
+                }
+            };
+        if ignored {
             continue;
         }
         count_row(&mut changes, target, depth);

@@ -33,7 +33,7 @@
 //! name in the physical pass. They need a per-row evaluation the pipeline does
 //! not have, which is a piece of work of its own.
 
-use inillucent_base::DbResult;
+use inillucent_base::{DbError, DbResult, PrimaryCode};
 use inillucent_sql::bind::{BoundExpr, BoundSelect};
 use inillucent_sql::plan::{plan_select_with, Levers, PhysicalPlan};
 use inillucent_tree::datum::OwnedDatum;
@@ -50,6 +50,14 @@ use crate::physical::{run_any, Params, TreeCatalog};
 pub struct Subvalue {
     /// The first column of each row, one entry per row.
     pub column: Vec<OwnedDatum>,
+    /// The error the block failed with, when it failed.
+    ///
+    /// SQLite runs an uncorrelated subquery the first time an expression uses it, so a
+    /// subquery that fails inside a `CASE` branch, a `coalesce` argument or the right side
+    /// of an `OR` that is never reached does not fail the statement. This engine runs the
+    /// block before the statement starts, so the failure is kept here and raised by the
+    /// expression that reads the answer, at the moment the expression is evaluated.
+    pub failure: Option<DbError>,
 }
 
 impl Subvalue {
@@ -140,14 +148,50 @@ fn fill(
             continue;
         }
         let inner = plan_select_with(block.select.clone(), levers);
-        let (rows, _shape) = run_any(&inner, catalog, &folded)?;
+        let (rows, _shape) = match run_any(&inner, catalog, &folded) {
+            Ok(done) => done,
+            // A failure of the query itself waits for the expression that reads the answer.
+            // Anything else (a busy file, an interrupt, a corrupt page) is not about the
+            // expression and stops the statement here as it always did.
+            Err(error) if defers_to_use(&error) => {
+                folded.set_subquery(
+                    block.id,
+                    Subvalue {
+                        column: Vec::new(),
+                        failure: Some(error),
+                    },
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let column = rows
             .into_iter()
             .map(|row| row.into_iter().next().unwrap_or(OwnedDatum::Null))
             .collect();
-        folded.set_subquery(block.id, Subvalue { column });
+        folded.set_subquery(
+            block.id,
+            Subvalue {
+                column,
+                failure: None,
+            },
+        );
     }
     Ok(folded)
+}
+
+/// Reports whether a subquery's failure is kept until an expression reads the answer.
+///
+/// Only the failures an expression can cause: an arithmetic overflow, a function refusing its
+/// arguments, a type mismatch, a value too large. Failures of the file or of the connection
+/// are not about whether the subquery is reached, so they stop the statement.
+///
+/// @param error - what the subquery's block failed with
+fn defers_to_use(error: &DbError) -> bool {
+    matches!(
+        error.code(),
+        PrimaryCode::Error | PrimaryCode::Constraint | PrimaryCode::Mismatch | PrimaryCode::TooBig
+    )
 }
 
 /// Collects every subquery of a planned statement, innermost first.
