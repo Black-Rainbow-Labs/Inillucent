@@ -57,7 +57,100 @@ fn transcript(shell: &Path, sql: &str) -> (String, String) {
 fn scripts() -> Vec<(&'static str, String, Option<usize>)> {
     let mut all = scripts_over_one_select();
     all.extend(scripts_over_compounds_and_windows());
+    all.extend(scripts_over_offset());
     all
+}
+
+/// The scripts where a row `OFFSET` skips would fail if its select list were evaluated.
+///
+/// **SQLite does not evaluate the select list of a row it skips**, except where the value is
+/// needed to decide which rows survive: a sort, a `DISTINCT`, a `GROUP BY` and a window all
+/// evaluate every row first. The engine projected every row ahead of the `LIMIT`, so
+/// `LIMIT 1 OFFSET 5` failed on a skipped row that SQLite never looked at.
+fn scripts_over_offset() -> Vec<(&'static str, String, Option<usize>)> {
+    let t = |text: &str| format!("{FILL} {text}");
+    let seven = |text: &str| {
+        format!("CREATE TABLE s(a); INSERT INTO s VALUES (1),(2),(3),(4),(5),(6),(7); {text}")
+    };
+    let probe = "SELECT a, CASE WHEN a=3 THEN json('x') END FROM s";
+    vec![
+        (
+            "an OFFSET past the failing row never evaluates it",
+            seven(&format!("{probe} LIMIT 1 OFFSET 5;")),
+            None,
+        ),
+        (
+            "an OFFSET that lands on the failing row raises it",
+            seven(&format!("{probe} LIMIT 1 OFFSET 2;")),
+            Some(0),
+        ),
+        (
+            "a LIMIT that reaches the failing row after an OFFSET raises it",
+            seven(&format!("{probe} LIMIT 3 OFFSET 1;")),
+            Some(1),
+        ),
+        (
+            "an OFFSET with a negative LIMIT skips the failing row",
+            seven(&format!("{probe} LIMIT -1 OFFSET 5;")),
+            None,
+        ),
+        (
+            "an OFFSET past a failing row more than one batch in",
+            t(&format!("SELECT a, {BAD} FROM t LIMIT 2 OFFSET 4000;")),
+            None,
+        ),
+        (
+            "an OFFSET counts the rows that pass the WHERE clause",
+            seven(&format!("{probe} WHERE a <> 1 AND a <> 2 LIMIT 1 OFFSET 1;")),
+            None,
+        ),
+        (
+            "an OFFSET in rowid order skips the failing row",
+            seven(&format!("{probe} ORDER BY rowid LIMIT 1 OFFSET 5;")),
+            None,
+        ),
+        (
+            "an OFFSET in descending rowid order skips the failing row",
+            seven(&format!("{probe} ORDER BY rowid DESC LIMIT 1 OFFSET 5;")),
+            None,
+        ),
+        (
+            "an OFFSET over a derived table skips the failing row",
+            t(&format!("SELECT x FROM (SELECT a, {BAD} AS x FROM t) LIMIT 1 OFFSET 3500;")),
+            None,
+        ),
+        (
+            "an OFFSET over a cross join skips the failing row",
+            seven(
+                "CREATE TABLE u(b); INSERT INTO u VALUES (10),(20); SELECT a, b, CASE WHEN a=3 THEN json('x') END FROM s, u LIMIT 2 OFFSET 8;",
+            ),
+            None,
+        ),
+        (
+            "a sort evaluates every row before the OFFSET applies",
+            seven(&format!("{probe} ORDER BY a LIMIT 1 OFFSET 5;")),
+            Some(0),
+        ),
+        (
+            "DISTINCT evaluates every row before the OFFSET applies",
+            seven("SELECT DISTINCT a, CASE WHEN a=3 THEN json('x') END FROM s LIMIT 1 OFFSET 5;"),
+            Some(0),
+        ),
+        (
+            "GROUP BY evaluates every row before the OFFSET applies",
+            seven(
+                "SELECT a, max(CASE WHEN a=3 THEN json('x') END) FROM s GROUP BY a LIMIT 1 OFFSET 5;",
+            ),
+            Some(0),
+        ),
+        (
+            "a WHERE clause evaluates every row before the OFFSET applies",
+            seven(
+                "SELECT a FROM s WHERE CASE WHEN a=3 THEN json('x') ELSE 1 END LIMIT 1 OFFSET 5;",
+            ),
+            Some(0),
+        ),
+    ]
 }
 
 /// The scripts whose failure is in the projection or the filter of one `SELECT`.
