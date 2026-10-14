@@ -1604,7 +1604,7 @@ fn vector_path(
 
 /// Returns what one term's path costs, and how many rows it produces.
 fn path_cost(source: &BoundSource, path: &AccessPath) -> (f64, f64) {
-    let rows = estimated_rows(&source.table);
+    let rows = source_rows(source);
     match path {
         AccessPath::TableScan { .. } => (cost::scan_cost(rows), rows),
         // A module prices its own scan, and the planner cannot ask it here
@@ -1763,6 +1763,59 @@ fn estimated_rows(table: &TableInfo) -> f64 {
         // make an `ANALYZE` on an empty table look like no `ANALYZE` at all.
         Some(_) => 1.0,
         None => cost::DEFAULT_ROWS,
+    }
+}
+
+/// Returns how many rows a FROM term is estimated to produce.
+///
+/// **A derived table is sized by what it selects.** `FROM t, (SELECT 1 k UNION ALL
+/// SELECT 2) j` priced `j` at the default row count of an unmeasured table, so
+/// both orders cost the same and the written order stood: `t` was the outer
+/// loop. SQLite sizes the subquery (two rows here) and makes it the outer loop,
+/// so it scans `t` twice rather than the subquery a million times, and the two
+/// engines returned the same rows in a different order. The estimate follows
+/// SQLite's: a `SELECT` with no `FROM` clause or with an aggregate and no
+/// `GROUP BY` is one row, a `UNION` or `UNION ALL` adds its arms, and a constant
+/// `LIMIT` caps it. Anything else keeps the default, so a subquery over a table
+/// is still ordered by the written order.
+///
+/// @param source - the FROM term
+fn source_rows(source: &BoundSource) -> f64 {
+    match &source.rows {
+        SourceRows::Subquery(select) => subquery_rows(select),
+        _ => estimated_rows(&source.table),
+    }
+}
+
+/// Returns how many rows a subquery in a FROM clause is estimated to produce.
+///
+/// @param select - the subquery, with the arms of its compound
+fn subquery_rows(select: &BoundSelect) -> f64 {
+    let mut rows = arm_rows(select);
+    for (op, arm) in &select.compounds {
+        let arm = arm_rows(arm);
+        rows = match op {
+            CompoundOp::Union | CompoundOp::UnionAll => rows + arm,
+            CompoundOp::Intersect => rows.min(arm),
+            CompoundOp::Except => rows,
+        };
+    }
+    match select.limit.as_ref() {
+        Some(BoundExpr::Integer(limit)) if *limit >= 0 => rows.min((*limit as f64).max(1.0)),
+        _ => rows,
+    }
+}
+
+/// Returns how many rows one arm of a subquery is estimated to produce, before
+/// its compound or `LIMIT` applies.
+///
+/// @param select - the arm
+fn arm_rows(select: &BoundSelect) -> f64 {
+    let one_row =
+        select.sources.is_empty() || (select.group_by.is_empty() && !select.aggregates.is_empty());
+    match one_row {
+        true => 1.0,
+        false => cost::DEFAULT_ROWS,
     }
 }
 
