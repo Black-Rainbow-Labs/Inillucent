@@ -346,7 +346,8 @@ order is an error your code can see, and the process does not crash.
 
 One file has one buffer pool, and the engine runs on one thread. Keep an `inillucent_db` and every
 handle made from it on one thread, or guard every call with a lock your binding owns. The C library
-has no lock inside it. `inillucent_cancel` is the one call that is safe from another thread while a
+has no lock inside it, and the Python binding takes one lock per `Database` around every call except
+`cancel`, which is the model to copy. `inillucent_cancel` is the one call that is safe from another thread while a
 statement runs. It sets a flag and touches nothing else. In Rust, `Database::cancel_handle()` returns
 a `CancelHandle` that is `Send` and `Sync`: take it before the statement starts, move it to another
 thread and call `cancel()` there. `Connection::cancel()` can only be called between statements,

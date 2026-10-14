@@ -34,9 +34,10 @@ not built that construct; it is *not* :class:`SyntaxError`-shaped and rewording
 the statement will not help. Catching them together throws away the one
 distinction this driver was designed around.
 
-Threads: the engine is single threaded and one file is one buffer pool. Confine
-a :class:`Database` and everything under it to one thread, or serialise every
-call on it yourself. There is no lock inside.
+Threads: the engine is single threaded and one file is one buffer pool. Every
+call on a :class:`Database` and on the connections, statements and transactions
+under it takes one lock that the database owns, so a second thread waits for the
+first call to finish. :meth:`Connection.cancel` does not take the lock.
 """
 
 from __future__ import annotations

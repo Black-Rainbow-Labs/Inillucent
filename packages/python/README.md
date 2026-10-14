@@ -89,9 +89,14 @@ Any other type raises `TypeError`.
 
 ### Threads
 
-The engine is single threaded, and the driver has no lock inside. Use a `Database` and everything
-opened from it on one thread, or serialize every call yourself. `Connection.cancel()` is the one call
-meant to come from another thread.
+The engine is single threaded, and the interpreter lock is let go while a statement runs. So that two
+threads are never inside one database together, every call on a `Database`, and on the connections,
+statements and transactions opened from it, takes one lock that the `Database` owns. A second thread
+waits until the first call returns and then runs. `Connection.cancel()` is the one call that does not
+take the lock, because it exists to be made from another thread while a statement runs. The lock covers
+one call. A `Transaction` that stays open between calls does not stop another thread's statements on
+the same connection from running inside it, so give each thread its own connection, or keep a
+transaction on one thread.
 
 ## Encrypted databases
 
