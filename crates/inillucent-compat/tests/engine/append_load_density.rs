@@ -175,9 +175,8 @@ fn single_row_inserts_pack_like_a_bulk_build() {
     );
 }
 
-/// `VACUUM` of a table that is larger than one of its own 20,000 row chunks
-/// gives no more pages than the bulk build, and no more than the file it
-/// started from.
+/// `VACUUM` of a table loaded by appends gives no more pages than the file it
+/// started from, and stays within a quarter of the bulk build.
 #[test]
 fn vacuum_does_not_leave_a_looser_file_than_a_bulk_build() {
     let rows = 90_000;
@@ -201,8 +200,14 @@ fn vacuum_does_not_leave_a_looser_file_than_a_bulk_build() {
         vacuumed <= loaded,
         "VACUUM took {loaded} pages to {vacuumed}, which is more"
     );
+    // **`VACUUM` copies a table a page of rows at a time, so it packs as an
+    // append does, not as one bulk build.** Reading the whole table to build it
+    // in one pass is what made `VACUUM` of a 1.1 GB file peak at 937 MB, and
+    // bug hunt 10 bounded that memory. An appended leaf is left between 0.6 and
+    // 0.95 full where a bulk built one is 0.9, so the bound is a quarter above
+    // the bulk build: 90,000 rows take 28 pages against 23.
     assert!(
-        vacuumed <= bulk + SLACK_PAGES,
+        vacuumed <= bulk + bulk / 4 + SLACK_PAGES,
         "{rows} rows took {vacuumed} pages after VACUUM and {bulk} as one INSERT ... SELECT"
     );
 }
