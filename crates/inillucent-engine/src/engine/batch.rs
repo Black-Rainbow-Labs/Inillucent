@@ -135,7 +135,7 @@ impl crate::ImportedDatabase {
         // their trees were last matched to the catalog.
         let mut catalog_restored: Vec<usize> = Vec::new();
         while self.writing.undo().borrow().len() > floor {
-            let Some(entry) = self.writing.undo().borrow_mut().pop() else {
+            let Some(entry) = self.writing.undo().borrow_mut().pop()? else {
                 break;
             };
             // **The record says which file it came out of, and that is the

@@ -57,4 +57,5 @@ pub mod state;
 pub mod statements;
 pub mod tables;
 pub mod undo;
+mod undo_spill;
 pub mod write;

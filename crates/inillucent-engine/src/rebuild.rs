@@ -196,98 +196,258 @@ fn copy_rows(
     shadow: bool,
 ) -> DbResult<()> {
     let name = quoted(table);
-    let (rows, columns) = source.run(&format!("SELECT * FROM {name}"))?;
-    if rows.is_empty() {
-        return Ok(());
+    let paged = can_be_read_in_pages(source, table);
+    let mut after: Option<i64> = None;
+    let mut limit = FIRST_PAGE_ROWS;
+    let mut writer: Option<RowWriter> = None;
+    loop {
+        let (rows, columns, last) = match paged {
+            true => read_page(source, &name, after, limit)?,
+            false => {
+                let (rows, columns) = source.run(&format!("SELECT * FROM {name}"))?;
+                (rows, columns, None)
+            }
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        if writer.is_none() {
+            writer = Some(RowWriter::prepare(source, fresh, table, shadow, &columns)?);
+        }
+        limit = rows_for_a_page(&rows);
+        if let Some(prepared) = writer.as_ref() {
+            prepared.write(fresh, rows)?;
+        }
+        match last {
+            Some(rowid) => after = Some(rowid),
+            None => return Ok(()),
+        }
     }
-    // **A generated column is computed again, not copied.** `SELECT *` reads
-    // a STORED generated column's value, and naming that column in the
-    // `INSERT` is refused ("cannot INSERT into generated column"), which made
-    // `VACUUM` fail on any table that had one. SQLite's own copy leaves them
-    // out for the same reason, and the new table computes them from the
-    // columns it is given.
+}
+
+/// The rows the first page of a table is asked for, before the size of a row is known.
+const FIRST_PAGE_ROWS: usize = 256;
+
+/// The bytes of rows one page of a table aims at, whatever the size of a row.
+///
+/// **The copy read every row of a table before it wrote the first** (`SELECT * FROM t`), so
+/// `VACUUM` of a 194 MB table peaked at 494 MB and of a 1.1 GB file at 937 MB, where SQLite's
+/// peaks at 11 MB. A page is read, written into the new file, and dropped before the next.
+const PAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Reports whether a table can be read a page at a time in rowid order.
+///
+/// A rowid table that is not virtual and has no column a query would read as the rowid instead.
+/// Any other table is read whole, as it always was.
+///
+/// @param source - the database being rebuilt
+/// @param table - the table's name, as written
+fn can_be_read_in_pages(source: &ImportedDatabase, table: &[u8]) -> bool {
     let folded = table.to_ascii_lowercase();
-    let generated: Vec<Vec<u8>> = source
+    source
         .schema
         .tables
         .iter()
         .find(|held| held.folded == folded && held.database == crate::MAIN)
-        .map(|held| {
-            held.columns
-                .iter()
-                .filter(|column| column.generated)
-                .map(|column| column.folded.clone())
-                .collect()
+        .is_some_and(|held| {
+            held.kind == inillucent_sql::catalog_view::TableKind::Table
+                && held.has_rowid()
+                && !held.columns.iter().any(|column| {
+                    matches!(column.folded.as_slice(), b"rowid" | b"oid" | b"_rowid_")
+                })
         })
-        .unwrap_or_default();
-    let kept: Vec<usize> = columns
-        .iter()
-        .enumerate()
-        .filter(|(_, column)| !generated.contains(&column.to_ascii_lowercase().into_bytes()))
-        .map(|(at, _)| at)
-        .collect();
-    let placeholders = (1..=kept.len())
-        .map(|at| format!("?{at}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let names = kept
-        .iter()
-        .filter_map(|at| columns.get(*at))
-        .map(|column| quoted(column.as_bytes()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    // **A shadow table is not empty when its rows arrive.** The module wrote
-    // its own opening rows when `CREATE VIRTUAL TABLE` connected it - a version
-    // row in `_config`, a structure row in `_data` - and those keys are in the
-    // source too, so a plain `INSERT` reports a `UNIQUE` violation on the first
-    // of them. The source's row is the one that is right.
-    let verb = match shadow {
-        true => "INSERT OR REPLACE INTO",
-        false => "INSERT INTO",
-    };
-    // **A shadow table is filled by position, not by column name.** A module reads its own
-    // shadow tables by position, and the layout can change between releases: an FTS5 table
-    // written by release 0.1.1 has `note_fts_idx(segid, term, pgno)` where this build creates
-    // `(segid, term, doclist)`, so `SELECT *` named `pgno` and the insert into the fresh table
-    // failed with `table note_fts_idx has no column named pgno`. The third column holds the
-    // value the module resolves either way (bug hunt 10).
-    let insert = match shadow {
-        true => format!("{verb} {name} VALUES ({placeholders})"),
-        false => format!("{verb} {name} ({names}) VALUES ({placeholders})"),
-    };
-    let statement = fresh.prepare_statement(&insert)?;
-    let at_once = fresh.runs_rows_at_once(&statement)?;
-    let mut rows = rows.into_iter().peekable();
-    while rows.peek().is_some() {
-        let chunk: Vec<Vec<inillucent_tree::datum::OwnedDatum>> = rows
-            .by_ref()
-            .take(ROWS_PER_STATEMENT)
-            .map(|row| {
-                kept.iter()
-                    .map(|at| {
-                        row.get(*at)
-                            .cloned()
-                            .unwrap_or(inillucent_tree::datum::OwnedDatum::Null)
-                    })
-                    .collect()
-            })
-            .collect();
-        if at_once
-            && fresh
-                .execute_rows_at_once(&statement, chunk.clone())?
-                .is_some()
-        {
-            continue;
-        }
-        for row in chunk {
-            let mut params = inillucent_exec::physical::Params::new();
-            for (slot, value) in row.into_iter().enumerate() {
-                params.set(slot.saturating_add(1) as u32, value);
-            }
-            fresh.execute_any(&insert, &params)?;
+}
+
+/// Reads up to `limit` rows of a table that come after a rowid, in rowid order.
+///
+/// Returns the rows without the rowid column that was added to order them, the column names, and
+/// the rowid of the last row when the page was full (so another page may follow).
+///
+/// @param source - the database being rebuilt
+/// @param name - the table's quoted name
+/// @param after - the rowid the previous page ended at, or `None` for the first page
+/// @param limit - how many rows to ask for
+fn read_page(
+    source: &ImportedDatabase,
+    name: &str,
+    after: Option<i64>,
+    limit: usize,
+) -> DbResult<(
+    Vec<Vec<inillucent_tree::datum::OwnedDatum>>,
+    Vec<String>,
+    Option<i64>,
+)> {
+    let sql = format!("SELECT *, rowid FROM {name} WHERE rowid > ?1 ORDER BY rowid LIMIT {limit}");
+    let mut params = inillucent_exec::physical::Params::new();
+    params.set(
+        1,
+        inillucent_tree::datum::OwnedDatum::Int(after.unwrap_or(i64::MIN)),
+    );
+    let (mut rows, mut columns) = source.run_with(&sql, &params)?;
+    columns.pop();
+    let full = rows.len() >= limit;
+    let mut last = None;
+    for row in rows.iter_mut() {
+        if let Some(inillucent_tree::datum::OwnedDatum::Int(rowid)) = row.pop() {
+            last = Some(rowid);
         }
     }
-    Ok(())
+    Ok((rows, columns, last.filter(|_| full)))
+}
+
+/// Returns how many rows the next page should ask for, so that a page is about [`PAGE_BYTES`].
+///
+/// @param rows - the page that was just read
+fn rows_for_a_page(rows: &[Vec<inillucent_tree::datum::OwnedDatum>]) -> usize {
+    let bytes = rows.iter().fold(0usize, |sum, row| {
+        row.iter()
+            .fold(sum.saturating_add(32), |inner, value| match value {
+                inillucent_tree::datum::OwnedDatum::Text(held)
+                | inillucent_tree::datum::OwnedDatum::Blob(held) => {
+                    inner.saturating_add(held.len()).saturating_add(24)
+                }
+                _ => inner.saturating_add(24),
+            })
+    });
+    let each = (bytes / rows.len().max(1)).max(1);
+    (PAGE_BYTES / each).clamp(16, ROWS_PER_STATEMENT)
+}
+
+/// The statement a table's rows are inserted with, and the columns it takes.
+struct RowWriter {
+    /// The prepared `INSERT`.
+    statement: crate::Statement,
+    /// Whether the engine runs a chunk of rows as one statement.
+    at_once: bool,
+    /// Which of the source's columns the `INSERT` takes (a generated column is not).
+    kept: Vec<usize>,
+    /// The text of the `INSERT`.
+    insert: String,
+}
+
+impl RowWriter {
+    /// Prepares the `INSERT` for a table.
+    ///
+    /// @param source - the database being rebuilt
+    /// @param fresh - the database being built
+    /// @param table - the table's name, as written
+    /// @param shadow - whether the table is a virtual table's shadow table
+    /// @param columns - the column names the source returned
+    fn prepare(
+        source: &ImportedDatabase,
+        fresh: &mut ImportedDatabase,
+        table: &[u8],
+        shadow: bool,
+        columns: &[String],
+    ) -> DbResult<RowWriter> {
+        let name = quoted(table);
+        // **A generated column is computed again, not copied.** `SELECT *` reads
+        // a STORED generated column's value, and naming that column in the
+        // `INSERT` is refused ("cannot INSERT into generated column"), which made
+        // `VACUUM` fail on any table that had one. SQLite's own copy leaves them
+        // out for the same reason, and the new table computes them from the
+        // columns it is given.
+        let folded = table.to_ascii_lowercase();
+        let generated: Vec<Vec<u8>> = source
+            .schema
+            .tables
+            .iter()
+            .find(|held| held.folded == folded && held.database == crate::MAIN)
+            .map(|held| {
+                held.columns
+                    .iter()
+                    .filter(|column| column.generated)
+                    .map(|column| column.folded.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let kept: Vec<usize> = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| !generated.contains(&column.to_ascii_lowercase().into_bytes()))
+            .map(|(at, _)| at)
+            .collect();
+        let placeholders = (1..=kept.len())
+            .map(|at| format!("?{at}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let names = kept
+            .iter()
+            .filter_map(|at| columns.get(*at))
+            .map(|column| quoted(column.as_bytes()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // **A shadow table is not empty when its rows arrive.** The module wrote
+        // its own opening rows when `CREATE VIRTUAL TABLE` connected it - a version
+        // row in `_config`, a structure row in `_data` - and those keys are in the
+        // source too, so a plain `INSERT` reports a `UNIQUE` violation on the first
+        // of them. The source's row is the one that is right.
+        let verb = match shadow {
+            true => "INSERT OR REPLACE INTO",
+            false => "INSERT INTO",
+        };
+        // **A shadow table is filled by position, not by column name.** A module reads its own
+        // shadow tables by position, and the layout can change between releases: an FTS5 table
+        // written by release 0.1.1 has `note_fts_idx(segid, term, pgno)` where this build creates
+        // `(segid, term, doclist)`, so `SELECT *` named `pgno` and the insert into the fresh table
+        // failed with `table note_fts_idx has no column named pgno`. The third column holds the
+        // value the module resolves either way (bug hunt 10).
+        let insert = match shadow {
+            true => format!("{verb} {name} VALUES ({placeholders})"),
+            false => format!("{verb} {name} ({names}) VALUES ({placeholders})"),
+        };
+        let statement = fresh.prepare_statement(&insert)?;
+        let at_once = fresh.runs_rows_at_once(&statement)?;
+        Ok(RowWriter {
+            statement,
+            at_once,
+            kept,
+            insert,
+        })
+    }
+
+    /// Inserts rows read from the source, in chunks of [`ROWS_PER_STATEMENT`].
+    ///
+    /// @param fresh - the database being built
+    /// @param rows - the rows, with every column the source returned
+    fn write(
+        &self,
+        fresh: &mut ImportedDatabase,
+        rows: Vec<Vec<inillucent_tree::datum::OwnedDatum>>,
+    ) -> DbResult<()> {
+        let mut rows = rows.into_iter().peekable();
+        while rows.peek().is_some() {
+            let chunk: Vec<Vec<inillucent_tree::datum::OwnedDatum>> = rows
+                .by_ref()
+                .take(ROWS_PER_STATEMENT)
+                .map(|row| {
+                    self.kept
+                        .iter()
+                        .map(|at| {
+                            row.get(*at)
+                                .cloned()
+                                .unwrap_or(inillucent_tree::datum::OwnedDatum::Null)
+                        })
+                        .collect()
+                })
+                .collect();
+            if self.at_once
+                && fresh
+                    .execute_rows_at_once(&self.statement, chunk.clone())?
+                    .is_some()
+            {
+                continue;
+            }
+            for row in chunk {
+                let mut params = inillucent_exec::physical::Params::new();
+                for (slot, value) in row.into_iter().enumerate() {
+                    params.set(slot.saturating_add(1) as u32, value);
+                }
+                fresh.execute_any(&self.insert, &params)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// How many rows one `INSERT` of a rebuild carries when the engine can run rows at once.

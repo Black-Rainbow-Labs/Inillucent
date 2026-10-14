@@ -1648,6 +1648,16 @@ impl Writing {
         self.next_txn.set(next_txn);
     }
 
+    /// Lets the undo buffer move its oldest records to a temporary file on a file system.
+    ///
+    /// A separate call because the write state is made before the file is opened (see
+    /// `SharedState::fresh`), so the file system is not known when it is made.
+    ///
+    /// @param vfs - the file system the database was opened on
+    pub(crate) fn spill_undo_onto(&self, vfs: std::sync::Arc<dyn inillucent_vfs::Vfs>) {
+        self.undo.borrow_mut().spill_onto(vfs);
+    }
+
     /// Sets touched and returns what it was.
     ///
     /// @param value - what to set it to

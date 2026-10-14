@@ -159,6 +159,8 @@ impl crate::ImportedDatabase {
         database.pool().set_durable_lsn(wal.write_ahead_point());
         let_the_pool_ask_the_log(database.pool(), &wal);
         let_the_pool_spill(database.pool(), &vfs);
+        let writing = std::rc::Rc::new(Writing::starting_at(1));
+        writing.spill_undo_onto(std::sync::Arc::clone(&vfs));
 
         // Smallest tree first, so the physical pass takes the cheapest
         // structure that covers the query. Sorting by bytes rather than by
@@ -221,7 +223,7 @@ impl crate::ImportedDatabase {
                 scratch_binder: std::cell::RefCell::new(None),
                 index_stages: std::cell::Cell::new(StageTimings::default()),
             }),
-            writing: std::rc::Rc::new(Writing::starting_at(1)),
+            writing,
             storage: Storage {
                 database,
                 page_size,
@@ -744,6 +746,7 @@ impl crate::ImportedDatabase {
         // Above every number the log still holds, so that this run cannot
         // call something by a name a crashed one already used.
         shared.writing.start_at(highest_txn.saturating_add(1));
+        shared.writing.spill_undo_onto(std::sync::Arc::clone(&vfs));
         // **The file's own page size, not the one the caller asked for.** The
         // default open asks for 32,768, and a file made at 4,096 opened that way
         // kept 32,768 here, so `VACUUM` rebuilt it at 32,768 and the cache size

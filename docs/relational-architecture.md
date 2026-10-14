@@ -296,6 +296,16 @@ that no later fold on that connection, and not its close, writes a half applied 
 
 `ROLLBACK` is done from the log. It works the same way in every journal mode, including `off`.
 
+A transaction keeps each row it changed as the row was before, so that a rollback can put it back.
+These images stay in memory until the transaction holds 16 MiB of them. Past that, the connection
+writes the older images to a temporary file on the database's file system, in chunks of about 1 MiB,
+and keeps the newest image in memory. Only `ROLLBACK` and `ROLLBACK TO` read the file, newest chunk
+first, and a commit discards it unread. The operating system deletes the file when the connection
+closes it and when the process ends. Nothing in it has to survive a crash, because recovery never
+applies a transaction that was open when the process stopped. A transaction can therefore change
+more rows than fit in memory, and `PRAGMA cache_size` is not what limits it. If the file cannot be
+written, the images stay in memory and the transaction goes on.
+
 A rollback puts the rows back through the B+trees, so the page splits and new pages the transaction
 made stay in the trees, holding the rows as they were. The undo is logged under the same transaction
 as the changes, and a finished rollback ends with a commit record, so a replay applies the
@@ -904,6 +914,11 @@ record from a future build and checks each refusal, including the command line's
 | `VACUUM` | rebuilds the database: it runs the stored `CREATE` statements again, copies every row back through the normal write path, writes the result beside the database, and renames it over the database |
 | `VACUUM INTO '<file>'` | writes a compacted copy the same way. It refuses a file that already exists, with `output file already exists` |
 | `inillucent checkpoint` | runs `PRAGMA wal_checkpoint`. Run it before you copy a database file by hand |
+
+`VACUUM` reads an ordinary table that has a rowid a page of rows at a time, in rowid order, about
+8 MiB to a page, and writes each page into the new file before it reads the next. It does not hold a
+whole table in memory. A `WITHOUT ROWID` table and a table with a column named `rowid`, `oid` or
+`_rowid_` are read whole.
 
 A rename replaces a directory entry in one step, so a crash leaves either the old file or the new
 one. `VACUUM` holds the write lock from the start, so no other process can commit to the old file

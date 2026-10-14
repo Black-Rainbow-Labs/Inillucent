@@ -1013,6 +1013,14 @@ covers = ["inillucent-engine", "inillucent-tree"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "transaction_memory"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-tree"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "autoindex_reopen"
 tier = "engine"
 covers = ["inillucent-engine"]

@@ -92,6 +92,7 @@ mod storage;
 mod subquery_values;
 mod tlp_differential;
 mod torn_page_with_image;
+mod transaction_memory;
 mod unique_leaf_boundary;
 mod usage_paths;
 mod vacuum_on_vfs;
