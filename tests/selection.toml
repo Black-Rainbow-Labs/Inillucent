@@ -314,6 +314,7 @@ name = "matrix"
 module = "lists"
 tier = "matrix"
 covers = ["inillucent-compat"]
+requires = ["oracle"]
 
 [[target]]
 package = "inillucent-compat"

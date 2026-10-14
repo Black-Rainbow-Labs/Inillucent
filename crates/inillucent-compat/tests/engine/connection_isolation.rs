@@ -41,8 +41,10 @@ fn count_of(rows: Vec<Vec<OwnedDatum>>) -> i64 {
 /// @param name - the test's name
 fn database_with_a_table(name: &str) -> Database {
     let database = Database::open(scratch(name).join("isolated.rdb")).expect("the file opens");
+    // Session 1 is the one the test's first `session()` would get, so the first connection of
+    // each test is the one the open made.
     database
-        .session()
+        .session_as(1)
         .execute_batch("CREATE TABLE t (a INTEGER)")
         .expect("the table is made");
     database
@@ -64,7 +66,11 @@ fn a_second_connection_does_not_read_the_first_ones_uncommitted_rows() {
         "the connection that wrote reads its own row"
     );
     assert_eq!(
-        count_of(second.query("SELECT count(*) FROM t").expect("second reads")),
+        count_of(
+            second
+                .query("SELECT count(*) FROM t")
+                .expect("second reads")
+        ),
         0,
         "the other connection reads what is committed"
     );
@@ -78,7 +84,11 @@ fn a_second_connection_does_not_read_the_first_ones_uncommitted_rows() {
     );
     first.execute_batch("COMMIT").expect("COMMIT");
     assert_eq!(
-        count_of(second.query("SELECT count(*) FROM t").expect("second reads")),
+        count_of(
+            second
+                .query("SELECT count(*) FROM t")
+                .expect("second reads")
+        ),
         1,
         "after the commit the other connection reads the row"
     );
@@ -101,7 +111,11 @@ fn a_rollback_on_one_connection_does_not_undo_a_write_through_another() {
         "the acknowledged write is still there for the connection that rolled back"
     );
     assert_eq!(
-        count_of(second.query("SELECT count(*) FROM t").expect("second reads")),
+        count_of(
+            second
+                .query("SELECT count(*) FROM t")
+                .expect("second reads")
+        ),
         1,
         "and for the connection that made it"
     );
@@ -229,4 +243,28 @@ fn two_connections_of_a_memory_database_have_a_transaction_each() {
         .expect_err("the second writer is refused");
     assert_eq!(refused.code(), PrimaryCode::Busy, "{refused:?}");
     first.execute_batch("ROLLBACK").expect("ROLLBACK");
+}
+
+/// Releasing the first session rolls its transaction back too, though its engine stays.
+#[test]
+fn releasing_the_first_session_ends_its_transaction() {
+    let database = database_with_a_table("released_first");
+    let first = database.session();
+    let number = first.session();
+    first
+        .execute_batch("BEGIN; INSERT INTO t VALUES (1)")
+        .expect("the first session holds the file");
+    let writer = database.session();
+    writer
+        .execute_batch("PRAGMA busy_timeout = 0")
+        .expect("the writer does not wait");
+    assert!(writer.execute_batch("INSERT INTO t VALUES (2)").is_err());
+    database.release_session(number);
+    writer
+        .execute_batch("INSERT INTO t VALUES (2)")
+        .expect("the file is free once the first session is released");
+    assert_eq!(
+        count_of(writer.query("SELECT count(*) FROM t").expect("reads")),
+        1
+    );
 }

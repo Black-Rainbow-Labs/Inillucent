@@ -59,6 +59,9 @@ fn scratch(name: &str) -> std::path::PathBuf {
 struct Reentrant {
     /// The database the query goes to, which is the one being authorized.
     database: Rc<Database>,
+    /// The session of the connection being authorized, so the query is made on that connection
+    /// and not on a new one, which has an engine of its own and would not be refused.
+    session: u64,
     /// What the reentrant query answered, for the assertion below.
     answered: RefCell<Option<String>>,
 }
@@ -69,7 +72,7 @@ impl Authorizer for Reentrant {
     /// @param _action - what the binder is asking about
     fn authorize(&self, _action: AuthAction<'_>) -> Authorization {
         if self.answered.borrow().is_none() {
-            let outcome = self.database.session().query("SELECT 1");
+            let outcome = self.database.session_as(self.session).query("SELECT 1");
             // The detail rather than the `Display`, which is the primary
             // code's own sentence and is the same for every misuse.
             let said = match outcome {
@@ -100,6 +103,7 @@ fn a_callback_that_queries_its_own_connection_is_refused() {
 
     let watcher = Rc::new(Reentrant {
         database: Rc::clone(&database),
+        session: connection.session(),
         answered: RefCell::new(None),
     });
     connection
@@ -136,6 +140,7 @@ fn the_refusal_is_the_misuse_code() {
 
     let watcher = Rc::new(Reentrant {
         database: Rc::clone(&database),
+        session: connection.session(),
         answered: RefCell::new(None),
     });
     connection
@@ -158,6 +163,8 @@ fn the_refusal_is_the_misuse_code() {
 struct AsksAutocommit {
     /// The database the question goes to, which is the one being authorized.
     database: Rc<Database>,
+    /// The session of the connection being authorized.
+    session: u64,
     /// Every answer, in the order the authorizer was called.
     answers: RefCell<Vec<Result<bool, String>>>,
 }
@@ -169,7 +176,7 @@ impl Authorizer for AsksAutocommit {
     fn authorize(&self, _action: AuthAction<'_>) -> Authorization {
         let asked = self
             .database
-            .session()
+            .session_as(self.session)
             .autocommit()
             .map_err(|error| error.detail().unwrap_or("no detail").to_string());
         self.answers.borrow_mut().push(asked);
@@ -203,6 +210,7 @@ fn a_callback_can_ask_whether_a_transaction_is_open() {
 
     let watcher = Rc::new(AsksAutocommit {
         database: Rc::clone(&database),
+        session: connection.session(),
         answers: RefCell::new(Vec::new()),
     });
     connection

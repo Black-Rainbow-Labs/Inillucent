@@ -944,12 +944,20 @@ impl Database {
     /// handle on a connection is freed. A connection's own engine holds a buffer
     /// pool and a place in the log, so one that is never released lasts until the
     /// database closes. The first connection's engine is the database's own and
-    /// is not released. A transaction the session had open is rolled back by the
+    /// is kept, but a transaction it has open is rolled back, so closing the
+    /// first connection gives the file to the next writer as closing any other
+    /// does. A transaction another session had open is rolled back by its
     /// engine going away.
     ///
     /// @param session - the number the connection reported
     pub fn release_session(&self, session: u64) {
         if session <= FIRST_SESSION {
+            if !self.primary.pending() && self.primary.writer.batch().is_some() {
+                if let Ok(mut engine) = self.primary.ready() {
+                    engine.use_session(session);
+                    let _ = engine.execute_any("ROLLBACK", &Params::new());
+                }
+            }
             return;
         }
         let released = self.peers.borrow_mut().remove(&session);
@@ -1027,7 +1035,11 @@ impl Database {
             false,
         );
         let engine = ImportedDatabase::import_into(source, target.clone(), PAGE_SIZE, frames)?;
-        Ok(Database::over(Slot::Ready(Box::new(engine)), target, opening))
+        Ok(Database::over(
+            Slot::Ready(Box::new(engine)),
+            target,
+            opening,
+        ))
     }
 
     /// Returns a connection to this database.
@@ -1185,7 +1197,9 @@ impl Database {
         &self,
         module: std::sync::Arc<dyn inillucent_ext::vtab::Module>,
     ) -> DbResult<()> {
-        self.modules.borrow_mut().push(std::sync::Arc::clone(&module));
+        self.modules
+            .borrow_mut()
+            .push(std::sync::Arc::clone(&module));
         let mut registered = Ok(());
         for lane in self.lanes() {
             if lane.pending() {
@@ -1285,22 +1299,27 @@ impl Database {
     /// For `.stats`, which reports the work a statement caused rather than the
     /// answer it gave. The shape is the engine's own rather than the pool's, so
     /// a caller reading it does not have to name the crate the pool lives in.
+    ///
+    /// **Added up over every connection's engine**, because each connection has a
+    /// pool of its own and the work a caller counts is the database's.
     pub fn cache_stats(&self) -> CacheStats {
-        let Ok(engine) = self.ready() else {
-            return CacheStats::default();
-        };
-        let held = engine.pool_stats();
-        CacheStats {
-            hits: held.hits,
-            misses: held.misses,
-            rewarms: held.rewarms,
-            cooled: held.cooled,
-            evicted: held.evicted,
-            reads: held.reads,
-            writes: held.writes,
-            meta_reads: held.meta_reads,
-            meta_probes: held.meta_probes,
+        let mut total = CacheStats::default();
+        for lane in self.lanes() {
+            let Ok(engine) = lane.ready() else {
+                continue;
+            };
+            let held = engine.pool_stats();
+            total.hits += held.hits;
+            total.misses += held.misses;
+            total.rewarms += held.rewarms;
+            total.cooled += held.cooled;
+            total.evicted += held.evicted;
+            total.reads += held.reads;
+            total.writes += held.writes;
+            total.meta_reads += held.meta_reads;
+            total.meta_probes += held.meta_probes;
         }
+        total
     }
 
     /// Returns what the write-ahead log has been asked to do.
@@ -1310,17 +1329,21 @@ impl Database {
     /// with the amount of data. That is what makes it the right thing for a
     /// budget guard to assert on: it is a count of work rather than a reading of
     /// the clock, so it does not change when the machine is busy.
+    ///
+    /// Added up over every connection's engine, as [`Database::cache_stats`] is.
     pub fn log_stats(&self) -> LogStats {
-        let Ok(engine) = self.ready() else {
-            return LogStats::default();
-        };
-        let held = engine.wal().stats();
-        LogStats {
-            records: held.records,
-            writes: held.writes,
-            syncs: held.syncs,
-            bytes: held.bytes,
+        let mut total = LogStats::default();
+        for lane in self.lanes() {
+            let Ok(engine) = lane.ready() else {
+                continue;
+            };
+            let held = engine.wal().stats();
+            total.records += held.records;
+            total.writes += held.writes;
+            total.syncs += held.syncs;
+            total.bytes += held.bytes;
         }
+        total
     }
 
     /// Returns what the write path has done to every tree, added up.
@@ -1330,14 +1353,20 @@ impl Database {
     /// slower; the compactions, the splits and the nanoseconds spent making room
     /// say which tree paid for it and in which stage.
     pub fn write_stats(&self) -> inillucent_tree::write::WriteStats {
-        self.ready()
-            .map(|engine| engine.write_stats())
-            .unwrap_or_default()
+        self.lanes()
+            .iter()
+            .filter_map(|lane| lane.ready().ok().map(|engine| engine.write_stats()))
+            .fold(inillucent_tree::write::WriteStats::default(), |sum, one| {
+                sum + one
+            })
     }
 
     /// Returns how many bytes the page cache is holding.
     pub fn pool_bytes(&self) -> usize {
-        self.ready().map(|engine| engine.pool_bytes()).unwrap_or(0)
+        self.lanes()
+            .iter()
+            .filter_map(|lane| lane.ready().ok().map(|engine| engine.pool_bytes()))
+            .sum()
     }
 
     /// Checks every tree's structure.

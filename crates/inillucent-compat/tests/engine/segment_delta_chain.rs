@@ -499,11 +499,14 @@ fn a_reader_open_across_a_merge_is_not_broken_by_the_freed_segments() {
         &reader,
         &format!("SELECT rowid FROM docs WHERE vector = x'{query}' AND k = 100 ORDER BY rank"),
     );
+    // The reader is a connection of its own with a transaction of its own, so it reads the rows
+    // that were committed when its transaction began and not the writer's later ones. What this
+    // test checks is that the search ran at all: it loaded every segment its snapshot names.
     assert_eq!(
         found.len(),
-        AFTER as usize,
-        "the reader loads the manifest and the segments it names from the same committed state, \
-         and the merged segment holds every row: {found:?}"
+        BEFORE as usize,
+        "the reader loads the manifest and the segments it names from the committed state its \
+         transaction began in, and that state holds the rows written before it: {found:?}"
     );
     exec(&reader, "COMMIT");
     exec(&reader, "INSERT INTO docs(docs) VALUES ('integrity-check')");
