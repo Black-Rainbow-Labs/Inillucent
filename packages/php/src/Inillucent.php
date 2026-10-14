@@ -198,6 +198,17 @@ final class Inillucent
     {
         $result = $this->run('query', ['sql' => $sql, 'params' => $params ?: null, 'limit' => $limit]);
         $this->refuseFailure($result);
+        return self::associativeRows($result);
+    }
+
+    /**
+     * Turns a result's columns and rows into one associative array per row.
+     *
+     * @param array<string,mixed> $result a result, or a failure that carries the rows before it
+     * @return list<array<string,mixed>>
+     */
+    private static function associativeRows(array $result): array
+    {
         $names = array_map(static fn (array $column): string => $column['name'], $result['columns']);
         return array_map(
             static fn (array $row): array => array_combine(
@@ -305,10 +316,14 @@ final class Inillucent
         if (($result['ok'] ?? false) === true) {
             return;
         }
+        $before = isset($result['columns'], $result['rows']) && $result['rows'] !== []
+            ? self::associativeRows($result)
+            : null;
         throw new Error(
             (string) ($result['message'] ?? 'the command failed'),
             (string) ($result['status'] ?? 'internal'),
-            isset($result['feature']) ? (string) $result['feature'] : null
+            isset($result['feature']) ? (string) $result['feature'] : null,
+            $before
         );
     }
 }

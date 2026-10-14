@@ -22,11 +22,13 @@ final class Error extends RuntimeException
      * @param string $message what went wrong
      * @param string $status the failure class, as inillucent's driver names it
      * @param string|null $feature the construct that is not built, when the status is 'unsupported'
+     * @param list<array<string,mixed>>|null $partial the rows the statement produced before it failed, as `query()` returns rows, or null when it failed before its first row
      */
     public function __construct(
         string $message,
         public readonly string $status = 'internal',
         public readonly ?string $feature = null,
+        public readonly ?array $partial = null,
     ) {
         parent::__construct($message);
     }

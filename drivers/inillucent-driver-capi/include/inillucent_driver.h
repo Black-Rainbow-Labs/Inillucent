@@ -503,6 +503,16 @@ const char *inillucent_error_detail(const inillucent_error *error);
 /* The byte offset into the statement, or -1 when there is none. */
 int32_t inillucent_error_offset(const inillucent_error *error);
 
+/* The rows the statement produced before it failed, as a result you own and
+ * free with inillucent_rows_free. SQLite hands out every row ahead of the one
+ * that raised the error and then reports the error; so does this, when you
+ * ask. A statement that fails after 3 rows has those 3 in the result, cut to
+ * the limit you passed and with inillucent_rows_total counting all of them.
+ * NULL when the statement failed before its first row, when the rows were
+ * already taken, and for a NULL handle. Call it before inillucent_error_free,
+ * which frees rows nobody took. Since ABI 1.5.0. */
+inillucent_rows *inillucent_error_take_rows(inillucent_error *error);
+
 void inillucent_error_free(inillucent_error *error);
 
 #ifdef __cplusplus

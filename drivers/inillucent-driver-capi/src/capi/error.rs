@@ -26,6 +26,12 @@ pub struct inillucent_error {
     detail: Option<CString>,
     /// The byte offset into the statement, or -1.
     offset: i32,
+    /// The rows the statement produced before it failed, until the caller takes them.
+    ///
+    /// Behind a lock because `inillucent_error_take_rows` gives the rows away
+    /// through a pointer the header declares writable, and a handle is shared
+    /// by reference everywhere else.
+    rows: std::sync::Mutex<Option<inillucent_driver::Rows>>,
 }
 /// Runs an entry point's body, turning a panic into a status.
 ///
@@ -108,6 +114,7 @@ pub(crate) fn report(out: *mut *mut inillucent_error, failure: &Error, diagnosti
         offset: failure
             .offset
             .map_or(-1, |at| i32::try_from(at).unwrap_or(-1)),
+        rows: std::sync::Mutex::new(failure.partial.as_deref().cloned()),
     });
     // SAFETY: `out` is a caller-supplied pointer the header requires to be
     // either null - checked above - or writable. Ownership of the box moves to
@@ -241,6 +248,41 @@ pub unsafe extern "C" fn inillucent_error_detail(error: *const inillucent_error)
 #[no_mangle]
 pub unsafe extern "C" fn inillucent_error_offset(error: *const inillucent_error) -> i32 {
     guarded_value(|| held(error).map_or(-1, |held| held.offset), 0)
+}
+/// Hands over the rows the statement produced before it failed, once.
+///
+/// SQLite returns every row ahead of the one that raised the error and then
+/// reports the error, and `inillucent_driver::Error::partial` holds the same
+/// rows. The result belongs to the caller, who frees it with
+/// `inillucent_rows_free`. Answers null when the statement failed before its
+/// first row, when the rows were already taken, and for a null or freed
+/// handle. A failure whose rows are never taken frees them with itself.
+///
+/// @param error - the failure
+///
+/// # Safety
+///
+/// `error` must be null or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn inillucent_error_take_rows(
+    error: *mut inillucent_error,
+) -> *mut crate::capi::value::inillucent_rows {
+    guarded_value(
+        || {
+            let Some(held) = held(error as *const inillucent_error) else {
+                return std::ptr::null_mut();
+            };
+            let taken = match held.rows.lock() {
+                Ok(mut rows) => rows.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            match taken {
+                Some(rows) => publish(Box::new(crate::capi::value::built(rows))),
+                None => std::ptr::null_mut(),
+            }
+        },
+        std::ptr::null_mut(),
+    )
 }
 /// Frees a failure.
 ///

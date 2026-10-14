@@ -492,24 +492,33 @@ unsafe fn throw(api: &Napi, env: Opaque, code: &str, message: &str) -> Opaque {
 /// @param code - the status name, which the error carries as `code`
 /// @param message - what went wrong
 /// @param feature - the construct that is not built, if the engine said
+/// @param partial - the result object of the rows produced before the failure,
+///   or null. It is built before the throw, because after a throw every call
+///   answers the pending exception.
 unsafe fn throw_with_feature(
     api: &Napi,
     env: Opaque,
     code: &str,
     message: &str,
     feature: Option<&str>,
+    partial: Opaque,
 ) -> Opaque {
     let thrown = throw(api, env, code, message);
-    let Some(feature) = feature else {
+    if feature.is_none() && partial.is_null() {
         return thrown;
-    };
+    }
     let mut pending = std::ptr::null_mut();
     if (api.get_and_clear_last_exception)(env, &mut pending) != 0 || pending.is_null() {
         return thrown;
     }
-    let mut named = std::ptr::null_mut();
-    if (api.create_string_utf8)(env, feature.as_ptr().cast(), feature.len(), &mut named) == 0 {
-        (api.set_named_property)(env, pending, c"feature".as_ptr(), named);
+    if let Some(feature) = feature {
+        let mut named = std::ptr::null_mut();
+        if (api.create_string_utf8)(env, feature.as_ptr().cast(), feature.len(), &mut named) == 0 {
+            (api.set_named_property)(env, pending, c"feature".as_ptr(), named);
+        }
+    }
+    if !partial.is_null() {
+        (api.set_named_property)(env, pending, c"partial".as_ptr(), partial);
     }
     (api.throw_value)(env, pending);
     thrown
@@ -544,7 +553,14 @@ unsafe fn throw_failure(
         inillucent_error_free(error);
     }
     let code = status_name(status);
-    throw_with_feature(api, env, code, &message, feature.as_deref())
+    throw_with_feature(
+        api,
+        env,
+        code,
+        &message,
+        feature.as_deref(),
+        std::ptr::null_mut(),
+    )
 }
 
 /// Returns a status's name, as the command line's JSON spells it.
@@ -982,13 +998,22 @@ unsafe fn query_body(env: Opaque, info: Opaque) -> Opaque {
     let connection = database.database.session_as(session_of(conn));
     match connection.query(&sql, &values, usize::MAX) {
         Ok(rows) => result_of(api, env, &rows, conn, as_arrays),
-        Err(why) => throw_with_feature(
-            api,
-            env,
-            why.status.name(),
-            &why.message,
-            why.feature.as_deref(),
-        ),
+        Err(why) => {
+            // The rows before the failure ride on the thrown error as `partial`,
+            // in the shape a success returns, so one reader handles both.
+            let partial = match why.partial.as_deref() {
+                Some(rows) => result_of(api, env, rows, conn, as_arrays),
+                None => std::ptr::null_mut(),
+            };
+            throw_with_feature(
+                api,
+                env,
+                why.status.name(),
+                &why.message,
+                why.feature.as_deref(),
+                partial,
+            )
+        }
     }
 }
 

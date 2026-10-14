@@ -257,6 +257,13 @@ name = "inillucent_release_models"
 stability = "provisional"
 since = "1.5.0"
 
+# The rows a statement produced before it failed, handed over once. Additive, so it stays inside
+# 1.5.0. Provisional until the wrappers that call it have shipped a release.
+[[symbol]]
+name = "inillucent_error_take_rows"
+stability = "provisional"
+since = "1.5.0"
+
 # The Node addon's entry point, which Node calls when it loads the library
 # (task-2191). Provisional with the rest of 1.3.0.
 [[symbol]]

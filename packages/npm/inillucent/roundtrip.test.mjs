@@ -489,3 +489,33 @@ withDatabase('a session with an integer past 2^53 in a result keeps every digit'
     await session.close();
   }
 });
+
+everyRoute('a query that fails on its 4th row carries the 3 rows before it on every route', async (routes) => {
+  const failsAtFour =
+    'WITH RECURSIVE c(a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM c WHERE a < 5) ' +
+    "SELECT a, CASE WHEN a = 4 THEN json('x') END AS b FROM c";
+  const failsAtOne = "SELECT json('x') AS b";
+  for (const [route, run] of Object.entries(routes)) {
+    await assert.rejects(
+      run(failsAtFour, []),
+      (why) => {
+        assert.deepEqual(
+          why.partial,
+          [
+            { a: 1, b: null },
+            { a: 2, b: null },
+            { a: 3, b: null },
+          ],
+          `${route}: the rows before the failure did not come with it`,
+        );
+        return true;
+      },
+      `${route}: row 4 did not fail`,
+    );
+    await assert.rejects(
+      run(failsAtOne, []),
+      (why) => why.partial === null || why.partial === undefined,
+      `${route}: a statement that failed before its first row carried rows`,
+    );
+  }
+});
