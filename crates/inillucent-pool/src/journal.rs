@@ -944,6 +944,36 @@ fn hold_the_database(target: &dyn VfsFile) -> bool {
 /// @param vfs - where the files live
 /// @param database - the database file's path
 pub fn replay_hot_journal(vfs: &dyn Vfs, database: &DbPath) -> DbResult<bool> {
+    replay_hot_journal_holding(vfs, database, &|_| Ok(Vec::new()))
+}
+
+/// Puts a hot journal back as [`replay_hot_journal`] does, holding whatever `hold` opens from
+/// before the first page is written until after the journal is gone.
+///
+/// **For the log segments beside the database (the process storm).** On Windows a process holds
+/// a batch oplock on its open log segment, and while it holds one it skips reading the meta
+/// record on each statement, because no other process can have folded without opening that
+/// segment first (`inillucent_vfs::os::windows_log`). A restore changes the meta record, by
+/// announcing the generation, and opens no segment, so a reader holding the oplock went on
+/// answering from pages the restore had taken away, until some later process happened to open
+/// the segment. The process storm with a 64 page pool measured it as a reader that finished its
+/// open just before a restore and read the old pages in its next statement without
+/// resynchronising: 2 storms of 448.
+///
+/// Holding the segments open from before the first write breaks every reader's oplock first,
+/// since the kernel holds this open until the reader has acknowledged, and keeps the reader from
+/// taking the oplock again until the restore, the announcement and the journal's removal are
+/// done. A journal that restores nothing opens nothing.
+///
+/// @param vfs - where the files live
+/// @param database - the database file's path
+/// @param hold - opens the files to keep open, given the log sequence the meta record names
+///   now, or zero when no record decodes
+pub fn replay_hot_journal_holding(
+    vfs: &dyn Vfs,
+    database: &DbPath,
+    hold: &dyn Fn(u64) -> DbResult<Vec<Box<dyn VfsFile>>>,
+) -> DbResult<bool> {
     let path = database.journal();
     // **A cheap look before any lock is taken**, because this runs on every
     // open and the overwhelmingly common answer is "there is no journal". It
@@ -1017,6 +1047,7 @@ pub fn replay_hot_journal(vfs: &dyn Vfs, database: &DbPath) -> DbResult<bool> {
         let _ = vfs.delete(&path, false);
         return Ok(false);
     }
+    let _held = hold(log_sequence_named_by(target.as_ref(), page_size))?;
     let mut record = vec![0u8; page_size.saturating_add(RECORD_PREFIX)];
     let mut restored = 0usize;
     for index in 0..count {
@@ -1054,6 +1085,23 @@ pub fn replay_hot_journal(vfs: &dyn Vfs, database: &DbPath) -> DbResult<bool> {
     drop(journal);
     let _ = vfs.delete(&path, false);
     Ok(restored > 0)
+}
+
+/// Returns the log sequence the meta record in the file names, or zero when neither slot decodes.
+///
+/// @param target - the database file, held EXCLUSIVE by the caller
+/// @param page_size - the page size the journal was written at
+fn log_sequence_named_by(target: &dyn VfsFile, page_size: usize) -> u64 {
+    let mut primary = vec![0u8; page_size];
+    let mut shadow = vec![0u8; page_size];
+    if target.read_exact_at(0, &mut primary).is_err()
+        || target.read_exact_at(page_size as u64, &mut shadow).is_err()
+    {
+        return 0;
+    }
+    crate::meta::Meta::choose(&primary, &shadow)
+        .map(|meta| meta.wal_sequence)
+        .unwrap_or(0)
 }
 
 /// Moves the meta record's generation on after a journal's pages were put
@@ -1303,6 +1351,115 @@ mod tests {
             Meta::decode(&primary).expect("the primary decodes"),
             expected
         );
+    }
+
+    /// Builds a file with a meta record naming log sequence 9, a data page holding
+    /// 3s, and a sealed journal that holds that page's pre-image, then overwrites
+    /// the page with 9s as a writer that died after its fold began would.
+    ///
+    /// @param vfs - where to build it
+    /// @param path - the database file
+    fn a_file_with_a_hot_journal(vfs: &std::sync::Arc<dyn Vfs>, path: &DbPath) {
+        use crate::meta::{Meta, META_PAGE, SHADOW_PAGE};
+        use inillucent_vfs::OpenOptions;
+        let page_size = 4096usize;
+        let mut before = Meta::fresh(page_size as u32, 7);
+        before.page_count = 3;
+        before.wal_sequence = 9;
+        let mut record = vec![0u8; page_size];
+        before.encode(&mut record).expect("the record encodes");
+        let file = vfs
+            .open(path, OpenOptions::main_db())
+            .expect("the file opens");
+        for slot in [META_PAGE, SHADOW_PAGE] {
+            file.write_all_at(slot.0 * page_size as u64, &record)
+                .expect("the meta slot is written");
+        }
+        file.write_all_at(2 * page_size as u64, &vec![3u8; page_size])
+            .expect("the data page is written");
+        let mut journal = Journal::new(
+            std::sync::Arc::clone(vfs),
+            path,
+            JournalMode::Delete,
+            page_size,
+        );
+        journal
+            .save(PageId(2), &vec![3u8; page_size])
+            .expect("the pre-image is saved");
+        journal.seal().expect("the journal syncs");
+        file.write_all_at(2 * page_size as u64, &vec![9u8; page_size])
+            .expect("the page is overwritten");
+        drop(journal);
+    }
+
+    /// A restore opens what `hold` asks for once, with the log sequence the meta
+    /// record names, before the first page is put back.
+    ///
+    /// **The order is the property.** A reader on Windows that holds the oplock on
+    /// the log segment skips the meta record until some process opens the segment.
+    /// A restore changes the record without writing the log, so the segment has to
+    /// be opened before the restore writes, or the reader can read the restored
+    /// file through a cache that describes the file as it was.
+    #[test]
+    fn a_restore_holds_what_it_is_asked_to_before_it_writes() {
+        use inillucent_vfs::{MemoryVfs, OpenOptions};
+        let vfs: std::sync::Arc<dyn Vfs> = std::sync::Arc::new(MemoryVfs::new());
+        let path = DbPath::new("/held.db");
+        a_file_with_a_hot_journal(&vfs, &path);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let restored = replay_hot_journal_holding(vfs.as_ref(), &path, &|sequence| {
+            let file = vfs
+                .open(&path, OpenOptions::main_db())
+                .expect("the file opens");
+            let mut page = vec![0u8; 4096];
+            file.read_exact_at(2 * 4096, &mut page)
+                .expect("the page reads");
+            asked.borrow_mut().push((sequence, page[0]));
+            Ok(vec![file])
+        })
+        .expect("the replay runs");
+        assert!(restored, "the journal was hot");
+        assert_eq!(
+            *asked.borrow(),
+            vec![(9, 9)],
+            "hold must be asked once, with sequence 9, while the page still holds what the dead              writer left"
+        );
+        let file = vfs
+            .open(&path, OpenOptions::main_db())
+            .expect("the file opens");
+        let mut page = vec![0u8; 4096];
+        file.read_exact_at(2 * 4096, &mut page)
+            .expect("the page reads");
+        assert_eq!(page[0], 3, "the page was put back after hold ran");
+    }
+
+    /// A journal that restores nothing asks `hold` for nothing.
+    #[test]
+    fn a_journal_that_restores_nothing_holds_nothing() {
+        use inillucent_vfs::{MemoryVfs, OpenOptions};
+        let vfs: std::sync::Arc<dyn Vfs> = std::sync::Arc::new(MemoryVfs::new());
+        let path = DbPath::new("/none.db");
+        let file = vfs
+            .open(&path, OpenOptions::main_db())
+            .expect("the file opens");
+        file.write_all_at(0, &[7u8; 64])
+            .expect("the page is written");
+        drop(file);
+        let asked = std::cell::Cell::new(0u32);
+        let hold = |_: u64| {
+            asked.set(asked.get() + 1);
+            Ok(Vec::new())
+        };
+        assert!(!replay_hot_journal_holding(vfs.as_ref(), &path, &hold).expect("no journal"));
+        let journal = vfs
+            .open(&path.journal(), OpenOptions::of_kind(FileKind::MainJournal))
+            .expect("the journal opens");
+        journal
+            .write_all_at(0, &[0xEE; 80])
+            .expect("a journal with no valid header is written");
+        drop(journal);
+        assert!(!replay_hot_journal_holding(vfs.as_ref(), &path, &hold).expect("a bad header"));
+        assert_eq!(asked.get(), 0, "hold ran with nothing to restore");
     }
 
     /// A journal that was finished is not replayed, whatever is still in it.

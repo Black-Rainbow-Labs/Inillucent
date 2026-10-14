@@ -33,6 +33,7 @@ mod faults;
 mod file_damage;
 mod fold_protocol;
 mod free_map_checkpoint_crash;
+mod journal_restore_oplock;
 mod large_transactions;
 mod log_oplock;
 mod logical_split_crash;

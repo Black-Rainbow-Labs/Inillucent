@@ -2294,6 +2294,14 @@ covers = ["inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-
 package = "inillucent-compat"
 kind = "test"
 name = "durability"
+module = "journal_restore_oplock"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-vfs"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
 module = "shared_page_leak"
 tier = "durability"
 covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool", "inillucent-sim", "inillucent-vfs"]

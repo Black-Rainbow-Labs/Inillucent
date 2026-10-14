@@ -57,11 +57,17 @@ const CHECKPOINT_EVERY: usize = 100;
 
 /// A scratch directory for one run, emptied first.
 ///
+/// **`READERS_DIR` moves it**, so several copies of this suite can run side by
+/// side to reproduce a failure that only shows under load. Without it the
+/// directory is the one every earlier run used.
+///
 /// @param arm - the configuration this run is at
 fn area(arm: &Arm) -> PathBuf {
-    let path = workspace_root()
-        .join("_agent_output/process-readers")
-        .join(arm.name);
+    let root = match std::env::var_os("READERS_DIR") {
+        Some(directory) => PathBuf::from(directory),
+        None => workspace_root().join("_agent_output/process-readers"),
+    };
+    let path = root.join(arm.name);
     let _ = std::fs::remove_dir_all(&path);
     let _ = std::fs::create_dir_all(&path);
     path

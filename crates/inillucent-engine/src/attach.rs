@@ -248,7 +248,7 @@ impl ImportedDatabase {
         // that could have rebuilt it - after which the file's own hot journal
         // is stale and a later `main` open of it would replay old pages back
         // over the newer ones this session wrote.
-        inillucent_pool::journal::replay_hot_journal(vfs.as_ref(), &path)?;
+        crate::recovery::replay_hot_journal_holding_the_log(vfs.as_ref(), &path)?;
         let doubtful = self.doubt_for(&path)?;
         let in_doubt = !doubtful.is_empty();
         let OpenedFile {

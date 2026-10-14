@@ -268,6 +268,15 @@ fn open_with_nothing_to_replay(
                     let resumed = high_water.saturating_add(1);
                     let rolled = sequence.saturating_add(1);
                     database.set_log_position(resumed, meta.cts_watermark, rolled);
+                    // **This fold writes the meta record before this process has opened the
+                    // log.** A reader on Windows that holds the oplock on the segment skips
+                    // the meta record until a process opens it, so the segments are held
+                    // open from before the write; see `replay_hot_journal_holding_the_log`.
+                    let _held = inillucent_wal::hold_segments_from(
+                        vfs.as_ref(),
+                        db_path,
+                        meta.wal_sequence,
+                    )?;
                     database.checkpoint()?;
                     (resumed, rolled)
                 }
@@ -817,6 +826,27 @@ fn fold_what_the_replay_grew(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Puts a hot rollback journal back, with the log segments held open while it does.
+///
+/// **Every caller that replays a journal goes through here.** A journal restore changes the
+/// file and the meta record and writes no log record, and on Windows a reader that holds the
+/// oplock on the log segment skips the meta record on each statement. Opening the segments
+/// before the first page is put back is what tells that reader to look; see
+/// `inillucent_pool::journal::replay_hot_journal_holding`.
+///
+/// Returns whether anything was restored.
+///
+/// @param vfs - the file system the file and its log live on
+/// @param db_path - the database file
+pub fn replay_hot_journal_holding_the_log(
+    vfs: &dyn inillucent_vfs::Vfs,
+    db_path: &DbPath,
+) -> DbResult<bool> {
+    inillucent_pool::journal::replay_hot_journal_holding(vfs, db_path, &|sequence| {
+        inillucent_wal::hold_segments_from(vfs, db_path, sequence)
+    })
 }
 
 /// Reports whether the log on disk ends exactly where a replay stopped.

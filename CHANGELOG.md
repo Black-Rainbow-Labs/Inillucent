@@ -10,6 +10,19 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**A checkpoint makes the data pages durable before it writes the meta record.** The checkpoint
+that follows a log fold wrote the pages and the shadow meta slot and synced once for both, so a
+power loss inside that sync could leave the new meta record beside a torn catalog page that the log
+no longer covered, and the next open refused the file. The pages now have a sync of their own, which
+makes a fold sync the data file three times instead of twice. A test cuts the power at every sync of
+a `DELETE` followed by `PRAGMA wal_checkpoint`; 8 of 168 cuts damaged the file before, none after.
+
+**A reader on Windows notices a rollback journal that another process put back.** A reader that
+holds the oplock on its log segment skips reading the meta record, and a journal restore changes the
+record without opening the segment, so the reader went on answering from pages the restore had taken
+away. The process that restores a journal now opens the log segments first and holds them until it
+is done.
+
 **`ROLLBACK` restores everything a transaction changed, including after `DROP` and `ALTER TABLE`.**
 Bug hunt 10 found rollbacks that lost or kept rows. With foreign keys on, `BEGIN; DROP TABLE p;
 ROLLBACK` brought `p` back with no rows, because the rows `DROP TABLE` deletes first were put back
