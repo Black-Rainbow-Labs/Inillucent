@@ -65,7 +65,7 @@ pub fn splice_image(
     page_size: usize,
     fill: f64,
 ) -> DbResult<Option<Vec<u8>>> {
-    if leaf.has_extents() || splices_of(leaf) >= SPLICE_LIMIT {
+    if leaf.has_extents() || leaf.is_short() || splices_of(leaf) >= SPLICE_LIMIT {
         return Ok(None);
     }
     let rows = order.len();

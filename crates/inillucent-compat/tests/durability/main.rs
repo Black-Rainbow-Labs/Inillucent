@@ -16,6 +16,7 @@
 //! `tests/selection.toml`. `selection::discover` finds a module file with no
 //! row, so `no_test_hides_outside_the_map` names one that was forgotten.
 
+mod add_column_crash;
 mod auto_vacuum_crash;
 mod btree_model;
 mod bulk_build_crash;
@@ -68,3 +69,4 @@ mod story_nikaya_crash;
 mod two_connections_end_a_transaction;
 mod vacuum_crash;
 mod wal_crash;
+mod wide_row_crash;

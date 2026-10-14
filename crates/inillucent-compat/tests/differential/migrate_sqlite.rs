@@ -969,8 +969,20 @@ CREATE INDEX ex_doubled ON ex(b * 2, a);\n";
 /// @param columns - how many columns the table has
 /// @param rows - how many identical rows to insert
 fn wide_table_script(columns: usize, rows: usize) -> String {
+    wide_table_script_from(columns, rows, 0)
+}
+
+/// Writes the script for a table of `columns` untyped columns holding `rows` rows of the
+/// numbers `base` to `base + columns - 1`.
+///
+/// @param columns - how many columns the table has
+/// @param rows - how many identical rows to insert
+/// @param base - the number the first column holds
+fn wide_table_script_from(columns: usize, rows: usize, base: i64) -> String {
     let names: Vec<String> = (0..columns).map(|at| format!("c{at}")).collect();
-    let values: Vec<String> = (0..columns).map(|at| at.to_string()).collect();
+    let values: Vec<String> = (0..columns)
+        .map(|at| (base + at as i64).to_string())
+        .collect();
     let mut script = format!("CREATE TABLE wide({});\n", names.join(","));
     for _ in 0..rows {
         script.push_str(&format!("INSERT INTO wide VALUES({});\n", values.join(",")));
@@ -985,9 +997,12 @@ fn wide_table_script(columns: usize, rows: usize) -> String {
 /// it.** A table of 920 columns with one row failed with `database disk image is malformed`,
 /// because the migration wrapped every failure of the build in the error for a damaged file.
 /// A row too wide for the columnar region is now kept alone in the delta area of its leaf, which
-/// holds about 1,900 numbers. Three rows are inserted so the bulk build has to place more than
-/// one wide row, each in a leaf of its own. A table of 2,000 columns of numbers holds more than
-/// a 32 KiB page does and is refused with its real reason, not as a malformed file.
+/// holds about 1,900 numbers of eight bytes each, and up to about 3,200 when each fits 32 bits,
+/// because a row that wide writes its integers in the fewest bytes that hold them. Three rows
+/// are inserted so the bulk build has to place more than one wide row, each in a leaf of its
+/// own. A table of 2,000 columns of small numbers migrates. A table of 2,000 columns of numbers
+/// that each need eight bytes holds more than a 32 KiB page does and is refused with its real
+/// reason, not as a malformed file.
 #[test]
 fn a_table_of_a_thousand_columns_migrates_and_one_too_wide_for_a_page_is_refused_by_name() {
     let Some(shell) = reference() else {
@@ -995,7 +1010,7 @@ fn a_table_of_a_thousand_columns_migrates_and_one_too_wide_for_a_page_is_refused
         return;
     };
     let area = scratch("wide-rows");
-    for columns in [920usize, 1200, 1500] {
+    for columns in [920usize, 1200, 1500, 2000] {
         let source = area.join(format!("source-{columns}.db"));
         if !build_with_shell(&shell, &source, &wide_table_script(columns, 3)) {
             inillucent_compat::differential::skipping("the reference shell could not be run");
@@ -1028,14 +1043,18 @@ fn a_table_of_a_thousand_columns_migrates_and_one_too_wide_for_a_page_is_refused
         );
     }
 
-    let source = area.join("source-2000.db");
-    if !build_with_shell(&shell, &source, &wide_table_script(2000, 1)) {
+    let source = area.join("source-2000-full.db");
+    if !build_with_shell(
+        &shell,
+        &source,
+        &wide_table_script_from(2000, 1, 4_000_000_000_000_000_000),
+    ) {
         inillucent_compat::differential::skipping("the reference shell could not be run");
         return;
     }
-    let destination = area.join("migrated-2000.rdb");
+    let destination = area.join("migrated-2000-full.rdb");
     let error = sqlite::migrate(&source, &destination)
-        .expect_err("a row of 2,000 numbers does not fit a 32 KiB page");
+        .expect_err("2,000 numbers of eight bytes each do not fit a 32 KiB page");
     assert_ne!(
         error.code(),
         inillucent_base::PrimaryCode::Corrupt,

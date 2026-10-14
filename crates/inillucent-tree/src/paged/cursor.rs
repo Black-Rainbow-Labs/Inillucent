@@ -98,6 +98,7 @@ impl PagedTree {
             let guard = pool.fetch(page)?;
             let leaf = LeafRef::parse(&guard)?
                 .with_collations(&self.collations)
+                .with_pad(&self.pad)
                 .with_directions(&self.directions)
                 .with_pool(pool);
             // **The out-of-line values are read here, once per leaf, for every
@@ -182,6 +183,7 @@ impl PagedTree {
                 let guard = pool.fetch(descent.leaf)?;
                 let leaf = LeafRef::parse(&guard)?
                     .with_collations(&self.collations)
+                    .with_pad(&self.pad)
                     .with_directions(&self.directions)
                     .with_pool(pool);
                 if !self.with_leaf_extents(pool, Some(descent.leaf), leaf, |leaf| visit(leaf))? {
@@ -422,6 +424,7 @@ impl PagedTree {
         let mut next = {
             let leaf = LeafRef::parse(&guard)?
                 .with_collations(&self.collations)
+                .with_pad(&self.pad)
                 .with_directions(&self.directions)
                 .with_pool(pool);
             match self.with_leaf_extents(pool, None, leaf, |leaf| {
@@ -437,6 +440,7 @@ impl PagedTree {
             let guard = pool.fetch(next)?;
             let leaf = LeafRef::parse(&guard)?
                 .with_collations(&self.collations)
+                .with_pad(&self.pad)
                 .with_directions(&self.directions)
                 .with_pool(pool);
             match self.with_leaf_extents(pool, None, leaf, |leaf| {
@@ -647,6 +651,7 @@ impl PagedTree {
         self.last_leaf.set(Some(page));
         let leaf = LeafRef::parse(&guard)?
             .with_collations(&self.collations)
+            .with_pad(&self.pad)
             .with_directions(&self.directions)
             .with_pool(pool);
         // **One row's out-of-line values, not the leaf's.** A leaf whose values
@@ -735,6 +740,7 @@ impl PagedTree {
             let guard = pool.fetch(next)?;
             let leaf = LeafRef::parse(&guard)?
                 .with_collations(&self.collations)
+                .with_pad(&self.pad)
                 .with_directions(&self.directions)
                 .with_pool(pool);
             if let Some(hit) = self.hit_in(&leaf, probe)? {
@@ -839,6 +845,22 @@ impl PagedTree {
             Ok(values)
         })
     }
+    /// Reports whether the tree holds a live row, reading leaves until one does.
+    ///
+    /// **A question about existence, answered by existence.** `rows(...).is_empty()`
+    /// reads and copies every row of the tree to learn this, which made `ALTER TABLE
+    /// ... ADD COLUMN` take time in proportion to the table before it did anything.
+    ///
+    /// @param pool - the buffer pool
+    pub fn holds_a_row(&self, pool: &Pool) -> DbResult<bool> {
+        let mut found = false;
+        self.visit_leaves_unresolved(pool, &mut |leaf| {
+            found = leaf.live_count()? > 0;
+            Ok(!found)
+        })?;
+        Ok(found)
+    }
+
     /// Returns every row in key order, copying them out.
     ///
     /// The slow path the property test and the integrity checker use.

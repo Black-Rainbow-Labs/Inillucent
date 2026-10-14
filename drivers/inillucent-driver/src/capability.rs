@@ -470,16 +470,16 @@ pub static CAPABILITIES: &[Capability] = &[
             sql: "SELECT 1 FROM t WHERE (a, b) IN (SELECT x, y FROM s)",
         },
     },
-    // —— what it does not do ——————————————————————————————————————
     Capability {
         name: "attach_computed_path",
-        support: Support::No,
-        note: "ATTACH takes its file name as a string literal. A bound parameter or an expression in that place is refused, where SQLite evaluates it.",
+        support: Support::Yes,
+        note: "ATTACH takes its file name as any expression, as SQLite does: a bound parameter, a concatenation or a scalar subquery, evaluated when the statement runs. The schema name and the KEY stay string literals.",
         probe: Probe::Runs {
             setup: &[],
-            sql: "ATTACH ? AS other",
+            sql: "ATTACH ':memory' || ':' AS o",
         },
     },
+    // —— what it does not do ——————————————————————————————————————
     Capability {
         name: "match_in_an_or_reading_a_row",
         support: Support::No,

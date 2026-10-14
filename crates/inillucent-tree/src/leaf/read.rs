@@ -30,7 +30,22 @@ impl<'p> LeafRef<'p> {
     }
     /// Returns the number of columns.
     pub fn column_count(&self) -> usize {
-        self.column_count
+        self.width
+    }
+
+    /// Returns how many columns the page itself holds.
+    ///
+    /// Fewer than [`LeafRef::column_count`] for a leaf written before its tree
+    /// gained a column, when the view was given [`LeafRef::with_pad`].
+    pub fn physical_column_count(&self) -> usize {
+        self.page_columns
+    }
+
+    /// Reports whether the page holds fewer columns than the tree it is in.
+    ///
+    /// Only a view given [`LeafRef::with_pad`] can say yes.
+    pub fn is_short(&self) -> bool {
+        self.width > self.page_columns
     }
     /// Returns how many leading columns form the key.
     pub fn key_columns(&self) -> usize {
@@ -83,7 +98,7 @@ impl<'p> LeafRef<'p> {
         if !self.has_extents() {
             return Ok(refs);
         }
-        for column in self.key_columns()..self.column_count() {
+        for column in self.key_columns()..self.page_columns {
             let mini = self.column(column)?;
             if mini.class_at(row)? == ValueClass::Extent {
                 refs.push(mini.extent(row)?);
@@ -221,8 +236,11 @@ impl<'p> LeafRef<'p> {
     ///
     /// @param index - the column's position in the directory
     pub fn spec(&self, index: usize) -> DbResult<ColumnSpec> {
-        if index >= self.column_count {
-            return Err(misuse(format!("column {index} does not exist")));
+        if index >= self.page_columns {
+            return match self.pad.and_then(|pad| pad.spec(index)) {
+                Some(spec) => Ok(spec),
+                None => Err(misuse(format!("column {index} does not exist"))),
+            };
         }
         let entry = leaf_header::DIRECTORY
             .checked_add(index.saturating_mul(self.entry_size))
@@ -255,7 +273,7 @@ impl<'p> LeafRef<'p> {
     ///
     /// @param index - the column's position in the directory
     fn directory_entry(&self, index: usize) -> DbResult<&'p [u8]> {
-        if index >= self.column_count {
+        if index >= self.page_columns {
             return Err(misuse(format!("column {index} does not exist")));
         }
         let entry = leaf_header::DIRECTORY
@@ -282,6 +300,9 @@ impl<'p> LeafRef<'p> {
     ///
     /// @param index - the column's position in the directory
     pub fn column(&self, index: usize) -> DbResult<MiniColumn<'p>> {
+        if index >= self.page_columns {
+            return self.padded_column(index);
+        }
         let entry = self.directory_entry(index)?;
         let head: [u8; 8] = entry
             .get(..8)
@@ -326,6 +347,60 @@ impl<'p> LeafRef<'p> {
             page: self.page,
             extents: self.extents,
             index,
+            constant: None,
+        })
+    }
+
+    /// Returns a mini-column for a column the page does not hold.
+    ///
+    /// **Built to read like a column the page does hold.** A NULL fill is a class
+    /// array of zeros. An integer fill in an integer column is a class array of
+    /// typed values, slots one byte wide that are all zero, and a base equal to
+    /// the fill, which is how a column whose rows all hold one number is already
+    /// written, so the vectorised scans read it without a case of their own. Any
+    /// other fill is held in the view and answered by [`MiniColumn::value`], and
+    /// the view says it is not all typed so no scan reads its slots.
+    ///
+    /// @param index - the column's position in the tree
+    fn padded_column(&self, index: usize) -> DbResult<MiniColumn<'p>> {
+        let Some(pad) = self.pad else {
+            return Err(misuse(format!("column {index} does not exist")));
+        };
+        let Some(spec) = pad.spec(index) else {
+            return Err(misuse(format!("column {index} does not exist")));
+        };
+        let rows = self.row_count;
+        let class_len = class_bytes(rows);
+        let fill = pad.fill(index);
+        let (class, flags, base, constant): (&'static [u8], u8, i64, Option<Datum<'p>>) =
+            match (spec.physical, fill) {
+                (_, Datum::Null) => (&NO_CLASSES, spec.flags, 0, None),
+                (PhysicalType::Int64, Datum::Int(number)) => (
+                    &ALL_TYPED_CLASSES,
+                    spec.flags | COLUMN_ALL_TYPED,
+                    number,
+                    None,
+                ),
+                (_, other) => (&ALL_TYPED_CLASSES, spec.flags, 0, Some(other)),
+            };
+        let class = class
+            .get(..class_len)
+            .ok_or_else(|| corrupt("a leaf holds more rows than a page can"))?;
+        let values = NO_CLASSES
+            .get(..rows)
+            .ok_or_else(|| corrupt("a leaf holds more rows than a page can"))?;
+        Ok(MiniColumn {
+            physical: spec.physical,
+            flags,
+            width: 1,
+            base,
+            class,
+            values,
+            rows,
+            page: self.page,
+            extents: None,
+            index,
+            constant,
         })
     }
     /// Returns where the tombstone bitmap starts, which is also where the
@@ -541,7 +616,7 @@ impl<'p> LeafRef<'p> {
     /// row it shadows rather than joining it. `live_order_agrees_with_the_reference`
     /// checks them against a direct implementation of those three sentences.
     pub fn live_order(&self) -> DbResult<LiveOrder<'p>> {
-        self.live_order_decoding(self.column_count)
+        self.live_order_decoding(self.width)
     }
 
     /// [`LeafRef::live_order`], decoding only the leading columns of each delta row.
@@ -554,11 +629,11 @@ impl<'p> LeafRef<'p> {
     ///
     /// @param decode - how many leading columns of each delta row to decode
     pub fn live_order_decoding(&self, decode: usize) -> DbResult<LiveOrder<'p>> {
-        let mut columns = Vec::with_capacity(self.column_count);
-        for index in 0..self.column_count {
+        let mut columns = Vec::with_capacity(self.width);
+        for index in 0..self.width {
             columns.push(self.column(index)?);
         }
-        let delta_width = decode.max(self.key_columns).min(self.column_count);
+        let delta_width = decode.max(self.key_columns).min(self.width);
         // Each delta row decoded once, into one vector for the whole area, and
         // reused by every comparison below.
         let mut delta: Vec<Datum<'p>> =
@@ -572,7 +647,7 @@ impl<'p> LeafRef<'p> {
             delta,
             delta_width,
             order,
-            width: self.column_count,
+            width: self.width,
         })
     }
 
@@ -656,7 +731,7 @@ impl<'p> LeafRef<'p> {
         if self.delta_count == 0 {
             return Ok(sorted_live);
         }
-        let key_width = self.key_columns.min(self.column_count);
+        let key_width = self.key_columns.min(self.page_columns);
         let mut keys: Vec<Datum<'p>> =
             Vec::with_capacity(self.delta_count.saturating_mul(key_width));
         for index in 0..self.delta_count {
@@ -826,7 +901,7 @@ impl<'p> LeafRef<'p> {
         // key columns and the projected ones are decoded, as before the merge
         // was shared. The rows are visited in key order, which the callers do
         // not need and which costs nothing more than visiting them out of it.
-        let key_width = self.key_columns.min(self.column_count);
+        let key_width = self.key_columns.min(self.page_columns);
         let mut delta_keys: Vec<Datum<'p>> =
             Vec::with_capacity(self.delta_count.saturating_mul(key_width));
         for index in 0..self.delta_count {
@@ -903,8 +978,8 @@ impl<'p> LeafRef<'p> {
             if self.is_tombstoned(row)? {
                 continue;
             }
-            let mut values = Vec::with_capacity(self.column_count);
-            for column in 0..self.column_count {
+            let mut values = Vec::with_capacity(self.width);
+            for column in 0..self.width {
                 values.push(self.value(row, column)?);
             }
             sorted.push(values);
@@ -1103,8 +1178,8 @@ impl<'p> LeafRef<'p> {
             if self.is_tombstoned(row)? {
                 continue;
             }
-            let mut values = Vec::with_capacity(self.column_count);
-            for column in 0..self.column_count {
+            let mut values = Vec::with_capacity(self.width);
+            for column in 0..self.width {
                 values.push(self.value(row, column)?);
             }
             sorted.push(values);
@@ -1501,6 +1576,12 @@ pub struct MiniColumn<'p> {
     extents: Option<&'p Extents>,
     /// Which column this is, so an out-of-line value can be found by position.
     index: usize,
+    /// The one value every row holds, for a column the leaf does not have.
+    ///
+    /// Set only by `LeafRef::padded_column`, for a fill that the slots cannot
+    /// carry: a real, a text, a blob, or an integer in a column of another
+    /// layout. `class` then says every row is typed and `values` is not read.
+    constant: Option<Datum<'p>>,
 }
 impl<'p> MiniColumn<'p> {
     /// Returns the class of one row's value.
@@ -1522,6 +1603,9 @@ impl<'p> MiniColumn<'p> {
     /// contiguous run with no per-row branch, which is the vectorised fast
     /// path; a `false` answer costs a scan of 1/32nd of the data to find out.
     pub fn all_typed(&self) -> bool {
+        if self.constant.is_some() {
+            return false;
+        }
         if self.rows == 0 {
             return true;
         }
@@ -1612,6 +1696,12 @@ impl<'p> MiniColumn<'p> {
     ///
     /// @param row - the row's position in the sorted region
     pub fn value(&self, row: usize) -> DbResult<Datum<'p>> {
+        if let Some(constant) = self.constant {
+            return match row < self.rows {
+                true => Ok(constant),
+                false => Err(corrupt(format!("row {row} is outside the class array"))),
+            };
+        }
         // **The class array is not read when the directory already answered.**
         // `COLUMN_ALL_TYPED` is set by the builder only when every one of this
         // column's rows classified as `Typed`, and `update_slot` refuses any

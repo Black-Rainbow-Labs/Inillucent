@@ -31,6 +31,17 @@ pub fn class_bytes(rows: usize) -> usize {
         .unwrap_or(0)
         .saturating_mul(8)
 }
+/// A class array of NULLs, and a run of zero slots, as long as the longest leaf can need.
+///
+/// A leaf holds at most `u16::MAX` rows; `class_bytes` of that is 16,384, and one
+/// byte slots are `u16::MAX` bytes. These are what a column the leaf does not have
+/// reads as when its default is NULL, or an integer, so the column is a view over
+/// bytes that exist and no reader has a case for a missing column.
+pub(crate) static NO_CLASSES: [u8; 65_536] = [0; 65_536];
+
+/// A class array of typed values, one per row, as long as the longest leaf can need.
+pub(crate) static ALL_TYPED_CLASSES: [u8; 16_384] = [0x55; 16_384];
+
 /// The bytes a tombstone bitmap of `rows` rows occupies, padded to eight.
 ///
 /// @param rows - how many rows the leaf holds

@@ -143,14 +143,16 @@ impl ImportedDatabase {
         };
         let limit = match file.auto_vacuum() {
             1 => u64::MAX,
-            2 => self
+            // Mode 2 takes what `PRAGMA incremental_vacuum` queued. Mode 0 takes
+            // what `VACUUM` of that schema queued, because that pragma queues
+            // nothing in a file that is not in mode 2.
+            _ => self
                 .writing
                 .incremental_steps()
                 .borrow()
                 .get(&at)
                 .copied()
                 .unwrap_or(0),
-            _ => 0,
         };
         match file.has_free_below(file.pool().page_count()) {
             true => limit,

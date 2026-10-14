@@ -376,18 +376,56 @@
     },
     {
       "name": "an_unimplemented_construct_refuses_by_name",
-      "about": "A construct the engine has not built reports `unsupported` and names itself, which is a different thing from a statement that is wrong. A binding that folds this into its general error type has thrown the design away. The example moves as the engine grows: it was VACUUM before that was built, a second ON CONFLICT clause before that was built, an encryption key on ATTACH before that was built, and is now a bound parameter as the file ATTACH opens. When that is built, repoint this at whatever still is rather than deleting the case.",
+      "about": "A construct the engine has not built reports `unsupported` and names itself, which is a different thing from a statement that is wrong. A binding that folds this into its general error type has thrown the design away. The example moves as the engine grows: it was VACUUM before that was built, a second ON CONFLICT clause before that was built, an encryption key on ATTACH before that was built, a bound parameter as the file ATTACH opens before that was built, and is now EXPLAIN of another EXPLAIN. When that is built, repoint this at whatever still is rather than deleting the case.",
       "setup": [
         "CREATE TABLE conflicts (a INTEGER PRIMARY KEY, b TEXT UNIQUE)"
       ],
       "steps": [
         {
-          "sql": "ATTACH DATABASE ? AS vault",
+          "sql": "EXPLAIN EXPLAIN SELECT 1",
           "status": "unsupported",
-          "feature_contains": "ATTACH"
+          "feature_contains": "EXPLAIN"
         }
       ],
       "group": "status"
+    },
+    {
+      "name": "attach_takes_a_bound_file_name",
+      "about": "The file ATTACH opens is an expression, as in SQLite, so a bound parameter names it. The binding has to carry the parameter to the statement that evaluates it. ':memory:' keeps the case off the disk, and the second step proves the attached schema exists by creating a table in it and reading the table back.",
+      "setup": [],
+      "steps": [
+        {
+          "sql": "ATTACH ?1 AS other",
+          "params": [
+            {
+              "text": ":memory:"
+            }
+          ],
+          "affected": 0
+        },
+        {
+          "sql": "CREATE TABLE other.pages (a INTEGER PRIMARY KEY, b TEXT)",
+          "affected": 0
+        },
+        {
+          "sql": "INSERT INTO other.pages VALUES (1, 'one')",
+          "affected": 1
+        },
+        {
+          "sql": "SELECT b FROM other.pages",
+          "rows": [
+            [
+              {
+                "text": "one"
+              }
+            ]
+          ]
+        }
+      ],
+      "group": "core",
+      "needs": [
+        "session"
+      ]
     },
     {
       "name": "a_constraint_refuses_a_write",
@@ -1563,7 +1601,7 @@
           "status": "constraint"
         },
         {
-          "sql": "ATTACH ? AS other",
+          "sql": "EXPLAIN EXPLAIN SELECT 1",
           "status": "unsupported"
         }
       ]
@@ -1786,7 +1824,7 @@
       "lacks": [
         "session"
       ],
-      "why": "the npm package wraps the command line: every call is a process, so a transaction, a savepoint or a temporary table cannot outlive one step. Rows do outlive it - they are in the file - so only the five cases that hold one of those are skipped. Held-transaction and two-connection behaviour is graded by crates/inillucent-compat/tests/durability/process_concurrency.rs and busy_timeout.rs, over real processes, which is stronger than a runner could be."
+      "why": "the npm package wraps the command line: every call is a process, so a transaction, a savepoint or a temporary table cannot outlive one step. Rows do outlive it - they are in the file - so only the six cases that hold one of those are skipped. Held-transaction and two-connection behaviour is graded by crates/inillucent-compat/tests/durability/process_concurrency.rs and busy_timeout.rs, over real processes, which is stronger than a runner could be."
     },
     "go": {
       "lacks": [

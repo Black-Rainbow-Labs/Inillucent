@@ -539,8 +539,17 @@ impl crate::ImportedDatabase {
         if let AlterKind::DropColumn { position, .. } = action {
             self.rebuild_table_tree(at, &folded, Some(usize::from(*position)))?;
         }
+        // **`ADD COLUMN` writes no leaf when it can avoid it.** Rewriting every row
+        // took time in proportion to the table (783 ms for 800,000 rows, where SQLite
+        // takes 19). The tree is given the new column and a pad, and a leaf is
+        // rewritten, wider, the first time something writes to it. A table with no
+        // row has nothing to avoid, and a default the pad cannot read the way the
+        // engine computes it is stored in every row.
         if let AlterKind::AddColumn { .. } = action {
-            self.rebuild_table_tree(at, &folded, None)?;
+            let populated = self.table_has_a_row(at, &folded)?;
+            if !(populated && self.add_column_without_rewriting(at, &folded)?) {
+                self.rebuild_table_tree(at, &folded, None)?;
+            }
         }
         if matches!(
             action,
@@ -676,7 +685,7 @@ impl crate::ImportedDatabase {
     /// does not have - reports itself rather than silently becoming NULL.
     ///
     /// @param default_sql - the `DEFAULT` text as the declaration wrote it
-    fn constant_default(&mut self, default_sql: &[u8]) -> DbResult<OwnedDatum> {
+    pub(super) fn constant_default(&mut self, default_sql: &[u8]) -> DbResult<OwnedDatum> {
         // A bare word, quoted or not, is a string in a default (`DEFAULT "q"`,
         // `DEFAULT hello`), because a default has no column in scope. Running it
         // as `SELECT "q"` would look for a column.
@@ -829,7 +838,7 @@ impl crate::ImportedDatabase {
         let Some(tree) = self.schema.trees.get(&root) else {
             return Ok(false);
         };
-        Ok(!tree.rows(self.pool_of(root)?)?.is_empty())
+        tree.holds_a_row(self.pool_of(root)?)
     }
     /// Rebuilds one table's tree so its leaves carry the columns the catalog
     /// now says it has.
@@ -843,7 +852,7 @@ impl crate::ImportedDatabase {
     /// @param folded - the table's folded name
     /// @param dropped - the declared position `DROP COLUMN` removed, when that
     ///   is what is being rebuilt
-    fn rebuild_table_tree(
+    pub(crate) fn rebuild_table_tree(
         &mut self,
         at: usize,
         folded: &[u8],
@@ -1194,7 +1203,7 @@ impl crate::ImportedDatabase {
 ///
 /// @param declared - the column's declared type, as written
 /// @param value - the default after affinity was applied
-fn strict_default_fits(declared: &[u8], value: &OwnedDatum) -> bool {
+pub(super) fn strict_default_fits(declared: &[u8], value: &OwnedDatum) -> bool {
     let folded = declared.to_ascii_uppercase();
     match (folded.as_slice(), value) {
         (_, OwnedDatum::Null) => true,
@@ -1217,7 +1226,7 @@ fn strict_default_fits(declared: &[u8], value: &OwnedDatum) -> bool {
 ///
 /// @param value - what the default evaluated to
 /// @param affinity - the new column's affinity, when it has one
-fn with_column_affinity(
+pub(super) fn with_column_affinity(
     value: OwnedDatum,
     affinity: Option<inillucent_value::Affinity>,
 ) -> OwnedDatum {

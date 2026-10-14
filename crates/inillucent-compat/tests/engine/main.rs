@@ -16,6 +16,7 @@
 //! `tests/selection.toml`. `selection::discover` finds a module file with no
 //! row, so `no_test_hides_outside_the_map` names one that was forgotten.
 
+mod add_column_without_rewrite;
 mod analyze_reopen;
 mod analyze_same_session;
 mod append_load_density;
@@ -45,6 +46,7 @@ mod hostile;
 mod import_memory;
 mod levers;
 mod limited_writes;
+mod long_index_keys_small_page;
 mod long_keys_at_every_page_size;
 mod maintenance_speed;
 mod max_page_count;
@@ -102,6 +104,7 @@ mod torn_page_with_image;
 mod transaction_memory;
 mod unique_leaf_boundary;
 mod usage_paths;
+mod vacuum_attached_database;
 mod vacuum_on_vfs;
 mod vector;
 mod vector_edges;
@@ -112,4 +115,5 @@ mod vtab;
 mod vtab_lifecycle;
 mod vtab_refused_connect;
 mod wal;
+mod wide_rows;
 mod write_speed;

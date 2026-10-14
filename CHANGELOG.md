@@ -113,6 +113,44 @@ record without opening the segment, so the reader went on answering from pages t
 away. The process that restores a journal now opens the log segments first and holds them until it
 is done.
 
+**A row of 2,000 integer columns fits a 32 KiB page.** A row of about 1,940 integer columns or more
+failed with `a row of N columns does not fit one page`, where SQLite allows 2,000. A leaf spends eight
+bytes on each column's directory entry and the tagged form of an integer took nine. A row whose numbers
+take more than half a page in that form is now written with each integer in the fewest bytes that hold
+it: two bytes under 128, three under 32,768, five under 2,147,483,648. That holds about 3,200 such
+columns. A row of integers that need eight bytes each still holds about 1,925, and a longer one is
+refused as before. The first wide row moves the file to format 4, with the `FormatRaised` log record, and
+a release that stops at format 3 refuses the file by name. Tables with narrower rows, and files that
+hold none, are written exactly as before.
+
+**`ALTER TABLE ... ADD COLUMN` takes time that does not depend on the number of rows.** It read every
+row, built a new tree from them and freed the old one: 783 ms for `ADD COLUMN e DEFAULT 5` on 800,000
+rows, where SQLite takes 19, and 1,841 ms with a `CHECK`. It now writes the catalog row and no leaf
+when the default is a literal. A leaf written before the column existed reads the default for it, and
+is rewritten with the column the first time a write lands in it, one leaf at a time. A read writes
+nothing, a delete widens nothing, and a table with no row, a statement inside a transaction and a
+default the engine has to evaluate take the old path. `CHECK` is still run over the existing rows,
+as SQLite runs it. The first such column moves the file to **format 4**, with a log record of its own,
+`FormatRaised`: a release that stops at format 3 refuses the file with
+`this database is format version 4 and this build reads version 3`, and refuses a log that holds the
+record by kind. A file that never gains a column on a table with rows stays at the format it had.
+`docs/relational-architecture.md` has the details.
+
+**`VACUUM aux` shortens the file of an attached database.** It used to fold the log and leave the
+file at its old length. A delete that left every leaf a tenth full freed one page of 147, so the
+free map had nothing to give back either. `VACUUM aux` now packs each table and index of the
+attached file into new trees in the same file and cuts the file after the commit. It does not
+rename a new file over the old one, so another process that has the file attached keeps working.
+
+**`ATTACH` takes any expression as its file name.** `ATTACH ?1 AS x`, `ATTACH 'a' || 'b' AS x` and
+`ATTACH (SELECT path FROM p) AS x` exited 3 with `unsupported`. The engine now evaluates the
+expression when the statement runs, with the statement's bound parameters, and reads the value as
+text as SQLite does, so a NULL names a private temporary database. `--root` confines the evaluated
+name the same way it confines a literal one. `VACUUM INTO ?1` takes its parameter the same way.
+The `attach_computed_path` row of `inillucent capabilities` is now `yes`. The examples of the
+`unsupported` status in the documentation, the skills and the conformance suite use
+`EXPLAIN EXPLAIN SELECT 1`.
+
 **`ROLLBACK` restores everything a transaction changed, including after `DROP` and `ALTER TABLE`.**
 Bug hunt 10 found rollbacks that lost or kept rows. With foreign keys on, `BEGIN; DROP TABLE p;
 ROLLBACK` brought `p` back with no rows, because the rows `DROP TABLE` deletes first were put back

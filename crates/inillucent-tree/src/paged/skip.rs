@@ -94,6 +94,7 @@ impl PagedTree {
             let step = 'step: {
                 let leaf = LeafRef::parse(&guard)?
                     .with_collations(&self.collations)
+                    .with_pad(&self.pad)
                     .with_directions(&self.directions)
                     .with_pool(pool);
                 let resolved = self.read_extents(pool, &leaf)?;
@@ -286,6 +287,7 @@ impl PagedTree {
             let (low, rows, next) = {
                 let leaf = LeafRef::parse(&stepped)?
                     .with_collations(&self.collations)
+                    .with_pad(&self.pad)
                     .with_directions(&self.directions)
                     .with_pool(pool);
                 match leaf.has_writes() {
@@ -331,6 +333,7 @@ impl PagedTree {
         let (low, writes, rows, right) = {
             let leaf = LeafRef::parse(&landed_guard)?
                 .with_collations(&self.collations)
+                .with_pad(&self.pad)
                 .with_directions(&self.directions)
                 .with_pool(pool);
             let writes = leaf.has_writes();

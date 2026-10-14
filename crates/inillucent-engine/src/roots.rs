@@ -200,7 +200,28 @@ impl ImportedDatabase {
                 self.compact_roots_of(at, txn)?;
             }
         }
+        // A `VACUUM` of a file that does not give pages back by itself packed
+        // every tree into a new one, so the new roots sit at the end of the file
+        // and the step that cuts it would stop at the first of them.
+        for at in schemas_in(participants) {
+            if self.is_being_vacuumed(at) && !self.keeps_roots_low(at) {
+                self.compact_roots_of(at, txn)?;
+            }
+        }
         Ok(())
+    }
+
+    /// Reports whether this commit carries a `VACUUM` of one file in a mode that
+    /// does not give pages back by itself.
+    ///
+    /// `VACUUM` of such a file is the only statement that queues every page for
+    /// the step, which is how it is told apart from `PRAGMA incremental_vacuum`.
+    ///
+    /// @param at - the schema, as the binder numbers them
+    fn is_being_vacuumed(&self, at: usize) -> bool {
+        self.schema_file(at)
+            .is_some_and(|file| file.auto_vacuum() == 0)
+            && self.writing.incremental_steps().borrow().get(&at) == Some(&u64::MAX)
     }
 
     /// Compacts the roots of one file.

@@ -70,10 +70,9 @@ application that uses the driver does not change when crates below the engine mo
 1. **Handle `unsupported` on its own.** The engine returns `unsupported` (`INILLUCENT_UNSUPPORTED` in
    C, `Status::Unsupported` in Rust) for a construct it has not built. A mistyped statement gets a
    different status, such as `syntax`. A binding that turns both into one general error cannot tell
-   "not built yet" from "wrong". For example, `ATTACH ? AS other`
-   returns `unsupported`, because `ATTACH` takes its file name as a string literal and not as a
-   parameter. The 416 case differential probe, which runs each case on inillucent and on the pinned
-   SQLite 3.53.4, has no case that returns `unsupported`. Write the `unsupported` branch anyway,
+   "not built yet" from "wrong". For example, `EXPLAIN EXPLAIN SELECT 1`
+   returns `unsupported`, because an `EXPLAIN` of another `EXPLAIN` is not built. The 416 case
+   differential probe, which runs each case on inillucent and on the pinned SQLite 3.53.4, has no case that returns `unsupported`. Write the `unsupported` branch anyway,
    because the capability table lists 12 constructs the engine refuses.
 2. **Read the capability table before you write unusual SQL.** The table lists what the engine can
    do, with a sentence about each row. See [The capability table](#the-capability-table).

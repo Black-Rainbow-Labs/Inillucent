@@ -231,7 +231,7 @@ fn a_batch_reports_the_same_status_as_exec() {
     assert_eq!(code, 0, "the row is written: {stderr}");
 
     let cases: [(&str, i32, &str); 3] = [
-        ("ATTACH ? AS other", 3, "\"unsupported\""),
+        ("EXPLAIN EXPLAIN SELECT 1", 3, "\"unsupported\""),
         (
             "INSERT INTO note (id, body) VALUES (1, 'again')",
             1,

@@ -61,6 +61,7 @@ impl crate::ImportedDatabase {
     /// cache is the bug this function exists to make unwriteable: the next
     /// execution would take a plan built against the tree that used to be there.
     pub(crate) fn refresh_catalog(&mut self) {
+        self.refresh_column_pads();
         if self.refresh_catalog_for_appended_table() {
             return;
         }
