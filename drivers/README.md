@@ -361,11 +361,18 @@ asks: a statement on one session does not move another session's numbers. In C,
 `inillucent_connect` opens a session and the `inillucent_conn` handle keeps it. Every call on that
 handle runs in the same session.
 
-Two connections of one `Database` share one transaction. A `BEGIN` on either is joined by the
-other, and a write through the first is undone by a `ROLLBACK` on the second. Sessions separate
-`temp.` tables, `ATTACH`, pragmas and the counters. They do not separate transactions. An
-application that needs isolated connections opens a second `Database` on the same file, which takes
-the file lock the way a second process does.
+Each connection of one `Database` has a transaction of its own. The first connection runs on the
+engine the open made. Every later connection runs on an engine of its own, opened over the same file
+when the connection runs its first statement, and that engine takes the file's locks the way a second
+process does. A `BEGIN` on one connection is not joined by another. The other connection reads only
+what is committed. A second writer waits for `busy_timeout` and then fails with `INILLUCENT_BUSY`,
+and a write through one connection is kept when another connection rolls back. In SQLite and in
+Python's `sqlite3` two connections behave the same way. A connection also has its own `temp.` tables,
+`ATTACH`, pragmas, functions and counters. Opening that engine costs what opening a second `Database`
+on the file costs, so a program keeps its connections instead of opening one per statement. In C,
+`inillucent_conn_free` releases the connection's engine when the last handle on the connection, its
+statements and its transactions is freed, and a transaction the connection left open is rolled back
+then. In Rust, `Database::release_session` does the same for a session number.
 
 A Rust caller that holds a connection for a long time needs one more step. `Connection<'d>` borrows
 the `Database`, so one Rust struct cannot hold both. Such a caller holds the `Database`, makes a

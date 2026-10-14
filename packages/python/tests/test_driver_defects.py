@@ -518,6 +518,49 @@ def test_two_threads_never_run_inside_one_database_at_once() -> None:
     assert module is not None
 
 
+def test_two_connections_of_one_database_have_a_transaction_each() -> None:
+    """Two connections of one ``Database`` shared one transaction.
+
+    A ``BEGIN`` on one was joined by the other, the other read its uncommitted
+    rows, and a write through the second was undone by the first one's
+    ``ROLLBACK``, so an acknowledged write was lost. Python's ``sqlite3`` and
+    SQLite isolate two connections and refuse the second writer with busy.
+    """
+    module = _need()["module"]
+    staged = _need()
+    directory = Path(tempfile.mkdtemp(prefix="inillucent-isolation-", dir=staged["root"]))
+    database = module.Database(str(directory / "probe.rdb"), busy_timeout_ms=200)
+    first = database.connect()
+    second = database.connect()
+    first.execute("CREATE TABLE t (a INTEGER)")
+    first.execute("BEGIN")
+    first.execute("INSERT INTO t VALUES (1)")
+    assert first.execute("SELECT count(*) FROM t").rows == [[1]]
+    assert second.execute("SELECT count(*) FROM t").rows == [[0]], "an uncommitted row was read"
+    assert first.in_transaction and not second.in_transaction
+    try:
+        second.execute("INSERT INTO t VALUES (2)")
+    except module.DriverError as refused:
+        assert refused.status == module.driver.BUSY, refused
+    else:
+        raise AssertionError("a second writer was accepted while the first held the file")
+    first.execute("ROLLBACK")
+    assert second.execute("SELECT count(*) FROM t").rows == [[0]]
+    # A write through the second connection is kept when the first rolls back.
+    first.execute("BEGIN")
+    second.execute("INSERT INTO t VALUES (7)")
+    first.execute("ROLLBACK")
+    assert first.execute("SELECT count(*) FROM t").rows == [[1]], "an acknowledged write was lost"
+    assert second.execute("SELECT count(*) FROM t").rows == [[1]]
+    # Closing a connection gives up its transaction, and the file goes to the next writer.
+    first.execute("BEGIN")
+    first.execute("INSERT INTO t VALUES (8)")
+    first.close()
+    second.execute("INSERT INTO t VALUES (9)")
+    assert second.execute("SELECT count(*) FROM t").rows == [[2]]
+    database.close()
+
+
 def main() -> int:
     """Run every test in this file, for a machine with no pytest."""
     failures = []

@@ -127,8 +127,8 @@ engine through `inillucent-driver` too.
 `inillucent-driver` is built on `inillucent_engine::connect::Database`, which `inillucent-cli` also
 calls directly. `Database::open` creates or opens a file and recovers it. `Database::import` reads a
 SQLite file. `Database::session` returns a connection with `execute_batch`, `query`,
-`prepare_with_tail`, `explain` and `begin`. The method is named `session` because two sessions can
-share one transaction.
+`prepare_with_tail`, `explain` and `begin`. The method is named `session` because a session also
+scopes `temp.` tables and `ATTACH`. Each session has a transaction of its own.
 
 The engine that came before the current one is deleted.
 [Closed items](closed-items.md#the-old-engine-is-deleted) lists its crates and says what reads a

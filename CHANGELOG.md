@@ -10,6 +10,21 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**Each connection of one `Database` has a transaction of its own.** `Database::session` in Rust,
+`Database.connect()` in Python and `inillucent_connect` in C returned connections that shared one
+transaction. A `BEGIN` on one was joined by the other, the other read its uncommitted rows, and a
+write through the second was undone by the first one's `ROLLBACK`, so an acknowledged write was lost.
+The first connection still runs on the engine the open made. Every later connection runs on an engine
+of its own over the same file, which takes the file lock the way a second process does: it reads only
+what is committed, and a second writer is refused with `busy` after the busy timeout. A function, a
+collation, an authorizer or a pragma set on one connection is no longer set on another. The C library
+frees a connection's engine when its last handle is freed. A program that opened a connection for every
+statement now pays the cost of opening an engine each time and should keep its connections.
+
+**Every call on a Python `Database` takes one lock the database owns.** The Python binding let the
+interpreter lock go while the engine ran, so two threads could be inside one connection together. A
+second thread now waits for the first call to finish. `Connection.cancel()` does not take the lock.
+
 **`ROLLBACK` restores everything a transaction changed, including after `DROP` and `ALTER TABLE`.**
 Bug hunt 10 found rollbacks that lost or kept rows. With foreign keys on, `BEGIN; DROP TABLE p;
 ROLLBACK` brought `p` back with no rows, because the rows `DROP TABLE` deletes first were put back

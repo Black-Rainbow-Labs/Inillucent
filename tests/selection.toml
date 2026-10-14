@@ -1096,6 +1096,14 @@ covers = ["inillucent-engine"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "connection_isolation"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-pool", "inillucent-wal"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "hostile"
 tier = "engine"
 covers = ["inillucent-engine", "inillucent-ext"]

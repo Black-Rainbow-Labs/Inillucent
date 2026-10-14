@@ -29,6 +29,7 @@ mod bulk_write_log;
 mod chunk_text;
 mod compiled_chain_reuse;
 mod conformance;
+mod connection_isolation;
 mod delete_order;
 mod dml;
 mod embed_direct_only;
