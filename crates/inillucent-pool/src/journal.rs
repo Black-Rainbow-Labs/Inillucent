@@ -1422,7 +1422,7 @@ mod tests {
         assert_eq!(
             *asked.borrow(),
             vec![(9, 9)],
-            "hold must be asked once, with sequence 9, while the page still holds what the dead              writer left"
+            "hold must be asked once, with sequence 9, while the page still holds what the dead writer left"
         );
         let file = vfs
             .open(&path, OpenOptions::main_db())
