@@ -32,6 +32,15 @@
 //!   bytes, and `doclist` is the postings this build used to keep in a
 //!   separate `%_data` row. Reading or writing a term is one row.
 //!
+//! ## Segments
+//!
+//! The rows of `%_idx` below are the base segment, number 0, which every earlier build wrote
+//! and this build still reads. A commit no longer rewrites them. It writes the postings it
+//! added as a new segment, numbered above 0, and merges small segments as the load goes on.
+//! `segment.rs` has the layout, the merge rule and the reasons. A commit of one small row
+//! therefore writes what the row adds, where it used to write the whole list of every word
+//! the row contains.
+//!
 //! ## One row per term, not two
 //!
 //! Building the index used to cost two tree writes per term touched - the
@@ -85,10 +94,12 @@ mod fts3_snippet;
 mod index;
 mod merge;
 mod query;
+mod segment;
 mod snippet;
 
 pub use doclist::{doclist_entries_decoded, reset_doclist_entries_decoded};
 pub use index::{build_stages, decode_sizes, reset_build_stages, Buffer, BuildStages, Pending};
+pub use segment::set_merge_chunk_bytes;
 
 pub mod bm25;
 mod doclist;
@@ -115,13 +126,6 @@ use self::tokenize::Tokenizer;
 
 /// The `%_data` row that holds the totals.
 const TOTALS: i64 = 1;
-/// The segment number the term dictionary uses.
-///
-/// SQLite's `%_idx` keys a term by the segment it is in; this index has one
-/// logical segment, so every term is in segment zero and the key is really the
-/// term. Keeping the column means the table's declaration is the one SQLite
-/// writes, and a reader looking at the schema sees what it expects.
-const SEGMENT: i64 = 0;
 
 /// Which full-text surface a table presents.
 ///
@@ -740,6 +744,9 @@ impl VirtualTable for Fts5Table {
             &[Value::owned_text(b"version")?, Value::Integer(4)],
         )?;
         layout::stamp(context, &self.shadows)?;
+        // A table made by this build keeps nothing in the base segment, so a reader need not
+        // look there.
+        segment::write_structure(context, &self.shadows, &segment::Structure::empty())?;
         // `version` is the only row FTS5 writes. The tokenizer is *not* kept
         // here: it is re-read from the module arguments in `sqlite_master`
         // every time the table is connected, and a `tokenize` row would be a
@@ -958,23 +965,17 @@ impl VirtualTable for Fts5Table {
                 problems.push(format!("row {rowid} has no size"));
             }
         }
-        let mut terms: Vec<(Vec<u8>, Vec<Value<'static>>)> = Vec::new();
-        self.shadows.scan_keyed(context, b"idx", 2, |values| {
-            if let Some(term) = values.get(1).and_then(Value::as_blob) {
-                terms.push((term.raw().to_vec(), values.to_vec()));
-            }
-            Ok(true)
-        })?;
-        for (term, row) in &terms {
-            let Some(bytes) = resolve_doclist(context, &self.shadows, row)? else {
-                problems.push(format!(
-                    "the term {} has no doclist",
-                    String::from_utf8_lossy(term)
-                ));
-                continue;
-            };
-            for entry in decode_doclist(&bytes) {
-                if !rows.contains(&entry.rowid) {
+        let structure = segment::read_structure(context, &self.shadows)?;
+        problems.extend(segment::check_structure(
+            context,
+            &self.shadows,
+            &structure,
+        )?);
+        let held: std::collections::BTreeSet<i64> = rows.iter().copied().collect();
+        let terms = segment::scan_terms(context, &self.shadows, None, &structure, None)?;
+        for (term, entries) in &terms {
+            for entry in entries {
+                if !held.contains(&entry.rowid) {
                     problems.push(format!(
                         "the term {} names row {} which is not in the content",
                         String::from_utf8_lossy(term),

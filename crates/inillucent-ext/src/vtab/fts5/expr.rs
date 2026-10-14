@@ -30,10 +30,9 @@
 use std::collections::BTreeMap;
 
 use inillucent_base::DbResult;
-use inillucent_value::Value;
 
 use super::tokenize::Tokenizer;
-use super::{decode_doclist, DocEntry};
+use super::DocEntry;
 use crate::shadow::ShadowTables;
 use crate::vtab::{failure, Context};
 
@@ -912,9 +911,13 @@ pub fn evaluate(
     buffer: &super::Buffer,
     columns: usize,
 ) -> DbResult<(Vec<i64>, Vec<Hits>)> {
+    // The segment list is read once for the query, so every term is looked up in the same set.
+    let structure = super::segment::read_structure(context, shadows)?;
     let mut hits = Vec::with_capacity(query.phrases.len());
     for phrase in &query.phrases {
-        hits.push(phrase_hits(phrase, context, shadows, buffer, columns)?);
+        hits.push(phrase_hits(
+            phrase, context, shadows, buffer, &structure, columns,
+        )?);
     }
     let mut counter = 0usize;
     let rows = walk(&query.root, &hits, &mut counter);
@@ -960,9 +963,12 @@ pub fn evaluate_rows(
     {
         return Ok(None);
     }
+    let structure = super::segment::read_structure(context, shadows)?;
     let mut per_phrase = Vec::with_capacity(query.phrases.len());
     for phrase in &query.phrases {
-        per_phrase.push(phrase_rows(phrase, context, shadows, buffer, columns)?);
+        per_phrase.push(phrase_rows(
+            phrase, context, shadows, buffer, &structure, columns,
+        )?);
     }
     let mut counter = 0usize;
     Ok(walk_rows(&query.root, &per_phrase, &mut counter))
@@ -978,19 +984,21 @@ pub fn evaluate_rows(
 /// @param context - the host
 /// @param shadows - the table's shadow tables
 /// @param buffer - the doclists this transaction has staged
+/// @param structure - the segments the query reads
 /// @param columns - how many columns the table declares
 fn phrase_rows(
     phrase: &Phrase,
     context: &mut Context<'_>,
     shadows: &ShadowTables,
     buffer: &super::Buffer,
+    structure: &super::segment::Structure,
     columns: usize,
 ) -> DbResult<Vec<i64>> {
     let Some(term) = phrase.terms.first() else {
         return Ok(Vec::new());
     };
     let mut rows = Vec::new();
-    for bytes in term_doclists(term, context, shadows, buffer)? {
+    for bytes in term_doclists(term, context, shadows, buffer, structure)? {
         super::doclist_rows(&bytes, &phrase.columns, columns, &mut rows);
     }
     rows.sort_unstable();
@@ -1225,16 +1233,17 @@ fn union(left: &[i64], right: &[i64]) -> Vec<i64> {
 }
 
 /// Returns where one phrase appears, by row and column.
-pub fn phrase_hits(
+pub(crate) fn phrase_hits(
     phrase: &Phrase,
     context: &mut Context<'_>,
     shadows: &ShadowTables,
     buffer: &super::Buffer,
+    structure: &super::segment::Structure,
     columns: usize,
 ) -> DbResult<Hits> {
     let mut found: Option<Hits> = None;
     for (offset, term) in phrase.terms.iter().enumerate() {
-        let entries = term_entries(term, context, shadows, buffer)?;
+        let entries = term_entries(term, context, shadows, buffer, structure)?;
         let mut current: Hits = BTreeMap::new();
         for entry in entries {
             for (column, positions) in &entry.columns {
@@ -1328,90 +1337,67 @@ fn meet(left: &Hits, right: &Hits) -> Hits {
 
 /// Returns the doclists one term matches, prefix included.
 ///
-/// One doclist for an ordinary term; the whole prefix run for `word*`.
+/// One doclist for an ordinary term, with the entries of every segment and of the running
+/// transaction laid over one another; one for each term that starts with the prefix for
+/// `word*`.
 ///
 /// @param term - the term
 /// @param context - the host
 /// @param shadows - the table's shadow tables
 /// @param buffer - the doclists this transaction has staged
+/// @param structure - the segments the query reads
 fn term_doclists(
     term: &Term,
     context: &mut Context<'_>,
     shadows: &ShadowTables,
     buffer: &super::Buffer,
+    structure: &super::segment::Structure,
 ) -> DbResult<Vec<Vec<u8>>> {
-    let mut doclists = Vec::new();
-    if term.prefix {
-        // **The staged doclists are read from the buffer, not flushed.** A
-        // term this transaction created is held in the buffer and written in
-        // term order at the flush, so the scan of `%_idx` below cannot see it.
-        // Flushing here fixed that and made every prefix query that follows a
-        // write in the same transaction fail with "a module wrote to a shadow
-        // table while answering a query", because a query may not write. The
-        // buffer's doclists that start with the prefix are added instead, and
-        // they replace the stored row of the same term, since the staged
-        // doclist is the newer one.
-        let staged = super::staged_with_prefix(buffer, &term.token);
-        // A prefix reads every term the dictionary holds that starts with it.
-        // The dictionary is in term order, so the run is contiguous - which is
-        // what makes a prefix search cheaper than a scan of every term.
-        let mut rows: Vec<Vec<Value<'static>>> = Vec::new();
-        shadows.scan_keyed(context, b"idx", 2, |values| {
-            let Some(candidate) = values.get(1).and_then(Value::as_blob) else {
-                return Ok(true);
-            };
-            let candidate = candidate.raw();
-            if candidate < term.token.as_slice() {
-                return Ok(true);
-            }
-            if !candidate.starts_with(&term.token) {
-                return Ok(false);
-            }
-            if staged.contains_key(candidate) {
-                return Ok(true);
-            }
-            rows.push(values.to_vec());
-            Ok(true)
-        })?;
-        for row in rows {
-            let candidate = row
-                .get(1)
-                .and_then(Value::as_blob)
-                .map(|blob| blob.raw().to_vec())
-                .unwrap_or_default();
-            doclists.push(super::require_doclist(context, shadows, &candidate, &row)?);
-        }
-        doclists.extend(staged.into_values());
-    } else if let Some(bytes) = super::read_doclist(context, shadows, buffer, &term.token)? {
-        doclists.push(bytes);
+    if !term.prefix {
+        let bytes =
+            super::segment::read_term_bytes(context, shadows, buffer, structure, &term.token)?;
+        return Ok(bytes.into_iter().collect());
     }
-    Ok(doclists)
+    // **The staged postings are read from the buffer, not flushed.** A query may not write, so
+    // a prefix query that follows a write in the same transaction cannot flush what the write
+    // staged. They are laid over what is stored instead, term by term. A prefix reads every
+    // term the dictionary holds that starts with it, and the scan starts at the prefix, so it
+    // reads only those.
+    let terms =
+        super::segment::scan_terms(context, shadows, Some(buffer), structure, Some(&term.token))?;
+    Ok(terms
+        .into_values()
+        .map(|entries| super::doclist::encode_doclist(&entries))
+        .collect())
 }
 
+/// Returns the entries of the rows one term matches, prefix included, in rowid order.
+///
+/// @param term - the term
+/// @param context - the host
+/// @param shadows - the table's shadow tables
+/// @param buffer - the doclists this transaction has staged
+/// @param structure - the segments the query reads
 fn term_entries(
     term: &Term,
     context: &mut Context<'_>,
     shadows: &ShadowTables,
     buffer: &super::Buffer,
+    structure: &super::segment::Structure,
 ) -> DbResult<Vec<DocEntry>> {
-    let doclists = term_doclists(term, context, shadows, buffer)?;
-
-    // **One doclist is already the answer.** A term that is not a prefix has
-    // exactly one row, and a doclist holds each rowid once in ascending order
-    // - so the merge below has nothing to merge, and running it anyway
-    // searched a growing vector once per entry. That is quadratic in the
-    // documents a term appears in: a term in five hundred of them cost a
-    // hundred and twenty-five thousand comparisons per query, and `evaluate`
-    // was seventy per cent of `SELECT count(*) ... MATCH`.
-    if let Some(only) = doclists.first().filter(|_| doclists.len() == 1) {
-        return Ok(decode_doclist(only));
+    // **One term that is not a prefix is already the answer.** Its entries are in rowid order
+    // and name each row once, so there is nothing to merge, and running a merge anyway searched
+    // a growing vector once per entry. That is quadratic in the documents a term appears in: a
+    // term in five hundred of them cost a hundred and twenty-five thousand comparisons per
+    // query, and `evaluate` was seventy per cent of `SELECT count(*) ... MATCH`.
+    if !term.prefix {
+        return super::segment::read_term_entries(context, shadows, buffer, structure, &term.token);
     }
-    // A prefix reads several, and they can name the same row: merged by rowid
+    let found =
+        super::segment::scan_terms(context, shadows, Some(buffer), structure, Some(&term.token))?;
+    // A prefix reads several terms, and they can name the same row: merged by rowid
     // rather than searched for it.
-    let mut entries: Vec<DocEntry> = Vec::new();
-    for bytes in &doclists {
-        entries.extend(decode_doclist(bytes));
-    }
+    let mut entries: Vec<DocEntry> = found.into_values().flatten().collect();
     entries.sort_by_key(|entry| entry.rowid);
     let mut merged: Vec<DocEntry> = Vec::with_capacity(entries.len());
     for entry in entries {

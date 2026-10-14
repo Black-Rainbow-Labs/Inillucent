@@ -18,6 +18,16 @@ for a scan, for a lookup by rowid, for `highlight()` and `snippet()`, and for `r
 any external content table, FTS3, FTS4 and FTS5, also reads the owner's rows instead of the rows
 the index has been told about, so it answers before the first `rebuild`, as SQLite does.
 
+**A commit to an FTS5 table writes what its rows add, not the lists of every word they contain.**
+A load that committed each statement read the whole list of each word a row contained and wrote it
+back, so a word in every row was rewritten for every row and the work grew as the square of the rows. The index now writes each commit's postings as a segment of its own and merges
+small segments into larger ones, so each posting is written a number of times that grows with the
+logarithm of the rows. A deleted row is hidden by a marker in a newer segment until a merge drops
+it, and `INSERT INTO t(t) VALUES('optimize')` merges everything into one run. An index an earlier
+build wrote is read as before and is marked as layout 3 on its first write, so a build that does
+not read segments refuses it by name. `SELECT count(*) FROM t_idx` after deleting every row is no
+longer 0 until `optimize` runs.
+
 **FTS3 and FTS4 `MATCH` reads SQLite's default query language.** `MATCH 'x NOT y'` was an
 exclusion here and is a search for the three words `x`, `NOT` and `y` in SQLite. `AND` is a word
 too. `NEAR` and `NEAR/n` were handed to the FTS5 parser, which needs the `NEAR(a b, n)` spelling, so
