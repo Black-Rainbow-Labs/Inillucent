@@ -46,6 +46,10 @@ impl Parser<'_> {
             self.expect(Punctuator::RightParen)?;
         }
         let source = if self.at_keyword(Keyword::DEFAULT)? {
+            // SQLite's grammar for a trigger body has no `DEFAULT VALUES`.
+            if self.in_trigger_body {
+                return Err(self.unexpected(&["SELECT", "VALUES"])?);
+            }
             self.bump()?;
             self.expect_keyword(Keyword::VALUES)?;
             InsertSource::DefaultValues

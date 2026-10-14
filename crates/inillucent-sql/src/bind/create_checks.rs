@@ -404,6 +404,8 @@ impl Binder<'_> {
     pub(crate) fn refuse_unindexable(&self, target: &TableInfo) -> Result<(), ParseError> {
         let reason = if target.kind == TableKind::View {
             Some("views may not be indexed".to_string())
+        } else if target.kind == TableKind::Virtual {
+            Some("virtual tables may not be indexed".to_string())
         } else if target.folded.starts_with(b"sqlite_") {
             Some(format!(
                 "table {} may not be indexed",
@@ -729,6 +731,44 @@ impl Binder<'_> {
             checks: Vec::new(),
             module: None,
         }
+    }
+
+    /// Returns why the generated expression of an `ADD COLUMN` is refused, when it is.
+    ///
+    /// **`CREATE TABLE` refuses a generated expression that names no column, calls
+    /// a function whose answer changes, or holds a subquery, and `ADD COLUMN`
+    /// has to refuse the same ones.** SQLite finds them while it reads the schema
+    /// back after the change, so the statement fails as `error in table t after
+    /// add column: <reason>` and leaves the table as it was. The expression is
+    /// bound with the table's columns and the new column in scope, all of them as
+    /// plain columns: the new column may name itself, which SQLite accepts here
+    /// and reports as a loop when the table is read.
+    ///
+    /// @param table - the table the column is added to
+    /// @param column - the column definition
+    pub(crate) fn added_generated_fault(
+        &mut self,
+        table: &TableInfo,
+        column: &ColumnDef,
+    ) -> Option<String> {
+        let expr = column
+            .constraints
+            .iter()
+            .find_map(|(_, constraint)| match constraint {
+                ColumnConstraint::Generated { expr, .. } => Some(*expr),
+                _ => None,
+            })?;
+        let mut stand_in = table.clone();
+        for held in &mut stand_in.columns {
+            held.generated = false;
+            held.stored = false;
+            held.generated_sql = None;
+        }
+        let mut added = self.stand_in_table(&table.name, core::slice::from_ref(column));
+        stand_in.columns.append(&mut added.columns);
+        self.bind_declared_expressions(stand_in, &[(expr, "generated columns")])
+            .err()
+            .map(|error| error.message().to_string())
     }
 
     /// Binds declared expressions with one table in scope, and discards them.

@@ -236,6 +236,13 @@ pub fn canonical_sql(keywords: &str, source: &[u8], name_offset: u32, end: u32) 
     let start = name_offset as usize;
     let finish = (end as usize).min(source.len()).max(start);
     let mut tail = source.get(start..finish).unwrap_or(&[]).to_vec();
+    // **The text stops at the last token, so a comment written after it is not
+    // stored.** `CREATE TABLE t(a) -- note` is stored by SQLite as `CREATE TABLE
+    // t(a)`, and an `ADD COLUMN` that appended to the stored text kept the
+    // comment inside the rewritten statement.
+    if let Some(last) = end_of_last_token(&tail) {
+        tail.truncate(last);
+    }
     while matches!(
         tail.last(),
         Some(b';') | Some(b' ') | Some(b'\n') | Some(b'\r') | Some(b'\t')
@@ -246,6 +253,24 @@ pub fn canonical_sql(keywords: &str, source: &[u8], name_offset: u32, end: u32) 
     sql.push(b' ');
     sql.extend_from_slice(&tail);
     sql
+}
+
+/// Returns the offset just after the last token of a statement that is not a
+/// trailing semicolon, or `None` when the text does not lex.
+///
+/// @param text - the statement text
+fn end_of_last_token(text: &[u8]) -> Option<usize> {
+    use inillucent_sql::lexer::{Lexer, Punctuator, TokenKind};
+    let mut lexer = Lexer::at(text, 0);
+    let mut last = None;
+    loop {
+        let token = lexer.next_token().ok()?;
+        match token.kind {
+            TokenKind::EndOfInput => return last,
+            TokenKind::Punctuator(Punctuator::Semicolon) => {}
+            _ => last = Some(token.span.end as usize),
+        }
+    }
 }
 
 /// Returns the `sqlite_schema` text SQLite stores for a `CREATE INDEX`.

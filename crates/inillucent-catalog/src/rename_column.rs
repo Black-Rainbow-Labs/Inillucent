@@ -16,7 +16,7 @@
 use inillucent_base::limits::Limits;
 use inillucent_base::{error, DbResult};
 use inillucent_sql::ast::{
-    Ast, Expr, FromSource, FromTermId, SelectCoreId, SelectId, Statement as Parsed,
+    Ast, Expr, FromSource, FromTermId, NameId, SelectCoreId, SelectId, Statement as Parsed,
 };
 use inillucent_sql::lexer::{Lexer, Punctuator, Span, Token, TokenKind};
 use inillucent_sql::parser::parse_next_statement;
@@ -41,6 +41,14 @@ pub struct Target<'a> {
     pub table: &'a [u8],
     /// The folded name of the column.
     pub column: &'a [u8],
+    /// The folded name of the schema the table is in.
+    ///
+    /// A table written `main.t` is the target only when this is `main`, so a
+    /// temporary view that reads `main.t` is rewritten even when the temporary
+    /// schema has a table `t` of its own.
+    pub database: &'a [u8],
+    /// Whether a table written without a schema is the target.
+    pub unqualified: bool,
 }
 
 /// One `FROM` term (or the target of a write) that columns can be found in.
@@ -49,6 +57,9 @@ struct Term {
     table: Option<Vec<u8>>,
     columns: Option<Vec<Vec<u8>>>,
     scope: usize,
+    /// Whether this is the `excluded` row of an upsert, which an unqualified
+    /// name never means.
+    pseudo: bool,
 }
 
 /// Resolves column references in one parsed statement.
@@ -57,7 +68,8 @@ struct Resolver<'a> {
     sql: &'a [u8],
     scopes: Vec<Span>,
     terms: Vec<Term>,
-    trigger_table: Option<&'a [u8]>,
+    /// For a trigger, whether the table it is on is the target table.
+    trigger_on_target: Option<bool>,
     target: Target<'a>,
 }
 
@@ -77,12 +89,12 @@ pub fn view_edits(sql: &[u8], target: Target<'_>, known: &[KnownTable]) -> DbRes
 /// Returns the spans of the target column's name in a trigger's text.
 ///
 /// @param sql - the stored `CREATE TRIGGER` text
-/// @param trigger_table - the folded name of the table the trigger is on
+/// @param trigger_on_target - whether the table the trigger is on is the target's table
 /// @param target - the column being renamed
 /// @param known - the tables a `FROM` clause can name
 pub fn trigger_edits(
     sql: &[u8],
-    trigger_table: &[u8],
+    trigger_on_target: bool,
     target: Target<'_>,
     known: &[KnownTable],
 ) -> DbResult<Vec<Span>> {
@@ -101,12 +113,12 @@ pub fn trigger_edits(
         &parsed.ast,
         sql,
         ranges.clone(),
-        Some(trigger_table),
+        Some(trigger_on_target),
         target,
     );
     resolver.add_from_terms(known, body);
     let mut edits = resolver.column_edits();
-    if trigger_table == target.table {
+    if trigger_on_target {
         edits.extend(update_of_edits(sql, &tokens, target.column));
     }
     for (statement, range) in body.iter().zip(ranges.iter()) {
@@ -374,12 +386,14 @@ fn write_target_edits(
     statement: &Parsed,
     range: Span,
 ) -> Vec<Span> {
-    let table = match statement {
-        Parsed::Update(update) => resolver.target_of_term(update.target),
-        Parsed::Insert(insert) => Some(resolver.ast.folded(insert.table).to_vec()),
-        _ => None,
+    let writes_target = match statement {
+        Parsed::Update(update) => resolver.term_is_target_table(update.target),
+        Parsed::Insert(insert) => {
+            resolver.names_target_table(insert.database, resolver.ast.folded(insert.table))
+        }
+        _ => false,
     };
-    if table.as_deref() != Some(resolver.target.table) {
+    if !writes_target {
         return Vec::new();
     }
     let inside: Vec<usize> = (0..tokens.len())
@@ -555,13 +569,13 @@ impl<'a> Resolver<'a> {
     /// @param ast - the statement's arena
     /// @param sql - the stored text the arena was parsed from
     /// @param statements - the spans of a trigger's body statements
-    /// @param trigger_table - the trigger's table, when it is a trigger
+    /// @param trigger_on_target - when it is a trigger, whether its table is the target's table
     /// @param target - the column being renamed
     fn new(
         ast: &'a Ast,
         sql: &'a [u8],
         statements: Vec<Span>,
-        trigger_table: Option<&'a [u8]>,
+        trigger_on_target: Option<bool>,
         target: Target<'a>,
     ) -> Resolver<'a> {
         let mut scopes: Vec<Span> = (0..ast.core_count())
@@ -573,8 +587,22 @@ impl<'a> Resolver<'a> {
             sql,
             scopes,
             terms: Vec::new(),
-            trigger_table,
+            trigger_on_target,
             target,
+        }
+    }
+
+    /// Returns whether a table written with an optional schema is the target's table.
+    ///
+    /// @param database - the schema qualifier as written, when there was one
+    /// @param folded - the folded table name
+    fn names_target_table(&self, database: Option<NameId>, folded: &[u8]) -> bool {
+        if folded != self.target.table {
+            return false;
+        }
+        match database {
+            Some(schema) => self.ast.folded(schema) == self.target.database,
+            None => self.target.unqualified,
         }
     }
 
@@ -603,13 +631,15 @@ impl<'a> Resolver<'a> {
         names
     }
 
-    /// Returns the folded base table a `FROM` term names, when it names one.
+    /// Returns whether a `FROM` term names the target's table.
     ///
     /// @param term - the term
-    fn target_of_term(&self, term: FromTermId) -> Option<Vec<u8>> {
-        match &self.ast.from_term(term)?.source {
-            FromSource::Table { name, .. } => Some(self.ast.folded(*name).to_vec()),
-            _ => None,
+    fn term_is_target_table(&self, term: FromTermId) -> bool {
+        match self.ast.from_term(term).map(|found| &found.source) {
+            Some(FromSource::Table { database, name, .. }) => {
+                self.names_target_table(*database, self.ast.folded(*name))
+            }
+            _ => false,
         }
     }
 
@@ -634,15 +664,25 @@ impl<'a> Resolver<'a> {
             let alias = term.alias.map(|name| self.ast.folded(name).to_vec());
             match &term.source {
                 FromSource::Table {
-                    name, arguments, ..
+                    database,
+                    name,
+                    arguments,
+                    ..
                 } => {
                     let folded = self.ast.folded(*name).to_vec();
-                    let opaque = arguments.is_some() || ctes.contains(&folded);
+                    // A table in another schema, or one the schema search does
+                    // not reach, has columns this rename knows nothing about.
+                    let elsewhere = match database {
+                        Some(schema) => self.ast.folded(*schema) != self.target.database,
+                        None => !self.target.unqualified,
+                    };
+                    let opaque = arguments.is_some() || ctes.contains(&folded) || elsewhere;
                     terms.push(Term {
                         exposed: alias.unwrap_or_else(|| folded.clone()),
                         columns: if opaque { None } else { lookup(&folded) },
                         table: (!opaque).then_some(folded),
                         scope,
+                        pseudo: false,
                     });
                 }
                 FromSource::Subquery(_) => terms.push(Term {
@@ -650,6 +690,7 @@ impl<'a> Resolver<'a> {
                     table: None,
                     columns: None,
                     scope,
+                    pseudo: false,
                 }),
                 FromSource::Join(_) => {}
             }
@@ -664,19 +705,27 @@ impl<'a> Resolver<'a> {
                 let folded = self.ast.folded(insert.table).to_vec();
                 let alias = insert.alias.map(|name| self.ast.folded(name).to_vec());
                 let scope = statements_start.saturating_add(offset);
+                let elsewhere = match insert.database {
+                    Some(schema) => self.ast.folded(schema) != self.target.database,
+                    None => !self.target.unqualified,
+                };
+                let columns = if elsewhere { None } else { lookup(&folded) };
+                let table = (!elsewhere).then(|| folded.clone());
                 // `excluded` in an upsert is the row the insert proposed, which
                 // has the target table's columns.
                 terms.push(Term {
                     exposed: b"excluded".to_vec(),
-                    columns: lookup(&folded),
-                    table: Some(folded.clone()),
+                    columns: columns.clone(),
+                    table: table.clone(),
                     scope,
+                    pseudo: true,
                 });
                 terms.push(Term {
                     exposed: alias.unwrap_or_else(|| folded.clone()),
-                    columns: lookup(&folded),
-                    table: Some(folded),
+                    columns,
+                    table,
                     scope,
+                    pseudo: false,
                 });
             }
         }
@@ -728,9 +777,9 @@ impl<'a> Resolver<'a> {
         if column != self.target.column {
             return false;
         }
-        if let (Some(trigger_table), Some(q)) = (self.trigger_table, qualifier) {
+        if let (Some(on_target), Some(q)) = (self.trigger_on_target, qualifier) {
             if q == b"new" || q == b"old" {
-                return trigger_table == self.target.table;
+                return on_target;
             }
         }
         for scope in self.chain(span) {
@@ -745,6 +794,12 @@ impl<'a> Resolver<'a> {
                 }
                 continue;
             }
+            // **`excluded` is not searched for a bare name.** In an upsert a bare
+            // `v` means the table being inserted into, and only `excluded.v` means
+            // the proposed row. Counting both made every bare name in the upsert
+            // ambiguous, so a conflict target's `WHERE v IS NOT NULL` was left
+            // alone by a rename of `v`.
+            let here: Vec<&Term> = here.into_iter().filter(|term| !term.pseudo).collect();
             let with: Vec<&&Term> = here
                 .iter()
                 .filter(|term| {
@@ -765,11 +820,70 @@ impl<'a> Resolver<'a> {
         false
     }
 
+    /// Returns the `ORDER BY` and `GROUP BY` terms that are a bare name which a
+    /// result column of the same `SELECT` is aliased to.
+    ///
+    /// **SQLite resolves such a term against the result aliases first.** In
+    /// `SELECT b AS a FROM t ORDER BY a` the `a` sorts by the result column,
+    /// which is `b`, even though `t` has a column `a` as well. Renaming `t.a`
+    /// must leave that term alone, and the resolver would otherwise find the
+    /// table's column. A name inside a larger expression (`ORDER BY a + 1`) is
+    /// resolved against the tables first, so only the whole term counts.
+    fn alias_terms(&self) -> Vec<inillucent_sql::ast::ExprId> {
+        use inillucent_sql::ast::SelectBody;
+        let mut terms = Vec::new();
+        let bare = |expr: inillucent_sql::ast::ExprId| match self.ast.expr(expr) {
+            Some(Expr::Column {
+                database: None,
+                table: None,
+                column,
+            }) => Some(self.ast.folded(*column).to_vec()),
+            _ => None,
+        };
+        for index in 0..self.ast.select_count() {
+            let Some(select) = self.ast.select(SelectId(index as u32)) else {
+                continue;
+            };
+            let arms =
+                std::iter::once(select.first).chain(select.compounds.iter().map(|(_, core)| *core));
+            let mut aliases: Vec<Vec<u8>> = Vec::new();
+            for arm in arms {
+                let Some(SelectBody::Select {
+                    columns, group_by, ..
+                }) = self.ast.core(arm).map(|core| &core.body)
+                else {
+                    continue;
+                };
+                let own: Vec<Vec<u8>> = columns
+                    .iter()
+                    .filter_map(|column| column.alias)
+                    .map(|name| self.ast.folded(name).to_vec())
+                    .collect();
+                for expr in group_by {
+                    if bare(*expr).is_some_and(|name| own.contains(&name)) {
+                        terms.push(*expr);
+                    }
+                }
+                aliases.extend(own);
+            }
+            for term in &select.order_by {
+                if bare(term.expr).is_some_and(|name| aliases.contains(&name)) {
+                    terms.push(term.expr);
+                }
+            }
+        }
+        terms
+    }
+
     /// Returns the span of every column reference that means the target.
     fn column_edits(&self) -> Vec<Span> {
         let mut edits = Vec::new();
+        let by_alias = self.alias_terms();
         for index in 0..self.ast.expr_count() {
             let id = inillucent_sql::ast::ExprId(index as u32);
+            if by_alias.contains(&id) {
+                continue;
+            }
             let Some(Expr::Column { table, column, .. }) = self.ast.expr(id) else {
                 continue;
             };
@@ -839,6 +953,8 @@ mod tests {
         let target = Target {
             table: b"t",
             column: b"b",
+            database: b"main",
+            unqualified: true,
         };
         let edits = view_edits(sql.as_bytes(), target, &known()).expect("it resolves");
         assert_eq!(edits.len(), 2);
@@ -851,6 +967,8 @@ mod tests {
         let target = Target {
             table: b"t",
             column: b"b",
+            database: b"main",
+            unqualified: true,
         };
         let edits = view_edits(sql.as_bytes(), target, &known()).expect("it resolves");
         assert_eq!(texts(sql, edits), vec!["b".to_string()]);

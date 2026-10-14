@@ -36,6 +36,9 @@ pub(crate) struct Found {
     pub(crate) span: Span,
     /// What kind of place it is.
     pub(crate) site: Site,
+    /// The schema name written in front of the table (`main` in `main.t`), when
+    /// there was one.
+    pub(crate) schema: Option<Span>,
 }
 
 /// Which statement the text is, decided from its first words.
@@ -65,6 +68,8 @@ struct Scan<'a> {
     /// Whether some alias is spelled like the table, which makes a qualifier
     /// `name.column` ambiguous.
     aliased: bool,
+    /// The schema name just read in front of a pending table name.
+    qualifier: Option<Span>,
     found: Vec<Found>,
     /// Sites that are `name.column` qualifiers, kept apart so an alias can
     /// cancel them.
@@ -105,6 +110,7 @@ pub(crate) fn table_sites(sql: &[u8], folded: &[u8]) -> DbResult<Vec<Found>> {
         head_on_done: false,
         last_insert_is_target: false,
         aliased: false,
+        qualifier: None,
         found: Vec::new(),
         qualifiers: Vec::new(),
     };
@@ -115,8 +121,160 @@ pub(crate) fn table_sites(sql: &[u8], folded: &[u8]) -> DbResult<Vec<Found>> {
     if !scan.aliased {
         all.extend(scan.qualifiers);
     }
+    // A name that a common table expression in scope answers to is that
+    // expression and not the table, so it is not a place the table is written.
+    let shadows = cte_shadows(sql, &tokens, folded);
+    all.retain(|found| {
+        found.schema.is_some()
+            || !shadows
+                .iter()
+                .any(|shadow| shadow.start <= found.span.start && found.span.start < shadow.end)
+    });
     all.sort_by_key(|found| found.span.start);
     Ok(all)
+}
+
+/// Returns the stretches of the text in which a common table expression has the
+/// given name, and a bare use of that name means the expression.
+///
+/// **A rename must not rewrite a name that resolves to a `WITH` entry.** SQLite
+/// resolves a table name against the common table expressions in scope before it
+/// looks at the schema, so in `WITH t AS (SELECT 1) SELECT * FROM t` the `t` is
+/// the expression even when a table called `t` is being renamed. The scan above
+/// only sees tokens, so the scopes are worked out here from the same tokens: an
+/// expression is visible in every entry of its own `WITH` (a recursive one reads
+/// itself, and SQLite lets an entry name one written after it) and in the
+/// statement that follows, up to the closing parenthesis or semicolon that ends
+/// the statement the `WITH` belongs to.
+///
+/// @param sql - the stored text
+/// @param tokens - its tokens
+/// @param folded - the folded name of the table being renamed
+fn cte_shadows(sql: &[u8], tokens: &[Token], folded: &[u8]) -> Vec<Span> {
+    let mut depths = Vec::with_capacity(tokens.len());
+    let mut depth = 0usize;
+    for token in tokens {
+        if token.is(Punctuator::RightParen) {
+            depth = depth.saturating_sub(1);
+        }
+        depths.push(depth);
+        if token.is(Punctuator::LeftParen) {
+            depth = depth.saturating_add(1);
+        }
+    }
+    let mut shadows = Vec::new();
+    for (at, token) in tokens.iter().enumerate() {
+        if bare_word(sql, *token).as_deref() != Some(b"with") {
+            continue;
+        }
+        let (names, after) = with_entries(sql, tokens, at.saturating_add(1));
+        let level = depths.get(at).copied().unwrap_or(0);
+        let end = statement_end(tokens, &depths, after, level, sql.len());
+        if names.iter().any(|name| name.as_slice() == folded) {
+            shadows.push(Span::new(token.span.start as usize, end));
+        }
+    }
+    shadows
+}
+
+/// Reads the entries of a `WITH` clause and returns each folded name and the
+/// position of the first token after the clause.
+///
+/// @param sql - the stored text
+/// @param tokens - its tokens
+/// @param first - the position just after the `WITH` keyword
+fn with_entries(sql: &[u8], tokens: &[Token], first: usize) -> (Vec<Vec<u8>>, usize) {
+    let word = |at: usize| tokens.get(at).and_then(|token| bare_word(sql, *token));
+    let mut names = Vec::new();
+    let mut at = first;
+    if word(at).as_deref() == Some(b"recursive") {
+        at = at.saturating_add(1);
+    }
+    loop {
+        let Some(name) = tokens.get(at) else {
+            return (names, at);
+        };
+        if !matches!(name.kind, TokenKind::Identifier { .. }) {
+            return (names, at);
+        }
+        names.push(unquoted(name.span.slice(sql)).to_ascii_lowercase());
+        at = at.saturating_add(1);
+        if tokens
+            .get(at)
+            .is_some_and(|token| token.is(Punctuator::LeftParen))
+        {
+            at = after_group(tokens, at);
+        }
+        // `AS [NOT] [MATERIALIZED] ( query )`
+        while at < tokens.len() && !tokens.get(at).is_some_and(|t| t.is(Punctuator::LeftParen)) {
+            if tokens.get(at).is_some_and(|t| t.is(Punctuator::Semicolon)) {
+                return (names, at);
+            }
+            at = at.saturating_add(1);
+        }
+        at = after_group(tokens, at);
+        if tokens
+            .get(at)
+            .is_some_and(|token| token.is(Punctuator::Comma))
+        {
+            at = at.saturating_add(1);
+            continue;
+        }
+        return (names, at);
+    }
+}
+
+/// Returns the position just after the parenthesis group that opens at a position.
+///
+/// @param tokens - the tokens
+/// @param open - the position of the opening parenthesis
+fn after_group(tokens: &[Token], open: usize) -> usize {
+    let mut depth = 0usize;
+    let mut at = open;
+    while let Some(token) = tokens.get(at) {
+        if token.is(Punctuator::LeftParen) {
+            depth = depth.saturating_add(1);
+        }
+        if token.is(Punctuator::RightParen) {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return at.saturating_add(1);
+            }
+        }
+        at = at.saturating_add(1);
+    }
+    at
+}
+
+/// Returns the byte offset where the statement that a `WITH` clause belongs to
+/// ends.
+///
+/// @param tokens - the tokens
+/// @param depths - the parenthesis depth in front of each token
+/// @param from - the position of the first token after the clause
+/// @param level - the parenthesis depth the `WITH` was written at
+/// @param length - the length of the text, for a statement that runs to the end
+fn statement_end(
+    tokens: &[Token],
+    depths: &[usize],
+    from: usize,
+    level: usize,
+    length: usize,
+) -> usize {
+    for at in from..tokens.len() {
+        let depth = depths.get(at).copied().unwrap_or(0);
+        let Some(token) = tokens.get(at) else {
+            break;
+        };
+        // A closing parenthesis is numbered after it closes, so one that ends the
+        // group the `WITH` sits in is numbered below the `WITH`'s own level.
+        let closes = token.is(Punctuator::RightParen) && depth < level;
+        let ends = token.is(Punctuator::Semicolon) && depth <= level;
+        if closes || ends {
+            return token.span.start as usize;
+        }
+    }
+    length
 }
 
 /// Decides which kind of statement the text is.
@@ -260,13 +418,17 @@ impl<'a> Scan<'a> {
         let followed_by_dot = self.is_punct(index.checked_add(1), Punctuator::Dot);
         if let Some(site) = self.pending {
             if followed_by_dot {
-                // A schema qualifier: the table is the next name.
+                // A schema qualifier: the table is the next name. It is kept so
+                // that `main.t` and `temp.t` can be told apart.
+                self.qualifier = Some(token.span);
                 return;
             }
+            let schema = self.qualifier.take();
             if matches {
                 self.found.push(Found {
                     span: token.span,
                     site,
+                    schema,
                 });
             }
             if self.word_at(before).as_deref() == Some(b"into") {
@@ -282,14 +444,23 @@ impl<'a> Scan<'a> {
             self.qualifiers.push(Found {
                 span: token.span,
                 site: Site::Body,
+                schema: None,
             });
             return;
         }
         let after_dot = self.is_punct(before, Punctuator::Dot);
         if matches && followed_by_dot && (!after_dot || self.is_database_then_table(index)) {
+            let schema = match after_dot {
+                true => index
+                    .checked_sub(2)
+                    .and_then(|at| self.at(at))
+                    .map(|database| database.span),
+                false => None,
+            };
             self.qualifiers.push(Found {
                 span: token.span,
                 site: Site::Body,
+                schema,
             });
             return;
         }
@@ -371,6 +542,37 @@ mod tests {
             vec![("p".to_string(), Site::Head)]
         );
         assert!(sites("CREATE VIEW v AS SELECT 1 FROM c JOIN d ON p = 1", "p").is_empty());
+    }
+
+    /// A name that a `WITH` entry answers to is that entry and not the table.
+    #[test]
+    fn a_common_table_expression_of_the_same_name_is_not_the_table() {
+        let sql = "CREATE VIEW v AS WITH t AS (SELECT 1 AS x) SELECT x FROM t";
+        assert!(sites(sql, "t").is_empty());
+        // The entries of a `WITH` see each other, in either order.
+        let later = "CREATE VIEW v AS WITH c1 AS (SELECT a FROM t), t AS (SELECT 5 AS a) SELECT a FROM c1, t";
+        assert!(sites(later, "t").is_empty());
+        // A name outside the statement the `WITH` belongs to is still the table.
+        let outside = "CREATE VIEW v AS SELECT a FROM t WHERE a IN (WITH t AS (SELECT 7 AS a) SELECT a FROM t)";
+        assert_eq!(sites(outside, "t").len(), 1);
+        // A name qualified with a schema is never a `WITH` entry.
+        let qualified = "CREATE VIEW v AS WITH t AS (SELECT 1 AS a) SELECT a FROM t, main.t";
+        assert_eq!(sites(qualified, "t").len(), 1);
+    }
+
+    /// A schema written in front of the table is kept with the site.
+    #[test]
+    fn a_site_remembers_the_schema_written_in_front_of_it() {
+        let sql = "CREATE TEMP VIEW tv AS SELECT a FROM main.t, t";
+        let found = table_sites(sql.as_bytes(), b"t").expect("it scans");
+        assert_eq!(found.len(), 2);
+        assert_eq!(
+            found
+                .iter()
+                .map(|site| site.schema.map(|span| span.slice(sql.as_bytes()).to_vec()))
+                .collect::<Vec<_>>(),
+            vec![Some(b"main".to_vec()), None]
+        );
     }
 
     /// A reference clause is its own kind of site.

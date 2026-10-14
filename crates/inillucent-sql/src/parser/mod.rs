@@ -149,6 +149,9 @@ pub struct Parser<'a> {
     deferring_check_subquery: bool,
     /// Whether a `CHECK` subquery was seen while `deferring_check_subquery` was set.
     deferred_check_subquery: bool,
+    /// Whether the statement being parsed is part of a trigger's body, where
+    /// SQLite's grammar has no `INSERT ... DEFAULT VALUES`.
+    in_trigger_body: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -186,6 +189,7 @@ impl<'a> Parser<'a> {
             selects: 0,
             deferring_check_subquery: false,
             deferred_check_subquery: false,
+            in_trigger_body: false,
         }
     }
 

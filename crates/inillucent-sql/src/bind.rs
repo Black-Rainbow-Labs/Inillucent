@@ -1178,7 +1178,7 @@ pub struct Binder<'a> {
     /// How many nested queries used as values have been bound so far.
     subqueries: usize,
     /// How deep the binder is inside a generated column's own expression.
-    generating: u32,
+    pub(crate) generating: u32,
     /// The window calls bound in the block being bound.
     windows: Vec<BoundWindow>,
     /// The windows the block's `WINDOW` clause named.

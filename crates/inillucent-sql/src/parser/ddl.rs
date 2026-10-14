@@ -924,7 +924,8 @@ impl Parser<'_> {
     /// better diagnostic than letting the general dispatcher accept a `CREATE`
     /// and having the catalog refuse it much later.
     fn parse_trigger_body_statement(&mut self) -> Result<Statement, ParseError> {
-        let statement = match self.peek()?.keyword() {
+        self.in_trigger_body = true;
+        let parsed = match self.peek()?.keyword() {
             Some(Keyword::UPDATE) => self.parse_update(),
             Some(Keyword::INSERT) | Some(Keyword::REPLACE) => self.parse_insert(),
             Some(Keyword::DELETE) => self.parse_delete(),
@@ -932,7 +933,9 @@ impl Parser<'_> {
                 self.parse_select_statement()
             }
             _ => Err(self.unexpected(&["UPDATE", "INSERT", "DELETE", "SELECT"])?),
-        }?;
+        };
+        self.in_trigger_body = false;
+        let statement = parsed?;
         // A trigger body has no caller to return rows to, so SQLite refuses
         // `RETURNING` in one - and refuses it while parsing, which is why the
         // check is here rather than in the binder.

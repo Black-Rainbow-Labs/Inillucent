@@ -45,11 +45,19 @@ impl Binder<'_> {
             ));
         };
         let present = self.row_present_expr(source);
+        let table = std::rc::Rc::clone(&term.table);
+        let column_name = info.name.clone();
         self.generating = self.generating.saturating_add(1);
         if self.generating > MAX_GENERATED_DEPTH {
             self.generating = self.generating.saturating_sub(1);
-            return Err(ParseError::new(
-                ParseErrorKind::Unsupported("a generated column refers to itself"),
+            // SQLite's words for it: the table is readable up to the point a read
+            // goes round the loop, and then every statement that reads it fails.
+            let looped = generated_loop_column(&table).unwrap_or(column_name);
+            return Err(refused(
+                format!(
+                    "generated column loop on \"{}\"",
+                    String::from_utf8_lossy(&looped)
+                ),
                 Span::default(),
             ));
         }
@@ -175,4 +183,69 @@ impl Binder<'_> {
         self.scopes = saved;
         bound
     }
+}
+
+/// Returns the generated column SQLite names when a table's generated columns
+/// read each other in a loop, or `None` when they do not.
+///
+/// SQLite works the generated columns out in passes and, when a pass settles
+/// nothing, names the last column in declaration order that is still waiting.
+/// A column is settled once everything it reads is settled, and a column that
+/// is not generated is settled from the start.
+///
+/// @param table - the table whose generated columns are examined
+pub(crate) fn generated_loop_column(table: &crate::catalog_view::TableInfo) -> Option<Vec<u8>> {
+    let mut waiting: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut settled: Vec<usize> = Vec::new();
+    for (position, column) in table.columns.iter().enumerate() {
+        let reads = match (column.generated, column.generated_sql.as_deref()) {
+            (true, Some(sql)) => generated_reads(table, sql),
+            _ => {
+                settled.push(position);
+                continue;
+            }
+        };
+        waiting.push((position, reads));
+    }
+    loop {
+        let before = waiting.len();
+        let mut still = Vec::new();
+        for (position, reads) in waiting {
+            match reads.iter().all(|read| settled.contains(read)) {
+                true => settled.push(position),
+                false => still.push((position, reads)),
+            }
+        }
+        waiting = still;
+        if waiting.is_empty() || waiting.len() == before {
+            break;
+        }
+    }
+    let (position, _) = waiting.last()?;
+    table
+        .columns
+        .get(*position)
+        .map(|column| column.name.clone())
+}
+
+/// Returns the declared positions of the columns a generated expression names.
+///
+/// @param table - the table the expression belongs to
+/// @param sql - the expression's text
+fn generated_reads(table: &crate::catalog_view::TableInfo, sql: &[u8]) -> Vec<usize> {
+    let limits = inillucent_base::limits::Limits::default();
+    let Ok((ast, root)) = crate::parser::parse_expression(sql, &limits) else {
+        return Vec::new();
+    };
+    let mut pending = vec![root];
+    let mut reads = Vec::new();
+    while let Some(id) = pending.pop() {
+        if let Some(ast::Expr::Column { column, .. }) = ast.expr(id) {
+            if let Some(position) = table.column_position(ast.folded(*column)) {
+                reads.push(usize::from(position));
+            }
+        }
+        pending.extend(crate::directive::expression_children(&ast, id));
+    }
+    reads
 }

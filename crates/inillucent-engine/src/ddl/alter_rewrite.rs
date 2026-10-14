@@ -32,9 +32,62 @@ struct Alteration<'a> {
     legacy: bool,
     /// `PRAGMA foreign_keys`.
     foreign_keys: bool,
+    /// The folded name of the schema the table is in.
+    database: Vec<u8>,
+    /// Whether the rows being rewritten are the temporary schema's, which can
+    /// name a table of another schema.
+    temp_pass: bool,
+    /// Whether a table written without a schema, in the rows being rewritten,
+    /// is the table being altered.
+    ///
+    /// Always true for the rows of the table's own schema. A temporary view or
+    /// trigger finds a temporary table of the same name first, so a bare name
+    /// there is the altered table only when nothing in the way has that name.
+    unqualified: bool,
 }
 
 impl crate::ImportedDatabase {
+    /// Builds what every row of one pass is rewritten against.
+    ///
+    /// @param at - the schema the table is in
+    /// @param source - the statement text
+    /// @param table - the table's name as written
+    /// @param folded - the table's folded name
+    /// @param action - what the statement does
+    /// @param temp_pass - whether the rows are the temporary schema's
+    fn alteration<'a>(
+        &self,
+        at: usize,
+        source: &'a [u8],
+        table: &'a [u8],
+        folded: &'a [u8],
+        action: &'a AlterKind,
+        temp_pass: bool,
+    ) -> Alteration<'a> {
+        let in_front = |number: usize| {
+            self.schema
+                .tables
+                .iter()
+                .any(|held| held.database == number && held.folded == folded)
+        };
+        // The search order of a bare name in a temporary object: temp, main,
+        // then the attached databases.
+        let unqualified =
+            !temp_pass || !(in_front(crate::TEMP) || (at != crate::MAIN && in_front(crate::MAIN)));
+        Alteration {
+            source,
+            table,
+            folded,
+            action,
+            known: self.known_tables(at),
+            legacy: self.pragmas.legacy_alter_table(),
+            foreign_keys: self.pragmas.foreign_keys(),
+            database: self.schema_label(at).to_ascii_lowercase(),
+            temp_pass,
+            unqualified,
+        }
+    }
+
     /// Returns the new schema rows an `ALTER TABLE` writes, with their rowids.
     ///
     /// @param at - the schema the table is in
@@ -50,15 +103,7 @@ impl crate::ImportedDatabase {
         folded: &[u8],
         action: &AlterKind,
     ) -> DbResult<Vec<(i64, SchemaEntry)>> {
-        let context = Alteration {
-            source,
-            table,
-            folded,
-            action,
-            known: self.known_tables(at),
-            legacy: self.pragmas.legacy_alter_table(),
-            foreign_keys: self.pragmas.foreign_keys(),
-        };
+        let context = self.alteration(at, source, table, folded, action, false);
         let mut updates = Vec::new();
         for held in self.entries_of(at) {
             if let Some(moved) = altered_entry(&held.entry, &context)? {
@@ -73,8 +118,9 @@ impl crate::ImportedDatabase {
     ///
     /// A temporary trigger or view can name a table of `main` or of an attached
     /// database, and SQLite rewrites it when that table or one of its columns is
-    /// renamed. A temporary object is left alone when the temporary schema has a
-    /// table of the same name, because the name then means that table.
+    /// renamed. When the temporary schema has a table of the same name, a bare
+    /// name in the temporary object means that table and is left alone, and a
+    /// name written `main.t` still means the table that is being altered.
     ///
     /// @param at - the schema the altered table is in
     /// @param source - the statement text
@@ -93,23 +139,10 @@ impl crate::ImportedDatabase {
             action,
             AlterKind::RenameTable { .. } | AlterKind::RenameColumn { .. }
         );
-        let shadowed = self
-            .schema
-            .tables
-            .iter()
-            .any(|held| held.database == crate::TEMP && held.folded == folded);
-        if !renames || at == crate::TEMP || shadowed {
+        if !renames || at == crate::TEMP {
             return Ok(Vec::new());
         }
-        let context = Alteration {
-            source,
-            table,
-            folded,
-            action,
-            known: self.known_tables(at),
-            legacy: self.pragmas.legacy_alter_table(),
-            foreign_keys: self.pragmas.foreign_keys(),
-        };
+        let context = self.alteration(at, source, table, folded, action, true);
         let mut updates = Vec::new();
         for held in self.entries_of(crate::TEMP) {
             if !matches!(held.entry.kind, ObjectKind::Trigger | ObjectKind::View) {
@@ -242,8 +275,10 @@ impl crate::ImportedDatabase {
     /// Refuses a `SET NOT NULL` or an `ADD CHECK` that the rows already in the
     /// table do not satisfy.
     ///
-    /// SQLite's word for both is `constraint failed`. A `CHECK` that evaluates
-    /// to NULL passes, as it does on an insert.
+    /// SQLite's word for both is `constraint failed`. **Only a row whose `CHECK`
+    /// is true passes here.** An insert lets a `CHECK` that evaluates to NULL
+    /// through, but `ADD CONSTRAINT ... CHECK (a < b)` over a row with a NULL `a`
+    /// fails in SQLite 3.53.4, so the test is `IS NOT TRUE`.
     ///
     /// @param at - the schema the table is in
     /// @param folded - the table's folded name
@@ -270,7 +305,7 @@ impl crate::ImportedDatabase {
                 expr_end,
                 ..
             } => format!(
-                "NOT ({})",
+                "({}) IS NOT TRUE",
                 String::from_utf8_lossy(&statement_text(source, *expr_start, *expr_end))
             ),
             _ => return Ok(()),
@@ -327,13 +362,32 @@ impl crate::ImportedDatabase {
         action: &AlterKind,
     ) -> DbResult<()> {
         let when = match action {
-            AlterKind::RenameColumn { .. } => " after rename",
+            AlterKind::RenameTable { .. } | AlterKind::RenameColumn { .. } => " after rename",
             AlterKind::DropColumn { .. } => " after drop column",
             _ => return Ok(()),
         };
-        let Some(columns) = new_column_names(updates, folded) else {
-            return Ok(());
+        // A table rename keeps the columns and changes the name an index's
+        // qualified names have to match. With `legacy_alter_table` on, the
+        // bodies are not rewritten, so `WHERE t.c > 5` is left naming a table
+        // that no longer exists and SQLite refuses the rename.
+        let (columns, owner) = match action {
+            AlterKind::RenameTable { to } => {
+                let current = self
+                    .schema
+                    .tables
+                    .iter()
+                    .find(|table| table.database == at && table.folded == folded);
+                let Some(current) = current else {
+                    return Ok(());
+                };
+                (column_names(current), to.to_ascii_lowercase())
+            }
+            _ => match new_column_names(updates, folded) {
+                Some(columns) => (columns, folded.to_vec()),
+                None => return Ok(()),
+            },
         };
+        let renames_table = matches!(action, AlterKind::RenameTable { .. });
         // Every row in the order it was created, each in its new form when the
         // statement rewrites it: an index on a dropped column is not rewritten
         // and is the row that has to be found.
@@ -343,11 +397,13 @@ impl crate::ImportedDatabase {
                 .find(|(rowid, _)| *rowid == held.rowid)
                 .map_or(&held.entry, |(_, moved)| moved);
             let problem = match entry.kind {
-                ObjectKind::Table if entry.name.to_ascii_lowercase() == folded => {
+                ObjectKind::Table
+                    if !renames_table && entry.name.to_ascii_lowercase() == folded =>
+                {
                     table_text_problem(&entry.sql)
                 }
-                ObjectKind::Index if entry.table.to_ascii_lowercase() == folded => {
-                    index_text_problem(&entry.sql, &columns)
+                ObjectKind::Index if entry.table.to_ascii_lowercase() == owner => {
+                    index_text_problem(&entry.sql, &columns, &owner)
                 }
                 _ => None,
             };
@@ -521,9 +577,10 @@ fn new_column_names(updates: &[(i64, SchemaEntry)], folded: &[u8]) -> Option<Vec
 /// @param entry - the row
 /// @param context - what is being done
 fn altered_entry(entry: &SchemaEntry, context: &Alteration<'_>) -> DbResult<Option<SchemaEntry>> {
-    let owns = entry.table.to_ascii_lowercase() == context.folded;
-    let itself =
-        entry.name.to_ascii_lowercase() == context.folded && entry.kind == ObjectKind::Table;
+    let owns = entry_is_on_the_table(entry, context);
+    let itself = !context.temp_pass
+        && entry.name.to_ascii_lowercase() == context.folded
+        && entry.kind == ObjectKind::Table;
     if entry.sql.is_empty() {
         return Ok(renamed_automatic_index(entry, context, owns));
     }
@@ -533,7 +590,11 @@ fn altered_entry(entry: &SchemaEntry, context: &Alteration<'_>) -> DbResult<Opti
                 references: !context.legacy || context.foreign_keys,
                 bodies: !context.legacy,
             };
-            rename::rewrite_table(&entry.sql, context.table, to, which)?
+            let scope = rename::TableScope {
+                database: &context.database,
+                unqualified: context.unqualified,
+            };
+            rename::rewrite_table(&entry.sql, context.table, to, which, scope)?
         }
         AlterKind::RenameColumn {
             from,
@@ -547,9 +608,11 @@ fn altered_entry(entry: &SchemaEntry, context: &Alteration<'_>) -> DbResult<Opti
                 to,
                 to_quoted: *to_quoted,
                 known: &context.known,
+                database: &context.database,
+                unqualified: context.unqualified,
+                owner_is_target: owns,
             };
-            let owner = entry.table.to_ascii_lowercase();
-            rename::rewrite_column(&entry.sql, entry.kind, &owner, itself, &ren)?
+            rename::rewrite_column(&entry.sql, entry.kind, itself, &ren)?
         }
         AlterKind::AddColumn { start, end, .. } if itself => {
             let definition = context
@@ -605,6 +668,34 @@ fn altered_entry(entry: &SchemaEntry, context: &Alteration<'_>) -> DbResult<Opti
         }
     }
     Ok(Some(moved))
+}
+
+/// Returns whether a schema row belongs to the table being altered.
+///
+/// In the table's own schema a row belongs to it when its `tbl_name` is the
+/// table's name. A temporary trigger is on the table only when its `ON` clause
+/// finds it: `ON main.t` does, and a bare `ON t` does not while a temporary
+/// table `t` is in the way.
+///
+/// @param entry - the row
+/// @param context - what is being done
+fn entry_is_on_the_table(entry: &SchemaEntry, context: &Alteration<'_>) -> bool {
+    if entry.table.to_ascii_lowercase() != context.folded {
+        return false;
+    }
+    if !context.temp_pass {
+        return true;
+    }
+    if entry.kind != ObjectKind::Trigger {
+        return false;
+    }
+    match inillucent_catalog::load::trigger_from_create_sql(&entry.sql) {
+        Ok(trigger) => match trigger.table_database {
+            Some(database) => database.to_ascii_lowercase() == context.database,
+            None => context.unqualified,
+        },
+        Err(_) => false,
+    }
 }
 
 /// Returns the renamed row of an automatic index, which has no statement of its own.

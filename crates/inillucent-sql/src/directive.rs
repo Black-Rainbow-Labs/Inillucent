@@ -1548,10 +1548,12 @@ impl<'a> Binder<'a> {
                     .strict
                     .then(|| self.strict_column_fault(definition, &table_name))
                     .flatten();
+                let generated_fault = self.added_generated_fault(&target, definition);
                 let deferred = definition
                     .deferred_failure
                     .map(str::to_string)
-                    .or(strict_fault);
+                    .or(strict_fault)
+                    .or(generated_fault);
                 match deferred {
                     Some(reason) => AlterKind::AddColumnFailsAfter {
                         message: format!("error in table {table_name} after add column: {reason}"),
@@ -2364,6 +2366,12 @@ impl<'a> Binder<'a> {
             };
             return Err(crate::bind::no_such_table(&missing, Span::default()));
         };
+        if target.kind == TableKind::Virtual {
+            return Err(refused(
+                "cannot create triggers on virtual tables",
+                Span::default(),
+            ));
+        }
         // After the table is found, as SQLite does: `CREATE TRIGGER sqlite_x ... ON missing` is
         // a missing table and not a reserved name.
         if !self.writable_schema && written.to_ascii_lowercase().starts_with(b"sqlite_") {
@@ -2385,6 +2393,12 @@ impl<'a> Binder<'a> {
                     "trigger {} already exists",
                     String::from_utf8_lossy(&written)
                 ),
+                Span::default(),
+            ));
+        }
+        if target.folded.starts_with(b"sqlite_") {
+            return Err(refused(
+                "cannot create trigger on system table",
                 Span::default(),
             ));
         }

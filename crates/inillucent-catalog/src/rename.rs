@@ -43,6 +43,30 @@ impl TableRewrite {
     };
 }
 
+/// Which schema a name written in a stored statement means.
+///
+/// **A name is the renamed table only when it resolves to it.** A temporary view
+/// can read `main.t` while the temporary schema has a table `t` of its own, and
+/// then `t` written bare means the temporary table and `main.t` means the one
+/// being renamed. A name written with a schema is the table when the schema is the
+/// table's; a bare name is the table when `unqualified` says the statement it is
+/// in finds the table first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableScope<'a> {
+    /// The folded name of the schema the table is in.
+    pub database: &'a [u8],
+    /// Whether a name written without a schema means the table.
+    pub unqualified: bool,
+}
+
+impl TableScope<'static> {
+    /// A statement in the table's own schema, where a bare name means the table.
+    pub const OWN: TableScope<'static> = TableScope {
+        database: b"main",
+        unqualified: true,
+    };
+}
+
 /// Returns the stored SQL with a table's name replaced where `which` allows.
 ///
 /// **A table is written quoted.** SQLite's `ALTER TABLE` substitutes `"%w"` for
@@ -54,11 +78,22 @@ impl TableRewrite {
 /// @param from - the table's current name
 /// @param to - the new name
 /// @param which - the kinds of place to rewrite
-pub fn rewrite_table(sql: &[u8], from: &[u8], to: &[u8], which: TableRewrite) -> DbResult<Vec<u8>> {
+/// @param scope - which schema a written name means
+pub fn rewrite_table(
+    sql: &[u8],
+    from: &[u8],
+    to: &[u8],
+    which: TableRewrite,
+    scope: TableScope<'_>,
+) -> DbResult<Vec<u8>> {
     use crate::rename_table::Site;
     let sites = crate::rename_table::table_sites(sql, &from.to_ascii_lowercase())?;
     let edits: Vec<Span> = sites
         .iter()
+        .filter(|found| match found.schema {
+            Some(schema) => unquoted(schema.slice(sql)).to_ascii_lowercase() == scope.database,
+            None => scope.unqualified,
+        })
         .filter(|found| match found.site {
             Site::Head => true,
             Site::Reference => which.references,
@@ -82,6 +117,14 @@ pub struct ColumnRename<'a> {
     pub to_quoted: bool,
     /// The tables a view or a trigger body can read, for resolving a column.
     pub known: &'a [KnownTable],
+    /// The folded name of the schema the owning table is in.
+    pub database: &'a [u8],
+    /// Whether a table written without a schema, in the row being rewritten,
+    /// means the owning table.
+    pub unqualified: bool,
+    /// Whether the table the row belongs to (the `ON` table of a trigger or an
+    /// index) is the owning table.
+    pub owner_is_target: bool,
 }
 
 /// Returns the stored SQL of one schema row with a column renamed.
@@ -94,13 +137,11 @@ pub struct ColumnRename<'a> {
 ///
 /// @param sql - the stored `CREATE` text
 /// @param kind - what kind of object the row is
-/// @param owner - the folded name of the table the row belongs to
 /// @param itself - whether the row is the `CREATE TABLE` of the renamed column's table
 /// @param ren - the rename
 pub fn rewrite_column(
     sql: &[u8],
     kind: ObjectKind,
-    owner: &[u8],
     itself: bool,
     ren: &ColumnRename<'_>,
 ) -> DbResult<Vec<u8>> {
@@ -110,14 +151,16 @@ pub fn rewrite_column(
     let target = Target {
         table: ren.table,
         column: ren.from,
+        database: ren.database,
+        unqualified: ren.unqualified,
     };
     let edits = match kind {
         ObjectKind::Table if itself => own_text_edits(sql, target)?,
         ObjectKind::Table => reference_edits(sql, target)?,
-        ObjectKind::Index if owner == ren.table => own_text_edits(sql, target)?,
+        ObjectKind::Index if ren.owner_is_target => own_text_edits(sql, target)?,
         ObjectKind::Index => Vec::new(),
         ObjectKind::View => view_edits(sql, target, ren.known)?,
-        ObjectKind::Trigger => trigger_edits(sql, owner, target, ren.known)?,
+        ObjectKind::Trigger => trigger_edits(sql, ren.owner_is_target, target, ren.known)?,
     };
     Ok(splice_each(sql, &edits, |span| {
         let was_quoted = span
@@ -508,7 +551,8 @@ mod tests {
     #[test]
     fn a_rename_replaces_tokens_rather_than_bytes() {
         let sql = b"CREATE TABLE t (t TEXT DEFAULT 't', ts INTEGER, note TEXT DEFAULT 'about t')";
-        let out = rewrite_table(sql, b"t", b"u", TableRewrite::EVERYWHERE).expect("it rewrites");
+        let out = rewrite_table(sql, b"t", b"u", TableRewrite::EVERYWHERE, TableScope::OWN)
+            .expect("it rewrites");
         assert_eq!(
             String::from_utf8_lossy(&out),
             // Quoted, because SQLite quotes a renamed table unconditionally.
@@ -521,7 +565,8 @@ mod tests {
     #[test]
     fn an_index_follows_its_table() {
         let sql = b"CREATE INDEX t_name ON t (name)";
-        let out = rewrite_table(sql, b"t", b"u", TableRewrite::EVERYWHERE).expect("it rewrites");
+        let out = rewrite_table(sql, b"t", b"u", TableRewrite::EVERYWHERE, TableScope::OWN)
+            .expect("it rewrites");
         assert_eq!(
             String::from_utf8_lossy(&out),
             "CREATE INDEX t_name ON \"u\" (name)"

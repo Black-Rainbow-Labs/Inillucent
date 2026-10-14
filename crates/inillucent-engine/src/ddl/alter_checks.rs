@@ -19,23 +19,44 @@ use inillucent_sql::parser::parse_next_statement;
 /// A name that does not resolve is reported; a function that does not exist is
 /// not, because SQLite looks functions up when it generates code and this check
 /// only resolves names.
-const RESOLUTION_FAILURES: [&str; 3] = ["no such column", "no such table", "ambiguous column name"];
+const RESOLUTION_FAILURES: [&str; 4] = [
+    "no such column",
+    "no such table",
+    "ambiguous column name",
+    "cannot join using column",
+];
 
 impl crate::ImportedDatabase {
     /// Refuses the statement when a view or a trigger in a schema no longer binds.
     ///
     /// Objects are checked in the order they were created, and the first one
-    /// that fails is the one reported, which is what SQLite does.
+    /// that fails is the one reported, which is what SQLite does. **The
+    /// temporary schema is read after the table's own,** because a temporary
+    /// view or trigger can read a table of `main` and SQLite re-reads those too:
+    /// dropping a column that a temporary view selects is refused like dropping
+    /// one that a view in `main` selects.
     ///
     /// @param at - the schema the table is in
     /// @param when - the words SQLite puts after the object's name, such as
     ///   ` after rename`, or an empty string for the check made before the change
     pub(crate) fn schema_still_binds(&self, at: usize, when: &str) -> DbResult<()> {
-        for held in self.entries_of(at) {
+        self.schema_objects_bind(at, when)?;
+        match at == crate::TEMP {
+            true => Ok(()),
+            false => self.schema_objects_bind(crate::TEMP, when),
+        }
+    }
+
+    /// Checks the views and triggers of one schema against the catalog.
+    ///
+    /// @param of - the schema whose objects are checked
+    /// @param when - the words SQLite puts after the object's name
+    fn schema_objects_bind(&self, of: usize, when: &str) -> DbResult<()> {
+        for held in self.entries_of(of) {
             let entry = &held.entry;
             let problem = match entry.kind {
-                ObjectKind::View => self.view_problem(at, &entry.name),
-                ObjectKind::Trigger => self.trigger_problem(at, entry),
+                ObjectKind::View => self.view_problem(of, &entry.name),
+                ObjectKind::Trigger => self.trigger_problem(of, entry),
                 _ => None,
             };
             if let Some(message) = problem {
@@ -76,17 +97,23 @@ impl crate::ImportedDatabase {
         at: usize,
         entry: &inillucent_catalog::paged::SchemaEntry,
     ) -> Option<String> {
-        let table_folded = entry.table.to_ascii_lowercase();
         let name_folded = entry.name.to_ascii_lowercase();
-        let table = self
+        // A temporary trigger is held by the table it fires for, which can be
+        // in any schema, so the trigger is found by its name and by being
+        // temporary rather than through the schema its row is in.
+        let temporary = at == crate::TEMP;
+        let (table, trigger) = self
             .schema
             .tables
             .iter()
-            .find(|table| table.database == at && table.folded == table_folded)?;
-        let trigger = table
-            .triggers
-            .iter()
-            .find(|trigger| trigger.folded == name_folded)?;
+            .filter(|table| temporary || table.database == at)
+            .find_map(|table| {
+                table
+                    .triggers
+                    .iter()
+                    .find(|trigger| trigger.folded == name_folded && trigger.temporary == temporary)
+                    .map(|trigger| (table, trigger))
+            })?;
         // A view has no columns of its own in the catalog: `new` and `old` in an
         // `INSTEAD OF` trigger mean the columns its query produces.
         let mut subject = table.clone();
@@ -190,7 +217,7 @@ pub(crate) fn table_text_problem(sql: &[u8]) -> Option<String> {
     if only_generated {
         return Some("must have at least one non-generated column".to_string());
     }
-    if let Some(missing) = unresolved_column(&parsed.ast, &names) {
+    if let Some(missing) = unresolved_column(&parsed.ast, &names, None) {
         return Some(missing);
     }
     for (_, constraint) in constraints {
@@ -211,18 +238,28 @@ pub(crate) fn table_text_problem(sql: &[u8]) -> Option<String> {
 
 /// Returns why a `CREATE INDEX` text names a column its table does not have.
 ///
+/// A qualified name must also be written with the table's current name. A rename
+/// with `legacy_alter_table` on leaves the old name in a partial index's `WHERE`,
+/// and SQLite refuses that rename with `no such column: t.c`.
+///
 /// @param sql - the index's `CREATE` text
 /// @param columns - the folded names of the table's columns after the change
-pub(crate) fn index_text_problem(sql: &[u8], columns: &[Vec<u8>]) -> Option<String> {
+/// @param table - the folded name the table has after the change
+pub(crate) fn index_text_problem(sql: &[u8], columns: &[Vec<u8>], table: &[u8]) -> Option<String> {
     let parsed = parse_next_statement(sql, 0, &inillucent_base::limits::Limits::default()).ok()?;
-    unresolved_column(&parsed.ast, columns)
+    unresolved_column(&parsed.ast, columns, Some(table))
 }
 
 /// Returns the first column reference in a parse that no column answers to.
 ///
 /// @param ast - the parsed statement's arena
 /// @param columns - the folded names of the columns that exist
-fn unresolved_column(ast: &inillucent_sql::ast::Ast, columns: &[Vec<u8>]) -> Option<String> {
+/// @param table - the folded name a qualifier must match, when qualifiers are checked
+fn unresolved_column(
+    ast: &inillucent_sql::ast::Ast,
+    columns: &[Vec<u8>],
+    table_name: Option<&[u8]>,
+) -> Option<String> {
     for index in 0..ast.expr_count() {
         let id = ExprId(index as u32);
         let Some(Expr::Column { table, column, .. }) = ast.expr(id) else {
@@ -238,7 +275,11 @@ fn unresolved_column(ast: &inillucent_sql::ast::Ast, columns: &[Vec<u8>]) -> Opt
             continue;
         }
         let rowid = matches!(folded, b"rowid" | b"oid" | b"_rowid_");
-        if rowid || columns.iter().any(|name| name.as_slice() == folded) {
+        let wrong_qualifier = match (table, table_name) {
+            (Some(qualifier), Some(expected)) => ast.folded(*qualifier) != expected,
+            _ => false,
+        };
+        if !wrong_qualifier && (rowid || columns.iter().any(|name| name.as_slice() == folded)) {
             continue;
         }
         let written = match table {

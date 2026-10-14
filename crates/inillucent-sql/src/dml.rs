@@ -2280,6 +2280,11 @@ impl<'a> Binder<'a> {
         let (ast, expr) = parse_expression(sql, &limits)?;
         let mut nested = Binder::new(self.catalog, &ast, self.authorizer);
         nested.trigger_depth = self.trigger_depth;
+        // **The depth of generated columns read so far is carried into the nested
+        // binder.** A fresh binder started the count at zero for every column, so
+        // a column that reads itself recursed until the stack was gone instead of
+        // reaching `MAX_GENERATED_DEPTH`.
+        nested.generating = self.generating;
         // **This is where a `DEFAULT`, a `CHECK`, a generated column, an index
         // expression and a partial-index predicate all become a bound tree, so
         // it is where all five are told they are a schema (task-1972).** The
