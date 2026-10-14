@@ -10,6 +10,69 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**`ROLLBACK` restores everything a transaction changed, including after `DROP` and `ALTER TABLE`.**
+Bug hunt 10 found rollbacks that lost or kept rows. With foreign keys on, `BEGIN; DROP TABLE p;
+ROLLBACK` brought `p` back with no rows, because the rows `DROP TABLE` deletes first were put back
+into a tree that was no longer attached. `INSERT`, `UPDATE` or `DELETE` followed by `ALTER TABLE ...
+ADD COLUMN` or `DROP COLUMN` in one transaction kept those changes after `ROLLBACK`, and lost rows
+the transaction had deleted. A rollback now puts each row back into the tree the restored catalog
+names. Also: a rolled back `DROP` of an FTS5 table or of a table with a vector index leaves the
+table usable, `ROLLBACK` of `DROP TABLE` keeps the `AUTOINCREMENT` counter, `ROLLBACK TO s0` ends
+the savepoints opened after `s0`, `REINDEX` and `ROLLBACK` leave the index as it was, and
+`schema_version` goes back too.
+
+**Attached and temporary databases keep their own foreign keys, triggers, counters and schema
+changes.** A foreign key in an attached or temporary table looked up its parent in `main`, so every
+write to the child failed with `no such table: main.p`, or was checked against a `main` table of the
+same name. A trigger in an attached database read and wrote `main` when its body named a table
+without a database. `AUTOINCREMENT` counters of two databases were kept in one `sqlite_sequence`.
+`DROP TRIGGER`, `DROP VIEW` and `ALTER TABLE ... RENAME` of an attached file inside a transaction
+were lost when the file was opened again. `VACUUM aux` wrote `main`'s statistics into `aux`'s
+catalog, and `VACUUM aux INTO` copied `main`. `DROP TRIGGER` of a temporary trigger on a `main` table
+reported success and left the trigger firing. Each is fixed.
+
+**A connection can always end its transaction.** `ROLLBACK`, a `COMMIT` of a transaction that wrote
+nothing, and pragmas that set only the connection, such as `busy_timeout`, take no lock. They used to
+fail `busy` while another connection held the file to write it, which left the transaction open, and
+the statements after it reported success and were lost at close. A transaction that has read and
+written nothing goes on after another connection's `VACUUM`, where every statement and its
+`ROLLBACK` were refused until the connection closed.
+
+**A failed statement keeps nothing it should not.** With a foreign key that can reach its own table
+anywhere in the schema, a statement on a table with a trigger that broke a foreign key failed and
+kept its rows; the `todo-mvc` example's own test found it.
+
+**A write transaction's memory no longer grows with the rows it changes.** Each changed row kept a
+before image in memory until the transaction ended, so `UPDATE` of every row of a 564 MB table
+peaked at 825 MB. Past 16 MiB the oldest before images now go to a temporary file, which only a
+rollback reads; that `UPDATE` peaks at 219 MB. `VACUUM` reads a table a page at a time instead of
+whole. `CREATE INDEX` and the shell's `.import` still hold their input in memory.
+
+**`ALTER TABLE` rewrites only what it renames.** `RENAME TO` rewrote a CTE that had the table's name,
+`RENAME COLUMN` rewrote an `ORDER BY` that named a result alias, so a view returned its rows in
+another order, and both missed temporary views and triggers when a temporary table of the same name
+existed. `ADD COLUMN c AS (c)` was accepted and the next statement overflowed the stack; it now
+fails with `generated column loop on "c"`, and an `ADD COLUMN` generated expression is checked as
+`CREATE TABLE` checks one. `RENAME` of a table with a vector index carries the index, and
+`ALTER TABLE ... RENAME` of an FTS5 or `inillucent_search` table renames its shadow tables. The
+shadow tables of a module can no longer be dropped, altered or given triggers on a defensive
+connection, which the shell is. `DROP VIEW` drops the view's triggers.
+
+**Dumps and migration.** `.dump` and `inillucent dump` panicked on a table name with a character of
+several bytes. A SQLite `.dump` of a database with an `AUTOINCREMENT` table or an FTS5 table loads
+into `inillucent-shell`, the FTS5 table with its rows. `inillucent migrate` brings over FTS5
+`UNINDEXED` columns and tables of up to about 1,900 integer columns, and `VACUUM` works on a file
+release 0.1.1 wrote with an FTS5 table.
+
+**Queries.** An `IN` subquery correlated to the query two levels out failed with `the tree read for
+FROM term 1 does not carry column 0`; a random generator hit it in 540 of 3,432 queries. A
+recursive CTE that read itself on the right of a `LEFT JOIN` ran until it was stopped, and is now
+refused as SQLite refuses it. A string or blob result over the 1,000,000,000 byte limit fails with
+`string or blob too big` before it is built. A recursive CTE compares with the column's affinity and
+removes duplicates with its collation, a bare column beside `max()` under `GROUP BY` comes from the
+max row, and an uncorrelated subquery's error is raised only if its value is used. `x IN (SELECT
+...)` over a table valued function went from 6.2 s to 0.09 s.
+
 **A table loaded in key order takes about the pages a bulk build gives it, and `VACUUM` keeps that.**
 Twenty thousand rows of two integer columns loaded in 500 row `INSERT ... VALUES` statements took 25
 pages of 32 KiB. The same rows copied by one `INSERT ... SELECT` took 10, and SQLite's file for them
