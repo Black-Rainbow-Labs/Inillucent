@@ -10,6 +10,12 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**`VACUUM aux` shortens the file of an attached database.** It used to fold the log and leave the
+file at its old length. A delete that left every leaf a tenth full freed one page of 147, so the
+free map had nothing to give back either. `VACUUM aux` now packs each table and index of the
+attached file into new trees in the same file and cuts the file after the commit. It does not
+rename a new file over the old one, so another process that has the file attached keeps working.
+
 **`ATTACH` takes any expression as its file name.** `ATTACH ?1 AS x`, `ATTACH 'a' || 'b' AS x` and
 `ATTACH (SELECT path FROM p) AS x` exited 3 with `unsupported`. The engine now evaluates the
 expression when the statement runs, with the statement's bound parameters, and reads the value as

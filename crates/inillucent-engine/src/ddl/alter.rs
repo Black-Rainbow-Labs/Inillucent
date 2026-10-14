@@ -843,7 +843,7 @@ impl crate::ImportedDatabase {
     /// @param folded - the table's folded name
     /// @param dropped - the declared position `DROP COLUMN` removed, when that
     ///   is what is being rebuilt
-    fn rebuild_table_tree(
+    pub(crate) fn rebuild_table_tree(
         &mut self,
         at: usize,
         folded: &[u8],

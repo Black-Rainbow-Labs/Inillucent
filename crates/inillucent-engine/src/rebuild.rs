@@ -1259,18 +1259,19 @@ impl ImportedDatabase {
 
     /// Runs `VACUUM` on `temp` or an attached database.
     ///
-    /// **Folds the schema's log into its file and leaves the file where it is.**
-    /// `main` is rebuilt and renamed over, which is safe because every process
-    /// that opens `main` checks for a replaced file (`file_was_replaced`).
-    /// Nothing checks for that on an attached file, so another process that
-    /// had the same file attached would keep writing to the old inode after a
-    /// rename and its commits would be lost without an error. The pages of an
-    /// attached or temporary database are returned to its free map as they are
-    /// released, as they are for `main`, so what a rebuild would add is a
-    /// smaller file; `VACUUM <schema> INTO` still produces that, and the
-    /// statement leaves the schema exactly as it was, which is what it did to
-    /// every row before this existed. Before bug hunt 10 the statement rebuilt
-    /// `main` and put its catalog in place of the named schema's.
+    /// **Packs every table and index of the schema into new trees in the same
+    /// file, then gives the freed pages back, so the file gets shorter.**
+    /// `main` is rebuilt into a new file and renamed over, which is safe because
+    /// every process that opens `main` checks for a replaced file
+    /// (`file_was_replaced`). Nothing checks that on an attached file, so a
+    /// rename would send another process that has the same file attached on
+    /// writing to the old file, and its commits would be lost without an error.
+    /// This keeps the file where it is. Each table is read out and packed again
+    /// the way `ALTER TABLE ... ADD COLUMN` packs one, each index is rebuilt the
+    /// way `REINDEX` rebuilds it, and the commit then moves the pages above the
+    /// first free page down and cuts the file, with the same step `auto_vacuum`
+    /// uses. A delete that left every leaf a tenth full freed one page of 147
+    /// before this, and the file kept its size.
     ///
     /// @param schema - the schema to vacuum, as the binder numbers them
     pub(crate) fn vacuum_schema_in_place(&mut self, schema: usize) -> DbResult<()> {
@@ -1285,7 +1286,62 @@ impl ImportedDatabase {
                 String::from_utf8_lossy(&self.schema_name_of(schema))
             )));
         }
+        self.checkpoint_outside_the_ddl_schema()?;
+        self.repack_schema(schema)?;
         self.checkpoint_outside_the_ddl_schema()
+    }
+
+    /// Packs every table and index of one schema again and queues the pages it
+    /// freed to be given back at the commit.
+    ///
+    /// Virtual tables and views have no tree of their own to pack. An index a
+    /// module owns, and the primary key of a `WITHOUT ROWID` table, which is the
+    /// table's own tree, are packed with their table.
+    ///
+    /// @param schema - the schema to pack, as the binder numbers them
+    fn repack_schema(&mut self, schema: usize) -> DbResult<()> {
+        let tables: Vec<(Vec<u8>, Vec<u8>, Vec<Vec<u8>>)> = self
+            .schema
+            .tables
+            .iter()
+            .filter(|table| {
+                table.database == schema
+                    && table.module.is_none()
+                    && table.kind == inillucent_sql::catalog_view::TableKind::Table
+            })
+            .map(|table| {
+                let indexes = table
+                    .indexes
+                    .iter()
+                    .filter(|index| {
+                        index.origin != inillucent_sql::catalog_view::IndexOrigin::Module
+                            && !(table.without_rowid
+                                && index.origin
+                                    == inillucent_sql::catalog_view::IndexOrigin::PrimaryKey
+                                && index.root == table.root)
+                    })
+                    .map(|index| index.name.clone())
+                    .collect();
+                (table.name.clone(), table.folded.clone(), indexes)
+            })
+            .collect();
+        for (name, folded, indexes) in tables {
+            self.rebuild_table_tree(schema, &folded, None)?;
+            self.rebuild_tables()?;
+            self.refresh_catalog();
+            for index in indexes {
+                self.rebuild_index(schema, &name, &index)?;
+                self.rebuild_tables()?;
+                self.refresh_catalog();
+            }
+        }
+        self.writing
+            .incremental_steps()
+            .borrow_mut()
+            .insert(schema, u64::MAX);
+        self.writing
+            .set_touched(self.writing.touched() | crate::schema_bit(schema));
+        self.seal()
     }
 
     /// Checkpoints with `main` as the schema the catalog primitives write to.

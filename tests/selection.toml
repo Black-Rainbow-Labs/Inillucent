@@ -3797,3 +3797,11 @@ name = "nightly"
 module = "free_map_page_at_the_end"
 tier = "nightly"
 covers = ["inillucent-engine", "inillucent-pool", "inillucent-tree"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "vacuum_attached_database"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool"]

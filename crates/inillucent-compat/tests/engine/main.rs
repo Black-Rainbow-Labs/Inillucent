@@ -97,6 +97,7 @@ mod torn_page_with_image;
 mod transaction_memory;
 mod unique_leaf_boundary;
 mod usage_paths;
+mod vacuum_attached_database;
 mod vacuum_on_vfs;
 mod vector;
 mod vector_edges;
