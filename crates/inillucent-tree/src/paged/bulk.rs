@@ -552,6 +552,7 @@ impl PagedTree {
             root,
             shape: std::cell::Cell::new(Some((height, *leaves.first().unwrap_or(&PageId::NONE)))),
             columns,
+            pad: crate::leaf::TreePad::default(),
             key_columns,
             page_size,
             encoding,

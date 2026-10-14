@@ -754,15 +754,17 @@ recover and compare the result. Each campaign runs from a fixed seed and writes 
 ## 6. What a file's format version promises
 
 The first eight bytes of a database are `RDB2` and four zero bytes. The next four bytes are the
-**format version**. This build reads formats `1`, `2` and `3`. It writes format `3` to every file it
-creates, and moves a format `2` file to format `3` at the first of three events (see "Format 3" below).
+**format version**. This build reads formats `1`, `2`, `3` and `4`. It writes format `3` to every file it
+creates, moves a format `2` file to format `3` at the first of three events (see "Format 3" below),
+and moves a file to format `4` the first time a table of it gains a column while it has rows (see
+"Format 4" below).
 The number is covered by the meta page's checksum, so a hand edited version fails the checksum.
 
 | Rule | What it means |
 |---|---|
 | A point release reads every file an earlier point release of the same minor version wrote | a bug fix never changes the format version |
 | A change to the layout of a page, a record or the header raises the format version | that is a minor version, and it comes with a migration |
-| A build that meets a higher version refuses the file by name | the error is `this database is format version N and this build reads version 3; upgrade inillucent to open it`, with the status `unsupported`. The command line exits 3 |
+| A build that meets a higher version refuses the file by name | the error is `this database is format version N and this build reads version 4; upgrade inillucent to open it`, with the status `unsupported`. The command line exits 3 |
 | A version below 1 is reported as damage | there is no format 0, so a zero means the header was overwritten |
 
 A migration is `inillucent-migrate`, which reads the older file and writes a new one. It does not
@@ -810,8 +812,8 @@ owned layout, or both. A file this build creates says format 3 from the start an
 pages in the owned layout. A file at format 2 keeps writing extent pages in the older layout. It moves
 to format 3 at the first of three events: the first key stored out of line, a `VACUUM`, which rebuilds
 it as a new file, and `PRAGMA auto_vacuum` set to `FULL` or `INCREMENTAL`. Every reader handles both
-layouts on every page. There is no format 4. Nothing lowers the number again: the number says what a
-reader has to be able to read, and lowering it would need a walk of every page.
+layouts on every page. Nothing lowers the number again: the number says what a reader has to be able to
+read, and lowering it would need a walk of every page.
 
 A value over `page_size / 8` bytes, 4,096 at the default page size, goes out of line in any column,
 an indexed column and a primary key included. A row whose values are each under that size but
@@ -839,6 +841,40 @@ page says 2 and its log holds no `Format` record.
 | format 2, written by an earlier build, none of the three events yet | opens, stays 2 | opens | refuses by name, status `unsupported` | `database disk image is malformed` |
 | format 3, created by this build or raised by one of the three events | opens | refuses by name: `format version 3`, status `unsupported`, exit code 3 | the same | `database disk image is malformed` |
 | format 2 in the file, and a log holding a `Format` record after a crash | recovers | refuses: `a log record has kind 19, which this format does not define` | the same | the same |
+
+### Format 4, and when a file moves to it
+
+Format 4 means that the file may hold a leaf with fewer columns than its table.
+`ALTER TABLE ... ADD COLUMN` on a table that has rows writes no leaf: it writes the catalog row, and
+the table's tree takes the longer column list. A leaf written before that holds one column fewer, and
+every reader of it is given the new column's default, which is the same for all of its rows. The
+default is read from the column's declaration, so it is not stored anywhere, and it is a literal
+(a number, a string, a blob, `NULL`, a sign in front of a number, or a bare word). A default the
+engine has to evaluate, `CAST('5' AS INTEGER)`, is stored in every row as before. A table with no row,
+a statement inside a transaction, and a column the tree does not hold (a virtual generated column) also
+take the old path, or need no tree change at all.
+
+The first write that lands in a short leaf rewrites that leaf with every column. The leaf is read
+through the pad, so each row has the default in the new column, and is packed again by the same
+path as any other compaction. That path logs the page image, so a replay copies the result and never has
+to know what the default was. When the wider rows no longer fit one page the leaf is split first
+with the columns it has, which halves it, and each half is widened in turn
+(`widen_short_leaf` in `crates/inillucent-tree/src/write.rs`). A delete does not widen a leaf,
+because it touches no column. A read never writes.
+
+The file moves to format 4 before the catalog row is committed, in memory, with one log record,
+`FormatRaised` (kind 22). The record belongs to no transaction. It is a kind of its own, and not a
+`Format` record with a higher number, because a release that stops at format 3 knows kind 19: it
+would read `version: 4`, raise its own number and go on replaying records it cannot read. Kind 22 is
+refused by name, `a log record has kind 22, which this format does not define`. A release that opens
+the file after a checkpoint reads the number in the meta page and refuses it with
+`this database is format version 4 and this build reads version 3`.
+
+| File | This build | Releases 2.5.0 to this one |
+|---|---|---|
+| format 3, none of the events below yet | opens, stays 3 | opens |
+| format 4, a table gained a column while it had rows | opens | refuses by name: `format version 4`, status `unsupported`, exit code 3 |
+| format 3 in the file, and a log holding a `FormatRaised` record after a crash | recovers | refuses: `a log record has kind 22, which this format does not define` |
 
 The longest key is 1,048,576 bytes of encoded key. A longer one is refused before any page is touched,
 with `an index or primary key entry is longer than 1,048,576 bytes`. The limit exists because a delete

@@ -16,6 +16,7 @@
 //! `tests/selection.toml`. `selection::discover` finds a module file with no
 //! row, so `no_test_hides_outside_the_map` names one that was forgotten.
 
+mod add_column_without_rewrite;
 mod analyze_reopen;
 mod analyze_same_session;
 mod append_load_density;

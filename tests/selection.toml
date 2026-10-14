@@ -957,6 +957,14 @@ covers = ["inillucent-engine", "inillucent-catalog", "inillucent-sql"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "add_column_without_rewrite"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool", "inillucent-wal"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "auto_vacuum"
 tier = "engine"
 covers = ["inillucent-engine", "inillucent-pool", "inillucent-tree", "inillucent-wal", "inillucent-txn"]
@@ -1553,6 +1561,14 @@ kind = "test"
 name = "write_campaign"
 tier = "engine"
 
+# A tree that gained a column after its leaves were written: reads through the pad, and a
+# first write that widens one leaf.
+[[target]]
+package = "inillucent-tree"
+kind = "test"
+name = "short_leaves"
+tier = "engine"
+
 # Keys longer than the spill threshold, bulk built, written into and deleted
 # from, with separators long enough to be stored out of line.
 [[target]]
@@ -1718,6 +1734,15 @@ name = "differential"
 module = "advanced_sql"
 tier = "differential"
 covers = ["inillucent-engine"]
+requires = ["oracle"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "differential"
+module = "add_column"
+tier = "differential"
+covers = ["inillucent-engine", "inillucent-tree"]
 requires = ["oracle"]
 
 [[target]]
@@ -2588,6 +2613,14 @@ covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-p
 # Power loss at every cut point of an `INSERT ... SELECT` into an empty table,
 # which builds the table and its index with the bulk builder and rewrites their
 # catalog rows: the copy comes back whole or not at all.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "add_column_crash"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"

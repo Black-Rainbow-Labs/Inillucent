@@ -1429,8 +1429,9 @@ fn columns_end(page: &[u8]) -> DbResult<usize> {
 fn columns_end_of(leaf: &LeafRef<'_>) -> DbResult<usize> {
     let page = leaf.bytes();
     let stride = leaf.directory_entry_size();
-    let mut end = leaf_header::DIRECTORY.saturating_add(leaf.column_count().saturating_mul(stride));
-    for index in 0..leaf.column_count() {
+    let mut end =
+        leaf_header::DIRECTORY.saturating_add(leaf.physical_column_count().saturating_mul(stride));
+    for index in 0..leaf.physical_column_count() {
         let entry = leaf_header::DIRECTORY.saturating_add(index.saturating_mul(stride));
         let start = page::read_u32(page, entry.saturating_add(4))? as usize;
         // The column directory's own width, not the physical type's: an integer

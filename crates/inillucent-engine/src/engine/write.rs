@@ -439,7 +439,10 @@ impl TreeLog for WalLog<'_> {
         // Owned by no transaction, so recovery replays it even when this
         // transaction is abandoned; see `TreeLog::log_format`.
         self.wrote = true;
-        self.wal.append(0, Body::Format { version })
+        match version > inillucent_pool::meta::FORMAT_VERSION {
+            true => self.wal.append(0, Body::FormatRaised { version }),
+            false => self.wal.append(0, Body::Format { version }),
+        }
     }
 
     fn log_insert_row(&mut self, tree: u64, page: u64, row: &[u8]) -> DbResult<u64> {

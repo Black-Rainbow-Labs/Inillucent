@@ -284,6 +284,10 @@ impl<'p> LeafRef<'p> {
     /// @param index - the row's position in the directory
     /// @param column - which column
     pub fn delta_extent_at(&self, index: usize, column: usize) -> DbResult<Option<ExtentRef>> {
+        if column >= self.column_count {
+            // A column the page does not hold has no out-of-line value in it.
+            return Ok(None);
+        }
         let row = self.delta_row(index)?;
         let mut cursor = 0usize;
         for position in 0..=column {
@@ -397,6 +401,9 @@ impl<'p> LeafRef<'p> {
     /// @param column - which column to decode
     pub fn delta_value(&self, index: usize, column: usize) -> DbResult<Datum<'p>> {
         let row = self.delta_row(index)?;
+        if column >= self.column_count {
+            return self.padded_value(column);
+        }
         let mut cursor = 0usize;
         for _ in 0..column {
             let rest = row.get(cursor..).unwrap_or(&[]);
@@ -419,13 +426,26 @@ impl<'p> LeafRef<'p> {
     pub(super) fn delta_row_values(&self, index: usize) -> DbResult<Vec<Datum<'p>>> {
         let row = self.delta_row(index)?;
         let mut cursor = 0usize;
-        let mut values = Vec::with_capacity(self.column_count);
+        let mut values = Vec::with_capacity(self.width);
         for column in 0..self.column_count {
             let (value, next) = self.delta_column_at(row, cursor, index, column)?;
             values.push(value);
             cursor = next;
         }
+        for column in self.column_count..self.width {
+            values.push(self.padded_value(column)?);
+        }
         Ok(values)
+    }
+
+    /// Returns what a column the page does not hold reads as.
+    ///
+    /// @param column - the column's position in the tree
+    fn padded_value(&self, column: usize) -> DbResult<Datum<'p>> {
+        match self.pad {
+            Some(pad) if column < self.width => Ok(pad.fill(column)),
+            _ => Err(misuse(format!("column {column} does not exist"))),
+        }
     }
 
     /// Decodes the first `decode` columns of one delta row onto the end of a vector.
@@ -451,6 +471,9 @@ impl<'p> LeafRef<'p> {
             let (value, next) = self.delta_column_at(row, cursor, index, column)?;
             out.push(value);
             cursor = next;
+        }
+        for column in self.column_count..decode.min(self.width) {
+            out.push(self.padded_value(column)?);
         }
         Ok(())
     }

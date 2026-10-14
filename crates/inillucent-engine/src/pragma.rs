@@ -288,7 +288,10 @@ impl ImportedDatabase {
     /// Returns the file a qualified pragma is about, to write into.
     ///
     /// @param at - the attached database the pragma named
-    fn file_of_mut(&mut self, at: Option<usize>) -> DbResult<&mut inillucent_pool::Database> {
+    pub(crate) fn file_of_mut(
+        &mut self,
+        at: Option<usize>,
+    ) -> DbResult<&mut inillucent_pool::Database> {
         let at = at.unwrap_or(MAIN);
         if at == MAIN {
             return Ok(&mut self.storage.database);

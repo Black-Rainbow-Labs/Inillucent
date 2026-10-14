@@ -77,6 +77,7 @@ mod compare;
 mod encode;
 mod key_extent;
 mod layout;
+mod pad;
 mod read;
 
 pub use compare::{compare_rows, compare_rows_under, Hit, KeyView};
@@ -93,6 +94,7 @@ pub use layout::{
     class_bytes, extent_class_for, extent_datum, fits_frame, from_frame, tombstone_bytes,
     write_frame, Layout,
 };
+pub use pad::TreePad;
 pub use read::{LiveOrder, LiveRow, LiveSource, MiniColumn, RunCursor};
 
 mod delta;
@@ -316,7 +318,15 @@ pub struct LeafRef<'p> {
     page: &'p [u8],
     row_count: usize,
     delta_count: usize,
+    /// How many columns the page holds. Everything that walks the page's own
+    /// structure (the column directory, the delta rows) uses this one.
     column_count: usize,
+    /// How many columns the leaf reads as: `column_count`, or more when the tree
+    /// has gained columns since this leaf was written and the view was given
+    /// [`LeafRef::with_pad`].
+    width: usize,
+    /// What the columns past `column_count` read as, when the view has any.
+    pad: Option<&'p TreePad>,
     key_columns: usize,
     heap_start: usize,
     delta_start: usize,
@@ -409,6 +419,8 @@ impl<'p> LeafRef<'p> {
             row_count,
             delta_count,
             column_count,
+            width: column_count,
+            pad: None,
             key_columns,
             heap_start,
             delta_start,

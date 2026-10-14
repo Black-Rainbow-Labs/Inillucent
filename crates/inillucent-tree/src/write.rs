@@ -428,7 +428,10 @@ pub trait TreeLog {
     ///
     /// @param version - the version the file now says
     fn log_format(&mut self, version: u32) -> DbResult<u64> {
-        self.log(Body::Format { version })
+        match version > inillucent_pool::meta::FORMAT_VERSION {
+            true => self.log(Body::FormatRaised { version }),
+            false => self.log(Body::Format { version }),
+        }
     }
 
     /// Logs one inserted row and returns the LSN to stamp its leaf with.
@@ -635,10 +638,13 @@ pub enum Located {
     Absent,
 }
 
-/// What [`Tree::locate_and_read_previous`] found: where the key sits, the
-/// directory slot a new row takes, the row that was there, and the room the
-/// row has, or `None` when the leaf has to make room first.
+/// What [`Tree::locate_and_read_previous`] found: whether the leaf holds fewer
+/// columns than the tree and so has to be widened before anything is written to
+/// it, where the key sits, the directory slot a new row takes, the row that was
+/// there, and the room the row has, or `None` when the leaf has to make room
+/// first.
 type Located2 = (
+    bool,
     Located,
     usize,
     Option<Vec<OwnedDatum>>,
@@ -1136,12 +1142,18 @@ impl PagedTree {
         let guard = database.pool().fetch(page)?;
         let leaf = LeafRef::parse(&guard)?
             .with_collations(self.collations())
+            .with_pad(&self.pad)
             .with_directions(self.directions())
             .with_pool(database.pool());
         timing.fetch = timing
             .fetch
             .saturating_add(crate::stages::elapsed(fetching));
         let (key, new_key) = key;
+        if leaf.is_short() {
+            // Nothing below is asked of a leaf that is about to be rewritten: the
+            // room it reports is the room of a page that is not about to be used.
+            return Ok((true, Located::Absent, 0, None, None));
+        }
         let (located, slot) = match new_key {
             true => leaf.locate_new_key_slot(key, self.key_columns())?,
             false => leaf.locate_slot(key, self.key_columns())?,
@@ -1185,7 +1197,7 @@ impl PagedTree {
                 Some(values)
             }
         };
-        Ok((located, slot, previous, costed))
+        Ok((false, located, slot, previous, costed))
     }
 
     /// Returns the out-of-line pages a row about to be removed or replaced owns.
@@ -1531,19 +1543,16 @@ impl PagedTree {
         // When it cannot - a leaf with fewer than two live rows, or a row the
         // delta area will not hold at any fill - the write is packed instead.
         for attempt in 0..2 {
-            let (page, mut path, hinted) =
-                self.leaf_for_attempt(database.pool(), encoded_key, attempt, &mut timing)?;
+            let (page, mut path, hinted, located, slot, mut previous, costed) = self
+                .leaf_to_write_into(
+                    database,
+                    log,
+                    encoded_key,
+                    (key, new_key),
+                    (want_previous, encoded_row.len(), attempt),
+                    &mut timing,
+                )?;
             from_hint = from_hint || hinted;
-            // The key is found once, and the room asked of the same parse; see
-            // `Tree::locate_and_read_previous` for why both.
-            let (located, slot, mut previous, costed) = self.locate_and_read_previous(
-                database,
-                page,
-                (key, new_key),
-                want_previous,
-                encoded_row.len(),
-                &mut timing,
-            )?;
             // A caller that refuses a duplicate is told so before anything is
             // written, which is the whole point of asking.
             if !replace && previous.is_some() {
@@ -1863,6 +1872,13 @@ impl PagedTree {
         // touches nothing.
         {
             let guard = database.pool().fetch(page)?;
+            // A leaf written before the tree gained a column has no slot for it,
+            // and the general write widens the leaf.
+            if self.pad.width() > 0
+                && LeafRef::parse(guard.bytes())?.physical_column_count() < self.columns().len()
+            {
+                return Ok(false);
+            }
             if !crate::mutate::would_update_slot(guard.bytes(), column, row_index, value)? {
                 return Ok(false);
             }
@@ -2034,6 +2050,7 @@ impl PagedTree {
         let guard = database.pool().fetch(page)?;
         let leaf = LeafRef::parse(&guard)?
             .with_collations(self.collations())
+            .with_pad(&self.pad)
             .with_directions(self.directions())
             .with_pool(database.pool());
         let held = self.read_extents(database.pool(), &leaf)?;
@@ -3669,6 +3686,7 @@ impl PagedTree {
         let guard = pool.fetch(page)?;
         let leaf = LeafRef::parse(&guard)?
             .with_collations(self.collations())
+            .with_pad(&self.pad)
             .with_directions(self.directions())
             .with_pool(pool);
         // The row's own out-of-line values, not the leaf's: a delete reads one
@@ -3694,6 +3712,7 @@ impl PagedTree {
         let guard = pool.fetch(page)?;
         let leaf = LeafRef::parse(&guard)?
             .with_collations(self.collations())
+            .with_pad(&self.pad)
             .with_directions(self.directions())
             .with_pool(pool);
         let located = self.locate_in(&leaf, key)?;
@@ -3795,6 +3814,7 @@ impl PagedTree {
         let guard = pool.fetch(page)?;
         let leaf = LeafRef::parse(&guard)?
             .with_collations(self.collations())
+            .with_pad(&self.pad)
             .with_directions(self.directions())
             .with_pool(pool);
         if !leaf.has_extents() {
@@ -3896,6 +3916,232 @@ impl PagedTree {
         // `wide` ended a write campaign with 791 rows where SQLite had 500.
         self.in_key_order(&mut rows, &mut carried);
         Ok((rows, carried))
+    }
+
+    /// Finds the leaf a write belongs in and where its key sits there, widening the leaf
+    /// first when it was written before the tree gained a column.
+    ///
+    /// **A short leaf is rewritten with every column before anything is written to it.**
+    /// The rewrite may split the leaf because the rows got wider, so the key's leaf is
+    /// found again. A leaf the widening produced is never short, which is why this repeats
+    /// a few times at most.
+    ///
+    /// @param database - the file
+    /// @param log - where the records go
+    /// @param encoded_key - the key in its comparison encoding
+    /// @param key - the key columns of the row being written, and whether the caller knows
+    ///   the key is not live
+    /// @param how - whether the row that was there has to be read, how many bytes the new
+    ///   row's tagged form occupies, and which pass of the write's loop this is
+    /// @param timing - where the nanoseconds go, all zero unless a harness asked
+    fn leaf_to_write_into(
+        &mut self,
+        database: &mut Database,
+        log: &mut dyn TreeLog,
+        encoded_key: &[u8],
+        key: (&[Datum<'_>], bool),
+        how: (bool, usize, usize),
+        timing: &mut crate::stages::PutStages,
+    ) -> DbResult<(
+        PageId,
+        Vec<PageId>,
+        bool,
+        Located,
+        usize,
+        Option<Vec<OwnedDatum>>,
+        Option<crate::mutate::DeltaOffsets>,
+    )> {
+        let (want_previous, encoded_len, attempt) = how;
+        for _ in 0..5 {
+            let (page, path, hinted) =
+                self.leaf_for_attempt(database.pool(), encoded_key, attempt, timing)?;
+            // The key is found once, and the room asked of the same parse; see
+            // `Tree::locate_and_read_previous` for why both.
+            let (short, located, slot, previous, costed) = self.locate_and_read_previous(
+                database,
+                page,
+                key,
+                want_previous,
+                encoded_len,
+                timing,
+            )?;
+            if !short {
+                return Ok((page, path, hinted, located, slot, previous, costed));
+            }
+            self.widen_short_leaf(database, log, page, key.0)?;
+        }
+        Err(corrupt("a leaf stayed short after it was widened"))
+    }
+
+    /// Reports whether a leaf holds fewer columns than the tree has.
+    ///
+    /// Only a tree that was given a longer column list by [`PagedTree::set_shape`]
+    /// can have such a leaf, so every other tree answers without reading a page.
+    ///
+    /// @param pool - the buffer pool
+    /// @param page - the leaf
+    pub(crate) fn leaf_is_short(&self, pool: &Pool, page: PageId) -> DbResult<bool> {
+        if self.pad.width() == 0 {
+            return Ok(false);
+        }
+        let guard = pool.fetch(page)?;
+        Ok(LeafRef::parse(&guard)?.physical_column_count() < self.columns().len())
+    }
+
+    /// Returns the leaf a write to this key should go to, widened first when it was short.
+    ///
+    /// @param database - the file
+    /// @param log - where the records go
+    /// @param page - the leaf the key was found in
+    /// @param key - the key, one value per key column
+    pub(crate) fn leaf_ready_for_write(
+        &mut self,
+        database: &mut Database,
+        log: &mut dyn TreeLog,
+        page: PageId,
+        key: &[Datum<'_>],
+    ) -> DbResult<PageId> {
+        let mut page = page;
+        for _ in 0..4 {
+            if !self.leaf_is_short(database.pool(), page)? {
+                return Ok(page);
+            }
+            self.widen_short_leaf(database, log, page, key)?;
+            let encoded = self.encode_key(key);
+            page = self.leaf_for(database.pool(), &encoded)?.0;
+        }
+        Err(corrupt("a leaf stayed short after it was widened"))
+    }
+
+    /// Rewrites a leaf written before the tree gained a column so it holds every column.
+    ///
+    /// **The one place a short leaf is written.** `ALTER TABLE ... ADD COLUMN`
+    /// changes the catalog and no leaf; the first write that would land in such a
+    /// leaf comes here first. The rows are read through the padded view, so each
+    /// has the tree's default in the new column, and are packed again by the same
+    /// path a full leaf takes. That path logs the page image, or the images of the
+    /// halves when the wider rows no longer fit one page, so a replay copies the
+    /// result and never has to know what the default was. The cost is one leaf, on
+    /// the first write to it.
+    ///
+    /// @param database - the file
+    /// @param log - where the records go
+    /// @param page - the short leaf
+    /// @param key - a key the leaf holds or would hold, to find the pages above it
+    fn widen_short_leaf(
+        &mut self,
+        database: &mut Database,
+        log: &mut dyn TreeLog,
+        page: PageId,
+        key: &[Datum<'_>],
+    ) -> DbResult<()> {
+        let encoded = self.encode_key(key);
+        let (_, path) = self.leaf_for(database.pool(), &encoded)?;
+        let (rows, carried) = self.rows_to_repack(database.pool(), page)?;
+        let borrowed: Vec<Vec<Datum<'_>>> = rows
+            .iter()
+            .map(|row| row.iter().map(OwnedDatum::borrow).collect())
+            .collect();
+        let builder = LeafBuilder::new(
+            self.page_size(),
+            self.tree_id(),
+            self.columns().to_vec(),
+            self.key_columns(),
+        )?;
+        let fits = matches!(
+            builder.pack_with(&borrowed, COMPACT_FILL, Some(&mut Measuring))?,
+            Packed::Filled { rows: packed, .. } if packed == borrowed.len()
+        );
+        if fits {
+            return self.repack(database, log, page, &path, &borrowed, &carried, false);
+        }
+        // **The wider rows need more than one page, and a split makes two.** Several
+        // columns added to a full leaf can take it to three pages or more. So the leaf
+        // is split first with the columns it has, which halves it, and each half is
+        // widened in turn, splitting again if it still does not fit. The halves are
+        // found again by their keys, because a split of a root moves the left half.
+        let first = rows.first().map(|row| row.to_vec()).unwrap_or_default();
+        let last = rows.last().map(|row| row.to_vec()).unwrap_or_default();
+        self.split_short_leaf(database, log, page, &path)?;
+        for edge in [first, last] {
+            let probe: Vec<Datum<'_>> = edge
+                .iter()
+                .take(self.key_columns())
+                .map(OwnedDatum::borrow)
+                .collect();
+            let encoded = self.encode_key(&probe);
+            let half = self.leaf_for(database.pool(), &encoded)?.0;
+            if self.leaf_is_short(database.pool(), half)? {
+                self.widen_short_leaf(database, log, half, &probe)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Splits a short leaf in two, each half as short as the leaf was.
+    ///
+    /// **The tree is made to look as it did when the leaf was written, for the length of
+    /// one call.** The split packs rows with the tree's column list, and a short leaf's
+    /// rows have fewer values than that. So the column list and the pad are set aside,
+    /// the leaf is read and split as the narrower tree it was written for, and both are
+    /// put back whether the split worked or not. Nothing is read from the tree by anyone
+    /// else in between: the write path holds the tree by `&mut`.
+    ///
+    /// @param database - the file
+    /// @param log - where the records go
+    /// @param page - the short leaf
+    /// @param path - the interior pages above it, root first
+    fn split_short_leaf(
+        &mut self,
+        database: &mut Database,
+        log: &mut dyn TreeLog,
+        page: PageId,
+        path: &[PageId],
+    ) -> DbResult<()> {
+        let physical = {
+            let guard = database.pool().fetch(page)?;
+            LeafRef::parse(&guard)?.physical_column_count()
+        };
+        let wide_columns = self.columns.clone();
+        let wide_pad = std::mem::take(&mut self.pad);
+        self.columns.truncate(physical);
+        let split = (|| {
+            let (rows, carried) = self.rows_to_repack(database.pool(), page)?;
+            let borrowed: Vec<Vec<Datum<'_>>> = rows
+                .iter()
+                .map(|row| row.iter().map(OwnedDatum::borrow).collect())
+                .collect();
+            // **The fill that keeps half the rows on the left, so the leaf divides in the
+            // middle.** A split keeps on the left the rows that fit in the fraction it
+            // is given, and the rows of a leaf that fits with room to spare would all fit
+            // in half a page, which leaves one row on the right. The fraction is found by
+            // bisection, because the size of a prefix of rows is not a closed form of
+            // the count.
+            let builder = LeafBuilder::new(
+                self.page_size(),
+                self.tree_id(),
+                self.columns().to_vec(),
+                self.key_columns(),
+            )?;
+            let wanted = borrowed.len() / 2;
+            let (mut low, mut high) = (0.02f64, 1.0f64);
+            for _ in 0..12 {
+                let middle = (low + high) / 2.0;
+                let placed = match builder.pack_with(&borrowed, middle, Some(&mut Measuring))? {
+                    Packed::Filled { rows: placed, .. } => placed,
+                    Packed::RowTooLarge => 0,
+                };
+                match placed >= wanted {
+                    true => high = middle,
+                    false => low = middle,
+                }
+            }
+            let fill = high;
+            self.split_carrying(database, log, page, path, &borrowed, Some(&carried), fill)
+        })();
+        self.columns = wide_columns;
+        self.pad = wide_pad;
+        split.map(|_| ())
     }
 
     /// Writes a row the delta area cannot take, and reports the row it replaced.

@@ -10,6 +10,19 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**`ALTER TABLE ... ADD COLUMN` takes time that does not depend on the number of rows.** It read every
+row, built a new tree from them and freed the old one: 783 ms for `ADD COLUMN e DEFAULT 5` on 800,000
+rows, where SQLite takes 19, and 1,841 ms with a `CHECK`. It now writes the catalog row and no leaf
+when the default is a literal. A leaf written before the column existed reads the default for it, and
+is rewritten with the column the first time a write lands in it, one leaf at a time. A read writes
+nothing, a delete widens nothing, and a table with no row, a statement inside a transaction and a
+default the engine has to evaluate take the old path. `CHECK` is still run over the existing rows,
+as SQLite runs it. The first such column moves the file to **format 4**, with a log record of its own,
+`FormatRaised`: a release that stops at format 3 refuses the file with
+`this database is format version 4 and this build reads version 3`, and refuses a log that holds the
+record by kind. A file that never gains a column on a table with rows stays at the format it had.
+`docs/relational-architecture.md` has the details.
+
 **`VACUUM aux` shortens the file of an attached database.** It used to fold the log and leave the
 file at its old length. A delete that left every leaf a tenth full freed one page of 147, so the
 free map had nothing to give back either. `VACUUM aux` now packs each table and index of the

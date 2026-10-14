@@ -198,3 +198,28 @@ impl PagedTree {
         self.shape.get().map(|(_, leaf)| leaf)
     }
 }
+
+impl PagedTree {
+    /// Gives the tree its columns as the catalog now declares them, and says what
+    /// a leaf written with fewer reads as for the ones it lacks.
+    ///
+    /// **This is how `ALTER TABLE ... ADD COLUMN` changes a table of any size in
+    /// time that does not depend on the rows.** No leaf is written. The catalog
+    /// row changes, and the tree takes the longer column list here, so a leaf
+    /// with the old count is read through [`crate::leaf::TreePad`] and written
+    /// back, wider, the first time anything writes to it (see
+    /// `PagedTree::widen_short_leaf`). The key columns do not change, so neither
+    /// does the order the tree is stored in.
+    ///
+    /// @param columns - the column directory, key columns first, at least as long as the one before
+    /// @param fills - what each column reads as in a leaf written without it; short means NULL
+    pub fn set_shape(&mut self, columns: Vec<ColumnSpec>, fills: Vec<crate::datum::OwnedDatum>) {
+        self.pad = crate::leaf::TreePad::new(columns.clone(), fills);
+        self.columns = columns;
+    }
+
+    /// Returns what a leaf written before the tree gained a column reads as for it.
+    pub fn pad(&self) -> &crate::leaf::TreePad {
+        &self.pad
+    }
+}
