@@ -30,6 +30,22 @@ Describe 'Test-InstallPage' {
     }
 }
 
+Describe 'Test-LlmsPage' {
+    It 'accepts a page that names no version and links the install page' {
+        $text = "# Inillucent`n`n- Install (for an agent to follow): https://inillucent.com/install.md`n"
+        Test-LlmsPage -Text $text -Version '2.7.1' | Should BeNullOrEmpty
+    }
+
+    It 'refuses a page that names another release' {
+        $text = "# Inillucent 2.6.0`n`n- Install: https://inillucent.com/install.md`n"
+        Test-LlmsPage -Text $text -Version '2.7.1' | Should Be 'inillucent.com/llms.txt names 2.6.0, which no release rewrites'
+    }
+
+    It 'refuses a page that does not link the install page' {
+        Test-LlmsPage -Text "# Inillucent`n" -Version '2.7.1' | Should Be 'inillucent.com/llms.txt does not send the reader to https://inillucent.com/install.md'
+    }
+}
+
 Describe 'update-install-page.mjs' {
     It 'rewrites every version and the archive list, and the result passes' {
         $page = Join-Path $env:TEMP "install-page-test-$PID.md"
