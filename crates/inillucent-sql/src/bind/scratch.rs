@@ -179,6 +179,77 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Binds the query of a derived table, which cannot name the terms beside it.
+    ///
+    /// **A derived table sees the queries around its block and not the other
+    /// FROM terms of its own block (bug hunt 10).** `FROM b AS m, (SELECT c.z
+    /// FROM c WHERE c.w <= m.y) AS d` is `no such column: m.y` in SQLite, and
+    /// it was bound against `m` here and failed when it ran with "the tree
+    /// read for FROM term 1 does not carry column 0". The block's scope stays
+    /// on the stack, emptied while the query is bound, so a correlation to a
+    /// block further out is still found and still passed outward. A
+    /// parenthesised join is the same: `FROM a, (b JOIN c ON c.z = a.x)` is
+    /// `no such column: a.x`.
+    ///
+    /// @param select - the derived table's query
+    pub(super) fn bind_derived_select(
+        &mut self,
+        select: ast::SelectId,
+    ) -> Result<super::BoundSelect, super::ParseError> {
+        let siblings = self.scopes.last_mut().map(core::mem::take);
+        let bound = self.bind_select(select);
+        if let (Some(scope), Some(slot)) = (siblings, self.scopes.last_mut()) {
+            *slot = scope;
+        }
+        bound
+    }
+
+    /// Binds every arm after the head, in a scope that does not hold the head's terms.
+    ///
+    /// **An arm cannot name the head arm's FROM terms (bug hunt 10).** The head
+    /// arm's scope is still the innermost one while the other arms are bound,
+    /// so `SELECT 1 FROM t1 UNION ALL SELECT b FROM (SELECT 1 AS x)` resolved
+    /// `b` to `t1.b`, and failed at run time instead of at prepare time with
+    /// "no such column: b". The scope stays on the stack, emptied while the
+    /// arms are bound, so a correlation to an enclosing block is still passed
+    /// outward exactly as before.
+    ///
+    /// @param select - the statement as written
+    /// @param bound - the head arm, which the other arms are added to
+    pub(super) fn bind_other_arms(
+        &mut self,
+        select: &ast::Select,
+        bound: &mut super::BoundSelect,
+    ) -> Result<(), super::ParseError> {
+        let head_scope = self.scopes.last_mut().map(core::mem::take);
+        let armed = self.bind_arms_in_order(select, bound.columns.len());
+        if let (Some(scope), Some(slot)) = (head_scope, self.scopes.last_mut()) {
+            *slot = scope;
+        }
+        bound.compounds.extend(armed?);
+        Ok(())
+    }
+
+    /// Binds each compound arm of a statement and checks its width.
+    ///
+    /// @param select - the statement as written
+    /// @param width - how many result columns the head arm has
+    fn bind_arms_in_order(
+        &mut self,
+        select: &ast::Select,
+        width: usize,
+    ) -> Result<Vec<(ast::CompoundOp, super::BoundSelect)>, super::ParseError> {
+        let mut arms = Vec::with_capacity(select.compounds.len());
+        for (op, arm) in &select.compounds {
+            let armed = self.bind_isolated_arm(*arm)?;
+            if armed.columns.len() != width {
+                return Err(super::refusal::compound_width_mismatch(*op, select.span));
+            }
+            arms.push((*op, armed));
+        }
+        Ok(arms)
+    }
+
     /// Opens a query block: a fresh scope, and fresh per-block state.
     pub(super) fn enter_block(&mut self) -> BlockFrame {
         self.scopes.push(Vec::new());

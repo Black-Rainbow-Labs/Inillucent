@@ -20,9 +20,9 @@ mod using;
 // The refusals live in `bind/refusal.rs` and are named here so every call
 // site reads as it did. See that file for why they moved.
 pub(crate) use refusal::{
-    ambiguous_column, compound_order_unmatched, compound_width_mismatch, group_out_of_range,
-    no_query_solution, no_such_collation, no_such_column, no_such_column_quoted, no_such_function,
-    no_such_index, no_such_table, order_out_of_range, qualify_missing_table, schema_refused,
+    ambiguous_column, compound_order_unmatched, group_out_of_range, no_query_solution,
+    no_such_collation, no_such_column, no_such_column_quoted, no_such_function, no_such_index,
+    no_such_table, order_out_of_range, qualify_missing_table, schema_refused,
     subquery_width_mismatch, too_many_arguments, unconnected_module, unsupported,
     values_width_mismatch, wrong_arguments,
 };
@@ -52,6 +52,7 @@ mod nested_names;
 mod order_alias;
 mod ordinal;
 mod outer_aggregate;
+mod plain_value;
 mod raise;
 mod rowvalue;
 mod rowvalue_query;
@@ -66,6 +67,7 @@ use collation::apply_collation;
 pub use collation::result_collation;
 pub use comparison_rules::{comparison_rules, comparison_rules_over};
 use literal::checked_integer_literal;
+use outer_aggregate::exists_block;
 pub use set_rules::{compound_collation, in_list_rules};
 
 use cte::RecursiveTarget;
@@ -1187,6 +1189,8 @@ pub struct Binder<'a> {
     pub(crate) excluded: Option<crate::catalog_view::TableInfo>,
     /// The row `OLD` and `NEW` name while a trigger body is bound.
     pub(crate) row_aliases: Option<RowAliases>,
+    /// Whether a `RETURNING` clause is being bound, which may name `RAISE`.
+    pub(crate) in_returning: bool,
     /// The FROM term a write to a view runs against, when the target is one.
     ///
     /// A view has no rows of its own, so an `UPDATE` or `DELETE` on one is
@@ -1437,6 +1441,7 @@ impl<'a> Binder<'a> {
             named_windows: Vec::new(),
             excluded: None,
             row_aliases: None,
+            in_returning: false,
             view_target: None,
             firing: Vec::new(),
             trigger_depth: crate::dml::MAX_TRIGGER_DEPTH,
@@ -1596,6 +1601,7 @@ impl<'a> Binder<'a> {
                 select.span,
             ));
         }
+        let exists = std::mem::take(&mut self.outer.exists_next);
         let frame = self.enter_block();
         let depth = self.scopes.len();
         self.open_statement(depth);
@@ -1621,7 +1627,7 @@ impl<'a> Binder<'a> {
         let used = self.take_outer_use(depth);
         let ids = self.leave_block(frame);
         outcome?;
-        self.settle_outer_aggregates()?;
+        self.settle_outer_aggregates_after(exists)?;
         bound.sources = ids
             .iter()
             .filter_map(|id| self.sources.get(*id).cloned())
@@ -1650,13 +1656,7 @@ impl<'a> Binder<'a> {
         select: &'a ast::Select,
         bound: &mut BoundSelect,
     ) -> Result<(), ParseError> {
-        for (op, arm) in &select.compounds {
-            let armed = self.bind_isolated_arm(*arm)?;
-            if armed.columns.len() != bound.columns.len() {
-                return Err(compound_width_mismatch(*op, select.span));
-            }
-            bound.compounds.push((*op, armed));
-        }
+        self.bind_other_arms(select, bound)?;
         // **The result columns are read where they are, not copied first
         // (task-2026).** `bound` is a parameter rather than a field, so a
         // shared borrow of its columns and the mutable borrow of the binder are
@@ -1812,7 +1812,7 @@ impl<'a> Binder<'a> {
         let pending = self.pending_for_the_where();
         let attempted = filter.map(|expr| {
             let offered = self.offer_where_aliases(columns);
-            let bound = self.bind_expr(expr);
+            let bound = self.bind_plain_value(expr);
             if offered {
                 self.forget_where_aliases();
             }
@@ -1863,7 +1863,7 @@ impl<'a> Binder<'a> {
         self.allow_aggregates = true;
         self.in_group_by = false;
         let mut bound_having = match having {
-            Some(expr) => Some(self.bind_expr(*expr)?),
+            Some(expr) => Some(self.bind_plain_value(*expr)?),
             None => None,
         };
         having::refuse_when_nothing_aggregates(
@@ -2338,7 +2338,7 @@ impl<'a> Binder<'a> {
         span: Span,
     ) -> Result<(), ParseError> {
         let nested = self.ast.select(select).is_some_and(|held| held.nested_from);
-        let mut bound = self.bind_select(select)?;
+        let mut bound = self.bind_derived_select(select)?;
         let origins = if nested {
             self.expose_using_columns(&mut bound)?
         } else {
@@ -3521,7 +3521,10 @@ impl<'a> Binder<'a> {
                 self.bind_call_with(name, distinct, arguments, filter, &order_by, span)
             }
             Expr::Exists { negated, select } => {
-                let block = exists_block(self.bind_value_subquery(select, span)?);
+                self.outer.exists_next = true;
+                let bound = self.bind_value_subquery(select, span);
+                self.outer.exists_next = false;
+                let block = exists_block(bound?);
                 Ok(BoundExpr::Subquery {
                     id: self.next_subquery_id(),
                     kind: SubqueryKind::Exists,
@@ -4456,26 +4459,6 @@ fn no_such_window(name: &[u8], span: Span) -> ParseError {
 /// Returns an authorizer refusal.
 fn denied(what: &'static str, span: Span) -> ParseError {
     ParseError::new(ParseErrorKind::Unsupported(what), span)
-}
-
-/// Replaces the select list of an `EXISTS` block with the constant 1.
-///
-/// **The select list of an `EXISTS` is never evaluated.** SQLite replaces it
-/// with the constant 1, so `EXISTS (SELECT json('bad') FROM t)` is true however
-/// many rows `t` has.
-///
-/// @param block - the bound subquery
-fn exists_block(mut block: BoundSelect) -> BoundSelect {
-    if block.compounds.is_empty() && block.values.is_empty() {
-        block.columns = vec![BoundResultColumn {
-            expr: BoundExpr::Integer(1),
-            name: b"1".to_vec(),
-            origin: None,
-            declared_type: Vec::new(),
-            written: None,
-        }];
-    }
-    block
 }
 
 /// Returns the constant SQLite folds an `AND` or an `OR` to, when one operand

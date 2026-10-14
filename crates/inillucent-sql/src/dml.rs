@@ -1038,7 +1038,7 @@ impl<'a> Binder<'a> {
         let (joined, arguments) = self.bind_update_from(&update.from)?;
         let assignments = self.bind_update_assignments(update, &table)?;
         let mut filter = match update.filter {
-            Some(expr) => Some(self.bind_expr(expr)?),
+            Some(expr) => Some(self.bind_plain_value(expr)?),
             None => None,
         };
         for constraint in arguments {
@@ -1153,7 +1153,7 @@ impl<'a> Binder<'a> {
         refuse_module_returning(&table, &delete.returning, "DELETE")?;
         let index_exprs = self.bind_index_exprs(&table)?;
         let filter = match delete.filter {
-            Some(expr) => Some(self.bind_expr(expr)?),
+            Some(expr) => Some(self.bind_plain_value(expr)?),
             None => None,
         };
         let returning = self.bind_returning(&delete.returning)?;
@@ -2742,7 +2742,7 @@ impl<'a> Binder<'a> {
         value: ast::ExprId,
     ) -> Result<Vec<BoundExpr>, ParseError> {
         if names.len() == 1 {
-            return Ok(vec![self.bind_expr(value)?]);
+            return Ok(vec![self.bind_plain_value(value)?]);
         }
         let span = self.ast.expr_span(value);
         let values = match self.ast.expr(value) {
@@ -2794,7 +2794,12 @@ impl<'a> Binder<'a> {
         for column in columns {
             self.refuse_schema_qualified_column(column.expr)?;
         }
-        self.bind_result_columns_public(columns)
+        // SQLite lets a `RETURNING` expression call `RAISE` outside a trigger
+        // (bug hunt 10); the flag is what `bind_raise` reads.
+        self.in_returning = true;
+        let bound = self.bind_result_columns_public(columns);
+        self.in_returning = false;
+        bound
     }
 
     /// Refuses a column written with a schema name inside a `RETURNING` expression.

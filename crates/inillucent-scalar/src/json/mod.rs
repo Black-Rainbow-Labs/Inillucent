@@ -340,23 +340,44 @@ fn error_position(arguments: &[Argument<'_>]) -> DbResult<Answer> {
             let Ok(source) = std::str::from_utf8(&bytes) else {
                 return Ok(Answer::plain(Value::Integer(1)));
             };
-            Ok(Answer::plain(Value::Integer(match parse::parse(source) {
-                Ok(_) => 0,
-                // The parser counts bytes; SQLite reports characters, so a multi byte
-                // character before the error counts once (bug hunt 10).
-                Err(failure) => {
-                    let before = failure.position.saturating_sub(1);
-                    let characters = source
-                        .as_bytes()
-                        .iter()
-                        .take(before)
-                        .filter(|byte| (**byte & 0xc0) != 0x80)
-                        .count();
-                    characters.saturating_add(1) as i64
-                }
-            })))
+            Ok(Answer::plain(Value::Integer(text_error_position(source))))
+        }
+        // **A blob that is not valid JSONB is read as text (bug hunt 10).** That
+        // is what the document readers do, so the position is where the text
+        // reading fails: `x'80'` and the empty blob fail at 1, `x'7b'` (an open
+        // brace) at 2. A blob that decodes as JSONB has no error. It used to
+        // answer 0 for every blob.
+        Value::Blob(blob) => {
+            if binary::from_blob(blob.raw()).is_ok() {
+                return Ok(Answer::plain(Value::Integer(0)));
+            }
+            let source = String::from_utf8_lossy(blob.raw());
+            Ok(Answer::plain(Value::Integer(text_error_position(&source))))
         }
         _ => Ok(Answer::plain(Value::Integer(0))),
+    }
+}
+
+/// Returns the one based character position where JSON text stops parsing, or
+/// zero when it parses.
+///
+/// The parser counts bytes and SQLite reports characters, so a multi byte
+/// character before the error counts once (bug hunt 10).
+///
+/// @param source - the text
+fn text_error_position(source: &str) -> i64 {
+    match parse::parse(source) {
+        Ok(_) => 0,
+        Err(failure) => {
+            let before = failure.position.saturating_sub(1);
+            let characters = source
+                .as_bytes()
+                .iter()
+                .take(before)
+                .filter(|byte| (**byte & 0xc0) != 0x80)
+                .count();
+            characters.saturating_add(1) as i64
+        }
     }
 }
 
@@ -652,6 +673,11 @@ fn array_insert(arguments: &[Argument<'_>], binary: bool) -> DbResult<Answer> {
         let (Some(target), Some(value)) = (pair.first(), pair.get(1)) else {
             continue;
         };
+        // A NULL path inserts nothing, and the document comes back as it was,
+        // as it does for `json_set` (bug hunt 10).
+        if target.value.is_null() {
+            continue;
+        }
         let steps = path_of(target)?;
         let written = match target.value {
             Value::Text(text) => String::from_utf8_lossy(&text.utf8_bytes()).into_owned(),
@@ -690,7 +716,13 @@ fn merge_patch(arguments: &[Argument<'_>], binary: bool) -> DbResult<Answer> {
     let (Some(first), Some(second)) = (arguments.first(), arguments.get(1)) else {
         return Ok(Answer::null());
     };
-    let (Some(mut target), Some(updates)) = (document(first)?, document(second)?) else {
+    // **A NULL target answers NULL before the patch is read (bug hunt 10).**
+    // `json_patch(NULL, '{')` is NULL in SQLite, which parses the patch only
+    // for a target that is a document.
+    let Some(mut target) = document(first)? else {
+        return Ok(Answer::null());
+    };
+    let Some(updates) = document(second)? else {
         return Ok(Answer::null());
     };
     path::patch(&mut target, &updates);

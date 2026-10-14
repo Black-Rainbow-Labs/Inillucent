@@ -657,7 +657,7 @@ fn a_statement_past_the_depth_limit_does_not_end_the_server() {
     let deep = format!("SELECT {}1{}", "abs(".repeat(2_000), ")".repeat(2_000));
     let refused = session.tool("inillucent_query", &format!("{{\"sql\":\"{deep}\"}}"));
     assert!(
-        refused.contains("depth exceeded"),
+        refused.contains("Recursion limit") || refused.contains("Expression tree is too large"),
         "a statement 2,000 deep was not refused by a limit:\n{}",
         &refused[..refused.len().min(400)]
     );

@@ -731,7 +731,16 @@ impl VirtualCursor for Fts5Cursor {
             return Ok(());
         };
         self.pattern = pattern.clone();
-        let query = Query::parse(&pattern, &self.tokenizer, &self.names)?;
+        // The FTS3 and FTS4 front end reads `-` as an operator (bug hunt 10).
+        let parsed = if self.dialect == Dialect::Three {
+            match expr::fts3_pattern(&pattern)? {
+                Some(rewritten) => rewritten,
+                None => return Ok(()),
+            }
+        } else {
+            pattern
+        };
+        let query = Query::parse(&parsed, &self.tokenizer, &self.names)?;
         // **The buffered totals, not the row.** A score is computed from the
         // document count and the token totals, and those are staged rather than
         // written per document - so a query inside the same transaction that

@@ -130,12 +130,35 @@ impl Parser<'_> {
         let order_by = if self.at_keyword(Keyword::ORDER)? {
             self.bump()?;
             self.expect_keyword(Keyword::BY)?;
-            self.parse_order_terms()?
+            let terms = self.parse_order_terms()?;
+            self.refuse_too_many_terms(terms.len(), "too many terms in ORDER BY clause")?;
+            terms
         } else {
             Vec::new()
         };
         let (limit, offset) = self.parse_limit_clause()?;
         Ok((order_by, limit, offset))
+    }
+
+    /// Refuses an `ORDER BY` or `GROUP BY` list longer than a result set may be.
+    ///
+    /// SQLite bounds both by `SQLITE_MAX_COLUMN` and words the refusal as the
+    /// limit itself (bug hunt 10); 3,000 terms were accepted here.
+    ///
+    /// @param count - how many terms the clause has
+    /// @param said - SQLite's words for the clause
+    fn refuse_too_many_terms(
+        &mut self,
+        count: usize,
+        said: &'static str,
+    ) -> Result<(), ParseError> {
+        if count as i64 > self.limits.get(Limit::Column) {
+            return Err(ParseError::new(
+                ParseErrorKind::LimitExceeded(said),
+                Span::at(self.cursor()),
+            ));
+        }
+        Ok(())
     }
 
     /// Parses `LIMIT expr [OFFSET expr | , expr]`.
@@ -290,6 +313,7 @@ impl Parser<'_> {
                     break;
                 }
             }
+            self.refuse_too_many_terms(group_by.len(), "too many terms in GROUP BY clause")?;
         }
         // **`HAVING` is parsed whether or not a `GROUP BY` came first
         // (task-2040).** It used to be read inside the `GROUP BY` arm, so

@@ -126,8 +126,9 @@ fn adversarial_depth_is_refused_rather_than_crashing() {
             Err(failure) => failure,
             Ok(_) => panic!("depth {depth} must be refused"),
         };
+        // SQLite words the parser's own depth refusal as "Recursion limit".
         assert!(
-            failure.message().contains("depth"),
+            failure.message().contains("depth") || failure.message().contains("Recursion limit"),
             "depth {depth}: {}",
             failure.message()
         );

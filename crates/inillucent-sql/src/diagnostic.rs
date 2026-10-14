@@ -116,8 +116,17 @@ impl ParseError {
             ParseErrorKind::LimitExceeded(
                 what @ ("too many terms in compound SELECT"
                 | "too many columns in result set"
+                | "too many terms in ORDER BY clause"
+                | "too many terms in GROUP BY clause"
                 | "string or blob too big"),
             ) => (*what).to_string(),
+            // SQLite's two depth refusals, in its words (bug hunt 10): an
+            // expression more than 1,000 levels deep, and a statement whose
+            // nesting overflows the parser's stack.
+            ParseErrorKind::LimitExceeded("expression tree depth") => {
+                "Expression tree is too large (maximum depth 1000)".to_string()
+            }
+            ParseErrorKind::LimitExceeded("parser stack depth") => "Recursion limit".to_string(),
             ParseErrorKind::LimitExceeded(what) => format!("{what} exceeded"),
         }
     }

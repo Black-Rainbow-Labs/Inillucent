@@ -47,8 +47,47 @@ impl Binder<'_> {
             }
             return Some(name);
         }
+        // **A subquery in a `LIMIT` reads no column outside itself either (bug
+        // hunt 10).** SQLite resolves the whole expression with an empty name
+        // context, so `LIMIT (SELECT 1 WHERE m.y)` fails with "no such column"
+        // whether `m` belongs to the block or to an enclosing query. The
+        // block's `correlations` list the terms it reads from outside itself.
+        if let BoundExpr::Subquery { block, .. } = expr {
+            if !block.correlations.is_empty() {
+                let mut found = None;
+                let mut copy = (**block).clone();
+                crate::rewrite::rewrite_select(&mut copy, &mut |held: &mut BoundExpr| {
+                    if let (None, BoundExpr::Column { source, column, .. }) = (&found, &*held) {
+                        if block.correlations.contains(source) {
+                            found = Some((*source, *column));
+                        }
+                    }
+                });
+                if let Some((source, column)) = found {
+                    return Some(self.qualified_name(source, column));
+                }
+            }
+        }
         expr.children()
             .into_iter()
             .find_map(|child| self.own_column_name(child, own))
+    }
+
+    /// Returns `alias.column` for a column of a FROM term, as it is written in
+    /// SQLite's "no such column" message for a column reached through a term.
+    ///
+    /// @param source - the FROM term's statement wide number
+    /// @param column - the column's position in the term's table
+    fn qualified_name(&self, source: usize, column: u16) -> Vec<u8> {
+        let term = self.sources.get(source);
+        let mut name = Vec::new();
+        if let Some(term) = term {
+            name.extend_from_slice(&term.alias);
+            name.push(b'.');
+        }
+        if let Some(info) = term.and_then(|term| term.table.columns.get(usize::from(column))) {
+            name.extend_from_slice(&info.name);
+        }
+        name
     }
 }

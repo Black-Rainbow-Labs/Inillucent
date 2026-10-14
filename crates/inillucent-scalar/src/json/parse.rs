@@ -74,7 +74,9 @@ pub fn parse_pruned(text: &str, steps: &[Step]) -> Result<Parsed, ParseFailure> 
     }
     let node = parser.value_pruned(steps)?;
     parser.skip_space();
-    if parser.at != parser.bytes.len() {
+    // SQLite reads the text as a C string, so a zero byte after a complete value
+    // ends the document and whatever follows it is never read (bug hunt 10).
+    if parser.at != parser.bytes.len() && parser.peek() != Some(0) {
         return Err(parser.fail_at(0));
     }
     Ok(Parsed {
@@ -402,11 +404,16 @@ impl Parser<'_> {
             Some(b't') if self.word(b"true") => Ok(Node::True),
             Some(b'f') if self.word(b"false") => Ok(Node::False),
             Some(b'n') if self.word(b"null") => Ok(Node::Null),
-            Some(b'N') if self.word(b"NaN") => {
+            // **`nan`, `inf` and `infinity` in any letter case (bug hunt 10).**
+            // SQLite compares them without regard to case, so `json('inf')` is
+            // `9e999` and `json('nan')` is `null`.
+            Some(b'N' | b'n') if self.word_ignoring_case(b"nan") => {
                 self.used_json5 = true;
                 Ok(Node::Null)
             }
-            Some(b'I') if self.word(b"Infinity") => {
+            Some(b'I' | b'i')
+                if self.word_ignoring_case(b"infinity") || self.word_ignoring_case(b"inf") =>
+            {
                 self.used_json5 = true;
                 Ok(Node::Float("9e999".to_string()))
             }
@@ -422,6 +429,29 @@ impl Parser<'_> {
     fn word(&mut self, keyword: &[u8]) -> bool {
         let end = self.at.saturating_add(keyword.len());
         if self.bytes.get(self.at..end) != Some(keyword) {
+            return false;
+        }
+        if self
+            .bytes
+            .get(end)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            return false;
+        }
+        self.at = end;
+        true
+    }
+
+    /// Consumes a bare keyword, whatever its letter case, when it is the next
+    /// thing in the text and is not the start of a longer word.
+    ///
+    /// @param keyword - the keyword in lower case
+    fn word_ignoring_case(&mut self, keyword: &[u8]) -> bool {
+        let end = self.at.saturating_add(keyword.len());
+        let Some(found) = self.bytes.get(self.at..end) else {
+            return false;
+        };
+        if !found.eq_ignore_ascii_case(keyword) {
             return false;
         }
         if self
@@ -650,7 +680,7 @@ impl Parser<'_> {
         } else if matches!(self.peek(), Some(b'-')) {
             self.at += 1;
         }
-        if self.word(b"Infinity") {
+        if self.word_ignoring_case(b"infinity") || self.word_ignoring_case(b"inf") {
             self.used_json5 = true;
             let negative = self.bytes.get(start) == Some(&b'-');
             return Ok(Node::Float(if negative {
@@ -659,7 +689,9 @@ impl Parser<'_> {
                 "9e999".to_string()
             }));
         }
-        if self.word(b"NaN") {
+        // SQLite refuses a signed `nan`: `+nan` and `-nan` are not JSON5 numbers
+        // there, though `-inf` is (bug hunt 10).
+        if self.at == start && self.word_ignoring_case(b"nan") {
             self.used_json5 = true;
             return Ok(Node::Null);
         }

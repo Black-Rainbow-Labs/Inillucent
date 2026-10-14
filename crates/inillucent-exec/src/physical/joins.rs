@@ -906,7 +906,7 @@ fn build_materialised_join<'t>(
 /// @param params - the bound parameters
 /// @param joined_types - the types of the pair's columns
 #[allow(clippy::type_complexity)]
-fn join_condition(
+pub(crate) fn join_condition(
     on: Option<&BoundExpr>,
     catalog: &dyn TreeCatalog,
     space: &Space<'_>,

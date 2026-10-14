@@ -278,12 +278,24 @@ impl Binder<'_> {
         written: &[u8],
         span: Span,
     ) -> Result<BoundExpr, ParseError> {
-        let level = self.aggregate_owner(&candidate.arguments);
+        let level = self.aggregate_owner(&candidate.arguments, candidate.filter.as_ref());
         let outside = level.saturating_add(1) < self.scopes.len()
             && self.can_host_outer_aggregate(level, &candidate);
         if outside {
             let deferred = !self.allow_aggregates;
             return Ok(self.attach_outer_aggregate(level, candidate, written, span, deferred));
+        }
+        // **A call that belongs to an enclosing `UPDATE`, `DELETE` or trigger
+        // body is misuse, as it is in SQLite (bug hunt 10).** Those compute no
+        // aggregates, so `UPDATE a SET y = (SELECT sum(a.x) FROM b)` is refused
+        // where the call used to be computed inside the subquery.
+        // A `RETURNING` clause is the exception: SQLite computes the call inside
+        // the subquery there, once for each row the statement changes.
+        if level.saturating_add(1) < self.scopes.len()
+            && !self.in_returning
+            && self.owner_computes_no_aggregates(level)
+        {
+            return Err(self.misplaced_outer_aggregate(written, span));
         }
         if misplaced {
             return Err(self.aggregate_misuse(written, span));

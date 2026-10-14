@@ -520,7 +520,9 @@ fn a_statement_at_the_depth_limit_answers_and_one_past_it_names_the_limit() {
         );
         let said = ran.said();
         assert!(
-            said.contains("depth exceeded") || said.contains("nested SELECT"),
+            said.contains("Recursion limit")
+                || said.contains("Expression tree is too large")
+                || said.contains("nested SELECT"),
             "shape {build}: nothing named a limit for a statement {over} deep:\n{said}"
         );
         assert!(

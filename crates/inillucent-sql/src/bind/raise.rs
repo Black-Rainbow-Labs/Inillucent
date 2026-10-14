@@ -1,7 +1,8 @@
 //! Binding `RAISE(...)`.
 //!
-//! Invariant: **a `RAISE` binds only inside a trigger body, and its message is
-//! any expression.** A string literal is kept as text, which is what the
+//! Invariant: **a `RAISE` binds only inside a trigger body, or as `ABORT`,
+//! `FAIL` or `ROLLBACK` in a `RETURNING` clause, and its message is any
+//! expression.** A string literal is kept as text, which is what the
 //! foreign key bodies the binder synthesises use; anything else is bound over
 //! the trigger's row and evaluated when the `RAISE` fires.
 
@@ -29,7 +30,11 @@ impl Binder<'_> {
     ) -> Result<BoundExpr, ParseError> {
         // Outside a trigger body there is nothing for it to abandon, so
         // SQLite refuses it there rather than treating it as a no-op.
-        if self.row_aliases.is_none() {
+        // Except in a `RETURNING` clause, where `ABORT`, `FAIL` and `ROLLBACK`
+        // fail the statement with the message (bug hunt 10). `IGNORE` has no
+        // row to abandon there and keeps the refusal.
+        let returning_failure = self.in_returning && action != RaiseAction::Ignore;
+        if self.row_aliases.is_none() && !returning_failure {
             // SQLite prints no position for this failure.
             let _ = span;
             return Err(schema_refused(

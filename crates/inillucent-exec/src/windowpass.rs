@@ -117,7 +117,6 @@ pub fn run_windowed(
     // single group holds every call in the order the binder numbered them.
     if let [group] = groups.as_slice() {
         let pass = window_plan(select, &pre, group)?;
-        let values = crate::window::compute_values(&rows, &pass)?;
         let calls = group.slots.len();
         let in_order = group
             .slots
@@ -125,6 +124,13 @@ pub fn run_windowed(
             .enumerate()
             .all(|(nth, slot)| nth == *slot)
             && calls == select.windows.len();
+        let (values, failure) = crate::window::compute_values_until_failure(&rows, &pass);
+        if let Some(failure) = failure {
+            if in_order {
+                keep_rows_before_failure(select, &pre, width, &rows, &values, &failure, params);
+            }
+            return Err(failure.error);
+        }
         if in_order {
             let mut values = values.into_iter();
             let widened: Vec<Vec<OwnedDatum>> = rows
@@ -180,6 +186,57 @@ pub fn run_windowed(
         }
     }
     project_over_window(select, &pre, width, widened, params)
+}
+
+/// Keeps the result rows of the rows computed before a window call failed, for
+/// whoever reports the failure.
+///
+/// **SQLite answers the rows before the one that raised the error (bug hunt
+/// 10).** `SELECT sum(a) OVER (ORDER BY a)` over 1, 3 and 9223372036854775807
+/// returns `1` and `4` and then `integer overflow`. That only holds when
+/// nothing after the window has to see every row first: with an outer `ORDER
+/// BY` or a `DISTINCT` nothing is answered before the error, so no row is kept.
+///
+/// @param select - the bound statement
+/// @param pre - the buffered row's expressions
+/// @param width - how many columns the buffered row had before the pass
+/// @param rows - the buffered input
+/// @param values - the window values computed, `calls` for each row
+/// @param failure - the first row that could not be computed
+/// @param params - the bound parameters
+fn keep_rows_before_failure(
+    select: &BoundSelect,
+    pre: &[BoundExpr],
+    width: usize,
+    rows: &[Vec<OwnedDatum>],
+    values: &[OwnedDatum],
+    failure: &crate::window::WindowFailure,
+    params: &Params,
+) {
+    if !select.order_by.is_empty() || select.distinct || failure.before == 0 {
+        return;
+    }
+    let calls = select.windows.len();
+    let widened: Vec<Vec<OwnedDatum>> = rows
+        .iter()
+        .take(failure.before)
+        .enumerate()
+        .map(|(at, row)| {
+            let mut whole = row.clone();
+            let from = at.saturating_mul(calls);
+            whole.extend(
+                values
+                    .get(from..from.saturating_add(calls))
+                    .unwrap_or(&[])
+                    .iter()
+                    .cloned(),
+            );
+            whole
+        })
+        .collect();
+    if let Ok((answered, _)) = project_over_window(select, pre, width, widened, params) {
+        crate::physical::keep_partial_rows(answered);
+    }
 }
 
 /// Returns roughly how many bytes a buffer of owned rows holds.

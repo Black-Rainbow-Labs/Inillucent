@@ -139,6 +139,10 @@ pub fn widest_request(arguments: &[Value<'static>]) -> Option<u64> {
         }
         let precision = match spec.conversion {
             b's' | b'z' | b'q' | b'Q' | b'w' | b'%' | b'n' => 0,
+            // SQLite caps the digits of a real at 100,000,000 whatever the
+            // precision asks for, so `%.*f` with 2147483647 answers 100,000,002
+            // characters and is not refused (bug hunt 10).
+            b'f' | b'e' | b'E' | b'g' | b'G' => spec.precision.unwrap_or(0).min(100_000_000),
             _ => spec.precision.unwrap_or(0),
         };
         widest = widest.max(spec.width as u64).max(precision as u64);

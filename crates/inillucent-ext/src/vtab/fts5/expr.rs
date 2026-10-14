@@ -132,6 +132,69 @@ impl Query {
     }
 }
 
+/// Rewrites the `-` operator of an FTS3 or FTS4 query into the FTS5 spelling.
+///
+/// **A table made with `fts3` or `fts4` reads `-` as an operator, not as FTS5's
+/// column filter (bug hunt 10).** `MATCH 'x -y'` is `x` and not `y`. A `-` that
+/// is not directly followed by a term is only a separator, so `MATCH '- a'` is
+/// the query `a`; it was refused with an FTS5 message about a column filter.
+/// A `-term` with nothing before it, and a quote that is never closed, are
+/// SQLite's `malformed MATCH expression: [...]`. A query with no terms at all
+/// matches nothing, and `None` says so.
+///
+/// @param text - the query the `MATCH` operand was given
+pub fn fts3_pattern(text: &[u8]) -> DbResult<Option<Vec<u8>>> {
+    let malformed = || {
+        syntax(format!(
+            "malformed MATCH expression: [{}]",
+            String::from_utf8_lossy(text)
+        ))
+    };
+    let mut out = Vec::with_capacity(text.len().saturating_add(8));
+    let (mut quoted, mut has_term) = (false, false);
+    for (at, byte) in text.iter().copied().enumerate() {
+        if byte == b'"' {
+            quoted = !quoted;
+            has_term = true;
+            out.push(byte);
+            continue;
+        }
+        if quoted {
+            out.push(byte);
+            continue;
+        }
+        // Only a `-` that begins a word is the operator; one inside a word
+        // stays as it was written.
+        let begins_word = out
+            .last()
+            .is_none_or(|before| before.is_ascii_whitespace() || *before == b'(');
+        if byte == b'-' && begins_word {
+            let starts_term = text
+                .get(at.saturating_add(1))
+                .is_some_and(|next| next.is_ascii_alphanumeric() || *next >= 0x80 || *next == b'"');
+            if !starts_term {
+                out.push(b' ');
+            } else if has_term {
+                out.extend_from_slice(b" NOT ");
+            } else {
+                return Err(malformed());
+            }
+            continue;
+        }
+        if !byte.is_ascii_whitespace() && byte != b'(' && byte != b')' {
+            has_term = true;
+        }
+        out.push(byte);
+    }
+    if quoted {
+        return Err(malformed());
+    }
+    if out.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    Ok(Some(out))
+}
+
 impl Query {
     /// Returns where each `NEAR` group sits in the list of phrases.
     ///

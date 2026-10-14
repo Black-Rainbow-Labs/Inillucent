@@ -1523,7 +1523,7 @@ fn build_chain<'t>(
             .get(index)
             .ok_or_else(|| misuse("a stage vanished while building"))?;
         chain = build_nested(plan, catalog, space, params, stage, index, chain)?;
-        chain = hold_rows_before_join(plan, space, params, stage, chain)?;
+        chain = hold_rows_before_join(plan, catalog, space, params, stage, chain)?;
         chain = filter_rows_entering_join(plan, space, params, &prepared.stages, index, chain)?;
         operators.add(|| {
             format!(
@@ -1560,6 +1560,7 @@ fn build_chain<'t>(
 /// @param chain - the join, which the filter is put in front of
 fn hold_rows_before_join<'t>(
     plan: &PhysicalPlan,
+    catalog: &'t dyn TreeCatalog,
     space: &Space<'_>,
     params: &Params,
     stage: &PreparedStage,
@@ -1572,12 +1573,26 @@ fn hold_rows_before_join<'t>(
     else {
         return Ok(chain);
     };
-    let translated = translate_scan(before, space, params)?;
     let outer_types: Vec<StaticType> = space
         .types
         .get(..stage.offset)
         .map(<[StaticType]>::to_vec)
         .unwrap_or_default();
+    if inillucent_sql::plan::expression_holds_subquery(before) {
+        let (condition, correlated) =
+            super::joins::join_condition(Some(before), catalog, space, params, &outer_types)?;
+        if let Some(condition) = condition {
+            return Ok(Box::new(
+                HeldBefore::new(std::rc::Rc::from(condition), chain).with_correlations(
+                    correlated,
+                    catalog,
+                    params,
+                    outer_types.len(),
+                ),
+            ));
+        }
+    }
+    let translated = translate_scan(before, space, params)?;
     Ok(Box::new(HeldBefore::new(
         std::rc::Rc::from(compile(&translated, &outer_types)?),
         chain,
@@ -1701,6 +1716,15 @@ pub(crate) struct HeldBefore<'t> {
     selection: Vec<u32>,
     /// The join.
     downstream: Box<dyn Sink + 't>,
+    /// The subqueries of the terms that read a column of the entering row,
+    /// answered for each row and read by the predicate from the cells after it.
+    correlated: Vec<crate::correlate::Correlation>,
+    /// Where those subqueries read their tables.
+    catalog: Option<&'t dyn TreeCatalog>,
+    /// The values those subqueries run with.
+    answering: Params,
+    /// How many columns an entering row has.
+    width: usize,
 }
 
 impl<'t> HeldBefore<'t> {
@@ -1716,7 +1740,67 @@ impl<'t> HeldBefore<'t> {
             predicate,
             selection: Vec::new(),
             downstream,
+            correlated: Vec::new(),
+            catalog: None,
+            answering: Params::new(),
+            width: 0,
         }
+    }
+
+    /// Returns the filter with the subqueries of its terms to answer for each row.
+    ///
+    /// **A term held in front of a join may hold a subquery that reads the
+    /// entering row (bug hunt 10).** `FROM t4 JOIN t3 ON t3.a IN (SELECT t3.a)
+    /// FULL JOIN t2 ON 1` moves the first `ON` in front of the full join, and
+    /// the correlation operator that answers a subquery sits above every join,
+    /// so the term was refused as "a correlated subquery used as a value". The
+    /// answers are appended to each row here, as a join condition's are to each
+    /// pair, and the predicate reads them from there.
+    ///
+    /// @param correlated - the prepared subqueries
+    /// @param catalog - where they read their tables
+    /// @param params - the statement's bound values
+    /// @param width - how many columns an entering row has
+    pub(crate) fn with_correlations(
+        mut self,
+        correlated: Vec<crate::correlate::Correlation>,
+        catalog: &'t dyn TreeCatalog,
+        params: &Params,
+        width: usize,
+    ) -> HeldBefore<'t> {
+        self.correlated = correlated;
+        self.catalog = Some(catalog);
+        self.answering = params.without_subqueries();
+        self.width = width;
+        self
+    }
+
+    /// Chooses the live rows whose answers the predicate accepts, one row at a
+    /// time with the subqueries answered for it.
+    ///
+    /// @param batch - the rows entering the join
+    /// @param catalog - where the subqueries read their tables
+    fn select_with_answers(
+        &mut self,
+        batch: &crate::batch::Batch<'_>,
+        catalog: &'t dyn TreeCatalog,
+    ) -> DbResult<()> {
+        for nth in 0..batch.live() {
+            let mut row = crate::join::materialise(batch, nth, self.width)?;
+            let entering = row.len();
+            for correlation in &self.correlated {
+                let answer = correlation.answer(
+                    catalog,
+                    &mut self.answering,
+                    row.get(..entering).unwrap_or(&[]),
+                )?;
+                row.push(answer);
+            }
+            if crate::join::keeps(Some(&*self.predicate), &row)? {
+                self.selection.push(batch.row_at(nth) as u32);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1725,10 +1809,14 @@ impl Sink for HeldBefore<'_> {
         use crate::batch::Batch;
         use crate::ops::Flow;
         self.selection.clear();
-        for nth in 0..batch.live() {
-            let verdict = self.predicate.value(batch, nth)?;
-            if crate::expr::truth(&verdict.get()) == Some(true) {
-                self.selection.push(batch.row_at(nth) as u32);
+        if let (Some(catalog), false) = (self.catalog, self.correlated.is_empty()) {
+            self.select_with_answers(batch, catalog)?;
+        } else {
+            for nth in 0..batch.live() {
+                let verdict = self.predicate.value(batch, nth)?;
+                if crate::expr::truth(&verdict.get()) == Some(true) {
+                    self.selection.push(batch.row_at(nth) as u32);
+                }
             }
         }
         if self.selection.is_empty() {

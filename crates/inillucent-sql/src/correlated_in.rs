@@ -452,6 +452,22 @@ fn exists(block: &BoundSelect, extra: Option<BoundExpr>, next: &mut usize) -> Bo
             .is_some_and(|filter| conjuncts(filter).any(|term| term == extra))
     };
     if let Some(extra) = extra.filter(|extra| !held_already(extra)) {
+        // **The equality reads the operand, and the operand belongs to a block
+        // other than the copy (bug hunt 10).** The block's `correlations` named
+        // only the outer terms its own `WHERE` read. For `m.y IN (SELECT c.z
+        // FROM c WHERE c.w >= o.x)` inside a subquery over `m`, that is `o`
+        // alone, and the copy then also read `m` without listing it. The
+        // correlation operator treated the copy as reading nothing of the row
+        // it ran under, folded it once with `m.y` unbound, and the statement
+        // failed with "the tree read for FROM term 1 does not carry column 0".
+        let mut read = Vec::new();
+        extra.sources_used(&mut read);
+        for source in read {
+            let owned = copy.sources.iter().any(|held| held.id == source);
+            if !owned && !copy.correlations.contains(&source) {
+                copy.correlations.push(source);
+            }
+        }
         copy.filter = Some(match copy.filter.take() {
             Some(held) => BoundExpr::And(Box::new(held), Box::new(extra)),
             None => extra,

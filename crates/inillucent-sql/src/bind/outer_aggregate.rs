@@ -97,6 +97,10 @@ pub(super) struct OuterAggregates {
     /// Whether the refusal being returned was worded for the block that wrote
     /// the call, which an enclosing `WHERE` must not reword.
     pub(super) reported: bool,
+    /// Set by the binder just before it binds an `EXISTS` subquery and taken by
+    /// that subquery's first `SELECT`, which then knows its result columns are
+    /// never read.
+    pub(super) exists_next: bool,
 }
 
 /// Replaces the references a rewritten query makes to its own terms with
@@ -300,6 +304,33 @@ fn terms_read(expr: &BoundExpr, into: &mut Vec<usize>) {
     }
 }
 
+/// Replaces the select list of an `EXISTS` block with the constant 1.
+///
+/// **The select list of an `EXISTS` is never evaluated.** SQLite replaces it
+/// with the constant 1, so `EXISTS (SELECT json('bad') FROM t)` is true however
+/// many rows `t` has. The aggregates stay, because they decide whether the
+/// block answers one row or none. The window calls go with the select list,
+/// unless the `ORDER BY` reads them (bug hunt 10): one that belongs to an
+/// aggregate this block handed to an enclosing query would otherwise be left
+/// reading a column of a query that no longer exists.
+///
+/// @param block - the bound subquery
+pub(super) fn exists_block(mut block: BoundSelect) -> BoundSelect {
+    if block.compounds.is_empty() && block.values.is_empty() {
+        block.columns = vec![BoundResultColumn {
+            expr: BoundExpr::Integer(1),
+            name: b"1".to_vec(),
+            origin: None,
+            declared_type: Vec::new(),
+            written: None,
+        }];
+        if block.order_by.is_empty() {
+            block.windows.clear();
+        }
+    }
+    block
+}
+
 impl Binder<'_> {
     /// Reports whether an aggregate is written where the block being bound
     /// allows none.
@@ -321,14 +352,25 @@ impl Binder<'_> {
     /// aggregate that reads a term of this query and a term of an enclosing one
     /// belongs to this query, and the enclosing term is a constant for the group.
     ///
+    /// **The `FILTER` counts as part of the call (bug hunt 10).** SQLite reads
+    /// the terms of the arguments and of the `FILTER` together, so in `(SELECT
+    /// count(*) FILTER (WHERE a.x = 1) FROM b) FROM a` the only term the call
+    /// reads is `a`'s, and the call is `a`'s query's: one row of counts, where
+    /// the call used to be counted inside the subquery for every row of `a`.
+    ///
     /// @param arguments - the call's bound arguments
-    pub(super) fn aggregate_owner(&self, arguments: &[BoundExpr]) -> usize {
+    /// @param filter - the call's `FILTER` condition, when it has one
+    pub(super) fn aggregate_owner(
+        &self,
+        arguments: &[BoundExpr],
+        filter: Option<&BoundExpr>,
+    ) -> usize {
         let innermost = self.scopes.len().saturating_sub(1);
         if innermost == 0 {
             return innermost;
         }
         let mut used: Vec<usize> = Vec::new();
-        for argument in arguments {
+        for argument in arguments.iter().chain(filter) {
             terms_read(argument, &mut used);
         }
         for level in (0..self.scopes.len()).rev() {
@@ -341,6 +383,15 @@ impl Binder<'_> {
             }
         }
         innermost
+    }
+
+    /// Reports whether the scope at a level belongs to a statement that is not
+    /// a `SELECT`, so it computes no aggregate for a subquery.
+    ///
+    /// @param level - the owner's scope level
+    pub(super) fn owner_computes_no_aggregates(&self, level: usize) -> bool {
+        let depth = level.saturating_add(1);
+        depth < 128 && ((self.outer.statements >> depth) & 1) == 0
     }
 
     /// Reports whether the query at a scope level can own an aggregate that a
@@ -487,6 +538,21 @@ impl Binder<'_> {
     /// `ORDER BY` of a query that aggregates nothing else, is refused as SQLite
     /// refuses it.
     pub(super) fn settle_outer_aggregates(&mut self) -> Result<(), ParseError> {
+        self.settle_outer_aggregates_after(false)
+    }
+
+    /// Settles the aggregates a nested query attached, knowing whether it was
+    /// an `EXISTS`.
+    ///
+    /// **An aggregate in the result list of an `EXISTS` that belongs to the
+    /// enclosing query is dropped where that query computes none (bug hunt
+    /// 10).** SQLite answers `WHERE EXISTS (SELECT sum(o.x) FROM b)` for every
+    /// row and raises no `misuse of aggregate`: `EXISTS` never reads its result
+    /// columns. Where the enclosing query does compute aggregates, in its own
+    /// result list, the call still counts for it.
+    ///
+    /// @param exists - whether the query that has just closed was an `EXISTS`
+    pub(super) fn settle_outer_aggregates_after(&mut self, exists: bool) -> Result<(), ParseError> {
         let depth = self.scopes.len();
         let Some(at) = self.outer.uses.iter().position(|held| held.depth == depth) else {
             return Ok(());
@@ -506,6 +572,12 @@ impl Binder<'_> {
             .unwrap_or_default();
         for (index, aggregate, written, span) in pending {
             if self.aggregate_is_misplaced() {
+                if exists {
+                    if let Some(held) = self.outer.uses.get_mut(at) {
+                        held.attached.retain(|attached| attached.slot.is_some());
+                    }
+                    return Ok(());
+                }
                 return Err(self.misplaced_outer_aggregate(&written, span));
             }
             let BoundExpr::Aggregate { slot, .. } = self.aggregate_slot(aggregate) else {
@@ -528,7 +600,7 @@ impl Binder<'_> {
     ///
     /// @param written - the function name as written
     /// @param span - where the call was written
-    fn misplaced_outer_aggregate(&self, written: &[u8], span: Span) -> ParseError {
+    pub(super) fn misplaced_outer_aggregate(&self, written: &[u8], span: Span) -> ParseError {
         if self.in_group_by {
             return self.aggregate_misuse(written, span);
         }

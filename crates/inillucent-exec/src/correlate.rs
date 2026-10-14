@@ -911,8 +911,14 @@ fn prepare_blocks(
         }
         forget_parameterised(&mut block, &owned);
         inillucent_sql::rewrite::rewrite_select(&mut block, &mut |expr: &mut BoundExpr| {
+            // **The derived tables and compound arms of the nested block too
+            // (bug hunt 10).** Only the nested block's own list was trimmed, so
+            // `m.y IN (SELECT k FROM (SELECT c.z AS k FROM c WHERE c.w >= o.x))`
+            // inside a subquery left the derived table listing `o` after `o.x`
+            // had become a parameter. The planner then took the derived table
+            // for a correlated first term and refused it.
             if let Some(inner) = expr.block_mut() {
-                inner.correlations.retain(|held| owned.contains(held));
+                forget_parameterised(inner, &owned);
             }
         });
         // Prepared here, once, which is the whole of section 4.3.1: the plan

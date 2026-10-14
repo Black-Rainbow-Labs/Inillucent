@@ -1075,9 +1075,14 @@ fn list_values(
     catalog: &dyn inillucent_exec::physical::TreeCatalog,
 ) -> DbResult<Option<Vec<Value<'static>>>> {
     let candidates = in_list_items(held, params, catalog)?;
+    // **A set decides what has been seen, not a scan of the values kept so far
+    // (bug hunt 10).** `value IN (SELECT ...)` over `generate_series` compared
+    // every value with every earlier one, so the time grew with the square of
+    // the list: 100,000 values took 6.2 s, SQLite 60 ms, and 10,000 took 54 ms.
+    let mut known = std::collections::HashSet::with_capacity(candidates.len());
     let mut seen: Vec<OwnedDatum> = Vec::with_capacity(candidates.len());
     for value in candidates {
-        if !seen.contains(&value) {
+        if known.insert(datum_identity(&value)) {
             seen.push(value);
         }
     }
@@ -1086,6 +1091,40 @@ fn list_values(
         values.push(owned_value(datum)?);
     }
     Ok(Some(values))
+}
+
+/// Returns bytes that are equal for two values exactly when the values are equal
+/// and of the same kind, so a set of them removes the repeats of a list.
+///
+/// A real is kept by its bits, with zero and negative zero as one value, since
+/// they compare equal.
+///
+/// @param value - one value of an `IN` list
+fn datum_identity(value: &OwnedDatum) -> Vec<u8> {
+    match value {
+        OwnedDatum::Null => vec![0],
+        OwnedDatum::Int(number) => {
+            let mut key = vec![1];
+            key.extend_from_slice(&number.to_le_bytes());
+            key
+        }
+        OwnedDatum::Real(number) => {
+            let mut key = vec![2];
+            let normal = if *number == 0.0 { 0.0 } else { *number };
+            key.extend_from_slice(&normal.to_bits().to_le_bytes());
+            key
+        }
+        OwnedDatum::Text(bytes) => {
+            let mut key = vec![3];
+            key.extend_from_slice(bytes);
+            key
+        }
+        OwnedDatum::Blob(bytes) => {
+            let mut key = vec![4];
+            key.extend_from_slice(bytes);
+            key
+        }
+    }
 }
 
 /// Passes on only the rows that satisfy every `IN` list an eponymous table was

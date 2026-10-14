@@ -377,6 +377,9 @@ struct Rare {
     json_marks: Vec<u32>,
     /// The joined text, for `group_concat`.
     joined: String,
+    /// Whether the joined text would have passed the value limit, so the answer
+    /// is the refusal and not a string.
+    joined_too_big: bool,
     /// Every row of the group, for a registered aggregate and nothing else.
     ///
     /// Empty for every built-in, which is what makes them pay nothing for it.
@@ -827,8 +830,20 @@ impl Accumulator {
             AggregateKind::Minimum => self.push_extreme(value, std::cmp::Ordering::Less),
             AggregateKind::Maximum => self.push_extreme(value, std::cmp::Ordering::Greater),
             AggregateKind::GroupConcat(separator) => {
+                let first = self.count <= 1;
                 let rare = self.rare.get_or_insert_with(Box::default);
-                if self.count > 1 {
+                // **The answer stops growing at the value limit (bug hunt 10).**
+                // `group_concat(zeroblob(100000000))` over fifty rows built five
+                // gigabytes before anything looked at the size, and one process
+                // ran out of memory. The overflow is remembered here, because
+                // `push` cannot fail, and reported by `finish` as "string or
+                // blob too big", which is what SQLite answers.
+                let added = datum_length(value).saturating_add(if first { 0 } else { separator.len() });
+                if rare.joined_too_big || exceeds_value_limit(rare.joined.len(), added) {
+                    rare.joined_too_big = true;
+                    return;
+                }
+                if !first {
                     rare.joined.push_str(separator);
                 }
                 rare.joined.push_str(&render(value));
@@ -850,7 +865,7 @@ impl Accumulator {
     /// The first row that survives contributes no separator, which is what
     /// makes `group_concat(s, n)` over `('a',1),('b',2)` read `a2b` rather
     /// than `1a2b`. See [`AggregateKind::GroupConcatComputed`].
-    fn group_concat_computed(&self) -> OwnedDatum {
+    fn group_concat_computed(&self) -> DbResult<OwnedDatum> {
         let mut joined = String::new();
         let mut any = false;
         for row in self.kept_rows() {
@@ -859,6 +874,18 @@ impl Accumulator {
             };
             if matches!(value, inillucent_value::value::Value::Null) {
                 continue;
+            }
+            let mut added = value_length(value);
+            if any {
+                if let Some(separator) = row.get(1) {
+                    if !matches!(separator, inillucent_value::value::Value::Null) {
+                        added = added.saturating_add(value_length(separator));
+                    }
+                }
+            }
+            // The same limit the single value path keeps (bug hunt 10).
+            if exceeds_value_limit(joined.len(), added) {
+                return Err(string_too_big());
             }
             if any {
                 if let Some(separator) = row.get(1) {
@@ -870,11 +897,11 @@ impl Accumulator {
             joined.push_str(&text_of(value));
             any = true;
         }
-        if any {
+        Ok(if any {
             OwnedDatum::Text(joined.into_bytes())
         } else {
             OwnedDatum::Null
-        }
+        })
     }
 
     /// Returns what a percentile aggregate settles on, over the sorted group.
@@ -1335,7 +1362,11 @@ impl Accumulator {
                         },
                     )?;
                 }
-                OwnedDatum::from(inillucent_scalar::json::group_array_final(items, *binary)?.value)
+                let answer = OwnedDatum::from(
+                    inillucent_scalar::json::group_array_final(items, *binary)?.value,
+                );
+                refuse_past_value_limit(&answer)?;
+                answer
             }
             AggregateKind::JsonGroupObject(binary) => {
                 let mut members = Vec::with_capacity(self.json_kept().len());
@@ -1357,15 +1388,20 @@ impl Accumulator {
                         },
                     )?;
                 }
-                OwnedDatum::from(
+                let answer = OwnedDatum::from(
                     inillucent_scalar::json::group_object_final(members, *binary)?.value,
-                )
+                );
+                refuse_past_value_limit(&answer)?;
+                answer
             }
             AggregateKind::Bare(_) => self.chosen.clone().unwrap_or(OwnedDatum::Null),
             AggregateKind::Minimum | AggregateKind::Maximum => {
                 self.extreme.clone().unwrap_or(OwnedDatum::Null)
             }
             AggregateKind::GroupConcat(_) => {
+                if self.rare.as_ref().is_some_and(|rare| rare.joined_too_big) {
+                    return Err(string_too_big());
+                }
                 if self.count == 0 {
                     OwnedDatum::Null
                 } else {
@@ -1376,7 +1412,7 @@ impl Accumulator {
                     )
                 }
             }
-            AggregateKind::GroupConcatComputed => self.group_concat_computed(),
+            AggregateKind::GroupConcatComputed => self.group_concat_computed()?,
         })
     }
     /// Returns the aggregate's value over its rows in the sort's own order.
@@ -1474,6 +1510,66 @@ impl Accumulator {
             }
         }
         folded.finish()
+    }
+}
+
+/// The longest string or blob SQLite's default build admits, in bytes.
+///
+/// The accumulators do not see the connection's own bound (`SQLITE_LIMIT_LENGTH`),
+/// so `group_concat` keeps SQLite's default for it.
+const VALUE_LIMIT: usize = 1_000_000_000;
+
+/// Reports whether appending bytes to a string of a length would reach the limit.
+///
+/// SQLite's string builder refuses when the length including the closing zero
+/// byte would pass the limit, so a string of exactly the limit is refused.
+///
+/// @param length - the bytes held already
+/// @param added - the bytes about to be appended
+fn exceeds_value_limit(length: usize, added: usize) -> bool {
+    length.saturating_add(added) >= VALUE_LIMIT
+}
+
+/// Refuses an answer that reaches the value limit.
+///
+/// @param value - the finished answer of an aggregate
+fn refuse_past_value_limit(value: &OwnedDatum) -> DbResult<()> {
+    match value {
+        OwnedDatum::Text(bytes) | OwnedDatum::Blob(bytes) if bytes.len() >= VALUE_LIMIT => {
+            Err(string_too_big())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Returns the refusal SQLite gives for a value past its length limit.
+fn string_too_big() -> inillucent_base::error::DbError {
+    inillucent_base::error::DbError::primary(inillucent_base::error::PrimaryCode::TooBig)
+        .with_message("string or blob too big")
+        .with_detail("string or blob too big")
+}
+
+/// Returns how many bytes `render` will produce for a value, without producing them.
+///
+/// @param value - the value about to be appended
+fn datum_length(value: &Datum<'_>) -> usize {
+    match value {
+        Datum::Null => 0,
+        Datum::Int(_) | Datum::Real(_) => 32,
+        Datum::Text(bytes) | Datum::Blob(bytes) => bytes.len(),
+    }
+}
+
+/// Returns how many bytes `text_of` will produce for a collected value.
+///
+/// @param value - the collected value
+fn value_length(value: &inillucent_value::value::Value<'_>) -> usize {
+    use inillucent_value::value::Value;
+    match value {
+        Value::Null => 0,
+        Value::Integer(_) | Value::Real(_) => 32,
+        Value::Text(text) => text.utf8_bytes().len(),
+        Value::Blob(blob) => blob.raw().len(),
     }
 }
 

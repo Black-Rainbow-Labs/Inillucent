@@ -217,9 +217,39 @@ pub fn compute(rows: &[Vec<OwnedDatum>], plan: &WindowPlan) -> DbResult<Vec<Vec<
 /// @param rows - the buffered input, already sorted
 /// @param plan - the partition keys and the calls
 pub fn compute_values(rows: &[Vec<OwnedDatum>], plan: &WindowPlan) -> DbResult<Vec<OwnedDatum>> {
+    match compute_values_until_failure(rows, plan) {
+        (extra, None) => Ok(extra),
+        (_, Some(failure)) => Err(failure.error),
+    }
+}
+
+/// The first row a window pass could not compute, and why.
+pub struct WindowFailure {
+    /// How many rows, counted from the first, were computed before it.
+    pub before: usize,
+    /// What went wrong.
+    pub error: inillucent_base::DbError,
+}
+
+/// Computes every window value it can, and reports the first row it cannot.
+///
+/// **SQLite hands out the rows before the one that raised the error (bug hunt
+/// 10).** `sum(a) OVER (ORDER BY a)` over 1, 3 and 9223372036854775807 answers
+/// `1` and `4` and then `integer overflow`, and the pass used to fail without
+/// keeping the two rows it had computed. Every value of a row before the
+/// failure is right; the values from the failing row on are NULL and are not to
+/// be used.
+///
+/// @param rows - the buffered input, already sorted
+/// @param plan - the partition keys and the calls
+pub fn compute_values_until_failure(
+    rows: &[Vec<OwnedDatum>],
+    plan: &WindowPlan,
+) -> (Vec<OwnedDatum>, Option<WindowFailure>) {
     let total = rows.len();
     let calls = plan.calls.len();
     let mut extra: Vec<OwnedDatum> = vec![OwnedDatum::Null; total.saturating_mul(calls)];
+    let mut failure: Option<WindowFailure> = None;
     for (nth, call) in plan.calls.iter().enumerate() {
         let slot_of = |row: usize| row.saturating_mul(calls).saturating_add(nth);
         // Every call shares the partition boundaries but brings its own
@@ -231,28 +261,49 @@ pub fn compute_values(rows: &[Vec<OwnedDatum>], plan: &WindowPlan) -> DbResult<V
             !call.order.is_empty(),
         );
         for partition in &partitions {
-            let streamed = match (slides_a_sum(call), grows_from_the_start(call)) {
-                (Some(kind), _) => Some(sliding_sums(rows, call, partition, kind)?),
-                (None, Some(kind)) => Some(growing_aggregate(rows, call, partition, kind)?),
+            if failure
+                .as_ref()
+                .is_some_and(|held| partition.start >= held.before)
+            {
+                break;
+            }
+            let mut values: Vec<OwnedDatum> = Vec::new();
+            let outcome = match (slides_a_sum(call), grows_from_the_start(call)) {
+                (Some(kind), _) => Some(sliding_sums(rows, call, partition, kind, &mut values)),
+                (None, Some(kind)) => {
+                    Some(growing_aggregate(rows, call, partition, kind, &mut values))
+                }
                 (None, None) => None,
             };
-            if let Some(values) = streamed {
-                for (row, value) in (partition.start..partition.end).zip(values) {
-                    if let Some(slot) = extra.get_mut(slot_of(row)) {
-                        *slot = value;
+            let mut failed: Option<inillucent_base::DbError> = None;
+            if let Some(outcome) = outcome {
+                failed = outcome.err();
+            } else {
+                for row in partition.start..partition.end {
+                    match evaluate(rows, call, partition, row) {
+                        Ok(value) => values.push(value),
+                        Err(error) => {
+                            failed = Some(error);
+                            break;
+                        }
                     }
                 }
-                continue;
             }
-            for row in partition.start..partition.end {
-                let value = evaluate(rows, call, partition, row)?;
+            let computed = values.len();
+            for (row, value) in (partition.start..partition.end).zip(values) {
                 if let Some(slot) = extra.get_mut(slot_of(row)) {
                     *slot = value;
                 }
             }
+            if let Some(error) = failed {
+                let before = partition.start.saturating_add(computed);
+                if failure.as_ref().is_none_or(|held| before < held.before) {
+                    failure = Some(WindowFailure { before, error });
+                }
+            }
         }
     }
-    Ok(extra)
+    (extra, failure)
 }
 
 /// Returns the accumulator kind when a call is `sum()`, `total()` or `avg()`
@@ -300,14 +351,16 @@ fn slides_a_sum(call: &WindowCall) -> Option<AggregateKind> {
 /// @param call - the window call
 /// @param partition - the partition
 /// @param kind - `Sum`, `Total` or `Average`
+/// @param values - where the answers go, so a failure keeps the ones before it
 fn sliding_sums(
     rows: &[Vec<OwnedDatum>],
     call: &WindowCall,
     partition: &frames::Partition,
     kind: AggregateKind,
-) -> DbResult<Vec<OwnedDatum>> {
+    values: &mut Vec<OwnedDatum>,
+) -> DbResult<()> {
     let Some(column) = call.arguments.first().copied() else {
-        return Ok(Vec::new());
+        return Ok(());
     };
     let mut accumulator = Accumulator::new(kind);
     // The rows the accumulator holds, as a half open range of the partition.
@@ -319,7 +372,7 @@ fn sliding_sums(
     // row: `sum(v) OVER (ORDER BY id ROWS 1000 PRECEDING)` over 100,000 rows
     // was ten times SQLite's time.
     let (mut held_start, mut held_end) = (partition.start, partition.start);
-    let mut values = Vec::with_capacity(partition.end.saturating_sub(partition.start));
+    values.reserve(partition.end.saturating_sub(partition.start));
     for row in partition.start..partition.end {
         let (start, end) = match frame_bounds(rows, call, partition, row)? {
             Some((low, high)) => (low, high.saturating_add(1)),
@@ -342,7 +395,7 @@ fn sliding_sums(
         held_end = end.max(start);
         values.push(accumulator.finish()?);
     }
-    Ok(values)
+    Ok(())
 }
 
 /// Finishes a sliding sum by recomputing each remaining row's frame.
@@ -361,12 +414,12 @@ fn sliding_sums_by_row(
     call: &WindowCall,
     partition: &frames::Partition,
     column: usize,
-    mut values: Vec<OwnedDatum>,
-) -> DbResult<Vec<OwnedDatum>> {
+    values: &mut Vec<OwnedDatum>,
+) -> DbResult<()> {
     let first = partition.start.saturating_add(values.len());
     for row in first..partition.end {
         let WindowSlot::Aggregate(kind) = &call.func else {
-            return Ok(values);
+            return Ok(());
         };
         let mut accumulator = Accumulator::new(kind.clone());
         for member in frame_of(rows, call, partition, row)? {
@@ -376,7 +429,7 @@ fn sliding_sums_by_row(
         }
         values.push(accumulator.finish()?);
     }
-    Ok(values)
+    Ok(())
 }
 
 /// Returns the accumulator kind when a call is an aggregate over a frame that
@@ -410,17 +463,19 @@ fn grows_from_the_start(call: &WindowCall) -> Option<AggregateKind> {
 /// @param call - the window call
 /// @param partition - the partition
 /// @param kind - the aggregate
+/// @param values - where the answers go, so a failure keeps the ones before it
 fn growing_aggregate(
     rows: &[Vec<OwnedDatum>],
     call: &WindowCall,
     partition: &frames::Partition,
     kind: AggregateKind,
-) -> DbResult<Vec<OwnedDatum>> {
+    values: &mut Vec<OwnedDatum>,
+) -> DbResult<()> {
     let whole_rows = keeps_whole_rows(&kind);
     let mut accumulator = Accumulator::new(kind);
     accumulator.compare_under(call.collation);
     let mut added = partition.start;
-    let mut values = Vec::with_capacity(partition.end.saturating_sub(partition.start));
+    values.reserve(partition.end.saturating_sub(partition.start));
     for row in partition.start..partition.end {
         let end = match frame_bounds(rows, call, partition, row)? {
             Some((_, high)) => high.saturating_add(1),
@@ -439,7 +494,7 @@ fn growing_aggregate(
         added = end;
         values.push(accumulator.finish()?);
     }
-    Ok(values)
+    Ok(())
 }
 
 /// Returns a window call's aggregate kind, or `count(*)`'s when it has none.

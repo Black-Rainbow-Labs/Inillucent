@@ -197,6 +197,35 @@ fn the_eponymous_forms_bind() {
     assert_eq!(info, vec!["Int(2)".to_string()]);
 }
 
+/// The values of `value IN (SELECT ...)` over a series column are made distinct in
+/// time that grows with their number, not with its square.
+///
+/// The list is offered to the module as an equality and the module is started
+/// once for each distinct value the subquery returned. Telling which values
+/// were distinct compared each with every earlier one, so 100,000 values took
+/// 6.2 s against SQLite's 60 ms and 10,000 took 54 ms (bug hunt 10). With
+/// 150,000 values the earlier engine needs about 14 s, which is past the
+/// deadline, and this one needs a fraction of a second. The hidden argument
+/// column keeps the per value form, which the second statement checks.
+#[test]
+fn an_in_subquery_over_a_series_column_does_not_compare_every_pair() {
+    let (counted, elapsed) = answer_within(
+        "in-subquery-series",
+        &[],
+        "SELECT count(*) FROM generate_series(1,300000) WHERE value IN \
+         (SELECT value * 2 FROM generate_series(1,150000))",
+    );
+    assert_eq!(counted, vec!["Int(150000)".to_string()], "took {elapsed:?}");
+
+    let (stops, _) = answer_within(
+        "in-subquery-series-argument",
+        &[],
+        "SELECT count(*) FROM generate_series(1) WHERE stop IN \
+         (SELECT value FROM generate_series(1, 3))",
+    );
+    assert_eq!(stops, vec!["Int(6)".to_string()]);
+}
+
 /// A module's constraints still reach it through the eponymous form.
 ///
 /// The arguments a caller writes are bound as `Eq` constraints on the module's

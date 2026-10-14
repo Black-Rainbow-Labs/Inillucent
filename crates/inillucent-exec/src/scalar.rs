@@ -194,7 +194,10 @@ impl Eval for ScalarCall {
         // knows - `replace`, `hex`, `char`, `group_concat`'s separator work and
         // the rest.
         let produced = value_bytes(&built);
-        if !context.permits_length(produced) {
+        // `printf` builds its answer in a string that counts the closing zero
+        // byte, so an answer of exactly the limit is refused (bug hunt 10).
+        let counted = produced.saturating_add(u64::from(self.func == ScalarFunc::Printf));
+        if !context.permits_length(counted) {
             return Err(too_big());
         }
         if produced >= MATERIALISED_AT {
@@ -245,9 +248,100 @@ fn size_asked_for(func: ScalarFunc, values: &[inillucent_value::Value<'static>])
             (asked > 0).then_some(asked as u64)
         }
         // A format string's width fields are what make `printf` allocate, and
-        // they are in the string before anything is written.
-        ScalarFunc::Printf => inillucent_scalar::printf::widest_request(values),
+        // they are in the string before anything is written. SQLite's string
+        // builder counts the closing zero byte, so an answer of exactly the
+        // limit is refused (bug hunt 10).
+        ScalarFunc::Printf => {
+            inillucent_scalar::printf::widest_request(values).map(|widest| widest.saturating_add(1))
+        }
+        // Two hexadecimal digits for each byte, and the zero byte after them:
+        // `hex(zeroblob(500000000))` is refused, and `unhex(hex(...))` of it
+        // with it (bug hunt 10).
+        ScalarFunc::Hex => {
+            let bytes = argument_bytes(values.first()?)?;
+            Some(bytes.saturating_mul(2).saturating_add(1))
+        }
+        // The argument is read as text, which needs its closing zero byte. The
+        // answer of `upper(zeroblob(1000000000))` used to be built and counted
+        // as 0 characters.
+        ScalarFunc::Upper | ScalarFunc::Lower => {
+            Some(argument_bytes(values.first()?)?.saturating_add(1))
+        }
+        ScalarFunc::Replace => replaced_size(values),
         _ => None,
+    }
+}
+
+/// Returns how many bytes an argument occupies as text or a blob, or nothing for NULL.
+///
+/// @param value - the argument
+fn argument_bytes(value: &inillucent_value::Value<'static>) -> Option<u64> {
+    match value {
+        inillucent_value::Value::Null => None,
+        inillucent_value::Value::Blob(blob) => Some(blob.raw().len() as u64),
+        inillucent_value::Value::Text(text) => Some(text.utf8_bytes().len() as u64),
+        _ => Some(32),
+    }
+}
+
+/// Returns how many bytes `replace(x, pattern, replacement)` will produce, when
+/// it can be more than the string it started with.
+///
+/// **Counted before the string is built (bug hunt 10).** `replace(hex(zeroblob(
+/// 100000000)), '0', hex(zeroblob(100000000)))` replaces two hundred million
+/// characters with two hundred million characters each, and building that ran
+/// until memory was gone. SQLite counts the matches first and refuses an answer
+/// over the limit, and so does this. A replacement no longer than the pattern
+/// cannot make the answer larger than the string it started with.
+///
+/// @param values - the call's three arguments
+fn replaced_size(values: &[inillucent_value::Value<'static>]) -> Option<u64> {
+    let (subject, pattern, replacement) = (values.first()?, values.get(1)?, values.get(2)?);
+    if subject.is_null() || pattern.is_null() || replacement.is_null() {
+        return None;
+    }
+    let (subject, pattern, replacement) = (
+        bytes_as_text(subject),
+        bytes_as_text(pattern),
+        bytes_as_text(replacement),
+    );
+    if pattern.is_empty() || replacement.len() <= pattern.len() {
+        return None;
+    }
+    // Small answers are never near the limit, and counting is a pass over the string.
+    let growth = (replacement.len() - pattern.len()) as u64;
+    let worst = (subject.len() as u64)
+        .saturating_add((subject.len() as u64 / pattern.len() as u64).saturating_mul(growth));
+    if worst < (1 << 20) {
+        return None;
+    }
+    let mut matches = 0u64;
+    let mut at = 0usize;
+    while let Some(window) = subject.get(at..) {
+        let Some(found) = window
+            .windows(pattern.len())
+            .position(|part| part == &*pattern)
+        else {
+            break;
+        };
+        matches = matches.saturating_add(1);
+        at = at.saturating_add(found).saturating_add(pattern.len());
+    }
+    Some((subject.len() as u64).saturating_add(matches.saturating_mul(growth)))
+}
+
+/// Returns an argument's bytes as `replace` reads them: a blob as it is and
+/// anything else as its text.
+///
+/// @param value - the argument
+fn bytes_as_text<'a>(value: &'a inillucent_value::Value<'static>) -> std::borrow::Cow<'a, [u8]> {
+    match value {
+        inillucent_value::Value::Blob(blob) => std::borrow::Cow::Borrowed(blob.raw()),
+        inillucent_value::Value::Text(held) => held.utf8_bytes(),
+        other => std::borrow::Cow::Owned(inillucent_scalar::eval::text_bytes(
+            other,
+            inillucent_value::encoding::TextEncoding::Utf8,
+        )),
     }
 }
 
@@ -667,15 +761,34 @@ impl JsonCall {
 
 impl Eval for JsonCall {
     fn value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<Computed<'p>> {
-        Ok(Computed::Owned(OwnedDatum::from(
-            self.answer(batch, nth)?.value,
-        )))
+        let answer = OwnedDatum::from(self.answer(batch, nth)?.value);
+        refuse_past_the_default_limit(&answer)?;
+        Ok(Computed::Owned(answer))
     }
 
     fn json_value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<(Computed<'p>, bool)> {
         let answer = self.answer(batch, nth)?;
-        Ok((Computed::Owned(OwnedDatum::from(answer.value)), answer.json))
+        let value = OwnedDatum::from(answer.value);
+        refuse_past_the_default_limit(&value)?;
+        Ok((Computed::Owned(value), answer.json))
     }
+}
+
+/// The longest string or blob SQLite's default build admits, in bytes.
+const DEFAULT_VALUE_LIMIT: u64 = 1_000_000_000;
+
+/// Refuses a JSON function's answer that reaches SQLite's default value limit.
+///
+/// SQLite builds a JSON answer in a string that counts its closing zero byte,
+/// so an answer of exactly the limit is refused too (bug hunt 10). The JSON
+/// calls do not see the connection's own bound, so the default is the one kept.
+///
+/// @param value - the answer
+fn refuse_past_the_default_limit(value: &OwnedDatum) -> DbResult<()> {
+    if value_bytes(value) >= DEFAULT_VALUE_LIMIT {
+        return Err(too_big());
+    }
+    Ok(())
 }
 
 /// Compiles one JSON call and its arguments, keeping the nesting.

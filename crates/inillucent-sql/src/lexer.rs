@@ -627,20 +627,9 @@ impl<'a> Lexer<'a> {
                 span: Span::new(start, cursor),
             });
         }
-        while self.byte(cursor).is_some_and(is_identifier_part) {
-            cursor += 1;
-        }
-        // `$name` accepts a bracketed or quoted suffix in SQLite's TCL variable
-        // syntax; the parenthesised form is the one that reaches SQL.
-        if sigil == b'$' && self.byte(cursor) == Some(b'(') {
-            while let Some(byte) = self.byte(cursor) {
-                cursor += 1;
-                if byte == b')' {
-                    break;
-                }
-            }
-        }
-        if cursor == start + 1 {
+        let (end, usable) = parameter_extent(self.source, start);
+        cursor = cursor.max(end);
+        if !usable {
             // A bare `:` or `@` is not a parameter. `:` is punctuation SQLite
             // has no use for, so the byte is unrecognised.
             return Err(LexError {
@@ -730,6 +719,44 @@ pub fn is_identifier_start(byte: u8) -> bool {
     byte.is_ascii_alphabetic() || byte == b'_' || byte >= 0x80
 }
 
+/// Returns where a named parameter ends, and whether it is a usable one.
+///
+/// SQLite's tokenizer, with its TCL variable syntax: identifier characters, any
+/// number of `::` separators between them, and a parenthesised suffix that
+/// follows at least one identifier character and runs to the next `)`. A suffix
+/// that meets a space or the end of the text first is an illegal token that
+/// includes everything read, and so is a name with no identifier character at
+/// all. `$x::y(z)` is one parameter (bug hunt 10).
+///
+/// @param source - the SQL text
+/// @param start - the offset of the sigil
+fn parameter_extent(source: &[u8], start: usize) -> (usize, bool) {
+    let at = |index: usize| source.get(index).copied();
+    let (mut cursor, mut named, mut usable) = (start + 1, 0usize, true);
+    while let Some(byte) = at(cursor) {
+        if is_identifier_part(byte) {
+            named += 1;
+            cursor += 1;
+        } else if byte == b'(' && named > 0 {
+            cursor += 1;
+            while at(cursor).is_some_and(|inner| !inner.is_ascii_whitespace() && inner != b')') {
+                cursor += 1;
+            }
+            if at(cursor) == Some(b')') {
+                cursor += 1;
+            } else {
+                usable = false;
+            }
+            break;
+        } else if byte == b':' && at(cursor + 1) == Some(b':') {
+            cursor += 2;
+        } else {
+            break;
+        }
+    }
+    (cursor, usable && named > 0)
+}
+
 /// Returns whether the byte may continue a bare identifier.
 pub fn is_identifier_part(byte: u8) -> bool {
     is_identifier_start(byte) || byte.is_ascii_digit() || byte == b'$'
@@ -753,7 +780,8 @@ pub fn illegal_token_text(source: &[u8], error: LexError) -> &[u8] {
         LexErrorKind::UnterminatedQuote | LexErrorKind::UnterminatedComment => source.len(),
         LexErrorKind::MalformedBlob => blob_token_end(source, start),
         LexErrorKind::MalformedNumber => number_token_end(source, start),
-        LexErrorKind::MalformedParameter | LexErrorKind::UnrecognisedByte => start + 1,
+        LexErrorKind::MalformedParameter => parameter_extent(source, start).0,
+        LexErrorKind::UnrecognisedByte => start + 1,
     };
     source.get(start..end.min(source.len())).unwrap_or(&[])
 }

@@ -68,7 +68,7 @@ impl Binder<'_> {
             match constraint {
                 JoinConstraint::None => {}
                 JoinConstraint::On(expr) => {
-                    let bound = self.bind_expr(expr)?;
+                    let bound = self.bind_plain_value(expr)?;
                     self.refuse_on_to_the_right(position, &bound)?;
                     self.set_constraint(position, Some(bound));
                 }
@@ -130,13 +130,36 @@ impl Binder<'_> {
                 .position(|candidate| candidate == id)
                 .is_some_and(|found| found > position)
         });
-        if reads_right {
+        if reads_right || self.recursive_term_reads_another(position, &used) {
             return Err(refused(
                 "ON clause references tables to its right",
                 Span::default(),
             ));
         }
         Ok(())
+    }
+
+    /// Reports whether the `ON` clause of an outer joined recursive reference
+    /// reads a table other than the reference itself.
+    ///
+    /// **SQLite runs the recursive table of a recursive step as the outermost
+    /// loop, wherever it is written.** The `ON` clause of an outer join on that
+    /// table then reads every other table to its right, and SQLite refuses it
+    /// with the same message as any other `ON` clause that reads to its right.
+    /// Written as `emp e LEFT JOIN chain c ON e.boss = c.id` the step never
+    /// finished here: each pass added the rows of `emp` that matched nothing,
+    /// forever (bug hunt 10). An `ON` clause that reads only the recursive
+    /// table, `ON 1` and `USING` stay accepted, as they are by SQLite.
+    ///
+    /// @param position - the joined term's position in the block
+    /// @param used - the source numbers the bound `ON` expression reads
+    fn recursive_term_reads_another(&self, position: usize, used: &[usize]) -> bool {
+        let Some(source) = self.source_at(position) else {
+            return false;
+        };
+        position > 0
+            && matches!(source.rows, SourceRows::RecursiveSelf { .. })
+            && used.iter().any(|id| self.scope_id(position) != Some(*id))
     }
 
     /// Stores a join constraint on a source of the current block.

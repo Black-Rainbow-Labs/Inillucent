@@ -221,7 +221,7 @@ pub fn call_with(
         // what is left is `json_extract`, which carries the JSON subtype when
         // what it extracted was itself an array or an object.
         ScalarFunc::Subtype => Value::Integer(json_shaped(arguments.first())),
-        ScalarFunc::Unistr => unistr(arguments.first()).unwrap_or(Value::Null),
+        ScalarFunc::Unistr => unistr(arguments.first(), encoding).unwrap_or(Value::Null),
         ScalarFunc::UnistrQuote => {
             unistr_quote(&arguments.first().cloned().unwrap_or(Value::Null), encoding)
         }
@@ -537,12 +537,13 @@ fn iif(arguments: &[Value<'static>]) -> Value<'static> {
 /// quiet NULL.
 ///
 /// @param value - the argument, or nothing
-fn unistr(value: Option<&Value<'static>>) -> Option<Value<'static>> {
+/// @param encoding - the connection's text encoding
+fn unistr(value: Option<&Value<'static>>, encoding: TextEncoding) -> Option<Value<'static>> {
     let value = value?;
-    let Value::Text(text) = value else {
-        return Some(value.clone());
-    };
-    let expanded = expand_unicode_escapes(&text.utf8_bytes())?;
+    if value.is_null() {
+        return Some(Value::Null);
+    }
+    let expanded = expand_unicode_escapes(&eval::text_bytes(value, encoding))?;
     Some(Value::owned_text(&expanded).unwrap_or(Value::Null))
 }
 
@@ -650,10 +651,12 @@ fn unistr_quote(value: &Value<'static>, encoding: TextEncoding) -> Value<'static
 
 /// `sqlite_compileoption_used(name)`.
 fn compile_option_used(value: Option<&Value<'static>>) -> Value<'static> {
-    let Some(Value::Text(text)) = value else {
+    // **Any argument that is not NULL is read as text (bug hunt 10).** SQLite
+    // answers `sqlite_compileoption_used(1)` with 0, and NULL only for NULL.
+    let Some(value) = value.filter(|held| !held.is_null()) else {
         return Value::Null;
     };
-    let name = String::from_utf8_lossy(&text.utf8_bytes()).into_owned();
+    let name = String::from_utf8_lossy(&eval::text_bytes(value, TextEncoding::Utf8)).into_owned();
     Value::Integer(i64::from(inillucent_base::compile_option_used(&name)))
 }
 
@@ -818,9 +821,20 @@ fn unhex(arguments: &[Value<'static>], encoding: TextEncoding) -> Value<'static>
     // ignored characters first made it the bytes 41 42.
     let mut out = Vec::with_capacity(bytes.len() / 2);
     let mut index = 0usize;
+    let ignored_characters = utf8_characters(&ignored);
     while let Some(byte) = bytes.get(index) {
-        if ignored.contains(byte) {
-            index = index.saturating_add(1);
+        // **A hexadecimal digit is never skipped, whatever the ignore list
+        // holds, and an ignored character is a whole UTF-8 character (bug hunt
+        // 10).** `unhex('a', 'a')` is NULL because the digit has no partner,
+        // and `unhex('1e3', '$[#-1]')` is NULL for the same reason: the ignore
+        // list only applies to what is not a digit.
+        if nibble(*byte).is_none() {
+            let width = utf8_width(*byte).min(bytes.len().saturating_sub(index));
+            let character = bytes.get(index..index.saturating_add(width)).unwrap_or(&[]);
+            if !ignored_characters.contains(&character) {
+                return Value::Null;
+            }
+            index = index.saturating_add(width.max(1));
             continue;
         }
         let (Some(high), Some(low)) = (
@@ -835,6 +849,36 @@ fn unhex(arguments: &[Value<'static>], encoding: TextEncoding) -> Value<'static>
         index = index.saturating_add(2);
     }
     Value::owned_blob(&out).unwrap_or(Value::Null)
+}
+
+/// Returns how many bytes the UTF-8 character starting with a byte occupies.
+///
+/// @param lead - the first byte of the character
+fn utf8_width(lead: u8) -> usize {
+    match lead {
+        0xf0..=0xff => 4,
+        0xe0..=0xef => 3,
+        0xc0..=0xdf => 2,
+        _ => 1,
+    }
+}
+
+/// Splits bytes into the UTF-8 characters SQLite's own reader would see.
+///
+/// @param bytes - the text
+fn utf8_characters(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut characters = Vec::new();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let width = utf8_width(bytes.get(at).copied().unwrap_or(0))
+            .min(bytes.len().saturating_sub(at))
+            .max(1);
+        if let Some(character) = bytes.get(at..at.saturating_add(width)) {
+            characters.push(character);
+        }
+        at = at.saturating_add(width);
+    }
+    characters
 }
 
 /// Returns the value of a hexadecimal digit.
@@ -1606,8 +1650,8 @@ pub fn refusal_for(func: ScalarFunc, arguments: &[Value<'static>]) -> Option<Str
             return single_character_escape(&eval::text_bytes(asked, TextEncoding::Utf8)).err();
         }
         ScalarFunc::Unistr => {
-            if let Some(Value::Text(text)) = arguments.first() {
-                if expand_unicode_escapes(&text.utf8_bytes()).is_none() {
+            if let Some(value) = arguments.first().filter(|held| !held.is_null()) {
+                if expand_unicode_escapes(&eval::text_bytes(value, TextEncoding::Utf8)).is_none() {
                     return Some("invalid Unicode escape".to_string());
                 }
             }
