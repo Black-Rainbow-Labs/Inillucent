@@ -99,6 +99,7 @@ mod usage_paths;
 mod vacuum_on_vfs;
 mod vector;
 mod vector_edges;
+mod vector_index_agreement;
 mod vector_metric;
 mod vector_rename;
 mod vtab;

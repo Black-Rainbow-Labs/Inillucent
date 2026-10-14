@@ -969,6 +969,7 @@ crashes a simulated machine inside the rename.
 | every tree on its own | a leaf that does not parse, keys out of order, a separator that does not match its child, a sibling chain that skips a leaf | yes | yes |
 | every page against every other page and the free map | a page two trees both reach, a page a tree reaches that the free map calls free, a page marked allocated that no tree reaches | yes | yes |
 | every index against its table | a duplicate in a `UNIQUE` index, a row with no index entry, an index entry for a row that is not there | no | yes |
+| every `inillucent_search` table and vector index against its rows | an index that holds a different number of vectors than the rows it indexes, a vector index whose row count differs from the non NULL vectors of its table | no | yes |
 
 The page pass finds a page that two tables share. Each tree looks correct on its own in that case,
 so only the page pass can report it.
@@ -1173,8 +1174,11 @@ repairs a table that lost links that way.
 
 If a generation cannot be read back, the query fails with an error, and `rebuild` repairs it.
 `%_content` holds every row, so the index can always be built again from the database alone.
-`integrity-check` compares the recorded row count with the rows, checks every vector's width, and
-names any delta entry whose row is missing.
+`integrity-check` compares the recorded row count with the rows, checks every vector's width, names
+any delta entry whose row is missing, and compares the number of vectors the index holds with the
+number of rows. `PRAGMA integrity_check` runs the same check on every `inillucent_search` table, and
+for a vector index made with `CREATE INDEX ... USING inillucent_hnsw` it also compares the index with
+the non NULL vectors of the table it is on.
 
 **Checked by:** `search.rs`, `search_crash.rs`, `vector.rs`, `new_engine_search.rs`, the graph's own
 tests in `crates/inillucent-core/src/hnsw.rs`, and `inillucent-foldgate` for the numbers.

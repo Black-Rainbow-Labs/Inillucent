@@ -2959,6 +2959,17 @@ covers = ["inillucent-engine", "inillucent-search"]
 # the connection its module back. The FTS5 table refused every statement, and
 # rows written after the rollback never reached the vector index (task-2264).
 
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "vector_index_agreement"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-search"]
+# A statement is applied to the vector indexes of its own table only, confidence() on a
+# cosine table does not depend on the length of the query vector, and integrity_check
+# reports an index whose vector count differs from its table (task-2110).
+
 # One writer, four readers and a checkpoint under them (task-2036). Nothing in
 # the tree ran a reader *while* a writer was working, and a checkpoint under a
 # reader is the second cause task-1987 had.
