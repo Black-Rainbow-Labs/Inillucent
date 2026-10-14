@@ -3789,3 +3789,19 @@ name = "nightly"
 module = "free_map_page_at_the_end"
 tier = "nightly"
 covers = ["inillucent-engine", "inillucent-pool", "inillucent-tree"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "range_delete_work"
+tier = "engine"
+covers = ["inillucent-pool", "inillucent-wal", "inillucent-tree", "inillucent-txn", "inillucent-exec", "inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "derived_table_lookup_work"
+tier = "engine"
+covers = ["inillucent-exec", "inillucent-engine", "inillucent-sql"]
