@@ -131,6 +131,9 @@ impl crate::ImportedDatabase {
         txn: u64,
     ) -> DbResult<()> {
         let (floor, dropped_floor, built_floor) = (to.undo, to.dropped, to.built);
+        // The databases whose catalog rows this rollback has put back since
+        // their trees were last matched to the catalog.
+        let mut catalog_restored: Vec<usize> = Vec::new();
         while self.writing.undo().borrow().len() > floor {
             let Some(entry) = self.writing.undo().borrow_mut().pop() else {
                 break;
@@ -166,6 +169,29 @@ impl crate::ImportedDatabase {
             } else {
                 self.handle_of(at, entry.tree).unwrap_or(0)
             };
+            // **A row is put back into the tree the catalog names at that
+            // point of the undo, which a `DROP` or an `ALTER` may have
+            // replaced.** Undo runs newest first, so once the records of a
+            // `DROP TABLE`, `DROP INDEX` or a rebuilding `ALTER TABLE` have
+            // put the catalog rows back, the records older than it belong to
+            // the tree those rows name: one the drop released, or the one the
+            // rebuild superseded under the same handle. Applying them to
+            // whatever the handle held lost data two ways. A dropped tree was
+            // not attached, so its records were skipped: with foreign keys on,
+            // `DROP TABLE` first deletes every row, and `BEGIN; DROP TABLE p;
+            // ROLLBACK` brought `p` back empty. A rebuilt tree was attached, so
+            // `BEGIN; INSERT ...; ALTER TABLE t DROP COLUMN c; ROLLBACK`
+            // removed the insert from the new tree, and the reattach that
+            // followed brought back the old tree with the insert still in it
+            // and the deleted rows gone.
+            if entry.tree == inillucent_catalog::paged::SCHEMA_TREE_ID {
+                if !catalog_restored.contains(&at) {
+                    catalog_restored.push(at);
+                }
+            } else if let Some(position) = catalog_restored.iter().position(|held| *held == at) {
+                catalog_restored.remove(position);
+                self.reattach_from_catalog(at)?;
+            }
             let Some(tree) = self.schema.trees.get_mut(&root) else {
                 // The tree is gone, which a rollback of a `CREATE TABLE` makes
                 // true. Its rows went with it.
@@ -261,6 +287,30 @@ impl crate::ImportedDatabase {
                 missing.join(", ")
             )));
         }
+        Ok(())
+    }
+
+    /// Attaches the tree of every object one database's catalog tree names and this connection has lost.
+    ///
+    /// Used in the middle of a rollback, before `reload_entries` runs, so an
+    /// undo record for a dropped tree has a tree to be applied to. The catalog
+    /// is read as the undo has left it so far.
+    ///
+    /// @param at - which database
+    fn reattach_from_catalog(&mut self, at: usize) -> DbResult<()> {
+        let Some(database) = self.schema_file(at) else {
+            return Ok(());
+        };
+        let catalog_tree = attach_catalog(database.pool(), database.catalog_root())?;
+        let stored = inillucent_catalog::paged::read_catalog_rows(database.pool(), &catalog_tree)?;
+        let entries: Vec<Recorded> = stored
+            .into_iter()
+            .map(|(rowid, entry)| {
+                let root = self.handle_of(at, entry.tree_id).unwrap_or(0);
+                Recorded { rowid, root, entry }
+            })
+            .collect();
+        self.reattach_entries(at, &entries)?;
         Ok(())
     }
 

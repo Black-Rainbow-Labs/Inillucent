@@ -254,7 +254,17 @@ impl crate::ImportedDatabase {
         // statement prepared and stepped - and a settle that only one of them
         // performed would leave the tree half-repaired depending on which API
         // the application happened to use.
-        if !self.writing.settling() {
+        //
+        // **Only for the outermost statement.** A statement's own key check
+        // runs a query through this function while the statement's write is
+        // still open, and a settle there ran its sweep statements as
+        // autocommit writes: their commit committed the outer statement's rows
+        // and emptied its undo buffer, so when the key check then failed there
+        // was nothing to undo. With a cyclic key with an action anywhere in
+        // the schema, an `INSERT` into a table with a trigger that broke a
+        // foreign key reported `FOREIGN KEY constraint failed` and kept the
+        // row. The outermost statement settles everything its nested ones did.
+        if !self.writing.settling() && self.session_state.nesting.get() == 0 {
             self.writing.set_settling(true);
             let settled = self.settle_foreign_keys();
             self.writing.set_settling(false);
