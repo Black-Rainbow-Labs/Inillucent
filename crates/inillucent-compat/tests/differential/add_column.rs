@@ -373,6 +373,37 @@ fn a_table_without_a_rowid_takes_the_column_the_same_way() {
     grade("without-rowid", script);
 }
 
+/// A delete or an update that is rolled back puts back the rows of leaves nothing has widened.
+///
+/// The rows are restored from images copied out of leaves that still have the old width, so
+/// they come back with fewer values than the table has columns and take the defaults.
+#[test]
+fn a_rolled_back_write_into_short_leaves_restores_every_row() {
+    let script = format!(
+        "{TABLE}
+         ALTER TABLE t ADD COLUMN e INTEGER DEFAULT 5;
+         ALTER TABLE t ADD COLUMN f TEXT DEFAULT 'hi';
+         BEGIN;
+         DELETE FROM t WHERE id % 3 = 0;
+         SELECT count(*), sum(e) FROM t;
+         ROLLBACK;
+         SELECT count(*), sum(e), count(f) FROM t;
+         SAVEPOINT w;
+         DELETE FROM t WHERE id < 1200;
+         UPDATE t SET n = 0 WHERE id >= 1200;
+         ROLLBACK TO w;
+         RELEASE w;
+         SELECT count(*), sum(e), sum(n), count(f) FROM t;
+         BEGIN;
+         UPDATE t SET e = 9 WHERE id % 2 = 0;
+         DELETE FROM t WHERE id % 5 = 0;
+         ROLLBACK;
+         SELECT count(*), sum(e), sum(n), min(f) FROM t;
+         PRAGMA integrity_check;"
+    );
+    grade("rollback-short", &script);
+}
+
 /// Adding a column inside a transaction that is rolled back leaves the table as it was.
 #[test]
 fn a_rolled_back_add_column_leaves_no_trace() {

@@ -1523,6 +1523,22 @@ impl PagedTree {
         let entered = crate::stages::clock();
         let mut timing = crate::stages::PutStages::default();
         self.growing = new_key;
+        // A row read from a leaf written before the tree gained a column has fewer values
+        // than the tree has columns: an undo image copied from the page is one. It takes the
+        // defaults for the columns it lacks, which is what every reader gives such a leaf.
+        let missing = self.defaults_for_missing_columns(row.len());
+        let padded: Vec<Datum<'_>>;
+        let row = match missing.is_empty() {
+            true => row,
+            false => {
+                padded = row
+                    .iter()
+                    .copied()
+                    .chain(missing.iter().map(OwnedDatum::borrow))
+                    .collect();
+                &padded[..]
+            }
+        };
         // A log collecting before-images needs the row that was there, so the
         // read the caller did not ask for happens anyway. That is the whole
         // cost of being able to abandon a transaction, and it is paid only
@@ -4004,6 +4020,18 @@ impl PagedTree {
             self.widen_short_leaf(database, log, page, key.0)?;
         }
         Err(corrupt("a leaf stayed short after it was widened"))
+    }
+
+    /// Returns what the trailing columns a short row lacks read as, or nothing for a full row.
+    ///
+    /// @param held - how many values the row has
+    fn defaults_for_missing_columns(&self, held: usize) -> Vec<OwnedDatum> {
+        match held < self.columns().len() && self.pad.width() == self.columns().len() {
+            true => (held..self.columns().len())
+                .map(|column| OwnedDatum::from_datum(&self.pad.fill(column)))
+                .collect(),
+            false => Vec::new(),
+        }
     }
 
     /// Reports whether a leaf holds fewer columns than the tree has.
