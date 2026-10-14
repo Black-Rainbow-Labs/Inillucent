@@ -120,8 +120,13 @@ fn scan_log(vfs: &SimVfs, engine: &ImportedDatabase) -> LogWork {
         doubtful: std::collections::BTreeSet::new(),
     };
     let mut work = LogWork::default();
-    recover(vfs, &DbPath::new(PathBuf::from("range-delete.rdb")), start, &mut work)
-        .expect("the log scans");
+    recover(
+        vfs,
+        &DbPath::new(PathBuf::from("range-delete.rdb")),
+        start,
+        &mut work,
+    )
+    .expect("the log scans");
     work
 }
 
@@ -176,30 +181,77 @@ fn a_range_delete_of_forty_thousand_rows_logs_a_record_per_leaf() {
     println!("log work   : {work:?}");
     println!("write stats before: {before:?}");
     println!("write stats after : {after:?}");
+    assert_eq!(after.deleted - before.deleted, 40_000, "{after:?}");
     assert_eq!(number(&mut engine, "SELECT count(*) FROM copied"), 60_000);
     assert_eq!(work.delete_row, 0, "{work:?}");
     assert_eq!(work.rows_named, 40_000, "{work:?}");
+    // 81 leaves hold the range. One record for each, plus one structural record for each leaf
+    // a merge dissolved, and at most a page image or two; 40,000 records or 81 page images of
+    // 32 KB would each fail one of these.
+    assert!(work.delete_rows <= 100, "{work:?}");
+    assert!(work.other <= 100, "{work:?}");
+    assert!(work.page_images <= 2, "{work:?}");
+    assert!(work.bytes <= 800_000, "{work:?}");
 }
 
-/// Deletes the gate's range under the default locking mode and prints what it cost.
+/// Runs the gate's own sequence for `copied` through the `Connection` and counts the delete.
+///
+/// A source table with two indexes, then rounds of `DROP`, `CREATE`, `INSERT ... SELECT` and
+/// the range delete, in the default locking mode, where each statement is folded into the file
+/// when it ends. Every round must fetch the same few pages, write one record per leaf and sync
+/// the log once, whichever pages the copy was given from the free list.
 #[test]
-fn a_range_delete_of_forty_thousand_rows_reports_its_page_and_log_work() {
-    let vfs = media();
-    let mut engine = copied_table(&vfs, false);
-    let cache_before = engine.pool_stats();
-    run(&mut engine, RANGE_DELETE);
-    let cache_after = engine.pool_stats();
-    // The wall clock is printed for a person comparing builds; no assertion reads it.
-    let mut times = Vec::new();
-    for _ in 0..5 {
-        let mut again = copied_table(&media(), false);
-        let started = std::time::Instant::now();
-        run(&mut again, RANGE_DELETE);
-        times.push(started.elapsed().as_micros());
+fn a_range_delete_after_the_gates_copy_rounds_costs_the_same_each_round() {
+    use inillucent_compat::newengine::connect::Database;
+    let directory =
+        inillucent_compat::workspace_root().join("_agent_output/range-delete-work/rounds");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("the case directory can be made");
+    let database = Database::open(directory.join("case.rdb")).expect("the database opens");
+    database
+        .session()
+        .execute_batch(
+            "CREATE TABLE main_table(id INTEGER PRIMARY KEY, key INTEGER NOT NULL, category INTEGER NOT NULL, label TEXT NOT NULL, payload BLOB);              CREATE INDEX main_key ON main_table(key);              CREATE INDEX main_category ON main_table(category, key);              WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 100000)              INSERT INTO main_table SELECT i, (i * 2654435761) % 100000, i % 64,              'row ' || i || ' lorem ipsum dolor sit amet consectetur', zeroblob(48) FROM c",
+        )
+        .expect("the source table is built");
+    for round in 0..4 {
+        database
+            .session()
+            .execute_batch(
+                "DROP TABLE IF EXISTS copied;                  CREATE TABLE copied(id INTEGER PRIMARY KEY, key INTEGER, label TEXT)",
+            )
+            .expect("the copy table is made");
+        database
+            .session()
+            .execute_batch(
+                "INSERT INTO copied(id, key, label) SELECT id, key, label FROM main_table",
+            )
+            .expect("the copy runs");
+        let cache_before = database.cache_stats();
+        let log_before = database.log_stats();
+        database
+            .session()
+            .execute_batch(RANGE_DELETE)
+            .expect("the delete runs");
+        let cache = database.cache_stats();
+        let log = database.log_stats();
+        let fetches = (cache.hits + cache.misses) - (cache_before.hits + cache_before.misses);
+        let records = log.records - log_before.records;
+        let bytes = log.bytes - log_before.bytes;
+        println!(
+            "round {round}: fetches {fetches} reads {} writes {} log records {records}              log bytes {bytes} log syncs {}",
+            cache.reads - cache_before.reads,
+            cache.writes - cache_before.writes,
+            log.syncs - log_before.syncs
+        );
+        // The table has 81 leaves in the range. A record for each of 40,000 rows would be over
+        // 40,000 records, and a page image for each leaf would add 81 images of 32 KB.
+        assert!(records <= 200, "round {round}: {records} log records");
+        assert!(bytes <= 800_000, "round {round}: {bytes} log bytes");
+        assert!(fetches <= 3_000, "round {round}: {fetches} page fetches");
+        assert!(
+            log.syncs - log_before.syncs <= 2,
+            "round {round}: log syncs"
+        );
     }
-    println!("delete microseconds, five fresh tables: {times:?}");
-    println!("cache before: {cache_before:?}");
-    println!("cache after : {cache_after:?}");
-    println!("write stats : {:?}", engine.write_stats());
-    assert_eq!(number(&mut engine, "SELECT count(*) FROM copied"), 60_000);
 }
