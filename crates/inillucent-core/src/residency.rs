@@ -502,6 +502,9 @@ fn register_exit_unload<S: Session>(shared: Weak<Shared<S>>) {
         };
         if let Ok(mut state) = shared.state.try_lock() {
             state.embedder = None;
+            // Wakes a parked reaper so it sees no session and ends, instead of
+            // sleeping out the idle period inside a process that is exiting.
+            shared.idle.notify_all();
         };
     }));
 }
@@ -563,6 +566,12 @@ fn reap<S: Session>(shared: Weak<Shared<S>>, after: Duration) {
             // Somebody unloaded it by hand, or the policy changed underneath.
             // Either way there is nothing left to reap and no reason to keep a
             // thread parked; the next call starts a new one.
+            state.reaping = false;
+            return;
+        }
+        if crate::exit_hook::exiting() {
+            // The exit handler is dropping sessions, and a drop from this thread
+            // would race it. The process is ending, so leave the session to it.
             state.reaping = false;
             return;
         }

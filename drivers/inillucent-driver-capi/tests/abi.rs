@@ -326,6 +326,7 @@ fn every_stability_is_one_of_the_two_that_mean_something() {
             "inillucent_py_init_threads",
             "inillucent_py_params",
             "inillucent_py_stmt_execute",
+            "inillucent_release_models",
             "inillucent_rows_json",
             "inillucent_rows_py",
             "inillucent_stmt_execute_many",

@@ -32,6 +32,7 @@ call on it yourself. There is no lock inside.
 
 from __future__ import annotations
 
+import atexit
 import ctypes
 import json
 import os
@@ -400,6 +401,27 @@ def _load() -> ctypes.CDLL:
 
 
 _LIB = _load()
+
+
+def _release_models_at_exit(lib: ctypes.CDLL) -> None:
+    """Drop the library's loaded embedding model when the interpreter exits.
+
+    A process that called ``embed()`` could abort at exit on macOS with
+    ``libc++abi: terminating due to uncaught exception of type std::__1::system_error:
+    mutex lock failed: Invalid argument`` and exit code 134, because ONNX Runtime's own
+    destructors ran while a session's threads were still running. The ``atexit`` hook runs
+    before the interpreter unloads anything, so the library joins those threads here. A library
+    from before ABI 1.5.0 has no such function and nothing is registered.
+    """
+    release = getattr(lib, "inillucent_release_models", None)
+    if release is None:
+        return
+    release.argtypes = []
+    release.restype = None
+    atexit.register(release)
+
+
+_release_models_at_exit(_LIB)
 
 # Whether the library reads and binds whole results as JSON (ABI 1.3.0).
 _JSON = hasattr(_LIB, "inillucent_rows_json")

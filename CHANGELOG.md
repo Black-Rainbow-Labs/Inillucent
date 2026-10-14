@@ -47,6 +47,20 @@ sort. The modes that size each column to the widest value (`column`, `table`, `b
 `qbox`, `psql`, `split`) and `--limit 0` of `inillucent query` hold the result, as they must.
 `Connection::query_each` in the Rust driver hands each row to a `RowSink` as it is produced.
 
+**A process that used `embed()`, or asked for a CUDA card that would not start, no longer crashes as
+it exits.** On Windows about 30 of 100 runs of `INILLUCENT_EMBED_DEVICE=cuda:99 inillucent query
+"SELECT length(embed('a word'))"` printed the refusal and then ended with `STATUS_ACCESS_VIOLATION`
+or `STATUS_STACK_BUFFER_OVERRUN`, and a process that dropped a session ended the same way about one
+run in six. The `ort` crate released ONNX Runtime's environment while the process was exiting, after
+other libraries had started to unload, and the release read freed memory. The engine now holds one
+reference to the environment from the moment it first builds a session, on every operating system,
+so that release is never the last one. `inillucent embed` no longer keeps finished sessions in a
+static to avoid the drop. The idle reaper leaves a session alone once the process has started to
+exit. A new C call, `inillucent_release_models` (ABI 1.5.0), drops the loaded embedder and reranker
+sessions, and the Node and Python packages call it when the process exits. The macOS abort in Node
+(`mutex lock failed: Invalid argument`, exit code 134) has the same cause; the change is made for
+Apple targets as well, and it has not been run on a Mac.
+
 **`ROLLBACK` restores everything a transaction changed, including after `DROP` and `ALTER TABLE`.**
 Bug hunt 10 found rollbacks that lost or kept rows. With foreign keys on, `BEGIN; DROP TABLE p;
 ROLLBACK` brought `p` back with no rows, because the rows `DROP TABLE` deletes first were put back

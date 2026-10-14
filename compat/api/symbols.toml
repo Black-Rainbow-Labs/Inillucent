@@ -5,7 +5,7 @@
 # `inillucent-compat::obligations::the_registers_match_the_engine` fails if
 # this file and the engine disagree.
 
-count = 68
+count = 69
 profile = "default"
 
 [[symbol]]
@@ -163,6 +163,10 @@ signature = "inillucent_py_params(rows: *mut c_void) -> *mut inillucent_params"
 [[symbol]]
 name = "inillucent_py_stmt_execute"
 signature = "inillucent_py_stmt_execute( stmt: *mut crate::capi::stmt::inillucent_stmt, params: *mut c_void, limit: u64, ) -> *mut c_void"
+
+[[symbol]]
+name = "inillucent_release_models"
+signature = "inillucent_release_models()"
 
 [[symbol]]
 name = "inillucent_rows_affected"

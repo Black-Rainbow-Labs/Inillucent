@@ -155,6 +155,14 @@ uint32_t    inillucent_abi_version(void);
 /* What the driver calls itself. A C string, valid forever. */
 const char *inillucent_version(void);
 
+/* Drops the loaded embedder and reranker sessions. Call it just before the
+ * process exits if it ever called embed(): ONNX Runtime's threads are then
+ * joined by your code and not by an exit handler, which on macOS could run
+ * after ONNX Runtime's own destructors and abort the process. Safe to call at
+ * any time and when nothing is loaded; a later embed() loads the model again.
+ * Since ABI 1.5.0. */
+void        inillucent_release_models(void);
+
 /* How many capabilities this build knows about. */
 size_t inillucent_capability_count(void);
 

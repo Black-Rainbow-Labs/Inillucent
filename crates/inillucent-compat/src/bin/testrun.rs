@@ -19,11 +19,13 @@
 //! one of the other two. `inillucent_compat::verdict` is where that reading lives
 //! and where its tests are.
 //!
-//! A target the runner could not read is run **once more, on its own, at the
-//! end**, so the answer comes from a second measurement rather than from a guess
-//! about which way to round the first. The retry fires only on an absence of
-//! information; a target that failed a test is never re-run, because a retry on a
-//! failure is how a flaky test stops being noticed.
+//! A target the runner could not read is **not run again**. It is reported as
+//! UNKNOWN with its exit status and the run exits 1. A process that dies at
+//! teardown after its tests passed has a defect, and a second attempt that passed
+//! would hide it. The runner used to run such a target once more, and a crash at
+//! exit in the `inillucent-core` test binary went unseen behind that retry until
+//! the cause, a release of ONNX Runtime's environment while the process exited,
+//! was fixed in `inillucent_core::exit_hook`.
 //!
 //! ## Why this exists
 //!
@@ -502,12 +504,6 @@ struct Outcome {
     /// operating system. Without the status in the report, that failure has no
     /// visible cause at all.
     status: String,
-    /// What the first attempt looked like, when this outcome is a second one.
-    ///
-    /// Printed whether the retry settled the question or not: a target that
-    /// passes its retry still died once, and a report that hid that would be the
-    /// same silence this runner was fixed for.
-    retry_of: Option<String>,
 }
 
 /// The exit code for a run that did not happen. See `main`.
@@ -530,7 +526,7 @@ fn did_not_run() -> ExitCode {
 ///
 /// - `0` - every selected target ran and passed.
 /// - `1` - the run happened and was red: a target failed, a target was still
-///   undetermined after its second attempt, or `--strict` found a suite whose
+///   undetermined, or `--strict` found a suite whose
 ///   prerequisite was absent.
 /// - `2` - the run did not happen. The command line was wrong, a named
 ///   selection matched nothing, the MSVC environment could not be found, the
@@ -683,7 +679,6 @@ fn run(options: &Options) -> Result<bool, String> {
         };
         outcomes.extend(execute(alone, &solo, &budgets));
     }
-    let outcomes = settle_undetermined(outcomes, &executables, options, &budgets);
     let wall = started.elapsed();
 
     let absences = absences(&outcomes, &map, &declared);
@@ -713,8 +708,8 @@ fn run(options: &Options) -> Result<bool, String> {
 
     // Undetermined counts as red, and deliberately so. The run is a gate, and
     // "the runner could not tell" is not evidence that anything passed. What
-    // stops that being the old wrong red is the retry above: a target only stays
-    // undetermined here when a second, solitary attempt could not read it either.
+    // A target the runner could not read is not run again, because a second
+    // attempt that passed would hide a process that dies at teardown.
     //
     // A target whose every failure is a strict skip is not red: it evidenced
     // nothing, and `hollow` is where that is graded, which is the one place a
@@ -1957,7 +1952,6 @@ fn run_one(
         ran: 0,
         output: "no test list to run".to_string(),
         status: "never started".to_string(),
-        retry_of: None,
     })
 }
 
@@ -1983,7 +1977,6 @@ fn merge_outcomes(earlier: Outcome, later: Outcome) -> Outcome {
         ran: earlier.ran + later.ran,
         output: format!("{}\n{}", earlier.output, later.output),
         status: format!("{}; {}", earlier.status, later.status),
-        retry_of: earlier.retry_of,
     }
 }
 
@@ -2091,7 +2084,6 @@ fn run_process(
             ran: 0,
             output: format!("cannot start {}: {error}", built.executable.display()),
             status: "never started".to_string(),
-            retry_of: None,
         },
     }
 }
@@ -2126,7 +2118,6 @@ fn read_run(built: &Built, run: supervise::Supervised) -> Outcome {
                 ran_for.as_secs_f64(),
                 silent_for.as_secs_f64()
             ),
-            retry_of: None,
         };
     }
     let mut status = match run.status.and_then(|status| status.code()) {
@@ -2146,87 +2137,7 @@ fn read_run(built: &Built, run: supervise::Supervised) -> Outcome {
         ran,
         output: text,
         status,
-        retry_of: None,
     }
-}
-
-/// Runs each target the first pass could not read once more, on its own.
-///
-/// **Why this is not a retry of failures.** A runner that re-runs a failing test
-/// until it passes has stopped being a gate. This re-runs only a target whose
-/// first attempt produced no readable answer - the harness said everything passed
-/// and the process then died, or there was no summary to read at all - which is
-/// an absence of information rather than a result. One more attempt, alone,
-/// replaces a guess about which way to round the first one with a second
-/// measurement.
-///
-/// Whatever the second attempt says stands, and the first attempt's reason and
-/// exit status travel with it into the report either way.
-///
-/// A target the runner **stopped** is not retried either, and for the opposite
-/// reason. Its first attempt was not an absence of information: the runner
-/// refused to wait any longer, and a second attempt would refuse again at the
-/// same budget, having spent it twice. What there is to say about a stopped
-/// target is in the report.
-///
-/// @param outcomes - what the first pass produced
-/// @param executables - the built binaries, by target
-/// @param options - what the command line asked for
-/// @param budgets - how long each target may run
-fn settle_undetermined(
-    outcomes: Vec<Outcome>,
-    executables: &BTreeMap<Target, Built>,
-    options: &Options,
-    budgets: &BTreeMap<Target, Option<Duration>>,
-) -> Vec<Outcome> {
-    let unread: Vec<(Target, Undetermined, String)> = outcomes
-        .iter()
-        .filter_map(|outcome| {
-            outcome
-                .verdict
-                .undetermined()
-                .filter(|reason| *reason != Undetermined::TimedOut)
-                .map(|reason| (outcome.target.clone(), reason, outcome.status.clone()))
-        })
-        .collect();
-    if unread.is_empty() {
-        return outcomes;
-    }
-    let mut settled = outcomes;
-    println!(
-        "\n{} target(s) could not be read; running each one alone, once more",
-        unread.len()
-    );
-    let threads = options.test_threads.to_string();
-    for (target, reason, status) in unread {
-        let Some(built) = executables.get(&target) else {
-            continue;
-        };
-        let budget = budgets.get(&target).copied().flatten();
-        let mut again = run_one(
-            built,
-            &threads,
-            options.filter.as_deref(),
-            options.strict,
-            budget,
-        );
-        again.retry_of = Some(format!(
-            "{} on the first attempt ({status})",
-            reason.reason()
-        ));
-        println!(
-            "  {:<7} {:<44} {:>7.2}s  {} test(s)  [second attempt]",
-            again.verdict.word(),
-            target.label(),
-            again.elapsed.as_secs_f64(),
-            again.ran
-        );
-        let _ = std::io::stdout().flush();
-        if let Some(slot) = settled.iter_mut().find(|outcome| outcome.target == target) {
-            *slot = again;
-        }
-    }
-    settled
 }
 
 /// Returns how many tests a transcript says failed.
@@ -2471,10 +2382,8 @@ fn report(outcomes: &[Outcome], wall: Duration, strict: bool, absences: &Absence
         .iter()
         .filter(|outcome| outcome.verdict.undetermined().is_some())
         .collect();
-    // Listed apart from the rest of `unread` below, because the sentence that
-    // list ends on - that a second attempt did not settle it either - is not
-    // true of these and must not be printed over them. A stopped target was
-    // never retried, on purpose.
+    // Listed apart from the rest of `unread` below, because a stopped target
+    // was refused more time by the runner and is not one it could not read.
     let stopped: Vec<&Outcome> = outcomes
         .iter()
         .filter(|outcome| outcome.verdict.undetermined() == Some(Undetermined::TimedOut))
@@ -2491,9 +2400,6 @@ fn report(outcomes: &[Outcome], wall: Duration, strict: bool, absences: &Absence
                 reason.reason()
             ),
             None => println!("\n=== {} ({}) ===", outcome.target.label(), outcome.status),
-        }
-        if let Some(first) = &outcome.retry_of {
-            println!("(second attempt; {first})");
         }
         println!("{}", outcome.output.trim_end());
     }
@@ -2531,24 +2437,6 @@ fn report(outcomes: &[Outcome], wall: Duration, strict: bool, absences: &Absence
     }
 
     let hollow = report_prerequisites(strict, absences);
-
-    let settled: Vec<&Outcome> = outcomes
-        .iter()
-        .filter(|outcome| outcome.retry_of.is_some() && outcome.verdict.is_green())
-        .collect();
-    if !settled.is_empty() {
-        println!(
-            "\n{} target(s) passed on a second attempt, having been unreadable on the first:",
-            settled.len()
-        );
-        for outcome in &settled {
-            println!(
-                "  {:<44} {}",
-                outcome.target.label(),
-                outcome.retry_of.as_deref().unwrap_or("")
-            );
-        }
-    }
 
     if failures.is_empty() && unread.is_empty() {
         // **`ok` is what a reader remembers, so it is not printed on a run that
@@ -2595,7 +2483,7 @@ fn report(outcomes: &[Outcome], wall: Duration, strict: bool, absences: &Absence
         .filter(|outcome| outcome.verdict.undetermined() != Some(Undetermined::TimedOut))
         .collect();
     if !unsettled.is_empty() {
-        println!("\nUNDETERMINED - a second attempt alone did not settle these either:");
+        println!("\nUNDETERMINED - the runner could not read what these did:");
         for outcome in &unsettled {
             println!(
                 "  {:<44} {}, {}",

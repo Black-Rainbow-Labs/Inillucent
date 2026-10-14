@@ -172,6 +172,8 @@ use inillucent_exec::dml::{self, Changes, Trees, WriteTarget};
 use inillucent_exec::physical::{self, Params, SourceLayout, TreeCatalog};
 pub use inillucent_ext as ext;
 use inillucent_pool::{Database, Options, PageId, Pool};
+/// Drops the loaded embedder and reranker sessions; the C library's `inillucent_release_models` calls it.
+pub use inillucent_search::release_models;
 /// The authorizer contract, re-exported for a caller above this crate.
 ///
 /// **Re-exported rather than depended on directly**, because the layering

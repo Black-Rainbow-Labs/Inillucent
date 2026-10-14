@@ -188,15 +188,15 @@ sha256 = "3f8c9918845848bba6c58be46c3b9c47a97f72ad4847bdfb707c1091cae10ccb"
 
 [[amendment]]
 path = "crates/inillucent-core/src/embed_onnx.rs"
-ticket = "task-2167"
-reason = "An ONNX Runtime that is installed and will not load is an error naming the file and the reason, and a panic inside ort while it loads the library is caught and returned as an error. 2.0.3 printed a warning, fell back to the system loader, and on macOS panicked with exit code 134. No change to what a loaded session computes."
-sha256 = "accbd68a1ee48da9b0ca4c1855b3ac991f672f9e258cd0376ca45e5b4c6449aa"
+ticket = "task-2110"
+reason = "Keep ONNX Runtime environment reference from the first session build on every platform, exiting flag for the idle reaper, release_all for the C call inillucent_release_models"
+sha256 = "a6e45f6fd59237023961135b79c7687bab31ee8b46f4362f4e8527c0e776de16"
 
 [[amendment]]
 path = "crates/inillucent-core/src/exit_hook.rs"
-ticket = "task-2168"
-reason = "task-2167 added this file: it drops every loaded model session from an atexit handler and keeps one ONNX Runtime environment reference, so a process that embedded exits with its own exit code. task-2168 passes the unloader to catch_unwind directly instead of through a closure, which clippy on Linux refused as a redundant closure. No change to any embedding."
-sha256 = "80ecbf5612bce08ee18b8f4a7c0d64116a4ced774190e3cedccf7d304e4587de"
+ticket = "task-2110"
+reason = "Keep ONNX Runtime environment reference from the first session build on every platform, exiting flag for the idle reaper, release_all for the C call inillucent_release_models"
+sha256 = "d895bf00bcea50969d4fa9b99c5ce26184754ea679bf5ad2c878d07537eb8f8f"
 
 [[amendment]]
 path = "crates/inillucent-core/src/filter.rs"
@@ -266,9 +266,9 @@ sha256 = "76bcdcd2c409c80813dab9404864af9906eb43c70860745f8405440640e71a85"
 
 [[amendment]]
 path = "crates/inillucent-core/src/residency.rs"
-ticket = "task-2167"
-reason = "A holder registers with exit_hook the first time its session opens, so the session is dropped before ONNX Runtime's own exit code runs. The residency policy and its counters are unchanged."
-sha256 = "6efe79dd4b4eba7c665aa583ef9c9efcd2aef465c9a7429befb4136e6c661efb"
+ticket = "task-2110"
+reason = "Keep ONNX Runtime environment reference from the first session build on every platform, exiting flag for the idle reaper, release_all for the C call inillucent_release_models"
+sha256 = "824db2f2a57ddb63805e88c6a34350d9ae8eda9b20f3989e1afd6b9b62726e47"
 
 [[amendment]]
 path = "crates/inillucent-core/src/store.rs"
