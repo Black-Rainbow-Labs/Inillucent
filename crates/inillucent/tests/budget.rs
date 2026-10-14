@@ -837,7 +837,9 @@ fn file_bytes(path: &PathBuf) -> u64 {
 fn a_full_scan_is_linear_enough_to_finish() {
     let directory = scratch("scan");
     let database = build(&directory.join("b.rdb"));
-    let connection = database.session();
+    // The connection `build` wrote through, whose pool holds the table. A connection of its own
+    // would open a second engine with an empty pool and fetch every page from the file.
+    let connection = database.session_as(1);
     let before = fetches(&database);
     let started = Instant::now();
     let rows = connection

@@ -529,6 +529,19 @@ impl Slot {
 }
 
 impl Lane {
+    /// Closes the engine, leaving the lane as a shell that answers every call
+    /// with an error.
+    ///
+    /// A connection and a statement keep their lane alive with an `Rc`, and
+    /// the borrow checker lets a `Database` be dropped while a connection that
+    /// is not used again is still in scope. Without this the engine, and the
+    /// file locks it holds, lasted until that connection went out of scope.
+    fn close(&self) {
+        if let Ok(mut slot) = self.engine.try_borrow_mut() {
+            *slot = Slot::Failed(misuse("the database is closed"));
+        }
+    }
+
     /// Wraps an engine, opened or pending, in a lane.
     ///
     /// @param slot - the engine
@@ -607,6 +620,19 @@ impl Lane {
     /// Reports whether the open is still waiting for its first statement.
     fn pending(&self) -> bool {
         matches!(self.engine.try_borrow().as_deref(), Ok(Slot::Pending(..)))
+    }
+}
+
+impl Drop for Database {
+    /// Closes every connection's engine, the others first and the first one
+    /// last, so the file is released when the database is dropped and not when
+    /// the last connection or statement that names an engine goes away.
+    fn drop(&mut self) {
+        let peers = std::mem::take(&mut *self.peers.borrow_mut());
+        for lane in peers.values() {
+            lane.close();
+        }
+        self.primary.close();
     }
 }
 
