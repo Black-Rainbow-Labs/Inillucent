@@ -570,6 +570,101 @@ pub struct Distinct {
     seen: inillucent_base::table_hash::TableSet<Vec<u8>>,
     pub(crate) rows: Vec<Vec<OwnedDatum>>,
     downstream: Box<dyn Sink>,
+    /// Where files come from, when the caller gave this operator somewhere to put them.
+    spill: Option<std::rc::Rc<dyn crate::spill::Spill>>,
+    /// Roughly how many bytes the key set and the rows occupy.
+    held: u64,
+    /// How many bytes the key set and the rows may occupy before they move to runs.
+    limit: u64,
+    /// The rows once the set passed its limit: sorted by key in runs, not hashed.
+    external: Option<ExternalDistinct>,
+}
+
+/// How many bytes `Distinct` holds in its key set and its rows before it sorts in runs.
+///
+/// **Half of what `Sort` holds.** The key set and the rows are held at the same time, and when the
+/// limit is passed the rows move to a sorter that holds as much again, so the peak is the limit
+/// twice over.
+const DISTINCT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// What a `Distinct` that passed its limit is doing.
+///
+/// Every row from then on is written with its encoded key and its arrival number to a sorter ordered
+/// by key and then by arrival. The first row of each key is the one a hash set would have kept, so
+/// the survivors are found by one pass over the merged runs, and a second sorter puts them back in
+/// the order they arrived in, which is the order the hash set emitted them in.
+struct ExternalDistinct {
+    /// Rows laid out as the encoded key, the arrival number, and then the row.
+    first: crate::spill::ExternalSorter,
+    /// The arrival number of the next row.
+    seq: i64,
+}
+
+/// Orders rows of the form (key, arrival number, ...) by key and then arrival number.
+///
+/// @param left - one row
+/// @param right - the other
+fn key_then_arrival(left: &[OwnedDatum], right: &[OwnedDatum]) -> Ordering {
+    match (left.first(), right.first()) {
+        (Some(OwnedDatum::Blob(a)), Some(OwnedDatum::Blob(b))) => a
+            .cmp(b)
+            .then_with(|| arrival_of(left).cmp(&arrival_of(right))),
+        _ => Ordering::Equal,
+    }
+}
+
+/// Returns the arrival number of a row of the form (key, arrival number, ...).
+///
+/// @param row - the row
+fn arrival_of(row: &[OwnedDatum]) -> i64 {
+    match row.get(1) {
+        Some(OwnedDatum::Int(number)) => *number,
+        _ => 0,
+    }
+}
+
+/// Reports whether two rows that sort next to each other have the same key.
+///
+/// @param earlier - the row that sorted first
+/// @param later - the row that sorted next
+fn same_key(earlier: &[OwnedDatum], later: &[OwnedDatum]) -> bool {
+    matches!(
+        (earlier.first(), later.first()),
+        (Some(OwnedDatum::Blob(a)), Some(OwnedDatum::Blob(b))) if a == b
+    )
+}
+
+/// Returns the encoded key of a row that is already owned.
+///
+/// The same bytes `Distinct::push` builds from a batch, so a row that went into the hash set and a
+/// row that arrives after the switch to runs agree about what a duplicate is.
+///
+/// @param row - the row
+/// @param compared - how many leading columns decide whether the row is a duplicate
+/// @param collations - the collation of each compared column
+fn encoded_key(row: &[OwnedDatum], compared: usize, collations: &[Collation]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(32);
+    for (column, value) in row.iter().take(compared).enumerate() {
+        key::encode_into_with(
+            &value.borrow(),
+            collations.get(column).copied().unwrap_or(Collation::Binary),
+            &mut encoded,
+        );
+    }
+    encoded
+}
+
+/// Returns a row laid out for the first sorter: the key, the arrival number, then the row.
+///
+/// @param key - the encoded key
+/// @param arrival - the arrival number
+/// @param row - the row
+fn keyed(key: Vec<u8>, arrival: i64, row: Vec<OwnedDatum>) -> Vec<OwnedDatum> {
+    let mut out = Vec::with_capacity(row.len().saturating_add(2));
+    out.push(OwnedDatum::Blob(key));
+    out.push(OwnedDatum::Int(arrival));
+    out.extend(row);
+    out
 }
 impl Distinct {
     /// Returns a de-duplicating operator over every column of the row.
@@ -596,11 +691,142 @@ impl Distinct {
             seen: inillucent_base::table_hash::TableSet::default(),
             rows: Vec::new(),
             downstream,
+            spill: None,
+            held: 0,
+            limit: crate::spill::run_bytes(DISTINCT_BYTES),
+            external: None,
         }
+    }
+
+    /// Returns this operator with somewhere to write runs.
+    ///
+    /// **Without one it behaves exactly as it did before runs existed**: every distinct row and key
+    /// is held, and the byte budget refuses the statement if one was armed.
+    ///
+    /// @param spill - where files come from
+    pub fn spilling_to(mut self, spill: Option<std::rc::Rc<dyn crate::spill::Spill>>) -> Distinct {
+        self.spill = spill;
+        self
+    }
+
+    /// Moves the rows and keys held to a sorter, once they have passed the limit.
+    ///
+    /// The hash set is dropped, not cleared, so its memory goes back before the sorter fills.
+    fn go_external(&mut self) -> DbResult<()> {
+        let Some(spill) = self.spill.clone() else {
+            return Ok(());
+        };
+        let mut first = crate::spill::ExternalSorter::new(
+            std::rc::Rc::new(key_then_arrival),
+            Some(spill),
+            self.limit,
+        )
+        .with_redundant(same_key);
+        self.seen = inillucent_base::table_hash::TableSet::default();
+        let mut arrival = 0i64;
+        for row in std::mem::take(&mut self.rows) {
+            let encoded = encoded_key(&row, self.compared, &self.collations);
+            first.push(keyed(encoded, arrival, row))?;
+            arrival = arrival.saturating_add(1);
+        }
+        self.held = 0;
+        self.external = Some(ExternalDistinct {
+            first,
+            seq: arrival,
+        });
+        Ok(())
+    }
+
+    /// Writes a batch's rows to the sorter, every one of them.
+    ///
+    /// Nothing is looked up: a row that is a duplicate of one already seen is found when the runs
+    /// are merged.
+    ///
+    /// @param batch - the batch
+    fn push_external(&mut self, batch: &Batch<'_>) -> DbResult<()> {
+        let columns = batch.columns.len();
+        let compared = self.compared.min(columns);
+        for nth in 0..batch.live() {
+            let mut encoded = Vec::with_capacity(32);
+            for column in 0..compared {
+                let value = batch.value(nth, column)?;
+                key::encode_into_with(
+                    &value,
+                    self.collations
+                        .get(column)
+                        .copied()
+                        .unwrap_or(Collation::Binary),
+                    &mut encoded,
+                );
+            }
+            let mut row = Vec::with_capacity(columns);
+            for column in 0..columns {
+                row.push(OwnedDatum::from_datum(&batch.value(nth, column)?));
+            }
+            if let Some(external) = self.external.as_mut() {
+                external.first.push(keyed(encoded, external.seq, row))?;
+                external.seq = external.seq.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Emits the first row of each key, in the order the keys first arrived.
+    ///
+    /// @param external - the sorter the rows were written to
+    fn finish_external(&mut self, external: ExternalDistinct) -> DbResult<()> {
+        let mut survivors = crate::spill::ExternalSorter::new(
+            std::rc::Rc::new(|left: &[OwnedDatum], right: &[OwnedDatum]| {
+                match (left.first(), right.first()) {
+                    (Some(OwnedDatum::Int(a)), Some(OwnedDatum::Int(b))) => a.cmp(b),
+                    _ => Ordering::Equal,
+                }
+            }),
+            self.spill.clone(),
+            self.limit,
+        );
+        let mut previous: Option<Vec<u8>> = None;
+        external.first.finish()?.for_each(|mut row| {
+            let Some(OwnedDatum::Blob(key)) = row.first().cloned() else {
+                return Ok(Flow::Continue);
+            };
+            if previous.as_ref() == Some(&key) {
+                return Ok(Flow::Continue);
+            }
+            previous = Some(key);
+            // Drop the key; the arrival number leads the row the second sorter orders by.
+            row.remove(0);
+            survivors.push(row)?;
+            Ok(Flow::Continue)
+        })?;
+        let mut batch: Vec<Vec<OwnedDatum>> = Vec::new();
+        let mut stopped = false;
+        let downstream = self.downstream.as_mut();
+        survivors.finish()?.for_each(|mut row| {
+            row.remove(0);
+            batch.push(row);
+            if batch.len() >= MERGE_BATCH {
+                let flow = emit_rows(&batch, downstream)?;
+                batch.clear();
+                if flow == Flow::Stop {
+                    stopped = true;
+                    return Ok(Flow::Stop);
+                }
+            }
+            Ok(Flow::Continue)
+        })?;
+        if !stopped && !batch.is_empty() {
+            emit_rows(&batch, downstream)?;
+        }
+        self.downstream.finish()
     }
 }
 impl Sink for Distinct {
     fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
+        if self.external.is_some() {
+            self.push_external(batch)?;
+            return Ok(Flow::Continue);
+        }
         let mut encoded = Vec::with_capacity(32);
         let columns = batch.columns.len();
         // A carried column is kept in the row and left out of the key, so it
@@ -641,13 +867,25 @@ impl Sink for Distinct {
             inillucent_base::budget::materialise(
                 owned_row_bytes(&row).saturating_add(encoded.len() as u64),
             )?;
+            // The row as held, the key as held, and the hash set's slot for it, which is a vector
+            // header, an allocation and a table entry.
+            self.held = self
+                .held
+                .saturating_add(resident_row_bytes(&row))
+                .saturating_add((encoded.len() as u64).saturating_add(64));
             self.seen.insert(encoded.clone());
             self.rows.push(row);
+        }
+        if self.spill.is_some() && self.held >= self.limit {
+            self.go_external()?;
         }
         Ok(Flow::Continue)
     }
 
     fn finish(&mut self) -> DbResult<()> {
+        if let Some(external) = self.external.take() {
+            return self.finish_external(external);
+        }
         let rows = std::mem::take(&mut self.rows);
         emit_rows(&rows, self.downstream.as_mut())?;
         self.downstream.finish()
@@ -657,6 +895,8 @@ impl Sink for Distinct {
     fn reset(&mut self) -> DbResult<()> {
         self.seen.clear();
         self.rows.clear();
+        self.held = 0;
+        self.external = None;
         self.downstream.reset()
     }
 }
@@ -1009,6 +1249,102 @@ mod spill_tests {
             spilled, in_memory,
             "the merge lost a descending term or a NULL's place"
         );
+    }
+
+    /// Pushes rows through a `DISTINCT` and returns what came out and how many runs it wrote.
+    ///
+    /// @param rows - the input, in the order it arrives
+    /// @param compared - how many leading columns decide a duplicate
+    /// @param collations - the collation of each compared column
+    /// @param limit - how many bytes to hold before moving to runs, or `None` for nowhere to spill
+    fn distinct(
+        rows: &[Vec<OwnedDatum>],
+        compared: usize,
+        collations: Vec<Collation>,
+        limit: Option<u64>,
+    ) -> (Vec<Vec<OwnedDatum>>, bool) {
+        let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = Box::new(crate::ops::CollectInto::new(std::rc::Rc::clone(&collected)));
+        let mut operator = Distinct::over(collations, compared, sink);
+        if let Some(bytes) = limit {
+            operator = operator.spilling_to(Some(std::rc::Rc::new(InMemory)));
+            operator.limit = bytes;
+        }
+        for chunk in rows.chunks(300) {
+            let width = chunk.first().map_or(0, Vec::len);
+            let borrowed: Vec<Vec<Datum<'_>>> = (0..width)
+                .map(|column| {
+                    chunk
+                        .iter()
+                        .map(|row| row.get(column).map_or(Datum::Null, OwnedDatum::borrow))
+                        .collect()
+                })
+                .collect();
+            let columns: Vec<Vector<'_>> = borrowed
+                .iter()
+                .map(|values| Vector::Values(values.as_slice()))
+                .collect();
+            operator
+                .push(&Batch::new(chunk.len(), columns))
+                .expect("a batch is pushed");
+        }
+        let went_external = operator.external.is_some();
+        operator.finish().expect("the distinct finishes");
+        let held = collected.borrow().clone();
+        (held, went_external)
+    }
+
+    /// **A `DISTINCT` that sorts in runs keeps the same rows in the same order.**
+    ///
+    /// The rows repeat keys, differ in a carried column that is not compared, and mix integers with
+    /// reals that compare equal and texts that a collation folds, which are the cases where
+    /// "the first row of a key" has to mean the first to arrive and not the first to be sorted.
+    #[test]
+    fn a_distinct_in_runs_keeps_the_first_row_of_each_key_in_arrival_order() {
+        let rows: Vec<Vec<OwnedDatum>> = (0..6_000i64)
+            .map(|n| {
+                let key = (n * 7919) % 2_500;
+                vec![
+                    if n % 3 == 0 {
+                        OwnedDatum::Real(key as f64)
+                    } else {
+                        OwnedDatum::Int(key)
+                    },
+                    OwnedDatum::Text(
+                        if n % 2 == 0 {
+                            format!("Key {}", key % 400)
+                        } else {
+                            format!("key {}", key % 400)
+                        }
+                        .into_bytes(),
+                    ),
+                    OwnedDatum::Int(n),
+                ]
+            })
+            .collect();
+        let collations = vec![Collation::Binary, Collation::NoCase];
+        let (in_memory, none) = distinct(&rows, 2, collations.clone(), None);
+        let (in_runs, external) = distinct(&rows, 2, collations, Some(16 * 1024));
+        assert!(!none, "a distinct with nowhere to spill went external");
+        assert!(
+            external,
+            "the limit was never reached, so this compared memory with memory"
+        );
+        assert!(
+            in_memory.len() > 500,
+            "{} distinct rows is too few to mean anything",
+            in_memory.len()
+        );
+        assert_eq!(in_runs, in_memory, "the runs and the hash set disagree");
+    }
+
+    /// A `DISTINCT` with nothing to spill to holds every row, as it did before.
+    #[test]
+    fn a_distinct_with_nowhere_to_spill_holds_every_row() {
+        let rows: Vec<Vec<OwnedDatum>> = (0..3_000i64).map(|n| vec![OwnedDatum::Int(n)]).collect();
+        let (kept, external) = distinct(&rows, 1, vec![Collation::Binary], None);
+        assert!(!external);
+        assert_eq!(kept.len(), 3_000);
     }
 }
 

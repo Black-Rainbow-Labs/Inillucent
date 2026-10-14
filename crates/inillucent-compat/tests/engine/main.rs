@@ -88,6 +88,7 @@ mod segment_delta_chain;
 mod segment_merge_bound;
 mod segmented_generations;
 mod space_reuse;
+mod spill_memory;
 mod sql;
 mod storage;
 mod subquery_values;

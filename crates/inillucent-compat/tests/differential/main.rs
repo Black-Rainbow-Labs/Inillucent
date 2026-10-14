@@ -43,6 +43,7 @@ mod new_engine_pragma;
 mod new_engine_vtab;
 mod new_engine_writes;
 mod numeric_text;
+mod operator_spill;
 mod oracle;
 mod ordering;
 mod planner;

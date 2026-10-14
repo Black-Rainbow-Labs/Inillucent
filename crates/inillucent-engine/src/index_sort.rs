@@ -202,6 +202,29 @@ impl SortedEntries {
         }
     }
 
+    /// Reports whether a `UNIQUE` index has two entries with one key, after refusing keys over the
+    /// limit.
+    ///
+    /// **Both checks run before the first page is written.** Entries sorted in memory are checked for
+    /// a key over the limit by the builder, which looks at every row before it allocates. Entries
+    /// sorted in runs reach the builder a chunk at a time, so they are read once here instead.
+    ///
+    /// @param unique - whether the index is `UNIQUE`
+    /// @param columns - the index tree's column directory
+    /// @param key_columns - how many leading columns form the key, the row identity included
+    pub(crate) fn has_duplicate_or_long_key(
+        &self,
+        unique: bool,
+        columns: &[ColumnSpec],
+        key_columns: usize,
+    ) -> DbResult<bool> {
+        if unique && self.has_duplicate(key_columns.saturating_sub(1))? {
+            return Ok(true);
+        }
+        self.refuse_long_keys(columns, key_columns)?;
+        Ok(false)
+    }
+
     /// Refuses entries whose keys are over the limit, before any page is written.
     ///
     /// The in memory form leaves this to the builder, which makes the same check over the whole

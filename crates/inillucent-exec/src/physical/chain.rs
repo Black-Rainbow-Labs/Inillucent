@@ -1066,7 +1066,7 @@ fn push_distinct(chain: Box<dyn Sink>, operators: &mut Listing, up: &Upward<'_>)
         return Box::new(AdjacentDistinct::over(collations, width, chain));
     }
     operators.add(|| "DISTINCT HASH".to_string());
-    Box::new(Distinct::over(collations, width, chain))
+    Box::new(Distinct::over(collations, width, chain).spilling_to(spill_of(up)))
 }
 
 /// Puts the projection on.

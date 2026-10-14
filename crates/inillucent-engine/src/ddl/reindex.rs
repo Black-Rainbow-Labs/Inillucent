@@ -198,10 +198,9 @@ impl ImportedDatabase {
             )?
         };
         let entries = collected.finish()?;
-        if index.unique && entries.has_duplicate(key_columns.saturating_sub(1))? {
+        if entries.has_duplicate_or_long_key(index.unique, &columns, key_columns)? {
             return Err(unique_violation(&owner, &index));
         }
-        entries.refuse_long_keys(&columns, key_columns)?;
         // **The catalog row names the new tree before the tree is filled
         // (task-1932, found by `reindex_crash.rs`).** A recovery derives every
         // tree's shape from the catalog rows it has replayed so far, and

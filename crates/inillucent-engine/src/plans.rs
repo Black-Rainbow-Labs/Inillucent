@@ -603,8 +603,8 @@ impl ImportedDatabase {
     ) -> DbResult<crate::engine::bulk::Collected> {
         use crate::engine::bulk::Collected;
         let Ok(mut held) = slot.try_borrow_mut() else {
-            let rows = physical::run_any_prepared(plan, self, prepared, params)?.0;
-            return Ok(Collected::Rows(rows));
+            return physical::run_any_gathered(plan, self, prepared, params, packed)
+                .map(Collected::from);
         };
         if let physical::Slot::Reusable(compiled) = &*held {
             if !compiled.built_under(params) {
@@ -632,8 +632,7 @@ impl ImportedDatabase {
             },
         }
         drop(held);
-        let rows = physical::run_any_prepared(plan, self, prepared, params)?.0;
-        Ok(Collected::Rows(rows))
+        physical::run_any_gathered(plan, self, prepared, params, packed).map(Collected::from)
     }
 }
 

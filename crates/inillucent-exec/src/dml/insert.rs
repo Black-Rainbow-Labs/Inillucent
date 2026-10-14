@@ -345,26 +345,66 @@ pub(super) fn insert_row_feed(
             // VALUES (50, ...)` makes the next allocated key 51.
             high_water = high_water.max(assigned);
         }
-        // **`AFTER INSERT` does not fire for a row the upsert updated.** The
-        // arm fired the `UPDATE` triggers itself, in `upsert_row`.
-        let after_insert: &[inillucent_sql::dml::BoundTrigger] = match stored {
-            Stored::Updated(_) => &[],
-            Stored::Inserted(_) => &statement.triggers,
-        };
-        let returned = returned_for_row(statement, plan, space, params, target, &stored, layout)?;
-        let fired = (after_insert, stored.row(), &**layout, params, depth);
-        if fire_and_count(fired, target, &mut changes)? {
-            continue;
-        }
-        if captured {
-            changes.written.push(stored.row().to_vec());
-        }
-        if let Some(out) = returned {
-            changes.returned.push(out);
-        }
+        finish_stored_row(
+            statement,
+            target,
+            params,
+            depth,
+            compiled,
+            &stored,
+            captured,
+            &mut changes,
+        )?;
     }
     close_sequence(statement, target, sequence_mark.as_ref(), high_water)?;
     Ok(changes)
+}
+
+/// Fires the `AFTER` triggers for a row that was written, and records it in the tally.
+///
+/// @param statement - the bound insert
+/// @param target - the file and its trees
+/// @param params - the bound parameters
+/// @param depth - how many triggers deep this write already is
+/// @param compiled - the plan, the row space, the layout and the declarations
+/// @param stored - what the write did
+/// @param captured - whether the target keeps the rows written
+/// @param changes - the statement's tally
+#[allow(clippy::too_many_arguments)]
+fn finish_stored_row(
+    statement: &BoundInsert,
+    target: &mut dyn WriteTarget,
+    params: &Params,
+    depth: Depth,
+    compiled: &CompiledInsert,
+    stored: &Stored,
+    captured: bool,
+    changes: &mut Changes,
+) -> DbResult<()> {
+    let CompiledInsert {
+        layout,
+        space,
+        plan,
+        ..
+    } = compiled;
+    // **`AFTER INSERT` does not fire for a row the upsert updated.** The
+    // arm fired the `UPDATE` triggers itself, in `upsert_row`.
+    let after_insert: &[inillucent_sql::dml::BoundTrigger] = match stored {
+        Stored::Updated(_) => &[],
+        Stored::Inserted(_) => &statement.triggers,
+    };
+    let returned = returned_for_row(statement, plan, space, params, target, stored, layout)?;
+    let fired = (after_insert, stored.row(), &**layout, params, depth);
+    if fire_and_count(fired, target, changes)? {
+        return Ok(());
+    }
+    if captured {
+        changes.written.push(stored.row().to_vec());
+    }
+    if let Some(out) = returned {
+        changes.returned.push(out);
+    }
+    Ok(())
 }
 /// Fires the foreign key triggers again for a row whose `NULL` a default replaced.
 ///

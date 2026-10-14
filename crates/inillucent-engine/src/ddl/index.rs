@@ -134,13 +134,9 @@ impl crate::ImportedDatabase {
         let mut entries = collected.finish()?;
         let sort = sorted_at.elapsed().as_nanos();
         let checked = std::time::Instant::now();
-        if unique && entries.has_duplicate(key_columns.saturating_sub(1))? {
+        if entries.has_duplicate_or_long_key(unique, &columns, key_columns)? {
             return Err(unique_violation(&owner, &index));
         }
-        // **Before the first page is written.** Entries sorted in memory are checked for a key over
-        // the limit by the builder, which looks at every row before it allocates. Entries sorted in
-        // runs reach the builder a chunk at a time, so they are read once here instead.
-        entries.refuse_long_keys(&columns, key_columns)?;
         let uniqueness = checked.elapsed().as_nanos();
         // The sort is finished and the uniqueness check with it, so everything
         // only they needed goes back before the pack - which is the half of the
