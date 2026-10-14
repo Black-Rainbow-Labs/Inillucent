@@ -132,15 +132,43 @@ impl Query {
     }
 }
 
-/// Rewrites the `-` operator of an FTS3 or FTS4 query into the FTS5 spelling.
+/// The byte that opens a `NEAR/n` marker in the text [`fts3_words`] produces.
 ///
-/// **A table made with `fts3` or `fts4` reads `-` as an operator, not as FTS5's
-/// column filter (bug hunt 10).** `MATCH 'x -y'` is `x` and not `y`. A `-` that
-/// is not directly followed by a term is only a separator, so `MATCH '- a'` is
-/// the query `a`; it was refused with an FTS5 message about a column filter.
-/// A `-term` with nothing before it, and a quote that is never closed, are
-/// SQLite's `malformed MATCH expression: [...]`. A query with no terms at all
-/// matches nothing, and `None` says so.
+/// A control byte, because no query a person types contains one and the marker
+/// has to survive until [`fts3_group_near`] reads it back.
+const NEAR_OPEN: u8 = 0x01;
+/// The byte that closes a `NEAR/n` marker.
+const NEAR_CLOSE: u8 = 0x02;
+/// How many tokens FTS3 allows between two terms joined by a bare `NEAR`.
+const FTS3_DEFAULT_NEAR: u32 = 10;
+
+/// Rewrites an FTS3 or FTS4 query into the FTS5 spelling.
+///
+/// **FTS3 and FTS4 read a different query language from FTS5 (bug hunt 10).**
+/// SQLite builds them without `SQLITE_ENABLE_FTS3_PARENTHESIS`, so the language
+/// has three operators and no more:
+///
+/// - a leading `-` on a term is `AND NOT`, so `MATCH 'x -y'` is `x` and not `y`;
+/// - `OR`, in capitals, is `OR`;
+/// - `NEAR` and `NEAR/n`, in capitals, join two terms or phrases that are at most
+///   `n` tokens apart. A bare `NEAR` is `NEAR/10`.
+///
+/// `AND` and `NOT` are ordinary words there, so `MATCH 'x NOT y'` finds rows
+/// holding all three words `x`, `NOT` and `y`. They are quoted on the way to the
+/// FTS5 parser, which would otherwise read them as operators. `near/3` and `or`
+/// in lower case are ordinary words as well.
+///
+/// A `-` that is not directly followed by a term is only a separator, so
+/// `MATCH '- a'` is the query `a`. A `-term` with nothing before it, a quote that
+/// is never closed, and a `NEAR` with no term on one side are SQLite's
+/// `malformed MATCH expression: [...]`. A query with no terms at all matches
+/// nothing, and `None` says so.
+///
+/// A chain such as `a NEAR/5 b NEAR/5 c` becomes one FTS5 group `NEAR(a b c, 5)`,
+/// which keeps every term within a window of that many tokens. FTS3 compares
+/// each pair that is next to each other in the chain. Both answer the same on
+/// the chains with one distance throughout. With several distances the group
+/// takes the largest.
 ///
 /// @param text - the query the `MATCH` operand was given
 pub fn fts3_pattern(text: &[u8]) -> DbResult<Option<Vec<u8>>> {
@@ -150,28 +178,114 @@ pub fn fts3_pattern(text: &[u8]) -> DbResult<Option<Vec<u8>>> {
             String::from_utf8_lossy(text)
         ))
     };
+    let Some(words) = fts3_words(text, &malformed)? else {
+        return Ok(None);
+    };
+    Ok(Some(fts3_group_near(&words, &malformed)?))
+}
+
+/// Returns the length of the FTS3 keyword that starts at a position, and what it becomes.
+///
+/// Only a word that begins at `at` and ends at a space, a parenthesis, a quote or
+/// the end of the query is a keyword. `AND` and `NOT` become quoted words. `NEAR`
+/// and `NEAR/n` become the marker [`fts3_group_near`] reads. `NEAR/` with no
+/// digits after it is the word `NEAR` followed by whatever the slash starts.
+///
+/// @param text - the query
+/// @param at - where a word begins
+fn fts3_keyword(text: &[u8], at: usize) -> Option<(usize, Vec<u8>)> {
+    let rest = text.get(at..)?;
+    let ends = |length: usize| {
+        rest.get(length)
+            .is_none_or(|next| next.is_ascii_whitespace() || matches!(*next, b'(' | b')' | b'"'))
+    };
+    if rest.starts_with(b"AND") && ends(3) {
+        return Some((3, b"\"AND\"".to_vec()));
+    }
+    if rest.starts_with(b"NOT") && ends(3) {
+        return Some((3, b"\"NOT\"".to_vec()));
+    }
+    if !rest.starts_with(b"NEAR") {
+        return None;
+    }
+    if ends(4) {
+        return Some((4, fts3_near_marker(FTS3_DEFAULT_NEAR)));
+    }
+    if rest.get(4) != Some(&b'/') {
+        return None;
+    }
+    let digits = rest
+        .get(5..)
+        .unwrap_or_default()
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    let end = 5usize.saturating_add(digits);
+    if digits == 0 || !ends(end) {
+        return None;
+    }
+    let distance = rest
+        .get(5..end)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(|number| number.parse::<u32>().ok())
+        .unwrap_or(FTS3_DEFAULT_NEAR);
+    Some((end, fts3_near_marker(distance)))
+}
+
+/// Returns the marker for a `NEAR/n` operator.
+///
+/// @param distance - how many tokens may sit between the two operands
+fn fts3_near_marker(distance: u32) -> Vec<u8> {
+    let mut marker = vec![NEAR_OPEN];
+    marker.extend_from_slice(distance.to_string().as_bytes());
+    marker.push(NEAR_CLOSE);
+    marker
+}
+
+/// Rewrites the words of an FTS3 query: `-` becomes `NOT`, `AND` and `NOT` are quoted, `NEAR` is marked.
+///
+/// @param text - the query
+/// @param malformed - builds the error for a query SQLite refuses
+fn fts3_words(
+    text: &[u8],
+    malformed: &dyn Fn() -> inillucent_base::DbError,
+) -> DbResult<Option<Vec<u8>>> {
     let mut out = Vec::with_capacity(text.len().saturating_add(8));
     let (mut quoted, mut has_term) = (false, false);
-    for (at, byte) in text.iter().copied().enumerate() {
+    let mut at = 0usize;
+    while let Some(byte) = text.get(at).copied() {
+        let next_at = at.saturating_add(1);
         if byte == b'"' {
             quoted = !quoted;
             has_term = true;
             out.push(byte);
+            at = next_at;
             continue;
         }
         if quoted {
             out.push(byte);
+            at = next_at;
             continue;
         }
-        // Only a `-` that begins a word is the operator; one inside a word
+        // Only a word that begins here can be an operator; one inside a word
         // stays as it was written.
         let begins_word = out
             .last()
             .is_none_or(|before| before.is_ascii_whitespace() || *before == b'(');
+        if begins_word {
+            if let Some((length, replacement)) = fts3_keyword(text, at) {
+                if replacement.first() != Some(&NEAR_OPEN) {
+                    has_term = true;
+                }
+                out.extend_from_slice(&replacement);
+                at = at.saturating_add(length);
+                continue;
+            }
+        }
         if byte == b'-' && begins_word {
             let starts_term = text
-                .get(at.saturating_add(1))
-                .is_some_and(|next| next.is_ascii_alphanumeric() || *next >= 0x80 || *next == b'"');
+                .get(next_at)
+                .is_some_and(|next| next.is_ascii_alphanumeric() || *next >= 0x80);
             if !starts_term {
                 out.push(b' ');
             } else if has_term {
@@ -179,12 +293,14 @@ pub fn fts3_pattern(text: &[u8]) -> DbResult<Option<Vec<u8>>> {
             } else {
                 return Err(malformed());
             }
+            at = next_at;
             continue;
         }
         if !byte.is_ascii_whitespace() && byte != b'(' && byte != b')' {
             has_term = true;
         }
         out.push(byte);
+        at = next_at;
     }
     if quoted {
         return Err(malformed());
@@ -193,6 +309,125 @@ pub fn fts3_pattern(text: &[u8]) -> DbResult<Option<Vec<u8>>> {
         return Ok(None);
     }
     Ok(Some(out))
+}
+
+/// Splits the rewritten query into items: quoted strings, words, parentheses and `NEAR` markers.
+///
+/// @param text - the output of [`fts3_words`]
+fn fts3_items(text: &[u8]) -> Vec<&[u8]> {
+    let mut items: Vec<&[u8]> = Vec::new();
+    let mut at = 0usize;
+    while let Some(byte) = text.get(at).copied() {
+        if byte.is_ascii_whitespace() {
+            at = at.saturating_add(1);
+            continue;
+        }
+        let start = at;
+        match byte {
+            b'(' | b')' => at = at.saturating_add(1),
+            NEAR_OPEN => {
+                while text.get(at).is_some_and(|held| *held != NEAR_CLOSE) {
+                    at = at.saturating_add(1);
+                }
+                at = at.saturating_add(1);
+            }
+            b'"' => {
+                at = at.saturating_add(1);
+                while text.get(at).is_some_and(|held| *held != b'"') {
+                    at = at.saturating_add(1);
+                }
+                at = at.saturating_add(1);
+                // A star after the closing quote makes the last word a prefix.
+                while text.get(at).is_some_and(|held| *held == b'*') {
+                    at = at.saturating_add(1);
+                }
+            }
+            _ => {
+                while text.get(at).is_some_and(|held| {
+                    !held.is_ascii_whitespace() && !matches!(*held, b'(' | b')' | b'"' | NEAR_OPEN)
+                }) {
+                    at = at.saturating_add(1);
+                }
+            }
+        }
+        items.push(text.get(start..at).unwrap_or_default());
+    }
+    items
+}
+
+/// Returns the distance a `NEAR` marker item carries, or nothing for any other item.
+///
+/// @param item - one item from [`fts3_items`]
+fn fts3_near_distance(item: &[u8]) -> Option<u32> {
+    let inner = item
+        .strip_prefix(&[NEAR_OPEN])?
+        .strip_suffix(&[NEAR_CLOSE])?;
+    std::str::from_utf8(inner).ok()?.parse::<u32>().ok()
+}
+
+/// Turns each run `a NEAR/n b NEAR/m c` into the FTS5 group `NEAR(a b c, k)`.
+///
+/// Every other item is copied through. An operator at either end of the query or
+/// next to another operator, `OR` or `NOT`, has no term on one side and is
+/// malformed, as it is in SQLite.
+///
+/// @param text - the output of [`fts3_words`]
+/// @param malformed - builds the error for a query SQLite refuses
+fn fts3_group_near(
+    text: &[u8],
+    malformed: &dyn Fn() -> inillucent_base::DbError,
+) -> DbResult<Vec<u8>> {
+    let items = fts3_items(text);
+    let operand = |item: &[u8]| {
+        !matches!(item, b"OR" | b"NOT" | b"(" | b")") && fts3_near_distance(item).is_none()
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(text.len().saturating_add(16));
+    let mut at = 0usize;
+    while let Some(item) = items.get(at).copied() {
+        if !out.is_empty() {
+            out.push(b' ');
+        }
+        if fts3_near_distance(item).is_some() {
+            return Err(malformed());
+        }
+        let joined = items
+            .get(at.saturating_add(1))
+            .copied()
+            .and_then(fts3_near_distance);
+        if joined.is_none() {
+            out.extend_from_slice(item);
+            at = at.saturating_add(1);
+            continue;
+        }
+        if !operand(item) {
+            return Err(malformed());
+        }
+        let mut members: Vec<&[u8]> = vec![item];
+        let mut widest = 0u32;
+        let mut next = at.saturating_add(1);
+        while let Some(distance) = items.get(next).copied().and_then(fts3_near_distance) {
+            let Some(member) = items
+                .get(next.saturating_add(1))
+                .copied()
+                .filter(|member| operand(member))
+            else {
+                return Err(malformed());
+            };
+            widest = widest.max(distance);
+            members.push(member);
+            next = next.saturating_add(2);
+        }
+        out.extend_from_slice(b"NEAR(");
+        for (index, member) in members.iter().enumerate() {
+            if index > 0 {
+                out.push(b' ');
+            }
+            out.extend_from_slice(member);
+        }
+        out.extend_from_slice(format!(", {widest})").as_bytes());
+        at = next;
+    }
+    Ok(out)
 }
 
 impl Query {
@@ -1212,6 +1447,70 @@ mod tests {
             &[b"title".to_vec(), b"body".to_vec()],
         )
         .expect("parses")
+    }
+
+    /// Returns what an FTS3 or FTS4 query becomes, as text.
+    ///
+    /// @param text - the query
+    fn fts3(text: &str) -> Option<String> {
+        fts3_pattern(text.as_bytes())
+            .expect("a well formed query")
+            .map(|bytes| String::from_utf8(bytes).expect("text"))
+    }
+
+    /// `AND` and `NOT` are words in FTS3 and FTS4, and the binary operator is a leading `-`.
+    #[test]
+    fn fts3_reads_and_and_not_as_words() {
+        assert_eq!(fts3("x NOT y").as_deref(), Some("x \"NOT\" y"));
+        assert_eq!(fts3("x AND y").as_deref(), Some("x \"AND\" y"));
+        assert_eq!(fts3("x not y").as_deref(), Some("x not y"));
+        assert_eq!(fts3("x -y").as_deref(), Some("x NOT y"));
+        assert_eq!(fts3("x OR y").as_deref(), Some("x OR y"));
+    }
+
+    /// `NEAR/n` becomes an FTS5 group with the same distance, and a bare `NEAR` is ten.
+    #[test]
+    fn fts3_near_becomes_a_near_group() {
+        assert_eq!(fts3("x NEAR/3 y").as_deref(), Some("NEAR(x y, 3)"));
+        assert_eq!(fts3("x NEAR y").as_deref(), Some("NEAR(x y, 10)"));
+        assert_eq!(
+            fts3("z OR x NEAR/0 y").as_deref(),
+            Some("z OR NEAR(x y, 0)")
+        );
+        assert_eq!(
+            fts3("\"x w\" NEAR/2 y*").as_deref(),
+            Some("NEAR(\"x w\" y*, 2)")
+        );
+        assert_eq!(
+            fts3("x NEAR/5 y NEAR/5 q").as_deref(),
+            Some("NEAR(x y q, 5)")
+        );
+        assert_eq!(fts3("x near/3 y").as_deref(), Some("x near/3 y"));
+    }
+
+    /// A `NEAR` with no term on one side is the error SQLite gives.
+    #[test]
+    fn fts3_near_needs_a_term_on_both_sides() {
+        for text in [
+            "NEAR",
+            "NEAR/3 y",
+            "x NEAR/3",
+            "x NEAR OR y",
+            "x NEAR NEAR y",
+        ] {
+            let error = fts3_pattern(text.as_bytes()).expect_err(text);
+            assert!(
+                error.message().contains("malformed MATCH expression"),
+                "{text}: {}",
+                error.message()
+            );
+        }
+    }
+
+    /// A `-` before a quote is only a separator in FTS3 and FTS4.
+    #[test]
+    fn fts3_minus_before_a_quote_is_not_an_operator() {
+        assert_eq!(fts3("x -\"w q\"").as_deref(), Some("x \"w q\""));
     }
 
     /// Two words side by side are an `AND`.

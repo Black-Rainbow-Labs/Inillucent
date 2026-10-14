@@ -957,3 +957,47 @@ SELECT docid, snippet(f, '[', ']', '..', -1, 8) FROM f WHERE f MATCH 'needle OR 
 SELECT docid, snippet(f, '[', ']', '..', 1, 8) FROM f WHERE f MATCH 'needle OR thread' ORDER BY docid;
 SELECT docid, snippet(f, '[', ']', '..', 2, -6) FROM f WHERE f MATCH 'needle OR thread OR button' ORDER BY docid;
 SELECT docid, snippet(f, '[', ']', '..', 5, 8) FROM f WHERE f MATCH 'needle' ORDER BY docid;
+
+-- case: bug-hunt-8/fts4/not_and_and_are_ordinary_words
+-- The default FTS3 query syntax has no NOT or AND operator. Both are words, and the binary operator is a leading minus.
+CREATE VIRTUAL TABLE f USING fts4(a);
+INSERT INTO f(rowid, a) VALUES (1, 'x y'), (2, 'x z'), (3, 'x w q r y'), (4, 'x NOT y'), (5, 'x AND y'), (6, 'x not y');
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'x NOT y';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'x AND y';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'x not y';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'x -y';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'NOT';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'z OR w';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'z or w';
+
+-- case: bug-hunt-8/fts4/near_distance
+-- NEAR/n allows n tokens between the two operands in either order, and a bare NEAR is NEAR/10.
+CREATE VIRTUAL TABLE f USING fts4(a);
+INSERT INTO f(rowid, a) VALUES (1, 'x y'), (2, 'x z'), (3, 'x w q r y'), (4, 'y x'), (5, 'a b c d e f g h i j k l m n x'), (6, 'y a b c d e f g h i j k x'), (7, 'y a b c d e f g h i x'), (8, 'x w y q z x');
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'x NEAR/3 y';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'x NEAR/0 y';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'x NEAR/1 y';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'x NEAR y';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'x NEAR/10 y';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'x NEAR/11 y';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'x* NEAR/3 y*';
+SELECT group_concat(rowid) FROM f WHERE f MATCH '"x w" NEAR/2 y';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'x NEAR/5 y NEAR/5 q';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'z x NEAR/3 y';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'z OR x NEAR/0 y';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'x near/3 y';
+
+-- case: bug-hunt-8/fts4/near_without_a_term_is_malformed
+CREATE VIRTUAL TABLE f USING fts4(a);
+INSERT INTO f(rowid, a) VALUES (1, 'x y');
+SELECT count(*) FROM f WHERE f MATCH 'NEAR';
+SELECT count(*) FROM f WHERE f MATCH 'NEAR/3 y';
+SELECT count(*) FROM f WHERE f MATCH 'x NEAR/3';
+SELECT count(*) FROM f WHERE f MATCH 'x NEAR OR y';
+
+-- case: bug-hunt-8/fts3/not_and_near
+CREATE VIRTUAL TABLE f USING fts3(a);
+INSERT INTO f(rowid, a) VALUES (1, 'x y'), (2, 'x z'), (3, 'x w q r y'), (4, 'x NOT y');
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'x NOT y';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'x NEAR/3 y';
+SELECT group_concat(rowid) FROM f WHERE f MATCH 'x -y';
