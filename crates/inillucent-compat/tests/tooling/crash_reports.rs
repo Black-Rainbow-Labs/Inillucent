@@ -140,10 +140,15 @@ const FLOORS: [Floor; 20] = [
     // the dropped cut points tested. Measured through `inillucent-testrun`:
     // 53 cut points before the change and 43 after. Every cut point
     // still recovers to a state the campaign accepts.
+    // **Two fewer since the pragmas `open()` runs take no lock (bug hunt 10).** `journal_mode`
+    // and `synchronous` set the connection only, and no longer take the read lock or read the
+    // header, so the campaign loses one `Lock` and one `Read` before the transaction starts.
+    // Every write, sync, truncate and journal delete of the commit is still armed: with those
+    // two calls left out, the traced sequences before and after are the same.
     Floor {
         name: "delete-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 43,
+        least: 41,
     },
     // **The same workload with the commit's log sync left to the fold that
     // follows it, which is what the command line's `exec` runs under
@@ -159,10 +164,15 @@ const FLOORS: [Floor; 20] = [
     // the dropped cut points tested. Measured through `inillucent-testrun`:
     // 51 cut points before the change and 39 after. Every cut point
     // still recovers to a state the campaign accepts.
+    // **Two fewer since the pragmas `open()` runs take no lock (bug hunt 10).** `journal_mode`
+    // and `synchronous` set the connection only, and no longer take the read lock or read the
+    // header, so the campaign loses one `Lock` and one `Read` before the transaction starts.
+    // Every write, sync, truncate and journal delete of the commit is still armed: with those
+    // two calls left out, the traced sequences before and after are the same.
     Floor {
         name: "delete-fold-crash.txt",
         shape: Shape::CutPoints,
-        least: 39,
+        least: 37,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -229,10 +239,15 @@ const FLOORS: [Floor; 20] = [
     // the dropped cut points tested. Measured through `inillucent-testrun`:
     // 53 cut points before the change and 43 after. Every cut point
     // still recovers to a state the campaign accepts.
+    // **Two fewer since the pragmas `open()` runs take no lock (bug hunt 10).** `journal_mode`
+    // and `synchronous` set the connection only, and no longer take the read lock or read the
+    // header, so the campaign loses one `Lock` and one `Read` before the transaction starts.
+    // Every write, sync, truncate and journal delete of the commit is still armed: with those
+    // two calls left out, the traced sequences before and after are the same.
     Floor {
         name: "delete-full-disk-full.txt",
         shape: Shape::CutPoints,
-        least: 43,
+        least: 41,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -299,10 +314,15 @@ const FLOORS: [Floor; 20] = [
     // the dropped cut points tested. Measured through `inillucent-testrun`:
     // 53 cut points before the change and 43 after. Every cut point
     // still recovers to a state the campaign accepts.
+    // **Two fewer since the pragmas `open()` runs take no lock (bug hunt 10).** `journal_mode`
+    // and `synchronous` set the connection only, and no longer take the read lock or read the
+    // header, so the campaign loses one `Lock` and one `Read` before the transaction starts.
+    // Every write, sync, truncate and journal delete of the commit is still armed: with those
+    // two calls left out, the traced sequences before and after are the same.
     Floor {
         name: "delete-full-io-error.txt",
         shape: Shape::CutPoints,
-        least: 43,
+        least: 41,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
@@ -369,10 +389,15 @@ const FLOORS: [Floor; 20] = [
     // the dropped cut points tested. Measured through `inillucent-testrun`:
     // 53 cut points before the change and 43 after. Every cut point
     // still recovers to a state the campaign accepts.
+    // **Two fewer since the pragmas `open()` runs take no lock (bug hunt 10).** `journal_mode`
+    // and `synchronous` set the connection only, and no longer take the read lock or read the
+    // header, so the campaign loses one `Lock` and one `Read` before the transaction starts.
+    // Every write, sync, truncate and journal delete of the commit is still armed: with those
+    // two calls left out, the traced sequences before and after are the same.
     Floor {
         name: "delete-full-short-write.txt",
         shape: Shape::CutPoints,
-        least: 43,
+        least: 41,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** 161 cut points became 153 over the same
@@ -428,10 +453,15 @@ const FLOORS: [Floor; 20] = [
     // the dropped cut points tested. Measured through `inillucent-testrun`:
     // 133 cut points before the change and 111 after. Every cut point
     // still recovers to a state the campaign accepts.
+    // **Two fewer since the pragmas `open()` runs take no lock (bug hunt 10).** `journal_mode`
+    // and `synchronous` set the connection only, and no longer take the read lock or read the
+    // header, so the campaign loses one `Lock` and one `Read` before the transaction starts.
+    // Every write, sync, truncate and journal delete of the commit is still armed: with those
+    // two calls left out, the traced sequences before and after are the same.
     Floor {
         name: "truncate-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 111,
+        least: 109,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** 161 cut points became 153 over the same
@@ -487,10 +517,15 @@ const FLOORS: [Floor; 20] = [
     // the dropped cut points tested. Measured through `inillucent-testrun`:
     // 133 cut points before the change and 111 after. Every cut point
     // still recovers to a state the campaign accepts.
+    // **Two fewer since the pragmas `open()` runs take no lock (bug hunt 10).** `journal_mode`
+    // and `synchronous` set the connection only, and no longer take the read lock or read the
+    // header, so the campaign loses one `Lock` and one `Read` before the transaction starts.
+    // Every write, sync, truncate and journal delete of the commit is still armed: with those
+    // two calls left out, the traced sequences before and after are the same.
     Floor {
         name: "persist-full-crash.txt",
         shape: Shape::CutPoints,
-        least: 111,
+        least: 109,
     },
     // **Eight fewer since a bulk UPDATE repacks a leaf whose rows outgrow
     // their slots (task-2183).** Measured by running this campaign at the
