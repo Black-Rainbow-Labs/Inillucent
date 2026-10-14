@@ -146,7 +146,7 @@ command line: read it from a secret store or from the environment.
 |---|---|
 | **Values are typed.** | A value is `Null`, `Integer`, `Real`, `Text` or `Blob`. The driver does not turn numbers into text. |
 | **`Null` is its own value.** | `Value::Null` and an empty `Value::Text` are different values. |
-| **`total` is exact.** | The engine builds the whole result before it returns. `limit` only caps the rows handed back, and `more` is true when rows were left out. A query over a large table costs the whole result, so put a `LIMIT` in the SQL when that matters. |
+| **`total` is exact.** | `limit` only caps the rows `query` hands back, and `more` is true when rows were left out. `query` and `query_all` hold every row the statement produced until they return, so a query over a large table costs the whole result. Put a `LIMIT` in the SQL, or read the rows with `Connection::query_each(sql, params, &sink)`, which hands each row to a `RowSink` as it is produced and holds none. The C library's `step` still builds the whole result. |
 | **A batch is one transaction, checked before the commit.** | `Connection::transaction(work, check)` runs every statement, passes the changed row counts to `check`, and commits only when `check` returns `Ok`. Any failure rolls back every statement. |
 | **One database runs one statement at a time.** | A `Database` is neither `Send` nor `Sync`. To use one database from several threads, open it with `SharedDatabase`, which runs each statement in turn on a thread of its own. |
 | **Read only is enforced by the driver.** | With `OpenOptions::read_only` set, the driver refuses any statement that does not bind to a query, including a `PRAGMA`. The file is still open for writing, so the `readonly_open` capability says `partial`. |

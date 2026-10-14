@@ -135,6 +135,25 @@ impl Value {
         }
     }
 
+    /// Copies a value the engine is handing over while a statement is still running.
+    ///
+    /// The same rule as [`Value::from_engine`], from the borrowed form a streamed row has: text
+    /// that is not UTF-8 becomes a blob.
+    ///
+    /// @param value - the engine's value, borrowed from the page it was read from
+    pub fn from_datum(value: &inillucent_engine::Datum<'_>) -> Value {
+        match value {
+            inillucent_engine::Datum::Null => Value::Null,
+            inillucent_engine::Datum::Int(number) => Value::Integer(*number),
+            inillucent_engine::Datum::Real(number) => Value::Real(*number),
+            inillucent_engine::Datum::Text(bytes) => match std::str::from_utf8(bytes) {
+                Ok(text) => Value::Text(text.to_owned()),
+                Err(_) => Value::Blob(bytes.to_vec()),
+            },
+            inillucent_engine::Datum::Blob(bytes) => Value::Blob(bytes.to_vec()),
+        }
+    }
+
     /// Takes a value coming out of the engine, without copying its bytes.
     ///
     /// The same rule as [`Value::from_engine`]: text that is not UTF-8 becomes

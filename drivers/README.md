@@ -133,6 +133,33 @@ match connection.query_all(statement, &[]) {
 }
 ```
 
+A result too large to hold is read with `query_each`, which hands each row to a `RowSink` while the
+engine produces the next one:
+
+```rust
+use std::{cell::RefCell, ops::ControlFlow, rc::Rc};
+use inillucent_driver::{Result, RowSink, Value};
+
+struct Total(i64);
+
+impl RowSink for Total {
+    fn row(&mut self, row: &[Value]) -> Result<ControlFlow<()>> {
+        if let Some(Value::Integer(id)) = row.first() {
+            self.0 += id;
+        }
+        Ok(ControlFlow::Continue(())) // ControlFlow::Break(()) stops the statement
+    }
+}
+
+let total = Rc::new(RefCell::new(Total(0)));
+let done = connection.query_each("SELECT id FROM people", &[], &total)?;
+println!("{} rows, ids add up to {}", done.total, total.borrow().0);
+```
+
+The sink is held in an `Rc<RefCell<..>>` so that you keep a handle on it and read what it collected
+after the call. It must not use the connection the statement is running on. `Streamed::total` is
+exact, counted as the rows go by.
+
 `Database::session` returns a `Connection`. The older name `Database::connect` still works and is
 deprecated.
 
@@ -170,7 +197,7 @@ integers and back.
 |---|---|
 | **Values are typed.** | A value is one of `Null`, `Integer`, `Real`, `Text` or `Blob`. The driver does not turn numbers into text. |
 | **`Null` is its own variant.** | `Value::Null` and an empty `Value::Text` are different values. |
-| **`total` is exact.** | The engine builds the whole result before it returns. `limit` caps the rows handed back. `total` counts every row the statement produced, and `more` is true when `limit` left rows out. A query over a large table costs the whole result, so put a `LIMIT` in the SQL when that matters. |
+| **`total` is exact.** | `limit` caps the rows `query` hands back. `total` counts every row the statement produced, and `more` is true when `limit` left rows out. `query` and `query_all` hold every row the statement produced until they return, so a query over a large table costs the whole result: put a `LIMIT` in the SQL, or read the rows with `query_each`, which hands each row to a sink as it is produced and holds none. A compound query, a window function and a write with `RETURNING` are not one pipeline, so `query_each` collects them first and then hands the rows over. The C library's `step` and `inillucent_rows_json` still build the whole result. |
 | **A batch is one transaction, checked before the commit.** | `Connection::transaction(work, check)` runs every statement, passes the changed row counts to `check`, and commits only when `check` returns `Ok`. Any failure rolls back all of it. `Connection::begin` returns a `Transaction` you drive one statement at a time. Dropping a `Transaction` without `commit` rolls it back. |
 | **One file has one buffer pool, and the engine runs on one thread.** | A `Database` is neither `Send` nor `Sync`. |
 | **Read only is enforced by the driver.** | With `OpenOptions::read_only` set, the driver refuses any statement that does not bind to a query, including a `PRAGMA`. The binder decides this, so whitespace or a comment in the SQL does not change the result. The file is still open for writing, so the `readonly_open` capability says `partial`. |

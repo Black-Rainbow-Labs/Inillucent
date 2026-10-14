@@ -1013,6 +1013,30 @@ covers = ["inillucent-engine", "inillucent-tree"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "streaming_rows"
+tier = "engine"
+covers = ["inillucent-driver", "inillucent-engine", "inillucent-exec"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "streaming_memory"
+tier = "engine"
+covers = ["inillucent-cli", "inillucent-driver", "inillucent-engine", "inillucent-exec"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "import_memory"
+tier = "engine"
+covers = ["inillucent-cli", "inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "transaction_memory"
 tier = "engine"
 covers = ["inillucent-engine", "inillucent-tree"]

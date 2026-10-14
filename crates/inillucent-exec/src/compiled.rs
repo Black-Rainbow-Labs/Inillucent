@@ -253,6 +253,9 @@ pub struct Compiled {
     /// Where `upper`'s `CollectInto` writes the rows instead while [`Compiled::run_packed`]
     /// runs: empty otherwise.
     packed: crate::ops::Packing,
+    /// Where `upper`'s `CollectInto` hands the rows instead while [`Compiled::run_streaming`]
+    /// runs: empty otherwise.
+    streaming: crate::ops::Streaming,
     /// The statement's correlated blocks and their gate, wrapped around
     /// `upper` on every run the way a join is; see [`CorrelatedRecipe`].
     correlated: Option<CorrelatedRecipe>,
@@ -520,6 +523,38 @@ impl Compiled {
         std::mem::take(&mut *self.collected.borrow_mut())
     }
 
+    /// Runs the chain with every row handed to a consumer as it is produced.
+    ///
+    /// **Nothing is collected**, so a statement that reads a large table holds one batch and
+    /// not the table. The consumer is returned whatever the outcome, with the result of the run
+    /// beside it: a run that fails after delivering rows has already handed those rows over,
+    /// and the failure is reported after them, as the stepping interface reports it.
+    ///
+    /// @param plan - the planner's output this chain was compiled from
+    /// @param catalog - where the trees and layouts come from, for this call only
+    /// @param params - the values bound to `?1`, `?2`, ...
+    /// @param consumer - what takes each row
+    pub fn run_streaming(
+        &mut self,
+        plan: &PhysicalPlan,
+        catalog: &dyn TreeCatalog,
+        params: &Params,
+        consumer: Box<dyn crate::ops::RowConsumer>,
+    ) -> (DbResult<()>, Box<dyn crate::ops::RowConsumer>) {
+        *self.streaming.borrow_mut() = Some(consumer);
+        let ran = self.run(plan, catalog, params);
+        let consumer = self.streaming.borrow_mut().take();
+        match consumer {
+            Some(consumer) => (ran, consumer),
+            // The cell is only emptied here, so a consumer that is not in it means a nested run
+            // took it: report that instead of losing the caller's consumer silently.
+            None => (
+                Err(misuse("a streamed statement lost its consumer")),
+                Box::new(crate::ops::NoConsumer),
+            ),
+        }
+    }
+
     /// Runs the chain into a packed set of rows instead of a vector a row.
     ///
     /// For an `INSERT ... SELECT` the bulk build will take; see
@@ -726,12 +761,14 @@ pub fn try_compile_limited(
     let before = params.reads();
     let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let packed: crate::ops::Packing = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let streaming: crate::ops::Streaming = std::rc::Rc::new(std::cell::RefCell::new(None));
     let sink = Box::new(
         match limit {
             Some(limit) => CollectInto::with_limit(std::rc::Rc::clone(&collected), limit),
             None => CollectInto::new(std::rc::Rc::clone(&collected)),
         }
-        .with_packed(std::rc::Rc::clone(&packed)),
+        .with_packed(std::rc::Rc::clone(&packed))
+        .with_streaming(std::rc::Rc::clone(&streaming)),
     );
     // The listing is kept here: a `Compiled` builds its chain once and every
     // later execution reuses it, so rendering the operators costs one render
@@ -780,6 +817,7 @@ pub fn try_compile_limited(
         bindings,
         collected,
         packed,
+        streaming,
         correlated,
     }))
 }

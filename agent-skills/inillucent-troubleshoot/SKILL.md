@@ -207,8 +207,10 @@ and reads a few rows when both `a` and `b` are indexed, and scans the table when
 
 Two things cost more than they appear to:
 
-- **`--limit` does not make a query cheaper.** The engine computes the whole result, so `total` is
-  exact. `--limit` (200 by default) only cuts the rows printed. Put `LIMIT` in the SQL itself.
+- **`--limit` does not make a query faster.** The engine reads every row so that `total` is exact.
+  `--limit` (200 by default) cuts the rows kept and printed, and the other rows are counted and not
+  held, so a query over millions of rows needs memory for 200 rows. Put `LIMIT` in the SQL itself to
+  read fewer rows. `--limit 0` asks for every row, and the output object holds them all.
 - **A vector search with no index reads every row.** The answer is still correct.
   `CREATE INDEX <name> ON <table> USING inillucent_hnsw (<column>)` adds an HNSW index, including
   over rows already in the table.

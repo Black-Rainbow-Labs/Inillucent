@@ -33,6 +33,20 @@ process, and it already works: a statement that fails to compile checks whether 
 compiles again, and a column added by another process is read by the next statement. A test now runs
 those exact steps, with and without parameters.
 
+**Printing a large result and loading a large file no longer hold the whole result or the whole
+file.** `inillucent-shell` collected every row of a statement before it printed the first, and
+`SELECT a, b FROM t` over 3,000,000 rows peaked at 984 MB where `sqlite3` stays near 10 MB. The
+shell now prints the rows as the engine produces them in `list`, `csv`, `tabs`, `quote`, `ascii`,
+`tcl`, `c`, `jatom`, `line`, `insert`, `json`, `jobject`, `html` and `count` modes, and the same
+statement peaks at 67 MB. `inillucent query` kept every row to cut the list to `--limit` and peaked
+at 896 MB with the default limit; it keeps the rows it prints and counts the rest, so `total` is
+unchanged and the peak is 71 MB. `.import` read and parsed the whole file before it inserted a row
+(407 MB for 1,000,000 rows); it reads a block of the file at a time and inserts at most 20,000 rows
+in one statement, and the same file peaks at 70 MB. A sorted result still needs the memory of the
+sort. The modes that size each column to the widest value (`column`, `table`, `box`, `markdown`,
+`qbox`, `psql`, `split`) and `--limit 0` of `inillucent query` hold the result, as they must.
+`Connection::query_each` in the Rust driver hands each row to a `RowSink` as it is produced.
+
 **`ROLLBACK` restores everything a transaction changed, including after `DROP` and `ALTER TABLE`.**
 Bug hunt 10 found rollbacks that lost or kept rows. With foreign keys on, `BEGIN; DROP TABLE p;
 ROLLBACK` brought `p` back with no rows, because the rows `DROP TABLE` deletes first were put back
