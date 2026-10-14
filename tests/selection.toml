@@ -2286,6 +2286,22 @@ covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-p
 package = "inillucent-compat"
 kind = "test"
 name = "durability"
+module = "open_beside_a_reader"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-sim", "inillucent-vfs"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "shared_page_leak"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool", "inillucent-sim", "inillucent-vfs"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
 module = "phase2_campaigns"
 tier = "durability"
 covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim", "inillucent-exec", "inillucent-catalog"]
