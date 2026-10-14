@@ -50,7 +50,7 @@ pub mod stages;
 // `Nowhere` was `pub` at `vtab::Nowhere` before the split and stays there:
 // `inillucent-ext`'s module contract names it in its own documentation.
 pub use shadow::Nowhere;
-pub(crate) use shadow::{ReadStore, WriteStore};
+pub(crate) use shadow::{ReadStore, ViewContent, WriteStore};
 // `ModuleStages` is named as `inillucent_engine::ModuleStages` by the gate and by
 // `crates/inillucent-compat/tests/engine/module_stages.rs`, beside `StageTimings` which
 // lives at the crate root, so `lib.rs` re-exports it there rather than moving it
@@ -233,6 +233,7 @@ impl ImportedDatabase {
                 )?,
                 trees: &mut self.schema.trees,
                 log: &mut log,
+                view: None,
             };
             let mut nowhere = inillucent_ext::vtab::WithStore { store };
             let mut context = Context {
@@ -481,6 +482,7 @@ impl ImportedDatabase {
         let store = ReadStore {
             pool: self.storage.database.pool(),
             trees: &self.schema.trees,
+            view: None,
         };
         let mut nowhere = inillucent_ext::vtab::WithStore { store };
         let mut context = Context {
@@ -490,6 +492,40 @@ impl ImportedDatabase {
             catalog: Some(&self.schema.catalog),
         };
         table.integrity(&mut context).map(ModuleIntegrity::of)
+    }
+
+    /// Reads the rows of the view an external content table takes its documents from.
+    ///
+    /// **SQLite runs a query over the named table or view, and a view has no tree.** The
+    /// module names the query ([`inillucent_ext::vtab::Module::owner_query`]) and this runs
+    /// it when the owner turns out to be a view. A table owner answers `None`, and the
+    /// module reads its tree as it always did.
+    ///
+    /// @param connected - the virtual table whose owner is wanted
+    pub(crate) fn owner_view_content(
+        &self,
+        connected: &Connected,
+    ) -> DbResult<Option<ViewContent>> {
+        let Some(module) = self
+            .session_state
+            .registry
+            .module(&connected.arguments.module)
+        else {
+            return Ok(None);
+        };
+        let Some((owner, query)) = module.owner_query(&connected.arguments) else {
+            return Ok(None);
+        };
+        let is_view = self
+            .schema
+            .catalog
+            .table_named(&owner.to_ascii_lowercase())
+            .is_some_and(|found| found.kind == inillucent_sql::catalog_view::TableKind::View);
+        if !is_view {
+            return Ok(None);
+        }
+        let (rows, _) = self.run(&query)?;
+        Ok(Some(ViewContent::from_query(&rows)?))
     }
 
     /// Produces the rows one virtual table's scan answers with.
@@ -579,7 +615,13 @@ impl ImportedDatabase {
             return Ok(answered);
         }
         let downstream = tested.downstream;
+        // **A view has no tree, so its rows are read once, with a query.** See `ViewContent`.
+        let view = match self.session_state.virtual_tables.get(&table.folded) {
+            Some(connected) => self.owner_view_content(connected)?,
+            None => None,
+        };
         let reach = ScanReach {
+            view: view.as_ref(),
             modules: &self.session_state.virtual_tables,
             registry: &self.session_state.registry,
             pool: self.storage.database.pool(),
@@ -634,6 +676,8 @@ fn with_supplied_value(
 /// every field here as a shared borrow beside the trees it writes, so it can
 /// build one of these and run the same scan.
 pub(crate) struct ScanReach<'a> {
+    /// The rows of the view the scanned table reads its content from, when its owner is a view.
+    pub(crate) view: Option<&'a ViewContent>,
     /// The virtual tables this connection has connected, by folded name.
     pub(crate) modules: &'a std::collections::HashMap<Vec<u8>, Connected>,
     /// What an eponymous module is connected from.
@@ -723,6 +767,7 @@ pub(crate) fn scan_module(
         let store = ReadStore {
             pool: reach.pool,
             trees: reach.trees,
+            view: reach.view,
         };
         let mut nowhere = inillucent_ext::vtab::WithStore { store };
         let mut context = Context {

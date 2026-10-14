@@ -76,6 +76,30 @@ statement now pays the cost of opening an engine each time and should keep its c
 interpreter lock go while the engine ran, so two threads could be inside one connection together. A
 second thread now waits for the first call to finish. `Connection.cancel()` does not take the lock.
 
+**An FTS5 table can take its content from a view, and an external content table scans its owner.**
+`CREATE VIRTUAL TABLE f USING fts5(body, content='v', content_rowid='id')` with `v` a view returned
+no rows from `SELECT * FROM f`, and `rebuild` indexed nothing, because the module read the owner
+through a tree and a view has none. The rows of the view are now read with a query, as SQLite does,
+for a scan, for a lookup by rowid, for `highlight()` and `snippet()`, and for `rebuild`. A scan of
+any external content table, FTS3, FTS4 and FTS5, also reads the owner's rows instead of the rows
+the index has been told about, so it answers before the first `rebuild`, as SQLite does.
+
+**A commit to an FTS5 table writes what its rows add, not the lists of every word they contain.**
+A load that committed each statement read the whole list of each word a row contained and wrote it
+back, so a word in every row was rewritten for every row and the work grew as the square of the rows. The index now writes each commit's postings as a segment of its own and merges
+small segments into larger ones, so each posting is written a number of times that grows with the
+logarithm of the rows. A deleted row is hidden by a marker in a newer segment until a merge drops
+it, and `INSERT INTO t(t) VALUES('optimize')` merges everything into one run. An index an earlier
+build wrote is read as before and is marked as layout 3 on its first write, so a build that does
+not read segments refuses it by name. `SELECT count(*) FROM t_idx` after deleting every row is no
+longer 0 until `optimize` runs.
+
+**FTS3 and FTS4 `MATCH` reads SQLite's default query language.** `MATCH 'x NOT y'` was an
+exclusion here and is a search for the three words `x`, `NOT` and `y` in SQLite. `AND` is a word
+too. `NEAR` and `NEAR/n` were handed to the FTS5 parser, which needs the `NEAR(a b, n)` spelling, so
+`x NEAR/3 y` matched nothing. A bare `NEAR` is `NEAR/10`. A `NEAR` with no term on one side is the
+error `malformed MATCH expression`. A `-` in front of a quoted phrase is only a separator.
+
 **`ROLLBACK` restores everything a transaction changed, including after `DROP` and `ALTER TABLE`.**
 Bug hunt 10 found rollbacks that lost or kept rows. With foreign keys on, `BEGIN; DROP TABLE p;
 ROLLBACK` brought `p` back with no rows, because the rows `DROP TABLE` deletes first were put back

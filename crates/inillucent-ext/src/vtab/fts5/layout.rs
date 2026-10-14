@@ -30,13 +30,14 @@
 //! ## When it is written, and why not more often
 //!
 //! At `CREATE VIRTUAL TABLE`, and again whenever `rebuild` or `delete-all`
-//! empties the index - the two places the whole index is written from scratch.
-//! An ordinary insert into an index that has no record does **not** stamp one,
-//! and that is deliberate: a file written by 0.1.2 through 0.1.7 has no record
-//! and is read by the per-row rule in [`super::term_value`], which is correct
-//! for it. Stamping one on the next write would claim the whole index is in
-//! this build's layout when half of its rows might still be in the older one,
-//! which is a claim the file cannot support.
+//! empties the index - the two places the whole index is written from scratch -
+//! and the first time a commit writes a segment into an index that has an older
+//! record or none. A segment is the one thing a build that does not know layout 3
+//! would read wrongly, so the record is what makes that build refuse the file.
+//! A file written by 0.1.2 through 0.1.7 has no record and is read by the per-row
+//! rule in [`super::term_value`], which is correct for it. The stamp does not
+//! claim that every row is in this build's layout, only that the file may hold
+//! segments, which is true from the first write on.
 //!
 //! ## `rebuild` is refused too, and that is not an oversight
 //!
@@ -91,8 +92,12 @@ const LAYOUT_ROW: i64 = 2;
 ///
 /// 1 was the two-table form: `%_idx` named a `%_data` row and that row held the
 /// doclist. 2 is the merged form task-1911 introduced, where the `%_idx` row
-/// carries the doclist itself. This build writes 2 and reads both.
-pub(crate) const LAYOUT: u32 = 2;
+/// carries the doclist itself, with one row per term in segment 0. 3 adds segments: a
+/// commit writes its postings as a new segment, numbered above 0, and the live segments
+/// are listed in a `%_data` row. A build that reads layout 2 and not 3 would look only in
+/// segment 0 and answer without the rows the segments hold, so it has to refuse. This
+/// build writes 3 and reads all three.
+pub(crate) const LAYOUT: u32 = 3;
 
 /// What a layout record says.
 #[derive(Clone, Debug, PartialEq, Eq)]

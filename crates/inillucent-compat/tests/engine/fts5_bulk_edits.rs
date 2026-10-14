@@ -135,10 +135,24 @@ fn deleting_every_row_decodes_a_bounded_number_of_entries() {
         vec!["0"],
         "no row is left to match"
     );
+    // The deleted rows are hidden by markers in a segment of their own, so the stored rows are
+    // still there until the segments are merged. What a reader sees is the vocabulary, and that
+    // is empty.
+    connection
+        .execute("CREATE VIRTUAL TABLE ftv USING fts5vocab(ft, row)")
+        .expect("creates the vocabulary");
+    assert_eq!(
+        column(&connection, "SELECT count(*) FROM ftv"),
+        vec!["0"],
+        "every term lost its last row, so no term is left"
+    );
+    connection
+        .execute("INSERT INTO ft(ft) VALUES ('optimize')")
+        .expect("merges the segments");
     assert_eq!(
         column(&connection, "SELECT count(*) FROM ft_idx"),
         vec!["0"],
-        "every term lost its last row, so the dictionary is empty"
+        "a merge of every segment drops the markers and the rows they hide, so the dictionary is empty"
     );
 }
 

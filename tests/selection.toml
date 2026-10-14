@@ -1883,6 +1883,22 @@ covers = ["inillucent-ext", "inillucent-engine"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "fts5_commit_cost"
+tier = "engine"
+covers = ["inillucent-ext", "inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "fts5_segments"
+tier = "engine"
+covers = ["inillucent-ext", "inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "fts5_legacy_layout"
 tier = "engine"
 covers = ["inillucent-ext"]

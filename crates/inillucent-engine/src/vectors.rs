@@ -276,6 +276,7 @@ impl ImportedDatabase {
         let store = vtab::ReadStore {
             pool: self.storage.database.pool(),
             trees: &self.schema.trees,
+            view: None,
         };
         let mut nowhere = inillucent_ext::vtab::WithStore { store };
         let mut context = inillucent_ext::vtab::Context {

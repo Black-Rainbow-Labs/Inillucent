@@ -925,7 +925,7 @@ stores in its shadow tables. Those layouts carry their own numbers:
 | Layout | Where its number is | What a newer number does |
 |---|---|---|
 | pages, records and header | byte 8 of the meta page, `crates/inillucent-pool/src/meta.rs` | the database does not open |
-| an FTS5 index | a `%_data` row, `crates/inillucent-ext/src/vtab/fts5/layout.rs` | the database opens and the table's rows read. `MATCH`, any write, and `fts5vocab` fail with `the full-text index on T is in layout N, written by inillucent X.Y.Z, and this build reads layouts up to 2` |
+| an FTS5 index | a `%_data` row, `crates/inillucent-ext/src/vtab/fts5/layout.rs` | the database opens and the table's rows read. `MATCH`, any write, and `fts5vocab` fail with `the full-text index on T is in layout N, written by inillucent X.Y.Z, and this build reads layouts up to 3` |
 | an `inillucent_search` index | the `format` row of `%_config`, `crates/inillucent-search/src/options.rs` | the database opens. Every read and write of the table fails with `the table is in format N, written by inillucent X.Y.Z, and this build reads formats 1 and 2` |
 
 All three refusals carry the status `unsupported`, so the command line exits 3. An application can
