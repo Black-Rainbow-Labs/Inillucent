@@ -763,7 +763,14 @@ impl crate::ImportedDatabase {
     /// @param entry - what it should now say
     pub(crate) fn rewrite(&mut self, rowid: i64, entry: SchemaEntry) -> DbResult<()> {
         let (at, txn, ..) = self.catalog_write()?;
-        self.rewrite_in(at, txn, rowid, entry)
+        self.rewrite_in(at, txn, rowid, entry)?;
+        // A schema change is a write, as in `record`. Without this, a `BEGIN`
+        // whose only change to an attached database was an `ALTER TABLE ...
+        // RENAME` never named that database at `COMMIT`, and the rename was
+        // lost when the file was opened again.
+        self.writing
+            .set_touched(self.writing.touched() | crate::schema_bit(at));
+        Ok(())
     }
     /// Replaces one catalog row of a file under a named transaction.
     ///
@@ -858,6 +865,13 @@ impl crate::ImportedDatabase {
         if let Some(held) = self.entries_of_mut(at) {
             held.retain(|row| row.rowid != rowid);
         }
+        // A schema change is a write, as in `record`. Without this, a `BEGIN`
+        // whose only change to an attached database was a `DROP TRIGGER` or a
+        // `DROP VIEW` never named that database at `COMMIT`: the drop was
+        // seen for the rest of the session and gone when the file was opened
+        // again.
+        self.writing
+            .set_touched(self.writing.touched() | crate::schema_bit(at));
         Ok(())
     }
     /// Returns the transaction a schema change joins.

@@ -641,3 +641,65 @@ PRAGMA integrity_check;
 SELECT count(*), sum(id), sum(v) FROM p;
 SELECT count(*) FROM t;
 PRAGMA integrity_check;
+-- case: bug-hunt-10/engine/drop-temp-trigger-on-main-table
+CREATE TABLE a(x); CREATE TABLE log(m);
+CREATE TEMP TRIGGER tr AFTER INSERT ON a BEGIN INSERT INTO log VALUES(new.x); END;
+DROP TRIGGER tr;
+INSERT INTO a VALUES(1);
+SELECT count(*) FROM log; SELECT name FROM temp.sqlite_schema;
+DROP TRIGGER tr;
+-- case: bug-hunt-10/engine/drop-temp-trigger-qualified
+CREATE TABLE a(x); CREATE TABLE log(m);
+CREATE TEMP TRIGGER tr AFTER INSERT ON main.a BEGIN INSERT INTO log VALUES(new.x); END;
+DROP TRIGGER main.tr;
+DROP TRIGGER temp.tr;
+INSERT INTO a VALUES(1);
+SELECT count(*) FROM log;
+-- case: bug-hunt-10/engine/drop-temp-trigger-in-transaction
+CREATE TABLE a(x); CREATE TEMP TRIGGER tr AFTER INSERT ON a BEGIN SELECT 1; END;
+BEGIN; DROP TRIGGER tr; COMMIT;
+SELECT name FROM temp.sqlite_schema;
+-- case: bug-hunt-10/engine/drop-trigger-same-name-in-temp-and-main
+CREATE TABLE a(x); CREATE TABLE log(m);
+CREATE TRIGGER tr AFTER INSERT ON a BEGIN INSERT INTO log VALUES('main'); END;
+CREATE TEMP TRIGGER tr AFTER INSERT ON a BEGIN INSERT INTO log VALUES('temp'); END;
+DROP TRIGGER tr;
+INSERT INTO a VALUES(1);
+SELECT * FROM log; SELECT name FROM temp.sqlite_schema; SELECT name FROM main.sqlite_schema WHERE type='trigger';
+-- case: bug-hunt-10/engine/rollback-drop-temp-trigger
+CREATE TABLE a(x); CREATE TABLE log(m);
+CREATE TEMP TRIGGER tr AFTER INSERT ON a BEGIN INSERT INTO log VALUES(new.x); END;
+BEGIN; DROP TRIGGER tr; ROLLBACK;
+INSERT INTO a VALUES(7); SELECT * FROM log;
+-- case: bug-hunt-10/engine/attached-drop-trigger-in-transaction-survives-reopen
+ATTACH 'aux.db' AS m; CREATE TABLE m.a(x);
+CREATE TRIGGER m.tr AFTER INSERT ON a BEGIN SELECT 1; END;
+BEGIN; DROP TRIGGER m.tr; COMMIT;
+-- reopen
+ATTACH 'aux.db' AS m; SELECT type, name FROM m.sqlite_schema ORDER BY name;
+-- case: bug-hunt-10/engine/attached-drop-view-in-transaction-survives-reopen
+ATTACH 'aux.db' AS m; CREATE TABLE m.a(x); CREATE VIEW m.v AS SELECT x FROM a;
+BEGIN; DROP VIEW m.v; COMMIT;
+-- reopen
+ATTACH 'aux.db' AS m; SELECT type, name FROM m.sqlite_schema ORDER BY name;
+-- case: bug-hunt-10/engine/attached-rename-in-transaction-survives-reopen
+ATTACH 'aux.db' AS m; CREATE TABLE m.a(x); INSERT INTO m.a VALUES(1);
+BEGIN; ALTER TABLE m.a RENAME TO z; COMMIT;
+-- reopen
+ATTACH 'aux.db' AS m; SELECT type, name FROM m.sqlite_schema ORDER BY name; SELECT * FROM m.z;
+-- case: bug-hunt-10/engine/attached-rename-column-in-transaction-survives-reopen
+ATTACH 'aux.db' AS m; CREATE TABLE m.a(x); INSERT INTO m.a VALUES(1);
+BEGIN; ALTER TABLE m.a RENAME COLUMN x TO y; COMMIT;
+-- reopen
+ATTACH 'aux.db' AS m; SELECT y FROM m.a;
+-- case: bug-hunt-10/engine/attached-two-databases-ddl-in-one-transaction
+ATTACH 'aux.db' AS m; ATTACH 'aux2.db' AS n;
+CREATE TABLE m.a(x); CREATE VIEW n.v AS SELECT 1 AS one; CREATE TABLE t(q);
+BEGIN; DROP VIEW n.v; ALTER TABLE m.a RENAME TO b; INSERT INTO t VALUES(1); COMMIT;
+-- reopen
+ATTACH 'aux.db' AS m; ATTACH 'aux2.db' AS n;
+SELECT name FROM m.sqlite_schema; SELECT count(*) FROM n.sqlite_schema; SELECT * FROM t;
+-- case: bug-hunt-10/engine/temp-drop-trigger-in-transaction
+CREATE TABLE a(x); CREATE TEMP TRIGGER tr AFTER INSERT ON a BEGIN SELECT 1; END;
+BEGIN; DROP TRIGGER tr; COMMIT;
+SELECT name FROM temp.sqlite_schema;

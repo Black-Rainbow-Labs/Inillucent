@@ -2772,8 +2772,9 @@ impl<'a> Binder<'a> {
                 .find_trigger(Some(database_name.as_slice()), &folded)
                 .is_some();
             if !exists && !if_exists {
+                // Named as written, `temp.tr` included, which is what SQLite prints.
                 return Err(refused(
-                    format!("no such trigger: {}", String::from_utf8_lossy(&written)),
+                    format!("no such trigger: {}", String::from_utf8_lossy(&qualified)),
                     Span::default(),
                 ));
             }
@@ -2883,7 +2884,7 @@ impl<'a> Binder<'a> {
             ObjectKind::Trigger => self
                 .catalog
                 .find_trigger(None, folded)
-                .map(|(table, _)| table.database),
+                .map(|(table, trigger)| self.catalog.trigger_database(table, trigger)),
             ObjectKind::Index => self
                 .catalog
                 .find_index(None, folded)

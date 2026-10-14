@@ -826,15 +826,43 @@ pub trait CatalogView {
         folded: &[u8],
     ) -> Option<(&TableInfo, &TriggerInfo)> {
         let wanted = database.and_then(|name| self.database_index(name));
+        // **A temporary trigger is in `temp`, whatever table it fires on**, and
+        // an unqualified name finds it first, as SQLite searches `temp` before
+        // `main`. Matching by the table's database instead made `DROP TRIGGER
+        // tr` of `CREATE TEMP TRIGGER tr ... ON main.t` look for its row in
+        // `main`, find none, and report success: the trigger went on firing.
+        let temp = self.database_index(b"temp");
+        let mut found = None;
         for table in self.every_table() {
-            if wanted.is_some_and(|index| index != table.database) {
-                continue;
-            }
-            if let Some(trigger) = table.triggers.iter().find(|one| one.folded == folded) {
-                return Some((table, trigger));
+            for trigger in table.triggers.iter().filter(|one| one.folded == folded) {
+                let home = if trigger.temporary {
+                    temp
+                } else {
+                    Some(table.database)
+                };
+                if wanted.is_some_and(|index| Some(index) != home) {
+                    continue;
+                }
+                if trigger.temporary || wanted.is_some() {
+                    return Some((table, trigger));
+                }
+                found = found.or(Some((table, trigger)));
             }
         }
-        None
+        found
+    }
+
+    /// Returns the database a trigger's row is in: `temp` for a temporary trigger, else its table's.
+    ///
+    /// @param table - the table the trigger fires on
+    /// @param trigger - the trigger
+    fn trigger_database(&self, table: &TableInfo, trigger: &TriggerInfo) -> usize {
+        if trigger.temporary {
+            if let Some(temp) = self.database_index(b"temp") {
+                return temp;
+            }
+        }
+        table.database
     }
 
     /// Returns every table of every attached database.
