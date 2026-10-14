@@ -149,4 +149,53 @@ These are recorded in the known bugs tickets: bugs 51 to 57 of task-2110 (medium
 
 ## 6. Results
 
-Filled in as the work is done.
+**The strict run.** `inillucent-testrun --changed origin/main --strict` selected 422 targets and
+5,099 tests. Four failed, and each was settled:
+
+- `engine::append_load_density`: `VACUUM` of 90,000 appended rows took 28 pages against 23 for a
+  bulk build, because the memory fix copies a table a page of rows at a time and so packs as an
+  append does. Reading the whole table to bulk build it is what the memory fix removed, so the
+  test allows a quarter over the bulk build, with that reason beside the assertion.
+- `tooling::crash_reports`: seven crash campaigns covered two fewer cut points. A bisection found
+  the change that makes connection pragmas take no lock: the pragmas `open()` runs no longer take a
+  lock and read the header, so each campaign lost one `Lock` and one `Read` before its transaction.
+  With those two left out, the traced call sequences before and after are the same, so every write,
+  sync, truncate and journal delete is still armed. The floors moved by two with the reason beside
+  them, and the regenerated schedules show no damage and no lost commit.
+- `durability::environment` and `durability::process_deferred`: timing. The first kills a worker
+  after a fixed 1.5 s and the second bounds 48 transactions at 20 s; under the run's load each
+  missed, and each passed alone (`environment` four times; `process_deferred` measured 20 to 23 s
+  with this branch and 28 to 37 s without it, because the change that lets a connection pragma
+  take no lock also shortens its workers' turns).
+
+The suites not evidenced are this machine's declared absences (MySQL, PostgreSQL, Go), plus
+`inillucent-remote::lib`, which needs `INILLUCENT_NETWORK_TESTS`, and the Nikaya workload freshness
+check, which needs the Nikaya checkout beside the main checkout.
+
+**Clippy** with `--all-features -D warnings` is clean. **`node tools/doc-facts/check.mjs`** agrees
+with the engine after the feature probe and the register audit were run on the release build, and
+**`node tools/doc-style/check.mjs`** reports no problems.
+
+**The usage corpus.** Ten new files hold 285 cases, all graded against SQLite 3.53.4 by
+`differential::usage_corpus`, and every one passes: `bug-hunt-10-engine.sql` (63),
+`bug-hunt-10-alter.sql` (53), `bug-hunt-10-writes.sql` (41), `bug-hunt-10-vacuum.sql` (37),
+`bug-hunt-10-query.sql` (27), `bug-hunt-10-drop.sql` (21), `bug-hunt-10-sql.sql` (18),
+`bug-hunt-10-files.sql` (14), `bug-hunt-10-shell.sql` (10) and `bug-hunt-10-cli.sql` (1). Of the 63
+lead cases, 55 differ on the build this ticket started from; the others are controls.
+
+**The random transaction generators** (`lead/gentx.mjs`, `lead/gentx2.mjs`) ran 300, 1,000, 1,500
+and 800 seeds on successive merged builds. The last 800 seeds after every fix differed in one case,
+which found the savepoint defect fixed last.
+
+**New Rust suites:** `engine::rollback_restores_modules`, `engine::transaction_memory`,
+`engine::append_load_density`, `engine::vector_rename`, `durability::two_connections_end_a_transaction`,
+`durability::restored_copy_under_newer_log` and `e2e::sqlite_dump_load`, plus new tests in
+`e2e::shell_command_line`, `e2e::cli_commands`, `e2e::mcp_per_call`, `engine::encryption_at_rest`,
+`engine::new_engine_vtab_stream`, `migrate_sqlite` and `release_format`.
+
+**What the hunters ran.** About 3,000 random write workloads and 120 killed writers; about 30,000
+generated or mutated statements for internal errors, 388 command lines and 95 MCP scenarios; 379
+upstream cases (about 4,700 statements) and 900 more single statements; 43 release fixtures and 3
+public databases migrated and compared; about 400 documentation examples and the 416 case feature
+probe; thread and process stress through Rust, Python and Node; about 560 timed runs on files up to
+3.5 GB; and 1,910 schema change cases.
