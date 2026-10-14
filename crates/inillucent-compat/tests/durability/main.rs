@@ -21,6 +21,7 @@ mod btree_model;
 mod bulk_build_crash;
 mod bulk_insert_crash;
 mod busy_timeout;
+mod checkpoint_sync_crash;
 mod concurrency;
 mod corruption;
 mod durability;

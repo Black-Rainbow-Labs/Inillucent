@@ -2197,6 +2197,14 @@ covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-p
 package = "inillucent-compat"
 kind = "test"
 name = "durability"
+module = "checkpoint_sync_crash"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim", "inillucent-vfs"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
 module = "btree_model"
 tier = "durability"
 # `every_retained_sequence_still_passes` replays `compat/corpus/btree/`, which

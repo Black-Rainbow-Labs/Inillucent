@@ -70,9 +70,11 @@ impl Pool {
     /// sync between them is what makes them two states rather than one - which is
     /// the next paragraph.
     ///
-    /// **The shadow slot goes first and takes the pages' own sync with it; the
-    /// primary follows and takes the second.** Two syncs of the data file, and
-    /// one complete meta record on the disk at every instant.
+    /// **The pages are synced first, the shadow slot goes next and takes the
+    /// second sync; the primary follows and takes the third.** Three syncs of
+    /// the data file, and one complete meta record on the disk at every instant.
+    /// The pages used to share the shadow slot's sync, which let a power loss
+    /// leave a durable record beside a torn page; see `Pool::checkpoint`.
     ///
     /// **Why the order is what it is** (task-2000, design 1a). Without a
     /// rollback journal, nothing else can put the old meta record back, so the
@@ -86,8 +88,9 @@ impl Pool {
     ///   appended before it wrote anything repair every page it had reached.
     /// - a crash between the syncs leaves the shadow holding this record,
     ///   whole, and `Meta::choose` takes it because its generation is higher.
-    ///   The first sync covered the pages **and** the shadow together, so a
-    ///   shadow that is durable cannot describe a page that is not.
+    ///   The first sync covered the pages, and `Pool::checkpoint` made it before
+    ///   this slot was written, so a shadow that is durable cannot describe a
+    ///   page that is not.
     /// - a crash after the second leaves both, identical.
     ///
     /// **Writing to one slot a fold, alternating by generation, was tried first
@@ -117,9 +120,10 @@ impl Pool {
     pub(super) fn write_meta_record(&self, route: MetaRoute, image: &[u8]) -> DbResult<()> {
         match route {
             // The redo log protects the fold, so the split sync above is what
-            // keeps one record whole. Three writes and two syncs of the data
-            // file: the pages, the shadow slot, one sync; the primary slot, one
-            // sync.
+            // keeps one record whole. `Pool::checkpoint` has already synced the
+            // pages, so no slot is written beside a page that is not durable.
+            // Then the shadow slot and a sync, and the primary slot and a sync:
+            // three syncs of the data file a checkpoint.
             MetaRoute::Logged => {
                 self.write_slot_and_sync(SHADOW_PAGE, image)?;
                 self.write_slot_and_sync(META_PAGE, image)
