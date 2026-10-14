@@ -228,6 +228,15 @@ pub fn grade(
         context.label(index)
     };
     match &asked.reference {
+        // A case the oracle grades records what SQLite does, including where
+        // inillucent differs on purpose: `SELECT 'abc' REGEXP 'a'` is
+        // `statement error` because SQLite's library has no REGEXP. The rules in
+        // `deliberate.toml` match those differences by SQLite's message, which
+        // a run without the oracle does not have, so comparing the case's
+        // records with inillucent alone failed the group for every such
+        // difference. Without the oracle the case still runs, so a panic, a
+        // failed integrity check or a broken property is still caught.
+        None if context.case.oracle => {}
         None => grade_alone(record, asked, index, context, &label),
         Some(reference) => grade_pair(record, reference, asked, index, context, &label, reopened),
     }
@@ -705,5 +714,48 @@ mod tests {
         assert!(tolerant("SELECT round(sin(1), 3)"));
         assert!(!tolerant("SELECT expected(a) FROM t"));
         assert!(!tolerant("SELECT sqrt(2)"));
+    }
+
+    /// Grades one `statement error` record that inillucent ran successfully,
+    /// with no oracle, and returns the failures.
+    ///
+    /// @param oracle - whether the case is one the oracle grades
+    fn ungraded_failures(oracle: bool) -> Vec<Failure> {
+        let mut case = Case::new("expression", "test");
+        case.id = "regexp".to_string();
+        case.oracle = oracle;
+        let record = Record::Statement {
+            expect: Expect::Error(None),
+            sql: "SELECT 'abc' REGEXP 'a'".to_string(),
+        };
+        let asked = Asked {
+            candidate: Observation::default(),
+            unsupported: None,
+            status: None,
+            reference: None,
+        };
+        let mut failures = Vec::new();
+        let mut context = CaseContext {
+            case: &case,
+            directory: Path::new("."),
+            graded: false,
+            counters: true,
+            setup_count: 0,
+            module_pending: false,
+            halted: false,
+            failures: &mut failures,
+        };
+        grade(&record, &asked, 0, &mut context, false);
+        failures
+    }
+
+    /// Without the oracle, a case the oracle grades is not held to its
+    /// records, which say what SQLite does. An `oracle none` case still is.
+    #[test]
+    fn records_written_for_the_oracle_are_not_compared_without_it() {
+        assert!(ungraded_failures(true).is_empty());
+        let failures = ungraded_failures(false);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, Kind::Recorded);
     }
 }

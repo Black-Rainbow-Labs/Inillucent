@@ -65,7 +65,7 @@ fn reading(database: &Path) -> Database {
 }
 
 /// Runs a command line call against the database and returns it with how
-/// long it took.
+/// long the call took, not counting the build of the program.
 ///
 /// @param database - the file
 /// @param arguments - the command and its arguments
@@ -76,9 +76,55 @@ fn other_process(
     let path = database.to_string_lossy().to_string();
     let mut all = vec!["--db", path.as_str()];
     all.extend_from_slice(arguments);
+    // The first call in a test process builds the command line. The program is
+    // found before the clock starts, so a case that times the call measures the
+    // call and not that build, which took 40 s from a cold target directory.
+    let inillucent = program("inillucent");
     let started = Instant::now();
-    let ran = run(&program("inillucent"), &all);
+    let ran = run(&inillucent, &all);
     (ran, started.elapsed())
+}
+
+/// The busy timeout a timed call is given, in milliseconds. A call that waits
+/// for the other process's lock takes this long and then fails.
+const TIMED_BUSY_MILLIS: &str = "60000";
+
+/// How long a timed call may take. It is far below [`TIMED_BUSY_MILLIS`], so a
+/// call that waited for the lock fails this limit by 40 seconds.
+///
+/// The limit was 3 and 4 seconds against the five second default busy timeout.
+/// Beside 400 other test targets on a 24 processor machine the calls took 4.4 s
+/// and 6.1 s without waiting for any lock, so the case failed on the load of
+/// the machine and not on the engine.
+const TIMED_LIMIT: Duration = Duration::from_secs(20);
+
+/// Runs a command line call with a busy timeout of [`TIMED_BUSY_MILLIS`] and
+/// returns it with how long the call took, not counting the build of the
+/// program.
+///
+/// @param database - the file
+/// @param arguments - the command and its arguments
+fn timed_process(
+    database: &Path,
+    arguments: &[&str],
+) -> (inillucent_compat::cliproc::Ran, Duration) {
+    let inillucent = program("inillucent");
+    let started = Instant::now();
+    let output = std::process::Command::new(&inillucent)
+        .env("INILLUCENT_BUSY_TIMEOUT", TIMED_BUSY_MILLIS)
+        .arg("--db")
+        .arg(database)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap_or_else(|error| panic!("{} did not start: {error}", inillucent.display()));
+    let took = started.elapsed();
+    let ran = inillucent_compat::cliproc::Ran {
+        code: output.status.code().unwrap_or(130),
+        stdout: String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+        stderr: String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n"),
+    };
+    (ran, took)
 }
 
 /// `inillucent backup` writes a complete copy while this process reads.
@@ -88,7 +134,7 @@ fn a_backup_runs_beside_another_processes_read_transaction() {
     let database = directory.join("app.rdb");
     let held = reading(&database);
     let copy = directory.join("copy.rdb");
-    let (ran, took) = other_process(&database, &["backup", &copy.to_string_lossy()]);
+    let (ran, took) = timed_process(&database, &["backup", &copy.to_string_lossy()]);
     assert_eq!(
         ran.code,
         0,
@@ -96,7 +142,7 @@ fn a_backup_runs_beside_another_processes_read_transaction() {
         ran.said()
     );
     assert!(
-        took < Duration::from_secs(4),
+        took < TIMED_LIMIT,
         "the backup waited {took:?} for the reader"
     );
     drop(held);
@@ -193,12 +239,9 @@ fn reading_pragmas_answer_beside_another_processes_write_transaction() {
         "PRAGMA journal_mode",
         "PRAGMA table_info(t)",
     ] {
-        let (ran, took) = other_process(&database, &["query", sql, "--output", "json"]);
+        let (ran, took) = timed_process(&database, &["query", sql, "--output", "json"]);
         assert_eq!(ran.code, 0, "{sql} failed after {took:?}:\n{}", ran.said());
-        assert!(
-            took < Duration::from_secs(3),
-            "{sql} waited {took:?} for the writer"
-        );
+        assert!(took < TIMED_LIMIT, "{sql} waited {took:?} for the writer");
     }
     session
         .execute("COMMIT", &[])

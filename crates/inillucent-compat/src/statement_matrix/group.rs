@@ -283,7 +283,15 @@ pub fn run_group_report(
         .iter()
         .map(|(case, _)| (case.id.clone(), case.origin.clone()))
         .collect();
-    judge_all(outcomes, &known_list, &deliberate, &origins, &mut report);
+    let graded = !report.oracle_missing;
+    judge_all(
+        outcomes,
+        &known_list,
+        &deliberate,
+        &origins,
+        graded,
+        &mut report,
+    );
     report.summary = format!(
         "matrix {family} group {group}/{groups} ({cadence:?}): {} case run(s), {} statement(s), \
          {} fixture(s) built, {} copied; {:.2}s in cases, {:.2}s building fixtures, {:.3}s \
@@ -355,11 +363,24 @@ fn run_cases(
 }
 
 /// Judges every case against the two lists and fills in the report.
+///
+/// A listed case that passed is reported as stale only when the oracle graded
+/// it. Without the oracle a case runs on inillucent alone and passes without
+/// being compared with SQLite, so every listed case looked fixed and the group
+/// failed, telling the reader to take lines off the list that were still bugs.
+///
+/// @param outcomes - each case's failures and the arms it ran at
+/// @param known_list - the cases listed as known bugs
+/// @param deliberate - the differences inillucent keeps on purpose
+/// @param origins - each case's axis values, for the message
+/// @param graded - whether the oracle compared the cases with SQLite
+/// @param report - the group's report, which this fills in
 fn judge_all(
     outcomes: BTreeMap<String, CaseOutcome>,
     known_list: &BTreeMap<String, known::Known>,
     deliberate: &[known::Deliberate],
     origins: &BTreeMap<String, String>,
+    graded: bool,
     report: &mut GroupReport,
 ) {
     for (id, (failures, ran)) in outcomes {
@@ -376,6 +397,7 @@ fn judge_all(
                 }
                 report.problems.push(rendered.join("\n    "));
             }
+            Judged::Stale(_) if !graded => {}
             Judged::Stale(listed) => report.problems.push(format!(
                 "{id} is in known.list as bug {} ({}) and now agrees with SQLite at every arm it \
                  ran at. Take its line off the list; a fixed defect left listed reads as coverage \
@@ -423,4 +445,46 @@ macro_rules! matrix_family {
             }
         )+
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A listed case that passed is stale only when the oracle graded it.
+    ///
+    /// Without the oracle every listed case passed ungraded, and the group
+    /// failed with "now agrees with SQLite" for bugs that were still there.
+    #[test]
+    fn a_listed_case_is_stale_only_when_the_oracle_graded_it() {
+        let listed = known::Known {
+            bug: "70".to_string(),
+            arms: Vec::new(),
+            reason: "still a bug".to_string(),
+        };
+        let known_list = BTreeMap::from([("case-1".to_string(), listed)]);
+        let judge = |graded: bool| {
+            let outcomes = BTreeMap::from([(
+                "case-1".to_string(),
+                (Vec::new(), vec!["default".to_string()]),
+            )]);
+            let mut report = GroupReport::default();
+            judge_all(
+                outcomes,
+                &known_list,
+                &[],
+                &BTreeMap::new(),
+                graded,
+                &mut report,
+            );
+            report.problems
+        };
+        assert_eq!(judge(false), Vec::<String>::new());
+        let problems = judge(true);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("now agrees with SQLite"),
+            "{problems:?}"
+        );
+    }
 }
