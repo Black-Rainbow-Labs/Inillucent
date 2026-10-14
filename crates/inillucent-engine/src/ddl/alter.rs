@@ -149,21 +149,32 @@ impl crate::ImportedDatabase {
                 } else {
                     ObjectKind::Trigger
                 };
+                // A view takes its triggers with it, which are the INSTEAD OF
+                // triggers: left behind, a later view of the same name fired them.
+                let with_view = kind == Ast::View;
                 let rowids: Vec<i64> = self
                     .entries_of(self.schema.ddl_schema)
                     .iter()
                     .filter(|held| {
-                        held.entry.kind == wanted && held.entry.name.to_ascii_lowercase() == folded
+                        (held.entry.kind == wanted
+                            && held.entry.name.to_ascii_lowercase() == folded)
+                            || (with_view
+                                && held.entry.kind == ObjectKind::Trigger
+                                && held.entry.table.to_ascii_lowercase() == folded)
                     })
                     .map(|held| held.rowid)
                     .collect();
                 for rowid in rowids {
                     self.forget(rowid)?;
                 }
+                if with_view {
+                    self.forget_temp_triggers_on(self.schema.ddl_schema, &folded)?;
+                }
             }
         }
         self.rebuild_tables()?;
         self.refresh_catalog();
+        self.refuse_commit_with_dropped_parents()?;
         self.seal()?;
         Ok(Outcome::empty())
     }
@@ -205,9 +216,11 @@ impl crate::ImportedDatabase {
         // After the virtual-table branch, because a virtual table keeps
         // no rows of its own and no foreign key can name one.
         self.empty_before_dropping(&owner)?;
+        self.note_orphans_of_dropped_parent(&owner)?;
         // Every row that names the table: the table, its indexes and its
         // triggers. Collected before anything is removed, because the
         // list is what decides what to remove.
+        let temp_has = self.has_temp_table(folded);
         let doomed: Vec<i64> = self
             .entries_of(at)
             .iter()
@@ -217,13 +230,19 @@ impl crate::ImportedDatabase {
                 // stays.
                 (held.entry.kind != ObjectKind::Trigger
                     && held.entry.name.to_ascii_lowercase() == folded)
-                    || held.entry.table.to_ascii_lowercase() == folded
+                    || (held.entry.table.to_ascii_lowercase() == folded
+                        // A temporary trigger written `ON main.t` sits in the
+                        // temporary database and is not this temporary table's.
+                        && (at != crate::TEMP
+                            || held.entry.kind != ObjectKind::Trigger
+                            || self.trigger_is_on_table(&held.entry.sql, at, temp_has)))
             })
             .map(|held| held.rowid)
             .collect();
         for rowid in doomed {
             self.forget(rowid)?;
         }
+        self.forget_temp_triggers_on(at, folded)?;
         if folded != b"sqlite_stat1" {
             self.forget_stat1_of(at, Some(name), None)?;
         }
@@ -240,6 +259,79 @@ impl crate::ImportedDatabase {
         }
         let _ = position;
         Ok(())
+    }
+
+    /// Returns whether the temporary database has a table of a name.
+    ///
+    /// @param folded - the table's folded name
+    fn has_temp_table(&self, folded: &[u8]) -> bool {
+        self.schema
+            .tables
+            .iter()
+            .any(|held| held.database == crate::TEMP && held.folded == folded)
+    }
+
+    /// Returns whether a temporary trigger's stored text puts it on a table in one schema.
+    ///
+    /// **`ON main.t` and `ON t` are different triggers when a temporary `t` exists.**
+    /// A qualified name belongs to the schema it names. An unqualified one belongs
+    /// to the table the name found when the trigger was made, which is the
+    /// temporary table if there is one and otherwise the permanent one. This is the
+    /// same reading `rebuild_tables` uses to attach the trigger to its table.
+    ///
+    /// @param sql - the trigger's stored `CREATE TRIGGER` text
+    /// @param table_schema - the schema of the table the question is about
+    /// @param temp_has - whether the temporary database has a table of that name
+    fn trigger_is_on_table(&self, sql: &[u8], table_schema: usize, temp_has: bool) -> bool {
+        let Ok(trigger) = inillucent_catalog::load::trigger_from_create_sql(sql) else {
+            return false;
+        };
+        match trigger.table_database.as_deref() {
+            Some(b"temp") | None => table_schema == crate::TEMP || !temp_has,
+            Some(name) => self.schema_named(name) == Some(table_schema),
+        }
+    }
+
+    /// Forgets the temporary triggers defined on a table or view that is being dropped.
+    ///
+    /// **A trigger lives in the database it was created in, not in its table's.**
+    /// `CREATE TEMP TRIGGER tr AFTER INSERT ON main.t` is a row of
+    /// `temp.sqlite_schema`, so removing the rows that name `t` in `t`'s own
+    /// schema missed it, and it stayed there for good. SQLite drops every trigger
+    /// on a table with the table, wherever the trigger is stored.
+    ///
+    /// @param at - the schema the dropped table or view is in
+    /// @param folded - its folded name
+    fn forget_temp_triggers_on(&mut self, at: usize, folded: &[u8]) -> DbResult<()> {
+        if at == crate::TEMP {
+            return Ok(());
+        }
+        let temp_has = self.has_temp_table(folded);
+        let doomed: Vec<i64> = self
+            .entries_of(crate::TEMP)
+            .iter()
+            .filter(|held| {
+                held.entry.kind == ObjectKind::Trigger
+                    && held.entry.table.to_ascii_lowercase() == folded
+                    && self.trigger_is_on_table(&held.entry.sql, at, temp_has)
+            })
+            .map(|held| held.rowid)
+            .collect();
+        if doomed.is_empty() {
+            return Ok(());
+        }
+        self.schema.ddl_schema = crate::TEMP;
+        let mut forgotten = Ok(());
+        for rowid in doomed {
+            forgotten = self.forget(rowid);
+            if forgotten.is_err() {
+                break;
+            }
+        }
+        self.schema.ddl_schema = at;
+        self.writing
+            .set_touched(self.writing.touched() | crate::schema_bit(crate::TEMP));
+        forgotten
     }
 
     /// Drops the stores of the vector indexes a table carries, before the table goes.
@@ -416,6 +508,9 @@ impl crate::ImportedDatabase {
         if let AlterKind::AddColumnFailsAfter { message } = action {
             return Err(statement_refusal(message.clone()));
         }
+        if let Some(outcome) = self.rename_if_virtual(source, at, table, &folded, action) {
+            return outcome;
+        }
         if let AlterKind::AddColumn { risk, .. } = action {
             self.refuse_a_column_past_the_limit(at, &folded)?;
             self.refuse_an_unaddable_column(at, &folded, risk)?;
@@ -429,10 +524,14 @@ impl crate::ImportedDatabase {
         self.check_constraint_rows(at, &folded, source, action, !updates.is_empty())?;
         self.check_new_texts(at, &folded, &updates, action)?;
         self.rename_sequence(at, &folded, action)?;
+        // The stores of vector indexes over this table, which name it in their
+        // own definitions.
+        let stores = self.store_argument_updates(at, &folded, action);
         for (rowid, entry) in updates {
             self.rewrite(rowid, entry)?;
         }
         self.rewrite_temp_dependents(at, source, table, &folded, action)?;
+        self.write_store_updates(stores)?;
         self.rebuild_tables()?;
         // A `DROP COLUMN` changes the *rows*, not only the text, and the tree is
         // rebuilt rather than edited in place: every leaf's column directory
@@ -454,6 +553,45 @@ impl crate::ImportedDatabase {
         self.seal()?;
         Ok(Outcome::empty())
     }
+    /// Renames a virtual table, when that is what the statement asks.
+    ///
+    /// `None` for every other statement, which the caller carries on with. A
+    /// virtual table accepts `RENAME TO` and nothing else; the binder has
+    /// already refused the rest.
+    ///
+    /// @param source - the statement text
+    /// @param at - the schema the table is in
+    /// @param table - the table's name as written
+    /// @param folded - the table's folded name
+    /// @param action - what the statement does
+    fn rename_if_virtual(
+        &mut self,
+        source: &[u8],
+        at: usize,
+        table: &[u8],
+        folded: &[u8],
+        action: &AlterKind,
+    ) -> Option<DbResult<Outcome>> {
+        let virtual_table = self
+            .schema
+            .tables
+            .iter()
+            .any(|held| held.database == at && held.folded == folded && held.module.is_some());
+        if !virtual_table {
+            return None;
+        }
+        let AlterKind::RenameTable { to } = action else {
+            return Some(Err(refusal(format!(
+                "cannot alter {}: not a table",
+                String::from_utf8_lossy(table)
+            ))));
+        };
+        if !self.is_connected_virtual_table(at, folded) {
+            return Some(Err(super::module_rename::virtual_table_elsewhere(table)));
+        }
+        Some(self.rename_virtual_table(source, at, table, folded, to))
+    }
+
     /// Refuses `DROP COLUMN` of a column a vector index is built over.
     ///
     /// SQLite refuses to drop a column an index names. The vector index's store is a virtual
@@ -500,7 +638,7 @@ impl crate::ImportedDatabase {
     /// @param table - the table's name as written
     /// @param folded - the table's folded name
     /// @param action - what the statement does
-    fn rewrite_temp_dependents(
+    pub(super) fn rewrite_temp_dependents(
         &mut self,
         at: usize,
         source: &[u8],

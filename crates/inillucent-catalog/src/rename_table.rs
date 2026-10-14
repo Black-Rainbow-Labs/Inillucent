@@ -356,6 +356,9 @@ impl<'a> Scan<'a> {
                     false => self.name(index),
                 }
             }
+            // A module's shadow table is created as `CREATE TABLE 'f_content'(...)`,
+            // and SQLite reads a single quoted string in the name's place as the name.
+            TokenKind::String if self.pending == Some(Site::Head) => self.name(index),
             _ => self.pending = None,
         }
     }

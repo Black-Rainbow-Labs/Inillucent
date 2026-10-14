@@ -1417,6 +1417,17 @@ covers = ["inillucent-engine", "inillucent-search"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "vector_rename"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-search"]
+# A table or column rename carries the vector index built over it, a renamed
+# inillucent_search table keeps working, and the tables of a vector index cannot
+# be dropped, altered or given triggers (bug hunt 10).
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "vtab_lifecycle"
 tier = "engine"
 covers = ["inillucent-engine", "inillucent-ext"]

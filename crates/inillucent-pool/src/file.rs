@@ -1020,6 +1020,13 @@ impl Database {
         self.meta.schema_cookie = self.meta.schema_cookie.wrapping_add(1);
     }
 
+    /// Puts the schema cookie back to a value it held, which a rolled back schema change needs.
+    ///
+    /// @param value - the cookie as it was before the change
+    pub fn set_schema_cookie(&mut self, value: i32) {
+        self.meta.schema_cookie = value;
+    }
+
     /// Records where the log had reached when this checkpoint was taken.
     ///
     /// `checkpoint_lsn` is **where recovery starts**, which is not simply the

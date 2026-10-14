@@ -1501,7 +1501,13 @@ impl<'a> Binder<'a> {
         };
         let index = target.database;
         let database_name = self.catalog.database_name(index).to_vec();
-        if target.kind != crate::catalog_view::TableKind::Table {
+        // A virtual table can be renamed, because its module keeps its storage
+        // in shadow tables named after it; every other form of `ALTER` is not
+        // one a module can take.
+        let renames_a_module_table = target.module.is_some()
+            && !target.folded.starts_with(b"sqlite_")
+            && matches!(action, ast::AlterAction::RenameTo(_));
+        if target.kind != crate::catalog_view::TableKind::Table && !renames_a_module_table {
             return Err(refused(
                 not_a_table_message(action, &target),
                 Span::default(),

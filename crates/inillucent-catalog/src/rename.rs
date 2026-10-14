@@ -237,6 +237,8 @@ pub(crate) fn unquoted(raw: &[u8]) -> Vec<u8> {
         b'"' => b'"',
         b'`' => b'`',
         b'[' => b']',
+        // A single quoted name, which SQLite accepts in `CREATE TABLE 'name'`.
+        b'\'' => b'\'',
         _ => return raw.to_vec(),
     };
     let inner = raw
@@ -331,6 +333,7 @@ pub fn reparsed(sql: Vec<u8>) -> DbResult<Vec<u8>> {
     let sane = matches!(
         parsed.statement,
         Statement::CreateTable { .. }
+            | Statement::CreateVirtualTable { .. }
             | Statement::CreateIndex { .. }
             | Statement::CreateView { .. }
             | Statement::CreateTrigger { .. }

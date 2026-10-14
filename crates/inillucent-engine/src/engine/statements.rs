@@ -342,8 +342,58 @@ impl ImportedDatabase {
         // lowering has to keep.
         inillucent_sql::correlated_in::lower(&mut bound);
         self.refuse_shadow_write(&bound)?;
+        self.refuse_shadow_definition_change(&bound)?;
         self.refuse_schema_write(&bound)?;
         Ok(bound)
+    }
+
+    /// Refuses `DROP TABLE`, `ALTER TABLE` and `CREATE TRIGGER` on a module's shadow table.
+    ///
+    /// **A shadow table with no module left to read it (bug hunt 10).** The
+    /// binder treats `f_content` as the ordinary table it is in `sqlite_schema`,
+    /// so `DROP TABLE f_content` succeeded and the FTS5 table `f` then failed
+    /// with `the catalog does not name f_content, which f needs` on the next
+    /// open. SQLite refuses these three statements while `PRAGMA defensive` is
+    /// on (`sqlite3ReadOnlyShadowTables`), which is what the shell turns on, and
+    /// allows them otherwise. The check sits beside [`Self::refuse_shadow_write`]
+    /// for the same reason: only the engine knows which tables are shadows.
+    ///
+    /// @param bound - the statement that was just bound
+    fn refuse_shadow_definition_change(&self, bound: &BoundStatement) -> DbResult<()> {
+        if !self.session_state.registry.policy().defensive {
+            return Ok(());
+        }
+        let BoundStatement::Directive(directive) = bound else {
+            return Ok(());
+        };
+        let (name, database, said) = match directive.as_ref() {
+            inillucent_sql::directive::Directive::Drop {
+                kind: inillucent_sql::ast::ObjectKind::Table,
+                name,
+                database,
+                exists: true,
+                ..
+            } => (name, *database, "may not be dropped"),
+            inillucent_sql::directive::Directive::Alter {
+                table, database, ..
+            } => (table, *database, "may not be altered"),
+            inillucent_sql::directive::Directive::CreateTrigger { table, .. } => {
+                if self.is_shadow_table(table) {
+                    return Err(inillucent_base::error::statement_refusal(
+                        "cannot create triggers on shadow tables",
+                    ));
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        if !self.is_shadow_table_in(name, database) {
+            return Ok(());
+        }
+        Err(inillucent_base::error::statement_refusal(format!(
+            "table {} {said}",
+            String::from_utf8_lossy(name)
+        )))
     }
 
     /// Gives the module's own error for a virtual table whose module refused

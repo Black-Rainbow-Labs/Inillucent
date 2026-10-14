@@ -615,6 +615,13 @@ pub(crate) struct SessionState {
     /// write and the commit and the rollback clear it. See
     /// `vtab::begin_modules`.
     pub(crate) modules_begun: std::cell::Cell<bool>,
+    /// Parent tables the open transaction dropped while child rows still named them.
+    ///
+    /// **SQLite counts these violations and this engine asks the question at the
+    /// commit**, so a dropped table has to be remembered or the commit cannot know
+    /// that rows were orphaned by a table that no longer exists. See
+    /// `ddl::dropped_parents`.
+    pub(crate) dropped_parents: std::cell::RefCell<Vec<crate::ddl::DroppedParent>>,
     /// The databases `ATTACH` has added beside the one this was opened on.
     ///
     /// **`main` is not one of these, deliberately.** The file a connection was
@@ -877,6 +884,14 @@ pub(crate) enum MetaField {
     UserVersion,
     /// `PRAGMA application_id`.
     ApplicationId,
+    /// `PRAGMA schema_version`, which every schema change moves.
+    ///
+    /// **A rolled back `ALTER TABLE` kept the number it had moved (bug hunt 10).**
+    /// SQLite reads 1 after `CREATE TABLE t(a); BEGIN; ALTER TABLE t ADD COLUMN b;
+    /// ROLLBACK;` and this engine read 2, because the cookie is a meta field and
+    /// the undo buffer holds rows. Unlike the other two it is not checkpointed at
+    /// the commit: it has always reached the file with the next fold.
+    SchemaCookie,
 }
 
 /// One thing a transaction has dropped and has not yet committed.

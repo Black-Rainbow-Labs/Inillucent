@@ -94,6 +94,10 @@ impl ImportedDatabase {
     /// reason nobody can reproduce. Asking the question directly costs a query
     /// per deferred key per commit and cannot drift.
     pub(crate) fn check_deferred_foreign_keys(&mut self) -> DbResult<()> {
+        // Before the early return: a dropped parent leaves no key to find.
+        if self.pragmas.foreign_keys() {
+            self.check_dropped_parents()?;
+        }
         if !self.pragmas.foreign_keys() || !self.has_deferred_foreign_keys() {
             return Ok(());
         }

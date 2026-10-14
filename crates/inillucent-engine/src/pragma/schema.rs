@@ -694,6 +694,19 @@ impl crate::ImportedDatabase {
                     None
                 },
             )
+            // An eponymous virtual table (`generate_series`, `json_each`) has no
+            // row in the schema, so the search above never found it and
+            // `PRAGMA table_xinfo(generate_series)` returned nothing where SQLite
+            // lists `value`, `start`, `stop` and `step`. They belong to `main`,
+            // so a pragma that names another schema does not find them.
+            .or_else(|| {
+                let in_main = at.is_none_or(|named| named == 0);
+                self.session_state
+                    .eponymous
+                    .iter()
+                    .find(|table| in_main && table.folded == wanted)
+                    .map(|table| table.as_ref())
+            })
     }
 }
 

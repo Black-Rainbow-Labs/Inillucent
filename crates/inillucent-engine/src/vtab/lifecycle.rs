@@ -56,6 +56,46 @@ impl crate::ImportedDatabase {
         self.connect_declared(ConnectWhich::NotConnected)
     }
 
+    /// Drops the connection of every virtual table whose declaration in the catalog differs from the one it was connected with.
+    ///
+    /// **A rolled back rename leaves the connection of the new definition.**
+    /// `ALTER TABLE p RENAME TO q` rewrites the `source=p` argument of a vector
+    /// index's store and connects the store again with `source=q`. The rollback
+    /// puts the old catalog row back and not the connection, so the index went on
+    /// reading the table's new name, and rows inserted into `p` never reached it.
+    /// The next [`ImportedDatabase::connect_missing`] connects what this removed.
+    pub(crate) fn disconnect_changed_modules(&mut self) {
+        let mut declared: std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> =
+            std::collections::HashMap::new();
+        for recorded in &self.schema.entries {
+            if recorded.entry.kind != ObjectKind::Table || !names_virtual(&recorded.entry.sql) {
+                continue;
+            }
+            let Ok(parsed) = inillucent_sql::parser::parse_next_statement(
+                &recorded.entry.sql,
+                0,
+                &self.pragmas.limits().borrow(),
+            ) else {
+                continue;
+            };
+            let inillucent_sql::ast::Statement::CreateVirtualTable {
+                name, arguments, ..
+            } = &parsed.statement
+            else {
+                continue;
+            };
+            declared.insert(
+                parsed.ast.text(*name).to_ascii_lowercase(),
+                arguments.clone(),
+            );
+        }
+        self.session_state.virtual_tables.retain(|name, connected| {
+            declared
+                .get(name)
+                .is_none_or(|held| *held == connected.arguments.arguments)
+        });
+    }
+
     /// Connects the virtual tables that could not be connected before, and
     /// reports whether any of them now is.
     ///

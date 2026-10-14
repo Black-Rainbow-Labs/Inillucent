@@ -42,6 +42,7 @@ impl crate::ImportedDatabase {
         }
         let sql = canonical_sql("CREATE TABLE", source, name_offset, source.len() as u32);
         self.define_table(name, sql)?;
+        self.note_parent_recreated(self.schema.ddl_schema, name);
         self.refresh_catalog();
         self.declarations_resolve(name)?;
         // **`sqlite_sequence` comes into being with the first `AUTOINCREMENT`

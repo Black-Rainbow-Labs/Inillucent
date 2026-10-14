@@ -393,6 +393,7 @@ impl crate::ImportedDatabase {
         // has no connection.** Connected before `rebuild_tables`, because a
         // virtual table's columns come from its connection, and before the
         // catalog refresh below, because a vector index is published from it.
+        self.disconnect_changed_modules();
         self.connect_missing()?;
         self.rebuild_tables()?;
         // **A rolled back `CREATE VIRTUAL TABLE` leaves its module connected,
@@ -615,6 +616,7 @@ impl crate::ImportedDatabase {
         // transaction that did not happen.** See `rollback_modules`: the file
         // was always put back correctly, and the module's own buffer was not.
         self.session_state.modules_begun.set(false);
+        self.forget_dropped_parents();
         let told = self.rollback_modules(None);
         let txn = self.current_txn();
         // Before the undo is committed, which settles space: a page count the
@@ -735,6 +737,7 @@ impl crate::ImportedDatabase {
             self.forget_compiled_statements();
         }
         self.session_state.modules_begun.set(false);
+        self.forget_dropped_parents();
         // Nothing to abandon once it is committed, and holding the before-images
         // would hold every row a long transaction touched.
         self.writing.undo().borrow_mut().clear();
@@ -751,7 +754,14 @@ impl crate::ImportedDatabase {
         self.commit_across(txn, participants)?;
         // A meta field the transaction set reaches the file only at a
         // checkpoint; see `set_meta_field`.
-        let changed_meta = !self.writing.meta_changes().borrow().is_empty();
+        // The schema cookie is not one of the fields a commit checkpoints: it
+        // reaches the file with the next fold, as it always has.
+        let changed_meta = self
+            .writing
+            .meta_changes()
+            .borrow()
+            .iter()
+            .any(|change| change.field != crate::engine::state::MetaField::SchemaCookie);
         self.writing.meta_changes().borrow_mut().clear();
         if changed_meta {
             self.checkpoint()?;

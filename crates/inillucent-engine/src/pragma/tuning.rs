@@ -387,10 +387,12 @@ impl crate::ImportedDatabase {
         let before = match field {
             MetaField::UserVersion => file.user_version(),
             MetaField::ApplicationId => file.application_id(),
+            MetaField::SchemaCookie => file.schema_cookie(),
         };
         match field {
             MetaField::UserVersion => file.set_user_version(value),
             MetaField::ApplicationId => file.set_application_id(value),
+            MetaField::SchemaCookie => file.set_schema_cookie(value),
         }
         if self.writing.batch().is_some() {
             self.writing
@@ -425,6 +427,7 @@ impl crate::ImportedDatabase {
             match change.field {
                 MetaField::UserVersion => file.set_user_version(change.before),
                 MetaField::ApplicationId => file.set_application_id(change.before),
+                MetaField::SchemaCookie => file.set_schema_cookie(change.before),
             }
         }
     }

@@ -98,6 +98,7 @@ mod vacuum_on_vfs;
 mod vector;
 mod vector_edges;
 mod vector_metric;
+mod vector_rename;
 mod vtab;
 mod vtab_lifecycle;
 mod vtab_refused_connect;

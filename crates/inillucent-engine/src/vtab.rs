@@ -375,6 +375,26 @@ impl ImportedDatabase {
             .any(|connected| shadow_names(&connected.arguments).any(|held| held == folded))
     }
 
+    /// Returns whether a name is a shadow table of a virtual table in one database.
+    ///
+    /// **What `DROP TABLE`, `ALTER TABLE` and `CREATE TRIGGER` ask (bug hunt 10).**
+    /// A shadow table dropped, altered or given a trigger leaves the virtual table
+    /// that owns it unable to open (`the catalog does not name f_content, which f
+    /// needs`), so SQLite refuses all three on a defensive connection. They name a
+    /// table in one schema, so a table of the same name in another schema is not
+    /// the shadow, which [`ImportedDatabase::is_shadow_table`] cannot tell apart.
+    ///
+    /// @param name - the table the statement names
+    /// @param database - the schema the table is looked up in, as the binder numbers them
+    pub(crate) fn is_shadow_table_in(&self, name: &[u8], database: usize) -> bool {
+        let folded = name.to_ascii_lowercase();
+        self.session_state
+            .virtual_tables
+            .values()
+            .filter(|connected| connected.arguments.database == database)
+            .any(|connected| shadow_names(&connected.arguments).any(|held| held == folded))
+    }
+
     /// Returns whether a name is a virtual table that owns shadow tables.
     ///
     /// **What `VACUUM` asks before it copies a table's rows (task-1979, R2).**
@@ -2022,7 +2042,7 @@ fn substitute_shadow_name(template: &str, name: &[u8]) -> String {
 ///
 /// @param table - the virtual table's own name
 /// @param suffix - the shadow table's suffix
-fn shadow_table_name(table: &[u8], suffix: &[u8]) -> Vec<u8> {
+pub(crate) fn shadow_table_name(table: &[u8], suffix: &[u8]) -> Vec<u8> {
     // **An empty suffix is the table itself.** A module that asks for a shadow
     // with no suffix is asking for the named table rather than for one derived
     // from it, which is what an external-content FTS5 index needs: its rows are

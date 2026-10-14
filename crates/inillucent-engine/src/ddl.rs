@@ -56,7 +56,10 @@ mod alter_checks;
 mod alter_rewrite;
 pub(crate) use alter::Already;
 mod catalog;
+mod dropped_parents;
+pub(crate) use dropped_parents::DroppedParent;
 mod index;
+mod module_rename;
 mod reindex;
 mod table;
 mod tree;
@@ -209,6 +212,18 @@ impl ImportedDatabase {
             self.writing.undo().borrow_mut().clear();
         }
         if changes_schema {
+            // Inside a transaction the old value is kept, so a ROLLBACK (or a
+            // ROLLBACK TO before this statement) puts it back.
+            if !autocommit {
+                self.writing
+                    .meta_changes()
+                    .borrow_mut()
+                    .push(crate::engine::state::MetaChange {
+                        at: None,
+                        field: crate::engine::state::MetaField::SchemaCookie,
+                        before: self.storage.database.schema_cookie(),
+                    });
+            }
             self.storage.database.bump_schema_cookie();
         }
         Ok(outcome)
