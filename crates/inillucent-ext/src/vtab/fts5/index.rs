@@ -1123,6 +1123,9 @@ fn write_new_segment(
     lists: &[(Vec<u8>, Vec<u8>)],
 ) -> DbResult<()> {
     let mut structure = segment::read_structure(context, shadows)?;
+    if structure == segment::Structure::legacy() {
+        structure.base_empty = !segment::base_has_rows(context, shadows)?;
+    }
     let id = structure.next_id;
     let bytes = segment::write_segment(context, shadows, id, lists)?;
     structure.next_id = id.saturating_add(1);

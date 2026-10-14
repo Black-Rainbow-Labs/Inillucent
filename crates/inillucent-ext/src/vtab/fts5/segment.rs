@@ -247,6 +247,23 @@ pub(crate) fn read_structure(
     })
 }
 
+/// Reports whether the base segment holds any row.
+///
+/// Asked once, when the first segment is written into an index that has no segment list. An
+/// index an earlier build wrote has all its rows in the base. A new one has none, and then a
+/// reader need not look there and a merge may drop deletion markers.
+///
+/// @param context - the running statement
+/// @param shadows - the table's shadow tables
+pub(crate) fn base_has_rows(context: &mut Context<'_>, shadows: &ShadowTables) -> DbResult<bool> {
+    let mut found = false;
+    shadows.scan_keyed_from(context, b"idx", 2, &key_of(0, b"")?, |values| {
+        found = segment_of(values) == Some(0);
+        Ok(false)
+    })?;
+    Ok(found)
+}
+
 /// Writes the list of live segments.
 ///
 /// @param context - the running statement

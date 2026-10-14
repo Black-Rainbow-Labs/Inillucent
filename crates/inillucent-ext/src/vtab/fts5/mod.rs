@@ -744,9 +744,10 @@ impl VirtualTable for Fts5Table {
             &[Value::owned_text(b"version")?, Value::Integer(4)],
         )?;
         layout::stamp(context, &self.shadows)?;
-        // A table made by this build keeps nothing in the base segment, so a reader need not
-        // look there.
-        segment::write_structure(context, &self.shadows, &segment::Structure::empty())?;
+        // No segment list is written here. VACUUM creates the table again and then copies the
+        // old shadow rows over it, and a list that says the base is empty would outlive a copy
+        // of an index whose rows are all in the base. The first commit writes the list, after
+        // looking at whether the base holds anything.
         // `version` is the only row FTS5 writes. The tokenizer is *not* kept
         // here: it is re-read from the module arguments in `sqlite_master`
         // every time the table is connected, and a `tokenize` row would be a
