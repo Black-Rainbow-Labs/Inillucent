@@ -20,6 +20,7 @@
 use inillucent_value::Value;
 
 mod columnar;
+pub mod stream;
 pub mod text;
 
 use text::escape_controls;

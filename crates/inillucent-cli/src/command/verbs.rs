@@ -220,10 +220,16 @@ fn produce(
     }
     let counters = write_counters(context);
     let started = std::time::Instant::now();
-    let collected = context.shell().collect_bound(sql, &bound);
+    // **Streamed, so only the rows the caller asked for are held.** The statement used to
+    // be collected whole and cut afterwards, which cost 896 MB to answer `SELECT a, b FROM t`
+    // over three million rows with the default limit of 200. The total is counted while the
+    // rows go by, so `total` and `more` are the numbers they always were.
+    let keep = if limit == 0 { usize::MAX } else { limit };
+    let collected = context.shell().collect_limited(sql, &bound, keep);
     let elapsed = started.elapsed().as_secs_f64() * 1000.0;
-    let (names, rows) = collected.map_err(|failure| Failed::from_shell(&failure))?;
-    let mut produced = rows_to_outcome(context, command, names, rows, limit, elapsed);
+    let held = collected.map_err(|failure| Failed::from_shell(&failure))?;
+    let (names, rows, total) = (held.columns, held.rows, held.total);
+    let mut produced = rows_to_outcome(context, command, names, rows, total, limit, elapsed);
     let (changes, rowid) = write_counters(context);
     produced.changes = (changes - counters.0).max(0);
     produced.last_insert_rowid = rowid_this_statement_assigned(sql, &produced, counters.1, rowid);
@@ -275,7 +281,9 @@ fn rowid_this_statement_assigned(sql: &str, produced: &Outcome, before: i64, aft
 /// @param context - for the null placeholder
 /// @param command - the verb
 /// @param names - the column names
-/// @param rows - every row the statement produced
+/// @param rows - the rows the statement produced, or the first of them when it produced more than
+///   the limit
+/// @param total - how many rows the statement produced in all
 /// @param limit - how many to hand back, zero meaning all of them
 /// @param elapsed - how long the statement took, in milliseconds
 fn rows_to_outcome(
@@ -283,10 +291,10 @@ fn rows_to_outcome(
     command: &str,
     names: Vec<String>,
     rows: Vec<Vec<Value<'static>>>,
+    total: usize,
     limit: usize,
     elapsed: f64,
 ) -> Outcome {
-    let total = rows.len();
     let kept = if limit == 0 { total } else { limit.min(total) };
     let cells: Vec<Vec<Json>> = rows
         .iter()
@@ -769,7 +777,10 @@ pub fn indexes(context: &mut Context, arguments: &Arguments) -> Result<Outcome, 
         key(left).cmp(&key(right))
     });
     let elapsed = started.elapsed().as_secs_f64() * 1000.0;
-    Ok(rows_to_outcome(context, "indexes", names, rows, 0, elapsed))
+    let total = rows.len();
+    Ok(rows_to_outcome(
+        context, "indexes", names, rows, total, 0, elapsed,
+    ))
 }
 
 /// Returns one row per vector index, in the shape the `indexes` listing uses.

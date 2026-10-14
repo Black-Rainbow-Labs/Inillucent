@@ -189,7 +189,8 @@ pub use inillucent_sql::keyword::lookup as keyword_lookup;
 use inillucent_sql::parser::parse_next_statement;
 use inillucent_sql::plan::Levers;
 use inillucent_sqlite_reader::SqliteFile;
-use inillucent_tree::datum::Datum;
+/// A value borrowed from a page, which is what a streamed statement hands its consumer.
+pub use inillucent_tree::datum::Datum;
 use inillucent_tree::types::ColumnSpec;
 use inillucent_tree::write::TreeLog;
 use inillucent_tree::PagedTree;

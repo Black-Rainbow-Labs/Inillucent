@@ -200,10 +200,68 @@ pub struct CollectInto {
     limit: Option<usize>,
     /// Where the rows go instead, while the caller has put a packed set here (task-2226).
     packed: Option<Packing>,
+    /// Where the rows go instead, while the caller has put a consumer here.
+    streaming: Option<Streaming>,
+    /// How many rows have been handed to the consumer, which the limit counts.
+    streamed: usize,
 }
 
 /// The packed set a [`CollectInto`] fills while the caller has put one in the cell.
 pub type Packing = std::rc::Rc<std::cell::RefCell<Option<crate::packed::PackedRows>>>;
+
+/// What receives the rows of a statement that is streamed instead of collected.
+///
+/// **The consumer is handed each row while the page it was read from is still
+/// pinned**, so the row borrows from the page and is gone when `accept` returns.
+/// A consumer that keeps a row copies it. A statement that is collected holds
+/// every row until it ends; a statement that is streamed holds one batch, which
+/// is why printing the rows of a large table no longer costs the size of the
+/// table.
+pub trait RowConsumer: std::any::Any {
+    /// Tells the consumer the names of the result columns, once, before its first row.
+    ///
+    /// Called for a statement that produces no rows too, so a consumer that draws a header can
+    /// tell a statement with columns and no rows from one with no columns. Provided, because a
+    /// consumer that only counts has no use for the names.
+    ///
+    /// @param names - the result columns, in order
+    fn columns(&mut self, _names: &[String]) {}
+
+    /// Takes one row of the answer.
+    ///
+    /// @param row - the row's values, borrowed from the page
+    fn accept(&mut self, row: &[Datum<'_>]) -> DbResult<Flow>;
+}
+
+/// The consumer a [`CollectInto`] hands rows to while the caller has put one in the cell.
+pub type Streaming = std::rc::Rc<std::cell::RefCell<Option<Box<dyn RowConsumer>>>>;
+
+/// A consumer that takes no rows, handed back when a streamed run lost the caller's own.
+pub struct NoConsumer;
+
+impl RowConsumer for NoConsumer {
+    /// Takes nothing and asks the pipeline to stop.
+    fn accept(&mut self, _row: &[Datum<'_>]) -> DbResult<Flow> {
+        Ok(Flow::Stop)
+    }
+}
+
+/// Hands rows that were collected to a consumer, one at a time, until it asks to stop.
+///
+/// For a statement that cannot stream: the rows exist already, so this is the same call the
+/// consumer would have had from the pipeline.
+///
+/// @param rows - the collected rows
+/// @param consumer - what takes each row
+pub fn hand_over(rows: &[Vec<OwnedDatum>], consumer: &mut dyn RowConsumer) -> DbResult<()> {
+    for row in rows {
+        let borrowed = inillucent_tree::datum::borrow_row(row);
+        if consumer.accept(&borrowed)? == Flow::Stop {
+            break;
+        }
+    }
+    Ok(())
+}
 impl CollectInto {
     /// Returns a sink appending into a shared buffer.
     ///
@@ -213,6 +271,53 @@ impl CollectInto {
             rows,
             limit: None,
             packed: None,
+            streaming: None,
+            streamed: 0,
+        }
+    }
+
+    /// Returns the sink handing rows to a consumer instead whenever the cell holds one.
+    ///
+    /// **For a statement the caller prints or counts row by row.** Nothing is
+    /// appended to the buffer while a consumer is in the cell, so the memory the
+    /// statement needs for its answer is one batch and not the answer.
+    ///
+    /// @param streaming - the cell; empty, the sink collects as before
+    pub fn with_streaming(mut self, streaming: Streaming) -> CollectInto {
+        self.streaming = Some(streaming);
+        self
+    }
+
+    /// Hands a batch's live rows to a consumer one at a time, stopping at the limit.
+    ///
+    /// @param consumer - what takes each row
+    /// @param batch - the rows
+    /// @param limit - how many rows to hand over in all
+    /// @param streamed - how many rows were handed over before this batch
+    fn push_streamed(
+        consumer: &mut dyn RowConsumer,
+        batch: &Batch<'_>,
+        limit: Option<usize>,
+        streamed: &mut usize,
+    ) -> DbResult<Flow> {
+        let width = batch.columns.len();
+        let mut row: Vec<Datum<'_>> = Vec::with_capacity(width);
+        for nth in 0..batch.live() {
+            if limit.is_some_and(|limit| *streamed >= limit) {
+                return Ok(Flow::Stop);
+            }
+            row.clear();
+            for column in 0..width {
+                row.push(batch.value(nth, column)?);
+            }
+            *streamed = streamed.saturating_add(1);
+            if consumer.accept(&row)? == Flow::Stop {
+                return Ok(Flow::Stop);
+            }
+        }
+        match limit {
+            Some(limit) if *streamed >= limit => Ok(Flow::Stop),
+            _ => Ok(Flow::Continue),
         }
     }
 
@@ -272,11 +377,23 @@ impl CollectInto {
             rows,
             limit: Some(limit),
             packed: None,
+            streaming: None,
+            streamed: 0,
         }
     }
 }
 impl Sink for CollectInto {
     fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
+        if let Some(streaming) = &self.streaming {
+            if let Some(consumer) = streaming.borrow_mut().as_mut() {
+                return CollectInto::push_streamed(
+                    consumer.as_mut(),
+                    batch,
+                    self.limit,
+                    &mut self.streamed,
+                );
+            }
+        }
         if let Some(packing) = &self.packed {
             if let Some(packed) = packing.borrow_mut().as_mut() {
                 return CollectInto::push_packed(packed, batch, self.limit);
@@ -308,6 +425,7 @@ impl Sink for CollectInto {
     /// Returns this operator and everything below it to its pre-input state.
     fn reset(&mut self) -> DbResult<()> {
         self.rows.borrow_mut().clear();
+        self.streamed = 0;
         Ok(())
     }
 }

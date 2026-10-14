@@ -729,6 +729,70 @@ impl ImportedDatabase {
         }
     }
 
+    /// Runs a prepared statement with every row of a `SELECT` handed to a consumer as the
+    /// pipeline produces it.
+    ///
+    /// **The outcome carries no rows**, and the engine holds a batch in place of the answer: a
+    /// statement that reads three million rows needs memory for the rows being handled, not for
+    /// the three million. A statement that cannot stream (a compound query, a window function, a
+    /// write with `RETURNING`, a pragma) runs as it always did and its rows are then handed to
+    /// the consumer, so every statement answers through the consumer. The consumer is returned
+    /// whatever happened. A failure is reported after the rows that came before it.
+    ///
+    /// @param statement - the handle
+    /// @param params - the values bound to `?1`, `?2`, ...
+    /// @param consumer - what takes each row
+    pub fn execute_statement_streaming(
+        &mut self,
+        statement: &Statement,
+        params: &Params,
+        consumer: Box<dyn inillucent_exec::ops::RowConsumer>,
+    ) -> (
+        DbResult<Outcome>,
+        Box<dyn inillucent_exec::ops::RowConsumer>,
+    ) {
+        params.supply_stream(consumer);
+        // Rows kept by an earlier failure are not this statement's.
+        inillucent_exec::physical::take_partial_rows();
+        let ran = self.execute_statement(statement, params);
+        let Some((mut consumer, streamed)) = params.recover_stream() else {
+            return (
+                Err(inillucent_base::error::misuse(
+                    "a streamed statement lost its consumer",
+                )),
+                Box::new(inillucent_exec::ops::NoConsumer),
+            );
+        };
+        let ran = match ran {
+            Ok(outcome) if !streamed => {
+                consumer.columns(&outcome.names);
+                inillucent_exec::ops::hand_over(&outcome.rows, consumer.as_mut()).map(|()| {
+                    Outcome {
+                        rows: Vec::new(),
+                        ..outcome
+                    }
+                })
+            }
+            // A statement that is not streamed and fails after it had rows to give, such as a
+            // write with `RETURNING` whose deferred foreign key fails at the end, hands those
+            // rows over before the failure, as `Statement::step` hands them out (bug hunt 10).
+            Err(error) if !streamed => {
+                let delivered = inillucent_exec::physical::take_partial_rows();
+                if let (Some(names), false) = (statement.query_names(), delivered.is_empty()) {
+                    consumer.columns(&names);
+                    if let Err(refused) =
+                        inillucent_exec::ops::hand_over(&delivered, consumer.as_mut())
+                    {
+                        return (Err(refused), consumer);
+                    }
+                }
+                Err(error)
+            }
+            other => other,
+        };
+        (ran, consumer)
+    }
+
     /// Runs a prepared statement once with the plan current for this
     /// connection's schema.
     ///

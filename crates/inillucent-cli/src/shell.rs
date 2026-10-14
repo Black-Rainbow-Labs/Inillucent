@@ -12,7 +12,7 @@
 //! wrong and the engine's own parser has to be the one that says when a
 //! statement is finished.
 
-use inillucent_engine::connect::{Connection, Database};
+use inillucent_engine::connect::{Connection, Database, Statement};
 use inillucent_tree::datum::{owned_row_values, OwnedDatum};
 use inillucent_value::Value;
 
@@ -21,6 +21,7 @@ use crate::render::{render, Layout};
 mod deferred;
 pub mod output;
 pub mod redirect;
+mod stream;
 
 /// Everything the shell remembers between lines.
 /// One open database and the session statements on it belong to.
@@ -358,6 +359,16 @@ fn described(error: inillucent_base::DbError) -> String {
         Some(detail) if detail != error.message() => format!("{}: {detail}", error.message()),
         _ => error.message().to_string(),
     }
+}
+
+/// The first rows of a statement and how many it produced in all.
+pub struct Limited {
+    /// The result column names.
+    pub columns: Vec<String>,
+    /// The rows kept, at most as many as were asked for.
+    pub rows: Vec<Vec<Value<'static>>>,
+    /// How many rows the statement produced, exactly.
+    pub total: usize,
 }
 
 /// Why a statement did not produce rows.
@@ -957,52 +968,15 @@ impl Shell {
     /// @param line - the text
     /// @param terminated - whether a newline follows it
     fn emit(&mut self, line: &str, terminated: bool) {
-        // **A `.testcase` captures instead of printing.** `.check` compares the
-        // output of the commands between the two, and a passing case prints
-        // nothing at all - which is what makes a test script's output the list
-        // of the cases that failed.
-        if self.testcase.is_some() {
-            self.captured.push_str(line);
-            if terminated {
-                self.captured.push('\n');
-            }
-            return;
-        }
-        // **A redirect outranks a collecting caller, and used to lose to one
-        // (task-2044).** `.once` and `.output` open their file and every line
-        // then went into the sink instead, so the file existed and was zero
-        // bytes while the rows came back in the caller's report. It was not a
-        // corner: `export --out` built a `.once` and ran it through
-        // `collect_output`, so the shipped command reported `"ok": true` with
-        // `"wrote": "<path>"` over an empty file in all eight formats, and a
-        // `.once` inside a script handed to `run` did the same. `export` asks
-        // for its redirect directly now, but `run` still hands the shell a
-        // script somebody else wrote, so this order is what makes that work.
-        //
-        // This order is what the two mean. A redirect is the caller of the
-        // shell saying where output goes; a sink is a caller collecting what
-        // was not redirected. `complain` is deliberately the other way round -
-        // an error goes to the sink even while a redirect is open, because an
-        // error belongs in the report rather than in the middle of the rows.
-        let ending = match (terminated, self.crlf) {
-            (false, _) => "",
-            (true, true) => "\r\n",
-            (true, false) => "\n",
-        };
-        if let Some(redirection) = self.redirection.as_mut() {
-            let mut bytes = crate::raw::encode(line).into_owned();
-            bytes.extend_from_slice(ending.as_bytes());
-            redirection.write(&bytes);
-            return;
-        }
-        if let Some(sink) = self.sink.as_mut() {
-            sink.push_str(line);
-            if terminated {
-                sink.push('\n');
-            }
-            return;
-        }
-        output::write_line(line, ending);
+        let captured = self.testcase.is_some().then_some(&mut self.captured);
+        stream::deliver(
+            &mut self.redirection,
+            &mut self.sink,
+            captured,
+            self.crlf,
+            line,
+            terminated,
+        );
     }
 
     /// Prints an error, which always goes to standard error.
@@ -1275,6 +1249,19 @@ impl Shell {
             inillucent_driver::StatementLimits::unbounded(),
             std::sync::Arc::clone(&self.cancel),
         );
+        if self.streams_rows(sql) {
+            let outcome = self.print_streamed(sql);
+            drop(armed);
+            match outcome {
+                Err(failure) => self.report(sql, &failure),
+                Ok(printed) => {
+                    self.rows_since_redirect = self.rows_since_redirect.saturating_add(printed);
+                    self.print_changes();
+                }
+            }
+            self.after_statement(started);
+            return;
+        }
         let outcome = self.collect(sql);
         drop(armed);
         // `.auth on` prints what the binder asked about, before the rows the
@@ -1342,15 +1329,27 @@ impl Shell {
                     render(&layout, &columns, &rows)
                 };
                 self.print_rendered(lines, &layout);
-                if self.show_changes {
-                    let changes = self.connection().changes().unwrap_or_default();
-                    // The reference prints both counters, aligned with three
-                    // spaces between them.
-                    let total = self.connection().total_changes().unwrap_or_default();
-                    self.say(&format!("changes: {changes}   total_changes: {total}"));
-                }
+                self.print_changes();
             }
         }
+        self.after_statement(started);
+    }
+
+    /// Prints the change counters after a statement, for `.changes on`.
+    fn print_changes(&mut self) {
+        if self.show_changes {
+            let changes = self.connection().changes().unwrap_or_default();
+            // The reference prints both counters, aligned with three
+            // spaces between them.
+            let total = self.connection().total_changes().unwrap_or_default();
+            self.say(&format!("changes: {changes}   total_changes: {total}"));
+        }
+    }
+
+    /// Prints what `.stats` and `.timer` ask for after a statement.
+    ///
+    /// @param started - when the statement began
+    fn after_statement(&mut self, started: std::time::Instant) {
         if self.stats {
             for line in crate::diagnose::statistics(self) {
                 self.say(&line);
@@ -1479,30 +1478,21 @@ impl Shell {
         }
     }
 
-    /// Runs a statement with values bound by position, and collects its rows.
+    /// Compiles a statement and binds the values it takes: the positional ones first, then the
+    /// ones `.parameter set` named.
     ///
-    /// **By position, because a caller that is a program has no names.** The
-    /// shell's own `.parameter` table binds `:name` and `@name` markers, which
-    /// is what a person typing a script wants; a command arriving over MCP or
-    /// off a command line carries an ordered array and means `?1`, `?2`, ... .
-    /// Going through the named table for those was the first thing tried,
-    /// and it bound nothing at all: the engine reports a numbered marker
-    /// under a name that is not the text `?1`, so every lookup missed and every
-    /// value silently arrived as NULL. Binding by the index the parser assigned
-    /// cannot miss.
+    /// Shared by the call that collects a statement's rows and the call that prints them as they
+    /// are produced, so both bind the same values the same way.
     ///
-    /// Both mechanisms apply: positional values are bound first and the named
-    /// table after, so a script that sets `:limit` once and passes `?1` per
-    /// call gets both.
-    ///
+    /// @param connection - the connection to prepare the statement on
     /// @param sql - the statement
     /// @param bound - the values for `?1`, `?2`, ... in order
-    pub fn collect_bound(
+    fn prepare_bound<'c>(
         &self,
+        connection: &'c Connection<'_>,
         sql: &str,
         bound: &[OwnedDatum],
-    ) -> Result<(Vec<String>, Vec<Vec<Value<'static>>>), Failure> {
-        let connection = self.connection();
+    ) -> Result<Statement<'c>, Failure> {
         let mut statement = connection.prepare(sql).map_err(|error| Failure {
             message: reason(&error),
             offset: error.sql_offset(),
@@ -1518,7 +1508,7 @@ impl Shell {
             statement
                 .bind(nth as u32 + 1, value.clone())
                 .map_err(|error| Failure {
-                    message: self.too_many_parameters(&connection, sql, bound.len(), &error),
+                    message: self.too_many_parameters(connection, sql, bound.len(), &error),
                     offset: None,
                     compiling: true,
                     error: Some(error),
@@ -1547,6 +1537,34 @@ impl Shell {
                 let _ = statement.bind(index, OwnedDatum::from(value));
             }
         }
+        Ok(statement)
+    }
+
+    /// Runs a statement with values bound by position, and collects its rows.
+    ///
+    /// **By position, because a caller that is a program has no names.** The
+    /// shell's own `.parameter` table binds `:name` and `@name` markers, which
+    /// is what a person typing a script wants; a command arriving over MCP or
+    /// off a command line carries an ordered array and means `?1`, `?2`, ... .
+    /// Going through the named table for those was the first thing tried,
+    /// and it bound nothing at all: the engine reports a numbered marker
+    /// under a name that is not the text `?1`, so every lookup missed and every
+    /// value silently arrived as NULL. Binding by the index the parser assigned
+    /// cannot miss.
+    ///
+    /// Both mechanisms apply: positional values are bound first and the named
+    /// table after, so a script that sets `:limit` once and passes `?1` per
+    /// call gets both.
+    ///
+    /// @param sql - the statement
+    /// @param bound - the values for `?1`, `?2`, ... in order
+    pub fn collect_bound(
+        &self,
+        sql: &str,
+        bound: &[OwnedDatum],
+    ) -> Result<(Vec<String>, Vec<Vec<Value<'static>>>), Failure> {
+        let connection = self.connection();
+        let mut statement = self.prepare_bound(&connection, sql, bound)?;
         let mut rows = Vec::new();
         loop {
             match statement.step() {
@@ -1583,6 +1601,121 @@ impl Shell {
         // first returned an empty list, and `.headers on` printed nothing.
         let columns: Vec<String> = statement.columns().to_vec();
         Ok((columns, rows))
+    }
+
+    /// Runs a statement with values bound by position, keeps its first rows and counts the rest.
+    ///
+    /// **The statement is streamed, so the rows past `keep` are never held.** `total` is exact:
+    /// it is counted as the rows go by, which is what a caller that shows `(200 of 3000000
+    /// rows)` needs and what `collect_bound` gave by holding every row to count them.
+    ///
+    /// @param sql - the statement
+    /// @param bound - the values for `?1`, `?2`, ... in order
+    /// @param keep - how many rows to keep
+    pub fn collect_limited(
+        &self,
+        sql: &str,
+        bound: &[OwnedDatum],
+        keep: usize,
+    ) -> Result<Limited, Failure> {
+        let connection = self.connection();
+        let mut statement = self.prepare_bound(&connection, sql, bound)?;
+        let limiter = std::rc::Rc::new(std::cell::RefCell::new(stream::Limiter::new(keep)));
+        let ended = statement.stream(&limiter).map_err(|error| Failure {
+            message: reason(&error),
+            offset: None,
+            compiling: false,
+            error: Some(error),
+            partial: None,
+        })?;
+        let rows = std::mem::take(&mut limiter.borrow_mut().rows);
+        Ok(Limited {
+            columns: ended.names.to_vec(),
+            rows,
+            total: ended.rows,
+        })
+    }
+
+    /// Reports whether a statement's rows are printed as they are produced.
+    ///
+    /// **Only where nothing needs the whole result before the first line.** The modes that size
+    /// their columns to the widest value need every row, and so do the two layouts that are drawn
+    /// from the whole result: `EXPLAIN QUERY PLAN`, which is a tree, and the bytecode listing of
+    /// `EXPLAIN`, which is a table. `.explain on` draws any statement with eight columns as that
+    /// table, and the column count is not known until the statement is compiled, so it keeps
+    /// every statement on the path that collects.
+    ///
+    /// @param sql - the statement
+    fn streams_rows(&self, sql: &str) -> bool {
+        // `.auth on` reports what the binder asked about before the rows, and a streamed
+        // statement prints its rows while it runs.
+        crate::render::stream::streams(self.layout.mode)
+            && !self.auth
+            && !is_query_plan(sql)
+            && match self.explain_mode {
+                crate::commands::ExplainMode::Auto => !is_bytecode_explain(sql),
+                crate::commands::ExplainMode::On => false,
+                crate::commands::ExplainMode::Off => true,
+            }
+    }
+
+    /// Runs a statement and prints its rows as the engine produces them.
+    ///
+    /// **The rows before a failure are printed before the failure is reported**, because the
+    /// printer has already written them, which is the order the reference shell prints them in.
+    /// Returns how many rows were printed.
+    ///
+    /// @param sql - the statement
+    pub fn print_streamed(&mut self, sql: &str) -> Result<usize, Failure> {
+        let layout = self.rendering_layout();
+        let sinks = stream::LineSinks {
+            redirection: self.redirection.take(),
+            sink: self.sink.take(),
+            captured: self
+                .testcase
+                .is_some()
+                .then(|| std::mem::take(&mut self.captured)),
+            crlf: self.crlf,
+        };
+        let printer = std::rc::Rc::new(std::cell::RefCell::new(stream::RowPrinter::new(
+            layout,
+            self.header_when_empty,
+            sinks,
+        )));
+        let ran = self.stream_into(sql, &printer);
+        let (printed, sinks) = {
+            let mut held = printer.borrow_mut();
+            (held.finish(ran.is_ok()), held.release())
+        };
+        self.redirection = sinks.redirection;
+        self.sink = sinks.sink;
+        if let Some(captured) = sinks.captured {
+            self.captured = captured;
+        }
+        ran.map(|()| printed)
+    }
+
+    /// Compiles a statement, binds its values and streams it into a printer.
+    ///
+    /// @param sql - the statement
+    /// @param printer - receives the column names and each row
+    fn stream_into(
+        &self,
+        sql: &str,
+        printer: &std::rc::Rc<std::cell::RefCell<stream::RowPrinter>>,
+    ) -> Result<(), Failure> {
+        let connection = self.connection();
+        let mut statement = self.prepare_bound(&connection, sql, &[])?;
+        statement
+            .stream(printer)
+            .map(|_| ())
+            .map_err(|error| Failure {
+                message: reason(&error),
+                offset: None,
+                compiling: false,
+                error: Some(error),
+                partial: None,
+            })
     }
 
     /// Prints the query plan for a statement, for `.eqp on`.

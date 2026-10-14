@@ -90,6 +90,8 @@ mod segmented_generations;
 mod space_reuse;
 mod sql;
 mod storage;
+mod streaming_memory;
+mod streaming_rows;
 mod subquery_values;
 mod tlp_differential;
 mod torn_page_with_image;

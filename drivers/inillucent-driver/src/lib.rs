@@ -67,6 +67,7 @@ pub mod error;
 pub mod introspect;
 pub mod rows;
 pub mod shared;
+pub mod stream;
 pub mod value;
 pub mod wire;
 
@@ -81,9 +82,14 @@ use inillucent_engine::connect::{Database as EngineDatabase, Statement as Engine
 
 pub use capability::{capability, supports, Capability, Support, CAPABILITIES};
 pub use error::{Error, Result, Status};
+/// The engine's own row consumer and the borrowed value it is handed, for the shell, which
+/// streams the rows of a statement it prepared on the engine's statement.
+pub use inillucent_engine::connect::{Flow, RowConsumer};
+pub use inillucent_engine::Datum;
 pub use introspect::{Item, Kind, Table};
 pub use rows::Rows;
 pub use shared::{SharedConnection, SharedDatabase, SharedTransaction};
+pub use stream::{RowSink, Streamed};
 pub use value::{Column, Value, ValueKind};
 
 /// What one statement may spend, and the default ceiling on the plan cache.

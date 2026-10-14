@@ -130,6 +130,46 @@ pub fn run_prepared_limited(
     let collected = std::mem::take(&mut *rows.borrow_mut());
     Ok((collected, shape))
 }
+/// Runs any planned query with every row handed to a consumer as it is produced.
+///
+/// **A query that is one pipeline streams; a compound or a windowed query does not.** Neither is
+/// one pipeline (see [`run_any_prepared_limited`]), so their rows are collected and then handed
+/// over, which is what they cost before and is not worse. The consumer is returned whatever the
+/// outcome, with the result of the run beside it.
+///
+/// @param plan - the planner's output
+/// @param catalog - where the trees and layouts come from
+/// @param prepared - the structural choice
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param consumer - what takes each row
+pub fn run_any_prepared_streaming(
+    plan: &PhysicalPlan,
+    catalog: &dyn TreeCatalog,
+    prepared: &Prepared,
+    params: &Params,
+    mut consumer: Box<dyn crate::ops::RowConsumer>,
+) -> (DbResult<()>, Box<dyn crate::ops::RowConsumer>) {
+    if !plan.compounds.is_empty() || !plan.select.windows.is_empty() {
+        let handed = run_any_prepared(plan, catalog, prepared, params)
+            .and_then(|(rows, _)| crate::ops::hand_over(&rows, consumer.as_mut()));
+        return (handed, consumer);
+    }
+    let rows = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let cell: crate::ops::Streaming = std::rc::Rc::new(std::cell::RefCell::new(Some(consumer)));
+    let sink = Box::new(CollectInto::new(rows).with_streaming(std::rc::Rc::clone(&cell)));
+    let ran = build_prepared(plan, catalog, prepared, params, sink)
+        .and_then(|(mut pipeline, _)| pipeline.run());
+    let consumer = cell.borrow_mut().take();
+    match consumer {
+        Some(consumer) => (ran, consumer),
+        None => (
+            Err(inillucent_base::error::misuse(
+                "a streamed statement lost its consumer",
+            )),
+            Box::new(crate::ops::NoConsumer),
+        ),
+    }
+}
 /// Runs a compound query: two or more arms joined by a set operator.
 ///
 /// **Each arm is an ordinary plan and is run as one.** The set operation is

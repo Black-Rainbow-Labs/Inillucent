@@ -237,6 +237,41 @@ pub struct Params {
     /// with none, because the rows belong to the one execution they were
     /// supplied for.
     supplied_rows: std::cell::RefCell<Option<Vec<Vec<OwnedDatum>>>>,
+    /// The consumer a statement's rows are streamed to, when the caller asked for that.
+    ///
+    /// A copy of the set starts with none: the consumer belongs to the one statement it was
+    /// supplied for, and a statement nested inside it (a trigger, a function that runs SQL) has
+    /// parameters of its own and so cannot take it.
+    stream: StreamSlot,
+}
+
+/// Where a streamed statement's consumer waits before the statement takes it, and where it is
+/// put back afterwards.
+#[derive(Default)]
+struct StreamSlot(std::cell::RefCell<StreamState>);
+
+/// Whether a consumer has been supplied, and whether a statement has used it.
+#[derive(Default)]
+enum StreamState {
+    /// No consumer.
+    #[default]
+    Idle,
+    /// Supplied, and not yet taken by a statement that streams.
+    Waiting(Box<dyn crate::ops::RowConsumer>),
+    /// Taken by a statement that streamed its rows into it, and put back.
+    Used(Box<dyn crate::ops::RowConsumer>),
+}
+
+impl std::fmt::Debug for StreamSlot {
+    /// Names the consumer's state without the consumer, which has no `Debug`.
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = match &*self.0.borrow() {
+            StreamState::Idle => "idle",
+            StreamState::Waiting(_) => "waiting",
+            StreamState::Used(_) => "used",
+        };
+        out.debug_tuple("StreamSlot").field(&state).finish()
+    }
 }
 
 /// The rows of the common table expressions an execution has evaluated.
@@ -274,6 +309,7 @@ impl Clone for Params {
             subqueries: self.subqueries.clone(),
             shared_rows: self.copy_of_shared_rows(),
             supplied_rows: std::cell::RefCell::new(None),
+            stream: StreamSlot::default(),
         }
     }
 }
@@ -294,6 +330,7 @@ impl Params {
             subqueries: Vec::new(),
             shared_rows: std::cell::OnceCell::new(),
             supplied_rows: std::cell::RefCell::new(None),
+            stream: StreamSlot::default(),
         }
     }
 
@@ -312,6 +349,7 @@ impl Params {
             subqueries: Vec::new(),
             shared_rows: std::cell::OnceCell::new(),
             supplied_rows: std::cell::RefCell::new(None),
+            stream: StreamSlot::default(),
         }
     }
 
@@ -333,6 +371,7 @@ impl Params {
             subqueries,
             shared_rows: self.copy_of_shared_rows(),
             supplied_rows: std::cell::RefCell::new(None),
+            stream: StreamSlot::default(),
         }
     }
 
@@ -360,6 +399,7 @@ impl Params {
             subqueries: Vec::new(),
             shared_rows: self.copy_of_shared_rows(),
             supplied_rows: std::cell::RefCell::new(None),
+            stream: StreamSlot::default(),
         }
     }
 
@@ -412,6 +452,50 @@ impl Params {
     /// Takes the rows [`Params::supply_rows`] handed over, if any.
     pub fn take_supplied_rows(&self) -> Option<Vec<Vec<OwnedDatum>>> {
         self.supplied_rows.borrow_mut().take()
+    }
+
+    /// Supplies the consumer a `SELECT` hands its rows to as it produces them.
+    ///
+    /// **Streamed, so the statement holds a batch and not its answer.** A statement that cannot
+    /// stream (a compound query, a window function, anything that is not a `SELECT`) leaves the
+    /// consumer waiting, and [`Params::recover_stream`] tells the caller so, because it then has
+    /// the rows to hand over itself.
+    ///
+    /// @param consumer - what takes each row
+    pub fn supply_stream(&self, consumer: Box<dyn crate::ops::RowConsumer>) {
+        *self.stream.0.borrow_mut() = StreamState::Waiting(consumer);
+    }
+
+    /// Takes the consumer [`Params::supply_stream`] supplied, for the statement that will stream
+    /// into it. The statement puts it back with [`Params::return_stream`].
+    pub fn take_stream(&self) -> Option<Box<dyn crate::ops::RowConsumer>> {
+        let mut held = self.stream.0.borrow_mut();
+        match std::mem::take(&mut *held) {
+            StreamState::Waiting(consumer) => Some(consumer),
+            other => {
+                *held = other;
+                None
+            }
+        }
+    }
+
+    /// Puts back a consumer a statement streamed its rows into, and records that it did.
+    ///
+    /// @param consumer - the consumer [`Params::take_stream`] gave out
+    pub fn return_stream(&self, consumer: Box<dyn crate::ops::RowConsumer>) {
+        *self.stream.0.borrow_mut() = StreamState::Used(consumer);
+    }
+
+    /// Takes the consumer back, and says whether a statement streamed rows into it.
+    ///
+    /// `None` when no consumer was supplied. `false` means the statement did not stream, and the
+    /// rows it answered with are still to be handed over.
+    pub fn recover_stream(&self) -> Option<(Box<dyn crate::ops::RowConsumer>, bool)> {
+        match std::mem::take(&mut *self.stream.0.borrow_mut()) {
+            StreamState::Idle => None,
+            StreamState::Waiting(consumer) => Some((consumer, false)),
+            StreamState::Used(consumer) => Some((consumer, true)),
+        }
     }
 
     /// Returns the rows a shared common table expression already produced in

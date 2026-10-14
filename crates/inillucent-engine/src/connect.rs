@@ -29,6 +29,8 @@ use inillucent_base::{DbError, DbResult, PrimaryCode};
 use inillucent_exec::physical::Params;
 use inillucent_tree::datum::OwnedDatum;
 
+pub use inillucent_exec::ops::{Flow, RowConsumer};
+
 use crate::{ImportedDatabase, DEFAULT_FRAMES};
 
 /// The page size a database is created at.
@@ -1922,6 +1924,42 @@ impl Drop for Transaction<'_> {
     }
 }
 
+/// How a streamed statement ended.
+#[derive(Clone, Debug)]
+pub struct StreamEnd {
+    /// The result column names.
+    pub names: std::rc::Rc<Vec<String>>,
+    /// How many rows were handed to the consumer.
+    pub rows: usize,
+    /// How many rows the statement changed.
+    pub changed: usize,
+}
+
+/// A consumer that counts the rows it forwards to the consumer the caller gave.
+struct Counting<C> {
+    /// The caller's consumer, which the caller holds a handle on too.
+    inner: std::rc::Rc<RefCell<C>>,
+    /// How many rows it has been given, readable by the caller.
+    rows: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl<C: RowConsumer + 'static> RowConsumer for Counting<C> {
+    /// Forwards the column names.
+    ///
+    /// @param names - the result columns
+    fn columns(&mut self, names: &[String]) {
+        self.inner.borrow_mut().columns(names);
+    }
+
+    /// Forwards a row and counts it.
+    ///
+    /// @param row - the row's values, borrowed from the page
+    fn accept(&mut self, row: &[inillucent_tree::datum::Datum<'_>]) -> DbResult<Flow> {
+        self.rows.set(self.rows.get().saturating_add(1));
+        self.inner.borrow_mut().accept(row)
+    }
+}
+
 /// A statement compiled once, bound, and stepped for its rows.
 ///
 /// **It materialises.** `step` runs the whole statement on its first call and
@@ -2081,6 +2119,81 @@ impl Statement<'_> {
             Some(error) => Err(error),
             None => Ok(false),
         }
+    }
+
+    /// Runs the statement and hands every row to a consumer as it is produced.
+    ///
+    /// **The statement holds a batch, not its answer.** [`Statement::step`] runs the whole
+    /// statement on its first call and keeps every row it produced; this hands each row to
+    /// `consumer` while the page it was read from is pinned, and keeps none. A statement over
+    /// three million rows needs memory for the rows being handled. A statement that cannot
+    /// stream (a compound query, a window function, a write with `RETURNING`, a pragma) runs as
+    /// it always did, and its rows are then handed to the consumer one at a time.
+    ///
+    /// **The caller keeps a handle on the consumer**, because the engine holds the other one
+    /// for the length of the call and nothing it borrows could outlive that. The consumer must
+    /// not use this connection: the statement is running on it. A failure is reported after the
+    /// rows that came before it, which the consumer has already been given. The statement is
+    /// left spent, so [`Statement::step`] answers `false` until it is reset.
+    ///
+    /// @param consumer - what takes the column names and then each row
+    pub fn stream<C: RowConsumer + 'static>(
+        &mut self,
+        consumer: &std::rc::Rc<RefCell<C>>,
+    ) -> DbResult<StreamEnd> {
+        let rows = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let counting = Box::new(Counting {
+            inner: std::rc::Rc::clone(consumer),
+            rows: std::rc::Rc::clone(&rows),
+        });
+        let (ran, _) = self.stream_into(counting);
+        let (names, changed) = ran?;
+        Ok(StreamEnd {
+            names,
+            rows: rows.get(),
+            changed,
+        })
+    }
+
+    /// Runs the statement into a boxed consumer, and returns it with the column names and the
+    /// number of rows the statement changed.
+    ///
+    /// @param consumer - the consumer, counting what it is given
+    fn stream_into(
+        &mut self,
+        consumer: Box<dyn RowConsumer>,
+    ) -> (
+        DbResult<(std::rc::Rc<Vec<String>>, usize)>,
+        Box<dyn RowConsumer>,
+    ) {
+        let mut held = match self.database.ready() {
+            Ok(held) => held,
+            Err(error) => return (Err(error), consumer),
+        };
+        held.use_session(self.session);
+        if held.schema_generation() != self.generation {
+            match held.prepare_current_statement(&self.sql) {
+                Ok(compiled) => {
+                    self.compiled = compiled;
+                    self.generation = held.schema_generation();
+                }
+                Err(error) => return (Err(error), consumer),
+            }
+        }
+        let (ran, consumer) =
+            held.execute_statement_streaming(&self.compiled, &self.params, consumer);
+        drop(held);
+        self.rows = Vec::new();
+        self.at = 0;
+        self.run = true;
+        self.pending = None;
+        let ended = ran.map(|outcome| {
+            self.changed = outcome.changes.rows;
+            self.database.changes.set(self.changed as i64);
+            self.names = outcome.names;
+            (std::rc::Rc::clone(&self.names), self.changed)
+        });
+        (ended, consumer)
     }
 
     /// Reports a failure of a `SELECT` after the rows it had already produced.
