@@ -18,11 +18,14 @@
 use super::*;
 use crate::separator::{slot_bytes_for, store_separators};
 
+mod chunks;
 mod leafplan;
 mod queue;
 use inillucent_pool::interior::SlotBytes;
 use leafplan::{plan_leaves, LeafPlan};
 use queue::{flush_built_pages, queue_built_page, PendingRun};
+
+pub use chunks::RowChunks;
 
 /// Records one bulk-built page's allocation and writes the page itself straight
 /// into the data file.
@@ -203,6 +206,20 @@ fn write_leaf_run<'d>(
         first_leaf,
         pages_written,
     })
+}
+
+/// The leaves of a finished leaf pass and what the interior levels need to know about them.
+struct BuiltLeaves {
+    /// Every leaf, in key order.
+    leaves: Vec<PageId>,
+    /// The first of them, which `Body::BulkBuilt` records.
+    first_leaf: PageId,
+    /// How many pages the leaves took.
+    pages_written: u64,
+    /// Each leaf's first key, one per leaf.
+    separators: Vec<Vec<u8>>,
+    /// How many rows the tree holds.
+    row_count: u64,
 }
 
 /// The leaves a build wrote.
@@ -509,19 +526,54 @@ impl PagedTree {
             key_columns,
         };
         let run = write_leaf_run(database, &mut log, tree_id, &keys, &builder, rows, &plan)?;
-        let leaves = run.leaves;
-        let first_leaf = run.first_leaf;
-        let levels = build_interior_levels(
-            database,
-            &mut log,
-            tree_id,
-            page_size,
-            &leaves,
-            plan.separators,
-        )?;
+        let built = BuiltLeaves {
+            leaves: run.leaves,
+            first_leaf: run.first_leaf,
+            pages_written: run.pages_written,
+            separators: plan.separators,
+            row_count,
+        };
+        PagedTree::finish_bulk_build(database, log, tree_id, columns, key_columns, built, sync)
+    }
+
+    /// Builds the interior levels over leaves already written, syncs when asked, and returns the
+    /// tree.
+    ///
+    /// **The tail every bulk build shares.** A build from one row source and a build from a
+    /// sequence of chunks write their leaves differently and finish the same way: the interior
+    /// levels are built from the leaves' separators, the data file is synced before the
+    /// statement's records, and one record names what happened.
+    ///
+    /// @param database - the file the pages were written into
+    /// @param log - where the build's record goes, when it is logged
+    /// @param tree_id - the tree's identifier
+    /// @param columns - the column directory
+    /// @param key_columns - how many leading columns form the key
+    /// @param built - the leaves and what pass one worked out about them
+    /// @param sync - whether to sync the data file once the pages are written
+    fn finish_bulk_build(
+        database: &mut Database,
+        mut log: Option<&mut dyn crate::write::TreeLog>,
+        tree_id: u64,
+        columns: Vec<ColumnSpec>,
+        key_columns: usize,
+        built: BuiltLeaves,
+        sync: bool,
+    ) -> DbResult<PagedTree> {
+        let page_size = database.page_size();
+        let encoding = KeyEncoding::choose(&columns, key_columns);
+        let BuiltLeaves {
+            leaves,
+            first_leaf,
+            pages_written: leaf_pages_written,
+            separators,
+            row_count,
+        } = built;
+        let levels =
+            build_interior_levels(database, &mut log, tree_id, page_size, &leaves, separators)?;
         let root = levels.root;
         let height = levels.height;
-        let pages_written = run.pages_written.saturating_add(levels.pages_written);
+        let pages_written = leaf_pages_written.saturating_add(levels.pages_written);
         // **The data file is synced before the statement's own records are, and
         // that is the whole of design 2's safety argument** (task-2000). Every page
         // this build wrote went straight into the file with no log record behind

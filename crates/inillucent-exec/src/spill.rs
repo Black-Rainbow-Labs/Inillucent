@@ -33,6 +33,72 @@
 use inillucent_base::{DbResult, PrimaryCode};
 use inillucent_tree::datum::{Datum, OwnedDatum};
 
+use crate::ops::resident_row_bytes;
+
+/// How many bytes of rows an operator holds before it writes a run, when a test has not changed it.
+///
+/// A test moves it through [`set_run_bytes_override`] so that a few thousand rows exercise the code
+/// that writes and merges runs. The shipped figures are far above any workload a unit test builds,
+/// and code that no test reaches is code whose first run is a customer's.
+static RUN_BYTES_OVERRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many rows a statement moves at a time through a bounded buffer, when a test has not changed
+/// it.
+static CHUNK_ROWS_OVERRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many runs every [`RunWriter`] in the process has written.
+///
+/// **So a test can say that a statement spilled.** A case that lowers the run size and then sorts
+/// fewer rows than the lowered size compares an in memory sort with an in memory sort and passes,
+/// which is a test that cannot fail. The count is read before and after the statement.
+static RUNS_WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Returns how many runs have been written in this process since it started.
+pub fn runs_written() -> u64 {
+    RUNS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Returns how many bytes an operator holds before it writes a run.
+///
+/// @param shipped - the figure the operator uses when nothing has changed it
+pub fn run_bytes(shipped: u64) -> u64 {
+    match RUN_BYTES_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => shipped,
+        changed => changed,
+    }
+}
+
+/// Changes how many bytes every spilling operator holds before it writes a run, for every
+/// connection in the process.
+///
+/// **Only a test calls this.** Lowering it changes when a run is written and never which rows come
+/// out, so a test running beside the caller still gets right answers, only slower ones.
+///
+/// @param bytes - the new figure, or zero to go back to each operator's own
+pub fn set_run_bytes_override(bytes: u64) {
+    RUN_BYTES_OVERRIDE.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Returns how many rows a statement moves at a time through a bounded buffer.
+///
+/// @param shipped - the figure used when nothing has changed it
+pub fn chunk_rows(shipped: usize) -> usize {
+    match CHUNK_ROWS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => shipped,
+        changed => usize::try_from(changed).unwrap_or(shipped),
+    }
+}
+
+/// Changes how many rows a statement moves at a time through a bounded buffer, for every
+/// connection in the process.
+///
+/// **Only a test calls this**, for the reason [`set_run_bytes_override`] gives.
+///
+/// @param rows - the new figure, or zero to go back to the shipped one
+pub fn set_chunk_rows_override(rows: u64) {
+    CHUNK_ROWS_OVERRIDE.store(rows, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A file a buffering operator writes runs to and reads them back from.
 ///
 /// Deliberately narrower than the VFS's own file: an operator appends, then
@@ -152,6 +218,12 @@ pub struct RunReader {
     /// so a fixed window would decode the front of such a row, find the value
     /// running past the buffer, and report a truncated run for a run that is
     /// perfectly good. Doubling until the row fits is bounded by the row.
+    ///
+    /// **It goes back to [`WINDOW`] once a row has been read.** It used to double after every
+    /// fill, so a run read from its first row to its last read a window twice the size of the one
+    /// before, and a single run of a million rows was read into memory whole by the fourteenth
+    /// fill. A merge's runs are short enough for that not to show; a file of rows read back in
+    /// one run is not.
     window: usize,
 }
 
@@ -173,10 +245,18 @@ impl RunReader {
     ///
     /// @param file - the spill file the run lives in
     pub fn next(&mut self, file: &dyn SpillFile) -> DbResult<Option<Vec<OwnedDatum>>> {
+        let mut fills = 0usize;
         loop {
             if let Ok(Some((row, taken))) = decode_row(self.held.get(self.at..).unwrap_or(&[])) {
                 self.at = self.at.saturating_add(taken);
+                self.window = WINDOW;
                 return Ok(Some(row));
+            }
+            // A fill that did not hold a whole row means the row is larger than the window, so
+            // the next fill is twice as large. The first fill of a call is not that case: the
+            // window was only empty.
+            if fills > 0 {
+                self.window = self.window.saturating_mul(2);
             }
             let consumed = self
                 .start
@@ -198,10 +278,402 @@ impl RunReader {
             self.start = consumed;
             self.held = buffer;
             self.at = 0;
-            // Grow for the next attempt, so a row larger than the window is
-            // reached by doubling rather than reported as truncated.
-            self.window = self.window.saturating_mul(2);
+            fills = fills.saturating_add(1);
         }
+    }
+}
+
+/// Compares two rows of a run, for the merge.
+pub type RowOrder<'a> = Box<dyn Fn(&[OwnedDatum], &[OwnedDatum]) -> std::cmp::Ordering + 'a>;
+
+/// The runs an operator has written, and the file they are in.
+///
+/// **One writer for every operator that spills.** `Sort` wrote its own copy of this and `Distinct`,
+/// the set operations, the window pass and `CREATE INDEX` need the same thing: rows already in the
+/// order the operator wants, appended to one transient file as a run, and read back by a merge. The
+/// file is opened on the first run and not before, so an operator that never spills never opens one.
+pub struct RunWriter {
+    /// Where files come from.
+    spill: std::rc::Rc<dyn Spill>,
+    /// The file the runs are in, opened by the first run.
+    file: Option<Box<dyn SpillFile>>,
+    /// Every run written so far, in the order they were written.
+    runs: Vec<Run>,
+    /// How many rows the runs hold in all.
+    rows: u64,
+}
+
+impl RunWriter {
+    /// Returns a writer that has written nothing.
+    ///
+    /// @param spill - where files come from
+    pub fn new(spill: std::rc::Rc<dyn Spill>) -> RunWriter {
+        RunWriter {
+            spill,
+            file: None,
+            runs: Vec::new(),
+            rows: 0,
+        }
+    }
+
+    /// Reports whether no run has been written.
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    /// Returns how many runs have been written.
+    pub fn run_count(&self) -> usize {
+        self.runs.len()
+    }
+
+    /// Returns how many rows the runs hold.
+    pub fn row_count(&self) -> u64 {
+        self.rows
+    }
+
+    /// Writes rows, already in the order the merge will compare them in, as one run.
+    ///
+    /// @param rows - the rows
+    pub fn write(&mut self, rows: &[Vec<OwnedDatum>]) -> DbResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.write_encoded(&encode_run(rows), rows.len())
+    }
+
+    /// Writes rows that the caller has already encoded as one run.
+    ///
+    /// The encoding is the one [`encode_run`] produces. A caller whose rows are not
+    /// `Vec<OwnedDatum>` (the index builder keeps its entries in an arena) encodes them itself and
+    /// avoids building the owned form of every row.
+    ///
+    /// @param bytes - the encoded rows
+    /// @param rows - how many rows the bytes hold
+    pub fn write_encoded(&mut self, bytes: &[u8], rows: usize) -> DbResult<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        if self.file.is_none() {
+            self.file = Some(self.spill.open()?);
+        }
+        let Some(file) = self.file.as_mut() else {
+            return Err(short("a spill file was not opened"));
+        };
+        let at = file.append(bytes)?;
+        self.runs.push(Run {
+            at,
+            bytes: bytes.len() as u64,
+            rows,
+        });
+        self.rows = self.rows.saturating_add(rows as u64);
+        RUNS_WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Returns a merge over every run written, in the order `compare` gives.
+    ///
+    /// @param compare - the order the rows of each run were written in
+    pub fn merge<'a>(&'a self, compare: RowOrder<'a>) -> DbResult<RunMerge<'a>> {
+        match self.file.as_deref() {
+            Some(file) => RunMerge::new(file, &self.runs, compare),
+            None => Ok(RunMerge::empty(compare)),
+        }
+    }
+}
+
+/// Reads the rows of many sorted runs back in one sorted order.
+///
+/// **The comparison is the caller's, and it is the same one that sorted each run.** A heap of the
+/// runs' front rows keeps the cost of a row at the logarithm of the runs and not at their number,
+/// which matters once a large input has written dozens of them. Of two rows that compare equal the
+/// one from the earlier run comes first, and the runs were written in arrival order, so the merge
+/// is stable whenever each run was sorted stably.
+pub struct RunMerge<'a> {
+    /// The file the runs are in.
+    file: Option<&'a dyn SpillFile>,
+    /// One reader per run.
+    readers: Vec<RunReader>,
+    /// The next row of each run, or none when it is exhausted.
+    fronts: Vec<Option<Vec<OwnedDatum>>>,
+    /// The runs that still have a front row, as a min heap ordered by those rows.
+    heap: Vec<usize>,
+    /// The order the rows of each run are in.
+    compare: RowOrder<'a>,
+}
+
+impl<'a> RunMerge<'a> {
+    /// Returns a merge of nothing.
+    ///
+    /// @param compare - the order, unused
+    fn empty(compare: RowOrder<'a>) -> RunMerge<'a> {
+        RunMerge {
+            file: None,
+            readers: Vec::new(),
+            fronts: Vec::new(),
+            heap: Vec::new(),
+            compare,
+        }
+    }
+
+    /// Returns a merge positioned before the first row.
+    ///
+    /// @param file - the file the runs are in
+    /// @param runs - the runs, each already in the order `compare` gives
+    /// @param compare - the order
+    fn new(file: &'a dyn SpillFile, runs: &[Run], compare: RowOrder<'a>) -> DbResult<RunMerge<'a>> {
+        let mut readers: Vec<RunReader> = runs.iter().map(|run| RunReader::new(*run)).collect();
+        let mut fronts: Vec<Option<Vec<OwnedDatum>>> = Vec::with_capacity(readers.len());
+        for reader in &mut readers {
+            fronts.push(reader.next(file)?);
+        }
+        let mut merge = RunMerge {
+            file: Some(file),
+            readers,
+            fronts,
+            heap: Vec::new(),
+            compare,
+        };
+        for run in 0..merge.fronts.len() {
+            if merge.fronts.get(run).is_some_and(Option::is_some) {
+                merge.heap.push(run);
+            }
+        }
+        for at in (0..merge.heap.len() / 2).rev() {
+            merge.sift_down(at);
+        }
+        Ok(merge)
+    }
+
+    /// Reports whether the run `a` sorts before the run `b`, by their front rows.
+    ///
+    /// @param a - one run
+    /// @param b - the other
+    fn precedes(&self, a: usize, b: usize) -> bool {
+        let (Some(Some(left)), Some(Some(right))) = (self.fronts.get(a), self.fronts.get(b)) else {
+            return a < b;
+        };
+        match (self.compare)(left, right) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => a < b,
+        }
+    }
+
+    /// Restores the heap below one position.
+    ///
+    /// @param start - the heap position whose children are heaps
+    fn sift_down(&mut self, start: usize) {
+        let mut at = start;
+        loop {
+            let first = at.saturating_mul(2).saturating_add(1);
+            let mut best = at;
+            for child in [first, first.saturating_add(1)] {
+                let (Some(candidate), Some(held)) = (self.heap.get(child), self.heap.get(best))
+                else {
+                    continue;
+                };
+                if self.precedes(*candidate, *held) {
+                    best = child;
+                }
+            }
+            if best == at {
+                return;
+            }
+            self.heap.swap(at, best);
+            at = best;
+        }
+    }
+
+    /// Returns the next row in order, or `None` when every run is exhausted.
+    pub fn next(&mut self) -> DbResult<Option<Vec<OwnedDatum>>> {
+        let Some(top) = self.heap.first().copied() else {
+            return Ok(None);
+        };
+        let Some(file) = self.file else {
+            return Ok(None);
+        };
+        let row = self.fronts.get_mut(top).and_then(Option::take);
+        let refilled = match self.readers.get_mut(top) {
+            Some(reader) => reader.next(file)?,
+            None => None,
+        };
+        let more = refilled.is_some();
+        if let Some(front) = self.fronts.get_mut(top) {
+            *front = refilled;
+        }
+        if !more {
+            self.heap.swap_remove(0);
+        }
+        self.sift_down(0);
+        Ok(row)
+    }
+}
+
+/// Compares two rows, owned by the sorter so it can outlive the call that built it.
+pub type OwnedOrder = std::rc::Rc<dyn Fn(&[OwnedDatum], &[OwnedDatum]) -> std::cmp::Ordering>;
+
+/// Says whether the later of two rows that sorted next to each other adds nothing.
+///
+/// Applied to the rows of a run as it is written, so a run of rows that repeat a key is shorter
+/// than the input that made it. A later stage still sees repeats that sit in different runs, and
+/// must drop them itself: this saves space and never decides an answer.
+pub type Redundant = fn(&[OwnedDatum], &[OwnedDatum]) -> bool;
+
+/// Sorts rows that may not fit in memory, by writing sorted runs and merging them.
+///
+/// **The one external sort the operators that are not `ORDER BY` share.** `DISTINCT`, the set
+/// operations and the window pass each need their rows in an order of their own, sometimes twice,
+/// and each used to hold every row in a vector. A sorter holds rows until they pass a byte limit,
+/// sorts them with a stable sort, and writes them as a run. [\`ExternalSorter::finish\`] returns
+/// the rows in order, merging the runs when there are any. Of two rows the order calls equal, the
+/// one pushed first comes first, whether they sat in one run or two, because the runs are merged
+/// in the order they were written.
+pub struct ExternalSorter {
+    /// The order of the output.
+    order: OwnedOrder,
+    /// Drops a row from a run when it adds nothing to the row before it.
+    redundant: Option<Redundant>,
+    /// Where files come from, or none to hold every row.
+    spill: Option<std::rc::Rc<dyn Spill>>,
+    /// The rows held since the last run.
+    rows: Vec<Vec<OwnedDatum>>,
+    /// Roughly how many bytes they occupy.
+    held: u64,
+    /// How many bytes may be held before a run is written.
+    limit: u64,
+    /// The runs, once there is one.
+    writer: Option<RunWriter>,
+}
+
+impl ExternalSorter {
+    /// Returns a sorter with nothing in it.
+    ///
+    /// @param order - the order of the output
+    /// @param spill - where files come from, or none to hold every row
+    /// @param shipped - how many bytes to hold before writing a run, unless a test changed it
+    pub fn new(
+        order: OwnedOrder,
+        spill: Option<std::rc::Rc<dyn Spill>>,
+        shipped: u64,
+    ) -> ExternalSorter {
+        ExternalSorter {
+            order,
+            redundant: None,
+            spill,
+            rows: Vec::new(),
+            held: 0,
+            limit: run_bytes(shipped),
+            writer: None,
+        }
+    }
+
+    /// Returns the sorter with a rule that drops repeats from the runs it writes.
+    ///
+    /// @param redundant - the rule
+    pub fn with_redundant(mut self, redundant: Redundant) -> ExternalSorter {
+        self.redundant = Some(redundant);
+        self
+    }
+
+    /// Adds one row, writing a run first when the rows held have passed the limit.
+    ///
+    /// @param row - the row
+    pub fn push(&mut self, row: Vec<OwnedDatum>) -> DbResult<()> {
+        self.held = self.held.saturating_add(resident_row_bytes(&row));
+        self.rows.push(row);
+        if self.spill.is_some() && self.held >= self.limit {
+            self.write_a_run()?;
+        }
+        Ok(())
+    }
+
+    /// Returns how many runs have been written.
+    pub fn runs_written(&self) -> usize {
+        self.writer.as_ref().map_or(0, RunWriter::run_count)
+    }
+
+    /// Sorts the rows held and writes them as one run.
+    fn write_a_run(&mut self) -> DbResult<()> {
+        let Some(spill) = self.spill.clone() else {
+            return Ok(());
+        };
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        let order = std::rc::Rc::clone(&self.order);
+        self.rows.sort_by(|left, right| order(left, right));
+        if let Some(redundant) = self.redundant {
+            let mut kept: Vec<Vec<OwnedDatum>> = Vec::with_capacity(self.rows.len());
+            for row in std::mem::take(&mut self.rows) {
+                if kept.last().is_some_and(|last| redundant(last, &row)) {
+                    continue;
+                }
+                kept.push(row);
+            }
+            self.rows = kept;
+        }
+        let writer = self.writer.get_or_insert_with(|| RunWriter::new(spill));
+        writer.write(&self.rows)?;
+        self.rows.clear();
+        self.held = 0;
+        Ok(())
+    }
+
+    /// Ends the sort and returns the rows in order.
+    pub fn finish(mut self) -> DbResult<SortedRows> {
+        if self.writer.is_some() {
+            self.write_a_run()?;
+        } else {
+            let order = std::rc::Rc::clone(&self.order);
+            self.rows.sort_by(|left, right| order(left, right));
+        }
+        Ok(SortedRows {
+            rows: self.rows,
+            writer: self.writer,
+            order: self.order,
+        })
+    }
+}
+
+/// Rows in order, from memory or from a merge of runs.
+pub struct SortedRows {
+    /// The rows, when no run was written.
+    rows: Vec<Vec<OwnedDatum>>,
+    /// The runs, when any were.
+    writer: Option<RunWriter>,
+    /// The order the runs were written in.
+    order: OwnedOrder,
+}
+
+impl SortedRows {
+    /// Hands each row to \`each\` in order, until it answers \`Flow::Stop\`.
+    ///
+    /// @param each - what to do with a row
+    pub fn for_each(
+        self,
+        mut each: impl FnMut(Vec<OwnedDatum>) -> DbResult<crate::ops::Flow>,
+    ) -> DbResult<()> {
+        let SortedRows {
+            rows,
+            writer,
+            order,
+        } = self;
+        let Some(writer) = writer else {
+            for row in rows {
+                if each(row)? == crate::ops::Flow::Stop {
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        };
+        let mut merge = writer.merge(Box::new(move |left, right| order(left, right)))?;
+        while let Some(row) = merge.next()? {
+            inillucent_base::budget::check()?;
+            if each(row)? == crate::ops::Flow::Stop {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 

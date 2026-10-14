@@ -3670,6 +3670,17 @@ tier = "differential"
 covers = ["inillucent-scalar", "inillucent-value", "inillucent-cli"]
 requires = ["shell"]
 
+# CREATE INDEX and REINDEX over entries sorted in runs, against SQLite, with the run size lowered.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "differential"
+module = "index_build_spill"
+tier = "differential"
+covers = ["inillucent-engine", "inillucent-exec", "inillucent-tree"]
+requires = ["oracle"]
+
+
 # The coverage ratchet (task-2066 section 4.4.13). `docs/repository.md` carries
 # what `tools/coverage.mjs` measured, the measurement takes about an hour, and
 # until this target existed nothing read the table it wrote - so a refresh that

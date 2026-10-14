@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use crate::index_sort::{EntrySorter, SortedEntries};
 use inillucent_base::error::refusal;
 use inillucent_base::DbResult;
 use inillucent_catalog::ddl::canonical_index_sql;
@@ -109,7 +110,7 @@ impl crate::ImportedDatabase {
         // same shape `create_vector_index` uses to backfill a store.
         let computed =
             index.partial_sql.is_some() || index.columns.iter().any(|key| key.expr_sql.is_some());
-        let mut entries = if computed {
+        let collected = if computed {
             self.index_entries_by_query(
                 &owner,
                 &index,
@@ -129,13 +130,17 @@ impl crate::ImportedDatabase {
             )?
         };
         let scan = scanned.elapsed().as_nanos();
-        let sorted = std::time::Instant::now();
-        let order = entries.order();
-        let sort = sorted.elapsed().as_nanos();
+        let sorted_at = std::time::Instant::now();
+        let mut entries = collected.finish()?;
+        let sort = sorted_at.elapsed().as_nanos();
         let checked = std::time::Instant::now();
-        if unique {
-            refuse_duplicates(&entries, &order, &owner, &index, key_columns)?;
+        if unique && entries.has_duplicate(key_columns.saturating_sub(1))? {
+            return Err(unique_violation(&owner, &index));
         }
+        // **Before the first page is written.** Entries sorted in memory are checked for a key over
+        // the limit by the builder, which looks at every row before it allocates. Entries sorted in
+        // runs reach the builder a chunk at a time, so they are read once here instead.
+        entries.refuse_long_keys(&columns, key_columns)?;
         let uniqueness = checked.elapsed().as_nanos();
         // The sort is finished and the uniqueness check with it, so everything
         // only they needed goes back before the pack - which is the half of the
@@ -148,9 +153,7 @@ impl crate::ImportedDatabase {
         // over the arena and the order vector, and the packer indexes it. The
         // timer stays so that four runs of gate output either side of the change
         // are comparable line for line.
-        let flattened = std::time::Instant::now();
-        let source = entries.in_order(&order);
-        let flatten = flattened.elapsed().as_nanos();
+        let flatten = 0u128;
         let packed = std::time::Instant::now();
         // **The catalog row names the new tree before the tree is filled
         // (task-1932).** A recovery derives a tree's shape from the catalog
@@ -176,7 +179,7 @@ impl crate::ImportedDatabase {
                 tree_id: 0,
             },
         )?;
-        let page = self.build_tree_rows(root, columns, key_columns, layout, &source)?;
+        let page = self.build_tree_from_entries(root, columns, key_columns, layout, &entries)?;
         let pack = packed.elapsed().as_nanos();
         // The tail is timed too, because it is not free and it is not the
         // build: recording the catalog row, re-deriving every table from the
@@ -262,7 +265,7 @@ impl crate::ImportedDatabase {
         encoding: KeyEncoding,
         collations: &[Collation],
         directions: &[bool],
-    ) -> DbResult<EntrySet> {
+    ) -> DbResult<EntrySorter> {
         let layout = self
             .schema
             .layouts
@@ -297,12 +300,13 @@ impl crate::ImportedDatabase {
         } else {
             layout.identity.clone()
         };
-        let mut entries = EntrySet::with_capacity(
+        let mut entries = EntrySorter::new(
             width,
             tree.row_count() as usize,
             encoding,
             collations,
             directions,
+            inillucent_exec::physical::TreeCatalog::spill(self),
         );
         let pool = self.pool_of(owner.root)?;
         tree.visit_leaves(pool, &mut |leaf| {
@@ -334,10 +338,7 @@ impl crate::ImportedDatabase {
                 let mut projected: Vec<usize> = Vec::with_capacity(width);
                 projected.extend(sources.iter().copied());
                 projected.extend(trailing.iter().copied());
-                leaf.visit_live(&projected, &mut |values| {
-                    entries.push(values);
-                    Ok(())
-                })?;
+                leaf.visit_live(&projected, &mut |values| entries.push(values))?;
                 return Ok(true);
             }
             // **The mini-columns are derived once per leaf, not once per
@@ -355,7 +356,7 @@ impl crate::ImportedDatabase {
                 for column in &columns {
                     entry.push(column.value(row)?);
                 }
-                entries.push(&entry);
+                entries.push(&entry)?;
             }
             Ok(true)
         })?;
@@ -394,7 +395,7 @@ impl crate::ImportedDatabase {
         encoding: KeyEncoding,
         collations: &[Collation],
         directions: &[bool],
-    ) -> DbResult<EntrySet> {
+    ) -> DbResult<EntrySorter> {
         let mut projected: Vec<String> = Vec::with_capacity(width);
         for key in &index.columns {
             match (key.computed_text(owner), key.column) {
@@ -441,17 +442,54 @@ impl crate::ImportedDatabase {
         let rows = self
             .execute_any(&query, &inillucent_exec::physical::Params::new())?
             .rows;
-        let mut entries =
-            EntrySet::with_capacity(width, rows.len(), encoding, collations, directions);
+        let mut entries = EntrySorter::new(
+            width,
+            rows.len(),
+            encoding,
+            collations,
+            directions,
+            inillucent_exec::physical::TreeCatalog::spill(self),
+        );
         let mut entry: Vec<Datum<'_>> = Vec::with_capacity(width);
         for row in &rows {
             entry.clear();
             for value in row.iter().take(width) {
                 entry.push(value.borrow());
             }
-            entries.push(&entry);
+            entries.push(&entry)?;
         }
         Ok(entries)
+    }
+    /// Builds an index tree from its sorted entries, whichever way they were sorted.
+    ///
+    /// Entries that stayed in memory are packed from the arena, the way every index was built
+    /// before the sort could write runs. Entries sorted in runs are read back by a merge and given
+    /// to the builder a chunk at a time, so the entries are never all resident.
+    ///
+    /// @param root - the identifier the tree is registered under
+    /// @param columns - the index tree's column directory
+    /// @param key_columns - how many leading columns form the key
+    /// @param layout - how the tree's columns map onto the table's
+    /// @param entries - the entries, sorted
+    pub(crate) fn build_tree_from_entries(
+        &mut self,
+        root: u32,
+        columns: Vec<inillucent_tree::types::ColumnSpec>,
+        key_columns: usize,
+        layout: inillucent_exec::physical::SourceLayout,
+        entries: &SortedEntries,
+    ) -> DbResult<inillucent_pool::PageId> {
+        if let Some(source) = entries.in_memory() {
+            return self.build_tree_rows(root, columns, key_columns, layout, &source);
+        }
+        match entries.chunks()? {
+            Some(mut chunks) => {
+                self.build_tree_chunks(root, columns, key_columns, layout, &mut chunks)
+            }
+            None => Err(refusal(
+                "sorted index entries were neither held nor written",
+            )),
+        }
     }
     /// Puts a table's covering indexes back in smallest-tree-first order.
     ///

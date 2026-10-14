@@ -10,6 +10,8 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**`CREATE INDEX` and `REINDEX` no longer hold every entry in memory.** The entries were scanned into one arena of about 105 bytes an entry and sorted there, so an index over 5,000,000 rows peaked at 543 to 616 MB where SQLite stays near 10 MB. The arena now holds at most 32 MiB. When it fills, the entries held are sorted and written to a temporary file as a run, and the runs are merged into the tree builder a chunk at a time. A `UNIQUE` index is checked over the merge before any page is written, so a failure leaves nothing behind. An index over 3,000,000 rows peaked at 321 MB before and 132 MB after.
+
 **`ROLLBACK` restores everything a transaction changed, including after `DROP` and `ALTER TABLE`.**
 Bug hunt 10 found rollbacks that lost or kept rows. With foreign keys on, `BEGIN; DROP TABLE p;
 ROLLBACK` brought `p` back with no rows, because the rows `DROP TABLE` deletes first were put back

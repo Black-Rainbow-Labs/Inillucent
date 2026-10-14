@@ -29,6 +29,7 @@ mod foreign_keys;
 mod fts5;
 mod fts5_parity;
 mod group_by;
+mod index_build_spill;
 mod json;
 mod lifecycle;
 mod merge_join;

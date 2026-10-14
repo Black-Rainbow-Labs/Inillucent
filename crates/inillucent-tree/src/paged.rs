@@ -52,6 +52,7 @@
 // holds is a fourth question, asked by `DROP` and by the integrity checker and
 // by nothing that reads a row.
 mod bulk;
+pub use bulk::RowChunks;
 mod copies;
 mod cursor;
 mod descent;

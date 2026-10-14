@@ -43,7 +43,7 @@ use inillucent_exec::dml::Changes;
 use inillucent_sql::bind::BoundStatement;
 use inillucent_sql::catalog_view::{IndexInfo, TableInfo};
 use inillucent_sql::directive::Directive;
-use inillucent_tree::datum::{Datum, OwnedDatum};
+use inillucent_tree::datum::OwnedDatum;
 use inillucent_tree::paged::KeyEncoding;
 use inillucent_value::collation::Collation;
 
@@ -630,30 +630,38 @@ pub(crate) fn refuse_duplicates(
     let compared = key_columns.saturating_sub(1);
     for at in 0..order.len().saturating_sub(1) {
         if entries.shares_key_prefix(order, at, compared) {
-            let columns: Vec<String> = index
-                .columns
-                .iter()
-                .map(|key| {
-                    let name = key
-                        .column
-                        .and_then(|at| owner.column(at))
-                        .map(|column| String::from_utf8_lossy(&column.name).into_owned())
-                        .unwrap_or_else(|| "?".to_string());
-                    format!("{}.{}", String::from_utf8_lossy(&owner.name), name)
-                })
-                .collect();
-            // `SQLITE_CONSTRAINT_UNIQUE` (2067), which is what SQLite reports
-            // when the rows already there break the new index; `refusal`
-            // answered `SQLITE_MISUSE` (21).
-            let said = format!("UNIQUE constraint failed: {}", columns.join(", "));
-            return Err(inillucent_base::DbError::new(inillucent_base::ExtendedCode(
-                inillucent_sql::dml::codes::UNIQUE,
-            ))
-            .with_message(said.clone())
-            .with_detail(said));
+            return Err(unique_violation(owner, index));
         }
     }
     Ok(())
+}
+
+/// Returns the failure a `CREATE UNIQUE INDEX` reports when two rows share a key.
+///
+/// @param owner - the table, for the message
+/// @param index - the index, for the message
+pub(crate) fn unique_violation(owner: &TableInfo, index: &IndexInfo) -> inillucent_base::DbError {
+    let columns: Vec<String> = index
+        .columns
+        .iter()
+        .map(|key| {
+            let name = key
+                .column
+                .and_then(|at| owner.column(at))
+                .map(|column| String::from_utf8_lossy(&column.name).into_owned())
+                .unwrap_or_else(|| "?".to_string());
+            format!("{}.{}", String::from_utf8_lossy(&owner.name), name)
+        })
+        .collect();
+    // `SQLITE_CONSTRAINT_UNIQUE` (2067), which is what SQLite reports
+    // when the rows already there break the new index; `refusal`
+    // answered `SQLITE_MISUSE` (21).
+    let said = format!("UNIQUE constraint failed: {}", columns.join(", "));
+    inillucent_base::DbError::new(inillucent_base::ExtendedCode(
+        inillucent_sql::dml::codes::UNIQUE,
+    ))
+    .with_message(said.clone())
+    .with_detail(said)
 }
 
 /// Returns an identifier quoted the way SQL wants it.
