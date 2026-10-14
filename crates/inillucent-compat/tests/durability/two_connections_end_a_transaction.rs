@@ -148,7 +148,6 @@ fn a_rollback_succeeds_while_another_connection_holds_the_file() {
         );
         two.execute_batch("COMMIT")
             .unwrap_or_else(|error| panic!("the other connection's COMMIT: {error:?}"));
-        drop(two);
         drop(b);
         one.execute("UPDATE t SET n = 7", &[])
             .unwrap_or_else(|error| panic!("the autocommit UPDATE: {error:?}"));

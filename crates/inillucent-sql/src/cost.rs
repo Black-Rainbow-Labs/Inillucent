@@ -205,12 +205,12 @@ pub fn index_is_narrower(
         let key = table.primary_key();
         return table.columns.iter().enumerate().any(|(at, column)| {
             let at = at as u16;
-            !(column.generated && !column.stored)
-                && !key.contains(&at)
-                && !index
-                    .columns
-                    .iter()
-                    .any(|held| held.plain_column() == Some(at))
+            let virtual_column = column.generated && !column.stored;
+            let in_the_index = index
+                .columns
+                .iter()
+                .any(|held| held.plain_column() == Some(at));
+            !(virtual_column || key.contains(&at) || in_the_index)
         });
     }
     let row: u32 = table

@@ -255,7 +255,7 @@ fn renamed_store_text(sql: &[u8], folded: &[u8], action: &AlterKind) -> Option<V
         AlterKind::RenameTable { to } => replace_argument(sql, b"source", to),
         AlterKind::RenameColumn { from, to, .. } => {
             let held = argument_value(sql, b"source_column")?;
-            if held.to_ascii_lowercase() != from.to_ascii_lowercase() {
+            if !held.eq_ignore_ascii_case(from) {
                 return None;
             }
             replace_argument(sql, b"source_column", to)

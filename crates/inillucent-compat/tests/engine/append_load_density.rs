@@ -112,7 +112,7 @@ fn value_statements(
 /// @param name - the case's name
 /// @param rows - how many rows
 fn bulk_pages(name: &str, rows: i64) -> i64 {
-    let database = Database::open(&fresh(&format!("{name}-bulk"))).expect("the database opens");
+    let database = Database::open(fresh(&format!("{name}-bulk"))).expect("the database opens");
     database
         .session()
         .execute_batch(&format!(
@@ -132,7 +132,7 @@ fn bulk_pages(name: &str, rows: i64) -> i64 {
 fn multi_row_inserts_pack_like_a_bulk_build() {
     let rows = 20_000;
     let bulk = bulk_pages("values", rows);
-    let database = Database::open(&fresh("values")).expect("the database opens");
+    let database = Database::open(fresh("values")).expect("the database opens");
     let session = database.session();
     session
         .execute_batch("CREATE TABLE n(a INTEGER, b INTEGER); BEGIN;")
@@ -156,7 +156,7 @@ fn multi_row_inserts_pack_like_a_bulk_build() {
 fn single_row_inserts_pack_like_a_bulk_build() {
     let rows = 20_000;
     let bulk = bulk_pages("single", rows);
-    let database = Database::open(&fresh("single")).expect("the database opens");
+    let database = Database::open(fresh("single")).expect("the database opens");
     let session = database.session();
     session
         .execute_batch("CREATE TABLE n(a INTEGER, b INTEGER); BEGIN;")
@@ -182,7 +182,7 @@ fn single_row_inserts_pack_like_a_bulk_build() {
 fn vacuum_does_not_leave_a_looser_file_than_a_bulk_build() {
     let rows = 90_000;
     let bulk = bulk_pages("vacuum", rows);
-    let database = Database::open(&fresh("vacuum")).expect("the database opens");
+    let database = Database::open(fresh("vacuum")).expect("the database opens");
     let session = database.session();
     session
         .execute_batch("CREATE TABLE n(a INTEGER, b INTEGER); BEGIN;")
@@ -213,7 +213,7 @@ fn vacuum_does_not_leave_a_looser_file_than_a_bulk_build() {
 fn random_order_rows_still_split_into_well_filled_leaves() {
     let rows = 30_000;
     let bulk = {
-        let database = Database::open(&fresh("random-bulk")).expect("the database opens");
+        let database = Database::open(fresh("random-bulk")).expect("the database opens");
         database
             .session()
             .execute_batch(&format!(
@@ -225,7 +225,7 @@ fn random_order_rows_still_split_into_well_filled_leaves() {
             .expect("the bulk load runs");
         used_pages(&database)
     };
-    let database = Database::open(&fresh("random")).expect("the database opens");
+    let database = Database::open(fresh("random")).expect("the database opens");
     let session = database.session();
     session
         .execute_batch("CREATE TABLE p(id INTEGER PRIMARY KEY, b INTEGER); BEGIN;")
@@ -252,7 +252,7 @@ fn random_order_rows_still_split_into_well_filled_leaves() {
 #[test]
 fn wide_appended_rows_are_not_repacked_more_than_they_were() {
     let rows = 6_000;
-    let database = Database::open(&fresh("wide")).expect("the database opens");
+    let database = Database::open(fresh("wide")).expect("the database opens");
     let session = database.session();
     session
         .execute_batch("CREATE TABLE w(id INTEGER PRIMARY KEY, body TEXT); BEGIN;")
