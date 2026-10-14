@@ -1,0 +1,10 @@
+# Differential cases, category `task2110`: defects from the known bugs ticket.
+# One case per line: the case's id, a tab, and the statements, with `\n` for a newline.
+# Read by `crates/inillucent-compat/tests/differential/differential_part8.rs`; nothing else parses this.
+#
+# tuf: an UPDATE ... FROM in a trigger body. The keys query of a body statement had one source and
+# no assigned values, so the joined table the assignments name did not exist when the body ran.
+t2110-tuf-001	CREATE TABLE t(a, v);\nCREATE TABLE s(a, v);\nCREATE TABLE log(x);\nINSERT INTO s VALUES (1, 'joined');\nCREATE TRIGGER tr AFTER INSERT ON log BEGIN UPDATE t SET v = s.v FROM s WHERE s.a = t.a; END;\nINSERT INTO t VALUES (1, 'old'), (2, 'other');\nINSERT INTO log VALUES (1);\nSELECT * FROM t ORDER BY a
+t2110-tuf-002	CREATE TABLE t(a INTEGER PRIMARY KEY, v);\nCREATE TABLE s(a, w);\nCREATE TABLE log(x);\nINSERT INTO s VALUES (1, 10), (1, 20), (2, 30);\nCREATE TRIGGER tr AFTER INSERT ON log BEGIN UPDATE t SET v = s.w + new.x FROM s WHERE s.a = t.a; END;\nINSERT INTO t VALUES (1, 0), (2, 0), (3, 0);\nINSERT INTO log VALUES (5);\nSELECT * FROM t ORDER BY a;\nSELECT changes()
+t2110-tuf-003	CREATE TABLE t(a, v);\nCREATE TABLE s(a, v);\nCREATE TABLE log(x);\nINSERT INTO s VALUES (1, 'one'), (2, 'two');\nCREATE TRIGGER tr BEFORE INSERT ON log BEGIN UPDATE t SET v = s.v || new.x FROM s WHERE s.a = t.a AND s.a = new.x; END;\nINSERT INTO t VALUES (1, 'a'), (2, 'b');\nINSERT INTO log VALUES (2), (1);\nSELECT * FROM t ORDER BY a
+t2110-tuf-004	CREATE TABLE t(a, b, v);\nCREATE TABLE s(a, b);\nCREATE TABLE log(x);\nINSERT INTO s VALUES (1, 5), (2, 6);\nCREATE TRIGGER tr AFTER DELETE ON log BEGIN UPDATE t SET b = s.b, v = old.x FROM s WHERE s.a = t.a; END;\nINSERT INTO t VALUES (1, 0, 'x'), (2, 0, 'y');\nINSERT INTO log VALUES (9);\nDELETE FROM log;\nSELECT * FROM t ORDER BY a
