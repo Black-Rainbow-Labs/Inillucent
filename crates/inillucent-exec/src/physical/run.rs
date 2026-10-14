@@ -150,8 +150,18 @@ pub fn run_any_prepared_streaming(
     mut consumer: Box<dyn crate::ops::RowConsumer>,
 ) -> (DbResult<()>, Box<dyn crate::ops::RowConsumer>) {
     if !plan.compounds.is_empty() || !plan.select.windows.is_empty() {
-        let handed = run_any_prepared(plan, catalog, prepared, params)
-            .and_then(|(rows, _)| crate::ops::hand_over(&rows, consumer.as_mut()));
+        let handed = match run_any_prepared(plan, catalog, prepared, params) {
+            Ok((rows, _)) => crate::ops::hand_over(&rows, consumer.as_mut()),
+            // The rows a failing query had produced come out before the failure, as they do
+            // when the rows are collected and the statement is stepped.
+            Err(error) => {
+                let delivered = take_partial_rows();
+                match crate::ops::hand_over(&delivered, consumer.as_mut()) {
+                    Ok(()) => Err(error),
+                    Err(refused) => Err(refused),
+                }
+            }
+        };
         return (handed, consumer);
     }
     let rows = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));

@@ -432,3 +432,25 @@ fn a_write_that_fails_after_returning_rows_hands_them_over_before_the_failure() 
         "the insert was undone"
     );
 }
+
+/// A window query that fails after producing rows hands them over before the failure, as the
+/// reference shell prints them. A window query is not one pipeline, so its rows are collected and
+/// the rows kept by the failure are what the sink is given.
+#[test]
+fn a_window_query_that_fails_hands_over_the_rows_it_had_before_the_failure() {
+    let database = open("window-failure");
+    let connection = database.session();
+    connection
+        .execute_batch("CREATE TABLE z1 (a); INSERT INTO z1 VALUES (9223372036854775807), (1);")
+        .expect("the table is made");
+    let sink = Rc::new(RefCell::new(Keep::default()));
+    let failed = connection
+        .query_each(
+            "SELECT sum(a) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM z1",
+            &[],
+            &sink,
+        )
+        .expect_err("the sum overflows");
+    assert!(failed.message.contains("overflow"), "{}", failed.message);
+    assert_eq!(sink.borrow().rows, vec![vec![Value::Integer(1)]]);
+}
