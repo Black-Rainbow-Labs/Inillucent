@@ -337,8 +337,10 @@ pub fn ordinal(number: usize) -> String {
 /// @param error - the failure
 fn described(error: inillucent_base::DbError) -> String {
     match error.detail() {
-        Some(detail) => format!("{}: {detail}", error.message()),
-        None => error.message().to_string(),
+        // A detail that only repeats the message is said once: opening an
+        // encrypted file without its key printed the same sentence twice.
+        Some(detail) if detail != error.message() => format!("{}: {detail}", error.message()),
+        _ => error.message().to_string(),
     }
 }
 

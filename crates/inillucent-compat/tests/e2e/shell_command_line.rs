@@ -310,3 +310,32 @@ fn a_failing_system_command_is_reported_and_not_fatal() {
     assert_eq!(text(&ran), "1\n2\n");
     assert!(ran.err.contains("System command returns 3"), "{}", ran.err);
 }
+
+/// Opening an encrypted file without its key says why once.
+///
+/// The open error's detail repeated its message, so the shell printed the same sentence twice
+/// after the path. Found by bug hunt 10.
+#[test]
+fn opening_an_encrypted_file_without_its_key_says_why_once() {
+    let made = run(
+        "encrypted-without-key",
+        &["-key-file", "app.key", "app.rdb"],
+        b"create table t(a);
+",
+        &[("app.key", b"the passphrase")],
+    );
+    assert_eq!(made.code, Some(0), "{}", made.err);
+    let output = Command::new(program("inillucent-shell"))
+        .arg("app.rdb")
+        .current_dir(&made.dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("the shell runs");
+    let err = String::from_utf8_lossy(&output.stderr).to_string();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        err.matches("this database is encrypted").count(),
+        1,
+        "the reason is printed once: {err}"
+    );
+}
