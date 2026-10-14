@@ -369,6 +369,17 @@ pub trait VfsFile: Send + Sync + Debug {
         None
     }
 
+    /// Makes the next [`VfsFile::quiet_token`] differ from every one given before, for a change
+    /// this process makes to the database that the token cannot see.
+    ///
+    /// **The token says nobody outside this process touched the file, and two connections in one
+    /// process are both inside it.** A log that rolls to its next segment writes nothing to the
+    /// segment it leaves when everything bound for it was already written, so a second connection
+    /// in the same process, holding the same shared segment, saw an unchanged token and skipped the
+    /// check for the next segment. The log calls this when it rolls. The default does nothing,
+    /// because a file system that gives no token has no check to skip.
+    fn end_quiet(&self) {}
+
     /// Returns what the device underneath guarantees.
     fn device_characteristics(&self) -> DeviceCharacteristics;
 

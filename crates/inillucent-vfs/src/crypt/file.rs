@@ -540,6 +540,11 @@ impl VfsFile for CryptFile {
         self.inner.quiet_token()
     }
 
+    /// Passes the end of quiet through to the file underneath.
+    fn end_quiet(&self) {
+        self.inner.end_quiet();
+    }
+
     /// Passes the reserved lock check through.
     fn check_reserved_lock(&self) -> VfsResult<bool> {
         self.inner.check_reserved_lock()

@@ -10,6 +10,29 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**Two connections on one file see each other's commits when the log rolls to a new segment, and an
+attached file does too.** The log moves to a new segment when the open one reaches 64 MiB, and that
+writes no meta record. A connection asks whether the next segment exists, and on Windows it skips
+that question while its segment's oplock says no other process opened it. A second connection in
+the same process shares the segment's file object, so its roll left the oplock unbroken and the
+first connection read pages without the commit, and a write from those pages gave two connections
+different rows. A roll now moves the segment's token on. A file attached with `ATTACH` never asked
+about the next segment at all, so it showed a stale file in the same case; it asks now. A new test
+sets the segment size to 128 bytes so that every statement rolls.
+
+**A session that only reads no longer leaves a discarded transaction to be found at every open.**
+A writer killed inside a large transaction leaves records with no commit record, and the next open
+discards them and says so. Recovery wrote nothing about that, a session that only read did not
+fold on close, and every later open scanned the same records and printed `recovered the log` again.
+A connection that can write now folds on close after an open that discarded a transaction, so the
+second open recovers nothing.
+
+**A table another process created is found by an open connection.** This was reported for a
+connection that ran `CREATE TABLE a` and then met a table `b` made by the command line in another
+process, and it already works: a statement that fails to compile checks whether the schema moved and
+compiles again, and a column added by another process is read by the next statement. A test now runs
+those exact steps, with and without parameters.
+
 **`ROLLBACK` restores everything a transaction changed, including after `DROP` and `ALTER TABLE`.**
 Bug hunt 10 found rollbacks that lost or kept rows. With foreign keys on, `BEGIN; DROP TABLE p;
 ROLLBACK` brought `p` back with no rows, because the rows `DROP TABLE` deletes first were put back

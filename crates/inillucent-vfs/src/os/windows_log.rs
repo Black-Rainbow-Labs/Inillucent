@@ -115,6 +115,14 @@ impl LogShare {
         (before == after).then_some((self.id << 32) ^ after)
     }
 
+    /// Moves `quiet_token` on without a break, for a change of this process the oplock cannot see.
+    ///
+    /// A log that rolls leaves this segment as it is, so a second connection in this process that
+    /// shares the segment would otherwise compare equal tokens across the roll.
+    pub fn end_quiet(&self) {
+        self.breaks.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Returns the shared file.
     pub fn file(&self) -> &Arc<File> {
         &self.file

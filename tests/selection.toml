@@ -2970,6 +2970,28 @@ module = "process_readers"
 tier = "durability"
 covers = ["inillucent-cli", "inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-vfs"]
 
+# Two connections on one file while the log rolls to a new segment after every
+# record and no fold happens: each sees the other's commits, and a write goes
+# after the last record of the whole log.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "log_roll_between_connections"
+tier = "durability"
+covers = ["inillucent-driver", "inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-vfs"]
+
+# A writer killed in the middle of a transaction bigger than the log's spill
+# size leaves uncommitted records in the log. A session that only reads
+# discards them once, and the open after it recovers nothing.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "recovery_discard_runs_once"
+tier = "durability"
+covers = ["inillucent-cli", "inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-vfs"]
+
 # A reader holding the log segment's oplock sees another process's commit at
 # once, and the oplock is taken and given back (task-2209).
 [[target]]
