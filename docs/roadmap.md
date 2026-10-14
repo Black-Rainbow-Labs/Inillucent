@@ -32,8 +32,6 @@ slower.
 | 3 | Two lines of the command line that bypass the driver | one code path from every program to the engine | 28 lines are down to 2 |
 | 4 | PostgreSQL parity | a server that PostgreSQL clients can connect to | designed, not built |
 
-<a id="1-the-extension-and-join-families-either-side-of-their-bars"></a>
-
 ## 1. Workloads that are slower than SQLite
 
 **What it is.** The benchmark against SQLite times 116 workloads: the engine plan of 34 through the

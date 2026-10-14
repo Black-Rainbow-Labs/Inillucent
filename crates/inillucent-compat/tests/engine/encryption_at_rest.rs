@@ -324,6 +324,45 @@ fn vacuum_and_backup_write_encrypted_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `PRAGMA <schema>.encryption` answers for the database the qualifier names.
+///
+/// Bug hunt 10: the qualifier was discarded, so an encrypted `main` reported
+/// every attachment as encrypted and a plaintext `main` reported an encrypted
+/// attachment as `none`.
+#[test]
+fn the_encryption_pragma_answers_for_the_database_it_names() {
+    let dir = directory("pragma-per-database");
+    let other = dir.join("other.rdb");
+    let plain = dir.join("plain.rdb");
+    let database = open(&dir.join("main.rdb"), KEY_A);
+    run(
+        &database,
+        &format!(
+            "ATTACH '{}' AS o KEY \"{KEY_B}\";
+             ATTACH '{}' AS p KEY '';
+             ATTACH ':memory:' AS m;",
+            other.display(),
+            plain.display()
+        ),
+    );
+    let cipher = vec![vec![OwnedDatum::Text(b"xchacha20-poly1305".to_vec())]];
+    let none = vec![vec![OwnedDatum::Text(b"none".to_vec())]];
+    assert_eq!(rows(&database, "PRAGMA main.encryption"), cipher);
+    assert_eq!(rows(&database, "PRAGMA o.encryption"), cipher);
+    assert_eq!(rows(&database, "PRAGMA p.encryption"), none);
+    assert_eq!(rows(&database, "PRAGMA m.encryption"), none);
+    let refused = database
+        .session()
+        .execute_batch("PRAGMA p.encryption = 'x'")
+        .expect_err("the pragma cannot be set");
+    assert!(
+        refused.to_string().contains("cannot be set"),
+        "the refusal says why: {refused}"
+    );
+    drop(database);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `ATTACH ... KEY` opens an encrypted file with its own key, `KEY ''` opens
 /// a plaintext one, and no `KEY` uses the connection's own key.
 #[test]

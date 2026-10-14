@@ -399,6 +399,47 @@ everyRoute('a parameter the addon refuses is refused on every route', async (rou
   }
 });
 
+withDatabase('a failure carries its feature and a write through query is readonly on every route', async (db) => {
+  const key = `x'${'5a'.repeat(32)}'`;
+  const encrypted = `${db}.encrypted`;
+  const made = await inillucent('exec', { db: encrypted, key, sql: 'CREATE TABLE seed (a)' });
+  assert.equal(made.ok, true, made.message);
+  // The addon is the default route; a call with a key goes through the program.
+  const routes = { addon: { db }, program: { db: encrypted, key } };
+  const unsupported = "CREATE VIRTUAL TABLE v USING fts5(a, tokenize='trigram')";
+  for (const [route, where] of Object.entries(routes)) {
+    const result = await inillucent('exec', { ...where, sql: unsupported });
+    assert.equal(result.ok, false, route);
+    assert.equal(result.status, 'unsupported', route);
+    assert.equal(result.feature, 'the fts5 tokenizer trigram', `${route}: the feature is missing`);
+    assert.match(result.message, /is not built/, route);
+    const batch = await inillucent('batch', { ...where, sql: unsupported });
+    assert.equal(batch.feature, 'the fts5 tokenizer trigram', `${route}: batch lost the feature`);
+    // `ATTACH ?1` is a write: `query` says so, instead of the engine saying it
+    // does not take a parameter there.
+    await assert.rejects(
+      query('ATTACH ?1 AS o', { ...where, params: ['other.rdb'] }),
+      (why) => why.status === 'readonly',
+      `${route}: ATTACH through query was not readonly`,
+    );
+    await assert.rejects(
+      query('SELEC 1', where),
+      (why) => why.status === 'syntax',
+      `${route}: a typo through query was not a syntax error`,
+    );
+  }
+  const session = await open(db);
+  try {
+    await assert.rejects(
+      session.query('ATTACH ?1 AS o', { params: ['other.rdb'] }),
+      (why) => why.status === 'readonly',
+      'session: ATTACH through query was not readonly',
+    );
+  } finally {
+    await session.close();
+  }
+});
+
 everyRoute('text that is not UTF-8 comes back as bytes on every route', async (routes) => {
   for (const [route, run] of Object.entries(routes)) {
     const [row] = await run("SELECT CAST(x'61ff62' AS TEXT) AS v, 'ok' AS t", []);

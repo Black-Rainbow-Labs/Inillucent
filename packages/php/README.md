@@ -84,7 +84,7 @@ binding over the C library with `ext-ffi`. The
 [driver guide](https://github.com/Black-Rainbow-Labs/Inillucent/blob/main/drivers/README.md)
 explains how.
 
-The constructor takes three optional arguments after the path:
+The constructor takes four optional arguments after the path:
 
 ```php
 $db = new Inillucent('app.rdb', binary: '/usr/local/bin/inillucent', readOnly: true, root: '/srv/data');
@@ -96,6 +96,7 @@ $db = new Inillucent('app.rdb', binary: '/usr/local/bin/inillucent', readOnly: t
 | `binary` | the `inillucent` program to run. `null` means the search above |
 | `readOnly` | adds `--readonly`, so every statement that changes data is refused |
 | `root` | adds `--root`, so every path outside that directory is refused |
+| `key` | the key of an encrypted database. See [Encrypted databases](#encrypted-databases) |
 
 ### Values
 
@@ -167,7 +168,7 @@ first column is not declared in `Inillucent.php` or `Error.php`.
 
 | what | one line |
 |---|---|
-| `new Inillucent(path, binary, readOnly, root)` | opens a database file. Only `path` is required. |
+| `new Inillucent(path, binary, readOnly, root, key)` | opens a database file. Only `path` is required. |
 | `Inillucent::run(command, arguments)` | runs any `inillucent` command and returns its whole JSON result as an array. `['table' => 'people']` becomes `--table people`. |
 | `Inillucent::query(sql, params, limit)` | runs one query and returns its rows as associative arrays keyed by column name. |
 | `Inillucent::exec(sql, params)` | runs one statement for its effect and returns the number of rows it changed. |

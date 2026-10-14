@@ -795,10 +795,11 @@ dot commands are outside the probe's cases:
 | `.cd`, `.shell`, `.system`, `.excel`, `.www` | the same |
 | `.crlf`, `.prompt`, `.explain`, `.nonce` | the same |
 | `.testcase`, `.check` | the same, including the summary line |
-| `.scanstats`, `.trace` | the same |
+| `.trace` | writes each statement to `stdout`, `stderr` or a file, as `select 1;`. The options `--expanded`, `--plain` and `--stmt` are accepted. A statement with bound parameters is written as typed. `--profile`, `--row` and `--close` are accepted and write nothing extra |
+| `.scanstats` | accepted and recorded. It prints nothing, where `sqlite3` prints a table of processor cycles, loops and rows that differs on every run. The `sqlite_stmt` table has `nscan`, `nsort` and `naidx` |
 | `.auth ON\|OFF` | the same. It installs an authorizer on the connection |
 | `.dbinfo`, `.dbtotxt`, `.intck`, `.filectrl` | the same reports, over this file's own numbers. Five of `.dbinfo`'s 22 lines name SQLite header fields this file format does not have |
-| `.connection` | the same: five slots, with `ACTIVE` on the current one |
+| `.connection` | the same: five slots, with `ACTIVE` on the current one. A database opened as `:memory:` is named `:memory:`, one opened with `.open` and no name is `(memory)`, and one opened with an empty name is `(temporary-file)` |
 | `.imposter INDEX TABLE` | the same. It reads an index as a `WITHOUT ROWID` table |
 | `.load FILE` | prints SQLite's message for a library it cannot open. inillucent has no C extension interface, so it cannot load a SQLite extension |
 | `.progress N` | accepts the same options and shows them in `.show`. It does not stop a statement part way, because inillucent has no bytecode steps to count |
@@ -963,16 +964,16 @@ name exists and how it reports a missing argument.
 
 | Result | Count |
 |---|---:|
-| the same answer as SQLite | 135 |
+| the same answer as SQLite | 137 |
 | only valid in a special context, such as a window or an FTS5 query. These are then called properly, and they match | 13 |
 | not in inillucent: the 41 shell functions and `fts3_tokenizer` | 42 |
-| answered differently | 26 |
+| answered differently | 24 |
 
-The 26 that answer differently with no arguments:
+The 24 that answer differently with no arguments:
 
 | Functions | What differs |
 |---|---|
-| `count`, `format`, `printf`, `strftime`, `geopoly_svg`, `json_extract`, `json_insert`, `json_remove`, `json_replace`, `json_set`, `json_array_insert`, and the six matching `jsonb_` functions | SQLite answers a call with no arguments: `count()` returns 1 and the others return NULL. inillucent refuses the call with `wrong number of arguments`. With their normal arguments all of them match, as the probe's function cases show |
+| `count`, `format`, `printf`, `json_extract`, `json_insert`, `json_remove`, `json_replace`, `json_set`, `json_array_insert`, and the six matching `jsonb_` functions | SQLite answers a call with no arguments: `count()` returns 1 and the others return NULL. inillucent refuses the call with `wrong number of arguments`. With their normal arguments all of them match, as the probe's function cases show |
 | `fts5`, `fts5_locale`, `fts5_insttoken` | a different error message |
 | `fts5_get_locale`, `rtreecheck` | the same message, printed as a parse error with the position of the error |
 | `sqlite_source_id`, `fts5_source_id` | each names its own build |
@@ -981,9 +982,11 @@ The 26 that answer differently with no arguments:
 ## Constructs the probe does not reach
 
 `inillucent capabilities` lists 57 capabilities reported by the engine. 13 of them are `no`: the
-engine refuses the construct, and all but one of them with exit code 3. None of these is one of the
-416 cases. Most of them run in SQLite. One, writing to a view, is refused by SQLite too, with the
-same message and exit code 1.
+engine refuses the construct. Eight are refused with status `unsupported` and exit code 3. Five are
+refused with status `syntax` and exit code 1: `load_extension`, `compound_ordered_by_expression`,
+`writing_to_a_view`, `returning_inside_a_trigger` and `changing_a_schema_row`. None of these is one
+of the 416 cases. Most of them run in SQLite. One, writing to a view, is refused by SQLite too, with
+the same message and exit code 1.
 
 | Capability | What is refused |
 |---|---|
@@ -998,6 +1001,7 @@ same message and exit code 1.
 | `fts5_unavailable_tokenizer` | an FTS5 tokenizer other than `ascii`, `unicode61` and `porter` |
 | `fts5_detail_option` | FTS5 `detail='none'` or `detail='column'` |
 | `fts5_columnsize_option` | FTS5 `columnsize=0` |
+| `fts5_contentless_delete_option` | FTS5 `contentless_delete=1` |
 | `changing_a_schema_row` | `UPDATE` or `DELETE` on `sqlite_schema` |
 
 Run `inillucent capabilities` to see the note on each one.

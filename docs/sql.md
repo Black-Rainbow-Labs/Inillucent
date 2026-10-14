@@ -60,7 +60,7 @@ pragmas, modules, collations and dot commands, and asks inillucent for the same 
 |---|---|---|---|
 | Pragmas in `pragma_list` | 67 | 67 | none |
 | Function names in the library | 177 | 172 of the 177, plus 18 vector functions | `fts3_tokenizer`, `fts5`, `fts5_get_locale`, `fts5_insttoken`, `fts5_locale` |
-| Modules for `CREATE VIRTUAL TABLE` | 19 | 16 of the 19, plus 4 of its own | `fts3tokenize`, `fts4aux`, `pragma_module_list` |
+| Modules for `CREATE VIRTUAL TABLE` | 19 | 16 of the 19, plus 5 of its own: `chunk_text`, `inillucent_search`, `ivfflat`, `json_each` and `json_tree` | `fts3tokenize`, `fts4aux`, `pragma_module_list` |
 | Collations | 5 | 5 | none |
 | Shell dot commands | 65 | 63 | `.expert`, `.session` |
 
@@ -347,11 +347,11 @@ them too.
 
 | Construct | inillucent's message |
 |---|---|
-| a compound query ordered by an expression | `ORDER BY term does not match any column in the result set` |
+| a compound query ordered by an expression | `1st ORDER BY term does not match any column in the result set`, with status `syntax` and exit code 1 |
 | `INSERT`, `UPDATE` or `DELETE` on a view that has no `INSTEAD OF` trigger for that statement | `cannot modify v because it is a view`, with exit code 1 as in SQLite. An `INSTEAD OF` trigger writes through a view. `INSERT ... ON CONFLICT` on a view fails with `cannot UPSERT a view` |
 | `EXPLAIN EXPLAIN` | `unsupported: nested EXPLAIN` |
-| `RETURNING` inside a trigger | `unsupported: RETURNING is not available in triggers` |
-| `UPDATE` or `DELETE` of a `sqlite_schema` row | `only an INSERT into sqlite_schema is built, not an UPDATE or a DELETE` |
+| `RETURNING` inside a trigger | `cannot use RETURNING in a trigger`, with status `syntax` and exit code 1 |
+| `UPDATE` or `DELETE` of a `sqlite_schema` row | `table sqlite_master may not be modified`, with status `syntax` and exit code 1 |
 
 ### Refused for other reasons
 
@@ -450,8 +450,8 @@ commit writes it into the database file. Measured with a 64 page cache: one tran
 | Topic | inillucent | SQLite 3.53.4 |
 |---|---|---|
 | `SELECT * FROM pragma_foreign_keys` | fails with `no such table: pragma_foreign_keys`. Use `PRAGMA foreign_keys` | returns one row with the setting |
-| `inillucent vector-search` result columns | the primary key appears twice: once as the table's column, and once as the column the search adds | no vector search |
-| an `inillucent_search` insert with a vector of the wrong length | fails with status `syntax` and the message `SQL logic error`, which does not name the vector | no vector search |
+| `inillucent vector-search` result columns | the columns are the table's columns and `distance`. A table whose primary key is not an `INTEGER PRIMARY KEY` also gets a `rowid` column in front, and a table with an `INTEGER PRIMARY KEY` shows that key once | no vector search |
+| an `inillucent_search` insert with a vector of the wrong length | fails with status `syntax` and a message that says the vector is not of the declared width and gives both widths | no vector search |
 | the longest key | a key of an index or a primary key is limited to 1,048,576 bytes once encoded. A longer one fails with `an index or primary key entry is longer than 1,048,576 bytes` before any page is written. A zero byte in a text or a blob takes two bytes once encoded | a key can be up to the gigabyte limit of a value |
 
 A vector written to an `inillucent_search` table as JSON text, such as `'[1,0,0,0]'`, is accepted

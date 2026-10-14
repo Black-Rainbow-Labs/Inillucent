@@ -99,6 +99,15 @@ pub fn run(shell: &mut Shell, line: &str) {
     else {
         return;
     };
+    // sqlite3 matches a dot command by any prefix of its name, in the order the
+    // commands appear in its source. `headers` comes before `help` there, so `.h`,
+    // `.he`, `.hea`, `.head` and `.header` all reach it, and `.hel` is the first
+    // that reaches `.help` (bug hunt 10 found `.header off` unknown).
+    let name = if !name.is_empty() && "headers".starts_with(name.as_str()) {
+        "headers".to_string()
+    } else {
+        name
+    };
     shell.dot_line = without_terminator(line).to_string();
     shell.dot_offsets = parsed.iter().map(|(_, at)| *at).collect();
     let arguments: Vec<&str> = parsed
@@ -1152,17 +1161,18 @@ pub fn run_script_bytes(shell: &mut Shell, named: &str, bytes: &[u8]) {
 /// Reports a mistake in one word of the dot command being run, in the reference's form.
 ///
 /// Two lines: the command as it was typed, and a caret under the first character
-/// of the word with the reason after it, each starting `line N: `.
+/// of the word with the reason after it, each starting `line N:`, or `argv[N]:` for
+/// a command given as an argument on the command line.
 ///
 /// @param shell - where the complaint goes
 /// @param word - which word, counting the command itself as word 0
 /// @param reason - what is wrong with it, such as `unknown option`
 pub(crate) fn word_error(shell: &mut Shell, word: usize, reason: &str) {
-    let line = shell.line;
+    let place = shell.error_location();
     let column = shell.dot_offsets.get(word).copied().unwrap_or(0);
     let typed = shell.dot_line.clone();
-    shell.complain(&format!("line {line}: {typed}"));
-    shell.complain(&format!("line {line}: {}^--- {reason}", " ".repeat(column)));
+    shell.complain(&format!("{place} {typed}"));
+    shell.complain(&format!("{place} {}^--- {reason}", " ".repeat(column)));
 }
 
 /// Reports an option a dot command does not know.

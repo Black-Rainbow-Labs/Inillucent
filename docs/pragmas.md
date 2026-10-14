@@ -21,77 +21,77 @@ pragmas do.
 
 | pragma | takes an argument | columns of its answer |
 |---|---|---|
-| `analysis_limit` | yes | one unnamed column |
-| `application_id` | yes | one unnamed column |
-| `auto_vacuum` | yes | one unnamed column |
-| `automatic_index` | yes | one unnamed column |
+| `analysis_limit` | yes | `analysis_limit` |
+| `application_id` | yes | `application_id` |
+| `auto_vacuum` | yes | `auto_vacuum` |
+| `automatic_index` | yes | `automatic_index` |
 | `busy_timeout` | yes | `timeout` |
-| `cache_size` | yes | one unnamed column |
-| `cache_spill` | yes | one unnamed column |
-| `case_sensitive_like` | yes | one unnamed column |
-| `cell_size_check` | yes | one unnamed column |
-| `checkpoint_fullfsync` | yes | one unnamed column |
+| `cache_size` | yes | `cache_size` |
+| `cache_spill` | yes | `cache_spill` |
+| `case_sensitive_like` | yes | `case_sensitive_like` |
+| `cell_size_check` | yes | `cell_size_check` |
+| `checkpoint_fullfsync` | yes | `checkpoint_fullfsync` |
 | `collation_list` | no | `seq`, `name` |
 | `compile_options` | no | `compile_options` |
-| `count_changes` | yes | one unnamed column |
-| `data_store_directory` | yes | one unnamed column |
-| `data_version` | yes | one unnamed column |
+| `count_changes` | yes | `count_changes` |
+| `data_store_directory` | yes | `data_store_directory` |
+| `data_version` | yes | `data_version` |
 | `database_list` | no | `seq`, `name`, `file` |
-| `default_cache_size` | yes | one unnamed column |
-| `defensive` | yes | one unnamed column |
-| `defer_foreign_keys` | yes | one unnamed column |
-| `empty_result_callbacks` | yes | one unnamed column |
+| `default_cache_size` | yes | `default_cache_size` |
+| `defensive` | yes | `defensive` |
+| `defer_foreign_keys` | yes | `defer_foreign_keys` |
+| `empty_result_callbacks` | yes | `empty_result_callbacks` |
 | `encoding` | yes | `encoding` |
 | `encryption` | no | `encryption` |
 | `foreign_key_check` | yes | `table`, `rowid`, `parent`, `fkid` |
 | `foreign_key_list` | yes | `id`, `seq`, `table`, `from`, `to`, `on_update`, `on_delete`, `match` |
-| `foreign_keys` | yes | one unnamed column |
-| `freelist_count` | yes | one unnamed column |
-| `full_column_names` | yes | one unnamed column |
-| `fullfsync` | yes | one unnamed column |
+| `foreign_keys` | yes | `foreign_keys` |
+| `freelist_count` | yes | `freelist_count` |
+| `full_column_names` | yes | `full_column_names` |
+| `fullfsync` | yes | `fullfsync` |
 | `function_list` | no | `name`, `builtin`, `type`, `enc`, `narg`, `flags` |
-| `hard_heap_limit` | yes | one unnamed column |
-| `ignore_check_constraints` | yes | one unnamed column |
-| `incremental_vacuum` | yes | one unnamed column |
+| `hard_heap_limit` | yes | `hard_heap_limit` |
+| `ignore_check_constraints` | yes | `ignore_check_constraints` |
+| `incremental_vacuum` | yes | `incremental_vacuum` |
 | `index_info` | yes | `seqno`, `cid`, `name` |
 | `index_list` | yes | `seq`, `name`, `unique`, `origin`, `partial` |
 | `index_xinfo` | yes | `seqno`, `cid`, `name`, `desc`, `coll`, `key` |
 | `integrity_check` | yes | `integrity_check` |
 | `journal_mode` | yes | `journal_mode` |
-| `journal_size_limit` | yes | one unnamed column |
-| `key` | yes | one unnamed column |
-| `legacy_alter_table` | yes | one unnamed column |
+| `journal_size_limit` | yes | `journal_size_limit` |
+| `key` | yes | `key` |
+| `legacy_alter_table` | yes | `legacy_alter_table` |
 | `locking_mode` | yes | `locking_mode` |
-| `max_page_count` | yes | one unnamed column |
-| `mmap_size` | yes | one unnamed column |
+| `max_page_count` | yes | `max_page_count` |
+| `mmap_size` | yes | `mmap_size` |
 | `module_list` | no | `name` |
-| `optimize` | yes | one unnamed column |
-| `page_count` | yes | one unnamed column |
-| `page_size` | yes | one unnamed column |
+| `optimize` | yes | `optimize` |
+| `page_count` | yes | `page_count` |
+| `page_size` | yes | `page_size` |
 | `pragma_list` | no | `name` |
-| `query_only` | yes | one unnamed column |
+| `query_only` | yes | `query_only` |
 | `quick_check` | yes | `quick_check` |
-| `read_uncommitted` | yes | one unnamed column |
-| `recursive_triggers` | yes | one unnamed column |
-| `rekey` | yes | one unnamed column |
-| `reverse_unordered_selects` | yes | one unnamed column |
-| `schema_version` | yes | one unnamed column |
-| `secure_delete` | yes | one unnamed column |
-| `short_column_names` | yes | one unnamed column |
-| `shrink_memory` | yes | one unnamed column |
-| `soft_heap_limit` | yes | one unnamed column |
-| `synchronous` | yes | one unnamed column |
+| `read_uncommitted` | yes | `read_uncommitted` |
+| `recursive_triggers` | yes | `recursive_triggers` |
+| `rekey` | yes | `rekey` |
+| `reverse_unordered_selects` | yes | `reverse_unordered_selects` |
+| `schema_version` | yes | `schema_version` |
+| `secure_delete` | yes | `secure_delete` |
+| `short_column_names` | yes | `short_column_names` |
+| `shrink_memory` | yes | `shrink_memory` |
+| `soft_heap_limit` | yes | `soft_heap_limit` |
+| `synchronous` | yes | `synchronous` |
 | `table_info` | yes | `cid`, `name`, `type`, `notnull`, `dflt_value`, `pk` |
 | `table_list` | yes | `schema`, `name`, `type`, `ncol`, `wr`, `strict` |
 | `table_xinfo` | yes | `cid`, `name`, `type`, `notnull`, `dflt_value`, `pk`, `hidden` |
-| `temp_store` | yes | one unnamed column |
-| `temp_store_directory` | yes | one unnamed column |
-| `threads` | yes | one unnamed column |
-| `trusted_schema` | yes | one unnamed column |
-| `user_version` | yes | one unnamed column |
+| `temp_store` | yes | `temp_store` |
+| `temp_store_directory` | yes | `temp_store_directory` |
+| `threads` | yes | `threads` |
+| `trusted_schema` | yes | `trusted_schema` |
+| `user_version` | yes | `user_version` |
 | `wal_autocheckpoint` | yes | `wal_autocheckpoint` |
 | `wal_checkpoint` | yes | `busy`, `log`, `checkpointed` |
-| `writable_schema` | yes | one unnamed column |
+| `writable_schema` | yes | `writable_schema` |
 
 ## Two defaults that matter when several processes share a file
 

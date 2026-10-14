@@ -161,18 +161,43 @@ impl ImportedDatabase {
         }
     }
 
+    /// Reports whether the database a qualifier names is encrypted.
+    ///
+    /// **Each attached database has its own file system, so each has its own
+    /// answer (bug hunt 10).** `PRAGMA aux.encryption` read `main`'s file
+    /// system whatever the qualifier said, so an encrypted `main` with a
+    /// plaintext attachment reported the attachment as encrypted, and the other
+    /// way round. `docs/encryption.md` says the pragma answers per database.
+    ///
+    /// @param at - the attached database the pragma named, `None` for `main`
+    fn is_encrypted_at(&self, at: Option<usize>) -> DbResult<bool> {
+        match at.unwrap_or(crate::MAIN) {
+            crate::MAIN => Ok(self.is_encrypted()),
+            index => self
+                .session_state
+                .schema_at(index)
+                .map(|held| held.vfs.encryption().is_some())
+                .ok_or_else(|| refusal("that pragma names a database that is not attached")),
+        }
+    }
+
     /// `PRAGMA encryption`: which cipher the database is encrypted with, or
     /// `none`. It reports and cannot be set.
     ///
     /// @param argument - the value, which is refused
-    pub(crate) fn pragma_encryption(&self, argument: Option<&PragmaArgument>) -> DbResult<Outcome> {
+    /// @param at - the attached database the pragma named, `None` for `main`
+    pub(crate) fn pragma_encryption(
+        &self,
+        argument: Option<&PragmaArgument>,
+        at: Option<usize>,
+    ) -> DbResult<Outcome> {
         if argument.is_some() {
             return Err(refusal(
                 "PRAGMA encryption reports and cannot be set. `inillucent encrypt` and \
                  `inillucent decrypt` write a copy with or without encryption",
             ));
         }
-        let word = match self.is_encrypted() {
+        let word = match self.is_encrypted_at(at)? {
             true => CIPHER_NAME,
             false => "none",
         };

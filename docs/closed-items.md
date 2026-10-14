@@ -40,7 +40,7 @@ it, with its date. The current numbers are in [Performance](performance.md) and
 | [`extension.fts.build`](#extensionftsbuild) | a segment format built and reverted | now 0.95x | 2026-09-23 |
 | [The old engine](#the-old-engine-is-deleted) | deleted | 30,697 lines removed | during the engine rework |
 | [Search index publishing](#a-generation-is-one-blob) | segmented generations | a commit's cost no longer grows with the table | during the engine rework |
-| [Seven correctness items](#eight-items-closed-together) | fixed, with crash campaigns | zero damage at every cut point | during the engine rework |
+| [Seven correctness items](#seven-items-closed-during-the-engine-rework) | fixed, with crash campaigns | zero damage at every cut point | during the engine rework |
 | [Torn page during recovery](#recovery-reads-a-page-before-redo-has-had-a-chance-to-rewrite-it) | fixed in `cdc58eb` | 199 of 199 rows answered | 2026-09-15 |
 
 ## A macOS archive
@@ -257,7 +257,7 @@ the 13 are part of the compiled statement that the call returns.
 
 The 200 row range scan spends its time on each of its 200 probes, so a saving per statement does not
 change it. That cost is
-[roadmap item 1](roadmap.md#1-the-extension-and-join-families-either-side-of-their-bars).
+[roadmap item 1](roadmap.md#1-workloads-that-are-slower-than-sqlite).
 
 The work found four defects in `build_statement`:
 
@@ -351,7 +351,7 @@ The remaining cost was reading the manifest from disk on every query. A module h
 that another connection had committed, so the manifest could not be cached. That hook now exists:
 `VirtualTable::committed_elsewhere` and `schema_changed`. Trying the format again with a cached
 manifest is part of
-[roadmap item 1](roadmap.md#1-the-extension-and-join-families-either-side-of-their-bars).
+[roadmap item 1](roadmap.md#1-workloads-that-are-slower-than-sqlite).
 
 ## The old engine is deleted
 
@@ -398,8 +398,6 @@ The default delta log became a constant 1,024 entries at the same time. It had b
 `max(1024, rows / 8)`.
 [Keeping a vector index current](relational-architecture.md#10-keeping-a-vector-index-current) has
 the measured range and how to choose `compact = N`.
-
-<a id="eight-items-closed-together"></a>
 
 ## Seven items closed during the engine rework
 

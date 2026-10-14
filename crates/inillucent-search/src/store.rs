@@ -1301,16 +1301,19 @@ pub fn vector_of(value: &Value<'static>, dims: usize) -> DbResult<Vec<f32>> {
         Value::Text(text) => inillucent_value::vector::vector_from_json(text.raw())
             .unwrap_or_else(|| decode_vector(text.raw())),
         _ => {
-            return Err(failure(
-                "inillucent_search: a vector is a blob of little-endian 32-bit floats",
-            ))
+            let said = "inillucent_search: a vector is a blob of little-endian 32-bit floats";
+            return Err(failure(said).with_message(said));
         }
     };
     if vector.len() != dims {
-        return Err(failure(format!(
-            "inillucent_search: this index has {dims} dimensions, and the vector has {}",
+        // **With a message** (bug hunt 10). `failure` alone carries only a code, which the
+        // command line reported as `SQL logic error`, a sentence that does not name the vector.
+        let said = format!(
+            "inillucent_search: it is not a vector of the declared width: this index has {dims} \
+             dimensions, and the vector has {}",
             vector.len()
-        )));
+        );
+        return Err(failure(said.clone()).with_message(said));
     }
     // **A NaN is refused here, at the one place a vector enters the index
     // (task-1932, M4).** `hnsw.rs` orders candidates with
@@ -1325,11 +1328,12 @@ pub fn vector_of(value: &Value<'static>, dims: usize) -> DbResult<Vec<f32>> {
     // Refused with the same shape as the width check, because a caller that
     // handles one handles the other.
     if let Some(at) = vector.iter().position(|component| !component.is_finite()) {
-        return Err(failure(format!(
+        let said = format!(
             "inillucent_search: component {at} of this vector is {}, and a vector's \
              components have to be finite numbers",
             vector.get(at).copied().unwrap_or(f32::NAN)
-        )));
+        );
+        return Err(failure(said.clone()).with_message(said));
     }
     Ok(vector)
 }

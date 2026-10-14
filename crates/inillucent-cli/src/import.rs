@@ -171,13 +171,13 @@ fn reading<'a>(shell: &mut Shell, arguments: &[&'a str]) -> Option<Reading<'a>> 
         }
     }
 
-    let line = shell.line;
+    let place = shell.error_location();
     let Some(path) = positional.first().copied() else {
-        shell.complain(&format!("line {line}: Missing FILE argument\n"));
+        shell.complain(&format!("{place} Missing FILE argument\n"));
         return None;
     };
     let Some(table) = positional.get(1).copied() else {
-        shell.complain(&format!("line {line}: Missing TABLE argument\n"));
+        shell.complain(&format!("{place} Missing TABLE argument\n"));
         return None;
     };
     // SQLite never ends a row at a bare carriage return outside `--ascii`.
@@ -267,8 +267,8 @@ pub fn import(shell: &mut Shell, arguments: &[&str]) {
     let text = match read_text(&path) {
         Ok(text) => text,
         Err(_) => {
-            let line = shell.line;
-            shell.complain(&format!("line {line}: cannot open \"{named}\""));
+            let place = shell.error_location();
+            shell.complain(&format!("{place} cannot open \"{named}\""));
             return;
         }
     };

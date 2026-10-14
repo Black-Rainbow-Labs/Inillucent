@@ -602,7 +602,7 @@ file holds.
 
 In `FULL` mode every commit runs a step on each file that has a free page below its end, and in
 `INCREMENTAL` mode a commit runs it for the number of pages `PRAGMA incremental_vacuum(N)` asked for.
-The step is in `crates/inillucent-engine/src/engine/shrink.rs` and runs inside `commit_across`, after
+The step is in `crates/inillucent-engine/src/shrink.rs` and runs inside `commit_across`, after
 the trees are built and before the commit is voted on. It looks at the last page of the file. A page
 that is free is dropped from the end by lowering the page count. A page in use is moved to the lowest
 free page, the one reference to it is rewritten, and the page count is lowered by one.

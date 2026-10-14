@@ -562,6 +562,51 @@ fn k_is_taken_as_a_row_count() {
         );
         assert!(said.contains("k must be a whole number"), "{query}: {said}");
     }
+    // The largest `k` is 1,000,000: that one is accepted and one more is refused,
+    // where it used to be lowered to 1,000,000 without a word (bug hunt 10).
+    assert_eq!(
+        column(
+            &connection,
+            "SELECT count(*) FROM s WHERE vector='[1,0]' AND k=1000000"
+        ),
+        vec!["3"]
+    );
+    for query in [
+        "vector='[1,0]' AND k=1000001",
+        "s MATCH 'alpha' AND k=9999999999",
+    ] {
+        let said = refusal(
+            &connection,
+            &format!("SELECT count(*) FROM s WHERE {query}"),
+        );
+        assert!(
+            said.contains("k cannot be more than 1000000"),
+            "{query}: {said}"
+        );
+    }
+}
+
+/// A JSON array of numbers of the wrong width says it is not a vector of the
+/// declared width, and text that is not such an array says it is not a vector.
+///
+/// Bug hunt 10: both said `it is not a vector`, though the search skill shows the
+/// first as `it is not a vector of the declared width`.
+#[test]
+fn a_json_vector_of_the_wrong_width_names_the_width() {
+    let connection = start_inillucent(AREA, "json-vector-width");
+    exec(
+        &connection,
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, v VECTOR(3))",
+    );
+    for text in ["[1,2]", "[1,2,3,4]", "[]"] {
+        let said = refusal(&connection, &format!("INSERT INTO w VALUES (1, '{text}')"));
+        assert!(
+            said.contains("it is not a vector of the declared width"),
+            "{text}: {said}"
+        );
+    }
+    let said = refusal(&connection, "INSERT INTO w VALUES (1, 'abc')");
+    assert!(said.contains("it is not a vector,"), "{said}");
 }
 
 /// `INSERT OR REPLACE`, `REPLACE` and an upsert replace a row and its vector in the index.

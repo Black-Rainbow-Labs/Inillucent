@@ -108,14 +108,15 @@ impl Tokenizer {
                 );
                 return Err(crate::vtab::failure(said.clone()).with_message(said));
             }
+            // **The same words the other fts5 refusals use** (bug hunt 10): the
+            // construct, then `is not built`. This one named "the new engine's
+            // physical pass", an internal stage a caller has no use for.
             let said = format!("the fts5 tokenizer {name}");
-            return Err(inillucent_base::error::misuse(format!(
-                "the new engine's physical pass does not handle {said} yet"
-            ))
-            .with_message(format!(
-                "the new engine's physical pass does not handle {said} yet"
-            ))
-            .with_unsupported(said));
+            return Err(
+                inillucent_base::error::misuse(format!("{said} is not built"))
+                    .with_message(format!("{said} is not built"))
+                    .with_unsupported(said),
+            );
         }
         let mut remove_diacritics = 1u8;
         let mut extra_tokens = Vec::new();
@@ -507,6 +508,11 @@ mod tests {
             refused.unsupported(),
             Some("the fts5 tokenizer trigram"),
             "the refusal must name the tokenizer it refused"
+        );
+        assert_eq!(
+            refused.message(),
+            "the fts5 tokenizer trigram is not built",
+            "the refusal says the feature is not built, as the other fts5 refusals do"
         );
         // A name SQLite has never heard of is a mistake, and is refused in SQLite's words.
         for name in ["icu", "porter2", "nonsense"] {

@@ -80,6 +80,8 @@ struct Napi {
         *mut usize,
     ) -> i32,
     throw_error: unsafe extern "C" fn(Opaque, *const c_char, *const c_char) -> i32,
+    get_and_clear_last_exception: unsafe extern "C" fn(Opaque, *mut Opaque) -> i32,
+    throw_value: unsafe extern "C" fn(Opaque, Opaque) -> i32,
     add_env_cleanup_hook:
         unsafe extern "C" fn(Opaque, unsafe extern "C" fn(*mut c_void), *mut c_void) -> i32,
     open_handle_scope: unsafe extern "C" fn(Opaque, *mut Opaque) -> i32,
@@ -216,6 +218,8 @@ unsafe fn resolve() -> Option<Napi> {
         is_typedarray: find!(c"napi_is_typedarray"),
         get_typedarray_info: find!(c"napi_get_typedarray_info"),
         throw_error: find!(c"napi_throw_error"),
+        get_and_clear_last_exception: find!(c"napi_get_and_clear_last_exception"),
+        throw_value: find!(c"napi_throw"),
         add_env_cleanup_hook: find!(c"napi_add_env_cleanup_hook"),
         open_handle_scope: find!(c"napi_open_handle_scope"),
         close_handle_scope: find!(c"napi_close_handle_scope"),
@@ -471,6 +475,44 @@ unsafe fn throw(api: &Napi, env: Opaque, code: &str, message: &str) -> Opaque {
     std::ptr::null_mut()
 }
 
+/// Throws a JavaScript `Error` with a code and, when the engine named one, the
+/// construct it has not built.
+///
+/// **The error carries `feature` as a property (bug hunt 10).** The command
+/// line's JSON puts `feature` in a result whose status is `unsupported`, and the
+/// Node package's `error.feature` reads it. The addon threw only the code and the
+/// message, so the same failure had a `feature` through a program and none
+/// in process. `napi_throw_error` makes the error and throws it in one step, so
+/// the pending exception is taken back, given the property, and thrown again.
+///
+/// @param api - the table
+/// @param env - the environment
+/// @param code - the status name, which the error carries as `code`
+/// @param message - what went wrong
+/// @param feature - the construct that is not built, if the engine said
+unsafe fn throw_with_feature(
+    api: &Napi,
+    env: Opaque,
+    code: &str,
+    message: &str,
+    feature: Option<&str>,
+) -> Opaque {
+    let thrown = throw(api, env, code, message);
+    let Some(feature) = feature else {
+        return thrown;
+    };
+    let mut pending = std::ptr::null_mut();
+    if (api.get_and_clear_last_exception)(env, &mut pending) != 0 || pending.is_null() {
+        return thrown;
+    }
+    let mut named = std::ptr::null_mut();
+    if (api.create_string_utf8)(env, feature.as_ptr().cast(), feature.len(), &mut named) == 0 {
+        (api.set_named_property)(env, pending, c"feature".as_ptr(), named);
+    }
+    (api.throw_value)(env, pending);
+    thrown
+}
+
 /// Throws the failure a C ABI call reported, and frees it.
 ///
 /// @param api - the table
@@ -489,11 +531,18 @@ unsafe fn throw_failure(
             .to_string_lossy()
             .into_owned(),
     };
+    let feature = match error.is_null() {
+        true => None,
+        false => {
+            let named = inillucent_error_feature(error);
+            (!named.is_null()).then(|| CStr::from_ptr(named).to_string_lossy().into_owned())
+        }
+    };
     if !error.is_null() {
         inillucent_error_free(error);
     }
     let code = status_name(status);
-    throw(api, env, code, &message)
+    throw_with_feature(api, env, code, &message, feature.as_deref())
 }
 
 /// Returns a status's name, as the command line's JSON spells it.
@@ -856,16 +905,19 @@ unsafe fn js_value(api: &Napi, env: Opaque, value: &Value) -> Opaque {
     }
 }
 
-/// `query(conn, sql, params, arrays)`: runs one statement.
+/// `query(conn, sql, params, arrays, readsOnly)`: runs one statement.
 ///
 /// Answers `{ columns, rows, changes, lastInsertRowid, total }`. `rows` holds
 /// one object a row keyed by column name, or one array a row when `arrays` is
-/// true. `params` is an array of values, or `undefined` for none.
+/// true. `params` is an array of values, or `undefined` for none. When
+/// `readsOnly` is true a statement that is not a read is refused with status
+/// `readonly` before it runs, which is what the command line's `query` does; a
+/// statement that does not parse is passed on so the engine reports `syntax`.
 unsafe fn query_body(env: Opaque, info: Opaque) -> Opaque {
     let Some(api) = napi() else {
         return std::ptr::null_mut();
     };
-    let [conn, sql, params, arrays] = arguments::<4>(api, env, info);
+    let [conn, sql, params, arrays, reads_only] = arguments::<5>(api, env, info);
     let Some(conn) = handle_of(api, env, conn, false) else {
         return not_this_threads(api, env);
     };
@@ -880,6 +932,20 @@ unsafe fn query_body(env: Opaque, info: Opaque) -> Opaque {
     };
     let mut as_arrays = false;
     (api.get_value_bool)(env, arrays, &mut as_arrays);
+    let mut only_reads = false;
+    // An absent argument is `undefined`, which this leaves false.
+    (api.get_value_bool)(env, reads_only, &mut only_reads);
+    if only_reads
+        && !inillucent_driver::readonly::admits(&sql)
+        && !inillucent_driver::readonly::fails_to_parse(&sql)
+    {
+        return throw(
+            api,
+            env,
+            "readonly",
+            inillucent_driver::readonly::QUERY_REFUSES_A_WRITE,
+        );
+    }
     let values = match parameters_of(api, env, params) {
         Ok(values) => values,
         Err(message) => return throw(api, env, "invalid_state", &message),
@@ -899,7 +965,13 @@ unsafe fn query_body(env: Opaque, info: Opaque) -> Opaque {
     let connection = database.database.session_as(session_of(conn));
     match connection.query(&sql, &values, usize::MAX) {
         Ok(rows) => result_of(api, env, &rows, conn, as_arrays),
-        Err(why) => throw(api, env, why.status.name(), &why.message),
+        Err(why) => throw_with_feature(
+            api,
+            env,
+            why.status.name(),
+            &why.message,
+            why.feature.as_deref(),
+        ),
     }
 }
 

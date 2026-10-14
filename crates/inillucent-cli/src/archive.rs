@@ -59,6 +59,14 @@ struct Request {
 /// @param shell - the shell
 /// @param arguments - the options and the paths
 pub fn archive(shell: &mut Shell, arguments: &[&str]) {
+    // With no arguments the reference prints its usage text and fails (bug hunt
+    // 10). This listed the `sqlar` table instead and said `no such table: sqlar`
+    // on a database without one, which hid that an operation has to be named.
+    if arguments.is_empty() {
+        shell.complain("Wrong number of arguments.  Usage:");
+        crate::help::show_help(Some("archive"), &mut |line| shell.complain(line));
+        return;
+    }
     let request = match parse(arguments) {
         Ok(request) => request,
         Err(message) => {

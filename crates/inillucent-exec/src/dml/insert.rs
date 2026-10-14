@@ -1344,6 +1344,17 @@ fn vector_column_is_met(
     let bytes = match value {
         Some(OwnedDatum::Blob(bytes)) => bytes,
         Some(OwnedDatum::Null) | None => return Ok(()),
+        // A JSON array of numbers that is not `width` long (the caller converts
+        // the ones that are) is a vector of the wrong width, and says so. Only
+        // text that is not such an array "is not a vector" (bug hunt 10).
+        Some(OwnedDatum::Text(text)) if json_numbers(text).is_some() => {
+            return Err(not_a_vector(
+                table,
+                column,
+                width,
+                "it is not a vector of the declared width",
+            ))
+        }
         _ => return Err(not_a_vector(table, column, width, "it is not a vector")),
     };
     if bytes.len() != width.saturating_mul(4) {

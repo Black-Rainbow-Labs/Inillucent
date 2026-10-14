@@ -85,7 +85,7 @@ can change between releases.
 ## "It says unsupported" or "it exited 3"
 
 ```sh
-inillucent --db app.rdb query "ATTACH ? AS other" --params '["other.rdb"]'
+inillucent --db app.rdb exec "ATTACH ? AS other" --params '["other.rdb"]'
 ```
 
 ```text
@@ -102,7 +102,7 @@ inillucent capabilities                  # the whole table
 inillucent capabilities triggers         # one row
 ```
 
-`inillucent capabilities` lists 55 capabilities. A test checks every row but two against the running
+`inillucent capabilities` lists 57 capabilities. A test checks every row but two against the running
 engine in both directions: a row that says yes and fails, or a row that says no and works, fails the
 build. The two unchecked rows are `cancel` and `readonly_open`, and both say `partial`. A name that
 is not in the table is the status `not_found` and means no.

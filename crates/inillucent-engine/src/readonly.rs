@@ -140,6 +140,33 @@ pub fn admits(sql: &str) -> bool {
     }
 }
 
+/// What a `query` call says when it is given a statement that is not a read.
+///
+/// One sentence for the command line, the MCP server and the Node addon, so the
+/// three routes to `query` refuse a write in the same words.
+pub const QUERY_REFUSES_A_WRITE: &str = "query only reads, and that statement changes something or controls a transaction. Run it with exec (inillucent_exec), or with batch for several.";
+
+/// Returns whether the first statement in the text fails to parse.
+///
+/// **A statement that does not parse has no class, so refusing it as a write
+/// gives the wrong answer (bug hunt 10).** `SELEC 1`, `FOO BAR` and `INSERT INTO`
+/// were reported with status `readonly` by `inillucent query`, because
+/// [`admits`] is false for them. The caller wrote a typo and was told the
+/// connection cannot write. A command surface checks this before it refuses,
+/// and lets the statement through to the engine, which reports the parse error
+/// with status `syntax`. Nothing is written by a statement that does not parse,
+/// and the commit path still refuses a write on a read only connection.
+///
+/// @param sql - the statement, as the caller wrote it
+pub fn fails_to_parse(sql: &str) -> bool {
+    inillucent_sql::parser::parse_next_statement(
+        sql.as_bytes(),
+        0,
+        &inillucent_base::limits::Limits::default(),
+    )
+    .is_err()
+}
+
 /// Returns whether a statement would change the database if it ran.
 ///
 /// **What the engine refuses on a connection that opened the file read only

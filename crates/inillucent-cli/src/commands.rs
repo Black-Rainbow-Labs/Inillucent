@@ -208,14 +208,15 @@ pub fn testcase(shell: &mut Shell, arguments: &[&str]) {
 /// @param arguments - the words after the command
 pub fn check(shell: &mut Shell, arguments: &[&str]) {
     let line = shell.line;
+    let place = shell.error_location();
     let typed = if arguments.is_empty() {
         ".check".to_string()
     } else {
         format!(".check {}", arguments.join(" "))
     };
     let Some(name) = shell.testcase.take() else {
-        shell.complain(&format!("line {line}: {typed}"));
-        shell.complain(&format!("line {line}:  ^--- no .testcase is active"));
+        shell.complain(&format!("{place} {typed}"));
+        shell.complain(&format!("{place}  ^--- no .testcase is active"));
         return;
     };
     shell.tests_run = shell.tests_run.saturating_add(1);
@@ -312,12 +313,13 @@ pub fn open_viewer(path: &std::path::Path) {
 
 /// `.scanstats on|off|est`: whether per-statement scan metrics are collected.
 ///
-/// **Accepted and recorded rather than acted on, and the reference's own build
-/// is the same.** The metrics come from `sqlite3_stmt_scanstatus`, which is
-/// compiled out of the pinned `sqlite3` - `.scanstats on` there prints nothing
-/// extra either. What this engine has instead is the `sqlite_stmt` table, whose
-/// `nscan`, `nsort` and `naidx` columns are the same three numbers asked for as
-/// SQL.
+/// **Accepted and recorded, and nothing extra is printed (bug hunt 10).** The
+/// pinned `sqlite3` prints a table after each statement whose columns are CPU
+/// cycles, loops and rows, with the cycle counts taken from the processor's
+/// counter, so they differ on every run and there is no output to match. What
+/// this engine has instead is the `sqlite_stmt` table, whose `nscan`, `nsort`
+/// and `naidx` columns count full scans, sorts and automatic indexes, asked for
+/// as SQL.
 ///
 /// @param shell - the shell
 /// @param arguments - the words after the command
@@ -336,13 +338,38 @@ pub fn scanstats(shell: &mut Shell, arguments: &[&str]) {
 
 /// `.trace ?FILE|off?`: echo each statement before it runs.
 ///
-/// `stdout` and `stderr` name the two streams; anything else is a file; `off`
-/// stops. With no argument it stops, which is what the reference does.
+/// `stdout` and `stderr` name the two streams; anything else is a file, which is
+/// emptied when the command runs; `off` stops. With no argument it stops, which
+/// is what the reference does.
+///
+/// **The statement is written, the way the reference writes it, with any trailing
+/// semicolons replaced by one and a newline** (bug hunt 10). The command used to
+/// record the target and never write to it, so `.trace stdout` printed nothing.
+/// The options `--expanded`, `--plain` and `--stmt` are accepted. A statement
+/// with bound parameters is written as it was typed, which is what `--plain`
+/// gives and what `--expanded` gives when there are none. `--profile`, `--row`
+/// and `--close` are accepted and write nothing extra. Any other option is
+/// refused, as it is in the reference.
 ///
 /// @param shell - the shell
 /// @param arguments - the words after the command
 pub fn trace(shell: &mut Shell, arguments: &[&str]) {
-    let Some(word) = arguments.first() else {
+    let mut target: Option<String> = None;
+    for word in arguments {
+        if let Some(option) = word.strip_prefix('-') {
+            let option = option.trim_start_matches('-');
+            if !matches!(
+                option,
+                "expanded" | "plain" | "stmt" | "profile" | "row" | "close"
+            ) {
+                shell.complain(&format!("Unknown option \"{word}\" on \".trace\""));
+                return;
+            }
+        } else {
+            target = Some((*word).to_string());
+        }
+    }
+    let Some(word) = target else {
         shell.trace = None;
         return;
     };
@@ -350,7 +377,40 @@ pub fn trace(shell: &mut Shell, arguments: &[&str]) {
         shell.trace = None;
         return;
     }
-    shell.trace = Some((*word).to_string());
+    if !matches!(word.as_str(), "stdout" | "stderr") {
+        let Some(path) = crate::dot::confine_path(shell, &word) else {
+            return;
+        };
+        if std::fs::write(&path, b"").is_err() {
+            shell.complain(&format!("Error: cannot open \"{word}\""));
+            return;
+        }
+        shell.trace = Some(path);
+        return;
+    }
+    shell.trace = Some(word);
+}
+
+/// Writes one statement to where `.trace` sends them.
+///
+/// @param shell - the shell
+/// @param target - `stdout`, `stderr` or the path of a file
+/// @param sql - the statement about to run
+pub fn trace_statement(shell: &mut Shell, target: &str, sql: &str) {
+    let text =
+        sql.trim_end_matches(|character: char| character == ';' || character.is_whitespace());
+    let line = format!("{text};");
+    match target {
+        "stdout" => shell.say(&line),
+        "stderr" => shell.note(&line),
+        path => {
+            use std::io::Write;
+            let opened = std::fs::OpenOptions::new().append(true).open(path);
+            if let Ok(mut file) = opened {
+                let _ = writeln!(file, "{line}");
+            }
+        }
+    }
 }
 
 /// `.auth ON|OFF`: print every decision the authorizer is asked to make.
@@ -440,12 +500,7 @@ pub fn connection(shell: &mut Shell, arguments: &[&str]) {
                     continue;
                 };
                 let mark = if slot == active { "ACTIVE" } else { "" };
-                let name = if path == ":memory:" {
-                    "(memory)".to_string()
-                } else {
-                    path
-                };
-                let line = format!("{mark:<MARK$} {slot}: {name}");
+                let line = format!("{mark:<MARK$} {slot}: {path}");
                 shell.say(&line);
             }
         }

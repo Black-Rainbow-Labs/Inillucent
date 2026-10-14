@@ -48,6 +48,12 @@ pub struct Opened {
     path: String,
     /// Whether the file was opened read only, which `.databases` reports as `r/o`.
     read_only: bool,
+    /// How `.connection` names this database when that is not its path.
+    ///
+    /// The reference prints `:memory:` for a database opened by that name, `(memory)`
+    /// for one opened with no name, and `(temporary-file)` for an empty name, and
+    /// all three are in memory here. `None` means the in-memory form with no name.
+    label: Option<String>,
 }
 
 /// How many databases `.connection` can hold open at once.
@@ -473,6 +479,7 @@ impl Shell {
             session,
             path: path.to_string(),
             read_only,
+            label: None,
         })
     }
 
@@ -519,7 +526,11 @@ impl Shell {
     /// Builds a shell around its first open database.
     ///
     /// @param first - the database statements run on
-    fn around(first: Opened) -> Shell {
+    fn around(mut first: Opened) -> Shell {
+        // The database the program started on was named, `:memory:` when none was.
+        if first.path == ":memory:" {
+            first.label = Some(":memory:".to_string());
+        }
         let mut connections: Vec<Option<Opened>> = (0..CONNECTIONS).map(|_| None).collect();
         if let Some(slot) = connections.first_mut() {
             *slot = Some(first);
@@ -806,12 +817,34 @@ impl Shell {
         self.active
     }
 
-    /// Returns each slot and what it holds, for `.connection`.
+    /// Returns each slot and the name `.connection` shows for it.
+    ///
+    /// **The names are the reference's** (bug hunt 10): the path of a file, the
+    /// label the database was opened under when it has one (`:memory:`,
+    /// `(temporary-file)`), and `(memory)` for an in-memory database opened with
+    /// no name, which `.connection` printed for all three.
     pub fn slots(&self) -> Vec<Option<String>> {
         self.connections
             .iter()
-            .map(|held| held.as_ref().map(|open| open.path.clone()))
+            .map(|held| {
+                held.as_ref()
+                    .map(|open| match (&open.label, open.path.as_str()) {
+                        (Some(label), _) => label.clone(),
+                        (None, ":memory:") => "(memory)".to_string(),
+                        (None, path) => path.to_string(),
+                    })
+            })
             .collect()
+    }
+
+    /// Sets how `.connection` names the active database.
+    ///
+    /// @param label - the name to show, or `None` for the in-memory form with no name
+    pub fn label_active(&mut self, label: Option<String>) {
+        let active = self.active;
+        if let Some(Some(open)) = self.connections.get_mut(active) {
+            open.label = label;
+        }
     }
 
     /// Switches to one slot, opening an in-memory database if it is closed.
@@ -1216,6 +1249,9 @@ impl Shell {
             let text = sql.to_string();
             self.say(&text);
         }
+        if let Some(target) = self.trace.clone() {
+            crate::commands::trace_statement(self, &target, sql);
+        }
         let started = std::time::Instant::now();
         if self.explain_plan {
             self.print_plan(sql);
@@ -1318,6 +1354,21 @@ impl Shell {
                 self.timer = false;
                 self.timer_once = false;
             }
+        }
+    }
+
+    /// Returns the location a dot command's usage error starts with.
+    ///
+    /// **A dot command given as a command line argument is `argv[N]:`, and one
+    /// read from input is `line N:`** (bug hunt 10). The reference prints
+    /// `argv[2]: .mode --bogus` for the first, and these messages said
+    /// `line 1:` for both, so a script that matched the location found nothing.
+    /// `argument` is the position counted from the program name, which is the
+    /// number the reference prints.
+    pub fn error_location(&self) -> String {
+        match self.argument {
+            Some(index) => format!("argv[{index}]:"),
+            None => format!("line {}:", self.line),
         }
     }
 

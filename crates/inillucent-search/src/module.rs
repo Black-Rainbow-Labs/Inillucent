@@ -1757,15 +1757,21 @@ impl VirtualTable for SearchTable {
     }
 }
 
+/// The largest `k` a search accepts.
+const MOST_K: i64 = 1_000_000;
+
 /// Reads the number of rows `k` asks for.
 ///
 /// A whole number of zero or more is accepted, as an integer, as a real with no fraction, or as
 /// text that reads as one. Anything else is refused: `k = -1` used to be raised to 1 and
 /// `k = 'abc'` or `k = 2.5` fell back to the default of 20, so a mistyped `k` was answered with
-/// rows the caller had not asked for. NULL keeps the default. The largest `k` is 1,000,000.
+/// rows the caller had not asked for. NULL keeps the default. The largest `k` is 1,000,000, and a
+/// larger one is refused: it was lowered to 1,000,000 without a word, so `k = 2000000` answered
+/// with half the rows that were asked for and nothing said so (bug hunt 10).
 ///
 /// @param value - the value bound to the `k` column
-fn limit_of(value: &Value<'static>) -> DbResult<usize> {
+/// @param refuse_above_most - whether a `k` above the largest is refused, and not lowered to it
+fn limit_of(value: &Value<'static>, refuse_above_most: bool) -> DbResult<usize> {
     let whole = match value {
         Value::Null => return Ok(DEFAULT_K as usize),
         Value::Integer(held) => Some(*held),
@@ -1773,7 +1779,12 @@ fn limit_of(value: &Value<'static>) -> DbResult<usize> {
         other => text_of(Some(other)).and_then(|text| text.trim().parse::<i64>().ok()),
     };
     match whole {
-        Some(held) if held >= 0 => Ok(held.min(1_000_000) as usize),
+        Some(held) if (0..=MOST_K).contains(&held) => Ok(held as usize),
+        Some(held) if held > MOST_K && !refuse_above_most => Ok(MOST_K as usize),
+        Some(held) if held > MOST_K => {
+            let said = format!("inillucent_search: k cannot be more than {MOST_K}");
+            Err(failure(said.clone()).with_message(said))
+        }
         _ => {
             let said = "inillucent_search: k must be a whole number of zero or more";
             Err(failure(said).with_message(said))
@@ -1877,7 +1888,11 @@ impl VirtualCursor for SearchCursor {
                     }
                 }
                 ROLE_LIMIT => {
-                    self.request.limit = limit_of(value)?;
+                    // A table that backs a `CREATE INDEX ... USING inillucent_hnsw` gets its
+                    // `k` from the query's `LIMIT`, which may be any size and is answered
+                    // with the rows there are. Only a table a person wrote `k = N` against
+                    // is refused above the largest `k`.
+                    self.request.limit = limit_of(value, self.options.source.is_none())?;
                 }
                 ROLE_VECTOR => {
                     self.request.vector = crate::store::vector_of(value, self.options.dims.max(1))?;

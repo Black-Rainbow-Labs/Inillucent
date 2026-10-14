@@ -189,7 +189,13 @@ not be run at all.
 
 `unsupported` means the engine has not built that feature, and `feature` names it. The SQL is not
 wrong, and a different spelling fails the same way. Check `inillucent capabilities` before you
-write an unusual statement.
+write an unusual statement. `feature` is on the result of `inillucent()` and on the error `query()`
+throws whether the call runs in this process or through a program.
+
+`query()`, `inillucent('query', ...)` and `session.query()` only read. A statement that writes, such
+as `INSERT` or `ATTACH ?1 AS other`, is refused with status `readonly` on every route, and a
+statement that does not parse is `syntax`. Use `inillucent('exec', ...)` or `inillucent('batch', ...)`
+to write.
 
 ## For an AI agent
 

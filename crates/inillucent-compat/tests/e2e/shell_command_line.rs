@@ -339,3 +339,58 @@ fn opening_an_encrypted_file_without_its_key_says_why_once() {
         "the reason is printed once: {err}"
     );
 }
+
+/// A dot command given as an argument reports its usage error as `argv[N]:`.
+///
+/// Bug hunt 10: the location said `line 1:` for an argument as well as for
+/// input, where the pinned `sqlite3` says `argv[2]:`, the position of the
+/// argument counted from the program name.
+#[test]
+fn a_dot_command_argument_reports_its_position_as_argv() {
+    let ran = run("argv-usage", &[":memory:", ".mode --bogus"], b"", &[]);
+    assert_eq!(ran.code, Some(1), "{}", ran.err);
+    assert_eq!(
+        ran.err,
+        "argv[2]: .mode --bogus\nargv[2]:       ^--- bad option\nargv[2]: Use \".help .mode\" for more info\n"
+    );
+    let later = run(
+        "argv-usage-later",
+        &[":memory:", "select 1", ".mode --bogus"],
+        b"",
+        &[],
+    );
+    assert!(
+        later.err.starts_with("argv[3]: .mode --bogus\n"),
+        "{}",
+        later.err
+    );
+    let input = run("line-usage", &[], b".mode --bogus\n", &[]);
+    assert!(
+        input.err.starts_with("line 1: .mode --bogus\n"),
+        "{}",
+        input.err
+    );
+}
+
+/// `.open --readonly` of a file that is not there reports it, switches to an
+/// in-memory database, exits 0 and runs the arguments after it.
+///
+/// Bug hunt 10: the run was marked failed, so it exited 1 and the statement
+/// argument after the `.open` never ran.
+#[test]
+fn a_failed_dot_open_does_not_fail_the_run() {
+    let ran = run(
+        "open-missing",
+        &[":memory:", ".open --readonly missing.db", "select 1"],
+        b"",
+        &[],
+    );
+    assert_eq!(ran.code, Some(0), "{}", ran.err);
+    assert_eq!(text(&ran), "1\n");
+    assert!(
+        ran.err.contains("using substitute in-memory database"),
+        "{}",
+        ran.err
+    );
+    assert!(!ran.dir.join("missing.db").exists());
+}

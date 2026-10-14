@@ -86,8 +86,8 @@ that names the column, and the command line exits with code 1:
 
 | You write | The error |
 |---|---|
-| a vector of the wrong width, `'[1, 0]'` | `cannot store this value in passage.v: it is not a vector, and the column is declared VECTOR(3)` |
-| a value that is not a vector, `'hello'` | the same message |
+| a vector of the wrong width, `'[1, 0]'` | `cannot store this value in passage.v: it is not a vector of the declared width, and the column is declared VECTOR(3)` |
+| a value that is not a vector, `'hello'` | `cannot store this value in passage.v: it is not a vector, and the column is declared VECTOR(3)` |
 | a component that is NaN or infinite | `cannot store this value in passage.v: one of its components is not a finite number, and the column is declared VECTOR(3)` |
 
 A NaN component would make every distance to that row NaN and would make a later `CREATE INDEX`
@@ -169,8 +169,8 @@ SELECT id, body FROM passage ORDER BY vector_distance_cos(v, '[1, 0, 0]') LIMIT 
 ```
 id  parent  notused  detail
 --  ------  -------  -------------------------------------------------
-0   0       0        SEARCH passage USING VECTOR INDEX passage_v (k=2)
-1   0       0        USE TEMP B-TREE FOR ORDER BY
+1   0       0        SEARCH passage USING VECTOR INDEX passage_v (k=2)
+2   0       0        USE TEMP B-TREE FOR ORDER BY
 ```
 
 The query itself does not change. The planner sees `ORDER BY` a distance function with a `LIMIT`,
@@ -286,8 +286,8 @@ SELECT id FROM passage ORDER BY vector_distance_l2(v, '[1, 0, 0]') LIMIT 2;
 ```
 id  parent  notused  detail
 --  ------  -------  ----------------------------
-0   0       0        SCAN passage
-1   0       0        USE TEMP B-TREE FOR ORDER BY
+1   0       0        SCAN passage
+2   0       0        USE TEMP B-TREE FOR ORDER BY
 ```
 
 The table has only the cosine index `passage_v`, so the L2 ordering scans. The answer is still
@@ -484,7 +484,7 @@ models already return vectors of length 1. `l2_normalize(v)` scales any other ve
 |---|---|---|
 | the table's own name | `docs MATCH 'text'` | the keyword query, as plain words. See [The keyword query](#the-keyword-query) |
 | `vector` | `vector = ?1`, or `vector = embed('search_query: ' \|\| ?1)` | the query vector |
-| `k` | `k = 20` | how many hits the search collects. Defaults to 10. `k = 0` returns no rows. A `k` that is negative or is not a whole number is refused. The largest `k` is 1,000,000 |
+| `k` | `k = 20` | how many hits the search collects. Defaults to 10. `k = 0` returns no rows. A `k` that is negative or is not a whole number is refused. The largest `k` is 1,000,000, and a larger one is refused with `inillucent_search: k cannot be more than 1000000` |
 | `recall` | `recall = 0.9` | in approximate mode, widens the graph walk to reach this recall. Exact mode ignores it |
 | `question` | `question = 'plain words'` | the question in plain words. Naming it reranks the search with a cross encoder. See [Reranking a search](#reranking-a-search) |
 | `rank` | `ORDER BY rank` | the combined ranking. Ascending order is best first, as in FTS5 |

@@ -441,7 +441,14 @@ pub fn mode(shell: &mut Shell, arguments: &[&str]) {
     while let Some(word) = arguments.get(index).copied() {
         index += 1;
         let step = if word.starts_with('-') {
-            option(shell, arguments, &mut index, word, &mut verbose)
+            option(
+                shell,
+                arguments,
+                &mut index,
+                word,
+                &mut verbose,
+                chose_a_mode,
+            )
         } else if !chose_a_mode {
             chose_a_mode = true;
             choose(shell, word, index)
@@ -462,8 +469,8 @@ pub fn mode(shell: &mut Shell, arguments: &[&str]) {
         };
         if let Err(stop) = step {
             if stop == Stop::Help {
-                let line = shell.line;
-                shell.complain(&format!("line {line}: Use \".help .mode\" for more info"));
+                let place = shell.error_location();
+                shell.complain(&format!("{place} Use \".help .mode\" for more info"));
             }
             return;
         }
@@ -532,12 +539,14 @@ fn choose(shell: &mut Shell, word: &str, index: usize) -> Result<(), Stop> {
 /// @param index - how many words have been read, advanced past the value
 /// @param word - the option
 /// @param verbose - set when `-v` is given
+/// @param chose_a_mode - whether a mode name came before this option
 fn option(
     shell: &mut Shell,
     arguments: &[&str],
     index: &mut usize,
     word: &str,
     verbose: &mut bool,
+    chose_a_mode: bool,
 ) -> Result<(), Stop> {
     let name = match word {
         "-v" | "--verbose" => "--verbose".to_string(),
@@ -563,7 +572,7 @@ fn option(
         "--verbose" => *verbose = true,
         "--list" => shell.say(MODE_LIST),
         "--noquote" => shell.layout.quote = Quote::Off,
-        "--quote" => return quote_option(shell, arguments, index),
+        "--quote" => return quote_option(shell, arguments, index, chose_a_mode),
         _ => {
             let Some(value) = arguments.get(*index).copied() else {
                 return if is_known_with_value(&name) {
@@ -618,12 +627,27 @@ fn is_known_with_value(name: &str) -> bool {
 
 /// `--quote ?ARG?`: with no argument, SQL quoting.
 ///
+/// **The next word is a mode name, and not the quoting, when no mode has been
+/// chosen yet** (bug hunt 10). `.mode --quote csv` turns quoting on and then
+/// selects `csv`, and `.mode --quote list` selects `list`; both used to read the
+/// mode name as the quoting and fail or do nothing. `off` is always the quoting,
+/// and once a mode is chosen any word is. This is `dotCmdMode`'s rule in sqlite3.
+///
 /// @param shell - the shell
 /// @param arguments - every word after `.mode`
 /// @param index - how many words have been read, advanced past the value
-fn quote_option(shell: &mut Shell, arguments: &[&str], index: &mut usize) -> Result<(), Stop> {
+/// @param chose_a_mode - whether a mode name came before `--quote`
+fn quote_option(
+    shell: &mut Shell,
+    arguments: &[&str],
+    index: &mut usize,
+    chose_a_mode: bool,
+) -> Result<(), Stop> {
     match arguments.get(*index).copied() {
-        Some(value) if !value.starts_with('-') => {
+        Some(value)
+            if !value.starts_with('-')
+                && (chose_a_mode || value == "off" || !names_a_mode(shell, value)) =>
+        {
             *index += 1;
             match Quote::from_name(value) {
                 Some(style) => {
@@ -632,9 +656,9 @@ fn quote_option(shell: &mut Shell, arguments: &[&str], index: &mut usize) -> Res
                 }
                 None => {
                     left_error(shell, *index, "unknown");
+                    let place = shell.error_location();
                     shell.complain(&format!(
-                        "line {}: should be off, on, sql, csv, html, tcl, json, or relaxed",
-                        shell.line
+                        "{place} should be off, on, sql, csv, html, tcl, json, or relaxed"
                     ));
                     Err(Stop::Done)
                 }
@@ -645,6 +669,17 @@ fn quote_option(shell: &mut Shell, arguments: &[&str], index: &mut usize) -> Res
             Ok(())
         }
     }
+}
+
+/// Reports whether a word names an output mode, a saved mode tag, `batch` or `tty`.
+///
+/// @param shell - the shell, which holds the saved tags
+/// @param word - the word
+fn names_a_mode(shell: &Shell, word: &str) -> bool {
+    let lowered = word.to_ascii_lowercase();
+    shell.mode_tags.contains_key(&lowered)
+        || matches!(lowered.as_str(), "batch" | "tty")
+        || Mode::from_name(&lowered).is_some()
 }
 
 /// Sets the quoting, and the text for NULL that goes with it when none was chosen.
@@ -666,13 +701,13 @@ fn set_quote(shell: &mut Shell, style: Quote) {
 /// @param word - which word
 /// @param reason - what is wrong
 fn left_error(shell: &mut Shell, word: usize, reason: &str) {
-    let line = shell.line;
+    let place = shell.error_location();
     let column = shell.dot_offsets.get(word).copied().unwrap_or(0);
     let typed = shell.dot_line.clone();
-    shell.complain(&format!("line {line}: {typed}"));
+    shell.complain(&format!("{place} {typed}"));
     let tag = format!("{reason} ---");
     let spaces = column.saturating_sub(tag.chars().count());
-    shell.complain(&format!("line {line}: {}{tag}^", " ".repeat(spaces)));
+    shell.complain(&format!("{place} {}{tag}^", " ".repeat(spaces)));
 }
 
 /// Applies an option that has a value.
@@ -694,9 +729,9 @@ fn valued_option(shell: &mut Shell, name: &str, value: &str, at: usize) -> Resul
             shell.layout.align = valid;
             if !all_valid {
                 word_error(shell, at, "bad alignment string");
-                let line = shell.line;
+                let place = shell.error_location();
                 shell.complain(&format!(
-                    "line {line}: Should contain only characters L, C, and R."
+                    "{place} Should contain only characters L, C, and R."
                 ));
                 return Err(Stop::Done);
             }
@@ -737,8 +772,8 @@ fn valued_option(shell: &mut Shell, name: &str, value: &str, at: usize) -> Resul
             "symbol" => shell.layout.escape = Escape::Symbol,
             _ => {
                 word_error(shell, at, "unknown escape type");
-                let line = shell.line;
-                shell.complain(&format!("line {line}: should be off, ascii, or symbol"));
+                let place = shell.error_location();
+                shell.complain(&format!("{place} should be off, ascii, or symbol"));
                 return Err(Stop::Done);
             }
         },
@@ -783,9 +818,9 @@ fn titles_option(shell: &mut Shell, value: &str, at: usize) -> Result<(), Stop> 
             }
             _ => {
                 word_error(shell, at, "bad --titles value");
-                let line = shell.line;
+                let place = shell.error_location();
                 shell.complain(&format!(
-                    "line {line}: should be off, on, plain, sql, csv, html, tcl, or json"
+                    "{place} should be off, on, plain, sql, csv, html, tcl, or json"
                 ));
                 return Err(Stop::Done);
             }
@@ -827,9 +862,9 @@ fn limits_option(shell: &mut Shell, value: &str, at: usize) -> Result<(), Stop> 
         }
         _ => {
             left_error(shell, at, "bad argument");
-            let line = shell.line;
+            let place = shell.error_location();
             shell.complain(&format!(
-                "line {line}: Should be \"L,C,T\" where L, C and T are unsigned integers"
+                "{place} Should be \"L,C,T\" where L, C and T are unsigned integers"
             ));
             return Err(Stop::Done);
         }
@@ -856,9 +891,9 @@ fn widths_option(shell: &mut Shell, value: &str) -> Result<(), Stop> {
             Ok(())
         }
         None => {
-            let line = shell.line;
+            let place = shell.error_location();
             shell.complain(&format!(
-                "line {line}: should be a comma-separated list if integers"
+                "{place} should be a comma-separated list if integers"
             ));
             Err(Stop::Done)
         }

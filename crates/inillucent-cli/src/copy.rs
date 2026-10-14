@@ -51,8 +51,8 @@ fn read_request<'a>(
                 continue;
             }
             unknown_option(shell, command, arguments, word);
-            let line = shell.line;
-            shell.complain(&format!("line {line}: should be -append or -async"));
+            let place = shell.error_location();
+            shell.complain(&format!("{place} should be -append or -async"));
             return None;
         }
         match (destination, schema) {

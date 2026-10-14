@@ -228,7 +228,15 @@ pub fn open(shell: &mut Shell, arguments: &[&str]) {
     let target = if path.is_empty() { ":memory:" } else { &path };
     if let Err(message) = shell.reopen_as(target, read_only) {
         substitute_memory(shell, &named, &message);
+        return;
     }
+    // `.connection` names a database by how it was opened (bug hunt 10).
+    let label = match request.named.as_deref() {
+        Some(":memory:") => Some(":memory:".to_string()),
+        Some("") => Some("(temporary-file)".to_string()),
+        _ => None,
+    };
+    shell.label_active(label);
 }
 
 /// Works out the file, and whether it opens read only and has to exist.
@@ -296,7 +304,12 @@ fn refusal(request: &Request, path: &str, must_exist: bool, read_only: bool) -> 
 /// @param named - the file as typed
 /// @param reason - why it could not be opened
 fn substitute_memory(shell: &mut Shell, named: &str, reason: &str) {
-    shell.complain(&format!(
+    // **Printed without marking the run as failed (bug hunt 10).** The reference
+    // reports the failed `.open`, switches to the in-memory database and carries
+    // on, so `.open --readonly missing.db` ends with exit status 0 and the
+    // arguments after it still run. This marked the run failed, which exited 1
+    // and stopped the remaining command line arguments.
+    shell.note(&format!(
         "Error: unable to open database \"{named}\": {reason}"
     ));
     shell.note(&format!(

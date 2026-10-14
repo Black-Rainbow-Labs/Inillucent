@@ -902,7 +902,9 @@ impl Context {
         if !self.readonly {
             return Ok(());
         }
-        match inillucent_driver::readonly::admits(sql) {
+        match inillucent_driver::readonly::admits(sql)
+            || inillucent_driver::readonly::fails_to_parse(sql)
+        {
             true => Ok(()),
             false => Err(Failed::said(
                 Status::ReadOnly,

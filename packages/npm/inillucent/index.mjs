@@ -807,7 +807,10 @@ function nativeAddon() {
 function nativeCall(native, conn, command, options) {
   const started = performance.now();
   try {
-    const result = native.query(conn, String(options.sql), options.params, true);
+    // The fifth argument makes the addon refuse a statement that is not a read,
+    // with status `readonly`, as the `inillucent query` program does. Without it
+    // `ATTACH ?1 AS o` reached the engine and came back `unsupported`.
+    const result = native.query(conn, String(options.sql), options.params, true, command === 'query');
     const limit = options.limit === undefined || options.limit === null ? 200 : Number(options.limit);
     const kept = command === 'query' && limit > 0 ? result.rows.slice(0, limit) : result.rows;
     return {
@@ -823,8 +826,25 @@ function nativeCall(native, conn, command, options) {
       elapsed_ms: performance.now() - started,
     };
   } catch (why) {
-    return { ok: false, command, status: why.code ?? 'internal', message: why.message };
+    return failureOf(command, why);
   }
+}
+
+/**
+ * Turns an error the addon threw into the failure object the program prints.
+ *
+ * `feature` is there when the engine named the construct it has not built, as
+ * it is in the program's JSON, so `error.feature` is the same on every route.
+ *
+ * @param command - the verb
+ * @param why - what the addon threw: `code` is the status name
+ */
+function failureOf(command, why) {
+  const failure = { ok: false, command, status: why.code ?? 'internal', message: why.message };
+  if (typeof why.feature === 'string') {
+    failure.feature = why.feature;
+  }
+  return failure;
 }
 
 /**
@@ -853,7 +873,7 @@ function nativeBatch(native, conn, options) {
       transaction: result.transaction,
     };
   } catch (why) {
-    return { ok: false, command: 'batch', status: why.code ?? 'internal', message: why.message };
+    return failureOf('batch', why);
   }
 }
 
@@ -889,7 +909,7 @@ function nativeOnce(command, options) {
   try {
     db = native.open(String(options.db ?? ':memory:'), flags);
   } catch (why) {
-    return { ok: false, command, status: why.code ?? 'internal', message: why.message };
+    return failureOf(command, why);
   }
   const conn = native.connect(db);
   try {
@@ -1050,10 +1070,11 @@ export class NativeSession {
     }
     let result;
     try {
-      result = this.native.query(this.conn, String(sql), options.params, false);
+      result = this.native.query(this.conn, String(sql), options.params, false, true);
     } catch (why) {
       const error = new Error(why.message);
       error.status = why.code ?? 'internal';
+      error.feature = why.feature;
       throw error;
     }
     const limit = options.limit === undefined || options.limit === null ? 200 : Number(options.limit);

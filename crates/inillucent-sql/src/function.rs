@@ -1088,7 +1088,9 @@ pub fn scalar_arity_ok(func: ScalarFunc, count: usize) -> bool {
         ScalarFunc::GeopolyContainsPoint => count == 3,
         ScalarFunc::GeopolyRegular => count == 4,
         ScalarFunc::GeopolyXform => count == 7,
-        ScalarFunc::GeopolySvg => count >= 1,
+        // SQLite registers `geopoly_svg` with any count and answers NULL for none
+        // (bug hunt 10); `geopoly_svg` in the scalar crate returns NULL for no polygon.
+        ScalarFunc::GeopolySvg => true,
         ScalarFunc::Replace => count == 3,
         // `iif` is `CASE` written as a call: pairs of a test and a value, with
         // an optional final answer. Two arguments is the shortest legal form

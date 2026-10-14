@@ -294,7 +294,7 @@ was built with a lower limit.
 inillucent capabilities
 ```
 
-`inillucent capabilities` lists 53 features, each marked `yes`, `partial` or `no`. A test runs
+`inillucent capabilities` lists 57 features, each marked `yes`, `partial` or `no`. A test runs
 every row against the engine, so the list matches what the engine does.
 
 ## Bring in an existing database
@@ -325,7 +325,11 @@ let rows = connection.query("SELECT id, body FROM note", &[], 200)?;
 
 The last argument of `query` is the most rows to return.
 
-Python, Node, Go and PHP packages call the same engine through its C library. The
+The Python `Database` class and the Node package call the same engine through its C library. The
+Go package, the PHP package and the Python functions `run` and `query` start the `inillucent`
+program and read the JSON it prints. The Node package also starts the program for a call that passes
+a `key` or a `root`, and for every command except `query`, `exec` and `batch`. The
+[drivers page](../drivers/README.md) lists the route each language takes. The
 [`inillucent-embed` skill](../agent-skills/inillucent-embed/SKILL.md) shows each language.
 
 ## Where to go next

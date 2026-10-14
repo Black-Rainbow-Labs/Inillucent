@@ -137,7 +137,10 @@ pub fn pragma_page() -> String {
     out.push_str("|---|---|---|\n");
     for entry in entries {
         let columns = if entry.columns.is_empty() {
-            "one unnamed column".to_string()
+            // **Named after the pragma (bug hunt 10).** The page said `one unnamed
+            // column`, and `PRAGMA cache_size` answers one column called `cache_size`,
+            // as the register's `boolean` row says.
+            format!("`{}`", entry.name)
         } else {
             entry
                 .columns

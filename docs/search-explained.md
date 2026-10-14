@@ -413,8 +413,8 @@ SELECT id, body FROM passage ORDER BY vector_distance_cos(v, '[1, 0, 0]') LIMIT 
 ```
 id  parent  notused  detail
 --  ------  -------  -------------------------------------------------
-0   0       0        SEARCH passage USING VECTOR INDEX passage_v (k=2)
-1   0       0        USE TEMP B-TREE FOR ORDER BY
+1   0       0        SEARCH passage USING VECTOR INDEX passage_v (k=2)
+2   0       0        USE TEMP B-TREE FOR ORDER BY
 ```
 
 The query did not change. The planner saw `ORDER BY` a distance with a `LIMIT` and asked the index

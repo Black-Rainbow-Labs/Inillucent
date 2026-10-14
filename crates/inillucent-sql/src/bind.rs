@@ -4277,9 +4277,8 @@ impl<'a> Binder<'a> {
             if func == function::TimeFunc::TimeDiff && list.len() != 2 {
                 return Err(wrong_arguments(&folded, span));
             }
-            if func == function::TimeFunc::StrfTime && list.is_empty() {
-                return Err(wrong_arguments(&folded, span));
-            }
+            // `strftime()` with no arguments is allowed: SQLite registers it with any
+            // count and answers NULL, and `datetime::call` does the same (bug hunt 10).
             let mut bound = Vec::with_capacity(list.len());
             for argument in &list {
                 bound.push(self.bind_expr(*argument)?);

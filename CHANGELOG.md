@@ -42,6 +42,30 @@ not continue it: always for the `curl` transport that macOS uses, and when it is
 in client, which resumes a partial file with a `Range` request. A model folder the failed run left
 empty is removed too.
 
+**The command line, the shell and the Node package agree with the documentation in several places.**
+
+- `inillucent query` and the MCP tool `inillucent_query` report `syntax` for a statement that does
+  not parse, such as `SELEC 1`. They reported `readonly`.
+- `PRAGMA aux.encryption` answers for the attached database `aux`. It answered for the main
+  database whatever the qualifier said.
+- `strftime()` and `geopoly_svg()` with no arguments return NULL, as in SQLite.
+- `inillucent-shell`: `.header off` works, as does any prefix of `.headers` that SQLite accepts.
+  `.mode --quote csv` and `.mode --quote list` read the mode name after `--quote` as SQLite does. A
+  usage error in a dot command given as an argument starts with `argv[N]:`. `.open --readonly
+  missing.db` reports the failure, switches to an in memory database and exits 0, as SQLite does.
+  `.trace stdout` writes each statement. `.archive` with no arguments prints the usage text.
+  `.connection` names a database opened as `:memory:` by that name.
+- The Node package's in process route carries `feature` on a failure, as the program route does,
+  and refuses a write through `query()` with status `readonly`. `ATTACH ?1 AS o` through `query()`
+  was `unsupported` on one route and `readonly` on the other.
+- The refusal of an FTS5 `tokenize='trigram'` says `the fts5 tokenizer trigram is not built`.
+- A JSON vector of the wrong width in a `VECTOR(N)` column, and in an `inillucent_search` table, says
+  it is not a vector of the declared width. The search table said `SQL logic error`.
+- `k = 1000001` on an `inillucent_search` table is refused. It was lowered to 1,000,000 without a
+  word.
+- `docs/pragmas.md` names the column each pragma answers. Pages that gave a count, a
+  message, a plan number or a path that differs from what the programs print now match them.
+
 ## 2.6.0, 13 October 2026
 
 **An `inillucent_search` table can tokenize a language other than English.** Until now every table

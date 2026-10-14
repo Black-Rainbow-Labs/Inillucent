@@ -121,7 +121,7 @@ connection, which is no key for a plaintext connection.
 
 | Pragma | What it does |
 |---|---|
-| `PRAGMA encryption` | answers `xchacha20-poly1305` for an encrypted database and `none` otherwise. It cannot be set |
+| `PRAGMA encryption` | answers `xchacha20-poly1305` for an encrypted database and `none` otherwise. It answers for the database the qualifier names, so `PRAGMA aux.encryption` reports the attached database `aux` and `PRAGMA main.encryption` reports the main one. It cannot be set: `PRAGMA encryption = 'x'` fails and says so |
 | `PRAGMA rekey = 'new key'` | changes the key of an encrypted database. It fails inside a transaction and on a read only connection |
 | `PRAGMA key = '...'` | refused. In SQLCipher it is the first statement of a connection. Here the key is given when the database is opened, because opening reads the file |
 

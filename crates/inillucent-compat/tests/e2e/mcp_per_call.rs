@@ -273,6 +273,35 @@ fn the_command_line_query_refuses_a_write() {
     assert!(counted.stdout.contains('0'), "{}", counted.said());
 }
 
+/// A statement that does not parse is `syntax` on `query`, on the command line
+/// and over MCP, and not `readonly`.
+///
+/// Bug hunt 10: `SELEC 1`, `FOO BAR` and `INSERT INTO` have no statement class
+/// that a read only filter can admit, so `query` reported `readonly` for a typo.
+#[test]
+fn a_statement_that_does_not_parse_is_a_syntax_error_on_query() {
+    let directory = area("query_syntax");
+    let database = directory.join("app.rdb").to_string_lossy().into_owned();
+    let binary = program("inillucent");
+    let made = run(&binary, &["--db", &database, "exec", "CREATE TABLE u (x)"]);
+    assert_eq!(made.code, 0, "{}", made.said());
+    let mut session = serve(&area("query_syntax_mcp"), &[]);
+    for sql in ["SELEC 1", "FOO BAR", "INSERT INTO"] {
+        let ran = run(
+            &binary,
+            &["--db", &database, "--output", "json", "query", sql],
+        );
+        assert_eq!(ran.code, 1, "{sql}: {}", ran.said());
+        assert_eq!(text_field(&ran.stdout, "status"), "syntax", "{sql}");
+        let status = status_of(
+            &mut session,
+            "inillucent_query",
+            &format!("{{\"sql\":\"{sql}\"}}"),
+        );
+        assert_eq!(status, "syntax", "mcp {sql}");
+    }
+}
+
 /// `params-file` of `-` is refused, and the next request is still answered.
 #[test]
 fn a_params_file_of_dash_does_not_read_the_protocol() {

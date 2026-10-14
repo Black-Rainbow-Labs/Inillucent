@@ -220,15 +220,15 @@ fn unknown(shell: &mut Shell, arguments: &[&str]) {
     /// What `.dbconfig ` occupies, which is where the argument begins.
     const COMMAND: usize = 10;
 
-    let line = shell.line;
+    let place = shell.error_location();
     let typed = format!(".dbconfig {}", arguments.join(" "));
-    shell.complain(&format!("line {line}: {typed}"));
+    shell.complain(&format!("{place} {typed}"));
     shell.complain(&format!(
-        "line {line}: {}^--- unknown dbconfig",
+        "{place} {}^--- unknown dbconfig",
         " ".repeat(COMMAND)
     ));
     shell.complain(&format!(
-        "line {line}: Enter \".dbconfig\" with no arguments for a list"
+        "{place} Enter \".dbconfig\" with no arguments for a list"
     ));
 }
 

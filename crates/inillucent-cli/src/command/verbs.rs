@@ -466,11 +466,15 @@ pub fn query(context: &mut Context, arguments: &Arguments) -> Result<Outcome, Fa
     // bypassed by choosing the other tool. The class is the parser's, the same
     // one `--readonly` uses.
     context.refuse_if_it_writes(&sql)?;
-    if !inillucent_driver::readonly::admits(&sql) {
+    // A statement that does not parse is passed on so the engine reports the
+    // syntax error; reporting `readonly` for a typo sent callers looking at the
+    // wrong problem.
+    if !inillucent_driver::readonly::admits(&sql)
+        && !inillucent_driver::readonly::fails_to_parse(&sql)
+    {
         return Err(Failed::said(
             Status::ReadOnly,
-            "query only reads, and that statement changes something or controls a \
-             transaction. Run it with exec (inillucent_exec), or with batch for several.",
+            inillucent_driver::readonly::QUERY_REFUSES_A_WRITE,
         ));
     }
     let params = bound_values(context, arguments)?;

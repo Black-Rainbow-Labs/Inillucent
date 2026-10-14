@@ -964,13 +964,21 @@ refused the request:
 | `500` | a check the service runs on its own writes failed, such as a journal entry that does not balance. Nothing was saved |
 | `501` | the engine answered `unsupported`: this build has not implemented a construct the SQL uses |
 
-## 17. What inillucent 1.0.30 got wrong, and what this example does about it
+## 17. Differences from SQLite that inillucent 1.0.30 had
 
-Building this example found these differences from SQLite 3.53.4. Each was checked against the
-pinned SQLite shell, and each is reported to the inillucent maintainers. The example avoids each one
-and says so in a comment where it does.
+The example builds on inillucent 1.0.30 from crates.io. Building it found the eleven differences
+from SQLite 3.53.4 in the table below. Each was checked against the pinned SQLite shell and reported
+to the inillucent maintainers, and each was fixed in a later release. `CHANGELOG.md` describes the
+fixes under "1.0.31 to 2.3.3", which covers 25 September to 7 October 2026.
 
-| Problem | What SQLite does | What the example does instead |
+On 13 October 2026 the ten SQL rows were run again against the current source and against the
+pinned `sqlite3`, and every one gave the same answer in both. `SharedDatabase` now runs every
+statement of a database on one session, so a TEMP table lasts from one statement to the next.
+
+The example still avoids each difference, because its manifest names inillucent 1.0.30. A comment
+at each place says so. Moving the example to a current release lets each of these workarounds go.
+
+| Problem in 1.0.30 | What SQLite does | What the example does instead |
 |---|---|---|
 | In a grouped query, `ORDER BY quantity` sorts by the table's `quantity` column when `quantity` is also the alias of `sum(quantity)` | sorts by the result column | the Z report's best sellers name the count `sold` |
 | `SharedDatabase` starts a new session for every statement. Each statement costs about 2.8 ms more than through one `Connection`, and a TEMP table is gone by the next statement | not applicable: SQLite connections keep their session | nothing. Section 18 has the numbers |
@@ -986,7 +994,8 @@ and says so in a comment where it does.
 
 ## 18. Performance
 
-Measured on 25 September 2026 on the seed database, 270 orders, on the development machine:
+Measured on 25 September 2026 with inillucent 1.0.30 on the seed database, 270 orders, on the
+development machine. These numbers have not been measured again on a later release:
 
 | What | Time |
 |---|---|
@@ -997,8 +1006,10 @@ Measured on 25 September 2026 on the seed database, 270 orders, on the developme
 | `seed`, 270 orders and their deliveries, payments and closes | 30 seconds |
 | thirty orders opened and paid in parallel over HTTP | 2.3 seconds |
 
-Almost all of the time in a request is the new session `SharedDatabase` starts for each statement.
-The same statements through one `Connection` take a hundredth of it.
+In 1.0.30 almost all of the time in a request was the new session `SharedDatabase` started for each
+statement, and the same statements through one `Connection` took a hundredth of it. A later release
+keeps one session for the life of the database, so this cost no longer applies. Moving the example
+to that release would change the table above.
 
 ## 19. Tests
 

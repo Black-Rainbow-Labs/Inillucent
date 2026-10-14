@@ -146,7 +146,7 @@ impl ImportedDatabase {
             // Encryption at rest. None of the three is on SQLite's own list;
             // `key` and `rekey` are SQLCipher's names, so a script written for
             // it gets an answer that says where the key goes here.
-            b"encryption" => self.pragma_encryption(argument),
+            b"encryption" => self.pragma_encryption(argument, at),
             b"rekey" => self.pragma_rekey(argument, at),
             b"key" => self.pragma_key(),
             // A setting is silent in SQLite, which answers no row. This build keeps its own page
