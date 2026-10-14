@@ -39,6 +39,7 @@ mod fts5_bulk_edits;
 mod fts5_legacy_layout;
 mod functions;
 mod hostile;
+mod import_memory;
 mod levers;
 mod limited_writes;
 mod long_keys_at_every_page_size;

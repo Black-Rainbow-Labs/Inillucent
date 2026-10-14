@@ -215,36 +215,323 @@ fn mode_defaults(shell: &Shell) -> (char, char, bool) {
     }
 }
 
-/// Reads a file as text, keeping the bytes that are not UTF-8.
+/// How many bytes of the file are read at a time.
+const BLOCK: usize = 1 << 20;
+
+/// The most rows one `INSERT` statement takes.
 ///
-/// **A file that is not UTF-8 is data, not an error.** `sqlite3` reads the bytes
-/// of a cp1252 CSV and stores them as they are, and a table imported from one
-/// prints the bytes it was given. The file was refused here, with a message
-/// about its encoding, for the one byte of content that differs from an ASCII
-/// file. The bytes are carried through as described in `crate::raw`.
+/// A batch is converted to the engine's values and inserted as one statement, and that conversion
+/// is what a batch costs in memory. 20,000 rows of a few fields each is a few megabytes.
+const BATCH_ROWS: usize = 20_000;
+
+/// A delimited file, read a block at a time into text that starts at the beginning of a row.
+struct RowSource {
+    /// Where the bytes come from.
+    input: Box<dyn std::io::Read>,
+    /// Bytes read that end in the middle of a character, kept until the rest of it is read.
+    tail: Vec<u8>,
+    /// The decoded text from the start of the first row that has not been reported.
+    text: String,
+    /// The line of the file `text` starts on.
+    line: usize,
+    /// Whether the last block reached the end of the file.
+    ended: bool,
+    /// Whether the first block has been read, which is when a byte order mark is dropped.
+    started: bool,
+    /// How many bytes the next read asks for. It doubles when a block held no complete row, so a
+    /// row of any length is read in a number of reads that grows with its logarithm.
+    block: usize,
+}
+
+impl RowSource {
+    /// Returns a source over some bytes.
+    ///
+    /// @param input - the file, or the output of the command a name beginning with `|` runs
+    fn new(input: Box<dyn std::io::Read>) -> RowSource {
+        RowSource {
+            input,
+            tail: Vec::new(),
+            text: String::new(),
+            line: 1,
+            ended: false,
+            started: false,
+            block: BLOCK,
+        }
+    }
+
+    /// Reads the next block and adds its text to the text held.
+    ///
+    /// **A character cut by the end of the block waits for the rest of it.** Decoding the
+    /// block's bytes as they are would turn the two halves of one character into stand ins for
+    /// bytes that are not UTF-8, which is a different value from the file's. The bytes of the
+    /// unfinished character are kept and read again with the next block. A UTF-8 byte order mark
+    /// is dropped from the start of the file, as it was when the file was read whole.
+    fn read_block(&mut self) -> std::io::Result<()> {
+        use std::io::Read;
+        let mut bytes = std::mem::take(&mut self.tail);
+        let before = bytes.len();
+        // The first read is at least three bytes, so a byte order mark is whole when it is looked
+        // for.
+        let wanted = if self.started {
+            self.block
+        } else {
+            self.block.max(3)
+        };
+        (&mut self.input)
+            .take(wanted as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len().saturating_sub(before) < wanted {
+            self.ended = true;
+        }
+        if !self.started {
+            self.started = true;
+            if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                bytes.drain(..3);
+            }
+        }
+        let cut = if self.ended {
+            bytes.len()
+        } else {
+            whole_characters(&bytes)
+        };
+        self.tail = bytes.split_off(cut);
+        self.text.push_str(&crate::raw::decode(&bytes));
+        Ok(())
+    }
+}
+
+/// Returns how many leading bytes end on a character boundary, or at the end of a sequence that
+/// cannot be finished.
+///
+/// A character is at most four bytes, so only the last three bytes can be the start of one that
+/// the end of a block cut.
+///
+/// @param bytes - the bytes of a block
+fn whole_characters(bytes: &[u8]) -> usize {
+    let length = bytes.len();
+    for back in 1..=3usize.min(length) {
+        let at = length - back;
+        let needed = match bytes.get(at).copied() {
+            Some(0x80..=0xBF) => continue,
+            Some(0xC0..=0xDF) => 2,
+            Some(0xE0..=0xEF) => 3,
+            Some(0xF0..=0xF7) => 4,
+            _ => return length,
+        };
+        return if needed > back { at } else { length };
+    }
+    length
+}
+
+/// Reads a file window by window, giving the complete rows of each window to `take`.
+///
+/// **The whole file is never held.** A window is the text from the first row not yet reported to
+/// the end of the block just read, so what is held is a block plus the part of a row that was
+/// cut. `take` is told how many row separators the window's rows used, and answers whether to
+/// go on.
+///
+/// @param source - the file
+/// @param separators - what ends a field, and what ends a row
+/// @param quoted - whether a field may be quoted
+/// @param take - receives the rows of each window and the row separators they used
+fn each_window(
+    source: &mut RowSource,
+    separators: (char, char),
+    quoted: bool,
+    mut take: impl FnMut(Vec<Row<'_>>, usize) -> bool,
+) -> std::io::Result<()> {
+    loop {
+        if !source.ended {
+            source.read_block()?;
+        }
+        let (consumed, line, going) = {
+            let window = parse_window(&source.text, separators, quoted, source.line, source.ended);
+            let used = source.text.get(..window.consumed).unwrap_or_default();
+            let lines = used.matches(separators.1).count();
+            (window.consumed, window.line, take(window.rows, lines))
+        };
+        source.text.drain(..consumed);
+        source.line = line;
+        if !going || source.ended {
+            return Ok(());
+        }
+        if consumed == 0 {
+            source.block = source.block.saturating_mul(2);
+        }
+    }
+}
+
+/// Opens the file, or the command whose output is the file.
 ///
 /// A name that begins with `|` is a command, and its output is the file.
 ///
 /// @param path - the file to read, or `|` and a command
-fn read_text(path: &str) -> Result<String, String> {
-    let mut bytes = match path.strip_prefix('|') {
-        Some(command) => crate::commands::capture_output(command)
-            .ok_or_else(|| "the command could not be run".to_string())?,
-        None => std::fs::read(path).map_err(|error| error.to_string())?,
-    };
-    // **A UTF-8 byte order mark is not data.** Excel and Notepad write one at
-    // the start of a CSV file, and it was kept as the first three bytes of the
-    // first field: the first column of a new table was named BOM plus `id`, so
-    // `SELECT id` failed with "no such column", and into an existing table the
-    // first value became the text BOM plus `1` instead of the integer 1.
-    // SQLite's `.import` drops it.
-    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        bytes.drain(..3);
+fn open_input(path: &str) -> Result<Box<dyn std::io::Read>, String> {
+    match path.strip_prefix('|') {
+        Some(command) => {
+            let bytes = crate::commands::capture_output(command)
+                .ok_or_else(|| "the command could not be run".to_string())?;
+            Ok(Box::new(std::io::Cursor::new(bytes)))
+        }
+        None => std::fs::File::open(path)
+            .map(|file| Box::new(file) as Box<dyn std::io::Read>)
+            .map_err(|error| error.to_string()),
     }
-    Ok(crate::raw::decode(&bytes))
+}
+
+/// Where the rows of an import go, once the table is known.
+struct Target {
+    /// How many columns the table has, which is how many fields a row needs. Zero when there is
+    /// nothing to insert into.
+    columns: usize,
+    /// The `INSERT` with one parameter for each column.
+    sql: String,
+    /// Whether the import opened the transaction the rows go in.
+    began: bool,
+}
+
+/// What a `.import` has done so far, across the windows of the file.
+struct Load<'a> {
+    /// How the file is read.
+    reading: &'a Reading<'a>,
+    /// The file name as the person typed it, for the messages.
+    named: &'a str,
+    /// How many rows of `--skip` have still to be dropped.
+    skip_left: usize,
+    /// The table and statement, once the first row that is not skipped has been reached.
+    target: Option<Target>,
+    /// Whether the import was stopped by the table: a view, or a file with no header.
+    refused: bool,
+    /// How many rows went in.
+    added: usize,
+    /// How many rows the table refused.
+    errors: usize,
+    /// How many row separators the file held.
+    lines: usize,
+}
+
+impl<'a> Load<'a> {
+    /// Returns the state of an import that has read nothing.
+    ///
+    /// @param reading - how the file is read
+    /// @param named - the file name as the person typed it
+    fn new(reading: &'a Reading<'a>, named: &'a str) -> Load<'a> {
+        Load {
+            reading,
+            named,
+            skip_left: reading.skip,
+            target: None,
+            refused: false,
+            added: 0,
+            errors: 0,
+            lines: 0,
+        }
+    }
+
+    /// Takes the complete rows of one window: drops the rows `--skip` names, creates the table
+    /// from the header when there is none, and inserts the rest in batches.
+    ///
+    /// **A fault in a row that is skipped is still reported:** the reference reads the row to skip
+    /// it. The view check and the check for the table wait for the first row that is not
+    /// skipped, so the warnings for the rows before it come first, as they did when the file was
+    /// read whole. Answers whether to read on.
+    ///
+    /// @param shell - the shell whose database receives the rows
+    /// @param rows - the window's complete rows
+    /// @param lines - how many row separators those rows used
+    fn take(&mut self, shell: &mut Shell, mut rows: Vec<Row<'_>>, lines: usize) -> bool {
+        self.lines = self.lines.saturating_add(lines);
+        let skipped = self.skip_left.min(rows.len());
+        for row in rows.iter().take(skipped) {
+            for note in &row.notes {
+                warn(shell, &note_text(note, self.named));
+            }
+        }
+        rows.drain(..skipped);
+        self.skip_left -= skipped;
+        if rows.is_empty() {
+            return true;
+        }
+        if self.target.is_none() && !self.prepare(shell, &mut rows) {
+            self.refused = true;
+            return false;
+        }
+        for batch in rows.chunks(BATCH_ROWS) {
+            self.insert_batch(shell, batch);
+        }
+        true
+    }
+
+    /// Checks the table the rows go into, creates it from the header when it is not there, and
+    /// opens the transaction.
+    ///
+    /// @param shell - the shell whose database receives the rows
+    /// @param rows - the rows that are not skipped, which lose the header when the table is made
+    ///   from it
+    fn prepare(&mut self, shell: &mut Shell, rows: &mut Vec<Row<'_>>) -> bool {
+        let schema = self.reading.schema.unwrap_or("main");
+        let table = self.reading.table;
+        if is_view(shell, schema, table) {
+            shell.complain(&format!(
+                "Error: cannot modify {table} because it is a view"
+            ));
+            return false;
+        }
+        if !table_exists(shell, schema, table)
+            && !create_from_header(shell, self.reading, self.named, rows)
+        {
+            return false;
+        }
+        self.target = Some(open_target(shell, self.reading));
+        true
+    }
+
+    /// Inserts one batch of rows and counts what went in and what was refused.
+    ///
+    /// @param shell - the shell whose database receives the rows
+    /// @param rows - the batch
+    fn insert_batch(&mut self, shell: &mut Shell, rows: &[Row<'_>]) {
+        let Some(target) = self.target.as_ref() else {
+            return;
+        };
+        let (added, errors) = insert_batch(shell, target, rows, self.named);
+        self.added = self.added.saturating_add(added);
+        self.errors = self.errors.saturating_add(errors);
+    }
+
+    /// Ends the import: commits the transaction and says what was done when `-v` asked for it.
+    ///
+    /// A file with no rows after the skipped ones still has its table checked, so an empty file
+    /// is reported and a table that exists is left as it is.
+    ///
+    /// @param shell - the shell whose database received the rows
+    fn finish(mut self, shell: &mut Shell) {
+        if self.target.is_none() && !self.refused {
+            let mut none = Vec::new();
+            self.refused = !self.prepare(shell, &mut none);
+        }
+        if let Some(target) = self.target.take() {
+            if target.began {
+                if let Err(message) = shell.execute("COMMIT") {
+                    shell.complain(&format!("Error: {message}"));
+                }
+            }
+        }
+        if !self.refused && self.reading.verbose > 0 {
+            shell.say(&format!(
+                "Added {} rows with {} errors using {} lines of input",
+                self.added, self.errors, self.lines
+            ));
+        }
+    }
 }
 
 /// Reads a file into a table.
+///
+/// **The file is read a block at a time and inserted a batch at a time**, so the memory an import
+/// needs is a block and a batch and does not grow with the file. It parsed every row of the file
+/// before it inserted the first, and 1,000,000 rows peaked at 536 to 679 MB where `sqlite3`
+/// stays near 10 MB.
 ///
 /// @param shell - the shell whose database receives the rows
 /// @param arguments - the words after `.import`
@@ -264,13 +551,10 @@ pub fn import(shell: &mut Shell, arguments: &[&str]) {
             None => return,
         }
     };
-    let text = match read_text(&path) {
-        Ok(text) => text,
-        Err(_) => {
-            let place = shell.error_location();
-            shell.complain(&format!("{place} cannot open \"{named}\""));
-            return;
-        }
+    let Ok(input) = open_input(&path) else {
+        let place = shell.error_location();
+        shell.complain(&format!("{place} cannot open \"{named}\""));
+        return;
     };
     if reading.verbose > 0 {
         let note = format!(
@@ -280,40 +564,20 @@ pub fn import(shell: &mut Shell, arguments: &[&str]) {
         );
         shell.say(&note);
     }
-    let mut rows = parse(
-        &text,
-        reading.separator,
-        reading.quoted,
-        reading.row_separator,
-    );
-    // A fault in a row that is skipped is still reported: the reference reads
-    // the row to skip it.
-    let skipped = reading.skip.min(rows.len());
-    for row in rows.iter().take(skipped) {
-        for note in &row.notes {
-            warn(shell, &note_text(note, named));
-        }
+    let separators = (reading.separator, reading.row_separator);
+    let mut source = RowSource::new(input);
+    let mut load = Load::new(&reading, named);
+    let read = each_window(&mut source, separators, reading.quoted, |rows, lines| {
+        load.take(shell, rows, lines)
+    });
+    if read.is_err() {
+        // A file that cannot be read at all is reported as one that cannot be opened, as it was
+        // when the file was read whole; one that fails part way is reported where it stopped.
+        let place = shell.error_location();
+        let what = if source.started { "read" } else { "open" };
+        shell.complain(&format!("{place} cannot {what} \"{named}\""));
     }
-    rows.drain(..skipped);
-    let schema = reading.schema.unwrap_or("main");
-    let table = reading.table;
-    if is_view(shell, schema, table) {
-        shell.complain(&format!(
-            "Error: cannot modify {table} because it is a view"
-        ));
-        return;
-    }
-    if !table_exists(shell, schema, table) && !create_from_header(shell, &reading, named, &mut rows)
-    {
-        return;
-    }
-    let (added, errors) = insert(shell, &reading, &rows, named);
-    if reading.verbose > 0 {
-        let lines = text.matches(reading.row_separator).count();
-        shell.say(&format!(
-            "Added {added} rows with {errors} errors using {lines} lines of input"
-        ));
-    }
+    load.finish(shell);
 }
 
 /// Creates a table from the first row of the file and removes that row.
@@ -465,7 +729,7 @@ fn collides(names: &[String], repeated: &[bool], zeros: usize, digits: usize) ->
     })
 }
 
-/// Inserts every parsed row, reporting each line that will not go in.
+/// Opens the transaction the rows go in, and returns the statement that inserts them.
 ///
 /// One prepared statement for the whole file. Compiling an `INSERT` per row is
 /// the obvious way to write this and it is the wrong one: the statement is
@@ -474,24 +738,21 @@ fn collides(names: &[String], repeated: &[bool], zeros: usize, digits: usize) ->
 ///
 /// The rows are inserted in a transaction of their own when none is open, and
 /// the transaction is committed even when some rows were rejected, because the
-/// rows that went in are what the person asked for. Returns how many rows went in
-/// and how many were refused.
+/// rows that went in are what the person asked for.
 ///
 /// @param shell - the shell whose database receives the rows
 /// @param reading - how the import reads its file
-/// @param rows - the file's rows after the header
-/// @param named - the file name as the person typed it, for the messages
-fn insert(
-    shell: &mut Shell,
-    reading: &Reading<'_>,
-    rows: &[Row<'_>],
-    named: &str,
-) -> (usize, usize) {
+fn open_target(shell: &mut Shell, reading: &Reading<'_>) -> Target {
     let schema = reading.schema.unwrap_or("main");
     let table = reading.table;
+    let none = Target {
+        columns: 0,
+        sql: String::new(),
+        began: false,
+    };
     let columns = column_count(shell, schema, table);
     if columns == 0 {
-        return (0, 0);
+        return none;
     }
     let marks: Vec<&str> = std::iter::repeat_n("?", columns).collect();
     let target = match reading.schema {
@@ -510,10 +771,40 @@ fn insert(
     if own_transaction {
         if let Err(message) = shell.execute("BEGIN") {
             shell.complain(&format!("Error: {message}"));
-            return (0, 0);
+            return none;
         }
     }
-    let complaints = fill(&shell.connection(), &sql, rows, columns, named);
+    Target {
+        columns,
+        sql,
+        began: own_transaction,
+    }
+}
+
+/// Inserts a batch of parsed rows, reporting each line that will not go in.
+///
+/// Returns how many rows went in and how many were refused.
+///
+/// @param shell - the shell whose database receives the rows
+/// @param target - the statement and the table's width
+/// @param rows - the batch of the file's rows after the header
+/// @param named - the file name as the person typed it, for the messages
+fn insert_batch(
+    shell: &mut Shell,
+    target: &Target,
+    rows: &[Row<'_>],
+    named: &str,
+) -> (usize, usize) {
+    if target.columns == 0 {
+        return (0, 0);
+    }
+    let complaints = fill(
+        &shell.connection(),
+        &target.sql,
+        rows,
+        target.columns,
+        named,
+    );
     let mut errors = 0usize;
     for complaint in &complaints {
         if complaint.error {
@@ -527,11 +818,6 @@ fn insert(
             }
         } else {
             warn(shell, &complaint.text);
-        }
-    }
-    if own_transaction {
-        if let Err(message) = shell.execute("COMMIT") {
-            shell.complain(&format!("Error: {message}"));
         }
     }
     (rows.len().saturating_sub(errors), errors)
@@ -765,7 +1051,43 @@ fn column_count(shell: &Shell, schema: &str, table: &str) -> usize {
 /// @param separator - what ends a field
 /// @param quoted - whether a field may be quoted
 /// @param row_separator - what ends a row
+#[cfg(test)]
 fn parse(text: &str, separator: char, quoted: bool, row_separator: char) -> Vec<Row<'_>> {
+    parse_window(text, (separator, row_separator), quoted, 1, true).rows
+}
+
+/// The rows a window of the file held, and how much of the window they used.
+struct Window<'a> {
+    /// The rows that ended inside the window.
+    rows: Vec<Row<'a>>,
+    /// How many bytes of the window the rows used, which is where the next window starts.
+    consumed: usize,
+    /// The line of the file the next window starts on.
+    line: usize,
+}
+
+/// Splits the start of a file into the rows that are complete, and says where they end.
+///
+/// **A row is complete when its row separator has been read outside a quoted field.** Unless
+/// `last` says the window ends the file, a row that has not ended, and a quoted field that runs
+/// to the end of the window, are left alone and not reported: the caller reads more of the file
+/// and gives the same row again, from its first character. So a row of any length is read whole,
+/// the fields are the ones [`parse`] gives for the whole file, and the line numbers continue from
+/// `start_line`. For a window that is the whole file this is `parse`.
+///
+/// @param text - the window: the file from the start of a row
+/// @param separators - what ends a field, and what ends a row
+/// @param quoted - whether a field may be quoted
+/// @param start_line - the line of the file the window starts on
+/// @param last - whether the window ends the file
+fn parse_window(
+    text: &str,
+    separators: (char, char),
+    quoted: bool,
+    start_line: usize,
+    last: bool,
+) -> Window<'_> {
+    let (separator, row_separator) = separators;
     let mut rows = Vec::new();
     let mut row: Vec<Cow<'_, str>> = Vec::new();
     let mut notes: Vec<Note> = Vec::new();
@@ -773,8 +1095,10 @@ fn parse(text: &str, separator: char, quoted: bool, row_separator: char) -> Vec<
     let mut characters = text.char_indices().peekable();
     let mut anything = false;
     let mut run = 0usize;
-    let mut line = 1usize;
-    let mut row_line = 1usize;
+    let mut line = start_line;
+    let mut row_line = start_line;
+    let mut consumed = 0usize;
+    let mut cut_short = false;
     while let Some((at, character)) = characters.next() {
         // The line count follows every row separator, quoted or not, because
         // SQLite's does: a quoted field with a newline in it moves the next
@@ -784,12 +1108,17 @@ fn parse(text: &str, separator: char, quoted: bool, row_separator: char) -> Vec<
         }
         match character {
             '"' if quoted && field.is_empty() && run == at => {
-                let (value, term) = read_quoted(
+                let (value, term, ran_out) = read_quoted(
                     &mut characters,
                     (separator, row_separator),
                     &mut line,
                     &mut notes,
+                    last,
                 );
+                if ran_out {
+                    cut_short = true;
+                    break;
+                }
                 row.push(Cow::Owned(value));
                 anything = true;
                 run = characters.peek().map_or(text.len(), |&(next, _)| next);
@@ -805,6 +1134,7 @@ fn parse(text: &str, separator: char, quoted: bool, row_separator: char) -> Vec<
                         });
                         anything = false;
                         row_line = line;
+                        consumed = run;
                     }
                     None => {
                         rows.push(Row {
@@ -813,6 +1143,7 @@ fn parse(text: &str, separator: char, quoted: bool, row_separator: char) -> Vec<
                             notes: core::mem::take(&mut notes),
                         });
                         anything = false;
+                        consumed = text.len();
                     }
                 }
             }
@@ -838,20 +1169,32 @@ fn parse(text: &str, separator: char, quoted: bool, row_separator: char) -> Vec<
                 anything = false;
                 run = at + character.len_utf8();
                 row_line = line;
+                consumed = run;
             }
             _ => anything = true,
         }
     }
-    let last = finished(&mut field, text, run, text.len());
-    if anything || !last.is_empty() || !row.is_empty() {
-        row.push(last);
+    if cut_short || !last {
+        return Window {
+            rows,
+            consumed,
+            line: row_line,
+        };
+    }
+    let tail = finished(&mut field, text, run, text.len());
+    if anything || !tail.is_empty() || !row.is_empty() {
+        row.push(tail);
         rows.push(Row {
             line: row_line,
             fields: row,
             notes,
         });
     }
-    rows
+    Window {
+        rows,
+        consumed: text.len(),
+        line: row_line,
+    }
 }
 
 /// Reads the rest of a quoted field, the opening quote already taken.
@@ -865,18 +1208,22 @@ fn parse(text: &str, separator: char, quoted: bool, row_separator: char) -> Vec<
 /// quoted field is reported as unterminated. The characters after a stray quote
 /// were previously joined to the text before it, which is a different value.
 ///
-/// Returns the field and what ended it: none for the end of the file.
+/// Returns the field and what ended it: none for the end of the file. The last value is true when
+/// the text ended before the field did and the text is not the end of the file, which means the
+/// field has to be read again from more of the file.
 ///
 /// @param characters - the file after the opening quote
 /// @param separators - the column separator and the row separator
 /// @param line - the line the reader has reached, which a row separator advances
 /// @param notes - where faults are recorded
+/// @param last - whether the text ends the file
 fn read_quoted(
     characters: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
     separators: (char, char),
     line: &mut usize,
     notes: &mut Vec<Note>,
-) -> (String, Option<char>) {
+    last: bool,
+) -> (String, Option<char>, bool) {
     let (separator, row_separator) = separators;
     let start_line = *line;
     let mut value = String::new();
@@ -884,6 +1231,11 @@ fn read_quoted(
     let mut before_previous: Option<char> = None;
     loop {
         let current = characters.next().map(|(_, character)| character);
+        // A quote at the very end of a window may be the closing one or the first of a doubled
+        // pair, and only the character after it says which, so the field is read again.
+        if current.is_none() && !last {
+            return (value, None, true);
+        }
         if current == Some(row_separator) {
             *line += 1;
         }
@@ -904,7 +1256,7 @@ fn read_quoted(
                     break;
                 }
             }
-            return (value, current);
+            return (value, current, false);
         }
         if previous == Some('"') && current != Some('\r') {
             notes.push(Note {
@@ -917,7 +1269,7 @@ fn read_quoted(
                 line: start_line,
                 kind: NoteKind::Unterminated,
             });
-            return (value, None);
+            return (value, None, false);
         };
         value.push(character);
         before_previous = previous;
@@ -1071,6 +1423,102 @@ mod tests {
         let text = "a\u{1f}line\none\u{1e}c\u{1f}d\u{1e}";
         let rows = parse(text, UNIT_SEPARATOR, false, RECORD_SEPARATOR);
         assert_eq!(fields(&rows), vec![vec!["a", "line\none"], vec!["c", "d"]]);
+    }
+
+    /// Returns every row of a file as a window at a time reads it: the line it began on, its
+    /// fields, and how many faults it had.
+    ///
+    /// @param bytes - the file
+    /// @param block - how many bytes each read asks for
+    /// @param quoted - whether a field may be quoted
+    fn windowed(bytes: &[u8], block: usize, quoted: bool) -> Vec<(usize, Vec<String>, usize)> {
+        let mut source = RowSource::new(Box::new(std::io::Cursor::new(bytes.to_vec())));
+        source.block = block;
+        let mut seen = Vec::new();
+        each_window(&mut source, (',', '\n'), quoted, |rows, _| {
+            for row in rows {
+                let fields = row.fields.iter().map(|field| field.to_string()).collect();
+                seen.push((row.line, fields, row.notes.len()));
+            }
+            true
+        })
+        .expect("a cursor reads");
+        seen
+    }
+
+    /// Reading a file a window at a time gives the rows, the line numbers and the faults that
+    /// reading it whole gives, for every block size, including a block that ends inside a
+    /// quoted field, between the two quotes of a doubled quote, between a carriage return and a
+    /// line feed, and inside a character of more than one byte.
+    #[test]
+    fn windows_give_the_rows_of_the_whole_file() {
+        let files = [
+            "a,b\n1,2\n3,4\n",
+            "a,b\r\n1,2\r\n3,4",
+            "id,note\n1,\"line\none\"\n2,\"say \"\"hi\"\", ok\"\n3,plain\n",
+            "x,\"unterminated\nstill going",
+            "x,\"a\"b\",c\n1,2\n",
+            "caf\u{e9},\u{1f600},\u{4e2d}\u{6587}\n\u{1f600},2\n",
+            "\n\n,\n,,\n",
+            "\"\",\"\"\"\",\"a\"\"\"\n1,2\n",
+            "one\n",
+            "",
+        ];
+        for text in files {
+            let whole = parse(text, ',', true, '\n');
+            let expected: Vec<(usize, Vec<String>, usize)> = whole
+                .iter()
+                .map(|row| {
+                    (
+                        row.line,
+                        row.fields.iter().map(|field| field.to_string()).collect(),
+                        row.notes.len(),
+                    )
+                })
+                .collect();
+            for block in [1usize, 2, 3, 5, 8, 13, 64, 1 << 20] {
+                assert_eq!(
+                    windowed(text.as_bytes(), block, true),
+                    expected,
+                    "{text:?} read {block} bytes at a time"
+                );
+            }
+        }
+    }
+
+    /// A byte order mark is dropped from the start of the file, and bytes that are not UTF-8
+    /// come through as the same stand ins whatever the block size.
+    #[test]
+    fn windows_drop_the_byte_order_mark_and_keep_bytes_that_are_not_utf8() {
+        let mut file = vec![0xEF, 0xBB, 0xBF];
+        file.extend_from_slice(b"a,caf\xE9\n\xE4\xB8,2\n");
+        let whole = crate::raw::decode(file.get(3..).unwrap_or_default());
+        let expected: Vec<(usize, Vec<String>, usize)> = parse(&whole, ',', true, '\n')
+            .iter()
+            .map(|row| {
+                (
+                    row.line,
+                    row.fields.iter().map(|field| field.to_string()).collect(),
+                    row.notes.len(),
+                )
+            })
+            .collect();
+        for block in [1usize, 2, 3, 4, 7, 1 << 20] {
+            assert_eq!(windowed(&file, block, true), expected, "block {block}");
+        }
+    }
+
+    /// A row longer than the block is read whole.
+    #[test]
+    fn a_row_longer_than_the_block_is_read_whole() {
+        let field = "x".repeat(10_000);
+        let text = format!("a,{field}\n1,2\n");
+        let seen = windowed(text.as_bytes(), 16, true);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen.first().map(|row| row.1.get(1).map(String::len)),
+            Some(Some(10_000))
+        );
     }
 
     /// Returns the names a header gives, as owned strings.
