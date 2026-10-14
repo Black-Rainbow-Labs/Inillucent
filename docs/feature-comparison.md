@@ -712,6 +712,13 @@ new name, checks every tree in it before it returns, and refuses to overwrite a 
 `VACUUM` inside a transaction is refused with SQLite's message, `cannot VACUUM from within a
 transaction`.
 
+`VACUUM aux` and `VACUUM temp` act on the database they name and leave `main` alone.
+`VACUUM aux INTO 'copy.rdb'` writes a rebuilt copy of the attached database `aux`. `VACUUM aux`
+without `INTO` folds the log of the attached file into the file and does not rebuild it, because
+another process that has the same file attached would keep writing to the old file after a
+rename. Use `VACUUM aux INTO` and replace the file when the space matters. SQLite writes an empty
+database for `VACUUM temp INTO`, and this engine writes a copy of the temporary tables.
+
 ### Syntax and parameters
 
 | case | feature | result |

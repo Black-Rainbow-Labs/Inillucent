@@ -1160,7 +1160,20 @@ impl crate::ImportedDatabase {
         );
         // The parameter count is not of interest here: this is a generated
         // `DELETE` with no parameters in it.
-        let (mut compiled, _) = self.compile(&statement)?;
+        // **A key that cannot be enforced does not stop a drop.** A `DELETE` from
+        // a table whose key names a missing parent fails to compile with `no such
+        // table` (SQLite does the same for the statement), while the implicit
+        // delete of a `DROP TABLE` ignores such errors, so the drop goes ahead
+        // (bug hunt 10).
+        let broken = owner
+            .foreign_key_triggers
+            .iter()
+            .any(|planned| planned.trigger.is_none());
+        let (mut compiled, _) = match self.compile(&statement) {
+            Ok(compiled) => compiled,
+            Err(_) if broken => return Ok(()),
+            Err(error) => return Err(error),
+        };
         if let Cached::Delete(delete, _) = &mut compiled {
             delete
                 .triggers

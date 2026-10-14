@@ -75,6 +75,12 @@ const REFUSED_IN_SAFE_MODE: &[&str] = &[
 /// @param shell - the shell
 /// @param name - the command's name, without its leading dot
 fn refused_by_safe_mode(shell: &mut Shell, name: &str) -> bool {
+    if shell.no_programs && matches!(name, "shell" | "system") {
+        shell.complain(&format!(
+            "Error: .{name} is prohibited when the database is opened read only"
+        ));
+        return true;
+    }
     if !REFUSED_IN_SAFE_MODE.contains(&name) {
         return false;
     }

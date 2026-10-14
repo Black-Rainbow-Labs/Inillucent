@@ -77,7 +77,7 @@ pub fn insert_cached(
         };
         insert_rows(statement, target, params, &rows, depth, &setup.compiled)
     });
-    written.map_err(|error| outer_unwind(error, statement.on_conflict))
+    written.map_err(|error| outer_unwind_for_insert(error, statement))
 }
 
 /// Returns the setup kept for this statement when it is still valid, and

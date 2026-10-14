@@ -347,6 +347,7 @@ fn text(body: &[u8]) -> DbResult<String> {
 /// Returns the error every malformed document reports.
 fn malformed() -> inillucent_base::DbError {
     inillucent_base::DbError::primary(inillucent_base::PrimaryCode::Error)
+        .with_message("malformed JSON")
         .with_detail("malformed JSON")
 }
 

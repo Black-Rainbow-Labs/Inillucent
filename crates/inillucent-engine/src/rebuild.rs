@@ -78,7 +78,34 @@ pub(crate) fn rebuild_into(
     page_size: usize,
     frames: usize,
 ) -> DbResult<()> {
-    let captured = capture_schema(source);
+    rebuild_schema_into(vfs, source, crate::MAIN, destination, page_size, frames)
+}
+
+/// Rebuilds one schema of a connection into a fresh file.
+///
+/// **`VACUUM <schema> INTO` rebuilt `main` whatever it was given.** The rebuild
+/// read `main`'s catalog and queried unqualified table names, so `VACUUM m INTO
+/// 'f'` wrote a copy of `main` and called it `m` (bug hunt 10). Everything the
+/// rebuild reads now comes from `schema`: its catalog rows, its rows through
+/// qualified names, its sequences and its header fields. The fresh file always
+/// holds the copy as its own `main`, which is what an attached database is once
+/// it is opened by itself.
+///
+/// @param vfs - the file system the fresh file is made on
+/// @param source - the connection holding the schema
+/// @param schema - the schema to copy, as the binder numbers them
+/// @param destination - the file to write, which must not exist
+/// @param page_size - the page size the new file is laid out with
+/// @param frames - how many frames its pool is given
+pub(crate) fn rebuild_schema_into(
+    vfs: std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    source: &ImportedDatabase,
+    schema: usize,
+    destination: &Path,
+    page_size: usize,
+    frames: usize,
+) -> DbResult<()> {
+    let captured = capture_schema(source, schema);
     let mut fresh = ImportedDatabase::create_on(vfs, destination.to_path_buf(), page_size, frames)
         .map_err(|error| {
             inillucent_base::error::misuse(format!(
@@ -96,7 +123,10 @@ pub(crate) fn rebuild_into(
     // placed at the start of the file by the rule a file in that mode follows. The
     // mode is the one the connection will have after the rebuild: the file's own, or
     // the one a `PRAGMA auto_vacuum` asked for on a file that already held tables.
-    let mode = source.pragmas.auto_vacuum();
+    let mode = match source.schema_file(schema) {
+        Some(file) if schema != crate::MAIN => file.auto_vacuum(),
+        _ => source.pragmas.auto_vacuum(),
+    };
     if mode != 0 {
         fresh.apply_auto_vacuum_mode(crate::MAIN, mode, true)?;
     }
@@ -108,9 +138,9 @@ pub(crate) fn rebuild_into(
         if entry.kind != ObjectKind::Table || entry.owns_shadows {
             continue;
         }
-        copy_rows(source, &mut fresh, &entry.name, entry.shadow)?;
+        copy_rows(source, schema, &mut fresh, &entry.name, entry.shadow)?;
     }
-    carry_sequences(source, &mut fresh)?;
+    carry_sequences(source, schema, &mut fresh)?;
     replay_schema(&mut fresh, &captured, |entry| {
         entry.kind == ObjectKind::Index
     })?;
@@ -118,7 +148,7 @@ pub(crate) fn rebuild_into(
         matches!(entry.kind, ObjectKind::View | ObjectKind::Trigger)
     })?;
     fresh.commit_batch()?;
-    carry_header(source, &mut fresh).map_err(|error| {
+    carry_header(source, schema, &mut fresh).map_err(|error| {
         inillucent_base::error::misuse(format!("VACUUM could not carry the header: {error}"))
     })?;
     fresh.checkpoint().map_err(|error| {
@@ -129,21 +159,23 @@ pub(crate) fn rebuild_into(
     Ok(())
 }
 
-/// Reads the schema of `main` into something that outlives the source.
+/// Reads the schema of one database into something that outlives the source.
 ///
 /// @param source - the database being rebuilt
-fn capture_schema(source: &ImportedDatabase) -> Vec<Captured> {
+/// @param schema - the schema to read, as the binder numbers them
+fn capture_schema(source: &ImportedDatabase, schema: usize) -> Vec<Captured> {
     source
-        .main_entries()
+        .entries_of(schema)
         .iter()
+        .map(|held| &held.entry)
         .filter(|entry| !entry.sql.is_empty())
         .filter(|entry| !entry.name.starts_with(b"sqlite_"))
         .map(|entry| Captured {
             kind: entry.kind,
             name: entry.name.clone(),
             sql: entry.sql.clone(),
-            shadow: source.is_shadow_table(&entry.name),
-            owns_shadows: source.owns_shadow_tables(&entry.name),
+            shadow: source.is_shadow_table_in(&entry.name, schema),
+            owns_shadows: source.owns_shadow_tables_in(&entry.name, schema),
         })
         .collect()
 }
@@ -187,24 +219,30 @@ fn replay_schema(
 /// reaching around it.
 ///
 /// @param source - the database being rebuilt
+/// @param schema - the schema the table is read from, as the binder numbers them
 /// @param fresh - the database being built
 /// @param table - the table's name, as written
 fn copy_rows(
     source: &ImportedDatabase,
+    schema: usize,
     fresh: &mut ImportedDatabase,
     table: &[u8],
     shadow: bool,
 ) -> DbResult<()> {
     let name = quoted(table);
-    let paged = can_be_read_in_pages(source, table);
+    // The read is qualified so a table of the same name in another schema is
+    // never the one copied; the write is not, because the fresh file holds the
+    // copy as its own `main`.
+    let source_name = format!("{}.{name}", quoted(&source.schema_name_of(schema)));
+    let paged = can_be_read_in_pages(source, schema, table);
     let mut after: Option<i64> = None;
     let mut limit = FIRST_PAGE_ROWS;
     let mut writer: Option<RowWriter> = None;
     loop {
         let (rows, columns, last) = match paged {
-            true => read_page(source, &name, after, limit)?,
+            true => read_page(source, &source_name, after, limit)?,
             false => {
-                let (rows, columns) = source.run(&format!("SELECT * FROM {name}"))?;
+                let (rows, columns) = source.run(&format!("SELECT * FROM {source_name}"))?;
                 (rows, columns, None)
             }
         };
@@ -212,7 +250,9 @@ fn copy_rows(
             return Ok(());
         }
         if writer.is_none() {
-            writer = Some(RowWriter::prepare(source, fresh, table, shadow, &columns)?);
+            writer = Some(RowWriter::prepare(
+                source, schema, fresh, table, shadow, &columns,
+            )?);
         }
         limit = rows_for_a_page(&rows);
         if let Some(prepared) = writer.as_ref() {
@@ -241,14 +281,15 @@ const PAGE_BYTES: usize = 8 * 1024 * 1024;
 /// Any other table is read whole, as it always was.
 ///
 /// @param source - the database being rebuilt
+/// @param schema - the schema the table is read from
 /// @param table - the table's name, as written
-fn can_be_read_in_pages(source: &ImportedDatabase, table: &[u8]) -> bool {
+fn can_be_read_in_pages(source: &ImportedDatabase, schema: usize, table: &[u8]) -> bool {
     let folded = table.to_ascii_lowercase();
     source
         .schema
         .tables
         .iter()
-        .find(|held| held.folded == folded && held.database == crate::MAIN)
+        .find(|held| held.folded == folded && held.database == schema)
         .is_some_and(|held| {
             held.kind == inillucent_sql::catalog_view::TableKind::Table
                 && held.has_rowid()
@@ -329,12 +370,14 @@ impl RowWriter {
     /// Prepares the `INSERT` for a table.
     ///
     /// @param source - the database being rebuilt
+    /// @param schema - the schema the table is read from
     /// @param fresh - the database being built
     /// @param table - the table's name, as written
     /// @param shadow - whether the table is a virtual table's shadow table
     /// @param columns - the column names the source returned
     fn prepare(
         source: &ImportedDatabase,
+        schema: usize,
         fresh: &mut ImportedDatabase,
         table: &[u8],
         shadow: bool,
@@ -352,7 +395,7 @@ impl RowWriter {
             .schema
             .tables
             .iter()
-            .find(|held| held.folded == folded && held.database == crate::MAIN)
+            .find(|held| held.folded == folded && held.database == schema)
             .map(|held| {
                 held.columns
                     .iter()
@@ -469,16 +512,24 @@ const ROWS_PER_STATEMENT: usize = 20_000;
 /// `sqlite_sequence` as it is. Found by the bug hunt's ORM schemas.
 ///
 /// @param source - the database being rebuilt
+/// @param schema - the schema whose sequences are carried, as the binder numbers them
 /// @param fresh - the database being built
-fn carry_sequences(source: &ImportedDatabase, fresh: &mut ImportedDatabase) -> DbResult<()> {
+fn carry_sequences(
+    source: &ImportedDatabase,
+    schema: usize,
+    fresh: &mut ImportedDatabase,
+) -> DbResult<()> {
     let has_sequences = source
-        .main_entries()
+        .entries_of(schema)
         .iter()
-        .any(|entry| entry.name.eq_ignore_ascii_case(b"sqlite_sequence"));
+        .any(|held| held.entry.name.eq_ignore_ascii_case(b"sqlite_sequence"));
     if !has_sequences {
         return Ok(());
     }
-    let (rows, _) = source.run("SELECT name, seq FROM main.sqlite_sequence")?;
+    let (rows, _) = source.run(&format!(
+        "SELECT name, seq FROM {}.sqlite_sequence",
+        quoted(&source.schema_name_of(schema))
+    ))?;
     let empty = inillucent_exec::physical::Params::new();
     fresh.execute_any("DELETE FROM main.sqlite_sequence", &empty)?;
     for row in rows {
@@ -502,24 +553,31 @@ fn carry_sequences(source: &ImportedDatabase, fresh: &mut ImportedDatabase) -> D
 /// across a `VACUUM` for the same reason.
 ///
 /// @param source - the database being rebuilt
+/// @param schema - the schema whose header fields are carried, as the binder numbers them
 /// @param fresh - the database being built
-fn carry_header(source: &ImportedDatabase, fresh: &mut ImportedDatabase) -> DbResult<()> {
+fn carry_header(
+    source: &ImportedDatabase,
+    schema: usize,
+    fresh: &mut ImportedDatabase,
+) -> DbResult<()> {
+    // A `temp` the connection never made is an empty database with nothing to
+    // carry.
+    let Some(file) = source.schema_file(schema) else {
+        return Ok(());
+    };
     // The vacuum mode was applied before the first table, so the roots are where
     // the mode keeps them, and SQLite keeps the mode across a `VACUUM`.
     // **WAL mode is in the header as well, and it outlives the connection.**
     // It was not carried, so a database in WAL mode came out of `VACUUM` in
     // `delete` mode and stayed there on every later open; SQLite keeps it.
-    fresh
-        .storage
-        .database
-        .set_wal_mode(source.storage.database.wal_mode());
+    fresh.storage.database.set_wal_mode(file.wal_mode());
     let empty = inillucent_exec::physical::Params::new();
     fresh.execute_any(
-        &format!("PRAGMA user_version={}", source.user_version()),
+        &format!("PRAGMA user_version={}", file.user_version()),
         &empty,
     )?;
     fresh.execute_any(
-        &format!("PRAGMA application_id={}", source.application_id()),
+        &format!("PRAGMA application_id={}", file.application_id()),
         &empty,
     )?;
     Ok(())
@@ -1162,17 +1220,31 @@ impl ImportedDatabase {
     /// place keeps the checkpoint, because it then renames the result over the
     /// file another process is reading.
     ///
+    /// Takes the schema to copy, so `VACUUM temp INTO` and `VACUUM aux INTO` write
+    /// that database and not `main` (bug hunt 10).
+    ///
+    /// @param schema - the schema to copy, as the binder numbers them
     /// @param destination - the file to write, which must not already exist
-    pub(crate) fn rebuild_copy_into(&mut self, destination: &std::path::Path) -> DbResult<()> {
-        match self.checkpoint() {
+    pub(crate) fn rebuild_schema_copy_into(
+        &mut self,
+        schema: usize,
+        destination: &std::path::Path,
+    ) -> DbResult<()> {
+        match self.checkpoint_outside_the_ddl_schema() {
             Err(error) if error.code() == inillucent_base::error::PrimaryCode::Busy => {}
             other => other?,
         }
-        self.rebuild_without_checkpoint(destination)
+        crate::rebuild::rebuild_schema_into(
+            std::sync::Arc::clone(&self.storage.vfs),
+            self,
+            schema,
+            destination,
+            self.storage.page_size,
+            self.storage.frames,
+        )
     }
 
-    /// The rebuild both [`ImportedDatabase::rebuild_into`] and
-    /// [`ImportedDatabase::rebuild_copy_into`] run once the checkpoint is decided.
+    /// The rebuild [`ImportedDatabase::rebuild_into`] runs once the checkpoint is done.
     ///
     /// @param destination - the file to write, which must not already exist
     fn rebuild_without_checkpoint(&mut self, destination: &std::path::Path) -> DbResult<()> {
@@ -1185,6 +1257,53 @@ impl ImportedDatabase {
         )
     }
 
+    /// Runs `VACUUM` on `temp` or an attached database.
+    ///
+    /// **Folds the schema's log into its file and leaves the file where it is.**
+    /// `main` is rebuilt and renamed over, which is safe because every process
+    /// that opens `main` checks for a replaced file (`file_was_replaced`).
+    /// Nothing checks for that on an attached file, so another process that
+    /// had the same file attached would keep writing to the old inode after a
+    /// rename and its commits would be lost without an error. The pages of an
+    /// attached or temporary database are returned to its free map as they are
+    /// released, as they are for `main`, so what a rebuild would add is a
+    /// smaller file; `VACUUM <schema> INTO` still produces that, and the
+    /// statement leaves the schema exactly as it was, which is what it did to
+    /// every row before this existed. Before bug hunt 10 the statement rebuilt
+    /// `main` and put its catalog in place of the named schema's.
+    ///
+    /// @param schema - the schema to vacuum, as the binder numbers them
+    pub(crate) fn vacuum_schema_in_place(&mut self, schema: usize) -> DbResult<()> {
+        if self.schema_file(schema).is_none() {
+            // A connection that never made a temporary table has no `temp`
+            // yet, and SQLite vacuums the empty one without complaint.
+            if schema == crate::TEMP {
+                return Ok(());
+            }
+            return Err(refusal(format!(
+                "unknown database {}",
+                String::from_utf8_lossy(&self.schema_name_of(schema))
+            )));
+        }
+        self.checkpoint_outside_the_ddl_schema()
+    }
+
+    /// Checkpoints with `main` as the schema the catalog primitives write to.
+    ///
+    /// **`execute_ddl` sets the statement's schema for the primitives that
+    /// write catalog rows, and a checkpoint writes catalog rows of its own.**
+    /// The checkpoint refreshes the statistics of `main`'s tables first, and
+    /// with the schema of `VACUUM aux` still selected those rows went into
+    /// `aux`'s catalog: `aux.sqlite_master` then listed `main`'s tables and
+    /// `aux`'s own were gone (bug hunt 10). `VACUUM` creates and drops nothing,
+    /// so it has no use for the selection.
+    fn checkpoint_outside_the_ddl_schema(&mut self) -> DbResult<()> {
+        let selected = std::mem::replace(&mut self.schema.ddl_schema, crate::MAIN);
+        let checkpointed = self.checkpoint();
+        self.schema.ddl_schema = selected;
+        checkpointed
+    }
+
     /// Rebuilds this database into a database held in memory, and discards it.
     ///
     /// **What `VACUUM INTO ':memory:'` and `VACUUM INTO ''` do.** SQLite opens
@@ -1192,13 +1311,14 @@ impl ImportedDatabase {
     /// and closes it, so the statement succeeds and leaves nothing behind. It is
     /// still a full rebuild, which is what makes it a check that the schema and
     /// every row can be replayed.
-    pub(crate) fn rebuild_into_memory(&mut self) -> DbResult<()> {
-        self.checkpoint()?;
+    pub(crate) fn rebuild_into_memory(&mut self, schema: usize) -> DbResult<()> {
+        self.checkpoint_outside_the_ddl_schema()?;
         let vfs: std::sync::Arc<dyn inillucent_vfs::Vfs> =
             std::sync::Arc::new(inillucent_vfs::memory::MemoryVfs::new());
-        crate::rebuild::rebuild_into(
+        crate::rebuild::rebuild_schema_into(
             vfs,
             self,
+            schema,
             std::path::Path::new("vacuum-into-memory.rdb"),
             self.storage.page_size,
             self.storage.frames,

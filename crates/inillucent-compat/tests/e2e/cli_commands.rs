@@ -368,6 +368,123 @@ fn run_reports_an_unbuilt_construct_as_unsupported() {
     );
 }
 
+/// A JSON function's error reaches the caller with the function's own sentence.
+///
+/// The JSON functions put their sentence in the error's detail only, and the
+/// command line and MCP report the message, so `json('{')` came back as `SQL
+/// logic error` where the shell printed `malformed JSON` (bug hunt 10). Each
+/// of the five forms the report listed is run and its message compared with
+/// the sentence SQLite's function reports.
+#[test]
+fn a_json_function_error_keeps_its_own_message() {
+    let binary = program("inillucent");
+    let database = populated(&binary, "json-errors");
+    let path = database.to_string_lossy().to_string();
+    for (sql, message) in [
+        ("SELECT json('{')", "malformed JSON"),
+        ("SELECT json_extract('{}', 'a')", "bad JSON path: 'a'"),
+        ("SELECT json_set('{}', '$..', 1)", "bad JSON path: '$..'"),
+        (
+            "SELECT json_object('a')",
+            "json_object() requires an even number of arguments",
+        ),
+        (
+            "SELECT json_object(1, 2)",
+            "json_object() labels must be TEXT",
+        ),
+    ] {
+        let ran = run(&binary, &["--db", &path, "query", sql, "--output", "json"]);
+        assert_eq!(ran.code, 1, "`{sql}` exited {}:\n{}", ran.code, ran.stdout);
+        assert_eq!(
+            text_field(&ran.stdout, "message"),
+            message,
+            "`{sql}` reported:\n{}",
+            ran.stdout
+        );
+    }
+}
+
+/// `--readonly` refuses `.shell` and `.system`, and a surface without it runs them.
+///
+/// `inillucent --readonly run ".shell ..."` ran the program, and a program can
+/// write files anywhere the process can, so a surface that promised not to
+/// write did (bug hunt 10). The first half shows the command writes a file on
+/// an ordinary surface, so the second half is able to fail.
+#[test]
+fn readonly_refuses_the_commands_that_run_a_program() {
+    let binary = program("inillucent");
+    let database = populated(&binary, "readonly-shell");
+    let path = database.to_string_lossy().to_string();
+    // The program prints a word to the standard output it inherits, which shows
+    // it ran without depending on how the platform's shell redirects to a file.
+    let open = run(
+        &binary,
+        &[
+            "--db",
+            &path,
+            "run",
+            ".shell echo programran",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(open.code, 0, "{}\n{}", open.stdout, open.stderr);
+    assert!(
+        open.stdout.contains("programran"),
+        "`.shell` on a surface that is not read only did not run:\n{}",
+        open.stdout
+    );
+
+    for command in [".shell", ".system"] {
+        let line = format!("{command} echo programran");
+        let refused = run(
+            &binary,
+            &[
+                "--db",
+                &path,
+                "--readonly",
+                "run",
+                &line,
+                "--output",
+                "json",
+            ],
+        );
+        assert_eq!(
+            refused.code, 1,
+            "{command}: {}\n{}",
+            refused.stdout, refused.stderr
+        );
+        assert!(
+            text_field(&refused.stdout, "message").contains("prohibited"),
+            "{command} was not refused by name:\n{}",
+            refused.stdout
+        );
+        assert!(
+            !refused.stdout.contains("programran"),
+            "`{command}` ran on a read only surface:\n{}",
+            refused.stdout
+        );
+    }
+
+    let read = run(
+        &binary,
+        &[
+            "--db",
+            &path,
+            "--readonly",
+            "run",
+            "SELECT count(*) FROM note;",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(
+        read.code, 0,
+        "a read on a read only surface: {}",
+        read.stdout
+    );
+}
+
 /// A `.once` in a script handed to `run` writes its file.
 ///
 /// **The defect `export --out` was reported for was the shell's, not the

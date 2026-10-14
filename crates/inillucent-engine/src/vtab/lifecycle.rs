@@ -202,6 +202,13 @@ impl crate::ImportedDatabase {
                     .iter()
                     .find(|recorded| recorded.entry.name.to_ascii_lowercase() == shadow_name)
                 else {
+                    // A shadow another table owns, read and not made, may be a
+                    // table that does not exist: `fts5vocab(nosuch, row)` was
+                    // created that way and reports it when it is read (bug hunt
+                    // 10). The module is connected without the root.
+                    if shadow.owner.is_some() && found.reads_tables_that_may_be_missing() {
+                        continue;
+                    }
                     // **Refused rather than skipped.** A module connected
                     // without one of its shadow tables is a module that will
                     // answer wrongly rather than fail - it may even create a

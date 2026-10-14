@@ -157,11 +157,10 @@ impl ImportedDatabase {
             // Creating it would put a second, empty copy of somebody else's
             // storage beside the real one.
             if let Some(owner) = &shadow.owner {
-                let root = self.existing_shadow_root(owner, &shadow.suffix)?;
-                connect.shadows.push(ShadowRoot {
-                    suffix: shadow.suffix.clone(),
-                    root,
-                });
+                let tolerant = found.reads_tables_that_may_be_missing();
+                connect
+                    .shadows
+                    .extend(self.owned_shadow_root(owner, &shadow.suffix, tolerant)?);
                 continue;
             }
             // `%` stands for the virtual table's own name, which is what makes
@@ -322,6 +321,33 @@ impl ImportedDatabase {
         Ok(())
     }
 
+    /// Returns the connection root for a shadow table another object owns.
+    ///
+    /// **A shadow that is not there yet is left unconnected, not refused, for a
+    /// module that says it can cope (bug hunt 10).** `CREATE VIRTUAL TABLE v
+    /// USING fts5vocab(nosuch, row)` succeeds in SQLite, which looks the target
+    /// up when `v` is read and reports the missing table then. Any other module
+    /// keeps the refusal.
+    ///
+    /// @param owner - the table the shadows belong to
+    /// @param suffix - which shadow
+    /// @param tolerant - whether the module accepts a missing table
+    fn owned_shadow_root(
+        &self,
+        owner: &[u8],
+        suffix: &[u8],
+        tolerant: bool,
+    ) -> DbResult<Option<ShadowRoot>> {
+        match self.existing_shadow_root(owner, suffix) {
+            Ok(root) => Ok(Some(ShadowRoot {
+                suffix: suffix.to_vec(),
+                root,
+            })),
+            Err(_) if tolerant => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Returns the root of a shadow table another object already owns.
     ///
     /// The catalog rows are the authority, as they are at open time, and a name
@@ -410,12 +436,18 @@ impl ImportedDatabase {
     /// through the module as before.
     ///
     /// @param name - the table's name, as written
-    pub(crate) fn owns_shadow_tables(&self, name: &[u8]) -> bool {
+    ///
+    /// A virtual table of the same name in another schema is not the one asked
+    /// about, which the name alone cannot tell apart.
+    ///
+    /// @param database - the schema the table is in, as the binder numbers them
+    pub(crate) fn owns_shadow_tables_in(&self, name: &[u8], database: usize) -> bool {
         let folded = name.to_ascii_lowercase();
         let Some(connected) = self.session_state.virtual_tables.get(&folded) else {
             return false;
         };
-        shadow_names(&connected.arguments).any(|held| held != folded)
+        connected.arguments.database == database
+            && shadow_names(&connected.arguments).any(|held| held != folded)
     }
 
     /// Returns what a module says about its own storage.

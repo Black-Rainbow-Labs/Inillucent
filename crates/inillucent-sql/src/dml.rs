@@ -545,20 +545,51 @@ fn can_replace(table: &TableInfo, statement: Option<ConflictAction>) -> bool {
         })
 }
 
+/// Rewrites the failure of a `DEFAULT` that names a function nothing has.
+///
+/// **SQLite does not look a default's function up at `CREATE TABLE`.** It
+/// stores the text, and the first statement that evaluates the default fails
+/// with `unknown function: nosuchfn()`, a different sentence from the `no such
+/// function: nosuchfn` a `CHECK` or an ordinary expression reports. Binding the
+/// default with the common message made the engine's create-time probe
+/// (`declarations_resolve`) refuse the table, since that probe passes on any
+/// failure but `no such function` (bug hunt 10). Giving the default its own
+/// sentence matches the reference's text at the insert and leaves the probe
+/// with nothing to refuse.
+///
+/// @param error - what binding the default's text failed with
+fn unknown_default_function(error: ParseError) -> ParseError {
+    let crate::ParseErrorKind::Refused(said) = &error.kind else {
+        return error;
+    };
+    match said.strip_prefix("no such function: ") {
+        Some(name) => ParseError::new(
+            crate::ParseErrorKind::Refused(format!("unknown function: {name}()")),
+            error.span,
+        ),
+        None => error,
+    }
+}
+
 /// Reports whether an unusable key's fault is one this write has to report.
 ///
 /// A child's write reports a missing parent; a parent's write reports a
 /// mismatch. A statement that touches neither side of the broken key does not
 /// have to care, which is why the fault is carried rather than raised when the
 /// schema was read.
+///
+/// **A delete from the child reports it too.** `DELETE FROM child` where the
+/// child's key names a table that does not exist fails in SQLite with `no such
+/// table: main.t1`, because it looks the parent up before it knows there is no
+/// row to remove (bug hunt 10). It was reported only for a delete from the
+/// parent's side.
 fn fault_applies(
     planned: &crate::catalog_view::ForeignKeyTrigger,
     event: &TriggerEventInfo,
 ) -> bool {
     match event {
         TriggerEventInfo::Insert => planned.is_check,
-        TriggerEventInfo::Delete => !planned.is_check,
-        TriggerEventInfo::Update(_) => true,
+        TriggerEventInfo::Delete | TriggerEventInfo::Update(_) => true,
     }
 }
 
@@ -868,7 +899,18 @@ impl<'a> Binder<'a> {
         if !can_replace(table, on_conflict) {
             return Ok(Vec::new());
         }
-        let bound = self.bind_triggers(table, TriggerEventInfo::Delete, &[])?;
+        // **A written delete trigger that cannot be bound is left out.** With
+        // `recursive_triggers` off, which is the default, SQLite never compiles
+        // these triggers for a `REPLACE`, so `INSERT OR REPLACE` into a table
+        // whose `AFTER DELETE` trigger names a table that does not exist
+        // succeeds when no row is replaced, and when one is. The binder cannot
+        // see the pragma (a statement is cached across it), so a trigger that
+        // fails to bind is skipped here instead of failing every `REPLACE` into
+        // the table (bug hunt 10). With the pragma on, SQLite reports the
+        // missing table when the statement is compiled and this does not.
+        let bound = self
+            .bind_triggers(table, TriggerEventInfo::Delete, &[])
+            .unwrap_or_default();
         Ok(self
             .bind_foreign_keys(table, TriggerEventInfo::Delete, &[])?
             .around(bound))
@@ -1310,9 +1352,12 @@ impl<'a> Binder<'a> {
         };
         let mut bound = KeyTriggers::default();
         for planned in &live.foreign_key_triggers {
-            if planned.is_check && (planned.deferred || self.defer_foreign_keys) {
-                continue;
-            }
+            // **A key that cannot be enforced reports its fault whether or not
+            // its check is deferred.** The deferral skip came first, so
+            // `DEFERRABLE INITIALLY DEFERRED` on a key to a table that does not
+            // exist let the insert succeed where SQLite fails it with `no such
+            // table: main.t1`: what a deferred key waits for is the count of
+            // violations, and there is no parent to count against (bug hunt 10).
             let Some(trigger) = planned.trigger.as_ref() else {
                 if fault_applies(planned, &event) {
                     return Err(crate::bind::schema_refused(
@@ -1322,6 +1367,9 @@ impl<'a> Binder<'a> {
                 }
                 continue;
             };
+            if planned.is_check && (planned.deferred || self.defer_foreign_keys) {
+                continue;
+            }
             if !trigger.fires_for(&event, changed) {
                 continue;
             }
@@ -2182,7 +2230,7 @@ impl<'a> Binder<'a> {
         {
             return Ok(BoundExpr::Text(ast.text(*column).to_vec()));
         }
-        self.bind_schema_expr(sql)
+        self.bind_schema_expr(sql).map_err(unknown_default_function)
     }
 
     /// Binds the `DEFAULT` of every `NOT NULL` column that declares one.

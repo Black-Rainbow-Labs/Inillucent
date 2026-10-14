@@ -897,53 +897,32 @@ impl<'a> Binder<'a> {
                 strict,
             } => (columns, constraints, without_rowid, strict),
         };
-        // First, because SQLite meets `PRIMARY KEY(... AUTOINCREMENT)` before it
-        // looks at what the key names.
-        self.check_table_autoincrement(columns, constraints, *without_rowid)?;
-        for (_, constraint) in constraints {
-            match constraint {
-                ast::TableConstraint::PrimaryKey { columns, .. }
-                | ast::TableConstraint::Unique { columns, .. } => refuse_nulls_order(columns)?,
-                _ => {}
-            }
-        }
-        self.check_table_shape(self.ast.text(name), columns, constraints)?;
-        self.check_table_declarations(self.ast.text(name), columns, constraints)?;
-        if *without_rowid && !self.declares_primary_key(columns, constraints) {
-            return Err(schema_refused(
-                format!(
-                    "PRIMARY KEY missing on table {}",
-                    String::from_utf8_lossy(self.ast.text(name))
-                ),
-                Span::default(),
-            ));
-        }
-        self.check_autoincrement(columns, *without_rowid)?;
-        self.check_column_collations(columns)?;
-        if *strict {
-            self.check_strict(columns, name)?;
-        }
-        let refusal = self.check_generated(columns, constraints)?;
-        self.refuse_all_generated(columns)?;
-        if columns.is_empty() {
-            return Err(refused(
-                "a table must have at least one column",
-                Span::default(),
-            ));
-        }
+        // **Held, not returned yet.** SQLite reads the definition only for a
+        // table it is going to make: `CREATE TABLE IF NOT EXISTS t1(...)` on a
+        // table that exists returns before any of these checks, so a
+        // definition SQLite would refuse succeeds there (bug hunt 10). The
+        // error is returned below, after the checks that came after it before,
+        // unless the statement turns out to be that no-op.
+        let definition =
+            self.check_table_definition(name, columns, constraints, *without_rowid, *strict);
         let index = match temp {
             Some(index) => index,
-            None => self.resolve_database(database)?,
+            None => match self.resolve_database(database) {
+                Ok(index) => index,
+                Err(error) => return Err(definition.err().unwrap_or(error)),
+            },
         };
         let written = self.ast.text(name).to_vec();
         if !self.writable_schema && written.to_ascii_lowercase().starts_with(b"sqlite_") {
-            return Err(refused(
-                format!(
-                    "object name reserved for internal use: {}",
-                    String::from_utf8_lossy(&written)
-                ),
-                Span::default(),
-            ));
+            return Err(definition.err().unwrap_or_else(|| {
+                refused(
+                    format!(
+                        "object name reserved for internal use: {}",
+                        String::from_utf8_lossy(&written)
+                    ),
+                    Span::default(),
+                )
+            }));
         }
         let folded = self.ast.folded(name).to_vec();
         let database_name = self.catalog.database_name(index).to_vec();
@@ -951,6 +930,11 @@ impl<'a> Binder<'a> {
             .catalog
             .find_table(Some(database_name.as_slice()), &folded)
             .is_some();
+        let refusal = match definition {
+            Ok(refusal) => refusal,
+            Err(_) if exists && if_not_exists => None,
+            Err(error) => return Err(error),
+        };
         if exists && !if_not_exists {
             return Err(self.already_exists(&database_name, &folded, name));
         }
@@ -966,6 +950,63 @@ impl<'a> Binder<'a> {
             exists,
             refusal,
         })
+    }
+
+    /// Checks a `CREATE TABLE` definition, and returns the refusal a generated
+    /// column leaves for the run time to report.
+    ///
+    /// Everything in here is something SQLite checks once it knows the table
+    /// is new, so [`Binder::bind_create_table`] can set the error aside when
+    /// `IF NOT EXISTS` names a table that is there.
+    ///
+    /// @param name - the table's name
+    /// @param columns - the columns, in written order
+    /// @param constraints - the table constraints, in written order
+    /// @param without_rowid - whether `WITHOUT ROWID` was written
+    /// @param strict - whether `STRICT` was written
+    fn check_table_definition(
+        &mut self,
+        name: ast::NameId,
+        columns: &[ast::ColumnDef],
+        constraints: &[(Option<ast::NameId>, ast::TableConstraint)],
+        without_rowid: bool,
+        strict: bool,
+    ) -> Result<Option<String>, ParseError> {
+        // First, because SQLite meets `PRIMARY KEY(... AUTOINCREMENT)` before it
+        // looks at what the key names.
+        self.check_table_autoincrement(columns, constraints, without_rowid)?;
+        for (_, constraint) in constraints {
+            match constraint {
+                ast::TableConstraint::PrimaryKey { columns, .. }
+                | ast::TableConstraint::Unique { columns, .. } => refuse_nulls_order(columns)?,
+                _ => {}
+            }
+        }
+        self.check_table_shape(self.ast.text(name), columns, constraints)?;
+        self.check_table_declarations(self.ast.text(name), columns, constraints)?;
+        if without_rowid && !self.declares_primary_key(columns, constraints) {
+            return Err(schema_refused(
+                format!(
+                    "PRIMARY KEY missing on table {}",
+                    String::from_utf8_lossy(self.ast.text(name))
+                ),
+                Span::default(),
+            ));
+        }
+        self.check_autoincrement(columns, without_rowid)?;
+        self.check_column_collations(columns)?;
+        if strict {
+            self.check_strict(columns, name)?;
+        }
+        let refusal = self.check_generated(columns, constraints)?;
+        self.refuse_all_generated(columns)?;
+        if columns.is_empty() {
+            return Err(refused(
+                "a table must have at least one column",
+                Span::default(),
+            ));
+        }
+        Ok(refusal)
     }
 
     /// Binds `CREATE TABLE ... AS SELECT`.

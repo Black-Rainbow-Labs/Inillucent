@@ -1112,8 +1112,19 @@ fn automatic_indexes(
 /// with "no layout imported for root page 0" on `count(*)`, `DELETE` and every
 /// scan, and an upsert on `ON CONFLICT(c0)` reported a unique failure.
 ///
-/// A rowid table's indexes are returned as they were: they have trees of their
-/// own and have always been kept.
+/// **A rowid table folds them too (bug hunt 10).** This only ran for `WITHOUT
+/// ROWID`, so `CREATE TABLE t(c0 UNIQUE, PRIMARY KEY(c0))` made two
+/// `sqlite_autoindex_t_*` rows where SQLite makes one, and so did `UNIQUE(c0),
+/// UNIQUE(c0 DESC)` and `UNIQUE(c0,c1), PRIMARY KEY(c0,c1)`. SQLite's own
+/// comparison (`sqlite3CreateIndex`) looks at the key columns and their
+/// collations and ignores the sort order, so a rowid table does the same. A
+/// `WITHOUT ROWID` table also compares the declared order, as it always has,
+/// because its primary key tree is the table itself.
+///
+/// A database written before this change holds the second index's row and
+/// tree for such a table. Nothing names that row any more, so it is never
+/// read or written, and the table, its first index and the file as a whole
+/// behave as they did.
 ///
 /// @param table - the table's name, for the automatic names
 /// @param without_rowid - whether the table is `WITHOUT ROWID`
@@ -1123,9 +1134,6 @@ fn merge_duplicate_keys(
     without_rowid: bool,
     indexes: Vec<IndexInfo>,
 ) -> Vec<IndexInfo> {
-    if !without_rowid {
-        return indexes;
-    }
     let mut kept: Vec<IndexInfo> = Vec::with_capacity(indexes.len());
     for index in indexes {
         let same = |held: &IndexInfo| {
@@ -1138,7 +1146,8 @@ fn merge_duplicate_keys(
                         left.column.is_some()
                             && left.column == right.column
                             && left.collation.eq_ignore_ascii_case(&right.collation)
-                            && left.declared_descending == right.declared_descending
+                            && (!without_rowid
+                                || left.declared_descending == right.declared_descending)
                     })
         };
         let Some(earlier) = kept.iter_mut().find(|held| same(held)) else {

@@ -45,7 +45,7 @@ pub fn insert(
         supplied,
         Depth::outermost(statement.on_conflict),
     )
-    .map_err(|error| outer_unwind(error, statement.on_conflict))
+    .map_err(|error| outer_unwind_for_insert(error, statement))
 }
 /// Stamps the outermost statement's `OR` clause onto whatever it failed with.
 ///
@@ -86,12 +86,47 @@ pub(crate) fn outer_unwind(error: DbError, on_conflict: Option<ConflictAction>) 
         // there is nothing to roll back to. Outside a transaction the engine
         // still undoes everything, as SQLite's implicit rollback does.
         Some(ConflictAction::Fail | ConflictAction::Ignore | ConflictAction::Replace)
-            if error.extended().0 == codes::DATATYPE =>
+            if is_datatype_failure(&error) =>
         {
             error.with_rows_kept_in_transaction()
         }
         _ => error,
     }
+}
+
+/// Reports whether an error is a value of the wrong type for its column or rowid.
+///
+/// Two codes carry it: `SQLITE_CONSTRAINT_DATATYPE` from a `STRICT` column, and
+/// `SQLITE_MISMATCH` from an `INTEGER PRIMARY KEY` or rowid given text that is
+/// not a number. Only the first was recognised, so `INSERT OR FAIL INTO t VALUES
+/// (1,1),('x',2)` into an ordinary table rolled back row 1 inside a transaction
+/// where SQLite keeps it (bug hunt 10).
+///
+/// @param error - what the statement failed with
+fn is_datatype_failure(error: &DbError) -> bool {
+    use inillucent_sql::dml::codes;
+    matches!(error.extended().0, codes::DATATYPE | codes::MISMATCH)
+}
+
+/// [`outer_unwind`] for an `INSERT`, which also knows `ON CONFLICT DO NOTHING`.
+///
+/// SQLite opens a statement journal only for a statement that can abort on a
+/// constraint it resolves by aborting. A plain `INSERT ... ON CONFLICT DO
+/// NOTHING` has no such constraint, so a datatype failure on a later row leaves
+/// the earlier rows in place inside a transaction, exactly as `OR FAIL` does. A
+/// statement that also has an `ON CONFLICT DO UPDATE` arm, or an explicit `OR`
+/// clause, goes through [`outer_unwind`] unchanged.
+///
+/// @param error - what the statement failed with
+/// @param statement - the insert that failed
+pub(crate) fn outer_unwind_for_insert(error: DbError, statement: &BoundInsert) -> DbError {
+    let only_do_nothing = statement.on_conflict.is_none()
+        && !statement.upsert.is_empty()
+        && statement.upsert.iter().all(|arm| !arm.do_update);
+    if only_do_nothing && is_datatype_failure(&error) {
+        return error.with_rows_kept_in_transaction();
+    }
+    outer_unwind(error, statement.on_conflict)
 }
 /// Applies an `INSERT` that is already some triggers deep.
 ///

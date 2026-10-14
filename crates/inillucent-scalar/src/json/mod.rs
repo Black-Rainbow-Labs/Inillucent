@@ -73,8 +73,20 @@ pub fn malformed() -> inillucent_base::DbError {
 }
 
 /// Returns a statement error, which is what every JSON refusal is.
+///
+/// **The sentence is the error's message as well as its detail.** It was the
+/// detail alone, and the command line and MCP report the message, so
+/// `inillucent query "SELECT json('{')"` said `SQL logic error` where the
+/// shell said `malformed JSON` (bug hunt 10). The sentences here name no path,
+/// no page and no value beyond text the caller wrote in the statement, which
+/// is what a message may carry.
+///
+/// @param detail - the sentence SQLite's own function reports
 pub fn failure(detail: impl Into<String>) -> inillucent_base::DbError {
-    inillucent_base::DbError::primary(inillucent_base::PrimaryCode::Error).with_detail(detail)
+    let said: String = detail.into();
+    inillucent_base::DbError::primary(inillucent_base::PrimaryCode::Error)
+        .with_message(said.clone())
+        .with_detail(said)
 }
 
 /// Calls one JSON built-in.

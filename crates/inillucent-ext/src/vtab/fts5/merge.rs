@@ -133,10 +133,11 @@ impl Fts5Table {
                     &[Value::owned_text(b"automerge")?, value],
                 )
             }
-            "merge" => match argument {
-                Some(_) => Ok(()),
-                None => Err(unrecognized()),
-            },
+            // **`merge` with no rank value is accepted.** `INSERT INTO f(f)
+            // VALUES('merge')` reads the missing argument as zero in SQLite
+            // and succeeds; it was refused as an unrecognized command here
+            // (bug hunt 10). Nothing is merged either way, see above.
+            "merge" => Ok(()),
             // The settings *are* kept, because `%_config` is a table an
             // application reads. Nothing here acts on them - see above - but a
             // value that was written and cannot be read back would be a

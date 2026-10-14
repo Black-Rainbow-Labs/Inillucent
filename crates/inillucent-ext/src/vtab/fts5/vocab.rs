@@ -117,6 +117,11 @@ impl Module for Fts5VocabModule {
         "fts5vocab"
     }
 
+    /// A vocabulary over a table that is not there is created, and refuses when it is read.
+    fn reads_tables_that_may_be_missing(&self) -> bool {
+        true
+    }
+
     /// The index's own shadows, read rather than made.
     ///
     /// Only the two the vocabulary needs: `%_idx` is the term dictionary and
@@ -146,10 +151,15 @@ impl Module for Fts5VocabModule {
     ) -> DbResult<Box<dyn VirtualTable>> {
         let (_, shape) = parse_arguments(&arguments.arguments)?;
         let (target, _) = parse_arguments(&arguments.arguments)?;
+        // **A target that does not exist is not a reason to refuse the table.**
+        // SQLite creates `fts5vocab(nosuch, row)` and reports the missing table
+        // when the vocabulary is read, so the roots are optional here and
+        // `filter` answers for their absence (bug hunt 10).
+        let shadows = ShadowTables::of(arguments, &[b"idx", b"data"]).unwrap_or_default();
         Ok(Box::new(VocabTable {
             shape,
             target,
-            shadows: ShadowTables::of(arguments, &[b"idx", b"data"])?,
+            shadows,
             declaration: Declaration {
                 columns: shape
                     .columns()
@@ -258,6 +268,12 @@ impl VirtualCursor for VocabCursor {
     fn filter(&mut self, context: &mut Context<'_>, _plan: &FilterPlan) -> DbResult<()> {
         self.rows.clear();
         self.at = 0;
+        if self.shadows.root_id(b"idx").is_err() {
+            return Err(inillucent_base::error::statement_refusal(format!(
+                "no such fts5 table: main.{}",
+                String::from_utf8_lossy(&self.target)
+            )));
+        }
         // The vocabulary is the dictionary, so an index in a layout this build
         // does not read has nothing to report and says so - rather than
         // reporting an empty vocabulary for an index full of terms.

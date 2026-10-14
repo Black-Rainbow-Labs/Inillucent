@@ -196,8 +196,10 @@ fn read_number(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Opt
 
 /// Returns the error a malformed path reports.
 pub fn bad_path(text: &str) -> DbError {
+    let said = format!("bad JSON path: '{text}'");
     DbError::primary(inillucent_base::PrimaryCode::Error)
-        .with_detail(format!("bad JSON path: '{text}'"))
+        .with_message(said.clone())
+        .with_detail(said)
 }
 
 /// Resolves a path against a document, returning the element it names.

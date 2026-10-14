@@ -66,10 +66,11 @@
 //! is to damage a file on purpose, and an arm nothing has been run against is
 //! an arm nobody has checked.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use inillucent_base::error::refusal;
 use inillucent_base::{DbError, DbResult};
+use inillucent_pool::extent::ExtentRef;
 use inillucent_pool::{Database, PageId};
 use inillucent_tree::{PageShare, PagedTree};
 
@@ -164,9 +165,52 @@ impl crate::ImportedDatabase {
                 .ok_or_else(|| refusal("a tree names a database that is not attached"))?;
             let names = self.name_every_tree(&handles);
             let held = self.hold_every_page(file, &handles, &names)?;
-            compare_against_the_free_map(file, &held, &names, self.schema.skipped.is_empty())?;
+            let pending = self.pages_waiting_for_the_commit(at, file);
+            compare_against_the_free_map(
+                file,
+                &held,
+                &pending,
+                &names,
+                self.schema.skipped.is_empty(),
+            )?;
         }
         Ok(())
+    }
+
+    /// Returns the pages the open transaction has released and the free map
+    /// has not yet been told about, in one file.
+    ///
+    /// **Inside a transaction a dropped tree's pages are allocated and reached
+    /// by nothing, by design.** The free map is durable state, so a drop gives
+    /// its pages back at the commit (`flush_pending_frees`), and until then
+    /// the walk found each of them allocated with no owner and reported
+    /// `Page N: never used` for `DROP TABLE`, `DROP INDEX`, `REINDEX` and a
+    /// bulk insert that replaces an empty tree, inside a transaction, while
+    /// the same check after the `COMMIT` said `ok` (bug hunt 10). SQLite
+    /// answers `ok` in the transaction.
+    ///
+    /// A dropped out-of-line value is followed to its pages: a run of pages is
+    /// a chain, and a value packed into a shared page owns only that page.
+    ///
+    /// @param at - the schema whose pages are wanted, as the binder numbers them
+    /// @param file - the database the pages belong to
+    fn pages_waiting_for_the_commit(&self, at: usize, file: &Database) -> BTreeSet<PageId> {
+        use crate::engine::state::Freed;
+        let mut waiting = BTreeSet::new();
+        for dropped in self.writing.pending_frees().borrow().iter() {
+            if dropped.schema != at {
+                continue;
+            }
+            match &dropped.what {
+                Freed::Page(page) => {
+                    waiting.insert(*page);
+                }
+                Freed::Value(reference) => {
+                    follow_extent_chain(file, *reference, &mut waiting);
+                }
+            }
+        }
+        waiting
     }
 
     /// Returns what each of one file's trees is called, one entry per tree.
@@ -292,11 +336,13 @@ impl crate::ImportedDatabase {
 ///
 /// @param file - the database the pages belong to
 /// @param held - what each page the trees reach is held by
+/// @param pending - pages an open transaction released that wait for its commit
 /// @param names - what each tree handle is called
 /// @param complete - whether every object in the catalog was attached
 fn compare_against_the_free_map(
     file: &Database,
     held: &BTreeMap<PageId, Holder>,
+    pending: &BTreeSet<PageId>,
     names: &BTreeMap<u32, String>,
     complete: bool,
 ) -> DbResult<()> {
@@ -331,6 +377,9 @@ fn compare_against_the_free_map(
             // nothing, by design**, so it is not a leak. See
             // `FreeMap::reserving`.
             (None, true) if complete && file.page_is_reserved(page) => {}
+            // Released by the open transaction and given back to the free map
+            // at its commit, so it is not leaked.
+            (None, true) if pending.contains(&page) => {}
             (None, true) if complete => match leaked.len() < MOST_LEAKS_LISTED {
                 true => leaked.push(number),
                 false => more = more.saturating_add(1),
@@ -349,6 +398,46 @@ fn compare_against_the_free_map(
         said.push(format!("and {more} more pages never used"));
     }
     Err(damaged(said.join("\n")))
+}
+
+/// Adds the pages of one out-of-line value to a set.
+///
+/// A value packed into a shared page owns that page and nothing else. A run of
+/// pages is a chain, each page naming the next, and a page that cannot be read
+/// ends the walk: this is a read that only decides what is not a leak, and a
+/// chain it cannot follow is reported by the page check of the file itself.
+///
+/// @param file - the database the value lives in
+/// @param reference - the value, as its leaf held it
+/// @param into - the set the pages are added to
+fn follow_extent_chain(file: &Database, reference: ExtentRef, into: &mut BTreeSet<PageId>) {
+    if reference.is_dead() {
+        return;
+    }
+    if reference.slot.is_some() {
+        into.insert(reference.first);
+        return;
+    }
+    let pool = file.pool();
+    let bound = inillucent_pool::extent::pages_needed(reference.length, pool.page_size())
+        .max(inillucent_pool::extent::owned::chain_bound(
+            reference.length,
+            pool.page_size(),
+        ))
+        .saturating_add(1);
+    let mut page = reference.first;
+    let mut followed = 0u64;
+    while !page.is_none() && followed < bound {
+        into.insert(page);
+        let Ok(guard) = pool.fetch(page) else {
+            return;
+        };
+        let Ok((_, next)) = inillucent_pool::extent::read_page(guard.bytes()) else {
+            return;
+        };
+        page = next;
+        followed = followed.saturating_add(1);
+    }
 }
 
 /// How many leaked pages one check names before it counts the rest.

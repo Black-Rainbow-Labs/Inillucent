@@ -262,6 +262,16 @@ pub struct Shell {
     /// `.nonce` lifts it for one command, which is the reference's own escape
     /// hatch and is why the token is a secret the script's author chose.
     pub safe: bool,
+    /// Whether `.shell` and `.system` are refused because the surface was opened with
+    /// `--readonly`.
+    ///
+    /// `inillucent --readonly run ".shell ..."` ran the program, which can write files
+    /// anywhere the process can, so a surface that promised not to write did (bug hunt
+    /// 10). Only those two commands are refused. `.output`, `.read` and the rest of the
+    /// safe mode set are left alone, because a read only script reads files and writes
+    /// reports. The shell program's own `-readonly` is the reference's option for opening
+    /// the file read only and does not set this.
+    pub no_programs: bool,
     /// Where output goes when a caller is collecting it rather than printing.
     ///
     /// **Not the same as `captured`, and deliberately outside it.** `captured`
@@ -591,6 +601,7 @@ impl Shell {
             parameters: std::collections::BTreeMap::new(),
             readonly: false,
             safe: false,
+            no_programs: false,
             sink: None,
             rows_since_redirect: 0,
             line: 1,

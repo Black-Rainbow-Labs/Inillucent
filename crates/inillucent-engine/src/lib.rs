@@ -466,16 +466,6 @@ impl ImportedDatabase {
         self.storage.wal.sequence()
     }
 
-    /// Returns what `PRAGMA application_id` would answer.
-    pub(crate) fn application_id(&self) -> i32 {
-        self.storage.database.application_id()
-    }
-
-    /// Returns what `PRAGMA user_version` would answer.
-    pub(crate) fn user_version(&self) -> i32 {
-        self.storage.database.user_version()
-    }
-
     /// Sets what a commit waits for.
     ///
     /// @param policy - the `synchronous` setting

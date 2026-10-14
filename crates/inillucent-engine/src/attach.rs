@@ -64,6 +64,25 @@ impl ImportedDatabase {
             .map(|nth| nth.saturating_add(FIRST_ATTACHED))
     }
 
+    /// Returns the name a statement writes for one schema.
+    ///
+    /// The inverse of [`ImportedDatabase::schema_named`], for code that has a
+    /// schema number and must build SQL that names it.
+    ///
+    /// @param at - the schema, as the binder numbers them
+    pub(crate) fn schema_name_of(&self, at: usize) -> Vec<u8> {
+        if at == MAIN {
+            return b"main".to_vec();
+        }
+        if at == super::TEMP {
+            return TEMP.to_vec();
+        }
+        self.session_state
+            .schema_at(at)
+            .map(|held| held.name.clone())
+            .unwrap_or_default()
+    }
+
     /// Adds a database file to this connection under a name.
     ///
     /// The file is created when it is not there, which is what `ATTACH` does:

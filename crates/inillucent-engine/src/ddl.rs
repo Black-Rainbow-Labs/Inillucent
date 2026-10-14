@@ -298,6 +298,20 @@ impl ImportedDatabase {
     fn run_directive(&mut self, directive: Directive, sql: &str) -> DbResult<Outcome> {
         let source = sql.as_bytes();
         match directive {
+            // **`IF NOT EXISTS` on a table that exists never reads the
+            // definition.** SQLite returns from `sqlite3StartTable` as soon as it
+            // finds the table, and the checks this refusal stands for (`PRIMARY
+            // KEY missing on table`, `missing datatype for`) run in
+            // `sqlite3EndTable`, which is not reached. The refusal was raised
+            // first here, so a repeated `CREATE TABLE IF NOT EXISTS` with a
+            // definition SQLite would not accept failed where SQLite does
+            // nothing (bug hunt 10).
+            Directive::CreateTable {
+                refusal: Some(_),
+                if_not_exists: true,
+                exists: true,
+                ..
+            } => Ok(Outcome::empty()),
             Directive::CreateTable {
                 refusal: Some(said),
                 ..
@@ -512,59 +526,71 @@ impl ImportedDatabase {
             // are not committed. The message is SQLite's, and so is the code:
             // `SQLITE_ERROR` (1), not `refusal`'s `SQLITE_MISUSE` (21) -
             // `dml_differential.rs`'s `vacuum_matches_sqlite` grades it.
-            Directive::Vacuum { .. } if self.writing.batch().is_some() => {
-                Err(statement_refusal("cannot VACUUM from within a transaction"))
-            }
             Directive::Vacuum {
                 database,
-                into: None,
-                into_sql: Some(expression),
-            } => {
-                let path = self.vacuum_target(&expression)?;
-                self.run_directive(
-                    Directive::Vacuum {
-                        database,
-                        into: Some(path),
-                        into_sql: None,
-                    },
-                    sql,
-                )
-            }
-            Directive::Vacuum { into: None, .. } => {
-                self.vacuum_in_place()?;
-                Ok(Outcome::empty())
-            }
-            Directive::Vacuum {
-                into: Some(path), ..
-            } => {
-                let path = String::from_utf8_lossy(&path).into_owned();
-                if path.is_empty() || path == ":memory:" {
-                    self.rebuild_into_memory()?;
-                    return Ok(Outcome::empty());
-                }
-                // The second statement that names a file of its own, and so
-                // the second one a confined process refuses by name rather
-                // than leaving to the VFS's result code. See `attach`.
-                let path = match inillucent_vfs::confine::process_root() {
-                    None => path,
-                    Some(root) => match root.admit(&path) {
-                        Ok(inside) => inside.to_string_lossy().into_owned(),
-                        Err(refused) => return Err(confinement_refusal(refused.message())),
-                    },
-                };
-                if std::path::Path::new(&path).exists() {
-                    // SQLite's own rule, and the one that makes the statement
-                    // safe to put in a backup script: it never overwrites.
-                    return Err(refusal("output file already exists"));
-                }
-                // **A rebuild, not a copy.** `VACUUM INTO` is documented as
-                // writing a *compacted* database, and a byte copy reproduces
-                // the free pages and the half-empty leaves it was asked to
-                // remove - which is what it used to do here.
-                self.rebuild_copy_into(std::path::Path::new(&path))?;
-                Ok(Outcome::empty())
-            }
+                into,
+                into_sql,
+            } => self.run_vacuum(database, into, into_sql),
         }
+    }
+
+    /// Runs a `VACUUM` or `VACUUM INTO` on the schema it names.
+    ///
+    /// **`VACUUM <schema>` on `temp` or an attached database** used to take the
+    /// arm for `main`, which ignored `database`, so the statement rebuilt `main`
+    /// and then put `main`'s catalog in place of the named schema's (bug hunt
+    /// 10). `main` is rebuilt in place, any other schema is folded into its
+    /// file, and `INTO` copies the schema that was named.
+    ///
+    /// @param database - the schema, as the binder numbers them
+    /// @param into - the file name when it was a literal
+    /// @param into_sql - the file name expression when it was not a literal
+    fn run_vacuum(
+        &mut self,
+        database: usize,
+        into: Option<Vec<u8>>,
+        into_sql: Option<String>,
+    ) -> DbResult<Outcome> {
+        if self.writing.batch().is_some() {
+            return Err(statement_refusal("cannot VACUUM from within a transaction"));
+        }
+        let into = match (into, into_sql) {
+            (None, Some(expression)) => Some(self.vacuum_target(&expression)?),
+            (into, _) => into,
+        };
+        let Some(path) = into else {
+            match database {
+                super::MAIN => self.vacuum_in_place()?,
+                other => self.vacuum_schema_in_place(other)?,
+            }
+            return Ok(Outcome::empty());
+        };
+        let path = String::from_utf8_lossy(&path).into_owned();
+        if path.is_empty() || path == ":memory:" {
+            self.rebuild_into_memory(database)?;
+            return Ok(Outcome::empty());
+        }
+        // The second statement that names a file of its own, and so the second
+        // one a confined process refuses by name rather than leaving to the
+        // VFS's result code. See `attach`.
+        let path = match inillucent_vfs::confine::process_root() {
+            None => path,
+            Some(root) => match root.admit(&path) {
+                Ok(inside) => inside.to_string_lossy().into_owned(),
+                Err(refused) => return Err(confinement_refusal(refused.message())),
+            },
+        };
+        if std::path::Path::new(&path).exists() {
+            // SQLite's own rule, and the one that makes the statement safe to
+            // put in a backup script: it never overwrites.
+            return Err(refusal("output file already exists"));
+        }
+        // **A rebuild, not a copy.** `VACUUM INTO` is documented as writing a
+        // *compacted* database, and a byte copy reproduces the free pages and
+        // the half-empty leaves it was asked to remove - which is what it used
+        // to do here.
+        self.rebuild_schema_copy_into(database, std::path::Path::new(&path))?;
+        Ok(Outcome::empty())
     }
 }
 

@@ -49,7 +49,8 @@ inillucent --db app.rdb query "SELECT id, body FROM note WHERE created > ?1 ORDE
   rows, and `more` is `true` when rows were cut. The default is 200. `--limit 0` returns every row.
 - **`--readonly` refuses every statement that would change the database.** The engine decides this
   from the parsed statement, so `SELECT 'delete me'` runs and `DELETE FROM note` is refused with the
-  status `readonly`. Add `--readonly` whenever you only mean to read.
+  status `readonly`. Add `--readonly` whenever you only mean to read. It also refuses the `.shell`
+  and `.system` commands of `run`, because a program can write files the engine never sees.
 
 ```sh
 inillucent --db app.rdb --readonly query "SELECT count(*) FROM note"

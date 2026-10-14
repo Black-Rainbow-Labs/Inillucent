@@ -164,6 +164,16 @@ pub trait Module: Send + Sync {
         true
     }
 
+    /// Returns whether the module can be created over tables that do not exist yet.
+    ///
+    /// `fts5vocab(nosuch, row)` is created by SQLite and reports the missing
+    /// table when it is read. A module that answers true is connected without
+    /// the roots of the tables it only reads, and has to report their absence
+    /// itself. The others keep the refusal at the `CREATE` (bug hunt 10).
+    fn reads_tables_that_may_be_missing(&self) -> bool {
+        false
+    }
+
     /// Returns the shadow tables a `CREATE VIRTUAL TABLE` must build first.
     fn shadow_tables(&self, _arguments: &ModuleArguments) -> DbResult<Vec<ShadowTable>> {
         Ok(Vec::new())

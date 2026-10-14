@@ -535,6 +535,9 @@ impl Context {
         // and exited 0. The MCP server turns it on whether or not a root was
         // given - see `Context::refuse_the_world`.
         shell.safe = root.is_some();
+        // **`--readonly` refuses the commands that run a program** for the same
+        // reason: `.shell` walks past a surface that promised not to write.
+        shell.no_programs = readonly;
         // Read once, here, while the chain this open recovered is still the one
         // on the disk - see `Context::strays_beside`.
         let reported = shell.recovery();
@@ -609,6 +612,7 @@ impl Context {
             )
         })?;
         shell.safe = self.shell.safe;
+        shell.no_programs = self.shell.no_programs;
         let reported = shell.recovery();
         let strays = Context::strays_beside(&named, reported.last_sequence, reported.last_lsn);
         Ok(Some(Displaced {
