@@ -23,8 +23,8 @@ pub(crate) use refusal::{
     ambiguous_column, compound_order_unmatched, compound_width_mismatch, group_out_of_range,
     no_query_solution, no_such_collation, no_such_column, no_such_column_quoted, no_such_function,
     no_such_index, no_such_table, order_out_of_range, qualify_missing_table, schema_refused,
-    subquery_width_mismatch, unconnected_module, unsupported, values_width_mismatch,
-    wrong_arguments,
+    subquery_width_mismatch, too_many_arguments, unconnected_module, unsupported,
+    values_width_mismatch, wrong_arguments,
 };
 mod aggregate;
 mod collation;
@@ -2571,9 +2571,7 @@ impl<'a> Binder<'a> {
             )
             && order_by.len() != 1
         {
-            // SQLite refuses this at parse time with its own sentence; it is not a
-            // feature this build lacks, so it must not carry the `unsupported:` prefix
-            // or the unsupported status (bug hunt 10).
+            // SQLite's own parse error, not a feature this build lacks (bug hunt 10).
             return Err(refused(
                 "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression",
                 span,
@@ -2735,16 +2733,7 @@ impl<'a> Binder<'a> {
             })
             .collect();
         if arguments.len() > hidden.len() {
-            // SQLite words this for any table-valued function as `too many arguments on
-            // NAME() - max N`, where N counts the hidden columns (bug hunt 10).
-            return Err(refused(
-                format!(
-                    "too many arguments on {}() - max {}",
-                    String::from_utf8_lossy(&source.table.name),
-                    hidden.len()
-                ),
-                span,
-            ));
+            return Err(too_many_arguments(&source.table.name, hidden.len(), span));
         }
         for (position, argument) in arguments.iter().enumerate() {
             let Some((column, affinity, collation)) = hidden.get(position).copied() else {
@@ -3458,10 +3447,8 @@ impl<'a> Binder<'a> {
                 for item in &items {
                     list.push(self.bind_expr(*item)?);
                 }
-                let (mut affinity, collation) = in_list_rules(&operand, &list);
-                if let Some(step) = self.step_column_affinity(&operand) {
-                    affinity = step;
-                }
+                let (affinity, collation) = in_list_rules(&operand, &list);
+                let affinity = self.step_column_affinity(&operand).unwrap_or(affinity);
                 Ok(BoundExpr::InList {
                     negated,
                     operand: Box::new(operand),
@@ -3735,10 +3722,8 @@ impl<'a> Binder<'a> {
     ///
     /// @param expr - the operand
     fn seen_affinity(&self, expr: &BoundExpr) -> Option<Affinity> {
-        if let Some(step) = self.step_column_affinity(expr) {
-            return step;
-        }
-        comparison_rules::seen_affinity_among(&self.sources, expr)
+        let seen = || comparison_rules::seen_affinity_among(&self.sources, expr);
+        self.step_column_affinity(expr).unwrap_or_else(seen)
     }
 
     /// Returns the inner names of the derived table standing for a parenthesised

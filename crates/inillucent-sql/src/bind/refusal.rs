@@ -269,6 +269,22 @@ pub(crate) fn wrong_arguments(name: &[u8], span: Span) -> ParseError {
     )
 }
 
+/// Returns the failure for a table-valued function given more arguments than it has hidden
+/// columns, in SQLite's words (bug hunt 10).
+///
+/// @param name - the function's name
+/// @param most - how many arguments it takes
+/// @param span - where the call is
+pub(crate) fn too_many_arguments(name: &[u8], most: usize, span: Span) -> ParseError {
+    ParseError::new(
+        ParseErrorKind::Refused(format!(
+            "too many arguments on {}() - max {most}",
+            String::from_utf8_lossy(name)
+        )),
+        span,
+    )
+}
+
 /// Returns a "no such collation" failure.
 pub(crate) fn no_such_collation(name: &[u8], span: Span) -> ParseError {
     // SQLite points at nothing for this failure, so the span is dropped; the callers

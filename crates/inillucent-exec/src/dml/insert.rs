@@ -291,22 +291,10 @@ pub(super) fn insert_rows(
             Stored::Inserted(_) => &statement.triggers,
         };
         let returned = returned_for_row(statement, plan, space, params, target, &stored, layout)?;
-        let ignored =
-            match fire_after_insert(after_insert, target, stored.row(), layout, params, depth) {
-                Ok(ignored) => ignored,
-                Err(error) => {
-                    // SQLite adds the row to the change counters when it writes the row, which
-                    // is before an `AFTER INSERT` trigger runs. A trigger that fails with
-                    // `RAISE(FAIL)` keeps the row, so `changes()` and `total_changes()` must
-                    // already include it (bug hunt 10).
-                    count_row(&mut changes, target, depth);
-                    return Err(error);
-                }
-            };
-        if ignored {
+        let fired = (after_insert, stored.row(), &**layout, params, depth);
+        if fire_and_count(fired, target, &mut changes)? {
             continue;
         }
-        count_row(&mut changes, target, depth);
         if captured {
             changes.written.push(stored.row().to_vec());
         }
@@ -317,6 +305,42 @@ pub(super) fn insert_rows(
     close_sequence(statement, target, sequence_mark.as_ref(), high_water)?;
     Ok(changes)
 }
+/// Fires a written row's `AFTER INSERT` triggers and counts the row, and answers whether a
+/// trigger ignored the row.
+///
+/// SQLite adds the row to the change counters when it writes the row, which is before an
+/// `AFTER INSERT` trigger runs. A trigger that fails with `RAISE(FAIL)` keeps the row, so
+/// `changes()` and `total_changes()` must already include it; an ignored row stays uncounted
+/// (bug hunt 10).
+///
+/// @param fired - the triggers, the row, its layout, the parameters and the trigger depth
+/// @param target - the file and its trees
+/// @param changes - the statement's own tally
+fn fire_and_count(
+    fired: (
+        &[inillucent_sql::dml::BoundTrigger],
+        &[OwnedDatum],
+        &SourceLayout,
+        &Params,
+        Depth,
+    ),
+    target: &mut dyn WriteTarget,
+    changes: &mut Changes,
+) -> DbResult<bool> {
+    let (triggers, row, layout, params, depth) = fired;
+    match fire_after_insert(triggers, &mut *target, row, layout, params, depth) {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            count_row(changes, target, depth);
+            Ok(false)
+        }
+        Err(error) => {
+            count_row(changes, target, depth);
+            Err(error)
+        }
+    }
+}
+
 /// Everything an insert compiles once before its first row.
 ///
 /// Shared by [`insert_at`] and by the bulk path in `bulk.rs`, so a row built
