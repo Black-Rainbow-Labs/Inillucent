@@ -358,10 +358,10 @@ A search that runs only one branch gets 0 from the other branch. Its confidence 
 that branch's weight. A query with only a vector, for example, has no query words, so its weight
 stays at 0.35 and its confidence is at most 0.35. Set a threshold for the kind of query you run.
 
-On a cosine table, pass a query vector of length 1. The stored vectors are scaled to length 1, and
-the query vector is used as given. A query vector of length 0.5 halves the vector part of the
-confidence. The order of the rows does not change. `nomic-embed-text-v1.5` returns vectors of length
-1, so `embed()` output needs no change.
+On a cosine table, the query vector may have any length. The stored vectors are scaled to length 1,
+and the query vector is scaled to length 1 before it is scored, so the same direction gives the same
+rows and the same confidence at length 1, 0.9 or 0.45. A query vector of length 0 is used as given.
+On an `l2` table the query vector is used as given, because length is part of an L2 distance.
 
 ## 8. Abstention: returning nothing
 

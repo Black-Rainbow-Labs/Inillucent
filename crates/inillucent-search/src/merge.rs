@@ -1539,7 +1539,8 @@ fn run(index: &Index, options: &Options, request: &Request) -> DbResult<Vec<Hit>
     let ef = traversal_width(options, request, limit);
     let text = request.text.clone().unwrap_or_default();
     let has_text = !text.trim().is_empty();
-    let has_vector = !request.vector.is_empty();
+    let query_vector = query_vector_for(options.metric, &request.vector);
+    let has_vector = !query_vector.is_empty();
     let branches = match (has_text, has_vector) {
         (true, true) => inillucent_core::index::Branches::Both,
         (true, false) => inillucent_core::index::Branches::Lexical,
@@ -1547,7 +1548,7 @@ fn run(index: &Index, options: &Options, request: &Request) -> DbResult<Vec<Hit>
         (false, false) => return Ok(Vec::new()),
     };
     let (hits, _) = index
-        .search_branches(&text, &request.vector, &filter, limit, ef, branches)
+        .search_branches(&text, &query_vector, &filter, limit, ef, branches)
         .map_err(|why| failure(why.to_string()))?;
     let store = index.store();
     Ok(hits
@@ -1563,6 +1564,37 @@ fn run(index: &Index, options: &Options, request: &Request) -> DbResult<Vec<Hit>
             })
         })
         .collect())
+}
+
+/// Returns the query vector a table's metric scores against.
+///
+/// A cosine distance does not depend on a vector's length, but the vector
+/// score and `confidence()` are computed from the distance to the stored unit
+/// vectors, and the engine used the caller's vector at whatever length it was
+/// passed. The same direction at length 0.45 then gave a lower `confidence()`
+/// than at length 1, and could be refused by a confidence floor. A cosine
+/// table therefore scales the query to length 1 here. An L2 table keeps the
+/// caller's vector, because length is part of an L2 distance. A vector of
+/// length 0 or one with a non finite length is passed through unchanged.
+///
+/// @param metric - the table's declared metric
+/// @param vector - the vector the caller passed
+fn query_vector_for(metric: Metric, vector: &[f32]) -> Vec<f32> {
+    if metric != Metric::Cosine {
+        return vector.to_vec();
+    }
+    let length = vector
+        .iter()
+        .map(|x| f64::from(*x) * f64::from(*x))
+        .sum::<f64>()
+        .sqrt();
+    if !length.is_finite() || length == 0.0 {
+        return vector.to_vec();
+    }
+    vector
+        .iter()
+        .map(|x| (f64::from(*x) / length) as f32)
+        .collect()
 }
 
 /// Returns the predicate one request's facet constraints express.
