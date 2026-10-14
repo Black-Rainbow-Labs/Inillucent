@@ -81,6 +81,8 @@ use inillucent_engine::connect::{Database as EngineDatabase, Statement as Engine
 
 pub use capability::{capability, supports, Capability, Support, CAPABILITIES};
 pub use error::{Error, Result, Status};
+/// Drops the embedder's and the reranker's loaded model sessions; see `inillucent_search::release_models`.
+pub use inillucent_engine::release_models;
 pub use introspect::{Item, Kind, Table};
 pub use rows::Rows;
 pub use shared::{SharedConnection, SharedDatabase, SharedTransaction};
