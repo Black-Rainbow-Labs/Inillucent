@@ -190,6 +190,19 @@ pub fn owns(id: &str, group: usize, groups: usize) -> bool {
     hash % groups == group as u64 && (hash / groups) % shard_count == shard_index
 }
 
+/// The directory one cadence's groups put their scratch files under.
+///
+/// The tier is part of the name because `matrix::insert` and
+/// `matrix_deep::insert` run at the same time and both have a shard 1 and a
+/// group 1: without the tier they shared `s1/insert-1-default` and each deleted
+/// the other's fixtures mid case.
+///
+/// @param tmp - the test binary's `CARGO_TARGET_TMPDIR`
+/// @param cadence - when the suite runs
+pub fn scratch_root(tmp: &Path, cadence: Cadence) -> std::path::PathBuf {
+    tmp.join(format!("matrix-{cadence:?}"))
+}
+
 /// Runs one group of a family at a cadence, and fails once if anything failed.
 ///
 /// @param family - the family
@@ -438,8 +451,10 @@ macro_rules! matrix_family {
                     // sharing `matrix/s0/pragma-0-default` made each delete the
                     // other's fixtures mid case, which read as "unable to open
                     // database file" and "disk I/O error" against SQLite.
-                    &std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-                        .join(concat!("matrix-", stringify!($cadence))),
+                    &$crate::statement_matrix::group::scratch_root(
+                        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
+                        $crate::statement_matrix::group::Cadence::$cadence,
+                    ),
                     oracle_missing,
                 );
             }

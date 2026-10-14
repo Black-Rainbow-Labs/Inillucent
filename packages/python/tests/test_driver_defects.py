@@ -458,6 +458,109 @@ def test_a_bind_with_an_impossible_length_returns_an_error() -> None:
     database.close()
 
 
+def test_two_threads_never_run_inside_one_database_at_once() -> None:
+    """A second thread on a connection ran inside the engine with the first.
+
+    ``ctypes`` lets the interpreter lock go while the engine runs, and nothing
+    else stopped a second thread, so a call made while another statement ran
+    reached the engine's busy cell and failed with "already running a
+    statement", or corrupted its counts. Every call on a database now takes one
+    lock that the database owns: the second thread waits and then runs, and
+    neither fails.
+    """
+    import threading
+    import time
+
+    module = _need()["module"]
+    database, _ = _database("threads")
+    connection = database.connect()
+    slow = (
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000000) "
+        "SELECT count(*) FROM n"
+    )
+    started = threading.Event()
+    stamps: dict = {}
+    failures: list = []
+
+    def first() -> None:
+        stamps["begin"] = time.monotonic()
+        started.set()
+        try:
+            stamps["first"] = connection.execute(slow).rows
+        except Exception as failure:  # noqa: BLE001 - the test reports whatever happened
+            failures.append(("first", failure))
+        stamps["first_end"] = time.monotonic()
+
+    def second() -> None:
+        started.wait()
+        time.sleep(0.2)
+        try:
+            stamps["second"] = connection.execute("SELECT 41 + 1").rows
+        except Exception as failure:  # noqa: BLE001
+            failures.append(("second", failure))
+        stamps["second_end"] = time.monotonic()
+
+    threads = [threading.Thread(target=first), threading.Thread(target=second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not failures, failures
+    assert stamps["first"] == [[3000000]], stamps
+    assert stamps["second"] == [[42]], stamps
+    # The first call must have run long enough for the second to arrive in the middle of it.
+    assert stamps["first_end"] - stamps["begin"] > 0.5, stamps
+    # A margin for the instant between the first call returning and its time being read.
+    assert stamps["second_end"] >= stamps["first_end"] - 0.05, "the second call ran inside the first"
+    # `cancel` is the one call that does not wait, so it can be made while a statement runs.
+    assert callable(connection.cancel)
+    database.close()
+    assert module is not None
+
+
+def test_two_connections_of_one_database_have_a_transaction_each() -> None:
+    """Two connections of one ``Database`` shared one transaction.
+
+    A ``BEGIN`` on one was joined by the other, the other read its uncommitted
+    rows, and a write through the second was undone by the first one's
+    ``ROLLBACK``, so an acknowledged write was lost. Python's ``sqlite3`` and
+    SQLite isolate two connections and refuse the second writer with busy.
+    """
+    module = _need()["module"]
+    staged = _need()
+    directory = Path(tempfile.mkdtemp(prefix="inillucent-isolation-", dir=staged["root"]))
+    database = module.Database(str(directory / "probe.rdb"), busy_timeout_ms=200)
+    first = database.connect()
+    second = database.connect()
+    first.execute("CREATE TABLE t (a INTEGER)")
+    first.execute("BEGIN")
+    first.execute("INSERT INTO t VALUES (1)")
+    assert first.execute("SELECT count(*) FROM t").rows == [[1]]
+    assert second.execute("SELECT count(*) FROM t").rows == [[0]], "an uncommitted row was read"
+    assert first.in_transaction and not second.in_transaction
+    try:
+        second.execute("INSERT INTO t VALUES (2)")
+    except module.DriverError as refused:
+        assert refused.status == module.driver.BUSY, refused
+    else:
+        raise AssertionError("a second writer was accepted while the first held the file")
+    first.execute("ROLLBACK")
+    assert second.execute("SELECT count(*) FROM t").rows == [[0]]
+    # A write through the second connection is kept when the first rolls back.
+    first.execute("BEGIN")
+    second.execute("INSERT INTO t VALUES (7)")
+    first.execute("ROLLBACK")
+    assert first.execute("SELECT count(*) FROM t").rows == [[1]], "an acknowledged write was lost"
+    assert second.execute("SELECT count(*) FROM t").rows == [[1]]
+    # Closing a connection gives up its transaction, and the file goes to the next writer.
+    first.execute("BEGIN")
+    first.execute("INSERT INTO t VALUES (8)")
+    first.close()
+    second.execute("INSERT INTO t VALUES (9)")
+    assert second.execute("SELECT count(*) FROM t").rows == [[2]]
+    database.close()
+
+
 def main() -> int:
     """Run every test in this file, for a machine with no pytest."""
     failures = []

@@ -165,37 +165,19 @@ fn an_injected_allocation_failure_never_reaches_the_write_path() {
     );
 }
 
-/// Pins the writer-contention gap: two `Connection`s from one in-process
-/// `Database` do not hold independent transaction state, so a second
-/// connection's write joins the first's open transaction instead of being
-/// refused BUSY.
+/// A second connection's write is refused `busy` while the first holds the reservation.
 ///
-/// **Retired from `a_second_writer_is_refused_while_the_first_holds_the_reservation`**,
-/// which asserted the second connection's write was refused BUSY while the
-/// first held `BEGIN IMMEDIATE`'s reservation, and passed against the old
-/// engine (`inillucent-session`). Against `inillucent_engine::connect`,
-/// `Database` holds its `ImportedDatabase` behind one `RefCell`, and
-/// `ImportedDatabase` tracks one shared, unkeyed transaction rather than one
-/// per session - so the second connection's write is admitted, reports the
-/// same `autocommit() == false` the first connection's `BEGIN IMMEDIATE` set,
-/// and the first connection's later attempt to write the identical row then
-/// fails on the UNIQUE constraint the second connection's write already
-/// satisfied. That collision is the proof: both writes landed in one
-/// transaction, not two. Recorded as `txn.writer-contention`,
-/// `status = "missing"`, in `compat/sqlite-3.53.4.toml` -
-/// `inillucent-txn::slot::WriterSlot` already implements real `busy_timeout`
-/// semantics for the Phase 3 model driver, but nothing wires it to
-/// `inillucent_engine::connect`, and doing so is a cross-cutting change to
-/// `ImportedDatabase`'s transaction state, not a contained fix.
-///
-/// This test goes red the day the second connection's write is refused
-/// instead - the signal to bring back the BUSY-refusal version and move
-/// `txn.writer-contention` to `pass`.
+/// Each connection of a `Database` has an engine and a transaction of its own, so a second
+/// connection's write is arbitrated by the file's locks as a second process's is, and the first
+/// connection's `BEGIN IMMEDIATE` keeps it out until the first commits or rolls back. This is
+/// the test `txn.writer-contention` in `compat/sqlite-3.53.4.toml` was written against; the row
+/// stays `missing` until the nightly run has recorded this test on both platforms.
 #[test]
-fn a_second_connections_write_joins_the_first_writers_open_transaction() {
+fn a_second_writer_is_refused_busy_while_the_first_holds_the_reservation() {
     let database = built();
     let first = database.session();
     let second = database.session();
+    run(&second, "PRAGMA busy_timeout = 0").expect("the second connection does not wait");
 
     run(&first, "BEGIN IMMEDIATE").expect("the first writer reserves");
     assert!(
@@ -205,31 +187,35 @@ fn a_second_connections_write_joins_the_first_writers_open_transaction() {
         "BEGIN IMMEDIATE opens a transaction"
     );
 
-    run(&second, "INSERT INTO t VALUES(9, 'nine', 90)").expect(
-        "the second connection's write is admitted rather than refused BUSY - \
-         the gap this test pins",
+    let refused = run(&second, "INSERT INTO t VALUES(9, 'nine', 90)")
+        .expect_err("the second connection's write is refused while the first holds the file");
+    assert_eq!(
+        refused.code(),
+        inillucent_base::PrimaryCode::Busy,
+        "{refused}"
     );
     assert!(
-        !second
+        second
             .autocommit()
             .expect("nothing is running on this connection"),
-        "the second connection reports the same open transaction the first began"
+        "the second connection did not join the first one's transaction"
     );
 
-    let collides = run(&first, "INSERT INTO t VALUES(9, 'nine', 90)")
-        .expect_err("the first connection's identical insert collides with the second's");
-    assert_eq!(
-        collides.code(),
-        inillucent_base::PrimaryCode::Constraint,
-        "expected the UNIQUE constraint the second connection's insert already \
-         satisfied, not {collides}"
-    );
-
-    run(&first, "COMMIT").expect("the first connection commits what both wrote");
+    run(&first, "INSERT INTO t VALUES(9, 'nine', 90)")
+        .expect("the first connection's insert is not in the way of anything");
+    run(&first, "COMMIT").expect("the first connection commits");
     assert_eq!(
         rows(&first).len(),
         4,
-        "the second connection's insert survived the first connection's commit"
+        "the first connection's insert is kept"
+    );
+
+    run(&second, "INSERT INTO t VALUES(10, 'ten', 100)")
+        .expect("once the first has committed the second may write");
+    assert_eq!(
+        rows(&first).len(),
+        5,
+        "and the first reads the second's row"
     );
 }
 

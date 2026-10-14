@@ -314,6 +314,7 @@ name = "matrix"
 module = "lists"
 tier = "matrix"
 covers = ["inillucent-compat"]
+requires = ["oracle"]
 
 [[target]]
 package = "inillucent-compat"
@@ -1115,6 +1116,14 @@ name = "engine"
 module = "reentrant_connection"
 tier = "engine"
 covers = ["inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "connection_isolation"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-pool", "inillucent-wal"]
 
 [[target]]
 package = "inillucent-compat"

@@ -30,6 +30,13 @@ pub struct SqlIndex {
     /// storing it beside the database it borrows would be a self-referential
     /// struct for no gain.
     database: Database,
+    /// The one session every call on this index runs in.
+    ///
+    /// **One, because each connection of a database has a transaction of its
+    /// own.** `append` sends `BEGIN`, its rows and `COMMIT` as separate calls,
+    /// and a connection made fresh for each of them would have sent the `COMMIT`
+    /// to an engine that never saw the `BEGIN`.
+    session: u64,
     table: String,
     dims: usize,
     /// Whether the table declares the liveness facet the migration writes.
@@ -56,15 +63,16 @@ impl SqlIndex {
         // logical session each time it is called, and these two ask the same
         // shadow table the same kind of question at the same moment, so there
         // is no reason for them to be two.
-        let (dims, live_facet) = {
-            let connection = database.session();
-            (
-                declared_dims(&connection, table)?,
-                declares_live_facet(&connection, table)?,
-            )
-        };
+        let connection = database.session();
+        let session = connection.session();
+        let (dims, live_facet) = (
+            declared_dims(&connection, table)?,
+            declares_live_facet(&connection, table)?,
+        );
+        drop(connection);
         Ok(SqlIndex {
             database,
+            session,
             table: table.to_string(),
             dims,
             live_facet,
@@ -73,7 +81,7 @@ impl SqlIndex {
 
     /// Returns a connection, for a caller that wants ordinary SQL as well.
     pub fn connection(&self) -> Connection<'_> {
-        self.database.session()
+        self.database.session_as(self.session)
     }
 
     /// Walks every tree of the database and verifies its key order.
@@ -97,7 +105,7 @@ impl SqlIndex {
             "INSERT INTO {}({}) VALUES ('{}')",
             self.table, self.table, command
         );
-        self.database.session().execute_batch(&sql)
+        self.connection().execute_batch(&sql)
     }
 }
 
@@ -193,15 +201,15 @@ impl RetrievalIndex for SqlIndex {
             return Err(DbError::primary(inillucent_base::PrimaryCode::Misuse)
                 .with_detail("each chunk needs exactly one vector"));
         }
-        self.database.session().execute_batch("BEGIN")?;
+        self.connection().execute_batch("BEGIN")?;
         let outcome = self.append_inside(&chunks, embeddings);
         match outcome {
             Ok(count) => {
-                self.database.session().execute_batch("COMMIT")?;
+                self.connection().execute_batch("COMMIT")?;
                 Ok(count)
             }
             Err(failure) => {
-                let _ = self.database.session().execute_batch("ROLLBACK");
+                let _ = self.connection().execute_batch("ROLLBACK");
                 Err(failure)
             }
         }
@@ -213,7 +221,7 @@ impl RetrievalIndex for SqlIndex {
             return Ok(false);
         };
         let sql = format!("SELECT count(*) FROM {}_content WHERE id = ?1", self.table);
-        let mut probe = self.database.session().prepare(&sql)?;
+        let mut probe = self.connection().prepare(&sql)?;
         probe.bind_integer(1, rowid)?;
         let present = probe.step()?
             && probe
@@ -226,7 +234,7 @@ impl RetrievalIndex for SqlIndex {
             return Ok(false);
         }
         let sql = format!("DELETE FROM {} WHERE rowid = ?1", self.table);
-        let mut statement = self.database.session().prepare(&sql)?;
+        let mut statement = self.connection().prepare(&sql)?;
         statement.bind_integer(1, rowid)?;
         while statement.step()? {}
         Ok(true)
@@ -288,7 +296,7 @@ impl RetrievalIndex for SqlIndex {
             self.table,
             terms.join(" AND ")
         );
-        let mut statement = self.database.session().prepare(&sql)?;
+        let mut statement = self.connection().prepare(&sql)?;
         if has_text {
             statement.bind_text(1, &query.text)?;
         }
@@ -314,7 +322,7 @@ impl RetrievalIndex for SqlIndex {
     /// Returns how many rows the table holds.
     fn live_chunks(&mut self) -> DbResult<usize> {
         let sql = format!("SELECT count(*) FROM {}_content", self.table);
-        let mut statement = self.database.session().prepare(&sql)?;
+        let mut statement = self.connection().prepare(&sql)?;
         if !statement.step()? {
             return Ok(0);
         }
@@ -356,7 +364,7 @@ impl SqlIndex {
                 return Err(DbError::primary(inillucent_base::PrimaryCode::Misuse)
                     .with_detail(format!("{external} is not a rowid")));
             };
-            let mut statement = self.database.session().prepare(&sql)?;
+            let mut statement = self.connection().prepare(&sql)?;
             statement.bind_integer(1, rowid)?;
             statement.bind_text(2, &chunk.content)?;
             if self.dims > 0 {

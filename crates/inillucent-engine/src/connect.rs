@@ -100,41 +100,21 @@ pub struct LogStats {
     pub bytes: u64,
 }
 
-/// An open database file.
-pub struct Database {
+/// One engine, with the handles it shares with the code around it.
+///
+/// **Each connection of a [`Database`] has its own lane, and that is what gives
+/// each its own transaction.** The engine holds the open transaction, the
+/// writer and the pool, so two connections that borrowed one engine joined each
+/// other's `BEGIN`, read each other's uncommitted rows and had a write undone by
+/// the other's `ROLLBACK`. A second lane is a second engine opened over the same
+/// file, which takes the file's locks the way a second process does: it reads
+/// what is committed, and a second writer is refused with `busy` after the busy
+/// timeout.
+struct Lane {
     /// The engine, behind a cell because a statement takes `&mut` and a caller
     /// holds the database by shared reference - which is the same arrangement
     /// `inillucent-session` uses and for the same reason.
     engine: RefCell<Slot>,
-    /// The file, kept so it can be reported.
-    path: PathBuf,
-    /// How many rows the last statement changed.
-    ///
-    /// On the database rather than the statement because that is where
-    /// `sqlite3_changes` reads it from: a caller asks the connection what the
-    /// last statement did, having already dropped the statement.
-    changes: std::cell::Cell<i64>,
-    /// The next connection number to hand out.
-    ///
-    /// **On the database rather than on the engine (task-1962, A11).** It used
-    /// to live behind the cell, so opening a connection borrowed the engine -
-    /// and a callback that asked for one while a statement was running aborted
-    /// the process. A counter is the database's own bookkeeping; the engine
-    /// learns the number on the first statement that runs under it.
-    next_session: std::cell::Cell<u64>,
-    /// Modules registered while the open was still waiting for its first
-    /// statement, added when it finishes.
-    ///
-    /// **A registration does not finish the open (task-2191).** The shell
-    /// registers `fsdir` and `zipfile` on every database it opens, and each
-    /// registration used to run the deferred half of the open - recovery, the
-    /// schema, the catalog - and refresh the catalog again, so every command
-    /// line verb paid all of it inside the open and `refresh_catalog` ran three
-    /// times. They wait here, and the open adds them with one refresh.
-    modules_waiting: RefCell<Vec<std::sync::Arc<dyn inillucent_ext::vtab::Module>>>,
-    /// Whether the engine's commits wait for the fold, kept so a deferred open
-    /// applies it when it finishes; see [`Database::hold_commits_for_the_fold`].
-    commits_wait_for_fold: std::cell::Cell<bool>,
     /// The same writer the engine holds.
     ///
     /// **A second handle on one group, not a second group (task-1962, A1
@@ -167,6 +147,103 @@ pub struct Database {
     /// application asks what the statement it was just told about changed,
     /// while that statement is still running.
     counters: std::rc::Rc<crate::engine::state::Counters>,
+    /// Modules registered while the open was still waiting for its first
+    /// statement, added when it finishes.
+    ///
+    /// **A registration does not finish the open (task-2191).** The shell
+    /// registers `fsdir` and `zipfile` on every database it opens, and each
+    /// registration used to run the deferred half of the open - recovery, the
+    /// schema, the catalog - and refresh the catalog again, so every command
+    /// line verb paid all of it inside the open and `refresh_catalog` ran three
+    /// times. They wait here, and the open adds them with one refresh.
+    modules_waiting: RefCell<Vec<std::sync::Arc<dyn inillucent_ext::vtab::Module>>>,
+    /// Whether the engine's commits wait for the fold, kept so a deferred open
+    /// applies it when it finishes; see [`Database::hold_commits_for_the_fold`].
+    commits_wait_for_fold: std::cell::Cell<bool>,
+}
+
+/// What it takes to open another engine over the file a [`Database`] is on.
+///
+/// Kept from the open so a second connection can be given a lane of its own
+/// without asking the caller for the path, the key or the page size again.
+struct Opening {
+    /// The file system the first engine was opened through, which carries the
+    /// encryption key when the database has one, and is the one memory file
+    /// system an in memory database lives in.
+    vfs: std::sync::Arc<dyn inillucent_vfs::Vfs>,
+    /// The page size the file was opened at.
+    page_size: usize,
+    /// How many frames each engine's buffer pool holds.
+    frames: usize,
+    /// Whether the first engine was opened read only, which every other is too.
+    read_only: bool,
+    /// How long an open waits for a lock, and the `busy_timeout` a new engine
+    /// starts with, as the caller of the first open stated it.
+    busy_millis: u64,
+}
+
+impl Opening {
+    /// Records how an engine is being opened.
+    ///
+    /// @param vfs - the file system the engine is opened through
+    /// @param page_size - the page size the file is opened at
+    /// @param frames - how many frames the buffer pool holds
+    /// @param read_only - whether the engine may write the file
+    fn new(
+        vfs: std::sync::Arc<dyn inillucent_vfs::Vfs>,
+        page_size: usize,
+        frames: usize,
+        read_only: bool,
+    ) -> Opening {
+        Opening {
+            vfs,
+            page_size,
+            frames,
+            read_only,
+            busy_millis: inillucent_pool::file::default_busy_millis(),
+        }
+    }
+}
+
+/// The session number whose lane is the one the database was opened with.
+///
+/// `Database::session` hands out numbers from 1, so the first connection runs on
+/// the engine the open made and every later one gets an engine of its own.
+const FIRST_SESSION: u64 = 1;
+
+/// An open database file.
+pub struct Database {
+    /// The lanes of every connection after the first, by session number.
+    ///
+    /// **Declared before `primary` so they are dropped first.** A lane that
+    /// wrote folds its log into the file when it goes, and the first lane's own
+    /// fold then finds the file already current.
+    peers: RefCell<std::collections::BTreeMap<u64, std::rc::Rc<Lane>>>,
+    /// The lane the open made: the first connection's, and the one every call
+    /// made on the database itself (a checkpoint, a backup, the statistics)
+    /// runs on.
+    primary: std::rc::Rc<Lane>,
+    /// How to open another engine over the same file.
+    opening: Opening,
+    /// Every module registered on the database, so a connection opened later
+    /// gets them too.
+    modules: RefCell<Vec<std::sync::Arc<dyn inillucent_ext::vtab::Module>>>,
+    /// The file, kept so it can be reported.
+    path: PathBuf,
+    /// How many rows the last statement changed.
+    ///
+    /// On the database rather than the statement because that is where
+    /// `sqlite3_changes` reads it from: a caller asks the connection what the
+    /// last statement did, having already dropped the statement.
+    changes: std::cell::Cell<i64>,
+    /// The next connection number to hand out.
+    ///
+    /// **On the database rather than on the engine (task-1962, A11).** It used
+    /// to live behind the cell, so opening a connection borrowed the engine -
+    /// and a callback that asked for one while a statement was running aborted
+    /// the process. A counter is the database's own bookkeeping; the engine
+    /// learns the number on the first statement that runs under it.
+    next_session: std::cell::Cell<u64>,
 }
 
 /// Reports whether a path names an in-memory database rather than a file.
@@ -453,6 +530,114 @@ impl Slot {
     }
 }
 
+impl Lane {
+    /// Closes the engine, leaving the lane as a shell that answers every call
+    /// with an error.
+    ///
+    /// A connection and a statement keep their lane alive with an `Rc`, and
+    /// the borrow checker lets a `Database` be dropped while a connection that
+    /// is not used again is still in scope. Without this the engine, and the
+    /// file locks it holds, lasted until that connection went out of scope.
+    fn close(&self) {
+        if let Ok(mut slot) = self.engine.try_borrow_mut() {
+            *slot = Slot::Failed(misuse("the database is closed"));
+        }
+    }
+
+    /// Wraps an engine, opened or pending, in a lane.
+    ///
+    /// @param slot - the engine
+    fn over(slot: Slot) -> Lane {
+        let shared = match &slot {
+            Slot::Ready(engine) => crate::engine::open::SharedState {
+                counters: std::rc::Rc::clone(&engine.counters),
+                compiled: std::rc::Rc::clone(&engine.compiled),
+                writing: std::rc::Rc::clone(&engine.writing),
+                pragmas: std::rc::Rc::clone(&engine.pragmas),
+            },
+            Slot::Pending(_, shared) => crate::engine::open::SharedState {
+                counters: std::rc::Rc::clone(&shared.counters),
+                compiled: std::rc::Rc::clone(&shared.compiled),
+                writing: std::rc::Rc::clone(&shared.writing),
+                pragmas: std::rc::Rc::clone(&shared.pragmas),
+            },
+            Slot::Failed(_) => crate::engine::open::SharedState::fresh(),
+        };
+        Lane {
+            writer: shared.writing,
+            settings: shared.pragmas,
+            plans: shared.compiled,
+            counters: shared.counters,
+            engine: RefCell::new(slot),
+            modules_waiting: RefCell::new(Vec::new()),
+            commits_wait_for_fold: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Returns the engine, finishing a deferred open first.
+    ///
+    /// **An error rather than an abort when the engine is already in use**
+    /// (task-1962, A11): see [`Connection::engine_mut`]. A deferred open that
+    /// fails is remembered, and every later call answers the same error, as an
+    /// open that failed at once would have answered it.
+    fn ready(&self) -> DbResult<std::cell::RefMut<'_, ImportedDatabase>> {
+        let mut slot = self.engine.try_borrow_mut().map_err(|_| {
+            misuse(
+                "this connection is already running a statement; a function registered on a \
+                 connection cannot call back into it",
+            )
+        })?;
+        if matches!(&*slot, Slot::Pending(..)) {
+            let taken = std::mem::replace(&mut *slot, Slot::Failed(misuse("an open is finishing")));
+            if let Slot::Pending(pending, shared) = taken {
+                let waiting = self
+                    .modules_waiting
+                    .try_borrow_mut()
+                    .map(|mut held| std::mem::take(&mut *held))
+                    .unwrap_or_default();
+                *slot = match ImportedDatabase::finish_open(*pending, shared) {
+                    Ok(mut engine) => match engine.register_modules(waiting) {
+                        Ok(()) => {
+                            if self.commits_wait_for_fold.get() {
+                                engine.hold_commits_for_the_fold();
+                            }
+                            Slot::Ready(Box::new(engine))
+                        }
+                        Err(error) => Slot::Failed(error),
+                    },
+                    Err(error) => Slot::Failed(error),
+                };
+            }
+        }
+        std::cell::RefMut::filter_map(slot, |slot| match slot {
+            Slot::Ready(engine) => Some(engine.as_mut()),
+            _ => None,
+        })
+        .map_err(|slot| match &*slot {
+            Slot::Failed(error) => error.clone(),
+            _ => misuse("the database's open did not finish"),
+        })
+    }
+
+    /// Reports whether the open is still waiting for its first statement.
+    fn pending(&self) -> bool {
+        matches!(self.engine.try_borrow().as_deref(), Ok(Slot::Pending(..)))
+    }
+}
+
+impl Drop for Database {
+    /// Closes every connection's engine, the others first and the first one
+    /// last, so the file is released when the database is dropped and not when
+    /// the last connection or statement that names an engine goes away.
+    fn drop(&mut self) {
+        let peers = std::mem::take(&mut *self.peers.borrow_mut());
+        for lane in peers.values() {
+            lane.close();
+        }
+        self.primary.close();
+    }
+}
+
 impl Database {
     /// Opens a database, creating it when the path holds nothing.
     ///
@@ -593,19 +778,9 @@ impl Database {
         if is_memory(&path) {
             let vfs: std::sync::Arc<dyn inillucent_vfs::Vfs> =
                 std::sync::Arc::new(inillucent_vfs::MemoryVfs::new());
+            let opening = Opening::new(std::sync::Arc::clone(&vfs), page_size, frames, false);
             let engine = ImportedDatabase::create_on(vfs, path.clone(), page_size, frames)?;
-            return Ok(Database {
-                writer: std::rc::Rc::clone(&engine.writing),
-                settings: std::rc::Rc::clone(&engine.pragmas),
-                plans: std::rc::Rc::clone(&engine.compiled),
-                counters: std::rc::Rc::clone(&engine.counters),
-                engine: RefCell::new(Slot::Ready(Box::new(engine))),
-                path,
-                changes: std::cell::Cell::new(0),
-                next_session: std::cell::Cell::new(1),
-                modules_waiting: RefCell::new(Vec::new()),
-                commits_wait_for_fold: std::cell::Cell::new(false),
-            });
+            return Ok(Database::over(Slot::Ready(Box::new(engine)), path, opening));
         }
         let keyed = key.is_some();
         // **The open is tried before the file system is asked whether the file
@@ -621,8 +796,11 @@ impl Database {
             true => None,
             false => {
                 let vfs = crate::encryption::file_system(None, page_size)?;
+                let opening = Opening::new(std::sync::Arc::clone(&vfs), page_size, frames, false);
                 match ImportedDatabase::begin_open(vfs, path.clone(), page_size, frames, false) {
-                    Ok(pending) => return Ok(Database::over(Slot::pending(pending)?, path)),
+                    Ok(pending) => {
+                        return Ok(Database::over(Slot::pending(pending)?, path, opening))
+                    }
                     Err(error) => Some(error),
                 }
             }
@@ -638,6 +816,7 @@ impl Database {
             crate::encryption::check_the_file_matches_the_key(&path, keyed)?;
         }
         let vfs = crate::encryption::file_system(key, page_size)?;
+        let opening = Opening::new(std::sync::Arc::clone(&vfs), page_size, frames, read_only);
         let explain = |error| crate::encryption::explain_a_wrong_key(error, keyed);
         let opened = match (exists, read_only, first_try) {
             // **An empty file is an empty database, as in SQLite.** It failed the
@@ -711,91 +890,127 @@ impl Database {
                 return Err(error);
             }
         };
-        Ok(Database::over(slot, path))
+        Ok(Database::over(slot, path, opening))
     }
 
     /// Wraps an engine, opened or pending, in the handle a caller holds.
     ///
     /// @param slot - the engine
     /// @param path - the database file
-    fn over(slot: Slot, path: PathBuf) -> Database {
-        let shared = match &slot {
-            Slot::Ready(engine) => crate::engine::open::SharedState {
-                counters: std::rc::Rc::clone(&engine.counters),
-                compiled: std::rc::Rc::clone(&engine.compiled),
-                writing: std::rc::Rc::clone(&engine.writing),
-                pragmas: std::rc::Rc::clone(&engine.pragmas),
-            },
-            Slot::Pending(_, shared) => crate::engine::open::SharedState {
-                counters: std::rc::Rc::clone(&shared.counters),
-                compiled: std::rc::Rc::clone(&shared.compiled),
-                writing: std::rc::Rc::clone(&shared.writing),
-                pragmas: std::rc::Rc::clone(&shared.pragmas),
-            },
-            Slot::Failed(_) => crate::engine::open::SharedState::fresh(),
-        };
+    /// @param opening - how to open another engine over the same file
+    fn over(slot: Slot, path: PathBuf, opening: Opening) -> Database {
         Database {
-            writer: shared.writing,
-            settings: shared.pragmas,
-            plans: shared.compiled,
-            counters: shared.counters,
-            engine: RefCell::new(slot),
+            peers: RefCell::new(std::collections::BTreeMap::new()),
+            primary: std::rc::Rc::new(Lane::over(slot)),
+            opening,
+            modules: RefCell::new(Vec::new()),
             path,
             changes: std::cell::Cell::new(0),
-            next_session: std::cell::Cell::new(1),
-            modules_waiting: RefCell::new(Vec::new()),
-            commits_wait_for_fold: std::cell::Cell::new(false),
+            next_session: std::cell::Cell::new(FIRST_SESSION),
         }
     }
 
-    /// Returns the engine, finishing a deferred open first.
+    /// Returns the lane a connection runs on, making it when it is the first
+    /// use of a session that is not the first.
     ///
-    /// **An error rather than an abort when the engine is already in use**
-    /// (task-1962, A11): see [`Connection::engine_mut`]. A deferred open that
-    /// fails is remembered, and every later call answers the same error, as an
-    /// open that failed at once would have answered it.
-    fn ready(&self) -> DbResult<std::cell::RefMut<'_, ImportedDatabase>> {
-        let mut slot = self.engine.try_borrow_mut().map_err(|_| {
-            misuse(
-                "this connection is already running a statement; a function registered on a \
-                 connection cannot call back into it",
+    /// **The second engine is opened here, on the first statement of the
+    /// second connection, and not when the connection is handed out.** A
+    /// connection that is never used costs nothing, and a failure to open
+    /// (the file locked by another process, say) is answered to the statement
+    /// that needed the lane, which is where a caller can act on it.
+    ///
+    /// @param session - the connection's number
+    fn lane_for(&self, session: u64) -> DbResult<std::rc::Rc<Lane>> {
+        if session <= FIRST_SESSION {
+            return Ok(std::rc::Rc::clone(&self.primary));
+        }
+        if let Some(lane) = self.peers.borrow().get(&session) {
+            return Ok(std::rc::Rc::clone(lane));
+        }
+        let lane = std::rc::Rc::new(self.open_peer()?);
+        self.peers
+            .borrow_mut()
+            .insert(session, std::rc::Rc::clone(&lane));
+        Ok(lane)
+    }
+
+    /// Opens another engine over the file this database is on, with the
+    /// settings the first one has.
+    ///
+    /// **It opens the file the way a second process does**, through the same
+    /// file system and the same locks, so what it reads is what is committed and
+    /// what it writes waits for the writer that holds the file. The open waits
+    /// as long as the first open was told to, and the new engine starts with the
+    /// same `busy_timeout`, run-time limits and statement cache ceiling, so a
+    /// connection does not behave differently for being the second.
+    fn open_peer(&self) -> DbResult<Lane> {
+        let opening = &self.opening;
+        let pending = inillucent_pool::file::with_open_busy_millis(opening.busy_millis, || {
+            ImportedDatabase::begin_open(
+                std::sync::Arc::clone(&opening.vfs),
+                self.path.clone(),
+                opening.page_size,
+                opening.frames,
+                opening.read_only,
             )
         })?;
-        if matches!(&*slot, Slot::Pending(..)) {
-            let taken = std::mem::replace(&mut *slot, Slot::Failed(misuse("an open is finishing")));
-            if let Slot::Pending(pending, shared) = taken {
-                let waiting = self
-                    .modules_waiting
-                    .try_borrow_mut()
-                    .map(|mut held| std::mem::take(&mut *held))
-                    .unwrap_or_default();
-                *slot = match ImportedDatabase::finish_open(*pending, shared) {
-                    Ok(mut engine) => match engine.register_modules(waiting) {
-                        Ok(()) => {
-                            if self.commits_wait_for_fold.get() {
-                                engine.hold_commits_for_the_fold();
-                            }
-                            Slot::Ready(Box::new(engine))
-                        }
-                        Err(error) => Slot::Failed(error),
-                    },
-                    Err(error) => Slot::Failed(error),
-                };
-            }
+        let lane = Lane::over(Slot::pending(pending)?);
+        lane.commits_wait_for_fold
+            .set(self.primary.commits_wait_for_fold.get());
+        if let Ok(mut waiting) = lane.modules_waiting.try_borrow_mut() {
+            waiting.extend(self.modules.borrow().iter().cloned());
         }
-        std::cell::RefMut::filter_map(slot, |slot| match slot {
-            Slot::Ready(engine) => Some(engine.as_mut()),
-            _ => None,
-        })
-        .map_err(|slot| match &*slot {
-            Slot::Failed(error) => error.clone(),
-            _ => misuse("the database's open did not finish"),
-        })
+        lane.plans.set_limit(self.primary.plans.limit());
+        let limits = self.primary.settings.limits().borrow().clone();
+        *lane.settings.limits().borrow_mut() = limits;
+        Ok(lane)
     }
 
-    /// Reports whether the open is still waiting for its first statement.
+    /// Ends a connection's session, freeing the engine it ran on.
+    ///
+    /// For a caller that closes connections, such as the C library when the last
+    /// handle on a connection is freed. A connection's own engine holds a buffer
+    /// pool and a place in the log, so one that is never released lasts until the
+    /// database closes. The first connection's engine is the database's own and
+    /// is kept, but a transaction it has open is rolled back, so closing the
+    /// first connection gives the file to the next writer as closing any other
+    /// does. A transaction another session had open is rolled back by its
+    /// engine going away.
+    ///
+    /// @param session - the number the connection reported
+    pub fn release_session(&self, session: u64) {
+        if session <= FIRST_SESSION {
+            if !self.primary.pending() && self.primary.writer.batch().is_some() {
+                if let Ok(mut engine) = self.primary.ready() {
+                    engine.use_session(session);
+                    let _ = engine.execute_any("ROLLBACK", &Params::new());
+                }
+            }
+            return;
+        }
+        let released = self.peers.borrow_mut().remove(&session);
+        drop(released);
+    }
+
+    /// Returns every lane the database has, the first one first.
+    fn lanes(&self) -> Vec<std::rc::Rc<Lane>> {
+        let mut lanes = vec![std::rc::Rc::clone(&self.primary)];
+        lanes.extend(self.peers.borrow().values().cloned());
+        lanes
+    }
+
+    /// Returns the first lane's engine, finishing a deferred open first.
+    ///
+    /// The engine every call on the database itself runs on; a connection runs
+    /// on the lane [`Database::lane_for`] gives it.
+    fn ready(&self) -> DbResult<std::cell::RefMut<'_, ImportedDatabase>> {
+        self.primary.ready()
+    }
+
+    /// Reports whether the first lane's open is still waiting for its first
+    /// statement.
     fn pending(&self) -> bool {
-        matches!(self.engine.try_borrow().as_deref(), Ok(Slot::Pending(..)))
+        self.primary.pending()
     }
 
     /// Imports a SQLite file into a new database beside it, and opens that.
@@ -841,19 +1056,18 @@ impl Database {
     /// @param target - the file to write
     /// @param frames - how many frames the buffer pool holds
     pub fn import_into(source: PathBuf, target: PathBuf, frames: usize) -> DbResult<Database> {
+        let opening = Opening::new(
+            crate::encryption::file_system(None, PAGE_SIZE)?,
+            PAGE_SIZE,
+            frames,
+            false,
+        );
         let engine = ImportedDatabase::import_into(source, target.clone(), PAGE_SIZE, frames)?;
-        Ok(Database {
-            writer: std::rc::Rc::clone(&engine.writing),
-            settings: std::rc::Rc::clone(&engine.pragmas),
-            plans: std::rc::Rc::clone(&engine.compiled),
-            counters: std::rc::Rc::clone(&engine.counters),
-            engine: RefCell::new(Slot::Ready(Box::new(engine))),
-            path: target,
-            changes: std::cell::Cell::new(0),
-            next_session: std::cell::Cell::new(1),
-            modules_waiting: RefCell::new(Vec::new()),
-            commits_wait_for_fold: std::cell::Cell::new(false),
-        })
+        Ok(Database::over(
+            Slot::Ready(Box::new(engine)),
+            target,
+            opening,
+        ))
     }
 
     /// Returns a connection to this database.
@@ -864,47 +1078,43 @@ impl Database {
     /// number the engine can tell apart, rather than a borrow that is
     /// indistinguishable from every other borrow.
     ///
-    /// **A session does not scope the transaction, and the difference matters.**
-    /// Every connection returned here borrows one `ImportedDatabase`, and the
-    /// open transaction lives on that, so a `BEGIN` on any handle opens a
-    /// transaction every other handle then joins: a write issued through a
-    /// second connection lands inside the first one's transaction and is undone
-    /// by its `ROLLBACK`. Two connections are two sessions over one writer, not
-    /// two writers.
+    /// **A session scopes the transaction too.** The first connection runs on
+    /// the engine the open made. Every later one runs on an engine of its own,
+    /// opened over the same file the first time it runs a statement, and that
+    /// engine holds its own transaction. A `BEGIN` on one connection is not
+    /// joined by another, the other reads what is committed and not what the
+    /// first has written so far, and a second writer is refused with `busy`
+    /// after the `busy_timeout`, which is what a second *process* gets over the
+    /// SHARED, RESERVED, PENDING and EXCLUSIVE protocol SQLite uses; see
+    /// `docs/roadmap.md` item 9, which is where concurrency is graded. The
+    /// engines are separate, so a function, a collation, an authorizer or a
+    /// pragma set on one connection is not set on another, as in SQLite.
     ///
-    /// Two *processes* are genuinely independent, over the same SHARED,
-    /// RESERVED, PENDING and EXCLUSIVE protocol SQLite uses; see
-    /// `docs/roadmap.md` item 9, which is where concurrency is graded. An
-    /// application that needs two independent transactions needs two processes,
-    /// or two `Database` values over two files.
+    /// Opening an engine costs what opening a second `Database` on the file
+    /// costs, so a caller that opens a connection for every statement pays it
+    /// every time. Keep a connection, or continue a session with
+    /// [`Database::session_as`], and call [`Database::release_session`] when a
+    /// session is over.
     ///
-    /// **It is called `session` and not `connect` because that is what it
-    /// returns (task-1961, A5).** `connect()` returned something shaped exactly
-    /// like an independent connection, and the paragraph above - that two of
-    /// them share one transaction - was the only thing that said otherwise.
-    /// Anyone arriving from SQLite or rusqlite reads `connect` as "a second
-    /// handle with its own transaction", writes through it, and has the write
-    /// undone by the first handle's `ROLLBACK` with nothing reported. The name
-    /// now says which of the two things it is. `connect` is kept as a
-    /// deprecated alias for one release.
+    /// **It is called `session` because it also scopes `temp` and `ATTACH`
+    /// (task-1961, A5).** It was named `connect` when two of these shared one
+    /// transaction, which `connect` denied. They no longer do; `connect` is kept
+    /// as a deprecated alias for one release.
     pub fn session(&self) -> Connection<'_> {
         let session = self.next_session.get();
         self.next_session.set(session.saturating_add(1));
         Connection {
             database: self,
             session,
+            lane: std::cell::OnceCell::new(),
         }
     }
 
     /// Returns a connection to this database.
     ///
-    /// Renamed [`Database::session`] in task-1961, because two of these share
-    /// one transaction and `connect` says they do not. Kept for one release so
-    /// an application outside this workspace compiles while it is moved.
-    #[deprecated(
-        since = "0.1.3",
-        note = "renamed `session`: two of these share one transaction"
-    )]
+    /// Renamed [`Database::session`] in task-1961. Kept for one release so an
+    /// application outside this workspace compiles while it is moved.
+    #[deprecated(since = "0.1.3", note = "renamed `session`")]
     pub fn connect(&self) -> Connection<'_> {
         self.session()
     }
@@ -923,6 +1133,7 @@ impl Database {
         Connection {
             database: self,
             session,
+            lane: std::cell::OnceCell::new(),
         }
     }
 
@@ -1014,13 +1225,25 @@ impl Database {
         &self,
         module: std::sync::Arc<dyn inillucent_ext::vtab::Module>,
     ) -> DbResult<()> {
-        if self.pending() {
-            if let Ok(mut waiting) = self.modules_waiting.try_borrow_mut() {
-                waiting.push(module);
-                return Ok(());
+        self.modules
+            .borrow_mut()
+            .push(std::sync::Arc::clone(&module));
+        let mut registered = Ok(());
+        for lane in self.lanes() {
+            if lane.pending() {
+                if let Ok(mut waiting) = lane.modules_waiting.try_borrow_mut() {
+                    waiting.push(std::sync::Arc::clone(&module));
+                    continue;
+                }
+            }
+            let result = lane
+                .ready()
+                .and_then(|mut engine| engine.register_module(std::sync::Arc::clone(&module)));
+            if registered.is_ok() {
+                registered = result;
             }
         }
-        self.ready()?.register_module(module)
+        registered
     }
 
     /// Makes every commit durable by the fold that follows its statement
@@ -1030,11 +1253,13 @@ impl Database {
     /// See `ImportedDatabase::hold_commits_for_the_fold`. Kept here when the
     /// open is still deferred, so asking does not finish it.
     pub fn hold_commits_for_the_fold(&self) -> DbResult<()> {
-        self.commits_wait_for_fold.set(true);
-        if self.pending() {
-            return Ok(());
+        for lane in self.lanes() {
+            lane.commits_wait_for_fold.set(true);
+            if lane.pending() {
+                continue;
+            }
+            lane.ready()?.hold_commits_for_the_fold();
         }
-        self.ready()?.hold_commits_for_the_fold();
         Ok(())
     }
 
@@ -1043,31 +1268,35 @@ impl Database {
     /// See `ImportedDatabase::cached_statements`; this is the same count,
     /// reachable from the connection surface an application actually holds.
     pub fn cached_statements(&self) -> usize {
-        self.plans.held()
+        self.lanes().iter().map(|lane| lane.plans.held()).sum()
     }
 
     /// Returns the ceiling one session's plan cache is emptied at.
     pub fn statement_cache_limit(&self) -> usize {
-        self.plans.limit()
+        self.primary.plans.limit()
     }
 
     /// Sets the ceiling one session's plan cache is emptied at.
     ///
     /// @param most - how many compiled statements one session may hold
     pub fn set_statement_cache_limit(&self, most: usize) {
-        self.plans.set_limit(most);
+        for lane in self.lanes() {
+            lane.plans.set_limit(most);
+        }
     }
 
     /// Forgets every compiled statement.
     pub fn clear_statement_cache(&self) {
-        self.plans.forget_all();
+        for lane in self.lanes() {
+            lane.plans.forget_all();
+        }
     }
 
     /// Returns what one run-time limit is set to on this database.
     ///
     /// @param limit - which limit
     pub fn limit(&self, limit: inillucent_base::limits::Limit) -> i64 {
-        self.settings.limits().borrow().get(limit)
+        self.primary.settings.limits().borrow().get(limit)
     }
 
     /// Sets one run-time limit, and returns what it was before.
@@ -1083,9 +1312,12 @@ impl Database {
     /// @param requested - the value asked for
     /// @returns the value that was in force before this call
     pub fn set_limit(&self, limit: inillucent_base::limits::Limit, requested: i64) -> i64 {
-        let before = self.settings.limits().borrow_mut().set(limit, requested);
-        if self.limit(limit) != before {
-            self.plans.forget_all();
+        let before = self.limit(limit);
+        for lane in self.lanes() {
+            lane.settings.limits().borrow_mut().set(limit, requested);
+            if lane.settings.limits().borrow().get(limit) != before {
+                lane.plans.forget_all();
+            }
         }
         before
     }
@@ -1095,22 +1327,27 @@ impl Database {
     /// For `.stats`, which reports the work a statement caused rather than the
     /// answer it gave. The shape is the engine's own rather than the pool's, so
     /// a caller reading it does not have to name the crate the pool lives in.
+    ///
+    /// **Added up over every connection's engine**, because each connection has a
+    /// pool of its own and the work a caller counts is the database's.
     pub fn cache_stats(&self) -> CacheStats {
-        let Ok(engine) = self.ready() else {
-            return CacheStats::default();
-        };
-        let held = engine.pool_stats();
-        CacheStats {
-            hits: held.hits,
-            misses: held.misses,
-            rewarms: held.rewarms,
-            cooled: held.cooled,
-            evicted: held.evicted,
-            reads: held.reads,
-            writes: held.writes,
-            meta_reads: held.meta_reads,
-            meta_probes: held.meta_probes,
+        let mut total = CacheStats::default();
+        for lane in self.lanes() {
+            let Ok(engine) = lane.ready() else {
+                continue;
+            };
+            let held = engine.pool_stats();
+            total.hits += held.hits;
+            total.misses += held.misses;
+            total.rewarms += held.rewarms;
+            total.cooled += held.cooled;
+            total.evicted += held.evicted;
+            total.reads += held.reads;
+            total.writes += held.writes;
+            total.meta_reads += held.meta_reads;
+            total.meta_probes += held.meta_probes;
         }
+        total
     }
 
     /// Returns what the write-ahead log has been asked to do.
@@ -1120,17 +1357,21 @@ impl Database {
     /// with the amount of data. That is what makes it the right thing for a
     /// budget guard to assert on: it is a count of work rather than a reading of
     /// the clock, so it does not change when the machine is busy.
+    ///
+    /// Added up over every connection's engine, as [`Database::cache_stats`] is.
     pub fn log_stats(&self) -> LogStats {
-        let Ok(engine) = self.ready() else {
-            return LogStats::default();
-        };
-        let held = engine.wal().stats();
-        LogStats {
-            records: held.records,
-            writes: held.writes,
-            syncs: held.syncs,
-            bytes: held.bytes,
+        let mut total = LogStats::default();
+        for lane in self.lanes() {
+            let Ok(engine) = lane.ready() else {
+                continue;
+            };
+            let held = engine.wal().stats();
+            total.records += held.records;
+            total.writes += held.writes;
+            total.syncs += held.syncs;
+            total.bytes += held.bytes;
         }
+        total
     }
 
     /// Returns what the write path has done to every tree, added up.
@@ -1140,14 +1381,20 @@ impl Database {
     /// slower; the compactions, the splits and the nanoseconds spent making room
     /// say which tree paid for it and in which stage.
     pub fn write_stats(&self) -> inillucent_tree::write::WriteStats {
-        self.ready()
-            .map(|engine| engine.write_stats())
-            .unwrap_or_default()
+        self.lanes()
+            .iter()
+            .filter_map(|lane| lane.ready().ok().map(|engine| engine.write_stats()))
+            .fold(inillucent_tree::write::WriteStats::default(), |sum, one| {
+                sum + one
+            })
     }
 
     /// Returns how many bytes the page cache is holding.
     pub fn pool_bytes(&self) -> usize {
-        self.ready().map(|engine| engine.pool_bytes()).unwrap_or(0)
+        self.lanes()
+            .iter()
+            .filter_map(|lane| lane.ready().ok().map(|engine| engine.pool_bytes()))
+            .sum()
     }
 
     /// Checks every tree's structure.
@@ -1369,6 +1616,9 @@ pub struct Connection<'d> {
     database: &'d Database,
     /// Which connection this is, which is what `temp` is resolved against.
     session: u64,
+    /// The engine this connection runs on, found on its first use; see
+    /// [`Database::lane_for`].
+    lane: std::cell::OnceCell<std::rc::Rc<Lane>>,
 }
 
 impl Connection<'_> {
@@ -1411,9 +1661,21 @@ impl<'d> Connection<'d> {
     /// one `RefCell` holds the whole engine. A1 step 3 splits that cell into
     /// three and most of this goes with it.
     fn engine_mut(&self) -> DbResult<std::cell::RefMut<'_, ImportedDatabase>> {
-        let mut held = self.database.ready()?;
+        let mut held = self.lane()?.ready()?;
         held.use_session(self.session);
         Ok(held)
+    }
+
+    /// Returns the lane this connection runs on, finding it the first time.
+    ///
+    /// The first connection's is the engine the open made. Any other's is an
+    /// engine of its own, which is what gives it its own transaction.
+    fn lane(&self) -> DbResult<&std::rc::Rc<Lane>> {
+        if let Some(lane) = self.lane.get() {
+            return Ok(lane);
+        }
+        let found = self.database.lane_for(self.session)?;
+        Ok(self.lane.get_or_init(|| found))
     }
 
     /// Runs one or more statements for their effect.
@@ -1589,7 +1851,7 @@ impl<'d> Connection<'d> {
 
     /// Returns how many statements are compiled and held.
     pub fn cached_plan_count(&self) -> DbResult<usize> {
-        Ok(self.database.plans.held())
+        Ok(self.lane()?.plans.held())
     }
 
     /// Returns how many statements this connection has compiled since it opened.
@@ -1600,7 +1862,7 @@ impl<'d> Connection<'d> {
     /// `crates/inillucent/tests/budget.rs` asserts on it, and that file writes
     /// against this facade.
     pub fn compiled_statement_count(&self) -> DbResult<u64> {
-        Ok(self.database.plans.compiles())
+        Ok(self.lane()?.plans.compiles())
     }
 
     /// Turns off one or more planner optimizations for this connection.
@@ -1610,7 +1872,7 @@ impl<'d> Connection<'d> {
         // The plan cache is keyed by the levers rather than cleared by them -
         // see `ImportedDatabase::disable_optimizations` - so setting the value
         // is the whole of it, and it needs no borrow of the engine.
-        self.database.settings.set_levers(levers);
+        self.lane()?.settings.set_levers(levers);
         Ok(())
     }
 
@@ -1696,7 +1958,7 @@ impl<'d> Connection<'d> {
     ///
     /// @param sql - the statement text
     pub fn parameter_count(&self, sql: &str) -> DbResult<u32> {
-        self.database.ready()?.parameter_count(sql)
+        self.lane()?.ready()?.parameter_count(sql)
     }
 
     /// Returns the named parameters one statement declares, with their indexes.
@@ -1706,7 +1968,7 @@ impl<'d> Connection<'d> {
     ///
     /// @param sql - the statement text
     pub fn parameter_names(&self, sql: &str) -> DbResult<Vec<(Vec<u8>, u32)>> {
-        self.database.ready()?.parameter_names(sql)
+        self.lane()?.ready()?.parameter_names(sql)
     }
 
     /// Compiles a statement to be bound and stepped.
@@ -1732,6 +1994,7 @@ impl<'d> Connection<'d> {
         params.expect(declared);
         Ok(Statement {
             database: self.database,
+            lane: std::rc::Rc::clone(self.lane()?),
             sql: sql.to_string(),
             compiled,
             generation,
@@ -1762,7 +2025,7 @@ impl<'d> Connection<'d> {
     /// holding the previous statement's number, and `sqlite3_changes` and
     /// `changes()` could answer differently about the same statement.
     pub fn changes(&self) -> DbResult<i64> {
-        Ok(self.database.counters.of(self.session).last_changes)
+        Ok(self.lane()?.counters.of(self.session).last_changes)
     }
 
     /// Returns how many rows every statement so far has changed.
@@ -1771,12 +2034,12 @@ impl<'d> Connection<'d> {
     /// whatever the last `use_session` set, and a connection knows which one it
     /// is without asking.
     pub fn total_changes(&self) -> DbResult<i64> {
-        Ok(self.database.counters.of(self.session).total_changes)
+        Ok(self.lane()?.counters.of(self.session).total_changes)
     }
 
     /// Returns the rowid the last `INSERT` assigned.
     pub fn last_insert_rowid(&self) -> DbResult<i64> {
-        Ok(self.database.counters.of(self.session).last_rowid)
+        Ok(self.lane()?.counters.of(self.session).last_rowid)
     }
 
     /// Returns how many databases the last commit was decided over.
@@ -1784,7 +2047,7 @@ impl<'d> Connection<'d> {
     /// One for an ordinary statement; two or more for a transaction that wrote
     /// two files and was therefore committed through a super-journal.
     pub fn decided_over(&self) -> DbResult<usize> {
-        Ok(self.database.writer.decided_over())
+        Ok(self.lane()?.writer.decided_over())
     }
 
     /// Returns whether every statement is its own transaction.
@@ -1798,7 +2061,7 @@ impl<'d> Connection<'d> {
     /// is documented as callable from a callback. It reads the writer the
     /// database holds beside the engine instead, and takes no cell at all.
     pub fn autocommit(&self) -> DbResult<bool> {
-        Ok(self.database.writer.batch().is_none())
+        Ok(self.lane()?.writer.batch().is_none())
     }
 
     /// Opens a transaction that rolls back unless it is committed.
@@ -1812,14 +2075,11 @@ impl<'d> Connection<'d> {
     /// task-1932; it lives here now so the engine's own connection has it and
     /// the driver marshals rather than decides.
     ///
-    /// Refuses when a transaction is already open, and the check is
-    /// [`Connection::autocommit`] rather than a counter this type keeps,
-    /// because in this engine a transaction belongs to the *database* and not
-    /// to the connection that opened it: a `BEGIN` on one handle is joined by
-    /// every other handle on the same file, which is what the invariant on
-    /// [`Database::connect`] says. A counter per connection would answer "no
-    /// transaction here" while one was open on a sibling, and committing it
-    /// would settle work the sibling had not finished.
+    /// Refuses when a transaction is already open on this connection, and the
+    /// check is [`Connection::autocommit`] rather than a counter this type
+    /// keeps, because a `BEGIN` written as SQL is a transaction this type did
+    /// not open. A transaction belongs to the connection that opened it: another
+    /// connection of the same database has an engine of its own.
     pub fn begin(&self) -> DbResult<Transaction<'_>> {
         if !self.autocommit()? {
             // `SQLITE_ERROR`, which is what the pinned reference answers for
@@ -1973,6 +2233,8 @@ impl<C: RowConsumer + 'static> RowConsumer for Counting<C> {
 pub struct Statement<'d> {
     /// The database the statement runs against.
     database: &'d Database,
+    /// The engine of the connection the statement was compiled on.
+    lane: std::rc::Rc<Lane>,
     /// The text this statement was compiled from.
     ///
     /// Kept so a schema change can be answered by recompiling, the way
@@ -2089,7 +2351,9 @@ impl Statement<'_> {
     /// `sqlite3_step` does the equivalent automatic reprepare.
     pub fn step(&mut self) -> DbResult<bool> {
         if !self.run {
-            let mut held = self.database.ready()?;
+            // A clone, so the engine's borrow is of this local and not of `self`.
+            let lane = std::rc::Rc::clone(&self.lane);
+            let mut held = lane.ready()?;
             // The statement runs on the connection that compiled it, because
             // `temp` means that connection's temporary database and the plan was
             // bound against it.
@@ -2273,7 +2537,7 @@ impl Statement<'_> {
     /// See `ImportedDatabase::runs_rows_at_once`: a single row `INSERT` of its
     /// parameters into a plain table, inside a transaction the caller opened.
     pub fn can_run_rows_at_once(&mut self) -> DbResult<bool> {
-        let mut held = self.database.ready()?;
+        let mut held = self.lane.ready()?;
         held.use_session(self.session);
         if held.schema_generation() != self.generation {
             self.compiled = held.prepare_current_statement(&self.sql)?;
@@ -2294,7 +2558,7 @@ impl Statement<'_> {
     ///
     /// @param rows - the rows, each one value per parameter
     pub fn run_rows_at_once(&mut self, rows: Vec<Vec<OwnedDatum>>) -> DbResult<Option<usize>> {
-        let mut held = self.database.ready()?;
+        let mut held = self.lane.ready()?;
         held.use_session(self.session);
         let Some(outcome) = held.execute_rows_at_once(&self.compiled, rows)? else {
             return Ok(None);

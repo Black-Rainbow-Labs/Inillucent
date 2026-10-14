@@ -17,7 +17,7 @@ release archive, has the full contract.
 | C library | `inillucent-driver-capi`, a C interface over the driver. Its header is `drivers/inillucent-driver-capi/include/inillucent_driver.h` |
 | binding | code in another language that calls the C library |
 | capability table | the list of features the engine reports, each marked `yes`, `partial` or `no` |
-| session | what `temp.` tables, `ATTACH` and connection pragmas belong to |
+| session | what `temp.` tables, `ATTACH`, connection pragmas and a transaction belong to. Each connection is one session |
 
 ## How each language reaches the engine
 
@@ -91,7 +91,8 @@ match connection.query_all(statement, &[]) {
 ```
 
 `Database::session` returns a `Connection`. The older name `Database::connect` still works and is
-deprecated. Rust calls the driver directly and does not go through the C library.
+deprecated. Each connection has a transaction of its own: another connection reads only what is
+committed, and a second writer waits for the busy timeout and then fails with `busy`. Rust calls the driver directly and does not go through the C library.
 
 `embed(TEXT)` is compiled in only with the `embed` feature. Name it on the crate you depend on:
 `inillucent = { version = "1.0", features = ["embed"] }`, or `features = ["embed"]` on

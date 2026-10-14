@@ -57,14 +57,9 @@ fn workspace_root() -> PathBuf {
 /// Opens the one database a path has.
 ///
 /// **One `Database` per file, and every "connection" in this file is a session
-/// on it.** The old engine's `Connection` owned its own handle, so a suite
-/// about two connections opened the path twice; this engine is built the other
-/// way round and says so - "one file is one pool: two connections that each
-/// held a pool over one file would be two page caches over one set of bytes".
-/// Opening the path a second time therefore does not give a second connection,
-/// it gives a second *writer*, and the second one is refused with "a writer
-/// holds PENDING" before any test body runs. `database.session()` twice is the
-/// shape these tests are actually about.
+/// on it.** Each session has an engine and a transaction of its own, opened over
+/// the same file, so two of them are arbitrated by the file's locks as two
+/// processes are. The first session is the engine the open made.
 fn database(path: &std::path::Path) -> Database {
     Database::open(path).expect("the database opens")
 }
@@ -99,29 +94,14 @@ fn as_integer(value: Option<&OwnedDatum>) -> i64 {
     }
 }
 
-/// Two sessions on one database share what they can see, so a `BEGIN` on one
-/// does **not** hold a snapshot against the other's commits.
+/// A `BEGIN` on one connection holds a snapshot against the other connection's commits.
 ///
-/// **This is a recorded difference, not the behaviour anybody wants.** It used
-/// to assert the opposite - a reader holding its snapshot while a writer
-/// committed over the top of it, which is the promise WAL mode exists to make
-/// and which the old engine kept, because each of its connections owned its own
-/// handle and its own read mark. This engine is one pool per file, and the two
-/// "connections" here are two *sessions* on that one pool, so the second one
-/// reads the first one's committed rows immediately.
-///
-/// Where the real promise lives now is **across processes**, and this file is
-/// not where it is graded: `process_concurrency.rs` spawns two real writer
-/// processes and asserts that rows present equal commits acknowledged. That
-/// distinction is not a technicality - until task-1980 this file's own comment
-/// claimed the cross-process case was measured, and two real processes were
-/// losing 43% of their acknowledged commits at the time (task-1979, section 4).
-/// What this test pins is the in-process answer, so that a future
-/// engine which does give a session its own read mark turns this red and the
-/// original expectations - 1 while the writer commits, 3 after the commit - go
-/// back in.
+/// Each connection of a `Database` has an engine, a read mark and a transaction of its own, so a
+/// reader that has read inside a `BEGIN` goes on reading the rows that were committed when it
+/// began, and the writer commits over the top of it without waiting. This is the promise WAL mode
+/// exists to make. Once the reader's transaction ends it reads the writer's commits.
 #[test]
-fn two_sessions_on_one_database_do_not_hold_separate_snapshots() {
+fn two_sessions_on_one_database_hold_separate_snapshots() {
     let path = scratch("snapshot");
     let held = database(&path);
     let writer = held.session();
@@ -149,55 +129,26 @@ fn two_sessions_on_one_database_do_not_hold_separate_snapshots() {
         .expect("a row");
     assert_eq!(integer(&writer, "SELECT count(*) FROM t"), 3);
 
-    // The reader sees all three straight away, because it is a session on the
-    // same pool rather than a connection with a read mark of its own.
     assert_eq!(
         integer(&reader, "SELECT count(*) FROM t"),
-        3,
-        "a session on one pool is expected to see the other session's commits \
-         immediately; if this now reads 1, sessions have grown their own read \
-         marks and this test should go back to asserting 1 here and 3 after the \
-         COMMIT below"
+        1,
+        "the reader holds the snapshot it began with"
     );
     reader.execute_batch("COMMIT").expect("the read closes");
     assert_eq!(
         integer(&reader, "SELECT count(*) FROM t"),
         3,
-        "the rows are still all there after the read transaction closes"
+        "once the read transaction closes the reader reads the commits made meanwhile"
     );
 }
 
-/// A passive checkpoint copies the whole log back past a session whose
-/// `BEGIN` has not written anything, because a session is not a reader with a
-/// mark.
+/// A passive checkpoint cannot copy the log back past a connection whose `BEGIN` has read.
 ///
-/// **The second recorded difference, and it has the same cause as
-/// `two_sessions_on_one_database_do_not_hold_separate_snapshots`.** This used
-/// to assert that a checkpoint could *not* pass a live reader - that it copied
-/// fewer frames than the log held and said so - which is what protects a reader
-/// from having the pages under it rewritten. With one pool per file there is no
-/// second reader to be in the way, so the checkpoint finishes.
-///
-/// **The reader's `BEGIN` here must stay unwritten.** This test used to have
-/// the writer insert a second row *after* the reader's `BEGIN`, meaning to
-/// model a concurrent writer running past a live reader. On one shared
-/// `ImportedDatabase` there is no such thing: `self.batch` is one field the
-/// two `connect()` handles share, so that insert was not a second writer, it
-/// was the reader's own transaction being written to - and
-/// `pragma_wal_checkpoint`'s refusal (added alongside the no-steal fix,
-/// matching the pinned SQLite 3.53.4 reference) now declines a checkpoint
-/// there correctly. See `a_checkpoint_refuses_once_a_shared_transaction_has_written`,
-/// below, for that case asserted directly, and `docs/sql.md`'s
-/// `PRAGMA wal_checkpoint` entry.
-///
-/// A reader that genuinely holds a checkpoint back, independent of any
-/// writer's transaction, is a cross-process case, and `docs/roadmap.md` item 9
-/// is where that is graded. If this engine ever gives a session a read mark of
-/// its own, this goes red and the original assertion - `copied < frames` while
-/// the reader is open, then `copied == frames` after it commits - is what
-/// belongs here again.
+/// The reader's read mark protects the pages it can still see from being rewritten, so the
+/// checkpoint copies fewer frames than the log holds, and copies all of them once the reader's
+/// transaction has ended.
 #[test]
-fn a_checkpoint_copies_the_whole_log_back_past_a_session() {
+fn a_checkpoint_does_not_copy_the_log_back_past_a_reader() {
     let path = scratch("protected");
     let held = database(&path);
     let writer = held.session();
@@ -214,15 +165,13 @@ fn a_checkpoint_copies_the_whole_log_back_past_a_session() {
     let reader = held.session();
     reader.execute_batch("BEGIN").expect("the read opens");
     assert_eq!(integer(&reader, "SELECT count(*) FROM t"), 1);
+    writer
+        .execute_batch("INSERT INTO t VALUES(2)")
+        .expect("a row written while the reader is open");
 
-    // A passive checkpoint reports how many frames the log holds and how many
-    // it managed to copy. Both numbers are real and both are asserted: the log
-    // has frames in it, and with no reader mark to stop it - and nothing
-    // written inside the reader's still-open `BEGIN` - the checkpoint copies
-    // all of them.
     let rows = writer
         .query("PRAGMA wal_checkpoint(PASSIVE)")
-        .expect("an unwritten BEGIN does not block a checkpoint");
+        .expect("a checkpoint beside a reader reports instead of failing");
     let row = rows.first().expect("the checkpoint reports a row");
     let frames = as_integer(row.get(1));
     let copied = as_integer(row.get(2));
@@ -230,19 +179,17 @@ fn a_checkpoint_copies_the_whole_log_back_past_a_session() {
         frames > 0,
         "the log held {frames} frames, so this checkpoint had nothing to prove"
     );
+    assert!(
+        copied < frames,
+        "a checkpoint copied {copied} of {frames} frames past a reader that could still see them"
+    );
     assert_eq!(
-        copied, frames,
-        "a checkpoint copied {copied} of {frames} frames; if it now stops short, \
-         a session has grown a read mark and this test should go back to \
-         asserting copied < frames while the reader is open"
+        integer(&reader, "SELECT count(*) FROM t"),
+        1,
+        "the reader still reads its snapshot"
     );
     reader.execute_batch("COMMIT").expect("the read closes");
 
-    // With the reader gone, a fresh write and the same checkpoint finish the
-    // job again.
-    writer
-        .execute_batch("INSERT INTO t VALUES(2)")
-        .expect("a row");
     let rows = writer
         .query("PRAGMA wal_checkpoint(PASSIVE)")
         .expect("the checkpoint runs");
@@ -251,25 +198,18 @@ fn a_checkpoint_copies_the_whole_log_back_past_a_session() {
     let copied = as_integer(row.get(2));
     assert!(
         frames > 0,
-        "the second write left no frames for this checkpoint to prove either"
+        "the log holds frames for this checkpoint to copy"
     );
     assert_eq!(copied, frames, "the log was not fully copied back");
 }
 
-/// A checkpoint refuses once a session has written inside a transaction
-/// another `connect()` handle opened, because the two share one `self.batch`
-/// rather than holding independent transactions.
+/// A checkpoint refuses once the connection asking has written inside a transaction it has open.
 ///
-/// **This is the shape `a_checkpoint_copies_the_whole_log_back_past_a_session`
-/// used to test, without either the test or a reader of it being told that is
-/// what it was testing.** Its `BEGIN` on a second handle followed by a write on
-/// the first was never a concurrent writer running past a live reader - see
-/// that test's own comment for why one handle's `BEGIN` and another's write are
-/// the same transaction here - and asserting the refusal directly, rather than
-/// deleting the case once the mistaken framing was found, is what keeps this
-/// distinction on record.
+/// SQLite declines a checkpoint inside a transaction that has written and not committed, and
+/// this engine does the same. It is the connection's own transaction that stops it: another
+/// connection's `BEGIN` is not part of it.
 #[test]
-fn a_checkpoint_refuses_once_a_shared_transaction_has_written() {
+fn a_checkpoint_refuses_once_its_own_transaction_has_written() {
     let path = scratch("protected-refusal");
     let held = database(&path);
     let writer = held.session();
@@ -280,13 +220,12 @@ fn a_checkpoint_refuses_once_a_shared_transaction_has_written() {
         .execute_batch("CREATE TABLE t(a INTEGER PRIMARY KEY)")
         .expect("the table is made");
 
-    let reader = held.session();
-    reader
+    writer
         .execute_batch("BEGIN")
         .expect("the transaction opens");
     writer
         .execute_batch("INSERT INTO t VALUES(1)")
-        .expect("the write joins the transaction the BEGIN opened");
+        .expect("the write is inside the transaction");
 
     let refused = writer.query("PRAGMA wal_checkpoint(PASSIVE)");
     assert_eq!(
@@ -297,7 +236,7 @@ fn a_checkpoint_refuses_once_a_shared_transaction_has_written() {
          as the pinned SQLite 3.53.4 reference does"
     );
 
-    reader
+    writer
         .execute_batch("COMMIT")
         .expect("the transaction closes");
     let rows = writer
@@ -313,16 +252,11 @@ fn a_checkpoint_refuses_once_a_shared_transaction_has_written() {
 
 /// One writer at a time, and the loser is told rather than left waiting.
 ///
-/// **The refusal is `Error` (code 1) rather than `Busy` on this engine**, and
-/// the difference is which layer answers. The old engine had two connections and a
-/// lock between them, so the second `BEGIN IMMEDIATE` lost a race and was told
-/// the database was `Busy`. Here the two are sessions on one pool, so a second
-/// `BEGIN IMMEDIATE` is a second transaction on a pool that already has one -
-/// which the engine refuses with SQLite's "cannot start a transaction within
-/// a transaction" before any lock is consulted. That refusal is code 1, as
-/// SQLite's is; it was code 21 until the statement matrix found it. Either way
-/// the invariant this test exists for holds: **two writers cannot both be open,
-/// and the loser is told rather than left waiting.**
+/// The second connection has an engine of its own, so a second `BEGIN IMMEDIATE`, and an
+/// autocommit write, are arbitrated by the file's locks and refused `Busy` once its busy timeout
+/// runs out, as a second process's would be. Neither joins the first connection's transaction,
+/// so the first connection's `ROLLBACK` undoes only the first connection's work, and the second
+/// connection gets in as soon as the first has finished.
 #[test]
 fn a_second_writer_in_this_process_is_refused() {
     let path = scratch("one-writer");
@@ -332,6 +266,9 @@ fn a_second_writer_in_this_process_is_refused() {
         .execute_batch("CREATE TABLE t(a INTEGER PRIMARY KEY)")
         .expect("the table is made");
     let second = held.session();
+    second
+        .execute_batch("PRAGMA busy_timeout = 0")
+        .expect("the second connection does not wait");
 
     first
         .execute_batch("BEGIN IMMEDIATE")
@@ -339,40 +276,23 @@ fn a_second_writer_in_this_process_is_refused() {
     let refused = second.execute_batch("BEGIN IMMEDIATE");
     assert_eq!(
         refused.map_err(|error| error.code()),
-        Err(PrimaryCode::Error),
-        "two sessions held the writer at once; a `Busy` here instead would mean \
-         the two are arbitrating through the lock rather than through the pool, \
-         which is what two separate connections used to do"
+        Err(PrimaryCode::Busy),
+        "two connections held the writer at once"
     );
 
-    // **An autocommit write from the second session is NOT refused, and what
-    // it does instead is the thing worth pinning.** The `BEGIN IMMEDIATE`
-    // route above is rejected, but a bare `INSERT` takes its reservation
-    // inside the statement and succeeds while the first session's transaction
-    // is still open. On one pool that is not a second writer racing the first
-    // - it is a write landing *inside* the open transaction, which is what the
-    // rollback below proves: the row goes away with the first session's
-    // `ROLLBACK`, rather than surviving it as a separately committed row.
-    //
-    // It is recorded rather than asserted away because the distinction decides
-    // how bad it is. A write that survived the rollback would be a lost-update
-    // hole of the kind this test's original comment describes. A write that is
-    // rolled back with the transaction it silently joined is coherent, and is
-    // a difference from the old engine rather than a defect in this one - but
-    // it does mean an application cannot treat two sessions as two independent
-    // writers.
-    second
-        .execute_batch("INSERT INTO t VALUES(99)")
-        .expect("an autocommit write from a second session is accepted");
+    let refused = second.execute_batch("INSERT INTO t VALUES(99)");
+    assert_eq!(
+        refused.map_err(|error| error.code()),
+        Err(PrimaryCode::Busy),
+        "an autocommit write from the second connection got in beside the open writer"
+    );
     first
         .execute_batch("ROLLBACK")
         .expect("the writer rolls back");
     assert_eq!(
         integer(&first, "SELECT count(*) FROM t WHERE a = 99"),
         0,
-        "a second session's autocommit write survived the first session's \
-         ROLLBACK, which means it committed independently while a transaction \
-         was open - a lost-update hole rather than a shared transaction"
+        "the refused write left a row"
     );
 
     // Re-open the writer so the rest of the test reads as it did before.

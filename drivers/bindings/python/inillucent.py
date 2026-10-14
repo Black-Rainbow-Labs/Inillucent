@@ -25,9 +25,15 @@ The four things every binding has to get right, all visible below:
    Python, and a binding that folds it into a generic ``DatabaseError`` has
    thrown the design away.
 
-Threads: the engine is single threaded and one file is one buffer pool. Confine
-a :class:`Database` and everything under it to one thread, or serialise every
-call on it yourself. There is no lock inside.
+Threads: the engine is single threaded and one file is one buffer pool, and
+the interpreter lock is let go while a statement runs. So that two threads
+cannot be inside one database at once, every call on a :class:`Database`, on its
+connections, statements and transactions, takes one lock that the database owns
+and gives it back when the call returns. A second thread waits for the first
+call to finish. :meth:`Connection.cancel` is the one call that does not take
+it, because it exists to be called from another thread while a statement runs.
+A transaction held open across calls does not stop another thread's statements
+from running between them; that is the caller's to arrange.
 """
 
 from __future__ import annotations
@@ -35,8 +41,10 @@ from __future__ import annotations
 import atexit
 import ctypes
 import json
+import functools
 import os
 import sys
+import threading
 import weakref
 from collections.abc import Mapping
 from ctypes import (
@@ -972,6 +980,28 @@ class Rows:
         return f"<Rows {self.tag}: {len(self.rows)} of {self.total}>"
 
 
+def _serialised(method):
+    """Run a method with its database's lock held.
+
+    **One lock per :class:`Database`, taken by every call that reaches the C
+    library.** ``ctypes`` and the calls that read Python objects let the
+    interpreter lock go while the engine runs, so without this two threads on
+    one connection were inside the engine together, and the engine is not built
+    for that. The lock is reentrant because ``close`` frees the statements and
+    ``execute`` prepares one, and both call methods that take it again. The
+    object carries it as ``_lock``, shared down from the database.
+
+    :param method: a method of a class whose instances have ``_lock``
+    """
+
+    @functools.wraps(method)
+    def serialised(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return serialised
+
+
 class Transaction:
     """One transaction, held while you decide whether to commit.
 
@@ -984,10 +1014,12 @@ class Transaction:
     exception, which is what a caller means either way.
     """
 
-    def __init__(self, handle: c_void_p) -> None:
+    def __init__(self, handle: c_void_p, lock: "threading.RLock") -> None:
         self._handle = handle
+        self._lock = lock
         self.affected: "list[int]" = []
 
+    @_serialised
     def execute(self, sql: str) -> int:
         """Run one statement inside the transaction, returning rows changed.
 
@@ -1003,6 +1035,7 @@ class Transaction:
         self.affected.append(changed.value)
         return changed.value
 
+    @_serialised
     def commit(self) -> None:
         """Commit. The handle is spent either way."""
         error = c_void_p()
@@ -1013,6 +1046,7 @@ class Transaction:
         finally:
             _LIB.inillucent_txn_rollback(handle)
 
+    @_serialised
     def rollback(self) -> None:
         """Roll back and free."""
         if self._handle:
@@ -1049,9 +1083,11 @@ class Connection:
 
     def __init__(self, database: "Database", handle: c_void_p) -> None:
         self._database = database
+        self._lock = database._lock
         self._handle = handle
         self._statements: "dict[str, Statement]" = {}
 
+    @_serialised
     def _cached(self, sql: str) -> "Statement":
         """Return a prepared statement for this text, preparing it once.
 
@@ -1074,12 +1110,14 @@ class Connection:
             self._statements[sql] = statement
         return statement
 
+    @_serialised
     def _drop_statements(self) -> None:
         """Free every statement `execute` kept."""
         for statement in self._statements.values():
             statement.close()
         self._statements.clear()
 
+    @_serialised
     def execute_many(self, sql: str, rows: Sequence[Sequence[Any]]) -> int:
         """Run one statement once for each list of parameters, and return the
         rows changed in all.
@@ -1090,6 +1128,7 @@ class Connection:
         """
         return self._cached(sql).execute_many(rows)
 
+    @_serialised
     def execute(self, sql: str, params: Sequence[Any] = (), limit: Optional[int] = None) -> Rows:
         """Run one statement and return everything it produced.
 
@@ -1117,12 +1156,14 @@ class Connection:
             return Rows(rows)
         return self._cached(sql).execute(params, limit)
 
+    @_serialised
     def execute_batch(self, sql: str) -> None:
         """Run several statements separated by semicolons, for their effect."""
         error = c_void_p()
         status = _LIB.inillucent_execute_batch(self._handle, _sql_bytes(sql), ctypes.byref(error))
         _check(status, error)
 
+    @_serialised
     def prepare(self, sql: str) -> "Statement":
         """Compile a statement so it can be run more than once."""
         handle = c_void_p()
@@ -1133,27 +1174,32 @@ class Connection:
         _check(status, error)
         return Statement(self, handle)
 
+    @_serialised
     def transaction(self) -> Transaction:
         """Open a transaction."""
         handle = c_void_p()
         error = c_void_p()
         status = _LIB.inillucent_txn_begin(self._handle, ctypes.byref(handle), ctypes.byref(error))
         _check(status, error)
-        return Transaction(handle)
+        return Transaction(handle, self._lock)
 
     @property
+    @_serialised
     def last_insert_rowid(self) -> int:
         return _LIB.inillucent_last_insert_rowid(self._handle)
 
     @property
+    @_serialised
     def total_changes(self) -> int:
         return _LIB.inillucent_total_changes(self._handle)
 
     @property
+    @_serialised
     def in_transaction(self) -> bool:
         return bool(_LIB.inillucent_in_transaction(self._handle))
 
     @property
+    @_serialised
     def schema_cookie(self) -> int:
         return _LIB.inillucent_schema_cookie(self._handle)
 
@@ -1170,6 +1216,7 @@ class Connection:
         status = _LIB.inillucent_cancel(self._handle, ctypes.byref(error))
         _check(status, error)
 
+    @_serialised
     def close(self) -> None:
         if self._handle:
             # The statements first: each holds the connection's session, and a
@@ -1194,8 +1241,10 @@ class Statement:
 
     def __init__(self, connection: Connection, handle: c_void_p) -> None:
         self._connection = connection
+        self._lock = connection._lock
         self._handle = handle
 
+    @_serialised
     def execute(self, params: Sequence[Any] = (), limit: Optional[int] = None) -> Rows:
         """Bind these values and run it.
 
@@ -1224,6 +1273,7 @@ class Statement:
         _check(status, error)
         return Rows(rows)
 
+    @_serialised
     def execute_many(self, rows: Sequence[Sequence[Any]]) -> int:
         """Run it once for each list of parameters, and return the rows changed
         in all.
@@ -1265,6 +1315,7 @@ class Statement:
         _check(status, error)
         return changed.value
 
+    @_serialised
     def _bind(self, index: int, value: Any) -> None:
         """Bind one value, choosing the call by the Python type.
 
@@ -1289,6 +1340,7 @@ class Statement:
         else:
             _refuse_type(value)
 
+    @_serialised
     def close(self) -> None:
         if self._handle:
             _LIB.inillucent_stmt_free(self._handle)
@@ -1328,6 +1380,8 @@ class Database:
         key: "str | None" = None,
         busy_timeout_ms: "int | None" = None,
     ) -> None:
+        # Before anything can raise, because `__del__` runs `close`, which takes it.
+        self._lock = threading.RLock()
         path = _path_text(path)
         flags = 0
         if create:
@@ -1374,6 +1428,7 @@ class Database:
         # finaliser. A list kept every connection ever made, closed or not.
         self._connections: "weakref.WeakSet[Connection]" = weakref.WeakSet()
 
+    @_serialised
     def connect(self) -> Connection:
         """Open a connection."""
         handle = c_void_p()
@@ -1385,19 +1440,23 @@ class Database:
         return connection
 
     @property
+    @_serialised
     def path(self) -> str:
         return _text(_LIB.inillucent_path(self._handle)) or ""
 
+    @_serialised
     def checkpoint(self) -> None:
         """Make everything written so far durable."""
         error = c_void_p()
         _check(_LIB.inillucent_checkpoint(self._handle, ctypes.byref(error)), error)
 
+    @_serialised
     def integrity_check(self) -> None:
         """Walk every tree and raise on the first thing that is wrong."""
         error = c_void_p()
         _check(_LIB.inillucent_integrity_check(self._handle, ctypes.byref(error)), error)
 
+    @_serialised
     def backup_to(self, path: "str | os.PathLike[str]") -> None:
         """Copy the database, opening and checking the copy before returning."""
         error = c_void_p()
@@ -1408,6 +1467,7 @@ class Database:
             error,
         )
 
+    @_serialised
     def close(self) -> None:
         """Checkpoint and close.
 

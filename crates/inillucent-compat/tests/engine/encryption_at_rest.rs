@@ -55,7 +55,7 @@ fn open(path: &Path, key: &str) -> Database {
 /// @param sql - the statements
 fn run(database: &Database, sql: &str) {
     database
-        .session()
+        .session_as(1)
         .execute_batch(sql)
         .unwrap_or_else(|error| panic!("{sql}: {error}"));
 }
@@ -66,7 +66,7 @@ fn run(database: &Database, sql: &str) {
 /// @param sql - the query
 fn rows(database: &Database, sql: &str) -> Vec<Vec<OwnedDatum>> {
     database
-        .session()
+        .session_as(1)
         .query(sql)
         .unwrap_or_else(|error| panic!("{sql}: {error}"))
 }
@@ -262,7 +262,7 @@ fn rekey_changes_the_key_and_keeps_the_rows() {
     let database = open(&path, KEY_B);
     assert_eq!(count(&database).0, 201);
     let refused = database
-        .session()
+        .session_as(1)
         .execute_batch("PRAGMA rekey = ''")
         .expect_err("refused");
     assert!(
@@ -271,7 +271,7 @@ fn rekey_changes_the_key_and_keeps_the_rows() {
         refused.message()
     );
     let refused = database
-        .session()
+        .session_as(1)
         .execute_batch("PRAGMA key = 'x'")
         .expect_err("refused");
     assert!(
@@ -282,7 +282,7 @@ fn rekey_changes_the_key_and_keeps_the_rows() {
     drop(database);
     let plain = Database::open(dir.join("plain.rdb")).expect("opens");
     let refused = plain
-        .session()
+        .session_as(1)
         .execute_batch(&format!("PRAGMA rekey = \"{KEY_A}\""))
         .expect_err("refused");
     assert!(
@@ -352,7 +352,7 @@ fn the_encryption_pragma_answers_for_the_database_it_names() {
     assert_eq!(rows(&database, "PRAGMA p.encryption"), none);
     assert_eq!(rows(&database, "PRAGMA m.encryption"), none);
     let refused = database
-        .session()
+        .session_as(1)
         .execute_batch("PRAGMA p.encryption = 'x'")
         .expect_err("the pragma cannot be set");
     assert!(
@@ -388,7 +388,7 @@ fn attach_takes_a_key() {
         ),
     );
     let refused = database
-        .session()
+        .session_as(1)
         .execute_batch(&format!(
             "ATTACH '{}' AS w KEY \"{KEY_A}\"",
             other.display()
@@ -480,8 +480,8 @@ fn a_changed_byte_is_reported_as_damage() {
     std::fs::write(&path, &bytes).expect("writes");
     let outcome =
         Database::open_encrypted(&path, EncryptionKey::parse(KEY_A)).and_then(|database| {
-            let answer = database.session().query("PRAGMA integrity_check")?;
-            let counted = database.session().query(&format!(
+            let answer = database.session_as(1).query("PRAGMA integrity_check")?;
+            let counted = database.session_as(1).query(&format!(
                 "SELECT count(*) FROM note WHERE body LIKE '{SECRET}%'"
             ));
             Ok((answer, counted.is_ok()))

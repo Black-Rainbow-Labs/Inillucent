@@ -601,12 +601,19 @@ impl Database {
     /// wants [`Database::session_as`], or every `CREATE TEMP TABLE` is gone by
     /// the next statement.
     ///
-    /// **It is called `session` and not `connect` because that is what it
-    /// returns (task-1961, A5).** Two of these share one transaction - a
-    /// `BEGIN` on either is joined by the other, and a write through the second
-    /// is undone by the first one's `ROLLBACK` - and `connect` reads as denying
-    /// exactly that to anyone arriving from SQLite or rusqlite. `connect` is
-    /// kept as a deprecated alias for one release.
+    /// **Each one has its own transaction.** The first connection runs on the
+    /// engine the open made. Every later one runs on an engine of its own, opened
+    /// over the same file on its first statement, so a `BEGIN` on one is not
+    /// joined by another, the other reads only what is committed, and a second
+    /// writer is refused with [`Status::Busy`] after the busy timeout, as a
+    /// second process is. A function, a collation or a pragma set on one
+    /// connection is not set on another. Opening that engine costs what opening
+    /// a second `Database` on the file costs, so keep a connection, and call
+    /// [`Database::release_session`] when one is finished with.
+    ///
+    /// **It is called `session` because it also scopes `temp` and `ATTACH`
+    /// (task-1961, A5).** `connect` is kept as a deprecated alias for one
+    /// release.
     pub fn session(&self) -> Connection<'_> {
         Connection {
             database: self,
@@ -618,12 +625,21 @@ impl Database {
     /// Returns a connection to this database.
     ///
     /// Renamed [`Database::session`] in task-1961.
-    #[deprecated(
-        since = "0.1.3",
-        note = "renamed `session`: two of these share one transaction"
-    )]
+    #[deprecated(since = "0.1.3", note = "renamed `session`")]
     pub fn connect(&self) -> Connection<'_> {
         self.session()
+    }
+
+    /// Ends a connection's session and frees the engine it ran on.
+    ///
+    /// For a caller that closes connections: the C library calls it when the
+    /// last handle on a connection is freed. The first connection's engine is
+    /// the database's own and is kept. A transaction the session left open is
+    /// rolled back.
+    ///
+    /// @param session - the number [`Connection::session`] returned
+    pub fn release_session(&self, session: u64) {
+        self.engine.release_session(session);
     }
 
     /// Returns a connection that continues an earlier one's session.

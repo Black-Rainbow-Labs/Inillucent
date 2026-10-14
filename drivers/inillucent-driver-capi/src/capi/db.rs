@@ -91,6 +91,10 @@ impl Drop for ConnState {
             database
                 .connections
                 .set(database.connections.get().saturating_sub(1));
+            // The connection's own engine goes with its last handle, so a
+            // program that opens and closes connections does not keep one
+            // engine for each until the database closes.
+            database.database.release_session(self.session);
         }
     }
 }
