@@ -2789,6 +2789,14 @@ name = "statement"
 tier = "e2e"
 covers = ["inillucent-driver"]
 
+# The rows a failed query produced before it failed, carried on the driver's error.
+[[target]]
+package = "inillucent-driver"
+kind = "test"
+name = "partial_rows"
+tier = "e2e"
+covers = ["inillucent-driver", "inillucent-exec", "inillucent-engine"]
+
 [[target]]
 package = "inillucent-driver"
 kind = "test"
@@ -2902,6 +2910,17 @@ name = "durability"
 module = "story_nikaya_crash"
 tier = "durability"
 covers = ["inillucent-cli", "inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool"]
+
+# A runtime error in the middle of a result: the rows before it are returned first, graded
+# against the pinned SQLite shell and read through the command line, MCP and the shell.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "differential"
+module = "partial_rows"
+tier = "differential"
+covers = ["inillucent-sql", "inillucent-exec", "inillucent-engine", "inillucent-cli"]
+requires = ["oracle"]
 
 [[target]]
 package = "inillucent-compat"

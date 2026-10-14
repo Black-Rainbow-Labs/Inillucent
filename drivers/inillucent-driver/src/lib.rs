@@ -1195,7 +1195,7 @@ impl Connection<'_> {
             started,
             self.database.options.diagnostics,
         )
-        .map_err(|error| self.database.classify(&error))
+        .map_err(|failure| failure.classified(|error| self.database.classify(error)))
     }
 
     /// Refuses a statement that is not a query, for a read-only connection.
@@ -1783,7 +1783,7 @@ impl Statement<'_> {
         self.engine.reset();
         let diagnostics = self.connection.database.options.diagnostics;
         collect(&mut self.engine, &self.sql, limit, started, diagnostics)
-            .map_err(|error| self.connection.database.classify(&error))
+            .map_err(|failure| failure.classified(|error| self.connection.database.classify(error)))
     }
 
     /// Runs the statement once for each list of values, adding the rows each
@@ -1935,10 +1935,34 @@ fn bind_all(statement: &mut EngineStatement<'_>, params: &[Value]) -> Result<()>
     Ok(())
 }
 
+/// A statement that failed, with the rows it produced first.
+struct CollectFailure {
+    /// What the engine said.
+    error: inillucent_engine::DbError,
+    /// The rows produced before the failure, when there were any.
+    ///
+    /// Boxed so the `Err` of `collect` stays small.
+    partial: Option<Box<Rows>>,
+}
+
+impl CollectFailure {
+    /// Turns the failure into the driver's error, carrying the rows before it.
+    ///
+    /// @param classify - how the open database classifies an engine error
+    fn classified(self, classify: impl FnOnce(&inillucent_engine::DbError) -> Error) -> Error {
+        let mut error = classify(&self.error);
+        error.partial = self.partial;
+        error
+    }
+}
+
 /// Steps a statement to the end and collects what it produced.
 ///
 /// **The limit cuts what is handed back, never what is produced**, so `total` is
 /// the exact count and `more` is a fact. See [`rows`].
+///
+/// A statement that fails after producing rows hands those rows back with the
+/// failure, because SQLite returns every row before the one that raised it.
 ///
 /// @param statement - the engine statement
 /// @param sql - the statement's text, for the tag
@@ -1951,11 +1975,20 @@ fn collect(
     limit: usize,
     started: Instant,
     diagnostics: bool,
-) -> std::result::Result<Rows, inillucent_engine::DbError> {
+) -> std::result::Result<Rows, CollectFailure> {
     let _ = diagnostics;
     let mut kept: Vec<Vec<Value>> = Vec::new();
     let mut total = 0usize;
-    while statement.step()? {
+    loop {
+        match statement.step() {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => {
+                let partial = (total > 0)
+                    .then(|| Box::new(rows_collected(statement, sql, limit, started, kept, total)));
+                return Err(CollectFailure { error, partial });
+            }
+        }
         total = total.saturating_add(1);
         if kept.len() < limit {
             // Taken rather than copied: the statement does not read the row
@@ -1969,6 +2002,25 @@ fn collect(
             );
         }
     }
+    Ok(rows_collected(statement, sql, limit, started, kept, total))
+}
+
+/// Builds the result of a statement from the rows it produced.
+///
+/// @param statement - the engine statement, already stepped
+/// @param sql - the statement's text, for the tag
+/// @param limit - how many rows were to be kept
+/// @param started - when the call began
+/// @param kept - the rows kept
+/// @param total - how many rows the statement produced
+fn rows_collected(
+    statement: &EngineStatement<'_>,
+    sql: &str,
+    limit: usize,
+    started: Instant,
+    kept: Vec<Vec<Value>>,
+    total: usize,
+) -> Rows {
     let columns: Vec<Column> = statement
         .columns()
         .iter()
@@ -1986,7 +2038,7 @@ fn collect(
         Some(count) if columns.is_empty() => count as usize,
         _ => total,
     };
-    Ok(Rows {
+    Rows {
         columns,
         rows: kept,
         affected,
@@ -1994,7 +2046,7 @@ fn collect(
         more: total > limit,
         elapsed: started.elapsed(),
         tag: rows::tag_for(sql, counted),
-    })
+    }
 }
 
 /// Reads a cell as text, answering the empty string for anything else.

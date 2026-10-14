@@ -65,6 +65,7 @@ impl Sink for Filter {
         // A predicate that can judge the whole batch in one loop does, and
         // gives the verdicts `value` would; see `Eval::truths_over`.
         let mut truths = Vec::new();
+        let mut failed: Option<inillucent_base::DbError> = None;
         if self.predicate.truths_over(batch, &mut truths) && truths.len() == batch.live() {
             for (nth, kept) in truths.iter().enumerate() {
                 if *kept {
@@ -77,21 +78,36 @@ impl Sink for Filter {
                 // true: NULL is not true, and the three-valued logic in `expr`
                 // produces NULL rather than false so the distinction survives to
                 // here.
-                let verdict = self.predicate.value(batch, nth)?;
+                let verdict = match self.predicate.value(batch, nth) {
+                    Ok(verdict) => verdict,
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
+                };
                 if crate::expr::truth(&verdict.get()) == Some(true) {
                     self.selection.push(batch.row_at(nth) as u32);
                 }
             }
         }
         if self.selection.is_empty() {
-            return Ok(Flow::Continue);
+            return match failed {
+                Some(error) => Err(error),
+                None => Ok(Flow::Continue),
+            };
         }
         let filtered = Batch {
             rows: batch.rows,
             selection: Some(&self.selection),
             columns: batch.columns.clone(),
         };
-        self.downstream.push(&filtered)
+        let flow = self.downstream.push(&filtered)?;
+        // The rows that passed ahead of the failing one went on first; SQLite
+        // returns them and then reports the error (bug 28).
+        match (failed, flow) {
+            (Some(error), Flow::Continue) => Err(error),
+            _ => Ok(flow),
+        }
     }
 
     fn finish(&mut self) -> DbResult<()> {
@@ -184,6 +200,9 @@ impl Sink for Project {
         let mut computed: Vec<Vec<crate::expr::Computed<'_>>> =
             Vec::with_capacity(self.expressions.len());
         let mut passthrough: Vec<Option<usize>> = Vec::with_capacity(self.expressions.len());
+        // The first row an expression failed on, and what it said. Rows before
+        // it are still good for every column, and are delivered (bug 28).
+        let mut failed: Option<(usize, inillucent_base::DbError)> = None;
         for expression in &self.expressions {
             match expression.column() {
                 Some(index) if batch.is_dense() => {
@@ -192,14 +211,22 @@ impl Sink for Project {
                 }
                 _ => {
                     passthrough.push(None);
-                    let mut values = Vec::with_capacity(live);
-                    for nth in 0..live {
-                        values.push(expression.value(batch, nth)?);
+                    let reach = failed.as_ref().map_or(live, |(row, _)| *row);
+                    let mut values = Vec::with_capacity(reach);
+                    for nth in 0..reach {
+                        match expression.value(batch, nth) {
+                            Ok(value) => values.push(value),
+                            Err(error) => {
+                                failed = Some((nth, error));
+                                break;
+                            }
+                        }
                     }
                     computed.push(values);
                 }
             }
         }
+        let live = failed.as_ref().map_or(live, |(row, _)| *row);
         let borrowed: Vec<Vec<Datum<'_>>> = computed
             .iter()
             .map(|column| column.iter().map(crate::expr::Computed::get).collect())
@@ -216,7 +243,19 @@ impl Sink for Project {
             });
         }
         let projected = Batch::new(live, columns);
-        self.downstream.push(&projected)
+        let Some((_, error)) = failed else {
+            return self.downstream.push(&projected);
+        };
+        // SQLite evaluates a row's columns before it starts the next row, so the
+        // rows ahead of the one that failed are answered and the failure comes
+        // after them. A failure further down the pipeline belongs to an earlier
+        // row than this one, so it is the one reported.
+        // A downstream that already has all the rows it wants (a `LIMIT`) never
+        // reaches the failing row, as in SQLite.
+        if live > 0 && self.downstream.push(&projected)? == Flow::Stop {
+            return Ok(Flow::Stop);
+        }
+        Err(error)
     }
 
     fn finish(&mut self) -> DbResult<()> {

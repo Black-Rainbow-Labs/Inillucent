@@ -146,6 +146,9 @@ On a failure, `ok` is `false` and the object has a `status` and a `message`:
 { "ok": false, "command": "query", "status": "not_found", "message": "no such table: nope", ... }
 ```
 
+A query that fails on one row has already produced the rows before it. Those rows are in the failure's
+`columns`, `rows` and `row_count` members, and a failure on the first row has none of them.
+
 Branch on `status`. Its values include `unsupported`, `syntax`, `not_found`, `constraint`,
 `readonly`, `busy` and `invalid_state`. `--json` is short for `--output json`.
 

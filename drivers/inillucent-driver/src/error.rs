@@ -121,7 +121,7 @@ impl Status {
 /// # drop(database);
 /// # std::fs::remove_dir_all(&directory).ok();
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Error {
     /// What kind of failure it is.
     pub status: Status,
@@ -153,6 +153,16 @@ pub struct Error {
     /// Reported rather than interpreted. A caller that needs a decision uses
     /// [`Error::status`]; this is here so a bug report can name the code.
     pub engine_code: i32,
+    /// The rows the statement produced before it failed.
+    ///
+    /// **SQLite returns every row ahead of the one that raised the error, and
+    /// then reports the error.** A statement such as `SELECT json(x) FROM t` fails
+    /// on the first row whose `x` is not JSON, and a program that reads rows until
+    /// a failure and reports how far it got needs the rows before it. `Some` only
+    /// for a query that produced at least one row before it failed, and the rows
+    /// are the ones the call would have returned, cut to the same limit. A caller
+    /// that does not want them ignores the field.
+    pub partial: Option<Box<crate::Rows>>,
 }
 
 impl Error {
@@ -168,6 +178,7 @@ impl Error {
             feature: None,
             offset: None,
             engine_code: 0,
+            partial: None,
         }
     }
 
@@ -251,6 +262,7 @@ impl Error {
             feature: error.unsupported().map(str::to_owned),
             offset: error.sql_offset(),
             engine_code: error.extended().value(),
+            partial: None,
         }
     }
 }

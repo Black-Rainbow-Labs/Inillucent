@@ -127,7 +127,14 @@ pub fn run_windowed(
         let (values, failure) = crate::window::compute_values_until_failure(&rows, &pass);
         if let Some(failure) = failure {
             if in_order {
-                keep_rows_before_failure(select, &pre, width, &rows, &values, &failure, params);
+                let before =
+                    keep_rows_before_failure(select, &pre, width, &rows, &values, &failure, params);
+                // A `LIMIT` already met by the rows before the failing one is
+                // the whole answer, because SQLite stops before it computes the
+                // failing row.
+                if let Some(answered) = before {
+                    return Ok(answered);
+                }
             }
             return Err(failure.error);
         }
@@ -189,7 +196,7 @@ pub fn run_windowed(
 }
 
 /// Keeps the result rows of the rows computed before a window call failed, for
-/// whoever reports the failure.
+/// whoever reports the failure, or returns them when a `LIMIT` is already met.
 ///
 /// **SQLite answers the rows before the one that raised the error (bug hunt
 /// 10).** `SELECT sum(a) OVER (ORDER BY a)` over 1, 3 and 9223372036854775807
@@ -212,9 +219,9 @@ fn keep_rows_before_failure(
     values: &[OwnedDatum],
     failure: &crate::window::WindowFailure,
     params: &Params,
-) {
+) -> Option<(Vec<Vec<OwnedDatum>>, Shape)> {
     if !select.order_by.is_empty() || select.distinct || failure.before == 0 {
-        return;
+        return None;
     }
     let calls = select.windows.len();
     let widened: Vec<Vec<OwnedDatum>> = rows
@@ -234,9 +241,13 @@ fn keep_rows_before_failure(
             whole
         })
         .collect();
-    if let Ok((answered, _)) = project_over_window(select, pre, width, widened, params) {
-        crate::physical::keep_partial_rows(answered);
+    let (answered, shape) = project_over_window(select, pre, width, widened, params).ok()?;
+    let limit = constant_count(select.limit.as_ref(), params, Negative::NoLimit).ok()?;
+    if limit.is_some_and(|limit| answered.len() >= limit) {
+        return Some((answered, shape));
     }
+    crate::physical::keep_partial_rows(answered);
+    None
 }
 
 /// Returns roughly how many bytes a buffer of owned rows holds.
@@ -732,7 +743,13 @@ fn project_over_window(
         extended.extend(computed_keys);
         head = Box::new(Project::new(extended, head));
     }
-    ValuesScan::new(rows).run(head.as_mut())?;
+    if let Err(error) = ValuesScan::new(rows).run(head.as_mut()) {
+        // The rows the projection answered before the one it failed on are kept
+        // for whoever reports the failure; a sort or a `DISTINCT` above it that
+        // had not emitted yet has left nothing here, as in SQLite.
+        crate::physical::keep_partial_rows(std::mem::take(&mut *collected.borrow_mut()));
+        return Err(error);
+    }
     let answer = collected.borrow().clone();
     Ok((
         answer,

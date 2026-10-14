@@ -175,6 +175,13 @@ integers and back.
 | **One file has one buffer pool, and the engine runs on one thread.** | A `Database` is neither `Send` nor `Sync`. |
 | **Read only is enforced by the driver.** | With `OpenOptions::read_only` set, the driver refuses any statement that does not bind to a query, including a `PRAGMA`. The binder decides this, so whitespace or a comment in the SQL does not change the result. The file is still open for writing, so the `readonly_open` capability says `partial`. |
 
+A query that fails on one row still returns `Err`, and `Error::partial` holds the rows it produced before
+the failure. SQLite returns every row ahead of the failing one and then reports the error, and a program
+that reads rows until a failure and reports how far it got needs those rows. `partial` is a `Rows` cut to
+the same `limit` as a success. It is `None` when the failure came before the first row and for a
+statement that is not a query, so a caller that ignores the field behaves as before. The C library does
+not carry the rows yet: an `inillucent_error` has the status, the message and the offset.
+
 `Database::open` uses these defaults from `OpenOptions`:
 
 | Option | Default |

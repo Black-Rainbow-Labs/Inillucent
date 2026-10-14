@@ -274,13 +274,17 @@ mod tests {
             Datum::Null,
             Datum::Null,
         ];
-        let mut distinct = Distinct::new(Vec::new(), Box::new(Collect::new()));
+        let kept = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut distinct = Distinct::new(
+            Vec::new(),
+            Box::new(CollectInto::new(std::rc::Rc::clone(&kept))),
+        );
         let batch = Batch::new(values.len(), vec![Vector::Values(&values)]);
         distinct.push(&batch).unwrap();
         // 1, "1", NULL survive; the second Int(1) and the second NULL do not.
         // Real(1.0) encodes equal to Int(1) because the key encoding compares
         // numerics numerically, which is what SQLite's DISTINCT does too.
-        assert_eq!(distinct.rows.len(), 3, "{:?}", distinct.rows);
+        assert_eq!(kept.borrow().len(), 3, "{:?}", kept.borrow());
     }
 
     /// A grouped aggregate produces one row per key, in key order, with the
