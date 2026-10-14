@@ -1175,6 +1175,14 @@ covers = ["inillucent-engine"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "long_index_keys_small_page"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "long_keys_at_every_page_size"
 tier = "engine"
 covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool"]

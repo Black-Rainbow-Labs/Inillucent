@@ -41,6 +41,7 @@ mod functions;
 mod hostile;
 mod levers;
 mod limited_writes;
+mod long_index_keys_small_page;
 mod long_keys_at_every_page_size;
 mod maintenance_speed;
 mod max_page_count;
