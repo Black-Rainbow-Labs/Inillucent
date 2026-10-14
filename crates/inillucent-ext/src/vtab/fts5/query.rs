@@ -698,18 +698,16 @@ impl VirtualCursor for Fts5Cursor {
             return self.filter_by_rowid(context, plan);
         }
         if plan.index_number & PLAN_MATCH == 0 {
-            // **The index's own rows, not the owner's.** An external content
-            // table's owner may hold rows this index has never seen, and a
-            // scan that returned them would answer with documents no query
-            // could match. `%_docsize` has one row per indexed document.
-            //
-            // **FTS3 and FTS4 read through to the owner instead.** SQLite
-            // answers `SELECT * FROM t` on `content=n` with every row of `n`,
-            // before any `rebuild`, because the scan never looks at the index.
-            let reads_owner = self.external.is_some() && self.dialect == Dialect::Three;
+            // **An external content table reads through to the owner.** SQLite
+            // answers `SELECT * FROM t` on `content='n'` with every row of `n`,
+            // before any `rebuild`, because the scan runs a query over `n` and
+            // never looks at the index. That holds for FTS3, FTS4 and FTS5, and
+            // for an owner that is a view as well as for one that is a table.
+            // A contentless table has no owner, so `%_docsize` has the rows.
+            let reads_owner = self.external.is_some();
             let suffix: &[u8] = if reads_owner {
                 b""
-            } else if self.external.is_some() || self.contentless {
+            } else if self.contentless {
                 b"docsize"
             } else {
                 b"content"

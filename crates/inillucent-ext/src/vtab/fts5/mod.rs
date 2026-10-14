@@ -177,6 +177,11 @@ impl Module for Fts3Module {
         Fts5Module.shadow_tables(arguments)
     }
 
+    /// The query that reads an external content table's rows when they are a view's.
+    fn owner_query(&self, arguments: &ModuleArguments) -> Option<(Vec<u8>, String)> {
+        owner_query_of(arguments)
+    }
+
     /// Connects, declaring the FTS3 surface over the FTS5 index.
     fn connect(
         &self,
@@ -262,6 +267,30 @@ impl Module for Fts5Module {
     ) -> DbResult<Box<dyn VirtualTable>> {
         connect_with(arguments, creating, Dialect::Five)
     }
+
+    /// The query that reads an external content table's rows when they are a view's.
+    fn owner_query(&self, arguments: &ModuleArguments) -> Option<(Vec<u8>, String)> {
+        owner_query_of(arguments)
+    }
+}
+
+/// Returns the owner of an external content table and the query that reads its rows.
+///
+/// SQLite reads external content with a query over the named table or view**, so a
+/// view works as an owner. The first column is the rowid, taken from `content_rowid=`
+/// and `rowid` when none was written, and the rest are the columns this table declares,
+/// in declared order. [`content_offsets_named`] reads a view's rows by those positions.
+///
+/// @param arguments - the arguments the table was created with
+fn owner_query_of(arguments: &ModuleArguments) -> Option<(Vec<u8>, String)> {
+    let options = parse_options(&arguments.arguments).ok()?;
+    let owner = options.content?;
+    let quoted =
+        |name: &[u8]| format!("\"{}\"", String::from_utf8_lossy(name).replace('"', "\"\""));
+    let mut selected = vec![quoted(&options.content_rowid)];
+    selected.extend(options.columns.iter().map(|column| quoted(&column.name)));
+    let query = format!("SELECT {} FROM {}", selected.join(", "), quoted(&owner));
+    Some((owner, query))
 }
 
 /// Connects one full-text table, in whichever dialect it was made with.
@@ -457,6 +486,11 @@ fn content_offsets_named(
         return (0..names.len()).map(|at| at.saturating_add(1)).collect();
     };
     let found = catalog.and_then(|catalog| catalog.table_named(&owner.to_ascii_lowercase()));
+    // **A view's rows are the declared columns in declared order** (see `owner_query_of`), so
+    // a column's position in the row is its position in the declaration.
+    if found.is_some_and(|table| table.kind == inillucent_sql::catalog_view::TableKind::View) {
+        return (0..names.len()).collect();
+    }
     names
         .iter()
         .map(|name| {

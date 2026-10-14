@@ -10,6 +10,20 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**An FTS5 table can take its content from a view, and an external content table scans its owner.**
+`CREATE VIRTUAL TABLE f USING fts5(body, content='v', content_rowid='id')` with `v` a view returned
+no rows from `SELECT * FROM f`, and `rebuild` indexed nothing, because the module read the owner
+through a tree and a view has none. The rows of the view are now read with a query, as SQLite does,
+for a scan, for a lookup by rowid, for `highlight()` and `snippet()`, and for `rebuild`. A scan of
+any external content table, FTS3, FTS4 and FTS5, also reads the owner's rows instead of the rows
+the index has been told about, so it answers before the first `rebuild`, as SQLite does.
+
+**FTS3 and FTS4 `MATCH` reads SQLite's default query language.** `MATCH 'x NOT y'` was an
+exclusion here and is a search for the three words `x`, `NOT` and `y` in SQLite. `AND` is a word
+too. `NEAR` and `NEAR/n` were handed to the FTS5 parser, which needs the `NEAR(a b, n)` spelling, so
+`x NEAR/3 y` matched nothing. A bare `NEAR` is `NEAR/10`. A `NEAR` with no term on one side is the
+error `malformed MATCH expression`. A `-` in front of a quoted phrase is only a separator.
+
 **`ROLLBACK` restores everything a transaction changed, including after `DROP` and `ALTER TABLE`.**
 Bug hunt 10 found rollbacks that lost or kept rows. With foreign keys on, `BEGIN; DROP TABLE p;
 ROLLBACK` brought `p` back with no rows, because the rows `DROP TABLE` deletes first were put back

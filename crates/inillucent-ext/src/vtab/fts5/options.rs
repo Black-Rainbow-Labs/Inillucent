@@ -37,6 +37,12 @@ pub(super) struct Options {
     /// is what an application uses when the documents already exist and a
     /// second copy of them would double the file.
     pub(super) content: Option<Vec<u8>>,
+    /// The column of the owner that holds each row's rowid, when `content_rowid=` named one.
+    ///
+    /// An owner that is a table has its rowid. An owner that is a view has none, so the
+    /// host reads the view with this column as the rowid. `rowid` when nothing was written,
+    /// which is what SQLite uses.
+    pub(super) content_rowid: Vec<u8>,
     /// The option this build cannot honour, when the table declares one.
     ///
     /// **Recorded rather than ignored (task-1979, R15).** `detail=` and
@@ -84,6 +90,7 @@ pub(super) fn parse_options(arguments: &[Vec<u8>]) -> DbResult<Options> {
     let mut columns = Vec::new();
     let mut tokenizer = vec![b"unicode61".to_vec()];
     let mut content: Option<Vec<u8>> = None;
+    let mut content_rowid: Vec<u8> = b"rowid".to_vec();
     let mut contentless = false;
     let mut unsupported: Option<String> = None;
     let mut not_indexed: Vec<String> = Vec::new();
@@ -108,6 +115,9 @@ pub(super) fn parse_options(arguments: &[Vec<u8>]) -> DbResult<Options> {
                     content = Some(unquote_option(&value).as_bytes().to_vec())
                 }
                 "content" => contentless = true,
+                "content_rowid" if !unquote_option(&value).is_empty() => {
+                    content_rowid = unquote_option(&value).as_bytes().to_vec()
+                }
                 // FTS4 names a column it must not index as `notindexed=b`,
                 // where FTS5 writes `b UNINDEXED`. The column is still stored
                 // and returned; a query never finds a row through it.
@@ -178,6 +188,7 @@ pub(super) fn parse_options(arguments: &[Vec<u8>]) -> DbResult<Options> {
         columns,
         tokenizer,
         content,
+        content_rowid,
         contentless,
         unsupported,
         invalid,

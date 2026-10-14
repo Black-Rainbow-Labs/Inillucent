@@ -36,6 +36,8 @@ pub struct ReadStore<'a> {
     pub pool: &'a Pool,
     /// The trees, by the identifier the catalog registered them under.
     pub trees: &'a HashMap<u32, PagedTree>,
+    /// The rows of the view an external content table reads, when its owner is a view.
+    pub view: Option<&'a ViewContent>,
 }
 /// The shadow tables of one database, for reading and writing.
 pub struct WriteStore<'a> {
@@ -45,6 +47,64 @@ pub struct WriteStore<'a> {
     pub trees: &'a mut HashMap<u32, PagedTree>,
     /// Where the records go.
     pub log: &'a mut dyn TreeLog,
+    /// The rows of the view an external content table reads, when its owner is a view.
+    pub view: Option<&'a ViewContent>,
+}
+
+/// The root a view is served under.
+///
+/// A view is not stored, so its schema row has root page 0. A real tree never has that
+/// root, because page 1 is the schema table and every other root is above it.
+const VIEW_ROOT: u32 = 0;
+
+/// The rows of a view, read once for one call to a module.
+///
+/// **A view has no tree, so an external content table whose owner is a view is given
+/// these rows instead.** The host runs the query the module asks for ([`Module::owner_query`])
+/// and holds the answer here for the length of the call. The rows are keyed by the owner's
+/// rowid and hold the view's columns in declared order, which is the layout a table's
+/// tree hands the module, so the module reads both the same way.
+pub(crate) struct ViewContent {
+    /// The view's rows by rowid.
+    rows: std::collections::BTreeMap<i64, Vec<Value<'static>>>,
+}
+
+impl ViewContent {
+    /// Builds the content from the rows of the owner query.
+    ///
+    /// @param rows - each row as the query returned it: the rowid, then the view's columns
+    pub(crate) fn from_query(rows: &[Vec<OwnedDatum>]) -> DbResult<ViewContent> {
+        let mut held = std::collections::BTreeMap::new();
+        for row in rows {
+            let Some((OwnedDatum::Int(rowid), rest)) = row.split_first() else {
+                continue;
+            };
+            held.insert(*rowid, owned_row_values(rest)?);
+        }
+        Ok(ViewContent { rows: held })
+    }
+
+    /// Returns the largest rowid the view holds.
+    fn highest(&self) -> i64 {
+        self.rows.keys().next_back().copied().unwrap_or(0)
+    }
+
+    /// Runs a body over the rows at or after a rowid, in rowid order, until it says stop.
+    ///
+    /// @param from - the smallest rowid to visit
+    /// @param body - what to do with each row
+    fn visit(
+        &self,
+        from: i64,
+        body: &mut dyn FnMut(i64, &[Value<'static>]) -> DbResult<bool>,
+    ) -> DbResult<()> {
+        for (rowid, values) in self.rows.range(from..) {
+            if !body(*rowid, values)? {
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 /// Returns a module's values as a tree row.
 ///
@@ -365,6 +425,9 @@ fn read_only() -> inillucent_base::DbError {
 }
 impl ShadowStore for ReadStore<'_> {
     fn read_row(&mut self, root: u32, rowid: i64) -> DbResult<Option<Vec<Value<'static>>>> {
+        if let (VIEW_ROOT, Some(view)) = (root, self.view) {
+            return Ok(view.rows.get(&rowid).cloned());
+        }
         let Some(tree) = self.trees.get(&root) else {
             return Ok(None);
         };
@@ -380,6 +443,9 @@ impl ShadowStore for ReadStore<'_> {
     }
 
     fn max_rowid(&mut self, root: u32) -> DbResult<i64> {
+        if let (VIEW_ROOT, Some(view)) = (root, self.view) {
+            return Ok(view.highest());
+        }
         match self.trees.get(&root) {
             Some(tree) => highest(self.pool, tree),
             None => Ok(0),
@@ -391,6 +457,9 @@ impl ShadowStore for ReadStore<'_> {
         root: u32,
         body: &mut dyn FnMut(i64, &[Value<'static>]) -> DbResult<bool>,
     ) -> DbResult<()> {
+        if let (VIEW_ROOT, Some(view)) = (root, self.view) {
+            return view.visit(i64::MIN, body);
+        }
         let Some(tree) = self.trees.get(&root) else {
             return Ok(());
         };
@@ -409,6 +478,9 @@ impl ShadowStore for ReadStore<'_> {
         from: i64,
         body: &mut dyn FnMut(i64, &[Value<'static>]) -> DbResult<bool>,
     ) -> DbResult<()> {
+        if let (VIEW_ROOT, Some(view)) = (root, self.view) {
+            return view.visit(from, body);
+        }
         let Some(tree) = self.trees.get(&root) else {
             return Ok(());
         };
@@ -473,6 +545,9 @@ impl ShadowStore for ReadStore<'_> {
 }
 impl ShadowStore for WriteStore<'_> {
     fn read_row(&mut self, root: u32, rowid: i64) -> DbResult<Option<Vec<Value<'static>>>> {
+        if let (VIEW_ROOT, Some(view)) = (root, self.view) {
+            return Ok(view.rows.get(&rowid).cloned());
+        }
         let Some(tree) = self.trees.get(&root) else {
             return Ok(None);
         };
@@ -526,6 +601,9 @@ impl ShadowStore for WriteStore<'_> {
     }
 
     fn max_rowid(&mut self, root: u32) -> DbResult<i64> {
+        if let (VIEW_ROOT, Some(view)) = (root, self.view) {
+            return Ok(view.highest());
+        }
         match self.trees.get(&root) {
             Some(tree) => highest(self.database.pool(), tree),
             None => Ok(0),
@@ -537,6 +615,9 @@ impl ShadowStore for WriteStore<'_> {
         root: u32,
         body: &mut dyn FnMut(i64, &[Value<'static>]) -> DbResult<bool>,
     ) -> DbResult<()> {
+        if let (VIEW_ROOT, Some(view)) = (root, self.view) {
+            return view.visit(i64::MIN, body);
+        }
         let Some(tree) = self.trees.get(&root) else {
             return Ok(());
         };
@@ -555,6 +636,9 @@ impl ShadowStore for WriteStore<'_> {
         from: i64,
         body: &mut dyn FnMut(i64, &[Value<'static>]) -> DbResult<bool>,
     ) -> DbResult<()> {
+        if let (VIEW_ROOT, Some(view)) = (root, self.view) {
+            return view.visit(from, body);
+        }
         let Some(tree) = self.trees.get(&root) else {
             return Ok(());
         };

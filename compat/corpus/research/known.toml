@@ -61,11 +61,6 @@ kind = "deviation"
 reason = "The delete command for rows the index never held: SQLite reports the index as malformed on the next query; this engine removes nothing and answers the query."
 
 [[known]]
-case = "research/sqlite-forum/fts5_external_content_view_no_trigger_match"
-kind = "defect"
-reason = "An external content table whose content is a view: a scan of the full text table reads the content through the shadow table mechanism, which has no tree for a view, so it returns no rows."
-
-[[known]]
 case = "research/sqlite-forum/fts5_match_phrase_near_prefix_bm25"
 kind = "deviation"
 reason = "One bm25 score differs in the seventeenth significant digit, because the per phrase terms are added in a different order."

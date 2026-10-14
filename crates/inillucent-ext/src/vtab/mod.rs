@@ -174,6 +174,21 @@ pub trait Module: Send + Sync {
         false
     }
 
+    /// Returns the query that reads the rows of the table this module's content belongs to.
+    ///
+    /// **A view has no tree, so a module cannot read its rows the way it reads a table's.**
+    /// An FTS5 table made with `content='v'` reads its documents from `v`, and when `v` is a
+    /// view there is no root page to hand the module. The host runs this query instead, when
+    /// the owner turns out to be a view, and gives the module its rows through the same shadow
+    /// store that serves a table. The first column of the query is the owner's rowid and the
+    /// rest are the owner's columns in the order the view declares them. The answer is the
+    /// owner's name and the query, or nothing for a module with no owner.
+    ///
+    /// @param _arguments - the arguments the table was created with
+    fn owner_query(&self, _arguments: &ModuleArguments) -> Option<(Vec<u8>, String)> {
+        None
+    }
+
     /// Returns the shadow tables a `CREATE VIRTUAL TABLE` must build first.
     fn shadow_tables(&self, _arguments: &ModuleArguments) -> DbResult<Vec<ShadowTable>> {
         Ok(Vec::new())

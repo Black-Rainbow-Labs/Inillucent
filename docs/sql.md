@@ -243,8 +243,8 @@ grouping and before a limit, so the answer would be wrong.
 | Extension | What is there |
 |---|---|
 | JSON | a binary storage form, and all 30 function names, `json_*` and `jsonb_*` |
-| FTS5 | full text search with `MATCH`, `t('query')` and `t = 'query'`, `bm25()`, `highlight()`, `snippet()`, the `rank` setting, external content and contentless tables with the `delete` command, and `fts5vocab`. The tokenizers are `ascii`, `unicode61` and `porter` |
-| FTS3 and FTS4 | the `fts3` and `fts4` modules with `matchinfo()` and `offsets()`. `fts4aux` and `fts3tokenize` are missing |
+| FTS5 | full text search with `MATCH`, `t('query')` and `t = 'query'`, `bm25()`, `highlight()`, `snippet()`, the `rank` setting, external content and contentless tables with the `delete` command, and `fts5vocab`. An external content table reads its rows from the named table or view, so `content='v'` works when `v` is a view and `content_rowid` names the view's rowid column. The tokenizers are `ascii`, `unicode61` and `porter` |
+| FTS3 and FTS4 | the `fts3` and `fts4` modules with `matchinfo()` and `offsets()`. The query language is SQLite's default one: a leading `-` excludes a term, `OR` and `NEAR` or `NEAR/n` in capitals are operators, and `AND` and `NOT` are ordinary words. `fts4aux` and `fts3tokenize` are missing |
 | R-Tree | `rtree`, `rtree_i32` and `geopoly` |
 | Others | `dbstat`, `sqlite_dbpage`, `bytecode`, `tables_used`, `completion`, `zipfile`, `fsdir` |
 | `inillucent_search` | inillucent's own table that combines vector and keyword search. [Vector search](vector-search.md) covers it |

@@ -173,6 +173,7 @@ impl WriteView<'_> {
             .with_unsupported(format!("reading {name} inside a write")));
         }
         let reach = crate::vtab::ScanReach {
+            view: None,
             modules: self.modules,
             registry: self.registry,
             pool: self.database.pool(),

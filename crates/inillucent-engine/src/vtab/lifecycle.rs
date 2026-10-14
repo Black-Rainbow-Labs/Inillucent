@@ -278,6 +278,22 @@ impl crate::ImportedDatabase {
             .virtual_tables
             .remove(&key)
             .ok_or_else(|| refusal(format!("no such table: {}", String::from_utf8_lossy(name))))?;
+        // **A view has no tree, so a change that reads the owner's rows is given them.**
+        // An insert that names its rowid reads nothing of the owner. A delete, an update
+        // and a command such as `rebuild` do, and they are the changes that ask here.
+        let reads_owner =
+            !matches!(change, Change::Insert { rowid, .. } if rowid.as_integer().is_some());
+        let view = match reads_owner {
+            true => self.owner_view_content(&connected),
+            false => Ok(None),
+        };
+        let view = match view {
+            Ok(view) => view,
+            Err(error) => {
+                self.session_state.virtual_tables.insert(key, connected);
+                return Err(error);
+            }
+        };
         let outcome = {
             let txn = self.current_txn();
             let at = self.schema.ddl_schema;
@@ -313,6 +329,7 @@ impl crate::ImportedDatabase {
                 )?,
                 trees: &mut self.schema.trees,
                 log: &mut log,
+                view: view.as_ref(),
             };
             let mut nowhere = inillucent_ext::vtab::WithStore { store };
             let mut context = Context {
@@ -953,6 +970,7 @@ impl crate::ImportedDatabase {
                     )?,
                     trees: &mut self.schema.trees,
                     log: &mut log,
+                    view: None,
                 };
                 let mut nowhere = inillucent_ext::vtab::WithStore { store };
                 let mut context = Context {
@@ -1121,6 +1139,7 @@ impl crate::ImportedDatabase {
             )?,
             trees: &mut self.schema.trees,
             log: &mut log,
+            view: None,
         };
         let mut nowhere = inillucent_ext::vtab::WithStore { store };
         let mut context = Context {
