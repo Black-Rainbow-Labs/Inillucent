@@ -1510,6 +1510,38 @@ impl PagedTree {
         replace: bool,
         new_key: bool,
     ) -> DbResult<Option<Vec<OwnedDatum>>> {
+        // A row read from a leaf written before the tree gained a column has fewer values
+        // than the tree has columns: an undo image copied from the page is one. It takes the
+        // defaults for the columns it lacks, which is what every reader gives such a leaf.
+        let missing = self.defaults_for_missing_columns(row.len());
+        if missing.is_empty() {
+            return self.write_full_row(database, log, row, want_previous, replace, new_key);
+        }
+        let padded: Vec<Datum<'_>> = row
+            .iter()
+            .copied()
+            .chain(missing.iter().map(OwnedDatum::borrow))
+            .collect();
+        self.write_full_row(database, log, &padded, want_previous, replace, new_key)
+    }
+
+    /// The body of [`PagedTree::write_row`], for a row that has a value for every column.
+    ///
+    /// @param database - the file
+    /// @param log - where the records go
+    /// @param row - the row, one value per column
+    /// @param want_previous - whether to copy out the row that was there
+    /// @param replace - whether a key already there is overwritten or left alone
+    /// @param new_key - whether the caller knows the key is not live
+    fn write_full_row(
+        &mut self,
+        database: &mut Database,
+        log: &mut dyn TreeLog,
+        row: &[Datum<'_>],
+        want_previous: bool,
+        replace: bool,
+        new_key: bool,
+    ) -> DbResult<Option<Vec<OwnedDatum>>> {
         // **Where one write's time goes, behind a switch** (task-2034). The
         // stage above this one has been measured twice and each time the
         // remainder landed here: task-2025 put the engine's virtual table arm
@@ -1523,22 +1555,7 @@ impl PagedTree {
         let entered = crate::stages::clock();
         let mut timing = crate::stages::PutStages::default();
         self.growing = new_key;
-        // A row read from a leaf written before the tree gained a column has fewer values
-        // than the tree has columns: an undo image copied from the page is one. It takes the
-        // defaults for the columns it lacks, which is what every reader gives such a leaf.
-        let missing = self.defaults_for_missing_columns(row.len());
-        let padded: Vec<Datum<'_>>;
-        let row = match missing.is_empty() {
-            true => row,
-            false => {
-                padded = row
-                    .iter()
-                    .copied()
-                    .chain(missing.iter().map(OwnedDatum::borrow))
-                    .collect();
-                &padded[..]
-            }
-        };
+
         // A log collecting before-images needs the row that was there, so the
         // read the caller did not ask for happens anyway. That is the whole
         // cost of being able to abandon a transaction, and it is paid only
