@@ -4109,6 +4109,17 @@ impl PagedTree {
             self.columns().to_vec(),
             self.key_columns(),
         )?;
+        if rows.is_empty() {
+            // A leaf whose rows were all deleted: an empty leaf with every column takes its
+            // place, in the same position in the chain.
+            let (right, max_cts) = {
+                let guard = database.pool().fetch(page)?;
+                let leaf = LeafRef::parse(&guard)?;
+                (leaf.right_sibling(), leaf.max_cts())
+            };
+            let image = builder.encode_empty()?;
+            return self.compact_into(database, log, page, image, right, max_cts, false);
+        }
         let fits = matches!(
             builder.pack_with(&borrowed, COMPACT_FILL, Some(&mut Measuring))?,
             Packed::Filled { rows: packed, .. } if packed == borrowed.len()

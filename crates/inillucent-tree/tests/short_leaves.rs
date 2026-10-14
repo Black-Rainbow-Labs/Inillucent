@@ -227,3 +227,45 @@ fn a_delete_from_a_short_leaf_leaves_the_other_rows_reading_the_defaults() {
     }
     assert_agrees(&database, &tree, &model, "after deletes");
 }
+
+/// A leaf whose rows were all deleted takes the next write, and is replaced by an empty leaf
+/// with every column.
+#[test]
+fn a_short_leaf_with_no_live_row_is_replaced_by_an_empty_full_leaf() {
+    let (mut database, mut tree) = fixture(2_000);
+    tree.set_shape(wide(), fills());
+    let mut model: BTreeMap<i64, Vec<OwnedDatum>> =
+        (0..2_000).map(|key| (key, defaulted(key))).collect();
+    let mut log = NoLog::default();
+    // Every row of the first few leaves goes.
+    for key in 0..400 {
+        tree.delete(&mut database, &mut log, &[Datum::Int(key)])
+            .expect("the delete");
+        model.remove(&key);
+    }
+    let row = [
+        Datum::Int(10),
+        Datum::Text(b"back"),
+        Datum::Int(1),
+        Datum::Null,
+        Datum::Real(1.5),
+    ];
+    tree.insert(&mut database, &mut log, &row)
+        .expect("the insert");
+    model.insert(
+        10,
+        vec![
+            OwnedDatum::Int(10),
+            OwnedDatum::Text(b"back".to_vec()),
+            OwnedDatum::Int(1),
+            OwnedDatum::Null,
+            OwnedDatum::Real(1.5),
+        ],
+    );
+    assert_agrees(
+        &database,
+        &tree,
+        &model,
+        "after the insert into an emptied leaf",
+    );
+}

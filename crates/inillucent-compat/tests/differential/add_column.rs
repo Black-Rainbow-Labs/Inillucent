@@ -404,6 +404,29 @@ fn a_rolled_back_write_into_short_leaves_restores_every_row() {
     grade("rollback-short", &script);
 }
 
+/// A leaf whose only row was deleted is widened when a row is put back, or a new one inserted.
+///
+/// The leaf holds no live row, so there is nothing to repack and the leaf is replaced by an
+/// empty one that has every column. A rolled back delete of the only row of a table is how
+/// this arrives.
+#[test]
+fn a_short_leaf_with_no_live_row_takes_the_next_write() {
+    let script = "CREATE TABLE s(k INTEGER PRIMARY KEY, a);
+         INSERT INTO s VALUES (1, 'one');
+         ALTER TABLE s ADD COLUMN b TEXT DEFAULT 'x';
+         BEGIN;
+         DELETE FROM s;
+         ROLLBACK;
+         SELECT * FROM s;
+         DELETE FROM s;
+         SELECT count(*) FROM s;
+         INSERT INTO s(k, a) VALUES (2, 'two');
+         INSERT INTO s(k, a, b) VALUES (3, 'three', 'y');
+         SELECT * FROM s ORDER BY k;
+         PRAGMA integrity_check;";
+    grade("empty-short-leaf", script);
+}
+
 /// Adding a column inside a transaction that is rolled back leaves the table as it was.
 #[test]
 fn a_rolled_back_add_column_leaves_no_trace() {
